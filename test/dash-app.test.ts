@@ -93,6 +93,8 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     context_input_tokens: null,
     context_window_size: null,
     dispatch_origin: null,
+    harness: null,
+    resume_target: null,
     ...overrides,
   };
 }

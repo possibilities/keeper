@@ -5,6 +5,7 @@
  * the whole flow is testable against a fake agent and a recording spawn.
  */
 
+import { spawnSync } from "node:child_process";
 import {
   accessSync,
   constants,
@@ -17,7 +18,13 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import {
+  type BirthRecordDraft,
+  buildBirthDraft,
+  emitBirthRecord,
+} from "../birth-record";
 import { ensureCodexDirTrust } from "../codex-trust";
+import { ensureHermesShimTrust } from "../hermes-trust";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
@@ -55,7 +62,8 @@ import {
   USAGE,
   VERSION,
 } from "./dispatch";
-import { READ_ONLY_DIRECTIVE } from "./launch-config";
+import { HARNESS_DESCRIPTORS } from "./harness";
+import { piExtensionArgs, READ_ONLY_DIRECTIVE } from "./launch-config";
 import {
   type LaunchHandleDeps,
   launchToResolvedHandle,
@@ -65,9 +73,11 @@ import {
   resolveHandle,
   runShowLastMessage,
   runWaitForStop,
+  type VerbDeps,
 } from "./pair-subcommands";
 import {
   findCodexPassthroughCommand,
+  findHermesPassthroughCommand,
   findPassthroughCommand,
   findPiPassthroughCommand,
   hasExplicitCodexEffortArg,
@@ -84,6 +94,7 @@ import {
 import { makePhaser } from "./phaser";
 import { discoverPlugins, PluginError } from "./plugins";
 import {
+  type ChildSpawnedFn,
   defaultSpawn,
   runPassthrough,
   runWithJobControl,
@@ -147,6 +158,7 @@ export interface MainDeps {
   claudeBin: string;
   codexBin: string;
   piBin: string;
+  hermesBin: string;
   pluginConfigPath: string;
   loadPluginSourcesFn: () => PluginSources;
   /**
@@ -186,6 +198,16 @@ export interface MainDeps {
   startCodexSessionNameIndexerFn: (
     opts: CodexSessionNameIndexerOptions,
   ) => () => void;
+  /**
+   * Emit a birth record for a freshly-spawned non-claude harness child (codex /
+   * pi / hermes): probe the child's platform-tagged start_time and atomically
+   * write the maildir record the ingest worker turns into a synthetic
+   * SessionStart. Fail-open — a write failure degrades to presence-only. Injected
+   * so the launcher wiring is testable without a real fs write or `ps` fork;
+   * `realDeps()` binds the real {@link emitBirthRecord}. Claude launches never
+   * call it (its hook SessionStart is the authoritative presence + resume seed).
+   */
+  emitBirthRecord: (draft: BirthRecordDraft, pid: number) => void;
   tmuxBin: string;
   /**
    * The argv PREFIX the detached pane re-execs (`[<abs bun>, <abs cli/keeper.ts>,
@@ -205,6 +227,14 @@ export interface MainDeps {
    * `~/.config/keeper`.
    */
   resolveStatuslineSettingsPathFn: () => string | null;
+  /**
+   * The pi native flags that arm keeper's ephemeral in-process extension
+   * (`["-e", <path>]`, or `[]` when the extension file is absent). Injected into
+   * every managed pi launch so pi shows live working/stopped churn; a seam so the
+   * byte-pin harness fixes the flags without depending on the real repo path.
+   * `realDeps()` binds it to {@link piExtensionArgs} (fail-open existence check).
+   */
+  resolvePiExtensionArgsFn: () => string[];
 }
 
 /** Production deps — the real collaborators. */
@@ -230,6 +260,7 @@ export function realDeps(): MainDeps {
     claudeBin: join(homedir(), ".local", "bin", "claude"),
     codexBin: resolveCodexBin(process.env),
     piBin: "pi",
+    hermesBin: resolveHermesBin(),
     pluginConfigPath: pluginConfigPath(),
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
@@ -249,6 +280,7 @@ export function realDeps(): MainDeps {
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
+    emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
     tmuxBin: resolveTmuxBin(process.env),
     launcherArgvPrefix: buildLauncherArgvPrefix(
       process.execPath,
@@ -262,6 +294,7 @@ export function realDeps(): MainDeps {
         join(homedir(), ".config", "keeper"),
         process.env,
       ),
+    resolvePiExtensionArgsFn: () => piExtensionArgs(),
   };
 }
 
@@ -304,6 +337,50 @@ function resolveCodexBin(env: NodeJS.ProcessEnv): string {
     }
   }
   return "codex";
+}
+
+/**
+ * Resolve the hermes binary: the canonical `~/.local/bin/hermes` install path
+ * when present + executable, else the bare `hermes` name (PATH fallback). Mirrors
+ * the binary-before-config ordering — a machine without the install path still
+ * launches if `hermes` is on PATH.
+ */
+function resolveHermesBin(): string {
+  const installed = join(homedir(), ".local", "bin", "hermes");
+  try {
+    accessSync(installed, constants.X_OK);
+    return installed;
+  } catch {
+    return "hermes";
+  }
+}
+
+/**
+ * Run `hermes sessions export --source cli -` and return its JSONL text, or null
+ * on any failure. The hermes M2 capture seam ({@link runHermesSessionsExport} is
+ * bound onto {@link VerbDeps.hermesExport} for the wait/show verbs). `--source cli`
+ * bounds the export to keeper's own one-shot launches (`source: cli`); reading is
+ * strictly read-only. A non-zero exit / spawn error / empty stdout → null so the
+ * poll loop keeps trying and fails to `no_transcript`, never hangs. Production
+ * only — tests inject a fixture seam, so this subprocess never runs under test.
+ */
+function runHermesSessionsExport(
+  hermesBin: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  try {
+    const result = spawnSync(
+      hermesBin,
+      ["sessions", "export", "--source", "cli", "-"],
+      { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    );
+    if (result.status !== 0 || typeof result.stdout !== "string") {
+      return null;
+    }
+    return result.stdout.trim() === "" ? null : result.stdout;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -350,23 +427,11 @@ function printVerbose(
 }
 
 function displayAgent(agent: AgentKind): string {
-  if (agent === "claude") {
-    return "Claude";
-  }
-  if (agent === "codex") {
-    return "Codex";
-  }
-  return "Pi";
+  return HARNESS_DESCRIPTORS[agent].displayName;
 }
 
 function agentProfileEnvName(agent: AgentKind): string {
-  if (agent === "claude") {
-    return "KEEPER_AGENT_CLAUDE_PROFILE";
-  }
-  if (agent === "codex") {
-    return "KEEPER_AGENT_CODEX_PROFILE";
-  }
-  return "KEEPER_AGENT_PI_PROFILE";
+  return HARNESS_DESCRIPTORS[agent].profileEnvVar;
 }
 
 function findPassthroughForAgent(
@@ -378,6 +443,9 @@ function findPassthroughForAgent(
   }
   if (agent === "codex") {
     return findCodexPassthroughCommand(args);
+  }
+  if (agent === "hermes") {
+    return findHermesPassthroughCommand(args);
   }
   return findPiPassthroughCommand(args);
 }
@@ -456,6 +524,16 @@ function resolveLaunchConfigSignals(
       exemptAll: hasExplicitCodexProfileArg(args),
     };
   }
+  if (agent === "hermes") {
+    // Model-only: hermes shares codex's `-m`/`--model` spelling and exposes no
+    // second axis, so `effortOrThinking` is trivially satisfied (readiness rests
+    // on the model alone via the descriptor-driven core).
+    return {
+      model: hasExplicitCodexModelArg(args),
+      effortOrThinking: true,
+      exemptAll: false,
+    };
+  }
   if (agent === "pi") {
     const colon = piModelColonThinking(args) !== null;
     return {
@@ -496,11 +574,37 @@ function unresolvedDefaultMessage(agent: AgentKind): string {
       `(or --model <model>:<thinking>).\n`
     );
   }
+  if (agent === "hermes") {
+    return (
+      `Error: keeper agent hermes: no model resolved for a fresh launch. ` +
+      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
+      `or pass -m <model> (hermes is model-only — no effort/thinking).\n`
+    );
+  }
   return (
     `Error: keeper agent claude: no model/effort resolved for a fresh launch. ` +
     `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
     `or pass --model <model> --effort <effort>.\n`
   );
+}
+
+/** The `<harness>_default` pointer for a harness — the preset a bare
+ *  `keeper agent <harness>` resolves. Keyed per harness so a new harness's default
+ *  never silently falls through to another's. */
+function harnessDefaultName(
+  agent: AgentKind,
+  catalog: PresetCatalog,
+): string | null {
+  switch (agent) {
+    case "claude":
+      return catalog.claude_default ?? null;
+    case "codex":
+      return catalog.codex_default ?? null;
+    case "pi":
+      return catalog.pi_default ?? null;
+    case "hermes":
+      return catalog.hermes_default ?? null;
+  }
 }
 
 /**
@@ -518,10 +622,16 @@ function resolveLaunchReadiness(
   preset: Preset | null,
   signals: LaunchConfigSignals,
 ): boolean {
-  const model = preset?.model ?? null;
+  const modelResolved = (preset?.model ?? null) !== null || signals.model;
+  // A model-only harness (hermes, `secondAxis: "none"`) needs no second axis —
+  // the model alone makes it ready. The axis is descriptor-driven, never a
+  // harness-name literal.
+  const axis = HARNESS_DESCRIPTORS[agent].secondAxis;
+  if (axis === "none") {
+    return modelResolved;
+  }
   const second =
-    agent === "pi" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
-  const modelResolved = model !== null || signals.model;
+    axis === "thinking" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
   const secondResolved = second !== null || signals.effortOrThinking;
   return modelResolved && secondResolved;
 }
@@ -616,6 +726,32 @@ function codexWrapperDefaults(args: string[]): string[] {
     defaults.push("--search");
   }
   return defaults;
+}
+
+/**
+ * The no-approval posture keeper prepends for a hermes launch: `--yolo` unless the
+ * caller already set an explicit posture (`--yolo` or `--safe-mode`). Paired with
+ * the `HERMES_ACCEPT_HOOKS=1` pane env (set at launch) so a detached one-shot never
+ * stalls on an approval or a first-use hook-consent prompt.
+ */
+function hermesWrapperDefaults(args: string[]): string[] {
+  if (args.includes("--yolo") || args.includes("--safe-mode")) {
+    return [];
+  }
+  return ["--yolo"];
+}
+
+/** The hermes model override, or null to leave it to the caller. An explicit
+ *  `-m`/`--model` (hermes shares codex's model-flag spelling) wins over the
+ *  preset/hermes_default. */
+function resolveHermesStartupModelOverride(
+  args: string[],
+  defaultModel: string | null,
+): string | null {
+  if (hasExplicitCodexModelArg(args)) {
+    return null;
+  }
+  return defaultModel;
 }
 
 /** The downstream renderer the statusLine tee chain feeds — the human's own
@@ -786,7 +922,7 @@ async function runTranscriptSubcommand(
     deps.write(tmuxErrorJson(TMUX_EXIT.BAD_ARGS, resolution.error));
     return deps.exit(TMUX_EXIT.BAD_ARGS);
   }
-  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const verbDeps = makeVerbDeps(deps);
 
   if (verb === "wait-for-stop") {
     const result = await runWaitForStop(resolution.handle, verbDeps);
@@ -831,6 +967,18 @@ async function runTranscriptSubcommand(
   return deps.exit(0);
 }
 
+/** The transcript-verb deps shared by wait-for-stop / show-last-message / the
+ *  run-capture compose — the env + home for the file-transcript agents, plus the
+ *  hermes export seam (a bounded `hermes sessions export` subprocess) its
+ *  store-based capture polls. */
+function makeVerbDeps(deps: MainDeps): VerbDeps {
+  return {
+    env: deps.env,
+    homeDir: deps.transcriptHomeDir,
+    hermesExport: () => runHermesSessionsExport(deps.hermesBin, deps.env),
+  };
+}
+
 /** The wait/show/clock seams the run-capture compose drives, bound to the
  *  production primitives + the injected clock. */
 function runCaptureSeams(deps: MainDeps): RunCaptureDeps {
@@ -855,6 +1003,7 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
     randomUuid: deps.randomUuid,
     runTmuxCommand: deps.runTmuxCommandFn,
     ensureCodexDirTrust,
+    ensureHermesShimTrust,
     now: deps.now,
     writeErr: deps.writeErr,
   };
@@ -950,7 +1099,7 @@ async function runRunCaptureSubcommand(
     );
   }
   const agent = parsed.cli;
-  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const verbDeps = makeVerbDeps(deps);
   const runBadArgs = (): Promise<never> =>
     emitRunCapture(
       deps,
@@ -998,12 +1147,7 @@ async function runRunCaptureSubcommand(
       }
       throw exc;
     }
-    const defaultName =
-      (agent === "claude"
-        ? catalog.claude_default
-        : agent === "codex"
-          ? catalog.codex_default
-          : catalog.pi_default) ?? null;
+    const defaultName = harnessDefaultName(agent, catalog);
     if (defaultName !== null) {
       runPreset = resolvePreset(catalog, defaultName);
     }
@@ -1113,7 +1257,7 @@ async function runWaitCaptureSubcommand(
       buildRunCaptureEnvelope({ outcome: "bad_args" }),
     );
   }
-  const verbDeps = { env: deps.env, homeDir: deps.transcriptHomeDir };
+  const verbDeps = makeVerbDeps(deps);
   const result = await captureFromHandle(runCaptureSeams(deps), verbDeps, {
     handle: resolution.handle,
     handleId: firstHandleToken(rest),
@@ -1259,6 +1403,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
           claude: catalog.claude_default ?? null,
           codex: catalog.codex_default ?? null,
           pi: catalog.pi_default ?? null,
+          hermes: catalog.hermes_default ?? null,
         },
       })}\n`,
     );
@@ -1296,6 +1441,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     ["claude", catalog.claude_default],
     ["codex", catalog.codex_default],
     ["pi", catalog.pi_default],
+    ["hermes", catalog.hermes_default],
   ] as const) {
     lines.push(`  ${harness}_default  ${pointer ?? "(unset)"}`);
   }
@@ -1536,12 +1682,15 @@ export async function main(deps: MainDeps): Promise<never> {
     agent = dispatch.agent;
     argv = dispatch.rest;
   }
-  const bin =
-    agent === "claude"
-      ? deps.claudeBin
-      : agent === "codex"
-        ? deps.codexBin
-        : deps.piBin;
+  // The injected resolved bins, keyed by harness — the descriptor-lookup form of
+  // the old `agent === "claude" ? … : …` chain (byte-identical selection).
+  const bins: Record<AgentKind, string> = {
+    claude: deps.claudeBin,
+    codex: deps.codexBin,
+    pi: deps.piBin,
+    hermes: deps.hermesBin,
+  };
+  const bin = bins[agent];
   const agentLabel = displayAgent(agent);
 
   // Wrapper-owned help short-circuits before the tmux pre-pass, passthrough
@@ -1734,12 +1883,7 @@ export async function main(deps: MainDeps): Promise<never> {
         }
         throw exc;
       }
-      const defaultName =
-        (agent === "claude"
-          ? catalog.claude_default
-          : agent === "codex"
-            ? catalog.codex_default
-            : catalog.pi_default) ?? null;
+      const defaultName = harnessDefaultName(agent, catalog);
       if (defaultName !== null) {
         resolvedPreset = resolvePreset(catalog, defaultName);
         actionLog.push(`Resolved ${agent}_default preset '${defaultName}'`);
@@ -1973,7 +2117,71 @@ export async function main(deps: MainDeps): Promise<never> {
       startedAtMs: Date.now(),
     });
 
-    return runWithJobControl(runCmd, deps.spawn, deps.exit);
+    const onCodexSpawned = armBirthRecord(deps, "codex", {
+      spawnName: codexSessionName,
+      configDir: codexHome,
+      pinnedSessionId: null,
+      hasContinueOrResume,
+    });
+    return runWithJobControl(runCmd, deps.spawn, deps.exit, onCodexSpawned);
+  }
+
+  if (agent === "hermes") {
+    // Hermes uses its native config — keeper does no profile routing for it (M0-M2).
+    if (launcherProfile === "auto") {
+      launcherProfile = "";
+      actionLog.push("Using native Hermes config");
+    }
+
+    const runCmd = [bin];
+    // No-approval posture: --yolo (unless the caller set one) + the hook-consent
+    // env below. hermes is model-only, so there is no effort/thinking to inject.
+    const defaults = hermesWrapperDefaults(remainingArgs);
+    runCmd.push(...defaults);
+    if (defaults.includes("--yolo")) {
+      actionLog.push("Added Hermes no-approval default (--yolo)");
+    }
+
+    // Preset (--x-preset or the resolved hermes_default) supplies the model;
+    // an explicit -m/--model still wins.
+    const startupModel = resolveHermesStartupModelOverride(
+      remainingArgs,
+      resolvedPreset?.model ?? null,
+    );
+    if (startupModel !== null) {
+      runCmd.push("-m", startupModel);
+      actionLog.push(`Added startup model override: -m ${startupModel}`);
+      note(`model: ${startupModel}`);
+    }
+
+    runCmd.push(...remainingArgs);
+
+    // Seed hook consent so a non-TTY / fresh pane never silently skips (or blocks
+    // on) hermes's first-use shell-hook prompt. Equivalent to `--accept-hooks`,
+    // but as pane env it survives the detached re-exec.
+    deps.env.HERMES_ACCEPT_HOOKS = "1";
+    actionLog.push("Set HERMES_ACCEPT_HOOKS=1");
+    deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
+
+    if (launcherVeryVerbose) {
+      printVerbose(deps, actionLog, formatCommand(runCmd));
+    }
+    if (sectionsOn) {
+      deps.write("~ launching hermes\n");
+    }
+
+    const hermesSpawnName = resolveLaunchSessionName(
+      remainingArgs,
+      deps.cwd,
+      deps.nextCwdOrdinalFn,
+    ).sessionName;
+    const onHermesSpawned = armBirthRecord(deps, "hermes", {
+      spawnName: hermesSpawnName,
+      configDir: null,
+      pinnedSessionId: null,
+      hasContinueOrResume,
+    });
+    return runWithJobControl(runCmd, deps.spawn, deps.exit, onHermesSpawned);
   }
 
   if (agent === "claude") {
@@ -2150,6 +2358,18 @@ export async function main(deps: MainDeps): Promise<never> {
       actionLog.push(`Added startup model override: --model ${startupModel}`);
       note(`model: ${startupModel}`);
     }
+
+    // Arm keeper's ephemeral pi extension (`-e <path>`) so this session shows
+    // live working/stopped churn — the M3b live-state channel, paired with the
+    // birth record armed below. EPHEMERAL per-launch only (never a persistent pi
+    // install). Fail-open: `resolvePiExtensionArgsFn` returns `[]` when the
+    // extension file is absent, degrading pi to presence-only. Both interactive
+    // and detached launches pass through this managed-launch choke point.
+    const piExtArgs = deps.resolvePiExtensionArgsFn();
+    if (piExtArgs.length > 0) {
+      runCmd.push(...piExtArgs);
+      actionLog.push(`Armed keeper pi extension: ${piExtArgs.join(" ")}`);
+    }
   }
 
   // Generate session ID and name for new Claude/Pi sessions.
@@ -2171,6 +2391,8 @@ export async function main(deps: MainDeps): Promise<never> {
   // A fresh launch OR a fork needs a fresh --name (a fork mints a new session
   // id; plain --resume/--continue keeps its persisted title and is excluded).
   const wantSessionName = sessionUuid !== null || hasForkSession;
+  // Captured for the pi birth record's spawn_name (display title).
+  let resolvedSessionName: string | null = null;
   if (
     wantSessionName &&
     !remainingArgs.includes("-n") &&
@@ -2181,6 +2403,7 @@ export async function main(deps: MainDeps): Promise<never> {
       deps.cwd,
       deps.nextCwdOrdinalFn,
     );
+    resolvedSessionName = sessionName;
     if (resolvedSlug) {
       actionLog.push(`Resolved session slug: ${resolvedSlug}`);
     } else {
@@ -2291,7 +2514,19 @@ export async function main(deps: MainDeps): Promise<never> {
     deps.write(`~ launching ${agent}\n`);
   }
 
-  return runWithJobControl(runCmd, deps.spawn, deps.exit);
+  // pi shares this path with claude; only pi gets a birth record (claude's hook
+  // SessionStart is its authoritative presence seed). pi pins its session id, so
+  // the pinned uuid is its job identity + resume target.
+  const onChildSpawned: ChildSpawnedFn | undefined =
+    agent === "pi"
+      ? armBirthRecord(deps, "pi", {
+          spawnName: resolvedSessionName,
+          configDir: profileDir,
+          pinnedSessionId: sessionUuid,
+          hasContinueOrResume,
+        })
+      : undefined;
+  return runWithJobControl(runCmd, deps.spawn, deps.exit, onChildSpawned);
 }
 
 function safeList(fn: () => string[]): string[] {
@@ -2300,6 +2535,64 @@ function safeList(fn: () => string[]): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Arm the birth record for a non-claude launch: resolve the keeper job identity,
+ * export it (plus codex's rollout originator override) to the harness child, and
+ * return the post-spawn callback that writes the maildir record. A birth record
+ * is the ONLY presence channel for codex/pi/hermes (they fire no keeper hook);
+ * claude is exempt — its SessionStart hook is authoritative for both presence and
+ * resume seed — and never calls this.
+ *
+ * Identity: pi pins its session id at launch (`job_id = session_id`); codex/hermes
+ * get a keeper-minted uuid. A RESUME relaunch reuses the ORIGINAL job id carried
+ * back in `KEEPER_JOB_ID` (set by the revive script / keeper tabs restore) so the
+ * revived session folds onto its existing row instead of minting an orphan. The
+ * callback runs shared by interactive AND detached launches: a detached pane
+ * re-execs `keeper agent` and passes back through this same spawn choke point, so
+ * the record is written by the pane's own launcher, never the outer wrapper.
+ */
+function armBirthRecord(
+  deps: MainDeps,
+  agent: Exclude<AgentKind, "claude">,
+  opts: {
+    spawnName: string | null;
+    configDir: string | null;
+    /** The session id keeper pinned at launch (pi), or null for a harness that
+     *  mints its own (codex/hermes). */
+    pinnedSessionId: string | null;
+    hasContinueOrResume: boolean;
+  },
+): ChildSpawnedFn {
+  const descriptor = HARNESS_DESCRIPTORS[agent];
+  const carried = (deps.env.KEEPER_JOB_ID ?? "").trim();
+  let jobId: string;
+  if (opts.hasContinueOrResume && carried !== "") {
+    jobId = carried;
+  } else if (opts.pinnedSessionId !== null) {
+    jobId = opts.pinnedSessionId;
+  } else {
+    jobId = deps.randomUuid();
+  }
+  // Export the identity to the harness child. Codex additionally overrides its
+  // rollout originator so the rollout tail can positively attribute the session.
+  deps.env.KEEPER_JOB_ID = jobId;
+  if (agent === "codex") {
+    deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE = jobId;
+  }
+  const draft = buildBirthDraft(deps.env, {
+    session_id: jobId,
+    harness: agent,
+    cwd: deps.cwd,
+    spawn_name: opts.spawnName,
+    config_dir: opts.configDir,
+    // pi's resume target is its pinned session id (authoritative at launch);
+    // codex/hermes back-fill theirs post-stop, so it is null at birth.
+    resume_target: descriptor.mintsOwnSessionId ? null : jobId,
+    launch_ts: new Date(deps.now()).toISOString(),
+  });
+  return (pid: number) => deps.emitBirthRecord(draft, pid);
 }
 
 /**

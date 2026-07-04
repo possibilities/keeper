@@ -20,6 +20,13 @@ interface Candidate {
   id: string;
   cwd: string | null;
   createdAtMs: number;
+  /**
+   * The rollout's `SessionMeta.originator` — normally codex's own tag
+   * (`"codex-tui"`), but the keeper launcher overrides it to the keeper job id
+   * via `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, so a keeper-launched rollout can be
+   * positively attributed by exact id match. NULL when the meta line omits it.
+   */
+  originator: string | null;
 }
 
 /**
@@ -95,36 +102,96 @@ export function codexSessionIdFromRolloutPath(p: string): string | null {
 export function findCodexSessionId(
   opts: CodexSessionNameIndexerOptions,
 ): string | null {
-  const candidates = findCandidateSessions(opts);
+  return pickCandidateByCwd(findCandidateSessions(opts), opts.expectedCwd);
+}
+
+/**
+ * Options for {@link resolveCodexResumeTarget} — the daemon-side back-fill of a
+ * tracked codex job's native rollout uuid (its resume target).
+ */
+export interface CodexResumeResolveOptions {
+  codexHome: string;
+  /**
+   * The keeper job id, which the launcher exports as
+   * `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` so the rollout stamps it as its
+   * `SessionMeta.originator` — the exact-match attribution key.
+   */
+  jobId: string;
+  /** The launching cwd, for the collision-tolerant fallback. */
+  expectedCwd: string | null;
+  /** Job launch instant (ms) — the candidate-rollout recency floor. */
+  startedAtMs: number;
+}
+
+/**
+ * Resolve a tracked codex job's native rollout uuid (the id it resumes by),
+ * reading ONLY each candidate rollout's `SessionMeta` head line — never session
+ * content. Attribution precedence:
+ *
+ *  1. **Exact originator match** — the launcher exports
+ *     `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=jobId`, so a keeper-launched rollout
+ *     carries `SessionMeta.originator === jobId`. This positively attributes the
+ *     session even when two concurrent codex sessions share a cwd (the case the
+ *     name indexer must refuse). A pathological >1 originator match refuses.
+ *  2. **cwd + created-at fallback** (override stripped or upstream-removed) — the
+ *     same refuse-to-guess-on-same-cwd-collision behavior {@link findCodexSessionId}
+ *     uses. An unresolvable session returns null; the caller leaves resume_target
+ *     NULL and presence is unaffected.
+ */
+export function resolveCodexResumeTarget(
+  opts: CodexResumeResolveOptions,
+): string | null {
+  const candidates = findCandidateSessions({
+    codexHome: opts.codexHome,
+    startedAtMs: opts.startedAtMs,
+  });
+  const byOriginator = candidates.filter(
+    (candidate) => candidate.originator === opts.jobId,
+  );
+  if (byOriginator.length === 1) {
+    return byOriginator[0]?.id ?? null;
+  }
+  if (byOriginator.length > 1) {
+    return null;
+  }
+  return pickCandidateByCwd(candidates, opts.expectedCwd);
+}
+
+/**
+ * Pick the one candidate whose cwd matches, refusing to guess on a same-cwd
+ * collision (naming the wrong session's rollout is worse than leaving it
+ * unnamed — never a newest-by-mtime pick). With no cwd constraint, a sole
+ * candidate is unambiguous. Shared by the launcher name indexer and the
+ * daemon resume back-fill's fallback path.
+ */
+function pickCandidateByCwd(
+  candidates: Candidate[],
+  expectedCwd: string | null,
+): string | null {
   if (candidates.length === 0) {
     return null;
   }
-
-  if (opts.expectedCwd !== null) {
+  if (expectedCwd !== null) {
     const cwdMatches = candidates.filter((candidate) => {
-      return candidate.cwd === opts.expectedCwd;
+      return candidate.cwd === expectedCwd;
     });
     if (cwdMatches.length === 1) {
       return cwdMatches[0]?.id ?? null;
     }
-    // More than one post-launch rollout shares the leg's cwd — a concurrent
-    // codex session collided. There is no id to pin at launch, so refuse to
-    // guess (never a newest-by-mtime pick): naming the wrong session's rollout is
-    // worse than leaving it unnamed.
     if (cwdMatches.length > 1) {
       return null;
     }
   }
-
   if (candidates.length === 1) {
     return candidates[0]?.id ?? null;
   }
   return null;
 }
 
-function findCandidateSessions(
-  opts: CodexSessionNameIndexerOptions,
-): Candidate[] {
+function findCandidateSessions(opts: {
+  codexHome: string;
+  startedAtMs: number;
+}): Candidate[] {
   const root = join(opts.codexHome, "sessions");
   const dirs = sessionDayDirs(root, opts.startedAtMs);
   const candidates: Candidate[] = [];
@@ -181,9 +248,7 @@ function safeStat(path: string): { mtimeMs: number } | null {
   }
 }
 
-function readSessionMeta(
-  path: string,
-): { id: string; cwd: string | null; createdAtMs: number } | null {
+function readSessionMeta(path: string): Candidate | null {
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
@@ -194,9 +259,12 @@ function readSessionMeta(
       if (!line.includes('"type":"session_meta"')) {
         continue;
       }
+      // Head line only (metadata, never session content — codex rollouts can
+      // carry secrets). A partially-written meta line (codex collects git fields
+      // async) fails the parse and folds to null, tolerated by the caller.
       const parsed = JSON.parse(line) as {
         timestamp?: unknown;
-        payload?: { id?: unknown; cwd?: unknown };
+        payload?: { id?: unknown; cwd?: unknown; originator?: unknown };
       };
       const id = parsed.payload?.id;
       if (typeof id !== "string" || !isUuid(id)) {
@@ -207,7 +275,13 @@ function readSessionMeta(
         return null;
       }
       const cwd = parsed.payload?.cwd;
-      return { id, cwd: typeof cwd === "string" ? cwd : null, createdAtMs };
+      const originator = parsed.payload?.originator;
+      return {
+        id,
+        cwd: typeof cwd === "string" ? cwd : null,
+        createdAtMs,
+        originator: typeof originator === "string" ? originator : null,
+      };
     }
     return null;
   } catch {

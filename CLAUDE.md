@@ -41,15 +41,9 @@ imperative guardrails only.
 
 ## Hook rules
 
-- **Four hooks under `plugins/keeper/plugin/hooks/`** — events-writer (logs every Bash invocation,
-  NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a SUBAGENT — `agent_id` present — from git
-  branch create/switch/worktree-add; the in-daemon worktree producer shells git with no `agent_id`, so it
-  is NOT gated), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state, NEVER the `.md`
-  body), docs-pusher (`Stop`, pushes `~/docs` once per turn).
-- **Always exit 0** — a non-zero exit can fail-closed the human's session. The branch-guard denies via the
-  `PreToolUse` JSON envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows + logs).
-- **No third-party deps, and NO `bun:sqlite`/`src/db.ts` in a hook.** Keep imports to `node:*` + the
-  dep-free `src/{dead-letter,derivers,exec-backend,sidecar,doc-commit}.ts` helpers; never the plan plugin.
+- **Four hooks under `plugins/keeper/plugin/hooks/`** — events-writer (logs every Bash invocation, NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a SUBAGENT — `agent_id` present — from git branch create/switch/worktree-add; the in-daemon worktree producer shells git with no `agent_id`, so it is NOT gated), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state, NEVER the `.md` body), docs-pusher (`Stop`, pushes `~/docs` once per turn). Two sibling events-log writers ride the SAME discipline — the hermes shell shim (`hooks/hermes-events-shim.ts`, registered in hermes's config by `src/hermes-trust.ts`) and the ephemeral pi in-process extension (`plugins/keeper/pi-extension/`, armed per-launch via `-e`, gated on `KEEPER_JOB_ID`).
+- **Always exit 0 / fail-open** — a non-zero exit can fail-closed the human's session; a throwing shim/extension must degrade its harness to presence-only, NEVER crash or stall its turn. The branch-guard denies via the `PreToolUse` JSON envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows + logs). A shim/extension NEVER writes host stdout (it is the harness's hook control channel) and logs every failure privately.
+- **No third-party deps, and NO `bun:sqlite`/`src/db.ts` in a hook or events-log writer.** Keep imports to `node:*` + the dep-free `src/{dead-letter,derivers,exec-backend,sidecar,doc-commit}.ts` helpers; never the plan plugin (the pi extension loads in ISOLATION via jiti — `node:*` + its own contract copy only). Hook/shim payloads are attacker-influenced: emit each record as ONE JSON line (no NDJSON injection, no shell interpolation), size-bounded.
 - **A `~/docs` hook may spawn a bounded git subprocess** — read-only probes (e.g. a `rev-parse` for sidecar provenance) against the session repo are fine; the hard line is NO mutating git or DB write outside the `~/docs` repo, and never `git fetch`/rebase/force-push even there.
 
 ## Migrations
@@ -66,12 +60,7 @@ imperative guardrails only.
   `replay_dead_letter`, `retry_dispatch`, `set_autopilot_paused`, `set_autopilot_mode`, `set_autopilot_config`,
   `set_epic_armed`, `request_handoff` — `set_autopilot_config` is GENERIC (a partial `autopilot_state` config patch; a future setting = a column + patch field, no new RPC). Never write `jobs`/`epics` directly.
 - **Plans are READ-ONLY.** The plan worker folds `.keeper/{epics,tasks}` snapshots into `epics`; no RPC writes a plan field. **Board-orient before acting** with `keeper status`; get per-task detail (tier/model/title/deps + readiness verdict) via `keeper query tasks` — never hand-parse a `keeper plan <verb>` read.
-- **Sole-writer rules.** The events-writer hook writes ONLY per-pid NDJSON files; the sidecar-writer + docs-pusher
-  write ONLY the `~/docs` repo. The events-log ingester is the sole writer of hook-sourced `events` rows; main
-  writes all synthetic events + `dead_letters` + the replay path, workers feed via main. The codex trust-seed
-  (`src/codex-trust.ts`) is the ONLY keeper surface writing codex's config dir, fail-open. `keeper statusline-sink`
-  is the SOLE writer of the statusLine leaf files `statusline-worker` reads (never the DB/socket); `keeper agent
-  panel start` the SOLE writer of `~/.local/state/keeper/panels/` (durable per-slug panel state, no daemon/hook).
+- **Sole-writer rules.** The events-log per-pid NDJSON tree has a writer CLASS keyed on the keeper job id — the claude events-writer hook, the hermes shell shim, and the ephemeral pi extension each write ONLY their own `<pid>.ndjson`, never the DB; the `keeper agent` launcher is the SOLE writer of the births tree (the non-claude presence maildir). The sidecar-writer + docs-pusher write ONLY the `~/docs` repo. The events-log ingester is the sole writer of hook-sourced `events` rows; main writes all synthetic events + `dead_letters` + the replay path (the birth-ingest and codex-state producers feed it, never the DB), workers feed via main. The codex/hermes trust-seeds (`src/{codex,hermes}-trust.ts`) are the ONLY keeper surfaces writing those harnesses' config dirs, fail-open. `keeper statusline-sink` is the SOLE writer of the statusLine leaf files `statusline-worker` reads (never the DB/socket); `keeper agent panel start` the SOLE writer of `~/.local/state/keeper/panels/` (durable per-slug panel state, no daemon/hook).
 - **Profile-dir names are guarded — never hand-create `~/.claude-profiles/default`.**
   `assertProfileDirNameAllowed` fail-loud rejects (StateError→exit 1) the reserved set (`""`/`default`/`auto`, trimmed) + path-escape (separator/`..`/NUL, checked on RAW input) at every `mkdir` site.
 

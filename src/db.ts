@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 108;
+export const SCHEMA_VERSION = 109;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -729,7 +729,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- v93->v94 (fn-997.1): durable per-job worktree-lane BRANCH captured by the
     -- hook at SessionStart from KEEPER_PLAN_WORKTREE_BRANCH (NULL on every
     -- non-SessionStart / non-worktree row). Folded set-once onto jobs.worktree.
-    worktree TEXT
+    worktree TEXT,
+    -- v106->v107 (fn-1103.3): the launching harness ("claude"/"codex"/"pi"/
+    -- "hermes") and its native resume target, both nullable TEXT. Part of the
+    -- FIVE-place events lockstep (this literal, KNOWN_EVENT_COLUMNS, the hook
+    -- insertBindings, INGEST_EVENTS_COLUMNS, the insertEvent prepared statement).
+    -- The claude hook stamps harness "claude" at SessionStart; the fold copies
+    -- the event's harness verbatim and NEVER synthesizes a value, so a legacy
+    -- NULL-harness row reads as claude at every consumer. resume_target rides the
+    -- SessionStart arm (claude/pi pin it at seed) OR a late ResumeTargetResolved
+    -- back-fill (codex/hermes). Declared AFTER worktree so a fresh CREATE and a
+    -- migrated ALTER (which appends) keep table_info byte-identical.
+    harness TEXT,
+    resume_target TEXT
 )
 `;
 
@@ -5957,6 +5969,35 @@ function migrate(db: Database): void {
       // test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "jobs", "dispatch_origin", "TEXT");
 
+      // v108->v109 (fn-1103.3): add the nullable `harness` + `resume_target` TEXT
+      // columns to BOTH the events and jobs surfaces, in ONE forward-only bump.
+      // TWO different column disciplines meet here, so keep them straight:
+      //
+      //   - EVENTS is a FIVE-place lockstep per column — `harness`/`resume_target`
+      //     are ALSO declared in the CREATE_EVENTS literal (after `worktree`),
+      //     KNOWN_EVENT_COLUMNS, the hook insertBindings, INGEST_EVENTS_COLUMNS,
+      //     and the prepared `insertEvent`. These ALTERs are the migrated-path
+      //     append; the CREATE literal is the fresh path, and the two column
+      //     lockstep tests (events-writer + events-ingest-worker) pin them equal.
+      //   - JOBS is migration-ONLY (the `:852` convention) — NOT in CREATE_JOBS.
+      //     Appended here AFTER `kill_reason` (the current final jobs column) so
+      //     fresh-vs-migrated `PRAGMA table_info(jobs)` stays byte-identical
+      //     (test/db.test.ts tail parity asserts).
+      //
+      // NULL rule: nullable, NO default (a DEFAULT would poison the NULL=absent
+      // invariant and break re-fold byte-identity). NO backfill — legacy rows stay
+      // NULL and read as claude everywhere; the fold copies the event's harness
+      // verbatim and never synthesizes a value, so a from-scratch re-fold folds
+      // both columns to NULL byte-identically on any pre-v109 stream. NO cursor
+      // rewind (mirrors `worktree`/`kill_reason`). Whitelist-only Python read
+      // (keeper-py reads neither new column) — this bump MUST add 109 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "events", "harness", "TEXT");
+      addColumnIfMissing(db, "events", "resume_target", "TEXT");
+      addColumnIfMissing(db, "jobs", "harness", "TEXT");
+      addColumnIfMissing(db, "jobs", "resume_target", "TEXT");
+
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       ).run(String(SCHEMA_VERSION));
@@ -5997,7 +6038,7 @@ export function prepareStmts(db: Database): Stmts {
         plan_subject_present, tool_use_id, config_dir,
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-        background_task_id, mutation_path, worktree
+        background_task_id, mutation_path, worktree, harness, resume_target
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -6006,7 +6047,7 @@ export function prepareStmts(db: Database): Stmts {
         $plan_subject_present, $tool_use_id, $config_dir,
         $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
-        $background_task_id, $mutation_path, $worktree
+        $background_task_id, $mutation_path, $worktree, $harness, $resume_target
       )
     `),
     selectWorldRev: db.prepare(

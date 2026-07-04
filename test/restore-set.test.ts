@@ -30,7 +30,9 @@ import {
   deriveRestoreSet,
   GENERATION_SUMMARY_SQL,
   isCrashLike,
+  isRestorableCandidate,
   RECENT_GENERATION_BOUND,
+  type RestoreCandidate,
   summarizeTopologyGenerations,
 } from "../src/restore-set";
 import type { Event } from "../src/types";
@@ -76,6 +78,9 @@ interface SeedJob {
   backend_exec_type?: string | null;
   backend_exec_pane_id?: string | null;
   backend_exec_generation_id?: string | null;
+  /** Launching harness + its native resume target (v107/v108 columns). */
+  harness?: string | null;
+  resume_target?: string | null;
 }
 
 /** Insert one jobs row with sensible defaults; only the fields a test cares
@@ -86,8 +91,8 @@ function seedJob(db: Database, j: SeedJob): void {
        job_id, created_at, updated_at, state, title, close_kind, window_index,
        cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
        last_event_id, backend_exec_type, backend_exec_pane_id,
-       backend_exec_generation_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       backend_exec_generation_id, harness, resume_target
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -108,6 +113,8 @@ function seedJob(db: Database, j: SeedJob): void {
       j.backend_exec_type ?? null,
       j.backend_exec_pane_id ?? null,
       j.backend_exec_generation_id ?? null,
+      j.harness ?? null,
+      j.resume_target ?? null,
     ],
   );
 }
@@ -601,6 +608,52 @@ test("deriveRestoreSet: resume_target is the session UUID (exact resume), label 
   // jobs projection) for the human-facing render.
   expect(res.candidates[0]?.resume_target).toBe(uuid);
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
+});
+
+test("deriveRestoreSet: a NULL harness reads as claude and resumes by job_id", () => {
+  seedJob(kdb.db, { job_id: "legacy-uuid", close_kind: "server_gone" });
+  const c = derive().candidates[0];
+  expect(c?.harness).toBe("claude");
+  expect(c?.resume_target).toBe("legacy-uuid");
+});
+
+test("deriveRestoreSet: a codex candidate is harness-tagged and resumes by its stored resume_target", () => {
+  seedJob(kdb.db, {
+    job_id: "keeper-codex-1",
+    close_kind: "server_gone",
+    harness: "codex",
+    resume_target: "codex-rollout-id",
+  });
+  const c = derive().candidates[0];
+  expect(c?.harness).toBe("codex");
+  // The harness-native id, NOT the keeper-minted job_id.
+  expect(c?.resume_target).toBe("codex-rollout-id");
+  expect(isRestorableCandidate(c as RestoreCandidate)).toBe(true);
+});
+
+test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED but not-resumable", () => {
+  // The rest of the generation still restores — the not-resumable agent is
+  // surfaced (an empty resume_target), never dropped.
+  seedJob(kdb.db, {
+    job_id: "hermes-nobackfill",
+    close_kind: "server_gone",
+    harness: "hermes",
+    resume_target: null,
+    window_index: 0,
+  });
+  seedJob(kdb.db, {
+    job_id: "claude-ok",
+    close_kind: "server_gone",
+    window_index: 1,
+  });
+  const res = derive();
+  expect(res.candidates.map((c) => c.job_id)).toEqual([
+    "hermes-nobackfill",
+    "claude-ok",
+  ]);
+  const hermes = res.candidates.find((c) => c.job_id === "hermes-nobackfill");
+  expect(hermes?.resume_target).toBe("");
+  expect(isRestorableCandidate(hermes as RestoreCandidate)).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

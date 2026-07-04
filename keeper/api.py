@@ -417,6 +417,9 @@ from pathlib import Path
 # v108 (fn-1107 task .1) adds the nullable ``jobs.dispatch_origin`` TEXT column (the
 # autopilot-vs-manual provenance discriminator the autoclose worker scopes on);
 # keeper-py never reads the new column, so only the version whitelist gains 108.
+# v109 (fn-1103 task .3) adds the nullable ``harness`` + ``resume_target`` TEXT
+# columns to BOTH the events and jobs surfaces (multi-harness agent maturity);
+# keeper-py reads neither column, so only the version whitelist gains 109.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -497,6 +500,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         106,
         107,
         108,
+        109,
     }
 )
 

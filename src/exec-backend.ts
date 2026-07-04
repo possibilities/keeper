@@ -18,6 +18,12 @@
  * projection, never via a surface ref; tmux is stateless from autopilot's side.
  */
 
+// The per-harness descriptor registry (src/agent/harness.ts) is a DEP-FREE
+// ISLAND — it imports nothing — so pulling the resume-argv builder here keeps
+// exec-backend within the "node:* + dep-free helper" hook budget while sourcing
+// the resume verb from the SINGLE registry, never a re-inlined harness switch.
+import { buildHarnessResumeArgv } from "./agent/harness";
+
 /** Bun.spawn-shaped subset the backend needs; injectable for tests. */
 export type SpawnFn = (
   cmd: string[],
@@ -80,11 +86,18 @@ export interface LaunchSpec {
    *  In resume mode ({@link resumeTarget} set) it is unused: the argv carries
    *  `--resume <target>` and NO trailing prompt positional. */
   readonly prompt: string;
-  /** Resume mode: when set (non-empty), the launch emits `--resume <target>` and
-   *  DROPS the trailing prompt positional — a `claude --resume` re-attach rather
-   *  than a fresh prompted session. Omitted for the prompt-mode worker/dispatch
-   *  launch (the byte-unchanged default). */
+  /** Resume mode: when set (non-empty), the launch emits the harness's own resume
+   *  argv (`--resume <target>` for claude/hermes, `resume <target>` for codex,
+   *  `--session <target>` for pi) and DROPS the trailing prompt positional — a
+   *  re-attach rather than a fresh prompted session. Omitted for the prompt-mode
+   *  worker/dispatch launch (the byte-unchanged default). */
   readonly resumeTarget?: string;
+  /** Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). Absent/NULL ⇒
+   *  claude: the agent token stays `claude` and the claude worker-permission
+   *  posture is emitted (byte-unchanged). A non-claude value routes `keeper agent
+   *  <harness>` with its native resume verb and NO claude permission flags (keeper
+   *  agent applies the harness's own posture default). */
+  readonly harness?: string;
   /** `--name <claudeName>` (the reap/classify correlation key). Omitted when absent. */
   readonly claudeName?: string;
   /** `--model <m>`. Omitted when absent. */
@@ -858,9 +871,16 @@ export interface KeeperAgentLaunchOpts {
   /** The initial interactive prompt — the FINAL positional argv element. Dropped
    *  in resume mode ({@link resumeTarget} set). */
   readonly prompt: string;
-  /** Resume mode: when set (non-empty), emit `--resume <target>` and NO trailing
-   *  prompt positional. Omitted for the prompt-mode worker/dispatch launch. */
+  /** Resume mode: when set (non-empty), emit the harness's native resume argv (see
+   *  {@link harness}) and NO trailing prompt positional. Omitted for the
+   *  prompt-mode worker/dispatch launch. */
   readonly resumeTarget?: string;
+  /** Launching harness. Absent/NULL ⇒ claude (agent token `claude`, claude
+   *  worker-permission flags emitted — byte-unchanged). A non-claude value swaps
+   *  the agent token to `<harness>`, drops the claude permission flags (keeper
+   *  agent applies the harness's own default), and shapes the resume tail via the
+   *  descriptor's resume verb. */
+  readonly harness?: string;
   /** `--name <claudeName>` (the reap/classify correlation key). Omitted when absent. */
   readonly claudeName?: string;
   /** `--model <m>`. Omitted when absent. */
@@ -952,16 +972,28 @@ export function buildKeeperAgentLaunchArgv(
   if (opts.pluginDir !== undefined && opts.pluginDir !== "") {
     flags.push("--plugin-dir", opts.pluginDir);
   }
-  // Resume mode is `--resume <target>` with NO trailing prompt positional — a
-  // re-attach to an existing session. Prompt mode keeps the prompt as the
-  // UNCONDITIONAL final positional, so the worker/dispatch argv is byte-unchanged.
+  const harness = opts.harness ?? "claude";
+  const isClaude = harness === "claude";
+  // Resume mode drops the trailing prompt positional and emits the harness's OWN
+  // resume argv (claude/hermes `--resume <t>`, codex `resume <t>`, pi `--session
+  // <t>`) sourced from the descriptor registry — never a re-inlined switch.
+  // Prompt mode keeps the prompt as the UNCONDITIONAL final positional, so the
+  // claude worker/dispatch argv is byte-unchanged.
   const tail =
     opts.resumeTarget !== undefined && opts.resumeTarget !== ""
-      ? ["--resume", opts.resumeTarget]
+      ? buildHarnessResumeArgv(harness, opts.resumeTarget)
       : [opts.prompt];
+  // The claude worker-permission posture (`--permission-mode acceptEdits
+  // --dangerously-skip-permissions`) is CLAUDE-native and forwarded to the claude
+  // CLI. A non-claude harness omits it — keeper agent applies that harness's own
+  // no-approval default (codex `--dangerously-bypass-approvals-and-sandbox`,
+  // hermes `--yolo`) at launch, so a claude flag here would reach the wrong CLI.
+  const permissionPosture = isClaude
+    ? ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"]
+    : [];
   return [
     ...opts.launcherArgvPrefix,
-    "claude",
+    harness,
     "--x-tmux",
     "--x-tmux-detached",
     "--x-tmux-session",
@@ -983,15 +1015,15 @@ export function buildKeeperAgentLaunchArgv(
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE_BRANCH=${opts.worktreeBranch ?? ""}`,
     // Keeper-owned worker permission posture, mirroring the pair-launch precedent
-    // (`nativeClaudeArgs`): every launch this builder mints is a detached automated
-    // worker with NO human to answer a prompt, so it skips permission prompting
-    // outright. This changes PROMPTING, not GUARDING — deny-via-envelope hooks
-    // (branch-guard et al) still hard-enforce under `--dangerously-skip-permissions`,
-    // so a worker still cannot create/switch branches. Unconditional (prompt AND
-    // resume): a resumed worker is just as human-less as a fresh one.
-    "--permission-mode",
-    "acceptEdits",
-    "--dangerously-skip-permissions",
+    // (`nativeClaudeArgs`): every claude launch this builder mints is a detached
+    // automated worker with NO human to answer a prompt, so it skips permission
+    // prompting outright. This changes PROMPTING, not GUARDING — deny-via-envelope
+    // hooks (branch-guard et al) still hard-enforce under
+    // `--dangerously-skip-permissions`, so a worker still cannot create/switch
+    // branches. Emitted for BOTH prompt and resume (a resumed worker is just as
+    // human-less as a fresh one) but CLAUDE-ONLY — a non-claude harness gets its
+    // own posture default from keeper agent instead.
+    ...permissionPosture,
     ...flags,
     ...tail,
   ];
@@ -1185,6 +1217,7 @@ export async function keeperAgentLaunch(
     ...(deps.spec.resumeTarget !== undefined
       ? { resumeTarget: deps.spec.resumeTarget }
       : {}),
+    ...(deps.spec.harness !== undefined ? { harness: deps.spec.harness } : {}),
     ...(deps.spec.claudeName !== undefined
       ? { claudeName: deps.spec.claudeName }
       : {}),

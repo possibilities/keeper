@@ -18,11 +18,15 @@
  * topology degrades to the retrospective killed-cohort model with a VISIBLE
  * `fallbackNote` banner (never a silent downgrade).
  *
- * RESULT. Each candidate's `resume_target` is the job's session UUID (`job_id`),
- * so `claude --resume <uuid>` re-attaches to the EXACT session; the `label` is the
- * latest title (read live from the jobs projection) for display only. The `cwd`
- * prefix on every resume command is load-bearing — a session UUID resolves only
- * within its project dir plus its git worktrees.
+ * RESULT. Each candidate carries a `harness` tag and a harness-native
+ * `resume_target`: a claude candidate re-attaches by session UUID
+ * (`claude --resume <uuid>`), while codex/pi/hermes resume via their own verb
+ * (`codex resume`, `pi --session`, `hermes --resume`) off the stored target. A
+ * non-claude agent whose target keeper never resolved is reported NOT-RESUMABLE
+ * (never launched) so the rest of the generation still restores. The `label` is
+ * the latest title (read live from the jobs projection) for display only. The
+ * `cwd` prefix on every resume command is load-bearing — a session id resolves
+ * only within its project dir plus its git worktrees.
  *
  * This module imports ONLY `src/` peers (no `cli/`), so both `cli/tabs.ts` and the
  * in-daemon restore-worker consume it. Every renderer is pure; the `load*` readers
@@ -32,6 +36,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { harnessOrClaude } from "./agent/harness";
 import { openDb } from "./db";
 import {
   buildKeeperAgentLaunchArgv,
@@ -51,6 +56,7 @@ import {
   type EnrichedGeneration,
   enrichedTopologyGenerations,
   type GenerationSummary,
+  isRestorableCandidate,
   RECENT_GENERATION_BOUND,
   type RestoreCandidate,
 } from "./restore-set";
@@ -74,14 +80,21 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
 export type AgentOutcome =
   | { kind: "would-restore"; candidate: RestoreCandidate }
   | { kind: "restored"; candidate: RestoreCandidate }
-  | { kind: "failed"; candidate: RestoreCandidate; error: string };
+  | { kind: "failed"; candidate: RestoreCandidate; error: string }
+  // A candidate keeper cannot resume — a non-claude harness whose native resume
+  // target was never resolved. Reported (never launched, never counted as a
+  // failure), so the REST of the generation still restores.
+  | { kind: "not-resumable"; candidate: RestoreCandidate; reason: string };
 
 /**
  * Pure: turn the candidate set into the per-agent pre-action plan, narrowed by
  * the optional `--session` filter (matched against the candidate's backend
  * session). Candidates arrive already sorted by visual window order, so this
- * preserves that order. The `--apply` path upgrades each `"would-restore"` to
- * `"restored"` / `"failed"`.
+ * preserves that order. A candidate with no resolved resume target
+ * ({@link isRestorableCandidate} false — a non-claude harness keeper never
+ * back-filled) becomes a `"not-resumable"` entry (reported, never launched) so
+ * the rest of the generation still restores. The `--apply` path upgrades each
+ * `"would-restore"` to `"restored"` / `"failed"`.
  */
 export function planRestore(
   candidates: RestoreCandidate[],
@@ -93,6 +106,14 @@ export function planRestore(
       sessionFilter !== null &&
       candidate.backend_exec_session_id !== sessionFilter
     ) {
+      continue;
+    }
+    if (!isRestorableCandidate(candidate)) {
+      out.push({
+        kind: "not-resumable",
+        candidate,
+        reason: `${harnessOrClaude(candidate.harness)} session has no resolved resume target`,
+      });
       continue;
     }
     out.push({ kind: "would-restore", candidate });
@@ -111,6 +132,7 @@ export type EnsureLaunchedFn = (
   session: string,
   resumeTarget: string,
   cwd: string,
+  harness: string,
 ) => Promise<{ ok: true } | { ok: false; error: string }>;
 
 /** Sleep injection for {@link applyRestore} — production passes the real
@@ -156,6 +178,7 @@ export async function applyRestore(
         session,
         entry.candidate.resume_target,
         cwd,
+        harnessOrClaude(entry.candidate.harness),
       );
       if (res.ok) {
         out.push({ kind: "restored", candidate: entry.candidate });
@@ -177,22 +200,27 @@ export async function applyRestore(
   return out;
 }
 
-/** Count restored / failed / would-restore outcomes in one pass. Exported so the
- *  consumer picks the partial-failure exit code without re-scanning. */
+/** Count restored / failed / would-restore / not-resumable outcomes in one pass.
+ *  Exported so the consumer picks the partial-failure exit code without
+ *  re-scanning. `notResumable` is NOT a failure — a not-resumable agent is an
+ *  expected, reported skip, so it never trips the partial-failure exit. */
 export function countOutcomes(outcomes: AgentOutcome[]): {
   restored: number;
   failed: number;
   wouldRestore: number;
+  notResumable: number;
 } {
   let restored = 0;
   let failed = 0;
   let wouldRestore = 0;
+  let notResumable = 0;
   for (const o of outcomes) {
     if (o.kind === "restored") restored++;
     else if (o.kind === "failed") failed++;
+    else if (o.kind === "not-resumable") notResumable++;
     else wouldRestore++;
   }
-  return { restored, failed, wouldRestore };
+  return { restored, failed, wouldRestore, notResumable };
 }
 
 /**
@@ -218,14 +246,24 @@ export function renderOutcomes(
   excludedIdleCount: number,
 ): string {
   const stanzas: string[] = [];
-  const { restored, failed, wouldRestore } = countOutcomes(outcomes);
+  const { restored, failed, wouldRestore, notResumable } =
+    countOutcomes(outcomes);
 
   for (const o of outcomes) {
     const c = o.candidate;
     const cwd = c.cwd == null ? "" : seg(c.cwd);
-    const cmd = buildResumeCommand(cwd, c.resume_target, null);
     const session = commentSafe(c.backend_exec_session_id);
     const label = commentSafe(c.label);
+    if (o.kind === "not-resumable") {
+      // No runnable command line — the harness has no resolved resume target.
+      stanzas.push(
+        `# (${session}) NOT-RESUMABLE ${label}: ${commentSafe(o.reason)}`,
+      );
+      continue;
+    }
+    // The resume command is per-harness (claude --resume / codex resume /
+    // pi --session / hermes --resume), sourced from the candidate's harness tag.
+    const cmd = buildResumeCommand(cwd, c.resume_target, null, c.harness);
     if (o.kind === "would-restore") {
       stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);
     } else if (o.kind === "restored") {
@@ -237,9 +275,11 @@ export function renderOutcomes(
     }
   }
 
+  const notResumableNote =
+    notResumable > 0 ? ` not-resumable=${notResumable}` : "";
   const summary = apply
-    ? `# summary: restored=${restored} failed=${failed}`
-    : `# summary: would-restore=${wouldRestore}`;
+    ? `# summary: restored=${restored} failed=${failed}${notResumableNote}`
+    : `# summary: would-restore=${wouldRestore}${notResumableNote}`;
   const idleNote =
     excludedIdleCount > 0
       ? `\n# note: ${excludedIdleCount} crash-like candidate(s) excluded as idle past the cutoff`
@@ -315,7 +355,7 @@ export function renderSnapshotScript(
     "# keeper tabs dump — runnable snapshot of the CURRENT live keeper agents.",
     `# Source: ${options.sourcePath}. Pipe to a file and run to revive these tabs.`,
     `# captured ${captured} keeper agent(s); ${excludedNote}.`,
-    "# Each window relaunches via keeper agent claude --resume by its LATEST name; the session is get-or-created.",
+    "# Each window relaunches via keeper agent <harness> with that harness's own resume argv; the session is get-or-created.",
     "set -euo pipefail",
   ];
   // Group candidates by backend session, preserving the incoming visual order.
@@ -353,14 +393,25 @@ export function renderSnapshotScript(
         `${quoteArgv(buildTmuxNewSessionArgs(sessionName))}`,
     );
     for (const candidate of bucket) {
+      // A non-claude agent keeper never back-filled a resume target for is
+      // NOT-RESUMABLE — emit a comment (never a broken `--resume ''` line) so the
+      // script stays runnable and the rest of the session still revives.
+      if (!isRestorableCandidate(candidate)) {
+        lines.push(
+          `# not-resumable: ${candidate.label} (${harnessOrClaude(candidate.harness)} session has no resolved resume target)`,
+        );
+        continue;
+      }
       const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
       // The BARE keeper agent resume argv — byte-aligned with what --apply spawns.
-      // keeper agent owns the session+window, so NO `tmux new-window` wrapper.
+      // keeper agent owns the session+window, so NO `tmux new-window` wrapper. The
+      // harness tag routes `keeper agent <harness>` + that harness's resume verb.
       const launchArgv = buildKeeperAgentLaunchArgv({
         launcherArgvPrefix: options.prefix,
         session: sessionName,
         prompt: "",
         resumeTarget: candidate.resume_target,
+        harness: harnessOrClaude(candidate.harness),
         noConfirm: true,
       });
       if (windowsEmitted > 0) {
@@ -794,13 +845,13 @@ export function makeEnsureLaunched(
   launcherArgvPrefix: string[],
   noteLine: (line: string) => void,
 ): EnsureLaunchedFn {
-  return (session, resumeTarget, cwd) =>
+  return (session, resumeTarget, cwd, harness) =>
     keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix,
       session,
       cwd,
-      label: `restore resume ${resumeTarget}`,
-      spec: { prompt: "", resumeTarget },
+      label: `restore resume ${harness} ${resumeTarget}`,
+      spec: { prompt: "", resumeTarget, harness },
     });
 }

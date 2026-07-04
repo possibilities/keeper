@@ -12,25 +12,23 @@
  * handler, the atomic writes — lives in the callers.
  */
 
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { HARNESS_NAME_SET, type HarnessName } from "./harness";
 
 // ---------------------------------------------------------------------------
 // CLIs, roles, read-only directive
 // ---------------------------------------------------------------------------
 
-/** The partner CLIs `keeper agent` can fan out to — the full agent-kind set. pi
- *  launches read-only and read-write like claude/codex; its read-only posture is
- *  the prompt directive only (prompting, not enforcement — pi has no native
- *  sandbox of its own). */
-export type AgentCli = "claude" | "codex" | "pi";
+/** The partner CLIs `keeper agent` can fan out to — the full agent-kind set,
+ *  derived from the harness registry (`src/agent/harness.ts`) so the name set
+ *  lives in one place. pi launches read-only and read-write like claude/codex;
+ *  its read-only posture is the prompt directive only (prompting, not enforcement
+ *  — pi has no native sandbox of its own). */
+export type AgentCli = HarnessName;
 
-export const AGENT_CLIS: ReadonlySet<string> = new Set<AgentCli>([
-  "claude",
-  "codex",
-  "pi",
-]);
+export const AGENT_CLIS: ReadonlySet<string> = HARNESS_NAME_SET;
 
 /** The role prompts, keyed by `--role`. Each maps to an in-repo asset under
  *  `src/agent/prompts/<role>.txt`. An unknown role fails loud at the CLI. */
@@ -136,6 +134,20 @@ export interface AgentLaunchOpts {
   name?: string;
 }
 
+/** Per-harness native-flag builder table — the descriptor-lookup form of the old
+ *  `cli === "claude" ? … : …` chain. Byte-identical: each entry is the harness's
+ *  existing pure builder. (The builders are hoisted function declarations, so the
+ *  table resolves them regardless of textual order.) */
+const NATIVE_ARGS_BUILDERS: Record<
+  AgentCli,
+  (opts: AgentLaunchOpts) => string[]
+> = {
+  claude: nativeClaudeArgs,
+  codex: nativeCodexArgs,
+  pi: nativePiArgs,
+  hermes: nativeHermesArgs,
+};
+
 /**
  * Build the detached `keeper agent` launch argv for a partner. Shape:
  *
@@ -188,12 +200,7 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
   if (opts.name !== undefined && opts.name !== "") {
     wrapperFlags.push("--x-tmux-window-name", opts.name);
   }
-  const native =
-    opts.cli === "claude"
-      ? nativeClaudeArgs(opts)
-      : opts.cli === "codex"
-        ? nativeCodexArgs(opts)
-        : nativePiArgs(opts);
+  const native = NATIVE_ARGS_BUILDERS[opts.cli](opts);
   return [
     ...opts.launcherArgvPrefix,
     opts.cli,
@@ -286,6 +293,29 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
   return args;
 }
 
+/**
+ * Native hermes flags for a one-turn partner. `--yolo` runs the turn with no
+ * approval gate so a detached pane never stalls; `-m <model>` sets the model
+ * (hermes has no effort/thinking axis, so neither is emitted). Hermes has NO
+ * interactive first-turn prompt positional (unlike claude/pi) — the prompt must
+ * ride its `-z/--oneshot` flag — so this builder ENDS with `-z`, making the
+ * trailing `opts.prompt` that {@link buildAgentLaunchArgv} appends the value of
+ * `-z`: `hermes --yolo -m <model> -z <prompt>`. The one-shot prints only the
+ * final message and records the session in hermes's store for post-stop capture.
+ * Hermes has no native `--name` flag (like codex), so `opts.name` rides only the
+ * tmux window name. Consent for its shell hooks is seeded via the
+ * `HERMES_ACCEPT_HOOKS=1` pane env (set by the inner launch), not a flag here.
+ * Pure — exported for tests.
+ */
+export function nativeHermesArgs(opts: AgentLaunchOpts): string[] {
+  const args = ["--yolo"];
+  if (opts.model !== undefined && opts.model !== "") {
+    args.push("-m", opts.model);
+  }
+  args.push("-z");
+  return args;
+}
+
 // ---------------------------------------------------------------------------
 // Env strip — CLAUDE* removal before the partner pane
 // ---------------------------------------------------------------------------
@@ -315,4 +345,42 @@ export function stripClaudeEnv(
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// pi extension arming (M3b live-state)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the on-disk path to keeper's ephemeral pi extension
+ * (`plugins/keeper/pi-extension/keeper-events.ts`). Like {@link promptsDir}, it
+ * resolves relative to THIS module's location so it holds under both the source
+ * tree and a `bun link`ed binary (`src/agent/` → repo root → `plugins/…`). The
+ * file must ship as source `.ts`: pi loads it via jiti, outside the keeper build.
+ */
+export function piExtensionPath(): string {
+  return resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "plugins",
+    "keeper",
+    "pi-extension",
+    "keeper-events.ts",
+  );
+}
+
+/**
+ * The pi native flags that arm the keeper extension: `["-e", <path>]` when the
+ * extension file is present, else `[]`. FAIL-OPEN existence check is the load
+ * -bearing guard — pi ABORTS the launch on an `-e` path that does not exist, so a
+ * partial checkout must degrade to presence-only rather than break every pi
+ * launch. `exists` is injected for tests; defaults to {@link existsSync}. Pure
+ * over its inputs.
+ */
+export function piExtensionArgs(
+  exists: (path: string) => boolean = existsSync,
+): string[] {
+  const path = piExtensionPath();
+  return exists(path) ? ["-e", path] : [];
 }

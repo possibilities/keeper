@@ -286,6 +286,23 @@ export interface Event {
    * `git worktree remove`/`move`.
    */
   worktree: string | null;
+  /**
+   * Launching harness for this session — `"claude"`/`"codex"`/`"pi"`/`"hermes"`.
+   * The claude hook stamps `"claude"` at SessionStart; a codex/hermes birth-ingest
+   * synthetic SessionStart carries its own tag. NULL on every non-SessionStart row
+   * AND on legacy rows. Folded onto `jobs.harness` via the SessionStart COALESCE
+   * arm; the fold NEVER synthesizes a value, so a NULL harness reads as claude at
+   * every consumer.
+   */
+  harness: string | null;
+  /**
+   * The harness-native resume target — the token its own `--resume` argv needs.
+   * claude/pi pin their session uuid at seed (carried on the SessionStart event);
+   * codex/hermes back-fill it later via a synthetic `ResumeTargetResolved` event
+   * (rollout SessionMeta / hook session id) that folds ONLY this column and never
+   * touches lifecycle state. NULL on rows that carry no resume identity.
+   */
+  resume_target: string | null;
 }
 
 /**
@@ -566,6 +583,25 @@ export interface Job {
    * column); set once on discharge-on-bind, untouched by resume.
    */
   dispatch_origin: string | null;
+  /**
+   * Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`), folded onto
+   * `jobs.harness` from the SessionStart tag. NULL on legacy rows and reads as
+   * claude at every consumer (the fold never synthesizes a value). The resume/
+   * restore surfaces route {@link resume_target} through this harness's native
+   * resume argv.
+   */
+  harness: string | null;
+  /**
+   * The harness-native resume target — the token the launching harness's own
+   * resume argv needs (claude/pi the session id at seed; codex/hermes back-filled
+   * post-stop). NULL when keeper resolved no resume identity, which the restore
+   * surfaces render as not-resumable for a non-claude harness.
+   */
+  resume_target: string | null;
+  // NOTE: the migration-only jobs column `kill_reason` (v103) is DELIBERATELY
+  // absent here — this interface mirrors only the fields Job-typed reads consume
+  // today. The column exists on the row and is read ad-hoc (a scoped SELECT) by
+  // the folds/producers that own it; a later read surface adds it when needed.
 }
 
 /**

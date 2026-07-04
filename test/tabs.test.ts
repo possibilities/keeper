@@ -177,6 +177,7 @@ function fakeCandidate(opts: {
   cwd?: string | null;
   backend_exec_session_id?: string;
   created_at?: number;
+  harness?: string;
 }): RestoreCandidate {
   return {
     job_id: opts.job_id,
@@ -186,6 +187,7 @@ function fakeCandidate(opts: {
     cwd: "cwd" in opts ? (opts.cwd ?? null) : "/repo",
     backend_exec_session_id: opts.backend_exec_session_id ?? "work",
     created_at: opts.created_at ?? 1000,
+    ...(opts.harness !== undefined ? { harness: opts.harness } : {}),
   };
 }
 
@@ -621,17 +623,130 @@ test("renderOutcomes surfaces / omits the idle-excluded note", () => {
   expect(renderOutcomes(plan, false, 0)).not.toContain("excluded as idle");
 });
 
-test("countOutcomes tallies restored / failed / would-restore", () => {
+test("countOutcomes tallies restored / failed / would-restore / not-resumable", () => {
   const outcomes: AgentOutcome[] = [
     { kind: "restored", candidate: fakeCandidate({ job_id: "a" }) },
     { kind: "failed", candidate: fakeCandidate({ job_id: "b" }), error: "x" },
     { kind: "would-restore", candidate: fakeCandidate({ job_id: "c" }) },
+    {
+      kind: "not-resumable",
+      candidate: fakeCandidate({ job_id: "d" }),
+      reason: "no target",
+    },
   ];
   expect(countOutcomes(outcomes)).toEqual({
     restored: 1,
     failed: 1,
     wouldRestore: 1,
+    notResumable: 1,
   });
+});
+
+// ---------------------------------------------------------------------------
+// harness-aware restore — mixed-harness plan / render / launch
+// ---------------------------------------------------------------------------
+
+test("planRestore marks a candidate with no resume target not-resumable, would-restore the rest", () => {
+  const plan = planRestore(
+    [
+      fakeCandidate({ job_id: "claude-a" }),
+      fakeCandidate({
+        job_id: "codex-b",
+        harness: "codex",
+        resume_target: "",
+      }),
+    ],
+    null,
+  );
+  expect(plan.map((p) => p.kind)).toEqual(["would-restore", "not-resumable"]);
+  expect((plan[1] as { reason: string }).reason).toContain("codex");
+});
+
+test("applyRestore passes each candidate's harness to ensureLaunched and skips a not-resumable one", async () => {
+  const plan = planRestore(
+    [
+      fakeCandidate({ job_id: "j1", resume_target: "u1" }),
+      fakeCandidate({
+        job_id: "j2",
+        harness: "codex",
+        resume_target: "codex-id",
+      }),
+      fakeCandidate({ job_id: "j3", harness: "hermes", resume_target: "" }),
+    ],
+    null,
+  );
+  const calls: { resumeTarget: string; harness: string }[] = [];
+  const out = await applyRestore(
+    plan,
+    async (_session, resumeTarget, _cwd, harness) => {
+      calls.push({ resumeTarget, harness });
+      return { ok: true };
+    },
+    async () => {},
+  );
+  expect(out.map((o) => o.kind)).toEqual([
+    "restored",
+    "restored",
+    "not-resumable",
+  ]);
+  expect(calls).toEqual([
+    { resumeTarget: "u1", harness: "claude" },
+    { resumeTarget: "codex-id", harness: "codex" },
+  ]);
+});
+
+test("renderOutcomes: per-harness resume command + a not-resumable stanza and summary note", () => {
+  const plan = planRestore(
+    [
+      fakeCandidate({
+        job_id: "cx",
+        harness: "codex",
+        resume_target: "rollout-9",
+        label: "codex tab",
+        cwd: "/repo",
+      }),
+      fakeCandidate({
+        job_id: "hz",
+        harness: "hermes",
+        resume_target: "",
+        label: "hermes tab",
+      }),
+    ],
+    null,
+  );
+  const out = renderOutcomes(plan, false, 0);
+  // codex renders its native subcommand resume form.
+  expect(out).toContain('cd /repo && codex resume "rollout-9"');
+  // the not-resumable agent is reported with a reason, no command line.
+  expect(out).toContain("NOT-RESUMABLE hermes tab");
+  expect(out).toContain("not-resumable=1");
+});
+
+test("renderSnapshotScript: a codex candidate emits `agent codex … resume`, a targetless one is a comment", () => {
+  const script = renderSnapshotScript(
+    [
+      fakeCandidate({
+        job_id: "cx",
+        harness: "codex",
+        resume_target: "rollout-9",
+        label: "codex tab",
+        cwd: "/repo",
+      }),
+      fakeCandidate({
+        job_id: "hz",
+        harness: "hermes",
+        resume_target: "",
+        label: "hermes tab",
+      }),
+    ],
+    { prefix: RESTORE_PREFIX, sourcePath: "/tmp/keeper.db" },
+  );
+  expect(script).toContain("'agent' 'codex'");
+  expect(script).toContain("'resume' 'rollout-9'");
+  expect(script).not.toContain("'--permission-mode'"); // codex omits claude flags
+  expect(script).toContain(
+    "# not-resumable: hermes tab (hermes session has no resolved resume target)",
+  );
 });
 
 // ---------------------------------------------------------------------------

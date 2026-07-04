@@ -470,7 +470,7 @@ function resolveCreatorJobs(epic: string): WakeCreator[] {
     for (const id of ids) {
       const row = db.db
         .query(
-          "SELECT job_id, cwd, title, state, backend_exec_pane_id, updated_at FROM jobs WHERE job_id = ?",
+          "SELECT job_id, cwd, title, state, backend_exec_pane_id, updated_at, harness, resume_target FROM jobs WHERE job_id = ?",
         )
         .get(id) as WakeCreator | null;
       if (row != null) {
@@ -484,6 +484,11 @@ function resolveCreatorJobs(epic: string): WakeCreator[] {
               ? null
               : String(row.backend_exec_pane_id),
           updated_at: Number(row.updated_at),
+          // Creators are claude today; carry the harness tag so the wake resume
+          // routes through the descriptor path instead of assuming claude.
+          harness: row.harness == null ? null : String(row.harness),
+          resume_target:
+            row.resume_target == null ? null : String(row.resume_target),
         });
       }
     }

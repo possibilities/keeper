@@ -403,6 +403,19 @@ function claudeStopFromObject(
   return null;
 }
 
+/**
+ * The codex rollout `event_msg` payload types that mark a turn's END. The single
+ * source of truth for a codex stop marker, shared by `show-last-message`'s stop
+ * parser here and the daemon-side live-state producer (`codex-state-worker`).
+ * codex's rollout stream carries no turn-START marker, so codex live churn is
+ * stop-only — a fact recorded in its harness descriptor's `hookMechanism`.
+ */
+export const CODEX_STOP_MARKERS: ReadonlySet<string> = new Set([
+  "task_complete",
+  "turn_aborted",
+  "error",
+]);
+
 function codexStopFromObject(
   obj: Record<string, unknown>,
 ): TranscriptStop | null {
@@ -411,11 +424,7 @@ function codexStopFromObject(
   }
   const payload = objectValue(obj.payload);
   const eventType = stringValue(payload?.type);
-  if (
-    eventType === "task_complete" ||
-    eventType === "turn_aborted" ||
-    eventType === "error"
-  ) {
+  if (eventType !== null && CODEX_STOP_MARKERS.has(eventType)) {
     return stopInfo("codex", eventType, eventType, obj, codexMessageText(obj));
   }
   return null;

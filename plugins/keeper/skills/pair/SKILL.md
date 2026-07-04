@@ -1,8 +1,8 @@
 ---
 name: pair
 description: >-
-  Pair with another model CLI — fan ONE task out to claude, codex, or pi, wait,
-  then read its answer. Use when the user wants a second opinion, a cross-check,
+  Pair with another model CLI — fan ONE task out to claude, codex, pi, or
+  hermes, wait, then read its answer. Use when the user wants a second opinion, a cross-check,
   or to "ask claude / ask codex / ask another model", a code review or co-plan
   from a different model, or a read-only audit by a partner — even when they
   never say "keeper" or "pair". Drives `keeper agent` from THIS session: a
@@ -13,20 +13,24 @@ description: >-
   RUNNING agent (that is `keeper:bus`), NOT for a multi-model consensus panel
   (that is `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash
-argument-hint: <what to ask> [--preset <name> | --cli claude|codex|pi] [--role …] [--read-only]
+argument-hint: <what to ask> [--preset <name> | --cli claude|codex|pi|hermes] [--role …] [--read-only]
 ---
 
 # pair
 
-Pairing fans ONE task out to another model CLI — `claude`, `codex`, or `pi` —
-launched as a detached **interactive TUI** partner via `keeper agent`, and reads
-the partner's final answer back as a uniform JSON envelope. It is keeper's
-pairing surface: a second opinion, a cross-vendor cross-check, a code review or
-co-plan from a different model, or a read-only audit. For a codex partner keeper
-seeds the cwd's codex directory-trust before launch (fail-open) so the
-interactive window never hangs on codex's "trust this directory?" prompt; a pi
-partner launches with `-na` (`--no-approve`) instead, ignoring the cwd's
-project-local `.pi/` resources so it likewise never stalls on pi's trust prompt.
+Pairing fans ONE task out to another model CLI — `claude`, `codex`, `pi`, or
+`hermes` — launched as a detached **interactive TUI** partner via `keeper agent`,
+and reads the partner's final answer back as a uniform JSON envelope. It is
+keeper's pairing surface: a second opinion, a cross-vendor cross-check, a code
+review or co-plan from a different model, or a read-only audit. Each harness that
+needs a first-use consent step is pre-seeded so the window never stalls, all
+fail-open: for a codex partner keeper seeds the cwd's codex directory-trust
+before launch so it never hangs on codex's "trust this directory?" prompt; a pi
+partner launches with `-na` (`--no-approve`), ignoring the cwd's project-local
+`.pi/` resources so it likewise never stalls on pi's trust prompt; a hermes
+partner has its shell-hook allowlist + keeper events-shim pre-seeded so it
+reports live state with no interactive hook-approval prompt (degrading to
+presence-only tracking if the seed can't be written).
 
 You wait with **blocking Bash calls**, never a Monitor — a blocking call bills
 zero tokens while it blocks (the model is suspended between emitting the tool_use
@@ -99,7 +103,7 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
   Capture `DIR`; every `wait`/`status` re-reads it — or address the run by `--slug
   <slug>`, the durable form that survives a restart. Each member's `yaml` is that
   leg's answer-envelope path.
-- Pick the member with `--cli <claude|codex|pi>` (a bare harness, add `--model` /
+- Pick the member with `--cli <claude|codex|pi|hermes>` (a bare harness, add `--model` /
   `--effort` / `--role` as needed) or `--preset <name>` (a catalog preset), or
   fan out with `--panel <name>`. `--panel` and `--preset`/`--cli` are mutually
   exclusive. An absent/empty `--slug`, a misconfigured/unknown panel, an undefined
@@ -179,9 +183,9 @@ schema-versioned JSON envelope. The fields:
 | Flag | Meaning |
 |---|---|
 | `--preset <name>` | Named launch-config preset from the catalog `~/.config/keeper/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Must be a real catalog entry: an unknown name or missing catalog exits 2 (run `keeper agent presets list` to see the configured names). A preset's harness drives the claude/codex/pi orchestration and its optional role; only a `--cli` whose harness disagrees with the preset fails loud. |
-| `--cli claude\|codex\|pi` | The partner CLI. **Required unless `--preset` is given.** All three launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded (fail-open), and pi launches with `-na` (ignore project-local `.pi/` resources), so neither stalls on a trust prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
-| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex -m`). Omit for the CLI's default; with `--preset` the launcher owns model resolution. |
-| `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi member is an arg fault). |
+| `--cli claude\|codex\|pi\|hermes` | The partner CLI. **Required unless `--preset` is given.** All four launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded, pi launches with `-na` (ignore project-local `.pi/` resources), and hermes gets its shell-hook allowlist + events-shim pre-seeded — all fail-open, so none stalls on a consent prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
+| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex`/`hermes` `-m`). Omit for the CLI's default; with `--preset` the launcher owns model resolution. |
+| `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi/hermes member is an arg fault; hermes is model-only, pi takes thinking not effort). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner` (rides the leg as a `--system` block on the panel path). Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
 

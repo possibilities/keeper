@@ -219,8 +219,9 @@ test("resolvePanelMembers: an unknown name is fail-loud (no fallback)", () => {
 });
 
 test("resolvePanelMembers: a pi single-preset is accepted (pair-launchable)", () => {
-  // Panel.yaml rejects pi members at load; a single pi catalog preset used
-  // directly as --panel still pairs (resolvePanelMembers gates on AGENT_CLIS).
+  // pi is capturable, so it is panel-eligible both in panel.yaml (the load gate)
+  // and here as a single pi catalog preset used directly as --panel
+  // (resolvePanelMembers gates on AGENT_CLIS, derived from the harness registry).
   const catalog: PresetCatalog = { presets: { thinker: preset("pi") } };
   const r = resolvePanelMembers(catalog, EMPTY_SELECTIONS, "thinker");
   expect(r.ok).toBe(true);

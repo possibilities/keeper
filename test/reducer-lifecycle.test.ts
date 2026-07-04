@@ -143,6 +143,11 @@ function insertEvent(
     // Schema v94 / fn-997: durable worktree-lane BRANCH. NULL by default so a
     // non-worktree SessionStart folds jobs.worktree NULL; worktree tests set it.
     worktree: overrides.worktree ?? null,
+    // Schema v107 / fn-1103: launching harness + native resume target. NULL by
+    // default so a claude/legacy SessionStart folds both NULL; harness-fold and
+    // ResumeTargetResolved tests set them via overrides.
+    harness: overrides.harness ?? null,
+    resume_target: overrides.resume_target ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -153,8 +158,8 @@ function insertEvent(
        plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id, mutation_path, worktree
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path, worktree, harness, resume_target
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -190,6 +195,8 @@ function insertEvent(
       row.background_task_id,
       row.mutation_path,
       row.worktree,
+      row.harness,
+      row.resume_target,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -774,6 +781,147 @@ test("fn-997 a resume (empty branch → NULL) preserves the first-launch branch 
   });
   expect(drainAll()).toBeGreaterThan(0);
   expect(worktreeOf("sess-resume")).toBe("keeper/epic/fn-986--fn-986.3");
+});
+
+// ---------------------------------------------------------------------------
+// Schema v107 / fn-1103 — the harness + resume_target multi-harness columns.
+// The SessionStart arm folds `events.{harness,resume_target}` verbatim via
+// COALESCE (never synthesizing a value); a separate ResumeTargetResolved arm
+// idempotently replaces ONLY resume_target and never touches lifecycle state.
+// ---------------------------------------------------------------------------
+
+const harnessOf = (jobId: string): string | null =>
+  (
+    db.query("SELECT harness FROM jobs WHERE job_id = ?").get(jobId) as {
+      harness: string | null;
+    }
+  ).harness;
+
+const resumeTargetOf = (jobId: string): string | null =>
+  (
+    db.query("SELECT resume_target FROM jobs WHERE job_id = ?").get(jobId) as {
+      resume_target: string | null;
+    }
+  ).resume_target;
+
+test("fn-1103 a SessionStart carrying harness/resume_target folds both onto the row", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-claude",
+    spawn_name: "work::fn-1-x.1",
+    harness: "claude",
+    resume_target: "sess-claude",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(harnessOf("sess-claude")).toBe("claude");
+  expect(resumeTargetOf("sess-claude")).toBe("sess-claude");
+});
+
+test("fn-1103 a legacy NULL-harness SessionStart leaves both columns NULL (fold never synthesizes claude)", () => {
+  // The NULL=claude reading is a CONSUMER convention; the fold itself must store
+  // the event's value verbatim, so a pre-stamp / non-claude-tagged SessionStart
+  // folds harness NULL — a synthesized "claude" here would break re-fold
+  // byte-identity on the legacy log.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-legacy",
+    spawn_name: "work::fn-1-y.1",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(harnessOf("sess-legacy")).toBeNull();
+  expect(resumeTargetOf("sess-legacy")).toBeNull();
+});
+
+test("fn-1103 a resume (NULL harness/resume_target) preserves the seeded values via COALESCE", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r",
+    spawn_name: "work::fn-1-z.1",
+    harness: "codex",
+    resume_target: "rollout-abc",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(harnessOf("sess-r")).toBe("codex");
+  expect(resumeTargetOf("sess-r")).toBe("rollout-abc");
+
+  // A resume SessionStart emitting NULL for both must NOT clobber the seed.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-r",
+    spawn_name: "work::fn-1-z.1",
+    harness: null,
+    resume_target: null,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(harnessOf("sess-r")).toBe("codex");
+  expect(resumeTargetOf("sess-r")).toBe("rollout-abc");
+});
+
+test("fn-1103 ResumeTargetResolved sets resume_target on a killed row WITHOUT changing state", () => {
+  // Seed a job, then kill it (proven-dead reap), then back-fill its resume target.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-k",
+    pid: 5150,
+    start_time: "darwin:seed",
+    spawn_name: "work::fn-1-k.1",
+    harness: "codex",
+  });
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "sess-k",
+    data: JSON.stringify({
+      pid: 5150,
+      start_time: "darwin:seed",
+      close_kind: "signaled",
+      reason: "exit_watched",
+    }),
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(getJob("sess-k")?.state).toBe("killed");
+  expect(resumeTargetOf("sess-k")).toBeNull();
+
+  // The late back-fill sets resume_target and leaves state 'killed' — the
+  // explicit regression case a separate arm (never the reviving SessionStart
+  // arm) exists to protect.
+  insertEvent({
+    hook_event: "ResumeTargetResolved",
+    session_id: "sess-k",
+    resume_target: "rollout-late-99",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(resumeTargetOf("sess-k")).toBe("rollout-late-99");
+  expect(getJob("sess-k")?.state).toBe("killed");
+  expect(harnessOf("sess-k")).toBe("codex");
+});
+
+test("fn-1103 ResumeTargetResolved with a NULL target or no jobs row is a safe no-op", () => {
+  // No jobs row for this session — must not throw or mint a row.
+  insertEvent({
+    hook_event: "ResumeTargetResolved",
+    session_id: "sess-absent",
+    resume_target: "rt-x",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(
+    db.query("SELECT 1 FROM jobs WHERE job_id = ?").get("sess-absent"),
+  ).toBeNull();
+
+  // A row exists but the event carries a NULL target — no write.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-nt",
+    spawn_name: "work::fn-1-nt.1",
+    harness: "pi",
+    resume_target: "seed-nt",
+  });
+  insertEvent({
+    hook_event: "ResumeTargetResolved",
+    session_id: "sess-nt",
+    resume_target: null,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(resumeTargetOf("sess-nt")).toBe("seed-nt");
 });
 
 // ---------------------------------------------------------------------------

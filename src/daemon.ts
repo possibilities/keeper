@@ -19,10 +19,12 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join, resolve as resolvePath, sep } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
+import { resolveCodexResumeTarget } from "./agent/codex-session-index";
 import type {
   AutocloseIntentMessage,
   AutocloseWorkerData,
@@ -56,8 +58,23 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { type BackupResult, liveBackupPage } from "./backup";
+import type {
+  BirthIngestWorkerData,
+  BirthRecordsChangedMessage,
+} from "./birth-ingest-worker";
+import {
+  type BirthRecord,
+  parseBirthRecord,
+  resolveBirthDir,
+} from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
+import {
+  type CodexStopSignal,
+  collectCodexStopSignals,
+  type LiveCodexJob,
+  type RolloutCursor,
+} from "./codex-state-worker";
 import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
@@ -545,6 +562,25 @@ export function buildPendingDispatchSweepRecords(
  * blocked task is not latency-sensitive on the order of seconds.
  */
 export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Cadence of the codex resume-target back-fill sweep (fn-1103). A tracked codex
+ * job is born with `resume_target` NULL (it mints its own rollout uuid); this
+ * sweep resolves the uuid from the rollout head and mints a `ResumeTargetResolved`
+ * synthetic event. Seconds-scale so a freshly-launched session becomes resumable
+ * promptly, yet the tick is cheap: the candidate query is an indexed point-read and
+ * the rollout-tree read runs ONLY when a NULL-target codex job exists.
+ */
+export const CODEX_RESUME_SWEEP_INTERVAL_MS = 5_000;
+
+/**
+ * Recency floor for codex resume candidates: a job whose rollout uuid stays
+ * unresolved past this (a same-cwd collision with the originator override
+ * stripped, or a rollout that never persisted) drops out of the candidate set so
+ * the sweep goes quiet instead of scanning the tree forever. Its presence is
+ * unaffected — it simply stays `resume_target` NULL (not-resumable).
+ */
+export const CODEX_RESUME_RECENT_WINDOW_SEC = 600;
 
 /**
  * The ONE blocked category that does NOT escalate to the planner: a
@@ -2470,6 +2506,8 @@ export const INGEST_EVENTS_COLUMNS = [
   "background_task_id",
   "mutation_path",
   "worktree",
+  "harness",
+  "resume_target",
 ] as const;
 
 /**
@@ -2884,6 +2922,412 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
+ * Convert a birth record's ISO `launch_ts` to the REAL unix-seconds `events.ts`
+ * the hook writes for a real SessionStart. A pure function of the record (never
+ * scan wall-clock), so a re-scan of the same record mints a byte-identical event
+ * — re-fold-safe by construction. Falls back to scan wall-clock ONLY when
+ * `launch_ts` is unparseable.
+ */
+function birthEventTs(record: BirthRecord): number {
+  const parsed = Date.parse(record.launch_ts);
+  return Number.isNaN(parsed) ? Date.now() / 1000 : parsed / 1000;
+}
+
+/**
+ * Mint ONE synthetic `SessionStart` event from a birth record on main's WRITER
+ * connection. The bindings mirror what the claude SessionStart hook writes
+ * (`hook_event='SessionStart'`, `event_type='session_start'`), so the EXISTING
+ * jobs fold — the same arm claude/pi run through — turns it into a tracked row
+ * with NO reducer arm added: harness + resume_target ride the v107 columns,
+ * `pid` + `start_time` seed the recycle-safe identity (NEVER NULL — a NULL-pid
+ * seed would be `boot_unwatchable`-reaped; a birth record always carries the
+ * child pid), `spawn_name` becomes the title, and the `backend_exec_*` coords
+ * fold via the every-event backend arm so the renamer + exit-watcher inherit the
+ * row. `data` is NULL (no transcript at birth). SQLite assigns `id`, landing the
+ * row at the tail of the log.
+ *
+ * The column list matches CREATE_EVENTS verbatim (a future column add updates
+ * this site AND its `seed-sweep` `insertKilledEvent` sibling); values bind
+ * positionally.
+ */
+function insertBirthSessionStart(db: Database, record: BirthRecord): void {
+  db.run(
+    `INSERT INTO events (
+       ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+       cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+       subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+       background_task_id, mutation_path, worktree, harness, resume_target
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      birthEventTs(record),
+      record.session_id,
+      record.pid,
+      "SessionStart",
+      "session_start",
+      null, // tool_name
+      null, // matcher
+      record.cwd,
+      null, // permission_mode
+      null, // agent_id
+      null, // agent_type
+      null, // stop_hook_active
+      null, // data (no transcript at birth)
+      null, // subagent_agent_id
+      record.spawn_name,
+      record.start_time,
+      null, // slash_command
+      null, // skill_name
+      null, // plan_op
+      null, // plan_target
+      null, // plan_epic_id
+      null, // plan_task_id
+      null, // plan_subject_present
+      null, // tool_use_id
+      record.config_dir,
+      null, // bash_mutation_kind
+      null, // bash_mutation_targets
+      null, // plan_files
+      record.backend_exec_type,
+      record.backend_exec_session_id,
+      record.backend_exec_pane_id,
+      null, // background_task_id
+      null, // mutation_path
+      record.worktree,
+      record.harness,
+      record.resume_target,
+    ],
+  );
+}
+
+/** Retire a processed / parked birth record — delete it from `new/`. An ENOENT
+ *  retire race (already gone) is a non-fatal no-op; the tree stays bounded. */
+function retireBirthFile(full: string): void {
+  try {
+    unlinkSync(full);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      console.error(
+        `[keeperd] births retire failed for ${full}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+}
+
+/**
+ * Resolve CODEX_HOME for the resume-target sweep — an explicit non-empty
+ * `CODEX_HOME` wins, else `<home>/.codex` (the same rule
+ * `codex-trust` / `transcript-watch` use).
+ */
+export function resolveCodexHomeDir(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return (env.CODEX_HOME ?? "").trim() || join(homedir(), ".codex");
+}
+
+/** A codex job awaiting resume-target back-fill — see {@link findCodexResumeCandidates}. */
+export interface CodexResumeCandidate {
+  jobId: string;
+  cwd: string | null;
+  /** Job launch instant in ms (jobs.created_at seconds × 1000). */
+  startedAtMs: number;
+}
+
+/**
+ * The live codex jobs whose native rollout uuid is not yet back-filled: harness
+ * `codex`, `resume_target` still NULL, a non-terminal (`working`/`stopped`) state,
+ * and launched within `recentWindowSec` of `nowSec`. The recency floor is what
+ * makes the sweep go quiet — an old unresolved job (collision, override stripped)
+ * drops out instead of provoking a tree scan every tick. Pure over the db + clock.
+ */
+export function findCodexResumeCandidates(
+  db: Database,
+  nowSec: number,
+  recentWindowSec: number,
+): CodexResumeCandidate[] {
+  const rows = db
+    .query(
+      `SELECT job_id, cwd, created_at FROM jobs
+         WHERE harness = 'codex' AND resume_target IS NULL
+           AND state IN ('working', 'stopped')
+           AND created_at >= ?`,
+    )
+    .all(nowSec - recentWindowSec) as {
+    job_id: string;
+    cwd: string | null;
+    created_at: number;
+  }[];
+  return rows.map((r) => ({
+    jobId: r.job_id,
+    cwd: r.cwd,
+    startedAtMs: r.created_at * 1000,
+  }));
+}
+
+/** A resolved (jobId → native rollout uuid) pair the sweep mints as `ResumeTargetResolved`. */
+export interface CodexResumeResolution {
+  jobId: string;
+  resumeTarget: string;
+}
+
+/**
+ * Resolve the native rollout uuid for every current codex resume candidate,
+ * reading each candidate's rollout `SessionMeta` head via
+ * {@link resolveCodexResumeTarget} (originator exact-match first, cwd+created-at
+ * fallback with refuse-to-guess). An unresolvable candidate is omitted — it keeps
+ * its NULL resume_target (not-resumable) and is retried next tick until it ages
+ * out of the recency window. Reads NO session content. Returns [] with NO tree
+ * read when there are no candidates (the sweep's idle path).
+ */
+export function resolveCodexResumeCandidates(
+  db: Database,
+  codexHome: string,
+  nowSec: number,
+  recentWindowSec: number,
+): CodexResumeResolution[] {
+  const resolutions: CodexResumeResolution[] = [];
+  for (const candidate of findCodexResumeCandidates(
+    db,
+    nowSec,
+    recentWindowSec,
+  )) {
+    const resumeTarget = resolveCodexResumeTarget({
+      codexHome,
+      jobId: candidate.jobId,
+      expectedCwd: candidate.cwd,
+      startedAtMs: candidate.startedAtMs,
+    });
+    if (resumeTarget !== null) {
+      resolutions.push({ jobId: candidate.jobId, resumeTarget });
+    }
+  }
+  return resolutions;
+}
+
+/**
+ * The tracked codex jobs whose live stop-churn the state producer tails: harness
+ * `codex`, a resolved (non-NULL) `resume_target` — the attributed rollout uuid
+ * the tailer keys on, so an unattributed job idles presence-only — and a
+ * non-terminal (`working`/`stopped`) state. No recency floor: a non-terminal job
+ * is recent by construction (the reapers drive stale sessions terminal), and
+ * following a long-lived session's ongoing churn is the point. Pure over the db.
+ */
+export function findLiveCodexStateJobs(db: Database): LiveCodexJob[] {
+  const rows = db
+    .query(
+      `SELECT job_id, resume_target, created_at FROM jobs
+         WHERE harness = 'codex' AND resume_target IS NOT NULL
+           AND state IN ('working', 'stopped')`,
+    )
+    .all() as {
+    job_id: string;
+    resume_target: string;
+    created_at: number;
+  }[];
+  return rows.map((r) => ({
+    jobId: r.job_id,
+    resumeTarget: r.resume_target,
+    createdAtMs: r.created_at * 1000,
+  }));
+}
+
+/**
+ * Park a birth record that cannot be folded — a malformed (poison) record, or a
+ * stale one whose mint perpetually throws — as a `dead_letters` row with
+ * status='poison' (replay's `WHERE status='waiting'` skips it). Deterministic
+ * `dl_id` keyed on the file path → `ON CONFLICT DO NOTHING` idempotent.
+ * `ts`/`dl_written_at` are scan wall-clock (dead_letters is an operational
+ * sidecar, never folded). Returns `true` when the row is durably parked (the
+ * caller then retires the file); `false` on a transient DB error (the caller
+ * LEAVES the file for the next scan). Emits one `birth-ingest-poison` backstop
+ * record when the sink is wired.
+ */
+function parkPoisonBirth(
+  db: Database,
+  full: string,
+  body: string,
+  pid: number | null,
+  ctx?: EventsIngestContext,
+): boolean {
+  const dlId = `birth-poison:${full}`;
+  const nowSec = Date.now() / 1000;
+  try {
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid,
+          bindings, status, recovered_at, replayed_event_id, source_file)
+       VALUES (?, 'poison', 'PoisonBirthRecord', ?, ?, ?, ?, 'poison', NULL, NULL, ?)
+       ON CONFLICT(dl_id) DO NOTHING`,
+      [
+        dlId,
+        nowSec,
+        nowSec,
+        pid,
+        JSON.stringify({ raw: body.slice(0, 64 * 1024), file: full }),
+        full,
+      ],
+    );
+  } catch (err) {
+    console.error(
+      `[keeperd] births poison-park failed for ${full}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+  if (ctx !== undefined) {
+    ctx.counters.bump("birth-ingest-poison", "timeout", true);
+    appendBackstopRecord(
+      buildTimeoutRecord({
+        backstop: "birth-ingest-poison",
+        worker: "main",
+        rescued: true,
+        now: Date.now(),
+        stalenessMs: null,
+        detail: { file: full, dl_id: dlId },
+      }),
+      ctx.backstopLogPath,
+    );
+  }
+  return true;
+}
+
+/** Grace before a mint-failing birth record is eligible for dead-pid GC. A
+ *  transient write failure deserves several retries; only a record aged past
+ *  this AND whose pid is provably dead is parked. */
+const BIRTH_STUCK_GRACE_MS = 5 * 60_000;
+
+/**
+ * Bound the births tree against a record whose mint PERPETUALLY throws: once the
+ * file has aged past {@link BIRTH_STUCK_GRACE_MS} AND its recorded pid is
+ * provably dead (nothing left to track — a live pid still deserves a retry so
+ * the session eventually appears), park it to `dead_letters` and retire it. A
+ * young or live-pid record is LEFT for the next scan.
+ */
+function gcStuckBirthRecord(
+  db: Database,
+  full: string,
+  record: BirthRecord,
+  ctx?: EventsIngestContext,
+): void {
+  let ageMs: number;
+  try {
+    ageMs = Date.now() - statSync(full).mtimeMs;
+  } catch {
+    return; // vanished — nothing to GC
+  }
+  if (ageMs < BIRTH_STUCK_GRACE_MS || pidAlive(record.pid)) {
+    return;
+  }
+  if (parkPoisonBirth(db, full, JSON.stringify(record), record.pid, ctx)) {
+    retireBirthFile(full);
+  }
+}
+
+/**
+ * Ingest the births maildir — the non-hook presence channel's analogue of
+ * {@link scanEventsLogDir}, but PROCESS-THEN-RETIRE (births are one-record files,
+ * not append logs, so there is no byte-offset cursor). For each record under
+ * `<dir>/new/`:
+ *
+ *  - PARSE ({@link parseBirthRecord}): a torn/partial file never reaches `new/`
+ *    (the launcher writes tmp→fsync→rename, an atomic move-in), so a null parse
+ *    is a genuinely malformed COMPLETE record — POISON. Park it (idempotent
+ *    dl_id) and retire, so one bad record never wedges the scan.
+ *  - MINT + RETIRE: a valid record mints ONE synthetic SessionStart
+ *    ({@link insertBirthSessionStart}) inside a `BEGIN IMMEDIATE`, then — after
+ *    the durable COMMIT — retires the file. A crash in the tiny commit→unlink
+ *    window re-mints on the next scan, which is HARMLESS: a duplicate
+ *    SessionStart folds idempotently (a resume). At-least-once + idempotent fold
+ *    = exactly-once observable, without an fs op inside the SQL transaction.
+ *  - INSERT-THROW: rolls the transaction back and LEAVES the file (retry next
+ *    scan); {@link gcStuckBirthRecord} bounds the tree if it never recovers.
+ *
+ * A read that ENOENTs (the file vanished — a concurrent scan retired it) is
+ * SKIPPED, never parked. NEVER THROWS out of the scan: every recoverable error
+ * is swallowed to stderr so one bad file never wedges boot or the message loop.
+ * When `ctx` is absent, poison records are STILL parked; only the backstop
+ * record is skipped. MUST run on `db` = main's WRITER connection.
+ */
+export function scanBirthDir(
+  db: Database,
+  dir: string,
+  ctx?: EventsIngestContext,
+): void {
+  const newDir = join(dir, "new");
+  if (!existsSync(newDir)) {
+    return;
+  }
+  let names: string[];
+  try {
+    names = readdirSync(newDir);
+  } catch (err) {
+    console.error(
+      `[keeperd] births scan failed to readdir ${newDir}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) {
+      // The launcher writes `<pid>.<start-time>.json`; ignore anything else.
+      continue;
+    }
+    const full = join(newDir, name);
+    let body: string;
+    try {
+      body = readFileSync(full, "utf8");
+    } catch {
+      // Read-vs-retire race (file vanished between readdir and read): skip,
+      // never park — a maildir move-in is atomic, so a present file is complete.
+      continue;
+    }
+    const record = parseBirthRecord(body);
+    if (record === null) {
+      // POISON: a complete-but-malformed record. Park + retire so it can never
+      // re-poison a later scan. Leave it only on a transient park failure.
+      if (parkPoisonBirth(db, full, body, null, ctx)) {
+        retireBirthFile(full);
+      }
+      continue;
+    }
+    // Valid record: mint the synthetic SessionStart atomically, COMMIT, then
+    // retire. A crash in the commit→unlink window re-mints harmlessly.
+    let committed = false;
+    db.run("BEGIN IMMEDIATE");
+    try {
+      insertBirthSessionStart(db, record);
+      db.run("COMMIT");
+      committed = true;
+    } catch (err) {
+      try {
+        db.run("ROLLBACK");
+      } catch {
+        // best-effort
+      }
+      console.error(
+        `[keeperd] births mint failed for ${full} (leaving for retry): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    if (committed) {
+      retireBirthFile(full);
+      continue;
+    }
+    // Mint kept failing — bound the tree against a permanently-stuck record.
+    gcStuckBirthRecord(db, full, record, ctx);
+  }
+}
+
+/**
  * Recover ONE oldest `waiting` dead-letter row: pick the smallest
  * `(dl_written_at, dl_id)`, rebuild an `events` INSERT from its stored
  * `bindings`, and flip the row to `recovered` — all in ONE `BEGIN IMMEDIATE`.
@@ -3041,6 +3485,7 @@ export type WorkerName =
   | "usageScraper"
   | "deadLetter"
   | "eventsIngest"
+  | "birthIngest"
   | "autopilot"
   | "handoff"
   | "maintenance"
@@ -3068,6 +3513,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "usageScraper",
   "deadLetter",
   "eventsIngest",
+  "birthIngest",
   "autopilot",
   "handoff",
   "maintenance",
@@ -3092,6 +3538,7 @@ const WATCHER_WORKERS: readonly WorkerName[] = [
   "statusline",
   "deadLetter",
   "eventsIngest",
+  "birthIngest",
 ] as const;
 
 /**
@@ -3393,6 +3840,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   mkdirSync(eventsLogDir, { recursive: true });
   scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
 
+  // Step 1c — births boot ingest (fn-1103). The non-hook presence channel's twin
+  // of the events-log boot scan: fold every birth record the `keeper agent`
+  // launcher dropped for a non-claude harness during downtime into a synthetic
+  // SessionStart BEFORE the boot drain, so the drain mints the tracked jobs rows
+  // this pass. `mkdir` the maildir `new/` HERE — before the boot scan AND the
+  // birth-ingest worker spawn — so the watcher always finds an existing dir
+  // (@parcel/watcher's `subscribe` requires one) regardless of deploy ordering.
+  // Reuses the same backstop sink as the events-log scan (a distinct
+  // `birth-ingest-poison` counter). DIRECT write on `db` (main's writer conn).
+  const birthDir = resolveBirthDir(process.env);
+  mkdirSync(join(birthDir, "new"), { recursive: true });
+  scanBirthDir(db, birthDir, eventsIngestCtx);
+
   // Captured ONCE at boot (the resolver reads `process.env`, restored by the
   // in-process test harness right after the synchronous boot window). The
   // handoff spill-file read confines `doc_path` under this dir — without the
@@ -3631,6 +4091,101 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * DELETE is a direct producer write (the gate is NOT a projection), idempotent,
    * and runs before the event insert so a clear is never swallowed.
    */
+  /**
+   * Mint ONE `ResumeTargetResolved` synthetic event (fn-1103) that back-fills a
+   * tracked codex job's `resume_target` with its resolved native rollout uuid.
+   * MAIN is the sole event writer, so the daemon-side codex rollout producer mints
+   * here rather than writing `jobs` directly — the fold's dedicated
+   * `ResumeTargetResolved` arm folds ONLY `jobs.resume_target` (never lifecycle
+   * state, so a late back-fill can never revive a terminal row) and a from-scratch
+   * re-fold reproduces it from the event's `resume_target` COLUMN. The caller sets
+   * `wakePending` + pumps.
+   */
+  function mintCodexResumeTargetResolved(
+    resolution: CodexResumeResolution,
+  ): void {
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: resolution.jobId,
+      $pid: null,
+      $hook_event: "ResumeTargetResolved",
+      $event_type: "resume_target_resolved",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: null,
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+      $resume_target: resolution.resumeTarget,
+    });
+  }
+
+  /**
+   * Mint ONE synthetic `Stop` event (fn-1103) carrying a codex turn-completion
+   * the daemon-side rollout tailer parsed. Stamped with the ROLLOUT LINE's own
+   * timestamp (never wall-clock), so a boot-scan / tail-catch-up replay of a dead
+   * session's rollout folds through the Stop arm's terminal guard as a no-op and
+   * can never flicker a killed/ended row back to life. MAIN is the sole event
+   * writer, so the tailer mints here rather than writing `jobs` directly — a
+   * from-scratch re-fold reproduces the row. Caller sets `wakePending` + pumps.
+   */
+  function mintCodexStop(signal: CodexStopSignal): void {
+    stmts.insertEvent.run({
+      $ts: signal.tsSec,
+      $session_id: signal.jobId,
+      $pid: null,
+      $hook_event: "Stop",
+      $event_type: "stop",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: null,
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+      $resume_target: null,
+    });
+  }
+
   function mintDispatchClearedEvent(verb: string, id: string): void {
     clearDispatchMintGate(db, `${verb}::${id}`);
     stmts.insertEvent.run({
@@ -5578,6 +6133,64 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (eventsIngestWorker)`
 
+  // The births-tree watch-hint thread (fn-1103), the twin of the events-ingest
+  // worker. Watches the births maildir and posts a contentless
+  // `{kind:"birth-records-changed"}`. The worker holds NO DB handle — main
+  // re-runs `scanBirthDir` on each message, minting a synthetic SessionStart per
+  // record (process-then-retire, idempotent fold) then pumping a wake. Spawns
+  // AFTER the boot ingest so the tree state is settled. In-process fold/UDS tests
+  // inject via DIRECT DB INSERT, not this path. Gated on the selector — `null`
+  // when unselected.
+  const birthIngestWorker = want("birthIngest")
+    ? new Worker(new URL("./birth-ingest-worker.ts", import.meta.url).href, {
+        workerData: {
+          dir: birthDir,
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies BirthIngestWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (birthIngestWorker) {
+    const biw = birthIngestWorker;
+    // Main owns the write: a `birth-records-changed` message triggers a fresh
+    // `scanBirthDir` (the watcher event is "go look", never the data). A wake IS
+    // pumped — the mint goes to `events` (the fold source), so the reducer must
+    // fold it into the tracked jobs row.
+    biw.onmessage = (
+      ev: MessageEvent<BirthRecordsChangedMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "birth-records-changed") {
+        return;
+      }
+      try {
+        scanBirthDir(db, birthDir, eventsIngestCtx);
+        wakePending = true;
+        pumpWakes();
+      } catch (err) {
+        // Defense-in-depth: an unexpected internal throw must NOT crash the
+        // daemon. Log and continue — the next watcher event retries the ingest.
+        console.error(
+          `[keeperd] births live ingest threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    };
+
+    // Same crash policy as the other workers: any thread failure → fatalExit.
+    biw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] birth-ingest worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    // Same crash-via-`close` gap: a `process.exit(1)` fires `close`, not
+    // `onerror`. `!shuttingDown` makes it inert on clean shutdown.
+    biw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // end `if (birthIngestWorker)`
+
   // The autopilot reconciler worker runs the level-triggered dispatch loop
   // server-side: data_version wake → desired-vs-observed verdict → launch via
   // keeper agent → confirm → mint on ceiling (bridged through main). The pure
@@ -6975,6 +7588,87 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
+  // Codex resume-target back-fill producer (fn-1103). A tracked codex job is born
+  // with resume_target NULL (it mints its own rollout uuid post-launch); this
+  // sweep resolves that uuid from the rollout SessionMeta head — originator
+  // exact-match (the launcher's CODEX_INTERNAL_ORIGINATOR_OVERRIDE) first, cwd +
+  // created-at with refuse-to-guess fallback — and has MAIN mint a
+  // `ResumeTargetResolved` synthetic event (never a direct jobs write, so a
+  // from-scratch re-fold reproduces it). Reads ONLY session metadata, never
+  // content, and does NO tree read when no NULL-target codex job exists (the
+  // candidate query is an indexed point-read). Gated on the `exit` lifecycle role
+  // — the sibling steady-state jobs producer — so a server-only boot skips it. A
+  // per-tick no-throw guard keeps a transient rollout-read error off fatalExit.
+  const codexResumeHome = resolveCodexHomeDir();
+  // Codex live-state producer cursors (fn-1103): per-job rollout forward-tail
+  // offsets, EOF-anchored on first sight and GC'd once a job leaves the live set,
+  // so the map stays bounded by the live codex sessions, never history. Rides the
+  // same `exit`-role sweep tick as the resume back-fill below.
+  const codexStateCursors = new Map<string, RolloutCursor>();
+  const codexResumeSweepTimer = want("exit")
+    ? setInterval(() => {
+        if (shuttingDown) return;
+        try {
+          const resolutions = resolveCodexResumeCandidates(
+            db,
+            codexResumeHome,
+            Date.now() / 1000,
+            CODEX_RESUME_RECENT_WINDOW_SEC,
+          );
+          let minted = false;
+          for (const resolution of resolutions) {
+            // Re-read: mint only while resume_target is still NULL. The candidate
+            // query already filters it, but a concurrent fold (a resume re-seed)
+            // could have set it since — never overwrite a resolved target.
+            const row = db
+              .query("SELECT resume_target FROM jobs WHERE job_id = ?")
+              .get(resolution.jobId) as { resume_target: string | null } | null;
+            if (!row || row.resume_target != null) {
+              continue;
+            }
+            mintCodexResumeTargetResolved(resolution);
+            minted = true;
+          }
+          if (minted) {
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          console.error(
+            `[keeperd] codex-resume sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        // Codex live stop-churn (fn-1103) rides the same tick under its OWN guard,
+        // so a rollout-tail throw never skips the resume mint above (and vice
+        // versa). Forward-tails each attributed codex job's rollout and mints a
+        // synthetic Stop per turn-completion — an unattributed job is absent from
+        // the query and stays presence-only. A job attributed THIS tick is folded
+        // by a later tick, so the state read here always sees the settled target.
+        try {
+          const stopSignals = collectCodexStopSignals(
+            findLiveCodexStateJobs(db),
+            codexResumeHome,
+            codexStateCursors,
+          );
+          if (stopSignals.length > 0) {
+            for (const signal of stopSignals) {
+              mintCodexStop(signal);
+            }
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          console.error(
+            `[keeperd] codex-state sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }, CODEX_RESUME_SWEEP_INTERVAL_MS)
+    : null;
+
   // Poll-is-truth fallback for the events-log live ingest. The watcher hint is
   // the fast path, but a dropped/coalesced event (or a worker that never
   // subscribed) would otherwise leave hook events undrained until the next boot
@@ -6990,6 +7684,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch (err) {
       console.error(
         `[keeperd] events-log fallback scan threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    // fn-1103: the births tree rides the SAME fallback tick (own guard so a
+    // birth-scan throw never skips the wake). The watcher hint is the fast path;
+    // this poll guarantees every record lands within one interval even if the
+    // birth-ingest worker never subscribed or dropped an event.
+    try {
+      scanBirthDir(db, birthDir, eventsIngestCtx);
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] births fallback scan threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -7911,6 +8620,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
     }
+    if (codexResumeSweepTimer !== null) {
+      clearInterval(codexResumeSweepTimer);
+    }
     clearInterval(eventsIngestFallbackTimer);
     clearInterval(retentionTimer);
     clearInterval(mutationPathBackfillTimer);
@@ -7942,6 +8654,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       usageScraperWorker,
       deadLetterWorker,
       eventsIngestWorker,
+      birthIngestWorker,
       autopilotWorkerInstance,
       handoffWorkerInstance,
       maintenanceWorker,

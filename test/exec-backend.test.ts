@@ -793,6 +793,77 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
   ]);
 });
 
+test("buildKeeperAgentLaunchArgv: codex resume emits `keeper agent codex … resume <t>` with NO claude permission flags", () => {
+  // A non-claude harness swaps the agent token, DROPS the claude worker-permission
+  // posture (keeper agent applies codex's own `--dangerously-bypass…` default), and
+  // resumes via the VERB-POSITION `resume <uuid>` subcommand, not `--resume`.
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "pair",
+    prompt: "",
+    resumeTarget: "rollout-uuid",
+    harness: "codex",
+    noConfirm: true,
+  });
+  expect(argv).toEqual([
+    ...LAP,
+    "codex",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-tmux-session",
+    "pair",
+    "--x-tmux-env",
+    "KEEPER_TMUX_SESSION=pair",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-no-confirm",
+    "resume",
+    "rollout-uuid",
+  ]);
+  expect(argv).not.toContain("--permission-mode");
+  expect(argv).not.toContain("--dangerously-skip-permissions");
+});
+
+test("buildKeeperAgentLaunchArgv: pi resume emits `--session <t>`, hermes emits `--resume <t>`", () => {
+  const pi = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "s",
+    prompt: "",
+    resumeTarget: "pi-42",
+    harness: "pi",
+    noConfirm: true,
+  });
+  expect(pi.slice(-2)).toEqual(["--session", "pi-42"]);
+  expect(pi[LAP.length]).toBe("pi");
+  expect(pi).not.toContain("--dangerously-skip-permissions");
+
+  const hermes = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "s",
+    prompt: "",
+    resumeTarget: "hx-9",
+    harness: "hermes",
+    noConfirm: true,
+  });
+  expect(hermes.slice(-2)).toEqual(["--resume", "hx-9"]);
+  expect(hermes[LAP.length]).toBe("hermes");
+});
+
+test("buildKeeperAgentLaunchArgv: an explicit claude harness is byte-identical to the default", () => {
+  const base = {
+    launcherArgvPrefix: LAP,
+    session: "agentbus",
+    prompt: "",
+    resumeTarget: "planner-session",
+    noConfirm: true,
+  };
+  expect(buildKeeperAgentLaunchArgv({ ...base, harness: "claude" })).toEqual(
+    buildKeeperAgentLaunchArgv(base),
+  );
+});
+
 test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
   expect(
     buildKeeperAgentLaunchArgv({

@@ -7,9 +7,13 @@ rationale and provenance live in `.keeper/` specs and git history.
 ## What keeper is
 
 A small TypeScript hook plugin appends one per-pid NDJSON line per Claude Code hook invocation
-(lock-free — it never opens SQLite). A long-running Bun daemon (`keeperd`, run by a macOS
-LaunchAgent) runs an events-log ingester that tails those per-pid files and lands each line as one
-row in the append-only `events` table — the durable log and sole fold source. The reducer folds new
+(lock-free — it never opens SQLite). keeper drives other harnesses too — codex, pi, and hermes — and
+they feed the same events-log tree: a hermes shell shim and an ephemeral in-process pi extension
+write per-pid NDJSON directly, while non-claude presence (a launcher-dropped birth record) and codex
+live churn (a rollout-file tail) reach the log as main-minted synthetic events. A long-running Bun
+daemon (`keeperd`, run by a macOS LaunchAgent) runs an events-log ingester that tails those per-pid
+files and lands each line as one row in the append-only `events` table — the durable log and sole
+fold source. The reducer folds new
 events into projections one short `BEGIN IMMEDIATE` transaction per event, advancing its cursor in
 the same transaction (exactly-once, and a boot drain re-converges idempotently after any crash).
 
@@ -37,18 +41,20 @@ separate scoped RPC path.
 ## System map
 
 ```
-Claude Code hook  --append NDJSON, no SQLite-->  ~/.local/state/keeper/events-log/<pid>.ndjson
+claude hook | hermes shim | pi extension  --append NDJSON, no SQLite-->  ~/.local/state/keeper/events-log/<pid>.ndjson
+keeper agent launcher  --birth record (non-claude presence)-->  births tree  --ingested by-->  main synthetic event
 events-log ingester (worker)  --read from durable byte-offset-->  INSERT rows into `events`
 reducer (main)  --fold, one BEGIN IMMEDIATE per event-->  projections (jobs, epics, git, usage, ...)
 consumers poll `PRAGMA data_version` on their own read-only connections:
     UDS subscribe + RPC server | autopilot reconciler | plan / exit-watcher / git workers | tmux control/renamer/autoclose workers
 producers feed the log via main only (never write the DB):
-    transcript-title | plan | usage-scraper | builds | dead-letter | statusline watchers
+    transcript-title | plan | usage-scraper | builds | dead-letter | statusline watchers | birth-ingest | codex-state (rollout tail)
 ```
 
-Main is the sole writer of the log's synthetic events and of every projection; the hook is the sole
-writer of the per-pid NDJSON files. Workers open their own read-only connections and post messages to
-main, which mints the events and pumps the fold.
+Main is the sole writer of the log's synthetic events and of every projection; the per-pid NDJSON
+files are written by a hook-writer class (the claude hook, the hermes shim, the pi extension), and the
+launcher is the sole writer of the births tree. Workers open their own read-only connections and post
+messages to main, which mints the events and pumps the fold.
 
 ## Install
 

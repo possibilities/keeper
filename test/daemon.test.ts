@@ -3216,8 +3216,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `pending_dispatches` row, else NULL; an additive ALTER, NO cursor rewind: the
   // `Dispatched` event precedes its binding SessionStart in the log, so a
   // from-scratch re-fold reproduces the same discharge and the same stamp
-  // byte-identical).
-  expect(SCHEMA_VERSION).toBe(108);
+  // byte-identical). And to 109 via fn-1103 task .3 (appending the nullable
+  // `harness`/`resume_target` columns to BOTH events — a five-place lockstep —
+  // and jobs — migration-only; an additive ALTER, NO cursor rewind: a pre-v109
+  // stream carries neither value, so a from-scratch re-fold folds both NULL
+  // byte-identical, and the fold never synthesizes a harness value).
+  expect(SCHEMA_VERSION).toBe(109);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -5077,6 +5081,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "usage-scraper-worker.ts": "usageScraper",
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
+  "birth-ingest-worker.ts": "birthIngest",
   "autopilot-worker.ts": "autopilot",
   "handoff-worker.ts": "handoff",
   "maintenance-worker.ts": "maintenance",
@@ -5175,7 +5180,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-one workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -5195,10 +5200,14 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty work
   // fn-1024 added `statusline` (the sixth file-watcher producer; watches the
   // statusLine leaf dir and mints `SessionTelemetry`, reads keeper.db read-only).
   // fn-1107 added `autoclose` (the done-window reaper; no watcher, posts a
-  // pre-kill intent hint to main but writes keeper.db NOTHING).
+  // pre-kill intent hint to main but writes keeper.db NOTHING). fn-1103 added
+  // `birthIngest` (the seventh file-watcher; watches the births maildir the
+  // `keeper agent` launcher drops non-claude birth records into and mints a
+  // synthetic SessionStart per record — the twin of `eventsIngest`, no DB
+  // handle).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(20);
+  expect(spawned).toHaveLength(21);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -5214,6 +5223,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty work
     "usageScraper",
     "deadLetter",
     "eventsIngest",
+    "birthIngest",
     "autopilot",
     "handoff",
     "maintenance",
@@ -5401,7 +5411,7 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
   // The UDS/RPC/fold tier's set: wake (main's reducer pump) + server (UDS).
   const minimal = spawnedWorkerNames({ workers: ["wake", "server"] });
   expect(minimal).toEqual(["wake", "server"]);
-  // Crucially NONE of the six @parcel/watcher workers spawned.
+  // Crucially NONE of the @parcel/watcher workers spawned.
   for (const w of [
     "transcript",
     "plan",
@@ -5409,6 +5419,7 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
     "usage",
     "deadLetter",
     "eventsIngest",
+    "birthIngest",
   ] as const) {
     expect(minimal).not.toContain(w);
   }

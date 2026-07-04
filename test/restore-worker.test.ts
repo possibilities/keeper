@@ -451,6 +451,28 @@ test("buildRestoreTier stamps resume_target as the session UUID (job_id), indepe
   ).toBe("sess-abc");
 });
 
+test("buildRestoreTier tags a non-claude harness + its native resume_target, leaves claude untagged", () => {
+  // ABSENT harness ⇒ claude (byte-stable): a claude agent carries no `harness`
+  // field and resumes by its session UUID. A codex agent is tagged and resumes by
+  // its stored native target.
+  const jobs: Job[] = [
+    fakeJob({ job_id: "claude-sess", backend_exec_session_id: "s1" }),
+    fakeJob({
+      job_id: "keeper-codex",
+      backend_exec_session_id: "s1",
+      harness: "codex",
+      resume_target: "codex-rollout-id",
+    }),
+  ];
+  const agents = buildRestoreTier(jobs, new Map(), 1000).sessions.s1.agents;
+  const claude = agents.find((a) => a.job_id === "claude-sess");
+  const codex = agents.find((a) => a.job_id === "keeper-codex");
+  expect(claude?.harness).toBeUndefined();
+  expect(claude?.resume_target).toBe("claude-sess");
+  expect(codex?.harness).toBe("codex");
+  expect(codex?.resume_target).toBe("codex-rollout-id");
+});
+
 test("buildRestoreTier sets captured_at on the tier shape (empty live set)", () => {
   const out = buildRestoreTier([], new Map(), 1234);
   expect(out.captured_at).toBe(1234);
@@ -1287,6 +1309,8 @@ function fakeJob(opts: {
   backend_exec_pane_id?: string | null;
   window_index?: number | null;
   created_at?: number;
+  harness?: string | null;
+  resume_target?: string | null;
 }): Job {
   return {
     job_id: opts.job_id,
@@ -1300,5 +1324,7 @@ function fakeJob(opts: {
     backend_exec_session_id: opts.backend_exec_session_id ?? null,
     backend_exec_pane_id: opts.backend_exec_pane_id ?? null,
     window_index: opts.window_index ?? null,
+    harness: opts.harness ?? null,
+    resume_target: opts.resume_target ?? null,
   } as unknown as Job;
 }
