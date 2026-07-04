@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Reconcile sidecar label and lock coverage",
-  "updated_at": "2026-07-04T17:08:32.836000Z"
+  "updated_at": "2026-07-04T17:18:18.015000Z",
+  "worker_done_at": "2026-07-04T17:18:18.015000Z"
 }

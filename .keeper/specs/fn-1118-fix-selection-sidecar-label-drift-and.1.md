@@ -53,5 +53,5 @@ plugins/plan/README.md.
 - [ ] `bun test` (plan fast suite) is green.
 
 ## Done summary
-
+Reconciled selection-sidecar label_source to one canonical heuristic-guided string across the type doc, tests, and all three runtime callers (plan/defer/README); degrade rows stay heuristic-default. Added coverage for the malformed selection: block guards (bad_yaml) and a string-valued confidence round-trip.
 ## Evidence
