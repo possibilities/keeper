@@ -50,5 +50,5 @@ sibling Lane / Merge-gate / Resolver / Fan-in entries.
 - [ ] CONTEXT.md's worktree glossary defines the recover pass in one entry consistent with its siblings.
 
 ## Done summary
-
+Rewrote the CLAUDE.md autopilot paragraph to the landed recover classification (durable close::<epic> worktree-merge-conflict sticky for content conflicts, transient worktree-recover* level-clear, positive-evidence-only clears, defer-on-inconclusive) net-neutral within the lint gate, and added a Recover pass CONTEXT.md glossary entry.
 ## Evidence
