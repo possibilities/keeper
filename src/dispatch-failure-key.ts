@@ -128,6 +128,38 @@ export const CRASH_LOOP_DISTRESS_VERB = "daemon";
 export const CRASH_LOOP_DISTRESS_ID = "crash-loop";
 export const CRASH_LOOP_DISTRESS_REASON = "daemon-crash-loop";
 
+/**
+ * The synthetic PER-REPO distress signal for a shared MAIN checkout stuck mid-merge
+ * (MERGE_HEAD + unresolved paths) past the recover grace watermark — the escalation
+ * layer ON TOP of the immediate per-epic `worktree-recover-mid-merge` /
+ * `-abort-failed` reasons. Mirrors the crash-loop idiom: the synthetic {@link
+ * CRASH_LOOP_DISTRESS_VERB} shares the un-retryable `daemon` verb (routes as {@link
+ * routeDispatchFailure}'s `unknown` arm — never in `failedKeys`, never
+ * `retry_dispatch`-clearable), and the boot orphan-GC + the recover level-clear both
+ * EXEMPT it — but the `id` is per-repo (`shared-checkout-wedge:<repoHash>`) so two
+ * checkouts on a multi-repo board wedge independently, one distress row each. Its
+ * ONLY legitimate clear is the recover pass's level-trigger observing the checkout
+ * clean (NOT `retry_dispatch`, NOT the `worktree-recover*` auto-clear — the `reason`
+ * deliberately lives OUTSIDE {@link WORKTREE_RECOVER_REASON_PREFIX}). In-memory grace
+ * tracking, so a daemon restart re-emits at most once per still-present wedge.
+ */
+export const SHARED_WEDGE_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const SHARED_WEDGE_DISTRESS_ID_PREFIX = "shared-checkout-wedge:";
+export const SHARED_WEDGE_DISTRESS_REASON = "shared-checkout-wedge";
+
+/**
+ * True iff `(verb, id)` is a shared-checkout-wedge distress key — the synthetic
+ * `daemon` verb plus the {@link SHARED_WEDGE_DISTRESS_ID_PREFIX} per-repo id. The
+ * boot orphan-GC exempts it (like the crash-loop key) since the operator surface
+ * never clears it; pure, dep-free, NEVER throws.
+ */
+export function isSharedWedgeDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === SHARED_WEDGE_DISTRESS_VERB &&
+    id.startsWith(SHARED_WEDGE_DISTRESS_ID_PREFIX)
+  );
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -139,7 +171,8 @@ export type DispatchFailureDisplayKind =
   | "slot-reclaimed"
   | "slot-occupied"
   | "instant-death"
-  | "crash-loop";
+  | "crash-loop"
+  | "shared-wedge";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -163,6 +196,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: SLOT_OCCUPIED_REASON_PREFIX, kind: "slot-occupied" },
   { prefix: INSTANT_DEATH_BREAKER_REASON, kind: "instant-death" },
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
+  { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

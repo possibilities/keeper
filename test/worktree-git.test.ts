@@ -835,6 +835,66 @@ test("mergeBranchInto: a local-timeout (124) merge with NO MERGE_HEAD → no spu
   );
 });
 
+// fn-1114 — a conflict/timeout abort that ITSELF fails leaves the checkout
+// mid-merge → the distinct `abort-failed` arm carrying the abort's stderr,
+// instead of a silently-swallowed conflict/local-timeout. The single abort site
+// is bounded by GIT_LOCAL_TIMEOUT_MS (a 124 abort surfaces here as abort-failed).
+test("mergeBranchInto: conflict then a FAILED `merge --abort` → abort-failed carrying the abort stderr, lock released", async () => {
+  const { run } = fakeAsyncGit([
+    resolvedSourceRule,
+    notAncestorRule,
+    gitDirRule,
+    {
+      when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+      result: { exitCode: 1, stdout: "CONFLICT (content): foo.ts" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 0, stdout: "mergehead\n" }, // MERGE_HEAD present
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge", "--abort"),
+      result: { exitCode: 128, stderr: "fatal: could not abort the merge" },
+    },
+  ]);
+  const lock = recordingLock();
+  const res = await mergeBranchInto("/wt", "src", run, lock.acquire);
+  expect(res.kind).toBe("abort-failed");
+  if (res.kind === "abort-failed") {
+    expect(res.stderr).toContain("could not abort");
+  }
+  // The lock is still released on the wedge path.
+  expect(lock.events).toEqual([
+    "acquire:/wt/.git/keeper-commit-work.lock",
+    "release",
+  ]);
+});
+
+test("mergeBranchInto: a local-timeout (124) merge then a 124 abort → abort-failed with a timeout note", async () => {
+  const { run } = fakeAsyncGit([
+    resolvedSourceRule,
+    notAncestorRule,
+    gitDirRule,
+    {
+      when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 0, stdout: "mergehead\n" }, // MERGE_HEAD residue present
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge", "--abort"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE }, // the abort itself SIGKILLed
+    },
+  ]);
+  const res = await mergeBranchInto("/wt", "src", run, recordingLock().acquire);
+  expect(res.kind).toBe("abort-failed");
+  if (res.kind === "abort-failed") {
+    expect(res.stderr).toContain("timed out");
+  }
+});
+
 // ---------------------------------------------------------------------------
 // removeWorktree — never blind-force; report a dirty refusal.
 // ---------------------------------------------------------------------------
@@ -1043,19 +1103,61 @@ const statusRule = (porcelain: string, exitCode = 0): FakeGitRule => ({
   result: { exitCode, stdout: porcelain },
 });
 
+// fn-1114 shared rules. MERGE_HEAD probe rules are keyed on the MERGE_HEAD token
+// so they never collide with the CHERRY_PICK_HEAD / REVERT_HEAD / MERGE_AUTOSTASH
+// pseudo-ref probes.
+const mergeHeadPresentRule = (sha: string): FakeGitRule => ({
+  when: (a) => argvStartsWith(a, "rev-parse") && argvHas(a, "MERGE_HEAD"),
+  result: { exitCode: 0, stdout: `${sha}\n` },
+});
+const mergeHeadAbsentRule: FakeGitRule = {
+  when: (a) => argvStartsWith(a, "rev-parse") && argvHas(a, "MERGE_HEAD"),
+  result: { exitCode: 1 },
+};
+const autostashAbsentRule: FakeGitRule = {
+  when: (a) => argvStartsWith(a, "rev-parse") && argvHas(a, "MERGE_AUTOSTASH"),
+  result: { exitCode: 1 },
+};
+const autostashPresentRule: FakeGitRule = {
+  when: (a) => argvStartsWith(a, "rev-parse") && argvHas(a, "MERGE_AUTOSTASH"),
+  result: { exitCode: 0, stdout: "stashsha\n" },
+};
+const pointsAtRule = (refs: string[], exitCode = 0): FakeGitRule => ({
+  when: (a) =>
+    argvStartsWith(a, "for-each-ref") &&
+    a.some((t) => t.startsWith("--points-at=")),
+  result: { exitCode, stdout: refs.length > 0 ? `${refs.join("\n")}\n` : "" },
+});
+// git-dir resolver for the on-disk in-progress probes (rebase dirs, index.lock).
+const gitDirRepoRule: FakeGitRule = {
+  when: (a) =>
+    argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+  result: { exitCode: 0, stdout: "/repo/.git\n" },
+};
+// A PathProbe reporting only the given git-dir leaf present.
+const onlyPresent =
+  (leaf: string): ((p: string) => boolean) =>
+  (p) =>
+    p === `/repo/.git/${leaf}`;
+const nonePresent = (): boolean => false;
+
 test("mergeReadiness: on the expected branch + clean tree → ready", async () => {
   const { run, calls } = fakeAsyncGit([onBranchRule("main"), statusRule("")]);
   expect(await mergeReadiness("/repo", "main", run)).toEqual({ kind: "ready" });
-  // It probes the working tree FIRST (the dirty cause is the actionable one and
-  // must win over off-branch when a checkout is both), THEN the branch.
-  expect(calls[0].args).toEqual([
-    "status",
-    "--porcelain",
-    "--untracked-files=no",
-  ]);
-  expect(
-    calls.some((c) => argvStartsWith(c.args, "rev-parse", "--abbrev-ref")),
-  ).toBe(true);
+  // Most-specific-first ordering: the MERGE_HEAD probe precedes the dirty
+  // (status) check (a stopped merge's tree is also dirty), and the dirty check
+  // precedes the off-branch (abbrev-ref) verdict (the actionable dirty cause must
+  // win over off-branch when a checkout is both).
+  const idxOf = (pred: (a: string[]) => boolean): number =>
+    calls.findIndex((c) => pred(c.args));
+  const mergeHeadIdx = idxOf((a) => argvHas(a, "MERGE_HEAD"));
+  const statusIdx = idxOf((a) => argvStartsWith(a, "status", "--porcelain"));
+  const branchIdx = idxOf((a) =>
+    argvStartsWith(a, "rev-parse", "--abbrev-ref"),
+  );
+  expect(mergeHeadIdx).toBeGreaterThanOrEqual(0);
+  expect(mergeHeadIdx).toBeLessThan(statusIdx);
+  expect(statusIdx).toBeLessThan(branchIdx);
 });
 
 test("mergeReadiness: a CLEAN tree off the expected branch → off-branch (dirty probed clean first)", async () => {
@@ -1127,19 +1229,247 @@ test("mergeReadiness: an untracked-only shared checkout → ready (probe exclude
   expect(calls.some((c) => argvHas(c.args, "--untracked-files=no"))).toBe(true);
 });
 
-test("mergeReadiness: a mid-merge's unmerged entries surface as dirty (no separate MERGE_HEAD shell)", async () => {
-  const { run, calls } = fakeAsyncGit([
+test("mergeReadiness: a dirty tree with NO MERGE_HEAD → dirty (the MERGE_HEAD probe resolves absent)", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadAbsentRule,
     onBranchRule("main"),
-    statusRule("UU src/conflict.ts\n"),
+    statusRule(" M src/conflict.ts\n"),
   ]);
+  // MERGE_HEAD probed and absent → the tree's dirt is a generic `dirty`, not a
+  // mid-merge (a rebase-conflict `UU` tree with no MERGE_HEAD lands here too).
   expect((await mergeReadiness("/repo", "main", run)).kind).toBe("dirty");
-  // The clean-tree verdict comes from status --porcelain alone — no MERGE_HEAD probe.
-  expect(calls.some((c) => argvHas(c.args, "MERGE_HEAD"))).toBe(false);
 });
 
 test("mergeReadiness: a non-zero status exit fails safe to dirty (never spuriously ready)", async () => {
-  const { run } = fakeAsyncGit([onBranchRule("main"), statusRule("", 128)]);
+  const { run } = fakeAsyncGit([
+    mergeHeadAbsentRule,
+    onBranchRule("main"),
+    statusRule("", 128),
+  ]);
   expect((await mergeReadiness("/repo", "main", run)).kind).toBe("dirty");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1114 — mergeReadiness classifies a mid-merge distinctly (sha + sole-
+// ownership + autostash), and NAMES the foreign non-merge in-progress states.
+// ---------------------------------------------------------------------------
+
+test("mergeReadiness: MERGE_HEAD present + sole keeper/epic branch at the sha, no autostash → mid-merge, owner keeper", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule(["refs/heads/keeper/epic/fn-1-foo"]),
+    autostashAbsentRule,
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res).toEqual({
+    kind: "mid-merge",
+    mergeHead: "deadbeef",
+    owner: "keeper",
+    autostash: false,
+  });
+});
+
+test("mergeReadiness: mid-merge is probed BEFORE dirty — a mid-merge tree never folds into dirty", async () => {
+  const { run, calls } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule(["refs/heads/keeper/epic/fn-1-foo"]),
+    autostashAbsentRule,
+    statusRule("UU src/conflict.ts\n"), // the mid-merge tree is ALSO dirty
+  ]);
+  expect((await mergeReadiness("/repo", "main", run)).kind).toBe("mid-merge");
+  // The MERGE_HEAD win short-circuits before the porcelain dirty probe.
+  expect(
+    calls.some((c) => argvStartsWith(c.args, "status", "--porcelain")),
+  ).toBe(false);
+});
+
+test("mergeReadiness: mid-merge with a FOREIGN branch also at the sha → owner foreign (not sole keeper)", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule([
+      "refs/heads/keeper/epic/fn-1-foo",
+      "refs/heads/someones-feature",
+    ]),
+    autostashAbsentRule,
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res.kind).toBe("mid-merge");
+  if (res.kind === "mid-merge") {
+    expect(res.owner).toBe("foreign");
+  }
+});
+
+test("mergeReadiness: mid-merge with an EMPTY branch-set at the sha → owner foreign", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule([]), // nothing points at the sha
+    autostashAbsentRule,
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res.kind).toBe("mid-merge");
+  if (res.kind === "mid-merge") {
+    expect(res.owner).toBe("foreign");
+  }
+});
+
+test("mergeReadiness: mid-merge with a FAILED for-each-ref ownership probe → owner foreign", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule([], GIT_SPAWN_TIMEOUT_CODE), // 124 — inconclusive → not ours
+    autostashAbsentRule,
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res.kind).toBe("mid-merge");
+  if (res.kind === "mid-merge") {
+    expect(res.owner).toBe("foreign");
+  }
+});
+
+test("mergeReadiness: mid-merge with a present MERGE_AUTOSTASH → owner foreign, autostash true (never auto-abortable)", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule(["refs/heads/keeper/epic/fn-1-foo"]), // sole keeper...
+    autostashPresentRule, // ...but an autostash refuses ownership
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res).toEqual({
+    kind: "mid-merge",
+    mergeHead: "deadbeef",
+    owner: "foreign",
+    autostash: true,
+  });
+});
+
+test("mergeReadiness: mid-merge with a 124-timed-out autostash probe → owner foreign (inconclusive is not ours)", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadPresentRule("deadbeef"),
+    pointsAtRule(["refs/heads/keeper/epic/fn-1-foo"]),
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse") && argvHas(a, "MERGE_AUTOSTASH"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+  ]);
+  const res = await mergeReadiness("/repo", "main", run);
+  expect(res.kind).toBe("mid-merge");
+  if (res.kind === "mid-merge") {
+    expect(res.owner).toBe("foreign");
+    expect(res.autostash).toBe(false); // unknown, reported as not-present
+  }
+});
+
+test("mergeReadiness: a rebase-merge dir → dirty naming the rebase (detection only, never aborted)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    mergeHeadAbsentRule,
+    gitDirRepoRule,
+    onBranchRule("main"),
+    statusRule("UU src/x.ts\n"),
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    undefined,
+    onlyPresent("rebase-merge"),
+  );
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("rebase");
+  }
+  // Detection only — a foreign in-progress state is NEVER aborted.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    false,
+  );
+});
+
+test("mergeReadiness: a rebase-apply dir → dirty naming the rebase", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadAbsentRule,
+    gitDirRepoRule,
+    onBranchRule("main"),
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    undefined,
+    onlyPresent("rebase-apply"),
+  );
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("rebase");
+  }
+});
+
+test("mergeReadiness: a CHERRY_PICK_HEAD → dirty naming the cherry-pick", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadAbsentRule,
+    gitDirRepoRule,
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse") && argvHas(a, "CHERRY_PICK_HEAD"),
+      result: { exitCode: 0, stdout: "picksha\n" },
+    },
+    onBranchRule("main"),
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    undefined,
+    nonePresent,
+  );
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("cherry-pick");
+  }
+});
+
+test("mergeReadiness: a REVERT_HEAD → dirty naming the revert", async () => {
+  const { run } = fakeAsyncGit([
+    mergeHeadAbsentRule,
+    gitDirRepoRule,
+    {
+      when: (a) => argvStartsWith(a, "rev-parse") && argvHas(a, "REVERT_HEAD"),
+      result: { exitCode: 0, stdout: "revertsha\n" },
+    },
+    onBranchRule("main"),
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    undefined,
+    nonePresent,
+  );
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("revert");
+  }
+});
+
+test("mergeReadiness: a stale index.lock on an otherwise-clean checkout → dirty naming it (never removed)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    mergeHeadAbsentRule,
+    gitDirRepoRule,
+    onBranchRule("main"),
+    statusRule(""), // clean tree — the lock is the only blocker
+  ]);
+  const res = await mergeReadiness(
+    "/repo",
+    "main",
+    run,
+    undefined,
+    onlyPresent("index.lock"),
+  );
+  expect(res.kind).toBe("dirty");
+  if (res.kind === "dirty") {
+    expect(res.detail).toContain("index.lock");
+  }
+  // The lock is NAMED, never removed and never aborted around.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    false,
+  );
 });
 
 // fn-988 — the would-clobber probe (an incoming lane path ∩ a main-untracked file)

@@ -16,11 +16,15 @@ import {
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
   isMergeEscalationReason,
+  isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isWorktreeRecoverReason,
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
   routeDispatchFailure,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_REASON,
+  SHARED_WEDGE_DISTRESS_VERB,
   SLOT_OCCUPIED_REASON_PREFIX,
   SLOT_RECLAIMED_REASON_PREFIX,
   WORKTREE_CLOSE_KEY_PREFIXES,
@@ -262,6 +266,47 @@ describe("routeDispatchFailure: representative variant kinds", () => {
       ).kind,
     ).toBe("unknown");
   });
+
+  test("shared-checkout-wedge distress key → unknown (never enters failedKeys)", () => {
+    // Same synthetic-verb discipline as crash-loop, but per-repo: the id carries the
+    // repo hash. It must route as `unknown` for EVERY repo hash so no wedge row ever
+    // suppresses a real dispatch key.
+    for (const hash of ["abc123", "0", "zzz999"]) {
+      const id = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${hash}`;
+      expect(
+        routeDispatchFailure(
+          row(
+            SHARED_WEDGE_DISTRESS_VERB,
+            id,
+            `${SHARED_WEDGE_DISTRESS_REASON}: /repo has stayed mid-merge`,
+          ),
+        ).kind,
+      ).toBe("unknown");
+      expect(isSharedWedgeDistressKey(SHARED_WEDGE_DISTRESS_VERB, id)).toBe(
+        true,
+      );
+    }
+  });
+
+  test("isSharedWedgeDistressKey rejects a real close/work row and the crash-loop key", () => {
+    // A per-repo finalize/recover close row and a work row are NOT distress keys —
+    // only the synthetic `daemon` verb plus the wedge id prefix qualifies. The
+    // crash-loop id ("crash-loop") shares the verb but lacks the prefix.
+    expect(
+      isSharedWedgeDistressKey("close", `${WORKTREE_RECOVER_KEY_PREFIX}fn-1-x`),
+    ).toBe(false);
+    expect(isSharedWedgeDistressKey("work", "fn-1-x.2")).toBe(false);
+    expect(
+      isSharedWedgeDistressKey(
+        CRASH_LOOP_DISTRESS_VERB,
+        CRASH_LOOP_DISTRESS_ID,
+      ),
+    ).toBe(false);
+    // The wedge shares the un-retryable synthetic verb with crash-loop by design.
+    expect(SHARED_WEDGE_DISTRESS_VERB).toBe(CRASH_LOOP_DISTRESS_VERB);
+    expect(SHARED_WEDGE_DISTRESS_VERB).not.toBe("work");
+    expect(SHARED_WEDGE_DISTRESS_VERB).not.toBe("close");
+  });
 });
 
 describe("historical recover/finalize collision shapes stay DISJOINT", () => {
@@ -396,6 +441,27 @@ describe("preserved predicate helpers", () => {
       expect(other.startsWith(CRASH_LOOP_DISTRESS_REASON)).toBe(false);
     }
   });
+
+  test("shared-checkout-wedge distress reason is collision-free + display-mapped", () => {
+    expect(SHARED_WEDGE_DISTRESS_REASON).toBe("shared-checkout-wedge");
+    expect(SHARED_WEDGE_DISTRESS_ID_PREFIX).toBe("shared-checkout-wedge:");
+    // No existing display-rule prefix is a prefix of the wedge reason, nor it of
+    // them, so the pill classifies a wedge row to its own kind (never shadowed).
+    for (const { prefix } of DISPATCH_FAILURE_DISPLAY_RULES) {
+      if (prefix === SHARED_WEDGE_DISTRESS_REASON) continue;
+      expect(SHARED_WEDGE_DISTRESS_REASON.startsWith(prefix)).toBe(false);
+      expect(prefix.startsWith(SHARED_WEDGE_DISTRESS_REASON)).toBe(false);
+    }
+    // A wedge row's reason must NOT route as a recover reason (it lives OUTSIDE the
+    // `worktree-recover*` auto-clear prefix — its only clear is the level-trigger).
+    expect(isWorktreeRecoverReason(`${SHARED_WEDGE_DISTRESS_REASON}: x`)).toBe(
+      false,
+    );
+    // The id prefix is itself a well-formed `shared-checkout-wedge` display match.
+    expect(
+      SHARED_WEDGE_DISTRESS_ID_PREFIX.startsWith(SHARED_WEDGE_DISTRESS_REASON),
+    ).toBe(true);
+  });
 });
 
 describe("single vocabulary source", () => {
@@ -429,6 +495,7 @@ describe("single vocabulary source", () => {
       ["slot-occupied", "slot-occupied"],
       ["instant-death-breaker", "instant-death"],
       ["daemon-crash-loop", "crash-loop"],
+      ["shared-checkout-wedge", "shared-wedge"],
     ]);
   });
 });

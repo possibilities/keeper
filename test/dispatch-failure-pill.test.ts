@@ -10,6 +10,9 @@ import { describe, expect, test } from "bun:test";
 import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_REASON,
+  SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
 import {
   classifyDispatchFailure,
@@ -105,6 +108,45 @@ describe("classifyDispatchFailure", () => {
     expect(
       resolveFailureTarget(
         { verb: CRASH_LOOP_DISTRESS_VERB, id: "crash-loop", dir: "" },
+        ["fn-1-a"],
+      ),
+    ).toBeNull();
+  });
+
+  test("maps the shared-checkout-wedge distress reason to its own display kind", () => {
+    // The full minted reason carries a trailing recover-verdict dump; the prefix
+    // rule classifies it to the shared-wedge pill, distinct from every other kind.
+    expect(
+      classifyDispatchFailure(
+        `${SHARED_WEDGE_DISTRESS_REASON}: /repo has stayed mid-merge past the 5min recovery grace — Last recover verdict: worktree-recover-abort-failed: …`,
+      ),
+    ).toBe("shared-wedge");
+    expect(classifyDispatchFailure(SHARED_WEDGE_DISTRESS_REASON)).toBe(
+      "shared-wedge",
+    );
+    // Distinct from the sibling distress + the recover kinds (a different operator
+    // response: hand-resolve the shared checkout, not retry a lane).
+    for (const other of [
+      CRASH_LOOP_DISTRESS_REASON,
+      "worktree-recover-dirty-checkout",
+      "worktree-recover-conflict",
+    ]) {
+      expect(classifyDispatchFailure(SHARED_WEDGE_DISTRESS_REASON)).not.toBe(
+        classifyDispatchFailure(other),
+      );
+    }
+  });
+
+  test("a per-repo shared-checkout-wedge distress row resolves to no board target", () => {
+    // Per-repo, but still a synthetic `daemon`-verb row — it surfaces as a
+    // needs_human count, never a mis-attributed per-epic pill.
+    expect(
+      resolveFailureTarget(
+        {
+          verb: SHARED_WEDGE_DISTRESS_VERB,
+          id: `${SHARED_WEDGE_DISTRESS_ID_PREFIX}abc123`,
+          dir: "/repo",
+        },
         ["fn-1-a"],
       ),
     ).toBeNull();

@@ -109,7 +109,17 @@ export type MergeResult =
    * NEVER a sticky `conflict` (a timed-out merge's non-zero exit must not be
    * mistaken for a content conflict).
    */
-  | { kind: "local-timeout" };
+  | { kind: "local-timeout" }
+  /**
+   * The conflict/timeout guarded `git merge --abort` ITSELF failed or timed out
+   * — it returned non-zero (or was SIGKILLed at {@link GIT_LOCAL_TIMEOUT_MS}), so
+   * the working copy is left MID-MERGE (MERGE_HEAD + unresolved paths) rather than
+   * self-healed. DISTINCT from `conflict` (which aborted cleanly): the residue did
+   * NOT clear, so the caller must ESCALATE the wedge instead of silently skip-
+   * retrying it forever. `stderr` carries the abort's own output (or a timeout
+   * note) for the sticky DispatchFailed.
+   */
+  | { kind: "abort-failed"; stderr: string };
 
 /** Outcome of a worktree removal attempt. */
 export type RemoveResult =
@@ -133,10 +143,36 @@ export type MergeReadiness =
   /** On the expected branch, clean working tree, no merge/rebase in flight. */
   | { kind: "ready" }
   /**
-   * The working tree / index is not clean (`git status --porcelain` non-empty).
-   * Subsumes a mid-MERGE on the main checkout — a stopped/`--no-commit` merge
-   * leaves unmerged or staged entries that show here — and a mid-rebase paused on
-   * a conflict. `detail` carries the porcelain lines for the skip reason.
+   * A merge is IN FLIGHT on the shared checkout: `MERGE_HEAD` is present (a
+   * keeper base-merge that conflicted and stopped, or a crash mid-merge). Probed
+   * BEFORE `dirty` because a stopped merge's tree is ALSO dirty — folding the
+   * wedge into `dirty` is exactly the mis-classification this arm fixes, so the
+   * recover/finalize pass can name it and self-heal only what it owns. Fields:
+   * `mergeHead` is the incoming commit; `owner` is a repo-state-only SOLE-
+   * ownership attribution — `"keeper"` IFF the branch-set pointing at `mergeHead`
+   * is non-empty and consists ENTIRELY of `keeper/epic/*` branches, no
+   * MERGE_AUTOSTASH is present, and every ownership probe resolved; ANY foreign
+   * branch, an empty set, a probe failure/timeout, or a present autostash reads
+   * `"foreign"`. `autostash` reports whether a MERGE_AUTOSTASH ref is set. A
+   * caller may auto-abort ONLY an `owner: "keeper"` residue; a `"foreign"` one is
+   * never touched.
+   */
+  | {
+      kind: "mid-merge";
+      mergeHead: string;
+      owner: "keeper" | "foreign";
+      autostash: boolean;
+    }
+  /**
+   * The working tree / index is not clean (`git status --porcelain` non-empty),
+   * OR a NON-merge in-progress operation is paused on the checkout — a rebase
+   * (`rebase-merge`/`rebase-apply`), cherry-pick (`CHERRY_PICK_HEAD`), or revert
+   * (`REVERT_HEAD`) — OR a stale `index.lock` sits in the git dir. A mid-MERGE is
+   * NO LONGER folded here (it gets the distinct `mid-merge` arm); every other
+   * in-progress state IS, but with `detail` NAMING the specific cause so a
+   * downstream reason stops saying just "dirty". All of these are foreign-shaped:
+   * the caller degrades to a named skip-and-retry and NEVER remediates (never
+   * aborts a rebase/cherry-pick/revert, never removes an index.lock).
    */
   | { kind: "dirty"; detail: string }
   /**
@@ -460,37 +496,31 @@ export async function pruneWorktrees(
 }
 
 /**
- * True IFF a merge is mid-flight at `cwd` (`MERGE_HEAD` present). A crash between
- * `git merge` starting and committing leaves `MERGE_HEAD`; the recovery path
- * detects it here, aborts, and prunes so the next reconcile cycle re-runs the
- * merge from a clean state (level-triggered retry, no in-process self-heal).
+ * The worktree-aware presence probe for a git PSEUDO-REF (`MERGE_HEAD`,
+ * `MERGE_AUTOSTASH`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`): the resolved sha when the
+ * ref is present, else `null`. Pseudo-refs are PER-WORKTREE, so they are resolved
+ * via `git rev-parse --verify --quiet <ref>` and NEVER statted as a hardcoded
+ * `.git/<ref>` path. Bounded by {@link GIT_LOCAL_TIMEOUT_MS} (a wedged git hook
+ * must never freeze the reconcile cycle); a 124 SIGKILL, any non-zero exit, OR an
+ * exit-0-but-empty stdout all read as "absent" (fail-safe — the next cycle re-
+ * probes). The single MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/MERGE_AUTOSTASH
+ * probe every readiness/abort site shares, so the module never grows a fourth
+ * ad-hoc merge-state helper.
  */
-async function hasMergeInProgress(
+async function verifyPseudoRef(
   cwd: string,
-  run: GitRunner = gitExec,
-): Promise<boolean> {
-  const r = await run(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], {
+  run: GitRunner,
+  ref: string,
+): Promise<string | null> {
+  const r = await run(["rev-parse", "--verify", "--quiet", ref], {
     cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
-  return r.code === 0;
-}
-
-/**
- * Abort an interrupted merge at `cwd` IFF a `MERGE_HEAD` is present (guarded so a
- * tree with no merge in flight is never spuriously `merge --abort`ed). Returns
- * `true` when it aborted, `false` when there was nothing to abort. Producer-only
- * recovery: the caller follows with a `pruneWorktrees` and lets the next cycle
- * re-attempt the merge.
- */
-export async function abortInterruptedMerge(
-  cwd: string,
-  run: GitRunner = gitExec,
-): Promise<boolean> {
-  if (!(await hasMergeInProgress(cwd, run))) {
-    return false;
+  if (r.code !== 0) {
+    return null;
   }
-  await run(["merge", "--abort"], { cwd });
-  return true;
+  const sha = r.stdout.trim();
+  return sha.length > 0 ? sha : null;
 }
 
 /**
@@ -515,40 +545,179 @@ export async function isAncestorOf(
 }
 
 /**
+ * Existence probe for an on-disk git-dir path (a directory or file like
+ * `rebase-merge` or `index.lock`), injectable so the fast tier fakes it with zero
+ * fs and zero real git; production uses a real `lstat`. Returns true IFF the path
+ * exists (any node type; a broken symlink still counts). NEVER throws — a probe
+ * error reads as "absent" (fail-open: an undetectable state is simply not named,
+ * never a false wedge). Used ONLY for the non-pseudo-ref in-progress states
+ * (rebase dirs, a stale index.lock); pseudo-refs go through {@link verifyPseudoRef}.
+ */
+export type PathProbe = (path: string) => boolean | Promise<boolean>;
+
+const defaultPathExists: PathProbe = async (p) => {
+  try {
+    await lstat(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Classify a present-MERGE_HEAD shared checkout into the `mid-merge` verdict:
+ * attach the incoming `mergeHead` sha, a repo-state-only SOLE-ownership `owner`,
+ * and whether a MERGE_AUTOSTASH is set. Ownership consults REPO STATE ALONE (the
+ * MERGE_MSG is never read — it is attacker-shaped free text): keeper owns the
+ * residue IFF `git for-each-ref --points-at=<sha> refs/heads/` (a server-side
+ * filter) returns a NON-EMPTY set that is ENTIRELY under `keeper/epic/*`. Any
+ * foreign branch at the sha, an empty set, or a probe failure/timeout refuses
+ * ownership. A present MERGE_AUTOSTASH ALSO refuses it: `git merge --abort` runs
+ * as `git reset --merge` and may be unable to reconstruct the stashed pre-merge
+ * changes, so an auto-abort could lose work — never ours to abort. Every probe is
+ * bounded (a wedged hook must not freeze the cycle).
+ */
+async function classifyMidMerge(
+  cwd: string,
+  run: GitRunner,
+  mergeHead: string,
+): Promise<MergeReadiness> {
+  const refsAt = await run(
+    [
+      "for-each-ref",
+      "--format=%(refname)",
+      `--points-at=${mergeHead}`,
+      "refs/heads/",
+    ],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const branches =
+    refsAt.code === 0
+      ? refsAt.stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0)
+      : [];
+  const keeperPrefix = `refs/heads/${KEEPER_EPIC_BRANCH_PREFIX}`;
+  const soleKeeper =
+    refsAt.code === 0 &&
+    branches.length > 0 &&
+    branches.every((b) => b.startsWith(keeperPrefix));
+
+  const autostashRef = await run(
+    ["rev-parse", "--verify", "--quiet", "MERGE_AUTOSTASH"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const autostash =
+    autostashRef.code === 0 && autostashRef.stdout.trim().length > 0;
+  // A definitive absence exits 1; an exit 0 means present (autostash true). Any
+  // OTHER code (124 SIGKILL, 127 spawn-fail, 128 fatal) is an inconclusive probe
+  // → refuse ownership (unknown state is never ours to abort).
+  const autostashProbeFailed =
+    autostashRef.code !== 0 && autostashRef.code !== 1;
+
+  const owner: "keeper" | "foreign" =
+    soleKeeper && !autostash && !autostashProbeFailed ? "keeper" : "foreign";
+  return { kind: "mid-merge", mergeHead, owner, autostash };
+}
+
+/**
+ * Name a NON-merge in-progress operation or stale lock on the checkout at `cwd`,
+ * mirroring wt-status.c's precedence — a paused rebase (`rebase-merge` /
+ * `rebase-apply` dir), cherry-pick (`CHERRY_PICK_HEAD`), revert (`REVERT_HEAD`),
+ * or a stale `index.lock` — as a human detail string, or `null` when none. Every
+ * such state is FOREIGN-SHAPED: DETECTION ONLY, so the caller names it in a
+ * not-ready skip and NEVER remediates (never aborts a rebase/cherry-pick/revert,
+ * never removes an index.lock). The pseudo-refs resolve via {@link verifyPseudoRef}
+ * (per-worktree, never a hardcoded `.git/` stat); the rebase dirs + index.lock are
+ * `pathExists`-probed on the rev-parse-resolved per-worktree git dir. A gitDir
+ * probe failure simply skips the on-disk checks (fail-open).
+ */
+async function nameForeignInProgress(
+  cwd: string,
+  run: GitRunner,
+  pathExists: PathProbe,
+): Promise<string | null> {
+  const gitDirR = await run(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const gitDir = gitDirR.code === 0 ? gitDirR.stdout.trim() : "";
+  if (gitDir.length > 0) {
+    if (await pathExists(joinPath(gitDir, "rebase-merge"))) {
+      return "rebase in progress (rebase-merge)";
+    }
+    if (await pathExists(joinPath(gitDir, "rebase-apply"))) {
+      return "rebase in progress (rebase-apply)";
+    }
+  }
+  if ((await verifyPseudoRef(cwd, run, "CHERRY_PICK_HEAD")) !== null) {
+    return "cherry-pick in progress (CHERRY_PICK_HEAD)";
+  }
+  if ((await verifyPseudoRef(cwd, run, "REVERT_HEAD")) !== null) {
+    return "revert in progress (REVERT_HEAD)";
+  }
+  if (gitDir.length > 0 && (await pathExists(joinPath(gitDir, "index.lock")))) {
+    return "stale index.lock present";
+  }
+  return null;
+}
+
+/**
  * Probe whether `cwd`'s shared main checkout is ready for a base merge: on
- * `expectedBranch`, clean working tree, no merge/rebase mid-flight. Two git
- * reads, DIRTY-FIRST:
- *  1. `git status --porcelain --untracked-files=no` — any output (uncommitted
- *     edits, staged work, or a stopped merge's unmerged entries) → `{ kind:
- *     "dirty" }`. Probed FIRST so a checkout that is BOTH dirty and off its
- *     expected branch surfaces the DIRTY cause (the actionable one — clean the
- *     tree) rather than masking it behind a bare off-branch verdict. Untracked
- *     files are EXCLUDED: a benign untracked file in the human's shared checkout
- *     (editor temp, un-ignored artifact, a `.env`) a merge cannot disturb must
- *     not force a never-finalizing skip-and-retry. A non-zero status exit is
- *     itself treated as not-ready (`dirty`, conservative). This single probe
- *     covers the mid-MERGE and conflict-paused-rebase cases without a separate
- *     `MERGE_HEAD` shell.
- *  2. `git rev-parse --abbrev-ref HEAD` — a CLEAN tree off `expectedBranch`
- *     (incl. a detached HEAD from a mid-rebase, which reports `HEAD`) → `{ kind:
- *     "off-branch" }`.
+ * `expectedBranch`, clean working tree, no merge/rebase/cherry-pick/revert mid-
+ * flight, no stale lock. The probes run MOST-SPECIFIC-FIRST so the actionable
+ * cause never masks behind a coarser one:
+ *  1. `git rev-parse --verify --quiet MERGE_HEAD` — a merge IN FLIGHT →
+ *     `{ kind: "mid-merge" }` carrying the sha, a sole-ownership `owner`, and
+ *     `autostash`. Probed FIRST because a stopped merge's tree is ALSO dirty:
+ *     folding it into `dirty` is the exact wedge this classification fixes.
+ *  2. A NAMED non-merge in-progress state (rebase / cherry-pick / revert dir or
+ *     ref, or a stale `index.lock`) → `{ kind: "dirty" }` with `detail` naming
+ *     it. Foreign-shaped, detection only.
+ *  3. `git status --porcelain --untracked-files=no` — any remaining output
+ *     (uncommitted edits, staged work) → `{ kind: "dirty" }`. Probed before the
+ *     branch check so a checkout that is BOTH dirty and off its expected branch
+ *     surfaces the DIRTY cause (the actionable one) rather than masking it behind
+ *     a bare off-branch verdict. Untracked files are EXCLUDED: a benign untracked
+ *     file (editor temp, un-ignored artifact, a `.env`) a merge cannot disturb
+ *     must not force a never-finalizing skip-and-retry. A non-zero status exit is
+ *     itself treated as not-ready (`dirty`, conservative).
+ *  4. `git rev-parse --abbrev-ref HEAD` — a CLEAN tree off `expectedBranch`
+ *     (incl. a detached HEAD, which reports `HEAD`) → `{ kind: "off-branch" }`.
  * When `incomingBranch` is supplied, a clean tree gets ONE further probe: a
  * would-clobber intersection (`incomingBranch`'s tracked paths ∩ the main
  * checkout's untracked files) — a non-empty overlap a `git merge` would hard-
  * abort on returns `{ kind: "would-clobber" }`. Omitting it skips that probe
  * (the bare clean-tree verdict). Otherwise `{ kind: "ready" }`. Pure git reads —
  * never a fetch / write. `run` precedes `incomingBranch` so existing two-/three-
- * arg callers keep the bare-readiness behavior unchanged. The caller degrades a
- * not-`ready` result to a clean skip-and-retry, never a merge.
+ * arg callers keep the bare-readiness behavior unchanged; `pathExists` is
+ * injectable so the fast tier fakes the on-disk in-progress checks. The caller
+ * degrades a not-`ready` result to a clean skip-and-retry, never a merge.
  */
 export async function mergeReadiness(
   cwd: string,
   expectedBranch: string,
   run: GitRunner = gitExec,
   incomingBranch?: string,
+  pathExists: PathProbe = defaultPathExists,
 ): Promise<MergeReadiness> {
-  // Dirty check FIRST — a dirty+off-branch checkout must report the actionable
-  // DIRTY cause, not mask it as off-branch. Bound the read (B4); a 124 timeout
+  // Mid-merge FIRST — a stopped merge leaves MERGE_HEAD AND a dirty tree, so the
+  // MERGE_HEAD probe MUST precede the dirty check or the wedge folds into a
+  // generic `dirty` the recover/finalize pass skip-retries forever.
+  const mergeHead = await verifyPseudoRef(cwd, run, "MERGE_HEAD");
+  if (mergeHead !== null) {
+    return classifyMidMerge(cwd, run, mergeHead);
+  }
+  // Then the NAMED non-merge in-progress states (rebase / cherry-pick / revert /
+  // stale index.lock) — probed before the porcelain dirty check so the SPECIFIC
+  // cause wins over generic dirt. Foreign-shaped: detection only, never aborted.
+  const foreign = await nameForeignInProgress(cwd, run, pathExists);
+  if (foreign !== null) {
+    return { kind: "dirty", detail: foreign };
+  }
+  // Dirty check — a dirty+off-branch checkout must report the actionable DIRTY
+  // cause, not mask it as off-branch. Bound the read (B4); a 124 timeout
   // (non-zero) folds through the `code !== 0` arm to `dirty` — a SAFE
   // not-ready/retry-skip, never a false clean.
   const status = await run(["status", "--porcelain", "--untracked-files=no"], {
@@ -922,30 +1091,72 @@ export async function ensureWorktree(
   }
 }
 
+/** Outcome of the consolidated guarded merge-abort helper. */
+type MergeAbortOutcome =
+  /** No `MERGE_HEAD` was present — nothing was in flight to abort. */
+  | { kind: "no-merge" }
+  /** A merge was in flight and the `git merge --abort` cleared it cleanly. */
+  | { kind: "aborted" }
+  /**
+   * A MERGE_HEAD was present but the `git merge --abort` ITSELF returned non-zero
+   * or was SIGKILLed at {@link GIT_LOCAL_TIMEOUT_MS}: the mid-merge residue did
+   * NOT clear. `stderr` carries the abort's own output (or a timeout note).
+   */
+  | { kind: "abort-failed"; stderr: string };
+
 /**
- * MERGE_HEAD-guarded `git merge --abort`: aborts IFF a merge is actually in
- * flight (a `MERGE_HEAD` exists), so a merge that never started is not
- * spuriously "aborted". Run on BOTH the conflict and the local-timeout
- * (SIGKILLed) exits of {@link mergeBranchInto} — a killed merge can leave
- * MERGE_HEAD/partial state that would read as a spurious conflict next cycle.
- * Best-effort + bounded by GIT_LOCAL_TIMEOUT_MS: a failed probe/abort leaves the
- * common-case self-heal (next cycle's {@link mergeReadiness} sees a dirty tree
- * and defers).
+ * The single MERGE_HEAD-guarded `git merge --abort` — the consolidated core the
+ * whole module's abort paths share. Aborts IFF a merge is actually in flight (a
+ * `MERGE_HEAD` exists via {@link verifyPseudoRef}), so a merge that never started
+ * is not spuriously "aborted". Run on BOTH the conflict and the local-timeout
+ * (SIGKILLed) exits of {@link mergeBranchInto} and behind the boolean
+ * {@link abortInterruptedMerge} recover wrapper — a killed merge can leave
+ * MERGE_HEAD/partial state that would read as a spurious conflict next cycle. The
+ * probe AND the abort are BOTH bounded by GIT_LOCAL_TIMEOUT_MS (the old recover
+ * abort was unbounded). Unlike the old void-returning helper, the abort's OUTCOME
+ * is surfaced: a failed/timed-out abort returns `abort-failed` (the wedge signal)
+ * instead of being silently swallowed, so the caller can escalate rather than
+ * skip-retry a checkout that never self-heals.
  */
 async function abortMergeIfInProgress(
-  worktreePath: string,
+  cwd: string,
   run: GitRunner,
-): Promise<void> {
-  const mergeHead = await run(
-    ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
-    { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-  );
-  if (mergeHead.code === 0) {
-    await run(["merge", "--abort"], {
-      cwd: worktreePath,
-      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-    });
+): Promise<MergeAbortOutcome> {
+  if ((await verifyPseudoRef(cwd, run, "MERGE_HEAD")) === null) {
+    return { kind: "no-merge" }; // no merge in flight → nothing to abort
   }
+  const abort = await run(["merge", "--abort"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (abort.code === 0) {
+    return { kind: "aborted" };
+  }
+  const out = (abort.stdout + abort.stderr).trim();
+  const stderr =
+    abort.code === GIT_SPAWN_TIMEOUT_CODE
+      ? `git merge --abort timed out${out.length > 0 ? `: ${out}` : ""}`
+      : out.length > 0
+        ? out
+        : `git merge --abort failed (exit ${abort.code})`;
+  return { kind: "abort-failed", stderr };
+}
+
+/**
+ * Abort an interrupted merge at `cwd` IFF a `MERGE_HEAD` is present (guarded so a
+ * tree with no merge in flight is never spuriously `merge --abort`ed). Returns
+ * `true` when a merge WAS in flight (an abort was attempted — cleanly or not),
+ * `false` when there was nothing to abort. The recover sweep's pass-1 entry point:
+ * the caller follows a `true` with a `pruneWorktrees` and lets the next cycle
+ * re-attempt the merge (level-triggered retry, no in-process self-heal). A thin
+ * boolean adapter over the consolidated {@link abortMergeIfInProgress} core, so
+ * the abort is now BOUNDED by GIT_LOCAL_TIMEOUT_MS (it was previously unbounded).
+ */
+export async function abortInterruptedMerge(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  return (await abortMergeIfInProgress(cwd, run)).kind !== "no-merge";
 }
 
 /**
@@ -958,7 +1169,10 @@ async function abortMergeIfInProgress(
  *  - Else `git merge --no-edit <sourceBranch>`; on conflict, abort via a
  *    `MERGE_HEAD`-guarded `git merge --abort` and return `{ kind: "conflict" }`.
  *    The abort is guarded so a merge that failed for a non-conflict reason (and
- *    left no MERGE_HEAD) is not "aborted" spuriously.
+ *    left no MERGE_HEAD) is not "aborted" spuriously. When the guarded abort
+ *    ITSELF fails or times out, the checkout is left mid-merge → the distinct
+ *    `{ kind: "abort-failed" }` wedge signal instead of a silently-swallowed
+ *    conflict.
  *
  * The flock path comes from the worktree's own git dir, so a merge serializes
  * only against a commit-work in the SAME worktree; disjoint lanes take distinct
@@ -1033,14 +1247,23 @@ export async function mergeBranchInto(
       // next cycle would read as a spurious conflict. Run the same MERGE_HEAD-
       // guarded abort here before returning so no residue is left. (The common
       // case already self-heals — next cycle's mergeReadiness sees a dirty tree
-      // and defers — so this is belt-and-suspenders.) The returned kind stays
-      // `local-timeout` (a retry-skip), unchanged.
-      await abortMergeIfInProgress(worktreePath, run);
+      // and defers — so this is belt-and-suspenders.) The kind stays
+      // `local-timeout` (a retry-skip) UNLESS the abort itself failed — then the
+      // residue did not clear, so surface the `abort-failed` wedge signal.
+      const abortedT = await abortMergeIfInProgress(worktreePath, run);
+      if (abortedT.kind === "abort-failed") {
+        return { kind: "abort-failed", stderr: abortedT.stderr };
+      }
       return { kind: "local-timeout" };
     }
     // Non-zero: a conflict (or other failure). Abort iff a MERGE_HEAD exists,
-    // so a merge that never started is not spuriously "aborted".
-    await abortMergeIfInProgress(worktreePath, run);
+    // so a merge that never started is not spuriously "aborted". A clean abort
+    // (or nothing to abort) → the sticky `conflict`; an abort that ITSELF failed
+    // left the checkout mid-merge → the distinct `abort-failed` wedge signal.
+    const aborted = await abortMergeIfInProgress(worktreePath, run);
+    if (aborted.kind === "abort-failed") {
+      return { kind: "abort-failed", stderr: aborted.stderr };
+    }
     return {
       kind: "conflict",
       stderr: (merge.stdout + merge.stderr).trim(),

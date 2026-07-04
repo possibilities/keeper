@@ -54,6 +54,7 @@ import {
   computeSlotOccupancy,
   confirmRunning,
   createDispatchFailedGate,
+  createSharedCheckoutWedgeTracker,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
   DISPATCH_FAILED_WATERMARK_SEC,
@@ -74,6 +75,7 @@ import {
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
+  isSharedCheckoutWedgeReason,
   isWorktreeRecoverReason,
   type LaunchResult,
   type LiveDispatch,
@@ -91,8 +93,12 @@ import {
   reposForRecovery,
   resolveWorkerLaunchConfig,
   runReconcileCycle,
+  SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
   type SlotOccupancySignal,
+  sharedWedgeDistressId,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
@@ -146,6 +152,23 @@ import {
   type FakeGitRule,
   fakeAsyncGit,
 } from "./helpers/fake-git";
+
+// A clean shared checkout has NO in-progress pseudo-ref present. mergeReadiness
+// now probes these via `rev-parse --verify --quiet <REF>`; real git exits 1 on
+// each for a settled tree, so the finalize/merge fakes below (whose broad
+// `rev-parse --verify → exists` catch-all would otherwise answer "present") must
+// report them absent or mergeReadiness would misread a clean checkout as
+// mid-merge / in-progress.
+const IN_PROGRESS_PSEUDO_REFS = [
+  "MERGE_HEAD",
+  "MERGE_AUTOSTASH",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+];
+const isInProgressPseudoRefProbe = (args: string[]): boolean =>
+  args[0] === "rev-parse" &&
+  args.includes("--verify") &&
+  IN_PROGRESS_PSEUDO_REFS.some((r) => args.includes(r));
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (same shape as test/autopilot.test.ts)
@@ -6908,6 +6931,9 @@ test("fn-990 finalizeEpic: a crashed closer (NOT done in the main projection) �
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch EXISTS
     }
@@ -6935,6 +6961,9 @@ test("fn-990 finalizeEpic: done in the projection but the lane is NOT ahead of d
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
     }
@@ -6968,6 +6997,9 @@ test("fn-992 finalizeEpic: a stranded base (absent from origin) while HEAD is OF
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
     }
@@ -7017,6 +7049,9 @@ test("fn-993 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → { kind
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7061,6 +7096,9 @@ test("fn-993 mergeLaneBaseIntoDefault: a local `merge --no-edit` TIMEOUT (124) �
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7114,6 +7152,9 @@ test("fn-993 finalizeEpic: a local merge timeout → worktree-finalize-local-tim
       }
       if (joined === "rev-parse --abbrev-ref HEAD") {
         return { code: 0, stdout: "main\n", stderr: "" }; // on default
+      }
+      if (isInProgressPseudoRefProbe(args)) {
+        return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
       }
       if (args[0] === "rev-parse" && args.includes("--verify")) {
         return { code: 0, stdout: "abc\n", stderr: "" }; // base/origin refs exist
@@ -7169,6 +7210,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs exist
     }
@@ -7221,6 +7265,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a real merge CONFLICT → { kind: 'confli
     args,
   ) => {
     const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7263,6 +7310,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a push failure on the merge → { kind: '
     args,
   ) => {
     const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7303,6 +7353,9 @@ test("fn-990 mergeLaneBaseIntoDefault: a push TIMEOUT (spawn-timeout sentinel) �
     args,
   ) => {
     const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7356,6 +7409,9 @@ test("fn-990 mergeLaneBaseIntoDefault: turn-key probe runs BEFORE the FF prechec
       joined.includes("refs/remotes/origin/")
     ) {
       return { code: 1, stdout: "", stderr: "" };
+    }
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
     }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base/source refs exist
@@ -7584,6 +7640,9 @@ test("fn-993 mergeLaneBaseIntoDefault: the MERGED arm re-pushes branch-explicit 
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -7661,6 +7720,9 @@ test("fn-959 createWorktreeDriver: finalizeEpic skips a never-forked epic (no ba
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     cmds.push(args.join(" "));
     // The base branch does not exist → rev-parse --verify returns non-zero.
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 1, stdout: "", stderr: "" };
     }
@@ -8109,6 +8171,9 @@ test("fn-988 reposForRecovery: knownRoots union in repos with no current epic (o
 function makeRecoveryGit(state: {
   worktreeList?: string; // git worktree list --porcelain stdout
   mergeHeadAt?: Set<string>; // cwds with a stale MERGE_HEAD
+  pointsAtBranches?: Map<string, string[]>; // cwd → `refs/heads/...` refs pointing at its MERGE_HEAD (ownership + owning-epic derivation)
+  autostashAt?: Set<string>; // cwds whose mid-merge carries a MERGE_AUTOSTASH (refuses keeper ownership)
+  abortFailsAt?: Set<string>; // cwds whose `merge --abort` returns non-zero (the un-cleared wedge)
   epicBases?: string[]; // keeper/epic/<id> short refs (for-each-ref output)
   defaultBranch?: string; // resolved via symbolic-ref
   ancestors?: Set<string>; // branches already an ancestor of LOCAL default
@@ -8163,8 +8228,30 @@ function makeRecoveryGit(state: {
       };
     }
     if (joined === "merge --abort") {
+      if (state.abortFailsAt?.has(cwd)) {
+        // The guarded abort ITSELF fails — the mid-merge residue does NOT clear.
+        return { code: 1, stdout: "", stderr: "error: could not abort merge" };
+      }
       state.mergeHeadAt?.delete(cwd);
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
+      const present = state.autostashAt?.has(cwd) ?? false;
+      return {
+        code: present ? 0 : 1,
+        stdout: present ? "stash\n" : "",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("--points-at")) {
+      // The branch-set at a cwd's MERGE_HEAD — shared by the mergeReadiness ownership
+      // probe (`refs/heads/`) and the recover pass's owning-epic derivation
+      // (`refs/heads/keeper/epic/`). MUST precede the `keeper/epic` catch-all below.
+      return {
+        code: 0,
+        stdout: (state.pointsAtBranches?.get(cwd) ?? []).join("\n"),
+        stderr: "",
+      };
     }
     if (joined.startsWith("worktree prune")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -8296,6 +8383,10 @@ function makeRecoveryGit(state: {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
       }
       if (state.mergeConflict) {
+        // A real merge conflict leaves the tree MID-MERGE (MERGE_HEAD present), so
+        // mergeBranchInto's guarded abort actually fires — modeling this lets a test
+        // drive the abort-failed path (abortFailsAt keeps the residue).
+        state.mergeHeadAt?.add(cwd);
         return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
       }
       const merged = args[2];
@@ -8446,6 +8537,228 @@ test("fn-1095 recoverWorktrees: pass-1 recovers a crashed resolver's lane once i
   expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
     true,
   );
+});
+
+test("fn-1114 recoverWorktrees: a keeper-owned mid-merge in the SHARED MAIN checkout is aborted (flock-guarded) EXACTLY ONCE, then pass-2 merges from a clean tree (incident reproduction)", async () => {
+  // The incident: a keeper base→default merge conflicted and left the human's
+  // shared MAIN checkout mid-merge (MERGE_HEAD + unresolved paths). The lane loop
+  // never sees it (the main worktree is on `main`, not a `keeper/epic/*` lane), so
+  // it wedged: finalize/recover skip-retried the folded-in "dirty" forever. Now the
+  // main checkout gets its own guarded, keeper-owned abort → pass-2 re-derives clean.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]), // the MAIN checkout is wedged mid-merge
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]), // MERGE_HEAD is a keeper base → keeper-owned
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(), // base not yet merged
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async (id) => id === "fn-1-foo", // epic is done
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]);
+  // The wedge was aborted EXACTLY ONCE in the main checkout...
+  const aborts = calls.filter(
+    (c) => c.cwd === "/repo" && c.args === "merge --abort",
+  );
+  expect(aborts).toHaveLength(1);
+  // ...under the commit-work flock (the lock path is keyed on the checkout's git dir).
+  expect(
+    calls.some(
+      (c) =>
+        c.cwd === "/repo" &&
+        c.args === "rev-parse --path-format=absolute --git-dir",
+    ),
+  ).toBe(true);
+  // ...then pass-2 re-derived the base merge from the now-clean tree.
+  expect(
+    calls.some(
+      (c) => c.cwd === "/repo" && c.args === `merge --no-edit ${base}`,
+    ),
+  ).toBe(true);
+});
+
+test("fn-1114 recoverWorktrees: a FOREIGN mid-merge in the main checkout is NEVER aborted; the reason names owner + MERGE_HEAD (not dirty-checkout), inside the recover prefix", async () => {
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", ["refs/heads/feature/human-wip"]]]), // a foreign branch at MERGE_HEAD
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  // A human's own merge is not keeper's to touch — never aborted.
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).toContain("owner=foreign");
+  expect(failures[0]?.reason).toContain("MERGE_HEAD=head");
+  expect(failures[0]?.reason).not.toContain("dirty-checkout");
+  // Inside the recover prefix so the level-triggered clear releases it on recovery.
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1114 recoverWorktrees: a keeper-branch mid-merge WITH a MERGE_AUTOSTASH refuses ownership → never aborted (an abort could lose the stashed work)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]), // a keeper base...
+    autostashAt: new Set(["/repo"]), // ...but a MERGE_AUTOSTASH is present → foreign-shaped
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).toContain("owner=foreign");
+  expect(failures[0]?.reason).toContain("autostash=true");
+});
+
+test("fn-1114 recoverWorktrees: a keeper-owned main mid-merge is NOT aborted while the owning epic has a LIVE resolver (scoped exclusion, silent skip)", async () => {
+  // The main-checkout wedge and a `resolve::<epic>` worker share the epic that owns
+  // the MERGE_HEAD base; racing an abort under a live resolver would destroy its
+  // in-progress resolution. Derive the owning epic from the branch-set at MERGE_HEAD
+  // and honor the SAME per-epic exclusion the lane loop uses — no failure minted.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    (epicId) => epicId === "fn-1-foo", // the owning epic's resolver is live
+  );
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toEqual([]); // silent skip — the resolver is actively working it
+});
+
+test("fn-1114 recoverWorktrees: a FAILED guarded abort of the main-checkout wedge surfaces its own worktree-recover-abort-failed reason (telemetry, not vanishing)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    abortFailsAt: new Set(["/repo"]), // the guarded abort itself fails → residue not cleared
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+  );
+  // The abort WAS attempted (keeper-owned) but did not clear the residue.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(true);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-abort-failed");
+  expect(failures[0]?.reason).toContain("MERGE_HEAD=head");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1114 recoverWorktrees: a lock-timeout acquiring the flock for the main-checkout abort degrades to a defer (no blind abort)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  // A bounded acquirer that TIMES OUT (returns null) — the abort must never run.
+  const timedOutLock: NonNullable<
+    Parameters<typeof recoverWorktrees>[3]
+  > = () => null;
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    timedOutLock,
+  );
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-lock-timeout");
+});
+
+test("fn-1114 recoverWorktrees pass-2: a foreign main-checkout wedge blocking a DONE base mints worktree-recover-mid-merge keyed on the epic (not dirty-checkout), no merge attempted", async () => {
+  const base = "keeper/epic/fn-2-bar";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", ["refs/heads/feature/human-wip"]]]), // foreign wedge
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async (id) => id === "fn-2-bar", // done → pass-2 attempts the base merge and hits the wedge
+    run,
+    lock,
+  );
+  // The foreign wedge is never aborted, and its base merge is never attempted.
+  expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
+  // pass-2's shared merge routine names the wedge distinctly, keyed on the epic.
+  const epicMid = failures.filter(
+    (f) =>
+      f.epicId === "fn-2-bar" &&
+      f.reason.includes("worktree-recover-mid-merge"),
+  );
+  expect(epicMid).toHaveLength(1);
+  expect(epicMid[0]?.reason).toContain("owner=foreign");
+  expect(epicMid[0]?.reason).toContain("MERGE_HEAD=head");
+  expect(epicMid[0]?.reason).not.toContain("dirty-checkout");
+});
+
+test("fn-1114 recoverWorktrees pass-2: a base→default merge whose conflict-abort ITSELF fails surfaces worktree-recover-abort-failed (the un-cleared wedge), not a plain conflict", async () => {
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(), // starts clean — the wedge is created by the failing merge below
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    mergeConflict: true, // the base→default `merge --no-edit` conflicts (leaves MERGE_HEAD)
+    abortFailsAt: new Set(["/repo"]), // ...and the guarded `merge --abort` itself fails
+  });
+  const failures = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBe("fn-1-foo");
+  expect(failures[0]?.reason).toContain("worktree-recover-abort-failed");
+  expect(failures[0]?.reason).not.toContain("worktree-recover-conflict");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  // No push on an un-cleared wedge.
+  expect(calls.some((c) => c.args === "push")).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default + push", async () => {
@@ -8692,6 +9005,9 @@ test("fn-1050 finalizeEpic teardown: a residue-only base husk is swept after a c
       args,
     ) => {
       const joined = args.join(" ");
+      if (isInProgressPseudoRefProbe(args)) {
+        return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+      }
       if (args[0] === "rev-parse" && args.includes("--verify")) {
         return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
       }
@@ -9675,6 +9991,9 @@ test("fn-982 finalizeEpic: a fully-merged lane base is pruned (branch -D) after 
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base exists / source exists
     }
@@ -9718,6 +10037,9 @@ test("fn-982 finalizeEpic: prune is gated on is-ancestor — a base NOT an ances
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9758,6 +10080,9 @@ test("fn-985 finalizeEpic: fully-merged rib worktrees + branches are pruned alon
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9823,6 +10148,9 @@ test("fn-988 finalizeEpic teardown: an orphan rib NOT in laneOrder (live-git enu
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9877,6 +10205,9 @@ test("fn-985 finalizeEpic: a rib NOT an ancestor of default is preserved while t
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -9951,11 +10282,31 @@ function makeFinalizeReadinessRun(opts: {
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
   untracked?: string; // ls-files --others --exclude-standard (main's untracked)
   incomingTracked?: string; // ls-tree -r --name-only <base> (incoming tracked)
+  midMergeHead?: string; // MERGE_HEAD present at readiness time (a wedge) → mid-merge verdict
+  midMergePointsAt?: string[]; // refs/heads/... at MERGE_HEAD (ownership)
+  midMergeAutostash?: boolean; // MERGE_AUTOSTASH present → foreign-shaped
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+      return opts.midMergeHead !== undefined
+        ? { code: 0, stdout: `${opts.midMergeHead}\n`, stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
+      return opts.midMergeAutostash
+        ? { code: 0, stdout: "stash\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("--points-at")) {
+      return {
+        code: 0,
+        stdout: (opts.midMergePointsAt ?? []).join("\n"),
+        stderr: "",
+      };
+    }
     if (joined === "remote get-url origin") {
       return opts.noRemote
         ? { code: 1, stdout: "", stderr: "error: No such remote 'origin'" }
@@ -9976,6 +10327,9 @@ function makeFinalizeReadinessRun(opts: {
       return opts.dryRunReject !== undefined
         ? { code: 1, stdout: "", stderr: opts.dryRunReject }
         : { code: 0, stdout: "", stderr: "" };
+    }
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
     }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin ref exists
@@ -10028,6 +10382,113 @@ test("fn-985 finalizeEpic: a DIRTY main checkout → skip-and-retry (retry:true)
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
   expect(cmds.some((c) => c === "push")).toBe(false);
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-1114 finalizeEpic: a MID-MERGE main checkout → skip-and-retry naming the wedge (worktree-finalize-mid-merge), NOT dirty-checkout, never aborted by finalize", async () => {
+  // Finalize does NOT abort the shared checkout (only the recover pass does) — it
+  // names the wedge distinctly and retry-skips, so the recover pass self-heals a
+  // keeper-owned residue next cycle. The incident's core regression was this
+  // degrading to a generic dirty-checkout skip that never surfaced the mid-merge.
+  const { run, cmds } = makeFinalizeReadinessRun({
+    midMergeHead: "deadbeef",
+    midMergePointsAt: ["refs/heads/keeper/epic/fn-1-foo"], // keeper-owned
+  });
+  const res = await createWorktreeDriver(run).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+  );
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true); // transient — the recover pass self-heals it
+    expect(res.reason).toContain("worktree-finalize-mid-merge");
+    expect(res.reason).toContain("owner=keeper");
+    expect(res.reason).toContain("MERGE_HEAD=deadbeef");
+    expect(res.reason).not.toContain("dirty-checkout");
+    // finalize-side reason stays OUT of the recover auto-clear prefix.
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // finalize never touches the wedge — no abort, no merge, no teardown.
+  expect(cmds.some((c) => c === "merge --abort")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-1114 finalizeEpic: a base→default merge whose conflict-abort ITSELF fails → VISIBLE sticky worktree-finalize-abort-failed (no retry), not a plain conflict", async () => {
+  // Reaches the real `merge --no-edit` (base ahead of default) under the real bounded
+  // FFI flock on a free temp lock file (acquires immediately); the merge conflicts,
+  // and the guarded `git merge --abort` ITSELF fails — the un-cleared wedge.
+  const lockDir = mkdtempSync(join(tmpdir(), "kw-finalize-abortfail-"));
+  try {
+    const cmds: string[] = [];
+    let mergeHeadPresent = false; // flips true once the conflict starts a merge
+    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
+      args,
+    ) => {
+      const joined = args.join(" ");
+      cmds.push(joined);
+      if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
+        return { code: 0, stdout: `${lockDir}\n`, stderr: "" }; // real, writable
+      }
+      if (joined === "rev-parse --abbrev-ref HEAD") {
+        return { code: 0, stdout: "main\n", stderr: "" }; // on default
+      }
+      if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+        return mergeHeadPresent
+          ? { code: 0, stdout: "confhead\n", stderr: "" }
+          : { code: 1, stdout: "", stderr: "" };
+      }
+      if (
+        joined === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
+        joined === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
+        joined === "rev-parse --verify --quiet REVERT_HEAD"
+      ) {
+        return { code: 1, stdout: "", stderr: "" }; // clean: other in-progress refs absent
+      }
+      if (args[0] === "rev-parse" && args.includes("--verify")) {
+        return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin refs exist
+      }
+      if (joined.startsWith("symbolic-ref")) {
+        return { code: 0, stdout: "origin/main\n", stderr: "" };
+      }
+      if (joined.startsWith("status --porcelain")) {
+        return { code: 0, stdout: "", stderr: "" }; // clean checkout
+      }
+      if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
+        return { code: 1, stdout: "", stderr: "" }; // base AHEAD → merge it
+      }
+      if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+        return { code: 0, stdout: "", stderr: "" }; // ff-able
+      }
+      if (joined.startsWith("merge-base --is-ancestor")) {
+        return { code: 1, stdout: "", stderr: "" }; // base vs HEAD: NOT merged → reach the merge
+      }
+      if (joined.startsWith("merge --no-edit")) {
+        mergeHeadPresent = true; // the conflict leaves the tree mid-merge
+        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+      }
+      if (joined === "merge --abort") {
+        return { code: 1, stdout: "", stderr: "error: could not abort merge" }; // abort itself fails
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+      makeFinalizeInfo(),
+      async () => true,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.retry).not.toBe(true); // STICKY — a real wedge needs an operator
+      expect(res.reason).toContain("worktree-finalize-abort-failed");
+      expect(res.reason).not.toContain("worktree-finalize-conflict");
+      expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+    }
+    // The abort WAS attempted (the conflict left a MERGE_HEAD), and teardown is skipped.
+    expect(cmds.some((c) => c === "merge --abort")).toBe(true);
+    expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+    expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
 });
 
 test("fn-985 finalizeEpic: an OFF-BRANCH main checkout → skip-and-retry, no working-tree probe past the branch", async () => {
@@ -10198,6 +10659,9 @@ test("fn-990 finalizeEpic: a push TIMEOUT → transient skip-retry (worktree-fin
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -10264,6 +10728,9 @@ test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" };
     }
@@ -11231,6 +11698,9 @@ test("fn-1014 regression: a lane base AHEAD of default merges via a TRUE `git me
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    }
     if (args[0] === "rev-parse" && args.includes("--verify")) {
       return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs resolve
     }
@@ -11467,4 +11937,219 @@ test("createDispatchFailedGate: the storm shape — one stuck condition over man
 
 test("DISPATCH_FAILED_WATERMARK_SEC is a bounded, non-trivial liveness interval", () => {
   expect(DISPATCH_FAILED_WATERMARK_SEC).toBe(15 * 60);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1114.3 — the shared-checkout mid-merge wedge distress escalation.
+// The recover pass mints an immediate per-epic reason the first cycle; this
+// grace tracker is the escalation layer ON TOP — a per-repo distress row when a
+// shared checkout stays wedged past the grace watermark, exactly-once per
+// episode, level-cleared off the durable open-distress set (robust across a
+// restart). All expected values are hand-computed constants, never re-derived
+// from the tracker.
+// ---------------------------------------------------------------------------
+
+const WEDGE_REASON =
+  "worktree-recover-mid-merge: /repo is mid-merge (owner=foreign) — waiting";
+const REPO_A = "/Users/x/code/keeper";
+const REPO_B = "/Users/x/code/other";
+
+test("isSharedCheckoutWedgeReason matches the mid-merge/abort/lock reasons, excludes dirty + conflict", () => {
+  // The unhealed-wedge reasons keeper cannot self-heal (foreign residue, an abort
+  // that keeps failing, a sustained inability to take the flock) escalate.
+  expect(isSharedCheckoutWedgeReason("worktree-recover-mid-merge: x")).toBe(
+    true,
+  );
+  expect(
+    isSharedCheckoutWedgeReason("worktree-recover-mid-merge-failed: x"),
+  ).toBe(true);
+  expect(isSharedCheckoutWedgeReason("worktree-recover-abort-failed: x")).toBe(
+    true,
+  );
+  expect(isSharedCheckoutWedgeReason("worktree-recover-lock-timeout: x")).toBe(
+    true,
+  );
+  // A dirty tree or a genuine content conflict is NOT this wedge — its own path.
+  expect(
+    isSharedCheckoutWedgeReason("worktree-recover-dirty-checkout: x"),
+  ).toBe(false);
+  expect(isSharedCheckoutWedgeReason("worktree-recover-conflict: x")).toBe(
+    false,
+  );
+  expect(
+    isSharedCheckoutWedgeReason("worktree-finalize-non-fast-forward"),
+  ).toBe(false);
+  expect(isSharedCheckoutWedgeReason("")).toBe(false);
+});
+
+test("sharedWedgeDistressId is stable per repo, distinct across repos, prefix-tagged", () => {
+  const a = sharedWedgeDistressId(REPO_A);
+  const b = sharedWedgeDistressId(REPO_B);
+  expect(a).toBe(sharedWedgeDistressId(REPO_A)); // deterministic
+  expect(a).not.toBe(b); // per-repo distinct
+  expect(a.startsWith(SHARED_WEDGE_DISTRESS_ID_PREFIX)).toBe(true);
+});
+
+test("SHARED_CHECKOUT_WEDGE_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(SHARED_CHECKOUT_WEDGE_GRACE_SEC).toBe(5 * 60);
+});
+
+test("wedge tracker: a repo wedged past the grace watermark mints EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const empty = new Set<string>();
+  // t=1000 first observed wedged → no mint (grace clock starts here).
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint.
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-repo, reason display-mapped.
+  const crossed = tracker.step({
+    wedged,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(sharedWedgeDistressId(REPO_A));
+  expect(crossed.mint[0]?.dir).toBe(REPO_A);
+  expect(
+    crossed.mint[0]?.reason?.startsWith(SHARED_WEDGE_DISTRESS_REASON),
+  ).toBe(true);
+  expect(crossed.mint[0]?.reason).toContain(REPO_A);
+  // Subsequent cycles while still wedged → NEVER re-mint (O(1) per episode).
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ wedged, openDistressDirs: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("wedge tracker: the storm shape — one persistent wedge over many cycles yields exactly ONE mint", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const empty = new Set<string>();
+  let mints = 0;
+  for (let ts = 1000; ts < 5000; ts++) {
+    mints += tracker.step({ wedged, openDistressDirs: empty, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("wedge tracker: a recovered checkout level-clears the open distress row EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const open = new Set([REPO_A]); // the durable open distress row for REPO_A
+  // Still wedged → no clear (the row belongs, the checkout is dirty).
+  expect(
+    tracker.step({ wedged, openDistressDirs: open, nowSec: 2000 }).clear,
+  ).toEqual([]);
+  // Checkout recovers (no fresh wedge this cycle) but the row is still open →
+  // level-clear it once, keyed on the same per-repo id.
+  const recovered = tracker.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 2001,
+  });
+  expect(recovered.clear.length).toBe(1);
+  expect(recovered.clear[0]?.id).toBe(sharedWedgeDistressId(REPO_A));
+  // Once main folds the clear the row is gone from openDistressDirs → no re-clear.
+  expect(
+    tracker.step({
+      wedged: new Map(),
+      openDistressDirs: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("wedge tracker: two repos on a multi-repo board wedge independently — distinct rows, no collision", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const empty = new Set<string>();
+  // A wedges at t=1000; B wedges later at t=1200.
+  tracker.step({
+    wedged: new Map([[REPO_A, WEDGE_REASON]]),
+    openDistressDirs: empty,
+    nowSec: 1000,
+  });
+  const both = new Map([
+    [REPO_A, WEDGE_REASON],
+    [REPO_B, WEDGE_REASON],
+  ]);
+  tracker.step({ wedged: both, openDistressDirs: empty, nowSec: 1200 });
+  // At t=1300, A has crossed its grace (started 1000) but B has not (started 1200).
+  const atA = tracker.step({
+    wedged: both,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(atA.mint.map((m) => m.dir)).toEqual([REPO_A]);
+  // At t=1500, B crosses its own grace — its own distinct row, A does not re-mint.
+  const atB = tracker.step({
+    wedged: both,
+    openDistressDirs: empty,
+    nowSec: 1500,
+  });
+  expect(atB.mint.map((m) => m.dir)).toEqual([REPO_B]);
+  expect(sharedWedgeDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_B));
+});
+
+test("wedge tracker: a repo that recovers then re-wedges waits the FULL grace again", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const empty = new Set<string>();
+  // First episode: mint at 1300.
+  tracker.step({ wedged, openDistressDirs: empty, nowSec: 1000 });
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1300 }).mint.length,
+  ).toBe(1);
+  // Recovers at 1400 (re-arms the in-memory grace clock).
+  tracker.step({ wedged: new Map(), openDistressDirs: empty, nowSec: 1400 });
+  // Re-wedges at 1500 — a NEW episode: no mint until a fresh full grace elapses.
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1500 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1799 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1800 }).mint.length,
+  ).toBe(1);
+});
+
+test("wedge tracker: a restart (fresh tracker) still level-clears a row minted before it, and re-mints at most once", () => {
+  const grace = 300;
+  // Simulate a daemon restart: a brand-new tracker with an empty in-memory clock,
+  // but the durable distress row for REPO_A is still open in the projection.
+  const fresh = createSharedCheckoutWedgeTracker(grace);
+  const open = new Set([REPO_A]);
+  // The checkout recovered during downtime: not wedged now, row still open →
+  // the projection-driven clear fires even though this instance never minted it.
+  const cleared = fresh.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([
+    sharedWedgeDistressId(REPO_A),
+  ]);
+
+  // Alternatively, still wedged after the restart: the fresh clock re-arms and
+  // re-mints ONCE after a full grace (the accepted bounded per-restart burst).
+  const fresh2 = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  let mints = 0;
+  for (let ts = 9000; ts < 9000 + 2 * grace; ts++) {
+    mints += fresh2.step({ wedged, openDistressDirs: open, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
 });
