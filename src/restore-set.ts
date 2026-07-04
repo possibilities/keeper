@@ -690,6 +690,20 @@ interface TopologyJobRow {
   resume_target: string | null;
 }
 
+interface PostTerminalBackendRow {
+  job_id: string;
+  created_at: number;
+  title: string | null;
+  window_index: number | null;
+  cwd: string | null;
+  backend_exec_session_id: string | null;
+  harness: string | null;
+  resume_target: string | null;
+  pid: number;
+  event_backend_exec_session_id: string | null;
+  event_backend_exec_pane_id: string;
+}
+
 /**
  * PRIMARY last-generation crash-restore deriver — derives the restore set from
  * POSITIVE pre-crash evidence: a DYING generation's `TmuxTopologySnapshot`
@@ -1126,6 +1140,11 @@ interface TmuxTopologyPaneLike {
   job_id?: string;
 }
 
+interface LatestTopologyPaneLocation {
+  session_name: string;
+  window_index: number | null;
+}
+
 /**
  * Per-pane projection-join fallback: resolve the keeper `job_id` owning a pane
  * when the snapshot payload carried none. Match on `(backend_exec_generation_id,
@@ -1185,9 +1204,152 @@ function loadTopologyJobRow(
   }
 }
 
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code =
+      typeof err === "object" && err !== null && "code" in err
+        ? (err as { code?: unknown }).code
+        : null;
+    return code === "EPERM";
+  }
+}
+
+/**
+ * Latest tmux pane locations keyed by pane id. This is a read-time helper for
+ * the CURRENT snapshot surface; no fold reads it, so probing the latest topology
+ * event here does not affect re-fold determinism.
+ */
+function loadLatestTopologyPaneLocations(
+  db: Database,
+): Map<string, LatestTopologyPaneLocation> {
+  try {
+    const row = db
+      .query(
+        `SELECT id, data FROM events
+          WHERE hook_event = 'TmuxTopologySnapshot'
+          ORDER BY id DESC
+          LIMIT 1`,
+      )
+      .get() as { id: number; data: string | null } | null;
+    if (row === null) {
+      return new Map();
+    }
+    const snapshot = extractTmuxTopologySnapshot({
+      id: row.id,
+      data: row.data,
+    } as Parameters<typeof extractTmuxTopologySnapshot>[0]);
+    if (snapshot === null) {
+      return new Map();
+    }
+    const byPane = new Map<string, LatestTopologyPaneLocation>();
+    for (const pane of snapshot.panes) {
+      byPane.set(pane.pane_id, {
+        session_name: pane.session_name,
+        window_index: pane.window_index,
+      });
+    }
+    return byPane;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Terminal rows normally stay out of a current snapshot. The exception is a row
+ * with later backend-exec evidence from the SAME still-live pid: that proves the
+ * terminal event did not describe the process currently owning the session. Read
+ * only; never writes a repair event or mutates the projection.
+ */
+function derivePostTerminalCurrentSet(
+  db: Database,
+  seenJobIds: Set<string>,
+): RestoreCandidate[] {
+  let rows: PostTerminalBackendRow[];
+  try {
+    rows = db
+      .query(
+        `SELECT j.job_id, j.created_at, j.title, j.window_index, j.cwd,
+                COALESCE(j.backend_exec_session_id, j.backend_exec_birth_session_id)
+                  AS backend_exec_session_id,
+                j.harness, j.resume_target, j.pid,
+                e.backend_exec_session_id AS event_backend_exec_session_id,
+                e.backend_exec_pane_id AS event_backend_exec_pane_id
+           FROM jobs j
+           JOIN events e ON e.id = (
+             SELECT e2.id FROM events e2
+              WHERE e2.session_id = j.job_id
+                AND e2.id > COALESCE(j.last_event_id, 0)
+                AND e2.pid = j.pid
+                AND e2.backend_exec_type = 'tmux'
+                AND e2.backend_exec_pane_id IS NOT NULL
+                AND e2.backend_exec_pane_id != ''
+              ORDER BY e2.id DESC
+              LIMIT 1
+           )
+          WHERE j.state IN ('ended', 'killed')
+            AND j.pid IS NOT NULL`,
+      )
+      .all() as PostTerminalBackendRow[];
+  } catch {
+    return [];
+  }
+
+  const locations = loadLatestTopologyPaneLocations(db);
+  const candidates: RestoreCandidate[] = [];
+  for (const row of rows) {
+    const jobId = seg(row.job_id);
+    if (jobId === "" || seenJobIds.has(jobId) || !pidAlive(row.pid)) {
+      continue;
+    }
+    const paneLocation = locations.get(seg(row.event_backend_exec_pane_id));
+    const backendSession =
+      paneLocation?.session_name !== undefined &&
+      paneLocation.session_name !== ""
+        ? paneLocation.session_name
+        : seg(row.event_backend_exec_session_id) !== ""
+          ? seg(row.event_backend_exec_session_id)
+          : seg(row.backend_exec_session_id);
+    if (backendSession === "") {
+      continue;
+    }
+    const label = row.title != null && row.title !== "" ? row.title : jobId;
+    candidates.push({
+      job_id: jobId,
+      resume_target: resumeTarget({
+        job_id: jobId,
+        harness: row.harness,
+        resume_target: row.resume_target,
+      }),
+      label,
+      harness: harnessOrClaude(row.harness),
+      window_index:
+        paneLocation?.window_index !== undefined
+          ? paneLocation.window_index
+          : typeof row.window_index === "number" &&
+              Number.isFinite(row.window_index)
+            ? row.window_index
+            : null,
+      cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
+      backend_exec_session_id: backendSession,
+      created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+    });
+    seenJobIds.add(jobId);
+  }
+  return candidates;
+}
+
 /**
  * Derive the CURRENT live set — every `state ∈ {working, stopped}` job that
  * holds backend coords — as restore candidates, ordered by visual window order.
+ * A terminal row also qualifies when later backend-exec evidence from the same
+ * still-live pid proves the process remains attached; that read-time guard keeps
+ * the current snapshot process-scoped without mutating the projection.
  *
  * This is NOT the crash-restore set: it is a snapshot of what is open RIGHT NOW,
  * the source for `restore-agents --snapshot-current`'s replayable revive script.
@@ -1196,8 +1358,8 @@ function loadTopologyJobRow(
  * after a crash the automatic path can't be trusted to catch. The resume target
  * is the session UUID (`job_id`), same as a crash candidate, so the emitted
  * script resumes each session EXACTLY; the display `label` keeps the latest name
- * (`title`, `job_id` fallback). Pure read off the passed read-only connection;
- * empty input returns `[]`, never throws.
+ * (`title`, `job_id` fallback). Read-only; empty input returns `[]`, never
+ * throws.
  */
 export function deriveCurrentSet(db: Database): RestoreCandidate[] {
   const rows = db
@@ -1254,6 +1416,9 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
     });
   }
+
+  const seenJobIds = new Set(candidates.map((c) => c.job_id));
+  candidates.push(...derivePostTerminalCurrentSet(db, seenJobIds));
 
   candidates.sort(compareCandidates);
   return candidates;

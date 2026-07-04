@@ -694,6 +694,30 @@ test("SessionEnd on a killed row is a no-op (terminal guard, killed stays)", () 
   expect(getJob()?.last_event_id).toBe(beforeLastId ?? 0);
 });
 
+test("SessionEnd from a different pid cannot close a live resumed row", () => {
+  insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
+  drainAll();
+
+  insertEvent({ hook_event: "SessionStart", pid: 2000, start_time: "t2" });
+  const liveId = insertEvent({ hook_event: "UserPromptSubmit", pid: 2000 });
+  drainAll();
+  const before = getJob();
+  expect(before?.state).toBe("working");
+  expect(before?.pid).toBe(2000);
+  expect(before?.start_time).toBe("t2");
+  expect(before?.last_event_id).toBe(liveId);
+
+  const staleEndId = insertEvent({ hook_event: "SessionEnd", pid: 1000 });
+  drainAll();
+
+  const after = getJob();
+  expect(after?.state).toBe("working");
+  expect(after?.pid).toBe(2000);
+  expect(after?.start_time).toBe("t2");
+  expect(after?.last_event_id).toBe(liveId);
+  expect(getCursor()).toBe(staleEndId);
+});
+
 test("PostToolUse / Notification on a killed row are no-ops (default branch, no state write)", () => {
   insertEvent({ hook_event: "SessionStart", pid: 1000, start_time: "t1" });
   killedEvent(1000, "t1");

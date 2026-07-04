@@ -8198,21 +8198,38 @@ function projectJobsRow(db: Database, event: Event): void {
     case "SessionEnd": {
       // The terminal guard keeps this idempotent on 'ended' AND prevents a late
       // SessionEnd from clobbering a 'killed' row (the killed signal carries
-      // proven-dead evidence and outranks). Clears `monitors='[]'` in the same
-      // UPDATE (terminal jobs have no live monitors). NULLs the backend-exec
-      // pane + generation coords too: tmux recycles `%N`, so a dead job that
-      // keeps its pane id would be mis-attributed as owning the live window
-      // that later inherits it (the post-switch COALESCE arm carries a matching
-      // terminal guard so a late hook event can't re-stamp the pane). Matches
-      // zero rows for a terminal event with no prior SessionStart — a correct
-      // no-op.
+      // proven-dead evidence and outranks). The process guard treats SessionEnd
+      // as evidence from one process: a resumed session can share the same
+      // session id while another process's close event is still in flight, so a
+      // mismatched pid must leave the live row untouched while the cursor still
+      // advances. When start_time is present on the event, it tightens the same
+      // identity check; current hooks usually stamp it only on SessionStart, so
+      // pid remains the mandatory process-scoped guard.
+      //
+      // Clears `monitors='[]'` in the same UPDATE (terminal jobs have no live
+      // monitors). NULLs the backend-exec pane + generation coords too: tmux
+      // recycles `%N`, so a dead job that keeps its pane id would be
+      // mis-attributed as owning the live window that later inherits it (the
+      // post-switch COALESCE arm carries a matching terminal guard so a late
+      // hook event can't re-stamp the pane). Matches zero rows for a terminal
+      // event with no prior SessionStart — a correct no-op.
       const res = db.run(
         `UPDATE jobs SET state = 'ended', monitors = '[]',
                          backend_exec_pane_id = NULL,
                          backend_exec_generation_id = NULL,
                          last_event_id = ?, updated_at = ?
-           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
-        [event.id, ts, jobId],
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')
+             AND (pid IS NULL OR (? IS NOT NULL AND pid = ?))
+             AND (start_time IS NULL OR ? IS NULL OR start_time = ?)`,
+        [
+          event.id,
+          ts,
+          jobId,
+          event.pid,
+          event.pid,
+          event.start_time,
+          event.start_time,
+        ],
       );
       if (res.changes > 0) {
         sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);

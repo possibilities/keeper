@@ -73,6 +73,7 @@ interface SeedJob {
   backend_exec_birth_session_id?: string | null;
   plan_verb?: string | null;
   last_event_id?: number | null;
+  pid?: number | null;
   /** Backend coords the topology deriver's projection-join fallback keys on
    *  (`(backend_exec_generation_id, backend_exec_pane_id)`). */
   backend_exec_type?: string | null;
@@ -90,9 +91,9 @@ function seedJob(db: Database, j: SeedJob): void {
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, close_kind, window_index,
        cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
-       last_event_id, backend_exec_type, backend_exec_pane_id,
+       last_event_id, pid, backend_exec_type, backend_exec_pane_id,
        backend_exec_generation_id, harness, resume_target
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -110,6 +111,7 @@ function seedJob(db: Database, j: SeedJob): void {
       j.backend_exec_birth_session_id ?? null,
       j.plan_verb ?? null,
       j.last_event_id ?? null,
+      j.pid ?? null,
       j.backend_exec_type ?? null,
       j.backend_exec_pane_id ?? null,
       j.backend_exec_generation_id ?? null,
@@ -713,6 +715,50 @@ test("deriveCurrentSet: resume_target is always the job_id; a never-named sessio
   // to the same job_id.
   expect(cur[0].resume_target).toBe("unnamed-uuid");
   expect(cur[0].label).toBe("unnamed-uuid");
+});
+
+test("deriveCurrentSet: terminal row with later live-pid backend evidence is current", () => {
+  const livePid = process.pid;
+  seedJob(kdb.db, {
+    job_id: "resumed-live",
+    state: "ended",
+    title: "resumed",
+    window_index: 9,
+    backend_exec_session_id: "work",
+    last_event_id: 10,
+    pid: livePid,
+  });
+  seedJob(kdb.db, {
+    job_id: "dead-terminal",
+    state: "ended",
+    title: "dead",
+    backend_exec_session_id: "work",
+    last_event_id: 10,
+    pid: 2_000_000_000,
+  });
+  kdb.db.run(
+    `INSERT INTO events (
+       id, ts, session_id, pid, hook_event, event_type, data,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+     ) VALUES (?, ?, ?, ?, 'Notification', 'idle_prompt', '{}', 'tmux', 'work', ?)`,
+    [11, NOW, "resumed-live", livePid, "%live"],
+  );
+  kdb.db.run(
+    `INSERT INTO events (
+       id, ts, session_id, pid, hook_event, event_type, data,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+     ) VALUES (?, ?, ?, ?, 'Notification', 'idle_prompt', '{}', 'tmux', 'work', ?)`,
+    [12, NOW, "dead-terminal", 2_000_000_000, "%dead"],
+  );
+  seedTmuxTopologySnapshot(kdb.db, 13, "gen-now", [
+    { pane_id: "%live", session_name: "work", window_index: 5 },
+    { pane_id: "%dead", session_name: "work", window_index: 6 },
+  ]);
+
+  const cur = deriveCurrentSet(kdb.db);
+  expect(cur.map((c) => c.job_id)).toEqual(["resumed-live"]);
+  expect(cur[0].label).toBe("resumed");
+  expect(cur[0].window_index).toBe(5);
 });
 
 test("deriveRestoreSet: carries cwd (the resume `cd` target); empty/NULL → null", () => {
