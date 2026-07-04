@@ -4786,6 +4786,32 @@ test("selectPendingResolverDispatches: empty table returns []", () => {
   db.close();
 });
 
+test("fn-1119 recover-origin escalation: a bare close::<epic> row with a recover-shaped worktree-merge-conflict reason (merging keeper/epic/<epic> into <default>) is selected by BOTH daemon sweeps, sequenced resolver-first", () => {
+  const { db } = freshMemDb();
+  const epic = "fn-1119-x";
+  // The EXACT reason recoverWorktrees pass-2 mints on a content conflict: the SOURCE
+  // is the epic BASE branch and the TARGET is the DEFAULT branch (not a rib into a
+  // base), keyed on the BARE epic id. The token gate is id-agnostic + token-exact, so
+  // this recover-origin shape escalates identically to finalize's close-sink conflict.
+  const reason = mergeConflictReason(`keeper/epic/${epic}`, "main");
+  expect(shouldEscalateMergeConflict(reason)).toBe(true);
+  // The resolver-dispatch sweep goes FIRST (fresh row, no resolver latch yet).
+  seedResolverFailureRow(db, { verb: "close", id: epic, reason, dir: "/repo" });
+  expect(selectPendingResolverDispatches(db)).toEqual([
+    { id: epic, reason, dir: "/repo" },
+  ]);
+  // Merge-escalation is SEQUENCED behind the resolver — it selects the same row once
+  // a resolver has been dispatched (resolver_dispatched_at set, escalate marker null).
+  db.run(
+    "UPDATE dispatch_failures SET resolver_dispatched_at = 555 WHERE verb = 'close' AND id = ?",
+    [epic],
+  );
+  expect(selectPendingMergeEscalations(db)).toEqual([
+    { id: epic, reason, dir: "/repo" },
+  ]);
+  db.close();
+});
+
 // ---- buildResolverBrief (the autonomous resolver worker prompt) --------------
 
 test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on the clear path, BLOCKED + unstick on everything else", () => {
