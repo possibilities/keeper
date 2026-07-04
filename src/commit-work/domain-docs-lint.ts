@@ -255,7 +255,9 @@ function parseTerms(rawLines: string[], inFence: boolean[]): TermBlock[] {
     let avoidText: string | null = null;
     if (avoidMatch && avoidMatch.index !== undefined) {
       def = blockText.slice(0, avoidMatch.index);
-      avoidText = blockText.slice(avoidMatch.index + avoidMatch[0].length).trim();
+      avoidText = blockText
+        .slice(avoidMatch.index + avoidMatch[0].length)
+        .trim();
     }
     blocks.push({ term: m[1].trim(), startLine, def, avoidText });
     i = j;
@@ -474,11 +476,13 @@ export async function runDomainDocsLint(
     const tagged: { file: string; finding: DomainDocFinding }[] = [];
     for (const f of contextDocs) {
       const text = readFileSync(join(cwd, f), "utf8");
-      for (const finding of scanContextDoc(text)) tagged.push({ file: f, finding });
+      for (const finding of scanContextDoc(text))
+        tagged.push({ file: f, finding });
     }
     for (const f of adrFiles) {
       const text = readFileSync(join(cwd, f), "utf8");
-      for (const finding of scanAdrFile(f, text)) tagged.push({ file: f, finding });
+      for (const finding of scanAdrFile(f, text))
+        tagged.push({ file: f, finding });
     }
     tagged.push(...scanAdrSet(adrFiles));
 

@@ -204,7 +204,9 @@ test("an over-cap ADR FAILs with adr-size", () => {
 test("duplicate ADR numbers across the staged set FAIL", () => {
   const dup = scanAdrSet(["docs/adr/0002-a.md", "docs/adr/0002-b.md"]);
   expect(dup.length).toBe(2);
-  expect(dup.every((d) => d.finding.rule === "adr-duplicate-number")).toBe(true);
+  expect(dup.every((d) => d.finding.rule === "adr-duplicate-number")).toBe(
+    true,
+  );
   expect(scanAdrSet(["docs/adr/0002-a.md", "docs/adr/0003-b.md"])).toEqual([]);
 });
 
@@ -287,8 +289,6 @@ test("a clean docs/adr commit passes runScopedLint and writes no ledger", async 
 
 test("a repo with no CONTEXT.md or docs/adr staged is untouched by the arm", async () => {
   writeFileSync(join(repo, "notes.md"), "# just notes\nsrc/foo.ts mentioned\n");
-  await expect(
-    runScopedLint(["notes.md"], repo),
-  ).resolves.toBeUndefined();
+  await expect(runScopedLint(["notes.md"], repo)).resolves.toBeUndefined();
   expect(existsSync(ledger)).toBe(false);
 });
