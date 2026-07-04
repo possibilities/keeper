@@ -13,6 +13,7 @@
 
 import type { OutputFormat } from "./format.ts";
 import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
+import { runAssignCells } from "./verbs/assign_cells.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runCat } from "./verbs/cat.ts";
@@ -88,6 +89,12 @@ interface CommandSpec {
 
 // Registration order = help-listing order (alphabetical, matching click).
 const COMMANDS: CommandSpec[] = [
+  {
+    name: "assign-cells",
+    shortHelp:
+      "Batch-overwrite a ghost epic's tier/model cells + write a sidecar.",
+    implemented: true,
+  },
   {
     name: "audit",
     shortHelp: "Close-phase audit-artifact submit verbs.",
@@ -887,6 +894,17 @@ function dispatch(parsed: ParsedArgs): number {
     case "task":
       dispatchGroup(TASK_GROUP, rest, format);
       return 0;
+    case "assign-cells": {
+      // Self-emits (emitMutating on success / emitFailureEnvelope or the restamp
+      // gate's integrity_failed line on failure) and owns its exit code — return
+      // it directly. Same arg shape as refine-apply: epic id positional, --file
+      // value-taking so the positional scan skips its value.
+      const epicId = readPositionalSkipping(rest, new Set(["--file"]));
+      return runAssignCells({
+        epicId,
+        file: readOption(rest, "--file") ?? "",
+      });
+    }
     case "refine-apply": {
       // Self-emits (emitMutating on success / emitFailureEnvelope or the restamp
       // gate's integrity_failed line on failure) and owns its exit code — return

@@ -53,6 +53,12 @@ const DISPLAY_DEF_ALLOW = new Set([
   "find_task_commit",
   "scaffold",
   "refine_apply",
+  // assign-cells reads runtime status ONLY to validate the todo-only + full-set
+  // contract (a read-for-decision, like tasks/ready), and writes only committed
+  // DEFS (task tier/model) + a committed selection sidecar (like refine_apply /
+  // scaffold). It runs in the pre-arm ghost window before any lane is cut, so it
+  // carries no primary-rooting concern — a def-only writer + status reader.
+  "assign_cells",
   "mv_repo",
   "task_set_target_repo",
   "detect",
