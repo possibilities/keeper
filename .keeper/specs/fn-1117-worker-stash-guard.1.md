@@ -69,5 +69,5 @@ reason names the shared stash stack and `git restore`. Run
 - [ ] The branch-guard suite and the repo fast suite are green
 
 ## Done summary
-
+Extended the branch-guard hook to deny every mutating/materializing git stash verb from subagents via the PreToolUse envelope (allowlist: list/show/create), broadened the shared DENY_REASON to name the shared refs/stash hazard and git restore alternative, and added a full stash deny/allow truth-table plus ladder tests.
 ## Evidence
