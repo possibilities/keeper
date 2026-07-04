@@ -114,4 +114,6 @@ Skills, agent prompts, and docs describe the system as it is now — never by
 reference to what was removed, renamed, or previously true. State the present-tense
 fact; if a constraint matters, phrase it as a forward rule (`there is no --no-push
 flag`), not a tombstone. This mirrors the repo-wide doc discipline and is part of
-what keeps the layer from accreting dead history.
+what keeps the layer from accreting dead history. The sole exception is `docs/adr/`
+— the typed home for resolved decision history, alongside commit messages — where a
+significant tradeoff is recorded on purpose, never as a tombstone in a skill or doc.
