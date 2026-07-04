@@ -56,6 +56,13 @@ Only when the target repo has a design system (a `DESIGN.md`) and the feature in
 - Do the color/spacing tokens in DESIGN.md cover this feature's needs?
 - Any design gaps that should be raised before implementation?
 
+### 7. Glossary Alignment
+
+Only when the target repo has a `CONTEXT.md` glossary — skip entirely otherwise. Challenge the request and the scout findings against the repo's canonical vocabulary:
+- Does the request (or a scout finding) use a term the glossary marks Avoid, or name a real domain concept the glossary does not yet define?
+- Is any term used in a sense that conflicts with its CONTEXT.md definition?
+- A vocabulary mismatch caught here is a cheap spec correction; left alone it becomes a mid-build surprise or a divergent-terms defect. Surface each conflicting/missing term as a flag feeding the Priority Questions.
+
 ## Output Format
 
 ```markdown
@@ -82,6 +89,9 @@ Only when the target repo has a design system (a `DESIGN.md`) and the feature in
 
 ### Design Gaps (if DESIGN.md present)
 - [ ] [Missing component/token]: [What's needed]
+
+### Glossary Challenge (if CONTEXT.md present)
+- [ ] [Term]: [conflicts with / missing from CONTEXT.md — the question it raises for the spec]
 
 ### Priority Questions (MUST answer before coding)
 1. [Critical question]
