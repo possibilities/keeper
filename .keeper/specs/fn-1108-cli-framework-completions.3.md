@@ -40,5 +40,5 @@ Factor destination selection and write planning into pure functions that accept 
 - [ ] README install and uninstall sections document the completion footprint and activation caveats.
 
 ## Done summary
-
+Add scripts/install-completions.ts: idempotently writes generated bash/zsh/fish completion files into shell-owned user paths, never editing rc files, printing activation notes when needed. install.sh invokes it after bun link honoring KEEPER_SKIP_COMPLETIONS=1; README documents footprint and cleanup.
 ## Evidence
