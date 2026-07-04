@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Defer on inconclusive resolver probe",
-  "updated_at": "2026-07-04T14:15:27.241000Z"
+  "updated_at": "2026-07-04T15:13:13.118000Z",
+  "worker_done_at": "2026-07-04T15:13:13.118000Z"
 }

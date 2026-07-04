@@ -31,5 +31,5 @@ failing-probe branch.
 - [ ] New fast-tier test: keeper-owned mid-merge + failing owning-epic for-each-ref asserts a defer and zero abort invocations.
 
 ## Done summary
-
+recoverSharedCheckoutMidMerge now defers (named worktree-recover-mid-merge failure, epicId null) when the owning-epic for-each-ref probe exits non-zero, instead of mapping it to owningEpics=[] and vacuously passing the resolver-exclusion guard into a destructive abort; a clean empty (code 0) result still self-heals. Added 3 fast-tier tests pinning the exit-1 and 124-timeout defer branches plus the clean-abort no-regression path.
 ## Evidence
