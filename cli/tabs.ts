@@ -40,6 +40,7 @@ import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { resolveDbPath } from "../src/db";
 import type { GenerationSummary } from "../src/restore-set";
+import { RECENT_GENERATION_BOUND } from "../src/restore-set";
 import {
   applyRestore,
   autopilotGateDecision,
@@ -91,9 +92,10 @@ Usage:
   keeper tabs list [--db <path>]
 
 Emits a {schema_version, ok, error, data} envelope on stdout (exit 0). 'data'
-carries 'generations' (every observed tmux-server generation ranked newest-first,
-each with its restorable count, peak pane count, degenerate/current flags, and a
-few sample labels) and 'current' (the live working/stopped set).
+carries 'generations' (the decode-bounded window ranked newest-first — the current
+tmux-server generation plus the newest ${RECENT_GENERATION_BOUND} dead ones, not every observed
+generation — each with its restorable count, peak pane count, degenerate/current
+flags, and a few sample labels) and 'current' (the live working/stopped set).
 
 Flags:
   --db <path>   keeper.db path override ($KEEPER_DB / default otherwise)
@@ -114,6 +116,9 @@ off a TTY (exit ${TABS_EXIT_REFUSE_AMBIGUOUS}, ranked table on stderr).
 
   --apply             Relaunch each candidate via keeper agent (default: DRY-RUN)
   --generation <id>   Restore a specific generation instead of the auto-pick
+                      (only within the decode bound: the current generation plus
+                      the newest ${RECENT_GENERATION_BOUND} dead ones, as 'keeper tabs list' shows —
+                      an older generation is past the bound and unreachable)
   --session <name>    Restore only agents from this backend session
   --allow-empty       Suppress the zero-candidate failure under --apply (exit ${TABS_EXIT_ZERO_CANDIDATES})
   --force             Override the --apply autopilot fail-closed gate (still warns)

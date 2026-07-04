@@ -645,8 +645,10 @@ export interface GenerationListEntry extends GenerationSummary {
   sample_labels: string[];
 }
 
-/** The `keeper tabs list` payload: every observed generation ranked newest-first
- *  plus the current live set. */
+/** The `keeper tabs list` payload: the decode-bounded generation window ranked
+ *  newest-first (the current generation plus the newest
+ *  {@link RECENT_GENERATION_BOUND} dead ones, NOT every observed generation) plus
+ *  the current live set. */
 export interface TabsListPayload {
   generations: GenerationListEntry[];
   current: CurrentLiveEntry[];
@@ -657,9 +659,10 @@ const SAMPLE_LABEL_LIMIT = 5;
 
 /**
  * Read the `keeper tabs list` payload off a read-only `keeper.db` in one open
- * span: probe `G_now`, enrich every generation (summary + sample labels), and
- * snapshot the current live set. Daemon-down OK. Re-throws on an open failure
- * (the caller maps it to an error envelope).
+ * span: probe `G_now`, enrich the decode-bounded window (the current generation
+ * plus the newest {@link RECENT_GENERATION_BOUND} dead ones — summary + sample
+ * labels), and snapshot the current live set. Daemon-down OK. Re-throws on an
+ * open failure (the caller maps it to an error envelope).
  */
 export function loadGenerationList(
   dbPath: string,
