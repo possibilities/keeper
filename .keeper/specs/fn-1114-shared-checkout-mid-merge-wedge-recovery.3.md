@@ -58,5 +58,5 @@ new reason together.
 - [ ] The CLAUDE.md autopilot invariant prose states the new mid-merge contract in place of the stale blanket dirty-degrade wording, and the CLAUDE.md size lint passes
 
 ## Done summary
-
+Escalate a sustained shared-checkout mid-merge wedge into a per-repo shared-checkout-wedge needs_human distress row (synthetic daemon verb, orphan-GC-exempt, outside the recover auto-clear, un-retryable) via an in-memory grace tracker that mints exactly-once past a ~5min watermark and level-clears off the durable open-distress set. Routes the new reason through the display-rules table + board pill and carves the mid-merge subcase into the CLAUDE.md autopilot clause.
 ## Evidence
