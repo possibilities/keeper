@@ -4,8 +4,8 @@
  * it opens its own read-only connection, watches the `jobs` projection
  * (level-triggered on `PRAGMA data_version` via the shared `watchLoop`
  * primitive), and on every change names each tmux WINDOW hosting a live
- * Claude session after that session's job title. The latest-appeared Claude
- * in a window wins.
+ * keeper session after that session's job title, regardless of harness. The
+ * latest-appeared session in a window wins.
  *
  * It reads the projection read-only and writes ONLY to tmux
  * (`rename-window`); it NEVER writes the DB and posts NOTHING to main beyond

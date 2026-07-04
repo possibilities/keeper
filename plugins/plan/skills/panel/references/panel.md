@@ -25,7 +25,11 @@ answers meet. Cross-pollination before the judge defeats the entire mechanism.
 
 The panel's members come from a named `panels.<name>` array in `~/.config/keeper/panel.yaml`, each
 member a named preset in the catalog `~/.config/keeper/presets.yaml` — a `{harness, model, effort}`
-triple. Run `keeper agent presets list` to see the configured presets + panels.
+triple. Eligibility is **capability-derived**: a preset is panel-valid when its harness is *capturable*
+(keeper can read that harness's final message) — a capability flag, never a harness-name allowlist.
+Today that is every harness keeper drives — claude, codex, pi, and hermes — so any of the four is a
+valid panelist; a preset on a non-capturable harness is rejected when the panel resolves. Run
+`keeper agent presets list` to see the configured presets + panels.
 `keeper agent presets resolve <panel>` returns the members in declaration order, each identified by its
 **preset name** (not its harness), so two panelists on the same harness but different models stay
 distinguishable. Every member answers **in parallel** via a detached
