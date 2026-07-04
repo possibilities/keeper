@@ -61,5 +61,5 @@ that minted reasons carry the MERGE_HEAD ref and ownership verdict.
 - [ ] The incident scenario is reproduced in the recover-pass suite and passes; the full fast tier stays green with no real git
 
 ## Done summary
-
+recoverWorktrees pass-1 self-heals a keeper-owned mid-merge in the shared main checkout via a flock-guarded, resolver-excluded abort; mergeLaneBaseIntoDefault + both recover/finalize switches mint distinct worktree-{recover,finalize}-{mid-merge,abort-failed} reasons instead of degrading to dirty-checkout.
 ## Evidence

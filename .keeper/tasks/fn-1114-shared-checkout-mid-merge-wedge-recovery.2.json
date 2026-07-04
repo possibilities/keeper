@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Recover self-heal and reason threading",
-  "updated_at": "2026-07-04T02:14:08.948000Z"
+  "updated_at": "2026-07-04T13:24:14.587000Z",
+  "worker_done_at": "2026-07-04T13:24:14.587000Z"
 }
