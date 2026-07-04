@@ -222,7 +222,7 @@ No single skill owns how the operator skills (`keeper:dispatch`, `keeper:autopil
 
 - **Parallel** (epics are independent / dep-free) → scaffold both, then `keeper:autopilot mode yolo` lets the reconciler dispatch them concurrently.
 - **Sequential** (B must run after A) → wire the cross-epic dep on the epic (`epic add-dep` / `depends_on_epics`) so autopilot sequences execution on its own; for a stricter human-gated cadence, `keeper:autopilot mode armed` plus a `keeper:await complete <epic>` phase gate holds B until A lands.
-- **Planning-dependent daisy-chain** (you genuinely can't author B until A's landed reality exists — new APIs, file shapes, schema) → plan A, arm `keeper:await landed fn-A`, and on `met` plan B against what landed. Gate on `landed` (lane merged to default), not `complete`: under worktree mode A's dependent lane is cut before A's finalize merge, so `complete` (done-AND-idle) can fire while A's files aren't yet on the default branch B authors against (`landed` degrades to `complete` semantics when worktree mode is off). If A is multi-repo, the per-repo slice B shares with A merges as one of A's groups, and `landed` fires only once ALL of A's groups have. One session drives several plan rounds without the human re-priming context. Each round re-runs the close/await check before arming the next; when nothing's left to arm, stay silent and hand back.
+- **Planning-dependent daisy-chain** (you genuinely can't author B until A's landed reality exists — new APIs, file shapes, schema) → plan A, arm `keeper:await landed fn-A`, and on `met` plan B against what landed. Gate on `landed`, not `complete` — the milestone distinction is spelled out below. One session drives several plan rounds without the human re-priming context. Each round re-runs the close/await check before arming the next; when nothing's left to arm, stay silent and hand back.
 - **Take-over window** (drive execution by hand for a stretch) → `keeper:autopilot` captures the current `{paused, mode, armed}` state, changes it for the window, and restores it when the human says done; `keeper:dispatch` fires one worker by hand inside that window.
 
 **These three are not human questions — derive them, don't ask.** "What order should the epics roll out?", "what deps should I set?", and "should I wait for this epic to finish before planning the next?" each have a determinate answer you already hold; surfacing them to the human is the failure mode, not the safe default.
@@ -232,6 +232,19 @@ No single skill owns how the operator skills (`keeper:dispatch`, `keeper:autopil
 - **Await-before-plan is the rare exception, gated by one test:** *can I author every epic's task specs right now, against today's codebase plus the other epics' plans?* **Yes — the common case → plan all the epics in this session now**, wire deps, and let autopilot sequence; do NOT await between plans. **No, and only when B's SPECS literally need A's landed reality** (new APIs, file shapes, schema the specs must reference) → daisy-chain: plan A, arm `keeper:await landed fn-A`, plan B on `met`. An *execution* dependency (B's code needs A's code) is NOT a planning dependency — that is `depends_on_epics` plus autopilot, never a reason to stall planning.
 
 Apply the test and commit to a topology. Ask only when the planability test is genuinely indeterminate AND a wrong call is expensive to unwind — not because more than one shape is conceivable.
+
+#### `landed` vs `complete` — the milestone a daisy-chain gates on
+
+<!-- BAKE:BEGIN keeper prompt render engineering/landed-vs-complete -->
+
+**`landed` and `complete` are distinct keeper plan milestones — they can fire at different times, and which one gates downstream work matters.**
+
+- **`landed <epic>`** fires when the epic's lane is merged to the default branch. Epic-only. It **degrades to `complete` semantics when worktree mode is off** (no lanes exist, so merged ⇔ done). For a **multi-repo** epic it fires only once ALL per-repo groups have merged — not on the first group.
+- **`complete <id>`** is **done AND idle**: the work is finished and every owning subagent has gone idle. Under worktree mode a dependent lane is cut before the upstream's finalize merge, so `complete` can fire while the epic's files are **not yet on the default branch**.
+
+Consequence: a planning daisy-chain — authoring or building against another epic's merged reality — gates on **`landed`, not `complete`**, because `complete` can report done while the files the downstream work reads still aren't on the default branch.
+
+<!-- BAKE:END keeper prompt render engineering/landed-vs-complete -->
 
 ### Always check the session is done — speak only to close it
 

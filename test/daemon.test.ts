@@ -4809,6 +4809,13 @@ test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on
   expect(brief).toContain("BOTH");
   expect(brief).toContain("tests");
   expect(brief).toContain("keeper autopilot retry close::fn-9-foo");
+  // Intent archaeology BEFORE classifying: read each side's primary sources
+  // (commits + keeper history) to ground classification in intent, not diff text.
+  expect(brief).toContain("INTENT ARCHAEOLOGY");
+  expect(brief).toContain("keeper find-file-history");
+  expect(brief).toContain("keeper search-history");
+  // The do-not-invent-new-behaviour guard: compose verbatim or default to BLOCKED.
+  expect(brief).toContain("Do NOT invent new behaviour");
   // The guardrail classes named VERBATIM + unsure-defaults-to-BLOCKED.
   expect(brief).toContain("state machine");
   expect(brief).toContain("schema");
@@ -4836,6 +4843,11 @@ test("buildResolverBrief: a parse-miss degrades to a still-actionable brief (nev
   expect(brief).not.toContain("keeper autopilot play");
   expect(brief).toContain("BLOCKED");
   expect(brief).toContain("to proceed, tell me exactly:");
+  // The archaeology step + do-not-invent guard ride the shared guardrail into the
+  // parse-miss branch too.
+  expect(brief).toContain("INTENT ARCHAEOLOGY");
+  expect(brief).toContain("keeper find-file-history");
+  expect(brief).toContain("Do NOT invent new behaviour");
 });
 
 test("buildResolverBrief: a null/empty repoDir degrades to the manual body (never throws)", () => {
@@ -4849,6 +4861,10 @@ test("buildResolverBrief: a null/empty repoDir degrades to the manual body (neve
   expect(brief).toContain("Do NOT `keeper autopilot pause`");
   expect(brief).not.toContain("keeper autopilot play");
   expect(brief).toContain("BLOCKED");
+  // The archaeology step + do-not-invent guard ride the shared guardrail into the
+  // null-repo manual branch too.
+  expect(brief).toContain("INTENT ARCHAEOLOGY");
+  expect(brief).toContain("Do NOT invent new behaviour");
 });
 
 // ---- runResolverDispatchSweep (orchestration core, injected deps) ------------

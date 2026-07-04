@@ -221,7 +221,8 @@ Pin the return. `Priority Questions` feed Phase 2d next; `Nice-to-Clarify` items
 A uniform 1-by-1 prose Q&A over every `### Priority Questions` bullet in the pinned gap-analyst report. No classifier, no numbered menu, no `AskUserQuestion`. Follow the arthack one-question-at-a-time rule:
 
 - **Triviality floor (apply before asking):** is there only one viable answer, or one option obviously better with no real tradeoff? If yes, resolve internally and surface as a fait accompli with one-line rationale (`"going with X (Y wasn't viable because Z) — flip if you'd rather"`). Floor is default-on, not a lockout — the human can override next turn. Real tradeoffs (multiple viable answers, genuine cost/benefit, anything load-bearing on intent) still get the full explainer-then-question. Anchor: *name the field `priority` vs `prio`* → trivial, just pick. *sync vs async* → real tradeoff, ask.
-- For a real question: write one short **explainer paragraph** (the tradeoff, why it matters, what each direction implies), then ask the one question. Wait. Let the conversation unfold — pushback, follow-ups, premise changes are all fine. Advance only when the thread is resolved.
+- For a real question: write one short **explainer paragraph** (the tradeoff, why it matters, what each direction implies), then ask the one question **with your own recommended answer attached** — say which way you'd go and the one-line why (`I'd go X — it keeps Y cheap; flip if Z matters more`), so the human ratifies or redirects a concrete proposal instead of answering cold. Never present a priority question empty-handed. Wait. Let the conversation unfold — pushback, follow-ups, premise changes are all fine. Advance only when the thread is resolved.
+- **No cap, no auto-proceed.** There is no limit on how many priority questions you ask — put every gap-analyst question that clears the triviality floor to the human, each carrying its recommended answer. Never AFK-auto-proceed past an unanswered one: a real question blocks on the human's reply. Speed comes from the recommended answer making each question cheap to ratify, never from skipping a question the human should decide or self-answering it as a fait accompli (that is the triviality floor's job, and only for questions with no real tradeoff).
 - `skip`/`pass` are valid — record and advance.
 - Synthesize each answer into working-memory refinements (create: feed Phase 3 on; refine: feed R4 on).
 - **Scope-confirm reflex:** when an answer settles one axis but leaves an adjacent one unstated (the human picked the auth mechanism but not the session-store, the schema but not the migration order), state your assumption on that unstated axis in one sentence before decomposing on it — don't silently pick and bake it into tasks. Fires on a genuinely unstated axis only; never re-litigate a directive the human already gave.
@@ -283,7 +284,7 @@ State depth + one-sentence rationale: *"STANDARD task depth, STANDARD epic depth
 
 Models handle cohesive chunks well. Prefer one fat task to three thin ones; split only at natural seams. Start from the **one-task test**:
 
-> Could this ship as a single PR touching a coherent slice of the codebase, with one set of acceptance criteria a reviewer could check in one sitting?
+> Could this ship as a single PR touching a coherent slice of the codebase, with one set of acceptance criteria a reviewer could check in one sitting (roughly: under ~300 lines, under a day of review)?
 
 If yes → **1 task**. Scale up only when one or more of these apply:
 
@@ -365,11 +366,7 @@ This becomes a field on the `epic:` block of the YAML (5h) — no CLI call here.
 
 ### 5d. Decompose into tasks (cognitive)
 
-Guided by the decomposition bias from 3c; spec richness flows from the depth pick in 3b. **Default to fewer tasks** — ask *"does this gap need its own task, or fold into a sibling?"* before each task beyond the first. When in doubt between 1 and 2, pick 1.
-
-**Collapse (lean to one task) when:** gaps touch the same files/module; gaps share acceptance a reviewer checks together; gaps are "the feature," not optional scaffolding; combined PR is under ~300 lines and under a day of review.
-
-**Split when:** files are disjoint and parallel-safe; one gap is risky (keystone) and another straightforward — isolate the keystone with its fallback; work spans a hard dep chain; there's a reviewer-shaped seam where seeing the pieces separately gives better feedback.
+Apply the decomposition bias from Phase 3c per candidate task — the one-task test, its scale-up triggers, and when-in-doubt-pick-1 are stated there once, authoritative; don't restate them here. Spec richness flows from the depth pick in 3b.
 
 For each task, decide:
 - **title** (3–6 words, slugifies)
@@ -582,33 +579,9 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 **Same-session multi-epic overlap (epic-scout's blind spot).** epic-scout detects overlaps only against epics that already have commits; sibling epics you scaffold in this *same* planning session have none yet, so their file collisions are structurally invisible to it. When one session scaffolds more than one epic, reason about shared files across the whole portfolio from the specs themselves (each epic's task `Files:` lists) and wire `depends_on_epics` for every colliding pair. This is the 5f same-file rule applied one level up — between sibling epics rather than sibling tasks — and epic-scout cannot do it for you.
 
-### Cross-skill orchestration awareness (multi-epic)
+**Driving multi-epic execution (operator branch).** When the plan spans more than one epic AND the human asks how those epics should EXECUTE — parallel, sequential, planning-dependent daisy-chain, or a hand-driven take-over window — read `references/operator-orchestration.md` for the cross-skill topologies and their `keeper:autopilot` / `keeper:await` / `keeper:dispatch` mechanics. Execution is a cross-skill concern the operator skills own: wire the topology into the plan here, never launch execution mid-plan.
 
-When the plan spans more than one epic, how those epics EXECUTE is a cross-skill concern the operator skills own — not this planning flow. Wire the topology into the plan itself; never proactively launch execution mid-plan. Reach for the operator skills only on clear user intent (they are model-invocable), referencing them for mechanics:
-
-- **Parallel** (dep-free epics) → scaffold both; `keeper:autopilot mode yolo` dispatches them concurrently.
-- **Sequential** (B after A) → the `epic.depends_on_epics` edge wired above sequences execution under autopilot; a stricter human-gated cadence is `keeper:autopilot mode armed` plus a `keeper:await complete <epic>` phase gate.
-- **Planning-dependent daisy-chain** (B genuinely unplannable until A lands) → arm `keeper:await landed fn-A`, then re-enter planning for B on `met`. Use `landed` (lane merged to default), not `complete`: under worktree mode a dependent lane is cut before A's finalize merge, so `complete` (done-AND-idle) can fire while A's files aren't yet on the default branch B will author against; `landed` degrades to `complete` semantics when worktree mode is off. When A is a multi-repo epic, `landed` waits for the per-repo slice B shares with A (its group merged to that repo's default) as part of ALL of A's groups landing — `landed` only fires once every group has.
-- **Take-over window** → `keeper:autopilot` captures `{paused, mode, armed}`, drives by hand, restores; `keeper:dispatch` fires one worker.
-
-The planning flow's default wrap-up stays quiet (Phase 8) — these shapes engage only on the human's request.
-
-### Helping a blocked work agent
-
-Your work agents ask you for help. Either the daemon escalates a blocked `/plan:work` worker to you ONCE over the Agent Bus — a `Plan task <task> (epic <epic>) is BLOCKED — the worker exhausted its own resolution and escalated rather than guess.` message carrying the `Category:`, `Repo:`, and verbatim `Blocked reason:` — or a still-live worker messages you directly. Either way, be prepared to do the work the resolution needs on the worker's behalf, then hand control back and ask it to resume. React in this order — **bus-resume is PRIMARY; cold-re-dispatch is the fallback, not the default**:
-
-1. **Resolve the blocker per its category** — do the human-gated action, clear the dep, refine the spec (`/plan:plan <epic> refine`), or whatever the `Category:` line calls for. The directive carries the verbatim `blocked_reason`.
-2. **Unblock the board** — `keeper plan unblock <task>` (flips the task `blocked → todo`, preserving claim history).
-3. **PRIMARY — resume the still-live worker in place over the bus:**
-
-   ```bash
-   keeper bus chat send work::<task> "RESOLVED: <what changed> — resume now"
-   ```
-
-   `work::<task>` is the still-live `/plan:work` orchestrator session's deterministic name. A `delivered` result (exit 0) means that session picks the task back up in-context with everything it already figured out — done. Say more than "resume now" if the resolution changed the work.
-4. **FALLBACK — only on a miss:** a `not_connected`/`unknown_target` send result (exit 1, per `keeper:bus`'s result tokens) means that worker session has died. The `keeper plan unblock` you already did lets the autopilot cold-re-dispatch a fresh worker; if the autopilot is paused, run `keeper dispatch work::<task>` yourself.
-
-Precedence is strict: try the bus-resume FIRST and fall through to cold-re-dispatch ONLY on the exit-1 miss. Do not pre-check `keeper bus list` — send blindly and branch on the send's own result. Resuming a live worker reuses its accumulated context; cold-re-dispatch discards it, so it is the genuinely-dead-worker path only.
+**A work agent escalated a blocked task (operator branch).** When the daemon escalates a BLOCKED `/plan:work` worker to you over the Agent Bus, or a still-live worker messages you for help, read `references/operator-orchestration.md` for the resolve → `unblock` → bus-resume flow (bus-resume PRIMARY, cold-re-dispatch the exit-1-miss fallback).
 
 ---
 

@@ -23,6 +23,36 @@ line with the verb or the condition that decides what happens — `On a
 per invocation` — not `It's worth noting that in some cases you might want to …`.
 Leading words are how a dense line stays skimmable.
 
+## The two-load frame
+
+Every skill spends one of two budgets, and the frontmatter picks which. A
+**model-invoked** skill — one whose `description` the model reads every turn to
+decide whether to fire — pays permanent **context load**: that description sits in
+the prompt on every turn, taxing all work whether or not the skill fires. A
+**slash-only** skill (`disable-model-invocation: true`) pays **human cognitive
+load** instead — it fires only when the human types `/name`, so the human is the
+index deciding relevance, and that cost is spent once, deliberately, where a human's
+judgment beats an automatic trigger. Pick the load on purpose: go model-invocable
+only when an automatic trigger genuinely routes better than the human would AND the
+always-on description cost earns its keep; stay slash-only when the human should own
+when the skill applies. Neither load is free — a description that rarely fires taxes
+every turn for nothing, and a slash-only skill is dead weight if the human forgets it
+exists.
+
+## Leitwort-as-compression
+
+Reuse a pretrained concept as a repeated token and it retires the sentences that
+would otherwise restate it. Pick a word the model already carries meaning for —
+`idempotent`, `ghost`, `fan-in`, `Leitwort` itself — bind it once to the local
+concept, then use that single token everywhere the concept recurs. The reader
+expands the token from pretraining instead of re-reading a paraphrase, so three
+duplicated explanations collapse to one coinage plus two bare tokens. This is a
+distinct lever from front-load-the-verb (the Leading words section): that rule
+governs WHERE the load-bearing word sits in a line so a skimmer catches it; this one
+governs REUSING one token so the prose stops paying to re-explain a concept it
+already named. When an idea recurs across sites, coin its Leitwort once and let the
+token carry it — don't re-teach the concept at each site.
+
 ## Progressive disclosure — licensed by branching
 
 Detail is earned by a branch, not sprinkled everywhere. Put the always-true rule
