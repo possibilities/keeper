@@ -60,5 +60,5 @@ root fast suite green.
 - [ ] No touched prose narrates history — present-tense rule statements only
 
 ## Done summary
-
+Stated the worker mutating-git-stash ban across every guard-narrating prose surface: broadened the work-skill Shared-tree principle and worker-agent mechanical-block sentence with the shared-stack rationale and restore/temp-commit alternatives, folded the denial + list/show/create allowlist into root CLAUDE.md, the plan-plugin guard sentence, and the keeper hooks.json description, then regenerated the skill + four worker manifests and recaptured the prompt oracle fixture. Lint, check-generated, prompt parity, and plan consistency all green.
 ## Evidence
