@@ -38,6 +38,11 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import {
+  isAdrPath,
+  isContextDocPath,
+  runDomainDocsLint,
+} from "./domain-docs-lint";
 import type { GitExecResult } from "./git-exec";
 
 /** JS/TS suffixes routed to the npm-lint arm (mirrors Python `_JS_TS_SUFFIXES`). */
@@ -410,6 +415,20 @@ export async function runScopedLint(
             }
           : null;
       },
+    });
+  }
+
+  // 11 --- domain-docs (CONTEXT.md/CONTEXT-MAP.md + docs/adr; ANY repo). The
+  //        check travels in the binary, so it gates ONLY on staged paths — never
+  //        on a repo-local script (a repo without these files is untouched). The
+  //        arm itself fails CLOSED internally, so it never rejects here. ---
+  const domainDocFiles = stagedFiles.filter(
+    (f) => isContextDocPath(f) || isAdrPath(f),
+  );
+  if (domainDocFiles.length > 0) {
+    tasks.push({
+      order: 11,
+      run: () => runDomainDocsLint(stagedFiles, cwd),
     });
   }
 

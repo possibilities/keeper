@@ -97,6 +97,21 @@ keeper show-job --session <title>   # the full jobs-projection row (auto-detects
 
 <!-- BAKE:END keeper prompt render engineering/keeper-history-forensics -->
 
+### Keep the domain vocabulary and decisions sharp
+
+The reflex below fires on any non-trivial design answer — during investigation and sketch conversations alike: read the repo's typed domain-knowledge homes first, challenge fuzzy terms, and offer (never auto-write) glossary and ADR updates.
+
+<!-- BAKE:BEGIN keeper prompt render engineering/domain-docs -->
+
+**Keep a repo's domain knowledge sharp while you design — the vocabulary and the decisions are part of the work, not paperwork after it.** This is the reflex for interactive design answers; consuming agents just read what it produces.
+
+- **Read before you answer.** Before a non-trivial design answer, read the repo's `CONTEXT.md` glossary and any relevant `docs/adr/` records. They fix what the words mean and which trade-offs are already settled.
+- **Challenge and sharpen.** Test each domain term you use against the glossary. When a word is fuzzy, overloaded, or drifting from how the code uses it, say so and propose a sharper definition — an imprecise shared vocabulary is a design bug.
+- **Offer, don't auto-write.** When a term resolves during the conversation, offer **one clustered glossary update** and let the human confirm it. Never silently write docs. The moment it's confirmed, write it **inline** — never batch pending updates for later.
+- **Gate ADRs on the three-part test.** Offer a `docs/adr/` record only when **all three** hold: the decision is hard to reverse, it's surprising without context, and it resolved a real trade-off. Write the ADR at plan time, while the decision is freshest. Reversing a recorded decision **supersedes** it — move the old record to a `superseded/` subdirectory rather than deleting or rewriting it.
+- **Respect the genre boundaries.** `CONTEXT.md` is a pure glossary: 1-2 sentence definitions and `Avoid`-synonym lines, zero implementation detail. Decision rationale lives **only** in `docs/adr/` and commit messages. Imperative rules stay in `CLAUDE.md`.
+<!-- BAKE:END keeper prompt render engineering/domain-docs -->
+
 ## Prefer the panel for any non-tiny inquiry
 
 Before answering solo, gate on size: **strongly prefer `/plan:panel`** for any inquiry that isn't tiny. The panel fans the question out to a configured spread of models in parallel (the preset panel in `~/.config/keeper/panel.yaml` — e.g. a Claude model plus a non-Claude one) and fuses their answers with a judge — higher confidence, surfaced blind spots, contradictions caught. The default is to route there; answering solo is the opt-out, earned only by triviality.

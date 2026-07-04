@@ -1,5 +1,5 @@
 {
-  "description": "Keeper hooks: (1) events-writer appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite) for the keeperd ingester to fold into the jobs projection; (2) branch-guard is a PreToolUse(Bash) hard-deny that blocks subagents (agent_id present) from creating/switching git branches via the deny JSON envelope (still exits 0), keeping worker subagents on the current branch; (3) sidecar-writer is a fail-open PostToolUse(Write|Edit|MultiEdit|Bash) hook that owns the ~/docs metadata sidecar AND git state — create-or-merge a doc's .yaml on Write, upsert the gist-url on `gh gist create` (NEVER touching the .md), and commit every doc write/edit/delete to the ~/docs repo (pathspec-scoped, mechanical message, fail-open so a commit failure never blocks; still exits 0); (4) docs-pusher is a fail-open Stop hook that pushes ~/docs to its remote once per turn when local is ahead of @{u} (local ahead-count, no fetch), serialized by a .git/ lockfile and best-effort: a non-fast-forward/auth/network failure is logged to .git/keeper-push.log and skipped (never rebase, never --force) and it ALWAYS exits 0 — a Stop hook exiting non-zero would block Claude from stopping",
+  "description": "Keeper hooks: (1) events-writer appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite) for the keeperd ingester to fold into the jobs projection; (2) branch-guard is a PreToolUse(Bash) hard-deny that blocks subagents (agent_id present) from creating/switching git branches via the deny JSON envelope (still exits 0), keeping worker subagents on the current branch; (3) sidecar-writer is a fail-open PostToolUse(Write|Edit|MultiEdit|Bash) hook that owns the ~/docs metadata sidecar AND git state — create-or-merge a doc's .yaml on Write, upsert the gist-url on `gh gist create` (NEVER touching the .md), and commit every doc write/edit/delete to the ~/docs repo (pathspec-scoped, mechanical message, fail-open so a commit failure never blocks; still exits 0); (4) docs-pusher is a fail-open Stop hook that pushes ~/docs to its remote once per turn when local is ahead of @{u} (local ahead-count, no fetch), serialized by a .git/ lockfile and best-effort: a non-fast-forward/auth/network failure is logged to .git/keeper-push.log and skipped (never rebase, never --force) and it ALWAYS exits 0 — a Stop hook exiting non-zero would block Claude from stopping; (5) context-hint is a fail-open SessionStart hook that emits one additionalContext line pointing a session at the repo root's CONTEXT.md glossary when it is present and non-empty (absent/empty/unreadable/non-git cwd → emits nothing), a dep-free node-only fs walk that ALWAYS exits 0",
   "hooks": {
     "SessionStart": [
       {
@@ -7,6 +7,14 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/events-writer.ts"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/context-hint.ts"
           }
         ]
       }

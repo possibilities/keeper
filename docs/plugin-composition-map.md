@@ -45,6 +45,13 @@ four-dispatcher hook set —
 - **UserPromptSubmit**: prompt reminders.
 - **PermissionRequest** (ExitPlanMode): empty-plan guard.
 
+The **keeper** plugin (`plugins/keeper/hooks/hooks.json`) also rides every launch;
+its full hook inventory lives in `CLAUDE.md`'s Hook rules. On **SessionStart** it
+fires two commands — the events-writer (folds the session-start row) and a
+fail-open **context-hint** that emits one `additionalContext` line pointing a
+vanilla session at the repo root's `CONTEXT.md` glossary when present + non-empty
+(nothing when absent/empty/unreadable or the cwd is non-git; always exits 0).
+
 ## Per launch channel
 
 | Channel | Route | Base set | Extra |

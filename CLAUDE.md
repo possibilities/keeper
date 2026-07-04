@@ -1,14 +1,16 @@
 keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite). Rationale and history
-live in `.keeper/` specs and git history; `README.md` is a lean front door; this file is
-imperative guardrails only.
+live in `docs/adr/`, `.keeper/` specs, and git history; `README.md` is a lean front door; this
+file is imperative guardrails only.
 
 ## Docs discipline (rule #0)
 
 - **Docs prune, never append-only.** Doc edits consolidate and delete as readily as they add;
   CLAUDE.md gains a line only for a rule an agent would otherwise get wrong.
   `bun scripts/lint-claude-md.ts` gates its size + bans re-narration — keep it green.
-- **Forward-facing advice only** in comments and docs: state current behavior, never change
-  history. No fn-ids, version numbers, dates, or past-tense provenance here.
+- **Forward-facing advice only** — state current behavior, never change history: no fn-ids,
+  version numbers, dates, or past-tense provenance in CLAUDE.md, README, `CONTEXT.md`, or code
+  comments. History and rationale have exactly one home — `docs/adr/`, alongside commit messages.
+  Typed homes: vocabulary → `CONTEXT.md`, resolved decisions → `docs/adr/`.
 
 ## Repo facts
 
@@ -21,8 +23,7 @@ imperative guardrails only.
   `~/.claude/plugins/keeper` symlink (double-registers the hook); the daemon, `cli/`, `src/`, and the `keeper` binary stay at the repo root.
 - **The Agent Bus inbox watcher is a session Monitor** in `plugins/keeper/monitors.json` — STRICTLY
   separate from `hooks.json`; never fold in.
-- **Bus presence = a SUBSCRIBED `keeper bus watch` channel; a pure `keeper bus chat send` is
-  EPHEMERAL** (`send_only:true`): a send MUST NOT join the live registry — only `watch` does.
+- **A `keeper bus chat send` MUST NOT join the live registry** (`send_only:true`); only a subscribed `keeper bus watch` channel establishes bus presence (`CONTEXT.md`).
 
 ## Event-sourcing invariants
 
@@ -41,7 +42,7 @@ imperative guardrails only.
 
 ## Hook rules
 
-- **Four hooks under `plugins/keeper/plugin/hooks/`** — events-writer (logs every Bash invocation, NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a SUBAGENT — `agent_id` present — from git branch create/switch/worktree-add; the in-daemon worktree producer shells git with no `agent_id`, so it is NOT gated), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state, NEVER the `.md` body), docs-pusher (`Stop`, pushes `~/docs` once per turn). Two sibling events-log writers ride the SAME discipline — the hermes shell shim (`hooks/hermes-events-shim.ts`, registered in hermes's config by `src/hermes-trust.ts`) and the ephemeral pi in-process extension (`plugins/keeper/pi-extension/`, armed per-launch via `-e`, gated on `KEEPER_JOB_ID`).
+- **Five hooks under `plugins/keeper/plugin/hooks/`** — events-writer (logs every Bash invocation, NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a SUBAGENT — `agent_id` present — from git branch create/switch/worktree-add; the in-daemon worktree producer shells git with no `agent_id`, so it is NOT gated), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state, NEVER the `.md` body), docs-pusher (`Stop`, pushes `~/docs` once per turn), context-hint (`SessionStart`, dep-free node-only, emits one `additionalContext` line pointing at the repo root's `CONTEXT.md` glossary when present + non-empty, else nothing; always exit 0). Two sibling events-log writers ride the SAME discipline — the hermes shell shim (`hooks/hermes-events-shim.ts`, registered in hermes's config by `src/hermes-trust.ts`) and the ephemeral pi in-process extension (`plugins/keeper/pi-extension/`, armed per-launch via `-e`, gated on `KEEPER_JOB_ID`).
 - **Always exit 0 / fail-open** — a non-zero exit can fail-closed the human's session; a throwing shim/extension must degrade its harness to presence-only, NEVER crash or stall its turn. The branch-guard denies via the `PreToolUse` JSON envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows + logs). A shim/extension NEVER writes host stdout (it is the harness's hook control channel) and logs every failure privately.
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts` in a hook or events-log writer.** Keep imports to `node:*` + the dep-free `src/{dead-letter,derivers,exec-backend,sidecar,doc-commit}.ts` helpers; never the plan plugin (the pi extension loads in ISOLATION via jiti — `node:*` + its own contract copy only). Hook/shim payloads are attacker-influenced: emit each record as ONE JSON line (no NDJSON injection, no shell interpolation), size-bounded.
 - **A `~/docs` hook may spawn a bounded git subprocess** — read-only probes (e.g. a `rev-parse` for sidecar provenance) against the session repo are fine; the hard line is NO mutating git or DB write outside the `~/docs` repo, and never `git fetch`/rebase/force-push even there.
@@ -66,15 +67,13 @@ imperative guardrails only.
 
 ## Process & DB-watch invariants
 
-- **No kernel watchers on keeper's OWN DB.** `fs.watch`/FSEvents/kqueue drop same-process and WAL
-  writes on macOS — detect DB changes via `PRAGMA data_version` polling on a read-only connection.
-  Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine. A transient `SQLITE_NOTADB` on that poll skips the tick via the shared `NotadbTolerance` helper, never an ad-hoc per-site catch.
-- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` → `process.exit(1)` (exit
-  NON-zero — `SuccessfulExit:false` gates the LaunchAgent respawn), the single recovery path; never
-  respawn a worker in-process (carve-outs: closing a stale/EPIPE UDS client, the git seed-liveness
-  watchdog's capped MAIN boot-seed re-runs before it escalates to `fatalExit`, and the serve-liveness
-  watchdog's bounded real-read socket probes that `fatalExit` a wedged serve path, NAMING which
-  socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
+- **No kernel watchers on keeper's OWN DB.** Detect DB changes via `PRAGMA data_version` polling on a
+  read-only connection. Carve-out: `@parcel/watcher` on EXTERNAL trees and kqueue/pidfd on EXTERNAL descriptors are fine. A transient `SQLITE_NOTADB` on that poll skips the tick via the shared `NotadbTolerance` helper, never an ad-hoc per-site catch.
+- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` (non-zero exit — the
+  LaunchAgent respawn is the sole recovery path); never respawn a worker in-process (carve-outs:
+  closing a stale/EPIPE UDS client, the git seed-liveness watchdog's capped MAIN boot-seed re-runs
+  before it escalates to `fatalExit`, and the serve-liveness watchdog's bounded real-read socket
+  probes that `fatalExit` a wedged serve path, NAMING which socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
 - **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract

@@ -151,6 +151,12 @@ Only when the target repo has a design system (a `DESIGN.md` in project root) AN
 - **Component drift**: UI patterns that diverge from DESIGN.md component specifications
 - This is ADVISORY — design token adoption is gradual, don't block shipping
 
+### 8. Domain-Doc Conformance (Spec axis, advisory)
+
+Only when the target repo has a `CONTEXT.md` glossary or a `docs/adr` tree — skip entirely otherwise. Two flags, both **Spec-axis** and **ADVISORY** (flag from the diff, never block shipping):
+- **Avoid-synonym use**: code or specs in the diff use a term the glossary marks Avoid instead of its canonical form — flag (file:line) with the canonical term the glossary prescribes.
+- **Missing ADR**: the diff ships a hard-to-reverse decision (a schema, protocol, dependency, or interface commitment) with no accompanying `docs/adr` entry — flag (file:line) the decision that wants a record.
+
 ## Report format
 
 Write the report markdown in this shape:
@@ -170,6 +176,8 @@ The two axes below are reported side by side and are NEVER merged or re-ranked i
 Does the diff do what the task spec, acceptance, and done summaries claim? When clean, say `Matches the spec — no drift found.`
 - **[File:line]** `Critical` | `Should fix` | `Consider`: [drift, correctness bug on the spec'd path, unhandled error path, or spec'd-but-untested behavior]
   - Risk: [what could go wrong] / Fix: [specific suggestion]
+
+Advisory domain-doc flags (Avoid-synonym use, missing ADR — section 8) also land here, tagged `Consider`.
 
 ### Axis 2 — Standards
 Repo conventions + the code-smell baseline. Smells are judgement calls, never hard violations; repo conventions override generic smells; skip anything lint enforces. When clean, say `Holds to repo standards.`

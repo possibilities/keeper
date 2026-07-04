@@ -15,6 +15,8 @@ related: [future-facing-docs, agents-md-symlink]
 
 **What does NOT belong:** architecture overviews, module-by-module walkthroughs, state-machine descriptions, schema documentation, design rationale. That is documentation, not a rule — it goes in `README.md`, `docs/`, or a design memo, and `CLAUDE.md` links to it. The code and tests are the source of truth for what the code *does*; don't restate them in prose that silently rots.
 
+**Route by genre — each has one typed home.** Domain **vocabulary** (what the words mean) goes in `CONTEXT.md`; a resolved **decision** and its rationale goes in `docs/adr/`; **imperative rules** an agent must follow stay here in `CLAUDE.md`. When a design conversation resolves a term or a trade-off, place it by genre rather than growing this file (see `keeper prompt render domain-docs`).
+
 **When updating docs after a change, prune and consolidate — never append-only.** Remove detail the change made redundant, collapse duplicate explanations into one, and delete history (see `keeper prompt render future-facing-docs`). If a `CLAUDE.md` has grown into an architecture doc, move that content out to `README.md`/`docs/` and leave a one-line pointer. Append-only doc edits are how a 40-line map becomes a 500-line changelog.
 
 Test each line: *would a capable engineer new to the repo make a mistake without it?* If it only describes what the code already shows, cut it.

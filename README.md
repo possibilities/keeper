@@ -4,6 +4,9 @@ Event-sourced control-data daemon for Claude Code agents — Bun + `bun:sqlite`,
 SQLite DB. Imperative fold/migration/write-scoping guardrails live in [CLAUDE.md](./CLAUDE.md);
 rationale and provenance live in `.keeper/` specs and git history.
 
+Domain vocabulary lives in the [CONTEXT.md](./CONTEXT.md) glossary; resolved architectural decisions
+live in [docs/adr/](./docs/adr/).
+
 ## What keeper is
 
 A small TypeScript hook plugin appends one per-pid NDJSON line per Claude Code hook invocation
