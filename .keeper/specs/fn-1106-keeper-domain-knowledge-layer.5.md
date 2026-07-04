@@ -32,5 +32,5 @@ Vendor-sync the upstream snippet work (new domain-docs + three revisions) into k
 - [ ] Drift gate and prompt suite pass
 
 ## Done summary
-
+Vendor-synced the arthack corpus to 305e1025 (new engineering/domain-docs snippet + revised claude-md-scope/code-comment-style/future-facing-docs), baked the domain-modeling reflex into hack/SKILL.md (sixth BAKE guard) and pointed plan/SKILL.md Phase 2d at it, bumped the plugins/plan CLAUDE.md bake count, and recaptured prompt oracle goldens. Drift gate and prompt suite green.
 ## Evidence
