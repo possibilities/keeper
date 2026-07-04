@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Test error-path comment sanitization",
-  "updated_at": "2026-07-04T00:46:26.464000Z"
+  "updated_at": "2026-07-04T16:43:01.138000Z",
+  "worker_done_at": "2026-07-04T16:43:01.138000Z"
 }
