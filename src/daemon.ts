@@ -3084,7 +3084,7 @@ const WATCHER_WORKERS: readonly WorkerName[] = [
 ] as const;
 
 /**
- * TTL (ms) for an autoclose intent hint (epic fn-1107). Sized to OUTLIVE the
+ * TTL (ms) for an autoclose intent hint. Sized to OUTLIVE the
  * slowest path by which the exit-watcher can observe an autoclosed process's
  * death: the periodic reprobe backstop, which cannot reap a row until it ages
  * past {@link REPROBE_MIN_AGE_SECS} and then fires on up to one more
@@ -3096,8 +3096,8 @@ export const AUTOCLOSE_HINT_TTL_MS =
   REPROBE_MIN_AGE_SECS * 2 * 1000 + REPROBE_MS;
 
 /**
- * Consume-once, TTL-bounded set of autoclose intent hints, keyed by job id (epic
- * fn-1107). The autoclose worker posts a hint IMMEDIATELY before it force-closes
+ * Consume-once, TTL-bounded set of autoclose intent hints, keyed by job id. The
+ * autoclose worker posts a hint IMMEDIATELY before it force-closes
  * a window; main consults it at the SINGLE `Killed`-mint site so a hinted death
  * is stamped `kill_reason: 'autoclosed'` instead of `exit_watched`. The
  * exit-watcher stays the sole `Killed` producer — this only relabels.
@@ -7465,7 +7465,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Gated on the selector — `null` when unselected. The autoclose worker
-  // (epic fn-1107): a pure external actuator cloned from the renamer — reads the
+  // is a pure external actuator cloned from the renamer — reads the
   // jobs projection READ-ONLY, self-gates on `autoclose_enabled` every pulse, and
   // writes ONLY to tmux (`kill-window`), NEVER keeper.db. ALWAYS spawned (a
   // runtime enable/disable flip needs no restart); NOT a WATCHER_WORKER (dlopens
