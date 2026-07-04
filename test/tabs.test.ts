@@ -328,6 +328,36 @@ test("renderSnapshotScript: a resume target with shell metacharacters is single-
   expect(script).toContain(`'--resume' ${quoted}`);
 });
 
+/**
+ * The script text bash would actually execute: walk lines with a
+ * single-quote-aware scanner, dropping comment lines (a line whose first
+ * non-blank char is an unquoted `#` runs to EOL and never parses quotes —
+ * so a prose apostrophe in a comment can't shift parity) and the interiors
+ * of single-quoted spans (which legally span lines and are inert). Returns
+ * one entry per executable line: its unquoted remainder.
+ */
+function executableRemainders(script: string): string[] {
+  const out: string[] = [];
+  let inQuote = false;
+  for (const line of script.split("\n")) {
+    if (!inQuote && line.trimStart().startsWith("#")) {
+      continue;
+    }
+    let bare = "";
+    for (const ch of line) {
+      if (ch === "'") {
+        inQuote = !inQuote;
+        continue;
+      }
+      if (!inQuote) {
+        bare += ch;
+      }
+    }
+    out.push(bare);
+  }
+  return out;
+}
+
 test("renderSnapshotScript: a newline in label AND session stays inside its # comment, never a live line", () => {
   const script = renderSnapshotScript(
     [
@@ -345,14 +375,9 @@ test("renderSnapshotScript: a newline in label AND session stays inside its # co
   // Both agent-influenced values fold onto a single `#` comment line each.
   expect(script).toContain("# harmless rm -rf ~/precious");
   expect(script).toContain("# session: work touch /tmp/pwned (1 window)");
-  // Erase every single-quoted span (shellQuote-wrapped argv tokens/cwd — a
-  // literal newline inside single quotes is inert), then assert no injected
-  // payload survives on a bare, non-comment line: nothing escaped its comment.
-  const bare = script.replace(/'[^']*'/g, "");
-  for (const line of bare.split("\n")) {
-    if (line.startsWith("#")) {
-      continue;
-    }
+  // Assert no injected payload survives on an executable line: nothing
+  // escaped its comment.
+  for (const line of executableRemainders(script)) {
     expect(line.includes("rm -rf ~/precious")).toBe(false);
     expect(line.includes("touch /tmp/pwned")).toBe(false);
   }
