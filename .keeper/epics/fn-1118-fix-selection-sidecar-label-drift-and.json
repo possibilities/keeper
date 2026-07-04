@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-04T17:08:32.836000Z",
+  "created_by_close_of": "fn-1109-post-scaffold-model-effort-selector",
+  "depends_on_epics": [
+    "fn-1109-post-scaffold-model-effort-selector"
+  ],
+  "id": "fn-1118-fix-selection-sidecar-label-drift-and",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix selection-sidecar label drift and provenance coverage",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-04T17:08:32.836000Z"
+}
