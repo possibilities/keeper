@@ -33,5 +33,5 @@ Extend the existing brief/claim tests: absent file → "", present → verbatim,
 - [ ] Plan suite is green
 
 ## Done summary
-
+Worker briefs now carry glossary_md: target repo's root CONTEXT.md read at assembly time, capped at 16KiB with line-boundary truncation + marker, present-but-empty when absent. No live Python assemble_brief twin exists (searched keeper/*.py and all .py — the TS assembler under plugins/plan/src is the sole implementation), so no byte-parity mirror was needed; recorded here per the approach.
 ## Evidence
