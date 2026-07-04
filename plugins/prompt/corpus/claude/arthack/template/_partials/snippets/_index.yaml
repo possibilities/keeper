@@ -56,7 +56,7 @@ snippets:
       - future-facing-docs
       - agents-md-symlink
     path: _partials/snippets/engineering/claude-md-scope.md.tmpl
-    token-estimate: 361
+    token-estimate: 459
     used-in: []
   - name: code-comment-style
     summary: Default to no comments — write one only when the WHY is non-obvious; never provenance/narration; prune on touch; protected suppressions/licenses/doc-comments never deleted; docs prune never append-only.
@@ -79,7 +79,7 @@ snippets:
       - future-facing-docs
       - claude-md-scope
     path: _partials/snippets/engineering/code-comment-style.md.tmpl
-    token-estimate: 421
+    token-estimate: 438
     used-in: []
   - name: commit-hygiene-flags
     summary: Never --no-verify / --no-gpg-sign / --amend / git add -A — applies to all commit-emitting layers.
@@ -127,6 +127,29 @@ snippets:
     path: _partials/snippets/engineering/commit-via-keeper-default.md.tmpl
     token-estimate: 628
     used-in: []
+  - name: domain-docs
+    summary: The interactive domain-modeling reflex for design work — read CONTEXT.md + ADRs first, challenge and sharpen terms, offer (don't auto-write) a clustered glossary update and write it inline on confirm, gate ADRs on the 3-part test, supersede old records into superseded/.
+    domain: engineering
+    audience: agent
+    severity: guard
+    tags:
+      - domain
+      - context-md
+      - adr
+      - glossary
+      - design
+      - ubiquitous-language
+      - supersession
+    scope:
+      - any
+    phase:
+      - planning
+    related:
+      - claude-md-scope
+      - future-facing-docs
+    path: _partials/snippets/engineering/domain-docs.md.tmpl
+    token-estimate: 403
+    used-in: []
   - name: escalate-inline-or-plan
     summary: 'Size a work-shaped request to choose where it lands: inline (1-2 files, no new contracts, wanted now), /plan:plan (multi-module or new contract or 3+ moves), or /plan:defer (inline-shaped but not now). Tie-break toward plan over inline, defer over now.'
     domain: engineering
@@ -167,7 +190,7 @@ snippets:
     related:
       - claude-md-scope
     path: _partials/snippets/engineering/future-facing-docs.md.tmpl
-    token-estimate: 371
+    token-estimate: 424
     used-in: []
   - name: keeper-history-forensics
     summary: Read-only recipes against keeper.db — every prompt, tool call, file mutation, and subagent run across all sessions. Find who touched a file, search past prompts, replay what a session or worker actually did.
