@@ -22,7 +22,6 @@ import {
   isAdrPath,
   isContextDocPath,
   resolveDomainDocsLedgerPath,
-  runDomainDocsLint,
   scanAdrFile,
   scanAdrSet,
   scanContextDoc,

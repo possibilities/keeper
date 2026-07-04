@@ -421,13 +421,13 @@ function appendPainLedger(
     const blob = tagged
       .map(
         ({ file, finding }) =>
-          JSON.stringify({
+          `${JSON.stringify({
             ts,
             repo,
             file,
             rule: finding.rule,
             line: finding.line,
-          }) + "\n",
+          })}\n`,
       )
       .join("");
     appendFileSync(path, blob);
