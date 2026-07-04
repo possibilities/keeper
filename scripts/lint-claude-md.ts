@@ -8,7 +8,7 @@
  * how-it-works prose dilutes the handful of rules that change agent behavior.
  * When a rule or paragraph outgrows either file, tighten or delete it:
  * consolidate into an existing rule, move a local contract into a code comment,
- * or drop it — git history and the `.keeper/` specs archive all provenance.
+ * or drop it — history and provenance live in `docs/adr/` and commit messages.
  * README is NOT a relocation target.
  *
  *   bun scripts/lint-claude-md.ts
@@ -203,8 +203,8 @@ function main(): number {
     "\nCLAUDE.md is the imperative-guardrail file and README.md is a lean front\n" +
       "door — neither is a change log or a relocation target. Tighten or delete:\n" +
       "consolidate into an existing rule, move a local contract into a code\n" +
-      "comment, or drop it — git history and the `.keeper/` specs archive all\n" +
-      "provenance (don't quote dates/versions/fn-ids even in examples; the\n" +
+      "comment, or drop it — history and provenance live in `docs/adr/` and\n" +
+      "commit messages (don't quote dates/versions/fn-ids even in examples; the\n" +
       "scanner is zero-tolerance per line).",
   );
   return 1;

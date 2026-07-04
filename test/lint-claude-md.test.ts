@@ -177,4 +177,8 @@ test("lint script epilogue points to tighten/delete, never README relocation", (
   // The old funnel wording must not survive anywhere in the script.
   expect(src).not.toContain("Relocate the offending lines");
   expect(src).not.toContain("belong in README `## Architecture`");
+  // History/provenance is re-pointed at the typed decision home + commit
+  // messages; the prior `.keeper/` specs-archive wording must not survive.
+  expect(src).toContain("docs/adr/");
+  expect(src).not.toContain("specs archive all provenance");
 });
