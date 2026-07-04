@@ -36,29 +36,35 @@ function fixtureTask(overrides: Partial<Task>): Task {
   return overrides as Task;
 }
 
-test("resumeTarget returns the latest session name, preferring the title over the job_id", () => {
-  // Resume by the latest name keeper knows: `title` tracks name_history's newest
-  // entry, resolved live from the jobs projection at resume time (never a frozen
-  // name), so `claude --resume "<name>"` re-attaches to the right session.
+test("resumeTarget returns the job_id (the session UUID) for exact resume, ignoring the title", () => {
+  // Browser-grade restore keys on the immutable session UUID: `claude --resume
+  // <uuid>` re-attaches to the EXACT session, where a name would only fuzzy-filter
+  // the /resume picker. The title feeds the display label only, never the key.
   const job = fixtureJob({ job_id: "sess-123", title: "fn-677.1 worker" });
-  expect(resumeTarget(job)).toBe("fn-677.1 worker");
-});
-
-test("resumeTarget falls back to the job_id when the job has no name", () => {
-  const job = fixtureJob({ job_id: "sess-123", title: null });
   expect(resumeTarget(job)).toBe("sess-123");
 });
 
-test("resumeTarget coerces a fully-degenerate (no name, no id) job to the empty string", () => {
-  // The producer invariant says job_id is always present; a degenerate row with
-  // neither name nor id coerces to "" (never NaN/undefined leaking into argv).
-  expect(resumeTarget(fixtureJob({ job_id: "", title: null }))).toBe("");
+test("resumeTarget returns the job_id whether or not the job carries a title", () => {
+  // Title presence is irrelevant to the resume key — a never-named job resumes by
+  // the same UUID as a named one.
+  expect(resumeTarget(fixtureJob({ job_id: "sess-123", title: null }))).toBe(
+    "sess-123",
+  );
 });
 
-test("buildResumeCommand emits cd + claude --resume with a quoted target", () => {
-  const cmd = buildResumeCommand("/Users/mike/code/keeper", "fn-677.1", null);
+test("resumeTarget coerces an empty job_id to the empty string; a title never rescues it", () => {
+  // The producer invariant says job_id is always present; a degenerate row with an
+  // empty id coerces to "" (never NaN/undefined leaking into argv). A present title
+  // does NOT rescue it — a name is not an exact resume key.
+  expect(resumeTarget(fixtureJob({ job_id: "", title: null }))).toBe("");
+  expect(resumeTarget(fixtureJob({ job_id: "", title: "has-name" }))).toBe("");
+});
+
+test("buildResumeCommand emits cd + claude --resume with a quoted UUID target", () => {
+  const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
+  const cmd = buildResumeCommand("/Users/mike/code/keeper", uuid, null);
   expect(cmd).toBe(
-    'cd /Users/mike/code/keeper && claude --resume "fn-677.1" --x-no-confirm',
+    `cd /Users/mike/code/keeper && claude --resume "${uuid}" --x-no-confirm`,
   );
 });
 

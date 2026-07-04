@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Identify deleter, teardown, clear rows",
-  "updated_at": "2026-07-03T19:05:20.715000Z"
+  "updated_at": "2026-07-03T20:44:13.889000Z",
+  "worker_done_at": "2026-07-03T20:44:13.889000Z"
 }

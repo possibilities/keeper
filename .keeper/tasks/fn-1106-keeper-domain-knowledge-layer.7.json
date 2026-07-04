@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-03T20:34:50.558000Z",
+  "depends_on": [
+    "fn-1106-keeper-domain-knowledge-layer.1",
+    "fn-1106-keeper-domain-knowledge-layer.6"
+  ],
+  "epic": "fn-1106-keeper-domain-knowledge-layer",
+  "id": "fn-1106-keeper-domain-knowledge-layer.7",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Bootstrap keeper domain docs",
+  "updated_at": "2026-07-03T20:34:50.558000Z"
+}

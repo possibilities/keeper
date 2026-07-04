@@ -7,10 +7,10 @@ import {
   buildKillSessionArgs,
   buildListPanesArgs,
   buildListSessionsArgs,
-  buildRestoreAgentsArgv,
   buildSelectLayoutArgs,
   buildSelectPaneArgs,
   buildSetMainPaneWidthArgs,
+  buildTabsRestoreArgv,
   buildWorkNewSessionArgs,
   dashPaneArgv,
   dashTmux,
@@ -21,7 +21,9 @@ import {
   isBusyCommand,
   main,
   parseBusyPanes,
+  type RestoreOffer,
   renderBusyTable,
+  renderRestoreOutcome,
   resolveDashSize,
   type SyncSpawnFn,
   type SyncSpawnResult,
@@ -607,22 +609,124 @@ describe("main() --kill-sessions busy-pane gate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildRestoreAgentsArgv — the subprocess invocation contract. setup-tmux owns
-// no ExecBackend; it spawns this exact argv (the subprocess owns ExecBackend).
+// buildTabsRestoreArgv — the subprocess invocation contract. setup-tmux owns no
+// ExecBackend; it spawns `keeper tabs restore --apply` (the subprocess owns
+// ExecBackend). --allow-empty makes the count/apply race a benign restored-0.
 // ---------------------------------------------------------------------------
 
-describe("buildRestoreAgentsArgv", () => {
-  test("spawns restore-agents --apply --session <name> --last-generation per session", () => {
-    const session = "work";
-    const argv = buildRestoreAgentsArgv(session);
-    expect(argv[0]).toBe("bun");
-    expect(argv[1]).toBe(`${KEEPER_DIR}/scripts/restore-agents.ts`);
-    expect(argv.slice(2)).toEqual([
+describe("buildTabsRestoreArgv", () => {
+  test("spawns keeper tabs restore --apply --allow-empty --session <name> --generation <id>", () => {
+    expect(buildTabsRestoreArgv("work", "12345")).toEqual([
+      "keeper",
+      "tabs",
+      "restore",
       "--apply",
+      "--allow-empty",
       "--session",
-      session,
-      "--last-generation",
+      "work",
+      "--generation",
+      "12345",
     ]);
+  });
+
+  test("null/empty generation ⇒ no --generation flag (child auto-picks on the fallback)", () => {
+    expect(buildTabsRestoreArgv("work", null)).toEqual([
+      "keeper",
+      "tabs",
+      "restore",
+      "--apply",
+      "--allow-empty",
+      "--session",
+      "work",
+    ]);
+    expect(buildTabsRestoreArgv("work", "")).not.toContain("--generation");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderRestoreOutcome — the ONE authoritative outcome line per session.
+// ---------------------------------------------------------------------------
+
+const okResult = (stdout: string): SyncSpawnResult => ({
+  exitCode: 0,
+  stdout: Buffer.from(stdout),
+  stderr: Buffer.from(""),
+});
+const failResult = (
+  exitCode: number | null,
+  stderr: string,
+): SyncSpawnResult => ({
+  exitCode,
+  stdout: Buffer.from(""),
+  stderr: Buffer.from(stderr),
+});
+
+describe("renderRestoreOutcome", () => {
+  const offer: RestoreOffer = {
+    count: 3,
+    generationId: "999",
+    generationLastTs: 1000,
+    generationMaxPanes: 9,
+  };
+
+  test("exit 0 ⇒ success line with restored count (parsed) + generation context", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      okResult("# summary: restored=3 failed=0\n"),
+      1000 + 120,
+    );
+    expect(line).toBe(
+      "keeper setup-tmux: 'work' restored 3 agent(s) from generation 999 (2m ago)",
+    );
+  });
+
+  test("exit 0 with restored=0 (candidate went live between offer and apply) ⇒ benign, not a failure", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      okResult("# summary: restored=0 failed=0\n"),
+      1000,
+    );
+    expect(line).toContain("restored 0 agent(s)");
+    expect(line).not.toContain("FAILED");
+  });
+
+  test("non-zero exit ⇒ FAILED line carrying the verbatim child stderr (autopilot-gate refusal)", () => {
+    const gateRefusal =
+      "keeper tabs: autopilot is UNPAUSED — refusing to --apply ...";
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      failResult(1, gateRefusal),
+    );
+    expect(line).toBe(
+      `keeper setup-tmux: 'work' restore FAILED (exit 1): ${gateRefusal}`,
+    );
+  });
+
+  test("signal kill (exitCode null) ⇒ FAILED (exit signal)", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      failResult(null, "killed"),
+    );
+    expect(line).toContain("restore FAILED (exit signal): killed");
+  });
+
+  test("no picked generation (fallback offer) ⇒ success line without generation context", () => {
+    const fallbackOffer: RestoreOffer = {
+      count: 2,
+      generationId: null,
+      generationLastTs: null,
+      generationMaxPanes: null,
+    };
+    const line = renderRestoreOutcome(
+      "work",
+      fallbackOffer,
+      okResult("# summary: restored=2 failed=0\n"),
+    );
+    expect(line).toBe("keeper setup-tmux: 'work' restored 2 agent(s)");
   });
 });
 
@@ -632,27 +736,42 @@ describe("buildRestoreAgentsArgv", () => {
 // new generation) and fire ONLY when `work` is absent AND count>0 AND TTY.
 // ---------------------------------------------------------------------------
 
-/** True iff `calls` contains the exact restore-agents argv for `session`. */
-const spawnedRestoreFor = (calls: string[][], session: string): boolean => {
-  const want = buildRestoreAgentsArgv(session);
-  return calls.some(
-    (c) => c.length === want.length && c.every((tok, i) => tok === want[i]),
+/** True iff `calls` contains a `keeper tabs restore --apply` spawn for `session`
+ *  (the `--generation` suffix is offer-dependent, so it is ignored here). */
+const spawnedRestoreFor = (calls: string[][], session: string): boolean =>
+  calls.some(
+    (c) =>
+      c[0] === "keeper" &&
+      c[1] === "tabs" &&
+      c[2] === "restore" &&
+      c.includes("--apply") &&
+      c[c.indexOf("--session") + 1] === session,
   );
-};
-/** True iff ANY restore-agents argv (any session) was spawned. */
+/** True iff ANY `keeper tabs restore` argv (work) was spawned. */
 const spawnedAnyRestore = (calls: string[][]): boolean =>
   ["work"].some((s) => spawnedRestoreFor(calls, s));
+
+/** Build a per-session offer with picked-generation context (id/age/panes). */
+const offerFor = (count: number): RestoreOffer => ({
+  count,
+  generationId: "777",
+  generationLastTs: 1000,
+  generationMaxPanes: 9,
+});
 
 /**
  * Spawn stub for the offer path: `has-session` returns the per-session exit from
  * `presentExits` (key = session name; default ABSENT/exit 1), so each work
- * session's presence is controllable independently of the others. Every other
- * spawn succeeds, with new-session/split-window emitting a pane id so
- * rebuildDash completes. Records into `calls`.
+ * session's presence is controllable independently of the others. The
+ * `keeper tabs restore` spawn returns `restoreResult` (default exit 0 with a
+ * `restored=<count>` summary). Every other spawn succeeds, with
+ * new-session/split-window emitting a pane id so rebuildDash completes. Records
+ * into `calls`.
  */
 function makeOfferStub(
   presentExits: Record<string, number>,
   calls: string[][],
+  restoreResult?: SyncSpawnResult,
 ): SyncSpawnFn {
   return (cmd): SyncSpawnResult => {
     calls.push([...cmd]);
@@ -664,6 +783,15 @@ function makeOfferStub(
         stderr: Buffer.from(""),
       };
     }
+    if (cmd[0] === "keeper" && cmd[1] === "tabs" && cmd[2] === "restore") {
+      return (
+        restoreResult ?? {
+          exitCode: 0,
+          stdout: Buffer.from("# summary: restored=1 failed=0\n"),
+          stderr: Buffer.from(""),
+        }
+      );
+    }
     const out =
       cmd[1] === "new-session" ? "%0" : cmd[1] === "split-window" ? "%1" : "";
     return {
@@ -674,19 +802,21 @@ function makeOfferStub(
   };
 }
 
-/** Run main() with stdin/stdout TTY pinned and a fake EOF/typed stdin, then
- *  restore every patched global. `answer` of "" ⇒ EOF (confirm → false).
- *  `counts` is the injected per-session candidate-count map. */
+/** Run main() with stdin/stdout TTY pinned and a fake EOF/typed stdin, capturing
+ *  every stdout write. `answer` of "" ⇒ EOF (confirm → false). `offers` is the
+ *  injected per-session restore-offer map. Returns the captured stdout writes so
+ *  a test can assert the prompt + outcome lines. */
 async function runWithTTY(opts: {
   spawn: SyncSpawnFn;
-  counts: Record<string, number>;
+  offers: Record<string, RestoreOffer>;
   tty: boolean;
   answer: string;
-}): Promise<void> {
+}): Promise<string[]> {
   const savedStdin = process.stdin;
   const savedStdinTTY = process.stdin.isTTY;
   const savedStdoutTTY = process.stdout.isTTY;
   const savedOut = process.stdout.write;
+  const writes: string[] = [];
 
   const { Readable } = await import("node:stream");
   // A line of input resolves rl.question; [] (EOF) resolves via "close".
@@ -705,10 +835,13 @@ async function runWithTTY(opts: {
     value: opts.tty,
     configurable: true,
   });
-  process.stdout.write = (() => true) as typeof process.stdout.write;
+  process.stdout.write = ((s: string | Uint8Array) => {
+    writes.push(String(s));
+    return true;
+  }) as typeof process.stdout.write;
 
   try {
-    await main([], opts.spawn, () => opts.counts);
+    await main([], opts.spawn, () => opts.offers);
   } finally {
     Object.defineProperty(process, "stdin", {
       value: savedStdin,
@@ -724,25 +857,33 @@ async function runWithTTY(opts: {
     });
     process.stdout.write = savedOut;
   }
+  return writes;
 }
 
 describe("main() restore-last-session offer", () => {
-  test("work absent + count>0 + TTY + y ⇒ spawns restore-agents for work", async () => {
+  test("work absent + count>0 + TTY + y ⇒ spawns keeper tabs restore for work, synchronously", async () => {
     const calls: string[][] = [];
     // work absent (has-session exits 1, the default).
     const spawn = makeOfferStub({}, calls);
-    await runWithTTY({
+    const writes = await runWithTTY({
       spawn,
-      counts: { work: 2 },
+      offers: { work: offerFor(2) },
       tty: true,
       answer: "y",
     });
 
-    // The offered session spawns its restore-agents argv.
+    // The offered session spawns its keeper-tabs restore argv, --generation
+    // carrying the offer's picked generation (same selection the offer read).
     expect(spawnedRestoreFor(calls, "work")).toBe(true);
+    const restoreCall = calls.find(
+      (c) => c[0] === "keeper" && c[1] === "tabs" && c[2] === "restore",
+    );
+    expect(restoreCall?.[restoreCall.indexOf("--generation") + 1]).toBe("777");
+    // The outcome line printed synchronously (nothing fire-and-forget).
+    expect(writes.some((w) => w.includes("'work' restored"))).toBe(true);
     // Ordering: the has-session absence probe precedes the first
     // session-creating call (dash new-session), so the kill-anchored generation
-    // window isn't shifted before the counts/probes are read.
+    // window isn't shifted before the offer/probes are read.
     const newSessionIdx = calls.findIndex((c) => c[1] === "new-session");
     expect(newSessionIdx).toBeGreaterThanOrEqual(0);
     const probeIdx = calls.findIndex(
@@ -752,13 +893,47 @@ describe("main() restore-last-session offer", () => {
     expect(newSessionIdx).toBeGreaterThan(probeIdx);
   });
 
+  test("the prompt carries the picked generation's agent count + age (skeleton recognizable)", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls);
+    const writes = await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      tty: true,
+      answer: "",
+    });
+    const prompt = writes.find((w) => w.includes("Restore last-session"));
+    expect(prompt).toBeDefined();
+    expect(prompt).toContain("work: 2 agent(s)");
+    expect(prompt).toContain("ago");
+    expect(prompt).toContain("peak 9 pane(s)");
+  });
+
+  test("non-zero child exit ⇒ outcome line marked FAILED with the child stderr", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls, {
+      exitCode: 1,
+      stdout: Buffer.from(""),
+      stderr: Buffer.from("keeper tabs: autopilot is UNPAUSED — refusing"),
+    });
+    const writes = await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      tty: true,
+      answer: "y",
+    });
+    const outcome = writes.find((w) => w.includes("'work' restore FAILED"));
+    expect(outcome).toBeDefined();
+    expect(outcome).toContain("autopilot is UNPAUSED");
+  });
+
   test("work present ⇒ no offer, no spawn", async () => {
     const calls: string[][] = [];
     const spawn = makeOfferStub({ work: 0 }, calls);
     // count>0 and TTY would otherwise prompt — presence must short-circuit.
     await runWithTTY({
       spawn,
-      counts: { work: 5 },
+      offers: { work: offerFor(5) },
       tty: true,
       answer: "y",
     });
@@ -770,7 +945,7 @@ describe("main() restore-last-session offer", () => {
     const spawn = makeOfferStub({}, calls);
     await runWithTTY({
       spawn,
-      counts: { work: 2 },
+      offers: { work: offerFor(2) },
       tty: true,
       answer: "",
     });
@@ -783,7 +958,7 @@ describe("main() restore-last-session offer", () => {
     // work absent but count 0 ⇒ not offered.
     await runWithTTY({
       spawn,
-      counts: { work: 0 },
+      offers: { work: offerFor(0) },
       tty: true,
       answer: "y",
     });
@@ -796,7 +971,7 @@ describe("main() restore-last-session offer", () => {
     // count>0 but non-TTY must skip silently (never auto-yes).
     await runWithTTY({
       spawn,
-      counts: { work: 3 },
+      offers: { work: offerFor(3) },
       tty: false,
       answer: "y",
     });
@@ -809,7 +984,7 @@ describe("main() restore-last-session offer", () => {
     const spawn = makeOfferStub({}, calls);
     await runWithTTY({
       spawn,
-      counts: { autopilot: 4 },
+      offers: { autopilot: offerFor(4) },
       tty: true,
       answer: "y",
     });

@@ -14,10 +14,19 @@
  * (pinned by the `agent-launch-handle-depgraph` hygiene test).
  */
 
+import { fileURLToPath } from "node:url";
+import {
+  HERMES_SHIM_EVENTS,
+  HERMES_SHIM_VERSION,
+} from "../../plugins/keeper/plugin/hooks/hermes-events-shim";
 import type {
   CodexTrustStatus,
   EnsureCodexDirTrustOptions,
 } from "../codex-trust";
+import type {
+  EnsureHermesShimTrustOptions,
+  HermesTrustStatus,
+} from "../hermes-trust";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_DESCRIPTORS } from "./harness";
@@ -110,9 +119,41 @@ export interface LaunchHandleDeps {
    * stub it (no real `~/.codex` write). Fail-open by contract (never throws).
    */
   ensureCodexDirTrust: (opts: EnsureCodexDirTrustOptions) => CodexTrustStatus;
+  /**
+   * Seed hermes shell-hook trust for the keeper events-shim (hermes-only, fired
+   * before the launch) so a keeper-launched hermes session fires the shim WITHOUT
+   * an interactive first-use consent prompt — the M3b live-churn channel. Injected
+   * as a seam (not a direct import) so this module keeps its "every effect via
+   * LaunchHandleDeps" DI contract and tests stub it (no real `~/.hermes` write).
+   * Fail-open by contract (never throws); a deferred/failed seed degrades hermes to
+   * presence-only, never blocks the launch.
+   */
+  ensureHermesShimTrust: (
+    opts: EnsureHermesShimTrustOptions,
+  ) => HermesTrustStatus;
   /** Wall clock (ms), sampled as the handle's `startedAtMs`. */
   now: () => number;
   writeErr: (s: string) => void;
+}
+
+/**
+ * The EXACT command hermes runs for the keeper events-shim, registered
+ * identically in `<hermes-home>/config.yaml` and its allowlist. Two tokens —
+ * `<abs bun> <abs shim path>` — so it depends on neither the shim's exec bit nor
+ * `bun` on PATH: the launcher's own bun (`launcherArgvPrefix[0]`) runs the shim
+ * resolved relative to THIS module (robust across worktrees). Assumes neither path
+ * contains a space (keeper worktree + bin paths never do); a mis-split command
+ * merely degrades hermes to presence-only, never errors.
+ */
+export function hermesShimCommand(launcherArgvPrefix: string[]): string {
+  const bun = launcherArgvPrefix[0] ?? "bun";
+  const shimPath = fileURLToPath(
+    new URL(
+      "../../plugins/keeper/plugin/hooks/hermes-events-shim.ts",
+      import.meta.url,
+    ),
+  );
+  return `${bun} ${shimPath}`;
 }
 
 /**
@@ -185,6 +226,21 @@ export function launchToResolvedHandle(
   // than the headless past. Uses the RAW env (codex reads CODEX_HOME off it).
   if (agent === "codex") {
     deps.ensureCodexDirTrust({ cwd: deps.cwd, env: deps.env });
+  }
+  // Seed hermes shell-hook trust before the launch (hermes-only; keyed on agent).
+  // The seed EDITS the persistent `<hermes-home>/config.yaml`, so it takes effect
+  // on the pane's inner `keeper agent hermes` re-exec (which exports KEEPER_JOB_ID
+  // + HERMES_ACCEPT_HOOKS) and every later hermes launch. Fail-open — the seam
+  // never throws; an unseedable trust merely lets hermes run without the shim
+  // (presence-only via the birth record). Uses the RAW env (hermes reads
+  // HERMES_HOME off it).
+  if (agent === "hermes") {
+    deps.ensureHermesShimTrust({
+      env: deps.env,
+      shimCommand: hermesShimCommand(deps.launcherArgvPrefix),
+      events: HERMES_SHIM_EVENTS,
+      version: HERMES_SHIM_VERSION,
+    });
   }
   try {
     const result = launchKeeperAgentInTmux({

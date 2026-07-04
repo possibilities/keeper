@@ -47,12 +47,12 @@
  * `job_id`. The candidate set is returned already ordered, so
  * `scripts/restore-agents.ts` is a thin presenter that never re-sorts.
  *
- * RESULT. Each candidate's `resume_target` is the latest `title` — the session
- * name keeper currently knows, read live from the jobs projection so it is never
- * a frozen name — falling back to the `job_id` for a never-named session. `label`
- * carries the same display name. Restore resumes by the LATEST name, which is why
- * deriving from the live DB (not a snapshot) is what makes a renamed session
- * restore correctly.
+ * RESULT. Each candidate's `resume_target` is the job's session UUID (`job_id`),
+ * so `claude --resume <uuid>` re-attaches to the EXACT session. `label` carries
+ * the latest `title` — the session name keeper currently knows, read live from
+ * the jobs projection so it is never a frozen name — falling back to the `job_id`
+ * for a never-named session. The title is display only; deriving from the live DB
+ * keeps that label current, but the resume key is the immutable UUID.
  *
  * PURE-ISH. The derivation reads ONLY the passed read-only `Database` handle and
  * the (injectable) `now` clock for the idle cutoff. No socket, no env, no
@@ -120,12 +120,15 @@ interface KilledJobRow {
 }
 
 /**
- * One crash-restore candidate. `resume_target` is the latest `title` (the resume
- * key `claude --resume` targets), falling back to the `job_id` for a never-named
- * session; `label` carries the same human-readable name.
+ * One crash-restore candidate. `resume_target` is the job's session UUID
+ * (`job_id`) — the exact key `claude --resume` targets; `label` carries the
+ * human-readable name (the latest `title`, falling back to the `job_id` for a
+ * never-named session) for the render only.
  * `window_index` rides through for the ordered render's debugging/diagnostics.
  * `cwd` is the directory the restore command `cd`s into before `claude --resume`
- * (`null` when the SessionStart event never carried one).
+ * (`null` when the SessionStart event never carried one) — load-bearing, since a
+ * session UUID resolves only within the session's project dir plus its git
+ * worktrees.
  */
 export interface RestoreCandidate {
   job_id: string;
@@ -146,12 +149,22 @@ export interface RestoreSetResult {
   /**
    * A human-readable note set ONLY when {@link deriveLastGenerationSetFromTopology}
    * degraded to the retrospective {@link deriveLastGenerationSet} fallback (no
-   * dying-generation `TmuxTopologySnapshot` survived). `undefined` on the
-   * topology-anchored happy path and on the non-last-generation derivers.
+   * restorable dying-generation `TmuxTopologySnapshot` survived). `undefined` on
+   * the topology-anchored happy path and on the non-last-generation derivers.
    * Mirrors the `[paused]` banner convention so a degraded restore is VISIBLE —
    * the consumer surfaces it, never silently downgrades the restore set.
    */
   fallbackNote?: string;
+  /**
+   * Set by {@link deriveLastGenerationSetFromTopology} when the auto-picked
+   * generation (max restorable) is NOT the newest non-degenerate candidate — the
+   * bounded selection could not confidently pick one generation over another, so
+   * the consumer must escalate (a TTY picker) or refuse (a non-TTY offer). Absent
+   * on an unambiguous pick and on every non-topology deriver. Advisory: the
+   * candidates ARE the auto-pick's set; the flag only tells the consumer the pick
+   * was contested.
+   */
+  ambiguous?: boolean;
 }
 
 /** Injectable knobs (tests pin `now`/cutoff; production takes the defaults). */
@@ -165,19 +178,84 @@ export interface DeriveRestoreSetOptions {
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
 /**
- * DESC-head bound for the dying-generation snapshot scan. The dying generation
- * is the newest `TmuxTopologySnapshot` whose generation differs from `G_now`, so
- * selection stops at the first non-`G_now` row scanned newest-first — it only
- * ever reads past `G_now`'s own leading snapshots (plus any malformed rows ahead
- * of the dying generation). Retention keeps every snapshot row unconditionally
- * (`RETENTION_KEEP_CLASS_PREDICATE`), so without a bound the scan would load the
- * whole snapshot history. This LIMIT is a heuristic sized above the plausible
- * count of `G_now`-or-malformed rows stacked ahead of the dying generation; it
- * is not a proven invariant. Should that many rows ever stack ahead, the scan
- * window fills before reaching the dying generation, `selectDyingGenerationSnapshot`
- * returns `null`, and the caller demotes to the labeled `fallbackNote` restore
- * (degraded but visible) — never a silent wrong answer. */
-export const DYING_GENERATION_SCAN_LIMIT = 256;
+ * How many of the newest dead tmux-server generations enter DEFAULT restore
+ * candidacy. The bounded generation-summary walk ranks generations by recency
+ * (event rowid, never pid compared numerically) and considers only the newest
+ * `K` that are also inside {@link DEFAULT_IDLE_CUTOFF_SECS}; anything older is a
+ * manual escalation, not an auto-restore. Five is comfortably above the handful
+ * of server restarts a human keeps context across, and keeps the per-candidate
+ * snapshot decode (max pane count + the newest attributed snapshot) bounded.
+ */
+export const RECENT_GENERATION_BOUND = 5;
+
+/**
+ * A generation is DEGENERATE — a short-lived single-pane skeleton, the 1-pane
+ * restore hazard this selection exists to reject — when its peak observed pane
+ * count is `<=` this AND (never OR) its snapshot ts-span is under
+ * {@link DEGENERATE_MAX_SPAN_SECS}. The AND is load-bearing: a long-lived
+ * single-agent session is legitimate and must stay restorable, so a lone pane
+ * only reads as a skeleton when it was ALSO observed only briefly. Degenerate
+ * generations are excluded from default candidacy but remain listable.
+ */
+export const DEGENERATE_MAX_PANES = 1;
+export const DEGENERATE_MAX_SPAN_SECS = 30 * 60;
+
+/**
+ * The index-only generation-summary walk behind {@link summarizeTopologyGenerations}
+ * and the bounded selection. GROUPs the `TmuxTopologySnapshot` slice by the
+ * v107 `events.tmux_generation_id` generated column, ordered newest-first by
+ * MAX(events.id) (the recency key — rowid ORDER, never `ts`, never a numeric pid
+ * compare). Served by the partial covering index `idx_events_tmux_generation`
+ * `(tmux_generation_id, id, ts) WHERE hook_event = 'TmuxTopologySnapshot'` so the
+ * walk never SCANs the `events` heap — EXPLAIN QUERY PLAN names that index (the
+ * acceptance instrument). `tmux_generation_id IS NOT NULL` drops a malformed
+ * snapshot whose `data` failed the generated column's `json_valid` guard.
+ * Exported so a test can EXPLAIN the exact executed statement.
+ */
+export const GENERATION_SUMMARY_SQL = `SELECT tmux_generation_id AS generation_id,
+        MIN(id) AS first_event_id,
+        MAX(id) AS last_event_id,
+        COUNT(*) AS snapshot_count,
+        MIN(ts) AS first_ts,
+        MAX(ts) AS last_ts
+   FROM events
+  WHERE hook_event = 'TmuxTopologySnapshot'
+    AND tmux_generation_id IS NOT NULL
+  GROUP BY tmux_generation_id
+  ORDER BY MAX(id) DESC`;
+
+/**
+ * One dead-or-live tmux-server generation summarized for `keeper tabs list` and
+ * the bounded restore selection. The `(generation_id, first_event_id)` pair keys
+ * a generation so a reused OS pid never aliases two servers; recency is
+ * `last_event_id` (rowid ORDER). `max_pane_count` is the peak panes observed
+ * across the generation's snapshots; `degenerate` marks the short-lived
+ * single-pane skeleton; `restorable` is the post-filter candidate count on the
+ * newest snapshot that would actually be restored (0 when no snapshot in the
+ * generation yields a candidate).
+ */
+export interface GenerationSummary {
+  generation_id: string;
+  /** MIN(events.id) over the generation's snapshots — the first-seen rowid; part
+   *  of the summary key so a recycled OS pid never merges two servers downstream. */
+  first_event_id: number;
+  /** MAX(events.id) — the recency key. */
+  last_event_id: number;
+  /** Number of `TmuxTopologySnapshot` events emitted in the generation. */
+  snapshot_count: number;
+  /** MIN/MAX snapshot `events.ts` (unix seconds) — the ts-span bounds. */
+  first_ts: number;
+  last_ts: number;
+  /** Peak pane count observed across the generation's snapshots. */
+  max_pane_count: number;
+  /** True when this generation is `G_now` (the current live server). */
+  is_current: boolean;
+  /** Short-lived single-pane skeleton — excluded from default candidacy. */
+  degenerate: boolean;
+  /** Post-filter restorable candidate count on the newest snapshot that would be
+   *  restored (idempotence filters applied; 0 when no snapshot yields one). */
+  restorable: number;
+}
 
 /**
  * Total-order comparator placing candidates in original visual (left-to-right)
@@ -187,7 +265,10 @@ export const DYING_GENERATION_SCAN_LIMIT = 256;
  * presents the set as-is. Total + deterministic for legacy/partial rows: a
  * non-finite `created_at` coerces to `0` (never NaN, which poisons a sort).
  */
-function compareCandidates(a: RestoreCandidate, b: RestoreCandidate): number {
+export function compareCandidates(
+  a: RestoreCandidate,
+  b: RestoreCandidate,
+): number {
   const ai = a.window_index;
   const bi = b.window_index;
   const aKnown = typeof ai === "number" && Number.isFinite(ai);
@@ -402,7 +483,7 @@ function collectCrashCandidates(
     collected.push({
       candidate: {
         job_id: jobId,
-        resume_target: label,
+        resume_target: jobId,
         label,
         window_index:
           typeof row.window_index === "number" &&
@@ -464,7 +545,7 @@ function collectCrashCandidates(
  *
  * Empty candidate set ⇒ empty result. Reads only `events` + `jobs` off the
  * passed read-only connection (daemon-down OK); reuses {@link RestoreCandidate}
- * and {@link compareCandidates} verbatim (resume_target = latest name).
+ * and {@link compareCandidates} verbatim (resume_target = session UUID).
  */
 export function deriveLastGenerationSet(
   db: Database,
@@ -570,68 +651,346 @@ interface TopologyJobRow {
 
 /**
  * PRIMARY last-generation crash-restore deriver — derives the restore set from
- * POSITIVE pre-crash evidence: the DYING generation's last `TmuxTopologySnapshot`
- * event, written BEFORE the crash and so immune to the server-restart race that
- * defeats the retrospective `close_kind`/killed-cohort model (epic fn-955).
+ * POSITIVE pre-crash evidence: a DYING generation's `TmuxTopologySnapshot`
+ * events, written BEFORE the crash and so immune to the server-restart race that
+ * defeats the retrospective `close_kind`/killed-cohort model (epic fn-955). The
+ * selection is RECENCY-BOUNDED and RICHNESS-RANKED over per-generation topology
+ * summaries — NOT "single newest non-current generation" (the defect that
+ * restored a 1-pane skeleton over a 9-pane session).
  *
  * SELECTION. Probe `G_now` (the current server pid) in the CONSUMER and pass it
- * as `currentGenerationId`. Scan `events` for `TmuxTopologySnapshot` rows ORDER
- * BY id DESC and take the newest whose decoded `generation_id != G_now` — that
- * is the dying generation (boot ordering posts the dead-gen snapshot with a LOWER
- * rowid than the new server's first post, so the `!= G_now` scan, NOT a
- * `BackendExecStart`-id anchor, is what isolates it). `G_now == null` (no server
- * up) ⇒ the newest snapshot overall is the dying generation. A MALFORMED newest
- * snapshot (un-decodable payload) is SKIPPED to the next-newest `!= G_now`, never
- * dropped straight to the fallback. Only the SINGLE newest non-`G_now`
- * generation is used — older crashes are manual escalation.
+ * as `currentGenerationId`. {@link summarizeTopologyGenerations} ranks every
+ * generation by recency (event rowid). Candidates are the newest
+ * {@link RECENT_GENERATION_BOUND} DEAD (`generation_id != G_now`) generations
+ * whose newest snapshot ts is inside the idle cutoff. A DEGENERATE generation (a
+ * short-lived single-pane skeleton — see {@link DEGENERATE_MAX_PANES}) is
+ * excluded from candidacy but stays listable. The AUTO-PICK is the candidate
+ * with the most restorable agents, recency as tiebreak; when that pick is NOT
+ * also the newest non-degenerate candidate the result is flagged
+ * {@link RestoreSetResult.ambiguous} so the consumer escalates (a TTY picker) or
+ * refuses (a non-TTY offer). `G_now == null` (no server up) ⇒ every generation
+ * is dead and the richest recent one wins.
  *
- * CANDIDATES. Each surviving snapshot pane resolves a keeper `job_id` from the
- * EVENT PAYLOAD (`pane.job_id`), with the `(generation_id, pane_id)` projection
- * join as the per-pane fallback when the payload carries none. The job's row
- * supplies the latest name (`title`, `job_id` fallback) for `resume_target` /
- * `label`, its `cwd`, and `created_at`. The pane's `session_name` is the restore
- * location (`backend_exec_session_id`) and its `window_index` the visual order.
- * The {@link collectCrashCandidates} idempotence filters are reused VERBATIM:
- * require backend coords, exclude `plan_verb='work'` (reconciler-managed), and
- * exclude any `job_id` already occupying a LIVE backend (the double-spawn guard).
- * Candidates sort by {@link compareCandidates} (window_index ascending).
+ * CANDIDATES. Within the picked generation the restore set is built from its
+ * newest ATTRIBUTED snapshot — the newest snapshot that yields at least one
+ * candidate — stepping back past the unattributed (zero-job_id) half of the
+ * emission pair. Each pane resolves a keeper `job_id` from the EVENT PAYLOAD
+ * (`pane.job_id`), with the `(generation_id, pane_id)` projection join as the
+ * per-pane fallback when the payload carries none. The job's row supplies the
+ * display `label` (latest `title`, `job_id` fallback), its `cwd`, and
+ * `created_at`; `resume_target` is the session UUID (`job_id`). The pane's
+ * `session_name` is the restore location and
+ * its `window_index` the visual order. The idempotence filters are reused
+ * VERBATIM: require backend coords, exclude `plan_verb='work'`
+ * (reconciler-managed), and exclude any `job_id` already occupying a LIVE
+ * backend (the double-spawn guard). Candidates sort by {@link compareCandidates}.
  *
- * FALLBACK. No non-`G_now` snapshot survives (none recorded, or every candidate
- * snapshot is malformed) ⇒ delegate to {@link deriveLastGenerationSet} (the
+ * FALLBACK. No candidate generation at all, OR every candidate is degenerate, OR
+ * zero restorable everywhere ⇒ delegate to {@link deriveLastGenerationSet} (the
  * retrospective killed-cohort model) and set `fallbackNote` so the consumer
- * surfaces a VISIBLE degraded-restore banner. A snapshot that decodes but yields
- * zero post-filter candidates is NOT the fallback — it is a genuine "the dying
- * generation had nothing to restore" answer.
+ * surfaces a VISIBLE degraded-restore banner (never a silent downgrade).
  *
- * PURE relative to the read-only `db` + injected `currentGenerationId` — no
+ * PURE relative to the read-only `db` + injected `currentGenerationId`/`now` — no
  * probe, no env, no wall-clock outside the injected `now`. Reads only `events` +
  * `jobs` (daemon-down OK). Never throws on data: a malformed snapshot decodes to
- * a skip, a missing job row drops the pane.
+ * a skip, a missing job row drops the pane. Signature-stable: existing consumers
+ * read `candidates`/`fallbackNote` unchanged and gain the richer selection.
  */
 export function deriveLastGenerationSetFromTopology(
   db: Database,
   options: DeriveFromTopologyOptions,
 ): RestoreSetResult {
-  const dying = selectDyingGenerationSnapshot(db, options.currentGenerationId);
-  if (dying === null) {
-    // No surviving non-`G_now` snapshot — degrade to the retrospective model and
-    // LABEL it so the degraded restore is visible (never a silent downgrade).
+  const now = options.now ?? Date.now() / 1000;
+  const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
+  const idleBefore = now - idleCutoffSecs;
+
+  const enriched = loadEnrichedGenerations(db, options.currentGenerationId);
+
+  // Candidate generations: DEAD (not the current server), newest snapshot inside
+  // the idle cutoff, bounded to the newest K (the summaries are already ranked
+  // newest-first, so `slice` takes the K most recent).
+  const candidateGens = enriched
+    .filter((e) => !e.summary.is_current)
+    .filter((e) => e.summary.last_ts >= idleBefore)
+    .slice(0, RECENT_GENERATION_BOUND);
+
+  // Eligible for auto-pick: non-degenerate AND at least one restorable agent.
+  const eligible = candidateGens.filter(
+    (e) => !e.summary.degenerate && e.summary.restorable > 0,
+  );
+  if (eligible.length === 0) {
+    // No candidate generation at all, all-degenerate, or zero restorable
+    // everywhere — degrade to the retrospective model and LABEL it (visible).
     const fallback = deriveLastGenerationSet(db, options);
     return {
       ...fallback,
       fallbackNote:
-        "no dying-generation topology snapshot — using the retrospective killed-cohort fallback (restore set may be approximate)",
+        "no restorable dying-generation topology — using the retrospective killed-cohort fallback (restore set may be approximate)",
     };
   }
 
+  // Auto-pick: MAX restorable, recency (highest last_event_id) as the tiebreak.
+  const pick = eligible.reduce((best, e) =>
+    e.summary.restorable > best.summary.restorable ||
+    (e.summary.restorable === best.summary.restorable &&
+      e.summary.last_event_id > best.summary.last_event_id)
+      ? e
+      : best,
+  );
+  // The newest eligible generation by recency. When the auto-pick is a DIFFERENT
+  // generation than this, the richest set was not the freshest — an ambiguous
+  // choice the consumer must resolve (picker) or refuse (non-TTY).
+  const newestEligible = eligible.reduce((a, b) =>
+    b.summary.last_event_id > a.summary.last_event_id ? b : a,
+  );
+  const ambiguous =
+    pick.summary.generation_id !== newestEligible.summary.generation_id ||
+    pick.summary.first_event_id !== newestEligible.summary.first_event_id;
+
+  // The topology path has no idle-cutoff concept for the panes themselves (they
+  // were all live at crash time); excludedIdleCount is 0 on this path.
+  return {
+    candidates: pick.candidates,
+    excludedIdleCount: 0,
+    ...(ambiguous ? { ambiguous: true } : {}),
+  };
+}
+
+/**
+ * The per-generation summaries `keeper tabs list` renders — every observed tmux
+ * generation ranked newest-first (event rowid), each enriched with its peak pane
+ * count, degenerate flag, current-server flag, and restorable count. Reads only
+ * `events` + `jobs` off the read-only connection (daemon-down OK); never throws
+ * on data. The SAME enrichment feeds {@link deriveLastGenerationSetFromTopology}'s
+ * bounded auto-pick, so the list a human sees and the set restore would offer
+ * are computed identically.
+ */
+export function summarizeTopologyGenerations(
+  db: Database,
+  options: DeriveFromTopologyOptions,
+): GenerationSummary[] {
+  return loadEnrichedGenerations(db, options.currentGenerationId).map(
+    (e) => e.summary,
+  );
+}
+
+/**
+ * Public read: every observed tmux generation enriched with the restore
+ * candidates its newest attributed snapshot yields (summary + candidates),
+ * newest-first. The SAME enrichment {@link summarizeTopologyGenerations} and
+ * {@link deriveLastGenerationSetFromTopology} read — exposed WHOLE so a consumer
+ * can target ONE generation off the same read the list view uses (the
+ * `keeper tabs restore` numbered picker and its `--generation <id>` flag both
+ * resolve a specific generation's candidates from this list). Reads only
+ * `events` + `jobs` off the read-only connection (daemon-down OK); never throws.
+ */
+export function enrichedTopologyGenerations(
+  db: Database,
+  options: DeriveFromTopologyOptions,
+): EnrichedGeneration[] {
+  return loadEnrichedGenerations(db, options.currentGenerationId);
+}
+
+/**
+ * A generation summary paired with the restore candidates its newest attributed
+ * snapshot yields — the shared enrichment behind the list view and the auto-pick.
+ */
+export interface EnrichedGeneration {
+  summary: GenerationSummary;
+  candidates: RestoreCandidate[];
+}
+
+/**
+ * Run the index-only generation-summary walk, then enrich each generation by
+ * decoding its snapshots: peak pane count, degeneracy, current-server flag, and
+ * the restore candidates from its newest attributed snapshot. Ordered
+ * newest-first (the walk's `ORDER BY MAX(id) DESC`). `liveJobIds` is read ONCE
+ * and shared across every generation's candidate build.
+ */
+function loadEnrichedGenerations(
+  db: Database,
+  currentGenerationId: string | null,
+): EnrichedGeneration[] {
+  const raws = summarizeGenerationsIndexOnly(db);
+  if (raws.length === 0) {
+    return [];
+  }
   const { liveJobIds } = loadRows(db);
+  return raws.map((raw) =>
+    enrichGeneration(db, raw, currentGenerationId, liveJobIds),
+  );
+}
+
+/** Raw (pre-enrichment) generation summary straight off {@link GENERATION_SUMMARY_SQL}. */
+interface RawGenerationSummary {
+  generation_id: string;
+  first_event_id: number;
+  last_event_id: number;
+  snapshot_count: number;
+  first_ts: number;
+  last_ts: number;
+}
+
+/**
+ * The index-only GROUP BY walk ({@link GENERATION_SUMMARY_SQL}) decoded into
+ * {@link RawGenerationSummary}s, ordered newest-first. Coerces each numeric field
+ * defensively (a non-finite value sinks to 0) and drops a row with an empty
+ * generation_id. Reads only the read-only `events` table; never throws.
+ */
+function summarizeGenerationsIndexOnly(db: Database): RawGenerationSummary[] {
+  let rows: {
+    generation_id: string | null;
+    first_event_id: number | null;
+    last_event_id: number | null;
+    snapshot_count: number | null;
+    first_ts: number | null;
+    last_ts: number | null;
+  }[];
+  try {
+    rows = db.query(GENERATION_SUMMARY_SQL).all() as typeof rows;
+  } catch {
+    return [];
+  }
+  const out: RawGenerationSummary[] = [];
+  for (const r of rows) {
+    const generationId = seg(r.generation_id);
+    if (generationId === "") {
+      continue;
+    }
+    const num = (v: number | null): number =>
+      typeof v === "number" && Number.isFinite(v) ? v : 0;
+    out.push({
+      generation_id: generationId,
+      first_event_id: num(r.first_event_id),
+      last_event_id: num(r.last_event_id),
+      snapshot_count: num(r.snapshot_count),
+      first_ts: num(r.first_ts),
+      last_ts: num(r.last_ts),
+    });
+  }
+  return out;
+}
+
+/**
+ * Enrich one generation: decode its snapshots newest-first to find the peak pane
+ * count (degeneracy input) and the newest ATTRIBUTED snapshot — the newest that
+ * yields at least one candidate, stepping back past the unattributed half of the
+ * emission pair. `restorable` is that snapshot's post-filter candidate count (0
+ * when none yields). Degenerate ⇔ peak panes `<=` {@link DEGENERATE_MAX_PANES}
+ * AND ts-span `<` {@link DEGENERATE_MAX_SPAN_SECS} (AND, never OR — a long-lived
+ * single-agent session stays legitimate).
+ */
+function enrichGeneration(
+  db: Database,
+  raw: RawGenerationSummary,
+  currentGenerationId: string | null,
+  liveJobIds: Set<string>,
+): EnrichedGeneration {
+  const snapshots = readGenerationSnapshotsDesc(db, raw.generation_id);
+  let maxPaneCount = 0;
+  let candidates: RestoreCandidate[] = [];
+  for (const snap of snapshots) {
+    if (snap.panes.length > maxPaneCount) {
+      maxPaneCount = snap.panes.length;
+    }
+    // First (newest, DESC order) snapshot that yields candidates is the newest
+    // attributed one; keep scanning the rest only to finish the pane-count max.
+    if (candidates.length === 0) {
+      const built = buildCandidatesFromSnapshot(
+        db,
+        raw.generation_id,
+        snap.panes,
+        liveJobIds,
+      );
+      if (built.length > 0) {
+        candidates = built;
+      }
+    }
+  }
+
+  const spanSecs = raw.last_ts - raw.first_ts;
+  const degenerate =
+    maxPaneCount <= DEGENERATE_MAX_PANES && spanSecs < DEGENERATE_MAX_SPAN_SECS;
+
+  return {
+    summary: {
+      generation_id: raw.generation_id,
+      first_event_id: raw.first_event_id,
+      last_event_id: raw.last_event_id,
+      snapshot_count: raw.snapshot_count,
+      first_ts: raw.first_ts,
+      last_ts: raw.last_ts,
+      max_pane_count: maxPaneCount,
+      is_current:
+        currentGenerationId !== null &&
+        raw.generation_id === currentGenerationId,
+      degenerate,
+      restorable: candidates.length,
+    },
+    candidates,
+  };
+}
+
+/**
+ * Read + decode one generation's `TmuxTopologySnapshot` events newest-first via
+ * the v107 `idx_events_tmux_generation` index (`tmux_generation_id = ?` seek,
+ * `ORDER BY id DESC`). A malformed snapshot decodes to `null` and is dropped.
+ * Reads only the read-only `events` table; never throws.
+ */
+function readGenerationSnapshotsDesc(
+  db: Database,
+  generationId: string,
+): { id: number; panes: TmuxTopologyPaneLike[] }[] {
+  let rows: { id: number; data: string | null }[];
+  try {
+    rows = db
+      .query(
+        `SELECT id, data FROM events
+          WHERE hook_event = 'TmuxTopologySnapshot'
+            AND tmux_generation_id = ?
+          ORDER BY id DESC`,
+      )
+      .all(generationId) as { id: number; data: string | null }[];
+  } catch {
+    return [];
+  }
+  const out: { id: number; panes: TmuxTopologyPaneLike[] }[] = [];
+  for (const row of rows) {
+    let snapshot: ReturnType<typeof extractTmuxTopologySnapshot>;
+    try {
+      snapshot = extractTmuxTopologySnapshot({
+        id: row.id,
+        data: row.data,
+      } as Parameters<typeof extractTmuxTopologySnapshot>[0]);
+    } catch {
+      snapshot = null;
+    }
+    if (snapshot !== null) {
+      out.push({ id: row.id, panes: snapshot.panes });
+    }
+  }
+  return out;
+}
+
+/**
+ * Build the restore candidates from one decoded snapshot's panes: resolve each
+ * pane's `job_id` (payload, then the `(generation_id, pane_id)` projection join),
+ * apply the idempotence filters VERBATIM (backend coords required,
+ * `plan_verb='work'` excluded, live-UUID excluded), and sort by
+ * {@link compareCandidates}. Returns `[]` when no pane yields a candidate — the
+ * signal {@link enrichGeneration} uses to step back to the attributed sibling.
+ */
+function buildCandidatesFromSnapshot(
+  db: Database,
+  generationId: string,
+  panes: TmuxTopologyPaneLike[],
+  liveJobIds: Set<string>,
+): RestoreCandidate[] {
   const candidates: RestoreCandidate[] = [];
   const seen = new Set<string>();
-  for (const pane of dying.panes) {
+  for (const pane of panes) {
     const jobId =
-      pane.job_id ??
-      resolvePaneJobId(db, dying.generation_id, pane.pane_id) ??
-      null;
+      pane.job_id ?? resolvePaneJobId(db, generationId, pane.pane_id) ?? null;
     if (jobId === null || jobId === "" || seen.has(jobId)) {
       continue; // unowned pane (never launched / no job row), or a dup pane.
     }
@@ -661,7 +1020,7 @@ export function deriveLastGenerationSetFromTopology(
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: label,
+      resume_target: jobId,
       label,
       window_index:
         typeof pane.window_index === "number" &&
@@ -673,69 +1032,8 @@ export function deriveLastGenerationSetFromTopology(
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
     });
   }
-
   candidates.sort(compareCandidates);
-  // The topology path has no idle-cutoff concept (the snapshot panes were all
-  // live at crash time); excludedIdleCount is 0 on this path.
-  return { candidates, excludedIdleCount: 0 };
-}
-
-/**
- * The decoded dying-generation snapshot {@link deriveLastGenerationSetFromTopology}
- * builds candidates from: the newest `TmuxTopologySnapshot` whose `generation_id`
- * differs from `currentGenerationId` (`G_now`). `null` ⇒ no surviving non-`G_now`
- * snapshot at all (the deriver falls back). A malformed newest snapshot is
- * SKIPPED to the next-newest `!= G_now` — a decode failure is not a "no snapshot"
- * verdict. Reads only the read-only `events` table ORDER BY id DESC, following
- * the daemon-down `seedLastGenerationHash` template (never throws). Returns the
- * decoded `{generation_id, panes}` so callers join panes to jobs. The scan is
- * bounded to {@link DYING_GENERATION_SCAN_LIMIT} rows off the DESC head so the
- * read does not load the full retained snapshot history.
- */
-function selectDyingGenerationSnapshot(
-  db: Database,
-  currentGenerationId: string | null,
-): { generation_id: string; panes: TmuxTopologyPaneLike[] } | null {
-  let rows: { id: number; data: string | null }[];
-  try {
-    rows = db
-      .query(
-        "SELECT id, data FROM events WHERE hook_event = 'TmuxTopologySnapshot' ORDER BY id DESC LIMIT ?",
-      )
-      .all(DYING_GENERATION_SCAN_LIMIT) as {
-      id: number;
-      data: string | null;
-    }[];
-  } catch {
-    return null;
-  }
-  for (const row of rows) {
-    let snapshot: ReturnType<typeof extractTmuxTopologySnapshot>;
-    try {
-      // extractTmuxTopologySnapshot reads only event.data; shape the row into the
-      // Event-like the decoder needs (id + data + a stable ts placeholder it
-      // never reads for the payload decode).
-      snapshot = extractTmuxTopologySnapshot({
-        id: row.id,
-        data: row.data,
-      } as Parameters<typeof extractTmuxTopologySnapshot>[0]);
-    } catch {
-      snapshot = null;
-    }
-    if (snapshot === null) {
-      continue; // malformed newest ⇒ skip to the next-newest, never fall back early.
-    }
-    // The dying generation is the newest snapshot whose generation differs from
-    // G_now; G_now == null ⇒ the newest overall (no server up to exclude).
-    if (
-      currentGenerationId !== null &&
-      snapshot.generation_id === currentGenerationId
-    ) {
-      continue;
-    }
-    return { generation_id: snapshot.generation_id, panes: snapshot.panes };
-  }
-  return null;
+  return candidates;
 }
 
 /** A snapshot pane as decoded by {@link extractTmuxTopologySnapshot} — the shape
@@ -816,9 +1114,10 @@ function loadTopologyJobRow(
  * It applies no crash-membership / idle / dedup filtering — the whole point is to
  * capture the live session verbatim so the human can dump a script and re-run it
  * after a crash the automatic path can't be trusted to catch. The resume target
- * is the latest name (`title`, `job_id` fallback), same as a crash candidate, so
- * the emitted script resumes by the name keeper currently knows. Pure read off
- * the passed read-only connection; empty input returns `[]`, never throws.
+ * is the session UUID (`job_id`), same as a crash candidate, so the emitted
+ * script resumes each session EXACTLY; the display `label` keeps the latest name
+ * (`title`, `job_id` fallback). Pure read off the passed read-only connection;
+ * empty input returns `[]`, never throws.
  */
 export function deriveCurrentSet(db: Database): RestoreCandidate[] {
   const rows = db
@@ -855,7 +1154,7 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: label,
+      resume_target: jobId,
       label,
       window_index:
         typeof row.window_index === "number" &&

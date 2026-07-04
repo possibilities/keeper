@@ -54,5 +54,5 @@ rejected, model-only accepted); envelope outcomes on synthetic session fixtures.
 - [ ] Hermes appears in presets list and keeper agent usage/help output
 
 ## Done summary
-
+Added hermes as the fourth harness (M0 Named, M1 Launchable, M2 Capturable): registry descriptor (model-only, mints own session id, capturable), --yolo + HERMES_ACCEPT_HOOKS launch posture with -z one-shot delivery, and export-poll capture attributed by cwd+created-at. Presets validate model-only/hermes_default; capturable makes it panel-eligible. Live run-capture returns outcome completed.
 ## Evidence

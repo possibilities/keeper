@@ -81,6 +81,7 @@ function makeHarness(): Harness {
       await: mkHandler("await"),
       "commit-work": mkHandler("commit-work"),
       "setup-tmux": mkHandler("setup-tmux"),
+      tabs: mkHandler("tabs"),
       "session-state": mkHandler("session-state"),
       "show-session-files": mkHandler("show-session-files"),
       "search-history": mkHandler("search-history"),
@@ -238,6 +239,15 @@ describe("cli/keeper dispatch", () => {
     expect(h.calls).toEqual([{ sub: "dispatch", argv: ["work::fn-1-x.2"] }]);
   });
 
+  test("tabs is a registered two-level subcommand routed to its handler", async () => {
+    const h = makeHarness();
+    expect(isSubcommand("tabs")).toBe(true);
+    await dispatch(["tabs", "restore", "--apply"], h.deps);
+    expect(h.calls).toEqual([{ sub: "tabs", argv: ["restore", "--apply"] }]);
+    // The verb list is published for the machine-readable command index.
+    expect(SUBCOMMAND_META.tabs.verbs).toEqual(["list", "restore", "dump"]);
+  });
+
   test("--help --json emits the machine-readable command index, exit 0", async () => {
     const h = makeHarness();
     let caught: unknown;
@@ -292,6 +302,7 @@ describe("cli/keeper command index", () => {
       "agent",
       "bus",
       "autopilot",
+      "tabs",
     ] as const) {
       const verbs = byName.get(name)?.verbs;
       expect(Array.isArray(verbs)).toBe(true);
@@ -318,7 +329,9 @@ describe("cli/keeper command index", () => {
 
   test("publishes the shared exit-code taxonomy", () => {
     const index = buildHelpIndex();
-    for (const code of ["0", "1", "2", "3", "4", "5"]) {
+    // 0–5 are the common core + await-owned range; 6–8 are the tabs-restore
+    // refuse / zero-candidate / partial-failure codes.
+    for (const code of ["0", "1", "2", "3", "4", "5", "6", "7", "8"]) {
       expect(index.exit_codes[code]?.length ?? 0).toBeGreaterThan(0);
     }
   });

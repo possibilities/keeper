@@ -87,5 +87,5 @@ stays green via the same-commit api.py edit.
 - [ ] Zero-candidate and all-degenerate boards degrade to the labeled killed-cohort fallback with its visible note
 
 ## Done summary
-
+Replaced the single-newest dying-generation restore selection with a bounded, richness-ranked walk over per-generation topology summaries: adds the v107 events.tmux_generation_id VIRTUAL generated column + partial covering index (index-only GROUP BY walk), bounds candidates to the newest K dead generations inside the idle cutoff, excludes short-lived single-pane skeletons, steps back to the newest attributed snapshot, and flags ambiguity when the richest pick is not the newest non-degenerate; exports the per-generation summary shape for keeper tabs list.
 ## Evidence
