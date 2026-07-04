@@ -26,5 +26,5 @@ RECENT_GENERATION_BOUND dead). Docs-only; no behavior change.
 - [ ] `bun test` green
 
 ## Done summary
-
+Updated tabs list/restore help + TabsListPayload/loadGenerationList docs to describe the bounded decode window (current + RECENT_GENERATION_BOUND dead), and noted --generation cannot reach an id past the bound. Docs-only.
 ## Evidence
