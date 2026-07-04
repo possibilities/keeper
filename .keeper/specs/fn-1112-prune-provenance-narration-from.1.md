@@ -31,5 +31,7 @@ out of scope. Do NOT touch migration version tags or `fn-NNN:` test names.
 - [ ] `bun scripts/lint-claude-md.ts` stays green; no source behavior changes.
 
 ## Done summary
-
+Pruned fn-1107 change-history provenance narration from code comments (comment-only, zero behavior change). Fast-forwarded the lane to latest main (40cb723d), which brought in fn-1107 autoclose-worker.ts (landed at 0c15abd7). Removed: autoclose-worker.ts header (epic fn-1107) tag + the fn-1005 dead-scar-tissue parenthetical + the prior-incarnation/commit-5b844449 narration (fail-closed rationale rewritten present-tense: a retry against a since-recycled pane id can interrupt a live session); daemon.ts three (epic fn-1107) tags; reducer.ts dispatch-provenance stamp (fn-1107) tag; types.ts dispatch_origin doc-header fn-id (kept (schema v107) to match the sibling (schema v100 / fn-1024) convention). LEFT db.ts:5939 v107-to-v108 (fn-1107.1) migration version tag untouched -- explicitly out of scope (protected migration-tag convention). why-fail-closed rationale preserved throughout.
 ## Evidence
+- Commits: d976ce3e
+- Tests: fast gate 5836+76 pass / 0 fail, whole-project tsc --noEmit clean, biome check clean on the 4 changed files, bun scripts/lint-claude-md.ts green
