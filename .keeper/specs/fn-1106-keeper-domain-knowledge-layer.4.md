@@ -33,5 +33,5 @@ Wire the read tier and the worker into the domain layer, flag-only for readers, 
 - [ ] Every read-tier agent still carries its write-free tool restrictions; worker cells re-rendered and the plan suite green
 
 ## Done summary
-
+Wired the read tier and worker template into the domain-knowledge layer: docs-gap-scout flags CONTEXT.md/docs/adr with a fixed reason-class taxonomy + no-docs-sweep rule; gap-analyst challenges the glossary, quality-auditor adds two advisory Spec-axis flags, close-planner routes them verb-free; the worker canonical block consumes glossary_md and gates durable-doc writes on declared deliverables. Cells re-rendered; plan suite green.
 ## Evidence
