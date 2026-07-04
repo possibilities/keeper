@@ -181,7 +181,7 @@ keeper agent run <harness> "$(cat "$PROMPT_FILE")" --model <model> --read-only -
 ```
 
 4. On `completed`, parse `message` as raw JSON (fenced-block fallback), enum-clamp `tier` / `model` to the configured axes, and require **exactly** the task's id. One repair retry on a validation miss (fresh leg, errors appended), then degrade.
-5. Feed the valid verdict to `keeper plan assign-cells` (`label_source: selector-chosen`). On **any** failure path — config missing, `launch_failed`, `timed_out`, `no_message`, parse/schema failure after the one retry, or an `assign-cells` rejection (codes `bad_yaml` / `cell_invalid`) — call `assign-cells` with the stamped default cell, `outcome: degraded:<reason>`, and `label_source: heuristic-default` so the sidecar records the failure; if even that fails, log one line and proceed.
+5. Feed the valid verdict to `keeper plan assign-cells` (`label_source: heuristic-guided`). On **any** failure path — config missing, `launch_failed`, `timed_out`, `no_message`, parse/schema failure after the one retry, or an `assign-cells` rejection (codes `bad_yaml` / `cell_invalid`) — call `assign-cells` with the stamped default cell, `outcome: degraded:<reason>`, and `label_source: heuristic-default` so the sidecar records the failure; if even that fails, log one line and proceed.
 
 ```bash
 keeper plan assign-cells <epic_id> --file - <<'YAML_EOF'
@@ -191,7 +191,7 @@ cells:
     model: opus
     rationale: <one-line why>
     confidence: <0-1 or a label>
-    label_source: selector-chosen        # heuristic-default on a degrade
+    label_source: heuristic-guided       # heuristic-default on a degrade
 selection:
   harness: <config selector harness>
   model: <config selector model>

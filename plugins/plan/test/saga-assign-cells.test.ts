@@ -148,6 +148,13 @@ function stampOldMarker(epicId: string): void {
   );
 }
 
+/** The canonical `label_source` a real (non-degrade) runtime selection
+ * persists — the exact string the plan Phase 6.5g, defer Phase 4b, and README
+ * verb-entry callers write. A degrade stamps `heuristic-default` instead. This
+ * is the independent source of truth (the caller docs), not a value the verb
+ * derives. */
+const REAL_SELECTION_LABEL_SOURCE = "heuristic-guided";
+
 // ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
@@ -242,6 +249,41 @@ describe("assign-cells happy path", () => {
     expect(r.code).toBe(0);
     const post = readEpic(epicId).last_validated_at as string;
     expect(typeof post === "string" && post > pre).toBe(true);
+  });
+
+  test("a real runtime selection persists the canonical label_source", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    // Feed the label a real caller writes (plan/defer/README), then assert the
+    // sidecar persists exactly that canonical string — a hand-written literal
+    // matching the caller docs, not a value re-derived from the input.
+    const yaml = assignYaml([
+      {
+        taskId: taskIds[0] as string,
+        tier: "xhigh",
+        model: "opus",
+        labelSource: REAL_SELECTION_LABEL_SOURCE,
+      },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)]);
+    expect(r.code).toBe(0);
+    const cell = (readSidecar(epicId).cells as Record<string, unknown>[])[0];
+    expect(cell?.label_source).toBe("heuristic-guided");
+  });
+
+  test("a string-valued confidence round-trips opaque into the sidecar", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const yaml = assignYaml([
+      {
+        taskId: taskIds[0] as string,
+        tier: "xhigh",
+        model: "opus",
+        confidence: "high",
+      },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)]);
+    expect(r.code).toBe(0);
+    const cell = (readSidecar(epicId).cells as Record<string, unknown>[])[0];
+    expect(cell?.confidence).toBe("high");
   });
 
   test("reads the cell set from stdin (--file -)", () => {
@@ -366,6 +408,54 @@ describe("assign-cells cell_invalid", () => {
     const r = run(["assign-cells", epicId, "--file", writeInput(yaml)]);
     expect(r.code).toBe(1);
     expect(errCode(r.output)).toBe("bad_yaml");
+  });
+
+  // The selection-block guards (requireSelStr / shuffle_seed integer / verdict_raw
+  // string) — a well-formed cell set with ONE malformed selection field rejects
+  // as bad_yaml, before any membership/axis check.
+  test("a malformed selection: block rejects with bad_yaml", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const goodCell =
+      `cells:\n  - task_id: ${taskIds[0]}\n    tier: xhigh\n    model: opus\n` +
+      "    label_source: heuristic-guided\n";
+    // Each variant swaps exactly one selection field to an invalid shape.
+    const variants: [string, string][] = [
+      // empty harness — requireSelStr rejects a blank required string
+      [
+        "empty harness",
+        'selection:\n  harness: ""\n  model: opus\n' +
+          "  config_hash: c\n  input_hash: i\n  outcome: completed\n",
+      ],
+      // non-integer shuffle_seed
+      [
+        "non-integer shuffle_seed",
+        "selection:\n  harness: claude\n  model: opus\n" +
+          "  config_hash: c\n  input_hash: i\n  outcome: completed\n" +
+          "  shuffle_seed: 1.5\n",
+      ],
+      // non-string verdict_raw
+      [
+        "non-string verdict_raw",
+        "selection:\n  harness: claude\n  model: opus\n" +
+          "  config_hash: c\n  input_hash: i\n  outcome: completed\n" +
+          "  verdict_raw: 42\n",
+      ],
+    ];
+    for (const [label, selBlock] of variants) {
+      const r = run([
+        "assign-cells",
+        epicId,
+        "--file",
+        writeInput(
+          goodCell + selBlock,
+          `sel-${label.replace(/\s+/g, "-")}.yaml`,
+        ),
+      ]);
+      expect(r.code).toBe(1);
+      expect(errCode(r.output)).toBe("bad_yaml");
+      // No sidecar written on any shape rejection.
+      expect(existsSync(sidecarPath(epicId))).toBe(false);
+    }
   });
 });
 

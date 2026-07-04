@@ -617,7 +617,7 @@ On `completed`, take the envelope's `message` and parse it as raw JSON (fenced `
 - **enum-clamp** each `tier` to the configured efforts and `model` to the configured models;
 - the cell set covers **exactly the epic's todo task-id set** — no missing, extra, or duplicate id (schema validation cannot express in-epic membership, so check it explicitly).
 
-A clean verdict → apply it (6.5g, `label_source: selector-chosen`). A validation miss → one repair retry (6.5f).
+A clean verdict → apply it (6.5g, `label_source: heuristic-guided`). A validation miss → one repair retry (6.5f).
 
 ### 6.5f — One repair retry, then degrade
 
@@ -635,7 +635,7 @@ cells:
     model: <model>
     rationale: <one-line why>
     confidence: <0-1 or a label>
-    label_source: selector-chosen        # heuristic-default on a degrade
+    label_source: heuristic-guided       # heuristic-default on a degrade
   # … one cell per todo task, covering the exact set
 selection:
   harness: <config selector harness>
