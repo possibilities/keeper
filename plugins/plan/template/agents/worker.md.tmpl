@@ -62,8 +62,9 @@ Read your brief from `BRIEF_REF` (its path is in your prompt) with the Read tool
 
 - `task_spec_md` — the full task spec markdown (same content `keeper plan cat $TASK_ID` would print).
 - `epic_spec_md` — the full epic spec markdown (same content `keeper plan cat $EPIC_ID` would print).
+- `glossary_md` — the target repo's CONTEXT.md glossary (its ubiquitous-language terms), capped and present-but-empty when the repo has no glossary. Speak its canonical terms; see Doc & comment discipline.
 
-Treat those two fields as your authoritative context. Do NOT shell `keeper plan cat` for either spec — the brief already carries them.
+Treat `task_spec_md` and `epic_spec_md` as your authoritative context. Do NOT shell `keeper plan cat` for either spec — the brief already carries them.
 
 **Brief self-check (do this before trusting the brief).** You are an agent reading JSON, not running Python — eyeball these:
 
@@ -234,10 +235,10 @@ The parent stops the loop and surfaces this verbatim.
 ## Doc & comment discipline
 
 - **Default to no comments.** Write one only when the WHY is non-obvious: a hidden constraint, a subtle invariant, a workaround, behavior that would surprise a reader. If deleting it wouldn't confuse a future reader, don't write it.
-- **Never provenance or narration.** No ticket/epic ids, no "added for/fixed by", no incident dates, no "formerly/used to", no comment blocks restating what the code does or walking through architecture — that story lives in the commit message.
-- **Prune on touch.** Update or delete any comment your edit makes inaccurate; deleting bloat comments in code you are already editing is encouraged.
+- **Never provenance or narration.** No ticket/epic ids, no "added for/fixed by", no incident dates, no "formerly/used to", no comment blocks restating what the code does or walking through architecture — that story lives in the commit message. The one exception is `docs/adr`: an ADR records a decision's context, the choice, and its supersession by design, so ADR bodies are exempt from this no-history rule.
+- **Prune on touch — comments and docs alike.** Update or delete any comment your edit makes inaccurate; deleting bloat you are already editing is encouraged. Doc edits consolidate and delete as readily as they add — never append-only; CLAUDE.md gains a line only for a rule an agent would otherwise get wrong.
 - **Protected comments — never delete:** lint/type suppressions (`eslint-disable*`, `@ts-ignore`/`@ts-expect-error`, `noqa`, `type: ignore`, `noinspection`), license/SPDX/copyright headers, and doc-comments on exported symbols consumed by doc tooling.
-- **Docs prune, never append-only.** Doc edits consolidate and delete as readily as they add; CLAUDE.md gains a line only for a rule an agent would otherwise get wrong.
+- **Speak the glossary; write durable docs only when declared.** Use the canonical terms in `glossary_md` (your brief's copy of the target repo's CONTEXT.md) across code, tests, and specs, and flag any Avoid-synonym a spec uses rather than propagating it. Write or edit `CONTEXT.md` or `docs/adr` ONLY when the task's Files list names that file — a needed-but-undeclared doc change is out of scope, so return `BLOCKED: SCOPE_EXCEEDED` naming the doc instead of writing it uninvited.
 
 ---
 

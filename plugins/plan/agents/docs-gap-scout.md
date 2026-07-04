@@ -21,7 +21,7 @@ You receive:
 Probe every common doc location in one call (`-d` lists each match or stays silent):
 
 ```bash
-ls -d README* CHANGELOG* CONTRIBUTING* docs/ documentation/ website/ site/ pages/ \
+ls -d README* CHANGELOG* CONTRIBUTING* CONTEXT.md docs/ docs/adr/ documentation/ website/ site/ pages/ \
       openapi.* swagger.* api-docs/ .storybook/ stories/ DESIGN.md .stitch/DESIGN.md \
       adr/ adrs/ decisions/ architecture/ typedoc.json jsdoc.json mkdocs.yml 2>/dev/null
 ```
@@ -33,6 +33,8 @@ Build a map:
 - **API docs**: OpenAPI specs, endpoint documentation
 - **Component docs**: Storybook, component library docs
 - **Architecture**: ADRs, design docs
+- **Domain glossary**: CONTEXT.md — the repo's ubiquitous-language term definitions
+- **Decision records**: docs/adr — the sanctioned home for architectural decision history
 - **Design system**: DESIGN.md with design tokens (colors, typography, components)
 - **Changelog**: CHANGELOG.md or similar
 
@@ -47,7 +49,8 @@ Based on the REQUEST, identify which docs likely need updates. The frontend rows
 | New component | Storybook story, component docs |
 | Config change | README config section |
 | Breaking change | CHANGELOG, migration guide |
-| Architectural decision | ADR |
+| Architectural decision | docs/adr ADR |
+| New/changed domain term | CONTEXT.md glossary entry |
 | CLI change | README CLI section, --help text |
 | Design tokens/theming | DESIGN.md color, typography, component sections |
 | Architecture/internals change | README/docs/ — NOT CLAUDE.md (see CLAUDE.md scope rule below) |
@@ -85,10 +88,22 @@ grep -rn "<term>" README.md CHANGELOG.md docs/ 2>/dev/null
 - Storybook (no UI components in this change)
 - ADR (no architectural decisions)
 
+### Domain-Doc Findings (CONTEXT.md / docs/adr)
+- **CONTEXT.md** `resolved-term-missing`: the change relies on "reducer cursor" — a real domain concept absent from the glossary; add a 1-2 sentence entry.
+- **docs/adr/0007-*.md** `bloat/prune`: superseded by the new retry model but never marked; flag for a supersession note or deletion.
+
 ### Templates/Patterns to Follow
 - CHANGELOG uses keep-a-changelog format
 - ADRs follow MADR template in adr/
 ```
+
+When the target repo has a CONTEXT.md or docs/adr, treat them as first-class targets you can flag for update OR deletion. Every Domain-Doc finding names the file and carries EXACTLY ONE reason class from this fixed taxonomy:
+
+- `resolved-term-missing` — a term the change introduces or relies on is a real domain concept absent from CONTEXT.md and merits a glossary entry.
+- `glossary-conflict` — the change uses a term in a sense that contradicts its CONTEXT.md definition, or uses an Avoid-synonym the glossary rejects.
+- `adr-conflict` — the change contradicts a decision recorded in docs/adr without superseding it.
+- `adr-worthy-decision` — the change makes a hard-to-reverse decision (schema, protocol, dependency, interface) that belongs in a new ADR.
+- `bloat/prune` — a docs/adr entry is superseded-but-unmarked, or a CONTEXT.md / adr index has gone stale — flag for a supersession note, consolidation, or deletion.
 
 If no docs found or no updates needed:
 ```markdown
@@ -110,5 +125,6 @@ No documentation updates identified for this change.
 - **Prune, don't append.** When flagging a doc that already covers the area, frame the update as *revise + consolidate* — remove what the change made redundant, collapse duplicates — not "add a paragraph." Doc files that only ever grow rot into changelogs. A Likely Updates Needed entry may recommend purely pruning or deleting doc content (e.g. "delete the stale V1 section", "collapse the duplicated install steps") — a prune-only gap is a valid gap.
 - **Recorded-fixture / golden coupling.** When the change edits content that recorded fixtures, golden/snapshot files, or vendored corpora pin (README snippets baked into a corpus, snapshot-tested doc output, a vendored copy living in another repo), flag that fixture/corpus surface as a likely-update target — cross-repo coupling included. A golden that pins deliberately-changed content is a real update gap, not a test to leave stale.
 - **CLAUDE.md scope.** CLAUDE.md is for small, localized, repo-specific rules an agent would otherwise get wrong — NOT architecture, walkthroughs, schema docs, or version history. If a change adds architectural detail, route it to README/docs/ and flag at most a one-line CLAUDE.md pointer. Never flag CLAUDE.md for "document how this works." If CLAUDE.md has itself grown oversized or narrative — architecture, walkthroughs, history that does not belong — flag that bloat as its own docs gap recommending a consolidation/trim.
-- **Future-facing.** Docs describe current state, not history: no "V2 added…", no schema-migration changelogs, no inline ticket IDs. That story lives in the commit/PR.
+- **Future-facing.** Docs describe current state, not history: no "V2 added…", no schema-migration changelogs, no inline ticket IDs. That story lives in the commit/PR. Exception: `docs/adr` is the sanctioned home for decision history — an ADR's superseded-by / supersedes lineage is by design, never bloat to flag.
+- **No docs-sweep for its own sake.** Never propose a standalone CONTEXT.md / docs/adr sweep unless the doc change is itself a declared deliverable of the work OR blocks worker correctness (an ambiguous term the implementer must resolve to build). A glossary or ADR gap that no task needs is noted, not turned into a task.
 - **Return the report inline** — return the markdown report as your Task tool return value. The caller pins it in working memory.

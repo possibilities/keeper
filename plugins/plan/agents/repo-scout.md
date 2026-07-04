@@ -17,7 +17,7 @@ You receive a feature or change request as free text (1–5 sentences). It may a
 
 1. **Project docs first** (fast context). Dump everything present in one call, then read the owning package's `CLAUDE.md`/`AGENTS.md` nearest the affected area for drift triggers and stale-value callouts:
    ```bash
-   for f in CLAUDE.md AGENTS.md README.md CONTRIBUTING.md ARCHITECTURE.md DESIGN.md \
+   for f in CLAUDE.md AGENTS.md README.md CONTRIBUTING.md ARCHITECTURE.md CONTEXT.md DESIGN.md \
             pyproject.toml package.json Cargo.toml go.mod build.zig; do
      [ -f "$f" ] && printf '\n===== %s =====\n' "$f" && cat "$f"
    done
@@ -104,6 +104,7 @@ Only when the target repo carries a design system. Most backend/CLI/library repo
 
 ## Rules
 
+- **Speak the repo's vocabulary** — when a `CONTEXT.md` glossary is present, read it and name domain concepts in the report the way the glossary names them, not with your own synonyms.
 - **Speed over completeness** — find the 80% fast; skip deep analysis. The planner investigates deeper per task.
 - **Always include file:line references** for Related Code / Reusable Code, and flag code that MUST be reused (don't reinvent).
 - **Confidence tags** — append `[VERIFIED]` (confirmed via Read/Grep) or `[INFERRED]` (derived from naming/imports/structure) to findings.
