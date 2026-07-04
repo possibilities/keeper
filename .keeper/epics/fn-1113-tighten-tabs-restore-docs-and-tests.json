@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-04T16:47:08.684000Z",
   "created_at": "2026-07-04T00:46:26.464000Z",
   "created_by_close_of": "fn-1111-harden-keeper-tabs-restore-script",
   "depends_on_epics": [
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-04T00:46:52.802000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Tighten tabs restore docs and tests",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-04T00:46:52.802000Z"
+  "updated_at": "2026-07-04T16:47:08.684000Z"
 }
