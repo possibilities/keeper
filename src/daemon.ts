@@ -38,6 +38,7 @@ import type {
   DispatchFailedMessage,
   LaneMergedMessage,
   ResolverOutcome,
+  SharedWedgeDistressMessage,
   Verb,
   WorktreeRepoStatusMessage,
 } from "./autopilot-worker";
@@ -122,7 +123,9 @@ import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
   isMergeEscalationReason,
+  isSharedWedgeDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_WEDGE_DISTRESS_VERB,
 } from "./dispatch-failure-key";
 import type {
   EventsIngestWorkerData,
@@ -339,10 +342,12 @@ export function drainToCompletion(
  * `DispatchCleared` for each via `mintClear` (the caller folds + pumps). Returns the
  * count swept (0 on a healthy board). Pure but for the SELECT + the injected mint.
  *
- * EXEMPTS the crash-loop distress key: its synthetic verb is un-retryable by the
- * wire validator BY DESIGN (an operator never clears it), and main's own
- * level-triggered recovery owns dropping it — so the orphan sweep must never reap
- * this self-managed row out from under the distress signal.
+ * EXEMPTS the crash-loop distress key AND every per-repo shared-checkout-wedge
+ * distress key ({@link isSharedWedgeDistressKey}): their synthetic `daemon` verb is
+ * un-retryable by the wire validator BY DESIGN (an operator never clears them), and a
+ * level-trigger (main's boot recovery / the recover pass observing the checkout
+ * clean) owns dropping them — so the orphan sweep must never reap a self-managed
+ * distress row out from under its signal.
  */
 export function gcUnretryableDispatchFailures(
   db: Database,
@@ -361,6 +366,12 @@ export function gcUnretryableDispatchFailures(
       row.verb === CRASH_LOOP_DISTRESS_VERB &&
       row.id === CRASH_LOOP_DISTRESS_ID
     ) {
+      continue;
+    }
+    // Same exemption for a per-repo shared-checkout-wedge distress row: its
+    // synthetic `daemon` verb is un-retryable BY DESIGN, and the recover pass's
+    // level-trigger (not the operator surface) owns its only legitimate clear.
+    if (isSharedWedgeDistressKey(row.verb, row.id)) {
       continue;
     }
     mintClear(row.verb, row.id);
@@ -6261,6 +6272,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | DispatchExpiredMessage
         | WorktreeRepoStatusMessage
         | LaneMergedMessage
+        | SharedWedgeDistressMessage
         | BackstopMessage
         | undefined
       >,
@@ -6281,6 +6293,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         handleLaneMergedMint(msg.entries);
       } else if (msg.kind === "dispatch-cleared") {
         handleDispatchClearedMint(msg.payload);
+      } else if (msg.kind === "shared-wedge-distress") {
+        // Per-repo shared-checkout-wedge distress: main is the sole writer of the
+        // synthetic `daemon`-verb row. The worker's grace tracker already decided
+        // exactly-once mint / level-clear; main just executes it.
+        if (msg.action === "mint") {
+          mintSharedWedgeDistress(
+            msg.id,
+            msg.reason ?? "",
+            msg.ts ?? Date.now() / 1000,
+            msg.dir,
+          );
+        } else {
+          mintDispatchClearedEvent(SHARED_WEDGE_DISTRESS_VERB, msg.id);
+        }
       } else if (msg.kind === "dispatched-request") {
         // Durable mint-before-launch: insert the `Dispatched` event, then reply
         // `dispatched-ack{id, ok}` so the worker only `launch()`es AFTER the row
@@ -6623,6 +6649,72 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch (err) {
       console.error(
         `[keeperd] crash-loop distress mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint a PER-REPO shared-checkout-wedge distress `DispatchFailed` on the synthetic
+   * `${SHARED_WEDGE_DISTRESS_VERB}::${id}` key — the crash-loop distress shape, but
+   * per-repo (the `id` carries `shared-checkout-wedge:<repoHash>`) and carrying the
+   * wedged `dir`. The worker's grace tracker gates it to exactly-once per wedge
+   * episode; the fold UPSERTs on `(verb, id)`, so a re-mint after a restart is
+   * idempotent. `reason` starts with the shared-wedge display prefix so the pill
+   * maps; `ts` is producer-stamped for re-fold determinism. NON-FATAL on failure.
+   */
+  function mintSharedWedgeDistress(
+    id: string,
+    reason: string,
+    tsSec: number,
+    dir: string | null,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${SHARED_WEDGE_DISTRESS_VERB}::${id}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: dir,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: SHARED_WEDGE_DISTRESS_VERB,
+          id,
+          reason,
+          dir,
+          ts: tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] shared-checkout-wedge distress mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );

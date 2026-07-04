@@ -84,8 +84,11 @@ import {
 } from "./db";
 import {
   assertNever,
+  isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   routeDispatchFailure,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_REASON,
   WORKTREE_FINALIZE_ID_PREFIX,
 } from "./dispatch-failure-key";
 import {
@@ -167,8 +170,12 @@ import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 // `from "./autopilot-worker"` import (tests, daemon) keeps resolving. The snapshot
 // loader routes recover/finalize failure rows through `routeDispatchFailure`.
 export {
+  isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isWorktreeRecoverReason,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_REASON,
+  SHARED_WEDGE_DISTRESS_VERB,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
@@ -618,6 +625,27 @@ export interface ConfirmRunningDeps {
    */
   emitDispatchCleared(payload: DispatchClearedPayload): void;
   /**
+   * Mint the synthetic per-repo shared-checkout-wedge distress row (via main —
+   * workers never write the DB). Main routes it through a thin closure keyed on the
+   * synthetic `daemon` verb (the crash-loop distress idiom), so the row surfaces in
+   * `needs_human` and the boot orphan-GC exempts it. OPTIONAL — a no-op when absent
+   * (a fake-deps test never needs the escalation), so the dispatch path is
+   * byte-identical without it. Producer-stamped `ts` for re-fold determinism.
+   */
+  emitSharedWedgeDistress?(payload: {
+    id: string;
+    dir: string;
+    reason: string;
+    ts: number;
+  }): void;
+  /**
+   * Level-clear a shared-checkout-wedge distress row once its checkout recovers
+   * (via main). Reuses the SAME `mintDispatchClearedEvent` path `retry_dispatch`
+   * drives, but the ONLY caller is the recover pass's level-trigger — the distress
+   * is never operator-clearable. OPTIONAL — a no-op when absent.
+   */
+  clearSharedWedgeDistress?(payload: { id: string; dir: string }): void;
+  /**
    * Kill the tmux window holding a provably-dead slot occupant's pane, releasing the
    * wedged dispatch slot. Wired to `paneOps.killWindow`; the ONLY producer side
    * effect the slot-occupancy reclaim takes, gated behind the strict
@@ -962,6 +990,152 @@ export function createDispatchFailedGate(
     },
     noteClear(verb, id) {
       lastEmitted.delete(keyOf(verb, id));
+    },
+  };
+}
+
+/**
+ * Grace window (in producer-`ts` seconds) a shared MAIN checkout may stay
+ * mid-merge before the recover pass escalates the wedge into a visible per-repo
+ * distress row. The immediate per-epic `worktree-recover-*` reason fires the FIRST
+ * cycle regardless; the distress is the sustained-wedge layer ON TOP. ~5 minutes —
+ * long enough that a keeper-owned residue self-heals (its guarded abort fires the
+ * next cycle) and a transient lock frees inside the window, short enough that a
+ * genuine wedge (foreign residue, or an abort that keeps failing) surfaces fast.
+ * Injectable so the fast tier drives the grace-crossing without a real clock.
+ */
+export const SHARED_CHECKOUT_WEDGE_GRACE_SEC = 5 * 60;
+
+/**
+ * The `worktree-recover-*` reason prefixes that denote an UNHEALED shared-checkout
+ * mid-merge wedge — the foreign/ambiguous residue keeper never auto-aborts, the
+ * keeper-owned residue whose guarded `git merge --abort` keeps failing, and the
+ * sustained inability to take the commit-work flock to run that abort. The generic
+ * `worktree-recover-dirty-checkout` / `-conflict` reasons are DELIBERATELY excluded
+ * (a dirty tree or a genuine content conflict is not this wedge and has its own
+ * escalation). The mid-merge prefix also subsumes `worktree-recover-mid-merge-failed`
+ * (a probe that keeps throwing), itself a sustained wedge worth surfacing.
+ */
+const SHARED_CHECKOUT_WEDGE_REASON_PREFIXES = [
+  "worktree-recover-mid-merge",
+  "worktree-recover-abort-failed",
+  "worktree-recover-lock-timeout",
+] as const;
+
+/**
+ * True iff a `worktree-recover-*` reason denotes an unhealed shared-checkout
+ * mid-merge wedge (see {@link SHARED_CHECKOUT_WEDGE_REASON_PREFIXES}). Pure; a
+ * non-matching reason yields false.
+ */
+export function isSharedCheckoutWedgeReason(reason: string): boolean {
+  return SHARED_CHECKOUT_WEDGE_REASON_PREFIXES.some((p) =>
+    reason.startsWith(p),
+  );
+}
+
+/**
+ * The `dispatch_failures` id a per-repo shared-checkout-wedge distress row keys on
+ * — `shared-checkout-wedge:<repoDirHash(repoDir)>`. Reuses the base36 {@link
+ * repoDirHash} so the mint and the level-clear target the SAME row across cycles,
+ * and two checkouts on a multi-repo board get DISTINCT rows. The composite
+ * `daemon::shared-checkout-wedge:<hash>` deliberately fails the `retry_dispatch`
+ * wire validator (the synthetic `daemon` verb), so only the level-trigger clears it.
+ */
+export function sharedWedgeDistressId(repoDir: string): string {
+  return `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
+}
+
+/** A shared-checkout-wedge distress row to mint (past grace) or clear (recovered). */
+export interface SharedWedgeDistressAction {
+  id: string;
+  dir: string;
+  /** The `reason` string (mint only) — starts with {@link SHARED_WEDGE_DISTRESS_REASON}. */
+  reason?: string;
+}
+
+/** The mints + clears one {@link SharedCheckoutWedgeTracker.step} decides. */
+export interface SharedWedgeDistressDecision {
+  mint: SharedWedgeDistressAction[];
+  clear: SharedWedgeDistressAction[];
+}
+
+/**
+ * Per-repo grace tracker for the shared-checkout mid-merge wedge distress. Pure of
+ * keeper.db / IO / the wall clock — the producer `ts` (`nowSec`) is the only clock,
+ * so the fast tier drives the grace-crossing, the exactly-once mint, and the
+ * level-clear directly.
+ *
+ * Two independent layers keep the signal O(1) per wedge episode AND robust across a
+ * daemon restart:
+ *  - MINT is in-memory grace + a per-repo minted-latch: a repo wedged CONTINUOUSLY
+ *    past `graceSec` mints exactly ONCE; a per-cycle re-derivation never re-mints
+ *    (no storm). A restart empties the tracker, so a still-present wedge re-arms and
+ *    re-mints once more after the grace re-elapses — the accepted bounded burst.
+ *  - CLEAR is projection-driven (the OPEN distress rows this cycle carry, from the
+ *    snapshot): any open distress row whose repo is NOT wedged this cycle clears.
+ *    Driven off durable state, not the in-memory latch, so a row minted before a
+ *    restart still level-clears the moment the checkout recovers.
+ */
+export interface SharedCheckoutWedgeTracker {
+  step(input: {
+    /** This cycle's wedged shared checkouts: `repoDir` → the recover-wedge reason. */
+    wedged: ReadonlyMap<string, string>;
+    /** `repoDir`s that currently have an OPEN distress row (from the projection). */
+    openDistressDirs: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+/**
+ * Build a {@link SharedCheckoutWedgeTracker}. `graceSec` is injectable for the
+ * cadence test.
+ */
+export function createSharedCheckoutWedgeTracker(
+  graceSec: number = SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+): SharedCheckoutWedgeTracker {
+  // repoDir → the first cycle-ts it was seen wedged + whether we have minted the
+  // distress for THIS continuous wedge episode. In-worker memory only.
+  const firstWedged = new Map<string, { sinceSec: number; minted: boolean }>();
+  const graceMin = Math.round(graceSec / 60);
+  return {
+    step({ wedged, openDistressDirs, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: track each wedged repo's grace clock; cross the watermark once.
+      for (const [dir, reason] of wedged) {
+        let entry = firstWedged.get(dir);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstWedged.set(dir, entry);
+        }
+        if (!entry.minted && nowSec - entry.sinceSec >= graceSec) {
+          entry.minted = true;
+          decision.mint.push({
+            id: sharedWedgeDistressId(dir),
+            dir,
+            reason:
+              `${SHARED_WEDGE_DISTRESS_REASON}: ${dir} has stayed mid-merge past ` +
+              `the ${graceMin}min recovery grace — the shared checkout will not ` +
+              `self-heal and every plan-state commit there fails until it is ` +
+              `hand-resolved (git merge --abort or resolve + commit). Last recover ` +
+              `verdict: ${reason}`,
+          });
+        }
+      }
+      // Re-arm any repo no longer wedged this cycle so a future re-wedge waits the
+      // full grace again (the in-memory episode is closed).
+      for (const dir of firstWedged.keys()) {
+        if (!wedged.has(dir)) {
+          firstWedged.delete(dir);
+        }
+      }
+      // CLEAR layer: level-trigger off the durable open-distress set — any open row
+      // whose checkout is clean this cycle clears (robust across a restart).
+      for (const dir of openDistressDirs) {
+        if (!wedged.has(dir)) {
+          decision.clear.push({ id: sharedWedgeDistressId(dir), dir });
+        }
+      }
+      return decision;
     },
   };
 }
@@ -3888,6 +4062,25 @@ export interface DispatchClearedMessage {
 }
 
 /**
+ * Worker → main: mint or clear the synthetic PER-REPO shared-checkout-wedge
+ * distress row. Main is the sole writer; the worker (the grace tracker) describes
+ * the `(id, dir)` and, on a mint, the producer-stamped `reason` + `ts`. Rides its
+ * own message (not `dispatch-failed`) because the distress `verb` is the synthetic
+ * `daemon`, outside the strict `DispatchFailedPayload` union — the same reason the
+ * crash-loop distress mints through a main-side thin closure.
+ */
+export interface SharedWedgeDistressMessage {
+  kind: "shared-wedge-distress";
+  action: "mint" | "clear";
+  id: string;
+  dir: string;
+  /** Present on `mint` only — starts with the shared-wedge display prefix. */
+  reason?: string;
+  /** Present on `mint` only — the producer-stamped seconds for re-fold determinism. */
+  ts?: number;
+}
+
+/**
  * Worker → main: Dispatched mint request (id-correlated + durable-acked). Main
  * is the sole writer; the worker describes what to mint. Outbox-ordered intent —
  * posted BEFORE `launch()` so a crash between mint and the tab spawn leaves a
@@ -4027,6 +4220,11 @@ export async function loadReconcileSnapshot(
   const recoverFailureIds = new Set<string>();
   const finalizeFailureIds = new Set<string>();
   const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
+  // The `repoDir`s with an OPEN shared-checkout-wedge distress row — the level-clear
+  // set the recover pass's grace tracker clears against (a row whose checkout is
+  // clean this cycle). Off the row's `dir` so a restarted worker still clears a
+  // distress it minted before the restart.
+  const sharedWedgeDistressDirs = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
@@ -4034,6 +4232,12 @@ export async function loadReconcileSnapshot(
       failedKeys.add(dispatchKey(verb as Verb, id));
       const reason = (row as { reason?: unknown }).reason;
       const reasonStr = typeof reason === "string" ? reason : "";
+      if (isSharedWedgeDistressKey(verb, id)) {
+        const dir = (row as { dir?: unknown }).dir;
+        if (typeof dir === "string" && dir.length > 0) {
+          sharedWedgeDistressDirs.add(dir);
+        }
+      }
       // Slot-occupancy rows (`slot-reclaimed` / `slot-occupied`, on the NATURAL key)
       // feed the slot pass's level-clear. Collected off the REASON — verb-agnostic
       // (a `work` OR `close` slot row) — because the typed router short-circuits a
@@ -4263,6 +4467,7 @@ export async function loadReconcileSnapshot(
     recoverFailureIds,
     finalizeFailureIds,
     slotOccupancyFailures,
+    sharedWedgeDistressDirs,
     liveTabKeys,
     livePaneIds,
     paneCommandById,
@@ -4377,6 +4582,10 @@ function main(): void {
   // appearance + reason-change + a bounded still-stuck watermark, suppresses
   // identical re-emits; a DispatchCleared resets it. In-worker memory only.
   const dispatchFailedGate = createDispatchFailedGate();
+  // Per-repo grace tracker escalating a SHARED-checkout mid-merge wedge that
+  // outlives the recover pass's self-heal window into a visible distress row. In-
+  // worker memory only, mirroring `dispatchFailedGate` — a restart re-arms it.
+  const sharedWedgeTracker = createSharedCheckoutWedgeTracker();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -4527,6 +4736,26 @@ function main(): void {
         kind: "dispatch-cleared",
         payload,
       } satisfies DispatchClearedMessage);
+    },
+    emitSharedWedgeDistress: (payload) => {
+      // Grace-tracker already enforced exactly-once per wedge episode; main mints
+      // the synthetic `daemon`-verb row (idempotent UPSERT on the per-repo key).
+      parentPort?.postMessage({
+        kind: "shared-wedge-distress",
+        action: "mint",
+        id: payload.id,
+        dir: payload.dir,
+        reason: payload.reason,
+        ts: payload.ts,
+      } satisfies SharedWedgeDistressMessage);
+    },
+    clearSharedWedgeDistress: (payload) => {
+      parentPort?.postMessage({
+        kind: "shared-wedge-distress",
+        action: "clear",
+        id: payload.id,
+        dir: payload.dir,
+      } satisfies SharedWedgeDistressMessage);
     },
     reclaimSlotPane: async (paneId) => {
       // Kill the dead session's window to free its slot. Fire-and-log: killWindow
@@ -4803,6 +5032,48 @@ function main(): void {
               failures,
             )) {
               deps.emitDispatchCleared({ verb: "close", id });
+            }
+            // Sustained-wedge escalation: the per-epic reason above fires the first
+            // cycle, but a SHARED checkout stuck mid-merge past the grace watermark
+            // is a wedge keeper cannot heal (foreign residue, or a keeper-owned abort
+            // that keeps failing) — mint a per-repo distress row so it surfaces in
+            // needs_human instead of skip-retrying invisibly. Scoped to the recover-
+            // wedge reasons on a KNOWN shared-checkout dir (a linked-lane path is
+            // excluded — the wedge is the default-branch working tree). The grace +
+            // exactly-once mint live in the in-memory tracker; the clear is a level-
+            // trigger off the OPEN distress rows the snapshot carries (robust across
+            // a restart). No-op when the escalation deps are absent (fake-deps tests).
+            const recoveryRepoKeys = new Set(
+              repos.map((r) => stripTrailingSlashPath(r.trim())),
+            );
+            const wedgedRepos = new Map<string, string>();
+            for (const f of failures) {
+              if (
+                f.dir != null &&
+                isSharedCheckoutWedgeReason(f.reason) &&
+                recoveryRepoKeys.has(stripTrailingSlashPath(f.dir.trim()))
+              ) {
+                // First matching reason per repo wins (both passes key one dir).
+                if (!wedgedRepos.has(f.dir)) {
+                  wedgedRepos.set(f.dir, f.reason);
+                }
+              }
+            }
+            const wedgeDecision = sharedWedgeTracker.step({
+              wedged: wedgedRepos,
+              openDistressDirs: snapshot.sharedWedgeDistressDirs ?? new Set(),
+              nowSec: deps.now(),
+            });
+            for (const m of wedgeDecision.mint) {
+              deps.emitSharedWedgeDistress?.({
+                id: m.id,
+                dir: m.dir,
+                reason: m.reason ?? SHARED_WEDGE_DISTRESS_REASON,
+                ts: deps.now(),
+              });
+            }
+            for (const c of wedgeDecision.clear) {
+              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
             }
           } catch (err) {
             console.error(

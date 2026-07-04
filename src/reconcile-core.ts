@@ -409,6 +409,16 @@ export interface ReconcileSnapshot {
    */
   slotOccupancyFailures: { verb: Verb; id: string }[];
   /**
+   * The `repoDir`s that currently have an OPEN per-repo shared-checkout-wedge
+   * distress row (synthetic `daemon::shared-checkout-wedge:<repoHash>`, collected off
+   * the row's `dir`). PRODUCER-ONLY: read by the recover pass's grace tracker to
+   * level-clear a distress row whose checkout has since recovered — NOT by the pure
+   * `reconcile`. Off the durable projection (not in-memory) so a restarted worker
+   * still clears a distress it minted before the restart. Optional for call-site
+   * back-compat; an absent field is an empty set (no open distress).
+   */
+  sharedWedgeDistressDirs?: Set<string>;
+  /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
    * BEFORE `launch()` and the discharging `SessionStart` has not folded yet (the

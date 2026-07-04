@@ -54,6 +54,7 @@ import {
   computeSlotOccupancy,
   confirmRunning,
   createDispatchFailedGate,
+  createSharedCheckoutWedgeTracker,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
   DISPATCH_FAILED_WATERMARK_SEC,
@@ -74,6 +75,7 @@ import {
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
+  isSharedCheckoutWedgeReason,
   isWorktreeRecoverReason,
   type LaunchResult,
   type LiveDispatch,
@@ -91,8 +93,12 @@ import {
   reposForRecovery,
   resolveWorkerLaunchConfig,
   runReconcileCycle,
+  SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
   type SlotOccupancySignal,
+  sharedWedgeDistressId,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
@@ -11931,4 +11937,219 @@ test("createDispatchFailedGate: the storm shape — one stuck condition over man
 
 test("DISPATCH_FAILED_WATERMARK_SEC is a bounded, non-trivial liveness interval", () => {
   expect(DISPATCH_FAILED_WATERMARK_SEC).toBe(15 * 60);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1114.3 — the shared-checkout mid-merge wedge distress escalation.
+// The recover pass mints an immediate per-epic reason the first cycle; this
+// grace tracker is the escalation layer ON TOP — a per-repo distress row when a
+// shared checkout stays wedged past the grace watermark, exactly-once per
+// episode, level-cleared off the durable open-distress set (robust across a
+// restart). All expected values are hand-computed constants, never re-derived
+// from the tracker.
+// ---------------------------------------------------------------------------
+
+const WEDGE_REASON =
+  "worktree-recover-mid-merge: /repo is mid-merge (owner=foreign) — waiting";
+const REPO_A = "/Users/x/code/keeper";
+const REPO_B = "/Users/x/code/other";
+
+test("isSharedCheckoutWedgeReason matches the mid-merge/abort/lock reasons, excludes dirty + conflict", () => {
+  // The unhealed-wedge reasons keeper cannot self-heal (foreign residue, an abort
+  // that keeps failing, a sustained inability to take the flock) escalate.
+  expect(isSharedCheckoutWedgeReason("worktree-recover-mid-merge: x")).toBe(
+    true,
+  );
+  expect(
+    isSharedCheckoutWedgeReason("worktree-recover-mid-merge-failed: x"),
+  ).toBe(true);
+  expect(isSharedCheckoutWedgeReason("worktree-recover-abort-failed: x")).toBe(
+    true,
+  );
+  expect(isSharedCheckoutWedgeReason("worktree-recover-lock-timeout: x")).toBe(
+    true,
+  );
+  // A dirty tree or a genuine content conflict is NOT this wedge — its own path.
+  expect(
+    isSharedCheckoutWedgeReason("worktree-recover-dirty-checkout: x"),
+  ).toBe(false);
+  expect(isSharedCheckoutWedgeReason("worktree-recover-conflict: x")).toBe(
+    false,
+  );
+  expect(
+    isSharedCheckoutWedgeReason("worktree-finalize-non-fast-forward"),
+  ).toBe(false);
+  expect(isSharedCheckoutWedgeReason("")).toBe(false);
+});
+
+test("sharedWedgeDistressId is stable per repo, distinct across repos, prefix-tagged", () => {
+  const a = sharedWedgeDistressId(REPO_A);
+  const b = sharedWedgeDistressId(REPO_B);
+  expect(a).toBe(sharedWedgeDistressId(REPO_A)); // deterministic
+  expect(a).not.toBe(b); // per-repo distinct
+  expect(a.startsWith(SHARED_WEDGE_DISTRESS_ID_PREFIX)).toBe(true);
+});
+
+test("SHARED_CHECKOUT_WEDGE_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(SHARED_CHECKOUT_WEDGE_GRACE_SEC).toBe(5 * 60);
+});
+
+test("wedge tracker: a repo wedged past the grace watermark mints EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const empty = new Set<string>();
+  // t=1000 first observed wedged → no mint (grace clock starts here).
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint.
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-repo, reason display-mapped.
+  const crossed = tracker.step({
+    wedged,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(sharedWedgeDistressId(REPO_A));
+  expect(crossed.mint[0]?.dir).toBe(REPO_A);
+  expect(
+    crossed.mint[0]?.reason?.startsWith(SHARED_WEDGE_DISTRESS_REASON),
+  ).toBe(true);
+  expect(crossed.mint[0]?.reason).toContain(REPO_A);
+  // Subsequent cycles while still wedged → NEVER re-mint (O(1) per episode).
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ wedged, openDistressDirs: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("wedge tracker: the storm shape — one persistent wedge over many cycles yields exactly ONE mint", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const empty = new Set<string>();
+  let mints = 0;
+  for (let ts = 1000; ts < 5000; ts++) {
+    mints += tracker.step({ wedged, openDistressDirs: empty, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("wedge tracker: a recovered checkout level-clears the open distress row EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const open = new Set([REPO_A]); // the durable open distress row for REPO_A
+  // Still wedged → no clear (the row belongs, the checkout is dirty).
+  expect(
+    tracker.step({ wedged, openDistressDirs: open, nowSec: 2000 }).clear,
+  ).toEqual([]);
+  // Checkout recovers (no fresh wedge this cycle) but the row is still open →
+  // level-clear it once, keyed on the same per-repo id.
+  const recovered = tracker.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 2001,
+  });
+  expect(recovered.clear.length).toBe(1);
+  expect(recovered.clear[0]?.id).toBe(sharedWedgeDistressId(REPO_A));
+  // Once main folds the clear the row is gone from openDistressDirs → no re-clear.
+  expect(
+    tracker.step({
+      wedged: new Map(),
+      openDistressDirs: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("wedge tracker: two repos on a multi-repo board wedge independently — distinct rows, no collision", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const empty = new Set<string>();
+  // A wedges at t=1000; B wedges later at t=1200.
+  tracker.step({
+    wedged: new Map([[REPO_A, WEDGE_REASON]]),
+    openDistressDirs: empty,
+    nowSec: 1000,
+  });
+  const both = new Map([
+    [REPO_A, WEDGE_REASON],
+    [REPO_B, WEDGE_REASON],
+  ]);
+  tracker.step({ wedged: both, openDistressDirs: empty, nowSec: 1200 });
+  // At t=1300, A has crossed its grace (started 1000) but B has not (started 1200).
+  const atA = tracker.step({
+    wedged: both,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(atA.mint.map((m) => m.dir)).toEqual([REPO_A]);
+  // At t=1500, B crosses its own grace — its own distinct row, A does not re-mint.
+  const atB = tracker.step({
+    wedged: both,
+    openDistressDirs: empty,
+    nowSec: 1500,
+  });
+  expect(atB.mint.map((m) => m.dir)).toEqual([REPO_B]);
+  expect(sharedWedgeDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_B));
+});
+
+test("wedge tracker: a repo that recovers then re-wedges waits the FULL grace again", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  const empty = new Set<string>();
+  // First episode: mint at 1300.
+  tracker.step({ wedged, openDistressDirs: empty, nowSec: 1000 });
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1300 }).mint.length,
+  ).toBe(1);
+  // Recovers at 1400 (re-arms the in-memory grace clock).
+  tracker.step({ wedged: new Map(), openDistressDirs: empty, nowSec: 1400 });
+  // Re-wedges at 1500 — a NEW episode: no mint until a fresh full grace elapses.
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1500 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1799 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1800 }).mint.length,
+  ).toBe(1);
+});
+
+test("wedge tracker: a restart (fresh tracker) still level-clears a row minted before it, and re-mints at most once", () => {
+  const grace = 300;
+  // Simulate a daemon restart: a brand-new tracker with an empty in-memory clock,
+  // but the durable distress row for REPO_A is still open in the projection.
+  const fresh = createSharedCheckoutWedgeTracker(grace);
+  const open = new Set([REPO_A]);
+  // The checkout recovered during downtime: not wedged now, row still open →
+  // the projection-driven clear fires even though this instance never minted it.
+  const cleared = fresh.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([
+    sharedWedgeDistressId(REPO_A),
+  ]);
+
+  // Alternatively, still wedged after the restart: the fresh clock re-arms and
+  // re-mints ONCE after a full grace (the accepted bounded per-restart burst).
+  const fresh2 = createSharedCheckoutWedgeTracker(grace);
+  const wedged = new Map([[REPO_A, WEDGE_REASON]]);
+  let mints = 0;
+  for (let ts = 9000; ts < 9000 + 2 * grace; ts++) {
+    mints += fresh2.step({ wedged, openDistressDirs: open, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
 });
