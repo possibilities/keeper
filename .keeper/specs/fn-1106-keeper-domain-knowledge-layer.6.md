@@ -36,5 +36,5 @@ lint-claude-md fixtures green; a hook smoke test is out of scope for the fast ti
 - [ ] skill-authoring and plugins/plan CLAUDE.md carry the docs/adr exception without forking the canonical discipline wording
 
 ## Done summary
-
+Added a dep-free SessionStart context-hint hook that points a session at its repo's non-empty root CONTEXT.md with a read-when trigger (fail-open, always exit 0), and decomposed the blanket no-history rule per-genre across the rule-0 surfaces (CLAUDE.md, plan CLAUDE.md, skill-authoring, lint-claude-md) so docs/adr + commit messages are the sole history homes.
 ## Evidence
