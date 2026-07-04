@@ -56,5 +56,5 @@ NDJSON lines (injection cases: quotes/newlines in tool payloads); no-op cases
 - [ ] Hostile payload content (quotes, newlines, shell metacharacters) round-trips as data in valid NDJSON lines
 
 ## Done summary
-
+Pi live-state extension: keeper-events.ts translates pi AgentHarness events to events-log NDJSON, wired via launch-config.ts/main.ts/harness.ts. Source commit 08c4761e, tests green, live-verified against pi 0.80.3.
 ## Evidence
