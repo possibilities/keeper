@@ -7,7 +7,7 @@
     "fn-1109-post-scaffold-model-effort-selector"
   ],
   "id": "fn-1118-fix-selection-sidecar-label-drift-and",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-04T17:08:34.271000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-04T17:08:32.836000Z"
+  "updated_at": "2026-07-04T17:08:34.271000Z"
 }
