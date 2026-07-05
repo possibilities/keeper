@@ -57,5 +57,5 @@ sandboxEnv(...); no subprocess, no git.
 - [ ] The suite is green via the sanctioned fast gate
 
 ## Done summary
-
+Ship src/baseline-store.ts: the dep-light suite-baseline contract — (repo,sha,toolchain) key, spool/leaf layout, the result envelope discriminated union (green/suite-red+flaky/infra-error/timeout + read-side miss/computing), and restart-ledger-shape pure helpers (fail-open parse, atomic write, bounded eviction, verdict classification). 26 pure unit tests.
 ## Evidence
