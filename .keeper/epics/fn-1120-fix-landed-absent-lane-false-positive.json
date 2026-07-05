@@ -4,7 +4,7 @@
   "created_at": "2026-07-05T16:42:24.540000Z",
   "depends_on_epics": [],
   "id": "fn-1120-fix-landed-absent-lane-false-positive",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-05T16:42:28.950000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-05T16:42:24.540000Z"
+  "updated_at": "2026-07-05T16:42:28.950000Z"
 }
