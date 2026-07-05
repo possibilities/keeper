@@ -1591,9 +1591,10 @@ export async function computeDeferredEpicIds(
  * The per-epic merge verdict mirrors {@link computeDeferredEpicIds}'s per-upstream
  * probe, applied to the epic's OWN lane — UNION-free (one lane per epic):
  *  - lane `keeper/epic/<id>` PRESENT ∧ an ancestor of LOCAL default → MERGED;
- *  - DEFINITIVELY ABSENT (a SUCCESSFUL enumeration that omits it) → merged-and-
- *    torn-down (keeper deletes a base only once it is an ancestor of default) →
- *    MERGED;
+ *  - DEFINITIVELY ABSENT (a SUCCESSFUL enumeration that omits it) ∧ the epic's
+ *    work is terminally done → merged-and-torn-down (keeper deletes a base only
+ *    once it is an ancestor of default) → MERGED; absent while the work is still
+ *    running (a serial-checkout epic that never cut a lane) → NOT merged;
  *  - PRESENT ∧ NOT an ancestor (or the ancestry probe errored/timed out — both
  *    collapse to `isAncestorOf`→`false`) → NOT merged;
  *  - enumeration FAILED/timed out → NOT merged (conservative: never CLAIM merged
@@ -1666,10 +1667,13 @@ export async function computeMergedLaneEntries(
   // memoized enumeration + ancestry probes. The `ok` verdict verbatim, factored so
   // a `clustered` epic's per-`worktree`-group probe shares it:
   //  - enumeration inconclusive → NOT merged (never claim off a failed probe);
-  //  - lane DEFINITIVELY ABSENT ∧ the epic ever started → merged-and-torn-down →
-  //    MERGED (no ancestry probe); DEFINITIVELY ABSENT ∧ never started → NOT
-  //    merged (the lane was never cut, not torn down after a merge — inferring
-  //    merged here fires `landed` spuriously on a fresh dep-blocked epic);
+  //  - lane DEFINITIVELY ABSENT ∧ the epic started ∧ `laneCarriesLandedWork` →
+  //    merged-and-torn-down → MERGED (no ancestry probe); DEFINITIVELY ABSENT ∧
+  //    (never started OR work not yet done) → NOT merged (a never-started epic
+  //    never cut a lane; a started-but-still-running serial-checkout epic also
+  //    reads absent, so it takes the same done-evidence the present arm requires
+  //    to tell a finished epic from a mid-flight one — inferring merged off bare
+  //    "started" fires `landed` spuriously on a fresh or in-flight epic);
   //  - PRESENT ∧ NOT `laneCarriesLandedWork` → NOT merged (a zero-commit lane sits
   //    AT its fork point, a VACUOUS ancestor of default — git alone cannot tell it
   //    from a merged lane, so the caller must prove non-emptiness, e.g. an `ok`
@@ -1687,10 +1691,14 @@ export async function computeMergedLaneEntries(
       return false; // enumeration inconclusive → NOT merged
     }
     if (!lanes.branches.has(laneBranch)) {
-      // DEFINITIVELY absent → merged-and-torn-down → MERGED, but ONLY if the epic
-      // ever started. A never-started epic's lane is absent because it was never
-      // cut, so absence proves nothing about merge (keep `landed` waiting).
-      return epicHasStarted;
+      // DEFINITIVELY absent → merged-and-torn-down → MERGED, but ONLY once the
+      // epic both started AND carries landed work. A started-but-still-running
+      // serial-checkout epic (tasks landing incrementally on the shared checkout,
+      // no lane ever cut) reads absent too, so "started" alone cannot tell it from
+      // a finished-and-torn-down epic — require the same done-evidence the present
+      // arm does. A never-started epic never cut a lane, so absence proves nothing
+      // about merge either way (keep `landed` waiting).
+      return epicHasStarted && laneCarriesLandedWork;
     }
     // PRESENT lane. A freshly-cut lane sits AT its fork point, so it is a VACUOUS
     // ancestor of default (default is at or past the fork) — git alone cannot tell
@@ -1725,19 +1733,27 @@ export async function computeMergedLaneEntries(
       continue;
     }
     const laneBranch = baseBranchFor(epic.epic_id);
-    // A never-started epic never cut a lane, so an absent lane must NOT read as
-    // merged-and-torn-down. `status === "done"` is a belt-and-suspenders disjunct
-    // (a done epic must have started) so a done epic always reports landed.
+    // Whether the epic ever started — necessary-but-not-sufficient for the absent
+    // arm to read merged-and-torn-down (it must ALSO carry landed work; see
+    // `laneMergedInRepo`). `status === "done"` is a belt-and-suspenders disjunct
+    // (a done epic must have started) so a force-closed epic always counts started.
     const started = epicStarted(epic) || epic.status === "done";
     try {
       if (resolution.kind === "ok") {
-        // Present-arm emptiness guard: this single lane carries landed work only
-        // once ALL the epic's tasks are administratively done (`worker_phase` — the
-        // terminal-completed signal the clustered serial-group arm keys). A started-
-        // but-unworked epic's lane sits empty at its fork point, so without this its
-        // vacuous ancestry would false-fire `landed`. A task-less epic is vacuously
-        // done (a present + merged lane still reads landed unchanged).
-        const tasksDone = epic.tasks.every((t) => t.worker_phase === "done");
+        // Shared done-evidence for BOTH the present and absent arms: this epic's
+        // work carries landed value only once ALL its tasks are administratively
+        // done (`worker_phase` — the terminal-completed signal the clustered
+        // serial-group arm keys), OR the epic is force-closed / legacy-imported
+        // `status: "done"` (its per-task `worker_phase` is never stamped, so a raw
+        // phase-only predicate would permanently false-negative it — mirror
+        // readiness's "a done epic is ABSORBING" rule). The present arm's empty-lane
+        // guard and the absent arm's torn-down check both key on this: a started-
+        // but-unworked epic's lane sits empty at its fork point (present) or was
+        // never cut (absent), and neither must false-fire `landed`. A task-less epic
+        // is vacuously done (a present + merged lane still reads landed unchanged).
+        const tasksDone =
+          epic.status === "done" ||
+          epic.tasks.every((t) => t.worker_phase === "done");
         if (
           await laneMergedInRepo(
             resolution.repoDir,
