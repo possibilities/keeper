@@ -1,0 +1,72 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Schema-version bump, new event payloads, and the UPSERT preserve-list edit are contract-touching event-sourcing work where a missed once-marker silently re-fires escalations \u2014 highest blast radius.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The epic's flagged proof point: a novel cross-store lineage-assembly data path with bounded cycle-guarded walk and degrade semantics \u2014 new pattern, spans two stores, intelligence-sensitive.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Mirrors the resolve:: launch pattern across a few files, but the dep-free leaf discipline and the deliberate keep-retry-wire-narrow contract decision need opus judgment; path is otherwise clear.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Markdown skill authoring following the close/ template, but security-sensitive: untrusted-transcript handling, least-privilege allowlists, and precise command/decline recipes warrant opus over sonnet.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Intricate daemon rewire with producer-only re-fold discipline, double-dispatch occupancy guards, a shared global-cap helper, and botctl-failure handling \u2014 concurrency-heavy, high blast radius.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Same daemon concurrency reasoning as .5 plus per-epic serialization for the herd case and an audit-then-delete of the notifyPlanner/bus-wake plumbing \u2014 risky dead-code removal needing opus.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.6",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.58,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Docs are low-blast-radius but this requires synthesizing the whole epic's semantics into an accurate CLAUDE.md (re-narration lint gate) and a coherent ADR \u2014 not mechanical; opus for accuracy of the guardrails file.",
+      "task_id": "fn-1129-autopilot-escalation-agent-dispatch.7",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0f78fc31c0896a8db68ce0899843a2e4c6102f5d25e5fb9c630d74194ce144c8",
+  "created_at": "2026-07-05T22:26:08.075000Z",
+  "epic_id": "fn-1129-autopilot-escalation-agent-dispatch",
+  "input_hash": "ce5942b3183caca7b53e7723c67792a18fe570f800a646edd31464ccbc6835aa",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 1129,
+  "verdict_raw": "{\"fn-1129-autopilot-escalation-agent-dispatch.1\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Schema-version bump, new event payloads, and the UPSERT preserve-list edit are contract-touching event-sourcing work where a missed once-marker silently re-fires escalations \u2014 highest blast radius.\", \"confidence\": 0.9}, \"fn-1129-autopilot-escalation-agent-dispatch.2\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"The epic's flagged proof point: a novel cross-store lineage-assembly data path with bounded cycle-guarded walk and degrade semantics \u2014 new pattern, spans two stores, intelligence-sensitive.\", \"confidence\": 0.85}, \"fn-1129-autopilot-escalation-agent-dispatch.3\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Mirrors the resolve:: launch pattern across a few files, but the dep-free leaf discipline and the deliberate keep-retry-wire-narrow contract decision need opus judgment; path is otherwise clear.\", \"confidence\": 0.68}, \"fn-1129-autopilot-escalation-agent-dispatch.4\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Markdown skill authoring following the close/ template, but security-sensitive: untrusted-transcript handling, least-privilege allowlists, and precise command/decline recipes warrant opus over sonnet.\", \"confidence\": 0.6}, \"fn-1129-autopilot-escalation-agent-dispatch.5\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Intricate daemon rewire with producer-only re-fold discipline, double-dispatch occupancy guards, a shared global-cap helper, and botctl-failure handling \u2014 concurrency-heavy, high blast radius.\", \"confidence\": 0.85}, \"fn-1129-autopilot-escalation-agent-dispatch.6\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Same daemon concurrency reasoning as .5 plus per-epic serialization for the herd case and an audit-then-delete of the notifyPlanner/bus-wake plumbing \u2014 risky dead-code removal needing opus.\", \"confidence\": 0.83}, \"fn-1129-autopilot-escalation-agent-dispatch.7\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Docs are low-blast-radius but this requires synthesizing the whole epic's semantics into an accurate CLAUDE.md (re-narration lint gate) and a coherent ADR \u2014 not mechanical; opus for accuracy of the guardrails file.\", \"confidence\": 0.58}}\n"
+}
