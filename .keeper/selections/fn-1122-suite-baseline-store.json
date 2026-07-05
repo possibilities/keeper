@@ -1,0 +1,56 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Dependency-free discriminated-union contract every other task consumes; infra-can-never-typecheck-as-green is a propagating abstraction.",
+      "task_id": "fn-1122-suite-baseline-store.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.75,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Sibling to ensureWorktree on the existing GitRunner seam \u2014 known template, but the lane-collision-prefix risk needs care.",
+      "task_id": "fn-1122-suite-baseline-store.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Daemon-blast-radius process lifecycle: process-group kill/reap-no-zombies, deadline abort, coalescing, crash-loop containment \u2014 many interacting edge cases where deeper reasoning lifts correctness.",
+      "task_id": "fn-1122-suite-baseline-store.3",
+      "tier": "max"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "House-registration verb consuming task-1's contract; bounded spool-write + wait-poll with clear exit-code acceptance.",
+      "task_id": "fn-1122-suite-baseline-store.4",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.55,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multi-artifact regen (skill + four manifests + oracle fixture) under strict CLAUDE.md size/re-narration gates and forward-facing doc discipline; subtle-failure-prone despite being prose.",
+      "task_id": "fn-1122-suite-baseline-store.5",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-05T17:01:58.006000Z",
+  "epic_id": "fn-1122-suite-baseline-store",
+  "input_hash": "d9874af9f5d7512e029fca05ac0b1979a5beaa8d252a2b1a6703b50b8e88bf45",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 20260705,
+  "verdict_raw": "{\"fn-1122-suite-baseline-store.1\":{\"tier\":\"xhigh\",\"model\":\"opus\"},\"fn-1122-suite-baseline-store.2\":{\"tier\":\"high\",\"model\":\"opus\"},\"fn-1122-suite-baseline-store.3\":{\"tier\":\"max\",\"model\":\"opus\"},\"fn-1122-suite-baseline-store.4\":{\"tier\":\"medium\",\"model\":\"opus\"},\"fn-1122-suite-baseline-store.5\":{\"tier\":\"xhigh\",\"model\":\"opus\"}}\n"
+}
