@@ -27,6 +27,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Arm**: To flip an epic or task from not-ready to dispatchable by stamping it validated. Avoid: enable, approve, unlock.
 - **Ghost**: A not-yet-validated epic or task that renders dashed and blocks dispatch until it is armed. Avoid: draft, stub, placeholder.
 - **Tier**: The capability class assigned to a task that selects which model and worker cell runs it. Avoid: level, rank, weight.
+- **Baseline**: The daemon-computed suite result at a commit sha that a worker consults to attribute a test failure as pre-existing or self-inflicted. Avoid: cache, snapshot, golden.
 
 ## Autopilot and dispatch
 
