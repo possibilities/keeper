@@ -17,6 +17,6 @@
 # model-guidance skill) carries exactly one guidance block per axis value here;
 # its drift gate (model-guidance-check.ts --check) fails until a newly-added
 # value is backfilled there.
-efforts: [medium, high, xhigh, max]
-models: [opus]
+efforts: [low, medium, high, xhigh, max]
+models: [opus, sonnet]
 subagents: [template/agents/worker.md.tmpl]
