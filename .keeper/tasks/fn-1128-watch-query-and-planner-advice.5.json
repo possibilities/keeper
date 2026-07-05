@@ -1,0 +1,19 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-05T17:38:55.521000Z",
+  "depends_on": [
+    "fn-1128-watch-query-and-planner-advice.1",
+    "fn-1128-watch-query-and-planner-advice.2",
+    "fn-1128-watch-query-and-planner-advice.3",
+    "fn-1128-watch-query-and-planner-advice.4"
+  ],
+  "epic": "fn-1128-watch-query-and-planner-advice",
+  "id": "fn-1128-watch-query-and-planner-advice.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Cross-surface consistency and gates",
+  "updated_at": "2026-07-05T17:38:55.521000Z"
+}
