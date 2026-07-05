@@ -105,6 +105,7 @@ import {
   buildWorkerCommand,
   type DispatchKey,
   dispatchKey,
+  type EpicRecoverVerdict,
   epicHasActiveResolver,
   FINALIZER_GUARD_S,
   isFinalizerVerb,
@@ -122,7 +123,10 @@ import {
   WORKER_EFFORT,
   WORKER_MODEL,
   type WorktreeLaunchInfo,
+  type WorktreeRecoveryEscalation,
   type WorktreeRecoveryFailure,
+  type WorktreeRecoveryOutcome,
+  type WorktreeRecoveryResolution,
   type WorktreeRepoGroup,
   type WorktreeRepoResolution,
   type WorktreeRepoStatusEntry,
@@ -181,6 +185,7 @@ export {
 } from "./dispatch-failure-key";
 export type {
   DispatchKey,
+  EpicRecoverVerdict,
   LaneMergedEntry,
   PlannedLaunch,
   ReconcileDecision,
@@ -192,7 +197,10 @@ export type {
   SlotOccupancySignal,
   Verb,
   WorktreeLaunchInfo,
+  WorktreeRecoveryEscalation,
   WorktreeRecoveryFailure,
+  WorktreeRecoveryOutcome,
+  WorktreeRecoveryResolution,
   WorktreeReject,
   WorktreeRepoGroup,
   WorktreeRepoResolution,
@@ -474,25 +482,37 @@ export function resolveWorkerLaunchConfig(
 }
 
 /**
- * Level-triggered auto-clear set: given the OPEN recover-originated dispatch ids
- * (`snapshot.recoverFailureIds`) and THIS cycle's fresh recover failures, return
- * the ids whose underlying git has since resolved (the junk branch was deleted,
- * the conflict was merged, or the epic was reaped) — i.e. an open recover row
- * with NO matching fresh failure this cycle. The caller mints a `DispatchCleared`
- * for each so a human just fixes the git and the next cycle clears the block, no
- * `retry_dispatch`. Pure: a function of the two inputs, no git, no clock.
+ * POSITIVE-EVIDENCE auto-clear set: given the OPEN recover-originated dispatch ids
+ * (`snapshot.recoverFailureIds`), THIS cycle's fresh recover failures, and THIS
+ * cycle's positive resolution observations, return the open ids the producer should
+ * `DispatchCleared`. An open row clears ONLY when it appears in the `resolved` set
+ * (the base merged, was already an ancestor of default, the epic read
+ * authoritatively absent, or its repo swept clean of path-tied failures) AND is NOT
+ * in the fresh-failure set (the never-clear-what-still-fails guard). Absence from
+ * BOTH sets RETAINS the row: a cycle that produced no report for it never dismisses
+ * it — the incident defect was an absence-based clear turning a silently-skipped
+ * cycle into a clean-looking board. Content conflicts are structurally outside this
+ * predicate (they escalate on the bare `close::<epic>` merge-escalation key, leaving
+ * the recover scope), matching finalize's never-auto-dismissed close-sink. All three
+ * keys route through {@link recoverFailureDispatchId} (the lockstep rule). Pure: a
+ * function of the three inputs, no git, no clock.
  */
 export function recoverFailuresToClear(
   openRecoverIds: ReadonlySet<string>,
   freshFailures: readonly WorktreeRecoveryFailure[],
+  resolved: readonly WorktreeRecoveryResolution[],
 ): string[] {
   const stillFailing = new Set<string>();
   for (const f of freshFailures) {
     stillFailing.add(recoverFailureDispatchId(f));
   }
+  const resolvedIds = new Set<string>();
+  for (const r of resolved) {
+    resolvedIds.add(recoverFailureDispatchId(r));
+  }
   const cleared: string[] = [];
   for (const id of openRecoverIds) {
-    if (!stillFailing.has(id)) {
+    if (resolvedIds.has(id) && !stillFailing.has(id)) {
       cleared.push(id);
     }
   }
@@ -869,16 +889,21 @@ export interface WorktreeDriver {
    *     gated by a SECONDARY is-ancestor-of-default safety. A live epic's lanes
    *     are PRESERVED (an omitted probe defaults to preserve — fail-safe).
    *
-   * Returns the failures (if any) for the caller to mint as sticky DispatchFailed;
-   * a recovery failure NEVER throws past the driver (a producer git error must not
-   * wedge the cycle).
+   * Returns a {@link WorktreeRecoveryOutcome} — transient `failures` (auto-clear
+   * scope), terminal `escalations` (the bare `close::<epic>` merge-escalation scope),
+   * and positive `resolved` observations (the clear predicate's evidence set) — for
+   * the caller to mint / clear; a recovery failure NEVER throws past the driver (a
+   * producer git error must not wedge the cycle). `isEpicDone` is pass-2's tri-state
+   * probe: it MAY return the legacy boolean (`true`→done, `false`→open) so existing
+   * callers are byte-identical, or the full {@link EpicRecoverVerdict} so pass-2 can
+   * distinguish authoritatively-absent (clear) from inconclusive (defer).
    */
   recover(
     repos: readonly string[],
-    isEpicDone: (epicId: string) => Promise<boolean>,
+    isEpicDone: (epicId: string) => Promise<boolean | EpicRecoverVerdict>,
     epicPresentAndNotDone: (epicId: string) => Promise<boolean>,
     hasActiveResolver: (epicId: string) => boolean,
-  ): Promise<WorktreeRecoveryFailure[]>;
+  ): Promise<WorktreeRecoveryOutcome>;
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
@@ -3420,21 +3445,27 @@ async function recoverSharedCheckoutMidMerge(
  */
 export async function recoverWorktrees(
   repos: readonly string[],
-  isEpicDone: (epicId: string) => Promise<boolean>,
+  isEpicDone: (epicId: string) => Promise<boolean | EpicRecoverVerdict>,
   run: WorktreeGitRunner = gitExec,
   acquireLock?: LockAcquirer,
   epicPresentAndNotDone: (epicId: string) => Promise<boolean> = () =>
     Promise.resolve(true),
   // Per-epic exclusion: true while an autonomous merge-resolver (`resolve::<epic>`)
-  // is LIVE for the lane's epic. Gates ONLY pass-1's interrupted-merge abort — the
-  // one action that would race a resolver mid-`git merge` — so the resolver no
-  // longer needs a GLOBAL `keeper autopilot pause`. Defaults to "no resolver" so
-  // every existing caller (and the OFF path) is byte-identical. Passes 2/3 need no
-  // gate: both act only on a done/absent epic, but a resolver runs while its epic
-  // is still open (resolution precedes the close→finalize→done that marks it done).
+  // is LIVE for the lane's epic. Gates pass-1's interrupted-merge abort AND pass-2's
+  // base→default merge — the two actions that would race a resolver mid-`git merge`
+  // — so the resolver no longer needs a GLOBAL `keeper autopilot pause`. Defaults to
+  // "no resolver" so every existing caller (and the OFF path) is byte-identical. A
+  // retargeted content conflict now dispatches a resolver for a DONE epic, so pass-2
+  // must skip re-attempting the same merge while that resolver is live.
   hasActiveResolver: (epicId: string) => boolean = () => false,
-): Promise<WorktreeRecoveryFailure[]> {
+): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
+  // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
+  // scope) and POSITIVE resolution observations (the clear predicate's evidence set)
+  // flow out alongside the transient `failures`. The recover worker still writes
+  // nothing to keeper.db — all three funnel through the emit deps to main.
+  const escalations: WorktreeRecoveryEscalation[] = [];
+  const resolved: WorktreeRecoveryResolution[] = [];
   // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
   // once. A repo whose main worktree is the same path is collapsed by the set.
   const seen = new Set<string>();
@@ -3460,6 +3491,14 @@ export async function recoverWorktrees(
     if (laneState !== "standalone") {
       continue;
     }
+    // POSITIVE observation for the PATH-TIED (null-epic) recover row of this dir: the
+    // repo classified standalone, so it IS being swept this cycle — a genuine "the
+    // dir is reachable" signal, not mere absence. Combined with the clear predicate's
+    // never-clear-what-still-fails guard, an old path-tied `worktree-recover:<slug>`
+    // row clears iff this sweep produces NO fresh path-tied failure for the dir; a
+    // SKIPPED cycle (paused / dir not in the sweep set) records nothing, so the row is
+    // retained — the incident's silent-skip defect, closed for path-tied rows too.
+    resolved.push({ epicId: null, dir: repo });
 
     // --- Pass 1: abort any interrupted merge in a live linked worktree. ---
     let entries: WorktreeEntry[];
@@ -3569,18 +3608,40 @@ export async function recoverWorktrees(
     }
     for (const base of bases) {
       try {
-        if (!(await isEpicDone(base.epicId))) {
-          continue; // epic still open — its base is merged by `finalizeEpic`, not here
+        // TRI-STATE done-probe: pass-2 consumes the full verdict, not a boolean.
+        //   open         → finalize owns the base merge; skip, no observation.
+        //   inconclusive → a non-result (error) read frame; DEFER — no merge, no
+        //                  observation, so an open recover row for (epic,repo) is
+        //                  RETAINED (absence of a read is never resolution).
+        //   absent       → authoritatively reaped (the pk-lookup bypasses every scope
+        //                  / recency floor); the base no longer needs merging — record
+        //                  a POSITIVE resolved observation and skip.
+        //   done         → attempt the merge (below).
+        const verdict = normalizeEpicVerdict(await isEpicDone(base.epicId));
+        if (verdict === "open" || verdict === "inconclusive") {
+          continue;
+        }
+        if (verdict === "absent") {
+          resolved.push({ epicId: base.epicId, dir: repo });
+          continue;
+        }
+        // A LIVE autonomous merge-resolver owns this base→default merge (a retargeted
+        // conflict dispatched it for this now-done epic). Skip so pass-2 never races it
+        // mid-`git merge` — mirrors pass-1's abort gate. The gated skip yields no
+        // observation, so an open row is retained for free.
+        if (hasActiveResolver(base.epicId)) {
+          continue;
         }
         // The ONE shared {@link mergeLaneBaseIntoDefault} routine, the same
         // finalize drives. The merge runs in the MAIN worktree (the repo dir).
         // `not-ahead` is the idempotency skip (an already-merged base is an ancestor
-        // of default). Every degrade maps to a `worktree-recover-*` reason: the
-        // recover prefix keeps the level-triggered auto-clear scope, so the block
+        // of default). Every TRANSIENT degrade maps to a `worktree-recover-*` reason:
+        // the recover prefix keeps the level-triggered auto-clear scope, so the block
         // lifts the moment the underlying git settles (no `retry_dispatch` needed) —
-        // the recover-side analogue of finalize's `retry` skip. The shared core
-        // stamps NO reason strings; recover owns the `worktree-recover-*` mapping
-        // exactly as finalize owns `worktree-finalize-*`.
+        // the recover-side analogue of finalize's `retry` skip. A CONTENT CONFLICT is
+        // terminal instead: it escalates (below). The shared core stamps NO reason
+        // strings; recover owns the `worktree-recover-*` mapping exactly as finalize
+        // owns `worktree-finalize-*`.
         const merge = await mergeLaneBaseIntoDefault(
           repo,
           base.branch,
@@ -3591,6 +3652,9 @@ export async function recoverWorktrees(
         switch (merge.kind) {
           case "not-ahead":
           case "merged":
+            // The base merged this cycle (or was already an ancestor of default) — a
+            // POSITIVE resolution observation that clears an open recover row.
+            resolved.push({ epicId: base.epicId, dir: repo });
             break;
           case "off-branch":
             failures.push({
@@ -3650,9 +3714,16 @@ export async function recoverWorktrees(
             });
             continue;
           case "conflict":
-            failures.push({
+            // TERMINAL. A content conflict leaves the recover auto-clear scope
+            // entirely: it escalates on the BARE `close::<epic>` id with finalize's
+            // EXACT close-sink reason (`worktree-merge-conflict: …`), so routing
+            // classifies it merge-escalation, the resolver-dispatch + merge-escalation
+            // sweeps engage, a same-epic finalize close-sink row UPSERT-converges, and
+            // only `retry_dispatch` drops it. NOT a `worktree-recover-*` reason — the
+            // absence-based auto-clear must never silently dismiss a real conflict.
+            escalations.push({
               epicId: base.epicId,
-              reason: `worktree-recover-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
+              reason: `worktree-merge-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
               dir: repo,
             });
             continue;
@@ -3858,7 +3929,25 @@ export async function recoverWorktrees(
       }
     }
   }
-  return failures;
+  return { failures, escalations, resolved };
+}
+
+/**
+ * Normalize a pass-2 done-probe result to the full {@link EpicRecoverVerdict}. The
+ * legacy boolean probe collapses onto the two states old callers meant: `true`→done
+ * (attempt the merge), `false`→open (skip, no observation). A verdict string passes
+ * through, so the production probe surfaces authoritatively-absent and inconclusive.
+ */
+function normalizeEpicVerdict(
+  v: boolean | EpicRecoverVerdict,
+): EpicRecoverVerdict {
+  if (v === true) {
+    return "done";
+  }
+  if (v === false) {
+    return "open";
+  }
+  return v;
 }
 
 /** Compact an unknown thrown value to its message string. */
@@ -3945,57 +4034,94 @@ export function reposForRecovery(
 }
 
 /**
- * The done-ness probe the recovery backstop threads into the driver.
+ * The ONE pure frame→verdict mapping the recover epic probes share, so
+ * {@link isEpicDoneById}, {@link epicRecoverVerdictById}, and
+ * {@link epicPresentAndNotDone} can never diverge on what a given read frame means.
+ * A RESULT frame with a `status === "done"` row → `"done"`; a result frame with a
+ * not-done row → `"open"`; a result frame with NO row → `"absent"` (AUTHORITATIVE —
+ * the pk-lookup bypasses the OPEN scope and every recency floor); a NON-result
+ * (error) frame → `"inconclusive"` (a read that did not complete is never a
+ * verdict). Pure, so an error frame is testable without engineering a live query
+ * failure.
+ */
+export function epicFrameVerdict(
+  res: ReturnType<typeof runQuery>,
+): EpicRecoverVerdict {
+  if (res.type !== "result") {
+    return "inconclusive";
+  }
+  const row = res.rows[0] as { status?: unknown } | undefined;
+  if (row === undefined) {
+    return "absent";
+  }
+  return row.status === "done" ? "done" : "open";
+}
+
+/** The pk-bypass `epics` query frame the recover probes share (OPEN-scope + recency
+ * floor bypassed via `runQuery(db, 0, …)`), tagged with `label` for trace ids. */
+function recoverEpicQueryFrame(label: string, epicId: string) {
+  return {
+    type: "query" as const,
+    collection: "epics",
+    id: `autopilot-recover-epic-${label}${epicId}`,
+    filter: { epic_id: epicId },
+    limit: 1,
+  };
+}
+
+/**
+ * The done-ness probe finalize threads into the driver.
  * A pk-lookup read of the `epics` projection by `epic_id` (which bypasses the
  * default OPEN scope AND any recency floor in `resolveFilter`), so a DONE epic is
  * resolved UNBOUNDED by `DONE_EPICS_REAP_WINDOW_SEC` — the whole point of the
- * decoupled backstop. Returns `true` IFF the epic exists and `status === "done"`.
- * A read-time producer probe (never a fold).
+ * decoupled backstop. Returns `true` IFF the epic exists and `status === "done"`
+ * (i.e. the shared {@link epicFrameVerdict} is `"done"`). A read-time producer probe
+ * (never a fold).
  */
 export function isEpicDoneById(
   db: Parameters<typeof runQuery>[0],
   epicId: string,
 ): Promise<boolean> {
-  const frame = {
-    type: "query" as const,
-    collection: "epics",
-    id: `autopilot-recover-epic-${epicId}`,
-    filter: { epic_id: epicId },
-    limit: 1,
-  };
-  const res = runQuery(db, 0, frame);
-  const rows = res.type === "result" ? res.rows : [];
-  const status = (rows[0] as { status?: unknown } | undefined)?.status;
-  return Promise.resolve(status === "done");
+  const verdict = epicFrameVerdict(
+    runQuery(db, 0, recoverEpicQueryFrame("", epicId)),
+  );
+  return Promise.resolve(verdict === "done");
 }
 
 /**
- * The present-and-not-done probe pass-3 teardown threads in to PRESERVE an active
- * epic's lanes. CLONES {@link isEpicDoneById}'s pk-bypass query frame (collection
- * `epics`, `filter:{epic_id}`, `runQuery(db, 0, …)`) so it bypasses the default
- * OPEN scope AND any recency floor in `resolveFilter` — a live in_progress/blocked
- * epic resolves PRESENT here, never absent. That bypass is load-bearing: a scoped
- * or `DONE_EPICS_REAP_WINDOW_SEC`-bounded read would read a live epic as ABSENT and
- * FALSELY sweep its base mid-flight (the most dangerous misread). Returns `true`
- * IFF the epic row exists AND `status !== "done"`; an ABSENT (reaped / EpicDeleted)
- * OR a done epic → `false` (eligible to sweep). A read-time producer probe (never a
- * fold).
+ * The pass-2 TRI-STATE done-probe the recover glue threads into `worktree.recover`.
+ * The SAME pk-bypass frame + {@link epicFrameVerdict} as {@link isEpicDoneById}, but
+ * surfaces the full {@link EpicRecoverVerdict} so pass-2 distinguishes done (merge)
+ * from authoritatively-absent (skip + record a positive resolution) from
+ * inconclusive (defer — retain open rows). A read-time producer probe (never a fold).
+ */
+export function epicRecoverVerdictById(
+  db: Parameters<typeof runQuery>[0],
+  epicId: string,
+): Promise<EpicRecoverVerdict> {
+  return Promise.resolve(
+    epicFrameVerdict(runQuery(db, 0, recoverEpicQueryFrame("", epicId))),
+  );
+}
+
+/**
+ * The present-and-not-done probe pass-3 teardown threads in to PRESERVE a lane.
+ * Shares {@link isEpicDoneById}'s pk-bypass frame + {@link epicFrameVerdict}, so a
+ * live in_progress/blocked epic resolves PRESENT, never absent. Returns `true` (=
+ * PRESERVE the lane) IFF the verdict is `"open"` OR `"inconclusive"` — the fail-safe:
+ * a scoped/recency-bounded read, OR a non-result (error) frame, must NEVER coerce to
+ * sweep-eligible and FALSELY tear down a base mid-flight (the probe's own most-
+ * dangerous misread). A `"done"` or authoritatively-`"absent"` epic → `false`
+ * (eligible to sweep). A read-time producer probe (never a fold).
  */
 export function epicPresentAndNotDone(
   db: Parameters<typeof runQuery>[0],
   epicId: string,
 ): Promise<boolean> {
-  const frame = {
-    type: "query" as const,
-    collection: "epics",
-    id: `autopilot-recover-epic-present-${epicId}`,
-    filter: { epic_id: epicId },
-    limit: 1,
-  };
-  const res = runQuery(db, 0, frame);
-  const rows = res.type === "result" ? res.rows : [];
-  const row = rows[0] as { status?: unknown } | undefined;
-  return Promise.resolve(row !== undefined && row.status !== "done");
+  const verdict = epicFrameVerdict(
+    runQuery(db, 0, recoverEpicQueryFrame("present-", epicId)),
+  );
+  return Promise.resolve(verdict === "open" || verdict === "inconclusive");
 }
 
 /** Trailing-slash-tolerant path compare helper for worktree-path equality. */
@@ -5002,21 +5128,25 @@ function main(): void {
               snapshot.worktreeRepoByEpicId,
               snapshot.worktreeKnownRoots ?? [],
             );
-            const failures = await deps.worktree.recover(
-              repos,
-              (epicId) => isEpicDoneById(db, epicId),
-              (epicId) => epicPresentAndNotDone(db, epicId),
-              // Per-epic resolver exclusion (from the SAME snapshot the cycle
-              // reconciled): pass-1 skips a lane whose epic has a live
-              // `resolve::<epic>` worker so its in-progress merge is never raced.
-              // A pure projection read (jobs + read-time liveness) — never a fold.
-              (epicId) =>
-                epicHasActiveResolver(
-                  snapshot.jobs,
-                  epicId,
-                  snapshot.livePaneIds,
-                ),
-            );
+            const { failures, escalations, resolved } =
+              await deps.worktree.recover(
+                repos,
+                // Pass-2's TRI-STATE done-probe — surfaces authoritatively-absent and
+                // inconclusive so pass-2 clears vs defers correctly (NOT the boolean
+                // `isEpicDoneById`, which collapses both to skip).
+                (epicId) => epicRecoverVerdictById(db, epicId),
+                (epicId) => epicPresentAndNotDone(db, epicId),
+                // Per-epic resolver exclusion (from the SAME snapshot the cycle
+                // reconciled): passes 1 AND 2 skip a lane whose epic has a live
+                // `resolve::<epic>` worker so its in-progress merge is never raced.
+                // A pure projection read (jobs + read-time liveness) — never a fold.
+                (epicId) =>
+                  epicHasActiveResolver(
+                    snapshot.jobs,
+                    epicId,
+                    snapshot.livePaneIds,
+                  ),
+              );
             for (const f of failures) {
               deps.emitDispatchFailed({
                 verb: "close",
@@ -5030,18 +5160,35 @@ function main(): void {
                 ts: deps.now(),
               });
             }
-            // Level-triggered auto-clear: a recover failure is a permanent state
-            // for the current refs — fail LOUD and block the lane, but the moment
-            // the git is resolved (junk branch deleted / conflict merged / epic
-            // reaped) the next cycle observes NO matching failure and clears the
-            // sticky row, so a human never needs `retry_dispatch`. Scoped to
-            // recover-reason rows (recoverFailureIds) so a normal close-sink
-            // failure sharing the `close::<id>` key is never clobbered. Runs ONLY
-            // inside this not-paused worktree-mode block — i.e. only when the
-            // recover pass actually ran — so a pause never clears a live block.
+            // TERMINAL content-conflict escalations mint on the BARE `close::<epic>`
+            // id (verb close): routing classifies them merge-escalation (OUTSIDE both
+            // auto-clear scopes), the resolver-dispatch + merge-escalation sweeps
+            // select them, `keeper autopilot retry close::<epic>` (hardcoded in the
+            // resolver brief + human escalation) drops them, and a same-epic finalize
+            // close-sink row UPSERT-converges on the shared key rather than double-
+            // minting.
+            for (const e of escalations) {
+              deps.emitDispatchFailed({
+                verb: "close",
+                id: e.epicId,
+                reason: e.reason,
+                dir: e.dir,
+                ts: deps.now(),
+              });
+            }
+            // POSITIVE-EVIDENCE level-triggered auto-clear: an OPEN recover row clears
+            // ONLY when this cycle produced a positive resolution observation for it
+            // (base merged, ancestor-of-default, epic authoritatively absent, or repo
+            // swept clean of path-tied failures) AND it is not still failing. Absence
+            // of any report RETAINS the row — a silently-skipped cycle (a sibling's
+            // conflict re-reported while this epic's probe was inconclusive, or the
+            // whole pass paused) never dismisses a live block. Scoped to recover-reason
+            // rows (`recoverFailureIds`) so a close-sink conflict sharing the key is
+            // never clobbered.
             for (const id of recoverFailuresToClear(
               snapshot.recoverFailureIds,
               failures,
+              resolved,
             )) {
               deps.emitDispatchCleared({ verb: "close", id });
             }

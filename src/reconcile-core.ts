@@ -334,11 +334,16 @@ export function worktreeRecoverEpicDispatchId(
  * The `dispatch_failures` id a {@link recoverWorktrees} failure keys on. Epic-tied →
  * the per-(epic,repo) {@link worktreeRecoverEpicDispatchId}; a path-tied failure (no
  * epic — the pass-1 list/abort/default-branch/base-list failures) → the per-dir
- * {@link worktreeRecoverDispatchId} slug. The mint and {@link recoverFailuresToClear}
- * BOTH route through this one helper so their keys never drift out of lockstep — a
- * one-sided change would strand rows un-clearable.
+ * {@link worktreeRecoverDispatchId} slug. The mint, the positive-evidence clear in
+ * {@link recoverFailuresToClear}, AND the {@link WorktreeRecoveryResolution}
+ * observation set ALL route through this one helper so their keys never drift out of
+ * lockstep — a one-sided change would strand rows un-clearable. Takes the `(epicId,
+ * dir)` pair structurally so both a failure and a resolution key identically.
  */
-export function recoverFailureDispatchId(f: WorktreeRecoveryFailure): string {
+export function recoverFailureDispatchId(f: {
+  epicId: string | null;
+  dir: string;
+}): string {
   return f.epicId != null
     ? worktreeRecoverEpicDispatchId(f.epicId, f.dir)
     : worktreeRecoverDispatchId(f.dir);
@@ -934,6 +939,52 @@ export interface WorktreeRecoveryFailure {
   epicId: string | null;
   reason: string;
   dir: string;
+}
+/**
+ * The tri-state verdict a recover-pass epic probe resolves to. A content-status
+ * condition, not a boolean: absence of an observation is NEVER resolution.
+ *   - `done`         — the epic row is present and `status === "done"`.
+ *   - `open`         — the epic row is present and not done (finalize owns its base).
+ *   - `absent`       — no epic row (reaped / EpicDeleted); AUTHORITATIVE, since the
+ *                      pk-lookup bypasses the OPEN scope and every recency floor.
+ *   - `inconclusive` — a non-result (error) read frame; DEFER, never coerce.
+ */
+export type EpicRecoverVerdict = "done" | "open" | "absent" | "inconclusive";
+/**
+ * A TERMINAL pass-2 content-conflict escalation, distinct from a transient {@link
+ * WorktreeRecoveryFailure}. The emit glue mints it as a `DispatchFailed` on the BARE
+ * `close::<epicId>` id with a `worktree-merge-conflict` leading reason, so routing
+ * classifies it merge-escalation (OUTSIDE both auto-clear scopes), the resolver-
+ * dispatch and merge-escalation sweeps select it, and only `retry_dispatch` drops it
+ * — matching finalize's close-sink conflict, never a `worktree-recover-*` degrade.
+ */
+export interface WorktreeRecoveryEscalation {
+  epicId: string;
+  reason: string;
+  dir: string;
+}
+/**
+ * A POSITIVE same-cycle resolution observation for a `(epicId, dir)` — the base
+ * merged, was already an ancestor of default, the epic read authoritatively absent,
+ * or a repo swept clean of path-tied failures. The positive-evidence clear
+ * ({@link recoverFailuresToClear}) keys it through the SAME {@link
+ * recoverFailureDispatchId} the mint uses (the lockstep rule), so an open recover row
+ * clears ONLY on a matching observation — a cycle that produces no report retains it.
+ */
+export interface WorktreeRecoveryResolution {
+  epicId: string | null;
+  dir: string;
+}
+/**
+ * The widened {@link WorktreeDriver.recover} outcome: transient `failures` (the
+ * per-(epic,repo) `worktree-recover-*` auto-clear scope), terminal `escalations` (the
+ * bare `close::<epic>` merge-escalation scope), and positive `resolved` observations
+ * (the clear predicate's evidence set). Replaces the former bare failure list.
+ */
+export interface WorktreeRecoveryOutcome {
+  failures: WorktreeRecoveryFailure[];
+  escalations: WorktreeRecoveryEscalation[];
+  resolved: WorktreeRecoveryResolution[];
 }
 /**
  * Translate a single readiness verdict on a row into the verb the
