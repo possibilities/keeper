@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching new id/reason family with cross-sibling disjointness plus a subtle ancestry-direction trap where a wrong abstraction propagates as false distress; specified enough to not be max.",
+      "task_id": "fn-1127-stale-base-lane-distress.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "0f78fc31c0896a8db68ce0899843a2e4c6102f5d25e5fb9c630d74194ce144c8",
+  "created_at": "2026-07-05T22:23:53.958000Z",
+  "epic_id": "fn-1127-stale-base-lane-distress",
+  "input_hash": "50769f4c48c40c623a4d0a244bec91621de9f1d0f26110c8b7881ab96748c515",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 24444,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1127-stale-base-lane-distress.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-touching new id/reason family with cross-sibling disjointness plus a subtle ancestry-direction trap where a wrong abstraction propagates as false distress; specified enough to not be max.\",\"confidence\":0.82}]}"
+}

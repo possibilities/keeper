@@ -7,7 +7,7 @@
     "fn-1124-dirty-shared-checkout-distress"
   ],
   "id": "fn-1127-stale-base-lane-distress",
-  "last_validated_at": "2026-07-05T22:21:13.216000Z",
+  "last_validated_at": "2026-07-05T22:23:54.405000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-05T22:21:13.117000Z"
+  "updated_at": "2026-07-05T22:23:54.405000Z"
 }
