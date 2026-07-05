@@ -117,5 +117,5 @@ observed scenario in prose.
 - [ ] Source comments describing the absent-lane arm state the tasks-done requirement and match behavior; no fn-ids appear in source comments.
 
 ## Done summary
-
+Gated the merge-landed absent-lane arm on work-done (epicHasStarted && laneCarriesLandedWork) with an absorbing status==='done' disjunct, so 'landed' no longer fires while a serial-checkout epic is mid-flight but still fires for merged-and-torn-down and force-closed epics. Repurposed the started-arm test and added mid-flight, force-closed, and completion-edge regressions.
 ## Evidence
