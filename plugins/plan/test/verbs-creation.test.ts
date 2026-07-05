@@ -148,7 +148,7 @@ describe("yaml scalar matrix (error envelopes)", () => {
     const err = parseCliOutput(r.output).error as Record<string, unknown>;
     expect(err.code).toBe("tier_invalid");
     expect(err.details).toEqual([
-      "task #1: `tier` 'ultrahigh' is not one of medium, high, xhigh, max",
+      "task #1: `tier` 'ultrahigh' is not one of low, medium, high, xhigh, max",
     ]);
   });
 

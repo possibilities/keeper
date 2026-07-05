@@ -1,9 +1,9 @@
 # Post-scaffold model+effort selector policy config.
 #
-# Read off disk by the /plan:plan and /plan:defer orchestrators only — never a
-# verb, never compile-embedded. During the ghost window the selector leg loads
-# this whole file into its prompt to choose each task's {effort, model} cell,
-# then writes the cells via `keeper plan assign-cells`.
+# Read off disk by the selection-brief handoff only — never compile-embedded.
+# During the ghost window the `plan:model-selector` subagent reads the brief,
+# uses this policy to choose each task's {effort, model} cell, then the
+# orchestrator writes the cells via `keeper plan assign-cells`.
 #
 # The `model-guidance` skill (plugins/plan/skills/model-guidance/) OWNS the
 # content here: every efforts:/models: block is authored and refreshed by that
@@ -14,9 +14,9 @@
 # to backfill here. The gate fails until backfilled:
 #   bun plugins/plan/scripts/model-guidance-check.ts --check
 
-# The leg the selector itself runs as (`keeper agent run --harness --model`).
-# harness is one of the agent-run harness tokens (claude/codex/pi/hermes); model
-# is an opaque passthrough string, hand-tuned to the strongest available.
+# Selector source metadata retained for the config schema.
+# Runtime is the custom `plan:model-selector` subagent; its frontmatter owns the
+# actual Claude model/effort used to classify tasks.
 selector:
   harness: claude
   model: opus
@@ -36,8 +36,12 @@ usage: |
 # One guidance block per configured `efforts:` axis value (subagents.yaml).
 # Concrete, behavioral, worker-facing selection advice — when to route a task to
 # this effort. Keep each block short: the whole config rides in every selector
-# prompt.
+# brief.
 efforts:
+  low: |
+    Tiny, reversible, near-mechanical edits: text/config polish, one obvious
+    assertion, or a trivial rename where the acceptance leaves no design choice.
+    No investigation, no multi-file coordination, and no contract surface.
   medium: |
     Single-file edit, mechanical refactor, or a straight test addition where the
     acceptance is "do exactly this." No abstraction to get wrong, no cross-module
@@ -72,6 +76,14 @@ models:
     default for anything intelligence-sensitive; route away only for genuinely
     mechanical work when a cheaper tier exists on the axis. When uncertain, keep
     opus.
+  sonnet: |
+    Balanced Claude tier for bounded coding work where cost/latency matters and
+    the path is clear. Strengths: routine implementation, template-following,
+    mechanical refactors, targeted tests, and straightforward fixes with a named
+    surface. Weaknesses: less margin than opus on ambiguous design, cross-repo or
+    contract-touching changes, migrations, schema/wire/API work, and gnarly
+    debugging. When to pick: route clearly mechanical or low-blast-radius work to
+    sonnet; keep opus for intelligence-sensitive tasks or any uncertainty.
 
 # Research provenance map: per configured model, the references/ cache file
 # (path relative to the plan plugin root) and its sha256. The drift gate asserts
@@ -81,3 +93,6 @@ research:
   opus:
     reference: skills/model-guidance/references/opus.md
     sha256: 8af8eaa19f62a59684796458b50a98cbd3cea95202a9cb1a65d8873e48a4e11e
+  sonnet:
+    reference: skills/model-guidance/references/sonnet.md
+    sha256: 482f0932135f95b41b81df37c6bc8677a8a8ccb99aaf6137e0bedd244047537e

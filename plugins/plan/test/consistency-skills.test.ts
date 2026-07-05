@@ -207,6 +207,52 @@ for (const skill of BARE_VERB_SKILLS) {
 }
 
 // ---------------------------------------------------------------------------
+// plan/defer model selector: content-blind subagent, no inline model override
+// ---------------------------------------------------------------------------
+
+const PLAN_SKILL = join(REPO, "skills", "plan", "SKILL.md");
+const DEFER_SKILL = join(REPO, "skills", "defer", "SKILL.md");
+const MODEL_SELECTOR_AGENT = join(REPO, "agents", "model-selector.md");
+
+describe("model-selector agent frontmatter", () => {
+  test("exists as a tracked agent named model-selector", () => {
+    expect(existsSync(MODEL_SELECTOR_AGENT)).toBe(true);
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_SELECTOR_AGENT));
+    expect(fm.name).toBe("model-selector");
+  });
+
+  test("pins its own model/effort and disallows write/exec/spawn tools", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_SELECTOR_AGENT));
+    expect(fm.model).toBe("opus");
+    expect(fm.effort).toBe("high");
+    expect(fm.disallowedTools).toContain("Edit");
+    expect(fm.disallowedTools).toContain("Write");
+    expect(fm.disallowedTools).toContain("Bash");
+    expect(fm.disallowedTools).toContain("Task");
+  });
+});
+
+describe("plan/defer selector handoff", () => {
+  for (const [label, path] of [
+    ["plan", PLAN_SKILL],
+    ["defer", DEFER_SKILL],
+  ] as const) {
+    test(`${label} uses selection-brief + plan:model-selector with no model=`, () => {
+      const text = readFileSync(path, "utf-8");
+      expect(text).toContain("keeper plan selection-brief");
+      expect(text).toContain('subagent_type="plan:model-selector"');
+      const selectorBlocks = extractTaskCallBlocks(text).filter((b) =>
+        b.includes("plan:model-selector"),
+      );
+      expect(selectorBlocks.length).toBeGreaterThanOrEqual(1);
+      for (const block of selectorBlocks) {
+        expect(block).not.toContain("model=");
+      }
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // defer-specific: carries no board-priority knob
 // ---------------------------------------------------------------------------
 

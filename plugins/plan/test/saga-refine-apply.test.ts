@@ -462,7 +462,7 @@ describe("refine-apply add_tasks tier", () => {
     expect(err.code).toBe("tier_invalid");
     const blob = (err.details as string[]).join(" ");
     expect(blob).toContain("missing");
-    for (const v of ["medium", "high", "xhigh", "max"]) {
+    for (const v of ["low", "medium", "high", "xhigh", "max"]) {
       expect(blob).toContain(v);
     }
     expect(taskExists(`${epicId}.3`)).toBe(false);
@@ -484,7 +484,7 @@ describe("refine-apply add_tasks tier", () => {
 
   test("every TASK_TIERS member persists", () => {
     // test_refine_apply.py::test_refine_apply_add_tasks_valid_tier_persists
-    const tiers = ["medium", "high", "xhigh", "max"];
+    const tiers = ["low", "medium", "high", "xhigh", "max"];
     const epicId = seedTwoTaskEpic();
     const block = tiers
       .map(
@@ -526,7 +526,7 @@ describe("refine-apply add_tasks tier", () => {
     const delta =
       "add_tasks:\n" +
       `  - title: missing tier\n    deps: []\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
-      `  - title: bogus tier\n    deps: []\n    tier: low\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `  - title: bogus tier\n    deps: []\n    tier: bogus\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).not.toBe(0);
     const details = (parseEnvelope(r.output).error as Record<string, unknown>)
@@ -535,7 +535,7 @@ describe("refine-apply add_tasks tier", () => {
       details.some((d) => d.includes("add_tasks #1") && d.includes("missing")),
     ).toBe(true);
     expect(
-      details.some((d) => d.includes("add_tasks #2") && d.includes("'low'")),
+      details.some((d) => d.includes("add_tasks #2") && d.includes("'bogus'")),
     ).toBe(true);
     expect(taskExists(`${epicId}.3`)).toBe(false);
     expect(taskExists(`${epicId}.4`)).toBe(false);
@@ -571,13 +571,13 @@ describe("refine-apply add_tasks model", () => {
 
   test("model_invalid accumulates in the SAME pass as tier_invalid; tier wins priority", () => {
     const epicId = seedTwoTaskEpic();
-    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: low\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const delta = `add_tasks:\n  - title: Third task\n    deps: []\n    tier: ultrahigh\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).not.toBe(0);
     const err = parseEnvelope(r.output).error as Record<string, unknown>;
     expect(err.code).toBe("tier_invalid");
     const blob = (err.details as string[]).join(" ");
-    expect(blob).toContain("'low'");
+    expect(blob).toContain("'ultrahigh'");
     expect(blob).toContain("'gpt'");
     expect(taskExists(`${epicId}.3`)).toBe(false);
   });

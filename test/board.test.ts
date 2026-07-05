@@ -45,6 +45,7 @@ import {
   pillOrEmpty,
   renderClosePills,
   renderDispatchFailurePill,
+  renderTaskCellPills,
   renderTaskPills,
   startedPill,
   subagentLinesFor,
@@ -1735,6 +1736,18 @@ const EPIC_NOT_VALIDATED: Verdict = {
 // their current value — defaults included, no verdict-aware suppression. The
 // `_verdict` arg is retained for arity but no longer consulted. (fn-756 dropped
 // the third [approval] pill with the rest of the approval surface.)
+test("renderTaskCellPills: shows model and effort on every task", () => {
+  expect(renderTaskCellPills({ model: "opus", tier: "xhigh" })).toBe(
+    ` ${pill("model:opus")} ${pill("effort:xhigh")}`,
+  );
+});
+
+test("renderTaskCellPills: missing model or effort renders unknown", () => {
+  expect(renderTaskCellPills({})).toBe(
+    ` ${pill("model:—")} ${pill("effort:—")}`,
+  );
+});
+
 test("renderTaskPills: all-resting task (todo/open) now shows both defaults", () => {
   expect(
     renderTaskPills({ runtime_status: "todo", worker_phase: "open" }, READY),

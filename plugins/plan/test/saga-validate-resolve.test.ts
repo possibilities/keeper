@@ -222,14 +222,14 @@ describe("resolve-task routing envelope", () => {
     expect(obj.primary_repo).not.toBe(lane);
   });
 
-  test("returned tier is in the medium|high|xhigh|max|null vocabulary", () => {
+  test("returned tier is in the low|medium|high|xhigh|max|null vocabulary", () => {
     // test_resolve_task.py::test_resolve_task_tier_in_vocab
     const { taskIds } = scaffoldEpic(project, { title: "Resolve epic" });
     const taskId = taskIds[0] as string;
     const obj = resolveEnvelope(
       run(["resolve-task", taskId, "--project", project.root]).output,
     );
-    expect([..."medium high xhigh max".split(" "), null]).toContain(
+    expect([..."low medium high xhigh max".split(" "), null]).toContain(
       obj.tier as string | null,
     );
   });

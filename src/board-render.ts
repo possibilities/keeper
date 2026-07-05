@@ -368,26 +368,21 @@ export function startedPill(isStarted: boolean): string {
   return isStarted ? ` ${pill("started")}` : "";
 }
 
+/** Render fixed model/effort cells for every board TASK LINE. */
+export function renderTaskCellPills(task: Record<string, unknown>): string {
+  let out = "";
+  const model =
+    typeof task.model === "string" && task.model !== "" ? task.model : null;
+  const effort =
+    typeof task.tier === "string" && task.tier !== "" ? task.tier : null;
+  out += ` ${pill(`model:${model ?? "—"}`)}`;
+  out += ` ${pill(`effort:${effort ?? "—"}`)}`;
+  return out;
+}
+
 /**
- * Render the trailing pill segment for a board TASK LINE —
- * the consolidated `[${runtime_status}] [${worker_phase}]` closure. Pure
- * `f(task, verdict)` — no readiness recompute, no wall-clock, no env;
- * `verdict` is already in scope at the call site. There is no `[approval]`
- * pill: the approval surface does not exist.
- *
- * Two fields, each lossless-consolidated per `~/docs/pill-inventory.md`
- * Part 4:
- *   - **runtime_status (B10, T1 + de-ambiguate)** — omit `todo` (default);
- *     render `in_progress` / `done` verbatim; relabel `blocked` →
- *     `[rt:blocked]` so the manual keeper plan block flag never collides with
- *     the verdict `[blocked:*]` family.
- *   - **worker_phase (B11, T1 + de-ambiguate)** — never render `[open]`;
- *     render the survivor as the LABELED `[worker-done]` (never bare
- *     `[done]`, which would collide with runtime `done`) and ONLY when the
- *     verdict does not already pin it (see {@link verdictPinsWorkerDone}).
- *
- * Returns a string beginning with `' '` per appended pill (or `""` when both
- * fields are at rest), so the caller appends unconditionally.
+ * Render runtime task state pills for every board TASK LINE: current
+ * `runtime_status` plus current `worker_phase`, both with defaults shown.
  */
 export function renderTaskPills(
   task: Record<string, unknown>,

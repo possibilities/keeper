@@ -575,7 +575,7 @@ interface RawTask {
   /**
    * Plan-native effort tier: top-level field on the task-def file,
    * read by `keeper plan resolve-task` from `task_def.get("tier")`. Plan's own
-   * vocabulary is `medium | high | xhigh | max` (plan `TASK_TIERS`), but
+   * vocabulary is `low | medium | high | xhigh | max`, but
    * keeper stores the field opaque — never branches on the value — so any
    * future tier widening rides through with no code change. Absent on legacy
    * task files / unset on newer ones; coerced to `null` by `asString`.

@@ -60,7 +60,7 @@ vanilla session at the repo root's `CONTEXT.md` glossary when present + non-empt
 | `keeper agent` manual dispatch / pair | `keeper agent claude …` → `agent/main.ts:2194` gate | full plugins.yaml | — |
 | Autopilot / dispatch worker | `buildKeeperAgentLaunchArgv` emits `keeper agent claude …` (`src/exec-backend.ts:854`); same gate | **full plugins.yaml** | per-cell `--plugin-dir <cell>` (`exec-backend.ts:874-876`), **additive** |
 
-The per-cell worker manifest (`plugins/plan/workers/opus-*/`, rendered from
+The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`, rendered from
 `subagents.yaml`) is appended via `--plugin-dir` AFTER `--name`
 (`exec-backend.ts:870-876`). It is **additive, not isolating**: the worker still
 inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
@@ -68,9 +68,9 @@ worker argv recovers the byte-identical interactive argv — pinned by the addit
 test.
 
 A sibling plan-plugin config surface, `plugins/plan/model-selector.yaml` (the
-post-scaffold model+effort selector's policy config), is read off disk by the
-`/plan:plan` and `/plan:defer` orchestrators during the select beat — never
-compiled in, never a `--plugin-dir` — so it rides no launch channel and is noted
+post-scaffold model+effort selector's policy config), is read off disk by
+`keeper plan selection-brief` during the select beat — never compiled in, never a
+`--plugin-dir` — so it rides no launch channel and is noted
 here only to keep the plan plugin's config-surface inventory complete alongside
 `subagents.yaml`.
 

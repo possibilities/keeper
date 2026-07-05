@@ -9,8 +9,8 @@ allowed-tools: Read, Glob, Grep, Edit, Write, Bash(shasum:*), Bash(bun plugins/p
 # Model guidance
 
 Own the content of `plugins/plan/model-selector.yaml` — the post-scaffold selector's policy
-config. The config rides inside every selector prompt, so it must stay short, concrete, and current;
-this skill is how it gets authored and kept honest. The selector verb and the orchestrators only
+config. The config rides inside every selector brief, so it must stay short, concrete, and current;
+this skill is how it gets authored and kept honest. The `selection-brief` verb and the orchestrators only
 *read* the config — nothing regenerates it automatically. That is deliberate: model guidance is
 researched judgment, and a human owns when it is refreshed.
 
@@ -70,6 +70,6 @@ newer version. The provenance header in each `references/<model>.md` records whe
 
 ## Keep the blocks short
 
-Every efforts:/models: block is loaded into the selector's prompt on every run. Distilled bands stay
+Every efforts:/models: block is loaded into the selector brief on every run. Distilled bands stay
 a few sentences; if you find yourself pasting research prose, it belongs in `references/`, not the
 config. Density over volume: each clause should change how the selector routes a task.

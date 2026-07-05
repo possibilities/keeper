@@ -47,6 +47,7 @@ import { runRefineApply } from "./verbs/refine_apply.ts";
 import { runRefineContext } from "./verbs/refine_context.ts";
 import { runResolveTask } from "./verbs/resolve_task.ts";
 import { runScaffold } from "./verbs/scaffold.ts";
+import { runSelectionBrief } from "./verbs/selection_brief.ts";
 import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
@@ -192,6 +193,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "scaffold",
     shortHelp: "Materialize a whole epic tree from one YAML.",
+    implemented: true,
+  },
+  {
+    name: "selection-brief",
+    shortHelp: "Write the model/effort selector brief for an epic.",
     implemented: true,
   },
   {
@@ -924,6 +930,15 @@ function dispatch(parsed: ParsedArgs): number {
         allowDuplicate: readFlag(rest, "--allow-duplicate"),
         createdByCloseOf: null,
       });
+    case "selection-brief":
+      // Commit-free brief handoff: writes gitignored state/ and emits one
+      // payload envelope; the selector subagent reads the brief itself.
+      runSelectionBrief({
+        epicId: readPositionalSkipping(rest, new Set(["--project"])),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
     case "show":
       // Read-only: emits one payload envelope via formatOutput.
       runShow(readPositional(rest), readOption(rest, "--project"), format);

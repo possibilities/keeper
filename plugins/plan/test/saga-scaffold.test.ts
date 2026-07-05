@@ -709,7 +709,7 @@ describe("scaffold per-task tier", () => {
     expect(err.code).toBe("tier_invalid");
     const blob = (err.details as string[]).join(" ");
     expect(blob).toContain("missing");
-    for (const valid of ["medium", "high", "xhigh", "max"]) {
+    for (const valid of ["low", "medium", "high", "xhigh", "max"]) {
       expect(blob).toContain(valid);
     }
     expect(noEpicsOrTasksLanded()).toBe(true);
@@ -731,21 +731,15 @@ describe("scaffold per-task tier", () => {
     expect(noEpicsOrTasksLanded()).toBe(true);
   });
 
-  test("'low' is rejected with the allowlist in the message", () => {
-    // test_scaffold.py::test_scaffold_tier_low_rejected_with_allowlist_in_message
+  test("'low' is accepted as a valid tier", () => {
     const r = run([
       "scaffold",
       "--file",
       writeYaml(oneTaskTierYaml("low", "low tier")),
     ]);
-    expect(r.code).not.toBe(0);
-    const err = parseEnvelope(r.output).error as Record<string, unknown>;
-    expect(err.code).toBe("tier_invalid");
-    const blob = (err.details as string[]).join(" ");
-    for (const valid of ["medium", "high", "xhigh", "max"]) {
-      expect(blob).toContain(valid);
-    }
-    expect(noEpicsOrTasksLanded()).toBe(true);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`tasks/${epicId}.1.json`).tier).toBe("low");
   });
 
   test("non-string tier is bad_yaml", () => {
@@ -768,7 +762,7 @@ describe("scaffold per-task tier", () => {
 
   test("every TASK_TIERS member is accepted", () => {
     // test_scaffold.py::test_scaffold_tier_all_valid_values_accepted
-    const tiers = ["medium", "high", "xhigh", "max"];
+    const tiers = ["low", "medium", "high", "xhigh", "max"];
     const tasksBlock = tiers
       .map(
         (tier, i) =>
@@ -790,7 +784,7 @@ describe("scaffold per-task tier", () => {
     // test_scaffold.py::test_scaffold_tier_invalid_collects_all_offenders
     const yaml =
       "epic:\n  title: two bad tiers\n  spec: |\n    ## Overview\n    x.\n" +
-      `tasks:\n  - title: task A\n    deps: []\n    tier: low\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: bogus\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
       `  - title: task B\n    deps: []\n    tier: extreme\n    model: opus\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).not.toBe(0);
@@ -798,7 +792,7 @@ describe("scaffold per-task tier", () => {
     expect(err.code).toBe("tier_invalid");
     const details = err.details as string[];
     expect(
-      details.some((d) => d.includes("task #1") && d.includes("'low'")),
+      details.some((d) => d.includes("task #1") && d.includes("'bogus'")),
     ).toBe(true);
     expect(
       details.some((d) => d.includes("task #2") && d.includes("'extreme'")),
@@ -869,13 +863,13 @@ describe("scaffold per-task model", () => {
     // offenders appended so no offender is silently dropped.
     const yaml =
       "epic:\n  title: both bad\n  spec: |\n    ## Overview\n    x.\n" +
-      `tasks:\n  - title: only task\n    deps: []\n    tier: low\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+      `tasks:\n  - title: only task\n    deps: []\n    tier: ultrahigh\n    model: gpt\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
     const r = run(["scaffold", "--file", writeYaml(yaml)]);
     expect(r.code).not.toBe(0);
     const err = parseEnvelope(r.output).error as Record<string, unknown>;
     expect(err.code).toBe("tier_invalid");
     const blob = (err.details as string[]).join(" ");
-    expect(blob).toContain("'low'");
+    expect(blob).toContain("'ultrahigh'");
     expect(blob).toContain("'gpt'");
     expect(noEpicsOrTasksLanded()).toBe(true);
   });

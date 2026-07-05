@@ -24,7 +24,7 @@ The create path runs Phase 0 → 8 top to bottom. The refine path (an `fn-N` id 
 - **Phase 4** — Undersized gate → maybe stop & sketch *(create only)*
 - **Phase 5** — Write the epic tree
 - **Phase 6** — Auto-wire epic dependencies
-- **Phase 6.5** — Select model+effort cells *(create only — a detached selector overwrites the stamped defaults before the arm)*
+- **Phase 6.5** — Select model+effort cells *(create only — a content-blind selector subagent overwrites the stamped defaults before the arm)*
 - **Phase 7** — Validate & arm (both paths — arms the ghost scaffold minted)
 - **Phase 8** — Report
 - **Phase R** — Refine an existing id (branches from Phase 1; rejoins at Phase 7)
@@ -582,48 +582,50 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 ## Phase 6.5 — Select model+effort cells (create path only)
 
-Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets a detached selector agent overwrite those cells with a researched {tier, model} per task, landing the writes plus a git-committed selection sidecar via `keeper plan assign-cells`. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path skips this beat entirely (it rejoins at Phase 7).
+Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets the `plan:model-selector` subagent overwrite those cells with a researched {tier, model} per task, landing the writes plus a git-committed selection sidecar via `keeper plan assign-cells`. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path skips this beat entirely (it rejoins at Phase 7).
 
-### 6.5a — Load the selector config
+### 6.5a — Build the content-blind selector brief
 
-Read `plugins/plan/model-selector.yaml` off disk. If it is **absent or unparseable, skip the whole beat** — the default cells stand and you proceed straight to Phase 7 (no sidecar, no degrade record; the config's presence is the beat's on/off switch). Otherwise pin its `selector: {harness, model}`, the `usage:` advice, and every `efforts:` / `models:` guidance block.
-
-### 6.5b — Build a self-contained selector prompt
-
-The captured envelope must be complete on its own — the selector reads nothing off disk. Inline into one prompt:
-
-- the config's `usage:` advice and every `efforts:` / `models:` guidance block;
-- the epic spec and **every task's full spec** (note each task's spec length so the selector can discount verbosity bias — a long spec is not a hard task);
-- the **candidate cells in per-task shuffled order** — shuffle the {tier, model} candidate order independently per task to counter first-position bias, and **record the shuffle seed** for the sidecar;
-- an explicit output contract: a **single raw JSON object**, one cell per task id, covering **exactly the epic's todo task-id set**, each cell's `tier` from the configured efforts axis and `model` from the configured models axis, plus a per-task `rationale` and `confidence`.
-
-### 6.5c — Launch the detached read-only leg
-
-Harness and model come from the config's `selector:` block. One bounded blocking call writes the uniform 9-key envelope to `--output` on every outcome (write the prompt to a file — never hand-inline a long prompt):
+Run the brief handoff verb and pin its envelope fields (`brief_ref`, `config_hash`, `input_hash`, `shuffle_seed`, `task_ids`, `candidate_cells`). The verb writes the full selector context under gitignored state: selector policy config, epic spec, todo task specs, and candidate cells. Do **not** open the brief and do not inline spec prose into the selector prompt.
 
 ```bash
-keeper agent run <harness> "$(cat "$PROMPT_FILE")" --model <model> --read-only --output "$OUT" --stop-timeout-ms <bound>
+keeper plan selection-brief <epic_id>
 ```
 
-### 6.5d — Branch on the envelope `outcome` field
+If this fails (missing config/specs, no todo tasks, bad id), skip the selector subagent and go straight to the degrade path (6.5d) with `degraded:selection-brief-failed`.
 
-Read `$OUT` and switch on its **`outcome`** field, **never the exit code** (`no_message` also exits 0). Only `completed` carries a verdict to parse; `no_message`, `timed_out`, `launch_failed`, `no_transcript`, and `transcript_ambiguous` all route to the degrade path (6.5f).
+### 6.5b — Spawn the selector subagent blind
 
-### 6.5e — Extract + validate the verdict
+Spawn `plan:model-selector` with a config-only prompt. No `model=` kwarg — the agent file owns its own model and effort. The selector reads `BRIEF_REF` itself and returns exactly one raw JSON verdict; the planner never holds the epic/task specs as selector prompt prose.
 
-On `completed`, take the envelope's `message` and parse it as raw JSON (fenced ```` ```json ```` block fallback if the model wrapped it). Then validate, rejecting on any miss:
+```
+Task(
+    subagent_type="plan:model-selector",
+    description="Select cells for <epic_id>",
+    prompt="""Select model/effort cells.
 
-- schema shape (one cell per task with `tier` / `model` / `rationale` / `confidence`);
-- **enum-clamp** each `tier` to the configured efforts and `model` to the configured models;
-- the cell set covers **exactly the epic's todo task-id set** — no missing, extra, or duplicate id (schema validation cannot express in-epic membership, so check it explicitly).
+EPIC_ID: <epic_id>
+PRIMARY_REPO: <primary_repo from selection-brief>
+BRIEF_REF: <brief_ref from selection-brief>
+"""
+)
+```
 
-A clean verdict → apply it (6.5g, `label_source: heuristic-guided`). A validation miss → one repair retry (6.5f).
+### 6.5c — Extract + validate the verdict
 
-### 6.5f — One repair retry, then degrade
+Parse the Task return as raw JSON (fenced ```` ```json ```` block fallback if the model wrapped it). Then validate, rejecting on any miss:
 
-On the **first** validation miss only, relaunch a **fresh** leg (6.5c) with the validation errors appended to the prompt, and re-validate once. If it still fails — or on any non-`completed` outcome from 6.5d — **degrade**: stop (never loop) and apply the stamped defaults via 6.5g with `outcome: degraded:<reason>` and `label_source: heuristic-default`.
+- schema shape (`cells:` list, one cell per task with `task_id` / `tier` / `model` / `rationale` / `confidence`);
+- **enum-clamp** each `tier` / `model` against the `candidate_cells` from the `selection-brief` envelope;
+- the cell set covers **exactly** the `task_ids` from the `selection-brief` envelope — no missing, extra, or duplicate id.
 
-### 6.5g — Apply cells via assign-cells
+A clean verdict → apply it (6.5e, `label_source: heuristic-guided`). A Task failure, an error-shaped return, or a validation miss → one repair retry (6.5d).
+
+### 6.5d — One repair retry, then degrade
+
+On the **first** Task failure / error-shaped return / validation miss only, relaunch a **fresh** `plan:model-selector` with the same config-only prompt plus a short `VALIDATION_ERRORS:` block naming only the schema errors (no spec prose). Re-validate once. If it still fails, **degrade**: stop (never loop) and apply the stamped defaults via 6.5e with `outcome: degraded:<reason>` and `label_source: heuristic-default`.
+
+### 6.5e — Apply cells via assign-cells
 
 Feed the cell set to the batch verb — a YAML with a `cells:` list (one cell per todo task, the full set) and a `selection:` provenance block:
 
@@ -638,11 +640,11 @@ cells:
     label_source: heuristic-guided       # heuristic-default on a degrade
   # … one cell per todo task, covering the exact set
 selection:
-  harness: <config selector harness>
-  model: <config selector model>
-  config_hash: <hash of the config the run used>
-  input_hash: <hash of the epic/task inputs>
-  shuffle_seed: <the recorded seed, or null>
+  harness: subagent
+  model: plan:model-selector
+  config_hash: <selection-brief config_hash>
+  input_hash: <selection-brief input_hash>
+  shuffle_seed: <selection-brief shuffle_seed>
   outcome: completed                     # or degraded:<reason>
   verdict_raw: <the selector's raw message, or null>
 YAML_EOF
@@ -650,7 +652,7 @@ YAML_EOF
 
 On success the verb overwrites every cell, writes the schema-versioned sidecar to `.keeper/selections/<epic_id>.json`, and lands both in one auto-commit. Failure codes: `bad_yaml` (shape/type), `cell_invalid` (out-of-axis tier/model, or an unknown / duplicate / missing / non-todo task id — the full-set + todo-only contract). A verb rejection of a real verdict is a validation miss (one repair retry, then degrade).
 
-**On ANY failure path** (config missing handled in 6.5a; `launch_failed` / `timed_out` / `no_message` / parse-or-schema failure after the one retry / assign-cells rejection) call assign-cells with the **stamped default cells** (`xhigh` / `opus`), `outcome: degraded:<reason>`, and `label_source: heuristic-default`, so the sidecar records the failure for offline analysis. If even that degrade write fails, **log one line and proceed** — Phase 7 still arms.
+**On ANY failure path** (`selection-brief` failure, Task failure, error-shaped return, parse-or-schema failure after the one retry, or `assign-cells` rejection) call assign-cells with the **stamped default cells** (`xhigh` / `opus`), `outcome: degraded:<reason>`, and `label_source: heuristic-default`, so the sidecar records the failure for offline analysis. If even that degrade write fails, **log one line and proceed** — Phase 7 still arms.
 
 ### Failure invariant
 

@@ -55,16 +55,16 @@ describe("subagents matrix loader", () => {
 
   test("the embedded snapshot carries today's axes (proves the compile-time embed)", () => {
     const matrix = subagentsMatrix();
-    expect(matrix.efforts).toEqual(["medium", "high", "xhigh", "max"]);
-    expect(matrix.models).toEqual(["opus"]);
+    expect(matrix.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(matrix.models).toEqual(["opus", "sonnet"]);
     expect(matrix.subagents.length).toBeGreaterThan(0);
   });
 
   test("configuredEfforts/configuredModels source the axes; workerAgentFor composes exactly them", () => {
     const efforts = configuredEfforts();
-    expect(efforts).toEqual(["medium", "high", "xhigh", "max"]);
+    expect(efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
     const models = configuredModels();
-    expect(models).toEqual(["opus"]);
+    expect(models).toEqual(["opus", "sonnet"]);
     for (const model of models) {
       for (const effort of efforts) {
         expect(workerAgentFor(effort, model)).toBe(

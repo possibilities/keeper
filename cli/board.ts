@@ -48,6 +48,7 @@ import {
   planVerbLabel,
   renderClosePills,
   renderDispatchFailurePill,
+  renderTaskCellPills,
   renderTaskPills,
   sessionTelemetryPillSeg,
   startedPill,
@@ -683,7 +684,7 @@ export async function main(argv: string[]): Promise<void> {
         // `renderTaskPills` consolidates the runtime_status / worker_phase /
         // approval triple, each rendering ONLY at its non-resting value (see
         // `keeper board --help` for the omit-default convention).
-        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg}${renderTaskPills(t, taskVerdict)}`,
+        `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg}${renderTaskCellPills(t)}${renderTaskPills(t, taskVerdict)}`,
         ...taskIdLines,
         ...renderJobLines(subagentIndex, t.jobs),
       );

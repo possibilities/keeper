@@ -13,7 +13,7 @@ allowed-tools: Bash(keeper plan:*), Bash(keeper:*), Read, Glob, Task
 
 # Defer
 
-Capture a tiny, actionable change as a single-task epic and stop. No priority jump — the epic sorts in normal `epic_number` order on the board. This skill sits in the `/plan:*` family, not `/plan:work` — it scaffolds an epic, runs the read-only cell-selector beat, arms it, and exits. It does NOT spawn the task's worker, does NOT run an audit, and does NOT close the epic. (The Phase 4b selector leg is a detached read-only advisory agent that only picks the {tier, model} cell — not the deferred work's executor.) Running the work is autopilot's job, not this skill's — defer itself never proactively surprise-launches execution. The operator skills (`keeper:dispatch` / `keeper:autopilot`) are model-invocable and may be reached on a clear user request, but never from this defer flow on its own.
+Capture a tiny, actionable change as a single-task epic and stop. No priority jump — the epic sorts in normal `epic_number` order on the board. This skill sits in the `/plan:*` family, not `/plan:work` — it scaffolds an epic, runs the read-only cell-selector beat, arms it, and exits. It does NOT spawn the task's worker, does NOT run an audit, and does NOT close the epic. (The Phase 4b selector subagent only picks the {tier, model} cell from a content-blind brief — it is not the deferred work's executor.) Running the work is autopilot's job, not this skill's — defer itself never proactively surprise-launches execution. The operator skills (`keeper:dispatch` / `keeper:autopilot`) are model-invocable and may be reached on a clear user request, but never from this defer flow on its own.
 
 ## When to invoke
 
@@ -170,18 +170,26 @@ The success envelope carries `epic_id` (the freshly-minted `fn-N-slug`) and `tas
 
 **On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`): scaffold collected all validation errors in one pass. Read `details`, fix the YAML, and re-run the single scaffold call. Do NOT fall back to incremental verbs. Codes (the scaffold validator's full set): `bad_yaml`, `spec_invalid`, `dep_invalid`, `epic_dep_invalid`, `repo_invalid`, `tier_invalid`, `model_invalid`, `repo_required`, `dep_cycle`, `id_collision`, `duplicate_epic`.
 
-**Select the cell (Phase 4b) — before the arm.** Between scaffold and the arm, run the same post-scaffold selector beat `/plan:plan` runs (its Phase 6.5), here over this epic's single todo task:
+**Select the cell (Phase 4b) — before the arm.** Between scaffold and the arm, run the same content-blind post-scaffold selector beat `/plan:plan` runs (its Phase 6.5), here over this epic's single todo task:
 
-1. Read `plugins/plan/model-selector.yaml`. **Absent or unparseable → skip the beat** — the stamped default stands and you go straight to the arm.
-2. Build a self-contained selector prompt: the config's `usage:` advice and every `efforts:` / `models:` guidance block, the epic spec and the one task's full spec inlined (the captured envelope must be complete — the selector reads nothing off disk), and the candidate cell in shuffled order (record the shuffle seed). Output contract: a single raw JSON object with one cell for the task id — `tier` from the configured efforts axis, `model` from the configured models axis, plus `rationale` + `confidence`.
-3. Launch the detached read-only leg (harness + model from the config's `selector:` block), then branch on the envelope's **`outcome`** field, never the exit code (`no_message` also exits 0):
+1. Run `keeper plan selection-brief <epic_id>` and pin its envelope fields (`brief_ref`, `config_hash`, `input_hash`, `shuffle_seed`, `task_ids`, `candidate_cells`). If it fails, degrade to the stamped default cell and continue to the arm. Do **not** open the brief — it carries selector config + specs out-of-band.
+2. Spawn `plan:model-selector` with a config-only prompt, no `model=` kwarg:
 
-```bash
-keeper agent run <harness> "$(cat "$PROMPT_FILE")" --model <model> --read-only --output "$OUT" --stop-timeout-ms <bound>
+```
+Task(
+    subagent_type="plan:model-selector",
+    description="Select cells for <epic_id>",
+    prompt="""Select model/effort cells.
+
+EPIC_ID: <epic_id>
+PRIMARY_REPO: <primary_repo from selection-brief>
+BRIEF_REF: <brief_ref from selection-brief>
+"""
+)
 ```
 
-4. On `completed`, parse `message` as raw JSON (fenced-block fallback), enum-clamp `tier` / `model` to the configured axes, and require **exactly** the task's id. One repair retry on a validation miss (fresh leg, errors appended), then degrade.
-5. Feed the valid verdict to `keeper plan assign-cells` (`label_source: heuristic-guided`). On **any** failure path — config missing, `launch_failed`, `timed_out`, `no_message`, parse/schema failure after the one retry, or an `assign-cells` rejection (codes `bad_yaml` / `cell_invalid`) — call `assign-cells` with the stamped default cell, `outcome: degraded:<reason>`, and `label_source: heuristic-default` so the sidecar records the failure; if even that fails, log one line and proceed.
+3. Parse the Task return as raw JSON (fenced-block fallback), enum-clamp `tier` / `model` against the `candidate_cells` from the `selection-brief` envelope, and require **exactly** the one `task_ids` value. One repair retry on a Task failure / error-shaped return / validation miss (fresh `plan:model-selector`, same config-only prompt plus `VALIDATION_ERRORS:` and no spec prose), then degrade.
+4. Feed the valid verdict to `keeper plan assign-cells` (`label_source: heuristic-guided`). On **any** failure path — `selection-brief` failure, Task failure, parse/schema failure after the one retry, or an `assign-cells` rejection (codes `bad_yaml` / `cell_invalid`) — call `assign-cells` with the stamped default cell, `outcome: degraded:<reason>`, and `label_source: heuristic-default` so the sidecar records the failure; if even that fails, log one line and proceed.
 
 ```bash
 keeper plan assign-cells <epic_id> --file - <<'YAML_EOF'
@@ -193,11 +201,11 @@ cells:
     confidence: <0-1 or a label>
     label_source: heuristic-guided       # heuristic-default on a degrade
 selection:
-  harness: <config selector harness>
-  model: <config selector model>
-  config_hash: <hash of the config the run used>
-  input_hash: <hash of the epic/task inputs>
-  shuffle_seed: <the recorded seed, or null>
+  harness: subagent
+  model: plan:model-selector
+  config_hash: <selection-brief config_hash>
+  input_hash: <selection-brief input_hash>
+  shuffle_seed: <selection-brief shuffle_seed>
   outcome: completed                     # or degraded:<reason>
   verdict_raw: <the selector's raw message, or null>
 YAML_EOF
@@ -229,7 +237,7 @@ No menu, no follow-up prompts, no epic close. Autopilot runs the task — this f
 
 - **Never scales up silently.** Phase 3's one-task fit check is the load-bearing gate. If the work won't fit, stop with a concrete alternative — never scaffold a partial epic.
 - **No mutating verbs before Phase 4.** Phase 1 + Phase 2 + Phase 3 emit zero envelopes, zero commits. The mutating verbs in this skill are `keeper plan scaffold`, the `keeper plan assign-cells` selector write, and the trailing `keeper plan validate --epic` arm — all in Phase 4.
-- **Not a job-launcher.** Autopilot runs the task; this flow never spawns the task's worker, runs an audit, closes the epic, or surprise-launches execution (full rule in the intro). The Phase 4b selector leg is a read-only advisory agent that only picks the {tier, model} cell — it never implements the deferred work.
+- **Not a job-launcher.** Autopilot runs the task; this flow never spawns the task's worker, runs an audit, closes the epic, or surprise-launches execution (full rule in the intro). The Phase 4b selector subagent only picks the {tier, model} cell from a content-blind brief — it never implements the deferred work.
 - **Subject inference excludes `.keeper/`.** Same prompt-injection guard as `/plan:plan` Phase 1b — historical plan state never seeds a new subject.
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.
 - **No `TodoWrite`.** the plan tooling tracks all tasks.

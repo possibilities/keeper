@@ -1686,7 +1686,7 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     task_number: 3,
     title: "Wire the callback",
     target_repo: "/Users/mike/code/keeper",
-    // fn-602: the producer ships `tier` (plan `medium|high|xhigh|max`)
+    // fn-602: the producer ships `tier` (plan `low|medium|high|xhigh|max`)
     // verbatim from the task-def file's top-level `tier` field. Stored
     // opaque — the reducer never branches on the value.
     tier: "high",
