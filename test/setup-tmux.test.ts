@@ -475,10 +475,12 @@ describe("main() --kill-sessions busy-pane gate", () => {
     // Non-TTY stdin is the refuse trigger.
     Object.defineProperty(process.stdin, "isTTY", {
       value: false,
+      writable: true,
       configurable: true,
     });
     Object.defineProperty(process.stdout, "isTTY", {
       value: true,
+      writable: true,
       configurable: true,
     });
     let exitCode: number | undefined;
@@ -497,10 +499,12 @@ describe("main() --kill-sessions busy-pane gate", () => {
     } finally {
       Object.defineProperty(process.stdin, "isTTY", {
         value: savedStdinTTY,
+        writable: true,
         configurable: true,
       });
       Object.defineProperty(process.stdout, "isTTY", {
         value: savedStdoutTTY,
+        writable: true,
         configurable: true,
       });
       process.exit = savedExit;
@@ -533,10 +537,12 @@ describe("main() --kill-sessions busy-pane gate", () => {
     });
     Object.defineProperty(process.stdin, "isTTY", {
       value: true,
+      writable: true,
       configurable: true,
     });
     Object.defineProperty(process.stdout, "isTTY", {
       value: true,
+      writable: true,
       configurable: true,
     });
     let exitCode: number | undefined;
@@ -559,6 +565,7 @@ describe("main() --kill-sessions busy-pane gate", () => {
       });
       Object.defineProperty(process.stdout, "isTTY", {
         value: savedStdoutTTY,
+        writable: true,
         configurable: true,
       });
       process.exit = savedExit;
@@ -852,10 +859,12 @@ async function runWithTTY(opts: {
   });
   Object.defineProperty(process.stdin, "isTTY", {
     value: opts.tty,
+    writable: true,
     configurable: true,
   });
   Object.defineProperty(process.stdout, "isTTY", {
     value: opts.tty,
+    writable: true,
     configurable: true,
   });
   process.stdout.write = ((s: string | Uint8Array) => {
@@ -878,10 +887,12 @@ async function runWithTTY(opts: {
     });
     Object.defineProperty(process.stdin, "isTTY", {
       value: savedStdinTTY,
+      writable: true,
       configurable: true,
     });
     Object.defineProperty(process.stdout, "isTTY", {
       value: savedStdoutTTY,
+      writable: true,
       configurable: true,
     });
     process.stdout.write = savedOut;
@@ -1120,10 +1131,12 @@ async function runProvision(opts: {
   const savedErr = process.stderr.write;
   Object.defineProperty(process.stdin, "isTTY", {
     value: false,
+    writable: true,
     configurable: true,
   });
   Object.defineProperty(process.stdout, "isTTY", {
     value: false,
+    writable: true,
     configurable: true,
   });
   process.stdout.write = (() => true) as typeof process.stdout.write;
@@ -1133,10 +1146,12 @@ async function runProvision(opts: {
   } finally {
     Object.defineProperty(process.stdin, "isTTY", {
       value: savedStdinTTY,
+      writable: true,
       configurable: true,
     });
     Object.defineProperty(process.stdout, "isTTY", {
       value: savedStdoutTTY,
+      writable: true,
       configurable: true,
     });
     process.stdout.write = savedOut;
@@ -1302,10 +1317,12 @@ async function runWithGuardFs(
   const savedErr = process.stderr.write;
   Object.defineProperty(process.stdin, "isTTY", {
     value: false,
+    writable: true,
     configurable: true,
   });
   Object.defineProperty(process.stdout, "isTTY", {
     value: false,
+    writable: true,
     configurable: true,
   });
   process.stdout.write = (() => true) as typeof process.stdout.write;
@@ -1315,10 +1332,12 @@ async function runWithGuardFs(
   } finally {
     Object.defineProperty(process.stdin, "isTTY", {
       value: savedStdinTTY,
+      writable: true,
       configurable: true,
     });
     Object.defineProperty(process.stdout, "isTTY", {
       value: savedStdoutTTY,
+      writable: true,
       configurable: true,
     });
     process.stdout.write = savedOut;

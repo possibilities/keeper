@@ -370,10 +370,14 @@ function captureWrite(
   };
 }
 
-/** Set a stream's isTTY without tripping the readonly type — the in-process
- * faithful-to-spawn pin and its restore. */
+/** Pin a stream's isTTY via a writable, configurable descriptor so it survives
+ * a prior non-writable definition; `value` may be `undefined` for piped streams. */
 function setTTY(stream: NodeJS.WriteStream, value: boolean | undefined): void {
-  (stream as unknown as { isTTY: boolean | undefined }).isTTY = value;
+  Object.defineProperty(stream, "isTTY", {
+    value,
+    configurable: true,
+    writable: true,
+  });
 }
 
 /** Decode a captured write chunk (Uint8Array | Buffer | string) to a UTF-8
