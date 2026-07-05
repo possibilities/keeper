@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching refactor extracting a new shared seam consumed by two callers with strict invariants (byte-identical autopilot argv, sticky-reject semantics, loud CLI exit) where a wrong abstraction propagates past the task.",
+      "task_id": "fn-1126-launcher-worker-cell-resolver.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-05T22:22:23.249000Z",
+  "epic_id": "fn-1126-launcher-worker-cell-resolver",
+  "input_hash": "e54a12e563ec2e4b57c6875e323aa93f24ad57ee7cb1f770683c65761d46dc9a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": "{\"task_id\": \"fn-1126-launcher-worker-cell-resolver.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Contract-touching refactor extracting a new shared seam consumed by two callers with strict invariants (byte-identical autopilot argv, sticky-reject semantics, loud CLI exit) where a wrong abstraction propagates past the task.\", \"confidence\": 0.82}"
+}
