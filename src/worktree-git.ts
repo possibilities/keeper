@@ -38,7 +38,8 @@
  */
 
 import { lstat, readdir, rm } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { basename, resolve, sep } from "node:path";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -46,6 +47,7 @@ import {
   type GitRunner,
   gitExec,
 } from "./commit-work/git-exec";
+import { repoDirHash } from "./worktree-plan";
 
 /**
  * Acquire the shared commit-work flock, returning a releasable handle — or `null`
@@ -1402,6 +1404,212 @@ function isEnoent(err: unknown): boolean {
     err !== null &&
     (err as { code?: string }).code === "ENOENT"
   );
+}
+
+// ---------------------------------------------------------------------------
+// Baseline scratch worktrees — the suite-baseline runner's detached checkouts.
+// ---------------------------------------------------------------------------
+
+/**
+ * The basename prefix every baseline scratch worktree dir carries. STRUCTURALLY
+ * distinct from a lane dir (`<repoName>-<hash>--keeper-epic-<...>`, see
+ * {@link worktreePathFor}): a lane's pre-`--` segment is `<repoName>-<hash>`, and
+ * a `repoDirHash` is a base36 uint32 (≤7 chars, always `< "baselin"`), so no lane
+ * basename can ever begin `keeper-baseline--`. The primary safety guarantee is
+ * stronger still: a scratch checkout is DETACHED (no branch), so the autopilot
+ * recover sweep — which classifies lanes by BRANCH via {@link isKeeperLaneEntry},
+ * never by path — can never mistake a scratch tree for a lane and sweep or merge
+ * it. The prefix is what lets {@link pruneBaselineScratchWorktrees} identify our
+ * own orphans to reap at boot.
+ */
+export const BASELINE_SCRATCH_PREFIX = "keeper-baseline--";
+
+/**
+ * The out-of-repo scratch worktree path the baseline runner checks a sha out at,
+ * keyed by (repo, sha). Mirrors {@link worktreePathFor}'s scheme — same
+ * `worktreesRoot` parent, same {@link repoDirHash} repo-disambiguation — but with
+ * the {@link BASELINE_SCRATCH_PREFIX} basename so it can never collide with a lane
+ * path (see the prefix doc). PURE: reaches no environment when `worktreesRoot` is
+ * passed (the producer injects `${homedir()}/worktrees`); when omitted it falls
+ * back to reading `homedir()` itself, yielding the byte-identical root — safe
+ * because that fallback runs PRODUCER-ONLY, never inside a fold. The `sha` is
+ * appended verbatim: the runner resolves a full hex sha before keying, so the
+ * segment is filesystem-safe.
+ */
+export function baselineScratchPathFor(
+  repoDir: string,
+  sha: string,
+  worktreesRoot?: string,
+): string {
+  const root = worktreesRoot ?? `${homedir()}/worktrees`;
+  return `${root}/${BASELINE_SCRATCH_PREFIX}${repoDirHash(repoDir)}-${sha}`;
+}
+
+/**
+ * True IFF `path`'s basename carries the {@link BASELINE_SCRATCH_PREFIX} — the
+ * gate that both identifies orphans for the boot reap and authorizes the `--force`
+ * in {@link removeScratchWorktree}. Pure — fast-tier covered.
+ */
+export function isBaselineScratchPath(path: string): boolean {
+  return basename(stripTrailingSlash(path.trim())).startsWith(
+    BASELINE_SCRATCH_PREFIX,
+  );
+}
+
+/** The typed outcome of {@link provisionScratchWorktree}. */
+export type ScratchProvisionResult =
+  /** A detached checkout exists at `path`, HEAD is exactly the sha, tree clean. */
+  | { kind: "ready"; path: string }
+  /**
+   * The scratch checkout could NOT be produced clean at the requested sha — an
+   * unresolvable/unfetched sha (the dominant case), a git-add failure, a HEAD
+   * that landed off the sha, or a tree that came up dirty. `detail` names the
+   * specific cause. A TYPED failure, never a throw: it feeds the baseline
+   * store's `infra-error: checkout` verdict a reader can never mistake for
+   * "no pre-existing failures". The scratch worktree is reaped before returning.
+   */
+  | { kind: "checkout-failed"; detail: string };
+
+/**
+ * Provision a detached scratch worktree at `sha` under `scratchPath` for the
+ * baseline runner. Idempotent + crash-recoverable: reaps any stale scratch entry
+ * at the path first (a prior run crashed), then `git worktree add --detach`. Only
+ * reports `ready` after verifying HEAD equals `sha` EXACTLY and the tree is clean
+ * — a dirty or off-sha scratch tree must never serve a result under a clean key,
+ * so it is reaped and returned as a typed `checkout-failed` instead. Every failure
+ * path reaps the scratch worktree before returning, so no orphan lingers under a
+ * failed key. All git flows through the injectable {@link GitRunner} seam.
+ *
+ * `scratchPath` MUST be a {@link baselineScratchPathFor} path (its prefix gates
+ * the `--force` reap); a non-scratch path throws via {@link removeScratchWorktree}.
+ */
+export async function provisionScratchWorktree(
+  mainRepoCwd: string,
+  scratchPath: string,
+  sha: string,
+  run: GitRunner = gitExec,
+): Promise<ScratchProvisionResult> {
+  // A crashed prior run may have left a stale worktree at this (repo, sha) path;
+  // reap it (+ prune the admin husk) before re-adding so the add never collides.
+  await removeScratchWorktree(mainRepoCwd, scratchPath, run);
+
+  const add = await run(["worktree", "add", "--detach", scratchPath, sha], {
+    cwd: mainRepoCwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (add.code !== 0) {
+    // Clear any partial admin entry a failed add may have left, then report the
+    // typed failure (an unresolvable sha lands here).
+    await removeScratchWorktree(mainRepoCwd, scratchPath, run);
+    const out = (add.stdout + add.stderr).trim();
+    return {
+      kind: "checkout-failed",
+      detail:
+        out.length > 0
+          ? out
+          : `git worktree add --detach failed (exit ${add.code})`,
+    };
+  }
+
+  // Verify HEAD is EXACTLY the requested sha — `--detach <commit-ish>` at a ref
+  // could land off the sha, and the baseline key IS the sha.
+  const head = await run(["rev-parse", "HEAD"], {
+    cwd: scratchPath,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (head.code !== 0) {
+    await removeScratchWorktree(mainRepoCwd, scratchPath, run);
+    return {
+      kind: "checkout-failed",
+      detail: `git rev-parse HEAD failed after checkout (exit ${head.code})${
+        head.stderr.trim().length > 0 ? `: ${head.stderr.trim()}` : ""
+      }`,
+    };
+  }
+  const headSha = head.stdout.trim();
+  if (headSha !== sha) {
+    await removeScratchWorktree(mainRepoCwd, scratchPath, run);
+    return {
+      kind: "checkout-failed",
+      detail: `scratch HEAD is ${headSha}, expected ${sha}`,
+    };
+  }
+
+  // Verify the scratch tree is clean — a dirty tree must never produce a result
+  // under a clean key.
+  const status = await run(["status", "--porcelain"], {
+    cwd: scratchPath,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (status.code !== 0) {
+    await removeScratchWorktree(mainRepoCwd, scratchPath, run);
+    return {
+      kind: "checkout-failed",
+      detail: `git status failed after checkout (exit ${status.code})${
+        status.stderr.trim().length > 0 ? `: ${status.stderr.trim()}` : ""
+      }`,
+    };
+  }
+  if (status.stdout.trim().length > 0) {
+    await removeScratchWorktree(mainRepoCwd, scratchPath, run);
+    return {
+      kind: "checkout-failed",
+      detail: `scratch tree is not clean at ${sha}`,
+    };
+  }
+
+  return { kind: "ready", path: scratchPath };
+}
+
+/**
+ * Remove a baseline scratch worktree, idempotently. Unlike {@link removeWorktree}
+ * (which NEVER blind-`--force`s, protecting a lane that may hold real work), this
+ * DOES `--force`: a scratch tree is a throwaway keyed by (repo, sha) holding only
+ * a checkout + build artifacts (nothing human), and a killed suite run leaves it
+ * dirty in a way a bare remove would refuse. The force is gated on the path
+ * carrying the {@link BASELINE_SCRATCH_PREFIX} — a non-scratch path THROWS (a
+ * producer bug), so a lane can never reach this force. Always prunes the admin
+ * husk after (idempotent), so a vanished-dir orphan entry is cleared too.
+ */
+export async function removeScratchWorktree(
+  mainRepoCwd: string,
+  scratchPath: string,
+  run: GitRunner = gitExec,
+): Promise<void> {
+  if (!isBaselineScratchPath(scratchPath)) {
+    throw new Error(
+      `worktree-git: refusing to force-remove non-scratch path ${scratchPath}`,
+    );
+  }
+  const existing = await listWorktrees(mainRepoCwd, run);
+  if (existing.some((e) => samePath(e.path, scratchPath))) {
+    await run(["worktree", "remove", "--force", scratchPath], {
+      cwd: mainRepoCwd,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+  }
+  await pruneWorktrees(mainRepoCwd, run);
+}
+
+/**
+ * Reap EVERY registered baseline scratch worktree — the boot orphan sweep. A
+ * scratch tree is owned by the in-daemon runner, so any that survives a restart
+ * is by definition a crashed-run orphan; reaping all of them at boot bounds the
+ * disk DoS surface. Idempotent (a second call finds none). Returns the reaped
+ * paths for the caller's log / a test assertion. Scratch entries are identified
+ * by their {@link BASELINE_SCRATCH_PREFIX} path — never by branch (they are
+ * detached), so a lane is never touched.
+ */
+export async function pruneBaselineScratchWorktrees(
+  mainRepoCwd: string,
+  run: GitRunner = gitExec,
+): Promise<string[]> {
+  const existing = await listWorktrees(mainRepoCwd, run);
+  const scratch = existing.filter((e) => isBaselineScratchPath(e.path));
+  for (const entry of scratch) {
+    await removeScratchWorktree(mainRepoCwd, entry.path, run);
+  }
+  return scratch.map((e) => e.path);
 }
 
 // ---------------------------------------------------------------------------
