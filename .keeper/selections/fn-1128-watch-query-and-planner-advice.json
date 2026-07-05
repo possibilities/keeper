@@ -1,0 +1,56 @@
+{
+  "cells": [
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Early proof point that sets the authoring contract (frontmatter/POINTER/NOT-for); moderate new-file authoring where convention precision pays permanent context load.",
+      "task_id": "fn-1128-watch-query-and-planner-advice.1",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Hardest task: a ~200-260 line five-rung triage ladder that must not contradict dense CLAUDE.md Autopilot invariants (sticky taxonomy, resolver-first sequencing, wedge-proof bounce gating); safety-shaped prose needing strong holistic reasoning.",
+      "task_id": "fn-1128-watch-query-and-planner-advice.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Three bounded, reference-shaped prose additions with byte-identical BAKE guards; additions land outside guards so risk is mechanical and well-scoped.",
+      "task_id": "fn-1128-watch-query-and-planner-advice.3",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Small reference-file + one-liner pointer edits; --help/anchor constraints are checkable and single-sourced, adequate for a careful mid-tier sonnet pass.",
+      "task_id": "fn-1128-watch-query-and-planner-advice.4",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.58,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-surface consistency audit across six files (piloting/blocked-mechanics/NOT-for web) plus full gate run; benefits from opus's holistic drift-detection and correct BLOCKED escalation judgment.",
+      "task_id": "fn-1128-watch-query-and-planner-advice.5",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0f78fc31c0896a8db68ce0899843a2e4c6102f5d25e5fb9c630d74194ce144c8",
+  "created_at": "2026-07-05T22:26:14.993000Z",
+  "epic_id": "fn-1128-watch-query-and-planner-advice",
+  "input_hash": "2b2c28e5eac72234f67d313eb8613acdad089a88f69dd223a421459bb78954b3",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 1128,
+  "verdict_raw": "{\n  \"fn-1128-watch-query-and-planner-advice.1\": {\"tier\": \"medium\", \"model\": \"opus\", \"rationale\": \"Early proof point that sets the authoring contract (frontmatter/POINTER/NOT-for); moderate new-file authoring where convention precision pays permanent context load.\", \"confidence\": 0.62},\n  \"fn-1128-watch-query-and-planner-advice.2\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Hardest task: a ~200-260 line five-rung triage ladder that must not contradict dense CLAUDE.md Autopilot invariants (sticky taxonomy, resolver-first sequencing, wedge-proof bounce gating); safety-shaped prose needing strong holistic reasoning.\", \"confidence\": 0.68},\n  \"fn-1128-watch-query-and-planner-advice.3\": {\"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"Three bounded, reference-shaped prose additions with byte-identical BAKE guards; additions land outside guards so risk is mechanical and well-scoped.\", \"confidence\": 0.6},\n  \"fn-1128-watch-query-and-planner-advice.4\": {\"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"Small reference-file + one-liner pointer edits; --help/anchor constraints are checkable and single-sourced, adequate for a careful mid-tier sonnet pass.\", \"confidence\": 0.6},\n  \"fn-1128-watch-query-and-planner-advice.5\": {\"tier\": \"medium\", \"model\": \"opus\", \"rationale\": \"Cross-surface consistency audit across six files (piloting/blocked-mechanics/NOT-for web) plus full gate run; benefits from opus's holistic drift-detection and correct BLOCKED escalation judgment.\", \"confidence\": 0.58}\n}\n"
+}
