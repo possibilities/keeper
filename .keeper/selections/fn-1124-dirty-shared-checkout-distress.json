@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Clones an existing idiom but is contract-touching (new id/reason family, ReconcileSnapshot field, un-retryable daemon-verb class + pill assertNever) where a wrong abstraction propagates past the task; pinned approach rules out max.",
+      "task_id": "fn-1124-dirty-shared-checkout-distress.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-05T17:31:06.850000Z",
+  "epic_id": "fn-1124-dirty-shared-checkout-distress",
+  "input_hash": "31b00d037a823c102b4cc8f823ac337cbbf5745d7ab5e49632258074c67e3317",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 31754,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1124-dirty-shared-checkout-distress.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Clones an existing idiom but is contract-touching (new id/reason family, ReconcileSnapshot field, un-retryable daemon-verb class + pill assertNever) where a wrong abstraction propagates past the task; pinned approach rules out max.\",\"confidence\":0.82}]}"
+}

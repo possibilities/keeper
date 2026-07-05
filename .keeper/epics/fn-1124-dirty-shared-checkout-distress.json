@@ -6,7 +6,7 @@
     "fn-1123-worktree-lane-pre-merge-recovery"
   ],
   "id": "fn-1124-dirty-shared-checkout-distress",
-  "last_validated_at": "2026-07-05T17:28:59.172000Z",
+  "last_validated_at": "2026-07-05T17:31:06.946000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-05T17:28:59.027000Z"
+  "updated_at": "2026-07-05T17:31:06.946000Z"
 }
