@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching (extends MergeResult/readiness union + both consumers), crosses the producer/fold boundary with event-sourcing determinism, and is correctness-critical (must never eat uncommitted work via git blob-equality across filters/eol/mode) \u2014 but extends an existing mid-merge recovery template, so xhigh not max.",
+      "task_id": "fn-1123-worktree-lane-pre-merge-recovery.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Touches the dispatch-failure routing contract and shared reason-string namespace, must preserve routeDispatchFailure's asserted-disjoint arms while adding positive-evidence-only level-clear and a per-lane distress surface \u2014 subtle invariants where a wrong abstraction propagates, despite mirroring existing trackers.",
+      "task_id": "fn-1123-worktree-lane-pre-merge-recovery.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-05T17:07:19.873000Z",
+  "epic_id": "fn-1123-worktree-lane-pre-merge-recovery",
+  "input_hash": "a6dae2c3bbb120ae9ca802831b847c60c0b80106011e89ffeb836ea7edbb2f23",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": "{\"fn-1123-worktree-lane-pre-merge-recovery.1\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Contract-touching (extends MergeResult/readiness union + both consumers), crosses the producer/fold boundary with event-sourcing determinism, and is correctness-critical (must never eat uncommitted work via git blob-equality across filters/eol/mode) \u2014 but extends an existing mid-merge recovery template, so xhigh not max.\", \"confidence\": 0.8}, \"fn-1123-worktree-lane-pre-merge-recovery.2\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Touches the dispatch-failure routing contract and shared reason-string namespace, must preserve routeDispatchFailure's asserted-disjoint arms while adding positive-evidence-only level-clear and a per-lane distress surface \u2014 subtle invariants where a wrong abstraction propagates, despite mirroring existing trackers.\", \"confidence\": 0.78}}"
+}
