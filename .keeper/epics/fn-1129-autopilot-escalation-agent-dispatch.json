@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-05T17:42:01.627000Z",
+  "depends_on_epics": [],
+  "id": "fn-1129-autopilot-escalation-agent-dispatch",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Autopilot escalation agent dispatch",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-05T17:42:01.627000Z"
+}

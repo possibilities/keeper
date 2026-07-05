@@ -1,0 +1,19 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-05T17:42:01.627000Z",
+  "depends_on": [
+    "fn-1129-autopilot-escalation-agent-dispatch.1",
+    "fn-1129-autopilot-escalation-agent-dispatch.3",
+    "fn-1129-autopilot-escalation-agent-dispatch.4",
+    "fn-1129-autopilot-escalation-agent-dispatch.5"
+  ],
+  "epic": "fn-1129-autopilot-escalation-agent-dispatch",
+  "id": "fn-1129-autopilot-escalation-agent-dispatch.6",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Unblock dispatch sweeps",
+  "updated_at": "2026-07-05T17:42:01.627000Z"
+}
