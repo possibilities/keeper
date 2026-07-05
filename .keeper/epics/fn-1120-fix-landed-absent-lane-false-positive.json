@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-05T16:42:24.540000Z",
+  "depends_on_epics": [],
+  "id": "fn-1120-fix-landed-absent-lane-false-positive",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix landed absent-lane false-positive",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-05T16:42:24.540000Z"
+}
