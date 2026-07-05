@@ -25,6 +25,8 @@ import {
   type GitRunner,
 } from "../src/commit-work/git-exec";
 import {
+  BASELINE_SCRATCH_PREFIX,
+  baselineScratchPathFor,
   branchExists,
   classifyLinkedWorktree,
   commitWorkLockPath,
@@ -33,6 +35,7 @@ import {
   ensureWorktree,
   enumerateEpicLaneBranches,
   epicIdFromKeeperLaneEntry,
+  isBaselineScratchPath,
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
@@ -40,14 +43,18 @@ import {
   mergeBranchInto,
   mergeReadiness,
   parseWorktreeList,
+  provisionScratchWorktree,
+  pruneBaselineScratchWorktrees,
   pruneWorktreeHusk,
   pruneWorktrees,
   remotePushFastForwardable,
+  removeScratchWorktree,
   removeWorktree,
   resolveDefaultBranch,
   resolveDefaultBranchPure,
   type WorktreeEntry,
 } from "../src/worktree-git";
+import { repoDirHash } from "../src/worktree-plan";
 import {
   argvHas,
   argvStartsWith,
@@ -1765,4 +1772,243 @@ test("remotePushFastForwardable: unresolved remote-tracking ref → 'unknown' (d
   // would deadlock a never-pushed-default first finalize push.
   expect(await remotePushFastForwardable("/repo", "main", run)).toBe("unknown");
   expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Baseline scratch worktrees — detached checkouts for the suite-baseline runner.
+// Pure-seam only: every git op through the recording fake, no real git.
+// ---------------------------------------------------------------------------
+
+const SCRATCH_SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+const OTHER_SHA = "cafef00dcafef00dcafef00dcafef00dcafef00d";
+
+// A fresh detached scratch entry the list rule can report as registered.
+function scratchEntryLine(path: string): string {
+  return `worktree ${path}\nHEAD ${SCRATCH_SHA}\ndetached\n\n`;
+}
+function revParseHeadRule(sha: string): FakeGitRule {
+  return {
+    when: (a) => argvStartsWith(a, "rev-parse", "HEAD"),
+    result: { stdout: `${sha}\n` },
+  };
+}
+function statusRuleFor(porcelain: string): FakeGitRule {
+  return {
+    when: (a) => argvStartsWith(a, "status", "--porcelain"),
+    result: { stdout: porcelain },
+  };
+}
+
+test("baselineScratchPathFor: prefixed, repo-disambiguated, sha-keyed — never a lane path", () => {
+  const p = baselineScratchPathFor("/home/me/repo", SCRATCH_SHA, "/wtroot");
+  expect(p).toBe(
+    `/wtroot/${BASELINE_SCRATCH_PREFIX}${repoDirHash("/home/me/repo")}-${SCRATCH_SHA}`,
+  );
+  // A lane path (worktreePathFor scheme: `<repoName>-<hash>--keeper-epic-<...>`)
+  // can never carry the scratch prefix, and the scratch path never carries a lane
+  // shape — the two are structurally disjoint.
+  expect(isBaselineScratchPath(p)).toBe(true);
+  expect(p.includes("--keeper-epic-")).toBe(false);
+  // Same repo, different sha → distinct path (keyed by sha).
+  expect(
+    baselineScratchPathFor("/home/me/repo", OTHER_SHA, "/wtroot"),
+  ).not.toBe(p);
+});
+
+test("isBaselineScratchPath: true only for the scratch prefix, false for a lane / other", () => {
+  expect(
+    isBaselineScratchPath(
+      `/wtroot/${BASELINE_SCRATCH_PREFIX}abc-${SCRATCH_SHA}`,
+    ),
+  ).toBe(true);
+  // trailing slash tolerated
+  expect(
+    isBaselineScratchPath(
+      `/wtroot/${BASELINE_SCRATCH_PREFIX}abc-${SCRATCH_SHA}/`,
+    ),
+  ).toBe(true);
+  // a real lane path shape
+  expect(
+    isBaselineScratchPath("/wtroot/keeper-1a2b3c--keeper-epic-fn-1-foo"),
+  ).toBe(false);
+  expect(isBaselineScratchPath("/wtroot/some-other-dir")).toBe(false);
+});
+
+test("provisionScratchWorktree: fresh add + HEAD==sha + clean → ready, detached add argv, verified in the scratch cwd", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule(""), // nothing registered — the pre-add reap is a no-op remove
+    revParseHeadRule(SCRATCH_SHA),
+    statusRuleFor(""), // clean tree
+  ]);
+  const res = await provisionScratchWorktree(
+    "/repo",
+    scratch,
+    SCRATCH_SHA,
+    run,
+  );
+  expect(res).toEqual({ kind: "ready", path: scratch });
+  // The checkout is a DETACHED add at exactly the sha.
+  const add = calls.find((c) => argvStartsWith(c.args, "worktree", "add"));
+  expect(add?.args).toEqual([
+    "worktree",
+    "add",
+    "--detach",
+    scratch,
+    SCRATCH_SHA,
+  ]);
+  // HEAD + status verification ran INSIDE the scratch worktree, not the main repo.
+  const head = calls.find((c) => argvStartsWith(c.args, "rev-parse", "HEAD"));
+  const status = calls.find((c) =>
+    argvStartsWith(c.args, "status", "--porcelain"),
+  );
+  expect(head?.cwd).toBe(scratch);
+  expect(status?.cwd).toBe(scratch);
+});
+
+test("provisionScratchWorktree: unresolvable sha (add fails) → typed checkout-failed carrying git stderr, no throw", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule(""),
+    {
+      when: (a) => argvStartsWith(a, "worktree", "add"),
+      result: { exitCode: 128, stderr: "fatal: invalid reference: deadbeef" },
+    },
+  ]);
+  const res = await provisionScratchWorktree(
+    "/repo",
+    scratch,
+    SCRATCH_SHA,
+    run,
+  );
+  expect(res.kind).toBe("checkout-failed");
+  if (res.kind === "checkout-failed") {
+    expect(res.detail).toContain("invalid reference");
+  }
+  // Never verified a failed checkout — no HEAD/status probe on the phantom tree.
+  expect(calls.some((c) => argvStartsWith(c.args, "rev-parse", "HEAD"))).toBe(
+    false,
+  );
+  // Cleanup pruned the admin husk even on the failure path.
+  expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+    true,
+  );
+});
+
+test("provisionScratchWorktree: HEAD lands off the requested sha → checkout-failed AND the scratch tree is force-reaped", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([
+    // The add registers the scratch entry, so the post-mismatch reap must remove it.
+    worktreeListRule(scratchEntryLine(scratch)),
+    revParseHeadRule(OTHER_SHA), // landed off the requested sha
+  ]);
+  const res = await provisionScratchWorktree(
+    "/repo",
+    scratch,
+    SCRATCH_SHA,
+    run,
+  );
+  expect(res.kind).toBe("checkout-failed");
+  if (res.kind === "checkout-failed") {
+    expect(res.detail).toContain(`expected ${SCRATCH_SHA}`);
+  }
+  // Reaped with --force (a dirty/partial scratch tree is a throwaway).
+  const forced = calls.filter(
+    (c) =>
+      argvStartsWith(c.args, "worktree", "remove") &&
+      argvHas(c.args, "--force"),
+  );
+  expect(forced.length).toBeGreaterThanOrEqual(1);
+  expect(forced[0].args).toEqual(["worktree", "remove", "--force", scratch]);
+});
+
+test("provisionScratchWorktree: dirty scratch tree → checkout-failed (never a clean-key result), reaped", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule(scratchEntryLine(scratch)),
+    revParseHeadRule(SCRATCH_SHA), // HEAD is right
+    statusRuleFor(" M src/foo.ts\n"), // but the tree is dirty
+  ]);
+  const res = await provisionScratchWorktree(
+    "/repo",
+    scratch,
+    SCRATCH_SHA,
+    run,
+  );
+  expect(res.kind).toBe("checkout-failed");
+  if (res.kind === "checkout-failed") {
+    expect(res.detail).toContain("not clean");
+  }
+  expect(
+    calls.some(
+      (c) =>
+        argvStartsWith(c.args, "worktree", "remove") &&
+        argvHas(c.args, "--force"),
+    ),
+  ).toBe(true);
+});
+
+test("removeScratchWorktree: registered scratch → force-removed + pruned (idempotent throwaway)", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule(scratchEntryLine(scratch)),
+  ]);
+  await removeScratchWorktree("/repo", scratch, run);
+  const rm = calls.find((c) => argvStartsWith(c.args, "worktree", "remove"));
+  expect(rm?.args).toEqual(["worktree", "remove", "--force", scratch]);
+  expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+    true,
+  );
+});
+
+test("removeScratchWorktree: not registered → no remove, still prunes (idempotent)", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([worktreeListRule("")]);
+  await removeScratchWorktree("/repo", scratch, run);
+  expect(calls.some((c) => argvStartsWith(c.args, "worktree", "remove"))).toBe(
+    false,
+  );
+  expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+    true,
+  );
+});
+
+test("removeScratchWorktree: a non-scratch path throws — the --force can never reach a lane", async () => {
+  const { run } = fakeAsyncGit([]);
+  expect(
+    removeScratchWorktree(
+      "/repo",
+      "/wtroot/keeper-1a2b--keeper-epic-fn-1-foo",
+      run,
+    ),
+  ).rejects.toThrow(/refusing to force-remove non-scratch path/);
+});
+
+test("pruneBaselineScratchWorktrees: reaps only scratch entries by prefix, never a lane, returns the reaped paths", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const lane = "/wtroot/keeper-1a2b--keeper-epic-fn-1-foo";
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule(
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo\n\n` +
+        scratchEntryLine(scratch),
+    ),
+  ]);
+  const reaped = await pruneBaselineScratchWorktrees("/repo", run);
+  expect(reaped).toEqual([scratch]);
+  // Only the scratch path was ever force-removed; the lane + main are untouched.
+  const removed = calls
+    .filter((c) => argvStartsWith(c.args, "worktree", "remove"))
+    .map((c) => c.args[c.args.length - 1]);
+  expect(removed).toEqual([scratch]);
+});
+
+test("pruneBaselineScratchWorktrees: no scratch entries → empty result, no remove", async () => {
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule("worktree /repo\nHEAD x\nbranch refs/heads/main\n\n"),
+  ]);
+  expect(await pruneBaselineScratchWorktrees("/repo", run)).toEqual([]);
+  expect(calls.some((c) => argvStartsWith(c.args, "worktree", "remove"))).toBe(
+    false,
+  );
 });
