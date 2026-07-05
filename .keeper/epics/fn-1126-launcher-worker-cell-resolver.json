@@ -2,9 +2,12 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-05T17:35:44.863000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1123-worktree-lane-pre-merge-recovery",
+    "fn-1125-dirty-checkout-finalize-distress"
+  ],
   "id": "fn-1126-launcher-worker-cell-resolver",
-  "last_validated_at": "2026-07-05T22:22:23.378000Z",
+  "last_validated_at": "2026-07-05T22:22:25.571000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-05T22:22:23.378000Z"
+  "updated_at": "2026-07-05T22:22:24.784000Z"
 }
