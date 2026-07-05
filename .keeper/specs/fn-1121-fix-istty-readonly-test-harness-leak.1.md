@@ -51,5 +51,5 @@ shape but is out of scope here; leave it as an optional follow-up.
   remain green.
 
 ## Done summary
-
+Made isTTY globals writable: added writable:true to all 19 isTTY defineProperty descriptors in setup-tmux.test.ts, and rewrote harness.ts setTTY to write via a writable+configurable descriptor. Raw bun test now reports 0 readonly-property errors (was ~578).
 ## Evidence

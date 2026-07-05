@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fix isTTY readonly leak both ends",
-  "updated_at": "2026-07-05T16:53:40.040000Z"
+  "updated_at": "2026-07-05T17:06:52.638000Z",
+  "worker_done_at": "2026-07-05T17:06:52.638000Z"
 }
