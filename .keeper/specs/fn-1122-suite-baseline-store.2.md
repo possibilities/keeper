@@ -48,5 +48,5 @@ typed-failure paths through GitRunner fakes. No real git in tests.
 - [ ] All new behavior is asserted through the pure git-runner seam; the suite is green via the sanctioned fast gate
 
 ## Done summary
-
+Added baseline scratch-worktree helpers to src/worktree-git.ts: baselineScratchPathFor (collision-proof detached prefix), provisionScratchWorktree (detached checkout verified HEAD==sha + clean, typed checkout-failed never a throw, reaps on every path), removeScratchWorktree (prefix-gated --force), and pruneBaselineScratchWorktrees (boot orphan reap). Covered pure-seam through the GitRunner fake.
 ## Evidence
