@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Mirrors an in-repo template but into subtle distress-machinery: positive-evidence level-clear, no cross-clear with the wedge row, orphan-GC exemption, and O(1) change-gating are contract-shaped invariants where a wrong abstraction propagates into a safety-critical silent-stall surface.",
+      "task_id": "fn-1125-dirty-checkout-finalize-distress.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-05T17:31:00.277000Z",
+  "epic_id": "fn-1125-dirty-checkout-finalize-distress",
+  "input_hash": "7e7463407f85468b99d90a8e297da238fd9d41a30dc8de9207009e91233e5fb1",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": "{\"task_id\": \"fn-1125-dirty-checkout-finalize-distress.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Mirrors an in-repo template but into subtle distress-machinery: positive-evidence level-clear, no cross-clear with the wedge row, orphan-GC exemption, and O(1) change-gating are contract-shaped invariants where a wrong abstraction propagates into a safety-critical silent-stall surface.\", \"confidence\": 0.72}"
+}
