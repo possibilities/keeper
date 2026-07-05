@@ -11639,9 +11639,12 @@ test("fn-1016 computeMergedLaneEntries: a lane PRESENT ∧ NOT an ancestor → N
   expect(entries).toEqual([]);
 });
 
-test("fn-1016 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane (enumeration ok) on a STARTED epic → MERGED-and-torn-down, no ancestry probe", async () => {
-  // A started signal (a task in progress) is what distinguishes a torn-down lane
-  // from a never-cut one — fn-1057 gates the absent arm on it.
+test("fn-1120 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane on a STARTED-but-NOT-done epic → NOT merged (work still landing, `landed` waits)", async () => {
+  // The absent arm takes the SAME done-evidence as the present arm: a started epic
+  // with an absent lane could be a serial-checkout epic still landing tasks
+  // incrementally (the fn-1106 shape) — "started" alone cannot tell it from a
+  // finished-and-torn-down epic. Its task ran (runtime `done`) but `worker_phase`
+  // is still open → work not terminally done → NOT merged.
   const a = makeEpic({
     epic_id: "fn-1-a",
     project_dir: "/repo",
@@ -11654,8 +11657,8 @@ test("fn-1016 computeMergedLaneEntries: a DEFINITIVELY ABSENT lane (enumeration 
     classifyIdentity(epics),
     run,
   );
-  expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
-  // A definitively-absent lane short-circuits to merged WITHOUT an ancestry probe.
+  expect(entries).toEqual([]);
+  // A definitively-absent lane short-circuits BEFORE any ancestry probe.
   expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
 });
 
@@ -11734,8 +11737,8 @@ test("fn-1097 computeMergedLaneEntries: a merged lane AWAITING TEARDOWN (PRESENT
 });
 
 test("fn-1097 computeMergedLaneEntries: a merged-and-TORN-DOWN lane (ABSENT, tasks done) still reads landed", async () => {
-  // Teardown deleted the lane after the merge. The absent arm is unchanged: a
-  // started epic's absent lane → merged-and-torn-down → MERGED, no ancestry probe.
+  // Teardown deleted the lane after the merge. The absent arm reads this MERGED —
+  // its done-gate is satisfied (all tasks `worker_phase` done) — no ancestry probe.
   const a = makeEpic({
     epic_id: "fn-1-a",
     project_dir: "/repo",
@@ -11777,6 +11780,107 @@ test("fn-1097 computeMergedLaneEntries: a NEVER-STARTED epic with a PRESENT vacu
     run,
   );
   expect(entries).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1120 — the absent-arm DONE-gate. An epic that lands its tasks serially on
+// the shared checkout (worktree mode ON, no `keeper/epic/<id>` lane ever cut)
+// reads its lane ABSENT while still mid-flight. "Started" alone cannot tell it
+// from a finished-and-torn-down epic, so the absent arm now takes the SAME
+// done-evidence the present arm does (the false-positive observed on fn-1106).
+// ---------------------------------------------------------------------------
+
+test("fn-1120 computeMergedLaneEntries: a mid-flight serial epic (some tasks done, one still open) with an absent lane → NOT merged (`landed` holds while it runs)", async () => {
+  // The fn-1106 shape: a multi-task epic landing serially on the shared checkout.
+  // `.2`/`.3` are administratively done but `.1` is still in progress → work not
+  // terminally done → NOT merged, even though the epic is plainly started.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-a.1",
+        epic_id: "fn-1-a",
+        worker_phase: "open",
+        runtime_status: "in_progress",
+      }),
+      makeTask({
+        task_id: "fn-1-a.2",
+        epic_id: "fn-1-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-a.3",
+        epic_id: "fn-1-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const epics = [a];
+  const { run } = gateGit({ lanes: [] }); // enumeration ok, no lane ever cut
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([]);
+});
+
+test("fn-1120 computeMergedLaneEntries: a FORCE-CLOSED epic (status done, per-task worker_phase never stamped) with an absent lane → MERGED (the absorbing disjunct)", async () => {
+  // A force-closed / legacy-imported done epic never advances its per-task
+  // `worker_phase` latch. A raw phase-only predicate would permanently
+  // false-negative it and hang `await landed`; the absorbing `status === "done"`
+  // disjunct keeps "a done epic always reports landed".
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" })], // worker_phase open
+  });
+  const epics = [a];
+  const { run } = gateGit({ lanes: [] }); // enumeration ok, lane absent
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
+});
+
+test("fn-1120 computeMergedLaneEntries: a serial epic with ALL tasks worker_phase done and an absent lane → MERGED (`landed` fires AT done, not before)", async () => {
+  // The completion edge: the same multi-task serial epic once EVERY task is
+  // administratively done and the lane is torn down → merged-and-torn-down →
+  // MERGED. Pins that `landed` fires exactly at done — not while mid-flight
+  // (above) and not never.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-a.1",
+        epic_id: "fn-1-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-a.2",
+        epic_id: "fn-1-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const epics = [a];
+  const { run, calls } = gateGit({ lanes: [] }); // enumeration ok, lane gone
+  const entries = await computeMergedLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
 });
 
 test("fn-1016 computeMergedLaneEntries: an enumeration FAILURE → NOT merged (never claim merged off an inconclusive probe)", async () => {
