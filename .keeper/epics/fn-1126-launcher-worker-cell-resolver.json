@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-05T17:35:44.863000Z",
+  "depends_on_epics": [],
+  "id": "fn-1126-launcher-worker-cell-resolver",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Launcher worker cell resolver",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-05T17:35:44.863000Z"
+}
