@@ -1,16 +1,19 @@
 {#-
 name: network-service-hardening
-summary: Network listeners need IP filtering (Tailscale CGNAT + localhost) and auth; no unauthenticated endpoints.
+summary: Network listeners must be limited to localhost and tailnet clients.
 domain: engineering
 audience: agent
 severity: default
-tags: [network, security, tailscale, auth, hardening]
+tags: [network, security, tailscale, hardening]
 scope: [any]
 phase: [planning, executing, reviewing]
 -#}
-Any code that listens on a network port must have both:
+Any code that listens on a network port must limit access to localhost and the tailnet.
 
-1. **IP filtering** — Tailscale CGNAT (`100.64.0.0/10`) and localhost only. Reject everything else.
-2. **Authentication** — bearer token, shared secret, or equivalent. No unauthenticated endpoints.
+Accept localhost plus Tailscale addresses only:
 
-Binding to `0.0.0.0` is fine when filtering happens in the request handler (more robust than interface binding when Tailscale connects after server start). Return terse 401/403 errors with no details.
+- IPv4 localhost (`127.0.0.1`) and IPv6 localhost (`::1`)
+- Tailscale CGNAT (`100.64.0.0/10`)
+- Tailscale IPv6 (`fd7a:115c:a1e0::/48`)
+
+Reject everything else with a terse 403. Binding to `0.0.0.0` is fine when filtering happens in the request handler (more robust than interface binding when Tailscale connects after server start). Separate app-layer auth is optional for local/tailnet-only personal services.
