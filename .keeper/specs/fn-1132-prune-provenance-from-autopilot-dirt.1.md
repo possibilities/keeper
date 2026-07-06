@@ -22,5 +22,5 @@ Files: `src/autopilot-worker.ts`.
 - [ ] `bun scripts/lint-claude-md.ts` (and the fast suite) stay green
 
 ## Done summary
-
+Stripped the past-tense incident clause from the SHARED_CHECKOUT_DIRTY_GRACE_SEC comment, preserving the forward-facing watermark rationale; incident context recorded in the commit body.
 ## Evidence
