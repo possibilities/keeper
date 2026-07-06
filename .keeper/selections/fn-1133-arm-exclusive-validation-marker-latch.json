@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching latch redesign across 12 verbs that regates autopilot dispatch safety - a wrong abstraction reintroduces the incident, but the approach is named so not max.",
+      "task_id": "fn-1133-arm-exclusive-validation-marker-latch.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "0f78fc31c0896a8db68ce0899843a2e4c6102f5d25e5fb9c630d74194ce144c8",
+  "created_at": "2026-07-06T01:11:54.472000Z",
+  "epic_id": "fn-1133-arm-exclusive-validation-marker-latch",
+  "input_hash": "cb4d0197c692641c67616a4afacee805e6e2189e4e71b7f885325793df549407",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 7,
+  "verdict_raw": "{\"fn-1133-arm-exclusive-validation-marker-latch.1\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Contract-touching latch redesign across 12 verbs (which writes to keep vs drop) that regates autopilot dispatch safety - a wrong abstraction reintroduces the incident, but the approach is named so not max.\", \"confidence\": 0.82}}"
+}

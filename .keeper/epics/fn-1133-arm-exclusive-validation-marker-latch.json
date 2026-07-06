@@ -7,7 +7,7 @@
     "fn-1129-autopilot-escalation-agent-dispatch"
   ],
   "id": "fn-1133-arm-exclusive-validation-marker-latch",
-  "last_validated_at": "2026-07-06T01:10:22.058000Z",
+  "last_validated_at": "2026-07-06T01:11:54.500000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T01:10:21.946000Z"
+  "updated_at": "2026-07-06T01:11:54.500000Z"
 }
