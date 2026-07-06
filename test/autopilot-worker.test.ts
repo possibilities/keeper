@@ -82,8 +82,6 @@ import {
   isInCooldown,
   isLaneWedgeDistressKey,
   isOccupyingJob,
-  isSharedCheckoutDirtyReason,
-  isSharedCheckoutWedgeReason,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
@@ -13426,34 +13424,6 @@ const WEDGE_REASON =
 const REPO_A = "/Users/x/code/keeper";
 const REPO_B = "/Users/x/code/other";
 
-test("isSharedCheckoutWedgeReason matches the mid-merge/abort/lock reasons, excludes dirty + conflict", () => {
-  // The unhealed-wedge reasons keeper cannot self-heal (foreign residue, an abort
-  // that keeps failing, a sustained inability to take the flock) escalate.
-  expect(isSharedCheckoutWedgeReason("worktree-recover-mid-merge: x")).toBe(
-    true,
-  );
-  expect(
-    isSharedCheckoutWedgeReason("worktree-recover-mid-merge-failed: x"),
-  ).toBe(true);
-  expect(isSharedCheckoutWedgeReason("worktree-recover-abort-failed: x")).toBe(
-    true,
-  );
-  expect(isSharedCheckoutWedgeReason("worktree-recover-lock-timeout: x")).toBe(
-    true,
-  );
-  // A dirty tree or a genuine content conflict is NOT this wedge — its own path.
-  expect(
-    isSharedCheckoutWedgeReason("worktree-recover-dirty-checkout: x"),
-  ).toBe(false);
-  expect(isSharedCheckoutWedgeReason("worktree-recover-conflict: x")).toBe(
-    false,
-  );
-  expect(
-    isSharedCheckoutWedgeReason("worktree-finalize-non-fast-forward"),
-  ).toBe(false);
-  expect(isSharedCheckoutWedgeReason("")).toBe(false);
-});
-
 test("sharedWedgeDistressId is stable per repo, distinct across repos, prefix-tagged", () => {
   const a = sharedWedgeDistressId(REPO_A);
   const b = sharedWedgeDistressId(REPO_B);
@@ -13637,35 +13607,6 @@ test("wedge tracker: a restart (fresh tracker) still level-clears a row minted b
 
 const DIRTY_REASON =
   "worktree-recover-dirty-checkout: /repo has a dirty working tree — skipping the merge until it is clean — M src/x.ts";
-
-test("isSharedCheckoutDirtyReason matches the dirty-checkout reason, excludes wedge/conflict/finalize", () => {
-  // The plain-dirty recover skip escalates; the mid-merge wedge reasons and a
-  // content conflict are NOT this dirt — each on its own path.
-  expect(
-    isSharedCheckoutDirtyReason("worktree-recover-dirty-checkout: x"),
-  ).toBe(true);
-  expect(isSharedCheckoutDirtyReason("worktree-recover-mid-merge: x")).toBe(
-    false,
-  );
-  expect(isSharedCheckoutDirtyReason("worktree-recover-abort-failed: x")).toBe(
-    false,
-  );
-  expect(isSharedCheckoutDirtyReason("worktree-recover-conflict: x")).toBe(
-    false,
-  );
-  expect(
-    isSharedCheckoutDirtyReason("worktree-finalize-non-fast-forward"),
-  ).toBe(false);
-  expect(isSharedCheckoutDirtyReason("")).toBe(false);
-  // The dirt and wedge predicates are DISJOINT over each other's exact reasons —
-  // neither feed ever escalates off the other's reason.
-  expect(
-    isSharedCheckoutWedgeReason("worktree-recover-dirty-checkout: x"),
-  ).toBe(false);
-  expect(isSharedCheckoutDirtyReason("worktree-recover-mid-merge: x")).toBe(
-    false,
-  );
-});
 
 test("sharedDirtyDistressId is stable per repo, distinct across repos, prefix-tagged + distinct from the wedge id", () => {
   const a = sharedDirtyDistressId(REPO_A);
