@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T19:19:32.276000Z",
+  "depends_on": [],
+  "epic": "fn-1144-lane-wedge-liveness-gate",
+  "id": "fn-1144-lane-wedge-liveness-gate.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Gate lane wedge on liveness",
+  "updated_at": "2026-07-06T19:19:32.276000Z"
+}
