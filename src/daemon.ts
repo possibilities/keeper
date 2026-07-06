@@ -117,7 +117,7 @@ import type {
   DeadLetterChangedMessage,
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
-import { extractMutationPath } from "./derivers";
+import { extractMutationPath, parsePlanRef } from "./derivers";
 import {
   defaultPlanPrompt,
   type EscalationVerb,
@@ -731,57 +731,11 @@ export function shouldEscalateBlockedCategory(
 }
 
 /**
- * Build the notification body the producer sends to `planner@<epic>`. The
- * free-text `blocked_reason` rides as a body line — NEVER interpolated into a
- * shell arg (the helper passes the whole body via stdin / array form). Pure. The
- * directive asks the planner to resolve the blocker, unblock the board, and then
- * RESUME the still-live worker in-context over the bus (`work::<task>`); cold
- * re-dispatch is named only as the dead-worker fallback. Opens pause-first so the
- * unblock does not cold-re-dispatch a fresh worker while the operator is resuming
- * the live one, and closes with the literal `keeper autopilot play` unstick. The
- * daemon sender still has no subscribable channel — the resume hop runs from the
- * planner session.
- */
-export function buildBlockEscalationBody(args: {
-  epicId: string;
-  taskId: string;
-  category: string;
-  blockedReason: string;
-  repo: string;
-}): string {
-  return [
-    `Plan task ${args.taskId} (epic ${args.epicId}) is BLOCKED — the worker`,
-    `exhausted its own resolution and escalated rather than guess.`,
-    ``,
-    `Category: ${args.category}`,
-    `Repo: ${args.repo}`,
-    ``,
-    `Blocked reason:`,
-    args.blockedReason.trim(),
-    ``,
-    `Resolve it:`,
-    `  0. keeper autopilot pause`,
-    `     (so unblocking the board doesn't cold-re-dispatch a fresh worker while you`,
-    `     resume the live one.)`,
-    `  1. Resolve the ${args.category} blocker — refine the spec, clear the dep, do`,
-    `     the human-gated action, whatever the category calls for.`,
-    `  2. keeper plan unblock ${args.taskId}`,
-    `  3. PRIMARY — resume the still-live worker in place over the bus:`,
-    `     \`keeper bus chat send work::${args.taskId} "RESOLVED: <what changed> — resume now"\``,
-    `     An exit-0 \`delivered\` means the live worker session picks the task back`,
-    `     up with full context.`,
-    `     FALLBACK — a \`not_connected\`/\`unknown_target\` miss (exit 1) means that`,
-    `     worker session is gone; run \`keeper dispatch work::${args.taskId}\` yourself.`,
-    ``,
-    `Unstick the board when done:`,
-    `  keeper autopilot play`,
-  ].join("\n");
-}
-
-/**
- * Compute the effective repo for the notification body: the task's `target_repo`
+ * Compute the effective repo for an unblock dispatch: the task's `target_repo`
  * override when present, else the epic's `project_dir`, else `""`. Mirrors the
- * autopilot/readiness `effectiveRoot` derivation (the dispatch cwd). Pure.
+ * autopilot/readiness `effectiveRoot` derivation — the launch cwd for the
+ * `unblock::<task>` escalation session, and the `dir` on the surface-and-stop
+ * re-dispatch suppression. Pure.
  */
 export function effectiveBlockEscalationRepo(
   targetRepo: string | null,
@@ -792,28 +746,23 @@ export function effectiveBlockEscalationRepo(
   return "";
 }
 
-/** The terminal outcome the producer records on the `block_escalations` latch
- *  (the `BlockEscalationAttempted.outcome` column). */
+/** The outcome the producer records on the `block_escalations` latch (the
+ *  `BlockEscalationAttempted.outcome` column). The TERMINAL `dispatched` (the
+ *  `unblock::<task>` session launched) and the two skip terminals advance the latch
+ *  to `attempted`; the non-terminal `dispatch_failed` (the launch missed) RESETS it
+ *  to `pending` so the sweep re-attempts (`foldBlockEscalationAttempted`). A
+ *  cap/occupancy SKIP (`at_cap` / `already_live`) mints NOTHING at all — the latch
+ *  stays `pending` and re-sweeps. */
 export type BlockEscalationOutcome =
-  | "sent"
-  | "queued_for_wake"
+  | "dispatched"
+  | "dispatch_failed"
   | "skipped_category"
-  | "skipped_unblocked"
-  | "skipped_coalesced"
-  | "send_failed";
+  | "skipped_unblocked";
 
-/** The result of the helper that notifies one planner over the bus. `wake` is
- *  attempted ONLY when `outcome === "queued_for_wake"` (the offline-creator path);
- *  fail-open — every error degrades to `send_failed`, never throws. */
-export interface BlockEscalationSendResult {
-  outcome: "sent" | "queued_for_wake" | "send_failed";
-  detail: string;
-}
-
-/** Injectable dependency surface for {@link runBlockEscalationSweep}. Mirrors
- *  `runWake`'s fail-open injectable-deps discipline so the producer is testable
- *  with synthetic rows + an injected helper, and never throws into the daemon
- *  loop. */
+/** Injectable dependency surface for {@link runBlockEscalationSweep} — the block/
+ *  unblock DISPATCH sweep. Mirrors {@link MergeEscalationSweepDeps}'s fail-open
+ *  injectable-deps discipline so the producer is testable with synthetic rows + an
+ *  injected dispatcher, and never throws into the daemon loop. */
 export interface BlockEscalationSweepDeps {
   /** The current-state pending working set (DELEGATES to
    *  {@link selectPendingBlockEscalations} in production). */
@@ -835,15 +784,22 @@ export interface BlockEscalationSweepDeps {
     taskId: string,
     outcome: BlockEscalationOutcome,
   ) => void;
-  /** Notify one planner over the bus (and wake on `queued_for_wake`). Async +
-   *  fail-open. */
-  readonly notifyPlanner: (args: {
-    epicId: string;
-    taskId: string;
-    category: string;
-    blockedReason: string;
-    repo: string;
-  }) => Promise<BlockEscalationSendResult>;
+  /** Launch ONE `unblock::<task>` escalation session for the blocked row (into the
+   *  managed session, at the escalation model/effort, with the `/plan:unblock`
+   *  prompt). DELEGATES to the shared {@link dispatchEscalationSession} in
+   *  production, so the global cap + per-key occupancy guard apply. Async +
+   *  fail-open — every error degrades to `dispatch_failed`, and a SKIP (`at_cap` /
+   *  `already_live`) mints nothing so the row re-sweeps. */
+  readonly dispatchUnblock: (
+    row: PendingBlockEscalation,
+  ) => Promise<EscalationDispatchOutcome>;
+  /** True IFF an `unblock::<task>` session for ANY task in `epicId` is already LIVE
+   *  — the per-EPIC serialization guard. At most one live unblock session per epic,
+   *  so a mass-block never fans an epic's siblings out at once; a same-epic sibling
+   *  stays latched `pending` and re-sweeps once the live session goes terminal.
+   *  Production reads the live jobs (via {@link epicHasLiveUnblock}) PLUS the
+   *  producer's not-yet-folded in-flight memo. */
+  readonly isEpicUnblockLive: (epicId: string) => boolean;
   /** True IFF an OPEN sticky `dispatch_failures` row already exists for
    *  `work::<taskId>` — the once-only guard for {@link suppressRedispatch}. Reads
    *  the live projection on the writable connection in production; the sweep skips
@@ -867,25 +823,30 @@ export interface BlockEscalationSweepDeps {
 }
 
 /**
- * Run one daemon block-escalation sweep. The producer half of the escalate-once
- * loop: walk the pending `block_escalations` latch rows, gate each by the
- * cancellation guard + category denylist, COALESCE the survivors per
- * `planner@<epic>` (at most one send per recipient per cycle), then for each
- * group mint `BlockEscalationRequested` → notify the planner over the bus → mint
- * `BlockEscalationAttempted{outcome}`. The latch advances pending→requested→
- * attempted exactly once per block instance.
+ * Run one daemon block-escalation sweep (stage 2) — the producer half of the
+ * dispatch-once loop for a blocked task with an escalatable category. Walk the
+ * pending `block_escalations` latch rows, gate each by the cancellation guard + the
+ * category denylist, then DISPATCH one `unblock::<task>` escalation session per
+ * escalatable block — SERIALIZED per epic (at most one live unblock session per
+ * epic). No planner@ bus message: the session boots `/plan:unblock` and resolves the
+ * blocker without the creator's context.
  *
- * Each row resolves to exactly one terminal outcome so it never re-evaluates next
- * sweep (a skipped/sent latch is no longer `pending`):
- *  - `skipped_unblocked` — the cancellation guard fired (task left `blocked`).
- *  - `skipped_category` — `TOOLING_FAILURE` / absent-or-unparseable reason.
- *  - `skipped_coalesced` — a sibling row already claimed this planner this cycle.
- *  - `sent` / `queued_for_wake` / `send_failed` — the helper result.
+ * Each row resolves to one of:
+ *  - `skipped_unblocked` (terminal) — the cancellation guard fired (task left
+ *    `blocked`). Mints Requested→Attempted so the latch leaves `pending`.
+ *  - `skipped_category` (terminal) — `TOOLING_FAILURE` / absent-or-unparseable
+ *    reason: surface-and-stop. Mints Requested→Attempted AND a durable
+ *    `work::<task>` re-dispatch suppression (once-only). NEVER dispatches an agent.
+ *  - a same-epic serialization SKIP — a sibling already holds the epic's one live
+ *    unblock (won the claim THIS cycle, or still live from a prior cycle): mints
+ *    NOTHING, so the latch stays `pending` and re-sweeps once that session goes
+ *    terminal (no starvation, no same-epic collision).
+ *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal, re-sweeps) — the
+ *    launch outcome. A cap/occupancy SKIP (`at_cap` / `already_live`) mints NOTHING.
  *
- * For a skipped row we STILL mint Requested→Attempted so the latch leaves
- * `pending` and the producer never re-sweeps it. NEVER throws — every helper edge
- * degrades to an outcome (mirrors `runWake`). The spawn lives ONLY here in the
- * producer, never reachable from `applyEvent`, so a re-fold never re-fires a send.
+ * NEVER throws — every helper edge degrades to a recorded outcome (mirrors {@link
+ * runMergeEscalationSweep}). The spawn lives ONLY here in the producer, never
+ * reachable from `applyEvent`, so a re-fold never re-fires a launch.
  */
 export async function runBlockEscalationSweep(
   deps: BlockEscalationSweepDeps,
@@ -904,11 +865,12 @@ export async function runBlockEscalationSweep(
   }
   if (pending.length === 0) return;
 
-  // First pass: classify each pending row WITHOUT side effects, so the
-  // coalescing decision sees every escalatable row this cycle before any send.
-  // The recipient claim is per-epic (`planner@<epic>`), so two blocked tasks in
-  // the same epic coalesce to a single send; tasks in different epics each send.
-  const claimedPlanner = new Set<string>();
+  // Per-EPIC serialization: at most one `unblock::<task>` dispatch per epic per
+  // sweep. `claimedEpics` bounds the WITHIN-sweep fan-out (a mass-block of many
+  // same-epic tasks); `isEpicUnblockLive` bounds it ACROSS sweeps (a session
+  // dispatched a prior cycle is still live). A same-epic sibling loses both guards
+  // and stays latched `pending` — it re-sweeps once the live session goes terminal.
+  const claimedEpics = new Set<string>();
   for (const row of pending) {
     // Cancellation guard: the task left `blocked` between arm and sweep. The
     // leave-blocked `TaskSnapshot` fold DELETEs the latch on its own, so mint
@@ -923,8 +885,8 @@ export async function runBlockEscalationSweep(
     const reason = deps.readBlockedReason(row.project_dir, row.task_id);
     const category = parseBlockedCategory(reason);
     if (!shouldEscalateBlockedCategory(category)) {
-      // TOOLING_FAILURE / absent / unparseable: surface-and-stop. Record a
-      // terminal outcome so it never re-evaluates.
+      // TOOLING_FAILURE / absent / unparseable: surface-and-stop, NEVER dispatch an
+      // agent. Record a terminal outcome so it never re-evaluates.
       deps.mintRequested(row.epic_id, row.task_id);
       deps.mintAttempted(row.epic_id, row.task_id, "skipped_category");
       // Durable re-dispatch guard: a surface-and-stop block must NOT auto-requeue.
@@ -948,44 +910,212 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
-    // Coalesce fan-in: at most one send per `planner@<epic>` per cycle. A sibling
-    // row in the same epic gets a terminal `skipped_coalesced` — its latch leaves
-    // pending, so the next sweep won't re-fan it; the single send already covers
-    // the epic's planner.
-    if (claimedPlanner.has(row.epic_id)) {
-      deps.mintRequested(row.epic_id, row.task_id);
-      deps.mintAttempted(row.epic_id, row.task_id, "skipped_coalesced");
+    // Per-epic serialization: an unblock is already in play for this epic — either a
+    // sibling won the claim THIS sweep, or a session dispatched a prior cycle is
+    // still live. Skip WITHOUT minting so the latch stays `pending` and re-sweeps
+    // once that session terminates (a shared root cause the unblock clears takes the
+    // sibling out of `blocked`, deleting its latch before it ever dispatches).
+    if (claimedEpics.has(row.epic_id) || deps.isEpicUnblockLive(row.epic_id)) {
       continue;
     }
-    claimedPlanner.add(row.epic_id);
+    claimedEpics.add(row.epic_id);
 
-    // The escalatable, coalescing-winner row. Mint Requested, THEN notify, THEN
-    // mint Attempted with the helper outcome. `category`/`reason` are non-null
-    // here (the gate above proved category non-null; a non-null category implies
-    // a non-null reason).
-    deps.mintRequested(row.epic_id, row.task_id);
-    const repo = effectiveBlockEscalationRepo(row.target_repo, row.project_dir);
-    let result: BlockEscalationSendResult;
+    // The escalatable serialization-winner row. Launch the `unblock::<task>` session,
+    // then record the outcome. A SKIP (`at_cap` / `already_live`) mints nothing — the
+    // latch stays `pending` and re-sweeps (at cap, or once the in-flight session
+    // folds). Only a real attempt (`dispatched` / `dispatch_failed`) mints
+    // Requested→Attempted: the fold advances the latch to `attempted` on `dispatched`
+    // and RESETS it to `pending` on `dispatch_failed` (a re-sweepable retry).
+    let outcome: EscalationDispatchOutcome;
     try {
-      result = await deps.notifyPlanner({
-        epicId: row.epic_id,
-        taskId: row.task_id,
-        category: category as string,
-        blockedReason: reason as string,
-        repo,
-      });
+      outcome = await deps.dispatchUnblock(row);
     } catch (err) {
-      // The helper is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a terminal outcome and never aborts the
-      // sweep.
+      // The dispatcher is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a non-terminal outcome and never aborts the sweep.
       note(
-        `# warn: block-escalation notify threw for ${row.task_id} (non-fatal): ${
+        `# warn: unblock dispatch threw for ${row.task_id} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-      result = { outcome: "send_failed", detail: "notify threw" };
+      outcome = "dispatch_failed";
     }
-    deps.mintAttempted(row.epic_id, row.task_id, result.outcome);
+    if (outcome === "at_cap" || outcome === "already_live") continue;
+    deps.mintRequested(row.epic_id, row.task_id);
+    deps.mintAttempted(row.epic_id, row.task_id, outcome);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// fn-1129 — daemon unblock human-notify sweep (stage 3)
+// ---------------------------------------------------------------------------
+//
+// The TERMINAL stage of the block/unblock escalation path, sibling to the
+// deconflict human-notify sweep. Where stage 2 (`runBlockEscalationSweep`)
+// DISPATCHES an `unblock::<task>` session, this sweep fires the ONE human
+// notification — via botctl — only once that session ALSO declines or dies. A
+// SUCCESSFUL unblock flips the task out of `blocked`, which DELETEs the latch via
+// the leave-blocked `TaskSnapshot` fold, so this sweep never sees a resolved block.
+
+/**
+ * A dispatched-but-not-yet-notified `block_escalations` latch row — the stage-3
+ * working set (keyed `(epic_id, task_id)`). Bounded by the number of concurrently
+ * dispatched-and-declined unblock escalations, never a history scan.
+ */
+export interface PendingBlockHumanNotify {
+  epic_id: string;
+  task_id: string;
+}
+
+/**
+ * Select every `block_escalations` latch whose `unblock::<task>` session was
+ * DISPATCHED (`status='attempted'`, `outcome='dispatched'`) but whose human has NOT
+ * yet been notified (`human_notified_at IS NULL`). The SQL twin of the stage-3 gate:
+ * `outcome='dispatched'` excludes the `skipped_*` terminals (no session ran for
+ * them), and a stamped `human_notified_at` (the terminal `notified` fold) drops the
+ * row — the notify-once guarantee. The leave-blocked DELETE re-arms the whole chain.
+ */
+export function selectPendingBlockHumanNotifications(
+  db: Database,
+): PendingBlockHumanNotify[] {
+  return db
+    .query(
+      `SELECT epic_id, task_id FROM block_escalations
+         WHERE status = 'attempted'
+           AND outcome = 'dispatched'
+           AND human_notified_at IS NULL`,
+    )
+    .all() as PendingBlockHumanNotify[];
+}
+
+/** The outcome the unblock human-notify sweep records on the `BlockHumanNotified`
+ *  event. The TERMINAL `notified` stamps the `human_notified_at` once-marker;
+ *  `notify_failed` is NON-TERMINAL — the row stays re-sweepable so the next tick
+ *  retries (the block stays operator-visible on the board meanwhile). */
+export type BlockHumanNotifiedOutcome = "notified" | "notify_failed";
+
+/**
+ * Build the ONE structured operator notification the unblock human-notify sweep
+ * sends over botctl when an `unblock::<task>` session DECLINES (stamped BLOCKED) or
+ * DIES. Short by design — the blocked task already carries the full context on the
+ * board (`keeper status` / `keeper plan show`); this is the courtesy ping that names
+ * the task, the verdict, and the unstick command. Pure.
+ */
+export function buildBlockHumanNotifyBody(args: {
+  epicId: string;
+  taskId: string;
+  verdict: "declined" | "died";
+}): string {
+  const verdictLine =
+    args.verdict === "died"
+      ? `its job DIED before resolving`
+      : `it DECLINED (could not resolve the blocker — stamped BLOCKED)`;
+  return [
+    `🔴 keeper: unblock::${args.taskId} needs you — the autonomous unblock`,
+    `escalation session gave up on the blocked task (${verdictLine}); task`,
+    `${args.taskId} (epic ${args.epicId}) stays BLOCKED and will NOT auto-retry.`,
+    ``,
+    `Resolve the blocker by hand, then unstick the board:`,
+    `  keeper plan unblock ${args.taskId}`,
+  ].join("\n");
+}
+
+/** Injectable dependency surface for {@link runBlockHumanNotifySweep} — the stage-3
+ *  unblock human-notify sweep. Same fail-open injectable-deps discipline as
+ *  {@link DeconflictHumanNotifySweepDeps}. */
+export interface BlockHumanNotifySweepDeps {
+  /** The current-state pending working set (DELEGATES to
+   *  {@link selectPendingBlockHumanNotifications} in production). */
+  readonly selectPending: () => PendingBlockHumanNotify[];
+  /** Re-read that the latch for `(epicId, taskId)` is STILL the dispatched-but-not-
+   *  notified stage-3 row — checked immediately before the notify to narrow the
+   *  clear-mid-sweep window (a leave-blocked DELETE between select and notify drops
+   *  the row). Reads the live projection on the writable connection in production. */
+  readonly stillPending: (epicId: string, taskId: string) => boolean;
+  /** Classify the dispatched `unblock::<task>` session's outcome for `taskId`
+   *  (DELEGATES to {@link classifyEscalationOutcome} over the live `jobs` map in
+   *  production). The human is notified ONLY on a terminal verdict; while the session
+   *  is live or its job has not folded yet it returns `{terminal:false}` and the
+   *  sweep skips the row (a successful unblock clears the latch before this runs). */
+  readonly unblockOutcome: (taskId: string) => ResolverOutcome;
+  /** Send the ONE botctl notification about the declined/dead unblock session.
+   *  Async + fail-open — every error degrades to `notify_failed` so the row re-sweeps
+   *  (the block stays operator-visible meanwhile), never a wedge or a silent drop. */
+  readonly notifyHuman: (
+    row: PendingBlockHumanNotify,
+    verdict: "declined" | "died",
+  ) => Promise<BlockHumanNotifiedOutcome>;
+  /** Mint a `BlockHumanNotified{outcome}` synthetic event. The fold stamps
+   *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the latch —
+   *  only the leave-blocked `TaskSnapshot` DELETE does, which re-arms it at NULL. */
+  readonly mintAttempted: (
+    epicId: string,
+    taskId: string,
+    outcome: BlockHumanNotifiedOutcome,
+  ) => void;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one daemon unblock human-notify sweep (stage 3) — the terminal "notify the
+ * human ONCE" half of the block/unblock escalation path. Walk the dispatched-but-
+ * not-notified latch rows, re-read that each is STILL pending, sequence behind the
+ * `unblock::<task>` session's TERMINAL decline/death, send ONE botctl notification,
+ * then mint `BlockHumanNotified{outcome}`.
+ *
+ * NOTIFIES ONCE — the sweep NEVER clears the latch; only the leave-blocked DELETE
+ * does. A TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next
+ * sweep's selector drops the row; a `notify_failed` (botctl absent / failed) leaves
+ * the marker NULL so the row re-sweeps and the notification is never lost (the block
+ * is operator-visible the whole time). NEVER throws — every helper edge degrades to a
+ * recorded outcome (mirrors {@link runDeconflictHumanNotifySweep}). The spawn lives
+ * ONLY here in the producer, never reachable from `applyEvent`.
+ */
+export async function runBlockHumanNotifySweep(
+  deps: BlockHumanNotifySweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let pending: PendingBlockHumanNotify[];
+  try {
+    pending = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: unblock human-notify sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  if (pending.length === 0) return;
+
+  for (const row of pending) {
+    // Re-read immediately before the notify: a leave-blocked DELETE (the task got
+    // unblocked) or the notified fold between select and notify means there is
+    // nothing left to notify — skip without minting.
+    if (!deps.stillPending(row.epic_id, row.task_id)) continue;
+    // Sequence behind the unblock session: notify the human only once that session
+    // reached a TERMINAL decline/death. While it is live — or its job has not folded
+    // yet — skip without minting, so the row re-sweeps next tick. A successful unblock
+    // takes the task out of `blocked`, deleting the latch before this sweep sees it.
+    const outcome = deps.unblockOutcome(row.task_id);
+    if (!outcome.terminal) continue;
+
+    let result: BlockHumanNotifiedOutcome;
+    try {
+      result = await deps.notifyHuman(row, outcome.verdict);
+    } catch (err) {
+      // The helper is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a non-terminal outcome and never aborts the sweep.
+      note(
+        `# warn: unblock human-notify threw for ${row.task_id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      result = "notify_failed";
+    }
+    // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
+    // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
+    deps.mintAttempted(row.epic_id, row.task_id, result);
   }
 }
 
@@ -1050,14 +1180,6 @@ export const MAX_LIVE_ESCALATION_SESSIONS = 3;
  *  (a launch that reported `ok` but never folded a jobs row), so the memo can never
  *  wedge a cap slot forever. Well above the launch → birth-ingest fold lag. */
 export const INFLIGHT_ESCALATION_TTL_MS = 5 * 60_000;
-
-/** The result of the shared `planner@<epic>` bus-notify core — the send + (on the
- *  offline-creator path) wake. Fail-open by contract: every error degrades to
- *  `send_failed`, never throws into a sweep. Used by the block-escalation producer. */
-export interface PlannerNotifyResult {
-  outcome: "sent" | "queued_for_wake" | "send_failed";
-  detail: string;
-}
 
 /**
  * Select every sticky `worktree-merge-conflict` close failure that has NOT yet been
@@ -1791,6 +1913,28 @@ export function escalationSessionLiveFor(
   for (const job of jobs) {
     if (job.plan_verb !== verb || job.plan_ref !== id) continue;
     if (escalationJobLive(job)) return true;
+  }
+  return false;
+}
+
+/**
+ * Is any `unblock::<task>` session for a task in `epicId` LIVE in `jobs`? The
+ * per-EPIC serialization guard for the block/unblock dispatch sweep: at most one live
+ * unblock session per epic, so a mass-block never fans an epic's siblings out at once.
+ * Each live `unblock` row's `plan_ref` is a task id (`<epic>.<ordinal>`), mapped back
+ * to its epic via {@link parsePlanRef} — the same parser the reducer's jobs→epic
+ * fan-out uses, so the epic mapping never diverges. Pure over the passed rows;
+ * exported for tests.
+ */
+export function epicHasLiveUnblock(
+  jobs: readonly Job[],
+  epicId: string,
+): boolean {
+  for (const job of jobs) {
+    if (job.plan_verb !== "unblock") continue;
+    if (!escalationJobLive(job)) continue;
+    const parsed = parsePlanRef(job.plan_ref ?? null);
+    if (parsed != null && parsed.epic_id === epicId) return true;
   }
   return false;
 }
@@ -7423,6 +7567,68 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
+   * Mint one synthetic `BlockHumanNotified` event onto the writable connection — the
+   * unblock human-notify sweep's (stage 3) only write path into the
+   * `block_escalations.human_notified_at` once-marker (it never UPDATEs the projection
+   * directly; the reducer fold owns that, stamping the marker ONLY on the terminal
+   * `notified` and NEVER clearing the latch). Sibling of {@link mintBlockEscalationEvent}
+   * and {@link mintMergeHumanNotifiedEvent}: `(epic_id, task_id)` rides the entity-key
+   * overload on `session_id` so a re-fold correlates the row WITHOUT re-parsing `data`;
+   * the full `{ epic_id, task_id, outcome }` payload also rides `data` for the strict
+   * fold parser. NON-FATAL on insert failure — the next heartbeat sweep re-attempts
+   * (the marker stays NULL on a `notify_failed`).
+   */
+  function mintBlockHumanNotifiedEvent(
+    epicId: string,
+    taskId: string,
+    outcome: BlockHumanNotifiedOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${epicId}::${taskId}`,
+        $pid: null,
+        $hook_event: "BlockHumanNotified",
+        $event_type: "block_escalations",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ epic_id: epicId, task_id: taskId, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] BlockHumanNotified mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
    * Mint one synthetic `MergeEscalationAttempted` event onto the writable
    * connection — the merge-escalation producer's only write path into the
    * `dispatch_failures.merge_escalated_at` once-marker (it never UPDATEs the
@@ -7636,116 +7842,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  /**
-   * Notify one `planner@<epic>` over the bus with a prebuilt body, then wake the
-   * planner ONLY when the send returns `queued_for_wake` (the known-but-offline
-   * creator path). Both legs spawn the `keeper` CLI ASYNC (`Bun.spawn`, NEVER
-   * `Bun.spawnSync` — a sync spawn would block the daemon main loop). The body goes
-   * in via STDIN (`keeper bus chat send <target> -`) so free-text body lines are
-   * NEVER interpolated into a shell arg. Mirrors `runWake`'s fail-open discipline —
-   * every error degrades to `send_failed`, never throws into a sweep. SHARED by the
-   * block + merge escalation producers (body assembly + target derivation live in
-   * each producer's wrapper).
-   */
-  async function notifyPlanner(
-    target: string,
-    body: string,
-  ): Promise<PlannerNotifyResult> {
-    // `[bun, cli/keeper.ts]` — the same resolved transport the autopilot launcher
-    // uses, minus the `agent` suffix, so the bus subcommand rides directly.
-    const cliPrefix = [process.execPath, resolveKeeperAgentPath()];
-    let sendResult: { result: string; failed: boolean };
-    try {
-      const proc = Bun.spawn(
-        [...cliPrefix, "bus", "chat", "send", target, "-"],
-        {
-          stdin: new TextEncoder().encode(body),
-          stdout: "pipe",
-          stderr: "pipe",
-          // PATH is load-bearing — a bare env drops it and a re-exec false-ENOENTs.
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const [stdoutText, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
-      // The CLI prints `queued_for_wake for <target>` on the offline-creator path
-      // and exits 0 on both `delivered` and `queued_for_wake`. A non-zero exit is
-      // a loud miss (not_connected / unknown_target / …).
-      const queued = stdoutText.includes("queued_for_wake");
-      sendResult = {
-        result: queued ? "queued_for_wake" : "delivered",
-        failed: exitCode !== 0,
-      };
-    } catch (err) {
-      console.error(
-        `[keeperd] planner bus send spawn threw for ${target} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return { outcome: "send_failed", detail: "send spawn threw" };
-    }
-
-    if (sendResult.failed) {
-      return {
-        outcome: "send_failed",
-        detail: `bus send to ${target} did not deliver`,
-      };
-    }
-
-    if (sendResult.result !== "queued_for_wake") {
-      // Delivered live — no wake needed.
-      return { outcome: "sent", detail: `delivered to ${target}` };
-    }
-
-    // Offline creator — wake it. A wake failure does NOT downgrade the outcome:
-    // the message is durably queued and redelivered when the planner returns, so
-    // the escalation succeeded regardless of the wake leg.
-    try {
-      const wakeProc = Bun.spawn([...cliPrefix, "bus", "wake", target], {
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-        env: process.env as Record<string, string | undefined>,
-      });
-      await wakeProc.exited;
-    } catch (err) {
-      console.error(
-        `[keeperd] planner bus wake spawn threw for ${target} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-    return {
-      outcome: "queued_for_wake",
-      detail: `queued_for_wake for ${target}`,
-    };
-  }
-
-  /**
-   * Notify one `planner@<epic>` that a plan task is BLOCKED — derives the target +
-   * assembles the block-specific body, then delegates the send/wake core to the
-   * shared {@link notifyPlanner}. Fail-open by contract.
-   */
-  async function notifyPlannerOfBlock(args: {
-    epicId: string;
-    taskId: string;
-    category: string;
-    blockedReason: string;
-    repo: string;
-  }): Promise<BlockEscalationSendResult> {
-    const target = `planner@${args.epicId}`;
-    const body = buildBlockEscalationBody({
-      epicId: args.epicId,
-      taskId: args.taskId,
-      category: args.category,
-      blockedReason: args.blockedReason,
-      repo: args.repo,
-    });
-    return notifyPlanner(target, body);
-  }
-
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -7832,79 +7928,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     sweepExpiredPendingDispatches();
   }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
 
-  // Producer-side block-escalation sweep (fn-941). Each heartbeat tick walks the
-  // current-state pending `block_escalations` latch rows, gates each by the
-  // cancellation guard + the TOOLING_FAILURE denylist, coalesces survivors per
-  // `planner@<epic>`, and for each escalatable winner mints
-  // `BlockEscalationRequested` → notifies the planner over the bus → mints
-  // `BlockEscalationAttempted{outcome}`. The latch advances pending→requested→
-  // attempted exactly once per block instance, so a daemon escalates a given
-  // block ONCE. All wall-clock + fs + spawn lives HERE in the producer, never in a
-  // fold; the spawn lives only here, so a re-fold never re-fires a notify.
-  //
-  // `void`: `runBlockEscalationSweep` is async (the notify spawns the bus CLI),
-  // but the sweep MUST NOT block the heartbeat — the mints land synchronously and
-  // the spawn resolves on a later tick. `.catch` is belt-and-braces; the sweep is
-  // fail-open by contract.
-  async function runBlockEscalationSweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    await runBlockEscalationSweep({
-      selectPending: () => selectPendingBlockEscalations(db),
-      readBlockedReason: readTaskBlockedReason,
-      mintRequested: (epicId, taskId) =>
-        mintBlockEscalationEvent(
-          "BlockEscalationRequested",
-          epicId,
-          taskId,
-          null,
-        ),
-      mintAttempted: (epicId, taskId, outcome) =>
-        mintBlockEscalationEvent(
-          "BlockEscalationAttempted",
-          epicId,
-          taskId,
-          outcome,
-        ),
-      notifyPlanner: notifyPlannerOfBlock,
-      hasOpenWorkFailure: (taskId) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? LIMIT 1",
-              )
-              .get(taskId) != null
-          );
-        } catch {
-          // Fail-open: a read miss re-mints, which is an idempotent UPSERT (the
-          // row's `created_at` is preserved), so the worst case is one redundant
-          // event — never a missed suppression.
-          return false;
-        }
-      },
-      suppressRedispatch: ({ taskId, reason, dir }) =>
-        handleDispatchFailedMint({
-          verb: "work",
-          id: taskId,
-          reason,
-          dir,
-          ts: Date.now() / 1000,
-        }),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  const blockEscalationSweepTimer = setInterval(() => {
-    void runBlockEscalationSweepTick().catch((err) => {
-      console.error(
-        `[keeperd] block-escalation sweep tick threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    });
-  }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS);
-
   // Shared escalation-dispatch production wiring (fn-1129) — the deconflict-dispatch
-  // sweep here and the unblock-dispatch sweep in the sibling task both launch a
+  // sweep AND the block/unblock-dispatch sweep both launch a
   // `<verb>::<id>` plan-skill session through `dispatchEscalationSession`, bounded by the
   // global concurrency cap + a per-key occupancy guard. `inFlightEscalations` is a
   // producer-side memo of keys THIS process launched that may not have folded into the
@@ -8127,6 +8152,204 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         void runDeconflictHumanNotifySweepTick().catch((err) => {
           console.error(
             `[keeperd] deconflict human-notify sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
+    : null;
+
+  // Launch ONE `unblock::<task>` escalation session for a blocked task with an
+  // escalatable category. Sibling of `dispatchDeconflict`: cwd = the task's effective
+  // repo (the lane worktree / project dir — the skill re-derives context from its
+  // escalation brief), the prompt is `/plan:unblock <task>`, and the launch runs at the
+  // SEPARATE escalation model/effort via the shared `dispatchEscalationSession` (so the
+  // global cap + per-key occupancy guard apply). Producer-only — never reachable from a
+  // fold.
+  async function dispatchUnblock(
+    row: PendingBlockEscalation,
+  ): Promise<EscalationDispatchOutcome> {
+    return dispatchEscalationSession(liveEscalationDispatchDeps, {
+      verb: "unblock",
+      id: row.task_id,
+      prompt: defaultPlanPrompt("unblock", row.task_id),
+      cwd: effectiveBlockEscalationRepo(row.target_repo, row.project_dir),
+    });
+  }
+
+  // The per-EPIC serialization guard: is any `unblock::<task>` session for a task in
+  // `epicId` already live? Reads the live jobs (mapped task→epic via `epicHasLiveUnblock`)
+  // PLUS the producer's not-yet-folded in-flight memo (a session launched THIS tick that
+  // has not folded a jobs row yet), so a same-epic sibling can never double-dispatch while
+  // one is in flight. `readLiveEscalationJobs` GCs the memo first, so the two reads stay
+  // disjoint.
+  function epicUnblockLive(epicId: string): boolean {
+    const jobs = readLiveEscalationJobs();
+    for (const key of inFlightEscalations.keys()) {
+      if (!key.startsWith("unblock::")) continue;
+      const parsed = parsePlanRef(key.slice("unblock::".length));
+      if (parsed != null && parsed.epic_id === epicId) return true;
+    }
+    return epicHasLiveUnblock(jobs, epicId);
+  }
+
+  // Send the ONE botctl notification about a declined/dead `unblock::<task>` session
+  // (stage 3). Sibling of `notifyHumanOfDeconflict`: ASYNC spawn, array form so the body
+  // rides as a literal argv element (no shell interpolation). A non-zero exit OR a missing
+  // botctl maps to `notify_failed` — NON-terminal, so the marker stays NULL and the row
+  // re-sweeps: the notification is never lost, and the blocked task stays operator-visible
+  // on the board throughout.
+  async function notifyHumanOfBlock(
+    row: PendingBlockHumanNotify,
+    verdict: "declined" | "died",
+  ): Promise<BlockHumanNotifiedOutcome> {
+    const body = buildBlockHumanNotifyBody({
+      epicId: row.epic_id,
+      taskId: row.task_id,
+      verdict,
+    });
+    try {
+      const proc = Bun.spawn(
+        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0 ? "notified" : "notify_failed";
+    } catch (err) {
+      console.error(
+        `[keeperd] unblock human-notify spawn threw for ${row.task_id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return "notify_failed";
+    }
+  }
+
+  // Producer-side block/unblock-dispatch sweep (fn-1129 stage 2), the rewired successor to
+  // the block-escalation planner@ notify. Each heartbeat tick walks the pending
+  // `block_escalations` latch rows, gates each by the cancellation guard + the
+  // TOOLING_FAILURE denylist (surface-and-stop still suppresses `work::<task>` re-dispatch,
+  // never dispatching an agent), and DISPATCHES one `unblock::<task>` escalation session
+  // per escalatable block — SERIALIZED per epic (at most one live unblock per epic). A
+  // terminal `dispatched` stamps the latch to `attempted` (the reducer fold); a
+  // `dispatch_failed` resets it to `pending`, and a cap/occupancy or same-epic
+  // serialization SKIP leaves it `pending` — all re-sweepable. All wall-clock + fs + spawn
+  // lives HERE in the producer; the spawn lives only here, so a re-fold never re-fires a
+  // launch.
+  async function runBlockEscalationSweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    // Paused = the human is in control; a paused board never auto-dispatches a NEW
+    // escalation session, mirroring the deconflict + resolver + reconciler pause gate.
+    if (autopilotPaused) return;
+    await runBlockEscalationSweep({
+      selectPending: () => selectPendingBlockEscalations(db),
+      readBlockedReason: readTaskBlockedReason,
+      mintRequested: (epicId, taskId) =>
+        mintBlockEscalationEvent(
+          "BlockEscalationRequested",
+          epicId,
+          taskId,
+          null,
+        ),
+      mintAttempted: (epicId, taskId, outcome) =>
+        mintBlockEscalationEvent(
+          "BlockEscalationAttempted",
+          epicId,
+          taskId,
+          outcome,
+        ),
+      dispatchUnblock: (row) => dispatchUnblock(row),
+      isEpicUnblockLive: (epicId) => epicUnblockLive(epicId),
+      hasOpenWorkFailure: (taskId) => {
+        try {
+          return (
+            db
+              .query(
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? LIMIT 1",
+              )
+              .get(taskId) != null
+          );
+        } catch {
+          // Fail-open: a read miss re-mints, which is an idempotent UPSERT (the
+          // row's `created_at` is preserved), so the worst case is one redundant
+          // event — never a missed suppression.
+          return false;
+        }
+      },
+      suppressRedispatch: ({ taskId, reason, dir }) =>
+        handleDispatchFailedMint({
+          verb: "work",
+          id: taskId,
+          reason,
+          dir,
+          ts: Date.now() / 1000,
+        }),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
+  // launcher is reachable (a server-only boot never dispatches). Rides the same 60s
+  // heartbeat as the deconflict-dispatch sweep.
+  const blockEscalationSweepTimer = want("autopilot")
+    ? setInterval(() => {
+        void runBlockEscalationSweepTick().catch((err) => {
+          console.error(
+            `[keeperd] block-escalation sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
+    : null;
+
+  // Producer-side unblock human-notify sweep (fn-1129 stage 3). Each heartbeat tick walks
+  // the block latches whose `unblock::<task>` session was dispatched but whose human is
+  // not yet notified, and sends ONE botctl notification once that session reaches a
+  // TERMINAL decline/death — then mints `BlockHumanNotified{outcome}`. A terminal
+  // `notified` stamps the `human_notified_at` once-marker so the human is notified ONCE; a
+  // `notify_failed` re-sweeps. A successful unblock takes the task out of `blocked`,
+  // deleting the latch before this ever fires. Same pause + autopilot-role gating as the
+  // dispatch sweep.
+  async function runBlockHumanNotifySweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    if (autopilotPaused) return;
+    await runBlockHumanNotifySweep({
+      selectPending: () => selectPendingBlockHumanNotifications(db),
+      stillPending: (epicId, taskId) => {
+        try {
+          return (
+            db
+              .query(
+                "SELECT 1 FROM block_escalations WHERE epic_id = ? AND task_id = ? AND status = 'attempted' AND outcome = 'dispatched' AND human_notified_at IS NULL LIMIT 1",
+              )
+              .get(epicId, taskId) != null
+          );
+        } catch {
+          return false;
+        }
+      },
+      unblockOutcome: (taskId) =>
+        classifyEscalationOutcome(
+          resolveEscalationJobsFor(db, "unblock", taskId),
+          "unblock",
+          taskId,
+        ),
+      notifyHuman: (row, verdict) => notifyHumanOfBlock(row, verdict),
+      mintAttempted: (epicId, taskId, outcome) =>
+        mintBlockHumanNotifiedEvent(epicId, taskId, outcome),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const blockHumanNotifySweepTimer = want("autopilot")
+    ? setInterval(() => {
+        void runBlockHumanNotifySweepTick().catch((err) => {
+          console.error(
+            `[keeperd] unblock human-notify sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -9290,7 +9513,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // integrity-probe + backup + catch-up timers live on the maintenance worker,
     // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
-    clearInterval(blockEscalationSweepTimer);
+    if (blockEscalationSweepTimer !== null) {
+      clearInterval(blockEscalationSweepTimer);
+    }
+    if (blockHumanNotifySweepTimer !== null) {
+      clearInterval(blockHumanNotifySweepTimer);
+    }
     if (mergeEscalationSweepTimer !== null) {
       clearInterval(mergeEscalationSweepTimer);
     }

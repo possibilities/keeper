@@ -30,11 +30,12 @@ import {
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
   type BlockEscalationOutcome,
-  type BlockEscalationSendResult,
   type BlockEscalationSweepDeps,
+  type BlockHumanNotifiedOutcome,
+  type BlockHumanNotifySweepDeps,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
-  buildBlockEscalationBody,
+  buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
@@ -56,6 +57,7 @@ import {
   type EscalationDispatchDeps,
   type EscalationDispatchOutcome,
   effectiveBlockEscalationRepo,
+  epicHasLiveUnblock,
   escalationSessionLiveFor,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
@@ -69,6 +71,7 @@ import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
+  type PendingBlockHumanNotify,
   type PendingMergeEscalation,
   type PendingResolverDispatch,
   parseBlockedCategory,
@@ -81,6 +84,7 @@ import {
   recoverOneDeadLetter,
   resolveEscalationJobsFor,
   runBlockEscalationSweep,
+  runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
   runMergeEscalationSweep,
   runResolverDispatchSweep,
@@ -90,6 +94,7 @@ import {
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
+  selectPendingBlockHumanNotifications,
   selectPendingHumanNotifications,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
@@ -3725,34 +3730,6 @@ test("effectiveBlockEscalationRepo: target_repo override, else project_dir, else
   expect(effectiveBlockEscalationRepo("", "")).toBe("");
 });
 
-test("buildBlockEscalationBody: pause-first, carries epic/task/category/repo/reason + resume directive, closes with play", () => {
-  const body = buildBlockEscalationBody({
-    epicId: "fn-9-foo",
-    taskId: "fn-9-foo.2",
-    category: "SPEC_UNCLEAR",
-    blockedReason: "SPEC_UNCLEAR: the acceptance is ambiguous",
-    repo: "/Users/me/code/foo",
-  });
-  expect(body).toContain("fn-9-foo.2");
-  expect(body).toContain("fn-9-foo");
-  expect(body).toContain("SPEC_UNCLEAR");
-  expect(body).toContain("/Users/me/code/foo");
-  expect(body).toContain("the acceptance is ambiguous");
-  // Opens pause-first (step 0) so the unblock does not cold-re-dispatch a fresh
-  // worker while the operator resumes the live one.
-  expect(body).toContain("keeper autopilot pause");
-  expect(body.indexOf("keeper autopilot pause")).toBeLessThan(
-    body.indexOf("keeper plan unblock fn-9-foo.2"),
-  );
-  // Unblock the board, then PRIMARY bus-resume the still-live worker, with the
-  // manual-dispatch fallback for a dead worker session.
-  expect(body).toContain("keeper plan unblock fn-9-foo.2");
-  expect(body).toContain("keeper bus chat send work::fn-9-foo.2");
-  expect(body).toContain("keeper dispatch work::fn-9-foo.2");
-  // Closes with the literal unstick command the operator runs when done.
-  expect(body).toContain("keeper autopilot play");
-});
-
 // ---- selectPendingBlockEscalations (the current-state working-set read) -----
 
 function seedEpicWithTasks(
@@ -3847,7 +3824,7 @@ test("selectPendingBlockEscalations: empty table returns []", () => {
   db.close();
 });
 
-// ---- runBlockEscalationSweep (the orchestration core, injected deps) --------
+// ---- runBlockEscalationSweep (the dispatch core, injected deps) -------------
 
 interface MintCall {
   kind: "requested" | "attempted";
@@ -3856,26 +3833,44 @@ interface MintCall {
   outcome?: BlockEscalationOutcome;
 }
 
-/** Build injectable deps over a synthetic pending set + a reason map + a notify
- *  stub, recording every mint + notify call for assertion. */
+/** One blocked pending row with sensible defaults (blocked + `/proj`). */
+function blockedRow(
+  epicId: string,
+  taskId: string,
+  overrides: Partial<PendingBlockEscalation> = {},
+): PendingBlockEscalation {
+  return {
+    epic_id: epicId,
+    task_id: taskId,
+    project_dir: "/proj",
+    runtime_status: "blocked",
+    target_repo: null,
+    ...overrides,
+  };
+}
+
+/** Build injectable deps over a synthetic pending set + a reason map + a dispatch
+ *  stub, recording every mint + dispatch call for assertion. */
 function fakeSweepDeps(opts: {
   pending: PendingBlockEscalation[];
   reasons?: Record<string, string | null>;
   /** Task ids whose `work::<id>` already has an open `dispatch_failures` row —
    *  drives the once-only guard for the durable re-dispatch suppression. */
   alreadyFailed?: Set<string>;
-  notify?: (args: {
-    epicId: string;
-    taskId: string;
-  }) => Promise<BlockEscalationSendResult>;
+  /** Epic ids for which an `unblock::<task>` session is already LIVE — drives the
+   *  per-epic serialization (across-sweep) guard. */
+  epicLive?: Set<string>;
+  dispatch?: (
+    row: PendingBlockEscalation,
+  ) => Promise<EscalationDispatchOutcome>;
 }): {
   deps: BlockEscalationSweepDeps;
   mints: MintCall[];
-  notifies: { epicId: string; taskId: string }[];
+  dispatches: { epicId: string; taskId: string }[];
   suppressions: { taskId: string; reason: string; dir: string | null }[];
 } {
   const mints: MintCall[] = [];
-  const notifies: { epicId: string; taskId: string }[] = [];
+  const dispatches: { epicId: string; taskId: string }[] = [];
   const suppressions: { taskId: string; reason: string; dir: string | null }[] =
     [];
   const deps: BlockEscalationSweepDeps = {
@@ -3885,65 +3880,47 @@ function fakeSweepDeps(opts: {
       mints.push({ kind: "requested", epicId, taskId }),
     mintAttempted: (epicId, taskId, outcome) =>
       mints.push({ kind: "attempted", epicId, taskId, outcome }),
-    notifyPlanner: async (args) => {
-      notifies.push({ epicId: args.epicId, taskId: args.taskId });
-      return (
-        (await opts.notify?.(args)) ?? {
-          outcome: "sent",
-          detail: "sent",
-        }
-      );
+    dispatchUnblock: async (row) => {
+      dispatches.push({ epicId: row.epic_id, taskId: row.task_id });
+      return (await opts.dispatch?.(row)) ?? "dispatched";
     },
+    isEpicUnblockLive: (epicId) => opts.epicLive?.has(epicId) ?? false,
     hasOpenWorkFailure: (taskId) => opts.alreadyFailed?.has(taskId) ?? false,
     suppressRedispatch: (args) => suppressions.push(args),
   };
-  return { deps, mints, notifies, suppressions };
+  return { deps, mints, dispatches, suppressions };
 }
 
-test("runBlockEscalationSweep: an escalatable block mints Requested→Attempted{sent} in order, sends once", async () => {
-  const { deps, mints, notifies } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+test("runBlockEscalationSweep: an escalatable block DISPATCHES one unblock and mints Requested→Attempted{dispatched} (no planner@ send)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: ambiguous acceptance" },
   });
   await runBlockEscalationSweep(deps);
 
-  expect(notifies).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
-  // Requested STRICTLY before Attempted.
+  // Exactly one unblock dispatch for the task — and no planner@ bus message (the
+  // deps surface has no notify path at all now).
+  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  // Requested STRICTLY before Attempted; the terminal outcome is `dispatched`.
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.1",
-      outcome: "sent",
+      outcome: "dispatched",
     },
   ]);
 });
 
-test("runBlockEscalationSweep: TOOLING_FAILURE is skipped with a recorded outcome, no send", async () => {
-  const { deps, mints, notifies } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+test("runBlockEscalationSweep: TOOLING_FAILURE never dispatches an agent (skipped_category)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "TOOLING_FAILURE: the runner is broken" },
   });
   await runBlockEscalationSweep(deps);
 
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
@@ -3955,23 +3932,15 @@ test("runBlockEscalationSweep: TOOLING_FAILURE is skipped with a recorded outcom
   ]);
 });
 
-test("runBlockEscalationSweep: an absent/unparseable reason is skipped (surface-and-stop), no send", async () => {
-  const { deps, mints, notifies } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+test("runBlockEscalationSweep: an absent/unparseable reason never dispatches (surface-and-stop)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     // No reason entry → readBlockedReason returns null → category null → skip.
     reasons: {},
   });
   await runBlockEscalationSweep(deps);
 
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
   expect(mints.map((m) => m.kind === "attempted" && m.outcome)).toContain(
     "skipped_category",
   );
@@ -3979,15 +3948,7 @@ test("runBlockEscalationSweep: an absent/unparseable reason is skipped (surface-
 
 test("runBlockEscalationSweep: a TOOLING_FAILURE block mints a durable DispatchFailed on work::<task> (re-dispatch suppression)", async () => {
   const { deps, suppressions } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: "/lane",
-      },
-    ],
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1", { target_repo: "/lane" })],
     reasons: { "fn-1-foo.1": "TOOLING_FAILURE: the runner is broken" },
   });
   await runBlockEscalationSweep(deps);
@@ -4001,15 +3962,7 @@ test("runBlockEscalationSweep: a TOOLING_FAILURE block mints a durable DispatchF
 
 test("runBlockEscalationSweep: an absent/unparseable block also durably suppresses (surface-and-stop)", async () => {
   const { deps, suppressions } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: {},
   });
   await runBlockEscalationSweep(deps);
@@ -4022,15 +3975,7 @@ test("runBlockEscalationSweep: an absent/unparseable block also durably suppress
 
 test("runBlockEscalationSweep: the durable suppression is once-only — skipped when a work failure row already exists", async () => {
   const { deps, mints, suppressions } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "TOOLING_FAILURE: still broken" },
     alreadyFailed: new Set(["fn-1-foo.1"]),
   });
@@ -4051,43 +3996,27 @@ test("runBlockEscalationSweep: the durable suppression is once-only — skipped 
 });
 
 test("runBlockEscalationSweep: an escalatable block does NOT durably suppress (only surface-and-stop categories do)", async () => {
-  const { deps, suppressions, notifies } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+  const { deps, suppressions, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: ambiguous acceptance" },
   });
   await runBlockEscalationSweep(deps);
 
-  // SPEC_UNCLEAR escalates to the planner (who unblocks + resumes); the autopilot
-  // re-dispatch path stays open, so NO durable failure is minted.
-  expect(notifies).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  // SPEC_UNCLEAR dispatches an unblock session; the autopilot re-dispatch path stays
+  // open, so NO durable failure is minted.
+  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
   expect(suppressions).toEqual([]);
 });
 
-test("runBlockEscalationSweep: cancellation guard — a task that left blocked is skipped_unblocked, no send", async () => {
-  const { deps, mints, notifies } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        // Latch still pending, but the live task already left blocked.
-        runtime_status: "todo",
-        target_repo: null,
-      },
-    ],
+test("runBlockEscalationSweep: cancellation guard — a task that left blocked is skipped_unblocked, no dispatch", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    // Latch still pending, but the live task already left blocked.
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1", { runtime_status: "todo" })],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: would-escalate-if-still-blocked" },
   });
   await runBlockEscalationSweep(deps);
 
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
@@ -4099,23 +4028,11 @@ test("runBlockEscalationSweep: cancellation guard — a task that left blocked i
   ]);
 });
 
-test("runBlockEscalationSweep: per-planner coalescing — two blocked tasks in one epic send ONCE", async () => {
-  const { deps, mints, notifies } = fakeSweepDeps({
+test("runBlockEscalationSweep: per-epic serialization — two blocked tasks in one epic DISPATCH once, the sibling stays latched", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
     pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.2",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
+      blockedRow("fn-1-foo", "fn-1-foo.1"),
+      blockedRow("fn-1-foo", "fn-1-foo.2"),
     ],
     reasons: {
       "fn-1-foo.1": "SPEC_UNCLEAR: a",
@@ -4124,41 +4041,61 @@ test("runBlockEscalationSweep: per-planner coalescing — two blocked tasks in o
   });
   await runBlockEscalationSweep(deps);
 
-  // Exactly ONE send for the shared planner@fn-1-foo (the first row wins).
-  expect(notifies).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
-  // The coalesced sibling still gets a terminal outcome so it leaves pending.
-  const attempts = mints.filter((m) => m.kind === "attempted");
-  expect(attempts).toContainEqual({
-    kind: "attempted",
-    epicId: "fn-1-foo",
-    taskId: "fn-1-foo.1",
-    outcome: "sent",
-  });
-  expect(attempts).toContainEqual({
-    kind: "attempted",
-    epicId: "fn-1-foo",
-    taskId: "fn-1-foo.2",
-    outcome: "skipped_coalesced",
-  });
+  // Exactly ONE unblock dispatch for the epic (the first row wins the claim).
+  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  // The winner mints dispatched; the same-epic sibling mints NOTHING (stays pending,
+  // re-sweeps once the live session goes terminal — no starvation, no collision).
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+    {
+      kind: "attempted",
+      epicId: "fn-1-foo",
+      taskId: "fn-1-foo.1",
+      outcome: "dispatched",
+    },
+  ]);
 });
 
-test("runBlockEscalationSweep: two DIFFERENT epics each get their own send", async () => {
-  const { deps, notifies } = fakeSweepDeps({
+test("runBlockEscalationSweep: a sibling is NOT dispatched while the epic's unblock is already live (across-sweep guard)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.2")],
+    reasons: { "fn-1-foo.2": "SPEC_UNCLEAR: still blocked" },
+    // A prior cycle already dispatched `unblock::fn-1-foo.1`, still live.
+    epicLive: new Set(["fn-1-foo"]),
+  });
+  await runBlockEscalationSweep(deps);
+
+  // The epic already holds its one live unblock → skip WITHOUT minting (stays latched).
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: once the epic's unblock terminates, a pending sibling dispatches (none starved)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.2")],
+    reasons: { "fn-1-foo.2": "SPEC_UNCLEAR: still blocked" },
+    // The prior session went terminal → the epic is no longer live.
+    epicLive: new Set(),
+  });
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.2" }]);
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.2" },
+    {
+      kind: "attempted",
+      epicId: "fn-1-foo",
+      taskId: "fn-1-foo.2",
+      outcome: "dispatched",
+    },
+  ]);
+});
+
+test("runBlockEscalationSweep: two DIFFERENT epics each get their own dispatch (serialization is per-epic)", async () => {
+  const { deps, dispatches } = fakeSweepDeps({
     pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-      {
-        epic_id: "fn-2-bar",
-        task_id: "fn-2-bar.1",
-        project_dir: "/proj2",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
+      blockedRow("fn-1-foo", "fn-1-foo.1"),
+      blockedRow("fn-2-bar", "fn-2-bar.1", { project_dir: "/proj2" }),
     ],
     reasons: {
       "fn-1-foo.1": "SPEC_UNCLEAR: a",
@@ -4167,93 +4104,314 @@ test("runBlockEscalationSweep: two DIFFERENT epics each get their own send", asy
   });
   await runBlockEscalationSweep(deps);
 
-  expect(notifies).toEqual([
+  expect(dispatches).toEqual([
     { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     { epicId: "fn-2-bar", taskId: "fn-2-bar.1" },
   ]);
 });
 
-test("runBlockEscalationSweep: a send_failed helper result is recorded as the latch outcome (fail-open)", async () => {
-  const { deps, mints } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
-    reasons: { "fn-1-foo.1": "EXTERNAL_BLOCKED: api down" },
-    notify: async () => ({ outcome: "send_failed", detail: "not_connected" }),
+test("runBlockEscalationSweep: an at_cap skip mints NOTHING (row stays pending, re-sweeps)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
+    dispatch: async () => "at_cap",
   });
   await runBlockEscalationSweep(deps);
 
-  expect(mints).toContainEqual({
-    kind: "attempted",
-    epicId: "fn-1-foo",
-    taskId: "fn-1-foo.1",
-    outcome: "send_failed",
-  });
+  // The dispatcher was consulted, but the cap skip mints no marker — the row re-sweeps.
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([]);
 });
 
-test("runBlockEscalationSweep: a THROWING notify never aborts the sweep (records send_failed)", async () => {
+test("runBlockEscalationSweep: an already_live skip (occupancy guard) mints NOTHING", async () => {
   const { deps, mints } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
+    dispatch: async () => "already_live",
+  });
+  await runBlockEscalationSweep(deps);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: a dispatch_failed outcome mints Requested→Attempted{dispatch_failed} (re-sweepable)", async () => {
+  const { deps, mints } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": "EXTERNAL_BLOCKED: api down" },
+    dispatch: async () => "dispatch_failed",
+  });
+  await runBlockEscalationSweep(deps);
+
+  // dispatch_failed mints attempted{dispatch_failed} — the fold resets the latch to
+  // pending, so the next sweep retries.
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+    {
+      kind: "attempted",
+      epicId: "fn-1-foo",
+      taskId: "fn-1-foo.1",
+      outcome: "dispatch_failed",
+    },
+  ]);
+});
+
+test("runBlockEscalationSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
+  const { deps, mints } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "DESIGN_CONFLICT: clash" },
-    notify: async () => {
+    dispatch: async () => {
       throw new Error("boom");
     },
   });
-  // MUST resolve (never throw) and record a terminal outcome.
+  // MUST resolve (never throw) and record a non-terminal outcome.
   await runBlockEscalationSweep(deps);
   expect(mints).toContainEqual({
     kind: "attempted",
     epicId: "fn-1-foo",
     taskId: "fn-1-foo.1",
-    outcome: "send_failed",
+    outcome: "dispatch_failed",
   });
 });
 
-test("runBlockEscalationSweep: an empty pending set is a no-op (no mints, no sends)", async () => {
-  const { deps, mints, notifies } = fakeSweepDeps({ pending: [] });
+test("runBlockEscalationSweep: an empty pending set is a no-op (no mints, no dispatches)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({ pending: [] });
   await runBlockEscalationSweep(deps);
+  expect(mints).toEqual([]);
+  expect(dispatches).toEqual([]);
+});
+
+// ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------
+
+test("epicHasLiveUnblock: true iff a LIVE unblock:: session exists for a task in the epic", () => {
+  const jobs: Job[] = [
+    escJob("unblock", "fn-1-foo.2", "working"), // live, epic fn-1-foo
+    escJob("unblock", "fn-2-bar.1", "ended"), // terminal — not live
+    escJob("deconflict", "fn-1-foo", "working"), // wrong verb (deconflict keys on epic)
+    escJob("work", "fn-1-foo.9", "working"), // a plain worker — not an escalation
+  ];
+  expect(epicHasLiveUnblock(jobs, "fn-1-foo")).toBe(true);
+  // The unblock for fn-2-bar is terminal → not live.
+  expect(epicHasLiveUnblock(jobs, "fn-2-bar")).toBe(false);
+  // No unblock session maps to this epic.
+  expect(epicHasLiveUnblock(jobs, "fn-9-none")).toBe(false);
+  expect(epicHasLiveUnblock([], "fn-1-foo")).toBe(false);
+});
+
+// ---- buildBlockHumanNotifyBody (pure stage-3 notification body) --------------
+
+test("buildBlockHumanNotifyBody: names the task, the epic, the declined verdict, and the unblock command", () => {
+  const body = buildBlockHumanNotifyBody({
+    epicId: "fn-9-foo",
+    taskId: "fn-9-foo.2",
+    verdict: "declined",
+  });
+  expect(body).toContain("fn-9-foo.2");
+  expect(body).toContain("fn-9-foo");
+  expect(body).toContain("DECLINED");
+  expect(body).toContain("keeper plan unblock fn-9-foo.2");
+});
+
+test("buildBlockHumanNotifyBody: a died verdict names the death", () => {
+  const body = buildBlockHumanNotifyBody({
+    epicId: "fn-9-foo",
+    taskId: "fn-9-foo.2",
+    verdict: "died",
+  });
+  expect(body).toContain("DIED");
+  expect(body).toContain("keeper plan unblock fn-9-foo.2");
+});
+
+// ---- selectPendingBlockHumanNotifications (the stage-3 working-set read) ------
+
+/** Seed one `block_escalations` latch row with the full stage-3 column set. */
+function seedFullBlockLatch(
+  db: ReturnType<typeof openDb>["db"],
+  epicId: string,
+  taskId: string,
+  status: string,
+  outcome: string | null,
+  humanNotifiedAt: number | null,
+): void {
+  db.run(
+    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at)
+       VALUES (?, ?, 1, ?, ?, 1, ?)`,
+    [epicId, taskId, status, outcome, humanNotifiedAt],
+  );
+}
+
+test("selectPendingBlockHumanNotifications: picks only dispatched-but-not-notified latches", () => {
+  const { db } = freshMemDb();
+  // Dispatched, human not yet notified → SELECTED (the stage-3 working set).
+  seedFullBlockLatch(
+    db,
+    "fn-1-foo",
+    "fn-1-foo.1",
+    "attempted",
+    "dispatched",
+    null,
+  );
+  // Not-yet-dispatched (a skipped_category terminal — no session ran) → dropped.
+  seedFullBlockLatch(
+    db,
+    "fn-2-tool",
+    "fn-2-tool.1",
+    "attempted",
+    "skipped_category",
+    null,
+  );
+  // Still pending (stage 2 owns it) → dropped.
+  seedFullBlockLatch(db, "fn-3-pend", "fn-3-pend.1", "pending", null, null);
+  // Already human-notified → dropped (notify-once).
+  seedFullBlockLatch(
+    db,
+    "fn-4-done",
+    "fn-4-done.1",
+    "attempted",
+    "dispatched",
+    333,
+  );
+
+  const rows = selectPendingBlockHumanNotifications(db);
+  expect(rows).toEqual([{ epic_id: "fn-1-foo", task_id: "fn-1-foo.1" }]);
+  db.close();
+});
+
+test("selectPendingBlockHumanNotifications: empty table returns []", () => {
+  const { db } = freshMemDb();
+  expect(selectPendingBlockHumanNotifications(db)).toEqual([]);
+  db.close();
+});
+
+// ---- runBlockHumanNotifySweep (stage-3 orchestration core, injected deps) -----
+
+interface BlockHumanNotifyMintCall {
+  epicId: string;
+  taskId: string;
+  outcome: BlockHumanNotifiedOutcome;
+}
+
+function fakeBlockHumanNotifySweepDeps(opts: {
+  pending: PendingBlockHumanNotify[];
+  stillPending?: (epicId: string, taskId: string) => boolean;
+  unblockOutcome?: (taskId: string) => ResolverOutcome;
+  notify?: (
+    row: PendingBlockHumanNotify,
+    verdict: "declined" | "died",
+  ) => Promise<BlockHumanNotifiedOutcome>;
+  selectThrows?: boolean;
+}): {
+  deps: BlockHumanNotifySweepDeps;
+  mints: BlockHumanNotifyMintCall[];
+  notifies: { taskId: string; verdict: "declined" | "died" }[];
+} {
+  const mints: BlockHumanNotifyMintCall[] = [];
+  const notifies: { taskId: string; verdict: "declined" | "died" }[] = [];
+  const deps: BlockHumanNotifySweepDeps = {
+    selectPending: () => {
+      if (opts.selectThrows) throw new Error("read boom");
+      return opts.pending;
+    },
+    stillPending: opts.stillPending ?? (() => true),
+    // Default: the unblock session already declined (terminal), so the notify fires.
+    unblockOutcome:
+      opts.unblockOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
+    notifyHuman: async (row, verdict) => {
+      notifies.push({ taskId: row.task_id, verdict });
+      return (await opts.notify?.(row, verdict)) ?? "notified";
+    },
+    mintAttempted: (epicId, taskId, outcome) =>
+      mints.push({ epicId, taskId, outcome }),
+  };
+  return { deps, mints, notifies };
+}
+
+function blockNotifyPending(): PendingBlockHumanNotify[] {
+  return [{ epic_id: "fn-1-foo", task_id: "fn-1-foo.1" }];
+}
+
+test("runBlockHumanNotifySweep: a declined unblock notifies the human ONCE and mints notified", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: blockNotifyPending(),
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ taskId: "fn-1-foo.1", verdict: "declined" }]);
+  expect(mints).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1", outcome: "notified" },
+  ]);
+});
+
+test("runBlockHumanNotifySweep: a DIED unblock notifies once and carries the died verdict", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: blockNotifyPending(),
+    unblockOutcome: () => ({ terminal: true, verdict: "died" }),
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ taskId: "fn-1-foo.1", verdict: "died" }]);
+  expect(mints).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1", outcome: "notified" },
+  ]);
+});
+
+test("runBlockHumanNotifySweep: a notify_failed leaves the marker unset (re-sweepable, never silent)", async () => {
+  const { deps, mints } = fakeBlockHumanNotifySweepDeps({
+    pending: blockNotifyPending(),
+    notify: async () => "notify_failed",
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(mints).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1", outcome: "notify_failed" },
+  ]);
+});
+
+test("runBlockHumanNotifySweep: a THROWING notify never aborts the sweep (records notify_failed)", async () => {
+  const { deps, mints } = fakeBlockHumanNotifySweepDeps({
+    pending: blockNotifyPending(),
+    notify: async () => {
+      throw new Error("botctl boom");
+    },
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(mints).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1", outcome: "notify_failed" },
+  ]);
+});
+
+test("runBlockHumanNotifySweep: a live/not-yet-terminal unblock defers — no notify, no mint", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: blockNotifyPending(),
+    unblockOutcome: () => ({ terminal: false }),
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockHumanNotifySweep: a row cleared mid-sweep (stillPending false, e.g. the task got unblocked) is skipped", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: blockNotifyPending(),
+    stillPending: () => false,
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockHumanNotifySweep: an empty pending set is a no-op", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: [],
+  });
+  await runBlockHumanNotifySweep(deps);
   expect(mints).toEqual([]);
   expect(notifies).toEqual([]);
 });
 
-test("runBlockEscalationSweep: a queued_for_wake helper result rides through as the outcome", async () => {
-  const { deps, mints } = fakeSweepDeps({
-    pending: [
-      {
-        epic_id: "fn-1-foo",
-        task_id: "fn-1-foo.1",
-        project_dir: "/proj",
-        runtime_status: "blocked",
-        target_repo: null,
-      },
-    ],
-    reasons: { "fn-1-foo.1": "RESUME_EXHAUSTED: out of budget" },
-    notify: async () => ({
-      outcome: "queued_for_wake",
-      detail: "queued",
-    }),
+test("runBlockHumanNotifySweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: [],
+    selectThrows: true,
   });
-  await runBlockEscalationSweep(deps);
-  expect(mints).toContainEqual({
-    kind: "attempted",
-    epicId: "fn-1-foo",
-    taskId: "fn-1-foo.1",
-    outcome: "queued_for_wake",
-  });
+  await runBlockHumanNotifySweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
