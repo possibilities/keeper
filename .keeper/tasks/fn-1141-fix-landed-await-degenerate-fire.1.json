@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T14:23:40.399000Z",
+  "depends_on": [],
+  "epic": "fn-1141-fix-landed-await-degenerate-fire",
+  "id": "fn-1141-fix-landed-await-degenerate-fire.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "root-cause and fix landed detector",
+  "updated_at": "2026-07-06T14:23:40.399000Z"
+}

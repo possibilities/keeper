@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-06T14:23:40.399000Z",
+  "depends_on_epics": [
+    "fn-1140-decouple-base-merge-from-checkout"
+  ],
+  "id": "fn-1141-fix-landed-await-degenerate-fire",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "fix landed await degenerate fire",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-06T14:23:40.399000Z"
+}
