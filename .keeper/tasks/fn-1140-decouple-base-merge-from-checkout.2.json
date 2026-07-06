@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T14:18:08.803000Z",
+  "depends_on": [
+    "fn-1140-decouple-base-merge-from-checkout.1"
+  ],
+  "epic": "fn-1140-decouple-base-merge-from-checkout",
+  "id": "fn-1140-decouple-base-merge-from-checkout.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "neuter obsolete shared-checkout distress",
+  "updated_at": "2026-07-06T14:18:08.803000Z"
+}
