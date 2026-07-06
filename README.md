@@ -148,7 +148,7 @@ neither:
   merges each finished lane back to the default branch. The lane/merge-gate invariants live in
   [CLAUDE.md](./CLAUDE.md).
 - **Example clients** ship as one binary — `keeper board`, `keeper jobs`, `keeper autopilot`,
-  `keeper git`, `keeper usage`, `keeper await`, `keeper status`, `keeper query`, `keeper tabs`
+  `keeper git`, `keeper usage`, `keeper await`, `keeper status`, `keeper query`, `keeper baseline`, `keeper tabs`
   (crash-restore of keeper-managed agent windows — distinct from the DB "Backup & restore" below).
 
 ## Backup & restore
