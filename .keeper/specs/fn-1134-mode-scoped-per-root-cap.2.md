@@ -50,5 +50,5 @@ Status/watch snapshots: worktree off + stored 3 → `max_concurrent_per_root: 1`
 - [ ] `bun test` fast tier green
 
 ## Done summary
-
+Client surfaces now distinguish stored per-root intent from the effective cap: readiness-client re-projects stored locally, status/watch/show carry both fields, the shared banner annotates the divergence, the board derives effective, await changed keys on stored, and help text drops the stale reject/pin-back claims.
 ## Evidence
