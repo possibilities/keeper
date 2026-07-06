@@ -162,7 +162,8 @@ epic:
     - <items deferred to a later epic>
 tasks:
   - title: <3–6 word task title>
-    tier: <medium|high|xhigh|max>   # REQUIRED — scaffold errors tier_invalid if absent
+    tier: <low|medium|high|xhigh|max>   # REQUIRED — scaffold errors tier_invalid if absent
+    model: <opus|sonnet>   # REQUIRED — scaffold errors model_invalid if absent; stamped cells are a mechanical default the close flow's selection beat overwrites
     target_repo: <absolute path — REQUIRED over a multi-repo source; see resolution rule below>
     # deps: [1]   # optional, 1-based ordinals into this task list
     spec: |
@@ -189,7 +190,7 @@ tasks:
 - `Task` cell is a **bare ordinal** (`.1`, `.2`) for `kept` / `merged-into-*` rows and `—` (em dash) for `culled` rows. It's a bare `.M` (not `<epic_id>.M`) because scaffold mints the epic id atomically — the body is authored before the id exists. A `merged-into-<fid>` row points its `Task` cell at the SAME ordinal as its merge target.
 - Every `merged-into-<fid>` row's `Rationale` MUST name BOTH the source fid (column 1) and the target fid. Silently merging without naming both is forbidden.
 
-**Task-spec rules:** each task `spec` is the full four-section block (`## Description` / `## Acceptance` / `## Done summary` / `## Evidence`) — all four headings present exactly once. `tier` is required per task. Merged findings fold into the task of their merge target — do NOT create a separate task for a `merged-into-*` row. Intra-task deps are 1-based ordinals via the optional `deps:` list (omit for the flat case). The task count MUST equal `expected_clusters` from Phase 4.
+**Task-spec rules:** each task `spec` is the full four-section block (`## Description` / `## Acceptance` / `## Done summary` / `## Evidence`) — all four headings present exactly once. `tier` and `model` are both required per task. Merged findings fold into the task of their merge target — do NOT create a separate task for a `merged-into-*` row. Intra-task deps are 1-based ordinals via the optional `deps:` list (omit for the flat case). The task count MUST equal `expected_clusters` from Phase 4.
 
 **`target_repo` resolution rule:** set each follow-up task's `target_repo` to the repo where its surviving finding's code lives — resolve the cited `file:line` against the brief's `touched_repos`; default to the `target_repo` of the source task the finding traces back to. Emit a concrete absolute path — sentinel values (`auto` / `inherit`) are forbidden. Keep ONE follow-up epic and annotate per-task so clusters stay repo-coherent (a single epic spanning repos is fine when each task pins its own repo); fall back to the one-shot `QUESTION:` protocol (Phase 6) ONLY when a finding genuinely cannot be pinned to one repo. Over a single-repo source (`touched_repos` absent or one entry) `target_repo` may be omitted — the engine defaults it to the epic's primary repo. Over a MULTI-repo source a missing OR out-of-set per-task `target_repo` is hard-rejected by the engine (`repo_required`); the fix is to add an explicit, in-set per-task `target_repo`.
 

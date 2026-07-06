@@ -356,6 +356,35 @@ describe("close skill coordinator invariants", () => {
 });
 
 // ---------------------------------------------------------------------------
+// close-planner: follow-up template stamps both tier and model, with the
+// full configured axes — derived from subagents.yaml so axis drift trips
+// this pin instead of silently rotting the template.
+// ---------------------------------------------------------------------------
+
+const CLOSE_PLANNER = join(REPO, "agents", "close-planner.md");
+
+describe("close-planner follow-up template tier/model shape", () => {
+  const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+
+  test("template block carries both `tier:` and `model:` lines with the full configured enums", () => {
+    const text = readFileSync(CLOSE_PLANNER, "utf-8");
+    const tierLine = new RegExp(
+      `tier: <${matrix.efforts.join("\\|")}>\\s+# REQUIRED`,
+    );
+    const modelLine = new RegExp(
+      `model: <${matrix.models.join("\\|")}>\\s+# REQUIRED`,
+    );
+    expect(text).toMatch(tierLine);
+    expect(text).toMatch(modelLine);
+  });
+
+  test("task-spec rules prose requires both tier and model", () => {
+    const text = readFileSync(CLOSE_PLANNER, "utf-8");
+    expect(text).toContain("`tier` and `model` are both required per task");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // panel skill — thin shim spawns plan:panel-runner; the runner agent's
 // frontmatter; the stale "never in a subagent" claim gone from both surfaces
 // ---------------------------------------------------------------------------
