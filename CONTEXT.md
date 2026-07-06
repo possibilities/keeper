@@ -39,6 +39,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Sticky**: A dispatch failure that stays parked and visible until an operator retries it, rather than clearing itself. Avoid: transient error, flake, warning.
 - **Distress row**: The single sticky signal keeper mints when it is crash-looping, cleared only once the boot rate recovers. Avoid: alert, log line, exception.
 - **Pill**: A small colored status badge the board and statusline render to show a job's kind or state. Avoid: label, tag, icon.
+- **Per-root cap**: The per-repo concurrent-dispatch limit stored as durable intent, applying while worktree mode is on. The effective cap dispatch honors is derived at read time and floors to one whenever worktree mode is off. Avoid: pinned cap; conflating stored with effective.
 
 ## Worktree and merge
 
