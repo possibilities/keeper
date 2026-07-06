@@ -1415,6 +1415,127 @@ export function createLaneWedgeTracker(
 }
 
 /**
+ * Grace (producer-`ts` seconds) a LIVE lane owner may go without folding a fresh event
+ * before the lane-wedge liveness gate treats it as STALLED. A worker actively running
+ * its task folds events continuously, so its `updated_at` (the reducer's last-fold
+ * instant) stays recent; a live pane whose fold has frozen past this window is stuck on
+ * a human, not making the progress that would self-heal the dirty base. Mirrors the
+ * slot-reclaim reaper's `now - updated_at >= grace` dead-vs-alive idiom
+ * ({@link SLOT_RECLAIM_GRACE_SEC}). Kept a DISTINCT const from {@link
+ * LANE_WEDGE_GRACE_SEC} so the wedge grace and the owner-stall grace can diverge.
+ */
+export const LANE_OWNER_STALL_GRACE_SEC = 5 * 60;
+
+/**
+ * Is the worker OWNING a wedged fan-in base lane (the session checked out in that lane
+ * worktree) ALIVE and PROGRESSING — so the lane's dirtiness is transient uncommitted
+ * WIP that self-heals the instant it commits, never a human-actionable wedge? The
+ * producer-side liveness gate on the GRACED lane-wedge escalation (fn-1144): a healthy
+ * running worker's base is naturally dirty, so escalating it pages the operator for a
+ * false positive.
+ *
+ * The owning worker is joined by lane PATH — a `work` job whose `cwd` normalizes to the
+ * lane worktree — the only lane→worker key available producer-side (the recover pass's
+ * lane observations carry a path, not a branch, and the whole lane-wedge surface is
+ * already keyed by lane path). Liveness reuses the reconciler's SHARED rule rather than
+ * re-inventing it: `working`, or `stopped` with a live backend pane via
+ * {@link isStoppedJobLive} (the exact stopped-arm {@link isOccupyingJob} uses), then
+ * the STALL check layered on top — an occupying worker counts as progressing ONLY while
+ * its last-fold `updated_at` is within `stallGraceSec`.
+ *
+ *  - `true`  → some owning `work` worker is occupying AND progressing → the caller
+ *              WITHHOLDS the lane from the wedge tracker (it stays the quiet self-
+ *              clearing premerge/recover note; no needs_human page).
+ *  - `false` → every owning worker is DEAD (none occupying the lane) or STALLED
+ *              (occupying but its fold froze past the grace) → escalate exactly as
+ *              before the gate.
+ *
+ * DEGRADED probe (`livePaneIds === null`, tmux unavailable) → `false`: with no
+ * trustworthy liveness picture the gate FALLS BACK to the pre-gate behavior (escalate
+ * past grace), never SUPPRESSING a genuine distress signal on an unprobeable cycle —
+ * strictly no regression, mirroring {@link computeSlotOccupancy}'s inert-when-degraded
+ * conservatism. Pure + re-fold-safe: reads only the passed jobs + live-pane set +
+ * `nowSec` (a producer read; never a fold).
+ */
+export function laneOwnerAliveAndProgressing(
+  lanePath: string,
+  jobs: Map<string, Job>,
+  livePaneIds: ReadonlySet<string> | null,
+  nowSec: number,
+  stallGraceSec: number = LANE_OWNER_STALL_GRACE_SEC,
+): boolean {
+  if (livePaneIds === null) {
+    return false;
+  }
+  const laneKey = normalizeLanePath(lanePath);
+  for (const job of jobs.values()) {
+    if (job.plan_verb !== "work" || job.cwd === null) {
+      continue;
+    }
+    if (normalizeLanePath(job.cwd) !== laneKey) {
+      continue;
+    }
+    const occupying =
+      job.state === "working" ||
+      (job.state === "stopped" && isStoppedJobLive(job, livePaneIds));
+    if (occupying && nowSec - job.updated_at < stallGraceSec) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Assemble the lane-wedge tracker's `wedged` input from the recover pass's raw lane
+ * observations, applying the fn-1144 liveness gate. A GRACED (`immediate:false`) lane
+ * whose owning worker is alive AND progressing ({@link laneOwnerAliveAndProgressing})
+ * is WITHHELD — omitted from the returned map so the tracker never mints a
+ * needs_human page for transient WIP. A hard `immediate` (abort-failed) lane is NEVER
+ * gated: an abort git could not clear is a real wedge even under a live worker, so it
+ * escalates at once as before. Preserves the pre-gate dedup (first observation per lane
+ * wins; an immediate beats a graced entry for the same lane). Producer-side, pure of
+ * the wall clock (`nowSec` is the only clock) — never a fold.
+ */
+export function gateWedgedLanesByLiveness(
+  laneWedged: readonly { path: string; reason: string; immediate: boolean }[],
+  jobs: Map<string, Job>,
+  livePaneIds: ReadonlySet<string> | null,
+  nowSec: number,
+  stallGraceSec: number = LANE_OWNER_STALL_GRACE_SEC,
+): Map<string, LaneWedgeObservation> {
+  const wedgedLanes = new Map<string, LaneWedgeObservation>();
+  for (const w of laneWedged) {
+    const key = normalizeLanePath(w.path);
+    // A graced lane under a live+progressing owner is transient WIP that self-heals on
+    // commit — withhold it (the quiet self-clearing note). An `immediate` lane bypasses
+    // the gate and always escalates.
+    if (
+      !w.immediate &&
+      laneOwnerAliveAndProgressing(
+        key,
+        jobs,
+        livePaneIds,
+        nowSec,
+        stallGraceSec,
+      )
+    ) {
+      continue;
+    }
+    // First observation per lane wins (an immediate abort-failed beats a later graced
+    // entry for the same lane).
+    const prev = wedgedLanes.get(key);
+    if (prev === undefined || (w.immediate && !prev.immediate)) {
+      wedgedLanes.set(key, {
+        path: key,
+        reason: w.reason,
+        immediate: w.immediate,
+      });
+    }
+  }
+  return wedgedLanes;
+}
+
+/**
  * Grace window (producer-`ts` seconds) an already-cut lane may read STALE-BASE before
  * the probe escalates it into a visible per-(epic,repo) distress row. ~5min — long
  * enough that a transient mid-finalize window (an upstream landing while its lane is
@@ -6649,20 +6770,17 @@ function main(): void {
             //  2. grace tracker — a lane wedged past the grace (or IMMEDIATELY for a
             //     hard `abort-failed`) mints a per-lane distress; the level-clear off the
             //     OPEN distress set fires the cycle the lane goes ready/gone.
-            const wedgedLanes = new Map<string, LaneWedgeObservation>();
-            for (const w of laneWedged ?? []) {
-              const key = normalizeLanePath(w.path);
-              // First observation per lane wins (an immediate abort-failed beats a
-              // later graced entry for the same lane).
-              const prev = wedgedLanes.get(key);
-              if (prev === undefined || (w.immediate && !prev.immediate)) {
-                wedgedLanes.set(key, {
-                  path: key,
-                  reason: w.reason,
-                  immediate: w.immediate,
-                });
-              }
-            }
+            // The wedge tracker's input is gated on owning-worker liveness+progress
+            // (fn-1144): a graced lane whose worker is alive and progressing is withheld
+            // so a healthy running worker's naturally-dirty base never pages a human;
+            // only a dead/stalled worker's lane (or a hard immediate abort-failed) feeds
+            // the tracker. Producer-side read of snapshot jobs + live panes, never a fold.
+            const wedgedLanes = gateWedgedLanesByLiveness(
+              laneWedged ?? [],
+              snapshot.jobs,
+              snapshot.livePaneIds,
+              deps.now(),
+            );
             const resolvedLanes = new Set(
               (laneResolved ?? []).map((p) => normalizeLanePath(p)),
             );
