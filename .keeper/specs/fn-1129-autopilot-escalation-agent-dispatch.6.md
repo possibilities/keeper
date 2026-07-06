@@ -38,5 +38,5 @@ Deps-injected: denylist still suppresses; per-epic serialization (a second sibli
 - [ ] buildBlockEscalationBody and notifyPlannerOfBlock are gone; planner@ notify/wake plumbing is deleted when no callers remain (or the surviving callers are recorded in the Done summary); fast suite green
 
 ## Done summary
-
+Rewired the block-escalation sweep to dispatch unblock::<task> sonnet/high sessions serialized per epic (global cap + per-key occupancy via the shared helper), replacing the planner@ notify; added the stage-3 sweep that notifies the human once when an unblock session declines/dies; deleted buildBlockEscalationBody, notifyPlannerOfBlock, notifyPlanner, PlannerNotifyResult, and BlockEscalationSendResult.
 ## Evidence
