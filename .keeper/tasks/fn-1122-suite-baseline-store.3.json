@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Baseline worker and daemon wiring",
-  "updated_at": "2026-07-05T17:01:58.006000Z"
+  "updated_at": "2026-07-06T00:38:51.700000Z",
+  "worker_done_at": "2026-07-06T00:38:51.700000Z"
 }

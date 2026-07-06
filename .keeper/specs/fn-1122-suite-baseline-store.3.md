@@ -66,5 +66,5 @@ module shape (inert import) and production is the integration net.
 - [ ] The suite is green via the sanctioned fast gate
 
 ## Done summary
-
+Supervised baseline-worker: consumes the request spool, computes the fast-gate suite once per key in a detached scratch worktree under a process-group deadline, sole writer of result leafs; coalesces same-key askers, reaps on every path (incl. crash/timeout), boot-prunes orphans, folds every failure to an infra-error/timeout leaf; wired into the daemon supervisor. Pure decision core unit-tested; fast gate green.
 ## Evidence
