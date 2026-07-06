@@ -1,0 +1,104 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Founding new-pattern architecture: defines the descriptor contract every leaf derives from, wide blast radius, the epic's early proof point.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Help-purity defect fix plus first plugin descriptor migration, but conforms to ordinal-1's shape and mirrors subgroup.ts; single-plugin blast radius.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.65,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Wide-but-mechanical 34-verb descriptor extraction feeding a drift gate; correctness-sensitive metadata keeps opus, established leaf-help pattern keeps effort at high.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Three bounded named fixes, but the route-help-before-deps reroute is correctness-sensitive (must keep db/daemon/state-dir off the path).",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.75,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Regression-proof for the whole purity architecture: stub-dep walk + import-graph gate design, may need minimal DispatchDeps seams; getting the gate genuinely catching drift is subtle.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Shared duration grammar is well-specified (Go ParseDuration subset); wide hard-cutover flag renames are mechanical across surfaces, clear path spanning files.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.6",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Output-format contract touching scripts' stdout: byte-parity exemptions, envelope discipline, format_modes truth across plan/prompt/native \u2014 a wrong abstraction propagates.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.7",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Hard-cutover semantic disambiguation (never-repurpose-a-flag), live panel-runner tooling must migrate atomically, broad citation sweep across skills/docs.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.8",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Genuinely mechanical cross-repo snippet find-replace with grep-to-zero acceptance and clear exclusions; the exact route-down case for a cheaper tier.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.9",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Wide cross-cutting cutover with load-bearing allowed-tools permission globs (silent-strip risk), byte-parity envelopes, corpus re-vendor + BAKE re-render gates.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.10",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multi-surface --agent-help runbook authoring plus pure pass-through wiring following the existing 5-subcommand pattern; opus for prose quality, high for the known pattern.",
+      "task_id": "fn-1142-cli-descriptor-and-grammar-convergence.11",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-06T14:56:04.083000Z",
+  "epic_id": "fn-1142-cli-descriptor-and-grammar-convergence",
+  "input_hash": "69467927ea941e78adbbfa5f4b9167f021851dc714def397d4021d73d2b81ab0",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": 1766226215,
+  "verdict_raw": "I've read the brief, the selector policy, and CONTEXT.md. Here are my per-task cell selections.\n\n{\n  \"fn-1142-cli-descriptor-and-grammar-convergence.1\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Founding new-pattern architecture: defines the descriptor contract every leaf derives from, wide blast radius, the epic's early proof point.\", \"confidence\": 0.9},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.2\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Help-purity defect fix plus first plugin descriptor migration, but conforms to ordinal-1's shape and mirrors subgroup.ts; single-plugin blast radius.\", \"confidence\": 0.6},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.3\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Wide-but-mechanical 34-verb descriptor extraction feeding a drift gate; correctness-sensitive metadata keeps opus, established leaf-help pattern keeps effort at high.\", \"confidence\": 0.65},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.4\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Three bounded named fixes, but the route-help-before-deps reroute is correctness-sensitive (must keep db/daemon/state-dir off the path).\", \"confidence\": 0.6},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.5\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Regression-proof for the whole purity architecture: stub-dep walk + import-graph gate design, may need minimal DispatchDeps seams; getting the gate genuinely catching drift is subtle.\", \"confidence\": 0.75},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.6\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Shared duration grammar is well-specified (Go ParseDuration subset); wide hard-cutover flag renames are mechanical across surfaces, clear path spanning files.\", \"confidence\": 0.6},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.7\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Output-format contract touching scripts' stdout: byte-parity exemptions, envelope discipline, format_modes truth across plan/prompt/native \u2014 a wrong abstraction propagates.\", \"confidence\": 0.85},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.8\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Hard-cutover semantic disambiguation (never-repurpose-a-flag), live panel-runner tooling must migrate atomically, broad citation sweep across skills/docs.\", \"confidence\": 0.7},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.9\": {\"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"Genuinely mechanical cross-repo snippet find-replace with grep-to-zero acceptance and clear exclusions; the exact route-down case for a cheaper tier.\", \"confidence\": 0.7},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.10\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Wide cross-cutting cutover with load-bearing allowed-tools permission globs (silent-strip risk), byte-parity envelopes, corpus re-vendor + BAKE re-render gates.\", \"confidence\": 0.85},\n  \"fn-1142-cli-descriptor-and-grammar-convergence.11\": {\"tier\": \"high\", \"model\": \"opus\", \"rationale\": \"Multi-surface --agent-help runbook authoring plus pure pass-through wiring following the existing 5-subcommand pattern; opus for prose quality, high for the known pattern.\", \"confidence\": 0.7}\n}\n"
+}

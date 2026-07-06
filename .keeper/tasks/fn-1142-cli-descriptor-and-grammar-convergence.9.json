@@ -4,11 +4,11 @@
   "depends_on": [],
   "epic": "fn-1142-cli-descriptor-and-grammar-convergence",
   "id": "fn-1142-cli-descriptor-and-grammar-convergence.9",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/arthack",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Arthack corpus source verb update",
-  "updated_at": "2026-07-06T14:50:59.352000Z"
+  "updated_at": "2026-07-06T14:56:04.083000Z"
 }
