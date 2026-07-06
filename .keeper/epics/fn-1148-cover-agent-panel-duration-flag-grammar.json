@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-06T23:54:23.062000Z",
+  "created_by_close_of": "fn-1147-converge-agent-panel-duration-flags",
+  "depends_on_epics": [
+    "fn-1147-converge-agent-panel-duration-flags"
+  ],
+  "id": "fn-1148-cover-agent-panel-duration-flag-grammar",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Cover agent-panel duration-flag grammar",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-06T23:54:23.062000Z"
+}
