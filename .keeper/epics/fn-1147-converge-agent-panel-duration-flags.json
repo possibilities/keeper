@@ -7,7 +7,7 @@
     "fn-1142-cli-descriptor-and-grammar-convergence"
   ],
   "id": "fn-1147-converge-agent-panel-duration-flags",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-06T23:17:23.951000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T23:17:23.766000Z"
+  "updated_at": "2026-07-06T23:17:23.951000Z"
 }
