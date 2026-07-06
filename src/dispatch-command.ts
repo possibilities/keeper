@@ -30,6 +30,43 @@ const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
   "approve",
 ]);
 
+/**
+ * The escalation spawn verbs — the two autonomous escalation dispatches
+ * (`unblock::<task>`, `deconflict::<epic>`). DELIBERATELY separate from {@link
+ * RetryDispatchVerb}: an escalation key is NEVER a sticky `dispatch_failures` row
+ * (those stay `work::`/`close::`), so the `retry_dispatch` wire validator ({@link
+ * parseDispatchKey}) must NOT accept them — widening it would let `retry_dispatch`
+ * accept keys that never exist as rows. The MANUAL `keeper dispatch` surface
+ * parses the wider {@link DispatchableVerb} set via {@link parseDispatchableKey}.
+ */
+export type EscalationVerb = "unblock" | "deconflict";
+
+/**
+ * Every verb the manual `keeper dispatch` plan-form positional accepts — the
+ * retry-wire verbs PLUS the escalation verbs. A strict superset of {@link
+ * RetryDispatchVerb}; the two stay distinct so the `retry_dispatch` wire stays
+ * narrow (see {@link EscalationVerb}).
+ */
+export type DispatchableVerb = RetryDispatchVerb | EscalationVerb;
+
+const DISPATCHABLE_VERBS = new Set<DispatchableVerb>([
+  "work",
+  "close",
+  "approve",
+  "unblock",
+  "deconflict",
+]);
+
+/**
+ * True iff `verb` is an escalation verb (`unblock` / `deconflict`). The launch
+ * surface uses this to select the escalation launch config (sonnet/high +
+ * `escalation` preset) over the worker one — the escalation dispatches boot a
+ * purpose-built plan skill, never a worker cell.
+ */
+export function isEscalationVerb(verb: string): verb is EscalationVerb {
+  return verb === "unblock" || verb === "deconflict";
+}
+
 /** Discriminated result of {@link parseDispatchKey}. */
 export type ParseDispatchKeyResult =
   | { ok: true; verb: RetryDispatchVerb; id: string }
@@ -99,6 +136,64 @@ export function parseDispatchKey(value: unknown): ParseDispatchKeyResult {
   return { ok: true, verb: verbRaw as RetryDispatchVerb, id: idRaw };
 }
 
+/** Discriminated result of {@link parseDispatchableKey}. */
+export type ParseDispatchableKeyResult =
+  | { ok: true; verb: DispatchableVerb; id: string }
+  | { ok: false; error: string };
+
+/**
+ * Split + validate a `${verb}::${id}` composite key for the MANUAL `keeper
+ * dispatch` surface, accepting the wider {@link DispatchableVerb} set (the
+ * retry-wire verbs PLUS the escalation verbs `unblock` / `deconflict`). The
+ * id-shape rules are identical to {@link parseDispatchKey} — same separator +
+ * {@link isSafeDispatchIdToken} filename-safety checks — the ONLY difference is
+ * the accepted verb set. Kept as a SEPARATE function (not a widening of
+ * {@link parseDispatchKey}) so the `retry_dispatch` wire validator stays
+ * byte-identical: it never accepts an escalation key, which is never a sticky
+ * `dispatch_failures` row. Returns a DISCRIMINATED result; dep-free.
+ */
+export function parseDispatchableKey(
+  value: unknown,
+): ParseDispatchableKeyResult {
+  if (typeof value !== "string" || value.length === 0) {
+    return {
+      ok: false,
+      error:
+        "dispatch: `id` must be a non-empty string of the form `verb::id` (e.g. `unblock::fn-1-foo.3`)",
+    };
+  }
+  const sep = value.indexOf("::");
+  if (sep <= 0 || sep === value.length - 2) {
+    return {
+      ok: false,
+      error:
+        "dispatch: `id` must contain exactly one `::` separator with non-empty halves",
+    };
+  }
+  if (value.indexOf("::", sep + 2) !== -1) {
+    return {
+      ok: false,
+      error: "dispatch: `id` must contain exactly ONE `::` separator",
+    };
+  }
+  const verbRaw = value.slice(0, sep);
+  const idRaw = value.slice(sep + 2);
+  if (!DISPATCHABLE_VERBS.has(verbRaw as DispatchableVerb)) {
+    return {
+      ok: false,
+      error: `dispatch: \`verb\` must be one of work|close|approve|unblock|deconflict (got ${JSON.stringify(verbRaw)})`,
+    };
+  }
+  if (!isSafeDispatchIdToken(idRaw)) {
+    return {
+      ok: false,
+      error:
+        "dispatch: `id` half is empty or weaponizable (path-traversal token rejected)",
+    };
+  }
+  return { ok: true, verb: verbRaw as DispatchableVerb, id: idRaw };
+}
+
 /**
  * True iff `${verb}::${id}` is a key the `retry_dispatch` wire path would accept
  * — i.e. an operator could clear it via `keeper autopilot retry`. A
@@ -131,8 +226,12 @@ function isSafeDispatchIdToken(value: string): boolean {
 // Plan prompt + launch-argv builders
 // ---------------------------------------------------------------------------
 
-/** The canonical `/plan:<verb> <id>` slash-command prompt for a plan-form dispatch. */
-export function defaultPlanPrompt(verb: RetryDispatchVerb, id: string): string {
+/** The canonical `/plan:<verb> <id>` slash-command prompt for a plan-form
+ *  dispatch. Accepts the full {@link DispatchableVerb} set so an escalation
+ *  dispatch boots `/plan:unblock` / `/plan:deconflict`; the reconciler's
+ *  `work`/`close` launches (a {@link RetryDispatchVerb} subset) pass through
+ *  unchanged. */
+export function defaultPlanPrompt(verb: DispatchableVerb, id: string): string {
   return `/plan:${verb} ${id}`;
 }
 
