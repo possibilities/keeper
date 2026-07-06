@@ -103,5 +103,5 @@ Pure in-process fast tier only (injected `run`, no real git). Extend `makeRecove
 - [ ] `bun test test/autopilot-worker.test.ts test/worktree-git.test.ts` is green
 
 ## Done summary
-
+Made the worktree-mode base->default merge working-tree-free: a merge-tree/commit-tree/update-ref-CAS/push plumbing pipeline replaces the shared-checkout git merge, so it lands even when the human's checkout is dirty or off-default. Added cas-stale/merge-tree-unsupported/plumbing-failed result kinds + a finalize exhaustiveness guard, decision-B best-effort resync, common-dir lock re-pin, and ADR 0008.
 ## Evidence
