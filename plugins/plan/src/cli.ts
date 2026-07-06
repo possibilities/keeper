@@ -875,11 +875,16 @@ function dispatch(parsed: ParsedArgs): number {
       break;
     case "close-finalize":
       // Self-emits its readonly invocation via emitReadonly, merged into its own
-      // single envelope.
+      // single envelope. --selection-verdict feeds an optional pre-selected cell
+      // set that finalize folds into the follow-up scaffold input.
       runCloseFinalize({
-        epicId: readPositionalSkipping(rest, new Set(["--project"])),
+        epicId: readPositionalSkipping(
+          rest,
+          new Set(["--project", "--selection-verdict"]),
+        ),
         project: readOption(rest, "--project"),
         format,
+        selectionVerdict: readOption(rest, "--selection-verdict"),
       });
       break;
     case "gist":
@@ -933,10 +938,13 @@ function dispatch(parsed: ParsedArgs): number {
     case "selection-brief":
       // Commit-free brief handoff: writes gitignored state/ and emits one
       // payload envelope; the selector subagent reads the brief itself.
+      // --from-followup briefs the stored follow-up document instead of the live
+      // epic's todo tasks (ordinal-keyed tasks, document-anchored input_hash).
       runSelectionBrief({
         epicId: readPositionalSkipping(rest, new Set(["--project"])),
         project: readOption(rest, "--project"),
         format,
+        fromFollowup: readFlag(rest, "--from-followup"),
       });
       break;
     case "show":

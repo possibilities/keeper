@@ -20,12 +20,33 @@
 //     (crash-resume); wired+partial → partial_followup (stop); absent →
 //     scaffold from followup.yaml → closed_with_followup.
 //
+// On the fresh-scaffold branch an optional `--selection-verdict` pre-selects the
+// follow-up cells: its ordinal-keyed {tier, model} fold into the scaffold input
+// (a merged temp YAML) so the tasks are BORN selected, scaffold's own tier/model
+// validation still enforcing the axes. A committed selection sidecar records the
+// outcome (heuristic-guided with a verdict, else heuristic-default + a degrade
+// reason). A malformed/absent verdict DEGRADES to the document's stamped defaults
+// rather than rejecting the finalize; the crash-resume adopt paths run no
+// selection and stay pure idempotent re-arms.
+//
 // finalize itself draws no .planctl/ commit — epic close and scaffold land their
-// own. In-process delegation calls bun's OWN ported runEpicClose / runScaffold
-// with stdout captured (never a subprocess of itself).
+// own, and the sidecar rides epic close's auto-commit sweep. In-process
+// delegation calls bun's OWN ported runEpicClose / runScaffold with stdout
+// captured (never a subprocess of itself).
 
-import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve as resolveAbs } from "node:path";
+
+import { stringify as stringifyYaml } from "yaml";
 
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
@@ -43,14 +64,21 @@ import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
+import { configuredEfforts, configuredModels } from "../models.ts";
 import {
   contextForRoot,
   type ProjectContext,
   resolveProject,
 } from "../project.ts";
+import {
+  SELECTION_SCHEMA_VERSION,
+  type SelectionSidecar,
+  writeSelectionSidecar,
+} from "../selection_sidecar.ts";
 import { clearCloseMarker } from "../session_markers.ts";
 import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe, nowIso } from "../store.ts";
+import { parseYamlInput } from "../yaml_input.ts";
 import { runEpicClose } from "./epic_close.ts";
 import { runScaffold } from "./scaffold.ts";
 import { armEpicValidated } from "./validate.ts";
@@ -414,10 +442,13 @@ export interface CloseFinalizeArgs {
   epicId: string;
   project: string | null;
   format: OutputFormat | null;
+  /** Optional path to a pre-selection verdict (ordinal-keyed cells + a selection
+   * provenance block) folded into a fresh follow-up scaffold. */
+  selectionVerdict: string | null;
 }
 
 export function runCloseFinalize(args: CloseFinalizeArgs): void {
-  const { epicId, project, format } = args;
+  const { epicId, project, format, selectionVerdict } = args;
   // Stash the claim so any terminal error (via emitFinalizeError) releases it —
   // a failed close must free the epic for a clean re-run. Set fresh every
   // invocation before any error path can fire.
@@ -603,7 +634,39 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
       { expected: fp, expected_tasks: expectedCount },
     );
   }
-  const newEpicId = scaffoldFollowup(stateCtx, fp, epicId, format);
+  // Pre-select: fold the optional selection verdict's ordinal-keyed cells into
+  // the scaffold input so the follow-up tasks are BORN selected. A valid verdict
+  // rewrites a merged temp YAML (scaffold's own tier/model validation re-enforces
+  // the axes); an absent / malformed verdict DEGRADES to the document's stamped
+  // defaults (never rejects the finalize). Both write a committed sidecar.
+  const followupText = readFileSync(fp, "utf-8");
+  const followupDoc = parseFollowupDoc(followupText, fp);
+  const selection = loadSelectionVerdict(
+    selectionVerdict,
+    followupText,
+    followupDoc?.taskCount ?? null,
+  );
+
+  let scaffoldFile = fp;
+  let mergedFile: string | null = null;
+  if (selection.kind === "guided" && followupDoc !== null) {
+    mergedFile = writeMergedFollowup(followupDoc.doc, selection.cells, format);
+    scaffoldFile = mergedFile;
+  }
+  let newEpicId: string;
+  try {
+    newEpicId = scaffoldFollowup(stateCtx, scaffoldFile, epicId, format);
+  } finally {
+    if (mergedFile !== null) {
+      unlinkQuiet(mergedFile);
+    }
+  }
+
+  // Sidecar BEFORE closeEpic: its atomic write records the touched path, and epic
+  // close's auto-commit sweeps the (dirty) top-level selections/ file into the
+  // close commit — finalize itself draws no commit.
+  writeCloseSelectionSidecar(stateCtx.dataDir, newEpicId, selection);
+
   closeEpic(stateCtx, epicId);
   emitOutcome(
     CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
@@ -687,6 +750,363 @@ function emitOutcome(
   // emit(data, plan_invocation=pc). format is honored upstream by the caller.
   void format;
   emitReadonly(data, pc);
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up cell pre-selection.
+// ---------------------------------------------------------------------------
+
+/** A validated, in-axis {tier, model} cell keyed by 1-based ordinal, carrying
+ * the selector's optional per-cell provenance. */
+interface VerdictCell {
+  tier: string;
+  model: string;
+  rationale: string | null;
+  confidence: number | string | null;
+}
+
+/** The selector's own provenance block, shape-mirroring the sidecar's. */
+interface SelectionProvenance {
+  selector: { harness: string; model: string };
+  configHash: string;
+  inputHash: string;
+  shuffleSeed: number | null;
+  outcome: string;
+  verdictRaw: string | null;
+}
+
+/** The verdict-load result: a guided selection (all cells in-axis + full
+ * coverage) or a degrade carrying a reason and the follow-up document hash (the
+ * reproducible input anchor for the degraded sidecar). */
+type SelectionResult =
+  | {
+      kind: "guided";
+      cells: Map<number, VerdictCell>;
+      provenance: SelectionProvenance;
+    }
+  | { kind: "degraded"; reason: string; inputHash: string };
+
+/** Parse the stored follow-up document to its task count (for verdict coverage)
+ * plus the mutable doc (for the merge rewrite). Returns null when the document is
+ * unparseable or carries no task list — scaffold then runs on the raw file and
+ * surfaces its own error. */
+function parseFollowupDoc(
+  text: string,
+  label: string,
+): { doc: Record<string, unknown>; taskCount: number } | null {
+  let doc: unknown;
+  try {
+    doc = parseYamlInput(Buffer.from(text, "utf-8"), label);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(doc)) {
+    return null;
+  }
+  const tasks = doc.tasks;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return null;
+  }
+  return { doc, taskCount: tasks.length };
+}
+
+/** Load + fail-closed validate the optional selection verdict. Any absence,
+ * unreadability, malformed shape, out-of-axis cell, or coverage mismatch DEGRADES
+ * (returns a reason) rather than throwing — a malformed verdict must never reject
+ * the finalize. `taskCount` is the follow-up document's task count (null when it
+ * could not be parsed); a null count forces a degrade. */
+function loadSelectionVerdict(
+  path: string | null,
+  followupText: string,
+  taskCount: number | null,
+): SelectionResult {
+  const followupHash = sha256(followupText);
+  const degrade = (reason: string): SelectionResult => ({
+    kind: "degraded",
+    reason,
+    inputHash: followupHash,
+  });
+
+  if (path === null) {
+    return degrade("no-selection-verdict-supplied");
+  }
+  let text: string;
+  try {
+    text = readFileSync(path, "utf-8");
+  } catch {
+    return degrade("verdict-unreadable");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return degrade("verdict-unparseable");
+  }
+  if (!isPlainObject(parsed)) {
+    return degrade("verdict-not-object");
+  }
+  const sv = parsed.schema_version;
+  if (typeof sv === "number" && sv > SELECTION_SCHEMA_VERSION) {
+    return degrade("verdict-schema-too-new");
+  }
+  if (!isPlainObject(parsed.cells)) {
+    return degrade("verdict-cells-missing");
+  }
+  if (!isPlainObject(parsed.selection)) {
+    return degrade("verdict-provenance-missing");
+  }
+  const provenance = parseSelectionProvenance(parsed.selection);
+  if (provenance === null) {
+    return degrade("verdict-provenance-invalid");
+  }
+  if (taskCount === null) {
+    return degrade("followup-unparseable");
+  }
+
+  const efforts = configuredEfforts();
+  const models = configuredModels();
+  const cells = new Map<number, VerdictCell>();
+  for (const [key, raw] of Object.entries(parsed.cells)) {
+    if (!/^[1-9][0-9]*$/.test(key)) {
+      return degrade("verdict-cell-key-invalid");
+    }
+    if (!isPlainObject(raw)) {
+      return degrade("verdict-cell-not-object");
+    }
+    const tier = raw.tier;
+    const model = raw.model;
+    if (typeof tier !== "string" || !efforts.includes(tier)) {
+      return degrade("verdict-cell-out-of-axis");
+    }
+    if (typeof model !== "string" || !models.includes(model)) {
+      return degrade("verdict-cell-out-of-axis");
+    }
+    const rationale = typeof raw.rationale === "string" ? raw.rationale : null;
+    const confidence =
+      typeof raw.confidence === "number" || typeof raw.confidence === "string"
+        ? raw.confidence
+        : null;
+    cells.set(Number.parseInt(key, 10), { tier, model, rationale, confidence });
+  }
+
+  // Full-set coverage: exactly the ordinals 1..taskCount, no gaps or extras.
+  if (cells.size !== taskCount) {
+    return degrade("verdict-coverage-mismatch");
+  }
+  for (let i = 1; i <= taskCount; i += 1) {
+    if (!cells.has(i)) {
+      return degrade("verdict-coverage-mismatch");
+    }
+  }
+
+  return { kind: "guided", cells, provenance };
+}
+
+/** Validate the verdict's `selection:` provenance block — harness, model,
+ * config_hash, input_hash, outcome as non-empty strings; shuffle_seed an integer
+ * or absent; verdict_raw a string or absent. Returns null on any violation. */
+function parseSelectionProvenance(
+  sel: Record<string, unknown>,
+): SelectionProvenance | null {
+  const reqStr = (key: string): string | null => {
+    const v = sel[key];
+    return typeof v === "string" && v.trim() !== "" ? v : null;
+  };
+  const harness = reqStr("harness");
+  const model = reqStr("model");
+  const configHash = reqStr("config_hash");
+  const inputHash = reqStr("input_hash");
+  const outcome = reqStr("outcome");
+  if (
+    harness === null ||
+    model === null ||
+    configHash === null ||
+    inputHash === null ||
+    outcome === null
+  ) {
+    return null;
+  }
+  let shuffleSeed: number | null = null;
+  const seedRaw = sel.shuffle_seed;
+  if (seedRaw !== null && seedRaw !== undefined) {
+    if (typeof seedRaw === "number" && Number.isInteger(seedRaw)) {
+      shuffleSeed = seedRaw;
+    } else {
+      return null;
+    }
+  }
+  let verdictRaw: string | null = null;
+  const vr = sel.verdict_raw;
+  if (vr !== null && vr !== undefined) {
+    if (typeof vr === "string") {
+      verdictRaw = vr;
+    } else {
+      return null;
+    }
+  }
+  return {
+    selector: { harness, model },
+    configHash,
+    inputHash,
+    shuffleSeed,
+    outcome,
+    verdictRaw,
+  };
+}
+
+/** Rewrite the follow-up document with the selected {tier, model} folded in by
+ * ordinal, serialized YAML 1.1 (so a 1.1-ambiguous scalar is re-quoted, never
+ * silently coerced on scaffold's re-parse), to a throwaway temp file scaffold
+ * consumes. The caller unlinks it. */
+function writeMergedFollowup(
+  doc: Record<string, unknown>,
+  cells: Map<number, VerdictCell>,
+  format: OutputFormat | null,
+): string {
+  const tasks = doc.tasks as unknown[];
+  for (let i = 0; i < tasks.length; i += 1) {
+    const cell = cells.get(i + 1);
+    const entry = tasks[i];
+    if (cell !== undefined && isPlainObject(entry)) {
+      entry.tier = cell.tier;
+      entry.model = cell.model;
+    }
+  }
+  let text: string;
+  try {
+    text = stringifyYaml(doc, { version: "1.1" });
+  } catch (exc) {
+    emitFinalizeError(
+      "SELECTION_MERGE_FAILED",
+      `could not merge the selected cells into the follow-up plan: ${
+        (exc as Error).message
+      }`,
+      format,
+    );
+  }
+  const dest = join(
+    tmpdir(),
+    `keeper-plan-followup-${randomBytes(16).toString("hex")}.yaml`,
+  );
+  writeFileSync(dest, text, "utf-8");
+  return dest;
+}
+
+/** The minted follow-up tasks in ascending ordinal order, each with its on-disk
+ * {tier, model} — the cell values the sidecar records regardless of path (the
+ * verdict-selected values on the guided path, the document defaults on degrade). */
+function readMintedCells(
+  dataDir: string,
+  epicId: string,
+): { ordinal: number; taskId: string; tier: string; model: string }[] {
+  const tasksDir = join(dataDir, "tasks");
+  if (!existsSync(tasksDir)) {
+    return [];
+  }
+  const prefix = `${epicId}.`;
+  const ordinals: number[] = [];
+  for (const name of readdirSync(tasksDir)) {
+    if (!name.startsWith(prefix) || !name.endsWith(".json")) {
+      continue;
+    }
+    const middle = name.slice(prefix.length, -".json".length);
+    if (middle.length === 0 || middle.includes(".")) {
+      continue;
+    }
+    const ord = Number.parseInt(middle, 10);
+    if (Number.isInteger(ord) && String(ord) === middle) {
+      ordinals.push(ord);
+    }
+  }
+  ordinals.sort((a, b) => a - b);
+  return ordinals.map((ord) => {
+    const taskId = `${epicId}.${ord}`;
+    const def = loadJsonSafe(join(tasksDir, `${taskId}.json`)) ?? {};
+    return {
+      ordinal: ord,
+      taskId,
+      tier: typeof def.tier === "string" ? def.tier : "",
+      model: typeof def.model === "string" ? def.model : "",
+    };
+  });
+}
+
+/** Write the committed selection sidecar for the minted follow-up epic. A guided
+ * selection stamps label_source heuristic-guided + the selector provenance; a
+ * degrade stamps heuristic-default + a `degraded:<reason>` outcome anchored on
+ * the follow-up document hash. The cell {tier, model} always mirror the minted
+ * tasks on disk. */
+function writeCloseSelectionSidecar(
+  dataDir: string,
+  epicId: string,
+  selection: SelectionResult,
+): void {
+  const minted = readMintedCells(dataDir, epicId);
+  const now = nowIso();
+  let sidecar: SelectionSidecar;
+  if (selection.kind === "guided") {
+    sidecar = {
+      schema_version: SELECTION_SCHEMA_VERSION,
+      epic_id: epicId,
+      created_at: now,
+      selector: selection.provenance.selector,
+      config_hash: selection.provenance.configHash,
+      input_hash: selection.provenance.inputHash,
+      shuffle_seed: selection.provenance.shuffleSeed,
+      outcome: selection.provenance.outcome,
+      verdict_raw: selection.provenance.verdictRaw,
+      cells: minted.map((m) => {
+        const c = selection.cells.get(m.ordinal);
+        return {
+          task_id: m.taskId,
+          tier: m.tier,
+          model: m.model,
+          rationale: c?.rationale ?? null,
+          confidence: c?.confidence ?? null,
+          label_source: "heuristic-guided",
+        };
+      }),
+    };
+  } else {
+    sidecar = {
+      schema_version: SELECTION_SCHEMA_VERSION,
+      epic_id: epicId,
+      created_at: now,
+      selector: { harness: "none", model: "none" },
+      config_hash: "",
+      input_hash: selection.inputHash,
+      shuffle_seed: null,
+      outcome: `degraded:${selection.reason}`,
+      verdict_raw: null,
+      cells: minted.map((m) => ({
+        task_id: m.taskId,
+        tier: m.tier,
+        model: m.model,
+        rationale: null,
+        confidence: null,
+        label_source: "heuristic-default",
+      })),
+    };
+  }
+  writeSelectionSidecar(dataDir, sidecar);
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Unlink best-effort — a temp merged-YAML cleanup that never masks a real
+ * error. */
+function unlinkQuiet(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // best-effort cleanup.
+  }
 }
 
 /** click UsageError shape: usage + try-help on stderr, exit 2. */
