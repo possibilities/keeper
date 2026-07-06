@@ -141,10 +141,10 @@ test("positional sha + flags parse", () => {
     "--repo",
     "/r",
     "--wait",
-    "--timeout-ms",
-    "1500",
-    "--poll-interval-ms",
-    "250",
+    "--timeout",
+    "1500ms",
+    "--poll-interval",
+    "250ms",
   ]);
   expect(p.ok).toBe(true);
   if (!p.ok) return;
@@ -176,12 +176,25 @@ test("two positionals are rejected", () => {
   expect(p.message).toContain("at most one sha");
 });
 
-test("non-positive / non-integer ms flags are rejected", () => {
-  for (const bad of ["0", "-5", "abc", "1.5"]) {
-    const p = parseBaselineArgs(["--timeout-ms", bad]);
+test("non-positive / unitless / malformed duration flags are rejected", () => {
+  // Bare numbers (the retired ms grammar), negatives, and garbage all fail.
+  for (const bad of ["0", "1500", "-5", "abc", "1.5"]) {
+    const p = parseBaselineArgs(["--timeout", bad]);
     expect(p.ok).toBe(false);
   }
-  expect(parseBaselineArgs(["--poll-interval-ms", "0"]).ok).toBe(false);
+  expect(parseBaselineArgs(["--poll-interval", "0"]).ok).toBe(false);
+});
+
+test("the retired -ms spellings hard-fail as unknown flags", () => {
+  expect(parseBaselineArgs(["--timeout-ms", "1500"]).ok).toBe(false);
+  expect(parseBaselineArgs(["--poll-interval-ms", "250"]).ok).toBe(false);
+});
+
+test("a unitless --timeout hint names the fix", () => {
+  const p = parseBaselineArgs(["--timeout", "600"]);
+  if (p.ok) throw new Error("expected a usage error for a unitless duration");
+  expect(p.message).toContain("--timeout");
+  expect(p.message).toContain("600s");
 });
 
 // ── terminal classification ──────────────────────────────────────────────────

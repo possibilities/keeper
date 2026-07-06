@@ -23,7 +23,6 @@ import { expect, test } from "bun:test";
 import {
   HELP as AWAIT_HELP,
   parseAwaitArgs,
-  parseDurationMs,
   parseMonitorSelector,
   type RunDeps,
   runAwait,
@@ -499,29 +498,6 @@ async function runAndCatch(
 }
 
 // ---------------------------------------------------------------------------
-// parseDurationMs
-// ---------------------------------------------------------------------------
-
-test("parseDurationMs: bare integer is ms", () => {
-  expect(parseDurationMs("0")).toBe(0);
-  expect(parseDurationMs("500")).toBe(500);
-});
-
-test("parseDurationMs: suffix units", () => {
-  expect(parseDurationMs("250ms")).toBe(250);
-  expect(parseDurationMs("30s")).toBe(30_000);
-  expect(parseDurationMs("5m")).toBe(300_000);
-  expect(parseDurationMs("2h")).toBe(7_200_000);
-});
-
-test("parseDurationMs: invalid input → null", () => {
-  expect(parseDurationMs("")).toBeNull();
-  expect(parseDurationMs("abc")).toBeNull();
-  expect(parseDurationMs("-5")).toBeNull();
-  expect(parseDurationMs("5x")).toBeNull();
-});
-
-// ---------------------------------------------------------------------------
 // parseAwaitArgs
 // ---------------------------------------------------------------------------
 
@@ -617,6 +593,14 @@ test("parseAwaitArgs: missing positional id for plan → usage error", () => {
 test("parseAwaitArgs: bad timeout → usage error", () => {
   const r = parseAwaitArgs(["complete", "fn-1-foo.1", "--timeout", "abc"]);
   expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: unitless --timeout is rejected (exit 2) with a self-healing hint", () => {
+  const r = parseAwaitArgs(["complete", "fn-1-foo.1", "--timeout", "30"]);
+  if (r.ok) throw new Error("expected a usage error for a unitless duration");
+  expect(r.exitCode).toBe(2);
+  expect(r.message).toContain("--timeout");
+  expect(r.message).toContain("30s");
 });
 
 // ---------------------------------------------------------------------------

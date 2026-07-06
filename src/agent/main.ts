@@ -1064,12 +1064,12 @@ function writeEnvelopeAtomic(
 /**
  * The first positional (run id or transcript path) of an `agent wait` argv —
  * echoed into the envelope's `handle`. Mirrors `resolveHandle`'s positional
- * detection (skip `--agent`/`--stop-timeout-ms` values and any other `--flag`).
+ * detection (skip `--agent`/`--stop-timeout` values and any other `--flag`).
  */
 function firstHandleToken(rest: string[]): string | null {
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
-    if (arg === "--agent" || arg === "--stop-timeout-ms") {
+    if (arg === "--agent" || arg === "--stop-timeout") {
       i += 1;
       continue;
     }

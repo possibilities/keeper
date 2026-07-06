@@ -102,16 +102,18 @@ import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import type { ScheduledTask, SubagentInvocation } from "../src/types";
 import { createViewShell, SELECTED_LINE_PREFIX } from "../src/view-shell";
 import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
+import { parseDuration } from "./duration";
 
 const HELP = `keeper jobs — live jobs list over the keeper subscribe server
 
-Usage: keeper jobs [--sock <path>] [--snapshot | --watch] [--timeout <s>]
+Usage: keeper jobs [--sock <path>] [--snapshot | --watch] [--timeout <dur>]
 
 Flags:
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --snapshot       Force one-shot snapshot mode (one frame + keeper-meta: line)
   --watch          Force the live subscribe stream even when piped
-  --timeout <s>    Snapshot wait before the timeout escape (default ~2s)
+  --timeout <dur>  Snapshot wait before the timeout escape (default ~2s;
+                   unit required, e.g. 500ms, 2s)
   --help           Show this help
 
 A non-TTY stdout (piped into an agent) auto-detects snapshot; a TTY gets the
@@ -597,18 +599,16 @@ export async function main(argv: string[]): Promise<void> {
     throw err;
   }
 
-  // Validate `--timeout` (seconds) only when snapshotting — a bad value is
-  // CLI misuse (exit 2). Watch mode ignores it.
+  // Validate `--timeout` (shared duration grammar) only when snapshotting — a
+  // bad value is CLI misuse (exit 2). Watch mode ignores it.
   let timeoutMs: number | undefined;
   if (values.timeout !== undefined) {
-    const secs = Number(values.timeout);
-    if (!Number.isFinite(secs) || secs <= 0) {
-      process.stderr.write(
-        `keeper jobs: --timeout must be a positive number of seconds (got '${values.timeout}')\n`,
-      );
+    const parsed = parseDuration(values.timeout);
+    if (!parsed.ok) {
+      process.stderr.write(`keeper jobs: --timeout ${parsed.message}\n`);
       process.exit(2);
     }
-    timeoutMs = Math.round(secs * 1000);
+    timeoutMs = parsed.ms;
   }
 
   const sockPath = values.sock ?? resolveSockPath();
