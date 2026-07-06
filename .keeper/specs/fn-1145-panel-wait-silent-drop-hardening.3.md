@@ -33,5 +33,5 @@ No test pins pair/SKILL.md wait prose; verify by reading the rendered section an
 - [ ] The subagent tripwire and turn-end rules remain absent from the pair skill
 
 ## Done summary
-
+Corrected the pair skill's Bash wait timeout prose to state true facts (120000ms default window, 600000ms ceiling only via explicit timeout parameter) and reshaped the chunked wait loop to one explicitly-timed Bash call per chunk, re-issued across calls.
 ## Evidence
