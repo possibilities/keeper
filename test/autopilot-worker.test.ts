@@ -54,6 +54,7 @@ import {
   computeSlotOccupancy,
   confirmRunning,
   createDispatchFailedGate,
+  createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
@@ -77,6 +78,7 @@ import {
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
+  isSharedCheckoutDirtyReason,
   isSharedCheckoutWedgeReason,
   isWorktreeRecoverReason,
   type LaunchResult,
@@ -95,11 +97,15 @@ import {
   reposForRecovery,
   resolveWorkerLaunchConfig,
   runReconcileCycle,
+  SHARED_CHECKOUT_DIRTY_GRACE_SEC,
   SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
   type SlotOccupancySignal,
+  sharedDirtyDistressId,
   sharedWedgeDistressId,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
@@ -12630,4 +12636,248 @@ test("wedge tracker: a restart (fresh tracker) still level-clears a row minted b
       .length;
   }
   expect(mints).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1125.1 — the shared-checkout plain-DIRTY distress escalation. The SIBLING of
+// the mid-merge wedge tracker: a per-repo distress row when a shared checkout stays
+// dirty (a non-clean working tree, NO MERGE_HEAD) past the grace watermark,
+// exactly-once per episode, level-cleared off the durable open-distress set (robust
+// across a restart), on a DISTINCT id/reason so the two never cross-clear. All
+// expected values are hand-computed constants, never re-derived from the tracker.
+// ---------------------------------------------------------------------------
+
+const DIRTY_REASON =
+  "worktree-recover-dirty-checkout: /repo has a dirty working tree — skipping the merge until it is clean — M src/x.ts";
+
+test("isSharedCheckoutDirtyReason matches the dirty-checkout reason, excludes wedge/conflict/finalize", () => {
+  // The plain-dirty recover skip escalates; the mid-merge wedge reasons and a
+  // content conflict are NOT this dirt — each on its own path.
+  expect(
+    isSharedCheckoutDirtyReason("worktree-recover-dirty-checkout: x"),
+  ).toBe(true);
+  expect(isSharedCheckoutDirtyReason("worktree-recover-mid-merge: x")).toBe(
+    false,
+  );
+  expect(isSharedCheckoutDirtyReason("worktree-recover-abort-failed: x")).toBe(
+    false,
+  );
+  expect(isSharedCheckoutDirtyReason("worktree-recover-conflict: x")).toBe(
+    false,
+  );
+  expect(
+    isSharedCheckoutDirtyReason("worktree-finalize-non-fast-forward"),
+  ).toBe(false);
+  expect(isSharedCheckoutDirtyReason("")).toBe(false);
+  // The dirt and wedge predicates are DISJOINT over each other's exact reasons —
+  // neither feed ever escalates off the other's reason.
+  expect(
+    isSharedCheckoutWedgeReason("worktree-recover-dirty-checkout: x"),
+  ).toBe(false);
+  expect(isSharedCheckoutDirtyReason("worktree-recover-mid-merge: x")).toBe(
+    false,
+  );
+});
+
+test("sharedDirtyDistressId is stable per repo, distinct across repos, prefix-tagged + distinct from the wedge id", () => {
+  const a = sharedDirtyDistressId(REPO_A);
+  const b = sharedDirtyDistressId(REPO_B);
+  expect(a).toBe(sharedDirtyDistressId(REPO_A)); // deterministic
+  expect(a).not.toBe(b); // per-repo distinct
+  expect(a.startsWith(SHARED_DIRTY_DISTRESS_ID_PREFIX)).toBe(true);
+  // A dirt row and a wedge row for the SAME repo are DISTINCT ids — never cross-clear.
+  expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+});
+
+test("SHARED_CHECKOUT_DIRTY_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(SHARED_CHECKOUT_DIRTY_GRACE_SEC).toBe(5 * 60);
+});
+
+test("dirty tracker: a repo dirty past the grace watermark mints EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDirtyTracker(grace);
+  const dirty = new Map([[REPO_A, DIRTY_REASON]]);
+  const empty = new Set<string>();
+  // t=1000 first observed dirty → no mint (grace clock starts here).
+  expect(
+    tracker.step({ dirty, openDistressDirs: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint (the pre-grace invariant: mints nothing).
+  expect(
+    tracker.step({ dirty, openDistressDirs: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-repo, reason display-mapped.
+  const crossed = tracker.step({
+    dirty,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(sharedDirtyDistressId(REPO_A));
+  expect(crossed.mint[0]?.dir).toBe(REPO_A);
+  expect(
+    crossed.mint[0]?.reason?.startsWith(SHARED_DIRTY_DISTRESS_REASON),
+  ).toBe(true);
+  expect(crossed.mint[0]?.reason).toContain(REPO_A);
+  // Subsequent cycles while still dirty → NEVER re-mint (O(1) per episode).
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ dirty, openDistressDirs: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("dirty tracker: the storm shape — one persistent dirty checkout over many cycles yields exactly ONE mint", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDirtyTracker(grace);
+  const dirty = new Map([[REPO_A, DIRTY_REASON]]);
+  const empty = new Set<string>();
+  let mints = 0;
+  for (let ts = 1000; ts < 5000; ts++) {
+    mints += tracker.step({ dirty, openDistressDirs: empty, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("dirty tracker: a cleaned checkout level-clears the open distress row EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDirtyTracker(grace);
+  const dirty = new Map([[REPO_A, DIRTY_REASON]]);
+  const open = new Set([REPO_A]); // the durable open dirt distress row for REPO_A
+  // Still dirty → no clear (the row belongs, the checkout is not clean).
+  expect(
+    tracker.step({ dirty, openDistressDirs: open, nowSec: 2000 }).clear,
+  ).toEqual([]);
+  // Checkout goes clean (no fresh dirt this cycle) but the row is still open →
+  // level-clear it once, keyed on the same per-repo id.
+  const recovered = tracker.step({
+    dirty: new Map(),
+    openDistressDirs: open,
+    nowSec: 2001,
+  });
+  expect(recovered.clear.length).toBe(1);
+  expect(recovered.clear[0]?.id).toBe(sharedDirtyDistressId(REPO_A));
+  // Once main folds the clear the row is gone from openDistressDirs → no re-clear.
+  expect(
+    tracker.step({
+      dirty: new Map(),
+      openDistressDirs: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("dirty tracker: two repos on a multi-repo board go dirty independently — distinct rows, no collision", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDirtyTracker(grace);
+  const empty = new Set<string>();
+  // A goes dirty at t=1000; B goes dirty later at t=1200.
+  tracker.step({
+    dirty: new Map([[REPO_A, DIRTY_REASON]]),
+    openDistressDirs: empty,
+    nowSec: 1000,
+  });
+  const both = new Map([
+    [REPO_A, DIRTY_REASON],
+    [REPO_B, DIRTY_REASON],
+  ]);
+  tracker.step({ dirty: both, openDistressDirs: empty, nowSec: 1200 });
+  // At t=1300, A has crossed its grace (started 1000) but B has not (started 1200).
+  const atA = tracker.step({
+    dirty: both,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(atA.mint.map((m) => m.dir)).toEqual([REPO_A]);
+  // At t=1500, B crosses its own grace — its own distinct row, A does not re-mint.
+  const atB = tracker.step({
+    dirty: both,
+    openDistressDirs: empty,
+    nowSec: 1500,
+  });
+  expect(atB.mint.map((m) => m.dir)).toEqual([REPO_B]);
+  expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedDirtyDistressId(REPO_B));
+});
+
+test("dirty tracker: a repo that cleans then re-dirties waits the FULL grace again", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDirtyTracker(grace);
+  const dirty = new Map([[REPO_A, DIRTY_REASON]]);
+  const empty = new Set<string>();
+  // First episode: mint at 1300.
+  tracker.step({ dirty, openDistressDirs: empty, nowSec: 1000 });
+  expect(
+    tracker.step({ dirty, openDistressDirs: empty, nowSec: 1300 }).mint.length,
+  ).toBe(1);
+  // Cleans at 1400 (re-arms the in-memory grace clock).
+  tracker.step({ dirty: new Map(), openDistressDirs: empty, nowSec: 1400 });
+  // Re-dirties at 1500 — a NEW episode: no mint until a fresh full grace elapses.
+  expect(
+    tracker.step({ dirty, openDistressDirs: empty, nowSec: 1500 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ dirty, openDistressDirs: empty, nowSec: 1799 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ dirty, openDistressDirs: empty, nowSec: 1800 }).mint.length,
+  ).toBe(1);
+});
+
+test("dirty tracker: a restart (fresh tracker) still level-clears a row minted before it, and re-mints at most once", () => {
+  const grace = 300;
+  // Simulate a daemon restart: a brand-new tracker with an empty in-memory clock,
+  // but the durable dirt distress row for REPO_A is still open in the projection.
+  const fresh = createSharedCheckoutDirtyTracker(grace);
+  const open = new Set([REPO_A]);
+  // The checkout was cleaned during downtime: not dirty now, row still open → the
+  // projection-driven clear fires even though this instance never minted it.
+  const cleared = fresh.step({
+    dirty: new Map(),
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([
+    sharedDirtyDistressId(REPO_A),
+  ]);
+
+  // Alternatively, still dirty after the restart: the fresh clock re-arms and
+  // re-mints ONCE after a full grace (the accepted bounded per-restart burst).
+  const fresh2 = createSharedCheckoutDirtyTracker(grace);
+  const dirty = new Map([[REPO_A, DIRTY_REASON]]);
+  let mints = 0;
+  for (let ts = 9000; ts < 9000 + 2 * grace; ts++) {
+    mints += fresh2.step({ dirty, openDistressDirs: open, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("dirty + wedge distress rows for the SAME repo never cross-clear (distinct ids, independent open sets)", () => {
+  // The incident shape: a repo can be flagged dirty in one cycle and mid-merge in
+  // another. The two trackers key on DISTINCT per-repo ids and each clears against
+  // ITS OWN open set only, so a clear from one can never target the other's row.
+  const grace = 300;
+  const dirtyTracker = createSharedCheckoutDirtyTracker(grace);
+  const wedgeTracker = createSharedCheckoutWedgeTracker(grace);
+  const openDirty = new Set([REPO_A]);
+  const openWedge = new Set([REPO_A]);
+  const dirtyClear = dirtyTracker.step({
+    dirty: new Map(),
+    openDistressDirs: openDirty,
+    nowSec: 5000,
+  });
+  const wedgeClear = wedgeTracker.step({
+    wedged: new Map(),
+    openDistressDirs: openWedge,
+    nowSec: 5000,
+  });
+  expect(dirtyClear.clear.map((c) => c.id)).toEqual([
+    sharedDirtyDistressId(REPO_A),
+  ]);
+  expect(wedgeClear.clear.map((c) => c.id)).toEqual([
+    sharedWedgeDistressId(REPO_A),
+  ]);
+  // The two ids are distinct — neither clear could ever target the other's row.
+  expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
 });

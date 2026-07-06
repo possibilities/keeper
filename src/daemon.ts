@@ -123,6 +123,7 @@ import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
   isMergeEscalationReason,
+  isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -343,7 +344,8 @@ export function drainToCompletion(
  * count swept (0 on a healthy board). Pure but for the SELECT + the injected mint.
  *
  * EXEMPTS the crash-loop distress key AND every per-repo shared-checkout-wedge
- * distress key ({@link isSharedWedgeDistressKey}): their synthetic `daemon` verb is
+ * ({@link isSharedWedgeDistressKey}) / shared-checkout-dirty ({@link
+ * isSharedDirtyDistressKey}) distress key: their synthetic `daemon` verb is
  * un-retryable by the wire validator BY DESIGN (an operator never clears them), and a
  * level-trigger (main's boot recovery / the recover pass observing the checkout
  * clean) owns dropping them — so the orphan sweep must never reap a self-managed
@@ -372,6 +374,11 @@ export function gcUnretryableDispatchFailures(
     // synthetic `daemon` verb is un-retryable BY DESIGN, and the recover pass's
     // level-trigger (not the operator surface) owns its only legitimate clear.
     if (isSharedWedgeDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the SIBLING plain-dirty distress row — same synthetic-verb / level-clear
+    // discipline on its own id prefix; the orphan sweep must never reap it either.
+    if (isSharedDirtyDistressKey(row.verb, row.id)) {
       continue;
     }
     mintClear(row.verb, row.id);
