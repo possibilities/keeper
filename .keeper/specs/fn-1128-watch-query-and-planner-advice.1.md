@@ -40,5 +40,5 @@ New model-invocable keeper skill `keeper:query` — the read-plane reference tea
 - [ ] Skill-id lint, vendored-corpus drift check, and the prompt test suite all pass
 
 ## Done summary
-
+Added keeper:query, a model-invocable read-plane reference teaching the three-tier read hierarchy (history verbs → query/status projections → read-only sqlite) and enumerating the 18 read-allowlist collections. 145 lines, 2 POINTER markers, 0 BAKE guards.
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Add keeper query read skill",
-  "updated_at": "2026-07-05T22:26:14.993000Z"
+  "updated_at": "2026-07-06T00:24:23.982000Z",
+  "worker_done_at": "2026-07-06T00:24:23.982000Z"
 }
