@@ -1,0 +1,40 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Early proof point that establishes the timeout/tripwire/PANEL_ANSWER contract vocabulary two downstream tasks consume, so a wrong abstraction propagates.",
+      "task_id": "fn-1145-panel-wait-silent-drop-hardening.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Tagged-union return contract with idempotent re-drive that must byte-match the landed runner marker and reason about malformed-vs-substring returns.",
+      "task_id": "fn-1145-panel-wait-silent-drop-hardening.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-file doc parity fix with explicit stated facts and clear do/don't scope, no downstream deps and no test to satisfy.",
+      "task_id": "fn-1145-panel-wait-silent-drop-hardening.3",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-06T20:12:09.228000Z",
+  "epic_id": "fn-1145-panel-wait-silent-drop-hardening",
+  "input_hash": "9aff609d7156d99246b480e15fac33267a1afa8089b9d82eadd00f360821e6ea",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2600427677,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1145-panel-wait-silent-drop-hardening.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Early proof point that establishes the timeout/tripwire/PANEL_ANSWER contract vocabulary two downstream tasks consume, so a wrong abstraction propagates.\",\"confidence\":0.83},{\"task_id\":\"fn-1145-panel-wait-silent-drop-hardening.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Tagged-union return contract with idempotent re-drive that must byte-match the landed runner marker and reason about malformed-vs-substring returns.\",\"confidence\":0.8},{\"task_id\":\"fn-1145-panel-wait-silent-drop-hardening.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-file doc parity fix with explicit stated facts and clear do/don't scope, no downstream deps and no test to satisfy.\",\"confidence\":0.72}]}\n"
+}
