@@ -168,6 +168,7 @@ import {
   isKeeperLaneEntry,
   type LockAcquirer,
   type MergeResult,
+  shortBranchName,
   type WorktreeEntry,
 } from "./worktree-git";
 import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
@@ -3732,9 +3733,7 @@ export function createWorktreeDriver(
           if (entry.branch === null) {
             continue;
           }
-          const short = entry.branch.startsWith("refs/heads/")
-            ? entry.branch.slice("refs/heads/".length)
-            : entry.branch;
+          const short = shortBranchName(entry.branch);
           if (laneBranchShorts.has(short)) {
             paths.add(entry.path);
           }
@@ -4688,9 +4687,7 @@ export async function recoverWorktrees(
       if (entry.branch === null) {
         continue;
       }
-      const short = entry.branch.startsWith("refs/heads/")
-        ? entry.branch.slice("refs/heads/".length)
-        : entry.branch;
+      const short = shortBranchName(entry.branch);
       wtByShortBranch.set(short, entry.path);
     }
     for (const lane of laneBranches) {
@@ -4871,9 +4868,7 @@ async function probeLaneBaseReadiness(
     if (laneEpicId !== null && hasActiveResolver(laneEpicId)) {
       continue; // a resolver's deliberate in-progress merge is never a wedge
     }
-    const expectedShort = entry.branch.startsWith("refs/heads/")
-      ? entry.branch.slice("refs/heads/".length)
-      : entry.branch;
+    const expectedShort = shortBranchName(entry.branch);
     const ready = await gitMergeReadiness(entry.path, expectedShort, run);
     if (ready.kind === "ready") {
       // Clean tracked tree on-branch — but a lingering UNTRACKED file is the
