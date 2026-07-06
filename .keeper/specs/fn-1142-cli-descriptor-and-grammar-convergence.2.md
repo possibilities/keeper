@@ -35,5 +35,5 @@ In-process: for every descriptor verb, `main(["<verb>", "--help"])` under a tmpd
 - [ ] Non-help behavior of every prompt verb is unchanged
 
 ## Done summary
-
+Prompt CLI now routes --help/-h for any verb before dispatch (killing the build-snippets --help write defect); the verb table + per-verb arg/option metadata live in a new pure-data descriptor.ts (ADR 0008 shape) that both the help renderer and dispatcher consume. Non-help behavior unchanged.
 ## Evidence
