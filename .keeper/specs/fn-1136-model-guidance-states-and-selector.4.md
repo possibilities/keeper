@@ -39,5 +39,5 @@ Saga tests: verdict supplied → minted tasks carry the verdict cells plus a heu
 - [ ] Crash-resume and adopt finalize paths behave exactly as before, and the full saga suite is green
 
 ## Done summary
-
+close-finalize --selection-verdict pre-selects follow-up cells (tasks born selected + committed sidecar; malformed/absent verdict degrades to document defaults, adopt paths untouched), and selection-brief --from-followup briefs the stored follow-up document with ordinal task keys.
 ## Evidence
