@@ -36,5 +36,5 @@ Per-surface: json/yaml/human render cases, alias equivalence, conflict exit 2, u
 - [ ] Every descriptor's format_modes matches what actually renders; all envelope-exempt surfaces are byte-unchanged
 
 ## Done summary
-
+Converged --format json|yaml|human across plan, prompt, and the native status/query/watch readers with --json as a documented alias; yaml renders through the shared PyYAML-parity serializer, unsupported/conflicting requests are exit-2 usage faults, and the emit()/validate/cat/watch envelope-exempt surfaces stay byte-frozen against yaml.
 ## Evidence
