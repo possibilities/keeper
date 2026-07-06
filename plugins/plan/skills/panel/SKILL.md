@@ -36,7 +36,9 @@ corrupts the independence the panel runs on. If the human named a specific panel
 runner defaults to the `default` panel. Also **auto-derive a short run slug** — a few kebab words drawn from
 the task (`[a-z0-9-]`, e.g. `oauth-token-refresh`); pick a sensible default, don't stall or ask. Inject it
 as a `Slug:` line so the runner forwards it (each panelist leg launches as `panel::<slug>::<preset>`, keeping
-the run identifiable in tmux + forensics).
+the run identifiable in tmux + forensics). **Capture that slug verbatim** — you replay it byte-for-byte if the
+runner's return is malformed and you re-drive (see *Validate the runner's return*), so the same slug
+reconciles the existing run instead of fanning out a second one.
 
 ```
 Task(
@@ -54,17 +56,35 @@ fans the panelists out, waits for every leg, spawns the judge, and returns the j
 neutral evidence only — the verbatim task, and a panel name if the human gave one — never your own read of
 the problem.
 
-## On a panel failure
+## Validate the runner's return
 
-The runner returns the sentinel `PANEL_RUN_FAILED` (with a `reason:` line and the per-leg status) when any
-leg fails, times out, or never produces its output — or when the panel resolves to zero members. On that
-marker, tell the human that **the panel failed** and why; do **not** present the failure text as an answer.
-No judge ran, so there is no panel answer to render.
+The runner's final message has **exactly two valid shapes**, each identified by its **first line** — match on
+the first line's shape, never a substring, so a fused answer that merely *mentions* a sentinel string is not a
+failure:
+
+- **`PANEL_ANSWER`** on the first line — success. Strip that marker line and absorb the fused answer that
+  follows (see *Absorb, then answer*).
+- **`PANEL_RUN_FAILED`** on the first line — failure. It carries a `reason:` line and the per-leg status; the
+  runner emits it when any leg fails, times out, or never produces its output, or when the panel resolves to
+  zero members. Tell the human that **the panel failed** and why; do **not** present the failure text as an
+  answer. No judge ran, so there is no panel answer to render.
+
+Anything else is a **malformed return** — status narration, "waiting" prose, a promise of future work, or an
+empty or error-shaped Task return. Never absorb a malformed return as an answer, and never let one end your
+turn in a waiting state.
+
+On the first malformed return, **re-drive once**: re-spawn `plan:panel-runner` with the **byte-identical** Task
+prompt from the first spawn — the same task text and the **same `Slug:` line** you captured above, never a
+freshly derived slug. `keeper agent panel start` reconciles idempotently by slug and reuses terminal legs, so
+the re-drive is cheap and cannot double-fan-out. If the **second** return is also malformed, surface it to the
+human as a **panel failure**, quoting the runner's raw return verbatim — **no further retries**, and never a
+turn left in a waiting state.
 
 ## Absorb, then answer
 
-On success the runner returns the judge's fused answer. Treat it as your own conclusion — data you
-received, now your thinking — and answer the human in whatever shape the question needs: a plain answer, a
+On success — a first-line `PANEL_ANSWER` — **strip that marker line**; everything from the next line down is
+the judge's fused answer. Treat it as your own conclusion — data you received, now your thinking — and answer
+the human in whatever shape the question needs: a plain answer, a
 report, a sketch, a ready-to-plan proposal, an open question. Never wrap it in a "here's what the panel
 did" container, never dump the judge's audit, never add a composition note, and don't name the panel by
 default. For a directly invoked `/plan:panel`, answer the question in its natural shape as your own answer.

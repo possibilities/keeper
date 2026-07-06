@@ -35,8 +35,10 @@ main session. So your only lever is the **blocking Bash call**: a blocking call 
 blocks* (the model is suspended between emitting the tool_use and receiving the tool_result). `keeper agent
 panel start` launches the legs detached and returns at once; each `keeper agent panel wait` is then one
 blocking poll call that bills zero tokens while it blocks. Never leave a background task unawaited, and
-never poll at the model level (re-invoking yourself every few seconds) — that is the one thing that
-actually burns tokens.
+never *tightly* poll at the model level — re-invoking yourself every few seconds is the one thing that
+actually burns tokens. Re-issuing one blocking `wait` per ~9-minute chunk (Step 3) is **not** tight
+polling: you wake once per chunk, bill nothing while each chunk blocks, and every re-issue is a deliberate
+bounded step, not a spin.
 
 ## Your input
 
@@ -121,31 +123,56 @@ a `machine-rebooted` reason on the non-terminal legs (not a 124 spin) — treat 
 `keeper agent panel start "$PROMPT" --slug "$SLUG" --panel "$PANEL"` (its idempotent reconcile relaunches the
 dead legs) then `wait` again.
 
-## Step 3 — Wait token-free (re-issue loop)
+## Step 3 — Wait token-free (one bounded call per chunk)
 
-`keeper agent panel wait` blocks ONE `--chunk` window (`540`s ≤ 9 min, safely under Bash's hard 10-min
-single-call cap) polling every leg's terminality, then exits: **0** = every leg terminal (verdict JSON on
-stdout), **124** = the chunk elapsed (re-issue it), **2** = a missing/corrupt manifest or bad flags.
-Re-issue one blocking call per chunk until exit 0, bounded by a backstop so a wedged leg never loops
-forever:
+`keeper agent panel wait` blocks ONE `--chunk` window polling every leg's terminality, then exits:
+**0** = every leg terminal (verdict JSON on stdout — carry it into Step 4), **124** = the chunk elapsed
+(re-issue the next chunk), **2** = a missing/corrupt manifest or bad flags.
+
+**Each `wait` is its own Bash tool call carrying the explicit `timeout: 600000` tool parameter.** That
+parameter is the Bash tool's per-call ceiling (600000ms = 10 min). The tool's *default* foreground window
+is only 120000ms (120s), and any call that outruns the window in force is silently **auto-backgrounded** —
+so a `--chunk 540` wait (9 min) blows straight past the 120s default and would vanish into the background
+unless `timeout: 600000` is set. With the ceiling set, chunk 540 blocks in the foreground and still leaves
+~60s of return-latency headroom under the 600000ms cap.
 
 ```bash
-BACKSTOP=6      # ~54 min of 9-min chunks — comfortably past the 30-min per-leg timeout; a leg later is wedged
-VERDICT=""
-n=0
-while [ "$n" -lt "$BACKSTOP" ]; do
-  VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540)
-  WAIT_RC=$?
-  [ "$WAIT_RC" -eq 0 ] && break                              # all legs terminal — verdict captured
-  [ "$WAIT_RC" -eq 124 ] && { n=$(( n + 1 )); continue; }    # chunk elapsed — re-issue the next chunk
-  break                                                      # exit 2 (or backstop) — handle as failure in Step 4
-done
+# ONE Bash tool call — set the tool parameter timeout: 600000
+keeper agent panel wait --run-dir "$DIR" --chunk 540
 ```
 
-Each `wait` is a single blocking Bash call — token-free while it blocks; the subcommand polls internally on
-a `Date.now()` deadline, so you never re-invoke yourself between chunks. Stop the moment a chunk returns 0
-(verdict in hand), a non-124 error fires (Step 4), or you exhaust `BACKSTOP` (a still-running leg this late
-is wedged — treat it as a failure in Step 4).
+`timeout: 600000` is the **Bash tool parameter**, not a shelled `timeout`/`gtimeout` binary — those do not
+exist on macOS and you never shell them (see the header). `$DIR` is the concrete path from the Step 2
+manifest; shell state does **not** survive across Bash calls, so pass its captured literal value (or
+`--slug "$SLUG"`, which resolves the same durable dir) on every wait. Read the one call's exit code:
+
+- **exit 0** — every leg terminal; the verdict JSON is on stdout. Go to Step 4.
+- **exit 124** — the chunk elapsed with legs still running. Issue the **next** chunk as a **new** Bash tool
+  call (same command, same `timeout: 600000`).
+- **exit 2** — missing/corrupt manifest or bad flags. Handle as a failure (Step 4).
+
+Bound the re-issues with a **backstop of 6** chunks (~54 min of 9-min chunks — comfortably past the 30-min
+per-leg timeout; a leg still running this late is wedged). **Hold the count in your own reasoning, never a
+shell variable** — because shell state does not cross Bash calls, you cannot wrap the chunks in one `while`
+loop: a single Bash call carrying `timeout: 600000` has room for exactly one `--chunk 540` wait, and a
+second loop iteration would run past the 10-min ceiling and be auto-backgrounded. Issue one wait, read its
+exit code, re-issue only on 124, and increment your mental count each time. When you exhaust the backstop
+of 6 with no exit-0 verdict, the run is wedged — emit `PANEL_RUN_FAILED` (Step 4) and never loop past it.
+
+### Auto-background tripwire
+
+The drop this discipline exists to catch: a `wait` whose result comes back as
+`Command running in background with ID …` **instead of** the verdict JSON or a clean exit code. That means
+the call outran its foreground window and was auto-backgrounded — its exit code is now unreliable, and the
+notify-on-completion promise **never fires for a subagent**. Treat the auto-background envelope itself as
+the **tripwire signal**, not something to wait on: immediately re-issue the blocking `wait` as a fresh Bash
+tool call (with `timeout: 600000`), and count that re-issue against the same backstop of 6 — so a wedged
+run still terminates in `PANEL_RUN_FAILED` rather than spinning forever.
+
+**Never end your turn while any leg is non-terminal** — never end a turn text-only to wait on an external
+event. A final message emitted while legs are still running drops the panel; the notify-on-completion wake
+never arrives to resume you. While legs are in flight your only moves are the next blocking `wait`, the
+judge spawn (Step 5), or the failure return (Step 4) — never a bare stop.
 
 ## Step 4 — Verdict (parse + tally)
 
@@ -211,7 +238,19 @@ five-section synthesis), and returns the fused answer plus its audit.
 
 ## Step 6 — Return
 
-Return the judge's fused answer **verbatim** as your final message — that is the whole output your caller
-consumes. Do not wrap it in a "here's what the panel did" container, do not add a composition note, and do
-not paste panelist transcripts. The full runs live in each `--output` result file's `transcript_path`
-(a field of the `keeper agent run` JSON envelope) for a caller that later wants to dig in.
+Return a **positively marked** success: your final message is `PANEL_ANSWER` on its **first line**, then the
+judge's fused answer **verbatim** from the next line down — nothing before the marker, nothing between it
+and the answer.
+
+```
+PANEL_ANSWER
+<the judge's fused answer, verbatim from here down>
+```
+
+The marker is what makes your caller's contract checkable: `/plan:panel` treats a first-line `PANEL_ANSWER`
+as the one success shape and `PANEL_RUN_FAILED` (Step 4) as the one failure shape, and strips the
+`PANEL_ANSWER` line before absorbing the answer. These two markers are the ONLY shapes your final message
+may take — never return an unmarked message, a status narration, or a "here's what the panel did"
+container, and never add a composition note or paste panelist transcripts. The full runs live in each
+`--output` result file's `transcript_path` (a field of the `keeper agent run` JSON envelope) for a caller
+that later wants to dig in.
