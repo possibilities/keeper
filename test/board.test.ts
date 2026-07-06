@@ -29,7 +29,9 @@
 
 import { expect, test } from "bun:test";
 import {
+  boardSummaryLabel,
   colorizePillsInLine,
+  computeBoardSummary,
   epicNumFromIdOrBare,
   renderDeadLetterPill,
   renderEpicDepPills,
@@ -1731,6 +1733,52 @@ const EPIC_NOT_VALIDATED: Verdict = {
   tag: "blocked",
   reason: { kind: "epic-not-validated" },
 };
+
+// Board summary banner counts visible open/running epics and tasks from the
+// same readiness verdicts the row renderer consumes.
+test("computeBoardSummary: counts open and running epics/tasks", () => {
+  const taskRunning = makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" });
+  const taskCompleted = makeTask({ task_id: "fn-1-a.2", epic_id: "fn-1-a" });
+  const epicFromTask = makeEpic({
+    epic_id: "fn-1-a",
+    tasks: [taskRunning, taskCompleted],
+  });
+  const epicCompleted = makeEpic({
+    epic_id: "fn-2-b",
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const epicFromClose = makeEpic({
+    epic_id: "fn-3-c",
+    tasks: [makeTask({ task_id: "fn-3-c.1", epic_id: "fn-3-c" })],
+  });
+
+  const counts = computeBoardSummary({
+    epics: [epicFromTask, epicCompleted, epicFromClose],
+    readiness: {
+      perTask: new Map<string, Verdict>([
+        [taskRunning.task_id, JOB_RUNNING],
+        [taskCompleted.task_id, COMPLETED],
+        ["fn-2-b.1", COMPLETED],
+        ["fn-3-c.1", COMPLETED],
+      ]),
+      perCloseRow: new Map<string, Verdict>([
+        [epicFromTask.epic_id, EPIC_NOT_VALIDATED],
+        [epicCompleted.epic_id, COMPLETED],
+        [epicFromClose.epic_id, JOB_RUNNING],
+      ]),
+    },
+  });
+
+  expect(counts).toEqual({
+    epicsOpen: 2,
+    epicsRunning: 2,
+    tasksOpen: 1,
+    tasksRunning: 1,
+  });
+  expect(boardSummaryLabel(counts)).toBe(
+    "board: epics 2 open/2 running · tasks 1 open/1 running",
+  );
+});
 
 // fn-713 follow-on: renderTaskPills appends runtime_status + worker_phase at
 // their current value — defaults included, no verdict-aware suppression. The

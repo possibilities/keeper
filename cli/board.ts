@@ -271,6 +271,85 @@ export function renderEpicDepPillsFromProjection(
   return refs;
 }
 
+export interface BoardSummaryCounts {
+  readonly epicsOpen: number;
+  readonly epicsRunning: number;
+  readonly tasksOpen: number;
+  readonly tasksRunning: number;
+}
+
+export interface BoardSummaryInput {
+  readonly epics: readonly unknown[];
+  readonly readiness: {
+    readonly perTask: ReadonlyMap<string, Verdict>;
+    readonly perCloseRow: ReadonlyMap<string, Verdict>;
+  };
+}
+
+function boardSummaryId(row: unknown, key: string): string {
+  if (row == null || typeof row !== "object") {
+    return "";
+  }
+  const value = (row as Record<string, unknown>)[key];
+  return value == null ? "" : String(value);
+}
+
+function boardSummaryArray(row: unknown, key: string): readonly unknown[] {
+  if (row == null || typeof row !== "object") {
+    return [];
+  }
+  const value = (row as Record<string, unknown>)[key];
+  return Array.isArray(value) ? value : [];
+}
+
+function isOpenVerdict(verdict: Verdict | undefined): boolean {
+  return verdict?.tag !== "completed";
+}
+
+function isRunningVerdict(verdict: Verdict | undefined): boolean {
+  return verdict?.tag === "running";
+}
+
+export function computeBoardSummary(input: BoardSummaryInput): BoardSummaryCounts {
+  let epicsOpen = 0;
+  let epicsRunning = 0;
+  let tasksOpen = 0;
+  let tasksRunning = 0;
+
+  for (const epic of input.epics) {
+    const epicId = boardSummaryId(epic, "epic_id");
+    const closeVerdict =
+      epicId === "" ? undefined : input.readiness.perCloseRow.get(epicId);
+    if (isOpenVerdict(closeVerdict)) {
+      epicsOpen += 1;
+    }
+
+    let epicRunning = isRunningVerdict(closeVerdict);
+    for (const task of boardSummaryArray(epic, "tasks")) {
+      const taskId = boardSummaryId(task, "task_id");
+      const taskVerdict =
+        taskId === "" ? undefined : input.readiness.perTask.get(taskId);
+      if (isOpenVerdict(taskVerdict)) {
+        tasksOpen += 1;
+      }
+      if (isRunningVerdict(taskVerdict)) {
+        tasksRunning += 1;
+        epicRunning = true;
+      }
+    }
+
+    if (epicRunning) {
+      epicsRunning += 1;
+    }
+  }
+
+  return { epicsOpen, epicsRunning, tasksOpen, tasksRunning };
+}
+
+export function boardSummaryLabel(counts: BoardSummaryCounts): string {
+  return `board: epics ${counts.epicsOpen} open/${counts.epicsRunning} running · tasks ${counts.tasksOpen} open/${counts.tasksRunning} running`;
+}
+
 function taskNumFromId(id: string): number | null {
   const m = /\.(\d+)$/.exec(id);
   return m ? Number.parseInt(m[1], 10) : null;
@@ -488,14 +567,18 @@ export async function main(argv: string[]): Promise<void> {
   const workFailures = new Map<string, string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
+  // Retain the last readiness snapshot so banner repaints can show board
+  // counts alongside autopilot metadata. Null until the first frame.
+  let lastSnap: ReadinessClientSnapshot | null = null;
+
   // Autopilot banner state — the metadata `keeper autopilot` pins at its top
   // (paused/mode/caps/worktree), sourced over the socket from the
   // `autopilot_state` singleton; the armed count reuses `armedSet` above.
   // Seeded to the daemon's boot-safe defaults (paused · yolo · max ∞ · per-root
   // 1 · worktree:off); the first `autopilot_state` edge overwrites them. The
-  // banner repaints from the `apBanner()` snapshot of this state on every
-  // autopilot_state OR armed_epics edge, and the view-shell restores it after a
-  // copy-key flash via the `persistentBannerPill` below.
+  // banner repaints from `boardBanner()` on every readiness, autopilot_state, or
+  // armed_epics edge, and the view-shell restores it after a copy-key flash via
+  // the `persistentBannerPill` below.
   const apState = {
     paused: true,
     maxConcurrentJobs: null as number | null,
@@ -518,6 +601,12 @@ export async function main(argv: string[]): Promise<void> {
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,
     });
+  const boardBanner = (): string => {
+    if (lastSnap === null) {
+      return apBanner();
+    }
+    return `${boardSummaryLabel(computeBoardSummary(lastSnap))} · ${apBanner()}`;
+  };
 
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -772,9 +861,9 @@ export async function main(argv: string[]): Promise<void> {
     mode: mode === "snapshot" ? "snapshot" : "live",
     streamCount: 4,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    // The fixed banner row carries the autopilot metadata, mirroring the top of
-    // `keeper autopilot`. Restored here after a copy-key flash expires.
-    persistentBannerPill: apBanner,
+    // The fixed banner row carries board counts plus autopilot metadata.
+    // Restored here after a copy-key flash expires.
+    persistentBannerPill: boardBanner,
     renderBody: (snap) => {
       // Per-frame `job_id → invocations` index — re-entrant sub-agents within
       // one session share a bucket, ordered by `turn_seq asc`.
@@ -798,17 +887,12 @@ export async function main(argv: string[]): Promise<void> {
   });
 
   // Seed the banner immediately so the autopilot metadata is on screen before
-  // the first `autopilot_state` edge lands (mirrors the autopilot viewer's
-  // pre-snapshot seed).
-  view.liveShell.setStatus(apBanner());
-
-  // Retain the last readiness snapshot so an `armed_epics` edge landing between
-  // readiness frames can repaint the `[armed]` pill immediately. Null until the
-  // first frame.
-  let lastSnap: ReadinessClientSnapshot | null = null;
+  // the first `autopilot_state` edge lands.
+  view.liveShell.setStatus(boardBanner());
 
   function emitFrame(snap: ReadinessClientSnapshot): void {
     lastSnap = snap;
+    view.liveShell.setStatus(boardBanner());
     // Drain diagnostics per-snapshot (not per-emit) so every observed ambiguity
     // is recorded even when the render is byte-stable and the view-shell's
     // `lastBody` short-circuits. Best-effort — `appendDiagnostic` swallows I/O
@@ -845,8 +929,8 @@ export async function main(argv: string[]): Promise<void> {
           armedSet.add(id);
         }
       }
-      // The armed count rides the autopilot banner — repaint it on every edge.
-      view.liveShell.setStatus(apBanner());
+      // The armed count rides the banner — repaint it on every edge.
+      view.liveShell.setStatus(boardBanner());
       if (!armedStreamReported) {
         armedStreamReported = true;
         view.reportSnapshotStream();
@@ -885,7 +969,7 @@ export async function main(argv: string[]): Promise<void> {
       apState.maxConcurrentPerRootStored = projectMaxConcurrentPerRoot(rows);
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
-      view.liveShell.setStatus(apBanner());
+      view.liveShell.setStatus(boardBanner());
     },
     onLifecycle: view.emitLifecycle,
   });
