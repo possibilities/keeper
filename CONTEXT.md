@@ -59,7 +59,9 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
-- **Handoff**: Passing a contextful piece of live work to a fresh fire-and-forget worker that boots and runs it independently. Avoid: delegation, assignment, transfer.
+- **Tmux session**: The terminal-multiplexer container workers, viewers, and panels launch into; an unqualified "session" in a launch or dispatch context means this one. Avoid: workspace, window group, terminal.
+- **Claude session**: One agent conversation with its own transcript, identified by an immutable session id; jobs and forensics key on it. Avoid: job, chat, conversation.
+- **Session title**: The human-renamable display name of a Claude session, distinct from its id; matching by title is a convenience lookup, never an identity. Avoid: session name, label.
 - **Sidecar**: The private per-turn docs mirror a session maintains alongside its work, owned by hooks and never the doc body itself. Avoid: backup, shadow copy, cache.
 - **Adopted job**: A tracked session a non-launcher path minted — a hand-started hermes self-seed or a claimed codex rollout — rather than the keeper agent launcher, marked so the board pills it distinctly and restore surfaces it. Avoid: orphan, imported session, unmanaged job.
 - **Originator**: The ownership signal on a codex rollout marking it keeper-launched; strictly absent or empty means keeper never owned it, so a sole unambiguous rollout becomes adoptable. Avoid: owner tag, launch marker, origin flag.
