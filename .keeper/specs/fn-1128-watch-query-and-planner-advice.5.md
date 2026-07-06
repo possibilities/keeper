@@ -34,5 +34,5 @@ Fan-in verification and wording-consistency sweep after the four authoring tasks
 - [ ] Any wording drift found is fixed and the affected gates re-run green
 
 ## Done summary
-
+Fan-in consistency sweep: audited all six prose surfaces — piloting sites reference (not restate) the autopilot take-over window, blocked-handshake mechanics single-sourced in operator-orchestration with both caveats (TOOLING_FAILURE silence, creator-edge durability) present at hack/plan-ref/watch-rung-2, NOT-for web mutually consistent (watch<->autopilot reciprocal, query vs hack/debug/autopilot), six hack BAKE guards intact, vendor-corpus green. One wording fix: query's 'retires the pipeline' -> forward-facing. Full gates green (the lone plan-suite failure was KEEPER_PLAN_WORKTREE env leakage from the worktree lane, proven not task-caused).
 ## Evidence
