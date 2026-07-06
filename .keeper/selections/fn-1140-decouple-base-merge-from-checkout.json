@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching plumbing-merge rewrite with new result-union kinds, CAS/idempotency and conflict-escalation semantics where a wrong abstraction strands epics.",
+      "task_id": "fn-1140-decouple-base-merge-from-checkout.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded multi-file neuter with a clear path, but draining only the correct distress families without touching live lane-wedge rows is correctness-sensitive.",
+      "task_id": "fn-1140-decouple-base-merge-from-checkout.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "1d3a118f5d4d8b07ad4a02fc3e496ccf4664b01f254bbfb6f290c9a67d2dd40a",
+  "created_at": "2026-07-06T14:19:21.518000Z",
+  "epic_id": "fn-1140-decouple-base-merge-from-checkout",
+  "input_hash": "8ca8165e3e99779981e1d7dfc879e2272542257f908abdd7ef685a8f6528110a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2359826014,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1140-decouple-base-merge-from-checkout.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-touching plumbing-merge rewrite\",\"confidence\":0.86},{\"task_id\":\"fn-1140-decouple-base-merge-from-checkout.2\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Bounded multi-file neuter\",\"confidence\":0.74}]}"
+}
