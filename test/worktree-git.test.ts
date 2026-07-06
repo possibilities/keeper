@@ -29,6 +29,7 @@ import {
   baselineScratchPathFor,
   branchExists,
   classifyLinkedWorktree,
+  classifyPremergeRedundancy,
   commitWorkLockPath,
   currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
@@ -39,7 +40,9 @@ import {
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
+  type LockAcquirer,
   listEpicLaneBranches,
+  losslessPremergeClean,
   mergeBranchInto,
   mergeReadiness,
   parseWorktreeList,
@@ -2011,4 +2014,423 @@ test("pruneBaselineScratchWorktrees: no scratch entries → empty result, no rem
   expect(calls.some((c) => argvStartsWith(c.args, "worktree", "remove"))).toBe(
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// classifyPremergeRedundancy — the blob-equality probe for the fan-in pre-merge
+// clean. Pure fake-git: a `status --porcelain=v2 -z` enumerates + pre-classifies
+// the dirty set, then per surviving candidate a filtered `hash-object` + an
+// incoming-blob `rev-parse`. Airtight: only an unstaged, non-mode, tracked change
+// whose filtered blob == the incoming blob (and != HEAD) is provably redundant.
+// ---------------------------------------------------------------------------
+
+const HEAD_HASH = "1111111111111111111111111111111111111111";
+const INC_HASH = "2222222222222222222222222222222222222222";
+const OTHER_HASH = "3333333333333333333333333333333333333333";
+
+/** A porcelain-v2 `1` (ordinary change) record. Fields never carry spaces except
+ *  the trailing path, mirroring git-status(1). */
+function v2Line(o: {
+  xy?: string;
+  mH?: string;
+  mI?: string;
+  mW?: string;
+  hH?: string;
+  hI?: string;
+  path: string;
+}): string {
+  const xy = o.xy ?? ".M";
+  const mH = o.mH ?? "100644";
+  const mI = o.mI ?? "100644";
+  const mW = o.mW ?? "100644";
+  const hH = o.hH ?? HEAD_HASH;
+  const hI = o.hI ?? HEAD_HASH;
+  return `1 ${xy} N... ${mH} ${mI} ${mW} ${hH} ${hI} ${o.path}`;
+}
+
+function premergeProbeRules(o: {
+  statusV2: string;
+  statusCode?: number;
+  wtHash?: string;
+  wtCode?: number;
+  incHash?: string;
+  incCode?: number;
+}): FakeGitRule[] {
+  return [
+    {
+      when: (a) => argvStartsWith(a, "status", "--porcelain=v2"),
+      result: { exitCode: o.statusCode ?? 0, stdout: o.statusV2 },
+    },
+    {
+      when: (a) => argvStartsWith(a, "hash-object"),
+      result: {
+        exitCode: o.wtCode ?? 0,
+        stdout: o.wtHash ? `${o.wtHash}\n` : "",
+      },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--verify") &&
+        (a[a.length - 1] ?? "").includes(":"),
+      result: {
+        exitCode: o.incCode ?? 0,
+        stdout: o.incHash ? `${o.incHash}\n` : "",
+      },
+    },
+  ];
+}
+
+test("classifyPremergeRedundancy: an unstaged modify whose filtered blob == incoming (!= HEAD) → redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ path: "src/foo.ts" })}\0`,
+      wtHash: INC_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  expect(await classifyPremergeRedundancy("/base", "rib", run)).toEqual({
+    kind: "redundant",
+    paths: ["src/foo.ts"],
+  });
+});
+
+test("classifyPremergeRedundancy: multiple redundant paths → all restorable", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ path: "a.ts" })}\0${v2Line({ path: "b.ts" })}\0`,
+      wtHash: INC_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  expect(await classifyPremergeRedundancy("/base", "rib", run)).toEqual({
+    kind: "redundant",
+    paths: ["a.ts", "b.ts"],
+  });
+});
+
+test("classifyPremergeRedundancy: an empty (clean-after-refresh) tree → redundant with no paths", async () => {
+  const { run } = fakeAsyncGit(premergeProbeRules({ statusV2: "" }));
+  expect(await classifyPremergeRedundancy("/base", "rib", run)).toEqual({
+    kind: "redundant",
+    paths: [],
+  });
+});
+
+test("classifyPremergeRedundancy: an ADD (no HEAD blob) → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ xy: "A.", mH: "000000", path: "new.ts" })}\0`,
+      wtHash: INC_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("new.ts");
+});
+
+test("classifyPremergeRedundancy: a DELETE (no worktree blob) → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ xy: ".D", mW: "000000", path: "gone.ts" })}\0`,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("gone.ts");
+});
+
+test("classifyPremergeRedundancy: a mode-only flip (blob identical, mode changed) → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ mW: "100755", path: "exe.sh" })}\0`,
+      wtHash: INC_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("mode change");
+});
+
+test("classifyPremergeRedundancy: a STAGED change (index != HEAD) → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ xy: "M.", hI: OTHER_HASH, path: "staged.ts" })}\0`,
+      wtHash: INC_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("staged");
+});
+
+test("classifyPremergeRedundancy: an untracked file → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({ statusV2: "? scratch.txt\0" }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("untracked");
+});
+
+test("classifyPremergeRedundancy: incoming blob == HEAD (merge would not re-apply) → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ path: "src/foo.ts" })}\0`,
+      wtHash: HEAD_HASH,
+      incHash: HEAD_HASH,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("equals HEAD");
+});
+
+test("classifyPremergeRedundancy: working blob differs from incoming → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ path: "src/foo.ts" })}\0`,
+      wtHash: OTHER_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("differs");
+});
+
+test("classifyPremergeRedundancy: incoming rib has no blob for the path → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ path: "src/foo.ts" })}\0`,
+      wtHash: INC_HASH,
+      incCode: 1,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("no blob");
+});
+
+test("classifyPremergeRedundancy: a hash-object timeout fails SAFE → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: `${v2Line({ path: "src/foo.ts" })}\0`,
+      wtCode: GIT_SPAWN_TIMEOUT_CODE,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("timed out");
+});
+
+test("classifyPremergeRedundancy: a status probe timeout fails SAFE → not-redundant", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      statusV2: "",
+      statusCode: GIT_SPAWN_TIMEOUT_CODE,
+    }),
+  );
+  const res = await classifyPremergeRedundancy("/base", "rib", run);
+  expect(res.kind).toBe("not-redundant");
+  if (res.kind === "not-redundant") expect(res.reason).toContain("timed out");
+});
+
+test("classifyPremergeRedundancy: ANY not-redundant path poisons the whole set (all-or-nothing)", async () => {
+  const { run } = fakeAsyncGit(
+    premergeProbeRules({
+      // One redundant modify + one untracked → not-redundant overall.
+      statusV2: `${v2Line({ path: "ok.ts" })}\0? scratch.txt\0`,
+      wtHash: INC_HASH,
+      incHash: INC_HASH,
+    }),
+  );
+  expect((await classifyPremergeRedundancy("/base", "rib", run)).kind).toBe(
+    "not-redundant",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// losslessPremergeClean — the flock-guarded orchestrator: attribution guard →
+// lock → refresh → probe → restore → mergeReadiness re-probe. Only a base that
+// re-probes `ready` returns `ready`; every doubt is a retry-skip (no discard).
+// ---------------------------------------------------------------------------
+
+const okLock: LockAcquirer = () => ({ release() {} });
+const timeoutLock: LockAcquirer = () => null;
+
+/** The full happy-path rule set: a redundant leak that restores + re-probes clean. */
+function cleanHappyRules(branch: string): FakeGitRule[] {
+  return [
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--path-format=absolute"),
+      result: { exitCode: 0, stdout: "/base/.git\n" },
+    },
+    // --really-refresh exits non-zero on a dirty tree — tolerated (only 124/127 stall).
+    {
+      when: (a) => argvStartsWith(a, "update-index"),
+      result: { exitCode: 1 },
+    },
+    {
+      when: (a) => argvStartsWith(a, "status", "--porcelain=v2"),
+      result: { exitCode: 0, stdout: `${v2Line({ path: "src/foo.ts" })}\0` },
+    },
+    {
+      when: (a) => argvStartsWith(a, "hash-object"),
+      result: { exitCode: 0, stdout: `${INC_HASH}\n` },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--verify") &&
+        (a[a.length - 1] ?? "").includes(":"),
+      result: { exitCode: 0, stdout: `${INC_HASH}\n` },
+    },
+    {
+      when: (a) => argvStartsWith(a, "restore"),
+      result: { exitCode: 0 },
+    },
+    // The mergeReadiness re-probe: on-branch + (default) clean status + no MERGE_HEAD.
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+      result: { exitCode: 0, stdout: `${branch}\n` },
+    },
+  ];
+}
+
+test("losslessPremergeClean: null attribution → retry (do-not-discard), no git shelled", async () => {
+  const { run, calls } = fakeAsyncGit([]);
+  const res = await losslessPremergeClean(
+    "/base",
+    "keeper/epic/fn-1-foo",
+    "keeper/epic/fn-1-foo--fn-1-foo.2",
+    null,
+    run,
+    okLock,
+  );
+  expect(res.kind).toBe("retry");
+  expect(calls).toEqual([]);
+});
+
+test("losslessPremergeClean: a lock-timeout → retry (never a blind restore)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--path-format=absolute"),
+      result: { exitCode: 0, stdout: "/base/.git\n" },
+    },
+  ]);
+  const res = await losslessPremergeClean(
+    "/base",
+    "keeper/epic/fn-1-foo",
+    "keeper/epic/fn-1-foo--fn-1-foo.2",
+    new Set(),
+    run,
+    timeoutLock,
+  );
+  expect(res.kind).toBe("retry");
+  // Never reached the restore.
+  expect(calls.some((c) => argvStartsWith(c.args, "restore"))).toBe(false);
+});
+
+test("losslessPremergeClean: a not-redundant base → retry, no restore", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--path-format=absolute"),
+      result: { exitCode: 0, stdout: "/base/.git\n" },
+    },
+    { when: (a) => argvStartsWith(a, "update-index"), result: { exitCode: 1 } },
+    {
+      when: (a) => argvStartsWith(a, "status", "--porcelain=v2"),
+      result: { exitCode: 0, stdout: "? scratch.txt\0" }, // untracked → not redundant
+    },
+  ]);
+  const res = await losslessPremergeClean(
+    "/base",
+    "keeper/epic/fn-1-foo",
+    "keeper/epic/fn-1-foo--fn-1-foo.2",
+    new Set(),
+    run,
+    okLock,
+  );
+  expect(res.kind).toBe("retry");
+  expect(calls.some((c) => argvStartsWith(c.args, "restore"))).toBe(false);
+});
+
+test("losslessPremergeClean: a redundant path ATTRIBUTED to a live job → retry, no restore", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--path-format=absolute"),
+      result: { exitCode: 0, stdout: "/base/.git\n" },
+    },
+    { when: (a) => argvStartsWith(a, "update-index"), result: { exitCode: 1 } },
+    {
+      when: (a) => argvStartsWith(a, "status", "--porcelain=v2"),
+      result: { exitCode: 0, stdout: `${v2Line({ path: "src/foo.ts" })}\0` },
+    },
+    {
+      when: (a) => argvStartsWith(a, "hash-object"),
+      result: { exitCode: 0, stdout: `${INC_HASH}\n` },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--verify") &&
+        (a[a.length - 1] ?? "").includes(":"),
+      result: { exitCode: 0, stdout: `${INC_HASH}\n` },
+    },
+  ]);
+  const res = await losslessPremergeClean(
+    "/base",
+    "keeper/epic/fn-1-foo",
+    "keeper/epic/fn-1-foo--fn-1-foo.2",
+    new Set(["src/foo.ts"]), // a live job owns this exact path
+    run,
+    okLock,
+  );
+  expect(res.kind).toBe("retry");
+  if (res.kind === "retry") expect(res.reason).toContain("live job");
+  expect(calls.some((c) => argvStartsWith(c.args, "restore"))).toBe(false);
+});
+
+test("losslessPremergeClean: a redundant + unattributed leak → restores to HEAD, re-probes ready", async () => {
+  const branch = "keeper/epic/fn-1-foo";
+  const { run, calls } = fakeAsyncGit(cleanHappyRules(branch));
+  const res = await losslessPremergeClean(
+    "/base",
+    branch,
+    "keeper/epic/fn-1-foo--fn-1-foo.2",
+    new Set(),
+    run,
+    okLock,
+  );
+  expect(res).toEqual({ kind: "ready" });
+  // It restored the EXACT proven path after `--`, never a bare `git restore .`.
+  const restore = calls.find((c) => argvStartsWith(c.args, "restore"));
+  expect(restore?.args).toEqual([
+    "restore",
+    "--source=HEAD",
+    "--worktree",
+    "--",
+    "src/foo.ts",
+  ]);
+});
+
+test("losslessPremergeClean: a failed restore → retry (never proceeds to merge)", async () => {
+  const branch = "keeper/epic/fn-1-foo";
+  // Prepend a failing restore rule (first-match-wins) over the happy set.
+  const rules: FakeGitRule[] = [
+    { when: (a) => argvStartsWith(a, "restore"), result: { exitCode: 1 } },
+    ...cleanHappyRules(branch),
+  ];
+  const { run } = fakeAsyncGit(rules);
+  const res = await losslessPremergeClean(
+    "/base",
+    branch,
+    "keeper/epic/fn-1-foo--fn-1-foo.2",
+    new Set(),
+    run,
+    okLock,
+  );
+  expect(res.kind).toBe("retry");
+  if (res.kind === "retry") expect(res.reason).toContain("restore failed");
 });

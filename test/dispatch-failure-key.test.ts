@@ -15,11 +15,16 @@ import {
   CRASH_LOOP_DISTRESS_VERB,
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
+  isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
+  isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
+  LANE_WEDGE_DISTRESS_ID_PREFIX,
+  LANE_WEDGE_DISTRESS_REASON,
+  LANE_WEDGE_DISTRESS_VERB,
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
   routeDispatchFailure,
@@ -34,6 +39,7 @@ import {
   WORKTREE_CLOSE_KEY_PREFIXES,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_NON_FF_REASON,
+  WORKTREE_LANE_PREMERGE_REASON_PREFIX,
   WORKTREE_RECOVER_KEY_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "../src/dispatch-failure-key";
@@ -590,7 +596,108 @@ describe("single vocabulary source", () => {
       ["daemon-crash-loop", "crash-loop"],
       ["shared-checkout-wedge", "shared-wedge"],
       ["shared-checkout-dirty", "shared-dirty"],
+      ["worktree-lane-wedge", "lane-wedge"],
+      ["worktree-lane-premerge", "lane-premerge"],
     ]);
+  });
+});
+
+// ── fn-1123.2 — fan-in LANE pre-merge vocabulary ────────────────────────────
+
+describe("fn-1123.2 worktree-lane pre-merge vocabulary", () => {
+  test("isWorktreeLanePremergeReason matches the provision lane family only", () => {
+    expect(
+      isWorktreeLanePremergeReason("worktree-lane-premerge-dirty-base: …"),
+    ).toBe(true);
+    expect(
+      isWorktreeLanePremergeReason("worktree-lane-premerge-not-ready: …"),
+    ).toBe(true);
+    expect(
+      isWorktreeLanePremergeReason(WORKTREE_LANE_PREMERGE_REASON_PREFIX),
+    ).toBe(true);
+    // Disjoint from every sibling worktree reason scope — a lane row must never be
+    // mis-collected as a recover row, a merge-escalation token, or the lane WEDGE
+    // distress reason (a distinct `worktree-lane-wedge` prefix).
+    expect(isWorktreeLanePremergeReason(LANE_WEDGE_DISTRESS_REASON)).toBe(
+      false,
+    );
+    expect(
+      isWorktreeLanePremergeReason("worktree-recover-dirty-checkout: …"),
+    ).toBe(false);
+    expect(isWorktreeLanePremergeReason("worktree-merge-conflict: …")).toBe(
+      false,
+    );
+    expect(isWorktreeLanePremergeReason("worktree-finalize-conflict: …")).toBe(
+      false,
+    );
+    expect(isWorktreeLanePremergeReason("")).toBe(false);
+  });
+
+  test("isLaneWedgeDistressKey is the synthetic daemon-verb per-lane surface only", () => {
+    expect(
+      isLaneWedgeDistressKey(
+        LANE_WEDGE_DISTRESS_VERB,
+        `${LANE_WEDGE_DISTRESS_ID_PREFIX}ab12`,
+      ),
+    ).toBe(true);
+    // Wrong verb, wrong id prefix, and cross-distress ids all miss — the three
+    // distress surfaces (lane / shared-wedge / shared-dirty) never cross-classify.
+    expect(
+      isLaneWedgeDistressKey("close", `${LANE_WEDGE_DISTRESS_ID_PREFIX}ab12`),
+    ).toBe(false);
+    expect(
+      isLaneWedgeDistressKey("work", `${LANE_WEDGE_DISTRESS_ID_PREFIX}ab12`),
+    ).toBe(false);
+    expect(
+      isLaneWedgeDistressKey(
+        LANE_WEDGE_DISTRESS_VERB,
+        `${SHARED_WEDGE_DISTRESS_ID_PREFIX}ab12`,
+      ),
+    ).toBe(false);
+    expect(
+      isLaneWedgeDistressKey(
+        LANE_WEDGE_DISTRESS_VERB,
+        `${SHARED_DIRTY_DISTRESS_ID_PREFIX}ab12`,
+      ),
+    ).toBe(false);
+    // The lane distress rides the SAME un-retryable synthetic `daemon` verb as the
+    // shared-checkout distress rows, so only a level-trigger clears it.
+    expect(LANE_WEDGE_DISTRESS_VERB).toBe(CRASH_LOOP_DISTRESS_VERB);
+    // A lane wedge distress key is NOT a shared-checkout distress key (disjoint).
+    expect(
+      isSharedWedgeDistressKey(
+        LANE_WEDGE_DISTRESS_VERB,
+        `${LANE_WEDGE_DISTRESS_ID_PREFIX}ab12`,
+      ),
+    ).toBe(false);
+    expect(
+      isSharedDirtyDistressKey(
+        LANE_WEDGE_DISTRESS_VERB,
+        `${LANE_WEDGE_DISTRESS_ID_PREFIX}ab12`,
+      ),
+    ).toBe(false);
+  });
+
+  test("the closed work:: routing asymmetry — a lane reason on a work row is NOT merge-escalation, but the close token still escalates", () => {
+    // A `work::<taskId>` lane pre-merge row routes to the (dead) `work-task` arm by the
+    // verb short-circuit — the router is UNCHANGED; the reason-scoped clear (not the
+    // router) is what makes it self-clearing.
+    const laneRow: DispatchFailureIdentity = {
+      verb: "work",
+      id: "fn-1-foo.2",
+      reason: "worktree-lane-premerge-dirty-base: deferring the fan-in …",
+      dir: "/wt/lane",
+    };
+    expect(routeDispatchFailure(laneRow).kind).toBe("work-task");
+    expect(isMergeEscalationReason(laneRow.reason)).toBe(false);
+    // The genuine close-sink conflict token STILL escalates (untouched) — the two
+    // paths are provably disjoint: a lane reason never carries the escalation token.
+    expect(
+      isMergeEscalationReason("worktree-merge-conflict: merging … into …"),
+    ).toBe(true);
+    expect(leadingReasonToken(laneRow.reason)).not.toBe(
+      MERGE_ESCALATION_REASON_TOKEN,
+    );
   });
 });
 

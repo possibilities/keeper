@@ -43,6 +43,7 @@ import { basename, resolve, sep } from "node:path";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
+  GIT_SPAWN_FAILED_CODE,
   GIT_SPAWN_TIMEOUT_CODE,
   type GitRunner,
   gitExec,
@@ -810,6 +811,314 @@ async function wouldClobberUntracked(
     }
   }
   return { kind: "ok", paths: clobbered };
+}
+
+/**
+ * Verdict of {@link classifyPremergeRedundancy}: whether the dirt sitting in a base
+ * lane worktree is a PROVABLY-REDUNDANT leak of the incoming rib's content — the
+ * fan-in merge would re-apply exactly what the working tree already holds, so
+ * restoring the proven paths to HEAD then merging is a lossless no-op on them.
+ *
+ *  - `redundant` — EVERY dirty tracked path is provably redundant vs `incomingBranch`:
+ *    its FILTERED working-tree blob (`git hash-object --path`, `.gitattributes` clean
+ *    filters + eol normalization applied — a raw byte compare would falsely differ
+ *    under CRLF/`autocrlf`/smudge-clean) equals the incoming branch's committed blob
+ *    for that path, that incoming blob differs from HEAD (so the merge genuinely
+ *    re-applies it), the change is UNSTAGED-only (index == HEAD), and the mode is
+ *    unchanged. `paths` is the exact restore pathspec (possibly empty when a
+ *    stat-only refresh already cleaned the tree).
+ *  - `not-redundant` — at least one dirty path is NOT provably redundant: an add
+ *    (no HEAD blob), a delete, a mode change (incl. a blob-identical mode-only flip),
+ *    a staged change, an untracked file, a rename/copy, an unmerged path, a blob that
+ *    differs from the incoming, an incoming blob equal to HEAD, OR any probe
+ *    failure/timeout. `reason` names the first disqualifier for the retry-skip log.
+ *    NEVER discard on this verdict — the dirt may carry real work.
+ */
+export type PremergeRedundancy =
+  | { kind: "redundant"; paths: string[] }
+  | { kind: "not-redundant"; reason: string };
+
+/**
+ * Classify whether the dirt in base worktree `cwd` is a provably-redundant leak of
+ * `incomingBranch`'s content (see {@link PremergeRedundancy}). Pure git READS — a
+ * single `git status --porcelain=v2 -z` to enumerate + pre-classify the dirty set
+ * (mode + HEAD/index hashes come straight off the v2 record, so an add / delete /
+ * mode change / staged path is disqualified with NO extra spawn), then per surviving
+ * candidate a filtered `git hash-object --path` and an incoming-blob `rev-parse`.
+ * Any non-zero / SIGKILL-timeout probe fails to `not-redundant` (fail SAFE — a doubt
+ * never licenses a discard). The caller runs this UNDER the commit-work flock (after
+ * an `update-index --really-refresh`); it takes no lock itself. Bounded (B4).
+ */
+export async function classifyPremergeRedundancy(
+  cwd: string,
+  incomingBranch: string,
+  run: GitRunner = gitExec,
+): Promise<PremergeRedundancy> {
+  const status = await run(
+    ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (status.code !== 0) {
+    return {
+      kind: "not-redundant",
+      reason:
+        status.code === GIT_SPAWN_TIMEOUT_CODE
+          ? "git status probe timed out"
+          : `git status probe failed (exit ${status.code})`,
+    };
+  }
+  // Parse the NUL-framed porcelain v2 records. An ordinary changed entry is
+  // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>` (mode + hash fields never contain
+  // spaces, so the path is the tail after the 8th field). Any OTHER record kind — an
+  // untracked `?`, a rename/copy `2`, an unmerged `u` — or a non-plain `1` (add /
+  // delete / mode change / staged) is a hard disqualifier: bail immediately.
+  const candidates: { path: string; headHash: string }[] = [];
+  const fields = status.stdout.split("\0");
+  for (const rec of fields) {
+    if (rec.length === 0) {
+      continue;
+    }
+    const kind = rec[0];
+    if (kind === "1") {
+      const parts = rec.split(" ");
+      const mH = parts[3];
+      const mW = parts[5];
+      const hH = parts[6];
+      const hI = parts[7];
+      const path = parts.slice(8).join(" ");
+      if (
+        mH === undefined ||
+        mW === undefined ||
+        hH === undefined ||
+        hI === undefined ||
+        path.length === 0
+      ) {
+        return {
+          kind: "not-redundant",
+          reason: "unparsable porcelain v2 record",
+        };
+      }
+      if (mH === "000000") {
+        return {
+          kind: "not-redundant",
+          reason: `added path not in HEAD: ${path}`,
+        };
+      }
+      if (mW === "000000") {
+        return { kind: "not-redundant", reason: `deleted path: ${path}` };
+      }
+      if (mH !== mW) {
+        return {
+          kind: "not-redundant",
+          reason: `mode change on ${path} (${mH} → ${mW})`,
+        };
+      }
+      if (hI !== hH) {
+        return { kind: "not-redundant", reason: `staged change on ${path}` };
+      }
+      candidates.push({ path, headHash: hH });
+    } else if (kind === "?") {
+      return {
+        kind: "not-redundant",
+        reason: `untracked path: ${rec.slice(2)}`,
+      };
+    } else if (kind === "2") {
+      return { kind: "not-redundant", reason: `rename/copy: ${rec.slice(2)}` };
+    } else if (kind === "u") {
+      return {
+        kind: "not-redundant",
+        reason: `unmerged path: ${rec.slice(2)}`,
+      };
+    }
+    // A `# branch.*` header (only with --branch, which we do not pass) or any other
+    // line is ignored — never a candidate.
+  }
+  // Every dirty entry is an unstaged, non-mode ordinary change. Prove each redundant:
+  // its filtered working-tree blob == the incoming committed blob AND that blob != HEAD.
+  const provenPaths: string[] = [];
+  for (const { path, headHash } of candidates) {
+    // The FILTERED working-tree blob — `--path=<p>` applies the path's clean filters
+    // + eol normalization exactly as `git add` would; the file to hash rides after
+    // `--` (an attacker-influenceable path can never be read as an option).
+    const wt = await run(["hash-object", `--path=${path}`, "--", path], {
+      cwd,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (wt.code !== 0) {
+      return {
+        kind: "not-redundant",
+        reason:
+          wt.code === GIT_SPAWN_TIMEOUT_CODE
+            ? `hash-object timed out for ${path}`
+            : `hash-object failed for ${path} (exit ${wt.code})`,
+      };
+    }
+    const wtHash = wt.stdout.trim();
+    // The incoming rib's committed blob for the same path — `refs/heads/` guards
+    // against a DWIM remote/tag match, `--end-of-options` against a `-`-leading name.
+    const inc = await run(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        `refs/heads/${incomingBranch}:${path}`,
+      ],
+      { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (inc.code === GIT_SPAWN_TIMEOUT_CODE) {
+      return {
+        kind: "not-redundant",
+        reason: `incoming blob probe timed out for ${path}`,
+      };
+    }
+    if (inc.code !== 0) {
+      return {
+        kind: "not-redundant",
+        reason: `incoming ${incomingBranch} has no blob for ${path}`,
+      };
+    }
+    const incHash = inc.stdout.trim();
+    if (wtHash.length === 0 || wtHash !== incHash) {
+      return {
+        kind: "not-redundant",
+        reason: `working-tree blob for ${path} differs from incoming ${incomingBranch}`,
+      };
+    }
+    if (incHash === headHash) {
+      // The incoming blob equals HEAD — the merge would not re-apply this path, so
+      // restoring to HEAD is NOT a no-op the merge undoes. (Unreachable given the
+      // status entry is dirty, but proven, not assumed.)
+      return {
+        kind: "not-redundant",
+        reason: `incoming blob for ${path} equals HEAD (merge would not re-apply it)`,
+      };
+    }
+    provenPaths.push(path);
+  }
+  return { kind: "redundant", paths: provenPaths };
+}
+
+/**
+ * Outcome of {@link losslessPremergeClean}.
+ *  - `ready` — the base worktree is clean on its branch and safe to merge: the dirt
+ *    was a provably-redundant leak restored to HEAD, or a stat-only refresh already
+ *    cleaned it.
+ *  - `retry` — the base could not be losslessly cleaned (not provably redundant, a
+ *    path attributed to a live job, the attribution set unavailable, a lock / local
+ *    timeout, or a restore / re-probe failure). The caller degrades to a NON-STICKY
+ *    retry-skip and logs `reason`; NEVER a merge, NEVER a discard.
+ */
+export type PremergeCleanOutcome =
+  | { kind: "ready" }
+  | { kind: "retry"; reason: string };
+
+/**
+ * Losslessly clean a DIRTY base lane worktree before a fan-in merge, IFF the dirt is
+ * a provably-redundant leak of `incomingBranch` and NONE of it is attributed to a
+ * live job — otherwise a retry-skip (never a blind merge, never a discard). The
+ * ordered contract:
+ *
+ *  1. `liveAttributedDirty === null` (the reconciler could not read attribution) →
+ *     retry (assume live-attributed — do-not-discard).
+ *  2. Take the per-worktree commit-work flock (the restore + index refresh mutate the
+ *     index) via the bounded {@link LockAcquirer}; a lock-timeout → retry.
+ *  3. `git update-index -q --really-refresh` collapses stat-only (mtime) false
+ *     positives so {@link classifyPremergeRedundancy} sees genuine content dirt only
+ *     (a non-zero exit is EXPECTED on a dirty tree; only a SIGKILL/spawn-fail stalls).
+ *  4. Probe redundancy; a non-`redundant` verdict → retry with its reason.
+ *  5. Do-not-discard if any proven path is in `liveAttributedDirty` (a live worker may
+ *     re-touch it) → retry.
+ *  6. `git restore --source=HEAD --worktree -- <exact proven pathspec>` (never a bare
+ *     `git restore .`; the index is left alone — the probe proved index == HEAD).
+ *  7. RE-PROBE {@link mergeReadiness}; ONLY a `ready` base returns `ready`. Anything
+ *     else → retry.
+ *
+ * The flock is released before returning, so the caller's own `mergeBranchInto`
+ * (which re-takes it) never self-deadlocks. `acquireLock` is injectable for the fast
+ * tier; production uses the deadline-bounded commit-work flock.
+ */
+export async function losslessPremergeClean(
+  worktreePath: string,
+  expectedBranch: string,
+  incomingBranch: string,
+  liveAttributedDirty: ReadonlySet<string> | null,
+  run: GitRunner = gitExec,
+  acquireLock: LockAcquirer = defaultLockAcquirer,
+): Promise<PremergeCleanOutcome> {
+  if (liveAttributedDirty === null) {
+    return {
+      kind: "retry",
+      reason: `live-job attribution unavailable for ${worktreePath} — not discarding the dirty base`,
+    };
+  }
+  const lockPath = await commitWorkLockPath(worktreePath, run);
+  const lock = await acquireLock(lockPath);
+  if (lock === null) {
+    return {
+      kind: "retry",
+      reason: `could not acquire the commit-work lock for ${worktreePath} within the deadline (a concurrent holder)`,
+    };
+  }
+  try {
+    // `--really-refresh` exits NON-ZERO when paths need updating (i.e. the tree is
+    // dirty — expected here), so only a SIGKILL timeout / spawn failure is a stall.
+    const refreshed = await run(["update-index", "-q", "--really-refresh"], {
+      cwd: worktreePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (
+      refreshed.code === GIT_SPAWN_TIMEOUT_CODE ||
+      refreshed.code === GIT_SPAWN_FAILED_CODE
+    ) {
+      return {
+        kind: "retry",
+        reason: `git update-index --really-refresh stalled for ${worktreePath} (exit ${refreshed.code})`,
+      };
+    }
+    const probe = await classifyPremergeRedundancy(
+      worktreePath,
+      incomingBranch,
+      run,
+    );
+    if (probe.kind !== "redundant") {
+      return { kind: "retry", reason: probe.reason };
+    }
+    const attributed = probe.paths.filter((p) => liveAttributedDirty.has(p));
+    if (attributed.length > 0) {
+      return {
+        kind: "retry",
+        reason: `dirty base path(s) attributed to a live job: ${attributed.join(", ")}`,
+      };
+    }
+    if (probe.paths.length > 0) {
+      const restore = await run(
+        ["restore", "--source=HEAD", "--worktree", "--", ...probe.paths],
+        { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (restore.code !== 0) {
+        return {
+          kind: "retry",
+          reason: `git restore failed for ${worktreePath} (exit ${restore.code})`,
+        };
+      }
+    }
+    const reready = await mergeReadiness(
+      worktreePath,
+      expectedBranch,
+      run,
+      incomingBranch,
+    );
+    if (reready.kind !== "ready") {
+      return {
+        kind: "retry",
+        reason: `base ${worktreePath} still not ready after restore (${reready.kind})`,
+      };
+    }
+    return { kind: "ready" };
+  } finally {
+    lock.release();
+  }
 }
 
 /**

@@ -49,8 +49,11 @@ describe("buildSuitePlan", () => {
 
   test("slow mode injects KEEPER_RUN_SLOW into root and swaps plan to test:slow", () => {
     const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
-    const root = plan.find((s) => s.name === "root")!;
-    const planSuite = plan.find((s) => s.name === "plan")!;
+    const root = plan.find((s) => s.name === "root");
+    const planSuite = plan.find((s) => s.name === "plan");
+    if (root === undefined || planSuite === undefined) {
+      throw new Error("expected root + plan suites in the plan");
+    }
 
     expect(root.envPatch.KEEPER_RUN_SLOW).toBe("1");
     expect(root.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
@@ -63,11 +66,14 @@ describe("buildSuitePlan", () => {
   test("slow mode leaves python and prompt scrubbed (no slow tier)", () => {
     const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
     for (const name of ["python", "prompt"]) {
-      const spec = plan.find((s) => s.name === name)!;
+      const spec = plan.find((s) => s.name === name);
+      if (spec === undefined) {
+        throw new Error(`expected ${name} suite in the plan`);
+      }
       expect(spec.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
       expect(spec.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
     }
-    expect(plan.find((s) => s.name === "prompt")!.cmd).toEqual([
+    expect(plan.find((s) => s.name === "prompt")?.cmd).toEqual([
       "bun",
       "run",
       "test",
@@ -82,13 +88,13 @@ describe("buildSuitePlan", () => {
 
   test("slow root gets a 600s floor while other suites keep the base budget", () => {
     const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
-    expect(plan.find((s) => s.name === "root")!.timeoutMs).toBe(600_000);
-    expect(plan.find((s) => s.name === "plan")!.timeoutMs).toBe(T);
+    expect(plan.find((s) => s.name === "root")?.timeoutMs).toBe(600_000);
+    expect(plan.find((s) => s.name === "plan")?.timeoutMs).toBe(T);
   });
 
   test("slow root floor never shrinks a larger configured budget", () => {
     const plan = buildSuitePlan("slow", { suiteTimeoutMs: 900_000 });
-    expect(plan.find((s) => s.name === "root")!.timeoutMs).toBe(900_000);
+    expect(plan.find((s) => s.name === "root")?.timeoutMs).toBe(900_000);
   });
 
   test("only the python suite carries the zero-tests scan", () => {
@@ -100,7 +106,10 @@ describe("buildSuitePlan", () => {
   test("python runs unittest discover against tests/ (cwd repo root)", () => {
     const python = buildSuitePlan("fast", { suiteTimeoutMs: T }).find(
       (s) => s.name === "python",
-    )!;
+    );
+    if (python === undefined) {
+      throw new Error("expected python suite in the plan");
+    }
     expect(python.cmd).toEqual([
       "python3",
       "-m",

@@ -72,15 +72,20 @@ import {
 } from "./db";
 import {
   assertNever,
+  isLaneWedgeDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
+  isWorktreeLanePremergeReason,
+  LANE_WEDGE_DISTRESS_ID_PREFIX,
+  LANE_WEDGE_DISTRESS_REASON,
   routeDispatchFailure,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_LANE_PREMERGE_REASON_PREFIX,
 } from "./dispatch-failure-key";
 import {
   createTmuxPaneOps,
@@ -100,6 +105,7 @@ import {
   epicHasActiveResolver,
   FINALIZER_GUARD_S,
   isFinalizerVerb,
+  isStoppedJobLive,
   KEEPER_ROOT,
   type LaneMergedEntry,
   type PlannedLaunch,
@@ -124,7 +130,7 @@ import {
   worktreeRecoverDispatchId,
 } from "./reconcile-core";
 import { runQuery } from "./server-worker";
-import type { Epic } from "./types";
+import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import { defaultShadowingWorkProbe, resolveWorkerCell } from "./worker-cell";
 import {
@@ -147,6 +153,7 @@ import {
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
+  losslessPremergeClean as gitLosslessPremergeClean,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
@@ -166,10 +173,15 @@ import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 // `from "./autopilot-worker"` import (tests, daemon) keeps resolving. The snapshot
 // loader routes recover/finalize failure rows through `routeDispatchFailure`.
 export {
+  isLaneWedgeDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
+  isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
+  LANE_WEDGE_DISTRESS_ID_PREFIX,
+  LANE_WEDGE_DISTRESS_REASON,
+  LANE_WEDGE_DISTRESS_VERB,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_VERB,
@@ -430,6 +442,56 @@ export function recoverFailuresToClear(
     }
   }
   return cleared;
+}
+
+/**
+ * POSITIVE-EVIDENCE verb-agnostic reason-scoped auto-clear for the fan-in LANE
+ * pre-merge `work::<taskId>` rows — the exact discipline {@link
+ * recoverFailuresToClear} enforces, keyed by the lane worktree PATH (a row's `dir`)
+ * instead of a recover dispatch id. Given the OPEN lane-failure rows
+ * (`snapshot.laneFailures`, collected off the {@link
+ * WORKTREE_LANE_PREMERGE_REASON_PREFIX} reason so the scope stays disjoint from a
+ * genuine merge conflict on the same key), this cycle's `wedged` lane paths (still
+ * not-mergeable), and this cycle's `resolved` lane paths (ready or torn down),
+ * return the `(verb, id)`s to `DispatchCleared`. A row clears ONLY when its normalized
+ * `dir` is in `resolved` AND NOT in `wedged` — a cycle with no observation for it
+ * RETAINS the row (absence is never resolution), so a paused / un-swept cycle never
+ * dismisses a live block. Bypasses the router's `verb==="work"→work-task`
+ * short-circuit entirely (it clears by REASON+path, never by route), so a lane row is
+ * self-clearing without touching {@link routeDispatchFailure}. Pure — a function of
+ * the three inputs, no git, no clock.
+ */
+export function laneFailuresToClear(
+  openLaneFailures: readonly { verb: Verb; id: string; dir: string }[],
+  wedgedLanePaths: ReadonlySet<string>,
+  resolvedLanePaths: ReadonlySet<string>,
+): { verb: Verb; id: string }[] {
+  const cleared: { verb: Verb; id: string }[] = [];
+  for (const row of openLaneFailures) {
+    const key = normalizeLanePath(row.dir);
+    if (resolvedLanePaths.has(key) && !wedgedLanePaths.has(key)) {
+      cleared.push({ verb: row.verb, id: row.id });
+    }
+  }
+  return cleared;
+}
+
+/**
+ * Normalize a lane worktree path to the key the lane-wedge tracker + the reason-scoped
+ * clear match on: realpath (so the macOS `/tmp`→`/private/tmp` + `/var`→`/private/var`
+ * symlinks collapse to ONE form on both the provision-mint side and the recover-probe
+ * side), then strip a trailing slash. A realpath failure (a torn-down lane) keeps the
+ * raw input, still trailing-slash-stripped. Mirrors {@link
+ * normalizeWorktreeAttributionKey} so the two lane keyings never drift.
+ */
+function normalizeLanePath(p: string): string {
+  let resolved = p;
+  try {
+    resolved = realpathSync.native(p);
+  } catch {
+    // A torn-down lane that no longer resolves — key on the raw path.
+  }
+  return stripTrailingSlashPath(resolved);
 }
 
 /**
@@ -735,12 +797,38 @@ export interface WorktreeDriver {
    * Provision the lane for one launch: ensure the worktree exists (lazily, off
    * the parent lane's committed tip), run the assignment's fan-in pre-merges in
    * order, then assert the worktree HEAD equals the derived branch. Returns the
-   * resolved worktree path on success (the producer overrides the launch cwd with
-   * it) or a `{ failed: <reason> }` the producer mints as a sticky DispatchFailed.
+   * resolved worktree path on success (the producer overrides the launch cwd with it).
+   *
+   * A failure carries a `reason` and, for a fan-in pre-merge failure, the base lane
+   * `dir` (so the producer keys the row on the lane path the recover pass matches on):
+   *  - `{ ok: false, reason }` — a GENUINE terminal block (a fan-in content merge
+   *    conflict, an unregistered/HEAD-mismatch worktree). The producer mints a STICKY
+   *    `DispatchFailed` a human clears with `retry_dispatch`.
+   *  - `{ ok: false, reason, dir }` with a {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX}
+   *    reason — a not-losslessly-mergeable base lane (dirty-but-not-cleanable /
+   *    off-branch / mid-merge / would-clobber / lock-timeout). NEVER a blind merge: the
+   *    producer mints a SELF-CLEARING `work::<taskId>` row the recover pass's
+   *    verb-agnostic reason-scoped level-clear drops once the base is ready (and a
+   *    persistent one escalates to a per-lane distress) — never the dead `work-task`
+   *    dead end. Consumes NO slot/cooldown (the mint precedes them).
+   *  - `{ ok: false, retry: true, reason }` — a transient the producer skips minting a
+   *    sticky for (used by finalize/close-sink; the pre-merge arm no longer emits it).
+   *
+   * Before each fan-in merge the driver probes {@link mergeReadiness}: a `ready` base
+   * merges unchanged; a DIRTY base is losslessly cleaned ONLY when the dirt is a
+   * provably-redundant leak of the incoming rib AND none of it is in
+   * `liveAttributedDirty` (the reconciler-supplied set of repo-relative paths a LIVE
+   * job holds an undischarged mutation for in this base worktree; `null` ⇒ the
+   * attribution read failed ⇒ do-not-discard). The driver never reads attribution
+   * itself.
    */
   provision(
     info: WorktreeLaunchInfo,
-  ): Promise<{ ok: true; cwd: string } | { ok: false; reason: string }>;
+    liveAttributedDirty: ReadonlySet<string> | null,
+  ): Promise<
+    | { ok: true; cwd: string }
+    | { ok: false; reason: string; retry?: boolean; dir?: string }
+  >;
   /**
    * After the epic closer reaches done: merge the epic base branch into the repo's
    * resolved default branch (sequential pairwise, pushed once), then tear the lane
@@ -1193,6 +1281,130 @@ export function createSharedCheckoutDirtyTracker(
       for (const dir of openDistressDirs) {
         if (!dirty.has(dir)) {
           decision.clear.push({ id: sharedDirtyDistressId(dir), dir });
+        }
+      }
+      return decision;
+    },
+  };
+}
+
+/**
+ * Grace window (producer-`ts` seconds) a fan-in base LANE worktree may stay
+ * not-losslessly-mergeable (a persistent divergent-dirty / off-branch / would-clobber
+ * base) before the recover pass escalates the wedge into a visible per-lane distress
+ * row. The per-cycle self-clearing `work::<taskId>` row fires the FIRST dispatch
+ * attempt regardless; the distress is the sustained-wedge layer ON TOP. ~5min — long
+ * enough that a transient not-ready base settles inside the window, short enough that
+ * a genuine wedge (a base a human must hand-resolve) surfaces fast. Injectable so the
+ * fast tier drives the grace-crossing without a real clock. Kept a DISTINCT const
+ * from the shared-checkout grace so the two can diverge.
+ */
+export const LANE_WEDGE_GRACE_SEC = 5 * 60;
+
+/**
+ * The `dispatch_failures` id a per-lane wedge distress row keys on —
+ * `worktree-lane-wedge:<repoDirHash(lanePath)>`. Reuses the base36 {@link
+ * repoDirHash} of the LANE worktree path so the mint and the level-clear target the
+ * SAME row across cycles, and two wedged lanes get DISTINCT rows. The composite
+ * `daemon::worktree-lane-wedge:<hash>` deliberately fails the `retry_dispatch` wire
+ * validator (the synthetic `daemon` verb), so only the recover-pass level-trigger
+ * clears it. Keyed on the lane path — a DISTINCT surface from {@link
+ * sharedWedgeDistressId} (which hashes a default-branch checkout dir).
+ */
+export function laneWedgeDistressId(lanePath: string): string {
+  return `${LANE_WEDGE_DISTRESS_ID_PREFIX}${repoDirHash(
+    normalizeLanePath(lanePath),
+  )}`;
+}
+
+/** One wedged base LANE observation the recover pass hands the tracker. */
+export interface LaneWedgeObservation {
+  /** The lane worktree path — the per-lane distress surface key. */
+  path: string;
+  /** The recover-pass reason (mint attribution). */
+  reason: string;
+  /** `true` for a hard `abort-failed` mid-merge lane → mint distress IMMEDIATELY
+   *  (not graced), matching `finalizeEpic`'s precedent; `false` → graced. */
+  immediate: boolean;
+}
+
+/**
+ * Per-LANE grace tracker for the fan-in base-lane wedge distress — the SIBLING of
+ * {@link createSharedCheckoutWedgeTracker} on its own id/reason/surface (keyed by
+ * lane worktree PATH, never a default-branch checkout dir), so the shared-checkout
+ * escalation stays byte-untouched and the two distress surfaces never share a row.
+ * Identical contract: pure of keeper.db / IO / the wall clock (the producer `ts` is
+ * the only clock); in-memory grace + per-path minted-latch for an exactly-once mint
+ * per wedge episode; projection-driven level-clear robust across a restart. A lane
+ * marked `immediate` (a hard `abort-failed`) skips the grace and mints AT ONCE.
+ * Reuses the verb-neutral {@link SharedWedgeDistressAction} / {@link
+ * SharedWedgeDistressDecision} shapes.
+ */
+export interface LaneWedgeTracker {
+  step(input: {
+    /** This cycle's wedged base lanes, keyed by normalized lane PATH. */
+    wedged: ReadonlyMap<string, LaneWedgeObservation>;
+    /** Lane PATHS with an OPEN distress row (from the projection). */
+    openDistressDirs: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+/**
+ * Build a {@link LaneWedgeTracker}. `graceSec` is injectable for the cadence test. A
+ * near-verbatim sibling of {@link createSharedCheckoutWedgeTracker} keyed on {@link
+ * laneWedgeDistressId} + the lane path, with the extra `immediate` short-circuit for
+ * an `abort-failed` hard wedge.
+ */
+export function createLaneWedgeTracker(
+  graceSec: number = LANE_WEDGE_GRACE_SEC,
+): LaneWedgeTracker {
+  // lanePath → the first cycle-ts it was seen wedged + whether we have minted the
+  // distress for THIS continuous wedge episode. In-worker memory only.
+  const firstWedged = new Map<string, { sinceSec: number; minted: boolean }>();
+  const graceMin = Math.round(graceSec / 60);
+  return {
+    step({ wedged, openDistressDirs, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: track each wedged lane's grace clock; cross the watermark once.
+      // An `immediate` (abort-failed) lane mints at once, regardless of grace.
+      for (const [path, obs] of wedged) {
+        let entry = firstWedged.get(path);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstWedged.set(path, entry);
+        }
+        const graced = nowSec - entry.sinceSec >= graceSec;
+        if (!entry.minted && (obs.immediate || graced)) {
+          entry.minted = true;
+          decision.mint.push({
+            id: laneWedgeDistressId(path),
+            dir: path,
+            reason: obs.immediate
+              ? `${LANE_WEDGE_DISTRESS_REASON}: the fan-in base lane ${path} is ` +
+                `hard-wedged — git could not clear it and the dependent task cannot ` +
+                `merge until it is hand-resolved (git merge --abort or resolve + ` +
+                `commit in that worktree). Last recover verdict: ${obs.reason}`
+              : `${LANE_WEDGE_DISTRESS_REASON}: the fan-in base lane ${path} has ` +
+                `stayed not-losslessly-cleanable past the ${graceMin}min recovery ` +
+                `grace — the dependent task's fan-in keeps deferring and will not ` +
+                `self-heal until the base is hand-cleaned (commit, discard, or ` +
+                `switch it back to its lane branch). Last recover verdict: ${obs.reason}`,
+          });
+        }
+      }
+      // Re-arm any lane no longer wedged this cycle so a future re-wedge waits the
+      // full grace again (the in-memory episode is closed).
+      for (const path of firstWedged.keys()) {
+        if (!wedged.has(path)) {
+          firstWedged.delete(path);
+        }
+      }
+      // CLEAR layer: level-trigger off the durable open-distress set — any open row
+      // whose lane is ready/gone this cycle clears (robust across a restart).
+      for (const dir of openDistressDirs) {
+        if (!wedged.has(dir)) {
+          decision.clear.push({ id: laneWedgeDistressId(dir), dir });
         }
       }
       return decision;
@@ -2206,6 +2418,96 @@ export async function confirmRunning(
   return "indoubt";
 }
 
+/** Shared empty set — the `liveAttrFor` fallback when a base worktree has no live-job
+ *  attribution, so a present map missing the key allocates nothing per launch. */
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Build the producer LIVE-JOB dirty-attribution map the fan-in pre-merge clean reads
+ * — `Map<laneWorktreePath, Set<repoRelPath>>` — so a running worker's uncommitted work
+ * is NEVER discarded as a "redundant leak". Reads undischarged `file_attributions`
+ * rows (`last_commit_at IS NULL OR last_commit_at < last_mutation_at`) whose
+ * `session_id` (== a job's `job_id`) belongs to a LIVE job — `working`, or `stopped`
+ * with a live backend pane (the SAME {@link isStoppedJobLive} rule the occupancy gate
+ * uses) — grouped by `project_dir` (the git toplevel a linked worktree resolves to ==
+ * the lane path), realpath + trailing-slash normalized to match the lookup key.
+ * Returns `null` on ANY read failure — the caller threads that as do-not-discard
+ * (assume live-attributed). A producer read (never a fold); the no-live-job fast path
+ * skips the SQL entirely.
+ */
+function computeLiveAttributedDirtyByWorktree(
+  db: Parameters<typeof runQuery>[0],
+  jobs: Map<string, Job>,
+  livePaneIds: ReadonlySet<string> | null,
+): Map<string, ReadonlySet<string>> | null {
+  try {
+    const liveSessions = new Set<string>();
+    for (const job of jobs.values()) {
+      const live =
+        job.state === "working" ||
+        (job.state === "stopped" && isStoppedJobLive(job, livePaneIds));
+      if (live) {
+        liveSessions.add(job.job_id);
+      }
+    }
+    if (liveSessions.size === 0) {
+      return new Map();
+    }
+    const rows = db
+      .query(
+        "SELECT project_dir, session_id, file_path FROM file_attributions " +
+          "WHERE last_commit_at IS NULL OR last_commit_at < last_mutation_at",
+      )
+      .all() as Array<{
+      project_dir: string;
+      session_id: string;
+      file_path: string;
+    }>;
+    const byWorktree = new Map<string, Set<string>>();
+    for (const r of rows) {
+      if (
+        typeof r.project_dir !== "string" ||
+        typeof r.session_id !== "string" ||
+        typeof r.file_path !== "string" ||
+        !liveSessions.has(r.session_id)
+      ) {
+        continue;
+      }
+      const key = normalizeWorktreeAttributionKey(r.project_dir);
+      let set = byWorktree.get(key);
+      if (set === undefined) {
+        set = new Set<string>();
+        byWorktree.set(key, set);
+      }
+      set.add(r.file_path);
+    }
+    return byWorktree;
+  } catch (err) {
+    console.error(
+      "[autopilot-worker] live-attributed dirty read threw (do-not-discard):",
+      err,
+    );
+    return null;
+  }
+}
+
+/**
+ * Normalize a worktree path to the pre-merge attribution map's key: realpath (so the
+ * macOS `/tmp`→`/private/tmp` + `/var`→`/private/var` symlinks collapse to the same
+ * form the lane-path lookup in `runReconcileCycle` produces), then strip a trailing
+ * slash. A realpath failure (a path already torn down) keeps the raw input, still
+ * trailing-slash-stripped.
+ */
+function normalizeWorktreeAttributionKey(p: string): string {
+  let resolved = p;
+  try {
+    resolved = realpathSync.native(p);
+  } catch {
+    // A torn-down worktree that no longer resolves — key on the raw path.
+  }
+  return stripTrailingSlashPath(resolved);
+}
+
 /**
  * Run one reconcile + dispatch cycle. Pure-glue — chains the decision's launches
  * one at a time through `confirmRunning` (the one-at-a-time stagger). Each launch
@@ -2219,6 +2521,14 @@ export async function runReconcileCycle(
   shell: string,
   signal: AbortSignal,
   deps: ConfirmRunningDeps,
+  // The producer LIVE-JOB dirty attribution from `loadReconcileSnapshot`, keyed by
+  // lane worktree path — threaded into every `provision` so the fan-in pre-merge
+  // clean never discards dirt a running worker owns. `null` (or omitted) = the read
+  // failed / no info → every base is treated do-not-discard.
+  liveAttributedDirtyByWorktree: ReadonlyMap<
+    string,
+    ReadonlySet<string>
+  > | null = null,
 ): Promise<void> {
   // Realpath-normalize the worktree lane before it rides the launch as the
   // KEEPER_PLAN_WORKTREE env (macOS /var→/private/var) — a PRODUCER fs read,
@@ -2233,6 +2543,20 @@ export async function runReconcileCycle(
         return p;
       }
     });
+  // The live-attributed dirty set for a launch's base lane worktree, keyed the SAME
+  // way the snapshot built the map (realpath + trailing-slash normalized). `null` ⇒
+  // do-not-discard (an OFF-mode launch with no geometry, or a failed attribution
+  // read); a present map missing the key ⇒ the empty set (nothing attributed there,
+  // so a provably-redundant leak is cleanable).
+  const liveAttrFor = (
+    info: WorktreeLaunchInfo | undefined,
+  ): ReadonlySet<string> | null => {
+    if (info === undefined || liveAttributedDirtyByWorktree === null) {
+      return null;
+    }
+    const key = stripTrailingSlashPath(realpath(info.assignment.worktreePath));
+    return liveAttributedDirtyByWorktree.get(key) ?? EMPTY_STRING_SET;
+  };
   // Scan-dir shadow probe — resolved once, memoized across the loop (the scan dirs
   // are cycle-invariant). `undefined` = not yet probed; a first `work`-cell launch
   // triggers the single on-disk scan, so a cycle with no cell launches never reads
@@ -2401,8 +2725,23 @@ export async function runReconcileCycle(
     // path so a serial/OFF launch leaves it undefined and stays byte-identical.
     let worktreeBranch: string | undefined;
     if (deps.worktree !== undefined) {
-      const wt = await runWorktreeProducerStep(plan, launchCwd, deps.worktree);
+      const wt = await runWorktreeProducerStep(
+        plan,
+        launchCwd,
+        deps.worktree,
+        liveAttrFor(plan.worktree),
+      );
       if (!wt.ok) {
+        if (wt.retry === true) {
+          // A transient not-ready base lane the fan-in pre-merge would blind-conflict
+          // on — retry-skip: mint NO sticky, and because this `continue` PRECEDES the
+          // inFlight / cooldown / pending-dispatch mint below, consume NO slot,
+          // cooldown, or pending row. Log so the silent skip stays diagnosable.
+          console.error(
+            `[autopilot-worker] provision ${plan.verb}::${plan.id}: ${wt.reason}`,
+          );
+          continue;
+        }
         deps.emitDispatchFailed({
           verb: plan.verb,
           id: plan.id,
@@ -2559,16 +2898,30 @@ export async function runReconcileCycle(
       if (signal.aborted) {
         return;
       }
-      const provisioned = await deps.worktree.provision(sink);
+      const provisioned = await deps.worktree.provision(
+        sink,
+        liveAttrFor(sink),
+      );
+      // A provision failure — genuine OR a transient retry-skip — ADDS to
+      // `provisionFailed` below so this group's finalize is skipped either way (its
+      // base is not assembled). Only a GENUINE block mints the sticky `close::<epic>`.
       if (!provisioned.ok) {
         provisionFailed.add(`${closeKeyEpicId(sink)} ${sink.repoDir}`);
-        deps.emitDispatchFailed({
-          verb: "close",
-          id: closeKeyEpicId(sink),
-          reason: provisioned.reason,
-          dir: sink.repoDir,
-          ts: deps.now(),
-        });
+        if (provisioned.retry === true) {
+          // A transient not-ready base lane — retry-skip: mint NO sticky
+          // `close::<epic>` row; the next cycle retries once the base settles.
+          console.error(
+            `[autopilot-worker] provision close::${closeKeyEpicId(sink)} (${sink.repoDir}): ${provisioned.reason}`,
+          );
+        } else {
+          deps.emitDispatchFailed({
+            verb: "close",
+            id: closeKeyEpicId(sink),
+            reason: provisioned.reason,
+            dir: sink.repoDir,
+            ts: deps.now(),
+          });
+        }
       }
     }
     // Track the per-repo finalize keys that finalized CLEAN this cycle so the
@@ -2655,13 +3008,28 @@ async function runWorktreeProducerStep(
   plan: PlannedLaunch,
   launchCwd: string,
   driver: WorktreeDriver,
+  liveAttributedDirty: ReadonlySet<string> | null,
 ): Promise<
-  { ok: true; cwd: string } | { ok: false; reason: string; dir: string }
+  | { ok: true; cwd: string }
+  | { ok: false; reason: string; dir: string; retry?: boolean }
 > {
   if (plan.worktree !== undefined) {
-    const provisioned = await driver.provision(plan.worktree);
+    const provisioned = await driver.provision(
+      plan.worktree,
+      liveAttributedDirty,
+    );
     if (!provisioned.ok) {
-      return { ok: false, reason: provisioned.reason, dir: launchCwd };
+      // `retry` propagates a transient finalize/close-sink retry-skip so the caller
+      // mints NO sticky; a genuine block carries no `retry`. `dir` propagates the LANE
+      // worktree path for a fan-in pre-merge failure (a `worktree-lane-premerge` row),
+      // so the minted `work::<taskId>` row keys its `dir` on the lane path the recover
+      // pass's reason-scoped level-clear matches on; else the launch cwd.
+      return {
+        ok: false,
+        reason: provisioned.reason,
+        dir: provisioned.dir ?? launchCwd,
+        retry: provisioned.retry,
+      };
     }
     return { ok: true, cwd: provisioned.cwd };
   }
@@ -2690,7 +3058,7 @@ export function createWorktreeDriver(
   run: WorktreeGitRunner = gitExec,
 ): WorktreeDriver {
   return {
-    async provision(info) {
+    async provision(info, liveAttributedDirty) {
       const { assignment, repoDir, parentBranch } = info;
       const { branch, worktreePath, preMerges } = assignment;
       try {
@@ -2710,6 +3078,76 @@ export function createWorktreeDriver(
         // a `missing-source` phantom lane (a branch never created because its task's
         // work landed on the default branch) is a lossless no-op we skip.
         for (const source of preMerges) {
+          // Probe the base worktree BEFORE merging the rib in (as finalize/recover
+          // already do), but ONLY for a source that will ACTUALLY merge — a phantom
+          // (unresolvable) or already-merged (ancestor) source folds nothing, so
+          // probing the base for it would both add cost AND, on a dirty base, wrongly
+          // retry-skip against a no-op. These guards mirror gitMergeBranchInto's own
+          // (idempotent — it re-runs them); a probe TIMEOUT falls through to it, which
+          // surfaces the transient degrade. `resolves &&` short-circuits the ancestry
+          // probe for a phantom so it stays a single-read cheap skip.
+          const srcRef = await run(
+            [
+              "rev-parse",
+              "--quiet",
+              "--verify",
+              "--end-of-options",
+              `refs/heads/${source}^{commit}`,
+            ],
+            { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+          );
+          const resolves = srcRef.code === 0;
+          const alreadyMerged =
+            resolves &&
+            (
+              await run(["merge-base", "--is-ancestor", source, "HEAD"], {
+                cwd: worktreePath,
+                timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+              })
+            ).code === 0;
+          if (resolves && !alreadyMerged) {
+            // A `ready` base merges unchanged (byte-identical clean path). A DIRTY base
+            // is LOSSLESSLY cleaned ONLY when its dirt is a provably-redundant leak of
+            // THIS rib and none is attributed to a live job — else every not-ready
+            // state degrades to a SELF-CLEARING (non-sticky) `worktree-lane-premerge`
+            // row so a dirty base never blind-conflicts (the wedge this arm fixes) yet
+            // is never the dead no-clear `work-task` dead end: the recover pass's
+            // verb-agnostic reason-scoped level-clear clears it by lane path once the
+            // base is ready, and a persistent one escalates to a per-lane distress.
+            // Genuine-conflict escalation of the merge ITSELF stays today's sticky.
+            const ready = await gitMergeReadiness(
+              worktreePath,
+              branch,
+              run,
+              source,
+            );
+            if (ready.kind === "dirty") {
+              const cleaned = await gitLosslessPremergeClean(
+                worktreePath,
+                branch,
+                source,
+                liveAttributedDirty,
+                run,
+              );
+              if (cleaned.kind === "retry") {
+                return {
+                  ok: false,
+                  dir: worktreePath,
+                  reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: deferring the fan-in merge of ${source} into ${branch} — ${cleaned.reason}`,
+                };
+              }
+              // cleaned.kind === "ready" → the redundant leak was restored to HEAD; the
+              // merge below re-applies exactly that content, a true no-op on it.
+            } else if (ready.kind !== "ready") {
+              // A not-ready base lane (off-branch / mid-merge / would-clobber) the merge
+              // would abort on — a self-clearing lane row, NEVER a blind merge.
+              return {
+                ok: false,
+                dir: worktreePath,
+                reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the fan-in`,
+              };
+            }
+          }
           const merge: MergeResult = await gitMergeBranchInto(
             worktreePath,
             source,
@@ -3526,6 +3964,12 @@ export async function recoverWorktrees(
   // nothing to keeper.db — all three funnel through the emit deps to main.
   const escalations: WorktreeRecoveryEscalation[] = [];
   const resolved: WorktreeRecoveryResolution[] = [];
+  // Per-cycle fan-in LANE base-readiness observations (keyed by lane path) — the
+  // evidence the lane-wedge grace tracker + the verb-agnostic reason-scoped clear
+  // consume. Filled by the per-repo lane-readiness probe below (after the mutating
+  // passes settle the tree) and by pass-3's teardown (a torn-down lane resolves).
+  const laneWedged: { path: string; reason: string; immediate: boolean }[] = [];
+  const laneResolved: string[] = [];
   // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
   // once. A repo whose main worktree is the same path is collapsed by the set.
   const seen = new Set<string>();
@@ -3573,6 +4017,10 @@ export async function recoverWorktrees(
       continue;
     }
     let prunedThisRepo = false;
+    // Lane worktree paths pass-3 tears down this repo — the lane pre-merge readiness
+    // probe below SKIPS them (they are already recorded `resolved`), so a torn-down
+    // lane is never re-probed on a vanished path and mis-classified wedged.
+    const prunedLanePaths = new Set<string>();
     for (const entry of entries) {
       if (entry.bare || entry.branch === null) {
         continue; // a bare/detached entry carries no lane merge to recover
@@ -3967,6 +4415,12 @@ export async function recoverWorktrees(
             });
             continue;
           }
+          // A torn-down lane is a POSITIVE resolution for any open lane pre-merge row
+          // / distress keyed on it — the wedge condition is gone, so the self-clearing
+          // `work::<taskId>` row clears rather than stranding on a lane that no longer
+          // exists (the probe below skips a pruned path, never re-observing it wedged).
+          laneResolved.push(wt);
+          prunedLanePaths.add(wt);
           // Removed clean (THIS lane's own result): sweep a residue-only `.claude`
           // husk dir git may have left behind. Swallow-and-log — a husk-prune throw
           // must NEVER mint a recover failure row (teardown already succeeded).
@@ -3988,8 +4442,131 @@ export async function recoverWorktrees(
         });
       }
     }
+
+    // --- Lane pre-merge base-readiness probe (fn-1123.2). --------------------
+    // AFTER the mutating passes settle the tree (pass-1 aborted keeper-owned lane
+    // mid-merges; pass-3 tore orphans down), re-classify each SURVIVING keeper lane's
+    // base readiness so a persistent not-losslessly-mergeable base surfaces + a
+    // resolved one clears — the level-clear that rides the recover pass rather than the
+    // next dispatch, so a wedge self-clears even while the owning task is cap-gated /
+    // cooled / paused. Reuses pass-1's `entries` (no extra list spawn) and skips the
+    // lanes pass-3 tore down. Wrapped so a producer git error never wedges the cycle.
+    try {
+      const probe = await probeLaneBaseReadiness(
+        entries,
+        prunedLanePaths,
+        run,
+        hasActiveResolver,
+      );
+      for (const w of probe.wedged) {
+        laneWedged.push(w);
+      }
+      for (const r of probe.resolved) {
+        laneResolved.push(r);
+      }
+    } catch (err) {
+      console.error(
+        `[autopilot-worker] lane pre-merge readiness probe threw for ${repo} (non-fatal): ${errMsg(err)}`,
+      );
+    }
   }
-  return { failures, escalations, resolved };
+  return { failures, escalations, resolved, laneWedged, laneResolved };
+}
+
+/**
+ * Probe every SURVIVING keeper lane worktree for fan-in base readiness, returning
+ * per-lane `wedged` (still not losslessly-mergeable) + `resolved` (ready) observations
+ * keyed by lane PATH — the recover-pass feed for the lane-wedge grace tracker + the
+ * verb-agnostic reason-scoped clear. Reuses pass-1's already-fetched `entries` (no
+ * second `git worktree list` spawn — the readiness of each lane is re-read LIVE per
+ * path, so a lane pass-1 aborted reads clean here) and SKIPS `prunedLanePaths` (a
+ * pass-3 teardown already recorded them `resolved`). Producer-only live-git READS,
+ * never a fold; NEVER throws past here (a spawn error DEFERS the repo's lanes).
+ *
+ * Classification per keeper lane (an active-resolver lane is skipped — its MERGE_HEAD
+ * is the resolver's deliberate in-progress merge, not a wedge):
+ *  - `mid-merge` surviving pass-1's abort → `immediate` wedge (a hard `abort-failed`:
+ *    git could not clear it), mints distress AT ONCE (matching finalize's precedent).
+ *  - tracked-`dirty` / `off-branch` → graced wedge (a base a human must hand-resolve).
+ *  - clean+on-branch but carrying UNTRACKED files → graced wedge: the would-clobber
+ *    class {@link mergeReadiness} ignores (`--untracked-files=no`), probed here so a
+ *    would-clobber lane row is CLEARED only once the untracked files are gone, never
+ *    flap-cleared against a source-agnostic "ready".
+ *  - fully clean + on-branch + no untracked → `resolved`.
+ */
+async function probeLaneBaseReadiness(
+  entries: readonly WorktreeEntry[],
+  prunedLanePaths: ReadonlySet<string>,
+  run: WorktreeGitRunner,
+  hasActiveResolver: (epicId: string) => boolean,
+): Promise<{
+  wedged: { path: string; reason: string; immediate: boolean }[];
+  resolved: string[];
+}> {
+  const wedged: { path: string; reason: string; immediate: boolean }[] = [];
+  const resolved: string[] = [];
+  for (const entry of entries) {
+    if (
+      entry.bare ||
+      entry.branch === null ||
+      !isKeeperLaneEntry(entry) ||
+      prunedLanePaths.has(entry.path)
+    ) {
+      continue;
+    }
+    const laneEpicId = epicIdFromKeeperLaneEntry(entry);
+    if (laneEpicId !== null && hasActiveResolver(laneEpicId)) {
+      continue; // a resolver's deliberate in-progress merge is never a wedge
+    }
+    const ready = await gitMergeReadiness(entry.path, entry.branch, run);
+    if (ready.kind === "ready") {
+      // Clean tracked tree on-branch — but a lingering UNTRACKED file is the
+      // would-clobber hazard `mergeReadiness` skips. One extra untracked probe so a
+      // would-clobber lane stays wedged until it is cleaned (no source needed here).
+      const untracked = await run(
+        ["status", "--porcelain", "--untracked-files=all"],
+        { cwd: entry.path, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      const hasUntracked =
+        untracked.code === 0 &&
+        untracked.stdout.split("\n").some((l) => l.startsWith("?? "));
+      if (untracked.code === 0 && !hasUntracked) {
+        resolved.push(entry.path);
+      } else if (hasUntracked) {
+        wedged.push({
+          path: entry.path,
+          reason: `would-clobber: ${entry.path} carries untracked files a fan-in merge could overwrite`,
+          immediate: false,
+        });
+      }
+      // A non-zero untracked probe (code !== 0) DEFERS this lane — neither wedged nor
+      // resolved (absence retains any open row), never a false clear.
+      continue;
+    }
+    if (ready.kind === "mid-merge") {
+      // Survived pass-1's guarded abort → git could not clear it: a hard wedge.
+      wedged.push({
+        path: entry.path,
+        reason: `abort-failed: ${entry.path} is mid-merge (MERGE_HEAD=${ready.mergeHead}) and could not be cleared`,
+        immediate: true,
+      });
+      continue;
+    }
+    // `dirty` / `off-branch` / `would-clobber` — a graced wedge (a base a human must
+    // hand-resolve; it settles inside the grace or escalates to distress).
+    const detail =
+      ready.kind === "dirty"
+        ? ready.detail
+        : ready.kind === "off-branch"
+          ? `HEAD is ${ready.head}`
+          : `would clobber ${ready.paths.join(", ")}`;
+    wedged.push({
+      path: entry.path,
+      reason: `${ready.kind}: ${entry.path} — ${detail}`,
+      immediate: false,
+    });
+  }
+  return { wedged, resolved };
 }
 
 /**
@@ -4427,6 +5004,14 @@ export async function loadReconcileSnapshot(
   // set (each keys on its own `daemon` id prefix) so a mid-merge wedge clear and a
   // dirt clear never target each other's row.
   const sharedDirtyDistressDirs = new Set<string>();
+  // The `(verb, id, dir)` of every OPEN fan-in LANE pre-merge row (reason carries
+  // WORKTREE_LANE_PREMERGE_REASON_PREFIX), collected VERB-AGNOSTICALLY off the REASON
+  // so the recover pass's level-clear reaches a `work::<taskId>` row the typed router
+  // would short-circuit to `work-task` — cleared by lane path, never the dead arm.
+  const laneFailures: { verb: Verb; id: string; dir: string }[] = [];
+  // The lane PATHS with an OPEN per-lane wedge distress row — the level-clear set the
+  // recover pass's lane grace tracker clears against (a lane ready/gone this cycle).
+  const laneWedgeDistressDirs = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
@@ -4445,6 +5030,27 @@ export async function loadReconcileSnapshot(
         if (typeof dir === "string" && dir.length > 0) {
           sharedDirtyDistressDirs.add(dir);
         }
+      }
+      if (isLaneWedgeDistressKey(verb, id)) {
+        const dir = (row as { dir?: unknown }).dir;
+        if (typeof dir === "string" && dir.length > 0) {
+          laneWedgeDistressDirs.add(dir);
+        }
+      }
+      // A fan-in LANE pre-merge row (its REASON, verb-agnostic — the `daemon`-verb
+      // lane WEDGE distress reason is excluded by `isLaneWedgeDistressKey` above and by
+      // the distinct `worktree-lane-wedge` prefix, so only a provision `work`/`close`
+      // premerge row lands here). Fed into the reason-scoped level-clear by lane path.
+      if (
+        (verb === "work" || verb === "close") &&
+        isWorktreeLanePremergeReason(reasonStr)
+      ) {
+        const dir = (row as { dir?: unknown }).dir;
+        laneFailures.push({
+          verb,
+          id,
+          dir: typeof dir === "string" ? dir : "",
+        });
       }
       // Slot-occupancy rows (`slot-reclaimed` / `slot-occupied`, on the NATURAL key)
       // feed the slot pass's level-clear. Collected off the REASON — verb-agnostic
@@ -4658,6 +5264,15 @@ export async function loadReconcileSnapshot(
     ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
     : [];
 
+  // The producer LIVE-JOB dirty attribution the fan-in pre-merge clean consults so it
+  // never discards dirt a running worker owns — keyed by lane worktree path. A raw
+  // read of undischarged `file_attributions` filtered to LIVE sessions. `null` on ANY
+  // read failure → every base is treated do-not-discard. Gated on `worktreeMode` (an
+  // OFF cycle provisions no lanes). NEVER a fold input, NEVER read by pure `reconcile`.
+  const liveAttributedDirtyByWorktree = worktreeMode
+    ? computeLiveAttributedDirtyByWorktree(db, jobs, livePaneIds)
+    : new Map<string, ReadonlySet<string>>();
+
   // The worktrees root the pure lane geometry derives every lane path under —
   // resolved HERE (producer side) so the pure `reconcile` / `prepareWorktreeGeometry`
   // / `deriveWorktreePlan` chain reaches no `homedir()` on the verdict path (re-fold
@@ -4677,6 +5292,8 @@ export async function loadReconcileSnapshot(
     slotOccupancyFailures,
     sharedWedgeDistressDirs,
     sharedDirtyDistressDirs,
+    laneFailures,
+    laneWedgeDistressDirs,
     liveTabKeys,
     livePaneIds,
     paneCommandById,
@@ -4693,6 +5310,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     landedLaneEntries,
+    liveAttributedDirtyByWorktree,
     worktreesRoot,
   };
 }
@@ -4800,6 +5418,11 @@ function main(): void {
   // own visible distress row. In-worker memory only; a restart re-arms it. Distinct
   // from `sharedWedgeTracker` so the mid-merge and dirt rows never cross-clear.
   const sharedDirtyTracker = createSharedCheckoutDirtyTracker();
+  // Per-LANE grace tracker escalating a fan-in base lane that stays not-losslessly-
+  // mergeable past the grace (or IMMEDIATELY for a hard `abort-failed`) into its own
+  // per-lane distress row. In-worker memory only; a restart re-arms it. Distinct
+  // surface from the shared-checkout trackers so the rows never cross-clear.
+  const laneWedgeTracker = createLaneWedgeTracker();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -5204,25 +5827,30 @@ function main(): void {
               snapshot.worktreeRepoByEpicId,
               snapshot.worktreeKnownRoots ?? [],
             );
-            const { failures, escalations, resolved } =
-              await deps.worktree.recover(
-                repos,
-                // Pass-2's TRI-STATE done-probe — surfaces authoritatively-absent and
-                // inconclusive so pass-2 clears vs defers correctly (NOT the boolean
-                // `isEpicDoneById`, which collapses both to skip).
-                (epicId) => epicRecoverVerdictById(db, epicId),
-                (epicId) => epicPresentAndNotDone(db, epicId),
-                // Per-epic resolver exclusion (from the SAME snapshot the cycle
-                // reconciled): passes 1 AND 2 skip a lane whose epic has a live
-                // `resolve::<epic>` worker so its in-progress merge is never raced.
-                // A pure projection read (jobs + read-time liveness) — never a fold.
-                (epicId) =>
-                  epicHasActiveResolver(
-                    snapshot.jobs,
-                    epicId,
-                    snapshot.livePaneIds,
-                  ),
-              );
+            const {
+              failures,
+              escalations,
+              resolved,
+              laneWedged,
+              laneResolved,
+            } = await deps.worktree.recover(
+              repos,
+              // Pass-2's TRI-STATE done-probe — surfaces authoritatively-absent and
+              // inconclusive so pass-2 clears vs defers correctly (NOT the boolean
+              // `isEpicDoneById`, which collapses both to skip).
+              (epicId) => epicRecoverVerdictById(db, epicId),
+              (epicId) => epicPresentAndNotDone(db, epicId),
+              // Per-epic resolver exclusion (from the SAME snapshot the cycle
+              // reconciled): passes 1 AND 2 skip a lane whose epic has a live
+              // `resolve::<epic>` worker so its in-progress merge is never raced.
+              // A pure projection read (jobs + read-time liveness) — never a fold.
+              (epicId) =>
+                epicHasActiveResolver(
+                  snapshot.jobs,
+                  epicId,
+                  snapshot.livePaneIds,
+                ),
+            );
             for (const f of failures) {
               deps.emitDispatchFailed({
                 verb: "close",
@@ -5347,6 +5975,61 @@ function main(): void {
             for (const c of dirtyDecision.clear) {
               deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
             }
+            // Fan-in LANE pre-merge arm (fn-1123.2): the recover pass re-probed each
+            // surviving keeper lane's base readiness. Normalize both sides to the ONE
+            // lane-path key (realpath + trailing-slash strip), then:
+            //  1. verb-agnostic reason-scoped level-clear — a `work::<taskId>` lane row
+            //     whose base is READY/gone this cycle (and not still wedged) clears,
+            //     bypassing the router's dead `work-task` arm. Rides the recover pass,
+            //     so it clears even while the owning task is cap-gated / cooled / paused.
+            //  2. grace tracker — a lane wedged past the grace (or IMMEDIATELY for a
+            //     hard `abort-failed`) mints a per-lane distress; the level-clear off the
+            //     OPEN distress set fires the cycle the lane goes ready/gone.
+            const wedgedLanes = new Map<string, LaneWedgeObservation>();
+            for (const w of laneWedged ?? []) {
+              const key = normalizeLanePath(w.path);
+              // First observation per lane wins (an immediate abort-failed beats a
+              // later graced entry for the same lane).
+              const prev = wedgedLanes.get(key);
+              if (prev === undefined || (w.immediate && !prev.immediate)) {
+                wedgedLanes.set(key, {
+                  path: key,
+                  reason: w.reason,
+                  immediate: w.immediate,
+                });
+              }
+            }
+            const resolvedLanes = new Set(
+              (laneResolved ?? []).map((p) => normalizeLanePath(p)),
+            );
+            const wedgedLaneKeys = new Set(wedgedLanes.keys());
+            for (const c of laneFailuresToClear(
+              snapshot.laneFailures ?? [],
+              wedgedLaneKeys,
+              resolvedLanes,
+            )) {
+              deps.emitDispatchCleared({ verb: c.verb, id: c.id });
+            }
+            const laneDecision = laneWedgeTracker.step({
+              wedged: wedgedLanes,
+              openDistressDirs: new Set(
+                [...(snapshot.laneWedgeDistressDirs ?? new Set<string>())].map(
+                  (d) => normalizeLanePath(d),
+                ),
+              ),
+              nowSec: deps.now(),
+            });
+            for (const m of laneDecision.mint) {
+              deps.emitSharedWedgeDistress?.({
+                id: m.id,
+                dir: m.dir,
+                reason: m.reason ?? LANE_WEDGE_DISTRESS_REASON,
+                ts: deps.now(),
+              });
+            }
+            for (const c of laneDecision.clear) {
+              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+            }
           } catch (err) {
             console.error(
               "[autopilot-worker] worktree recovery threw (non-fatal):",
@@ -5364,6 +6047,10 @@ function main(): void {
           // pause-abort + fresh controller doesn't retroactively un-abort this run.
           cycleController.signal,
           deps,
+          // The producer live-job dirty attribution (worktree mode only) — threaded
+          // into every `provision` so the fan-in pre-merge clean never discards dirt a
+          // running worker owns; `null` (a failed read) → do-not-discard.
+          snapshot.liveAttributedDirtyByWorktree ?? null,
         );
       } while (wakePending && !shutdown);
     } catch (err) {

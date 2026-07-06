@@ -50,6 +50,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Resolver**: An autonomous worker autopilot dispatches to settle a mechanically-clear merge conflict, stamping blocked when judgment is needed. Avoid: merger, rebase bot, fixer.
 - **Fan-in**: The convergence point where parallel lanes or failures collapse onto one epic-keyed outcome. Avoid: join, merge point, aggregation.
 - **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
+- **Lane pre-merge**: The guard that vets a dependent task's base lane before its fan-in merges the completed siblings in — restoring a provably-redundant leak to the base's HEAD, deferring a base it cannot safely settle to a self-clearing row, and escalating a persistent wedge to a needs-human distress. Avoid: clean, cleanup, premerge fixup.
 
 ## Bus, presence, and session surface
 

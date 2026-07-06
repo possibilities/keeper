@@ -196,6 +196,71 @@ export function isSharedDirtyDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/**
+ * The `dispatch_failures.reason` prefix a fan-in LANE pre-merge failure carries —
+ * minted by `provision()` when a dependent task's base lane cannot be losslessly
+ * cleaned before its fan-in merge (a persistent divergent-dirty base,
+ * would-clobber-untracked, off-branch, or mid-merge). Lands on the NATURAL
+ * `work::<taskId>` key, so {@link routeDispatchFailure} short-circuits it to
+ * `work-task` — but the reconciler's verb-agnostic reason-scoped level-clear
+ * collects it by THIS reason (not the router) and clears it once the base is ready,
+ * so it is a SELF-CLEARING (non-sticky) row, never the dead no-clear `work-task`
+ * dead end. Distinct from `worktree-recover-*`, `worktree-finalize-*`, and the
+ * exact {@link MERGE_ESCALATION_REASON_TOKEN} close token, so it never collides with
+ * the `close::<epic>` escalation semantics. A SUBSTRING of {@link
+ * LANE_WEDGE_DISTRESS_REASON} it is NOT — the two prefixes are disjoint
+ * (`worktree-lane-premerge` vs `worktree-lane-wedge`) so a distress row is never
+ * mis-collected as a provision lane-failure and vice versa.
+ */
+export const WORKTREE_LANE_PREMERGE_REASON_PREFIX = "worktree-lane-premerge";
+
+/**
+ * Whether a `dispatch_failures.reason` is a fan-in LANE pre-merge failure (see
+ * {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX}) — the reason scope the reconciler's
+ * verb-agnostic level-clear keys on to clear a `work::<taskId>` lane row WITHOUT
+ * touching {@link routeDispatchFailure}. Pure; NEVER throws.
+ */
+export function isWorktreeLanePremergeReason(reason: string): boolean {
+  return reason.startsWith(WORKTREE_LANE_PREMERGE_REASON_PREFIX);
+}
+
+/**
+ * The synthetic PER-LANE distress signal for a fan-in base lane worktree that stays
+ * not-losslessly-cleanable past the recover grace watermark (a persistent
+ * divergent-dirty / off-branch / would-clobber base), or IMMEDIATELY for a hard
+ * `abort-failed` mid-merge lane git could not even abort. The escalation layer ON
+ * TOP of the per-cycle self-clearing `work::<taskId>` {@link
+ * WORKTREE_LANE_PREMERGE_REASON_PREFIX} row. Mirrors the shared-checkout-wedge
+ * idiom EXACTLY but on its OWN id/reason so the two NEVER cross-clear: it shares the
+ * un-retryable synthetic `daemon` verb (routes as {@link routeDispatchFailure}'s
+ * `unknown` arm — never in `failedKeys`, never `retry_dispatch`-clearable), the boot
+ * orphan-GC exemption, and a recover-pass level-clear — but the `id` is per-LANE
+ * (`worktree-lane-wedge:<laneHash>`), keyed to the lane worktree PATH, so it is a
+ * DISTINCT surface from the default-branch shared-checkout dir set (which
+ * deliberately excludes linked-lane paths). Its ONLY clear is the recover pass's
+ * level-trigger observing the lane ready/gone (NOT `retry_dispatch`). In-memory
+ * grace tracking, so a daemon restart re-emits at most once per still-present wedge.
+ */
+export const LANE_WEDGE_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const LANE_WEDGE_DISTRESS_ID_PREFIX = "worktree-lane-wedge:";
+export const LANE_WEDGE_DISTRESS_REASON = "worktree-lane-wedge";
+
+/**
+ * True iff `(verb, id)` is a per-lane wedge distress key — the synthetic `daemon`
+ * verb plus the {@link LANE_WEDGE_DISTRESS_ID_PREFIX} per-lane id. The boot
+ * orphan-GC exempts it (like the shared-checkout-wedge / -dirty + crash-loop keys)
+ * since the operator surface never clears it; pure, dep-free, NEVER throws. Disjoint
+ * from {@link isSharedWedgeDistressKey} / {@link isSharedDirtyDistressKey}: the id
+ * prefixes never mutually match, so the three distress rows never cross-classify or
+ * cross-clear.
+ */
+export function isLaneWedgeDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === LANE_WEDGE_DISTRESS_VERB &&
+    id.startsWith(LANE_WEDGE_DISTRESS_ID_PREFIX)
+  );
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -209,7 +274,9 @@ export type DispatchFailureDisplayKind =
   | "instant-death"
   | "crash-loop"
   | "shared-wedge"
-  | "shared-dirty";
+  | "shared-dirty"
+  | "lane-premerge"
+  | "lane-wedge";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -235,6 +302,12 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
   { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
   { prefix: SHARED_DIRTY_DISTRESS_REASON, kind: "shared-dirty" },
+  // MOST-SPECIFIC-FIRST: the lane WEDGE distress prefix (`worktree-lane-wedge`)
+  // must precede the lane PREMERGE prefix (`worktree-lane-premerge`) — neither is a
+  // prefix of the other, but ordering keeps the table's stated invariant true even
+  // if a future rename shortens one.
+  { prefix: LANE_WEDGE_DISTRESS_REASON, kind: "lane-wedge" },
+  { prefix: WORKTREE_LANE_PREMERGE_REASON_PREFIX, kind: "lane-premerge" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

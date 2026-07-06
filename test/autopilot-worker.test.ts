@@ -54,6 +54,7 @@ import {
   computeSlotOccupancy,
   confirmRunning,
   createDispatchFailedGate,
+  createLaneWedgeTracker,
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
   createWorktreeDriver,
@@ -77,12 +78,19 @@ import {
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
+  isLaneWedgeDistressKey,
   isOccupyingJob,
   isSharedCheckoutDirtyReason,
   isSharedCheckoutWedgeReason,
   isWorktreeRecoverReason,
+  LANE_WEDGE_DISTRESS_ID_PREFIX,
+  LANE_WEDGE_DISTRESS_REASON,
+  LANE_WEDGE_GRACE_SEC,
+  type LaneWedgeObservation,
   type LaunchResult,
   type LiveDispatch,
+  laneFailuresToClear,
+  laneWedgeDistressId,
   loadReconcileSnapshot,
   mergeLaneBaseIntoDefault,
   prepareWorktreeGeometry,
@@ -4849,12 +4857,14 @@ test("reconcile yolo: dispatch is unchanged (mode arm is a no-op)", () => {
 interface FakeWorktreeLog {
   calls: string[];
   provisions: WorktreeLaunchInfo[];
+  provisionAttributions: (ReadonlySet<string> | null)[];
   finalizes: WorktreeLaunchInfo[];
   assertCwds: string[];
   recoverRepos: string[][];
 }
 function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
+  provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeRetry?: (info: WorktreeLaunchInfo) => string | null;
   assertFail?: (cwd: string) => string | null;
@@ -4865,14 +4875,22 @@ function makeFakeWorktreeDriver(opts?: {
   const log: FakeWorktreeLog = {
     calls: [],
     provisions: [],
+    provisionAttributions: [],
     finalizes: [],
     assertCwds: [],
     recoverRepos: [],
   };
   const driver: WorktreeDriver = {
-    async provision(info) {
+    async provision(info, liveAttributedDirty) {
       log.calls.push(`provision:${info.assignment.nodeId}`);
       log.provisions.push(info);
+      log.provisionAttributions.push(liveAttributedDirty);
+      // `provisionRetry` wins first (a transient not-ready base → retry-skip, no
+      // sticky), mirroring `finalizeRetry`; `provisionFail` is a genuine block.
+      const retry = opts?.provisionRetry?.(info) ?? null;
+      if (retry !== null) {
+        return { ok: false, retry: true, reason: retry };
+      }
       const reason = opts?.provisionFail?.(info) ?? null;
       if (reason !== null) {
         return { ok: false, reason };
@@ -6241,6 +6259,50 @@ test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a stick
   expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
 });
 
+test("fn-1123 runReconcileCycle: a non-primary sink fan-in RETRY mints NO sticky close row but still SKIPS that group's finalize", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    provisionRetry: (info) =>
+      info.repoDir === "/repo-b"
+        ? "worktree-premerge-dirty-base: base not losslessly cleanable"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = multiRepoSnap([epic], abResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The transient retry-skip minted NO sticky (unlike the conflict case above).
+  expect(depsLog.emissions).toEqual([]);
+  // But the /repo-b base is un-assembled, so ONLY the primary group finalizes.
+  expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
+});
+
 // ---------------------------------------------------------------------------
 // fn-1034.2 — per-repo finalize failure rows + producer level-clear
 // ---------------------------------------------------------------------------
@@ -6626,6 +6688,80 @@ test("fn-959 runReconcileCycle: worktree ON provision failure → sticky Dispatc
   });
   // Slot was never held (failed before inFlight.add).
   expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-1123 runReconcileCycle: a provision RETRY (transient dirty base) mints NO sticky and consumes no slot / cooldown", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    provisionRetry: () =>
+      "worktree-premerge-dirty-base: deferring the fan-in merge — base not losslessly cleanable",
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const state = makeState();
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    state,
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.calls).toEqual(["provision:fn-1-foo.1"]);
+  expect(depsLog.launches).toEqual([]); // never launched
+  expect(depsLog.emissions).toEqual([]); // NO sticky — the retry-skip is invisible
+  // No slot, cooldown, or pending consumed → re-dispatchable next cycle.
+  expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
+  expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-1123 runReconcileCycle: the live-attributed dirty set threads to provision (present map → set, omitted → null do-not-discard)", async () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  // Omitted param → the driver receives `null` (do-not-discard).
+  {
+    const { driver, log } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+    expect(log.provisionAttributions).toEqual([null]);
+  }
+
+  // A present (even empty) map → the driver receives a non-null set (nothing
+  // attributed to this lane, so a provably-redundant leak is cleanable).
+  {
+    const { driver, log } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map<string, ReadonlySet<string>>(),
+    );
+    expect(log.provisionAttributions).toHaveLength(1);
+    expect(log.provisionAttributions[0]).not.toBeNull();
+    expect([...(log.provisionAttributions[0] ?? [])]).toEqual([]);
+  }
 });
 
 test("fn-959 runReconcileCycle: worktree OFF → on-default-branch assertion runs; a mismatch is sticky DispatchFailed", async () => {
@@ -7870,7 +8006,7 @@ test("fn-959 createWorktreeDriver: provision ensures the worktree off the parent
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo",
   };
-  const res = await driver.provision(info);
+  const res = await driver.provision(info, null);
   expect(res).toEqual({
     ok: true,
     cwd: "/repo.worktrees/keeper-epic-fn-1-foo",
@@ -7931,7 +8067,7 @@ test("fn-959 createWorktreeDriver: provision forks the BASE lane off the resolve
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo", // === branch: the base lane
   };
-  const res = await driver.provision(info);
+  const res = await driver.provision(info, null);
   expect(res.ok).toBe(true);
   // Forks off `main` (resolved default), NOT the uncreated base branch.
   expect(cmds).toContain(
@@ -7988,7 +8124,7 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo", // the parent lane (!== branch)
   };
-  const res = await driver.provision(info);
+  const res = await driver.provision(info, null);
   expect(res.ok).toBe(true);
   // Forks off the parent lane; the default-branch resolution is never consulted.
   expect(cmds).toContain(
@@ -8019,6 +8155,10 @@ function makePhantomFanInRun(opts: {
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   let added = false;
+  // Stateful MERGE_HEAD: absent until a `merge --no-edit` conflicts, so the pre-merge
+  // readiness probe sees a CLEAN base and only the guarded post-conflict abort finds
+  // the in-flight merge. Cleared by `merge --abort`.
+  let midMerge = false;
   const conflicts = new Set(opts.conflictSources ?? []);
   const phantoms = opts.phantomSources;
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
@@ -8046,14 +8186,19 @@ function makePhantomFanInRun(opts: {
     }
     if (joined.startsWith("merge --no-edit")) {
       const source = args[2] ?? "";
-      return conflicts.has(source)
-        ? { code: 1, stdout: "CONFLICT (content)\n", stderr: "" }
-        : { code: 0, stdout: "", stderr: "" };
+      if (conflicts.has(source)) {
+        midMerge = true; // a conflict leaves MERGE_HEAD for the guarded abort
+        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
-      return { code: 0, stdout: "head\n", stderr: "" }; // present → abort runs
+      return midMerge
+        ? { code: 0, stdout: "head\n", stderr: "" } // in-flight → abort runs
+        : { code: 1, stdout: "", stderr: "" }; // clean base → readiness sees no merge
     }
     if (joined.startsWith("merge --abort")) {
+      midMerge = false;
       return { code: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("worktree add")) {
@@ -8105,7 +8250,7 @@ test("fn-979 createWorktreeDriver: provision skips a phantom pre-merge (missing-
   const phantom = "keeper/epic/fn-1-foo--fn-1-foo.2";
   const { run, cmds } = makePhantomFanInRun({ phantomSources: [phantom] });
   const driver = createWorktreeDriver(run);
-  const res = await driver.provision(makeFanInInfo([phantom]));
+  const res = await driver.provision(makeFanInInfo([phantom]), null);
   expect(res).toEqual({
     ok: true,
     cwd: "/repo.worktrees/keeper-epic-fn-1-foo",
@@ -8133,7 +8278,10 @@ test("fn-979 createWorktreeDriver: provision skips a phantom but a LATER real co
       lockDir,
     });
     const driver = createWorktreeDriver(run);
-    const res = await driver.provision(makeFanInInfo([phantom, conflict]));
+    const res = await driver.provision(
+      makeFanInInfo([phantom, conflict]),
+      null,
+    );
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.reason).toContain("worktree-merge-conflict");
@@ -8159,7 +8307,10 @@ test("fn-979 createWorktreeDriver: a real conflict BEFORE a phantom fails loud i
       lockDir,
     });
     const driver = createWorktreeDriver(run);
-    const res = await driver.provision(makeFanInInfo([conflict, phantom]));
+    const res = await driver.provision(
+      makeFanInInfo([conflict, phantom]),
+      null,
+    );
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.reason).toContain("worktree-merge-conflict");
@@ -8537,6 +8688,45 @@ test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async ()
   expect(failures).toEqual([]);
   expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
   expect(calls.some((c) => c.args.startsWith("worktree prune"))).toBe(false);
+});
+
+test("fn-1123.2 recoverWorktrees: re-probes each keeper lane's base readiness — a not-ready lane surfaces as a graced wedge, keyed by lane path", async () => {
+  // The lane's HEAD is on `main` (the fake's global branch), not its lane branch —
+  // an off-branch base a fan-in would abort on. The recover pass re-probes it AFTER
+  // the mutating passes and surfaces it as a per-lane WEDGE observation (keyed by the
+  // lane PATH), so the escalation/clear rides the recover pass rather than a dispatch.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set(), // clean — the probe classifies off-branch, not mid-merge
+    epicBases: [],
+  });
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  // The outcome now carries the lane arms. The keeper lane is off-branch → a GRACED
+  // wedge (not immediate — that is reserved for a hard abort-failed mid-merge).
+  expect(outcome.laneWedged?.map((w) => w.path)).toEqual([lane]);
+  expect(outcome.laneWedged?.[0]?.immediate).toBe(false);
+  expect(outcome.laneWedged?.[0]?.reason.startsWith("off-branch")).toBe(true);
+  // The standalone /repo is not a keeper lane → never a lane observation.
+  expect(outcome.laneResolved ?? []).not.toContain("/repo");
+});
+
+test("fn-1123.2 recoverWorktrees: a hard abort-failed lane mid-merge surfaces as an IMMEDIATE wedge", async () => {
+  // The lane is mid-merge AND its guarded abort keeps failing — git cannot clear it.
+  // Pass-1 records its own abort failure; the lane readiness re-probe then sees the
+  // surviving MERGE_HEAD and surfaces an IMMEDIATE (un-graced) wedge for the distress.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set([lane]),
+    abortFailsAt: new Set([lane]), // the guarded abort fails → residue survives
+    epicBases: [],
+  });
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  const laneObs = outcome.laneWedged?.find((w) => w.path === lane);
+  expect(laneObs).toBeDefined();
+  expect(laneObs?.immediate).toBe(true);
+  expect(laneObs?.reason.startsWith("abort-failed")).toBe(true);
 });
 
 test("fn-972 BUG 4 recoverWorktrees: pass-1 skips a non-keeper `.claude/worktrees` lane, still recovers the keeper lane", async () => {
@@ -12928,4 +13118,172 @@ test("dirty + wedge distress rows for the SAME repo never cross-clear (distinct 
   ]);
   // The two ids are distinct — neither clear could ever target the other's row.
   expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+});
+
+// ---------------------------------------------------------------------------
+// fn-1123.2 — the fan-in LANE pre-merge wedge escalation + verb-agnostic
+// reason-scoped clear. The lane tracker is the per-LANE sibling of the shared-
+// checkout wedge tracker (keyed by lane worktree PATH, own id/reason surface), with
+// an extra IMMEDIATE short-circuit for a hard `abort-failed` lane. All expected
+// values are hand-computed constants, never re-derived from the tracker/helper.
+// ---------------------------------------------------------------------------
+
+const LANE_A = "/Users/x/worktrees/lane-a";
+const LANE_B = "/Users/x/worktrees/lane-b";
+const LANE_DIRTY_OBS: LaneWedgeObservation = {
+  path: LANE_A,
+  reason: "dirty: /Users/x/worktrees/lane-a — M src/foo.ts",
+  immediate: false,
+};
+
+test("LANE_WEDGE_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(LANE_WEDGE_GRACE_SEC).toBe(5 * 60);
+});
+
+test("laneWedgeDistressId is per-lane stable, distinct across lanes + prefix-tagged, and yields a synthetic-verb distress key", () => {
+  const a = laneWedgeDistressId(LANE_A);
+  expect(a).toBe(laneWedgeDistressId(LANE_A)); // stable across calls
+  expect(a).not.toBe(laneWedgeDistressId(LANE_B)); // distinct across lanes
+  expect(a.startsWith(LANE_WEDGE_DISTRESS_ID_PREFIX)).toBe(true);
+  // The composite is a per-lane distress key the orphan-GC exempts + only a
+  // level-trigger clears (the synthetic `daemon` verb).
+  expect(isLaneWedgeDistressKey("daemon", a)).toBe(true);
+});
+
+test("lane wedge tracker: a divergent-dirty base past the grace mints EXACTLY once (graced)", () => {
+  const grace = 300;
+  const tracker = createLaneWedgeTracker(grace);
+  const wedged = new Map([[LANE_A, LANE_DIRTY_OBS]]);
+  const empty = new Set<string>();
+  // t=1000 first observed → grace clock starts, no mint.
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint (a transient dirt settles inside the window).
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-lane, reason display-mapped.
+  const crossed = tracker.step({
+    wedged,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(laneWedgeDistressId(LANE_A));
+  expect(crossed.mint[0]?.dir).toBe(LANE_A);
+  expect(crossed.mint[0]?.reason?.startsWith(LANE_WEDGE_DISTRESS_REASON)).toBe(
+    true,
+  );
+  // O(1): never re-mint while still wedged.
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ wedged, openDistressDirs: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("lane wedge tracker: a hard abort-failed lane mints an IMMEDIATE distress (not graced)", () => {
+  const grace = 300;
+  const tracker = createLaneWedgeTracker(grace);
+  const immediateObs: LaneWedgeObservation = {
+    path: LANE_A,
+    reason:
+      "abort-failed: /Users/x/worktrees/lane-a is mid-merge (MERGE_HEAD=deadbeef) and could not be cleared",
+    immediate: true,
+  };
+  // FIRST observation, grace clock just started (sinceSec === nowSec) → an immediate
+  // lane mints AT ONCE, matching finalizeEpic's abort-failed precedent.
+  const first = tracker.step({
+    wedged: new Map([[LANE_A, immediateObs]]),
+    openDistressDirs: new Set<string>(),
+    nowSec: 1000,
+  });
+  expect(first.mint.length).toBe(1);
+  expect(first.mint[0]?.id).toBe(laneWedgeDistressId(LANE_A));
+  expect(first.mint[0]?.reason).toContain("hard-wedged");
+  // Still O(1): no re-mint while it stays wedged.
+  expect(
+    tracker.step({
+      wedged: new Map([[LANE_A, immediateObs]]),
+      openDistressDirs: new Set<string>(),
+      nowSec: 1001,
+    }).mint,
+  ).toEqual([]);
+});
+
+test("lane wedge tracker: a resolved lane level-clears its open distress EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createLaneWedgeTracker(grace);
+  const open = new Set([LANE_A]);
+  // Still wedged → no clear.
+  expect(
+    tracker.step({
+      wedged: new Map([[LANE_A, LANE_DIRTY_OBS]]),
+      openDistressDirs: open,
+      nowSec: 2000,
+    }).clear,
+  ).toEqual([]);
+  // Lane goes ready/gone (no fresh wedge) but the row is open → level-clear once.
+  const recovered = tracker.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 2001,
+  });
+  expect(recovered.clear.map((c) => c.id)).toEqual([
+    laneWedgeDistressId(LANE_A),
+  ]);
+  // Once folded, the row leaves openDistressDirs → no re-clear.
+  expect(
+    tracker.step({
+      wedged: new Map(),
+      openDistressDirs: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("lane wedge distress is a DISTINCT surface from the shared-checkout wedge — ids never collide", () => {
+  // Even for the same underlying string, the lane id prefix differs from the
+  // shared-checkout one, so the two distress surfaces never cross-classify/clear.
+  expect(laneWedgeDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+  expect(isLaneWedgeDistressKey("daemon", sharedWedgeDistressId(REPO_A))).toBe(
+    false,
+  );
+});
+
+test("laneFailuresToClear: positive-evidence — clears a resolved-and-not-wedged row, retains on absence, never clears a still-wedged one", () => {
+  const workRow = {
+    verb: "work" as const,
+    id: "fn-1-foo.2",
+    dir: LANE_A,
+  };
+  // Resolved AND not wedged → cleared (bypasses the router's dead work-task arm).
+  expect(laneFailuresToClear([workRow], new Set(), new Set([LANE_A]))).toEqual([
+    { verb: "work", id: "fn-1-foo.2" },
+  ]);
+  // Still wedged this cycle → NEVER clear (the never-clear-what-still-fails guard),
+  // even if it also appears resolved (a stale/duplicate observation).
+  expect(
+    laneFailuresToClear([workRow], new Set([LANE_A]), new Set([LANE_A])),
+  ).toEqual([]);
+  // No observation for it this cycle → RETAINED (absence is never resolution — the
+  // silent-skip defect the shared recover clear also closes).
+  expect(laneFailuresToClear([workRow], new Set(), new Set())).toEqual([]);
+});
+
+test("laneFailuresToClear is verb-agnostic — a work AND a close lane row both clear by lane path", () => {
+  const rows = [
+    { verb: "work" as const, id: "fn-1-foo.2", dir: LANE_A },
+    { verb: "close" as const, id: "fn-1-foo", dir: LANE_B },
+  ];
+  const cleared = laneFailuresToClear(
+    rows,
+    new Set(),
+    new Set([LANE_A, LANE_B]),
+  );
+  expect(cleared).toEqual([
+    { verb: "work", id: "fn-1-foo.2" },
+    { verb: "close", id: "fn-1-foo" },
+  ]);
 });
