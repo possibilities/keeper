@@ -2,7 +2,9 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-06T20:10:59.499000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1142-cli-descriptor-and-grammar-convergence"
+  ],
   "id": "fn-1145-panel-wait-silent-drop-hardening",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T20:10:59.499000Z"
+  "updated_at": "2026-07-06T20:11:15.968000Z"
 }
