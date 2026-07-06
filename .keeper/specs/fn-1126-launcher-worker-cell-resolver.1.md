@@ -55,5 +55,5 @@ test/worker-cell.test.ts (new, fast tier): all union variants (ok, cell-less nul
 - [ ] Composition-map, work-skill template, and glossary describe the shared route, the refusal, and the worker-cell term accurately; the full fast suite is green
 
 ## Done summary
-
+Extracted resolveWorkerCell into src/worker-cell.ts as the one shared launcher seam: autopilot's cell-resolution stays byte-identical while manual dispatch now threads the task's {model, tier} cell --plugin-dir (or fails loud on any reject) and refuses a worktree-mode shared-checkout launch unless --force. Docs + glossary updated; full fast suite green.
 ## Evidence
