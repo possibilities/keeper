@@ -133,8 +133,6 @@ import {
   CRASH_LOOP_DISTRESS_VERB,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
-  isSharedDirtyDistressKey,
-  isSharedWedgeDistressKey,
   isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -356,15 +354,19 @@ export function drainToCompletion(
  * `DispatchCleared` for each via `mintClear` (the caller folds + pumps). Returns the
  * count swept (0 on a healthy board). Pure but for the SELECT + the injected mint.
  *
- * EXEMPTS the crash-loop distress key AND every per-repo shared-checkout-wedge
- * ({@link isSharedWedgeDistressKey}) / shared-checkout-dirty ({@link
- * isSharedDirtyDistressKey}) / per-lane fan-in wedge ({@link isLaneWedgeDistressKey}) /
- * per-(epic,repo) stale-base-lane ({@link isStaleBaseDistressKey}) distress key: their
- * synthetic `daemon` verb is un-retryable by the wire validator BY DESIGN (an operator
- * never clears them), and a level-trigger (main's boot recovery / the recover pass
- * observing the checkout or lane clean / the stale-base probe observing the lane
- * re-based or torn down) owns dropping them — so the orphan sweep must never reap a
- * self-managed distress row out from under its signal.
+ * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
+ * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
+ * isStaleBaseDistressKey}) distress key: their synthetic `daemon` verb is un-retryable
+ * by the wire validator BY DESIGN (an operator never clears them), and a level-trigger
+ * (main's boot recovery / the recover pass observing the lane clean / the stale-base
+ * probe observing the lane re-based or torn down) owns dropping them — so the orphan
+ * sweep must never reap a self-managed distress row out from under its signal.
+ *
+ * The per-repo shared-checkout-wedge/-dirty distress family is DELIBERATELY NOT exempt:
+ * a dirty or mid-merge shared checkout no longer blocks the working-tree-free base
+ * merge, so that signal is a neutered false positive with no live producer — the sweep
+ * DRAINS any such row still open so an operator is not left with an un-clearable
+ * daemon-verb row.
  */
 export function gcUnretryableDispatchFailures(
   db: Database,
@@ -385,18 +387,7 @@ export function gcUnretryableDispatchFailures(
     ) {
       continue;
     }
-    // Same exemption for a per-repo shared-checkout-wedge distress row: its
-    // synthetic `daemon` verb is un-retryable BY DESIGN, and the recover pass's
-    // level-trigger (not the operator surface) owns its only legitimate clear.
-    if (isSharedWedgeDistressKey(row.verb, row.id)) {
-      continue;
-    }
-    // And the SIBLING plain-dirty distress row — same synthetic-verb / level-clear
-    // discipline on its own id prefix; the orphan sweep must never reap it either.
-    if (isSharedDirtyDistressKey(row.verb, row.id)) {
-      continue;
-    }
-    // And the per-LANE fan-in wedge distress row — same synthetic `daemon`-verb /
+    // The per-LANE fan-in wedge distress row — same synthetic `daemon`-verb /
     // recover-pass level-clear discipline on its own `worktree-lane-wedge:` id prefix;
     // the operator surface never clears it, so the orphan sweep must not reap it.
     if (isLaneWedgeDistressKey(row.verb, row.id)) {

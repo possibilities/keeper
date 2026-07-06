@@ -1318,6 +1318,27 @@ export function createSharedCheckoutDirtyTracker(
 }
 
 /**
+ * The shared-checkout mid-merge / plain-dirty distress observations the recover cycle
+ * feeds its {@link SharedCheckoutWedgeTracker} / {@link SharedCheckoutDirtyTracker} —
+ * the SINGLE documented neuter point post base-merge decouple.
+ *
+ * A dirty or mid-merge SHARED checkout no longer blocks the working-tree-free base
+ * merge (it lands via the plumbing merge-tree/commit-tree/update-ref-CAS/push pipeline
+ * regardless), so a `worktree-recover-mid-merge` / `worktree-recover-dirty-checkout`
+ * observation is a FALSE POSITIVE for a block that no longer exists. Yields EMPTY maps
+ * by construction: the trackers can only DRAIN (their level-clear off the OPEN distress
+ * set releases any row already open), never mint. Pure; NEVER throws. (The trackers +
+ * this seam are torn down in the sequenced follow-up; kept now so the neuter lives in
+ * exactly one place rather than scattered across the recover loop.)
+ */
+export function sharedCheckoutDistressObservations(): {
+  wedged: Map<string, string>;
+  dirty: Map<string, string>;
+} {
+  return { wedged: new Map(), dirty: new Map() };
+}
+
+/**
  * Grace window (producer-`ts` seconds) a fan-in base LANE worktree may stay
  * not-losslessly-mergeable (a persistent divergent-dirty / off-branch / would-clobber
  * base) before the recover pass escalates the wedge into a visible per-lane distress
@@ -6605,32 +6626,18 @@ function main(): void {
             )) {
               deps.emitDispatchCleared({ verb: "close", id });
             }
-            // Sustained-wedge escalation: the per-epic reason above fires the first
-            // cycle, but a SHARED checkout stuck mid-merge past the grace watermark
-            // is a wedge keeper cannot heal (foreign residue, or a keeper-owned abort
-            // that keeps failing) — mint a per-repo distress row so it surfaces in
-            // needs_human instead of skip-retrying invisibly. Scoped to the recover-
-            // wedge reasons on a KNOWN shared-checkout dir (a linked-lane path is
-            // excluded — the wedge is the default-branch working tree). The grace +
-            // exactly-once mint live in the in-memory tracker; the clear is a level-
-            // trigger off the OPEN distress rows the snapshot carries (robust across
-            // a restart). No-op when the escalation deps are absent (fake-deps tests).
-            const recoveryRepoKeys = new Set(
-              repos.map((r) => stripTrailingSlashPath(r.trim())),
-            );
-            const wedgedRepos = new Map<string, string>();
-            for (const f of failures) {
-              if (
-                f.dir != null &&
-                isSharedCheckoutWedgeReason(f.reason) &&
-                recoveryRepoKeys.has(stripTrailingSlashPath(f.dir.trim()))
-              ) {
-                // First matching reason per repo wins (both passes key one dir).
-                if (!wedgedRepos.has(f.dir)) {
-                  wedgedRepos.set(f.dir, f.reason);
-                }
-              }
-            }
+            // Sustained-wedge escalation NEUTERED: a mid-merge (or plain-dirty, below)
+            // SHARED checkout no longer blocks the base merge — it lands via the
+            // working-tree-free plumbing pipeline regardless — so a
+            // `worktree-recover-mid-merge` observation is a FALSE POSITIVE for a block
+            // that no longer exists (a foreign in-flight merge in the human's checkout
+            // is now harmless). Feed the tracker NO observations: the mint never fires,
+            // and the level-clear (fed the OPEN distress set below) DRAINS any
+            // shared-checkout-wedge row already open so an operator is never left with
+            // an un-clearable daemon-verb row. The now-inert recoverSharedCheckoutMidMerge
+            // self-heal + this tracker machinery are torn down in the sequenced follow-up.
+            const { wedged: wedgedRepos, dirty: dirtyRepos } =
+              sharedCheckoutDistressObservations();
             const wedgeDecision = sharedWedgeTracker.step({
               wedged: wedgedRepos,
               openDistressDirs: snapshot.sharedWedgeDistressDirs ?? new Set(),
@@ -6647,27 +6654,12 @@ function main(): void {
             for (const c of wedgeDecision.clear) {
               deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
             }
-            // Sibling plain-DIRTY escalation: the same shape, fed off the recover
-            // pass's `worktree-recover-dirty-checkout` reason on a KNOWN shared repo
-            // (a dirty tree with no merge in flight — the mid-merge case is classified
-            // distinctly above and never reaches this reason). A shared checkout that
-            // keeps dirt-skipping finalize past the grace mints a per-repo dirt
-            // distress row; the level-clear fires the cycle the checkout goes clean.
-            // Reuses the SAME verb-neutral distress message channel — the `id` carries
-            // the dirt prefix, so main mints/clears the right synthetic-verb row.
-            const dirtyRepos = new Map<string, string>();
-            for (const f of failures) {
-              if (
-                f.dir != null &&
-                isSharedCheckoutDirtyReason(f.reason) &&
-                recoveryRepoKeys.has(stripTrailingSlashPath(f.dir.trim()))
-              ) {
-                // First matching reason per repo wins (both passes key one dir).
-                if (!dirtyRepos.has(f.dir)) {
-                  dirtyRepos.set(f.dir, f.reason);
-                }
-              }
-            }
+            // Sibling plain-DIRTY escalation NEUTERED for the same reason: the base
+            // merge is working-tree-free, so a dirty shared checkout no longer skips it.
+            // (Post-decouple the pass-2 `dirty` merge verdict is unreachable, so this
+            // observation source is already silent; feeding the tracker nothing keeps it
+            // that way and DRAINS any shared-checkout-dirty row already open. `dirtyRepos`
+            // is destructured with `wedgedRepos` from the one neuter seam above.)
             const dirtyDecision = sharedDirtyTracker.step({
               dirty: dirtyRepos,
               openDistressDirs: snapshot.sharedDirtyDistressDirs ?? new Set(),

@@ -119,6 +119,7 @@ import {
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
   type StaleBaseLaneObservation,
+  sharedCheckoutDistressObservations,
   sharedDirtyDistressId,
   sharedWedgeDistressId,
   staleBaseLaneDistressId,
@@ -13867,6 +13868,40 @@ test("dirty + wedge distress rows for the SAME repo never cross-clear (distinct 
   ]);
   // The two ids are distinct — neither clear could ever target the other's row.
   expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+});
+
+test("post base-merge decouple: the recover cycle derives NO shared-checkout wedge/dirty observation → the trackers can only drain, never mint", () => {
+  // The neuter seam the recover loop feeds its shared-checkout trackers now yields
+  // EMPTY maps unconditionally: a dirty/mid-merge shared checkout no longer blocks the
+  // working-tree-free base merge, so the mid-merge/dirty observation is a false positive.
+  const { wedged, dirty } = sharedCheckoutDistressObservations();
+  expect(wedged.size).toBe(0);
+  expect(dirty.size).toBe(0);
+  // Fed those empty observations — even with an OPEN distress row present for REPO_A —
+  // BOTH trackers mint NOTHING (no false positive) and level-clear the open row (the
+  // drain path so an operator is never left with an un-clearable daemon-verb row).
+  const grace = 300;
+  const wedgeTracker = createSharedCheckoutWedgeTracker(grace);
+  const dirtyTracker = createSharedCheckoutDirtyTracker(grace);
+  const open = new Set([REPO_A]);
+  const wedgeDecision = wedgeTracker.step({
+    wedged,
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  const dirtyDecision = dirtyTracker.step({
+    dirty,
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  expect(wedgeDecision.mint).toEqual([]);
+  expect(dirtyDecision.mint).toEqual([]);
+  expect(wedgeDecision.clear.map((c) => c.id)).toEqual([
+    sharedWedgeDistressId(REPO_A),
+  ]);
+  expect(dirtyDecision.clear.map((c) => c.id)).toEqual([
+    sharedDirtyDistressId(REPO_A),
+  ]);
 });
 
 // ---------------------------------------------------------------------------

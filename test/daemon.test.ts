@@ -123,6 +123,10 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  LANE_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
 import type { ResolverOutcome } from "../src/reconcile-core";
 import { drain, extractSessionTelemetry } from "../src/reducer";
@@ -274,6 +278,64 @@ test("gcUnretryableDispatchFailures: the crash-loop distress row is EXEMPT (self
 
   expect(swept).toBe(0);
   expect(cleared).toEqual([]);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout wedge/dirty distress rows, EXEMPTS the still-live lane-wedge + crash-loop rows", () => {
+  const { db } = freshMemDb();
+  // Post base-merge decouple the shared-checkout mid-merge/dirty distress family is a
+  // false positive with no live producer, so the orphan sweep DRAINS any such row left
+  // open (it is no longer exempt). The per-lane fan-in wedge + crash-loop rows are
+  // still live, self-managed signals and stay EXEMPT.
+  const insert = db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 100, ?, 100, 100)`,
+  );
+  const wedgeId = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}abc123`;
+  const dirtyId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`;
+  const laneId = `${LANE_WEDGE_DISTRESS_ID_PREFIX}def456`;
+  insert.run(
+    SHARED_WEDGE_DISTRESS_VERB,
+    wedgeId,
+    "shared-checkout-wedge: …",
+    "/repo",
+    30,
+  );
+  insert.run(
+    SHARED_WEDGE_DISTRESS_VERB,
+    dirtyId,
+    "shared-checkout-dirty: …",
+    "/repo",
+    31,
+  );
+  insert.run(
+    SHARED_WEDGE_DISTRESS_VERB,
+    laneId,
+    "worktree-lane-wedge: …",
+    "/lane",
+    32,
+  );
+  insert.run(
+    CRASH_LOOP_DISTRESS_VERB,
+    CRASH_LOOP_DISTRESS_ID,
+    `${CRASH_LOOP_DISTRESS_REASON}: 8 daemon boots in 30min`,
+    null,
+    33,
+  );
+
+  const cleared: { verb: string; id: string }[] = [];
+  const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
+    cleared.push({ verb, id }),
+  );
+
+  // Exactly the two shared-checkout rows are drained; the lane-wedge + crash-loop rows
+  // are left untouched (assert the drained set, order-independent).
+  expect(swept).toBe(2);
+  const clearedIds = cleared.map((c) => c.id).sort();
+  expect(clearedIds).toEqual([dirtyId, wedgeId].sort());
+  expect(cleared.every((c) => c.verb === SHARED_WEDGE_DISTRESS_VERB)).toBe(
+    true,
+  );
   db.close();
 });
 
