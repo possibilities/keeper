@@ -34,5 +34,5 @@ Surfacing: clone the shared-checkout grace-tracker idiom — pure injected-clock
 - [ ] The fast suite is green with probe-matrix, tracker, and family-disjointness coverage extended
 
 ## Done summary
-
+Added a producer-side stale-base lane probe (computeStaleBaseLaneEntries) sibling to the merge-gate that flags an already-cut lane whose satisfied same-repo upstream's landed work is definitively missing from its base, plus a self-clearing per-(epic,repo) stale-base-lane distress family (createStaleBaseLaneTracker) on the shared-checkout-wedge grace idiom — detection + surfacing only, the merge-gate cut-deferral is byte-identical.
 ## Evidence
