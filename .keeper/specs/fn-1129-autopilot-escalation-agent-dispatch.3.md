@@ -37,5 +37,5 @@ Unit tests beside the existing derivers/dispatch-command tests: the regex accept
 - [ ] derivers and dispatch-command modules remain dep-free
 
 ## Done summary
-
+Registered unblock::/deconflict:: as first-class escalation dispatch verbs: SPAWN_VERB_REF_RE folds them into jobs.plan_verb/plan_ref like resolve::; added ESCALATION_MODEL/EFFORT constants + resolveEscalationLaunchConfig (light leaf, no worker-module pull); parseDispatchableKey widens manual dispatch while retry_dispatch stays byte-identical; keeper dispatch accepts both keys with race-guard parity and escalation model/effort defaults.
 ## Evidence
