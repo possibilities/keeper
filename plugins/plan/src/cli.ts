@@ -562,11 +562,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function readFormat(value: string | undefined): OutputFormat {
-  if (value === "json" || value === "human") {
+  if (value === "json" || value === "yaml" || value === "human") {
     return value;
   }
   usageError(
-    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'human'.`,
+    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'yaml', 'human'.`,
   );
 }
 
@@ -596,7 +596,7 @@ function printHelp(): void {
   lines.push(`  ${DESCRIPTION}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
+  lines.push("  --format [json|human|yaml]  Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   lines.push("");
   lines.push("To orient on the board, prefer the keeper-native surfaces over");

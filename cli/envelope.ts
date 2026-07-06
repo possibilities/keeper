@@ -9,10 +9,12 @@
  * global envelope version int.
  *
  * Exit model (the reference is `cli/status.ts`): a bad board / bad domain state
- * is DATA on an `ok:true` envelope at exit 0. Only a TRANSPORT or usage failure
- * is an `ok:false` envelope, exit 1 — and the envelope still lands on stdout so
- * an agent always parses the last stdout as JSON, never empty stdout + stderr
- * prose.
+ * is DATA on an `ok:true` envelope at exit 0. A TRANSPORT failure is an
+ * `ok:false` envelope, exit 1 — the envelope still lands on stdout so an agent
+ * always parses the last stdout as JSON, never empty stdout + stderr prose. A
+ * USAGE / grammar fault (an unknown flag, a bad `--format`, a `--json --format
+ * yaml` conflict) is NOT an envelope: it prints help to stderr and exits 2,
+ * matching the shared unit-required-grammar / Click exit-2 stance.
  *
  * `error` is `null` on success and `{code, message, recovery}` on failure
  * (RFC 9457 problem-details informs the split):

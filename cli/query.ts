@@ -33,13 +33,13 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
-import { parseOptions } from "./descriptor";
+import { type FormatMode, parseOptions } from "./descriptor";
 import {
-  emitEnvelope,
   errorEnvelope,
   RECOVERY_DAEMON_DOWN,
   successEnvelope,
 } from "./envelope";
+import { emitEnvelopeFormatted, resolveFormat } from "./format";
 
 /** Envelope schema version for `keeper query`. */
 export const QUERY_SCHEMA_VERSION = 1;
@@ -68,7 +68,7 @@ const ALLOWLIST_SORTED = [
 export const HELP = `keeper query — one-shot read of an allowlisted daemon collection
 
 Usage:
-  keeper query <collection> [--filter k=v]... [--json] [--sock <path>]
+  keeper query <collection> [--filter k=v]... [--format json|yaml] [--sock <path>]
 
 Reads the named collection over the daemon's subscribe socket and prints one
 JSON envelope ({schema_version, ok, error, data}) where data is the row array.
@@ -78,11 +78,12 @@ Arguments:
   <collection>   One of the allowlisted collections (below)
 
 Flags:
-  --filter k=v   Exact-match filter (repeatable; ANDed). Keys resolve against
-                 the collection's declared filters server-side
-  --json         Emit JSON (default; accepted for symmetry with the viewers)
-  --sock <path>  Socket override ($KEEPER_SOCK / default)
-  --help         Show this help
+  --filter k=v      Exact-match filter (repeatable; ANDed). Keys resolve against
+                    the collection's declared filters server-side
+  --format json|yaml  Output format (default json); yaml for a yq consumer
+  --json            Alias of --format json
+  --sock <path>     Socket override ($KEEPER_SOCK / default)
+  --help            Show this help
 
 Allowlisted collections:
   ${ALLOWLIST_SORTED.join(", ")}
@@ -103,11 +104,16 @@ export interface ParsedQueryArgs {
   collection: string;
   filter: Record<string, FilterValue>;
   sock: string;
+  /** Resolved output format (`--format` / `--json` alias; json | yaml). */
+  format: FormatMode;
 }
 
 interface ParseFailure {
   ok: false;
   message: string;
+  /** Process exit code for `main` (default 1); a grammar fault (bad --format)
+   *  is a usage fault → exit 2. */
+  exitCode?: number;
 }
 
 interface ParseSuccess {
@@ -143,6 +149,11 @@ export function parseQueryArgs(argv: string[]): ParseFailure | ParseSuccess {
 
   if (values.help === true) {
     return { ok: false, message: "__help__" };
+  }
+
+  const fmt = resolveFormat("query", values);
+  if (!fmt.ok) {
+    return { ok: false, message: fmt.message, exitCode: 2 };
   }
 
   if (positionals.length === 0) {
@@ -187,7 +198,7 @@ export function parseQueryArgs(argv: string[]): ParseFailure | ParseSuccess {
       ? (values.sock as string)
       : resolveSockPath();
 
-  return { ok: true, args: { collection, filter, sock } };
+  return { ok: true, args: { collection, filter, sock, format: fmt.format } };
 }
 
 export interface RunQueryDeps {
@@ -220,17 +231,22 @@ export async function runQueryCommand(
       Object.keys(args.filter).length > 0 ? args.filter : undefined,
     );
   } catch (err) {
-    emitEnvelope(
+    emitEnvelopeFormatted(
       errorEnvelope(QUERY_SCHEMA_VERSION, {
         code: "query_failed",
         message: err instanceof Error ? err.message : String(err),
         recovery: RECOVERY_DAEMON_DOWN,
       }),
       deps,
+      args.format,
     );
     return;
   }
-  emitEnvelope(successEnvelope(QUERY_SCHEMA_VERSION, rows), deps);
+  emitEnvelopeFormatted(
+    successEnvelope(QUERY_SCHEMA_VERSION, rows),
+    deps,
+    args.format,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -337,19 +353,21 @@ export async function runTasksCommand(
   try {
     snap = await deps.fetchSnapshot(args.sock);
   } catch (err) {
-    emitEnvelope(
+    emitEnvelopeFormatted(
       errorEnvelope(QUERY_SCHEMA_VERSION, {
         code: "query_failed",
         message: err instanceof Error ? err.message : String(err),
         recovery: RECOVERY_DAEMON_DOWN,
       }),
       deps,
+      args.format,
     );
     return;
   }
-  emitEnvelope(
+  emitEnvelopeFormatted(
     successEnvelope(QUERY_SCHEMA_VERSION, flattenTaskRows(snap, args.filter)),
     deps,
+    args.format,
   );
 }
 
@@ -408,7 +426,7 @@ export async function main(argv: string[]): Promise<void> {
     }
     process.stderr.write(`keeper query: ${parsed.message}\n\n`);
     process.stderr.write(HELP);
-    process.exit(1);
+    process.exit(parsed.exitCode ?? 1);
   }
 
   if (VIRTUAL_QUERY_COLLECTIONS.has(parsed.args.collection)) {

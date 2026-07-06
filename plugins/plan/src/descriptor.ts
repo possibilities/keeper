@@ -54,9 +54,23 @@ export interface PlanCommand {
   readonly summary: string;
   readonly args?: readonly ArgDescriptor[];
   readonly options?: readonly OptionDescriptor[];
+  /** Output renderings this verb's `--format` advertises in leaf help. Absent
+   *  means the standard read surface `["json", "human", "yaml"]`; a verb whose
+   *  envelope is frozen against yaml (validate) or that is format-free (cat)
+   *  narrows to `["json", "human"]` so its help never advertises a mode it does
+   *  not render. */
+  readonly formatModes?: readonly ("json" | "human" | "yaml")[];
   /** Nested verbs for a subgroup (`epic`, `task`, `audit`, …). */
   readonly subcommands?: readonly PlanCommand[];
 }
+
+/** The standard `--format` surface a read verb advertises when it declares no
+ *  narrower {@link PlanCommand.formatModes}. */
+export const DEFAULT_FORMAT_MODES: readonly ("json" | "human" | "yaml")[] = [
+  "json",
+  "human",
+  "yaml",
+];
 
 // ── shared option fragments ──────────────────────────────────────────────────
 
@@ -357,6 +371,9 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
     summary: "Print the raw spec markdown for an epic or task.",
     args: [{ name: "ID" }],
     options: [OPT_PROJECT],
+    // Format-free: cat emits raw markdown regardless of --format, so its help
+    // never advertises yaml.
+    formatModes: ["json", "human"],
   },
   {
     name: "claim",
@@ -587,6 +604,9 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
         summary: "Validate + arm one epic (mutating stamp)",
       },
     ],
+    // The {valid, errors, warnings} envelope is frozen against yaml, so its help
+    // never advertises it and a --format yaml request is a usage fault.
+    formatModes: ["json", "human"],
   },
   {
     name: "verdict",

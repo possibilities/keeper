@@ -5,7 +5,9 @@
 // pretty-printed (2-space indent + one explicit trailing newline), the trailer
 // is compact (no spaces).
 
-export type OutputFormat = "json" | "human";
+import { yamlDump } from "../../prompt/src/yaml_dump.ts";
+
+export type OutputFormat = "json" | "yaml" | "human";
 
 /** Pretty JSON: 2-space indent, one trailing newline, unicode preserved. */
 export function jsonDumps(data: unknown): string {
@@ -41,11 +43,17 @@ function pyEnsureAscii(serialized: string): string {
   return out;
 }
 
+/** Serialize `data` to block-style YAML through the shared PyYAML-parity
+ * serializer, normalized to exactly one trailing newline. */
+export function yamlDumps(data: unknown): string {
+  return `${yamlDump(data).replace(/\n+$/, "")}\n`;
+}
+
 /**
  * Sole stdout emission path for verb payloads. JSON by default; a non-explicit
- * format auto-upgrades to human on a TTY. human falls back to JSON when no
- * renderer is supplied. Mirrors format_output's exactly-one-trailing-newline
- * normalization and EPIPE swallow.
+ * format auto-upgrades to human on a TTY. `yaml` renders through the shared
+ * serializer; `human` falls back to JSON when no renderer is supplied. Mirrors
+ * format_output's exactly-one-trailing-newline normalization and EPIPE swallow.
  */
 export function formatOutput(
   data: unknown,
@@ -58,7 +66,9 @@ export function formatOutput(
   }
 
   try {
-    if (fmt === "human" && textRenderer) {
+    if (fmt === "yaml") {
+      writeStdout(yamlDumps(data));
+    } else if (fmt === "human" && textRenderer) {
       const rendered = textRenderer(data);
       writeStdout(`${rendered.replace(/\n+$/, "")}\n`);
     } else {

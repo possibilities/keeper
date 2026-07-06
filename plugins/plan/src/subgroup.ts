@@ -15,12 +15,19 @@
 
 import {
   type ArgDescriptor,
+  DEFAULT_FORMAT_MODES,
   type PlanCommand,
   planCommand,
 } from "./descriptor.ts";
 import type { OutputFormat } from "./format.ts";
 
 const PROG = "keeper plan";
+
+/** The injected `--format [modes]` help label for a leaf, narrowed to whatever
+ *  the verb actually renders (default `[json|human|yaml]`). */
+function formatOptionLabel(cmd: PlanCommand): string {
+  return `--format [${(cmd.formatModes ?? DEFAULT_FORMAT_MODES).join("|")}]`;
+}
 // click's effective help wrap width: max_content_width (80) minus its 2-column
 // right margin. Verified against the Python binary's group-help wrap points.
 const HELP_WIDTH = 78;
@@ -109,7 +116,7 @@ export function printGroupHelp(group: GroupSpec): void {
   lines.push(`  ${group.description}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
+  lines.push("  --format [json|human|yaml]  Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   lines.push("");
   lines.push("Commands:");
@@ -173,7 +180,7 @@ export function renderLeafHelp(progPath: string, cmd: PlanCommand): void {
       summary: o.summary,
     })),
     {
-      label: "--format [json|human]",
+      label: formatOptionLabel(cmd),
       summary: "Output format (default: json)",
     },
     { label: "--help", summary: "Show this message and exit." },

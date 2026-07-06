@@ -172,6 +172,21 @@ const FLAG_AGENT_HELP_DEFAULTED = {
   default: false,
   summary: "Show the terse operator runbook",
 } as const satisfies FlagDescriptor;
+/** The shared `--format json|yaml|human` flag for a finite-output JSON reader.
+ *  The command's `format_modes` declares which values it actually renders; an
+ *  off-list value is a usage fault (see `cli/format.ts`). */
+const FLAG_FORMAT = {
+  name: "format",
+  type: "string",
+  summary: "Output format: json|yaml (default json)",
+} as const satisfies FlagDescriptor;
+/** `--json`, the documented alias of `--format json`, kept beside `--format`
+ *  for the readers that shipped it first. */
+const FLAG_JSON_ALIAS = {
+  name: "json",
+  type: "boolean",
+  summary: "Alias of --format json",
+} as const satisfies FlagDescriptor;
 
 /** The snapshot/live/timeout trio the plain viewer leaves share. */
 export const VIEWER_FLAGS = [
@@ -545,10 +560,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: false,
     requires_daemon: true,
     requires_tty: false,
-    format_modes: ["human", "json"],
+    format_modes: ["json", "yaml"],
     flags: [
       FLAG_HELP,
-      { name: "json", type: "boolean", summary: "Emit the JSON envelope" },
+      FLAG_FORMAT,
+      FLAG_JSON_ALIAS,
       FLAG_SOCK,
       {
         name: "connect-timeout",
@@ -564,10 +580,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: false,
     requires_daemon: true,
     requires_tty: false,
-    format_modes: ["human", "json"],
+    format_modes: ["json", "yaml"],
     flags: [
       FLAG_HELP,
-      { name: "json", type: "boolean", summary: "Emit the JSON envelope" },
+      FLAG_FORMAT,
+      FLAG_JSON_ALIAS,
       {
         name: "filter",
         type: "string",
@@ -587,7 +604,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     format_modes: ["json"],
     flags: [
       FLAG_HELP,
-      { name: "json", type: "boolean", summary: "Emit JSON delta lines" },
+      FLAG_FORMAT,
+      FLAG_JSON_ALIAS,
       FLAG_SOCK,
       {
         name: "filter",

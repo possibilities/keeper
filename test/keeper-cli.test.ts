@@ -1338,9 +1338,13 @@ describe("cli/descriptor purity + derivation", () => {
     });
   });
 
-  test("parseOptions('query') preserves the repeatable filter", () => {
+  test("parseOptions('query') preserves the repeatable filter + format grammar", () => {
+    // Independent source of truth: the query leaf's flag surface under the
+    // converged `--format` grammar (`--json` retained as its documented alias),
+    // hand-transcribed here rather than re-derived from the descriptor.
     expect(parseOptions("query")).toEqual({
       help: { type: "boolean", short: "h" },
+      format: { type: "string" },
       json: { type: "boolean" },
       filter: { type: "string", multiple: true },
       sock: { type: "string" },

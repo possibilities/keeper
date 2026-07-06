@@ -125,6 +125,18 @@ export function runValidate(
   epicId: string | null,
   format: OutputFormat | null,
 ): number {
+  // The {valid, errors, warnings} envelope is frozen against yaml (it merges
+  // plan_invocation on a fresh --epic stamp); a yaml request is an unsupported
+  // mode, so it is a usage fault (exit 2) naming what validate renders, never a
+  // silent JSON fallback.
+  if (format === "yaml") {
+    process.stderr.write(
+      "Error: Invalid value for '--format': 'yaml' is not one of 'json', " +
+        "'human' for 'validate'.\n",
+    );
+    return 2;
+  }
+
   const ctx = resolveProject(format);
   const dataDir = ctx.dataDir;
 

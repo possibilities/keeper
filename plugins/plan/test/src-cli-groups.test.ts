@@ -35,7 +35,7 @@ describe("epic group help", () => {
       "Usage: keeper plan epic [OPTIONS] COMMAND [ARGS]...",
     );
     expect(r.stdout).toContain("Manage epics.");
-    expect(r.stdout).toContain("--format [json|human]");
+    expect(r.stdout).toContain("--format [json|human|yaml]");
     expect(r.stdout).toContain("Commands:");
     // In-wave leaves are listed.
     for (const sub of [

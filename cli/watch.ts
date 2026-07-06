@@ -42,6 +42,7 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { parseOptions } from "./descriptor";
+import { resolveFormat } from "./format";
 
 /** Envelope schema version for `keeper watch` lines. */
 export const WATCH_SCHEMA_VERSION = 1;
@@ -112,7 +113,8 @@ Delta types (also the --filter allowlist):
 Flags:
   --filter <type>  Emit only the named delta type(s) (repeatable; allowlist
                    above). The 'baseline' line is always emitted
-  --json           Emit JSON (default; accepted for symmetry)
+  --format json    Output format (the coarse NDJSON frames render json only)
+  --json           Alias of --format json
   --sock <path>    Socket override ($KEEPER_SOCK / default)
   --help           Show this help
 
@@ -370,6 +372,9 @@ export interface ParsedWatchArgs {
 interface ParseFailure {
   ok: false;
   message: string;
+  /** Process exit code for `main` (default 1); a grammar fault (bad --format)
+   *  is a usage fault → exit 2. */
+  exitCode?: number;
 }
 
 interface ParseSuccess {
@@ -397,6 +402,14 @@ export function parseWatchArgs(argv: string[]): ParseFailure | ParseSuccess {
 
   if (values.help === true) {
     return { ok: false, message: "__help__" };
+  }
+
+  // The coarse NDJSON frame shape is byte-frozen, so watch renders json only:
+  // `--format json` / `--json` are accepted, `--format yaml|human` is a usage
+  // fault naming the one supported mode.
+  const fmt = resolveFormat("watch", values);
+  if (!fmt.ok) {
+    return { ok: false, message: fmt.message, exitCode: 2 };
   }
 
   const filter = new Set<string>();
@@ -632,7 +645,7 @@ export async function main(argv: string[]): Promise<void> {
     }
     process.stderr.write(`keeper watch: ${parsed.message}\n\n`);
     process.stderr.write(HELP);
-    process.exit(1);
+    process.exit(parsed.exitCode ?? 1);
   }
 
   runWatch(parsed.args, {

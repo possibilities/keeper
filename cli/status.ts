@@ -45,16 +45,16 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
-import { parseOptions } from "./descriptor";
+import { type FormatMode, parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import {
   type Envelope,
-  emitEnvelope,
   errorEnvelope,
   type ProblemError,
   RECOVERY_DAEMON_DOWN,
   successEnvelope,
 } from "./envelope";
+import { emitEnvelopeFormatted, resolveFormat } from "./format";
 
 /** Envelope schema version for `keeper status`. v2 adds the additive
  * `dispatch_failure: string[]` field to the per-task + close-row views; v3 adds
@@ -88,7 +88,7 @@ const FINALIZE_NON_FF_REASON = "worktree-finalize-non-fast-forward";
 export const HELP = `keeper status — one-shot unified board + autopilot JSON read
 
 Usage:
-  keeper status [--json] [--sock <path>] [--connect-timeout <dur>]
+  keeper status [--format json|yaml] [--sock <path>] [--connect-timeout <dur>]
 
 Prints ONE {schema_version, ok, error, data} envelope: autopilot config, the
 per-epic/-task/-close-row readiness verdicts, aggregate counts, drained/jammed
@@ -98,7 +98,8 @@ dispatch_failures block KINDS (multi-repo / merge-conflict / dirty-tree / non-ff
 readiness can't see; [] when clean.
 
 Flags:
-  --json                   Emit JSON (default; accepted for symmetry)
+  --format json|yaml       Output format (default json); yaml for a yq consumer
+  --json                   Alias of --format json
   --sock <path>            Socket override ($KEEPER_SOCK / default)
   --connect-timeout <dur>  Bounded reach-server deadline (e.g. 10s, 5m).
                            Default ~10s; a down daemon → exit 1 unreachable
@@ -412,6 +413,8 @@ export function buildStatusErrorEnvelope(error: ProblemError): StatusEnvelope {
 export interface ParsedStatusArgs {
   sock: string;
   connectTimeoutMs: number;
+  /** Resolved output format (`--format` / `--json` alias; json | yaml). */
+  format: FormatMode;
 }
 
 /** Exit code for a usage/grammar fault (a bad flag value). */
@@ -452,6 +455,11 @@ export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
     return { ok: false, message: "__help__" };
   }
 
+  const fmt = resolveFormat("status", values);
+  if (!fmt.ok) {
+    return { ok: false, message: fmt.message, exitCode: EXIT_USAGE };
+  }
+
   let connectTimeoutMs = DEFAULT_CONNECT_DEADLINE_MS;
   const raw = values["connect-timeout"];
   if (typeof raw === "string" && raw.length > 0) {
@@ -471,7 +479,7 @@ export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
       ? (values.sock as string)
       : resolveSockPath();
 
-  return { ok: true, args: { sock, connectTimeoutMs } };
+  return { ok: true, args: { sock, connectTimeoutMs, format: fmt.format } };
 }
 
 // ---------------------------------------------------------------------------
@@ -526,7 +534,7 @@ export async function runStatus(
       failures = [];
     }
     const envelope = buildStatusEnvelope(snap, latestBoot, failures);
-    emitEnvelope(envelope, deps);
+    emitEnvelopeFormatted(envelope, deps, args.format);
   };
 
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
@@ -553,7 +561,7 @@ export async function runStatus(
       message: `${reason}: ${err.message}`,
       recovery: RECOVERY_DAEMON_DOWN,
     });
-    emitEnvelope(envelope, deps);
+    emitEnvelopeFormatted(envelope, deps, args.format);
   };
 
   handle = subscribeReadiness({

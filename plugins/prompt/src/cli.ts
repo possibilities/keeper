@@ -84,11 +84,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function readFormat(value: string | undefined): OutputFormat {
-  if (value === "json" || value === "human") {
+  if (value === "json" || value === "yaml" || value === "human") {
     return value;
   }
   usageError(
-    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'human'.`,
+    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'yaml', 'human'.`,
   );
 }
 
@@ -114,7 +114,7 @@ function printHelp(): void {
   lines.push(`  ${DESCRIPTION}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
+  lines.push("  --format [json|human|yaml]  Output format (default: json)");
   lines.push("  --help, -h                  Show this message and exit.");
   lines.push("");
   lines.push("Commands:");
@@ -156,7 +156,7 @@ function printLeafHelp(spec: PromptCommandDescriptor): void {
     `--${f.name}${f.type === "string" ? " TEXT" : ""}`,
     f.summary ?? "",
   ]);
-  rows.push(["--format [json|human]", "Output format (default: json)"]);
+  rows.push(["--format [json|human|yaml]", "Output format (default: json)"]);
   rows.push(["--help, -h", "Show this message and exit."]);
   const optWidth = Math.max(...rows.map(([left]) => left.length));
   for (const [left, right] of rows) {
