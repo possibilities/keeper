@@ -34,6 +34,7 @@ export const SUBCOMMANDS = [
   "watch",
   "await",
   "commit-work",
+  "baseline",
   "setup-tmux",
   "tabs",
   "session-state",
@@ -119,6 +120,10 @@ export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
   "commit-work": {
     summary: "Stage session-attributed files, lint, commit, push",
     agentHelp: true,
+  },
+  baseline: {
+    summary:
+      "Read the suite-baseline result at a commit (--wait triggers + blocks)",
   },
   "setup-tmux": {
     summary: "Provision the tmux control plane (dash + work sessions)",
@@ -569,6 +574,7 @@ export async function main(): Promise<void> {
     watch: async (argv) => (await import("./watch")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
+    baseline: async (argv) => (await import("./baseline")).main(argv),
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
     tabs: async (argv) => (await import("./tabs")).main(argv),
     "session-state": async (argv) =>

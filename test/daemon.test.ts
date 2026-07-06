@@ -5116,6 +5116,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "autoclose-worker.ts": "autoclose",
   "bus-worker.ts": "bus",
   "tmux-control-worker.ts": "tmuxControl",
+  "baseline-worker.ts": "baseline",
 };
 
 /**
@@ -5206,7 +5207,7 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-one workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-two workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
@@ -5230,10 +5231,11 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-one 
   // `birthIngest` (the seventh file-watcher; watches the births maildir the
   // `keeper agent` launcher drops non-claude birth records into and mints a
   // synthetic SessionStart per record — the twin of `eventsIngest`, no DB
-  // handle).
+  // handle). fn-1122 added `baseline` (the suite-Baseline runner; no watcher, no
+  // message minter — sole writer of the on-disk result leafs, no DB handle).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(21);
+  expect(spawned).toHaveLength(22);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -5258,6 +5260,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-one 
     "autoclose",
     "bus",
     "tmuxControl",
+    "baseline",
   ]);
 });
 
