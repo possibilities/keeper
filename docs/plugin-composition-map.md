@@ -57,15 +57,33 @@ vanilla session at the repo root's `CONTEXT.md` glossary when present + non-empt
 | Channel | Route | Base set | Extra |
 | --- | --- | --- | --- |
 | Interactive (human) | your launcher points `plugin_scan_dirs` at `~/code/keeper/plugins` (README "Load the plugins") | full plugins.yaml | — |
-| `keeper agent` manual dispatch / pair | `keeper agent claude …` → `agent/main.ts:2194` gate | full plugins.yaml | — |
-| Autopilot / dispatch worker | `buildKeeperAgentLaunchArgv` emits `keeper agent claude …` (`src/exec-backend.ts:854`); same gate | **full plugins.yaml** | per-cell `--plugin-dir <cell>` (`exec-backend.ts:874-876`), **additive** |
+| `keeper agent` manual dispatch / pair | `keeper agent claude …` → `src/agent/main.ts:2417` gate | full plugins.yaml | — |
+| Autopilot / dispatch worker | `buildKeeperAgentLaunchArgv` emits `keeper agent claude …` (`src/exec-backend.ts:952`); same gate | **full plugins.yaml** | per-cell `--plugin-dir <cell>` (`exec-backend.ts:968-974`), **additive** |
+
+Both work-launch producers — the autopilot reconciler (`src/autopilot-worker.ts`
+`runReconcileCycle`) and the manual `keeper dispatch work::<id>` (`cli/dispatch.ts`)
+— resolve the launch's per-cell `work` plugin through ONE shared seam,
+`resolveWorkerCell` (`src/worker-cell.ts`): it applies the same
+out-of-matrix → missing-manifest → shadowed-plugin precedence and returns a closed
+machine-kind union. Each caller owns its own failure surface — autopilot mints a
+sticky `DispatchFailed`, dispatch exits non-zero with an actionable error — but the
+decision is identical, so a hand-fired plan worker loads the byte-same cell an
+automated one does. The producer injects a per-cycle memoized shadow probe; dispatch
+injects a fresh scan (it fires one worker).
 
 The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`, rendered from
 `subagents.yaml`) is appended via `--plugin-dir` AFTER `--name`
-(`exec-backend.ts:870-876`). It is **additive, not isolating**: the worker still
+(`exec-backend.ts:968-974`). It is **additive, not isolating**: the worker still
 inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
 worker argv recovers the byte-identical interactive argv — pinned by the additive
 test.
+
+A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
+refused (exit 1) instead of launching worktree-less into the shared checkout —
+autopilot provisions each task's lane, so a hand-fired shared-checkout worker is
+wrong-topology. The refusal names both recoveries (let autopilot dispatch it, or
+`--force` to launch in the shared checkout deliberately) and fails OPEN when the
+daemon is unreachable; `close::` / resume / free-form launches are untouched.
 
 A sibling plan-plugin config surface, `plugins/plan/model-selector.yaml` (the
 post-scaffold model+effort selector's policy config), is read off disk by

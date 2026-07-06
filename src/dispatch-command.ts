@@ -186,6 +186,12 @@ export interface DispatchLaunchOpts {
   model?: string;
   /** `--effort <e>` — emitted only when supplied. */
   effort?: string;
+  /** Per-cell worker plugin dir — `--plugin-dir <abs>` emitted AFTER `--name`
+   *  (mirrors the autopilot twin so the dispatch-key peel is unaffected).
+   *  Supplied only for a plan-form `work` launch whose task resolves a
+   *  {model, tier} cell; absent for close / cell-less / free-form launches so
+   *  those stay byte-identical. */
+  pluginDir?: string;
   /** Whether to pass `--x-no-confirm` (the live cwd-confirm suppressor). */
   noConfirm: boolean;
 }
@@ -203,10 +209,10 @@ export interface DispatchLaunchOpts {
  * positional would shift by one. The trailing `exec "$0" -l -i` leaves a usable
  * login+interactive shell if `claude` exits.
  *
- * `flags` carries `--x-no-confirm` (the LIVE cwd-confirm suppressor —
- * `src/autopilot-worker.ts:258`) always, and `--name <claudeName>` / `--model` /
- * `--effort` ONLY when supplied. cwd is NOT a flag — `ensureLaunched` applies
- * it via tmux `-c`, mirroring autopilot.
+ * `flags` carries `--x-no-confirm` (the LIVE cwd-confirm suppressor) always, and
+ * `--name <claudeName>` / `--model` / `--effort` / `--plugin-dir <pluginDir>`
+ * ONLY when supplied (the cell flag slots after `--name`). cwd is NOT a flag —
+ * `ensureLaunched` applies it via tmux `-c`, mirroring autopilot.
  *
  * `shell` is injected (the caller resolves `process.env.SHELL` once with a safe
  * default; this pure builder never reads env). `cwd` is accepted for call-site
@@ -225,6 +231,11 @@ export function buildDispatchLaunchArgv(
   // `--name <key>` is emitted only when supplied (mirrors `--model`/`--effort`).
   // When present its adjacency is load-bearing for reap/classify parsing.
   if (opts.claudeName !== undefined) flags.push("--name", opts.claudeName);
+  // Per-cell worker plugin dir — AFTER `--name` so the dispatch-key peel is
+  // unaffected. Present only for a plan-form `work` launch resolving a cell.
+  if (opts.pluginDir !== undefined && opts.pluginDir !== "") {
+    flags.push("--plugin-dir", opts.pluginDir);
+  }
   const body = `exec claude "$@" ; exec "$0" -l -i`;
   // `shell` fills the explicit `$0` slot so the first flag is NOT eaten as $0.
   return [shell, "-l", "-i", "-c", body, shell, ...flags, opts.prompt];
