@@ -6,6 +6,13 @@
 // {model, effort} cells. `/plan:plan` and `/plan:defer` pass only the brief path
 // to the `plan:model-selector` subagent; the planner stays content-blind to the
 // selector's read context just like `/plan:work` and `/plan:close` do.
+//
+// Two sources, one envelope: the default source briefs a LIVE epic's todo tasks
+// (keyed by real task id). The `--from-followup` source instead briefs the stored
+// follow-up document of a source epic (`audits/<epic>/followup.yaml`) — its tasks
+// have no ids yet, so they key by 1-based ordinal and the input_hash anchors on
+// the stored document, letting a close pre-select cells before finalize mints the
+// follow-up tree. Both emit the same envelope fields.
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -13,15 +20,17 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
+import { followupPath } from "../audit_artifacts.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
 import {
+  type ProjectContext,
   resolvePlanStateContext,
   tryResolveOwningProjectForId,
 } from "../project.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
 import { loadSubagentsMatrixFromDisk } from "../subagents_config.ts";
-import { loadYamlInput } from "../yaml_input.ts";
+import { loadYamlInput, parseYamlInput } from "../yaml_input.ts";
 
 export const SELECTION_BRIEF_SCHEMA_VERSION = 1;
 
@@ -29,6 +38,34 @@ export interface SelectionBriefArgs {
   epicId: string;
   project: string | null;
   format: OutputFormat | null;
+  /** Brief the stored follow-up document of `epicId` (ordinal-keyed tasks)
+   * instead of the live epic's todo tasks. */
+  fromFollowup: boolean;
+}
+
+/** One task row of a brief, before its per-task candidate-cell shuffle is added.
+ * `task_id` is the real task id in the live source, a 1-based ordinal string in
+ * the follow-up source. */
+interface BriefTaskBase {
+  task_id: string;
+  title: string;
+  current_tier: string | null;
+  current_model: string | null;
+  target_repo: string | null;
+  depends_on: string[];
+  spec_chars: number;
+  spec_md: string;
+}
+
+/** The mode-specific inputs the shared brief assembly consumes. */
+interface BriefSource {
+  briefTasksBase: BriefTaskBase[];
+  epicSpecMd: string;
+  /** The exact string hashed into `input_hash` — mode-specific so provenance is
+   * reproducible from the same source. */
+  inputForHash: string;
+  /** Brief-file basename under `selections/<epic_id>/`. */
+  briefBasename: string;
 }
 
 function emitSelectionBriefError(
@@ -75,8 +112,16 @@ function taskStatus(t: Record<string, unknown>): string {
   return typeof raw === "string" && raw !== "" ? raw : "todo";
 }
 
-function selectionBriefPath(stateDir: string, epicId: string): string {
-  return join(stateDir, "selections", epicId, "brief.json");
+function selectionBriefPath(
+  stateDir: string,
+  epicId: string,
+  basename = "brief.json",
+): string {
+  return join(stateDir, "selections", epicId, basename);
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function preflightEpicResolution(
@@ -181,6 +226,76 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
       ? epicDef.primary_repo
       : ctx.projectPath;
 
+  const candidateCells = matrix.models.flatMap((model) =>
+    matrix.efforts.map((effort) => ({ model, tier: effort })),
+  );
+
+  const source = args.fromFollowup
+    ? collectFollowupSource(epicId, primaryRepo, format)
+    : collectLiveSource(ctx, epicId, format, subagentsYaml);
+
+  const configHash = sha256(selectorConfigYaml);
+  const inputHash = sha256(source.inputForHash);
+  const shuffleSeed = Number.parseInt(inputHash.slice(0, 8), 16);
+  const briefTasks = source.briefTasksBase.map((t) => ({
+    ...t,
+    candidate_cells: shuffledCellsForTask(candidateCells, inputHash, t.task_id),
+  }));
+
+  const brief = {
+    schema_version: SELECTION_BRIEF_SCHEMA_VERSION,
+    epic_id: epicId,
+    primary_repo: primaryRepo,
+    from_followup: args.fromFollowup,
+    selector_config_path: configPath,
+    selector_config_hash: configHash,
+    selector_config_yaml: selectorConfigYaml,
+    subagents_path: subagentsPath,
+    subagents_yaml: subagentsYaml,
+    efforts: matrix.efforts,
+    models: matrix.models,
+    input_hash: inputHash,
+    shuffle_seed: shuffleSeed,
+    epic: {
+      epic_id: epicId,
+      spec_chars: source.epicSpecMd.length,
+      spec_md: source.epicSpecMd,
+    },
+    tasks: briefTasks,
+  };
+
+  const briefRef = selectionBriefPath(
+    ctx.stateDir,
+    epicId,
+    source.briefBasename,
+  );
+  atomicWriteRaw(briefRef, serializeStateJson(brief));
+
+  formatOutput(
+    {
+      success: true,
+      epic_id: epicId,
+      primary_repo: primaryRepo,
+      from_followup: args.fromFollowup,
+      brief_ref: briefRef,
+      config_hash: configHash,
+      input_hash: inputHash,
+      shuffle_seed: shuffleSeed,
+      task_ids: briefTasks.map((t) => t.task_id),
+      candidate_cells: candidateCells,
+    },
+    format,
+  );
+}
+
+/** Collect the brief source from a LIVE epic's todo tasks (keyed by real task
+ * id). Preserves the exact input-hash shape the selector's provenance rides. */
+function collectLiveSource(
+  ctx: ProjectContext,
+  epicId: string,
+  format: OutputFormat | null,
+  subagentsYaml: string,
+): BriefSource {
   const epicSpecPath = join(ctx.dataDir, "specs", `${epicId}.md`);
   const epicSpecMd = readUtf8(epicSpecPath, "EPIC_SPEC_MISSING", format);
   const tasks = loadTasksForEpic(ctx, epicId).sort(
@@ -194,11 +309,7 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
       format,
     );
   }
-
-  const candidateCells = matrix.models.flatMap((model) =>
-    matrix.efforts.map((effort) => ({ model, tier: effort })),
-  );
-  const briefTasksBase = todoTasks.map((t) => {
+  const briefTasksBase: BriefTaskBase[] = todoTasks.map((t) => {
     const taskId = asString(t.id);
     const specPath = join(ctx.dataDir, "specs", `${taskId}.md`);
     const specMd = readUtf8(specPath, "TASK_SPEC_MISSING", format);
@@ -213,7 +324,6 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
       spec_md: specMd,
     };
   });
-
   const inputForHash = JSON.stringify({
     epic_id: epicId,
     epic_spec_md: epicSpecMd,
@@ -226,50 +336,86 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
     })),
     subagents_yaml: subagentsYaml,
   });
-  const configHash = sha256(selectorConfigYaml);
-  const inputHash = sha256(inputForHash);
-  const shuffleSeed = Number.parseInt(inputHash.slice(0, 8), 16);
-  const briefTasks = briefTasksBase.map((t) => ({
-    ...t,
-    candidate_cells: shuffledCellsForTask(candidateCells, inputHash, t.task_id),
-  }));
-
-  const brief = {
-    schema_version: SELECTION_BRIEF_SCHEMA_VERSION,
-    epic_id: epicId,
-    primary_repo: primaryRepo,
-    selector_config_path: configPath,
-    selector_config_hash: configHash,
-    selector_config_yaml: selectorConfigYaml,
-    subagents_path: subagentsPath,
-    subagents_yaml: subagentsYaml,
-    efforts: matrix.efforts,
-    models: matrix.models,
-    input_hash: inputHash,
-    shuffle_seed: shuffleSeed,
-    epic: {
-      epic_id: epicId,
-      spec_chars: epicSpecMd.length,
-      spec_md: epicSpecMd,
-    },
-    tasks: briefTasks,
+  return {
+    briefTasksBase,
+    epicSpecMd,
+    inputForHash,
+    briefBasename: "brief.json",
   };
+}
 
-  const briefRef = selectionBriefPath(ctx.stateDir, epicId);
-  atomicWriteRaw(briefRef, serializeStateJson(brief));
-
-  formatOutput(
-    {
-      success: true,
-      epic_id: epicId,
-      primary_repo: primaryRepo,
-      brief_ref: briefRef,
-      config_hash: configHash,
-      input_hash: inputHash,
-      shuffle_seed: shuffleSeed,
-      task_ids: briefTasks.map((t) => t.task_id),
-      candidate_cells: candidateCells,
+/** Collect the brief source from the stored follow-up document of `epicId`
+ * (`audits/<epic>/followup.yaml`). Tasks key by 1-based ordinal (the follow-up
+ * has no ids yet); the input_hash anchors on the stored document's raw bytes so a
+ * later pre-select against this brief is reproducible. Missing / unparseable
+ * documents fail closed with a typed error. */
+function collectFollowupSource(
+  epicId: string,
+  primaryRepo: string,
+  format: OutputFormat | null,
+): BriefSource {
+  const fp = followupPath(primaryRepo, epicId);
+  if (!existsSync(fp)) {
+    emitSelectionBriefError(
+      "FOLLOWUP_MISSING",
+      `no stored follow-up document for ${epicId} at ${fp}; run ` +
+        "`keeper plan followup submit` (via /plan:close) first",
+      format,
+      { expected: fp },
+    );
+  }
+  const text = readFileSync(fp, "utf-8");
+  let doc: unknown;
+  try {
+    doc = parseYamlInput(Buffer.from(text, "utf-8"), fp);
+  } catch (exc) {
+    emitSelectionBriefError(
+      "FOLLOWUP_INVALID",
+      `stored follow-up document for ${epicId} is not valid YAML: ${fp}`,
+      format,
+      { path: fp, error: exc instanceof Error ? exc.message : String(exc) },
+    );
+  }
+  if (
+    !isPlainObject(doc) ||
+    !Array.isArray(doc.tasks) ||
+    doc.tasks.length === 0
+  ) {
+    emitSelectionBriefError(
+      "FOLLOWUP_INVALID",
+      `stored follow-up document for ${epicId} has no task list: ${fp}`,
+      format,
+      { path: fp },
+    );
+  }
+  const docObj = doc as Record<string, unknown>;
+  const epicNode = isPlainObject(docObj.epic) ? docObj.epic : {};
+  const epicSpecMd = typeof epicNode.spec === "string" ? epicNode.spec : "";
+  const briefTasksBase: BriefTaskBase[] = (docObj.tasks as unknown[]).map(
+    (entry, idx) => {
+      const e = isPlainObject(entry) ? entry : {};
+      const spec = typeof e.spec === "string" ? e.spec : "";
+      const deps = Array.isArray(e.deps)
+        ? e.deps
+            .filter((d) => typeof d === "number" && Number.isInteger(d))
+            .map(String)
+        : [];
+      return {
+        task_id: String(idx + 1),
+        title: typeof e.title === "string" ? e.title : "",
+        current_tier: typeof e.tier === "string" ? e.tier : null,
+        current_model: typeof e.model === "string" ? e.model : null,
+        target_repo: typeof e.target_repo === "string" ? e.target_repo : null,
+        depends_on: deps,
+        spec_chars: spec.length,
+        spec_md: spec,
+      };
     },
-    format,
   );
+  return {
+    briefTasksBase,
+    epicSpecMd,
+    inputForHash: text,
+    briefBasename: "followup-brief.json",
+  };
 }
