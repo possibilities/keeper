@@ -22,7 +22,7 @@
 
 import type { Database } from "bun:sqlite";
 import {
-  DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  effectivePerRootCap,
   readGitProjectionFloor,
   readGitProjectionSeedRequired,
 } from "./db";
@@ -63,8 +63,9 @@ export interface ReadinessInputs {
    *  `Set` (not `ReadonlySet`) so it drops straight into the reconciler's snapshot
    *  field; `computeReadiness` reads it through a `ReadonlySet` param regardless. */
   unseededRoots: Set<string>;
-  /** The per-root dispatch concurrency count N (`autopilot_state.
-   *  max_concurrent_per_root ?? DEFAULT`). */
+  /** The EFFECTIVE per-root dispatch concurrency count N, derived from the stored
+   *  `autopilot_state.max_concurrent_per_root` intent and worktree mode via
+   *  {@link effectivePerRootCap} (worktree off ⇒ 1). */
   maxConcurrentPerRoot: number;
 }
 
@@ -131,19 +132,18 @@ export function loadReadinessInputs(db: Database): ReadinessInputs {
     read("pending_dispatches"),
   );
 
-  // The per-root dispatch concurrency count N rides the `autopilot_state`
-  // singleton row — `max_concurrent_per_root ?? DEFAULT` (= 1). An absent /
-  // never-set row, NULL, or a non-positive / non-integer value → DEFAULT.
-  const autopilotRows = read("autopilot_state");
-  const perRootRaw = (
-    autopilotRows[0] as { max_concurrent_per_root?: unknown } | undefined
-  )?.max_concurrent_per_root;
-  const maxConcurrentPerRoot: number =
-    typeof perRootRaw === "number" &&
-    Number.isInteger(perRootRaw) &&
-    perRootRaw > 0
-      ? perRootRaw
-      : DEFAULT_MAX_CONCURRENT_PER_ROOT;
+  // The per-root dispatch concurrency count N is the EFFECTIVE cap derived from
+  // the `autopilot_state` singleton's stored intent and worktree mode (both on
+  // the SAME row — no extra query). Worktree off ⇒ 1 (shared checkout); worktree
+  // on ⇒ the stored positive integer, else the default. A missing/malformed
+  // stored value or an absent row fails closed to 1.
+  const autopilotRow = read("autopilot_state")[0] as
+    | { max_concurrent_per_root?: unknown; worktree_mode?: unknown }
+    | undefined;
+  const maxConcurrentPerRoot: number = effectivePerRootCap(
+    autopilotRow?.max_concurrent_per_root,
+    autopilotRow?.worktree_mode === 1,
+  );
 
   // The PER-ROOT unseeded set: while `seed_required` is SET, a root is unseeded
   // iff it has no `git_status` row above the floor; the normalized read key maps

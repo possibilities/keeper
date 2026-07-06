@@ -23,7 +23,6 @@ import {
   extractBuildSnapshot,
   serializeBuildSnapshot,
 } from "../src/reducer";
-import { enforceWorktreeConcurrencyInvariant } from "../src/rpc-handlers";
 import type { Event } from "../src/types";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
@@ -3420,74 +3419,53 @@ test("AutopilotConfigSet present-but-non-boolean worktree_multi_repo coerces to 
 });
 
 // ---------------------------------------------------------------------------
-// fn-972 — worktree-off ⟹ max_concurrent_per_root = 1 invariant. The guard runs
-// PRODUCER-SIDE (daemon main) BEFORE the AutopilotConfigSet event is minted:
-// `enforceWorktreeConcurrencyInvariant` reads the current folded worktree_mode
-// and coerces (worktree-off transition pins per-root → 1) or hard-rejects
-// (per-root > 1 while worktree off, no --force). These tests compose the guard
-// with the fold — the exact read→enforce→mint→fold sequence main runs — to prove
-// the folded row can never land worktree-off with per-root > 1.
+// fn-1134 — `max_concurrent_per_root` is DURABLE stored intent. Main mints every
+// config patch VERBATIM (no worktree-off coerce/reject); the fold preserves any
+// column a patch does not name. So a worktree toggle never mutates the stored
+// per-root cap, and a stored value > 1 survives worktree-off untouched — the
+// effective floor-to-1 lives at the read seams, not in the folded row.
 // ---------------------------------------------------------------------------
 
-/** Simulate the daemon producer for one config patch: read the current folded
- *  worktree_mode, run the cross-field guard, then mint + fold the (coerced)
- *  patch. Throws BEFORE any mint on the hard reject — exactly like the daemon
- *  handler, which catches the throw and reports ok:false without appending. */
-function applyConfigPatchViaGuard(patch: {
-  max_concurrent_jobs?: number | null;
-  max_concurrent_per_root?: number | null;
-  worktree_mode?: boolean;
-}): void {
-  const cur = getAutopilotStateConfig();
-  const effective = enforceWorktreeConcurrencyInvariant(
-    patch,
-    cur?.worktree_mode === 1,
-  );
-  autopilotConfigSetEvent(effective);
+test("worktree toggle never mutates the stored max_concurrent_per_root (fn-1134)", () => {
+  // Worktree ON with per-root 3.
+  autopilotConfigSetEvent({ worktree_mode: true, max_concurrent_per_root: 3 });
   drainAll();
-}
-
-test("worktree-off coerce: flipping worktree OFF pins max_concurrent_per_root to 1 in the folded row (fn-972)", () => {
-  // Worktree ON with per-root 3 — a legal state.
-  applyConfigPatchViaGuard({ worktree_mode: true, max_concurrent_per_root: 3 });
   expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
   expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(3);
-  // Flip worktree OFF without naming per-root — the guard coerces per-root → 1,
-  // so the folded row can never keep the stale per-root 3 with worktree off.
-  applyConfigPatchViaGuard({ worktree_mode: false });
+  // Flip worktree OFF without naming per-root — the fold preserves the untouched
+  // column, so the STORED intent stays 3 (no coerce to 1). This is the "no re-set"
+  // guarantee: the effective floor is derived at read time, not stamped here.
+  autopilotConfigSetEvent({ worktree_mode: false });
+  drainAll();
   expect(getAutopilotStateConfig()?.worktree_mode).toBe(0);
-  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(1);
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(3);
+  // Flip worktree back ON (naming nothing else) — the prior 3 is restored with no
+  // re-set, straight from the durable column the toggle never touched.
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(3);
 });
 
-test("worktree-off reject: setting max_concurrent_per_root > 1 while worktree is off throws and mints nothing (fn-972)", () => {
+test("setting max_concurrent_per_root > 1 while worktree is off is accepted and folds to the stored value (fn-1134)", () => {
   // Worktree OFF (the default) — materialize the row via a benign cap set.
-  applyConfigPatchViaGuard({ max_concurrent_jobs: 4 });
+  autopilotConfigSetEvent({ max_concurrent_jobs: 4 });
+  drainAll();
   expect(getAutopilotStateConfig()?.worktree_mode).not.toBe(1);
   const cursorBefore = getCursor();
-  expect(() =>
-    applyConfigPatchViaGuard({ max_concurrent_per_root: 3 }),
-  ).toThrow(/max_concurrent_per_root must be 1 while worktree mode is off/);
-  // The reject fires BEFORE any mint — cursor unchanged, no event appended.
-  expect(getCursor()).toBe(cursorBefore);
+  // No reject: the patch mints + folds, storing the intent verbatim.
+  autopilotConfigSetEvent({ max_concurrent_per_root: 3 });
+  drainAll();
+  expect(getCursor()).toBeGreaterThan(cursorBefore);
+  expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(3);
+  expect(getAutopilotStateConfig()?.worktree_mode).not.toBe(1);
 });
 
-test("worktree-off reject also fires when a single patch sets worktree off AND per-root > 1 (fn-972)", () => {
-  applyConfigPatchViaGuard({ worktree_mode: true });
-  const cursorBefore = getCursor();
-  expect(() =>
-    applyConfigPatchViaGuard({
-      worktree_mode: false,
-      max_concurrent_per_root: 3,
-    }),
-  ).toThrow(/max_concurrent_per_root must be 1 while worktree mode is off/);
-  expect(getCursor()).toBe(cursorBefore);
-  // The prior legal state (worktree on) is untouched by the rejected patch.
-  expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
-});
-
-test("worktree-on allow: max_concurrent_per_root > 1 lands while worktree mode is on (fn-972)", () => {
-  applyConfigPatchViaGuard({ worktree_mode: true });
-  applyConfigPatchViaGuard({ max_concurrent_per_root: 3 });
+test("worktree-on: max_concurrent_per_root > 1 lands in the folded row (fn-1134)", () => {
+  autopilotConfigSetEvent({ worktree_mode: true });
+  drainAll();
+  autopilotConfigSetEvent({ max_concurrent_per_root: 3 });
+  drainAll();
   expect(getAutopilotStateConfig()?.worktree_mode).toBe(1);
   expect(getAutopilotStateConfig()?.max_concurrent_per_root).toBe(3);
 });

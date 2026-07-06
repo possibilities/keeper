@@ -183,7 +183,7 @@ import type {
   BackendExecStartMessage,
   RestoreWorkerData,
 } from "./restore-worker";
-import { enforceWorktreeConcurrencyInvariant } from "./rpc-handlers";
+import { perRootStoredWhileOffNote } from "./rpc-handlers";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   BootCompleteMessage,
@@ -4536,19 +4536,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         const id = msg.id;
         let reply: SetAutopilotConfigResultMessage;
         try {
-          // Cross-field invariant: worktree-off ⟹ max_concurrent_per_root = 1.
-          // Read the CURRENT folded worktree mode (race-free — main folds each
-          // config append synchronously before the next message, so this read
-          // reflects every prior config event) and coerce/reject the patch before
-          // minting. A hard reject throws BadParamsError → the catch reports
-          // ok:false; the coerced patch is what we persist.
-          const cur = db
-            .query("SELECT worktree_mode FROM autopilot_state WHERE id = 1")
-            .get() as { worktree_mode: number | null } | null;
-          const effectivePatch = enforceWorktreeConcurrencyInvariant(
-            msg.patch,
-            cur?.worktree_mode === 1,
-          );
+          // Mint the validated patch VERBATIM — `max_concurrent_per_root` is
+          // durable stored intent, so a worktree-off patch never coerces/rejects
+          // it (the shared checkout safety invariant lives at the consumption
+          // seams via `effectivePerRootCap`, which is strictly stronger — a stale
+          // > 1 row can no longer over-dispatch).
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
             $session_id: "autopilot",
@@ -4562,7 +4554,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $agent_id: null,
             $agent_type: null,
             $stop_hook_active: null,
-            $data: JSON.stringify(effectivePatch),
+            $data: JSON.stringify(msg.patch),
             $subagent_agent_id: null,
             $spawn_name: null,
             $start_time: null,
@@ -4584,7 +4576,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           });
           wakePending = true;
           pumpWakes();
-          reply = { type: "set-autopilot-config-result", id, ok: true };
+          // `pumpWakes` drains synchronously, so the `AutopilotConfigSet` event is
+          // now folded — this read reflects the worktree mode AS OF the applied
+          // patch (the folded mode at reply time). A per-root cap stored while
+          // worktree mode is off is dormant (effective 1); surface that gap as an
+          // advisory note on the otherwise-successful reply.
+          const folded = db
+            .query("SELECT worktree_mode FROM autopilot_state WHERE id = 1")
+            .get() as { worktree_mode: number | null } | null;
+          const note = perRootStoredWhileOffNote(
+            msg.patch,
+            folded?.worktree_mode === 1,
+          );
+          reply = note
+            ? { type: "set-autopilot-config-result", id, ok: true, note }
+            : { type: "set-autopilot-config-result", id, ok: true };
         } catch (err) {
           reply = {
             type: "set-autopilot-config-result",
