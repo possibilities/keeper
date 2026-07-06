@@ -129,6 +129,10 @@ export function resolveHandoffSpillDir(): string {
 
 const DEFAULT_PLAN_ROOTS = ["~/code"];
 
+export const DEFAULT_REPO_CREATE_ROOT = "~/code";
+export const DEFAULT_REPO_CLONE_ROOT = "~/src";
+export const DEFAULT_REPO_FORK_ROOT = "~/src";
+
 const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
 const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
@@ -139,6 +143,12 @@ const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
  */
 export interface KeeperConfig {
   roots: string[];
+  // Destination roots for `keeper repo` lifecycle verbs. Parsed independently
+  // from plan roots: project discovery watches `roots`, while repo clone/fork
+  // default to a source checkout area.
+  repoCreateRoot: string;
+  repoCloneRoot: string;
+  repoForkRoot: string;
   claudeProjectsRoot?: string;
   agentusageRoot?: string;
   // Absolute path to the `uv` binary the usage-scraper-worker shells the
@@ -315,6 +325,9 @@ export function resolveConfigPath(): string {
 export function resolveConfig(): KeeperConfig {
   const path = resolveConfigPath();
   let roots: string[] = [...DEFAULT_PLAN_ROOTS];
+  let repoCreateRoot = DEFAULT_REPO_CREATE_ROOT;
+  let repoCloneRoot = DEFAULT_REPO_CLONE_ROOT;
+  let repoForkRoot = DEFAULT_REPO_FORK_ROOT;
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
   let agentusageRoot: string = DEFAULT_AGENTUSAGE_ROOT;
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
@@ -348,6 +361,9 @@ export function resolveConfig(): KeeperConfig {
     if (!existsSync(path)) {
       return {
         roots,
+        repoCreateRoot,
+        repoCloneRoot,
+        repoForkRoot,
         claudeProjectsRoot,
         agentusageRoot,
         usageScraperRuntime,
@@ -365,6 +381,18 @@ export function resolveConfig(): KeeperConfig {
         if (parsed.length > 0) {
           roots = parsed;
         }
+      }
+      const rcr = (raw as { repo_create_root?: unknown }).repo_create_root;
+      if (typeof rcr === "string" && rcr.length > 0) {
+        repoCreateRoot = rcr;
+      }
+      const rclr = (raw as { repo_clone_root?: unknown }).repo_clone_root;
+      if (typeof rclr === "string" && rclr.length > 0) {
+        repoCloneRoot = rclr;
+      }
+      const rfr = (raw as { repo_fork_root?: unknown }).repo_fork_root;
+      if (typeof rfr === "string" && rfr.length > 0) {
+        repoForkRoot = rfr;
       }
       const cpr = (raw as { claude_projects_root?: unknown })
         .claude_projects_root;
@@ -459,6 +487,9 @@ export function resolveConfig(): KeeperConfig {
     );
     return {
       roots: [...DEFAULT_PLAN_ROOTS],
+      repoCreateRoot: DEFAULT_REPO_CREATE_ROOT,
+      repoCloneRoot: DEFAULT_REPO_CLONE_ROOT,
+      repoForkRoot: DEFAULT_REPO_FORK_ROOT,
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       usageScraperRuntime: "uv",
@@ -469,6 +500,9 @@ export function resolveConfig(): KeeperConfig {
   }
   return {
     roots,
+    repoCreateRoot,
+    repoCloneRoot,
+    repoForkRoot,
     claudeProjectsRoot,
     agentusageRoot,
     buildbotUrl,
@@ -663,6 +697,40 @@ export function resolvePlanRoots(): string[] {
     }
   }
   return out;
+}
+
+/** Resolve `keeper repo create`'s destination root. Env wins, then config, then
+ * `~/code`. Tilde is expanded; existence is not required because the verb can
+ * create the destination parent. */
+export function resolveRepoCreateRoot(): string {
+  return expandTilde(
+    firstNonEmpty(
+      process.env.KEEPER_REPO_CREATE_ROOT,
+      resolveConfig().repoCreateRoot,
+    ) ?? DEFAULT_REPO_CREATE_ROOT,
+  );
+}
+
+/** Resolve `keeper repo clone`'s destination root. Env wins, then config, then
+ * `~/src`. Tilde is expanded; existence is not required. */
+export function resolveRepoCloneRoot(): string {
+  return expandTilde(
+    firstNonEmpty(
+      process.env.KEEPER_REPO_CLONE_ROOT,
+      resolveConfig().repoCloneRoot,
+    ) ?? DEFAULT_REPO_CLONE_ROOT,
+  );
+}
+
+/** Resolve `keeper repo fork`'s destination root. Env wins, then config, then
+ * `~/src`. Tilde is expanded; existence is not required. */
+export function resolveRepoForkRoot(): string {
+  return expandTilde(
+    firstNonEmpty(
+      process.env.KEEPER_REPO_FORK_ROOT,
+      resolveConfig().repoForkRoot,
+    ) ?? DEFAULT_REPO_FORK_ROOT,
+  );
 }
 
 /**

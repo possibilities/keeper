@@ -94,6 +94,8 @@ function makeHarness(): Harness {
       "escalation-brief": mkHandler("escalation-brief"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
+      projects: mkHandler("projects"),
+      repo: mkHandler("repo"),
       dispatch: mkHandler("dispatch"),
       handoff: mkHandler("handoff"),
       agent: mkHandler("agent"),
@@ -231,6 +233,8 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("show-job")).toBe(true);
     expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("prompt")).toBe(true);
+    expect(isSubcommand("projects")).toBe(true);
+    expect(isSubcommand("repo")).toBe(true);
     expect(isSubcommand("bus")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);

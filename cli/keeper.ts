@@ -47,6 +47,8 @@ export const SUBCOMMANDS = [
   "escalation-brief",
   "plan",
   "prompt",
+  "projects",
+  "repo",
   "dispatch",
   "handoff",
   "agent",
@@ -204,6 +206,15 @@ export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
       "list-bundles",
       "show-bundle",
     ],
+  },
+  projects: {
+    summary:
+      "List keeper-root projects ranked from keeper.db activity and manifest metadata",
+    verbs: ["roots", "names", "ranked", "grouped", "descriptions"],
+  },
+  repo: {
+    summary: "Create, clone, and fork GitHub repos into configured roots",
+    verbs: ["create", "clone", "fork"],
   },
   dispatch: {
     summary:
@@ -599,6 +610,8 @@ export async function main(): Promise<void> {
       (await import("./escalation-brief")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
     prompt: async (argv) => (await import("./prompt")).main(argv),
+    projects: async (argv) => (await import("./projects")).main(argv),
+    repo: async (argv) => (await import("./repo")).main(argv),
     dispatch: async (argv) => (await import("./dispatch")).main(argv),
     handoff: async (argv) => (await import("./handoff")).main(argv),
     agent: async (argv) => (await import("./agent")).main(argv),

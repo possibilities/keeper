@@ -14,6 +14,9 @@ import { join } from "node:path";
 import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  DEFAULT_REPO_CLONE_ROOT,
+  DEFAULT_REPO_CREATE_ROOT,
+  DEFAULT_REPO_FORK_ROOT,
   effectivePerRootCap,
   isTransientBootOpenError,
   MAX_IN_PARAMS,
@@ -22,6 +25,9 @@ import {
   resolveConfig,
   resolveDbPath,
   resolvePlanRoots,
+  resolveRepoCloneRoot,
+  resolveRepoCreateRoot,
+  resolveRepoForkRoot,
   resolveSockPath,
   SCHEMA_VERSION,
   selectWorldRev,
@@ -5822,6 +5828,61 @@ test("resolveConfig: KEEPER_CONFIG override parses roots via Bun.YAML", () => {
     writeFileSync(cfg, "roots:\n  - ~/code\n  - /tmp/projects\n");
     process.env.KEEPER_CONFIG = cfg;
     expect(resolveConfig().roots).toEqual(["~/code", "/tmp/projects"]);
+  } finally {
+    if (original === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = original;
+  }
+});
+
+test("resolveConfig: repo roots default independently and resolve with env overrides", async () => {
+  const originalConfig = process.env.KEEPER_CONFIG;
+  const originalCreate = process.env.KEEPER_REPO_CREATE_ROOT;
+  const originalClone = process.env.KEEPER_REPO_CLONE_ROOT;
+  const originalFork = process.env.KEEPER_REPO_FORK_ROOT;
+  try {
+    const cfg = join(tmpDir, "config.yaml");
+    writeFileSync(
+      cfg,
+      "repo_create_root: ~/made\nrepo_clone_root: /tmp/clones\nrepo_fork_root: /tmp/forks\n",
+    );
+    process.env.KEEPER_CONFIG = cfg;
+    const parsed = resolveConfig();
+    expect(parsed.repoCreateRoot).toBe("~/made");
+    expect(parsed.repoCloneRoot).toBe("/tmp/clones");
+    expect(parsed.repoForkRoot).toBe("/tmp/forks");
+
+    const { homedir } = await import("node:os");
+    expect(resolveRepoCreateRoot()).toBe(join(homedir(), "made"));
+    expect(resolveRepoCloneRoot()).toBe("/tmp/clones");
+    expect(resolveRepoForkRoot()).toBe("/tmp/forks");
+
+    process.env.KEEPER_REPO_CREATE_ROOT = "/env/create";
+    process.env.KEEPER_REPO_CLONE_ROOT = "/env/clone";
+    process.env.KEEPER_REPO_FORK_ROOT = "/env/fork";
+    expect(resolveRepoCreateRoot()).toBe("/env/create");
+    expect(resolveRepoCloneRoot()).toBe("/env/clone");
+    expect(resolveRepoForkRoot()).toBe("/env/fork");
+  } finally {
+    if (originalConfig === undefined) delete process.env.KEEPER_CONFIG;
+    else process.env.KEEPER_CONFIG = originalConfig;
+    if (originalCreate === undefined)
+      delete process.env.KEEPER_REPO_CREATE_ROOT;
+    else process.env.KEEPER_REPO_CREATE_ROOT = originalCreate;
+    if (originalClone === undefined) delete process.env.KEEPER_REPO_CLONE_ROOT;
+    else process.env.KEEPER_REPO_CLONE_ROOT = originalClone;
+    if (originalFork === undefined) delete process.env.KEEPER_REPO_FORK_ROOT;
+    else process.env.KEEPER_REPO_FORK_ROOT = originalFork;
+  }
+});
+
+test("resolveConfig: missing file carries repo root defaults", () => {
+  const original = process.env.KEEPER_CONFIG;
+  try {
+    process.env.KEEPER_CONFIG = join(tmpDir, "nope-repo-roots.yaml");
+    const parsed = resolveConfig();
+    expect(parsed.repoCreateRoot).toBe(DEFAULT_REPO_CREATE_ROOT);
+    expect(parsed.repoCloneRoot).toBe(DEFAULT_REPO_CLONE_ROOT);
+    expect(parsed.repoForkRoot).toBe(DEFAULT_REPO_FORK_ROOT);
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;
