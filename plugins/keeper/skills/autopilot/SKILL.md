@@ -11,7 +11,8 @@ description: >-
   never say "keeper" or "autopilot". NOT for launching one worker by hand
   (that is `keeper:dispatch`); "prioritize this" / "do this next" alone never
   triggers this skill (plan state carries no board-priority knob — only an
-  explicit autopilot/armed reference does); NOT for planning (`/plan:plan`).
+  explicit autopilot/armed reference does); NOT for ongoing board supervision or
+  babysitting a run (that is `keeper:watch`); NOT for planning (`/plan:plan`).
 allowed-tools: Bash
 argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | worktree <on|off> | config <key> <val> | retry <verb::id> | show
 ---
