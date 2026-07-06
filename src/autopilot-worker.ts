@@ -1044,7 +1044,6 @@ export const SHARED_CHECKOUT_WEDGE_GRACE_SEC = 5 * 60;
  * escalates the sustained dirt into a visible per-repo distress row — the same short
  * ~5min watermark the mid-merge wedge uses: long enough that a transient in-flight
  * commit-work settles inside the window, short enough that persistent operator dirt
- * (the incident where one stray file dirt-skipped four epics' finalizes invisibly)
  * surfaces fast. Injectable so the fast tier drives the grace-crossing without a
  * real clock. Kept a DISTINCT const from the wedge grace so the two can diverge.
  */
