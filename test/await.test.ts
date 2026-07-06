@@ -21,9 +21,9 @@
 
 import { expect, test } from "bun:test";
 import {
+  AGENT_HELP as AWAIT_AGENT_HELP,
   HELP as AWAIT_HELP,
   parseAwaitArgs,
-  parseDurationMs,
   parseMonitorSelector,
   type RunDeps,
   runAwait,
@@ -45,6 +45,17 @@ test("HELP documents complete as done-AND-idle and lists the landed condition", 
   expect(AWAIT_HELP).toContain("landed <epic>");
   const landed = parseAwaitArgs(["landed", "fn-1-foo"]);
   expect(landed.ok).toBe(true);
+});
+
+test("--agent-help routes to the runbook signal before any I/O", () => {
+  // Pure routing: the flag is classified into the meta signal `main` prints,
+  // never a condition — so no git-root resolve, no socket, no subscribe.
+  const r = parseAwaitArgs(["--agent-help"]);
+  expect(r.ok).toBe(false);
+  expect((r as { message: string }).message).toBe("__agent_help__");
+  // Content assertion (catches an empty stub): names its primary verb form.
+  expect(AWAIT_AGENT_HELP).toContain("operator runbook");
+  expect(AWAIT_AGENT_HELP).toContain("keeper await complete");
 });
 
 // ---------------------------------------------------------------------------
@@ -499,29 +510,6 @@ async function runAndCatch(
 }
 
 // ---------------------------------------------------------------------------
-// parseDurationMs
-// ---------------------------------------------------------------------------
-
-test("parseDurationMs: bare integer is ms", () => {
-  expect(parseDurationMs("0")).toBe(0);
-  expect(parseDurationMs("500")).toBe(500);
-});
-
-test("parseDurationMs: suffix units", () => {
-  expect(parseDurationMs("250ms")).toBe(250);
-  expect(parseDurationMs("30s")).toBe(30_000);
-  expect(parseDurationMs("5m")).toBe(300_000);
-  expect(parseDurationMs("2h")).toBe(7_200_000);
-});
-
-test("parseDurationMs: invalid input → null", () => {
-  expect(parseDurationMs("")).toBeNull();
-  expect(parseDurationMs("abc")).toBeNull();
-  expect(parseDurationMs("-5")).toBeNull();
-  expect(parseDurationMs("5x")).toBeNull();
-});
-
-// ---------------------------------------------------------------------------
 // parseAwaitArgs
 // ---------------------------------------------------------------------------
 
@@ -617,6 +605,14 @@ test("parseAwaitArgs: missing positional id for plan → usage error", () => {
 test("parseAwaitArgs: bad timeout → usage error", () => {
   const r = parseAwaitArgs(["complete", "fn-1-foo.1", "--timeout", "abc"]);
   expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: unitless --timeout is rejected (exit 2) with a self-healing hint", () => {
+  const r = parseAwaitArgs(["complete", "fn-1-foo.1", "--timeout", "30"]);
+  if (r.ok) throw new Error("expected a usage error for a unitless duration");
+  expect(r.exitCode).toBe(2);
+  expect(r.message).toContain("--timeout");
+  expect(r.message).toContain("30s");
 });
 
 // ---------------------------------------------------------------------------

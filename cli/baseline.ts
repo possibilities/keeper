@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `keeper baseline [<sha>] [--repo <dir>] [--wait] [--timeout-ms <n>]` — the
+ * `keeper baseline [<sha>] [--repo <dir>] [--wait] [--timeout <dur>]` — the
  * worker-facing READ surface over the suite-baseline store (docs/adr/0005). A
  * worker consults it to attribute a test failure as pre-existing at its base
  * commit or self-inflicted, instead of the banned `git stash` + rerun.
@@ -56,6 +56,8 @@ import {
   writeRequest,
 } from "../src/baseline-store";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
+import { parseOptions } from "./descriptor";
+import { parseDuration } from "./duration";
 
 // ── exit codes ───────────────────────────────────────────────────────────────
 
@@ -94,8 +96,10 @@ Flags:
   --repo <dir>          Repo to resolve against (default: cwd's git root)
   --wait                Trigger-and-await: write ONE spool request, then poll the
                         leaf until a terminal envelope or the deadline
-  --timeout-ms <n>      --wait deadline in ms (default ${DEFAULT_TIMEOUT_MS})
-  --poll-interval-ms <n>  --wait poll gap in ms (default ${DEFAULT_POLL_INTERVAL_MS})
+  --timeout <dur>       --wait deadline (unit required, e.g. 10m, 600s;
+                        default ${DEFAULT_TIMEOUT_MS}ms)
+  --poll-interval <dur> --wait poll gap (unit required, e.g. 1s, 500ms;
+                        default ${DEFAULT_POLL_INTERVAL_MS}ms)
   --help, -h            Show this help
 
 Exit codes:
@@ -138,26 +142,14 @@ interface ParseSuccess {
   args: ParsedArgs;
 }
 
-/** Parse a required positive-integer ms flag value. `null` on a bad value. */
-function parsePositiveIntMs(raw: string): number | null {
-  if (!/^\d+$/.test(raw.trim())) return null;
-  const n = Number.parseInt(raw.trim(), 10);
-  return Number.isSafeInteger(n) && n > 0 ? n : null;
-}
-
 export function parseBaselineArgs(argv: string[]): ParseFailure | ParseSuccess {
   let values: Record<string, unknown>;
   let positionals: string[];
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        repo: { type: "string" },
-        wait: { type: "boolean" },
-        "timeout-ms": { type: "string" },
-        "poll-interval-ms": { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("baseline"),
       allowPositionals: true,
       strict: true,
     });
@@ -184,27 +176,21 @@ export function parseBaselineArgs(argv: string[]): ParseFailure | ParseSuccess {
   const repo = typeof values.repo === "string" ? values.repo : null;
 
   let timeoutMs = DEFAULT_TIMEOUT_MS;
-  if (typeof values["timeout-ms"] === "string") {
-    const parsed = parsePositiveIntMs(values["timeout-ms"]);
-    if (parsed === null) {
-      return {
-        ok: false,
-        message: `invalid --timeout-ms '${values["timeout-ms"]}' (expected a positive integer)`,
-      };
+  if (typeof values.timeout === "string") {
+    const parsed = parseDuration(values.timeout);
+    if (!parsed.ok) {
+      return { ok: false, message: `--timeout ${parsed.message}` };
     }
-    timeoutMs = parsed;
+    timeoutMs = parsed.ms;
   }
 
   let pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
-  if (typeof values["poll-interval-ms"] === "string") {
-    const parsed = parsePositiveIntMs(values["poll-interval-ms"]);
-    if (parsed === null) {
-      return {
-        ok: false,
-        message: `invalid --poll-interval-ms '${values["poll-interval-ms"]}' (expected a positive integer)`,
-      };
+  if (typeof values["poll-interval"] === "string") {
+    const parsed = parseDuration(values["poll-interval"]);
+    if (!parsed.ok) {
+      return { ok: false, message: `--poll-interval ${parsed.message}` };
     }
-    pollIntervalMs = parsed;
+    pollIntervalMs = parsed.ms;
   }
 
   return {

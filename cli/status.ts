@@ -45,14 +45,16 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
+import { type FormatMode, parseOptions } from "./descriptor";
+import { parseDuration } from "./duration";
 import {
   type Envelope,
-  emitEnvelope,
   errorEnvelope,
   type ProblemError,
   RECOVERY_DAEMON_DOWN,
   successEnvelope,
 } from "./envelope";
+import { emitEnvelopeFormatted, resolveFormat } from "./format";
 
 /** Envelope schema version for `keeper status`. v2 adds the additive
  * `dispatch_failure: string[]` field to the per-task + close-row views; v3 adds
@@ -86,7 +88,7 @@ const FINALIZE_NON_FF_REASON = "worktree-finalize-non-fast-forward";
 export const HELP = `keeper status — one-shot unified board + autopilot JSON read
 
 Usage:
-  keeper status [--json] [--sock <path>] [--connect-timeout <dur>]
+  keeper status [--format json|yaml] [--sock <path>] [--connect-timeout <dur>]
 
 Prints ONE {schema_version, ok, error, data} envelope: autopilot config, the
 per-epic/-task/-close-row readiness verdicts, aggregate counts, drained/jammed
@@ -96,7 +98,8 @@ dispatch_failures block KINDS (multi-repo / merge-conflict / dirty-tree / non-ff
 readiness can't see; [] when clean.
 
 Flags:
-  --json                   Emit JSON (default; accepted for symmetry)
+  --format json|yaml       Output format (default json); yaml for a yq consumer
+  --json                   Alias of --format json
   --sock <path>            Socket override ($KEEPER_SOCK / default)
   --connect-timeout <dur>  Bounded reach-server deadline (e.g. 10s, 5m).
                            Default ~10s; a down daemon → exit 1 unreachable
@@ -410,11 +413,19 @@ export function buildStatusErrorEnvelope(error: ProblemError): StatusEnvelope {
 export interface ParsedStatusArgs {
   sock: string;
   connectTimeoutMs: number;
+  /** Resolved output format (`--format` / `--json` alias; json | yaml). */
+  format: FormatMode;
 }
+
+/** Exit code for a usage/grammar fault (a bad flag value). */
+const EXIT_USAGE = 2;
 
 interface ParseFailure {
   ok: false;
   message: string;
+  /** Process exit code for `main` (default 1); a bad duration is a usage
+   *  fault → exit 2 under the shared grammar. */
+  exitCode?: number;
 }
 
 interface ParseSuccess {
@@ -422,42 +433,13 @@ interface ParseSuccess {
   args: ParsedStatusArgs;
 }
 
-/** Parse a duration like `30s`, `5m`, `2h`, or a bare-ms integer. `null` on a
- *  parse error. */
-function parseDurationMs(s: string): number | null {
-  const m = /^(\d+)(ms|s|m|h)?$/.exec(s.trim());
-  if (m === null) {
-    return null;
-  }
-  const n = Number.parseInt(m[1] ?? "", 10);
-  if (!Number.isFinite(n) || n <= 0) {
-    return null;
-  }
-  switch (m[2] ?? "ms") {
-    case "ms":
-      return n;
-    case "s":
-      return n * 1000;
-    case "m":
-      return n * 60_000;
-    case "h":
-      return n * 3_600_000;
-    default:
-      return null;
-  }
-}
-
 export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
   let values: Record<string, unknown>;
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        json: { type: "boolean" },
-        sock: { type: "string" },
-        "connect-timeout": { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("status"),
       allowPositionals: false,
       strict: true,
     });
@@ -473,17 +455,23 @@ export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
     return { ok: false, message: "__help__" };
   }
 
+  const fmt = resolveFormat("status", values);
+  if (!fmt.ok) {
+    return { ok: false, message: fmt.message, exitCode: EXIT_USAGE };
+  }
+
   let connectTimeoutMs = DEFAULT_CONNECT_DEADLINE_MS;
   const raw = values["connect-timeout"];
   if (typeof raw === "string" && raw.length > 0) {
-    const parsed = parseDurationMs(raw);
-    if (parsed === null) {
+    const parsed = parseDuration(raw);
+    if (!parsed.ok) {
       return {
         ok: false,
-        message: `invalid --connect-timeout '${raw}' (expected e.g. 10s, 5m, or ms integer)`,
+        message: `--connect-timeout ${parsed.message}`,
+        exitCode: EXIT_USAGE,
       };
     }
-    connectTimeoutMs = parsed;
+    connectTimeoutMs = parsed.ms;
   }
 
   const sock =
@@ -491,7 +479,7 @@ export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
       ? (values.sock as string)
       : resolveSockPath();
 
-  return { ok: true, args: { sock, connectTimeoutMs } };
+  return { ok: true, args: { sock, connectTimeoutMs, format: fmt.format } };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +534,7 @@ export async function runStatus(
       failures = [];
     }
     const envelope = buildStatusEnvelope(snap, latestBoot, failures);
-    emitEnvelope(envelope, deps);
+    emitEnvelopeFormatted(envelope, deps, args.format);
   };
 
   const onSnapshot = (snap: ReadinessClientSnapshot): void => {
@@ -573,7 +561,7 @@ export async function runStatus(
       message: `${reason}: ${err.message}`,
       recovery: RECOVERY_DAEMON_DOWN,
     });
-    emitEnvelope(envelope, deps);
+    emitEnvelopeFormatted(envelope, deps, args.format);
   };
 
   handle = subscribeReadiness({
@@ -599,7 +587,7 @@ export async function main(argv: string[]): Promise<void> {
     }
     process.stderr.write(`keeper status: ${parsed.message}\n\n`);
     process.stderr.write(HELP);
-    process.exit(1);
+    process.exit(parsed.exitCode ?? 1);
   }
 
   await runStatus(parsed.args, {

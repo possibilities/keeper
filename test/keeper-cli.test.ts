@@ -21,6 +21,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildParseOptions,
+  NATIVE_COMMANDS,
+  nativeDescriptor,
+  parseOptions,
+} from "../cli/descriptor";
+import {
   checkRaceGuard,
   main as dispatchMain,
   type LaunchFn,
@@ -40,6 +46,7 @@ import {
   type Subcommand,
   USAGE,
 } from "../cli/keeper";
+import { main as sessionMain } from "../cli/session";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import type { Row } from "../src/protocol";
 
@@ -84,13 +91,10 @@ function makeHarness(): Harness {
       baseline: mkHandler("baseline"),
       "setup-tmux": mkHandler("setup-tmux"),
       tabs: mkHandler("tabs"),
-      "session-state": mkHandler("session-state"),
-      "show-session-files": mkHandler("show-session-files"),
+      session: mkHandler("session"),
       "search-history": mkHandler("search-history"),
       "find-file-history": mkHandler("find-file-history"),
-      "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
-      "session-summary": mkHandler("session-summary"),
       "escalation-brief": mkHandler("escalation-brief"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
@@ -225,11 +229,9 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("await")).toBe(true);
     expect(isSubcommand("commit-work")).toBe(true);
     expect(isSubcommand("setup-tmux")).toBe(true);
-    expect(isSubcommand("session-state")).toBe(true);
-    expect(isSubcommand("show-session-files")).toBe(true);
+    expect(isSubcommand("session")).toBe(true);
     expect(isSubcommand("search-history")).toBe(true);
     expect(isSubcommand("find-file-history")).toBe(true);
-    expect(isSubcommand("show-session-events")).toBe(true);
     expect(isSubcommand("show-job")).toBe(true);
     expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("prompt")).toBe(true);
@@ -254,6 +256,45 @@ describe("cli/keeper dispatch", () => {
     expect(h.calls).toEqual([{ sub: "tabs", argv: ["restore", "--apply"] }]);
     // The verb list is published for the machine-readable command index.
     expect(SUBCOMMAND_META.tabs.verbs).toEqual(["list", "restore", "dump"]);
+  });
+
+  test("session is a registered two-level subcommand routed to its handler", async () => {
+    const h = makeHarness();
+    expect(isSubcommand("session")).toBe(true);
+    // The subverb + its args ride in the residual, verb token first — the group
+    // dispatcher (cli/session.ts) owns routing to the leaf main.
+    await dispatch(["session", "summary", "abc", "--max-snippet", "9"], h.deps);
+    expect(h.calls).toEqual([
+      { sub: "session", argv: ["summary", "abc", "--max-snippet", "9"] },
+    ]);
+    // The four session-scoped reads are the group's published verbs.
+    expect(SUBCOMMAND_META.session.verbs).toEqual([
+      "state",
+      "files",
+      "events",
+      "summary",
+    ]);
+  });
+
+  test("the retired flat session leaf names hard-fail as unknown subcommands", async () => {
+    for (const retired of [
+      "session-state",
+      "show-session-files",
+      "show-session-events",
+      "session-summary",
+    ]) {
+      const h = makeHarness();
+      let caught: unknown;
+      try {
+        await dispatch([retired], h.deps);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ExitError);
+      expect((caught as ExitError).code).toBe(1);
+      expect(h.stderr.join("")).toContain(`unknown subcommand '${retired}'`);
+      expect(h.calls).toEqual([]);
+    }
   });
 
   test("--help --json emits the machine-readable command index, exit 0", async () => {
@@ -314,7 +355,7 @@ describe("cli/keeper command index", () => {
     ] as const) {
       const verbs = byName.get(name)?.verbs;
       expect(Array.isArray(verbs)).toBe(true);
-      expect((verbs as readonly string[]).length).toBeGreaterThan(0);
+      expect((verbs ?? []).length).toBeGreaterThan(0);
     }
     // A leaf (non-two-level) subcommand omits verbs entirely.
     expect(byName.get("status")?.verbs).toBeUndefined();
@@ -327,11 +368,25 @@ describe("cli/keeper command index", () => {
       .map((s) => String(s.name))
       .sort();
     expect(flagged).toEqual(
-      ["autopilot", "commit-work", "dispatch", "handoff", "reclaim"].sort(),
+      [
+        "agent",
+        "autopilot",
+        "await",
+        "bus",
+        "commit-work",
+        "dispatch",
+        "handoff",
+        "plan",
+        "prompt",
+        "reclaim",
+        "tabs",
+      ].sort(),
     );
     // The metadata source of truth agrees with the projected index.
     for (const s of index.subcommands) {
-      expect(s.agent_help).toBe(SUBCOMMAND_META[s.name].agentHelp === true);
+      expect(s.agent_help).toBe(
+        SUBCOMMAND_META[s.name as Subcommand].agentHelp === true,
+      );
     }
   });
 
@@ -405,6 +460,96 @@ describe("cli/keeper Clerc proxy routing", () => {
     }
     // No stray commands beyond the public surface (aliases would show here).
     expect(registered.size).toBe(SUBCOMMANDS.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli/session group dispatcher — `keeper session <state|files|events|summary>`
+// maps each verb to its leaf main (session-state / show-session-files /
+// show-session-events / session-summary), preserving that leaf's flags,
+// envelope, and exit codes; only the invocation spelling is the group. These
+// assert the group's own routing decisions: pure group help, leaf-specific help
+// (proving the verb reaches its leaf), and an unknown-verb exit 2. Full help
+// purity across every leaf rides the descriptor walk in help-purity.test.ts.
+// ---------------------------------------------------------------------------
+describe("cli/session group dispatcher", () => {
+  interface Captured {
+    out: string;
+    err: string;
+    code: number | null;
+  }
+
+  /** Run sessionMain with process stdout/stderr/exit captured. `exit` throws so
+   *  a never-returning arg-fault branch unwinds to a captured code. */
+  async function runSession(argv: string[]): Promise<Captured> {
+    const out: string[] = [];
+    const err: string[] = [];
+    let code: number | null = null;
+    const orig = {
+      stdout: process.stdout.write,
+      stderr: process.stderr.write,
+      exit: process.exit,
+    };
+    process.stdout.write = ((s: string | Uint8Array) => {
+      out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((s: string | Uint8Array) => {
+      err.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stderr.write;
+    process.exit = ((c?: number) => {
+      code = c ?? 0;
+      throw new ExitError(c ?? 0);
+    }) as typeof process.exit;
+    try {
+      await sessionMain(argv);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      process.stdout.write = orig.stdout;
+      process.stderr.write = orig.stderr;
+      process.exit = orig.exit;
+    }
+    return { out: out.join(""), err: err.join(""), code };
+  }
+
+  test("bare `keeper session` prints pure group help, no exit", async () => {
+    const r = await runSession([]);
+    expect(r.code).toBeNull();
+    expect(r.out).toContain("keeper session <state|files|events|summary>");
+    expect(r.err).toBe("");
+  });
+
+  test("`keeper session --help` lists every verb, no exit", async () => {
+    const r = await runSession(["--help"]);
+    expect(r.code).toBeNull();
+    for (const verb of ["state", "files", "events", "summary"]) {
+      expect(r.out).toContain(verb);
+    }
+  });
+
+  test("a subverb's --help reaches its leaf and renders leaf-specific help", async () => {
+    // The leaf help usage line names the grouped spelling, proving the group
+    // routed to that exact leaf (and that the leaf help cites no retired name).
+    expect((await runSession(["state", "--help"])).out).toContain(
+      "keeper session state",
+    );
+    expect((await runSession(["files", "--help"])).out).toContain(
+      "keeper session files",
+    );
+    expect((await runSession(["events", "--help"])).out).toContain(
+      "keeper session events",
+    );
+    expect((await runSession(["summary", "--help"])).out).toContain(
+      "keeper session summary",
+    );
+  });
+
+  test("an unknown subverb is an argument fault (exit 2)", async () => {
+    const r = await runSession(["bogus"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown verb 'bogus'");
   });
 });
 
@@ -1259,6 +1404,197 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
       expect(s.readArgvLog()).toContain("agent claude --x-tmux");
     } finally {
       s.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli/descriptor — the pure-data descriptor tree (ADR 0008) is the single
+// source of truth `keeper --help --json`, USAGE, completions, and every derived
+// leaf's parseArgs read from. These pin: the module stays dependency-free; the
+// name tuple matches the descriptor order; parseArgs options are genuinely
+// derived (asserted against a HAND-WRITTEN expected — an independent source of
+// truth, never re-derived from the descriptor by the code under test); the JSON
+// index mirrors the descriptor recursively; USAGE hides internal commands the
+// index still carries.
+// ---------------------------------------------------------------------------
+describe("cli/descriptor purity + derivation", () => {
+  test("descriptor.ts is dependency-free (imports nothing)", () => {
+    const src = readFileSync(
+      join(import.meta.dir, "..", "cli", "descriptor.ts"),
+      "utf8",
+    );
+    // Strip block + line comments (the module's prose names `import` in its
+    // header) before scanning for real import statements.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    // ANY `import … from` / bare `import "…"` / dynamic `import(` is a
+    // dependency; the descriptor must have zero — it is pure data + types.
+    expect(code).not.toMatch(/\bimport\b[\s\S]*?\bfrom\b/);
+    expect(code).not.toMatch(/\bimport\s*['"(]/);
+  });
+
+  test("SUBCOMMANDS tuple matches the descriptor order exactly", () => {
+    // The one hand-maintained list (names, for the literal `Subcommand` union)
+    // is pinned to the descriptor so a divergence is a hard fail, not drift.
+    expect(NATIVE_COMMANDS.map((c) => c.name)).toEqual([...SUBCOMMANDS]);
+  });
+
+  test("buildParseOptions carries type/short/multiple/default, drops summary", () => {
+    // Hand-written expected: the mapping is behavior-critical, so it is asserted
+    // literally rather than by round-tripping the same builder.
+    expect(
+      buildParseOptions([
+        { name: "help", type: "boolean", short: "h", summary: "drop me" },
+        { name: "filter", type: "string", multiple: true },
+        { name: "snapshot", type: "boolean", default: false },
+        { name: "sock", type: "string" },
+      ]),
+    ).toEqual({
+      help: { type: "boolean", short: "h" },
+      filter: { type: "string", multiple: true },
+      snapshot: { type: "boolean", default: false },
+      sock: { type: "string" },
+    });
+  });
+
+  test("parseOptions('baseline') reproduces the leaf's flag surface", () => {
+    // Independent source of truth: the baseline leaf's flag surface under the
+    // shared duration grammar (`-ms` spellings retired), hand-transcribed here.
+    expect(parseOptions("baseline")).toEqual({
+      help: { type: "boolean", short: "h" },
+      repo: { type: "string" },
+      wait: { type: "boolean" },
+      timeout: { type: "string" },
+      "poll-interval": { type: "string" },
+    });
+  });
+
+  test("parseOptions('board') preserves the viewer defaults", () => {
+    expect(parseOptions("board")).toEqual({
+      sock: { type: "string" },
+      snapshot: { type: "boolean", default: false },
+      watch: { type: "boolean", default: false },
+      timeout: { type: "string" },
+      help: { type: "boolean", default: false },
+    });
+  });
+
+  test("parseOptions('query') preserves the repeatable filter + format grammar", () => {
+    // Independent source of truth: the query leaf's flag surface under the
+    // converged `--format` grammar (`--json` retained as its documented alias),
+    // hand-transcribed here rather than re-derived from the descriptor.
+    expect(parseOptions("query")).toEqual({
+      help: { type: "boolean", short: "h" },
+      format: { type: "string" },
+      json: { type: "boolean" },
+      filter: { type: "string", multiple: true },
+      sock: { type: "string" },
+    });
+  });
+
+  test("parseOptions('tabs', 'restore') derives the per-verb surface", () => {
+    expect(parseOptions("tabs", "restore")).toEqual({
+      apply: { type: "boolean", default: false },
+      generation: { type: "string" },
+      session: { type: "string" },
+      "allow-empty": { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
+      db: { type: "string" },
+    });
+  });
+
+  test("parseOptions throws on an unknown command/verb (a wiring bug)", () => {
+    expect(() => parseOptions("nope")).toThrow(/unknown native command/);
+    expect(() => parseOptions("tabs", "nope")).toThrow(/unknown verb/);
+  });
+
+  test("nativeDescriptor resolves a top-level command, undefined otherwise", () => {
+    expect(nativeDescriptor("baseline")?.name).toBe("baseline");
+    expect(nativeDescriptor("nope")).toBeUndefined();
+  });
+});
+
+describe("keeper --help --json recursive descriptor tree", () => {
+  test("index nodes mirror the descriptor's per-command metadata", () => {
+    const index = buildHelpIndex();
+    // Every descriptor command projects to an index node in the same order.
+    expect(index.subcommands.map((s) => s.name)).toEqual(
+      NATIVE_COMMANDS.map((c) => c.name),
+    );
+    for (const cmd of NATIVE_COMMANDS) {
+      const node = index.subcommands.find((s) => s.name === cmd.name);
+      expect(node).toBeDefined();
+      const n = node as NonNullable<typeof node>;
+      expect(n.visibility).toBe(cmd.visibility);
+      expect(n.mutates).toBe(cmd.mutates);
+      expect(n.requires_daemon).toBe(cmd.requires_daemon);
+      expect(n.requires_tty).toBe(cmd.requires_tty);
+      expect(n.agent_help).toBe(cmd.agent_help === true);
+      // Flags round-trip name+type from the descriptor.
+      expect(n.flags.map((f) => f.name)).toEqual(cmd.flags.map((f) => f.name));
+    }
+  });
+
+  test("carries a self-describing schema note", () => {
+    expect(buildHelpIndex().schema.length).toBeGreaterThan(0);
+  });
+
+  test("indexes exit 124 (panel wait re-issue) in the shared taxonomy", () => {
+    expect(buildHelpIndex().exit_codes["124"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("baseline node declares its format_modes, flags, and exit codes", () => {
+    const baseline = buildHelpIndex().subcommands.find(
+      (s) => s.name === "baseline",
+    );
+    expect(baseline?.format_modes).toEqual(["json"]);
+    expect(baseline?.flags.map((f) => f.name)).toEqual([
+      "help",
+      "repo",
+      "wait",
+      "timeout",
+      "poll-interval",
+    ]);
+    expect(baseline?.exit_codes?.["3"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("tabs node carries its verbs recursively with per-verb flags", () => {
+    const tabs = buildHelpIndex().subcommands.find((s) => s.name === "tabs");
+    expect(tabs?.verbs?.map((v) => v.name)).toEqual([
+      "list",
+      "restore",
+      "dump",
+    ]);
+    const restore = tabs?.verbs?.find((v) => v.name === "restore");
+    expect(restore?.flags.map((f) => f.name)).toContain("apply");
+  });
+});
+
+describe("USAGE hides internal commands the JSON index still carries", () => {
+  test("statusline-sink is visibility:internal, omitted from USAGE, present in --help --json", () => {
+    // Omitted from the human USAGE block…
+    expect(USAGE).not.toContain("statusline-sink");
+    // …but present in the machine index, tagged internal.
+    const node = buildHelpIndex().subcommands.find(
+      (s) => s.name === "statusline-sink",
+    );
+    expect(node).toBeDefined();
+    expect(node?.visibility).toBe("internal");
+  });
+
+  test("every PUBLIC descriptor command appears in USAGE", () => {
+    for (const cmd of NATIVE_COMMANDS) {
+      if (cmd.visibility === "internal") continue;
+      expect(USAGE).toContain(cmd.name);
+    }
+  });
+
+  test("every descriptor command name dispatches to its handler", async () => {
+    // The dispatchable native surface is exactly the descriptor tree's names.
+    for (const cmd of NATIVE_COMMANDS) {
+      const h = makeHarness();
+      await dispatch([cmd.name], h.deps);
+      expect(h.calls).toEqual([{ sub: cmd.name as Subcommand, argv: [] }]);
     }
   });
 });

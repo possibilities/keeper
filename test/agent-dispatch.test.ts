@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { main as agentCliMain, routeMetaBeforeDeps } from "../cli/agent";
 import { splitSubcommand } from "../src/agent/dispatch";
 import { main } from "../src/agent/main";
 import {
@@ -16,6 +17,16 @@ import {
   makeHarness,
   runAndCapture,
 } from "./helpers/agent-main-harness";
+
+/** Tagged throw standing in for `process.exit(code)` so a routed help/version
+ *  path is observable without killing the test runner. */
+class ExitError extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super(`exit ${code}`);
+    this.code = code;
+  }
+}
 
 function harness(argv: string[]) {
   return makeHarness({
@@ -340,5 +351,79 @@ describe("main() dispatch routing", () => {
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.piBin);
     expect(cmd).toContain("--help");
+  });
+});
+
+describe("cli/agent.ts meta routing precedes deps construction", () => {
+  test("routeMetaBeforeDeps renders help / version / wrapper-help purely", () => {
+    const run = (argv: string[]): { handled: boolean; out: string } => {
+      let out = "";
+      const handled = routeMetaBeforeDeps(argv, (s) => {
+        out += s;
+      });
+      return { handled, out };
+    };
+    const help = run(["--help"]);
+    expect(help.handled).toBe(true);
+    expect(help.out).toContain("Usage:");
+    const version = run(["--version"]);
+    expect(version.handled).toBe(true);
+    expect(version.out).toContain("keeper agent ");
+    const wrapper = run(["--x-help"]);
+    expect(wrapper.handled).toBe(true);
+    expect(wrapper.out).toContain("Wrapper flags:");
+    // `--agent-help` is a distinct meta mode: the operator runbook, not the
+    // wrapper-flag overlay. Content assertion names its primary verb form.
+    const runbook = run(["--agent-help"]);
+    expect(runbook.handled).toBe(true);
+    expect(runbook.out).toContain("operator runbook");
+    expect(runbook.out).toContain("keeper agent run");
+    // A launch token is not a meta mode — routing declines it so deps get built.
+    const launch = run(["claude"]);
+    expect(launch.handled).toBe(false);
+    expect(launch.out).toBe("");
+  });
+
+  test("agent --help / --version / --agent-help exit 0 with output and NEVER construct deps", async () => {
+    // realDeps() runs the launcher state-dir migration; a buildDeps that throws
+    // when called proves the meta path never reaches it (no db/daemon/state dir).
+    const throwingBuild = (): never => {
+      throw new Error("realDeps constructed — state-dir migration ran");
+    };
+    for (const flag of ["--help", "--version", "--agent-help"]) {
+      const out: string[] = [];
+      const realOut = process.stdout.write.bind(process.stdout);
+      const realExit = process.exit.bind(process);
+      let code: number | undefined;
+      process.stdout.write = ((s: string | Uint8Array) => {
+        out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+        return true;
+      }) as typeof process.stdout.write;
+      process.exit = ((c?: number) => {
+        code = c ?? 0;
+        throw new ExitError(code);
+      }) as typeof process.exit;
+      try {
+        await agentCliMain([flag], throwingBuild);
+      } catch (e) {
+        if (!(e instanceof ExitError)) throw e;
+      } finally {
+        process.stdout.write = realOut;
+        process.exit = realExit;
+      }
+      expect(code).toBe(0);
+      expect(out.join("")).not.toBe("");
+    }
+  });
+
+  test("a real launch DOES construct deps — the buildDeps seam is wired, not dead", async () => {
+    const throwingBuild = (): never => {
+      throw new Error("realDeps constructed");
+    };
+    // `claude` is a launch token → routing declines → buildDeps() is called and
+    // its throw propagates (it throws before any process.exit, so no patch).
+    await expect(agentCliMain(["claude"], throwingBuild)).rejects.toThrow(
+      "realDeps constructed",
+    );
   });
 });

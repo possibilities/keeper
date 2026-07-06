@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { NATIVE_COMMANDS } from "../cli/descriptor";
 import {
   buildHelpIndex,
   COMPLETION_RESPONDER,
@@ -25,6 +26,8 @@ import {
   SUBCOMMANDS,
   type Subcommand,
 } from "../cli/keeper";
+import { PLAN_COMMANDS } from "../plugins/plan/src/descriptor";
+import { PROMPT_COMMANDS } from "../plugins/prompt/src/descriptor";
 
 const VERSION = "9.9.9";
 
@@ -90,6 +93,50 @@ describe("keeper complete responder candidates", () => {
       for (const verb of SUBCOMMAND_META[name].verbs ?? []) {
         expect(values).toContain(verb);
       }
+    }
+  });
+});
+
+describe("completions are generated from the descriptor tree (ADR 0008)", () => {
+  test("top-level TAB suggests exactly the dispatchable native surface", async () => {
+    // The candidate set is the descriptor's command names (minus the hidden
+    // responder, plus `completions` which the plugin registers itself).
+    const values = candidateValues(await completionResponder([""], VERSION));
+    for (const cmd of NATIVE_COMMANDS) {
+      expect(values).toContain(cmd.name);
+    }
+  });
+
+  test("second-level TAB enumerates a descriptor command's verbs", async () => {
+    const twoLevel = NATIVE_COMMANDS.filter((c) => (c.verbs?.length ?? 0) > 0);
+    expect(twoLevel.length).toBeGreaterThan(0);
+    for (const cmd of twoLevel) {
+      const values = candidateValues(
+        await completionResponder([cmd.name, ""], VERSION),
+      );
+      for (const verb of cmd.verbs ?? []) {
+        expect(values).toContain(verb.name);
+      }
+    }
+  });
+
+  test("plan TAB enumerates the PLAN plugin descriptor's verbs (merged, not restated)", async () => {
+    // The `plan` node carries no verbs in NATIVE_COMMANDS; its completion
+    // candidates are merged live from plugins/plan/src/descriptor.ts.
+    const values = candidateValues(
+      await completionResponder(["plan", ""], VERSION),
+    );
+    for (const cmd of PLAN_COMMANDS) {
+      expect(values).toContain(cmd.name);
+    }
+  });
+
+  test("prompt TAB enumerates the PROMPT plugin descriptor's verbs (merged)", async () => {
+    const values = candidateValues(
+      await completionResponder(["prompt", ""], VERSION),
+    );
+    for (const cmd of PROMPT_COMMANDS) {
+      expect(values).toContain(cmd.name);
     }
   });
 });
@@ -234,7 +281,7 @@ describe("dispatch routes the hidden complete responder", () => {
     expect(h.stderr).toEqual([]);
   });
 
-  test("`keeper complete -- plan <TAB>` emits the plan verbs", async () => {
+  test("`keeper complete -- plan <TAB>` emits the plan verbs from the plugin descriptor", async () => {
     const h = makeHarness();
     try {
       await dispatch([COMPLETION_RESPONDER, "--", "plan", ""], h.deps);
@@ -242,8 +289,11 @@ describe("dispatch routes the hidden complete responder", () => {
       /* swallow ExitError */
     }
     const values = candidateValues(h.stdout.join(""));
-    for (const verb of SUBCOMMAND_META.plan.verbs ?? []) {
-      expect(values).toContain(verb);
+    // Sourced live from plugins/plan/src/descriptor.ts — the plan node no longer
+    // restates its verbs in SUBCOMMAND_META.
+    expect(SUBCOMMAND_META.plan.verbs).toBeUndefined();
+    for (const cmd of PLAN_COMMANDS) {
+      expect(values).toContain(cmd.name);
     }
   });
 });

@@ -206,13 +206,19 @@ describe("parseRunArgs", () => {
     );
   });
 
-  test("--stop-timeout-ms space + equals forms parse", () => {
-    expect(
-      parseRunArgs(["codex", "p", "--stop-timeout-ms", "1800000"]),
-    ).toEqual(okParse({ cli: "codex", stopTimeoutMs: 1_800_000 }));
-    expect(parseRunArgs(["pi", "p", "--stop-timeout-ms=1500"])).toEqual(
+  test("--stop-timeout space + equals forms parse (unit-required duration)", () => {
+    expect(parseRunArgs(["codex", "p", "--stop-timeout", "30m"])).toEqual(
+      okParse({ cli: "codex", stopTimeoutMs: 1_800_000 }),
+    );
+    expect(parseRunArgs(["pi", "p", "--stop-timeout=1500ms"])).toEqual(
       okParse({ cli: "pi", stopTimeoutMs: 1500 }),
     );
+  });
+
+  test("the retired --stop-timeout-ms spelling hard-fails as an unknown flag", () => {
+    const r = parseRunArgs(["codex", "p", "--stop-timeout-ms", "1800000"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("unknown flag");
   });
 
   test("--read-only sets readOnly true (exact-match, any position)", () => {
@@ -223,9 +229,9 @@ describe("parseRunArgs", () => {
     expect(parseRunArgs(["codex", "--read-only", "explore"])).toEqual(
       okParse({ cli: "codex", prompt: "explore", readOnly: true }),
     );
-    // Composes with --stop-timeout-ms.
+    // Composes with --stop-timeout.
     expect(
-      parseRunArgs(["pi", "p", "--read-only", "--stop-timeout-ms", "1500"]),
+      parseRunArgs(["pi", "p", "--read-only", "--stop-timeout", "1500ms"]),
     ).toEqual(okParse({ cli: "pi", readOnly: true, stopTimeoutMs: 1500 }));
   });
 
@@ -341,8 +347,10 @@ describe("parseRunArgs", () => {
     [["claude"], "missing <prompt>"],
     [["claude", "p", "extra"], "unexpected extra argument"],
     [["claude", "p", "--bogus"], "unknown flag"],
-    [["claude", "p", "--stop-timeout-ms", "abc"], "must be a positive integer"],
-    [["claude", "p", "--stop-timeout-ms"], "requires a value"],
+    [["claude", "p", "--stop-timeout", "abc"], "not a valid duration"],
+    [["claude", "p", "--stop-timeout", "1500"], "needs a unit"],
+    [["claude", "p", "--stop-timeout"], "requires a value"],
+    [["claude", "p", "--stop-timeout-ms", "1500"], "unknown flag"],
     [["claude", "p", "--system-file"], "--system-file requires a value"],
     [["claude", "p", "--system"], "--system requires a value"],
     [["claude", "p", "--preset"], "--preset requires a value"],
@@ -742,12 +750,12 @@ describe("splitSubcommand classifies the new verbs", () => {
   });
 
   test("wait <handle> → wait-capture", () => {
-    expect(
-      splitSubcommand(["wait", "tmux-1", "--stop-timeout-ms", "5000"]),
-    ).toEqual({
-      kind: "wait-capture",
-      rest: ["tmux-1", "--stop-timeout-ms", "5000"],
-    });
+    expect(splitSubcommand(["wait", "tmux-1", "--stop-timeout", "5s"])).toEqual(
+      {
+        kind: "wait-capture",
+        rest: ["tmux-1", "--stop-timeout", "5s"],
+      },
+    );
   });
 
   test("bare run / wait keep an empty rest (handler mints bad_args)", () => {

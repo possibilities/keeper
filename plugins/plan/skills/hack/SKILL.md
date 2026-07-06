@@ -35,7 +35,7 @@ If two modes feel equally plausible and the choice would meaningfully change the
 - `searchctl` (web search) → the harness `WebSearch` tool.
 - `scrapectl fetch-markdown` / `agent-browser` (fetch and read pages) → the harness `WebFetch` tool (static pages; no JS or interaction).
 - `knowctl` (internal docs) → note in one line that no local topic docs are reachable, then go straight to web search.
-- `claudectl list-sessions` / `show-session` → the keeper session-forensics verbs below (`keeper find-file-history`, `keeper search-history`, `keeper show-session-events`, `keeper show-job`).
+- `claudectl list-sessions` / `show-session` → the keeper session-forensics verbs below (`keeper find-file-history`, `keeper search-history`, `keeper session events`, `keeper show-job`).
 - `tmuxctl` → plain `tmux` over Bash.
 
 Universal moves, in any mode:
@@ -69,7 +69,7 @@ Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code
 keeper find-file-history <path-fragment>   # session_id, mutation time, op, source, project_dir (most-recent-first)
 ```
 
-Feed a `session_id` to `keeper show-session-events --session-id <id>` (the tool-call spine) or `claudectl show-session <id>` to see what that session actually did and why.
+Feed a `session_id` to `keeper session events --session-id <id>` (the tool-call spine) or `claudectl show-session <id>` to see what that session actually did and why.
 
 **Search past prompts** — "when did we discuss X / decide Y":
 
@@ -80,19 +80,19 @@ keeper search-history <term>   # ts, session_id, prompt snippet for every matchi
 **What a session did** — the prompt/tool-call spine without transcript bulk:
 
 ```bash
-keeper show-session-events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
+keeper session events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
 ```
 
 **One session at a glance** — orient before touching any transcript:
 
 ```bash
-keeper session-summary <session-id>   # bounded envelope: title, lifecycle, plan linkage, first+last prompt, event counts
+keeper session summary <session-id>   # bounded envelope: title, lifecycle, plan linkage, first+last prompt, event counts
 ```
 
 **One job's metadata / failed-worker forensics**:
 
 ```bash
-keeper show-job --session <title>   # the full jobs-projection row (auto-detects your own job with no selector)
+keeper show-job --session-title <title>   # the full jobs-projection row (auto-detects your own job with no selector)
 ```
 
 `subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.

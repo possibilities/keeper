@@ -54,18 +54,21 @@ import {
 } from "../src/snapshot";
 import { listProfiles } from "../src/usage-picker";
 import { armViewerExitTriggers } from "../src/view-shell";
+import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
+import { parseDuration } from "./duration";
 
 const COLLECTION = "usage";
 
 const HELP = `keeper usage — live usage frames over the keeper subscribe server
 
-Usage: keeper usage [--sock <path>] [--snapshot | --watch] [--timeout <s>]
+Usage: keeper usage [--sock <path>] [--snapshot | --watch] [--timeout <dur>]
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
   --snapshot     Force one-shot snapshot mode (print one composed frame + a
                  machine-parseable keeper-meta: line, then exit) even on a TTY
   --watch        Force the live subscribe stream even when piped
-  --timeout <s>  Snapshot wait before the timeout escape (default ~2s)
+  --timeout <dur>  Snapshot wait before the timeout escape (default ~2s;
+                   unit required, e.g. 500ms, 2s)
   --help         Show this help
 
 By default, stdout that is NOT a TTY (piped into an agent) auto-detects
@@ -784,15 +787,9 @@ export function formatShadowAdvisory(
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      snapshot: { type: "boolean", default: false },
-      watch: { type: "boolean", default: false },
-      // parseArgs has no number type — capture as a string and validate
-      // manually below (exit 2 on a non-positive / non-numeric value).
-      timeout: { type: "string" },
-      help: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008). parseArgs has no number
+    // type — `timeout` is a string, validated manually below.
+    options: buildParseOptions(VIEWER_FLAGS),
     allowPositionals: false,
   });
 
@@ -821,18 +818,16 @@ export async function main(argv: string[]): Promise<void> {
     throw err;
   }
 
-  // Validate `--timeout` (seconds) only when snapshotting — a bad value is
-  // CLI misuse (exit 2). Watch mode ignores it.
+  // Validate `--timeout` (shared duration grammar) only when snapshotting — a
+  // bad value is CLI misuse (exit 2). Watch mode ignores it.
   let timeoutMs = DEFAULT_SNAPSHOT_TIMEOUT_MS;
   if (values.timeout !== undefined) {
-    const secs = Number(values.timeout);
-    if (!Number.isFinite(secs) || secs <= 0) {
-      process.stderr.write(
-        `keeper usage: --timeout must be a positive number of seconds (got '${values.timeout}')\n`,
-      );
+    const parsed = parseDuration(values.timeout);
+    if (!parsed.ok) {
+      process.stderr.write(`keeper usage: --timeout ${parsed.message}\n`);
       process.exit(2);
     }
-    timeoutMs = Math.round(secs * 1000);
+    timeoutMs = parsed.ms;
   }
   const isSnapshot = mode === "snapshot";
 

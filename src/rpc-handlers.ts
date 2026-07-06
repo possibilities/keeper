@@ -606,7 +606,7 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
     return v;
   };
   const title = optStr(obj.title, "title");
-  // The daemon-side absolute-path guard: the CLI always resolves `--dir` to an
+  // The daemon-side absolute-path guard: the CLI always resolves `--cwd` to an
   // absolute path, so a non-empty relative value at the trust boundary is a
   // hand-crafted/buggy RPC. Reject it rather than launch into an ambiguous
   // (keeperd-relative) directory. A null/empty value is tolerated (→ keeperd cwd).

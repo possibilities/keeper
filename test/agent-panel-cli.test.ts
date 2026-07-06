@@ -79,8 +79,11 @@ test("splitSubcommand: `panel start …` classifies, carrying start + flags in r
 
 test("splitSubcommand: `panel wait …` classifies, carrying wait + flags in rest", () => {
   expect(
-    splitSubcommand(["panel", "wait", "--dir", "/d", "--chunk", "540"]),
-  ).toEqual({ kind: "panel", rest: ["wait", "--dir", "/d", "--chunk", "540"] });
+    splitSubcommand(["panel", "wait", "--run-dir", "/d", "--chunk", "540"]),
+  ).toEqual({
+    kind: "panel",
+    rest: ["wait", "--run-dir", "/d", "--chunk", "540"],
+  });
 });
 
 test("splitSubcommand: bare `panel` classifies with an empty rest", () => {
@@ -138,7 +141,7 @@ beforeEach(() => {
       // user's real presets never bleed in.
       KEEPER_CONFIG: join(dir, "no-such-config.yaml"),
       KEEPER_CONFIG_DIR: dir,
-      // The durable panel-state root — sandboxed so `start` without `--dir` never
+      // The durable panel-state root — sandboxed so `start` without `--run-dir` never
       // pollutes the real ~/.local/state/keeper.
       KEEPER_STATE_DIR: join(dir, "keeper-state"),
     },
@@ -230,7 +233,14 @@ function seedTerminalPanel(): string {
 
 test("agent panel wait: terminal panel → exit 0 + verdict JSON (content-blind)", async () => {
   const pdir = seedTerminalPanel();
-  const r = await runAgent(["panel", "wait", "--dir", pdir, "--chunk", "540"]);
+  const r = await runAgent([
+    "panel",
+    "wait",
+    "--run-dir",
+    pdir,
+    "--chunk",
+    "540",
+  ]);
   expect(r.code).toBe(0);
   const v: PanelVerdict = JSON.parse(r.stdout.trim());
   expect(v.ok).toBe(true);
@@ -242,20 +252,27 @@ test("agent panel wait: terminal panel → exit 0 + verdict JSON (content-blind)
 
 test("agent panel wait: missing manifest → exit 2", async () => {
   const missing = join(dir, "no-such-panel-dir");
-  const agent = await runAgent(["panel", "wait", "--dir", missing]);
+  const agent = await runAgent(["panel", "wait", "--run-dir", missing]);
   expect(agent.code).toBe(2);
   expect(agent.stderr).toContain("cannot read manifest");
 });
 
-test("agent panel wait: no --dir → exit 2", async () => {
+test("agent panel wait: no --run-dir → exit 2", async () => {
   const r = await runAgent(["panel", "wait"]);
   expect(r.code).toBe(2);
-  expect(r.stderr).toContain("--dir");
+  expect(r.stderr).toContain("--run-dir");
 });
 
 test("agent panel wait: --chunk above the ceiling → exit 2", async () => {
   const pdir = seedTerminalPanel();
-  const r = await runAgent(["panel", "wait", "--dir", pdir, "--chunk", "9999"]);
+  const r = await runAgent([
+    "panel",
+    "wait",
+    "--run-dir",
+    pdir,
+    "--chunk",
+    "9999",
+  ]);
   expect(r.code).toBe(2);
   expect(r.stderr).toContain("ceiling");
 });
@@ -274,7 +291,7 @@ test("agent panel start: a missing/empty config is fail-loud exit 2 (no leg spaw
     "cfg-run",
     "--panel",
     "default",
-    "--dir",
+    "--run-dir",
     join(dir, "scratch"),
   ]);
   expect(r.code).toBe(2);
@@ -291,7 +308,7 @@ test("agent panel start: a missing --slug → exit 2 with a panel-scoped message
     promptFile,
     "--panel",
     "default",
-    "--dir",
+    "--run-dir",
     join(dir, "scratch-noslug"),
   ]);
   expect(r.code).toBe(2);
@@ -309,7 +326,7 @@ test("agent panel start: a --slug that slugifies to nothing → exit 2", async (
     "...",
     "--panel",
     "default",
-    "--dir",
+    "--run-dir",
     join(dir, "scratch-emptyslug"),
   ]);
   expect(r.code).toBe(2);
@@ -695,7 +712,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
 });
 
 describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
-  test("without --dir → writes keeperStateDir()/panels/<slug>/ (0700); manifest carries boot_epoch_ms + per-leg launched_at", async () => {
+  test("without --run-dir → writes keeperStateDir()/panels/<slug>/ (0700); manifest carries boot_epoch_ms + per-leg launched_at", async () => {
     const promptFile = join(dir, "ask.md");
     writeFileSync(promptFile, "what is the best answer?");
     const { deps, spawns } = makeAdHocDeps();
@@ -731,7 +748,7 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
     expect(typeof manifest.members[0]?.pidfile).toBe("string");
   });
 
-  test("--dir override wins (no durable dir minted); the boot-epoch seam is injected", async () => {
+  test("--run-dir override wins (no durable dir minted); the boot-epoch seam is injected", async () => {
     const promptFile = join(dir, "ask.md");
     writeFileSync(promptFile, "q");
     const pdir = join(dir, "override-dir");
@@ -1067,7 +1084,7 @@ test("agent panel start: --panel + --preset together → exit 2 (mutually exclus
     "default",
     "--preset",
     "codex-review",
-    "--dir",
+    "--run-dir",
     join(dir, "scratch-mx"),
   ]);
   expect(r.code).toBe(2);
@@ -1090,7 +1107,7 @@ for (const flag of ["model", "effort", "role"] as const) {
       "default",
       `--${flag}`,
       "x",
-      "--dir",
+      "--run-dir",
       join(dir, `scratch-orphan-${flag}`),
     ]);
     expect(r.code).toBe(2);
@@ -1337,7 +1354,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// wait/status routing — --slug resolves the durable dir, --dir wins
+// wait/status routing — --slug resolves the durable dir, --run-dir wins
 // ---------------------------------------------------------------------------
 
 /** Seed a terminal run at the durable slug path under the sandboxed state dir. */
@@ -1383,12 +1400,12 @@ test("agent panel wait --slug: resolves the durable slug dir", async () => {
   expect(v.ok).toBe(true);
 });
 
-test("agent panel wait: --dir wins when both --dir and --slug are given", async () => {
+test("agent panel wait: --run-dir wins when both --run-dir and --slug are given", async () => {
   const pdir = seedTerminalPanel();
   const r = await runAgent([
     "panel",
     "wait",
-    "--dir",
+    "--run-dir",
     pdir,
     "--slug",
     "nonexistent",
@@ -1406,10 +1423,10 @@ test("agent panel wait --slug: an unknown/pruned slug → exit 2 (missing manife
   expect(r.stderr).toContain("cannot read manifest");
 });
 
-test("agent panel wait: neither --dir nor --slug → exit 2", async () => {
+test("agent panel wait: neither --run-dir nor --slug → exit 2", async () => {
   const r = await runAgent(["panel", "wait"]);
   expect(r.code).toBe(2);
-  expect(r.stderr).toContain("--dir");
+  expect(r.stderr).toContain("--run-dir");
 });
 
 test("agent panel status --slug: prints the snapshot, exit 0", async () => {
@@ -1421,10 +1438,22 @@ test("agent panel status --slug: prints the snapshot, exit 0", async () => {
   expect(snap.members[0]?.status).toBe("completed");
 });
 
-test("agent panel status: neither --dir nor --slug → exit 2", async () => {
+test("agent panel status: neither --run-dir nor --slug → exit 2", async () => {
   const r = await runAgent(["panel", "status"]);
   expect(r.code).toBe(2);
 });
+
+// ---------------------------------------------------------------------------
+// Retired spelling — the run-dir flag is --run-dir; the old --dir hard-fails
+// (unknown option → exit 2), never silently ignored, on every sub-verb.
+// ---------------------------------------------------------------------------
+
+for (const op of ["wait", "status", "start"] as const) {
+  test(`agent panel ${op}: the retired --dir spelling hard-fails exit 2`, async () => {
+    const r = await runAgent(["panel", op, "--dir", join(dir, "whatever")]);
+    expect(r.code).toBe(2);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // panel prune — lock + live-pid + TTL gates, TOCTOU-safe delete

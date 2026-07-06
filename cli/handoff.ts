@@ -19,16 +19,16 @@
  * collection and prints the stored `doc` body so the brief can be inspected.
  *
  * Two forms mirror `keeper dispatch`'s free-form half: `--prompt "<doc>"` or
- * `--prompt-file <path>`, plus `--slug`, `--title`, `--session`, and `--dir`.
+ * `--prompt-file <path>`, plus `--slug`, `--title`, `--session`, and `--cwd`.
  *
- * `--dir <path>` is the directory the handoff-ee launches in — defaults to the
+ * `--cwd <path>` is the directory the handoff-ee launches in — defaults to the
  * caller's own cwd. The CLI expands `~`, resolves a relative path against
  * `process.cwd()` to an ABSOLUTE path, and validates it exists + is a directory
  * (exit 2 on a miss) before sending; the dispatcher worker launches the
  * handoff-ee with that path as its cwd.
  *
  * Exit codes: 0 success, 1 daemon-unreachable / generic failure, 2 arg fault
- * (missing/empty `--slug`, over-cap brief, bad `--dir`), 3 slug already in use.
+ * (missing/empty `--slug`, over-cap brief, bad `--cwd`), 3 slug already in use.
  */
 
 import {
@@ -45,6 +45,7 @@ import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
 import { slugifyHandoffSlug } from "../src/handoff-slug";
 import type { ClientFrame, ServerFrame } from "../src/protocol";
 import { queryCollection, roundTrip } from "./control-rpc";
+import { buildParseOptions, HANDOFF_FLAGS } from "./descriptor";
 import { resolveSession } from "./dispatch";
 
 const HELP = `keeper handoff — enqueue a fire-and-forget claude worker with a contextful brief
@@ -62,7 +63,7 @@ Enqueue flags:
   --prompt-file <path>  Read the brief from a file instead of --prompt
   --title <t>           Optional human title for the handoff
   --session <s>         Target tmux session (default: KEEPER_TMUX_SESSION > current > work)
-  --dir <path>          Directory the handoff-ee launches in (default: this
+  --cwd <path>          Directory the handoff-ee launches in (default: this
                         caller's cwd). Expands ~, resolves a relative path to an
                         absolute one; a non-existent / non-directory path → exit 2.
   --sock <path>         Override the daemon socket path
@@ -83,12 +84,12 @@ const AGENT_HELP = `keeper handoff — operator runbook (agent-facing)
 Enqueue a fire-and-forget claude worker with a contextful brief; keeperd boots it
 inline in your tmux session. The brief rides inline in the event log.
 
-  keeper handoff --slug <slug> --prompt "<brief>" [--title <t>] [--dir <path>]
+  keeper handoff --slug <slug> --prompt "<brief>" [--title <t>] [--cwd <path>]
   keeper handoff --slug <slug> --prompt-file <path> [...]
   keeper handoff show <slug>      # read back the stored brief (inspection)
 
 Rules: --slug is globally unique (reuse → exit 3); brief cap 64KB (over → exit 2,
-REJECTED never truncated); --dir launches cross-repo (default: caller's cwd).
+REJECTED never truncated); --cwd launches cross-repo (default: caller's cwd).
 Exit codes: 0 enqueued · 1 daemon-unreachable/generic · 2 arg fault · 3 slug in use.
 NOT a plan-id launch (that is keeper dispatch) or messaging a running agent (keeper bus).
 `;
@@ -99,8 +100,8 @@ export type ResolveTargetDirResult =
   | { ok: false; error: string };
 
 /**
- * Resolve the handoff-ee's launch directory from the raw `--dir` flag, against
- * the caller's `cwd`. Absent/empty `--dir` defaults to `cwd` (the caller's own
+ * Resolve the handoff-ee's launch directory from the raw `--cwd` flag, against
+ * the caller's `cwd`. Absent/empty `--cwd` defaults to `cwd` (the caller's own
  * dir). Otherwise expand a leading `~` against the home dir, resolve a relative
  * path against `cwd` to an ABSOLUTE path, then validate it exists + is a
  * directory (a symlinked dir is valid — `statSync` follows). A miss is CLI
@@ -134,13 +135,13 @@ export function resolveTargetDir(
   } catch {
     return {
       ok: false,
-      error: `--dir '${rawDir}' does not exist (resolved to ${abs})`,
+      error: `--cwd '${rawDir}' does not exist (resolved to ${abs})`,
     };
   }
   if (!st.isDirectory()) {
     return {
       ok: false,
-      error: `--dir '${rawDir}' is not a directory (resolved to ${abs})`,
+      error: `--cwd '${rawDir}' is not a directory (resolved to ${abs})`,
     };
   }
   return { ok: true, dir: abs };
@@ -243,22 +244,24 @@ function slugTaken(message: string): never {
   process.exit(3);
 }
 
+/** Parse the handoff flag surface (derived from the pure-data descriptor, ADR
+ *  0008). An unknown flag (or a value-shape fault) is CLI misuse → exit 2 with
+ *  the parser's own message, never the uncaught-throw exit 1. Keeps the precise
+ *  per-flag `values` typing (the `never` from {@link argFault} unions away). */
+function parseHandoffArgs(argv: string[]) {
+  try {
+    return parseArgs({
+      args: argv,
+      options: buildParseOptions(HANDOFF_FLAGS),
+      allowPositionals: true,
+    });
+  } catch (err) {
+    argFault((err as Error).message);
+  }
+}
+
 export async function main(argv: string[]): Promise<void> {
-  const parsed = parseArgs({
-    args: argv,
-    options: {
-      slug: { type: "string" },
-      prompt: { type: "string" },
-      "prompt-file": { type: "string" },
-      title: { type: "string" },
-      session: { type: "string" },
-      dir: { type: "string" },
-      sock: { type: "string" },
-      help: { type: "boolean", default: false },
-      "agent-help": { type: "boolean", default: false },
-    },
-    allowPositionals: true,
-  });
+  const parsed = parseHandoffArgs(argv);
 
   if (parsed.values.help) {
     process.stdout.write(HELP);
@@ -349,12 +352,12 @@ export async function main(argv: string[]): Promise<void> {
   // precedence: `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX`-current > `work`.
   const { session } = resolveSession({ sessionFlag: parsed.values.session });
 
-  // Resolve the launch directory for the handoff-ee. `--dir` defaults to THIS
+  // Resolve the launch directory for the handoff-ee. `--cwd` defaults to THIS
   // caller's cwd; a relative path / `~` is resolved here (the daemon only sees
   // the absolute result) and validated to exist + be a directory — exit 2 on a
   // miss, mirroring dispatch's cwd-existence guard. Always send an absolute
   // `target_dir` so the dispatcher never falls back to keeperd's own cwd.
-  const dirResult = resolveTargetDir(parsed.values.dir, process.cwd());
+  const dirResult = resolveTargetDir(parsed.values.cwd, process.cwd());
   if (!dirResult.ok) {
     argFault(dirResult.error);
   }

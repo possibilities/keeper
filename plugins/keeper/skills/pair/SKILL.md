@@ -121,7 +121,7 @@ BACKSTOP=6      # ~54 min of 9-min chunks; a leg still running this late is wedg
 VERDICT=""
 n=0
 while [ "$n" -lt "$BACKSTOP" ]; do
-  VERDICT=$(keeper agent panel wait --dir "$DIR" --chunk 540)
+  VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540)
   WAIT_RC=$?
   [ "$WAIT_RC" -eq 0 ] && break                            # all legs terminal
   [ "$WAIT_RC" -eq 124 ] && { n=$(( n + 1 )); continue; }  # chunk elapsed — re-issue

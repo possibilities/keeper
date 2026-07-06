@@ -147,6 +147,35 @@ function epicWith(
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Help text documents every dispatchable plan-form verb (the parser accepts
+// work/close/unblock/deconflict — the help must not under-claim work|close).
+// ---------------------------------------------------------------------------
+
+test("--help documents all four plan-form verbs with their id shapes + scope", async () => {
+  const r = await runDispatch(["--help"]);
+  expect(r.code).toBe(0);
+  for (const key of [
+    "work::fn-N.M",
+    "unblock::fn-N.M",
+    "close::fn-N",
+    "deconflict::fn-N",
+  ]) {
+    expect(r.stdout).toContain(key);
+  }
+  // Scope is named, not just the verbs — a task-id shape vs an epic-id shape.
+  expect(r.stdout).toContain("task-scoped");
+  expect(r.stdout).toContain("epic-scoped");
+});
+
+test("--agent-help names all four plan-form verbs and their scope", async () => {
+  const r = await runDispatch(["--agent-help"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toContain("work|close|unblock|deconflict");
+  expect(r.stdout).toContain("task-scoped");
+  expect(r.stdout).toContain("epic-scoped");
+});
+
 test("free-form --preset supplies the spec model/effort", async () => {
   writePresets(
     "presets:\n  fast:\n    harness: claude\n    model: haiku\n    effort: low\n",

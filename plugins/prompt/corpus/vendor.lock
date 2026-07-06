@@ -20,7 +20,7 @@ files:
   claude/arthack/template/_partials/snippets/engineering/domain-docs.md.tmpl: e66f0e74f119faf7cf5f65ba880e91a8df670d519ce890f2b6b4abfe5e49d3a6
   claude/arthack/template/_partials/snippets/engineering/escalate-inline-or-plan.md.tmpl: 812e953b1584d91ee6308b8c9e4aebdcabee0a842ff999884f3e7bd094801745
   claude/arthack/template/_partials/snippets/engineering/future-facing-docs.md.tmpl: 3fb941075fb58f92e72688b13f4dc7424ca79d52f7a8d2754a2f1ee2be8439df
-  claude/arthack/template/_partials/snippets/engineering/keeper-history-forensics.md.tmpl: 676ac8271205d8f3c17744ab772e0e387eb104dc98d247416d946d6d4b383e82
+  claude/arthack/template/_partials/snippets/engineering/keeper-history-forensics.md.tmpl: 73c1e40ec19d9cfe2bfad742c44bd1c266647edb2bb48c2817b52bb36290f73a
   claude/arthack/template/_partials/snippets/engineering/landed-vs-complete.md.tmpl: f03b52e43b167d2a496ea1d5182a4717bb817b7d434b30c63044ade7c4451f5e
   claude/arthack/template/_partials/snippets/engineering/network-service-hardening.md.tmpl: 6d9a3470a9b956f06429d6be68457999fc71a5ed9af77fc6ce3e00df3c346d14
   claude/arthack/template/_partials/snippets/engineering/never-assume-tests-pass.md.tmpl: c1fc670fa48477d05131aec375095d55cd9aa404457b904620221e7b1c1117a3

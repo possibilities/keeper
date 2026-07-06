@@ -42,6 +42,7 @@ import { resolveDbPath, resolveRestorePath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
 import { loadRestorePlan } from "../src/tabs-core";
 import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
+import { parseOptions } from "./descriptor";
 import { formatAge } from "./tabs";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
@@ -917,10 +918,8 @@ export async function main(
 ): Promise<void> {
   const parsed = parseArgs({
     args: argv,
-    options: {
-      "kill-sessions": { type: "boolean", default: false },
-      help: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008).
+    options: parseOptions("setup-tmux"),
     allowPositionals: false,
   });
 

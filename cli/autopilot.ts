@@ -52,6 +52,8 @@ import {
 import type { Epic, Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
 import { queryCollection, sendControlRpc } from "./control-rpc";
+import { AUTOPILOT_FLAGS, buildParseOptions } from "./descriptor";
+import { parseDuration } from "./duration";
 import {
   type Envelope,
   emitEnvelope,
@@ -66,7 +68,7 @@ export const AUTOPILOT_SHOW_SCHEMA_VERSION = 1;
 const HELP = `keeper autopilot — thin viewer + control surface for the server-side autopilot reconciler
 
 Usage:
-  keeper autopilot [--sock <path>] [--snapshot | --watch] [--timeout <s>]
+  keeper autopilot [--sock <path>] [--snapshot | --watch] [--timeout <dur>]
   keeper autopilot pause [--sock <path>]
   keeper autopilot play  [--sock <path>]
   keeper autopilot mode <yolo|armed> [--sock <path>]
@@ -139,7 +141,8 @@ Options:
   --snapshot     (viewer only) Force one-shot snapshot mode (print one frame +
                  a machine-parseable keeper-meta: line, then exit) even on a TTY
   --watch        (viewer only) Force the live subscribe stream even when piped
-  --timeout <s>  (viewer only) Snapshot wait before the timeout escape (~2s)
+  --timeout <dur>  (viewer only) Snapshot wait before the timeout escape (~2s;
+                 unit required, e.g. 500ms, 2s)
   --force        (worktree only) Bypass the started-epic toggle guard
   --help         Show this help
 
@@ -1191,18 +1194,10 @@ export async function assertNoMidEpicDispatch(
 export async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      snapshot: { type: "boolean", default: false },
-      watch: { type: "boolean", default: false },
-      // parseArgs has no number type — capture as a string and validate
-      // manually below (exit 2 on a non-positive / non-numeric value).
-      timeout: { type: "string" },
-      help: { type: "boolean", default: false },
-      "agent-help": { type: "boolean", default: false },
-      // `worktree <on|off> --force` — bypass the mid-epic toggle guard.
-      force: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008). `timeout` is a string
+    // (parseArgs has no number type), validated below; `force` rides the
+    // `worktree <on|off>` mid-epic toggle-guard bypass.
+    options: buildParseOptions(AUTOPILOT_FLAGS),
     allowPositionals: true,
   });
 
@@ -1237,18 +1232,16 @@ export async function main(argv: string[]): Promise<void> {
       }
       throw err;
     }
-    // Validate `--timeout` (seconds) only when snapshotting — a bad value is
-    // CLI misuse (exit 2). Watch mode ignores it.
+    // Validate `--timeout` (shared duration grammar) only when snapshotting — a
+    // bad value is CLI misuse (exit 2). Watch mode ignores it.
     let timeoutMs: number | undefined;
     if (parsed.values.timeout !== undefined) {
-      const secs = Number(parsed.values.timeout);
-      if (!Number.isFinite(secs) || secs <= 0) {
-        process.stderr.write(
-          `keeper autopilot: --timeout must be a positive number of seconds (got '${parsed.values.timeout}')\n`,
-        );
+      const dur = parseDuration(parsed.values.timeout);
+      if (!dur.ok) {
+        process.stderr.write(`keeper autopilot: --timeout ${dur.message}\n`);
         process.exit(2);
       }
-      timeoutMs = Math.round(secs * 1000);
+      timeoutMs = dur.ms;
     }
     await runViewer(sockPath, mode, timeoutMs);
     return;

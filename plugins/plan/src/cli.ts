@@ -11,8 +11,14 @@
 // done, the integrity-gate + close verbs, validate --epic on a fresh stamp) MERGE the
 // plan_invocation into their own single envelope via the emit.ts self-emitters.
 
+import { PLAN_COMMANDS, planCommand, SUBGROUP_NAMES } from "./descriptor.ts";
 import type { OutputFormat } from "./format.ts";
-import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
+import {
+  dispatchGroup,
+  type GroupSpec,
+  leafUsageError,
+  renderLeafHelp,
+} from "./subgroup.ts";
 import { runAssignCells } from "./verbs/assign_cells.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
@@ -70,181 +76,32 @@ export { emitMutating, emitReadonly } from "./emit.ts";
 const PROG = "keeper plan";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 
-// Subgroups ("keeper plan <group> <sub>"). A subgroup owns its own --help and
-// subcommand dispatch, so post-command --help is routed to the group, not the
-// top-level help.
-const SUBGROUP_NAMES = new Set([
-  "audit",
-  "epic",
-  "followup",
-  "task",
-  "verdict",
-  "worker",
-]);
-
-interface CommandSpec {
-  name: string;
-  shortHelp: string;
-  implemented: boolean;
-}
-
-// Registration order = help-listing order (alphabetical, matching click).
-const COMMANDS: CommandSpec[] = [
-  {
-    name: "assign-cells",
-    shortHelp:
-      "Batch-overwrite a ghost epic's tier/model cells + write a sidecar.",
-    implemented: true,
-  },
-  {
-    name: "audit",
-    shortHelp: "Close-phase audit-artifact submit verbs.",
-    implemented: true,
-  },
-  { name: "block", shortHelp: "Mark a task as blocked.", implemented: true },
-  {
-    name: "cat",
-    shortHelp: "Print the raw spec markdown for an epic or task.",
-    implemented: true,
-  },
-  {
-    name: "claim",
-    shortHelp: "Claim a task and return the worker briefing.",
-    implemented: true,
-  },
-  {
-    name: "close-finalize",
-    shortHelp: "Run the /plan:close saga to its outcome.",
-    implemented: true,
-  },
-  {
-    name: "close-preflight",
-    shortHelp: "Write the /plan:close brief and emit the handoff.",
-    implemented: true,
-  },
-  {
-    name: "detect",
-    shortHelp: "Check if cwd belongs to a plan project.",
-    implemented: true,
-  },
-  { name: "done", shortHelp: "Mark a task as complete.", implemented: true },
-  { name: "epic", shortHelp: "Manage epics.", implemented: true },
-  { name: "epics", shortHelp: "List all epics.", implemented: true },
-  {
-    name: "epic-question",
-    shortHelp: "Set or clear an epic-level parked question (board-visible).",
-    implemented: true,
-  },
-  {
-    name: "find-task-commit",
-    shortHelp: "Look up a task's source commits.",
-    implemented: true,
-  },
-  {
-    name: "followup",
-    shortHelp: "Close-phase follow-up-plan submit verb.",
-    implemented: true,
-  },
-  {
-    name: "gist",
-    shortHelp: "Create a multifile gist for an epic.",
-    implemented: true,
-  },
-  {
-    name: "init",
-    shortHelp: "Initialize a plan project for the current directory.",
-    implemented: true,
-  },
-  {
-    name: "list",
-    shortHelp: "List all epics and their tasks in a tree view.",
-    implemented: true,
-  },
-  {
-    name: "mv-repo",
-    shortHelp: "Rewrite stored board paths for a renamed repo (metadata only).",
-    implemented: true,
-  },
-  {
-    name: "ready",
-    shortHelp: "List tasks that are ready to be worked on.",
-    implemented: true,
-  },
-  {
-    name: "reconcile",
-    shortHelp: "Post-worker verdict for /plan:work (read-only).",
-    implemented: true,
-  },
-  {
-    name: "refine-apply",
-    shortHelp: "Apply a refine delta to an existing epic tree.",
-    implemented: true,
-  },
-  {
-    name: "refine-context",
-    shortHelp: "Fetch refine-state for /plan:plan (read-only).",
-    implemented: true,
-  },
-  {
-    name: "resolve-task",
-    shortHelp: "Routing lookup to launch /plan:work.",
-    implemented: true,
-  },
-  {
-    name: "scaffold",
-    shortHelp: "Materialize a whole epic tree from one YAML.",
-    implemented: true,
-  },
-  {
-    name: "selection-brief",
-    shortHelp: "Write the model/effort selector brief for an epic.",
-    implemented: true,
-  },
-  {
-    name: "show",
-    shortHelp: "Show detailed information about an epic or task.",
-    implemented: true,
-  },
-  {
-    name: "state-path",
-    shortHelp: "Print the resolved state directory path.",
-    implemented: true,
-  },
-  {
-    name: "status",
-    shortHelp: "Show overall project status.",
-    implemented: true,
-  },
-  { name: "task", shortHelp: "Manage tasks.", implemented: true },
-  {
-    name: "tasks",
-    shortHelp: "List tasks with optional filtering.",
-    implemented: true,
-  },
-  {
-    name: "unblock",
-    shortHelp: "Flip a blocked task back to todo.",
-    implemented: true,
-  },
-  {
-    name: "validate",
-    shortHelp: "Validate project data integrity.",
-    implemented: true,
-  },
-  {
-    name: "verdict",
-    shortHelp: "Close-phase verdict submit verb.",
-    implemented: true,
-  },
-  {
-    name: "worker",
-    shortHelp: "Worker resume helpers for dropped /plan:work invocations.",
-    implemented: true,
-  },
-];
+// Subgroups ("keeper plan <group> <sub>") own their own --help + subcommand
+// dispatch, so post-command --help routes to the group, not the top-level help.
+// The set is derived from the descriptor tree (SUBGROUP_NAMES).
 
 const DESCRIPTION =
   "File-based task tracking for structured development workflows.";
+
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. Pure —
+ *  routed before any verb body so it never reads state or auto-commits. */
+const AGENT_HELP = `keeper plan — operator runbook (agent-facing)
+
+File-based epic/task board. Every read verb emits exactly ONE top-level JSON value;
+--format json|yaml|human (default json). Every mutating verb auto-commits its own
+.keeper/ scope inline.
+
+  keeper plan status                      # board snapshot (prefer 'keeper status' to orient)
+  keeper plan tasks                       # per-task rows (prefer 'keeper query tasks' for detail)
+  keeper plan show <id>                   # one epic/task's spec markdown
+  keeper plan claim <id> / done <id>      # task lifecycle (each auto-commits .keeper/)
+  keeper plan --format yaml <verb>        # yaml/human render of any read
+
+Exit codes: 0 ok (a bad board state is still ok:true data at exit 0, never nonzero) ·
+1 verb error · 2 unknown verb / arg fault (Click parity). Footguns: board-orient with
+'keeper status' and read per-task detail with 'keeper query tasks' — never hand-parse a
+plan read. Plans are READ-ONLY to the reducer; no verb writes a projection field.
+`;
 
 // Leaf-arg parsing for subgroup verbs. A leaf receives the post-name argv (its
 // own positionals + options). Options are `--name value` / `--name=value`;
@@ -670,15 +527,18 @@ const FOLLOWUP_GROUP: GroupSpec = {
 interface ParsedArgs {
   format: OutputFormat | null;
   help: boolean;
+  agentHelp: boolean;
   command: string | null;
   rest: string[];
 }
 
-/** Split argv into the top-level --format/--help and the command + its args.
- * --format is accepted before OR after the command name. */
+/** Split argv into the top-level --format/--help/--agent-help and the command + its
+ * args. --format is accepted before OR after the command name; --agent-help is a
+ * top-level runbook request honored in the pre-command position. */
 function parseArgs(argv: string[]): ParsedArgs {
   let format: OutputFormat | null = null;
   let help = false;
+  let agentHelp = false;
   let command: string | null = null;
   const rest: string[] = [];
 
@@ -688,6 +548,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (command === null) {
       if (arg === "--help") {
         help = true;
+        i += 1;
+      } else if (arg === "--agent-help") {
+        agentHelp = true;
         i += 1;
       } else if (arg === "--format") {
         format = readFormat(argv[i + 1]);
@@ -721,15 +584,15 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { format, help, command, rest };
+  return { format, help, agentHelp, command, rest };
 }
 
 function readFormat(value: string | undefined): OutputFormat {
-  if (value === "json" || value === "human") {
+  if (value === "json" || value === "yaml" || value === "human") {
     return value;
   }
   usageError(
-    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'human'.`,
+    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'yaml', 'human'.`,
   );
 }
 
@@ -759,7 +622,7 @@ function printHelp(): void {
   lines.push(`  ${DESCRIPTION}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
+  lines.push("  --format [json|human|yaml]  Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   lines.push("");
   lines.push("To orient on the board, prefer the keeper-native surfaces over");
@@ -770,9 +633,9 @@ function printHelp(): void {
   lines.push("Every read verb still emits exactly one clean JSON value.");
   lines.push("");
   lines.push("Commands:");
-  const width = Math.max(...COMMANDS.map((c) => c.name.length));
-  for (const cmd of COMMANDS) {
-    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.shortHelp}`);
+  const width = Math.max(...PLAN_COMMANDS.map((c) => c.name.length));
+  for (const cmd of PLAN_COMMANDS) {
+    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.summary}`);
   }
   process.stdout.write(`${lines.join("\n")}\n`);
 }
@@ -784,8 +647,7 @@ function dispatch(parsed: ParsedArgs): number {
     return 0;
   }
 
-  const spec = COMMANDS.find((c) => c.name === command);
-  if (spec === undefined) {
+  if (planCommand(command) === undefined) {
     noSuchCommand(command);
   }
 
@@ -1127,8 +989,27 @@ function readPositional(rest: string[]): string {
 
 export function main(argv: string[]): number {
   const parsed = parseArgs(argv);
+  if (parsed.agentHelp) {
+    // Pure: the operator runbook renders from static text before any verb body,
+    // so it never reads state or auto-commits.
+    process.stdout.write(AGENT_HELP);
+    return 0;
+  }
   if (parsed.help) {
-    printHelp();
+    // Bare `keeper plan --help` -> the top-level group help. `keeper plan <verb>
+    // --help` for a top-level (non-subgroup) verb -> that verb's leaf help through
+    // the shared descriptor-fed renderer (subgroup --help is handled in dispatch,
+    // where parseArgs leaves the flag in `rest` for dispatchGroup). An unknown
+    // verb errors like any no-such-command.
+    if (parsed.command === null) {
+      printHelp();
+      return 0;
+    }
+    const cmd = planCommand(parsed.command);
+    if (cmd === undefined) {
+      noSuchCommand(parsed.command);
+    }
+    renderLeafHelp(`${PROG} ${parsed.command}`, cmd);
     return 0;
   }
   return dispatch(parsed);

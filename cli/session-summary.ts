@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `keeper session-summary <session-id>` — a BOUNDED one-shot summary of one
+ * `keeper session summary <session-id>` — a BOUNDED one-shot summary of one
  * session so an agent orients without Reading a multi-MB transcript into its
  * token cap. Emits ONE `{schema_version, ok, error, data}` envelope: the job's
  * title / lifecycle state / plan linkage / transcript_path, the first + last
@@ -25,14 +25,14 @@ import type { Database } from "bun:sqlite";
 import { openDb, resolveDbPath } from "../src/db";
 import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
 
-/** Envelope schema version for `keeper session-summary`. */
+/** Envelope schema version for `keeper session summary`. */
 export const SESSION_SUMMARY_SCHEMA_VERSION = 1;
 
 /** Max characters of a prompt snippet before truncation — the whole point of
  *  the verb is to STAY bounded, so a long first/last prompt is clipped. */
 export const MAX_SNIPPET_CHARS = 500;
 
-const HELP = `keeper session-summary <session-id> [options]
+const HELP = `keeper session summary <session-id> [options]
 
 Print a BOUNDED one-shot summary of one session as a {schema_version, ok, error,
 data} JSON envelope: title, lifecycle state, plan linkage, transcript_path, the
@@ -57,14 +57,14 @@ interface ParsedArgs {
 function parseMax(raw: string | undefined): number {
   if (raw === undefined) {
     process.stderr.write(
-      "keeper session-summary: --max-snippet requires a value\n",
+      "keeper session summary: --max-snippet requires a value\n",
     );
     process.exit(2);
   }
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
     process.stderr.write(
-      `keeper session-summary: --max-snippet must be a positive integer (got '${raw}')\n`,
+      `keeper session summary: --max-snippet must be a positive integer (got '${raw}')\n`,
     );
     process.exit(2);
   }
@@ -91,14 +91,14 @@ function parseArgs(argv: string[]): ParsedArgs {
         : parseMax(argv[++i]);
     } else if (a.startsWith("-")) {
       process.stderr.write(
-        `keeper session-summary: unexpected argument '${a}'\n`,
+        `keeper session summary: unexpected argument '${a}'\n`,
       );
       process.exit(2);
     } else if (p.sessionId === null) {
       p.sessionId = a;
     } else {
       process.stderr.write(
-        `keeper session-summary: unexpected argument '${a}'\n`,
+        `keeper session summary: unexpected argument '${a}'\n`,
       );
       process.exit(2);
     }
@@ -270,7 +270,7 @@ export function main(argv: string[]): void {
   }
   if (args.sessionId === null) {
     process.stderr.write(
-      "keeper session-summary: <session-id> is required\n\n",
+      "keeper session summary: <session-id> is required\n\n",
     );
     process.stderr.write(HELP);
     process.exit(2);

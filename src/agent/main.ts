@@ -57,6 +57,7 @@ import {
   type AgentKind,
   hasKeeperAgentHelpFlag,
   KEEPER_AGENT_HELP,
+  KEEPER_AGENT_RUNBOOK,
   type SubcommandKind,
   splitSubcommand,
   USAGE,
@@ -1064,12 +1065,12 @@ function writeEnvelopeAtomic(
 /**
  * The first positional (run id or transcript path) of an `agent wait` argv —
  * echoed into the envelope's `handle`. Mirrors `resolveHandle`'s positional
- * detection (skip `--agent`/`--stop-timeout-ms` values and any other `--flag`).
+ * detection (skip `--agent`/`--stop-timeout` values and any other `--flag`).
  */
 function firstHandleToken(rest: string[]): string | null {
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
-    if (arg === "--agent" || arg === "--stop-timeout-ms") {
+    if (arg === "--agent" || arg === "--stop-timeout") {
       i += 1;
       continue;
     }
@@ -1616,6 +1617,13 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "help-wrapper") {
     deps.write(KEEPER_AGENT_HELP);
+    return deps.exit(0);
+  }
+  if (dispatch.kind === "agent-help") {
+    // Meta mode: the operator runbook. cli/agent.ts routes it before deps are
+    // built; handling it here too keeps the launcher self-consistent when main()
+    // is driven directly, and never falls through to the harness-launch branch.
+    deps.write(KEEPER_AGENT_RUNBOOK);
     return deps.exit(0);
   }
   if (dispatch.kind === "version") {

@@ -14,6 +14,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseDuration } from "../../cli/duration";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_NAME_SET } from "./harness";
 import {
@@ -41,7 +42,7 @@ export interface ResolvedHandle {
   /** Known up-front only for the direct-path handle form; else resolved later. */
   transcriptPath: string | null;
   /**
-   * Caller-supplied stop-wait ceiling in ms (`--stop-timeout-ms`), threaded into
+   * Caller-supplied stop-wait ceiling in ms (`--stop-timeout`), threaded into
    * `waitForTranscriptStop`. Null when the flag is absent — the watcher then
    * falls back to `DEFAULT_STOP_TIMEOUT_MS`. Meaningful only to `wait-for-stop`;
    * `show-last-message` shares this resolver and tolerantly ignores it.
@@ -101,32 +102,26 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
       agentOverride = value as AgentKind;
       continue;
     }
-    if (arg === "--stop-timeout-ms") {
+    if (arg === "--stop-timeout") {
       const value = args.rest[i + 1];
       if (value === undefined) {
-        return { ok: false, error: "--stop-timeout-ms requires a value" };
+        return { ok: false, error: "--stop-timeout requires a value" };
       }
-      const parsed = parseStopTimeoutMs(value);
-      if (parsed === null) {
-        return {
-          ok: false,
-          error: `--stop-timeout-ms must be a positive integer ms: ${value}`,
-        };
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--stop-timeout ${parsed.message}` };
       }
-      stopTimeoutMs = parsed;
+      stopTimeoutMs = parsed.ms;
       i += 1;
       continue;
     }
-    if (arg.startsWith("--stop-timeout-ms=")) {
-      const value = arg.slice("--stop-timeout-ms=".length);
-      const parsed = parseStopTimeoutMs(value);
-      if (parsed === null) {
-        return {
-          ok: false,
-          error: `--stop-timeout-ms must be a positive integer ms: ${value}`,
-        };
+    if (arg.startsWith("--stop-timeout=")) {
+      const value = arg.slice("--stop-timeout=".length);
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--stop-timeout ${parsed.message}` };
       }
-      stopTimeoutMs = parsed;
+      stopTimeoutMs = parsed.ms;
       continue;
     }
     if (handleArg === null) {
@@ -161,19 +156,6 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
   }
 
   return resolveRunId(handleArg, args.stateDir, agentOverride, stopTimeoutMs);
-}
-
-/**
- * Parse a `--stop-timeout-ms` value to a finite positive integer of ms, or null
- * for anything malformed (`abc`, `0`, negative, non-integer, blank). A null maps
- * to BAD_ARGS upstream — NEVER a silent fallback to the 600s default.
- */
-function parseStopTimeoutMs(value: string): number | null {
-  if (!/^\d+$/.test(value.trim())) {
-    return null;
-  }
-  const n = Number(value);
-  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 function resolveRunId(
@@ -283,7 +265,7 @@ export async function runWaitForStop(
   // A bounded timeout maps to the caller's RETRYABLE (exit 4) path, mirroring the
   // transcript-path timeout above — a retryable transient, not a wrong answer.
   // The error self-reports the effective deadline and its source so the next
-  // failure tells us whether the caller's --stop-timeout-ms or the default bit.
+  // failure tells us whether the caller's --stop-timeout or the default bit.
   if (!outcome.ok) {
     const effectiveMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     const source = handle.stopTimeoutMs !== null ? "caller" : "default";

@@ -20,6 +20,19 @@
 import { Clerc, defineCommand } from "@clerc/core";
 import { completionsPlugin } from "@clerc/plugin-completions";
 import packageJson from "../package.json" with { type: "json" };
+import {
+  type OptionDescriptor,
+  PLAN_COMMANDS,
+  type PlanCommand,
+} from "../plugins/plan/src/descriptor.ts";
+import { PROMPT_COMMANDS } from "../plugins/prompt/src/descriptor.ts";
+import {
+  type CommandDescriptor,
+  type FlagDescriptor,
+  type FormatMode,
+  NATIVE_COMMANDS,
+  type Visibility,
+} from "./descriptor";
 
 export const SUBCOMMANDS = [
   "board",
@@ -37,13 +50,10 @@ export const SUBCOMMANDS = [
   "baseline",
   "setup-tmux",
   "tabs",
-  "session-state",
-  "show-session-files",
+  "session",
   "search-history",
   "find-file-history",
-  "show-session-events",
   "show-job",
-  "session-summary",
   "escalation-brief",
   "plan",
   "prompt",
@@ -60,14 +70,12 @@ export const SUBCOMMANDS = [
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
 /**
- * Per-subcommand metadata — the SINGLE source of truth the human `USAGE` block
- * and the machine `keeper --help --json` command index are both generated from,
- * so the two can never drift. `verbs` enumerates a two-level subcommand's verb
- * names (a static table the dispatcher owns, NOT introspected from the sub-CLI);
- * `agentHelp` marks a subcommand that carries a `--agent-help` operator runbook
- * distinct from `--help` (the index publishes this so an agent never assumes a
- * runbook that isn't there). The `Record<Subcommand, …>` type enforces that a
- * new subcommand cannot land without a summary.
+ * Per-subcommand metadata — a back-compat PROJECTION of the native descriptor
+ * tree (`cli/descriptor.ts`, ADR 0008), which is the single source of truth for
+ * every summary, verb list, and flag surface. The hand-maintained verb tables
+ * retired: `SUBCOMMAND_META` now derives from `NATIVE_COMMANDS`, so it cannot
+ * drift from the descriptor. `verbs` flattens a two-level subcommand's verb
+ * names; `agentHelp` marks a subcommand carrying a `--agent-help` runbook.
  */
 export interface SubcommandMeta {
   readonly summary: string;
@@ -75,189 +83,86 @@ export interface SubcommandMeta {
   readonly agentHelp?: boolean;
 }
 
-export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
-  board: {
-    summary: "Epics board (TTY: live TUI; non-TTY: one snapshot + exit)",
-  },
-  jobs: {
-    summary:
-      "Jobs list w/ dead-letter banner + 'r' replay (TTY: live; non-TTY: snapshot)",
-  },
-  git: {
-    summary: "Git status frames (TTY: live TUI; non-TTY: one snapshot + exit)",
-  },
-  usage: {
-    summary: "Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)",
-  },
-  autopilot: {
-    summary:
-      "Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)",
-    verbs: [
-      "pause",
-      "play",
-      "mode",
-      "config",
-      "arm",
-      "disarm",
-      "worktree",
-      "retry",
-    ],
-    agentHelp: true,
-  },
-  builds: {
-    summary:
-      "Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)",
-  },
-  dash: {
-    summary: "Read-only opening screen: header + PLAN + AGENTS (TTY-only)",
-  },
-  status: {
-    summary:
-      "One-shot unified board + autopilot JSON read (orient in one call)",
-  },
-  query: {
-    summary: "One-shot read of an allowlisted daemon collection (JSON)",
-  },
-  watch: { summary: "NDJSON tail of coarse board deltas (never exits)" },
-  await: { summary: "Block until a plan/git/job condition holds" },
-  "commit-work": {
-    summary: "Stage session-attributed files, lint, commit, push",
-    agentHelp: true,
-  },
-  baseline: {
-    summary:
-      "Read the suite-baseline result at a commit (--wait triggers + blocks)",
-  },
-  "setup-tmux": {
-    summary: "Provision the tmux control plane (dash + work sessions)",
-  },
-  tabs: {
-    summary:
-      "Restore keeper agents after a crash: `keeper tabs <list|restore|dump>`",
-    verbs: ["list", "restore", "dump"],
-  },
-  "session-state": {
-    summary: "Current session git context + on-hook files (JSON)",
-  },
-  "show-session-files": {
-    summary: "Session's on-hook dirty files grouped by repo (JSON)",
-  },
-  "search-history": {
-    summary: "Search UserPromptSubmit history by LIKE term (JSON)",
-  },
-  "find-file-history": {
-    summary: "List file attributions matching a path fragment (JSON)",
-  },
-  "show-session-events": {
-    summary: "Prompt/tool-call spine for one session (JSON)",
-  },
-  "show-job": {
-    summary:
-      "One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)",
-  },
-  "session-summary": {
-    summary:
-      "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
-  },
-  "escalation-brief": {
-    summary:
-      "Read-only context envelope an autopilot escalation session loads at boot (JSON)",
-  },
-  plan: {
-    summary:
-      "The plan CLI: `keeper plan <verb>` runs the plan dispatcher in-process",
-    verbs: [
-      "status",
-      "epics",
-      "tasks",
-      "ready",
-      "show",
-      "cat",
-      "list",
-      "scaffold",
-      "init",
-      "claim",
-      "done",
-      "block",
-      "unblock",
-      "verdict",
-      "close-preflight",
-      "close-finalize",
-      "validate",
-      "audit",
-      "reconcile",
-      "gist",
-      "mv-repo",
-      "followup",
-    ],
-  },
-  prompt: {
-    summary:
-      "Snippet/bundle substrate engine: `keeper prompt <verb>` runs the prompt CLI in-process",
-    verbs: [
-      "render",
-      "check-generated",
-      "render-plugin-templates",
-      "build-snippets",
-      "find-snippets",
-      "save-snippet",
-      "save-bundle",
-      "validate-bundles",
-      "list-bundles",
-      "show-bundle",
-    ],
-  },
-  projects: {
-    summary:
-      "List keeper-root projects ranked from keeper.db activity and manifest metadata",
-    verbs: ["roots", "names", "ranked", "grouped", "descriptions"],
-  },
-  repo: {
-    summary: "Create, clone, and fork GitHub repos into configured roots",
-    verbs: ["create", "clone", "fork"],
-  },
-  dispatch: {
-    summary:
-      "Manually fire one claude worker into a tmux window (client-side escape hatch)",
-    agentHelp: true,
-  },
-  handoff: {
-    summary:
-      "Enqueue a fire-and-forget claude worker with a contextful brief (`keeper handoff show <id>` reads it)",
-    agentHelp: true,
-  },
-  agent: {
-    summary:
-      "Launch an agent CLI: `keeper agent <claude|codex|pi> [args...]` (folded keeper agent launcher)",
-    verbs: [
-      "claude",
-      "codex",
-      "pi",
-      "run",
-      "wait",
-      "panel",
-      "presets",
-      "transcript",
-    ],
-  },
-  reclaim: {
-    summary:
-      "OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)",
-    agentHelp: true,
-  },
-  bus: {
-    summary: "Agent Bus: `keeper bus <list|resolve|chat send|watch>`",
-    verbs: ["list", "watch", "wake", "chat"],
-  },
-  "statusline-sink": {
-    summary:
-      "Coalesce a Claude Code statusLine payload (stdin) into a per-session leaf",
-  },
-  completions: {
-    summary:
-      "Emit a shell completion script: `keeper completions <bash|zsh|fish>`",
-  },
-};
+function projectMeta(c: CommandDescriptor): SubcommandMeta {
+  return {
+    summary: c.summary,
+    ...(c.verbs !== undefined ? { verbs: c.verbs.map((v) => v.name) } : {}),
+    ...(c.agent_help === true ? { agentHelp: true } : {}),
+  };
+}
+
+export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> =
+  Object.fromEntries(
+    NATIVE_COMMANDS.map((c) => [c.name, projectMeta(c)]),
+  ) as Record<Subcommand, SubcommandMeta>;
+
+/** The public (non-internal) descriptors, in canonical order — the ones the
+ *  human `USAGE` block lists. `internal` wiring commands (statusline-sink) are
+ *  omitted here yet still carried in `keeper --help --json`. */
+const PUBLIC_DESCRIPTORS: readonly CommandDescriptor[] = NATIVE_COMMANDS.filter(
+  (c) => c.visibility !== "internal",
+);
+
+/** One plan `--flag` → a native `FlagDescriptor`. `--project` → `project`;
+ *  `takesValue` picks string vs. boolean (the two `parseArgs` shapes). */
+function planOptionToFlag(o: OptionDescriptor): FlagDescriptor {
+  return {
+    name: o.name.replace(/^-+/, ""),
+    type: o.takesValue ? "string" : "boolean",
+    summary: o.summary,
+  };
+}
+
+/**
+ * Project one plan-descriptor command to the native `CommandDescriptor` the
+ * `--help --json` index and completion tree consume. The plan CLI's pure-data
+ * descriptor models name/summary/args/options/subcommands but NOT mutation,
+ * daemon, or TTY needs — the plan dispatcher runs in-process, so `requires_daemon`
+ * and `requires_tty` are truthfully `false`, and per-verb mutation is unmodeled
+ * there, so it projects to `false` (the parent `plan` node already carries
+ * `mutates: true`). The verb SET — names, flags, summaries, nesting — is what
+ * these two introspection surfaces read.
+ */
+function planVerbToDescriptor(p: PlanCommand): CommandDescriptor {
+  const base: CommandDescriptor = {
+    name: p.name,
+    summary: p.summary,
+    visibility: "public",
+    mutates: false,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: (p.options ?? []).map(planOptionToFlag),
+  };
+  return p.subcommands === undefined
+    ? base
+    : { ...base, verbs: p.subcommands.map(planVerbToDescriptor) };
+}
+
+let mergedCommandsCache: readonly CommandDescriptor[] | undefined;
+
+/**
+ * The native command tree with the `plan` and `prompt` verb sets merged in from
+ * the plugins' OWN pure-data descriptor modules (ADR 0008) — the single anti-drift
+ * seam feeding `keeper --help --json` and `buildCompletionCli`. Every other node
+ * passes through `NATIVE_COMMANDS` untouched; only the two plugin subcommands gain
+ * their verbs, so the dispatch tree (`buildKeeperCli`) — which reads
+ * `SUBCOMMAND_META`, never this — keeps its residual pass-through unaffected. The
+ * prompt descriptor is already `CommandDescriptor`-shaped; the plan descriptor is
+ * projected via {@link planVerbToDescriptor}. Cached: the projection runs once, on
+ * the first help/completion call, not on every dispatch.
+ */
+function mergedCommandTree(): readonly CommandDescriptor[] {
+  if (mergedCommandsCache === undefined) {
+    mergedCommandsCache = NATIVE_COMMANDS.map((c) =>
+      c.name === "plan"
+        ? { ...c, verbs: PLAN_COMMANDS.map(planVerbToDescriptor) }
+        : c.name === "prompt"
+          ? { ...c, verbs: PROMPT_COMMANDS }
+          : c,
+    );
+  }
+  return mergedCommandsCache;
+}
 
 /**
  * The shared exit-code taxonomy, published in `keeper --help --json` so every
@@ -278,6 +183,8 @@ export const EXIT_CODES: Record<string, string> = {
   "6": "tabs restore: refused a non-TTY AMBIGUOUS selection (ranked table on stderr) — re-run with --generation <id> or on a TTY",
   "7": "tabs restore --apply: ZERO candidates without --allow-empty",
   "8": "tabs restore --apply: PARTIAL launch failure (restored/failed summary printed)",
+  "124":
+    "agent panel wait: a chunk elapsed with no terminal answer — a re-issue signal to poll again, NOT a failure",
 };
 
 /** The `keeper --help --json` command index. A discovery/introspection surface,
@@ -285,34 +192,83 @@ export const EXIT_CODES: Record<string, string> = {
  *  envelope (like `watch`/`cat`) — it is neither a state read nor a mutate and
  *  cannot fail transport, so it prints its shape flat for a direct `jq
  *  '.subcommands'`. */
+export interface HelpIndexFlag {
+  name: string;
+  type: FlagDescriptor["type"];
+  short?: string;
+  multiple?: boolean;
+  default?: boolean | string;
+  summary?: string;
+}
+
+/** One command node in the recursive `--help --json` tree — the descriptor
+ *  projected to a JSON-friendly shape. `verbs`, when present, holds the same
+ *  node type recursively (a two-level subcommand's verbs). */
+export interface HelpIndexCommand {
+  name: string;
+  summary: string;
+  visibility: Visibility;
+  mutates: boolean;
+  requires_daemon: boolean;
+  requires_tty: boolean;
+  agent_help: boolean;
+  format_modes?: readonly FormatMode[];
+  exit_codes?: Readonly<Record<string, string>>;
+  flags: readonly HelpIndexFlag[];
+  verbs?: readonly HelpIndexCommand[];
+}
+
 export interface HelpIndex {
-  subcommands: Array<{
-    name: Subcommand;
-    summary: string;
-    verbs?: readonly string[];
-    agent_help: boolean;
-  }>;
+  /** Self-describing note: the shape a machine consumer should expect. */
+  schema: string;
+  subcommands: readonly HelpIndexCommand[];
   exit_codes: Record<string, string>;
 }
 
+const HELP_INDEX_SCHEMA =
+  "recursive command tree; each node = {name, summary, visibility, mutates, requires_daemon, requires_tty, agent_help, format_modes?, exit_codes?, flags[], verbs?}; top-level exit_codes is the shared taxonomy (per-command exit_codes carry the divergences)";
+
+function toIndexFlag(f: FlagDescriptor): HelpIndexFlag {
+  const flag: HelpIndexFlag = { name: f.name, type: f.type };
+  if (f.short !== undefined) flag.short = f.short;
+  if (f.multiple !== undefined) flag.multiple = f.multiple;
+  if (f.default !== undefined) flag.default = f.default;
+  if (f.summary !== undefined) flag.summary = f.summary;
+  return flag;
+}
+
+function toIndexCommand(c: CommandDescriptor): HelpIndexCommand {
+  const node: HelpIndexCommand = {
+    name: c.name,
+    summary: c.summary,
+    visibility: c.visibility,
+    mutates: c.mutates,
+    requires_daemon: c.requires_daemon,
+    requires_tty: c.requires_tty,
+    agent_help: c.agent_help === true,
+    flags: c.flags.map(toIndexFlag),
+  };
+  if (c.format_modes !== undefined) node.format_modes = c.format_modes;
+  if (c.exit_codes !== undefined) node.exit_codes = c.exit_codes;
+  if (c.verbs !== undefined) node.verbs = c.verbs.map(toIndexCommand);
+  return node;
+}
+
+/** The `keeper --help --json` payload: the full recursive descriptor tree
+ *  (every subcommand, INCLUDING `visibility:internal` ones) plus the shared
+ *  exit-code taxonomy. Generated from the merged tree — native leaves plus the
+ *  plan/prompt plugin descriptors' live verb sets — so the index cannot drift
+ *  from either the native surface or the plugins' dispatchable reality. */
 export function buildHelpIndex(): HelpIndex {
   return {
-    subcommands: SUBCOMMANDS.map((name) => {
-      const meta = SUBCOMMAND_META[name];
-      const entry: HelpIndex["subcommands"][number] = {
-        name,
-        summary: meta.summary,
-        agent_help: meta.agentHelp === true,
-      };
-      if (meta.verbs !== undefined) entry.verbs = meta.verbs;
-      return entry;
-    }),
+    schema: HELP_INDEX_SCHEMA,
+    subcommands: mergedCommandTree().map(toIndexCommand),
     exit_codes: EXIT_CODES,
   };
 }
 
-const SUBCOMMAND_LINES = SUBCOMMANDS.map(
-  (name) => `  ${name.padEnd(19)} ${SUBCOMMAND_META[name].summary}`,
+const SUBCOMMAND_LINES = PUBLIC_DESCRIPTORS.map(
+  (c) => `  ${c.name.padEnd(19)} ${c.summary}`,
 ).join("\n");
 
 export const USAGE = `keeper — unified CLI for the keeper TUIs
@@ -368,7 +324,7 @@ export interface DispatchDeps {
  * registered as nested Clerc commands: a nested `plan status` command would make
  * Clerc's command resolver match the longer path and strip `status` out of the
  * residual, breaking the leaf-owned pass-through. Their verb tokens ride in the
- * residual instead; completion candidates come from `SUBCOMMAND_META[*].verbs`.
+ * residual instead; completion candidates come from the descriptor tree's verbs.
  */
 export function buildKeeperCli(deps: {
   handlers: Record<Subcommand, SubcommandHandler>;
@@ -418,23 +374,32 @@ export const COMPLETION_RESPONDER = "complete";
  * is exactly what lets the responder suggest `keeper plan <verb>`. `completions`
  * is skipped — the plugin registers that command (and the hidden `complete`)
  * itself, so both surface as candidates without a double registration.
+ *
+ * Built from the merged tree (ADR 0008): the completion surface is generated from
+ * the SAME descriptor tree as `keeper --help --json` — native leaves plus the
+ * plan/prompt plugin descriptors' verb sets — so a command or verb can never be
+ * completable but undocumented, or vice versa, and plugin verbs cannot drift from
+ * their dispatchable reality.
  */
 export function buildCompletionCli(version: string): Clerc {
-  const commands = SUBCOMMANDS.filter((name) => name !== "completions").flatMap(
-    (name) => {
+  const commands = mergedCommandTree()
+    .filter((c) => c.name !== "completions")
+    .flatMap((c) => {
       const parent = defineCommand({
-        name,
-        description: SUBCOMMAND_META[name].summary,
+        name: c.name,
+        description: c.summary,
       });
-      const verbs = (SUBCOMMAND_META[name].verbs ?? []).map((verb) =>
+      const verbs = (c.verbs ?? []).map((verb) =>
         defineCommand({
-          name: `${name} ${verb}`,
-          description: `${name} ${verb}`,
+          name: `${c.name} ${verb.name}`,
+          description:
+            verb.summary === verb.name
+              ? `${c.name} ${verb.name}`
+              : verb.summary,
         }),
       );
       return [parent, ...verbs];
-    },
-  );
+    });
   return Clerc.create({ name: "keeper", scriptName: "keeper", version })
     .command(commands)
     .use(completionsPlugin());
@@ -483,10 +448,25 @@ export function completionResponder(
   );
 }
 
+export const COMPLETIONS_HELP = `Usage: keeper completions <${COMPLETION_SHELLS.join(
+  "|",
+)}>
+
+Emit a shell completion script for keeper on stdout. Source it (or install it
+where your shell auto-loads completions) so <TAB> suggests subcommands + verbs.
+The script wires <TAB> back to the hidden \`keeper complete\` responder, which
+reads the same descriptor tree as \`keeper --help --json\` — so completions can
+never drift from the dispatchable surface.
+
+  bash   eval "$(keeper completions bash)"   (or write to a bash-completion.d file)
+  zsh    keeper completions zsh > "\${fpath[1]}/_keeper"
+  fish   keeper completions fish > ~/.config/fish/completions/keeper.fish
+`;
+
 /** The `keeper completions <shell>` handler: validate the shell against keeper's
- *  supported set, emit the framework-generated script, exit 0. A missing/unknown
- *  shell is an arg fault (exit 2) naming the supported shells — never a silent
- *  empty script. */
+ *  supported set, emit the framework-generated script, exit 0. `--help`/`-h`
+ *  prints usage (exit 0, no state touched); a missing/unknown shell is an arg
+ *  fault (exit 2) naming the supported shells — never a silent empty script. */
 export async function runCompletionsCommand(
   argv: string[],
   io: {
@@ -497,6 +477,10 @@ export async function runCompletionsCommand(
   },
 ): Promise<void> {
   const shell = argv[0];
+  if (shell === "--help" || shell === "-h") {
+    io.stdout(COMPLETIONS_HELP);
+    return;
+  }
   if (shell === undefined || !isCompletionShell(shell)) {
     io.stderr(
       `keeper completions: expected a shell (${COMPLETION_SHELLS.join("|")}), got ${
@@ -593,19 +577,12 @@ export async function main(): Promise<void> {
     baseline: async (argv) => (await import("./baseline")).main(argv),
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
     tabs: async (argv) => (await import("./tabs")).main(argv),
-    "session-state": async (argv) =>
-      (await import("./session-state")).main(argv),
-    "show-session-files": async (argv) =>
-      (await import("./show-session-files")).main(argv),
+    session: async (argv) => (await import("./session")).main(argv),
     "search-history": async (argv) =>
       (await import("./search-history")).main(argv),
     "find-file-history": async (argv) =>
       (await import("./find-file-history")).main(argv),
-    "show-session-events": async (argv) =>
-      (await import("./show-session-events")).main(argv),
     "show-job": async (argv) => (await import("./show-job")).main(argv),
-    "session-summary": async (argv) =>
-      (await import("./session-summary")).main(argv),
     "escalation-brief": async (argv) =>
       (await import("./escalation-brief")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
