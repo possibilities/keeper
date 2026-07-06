@@ -13,7 +13,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildHermesEventLine,
+  HERMES_ADOPT_OPT_OUT_ENV,
   HERMES_SHIM_EVENTS,
+  HERMES_SHIM_VERSION,
+  validateNativeSessionId,
 } from "../plugins/keeper/plugin/hooks/hermes-events-shim";
 
 const JOB_ID = "job-abc-123";
@@ -29,6 +32,30 @@ function env(extra: Record<string, string | undefined> = {}) {
  *  same serializer the shim uses, so the assertion is exact-not-brittle. */
 function expectedLine(bindings: Record<string, unknown>): string {
   return `${JSON.stringify({ bindings })}\n`;
+}
+
+// --- Self-seed (hand-started hermes) fixtures ------------------------------
+// The injected SESSION pid (the shim's PARENT — hermes; `main` passes
+// `process.ppid`) and a fixed injected start_time thunk, so the self-seed tests
+// stay pure (no `process.ppid` read, no `ps` fork). START_TIME is an opaque
+// hand-chosen constant — the builder stamps whatever the thunk returns.
+const SESSION_PID = 4242;
+const START_TIME = "darwin:Mon Jul  6 09:00:00 2026";
+const startTimeProbe = () => START_TIME;
+/** A probe that MUST NOT be called (start_time is SessionStart-only + lazy). */
+const throwingProbe = (): string | null => {
+  throw new Error("probeStartTime called when it should not be");
+};
+
+/** Env for a hand-started hermes INSIDE a raw human tmux pane: `TMUX`/`TMUX_PANE`
+ *  set natively, NO keeper carrier (`KEEPER_TMUX_SESSION`) → session stays NULL,
+ *  NO `KEEPER_JOB_ID` → the self-seed path. */
+function selfSeedTmuxEnv(extra: Record<string, string | undefined> = {}) {
+  return {
+    TMUX: "/tmp/tmux-501/default,9999,0",
+    TMUX_PANE: "%7",
+    ...extra,
+  };
 }
 
 describe("buildHermesEventLine — event map (golden lines)", () => {
@@ -183,10 +210,23 @@ describe("buildHermesEventLine — injection + garbage (fail-safe)", () => {
     expect(parsed.bindings.fake).toBeUndefined();
   });
 
-  test("no KEEPER_JOB_ID → null (presence-only floor, never an orphan row)", () => {
+  test("no KEEPER_JOB_ID AND no native session_id → null (nothing to self-seed under)", () => {
+    // Self-seed needs a native id to become the job id; a SessionStart carrying
+    // none degrades to the presence-only floor. Whitespace KEEPER_JOB_ID trims to
+    // absent, so it takes the same self-seed-without-an-id path.
     const raw = JSON.stringify({ hook_event_name: "on_session_start" });
-    expect(buildHermesEventLine(raw, {}, TS)).toBeNull();
-    expect(buildHermesEventLine(raw, { KEEPER_JOB_ID: "  " }, TS)).toBeNull();
+    expect(
+      buildHermesEventLine(raw, {}, TS, SESSION_PID, startTimeProbe),
+    ).toBeNull();
+    expect(
+      buildHermesEventLine(
+        raw,
+        { KEEPER_JOB_ID: "  " },
+        TS,
+        SESSION_PID,
+        startTimeProbe,
+      ),
+    ).toBeNull();
   });
 
   test("unmapped hermes event → null (never poison)", () => {
@@ -215,5 +255,271 @@ describe("buildHermesEventLine — injection + garbage (fail-safe)", () => {
     expect((parsed.bindings.data as string).length).toBeLessThanOrEqual(
       64 * 1024,
     );
+  });
+});
+
+describe("validateNativeSessionId (self-seed id charset gate)", () => {
+  test("accepts a UUID-ish / hermes-native id verbatim (reject-or-passthrough)", () => {
+    for (const id of [
+      "hermes-sess-xyz",
+      "0c9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8",
+      "sess.42_abc-DEF",
+    ]) {
+      expect(validateNativeSessionId(id)).toBe(id);
+    }
+  });
+
+  test("rejects hostile ids to null — never sanitize-and-continue", () => {
+    for (const id of [
+      null, // absent
+      "", // empty
+      "..", // pure-dots traversal token
+      ".", // single-dot traversal token
+      "../../etc/passwd", // path traversal (slash)
+      "a/b", // path separator
+      "a\\b", // windows separator
+      "has space", // whitespace
+      "semi;colon", // shell metacharacter
+      "nul byte", // NUL
+      "x".repeat(129), // overlong (> 128)
+    ]) {
+      expect(validateNativeSessionId(id)).toBeNull();
+    }
+  });
+});
+
+describe("buildHermesEventLine — self-seed adoption (hand-started hermes)", () => {
+  test("in-tmux SessionStart → full adopted line (native id, adopted, session pid, witness, coords, shim version)", () => {
+    const raw = JSON.stringify({
+      hook_event_name: "on_session_start",
+      session_id: NATIVE_ID,
+      cwd: "/repo",
+    });
+    const line = buildHermesEventLine(
+      raw,
+      selfSeedTmuxEnv(),
+      TS,
+      SESSION_PID,
+      startTimeProbe,
+    );
+    expect(line).toBe(
+      expectedLine({
+        ts: TS,
+        session_id: NATIVE_ID, // the NATIVE id IS the job id
+        hook_event: "SessionStart",
+        event_type: "session_start",
+        data: raw,
+        cwd: "/repo",
+        harness: "hermes",
+        resume_target: NATIVE_ID,
+        adopted: 1,
+        pid: SESSION_PID, // the SESSION (parent) pid, not the shim pid
+        start_time: START_TIME, // the (pid, start_time) recycle witness
+        backend_exec_type: "tmux",
+        backend_exec_pane_id: "%7", // human tmux → no session name, only pane
+        shim_version: HERMES_SHIM_VERSION,
+      }),
+    );
+  });
+
+  test("outside-tmux SessionStart → adopted line WITHOUT coords (coordless adopted is legal)", () => {
+    const raw = JSON.stringify({
+      hook_event_name: "on_session_start",
+      session_id: NATIVE_ID,
+      cwd: "/repo",
+    });
+    // No TMUX, no carrier, no KEEPER_JOB_ID → self-seed with all-null coords.
+    const line = buildHermesEventLine(raw, {}, TS, SESSION_PID, startTimeProbe);
+    expect(line).toBe(
+      expectedLine({
+        ts: TS,
+        session_id: NATIVE_ID,
+        hook_event: "SessionStart",
+        event_type: "session_start",
+        data: raw,
+        cwd: "/repo",
+        harness: "hermes",
+        resume_target: NATIVE_ID,
+        adopted: 1,
+        pid: SESSION_PID,
+        start_time: START_TIME,
+        shim_version: HERMES_SHIM_VERSION,
+      }),
+    );
+  });
+
+  test("self-seed pre_llm_call → adopted + pid + coords, but NO start_time / harness / resume_target (probe stays lazy)", () => {
+    const raw = JSON.stringify({
+      hook_event_name: "pre_llm_call",
+      session_id: NATIVE_ID,
+    });
+    // A throwing probe proves the start_time thunk is NOT called off SessionStart.
+    const line = buildHermesEventLine(
+      raw,
+      selfSeedTmuxEnv(),
+      TS,
+      SESSION_PID,
+      throwingProbe,
+    );
+    expect(line).toBe(
+      expectedLine({
+        ts: TS,
+        session_id: NATIVE_ID,
+        hook_event: "UserPromptSubmit",
+        event_type: "user_prompt_submit",
+        data: raw,
+        adopted: 1,
+        pid: SESSION_PID, // pid on EVERY line → a watchable fork-seed row
+        backend_exec_type: "tmux",
+        backend_exec_pane_id: "%7",
+        shim_version: HERMES_SHIM_VERSION,
+      }),
+    );
+  });
+
+  test("opt-out env suppresses self-seeding → null, even with a valid native id", () => {
+    const raw = JSON.stringify({
+      hook_event_name: "on_session_start",
+      session_id: NATIVE_ID,
+    });
+    expect(
+      buildHermesEventLine(
+        raw,
+        selfSeedTmuxEnv({ [HERMES_ADOPT_OPT_OUT_ENV]: "1" }),
+        TS,
+        SESSION_PID,
+        startTimeProbe,
+      ),
+    ).toBeNull();
+    // An empty/whitespace opt-out value does NOT opt out (presence-gated).
+    expect(
+      buildHermesEventLine(
+        raw,
+        selfSeedTmuxEnv({ [HERMES_ADOPT_OPT_OUT_ENV]: "  " }),
+        TS,
+        SESSION_PID,
+        startTimeProbe,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("hostile native id never becomes a job id → null (line degrades to nothing)", () => {
+    for (const hostile of [
+      "../../etc/passwd",
+      "..",
+      "a/b",
+      "has space",
+      "nul byte",
+      "x".repeat(200),
+    ]) {
+      const raw = JSON.stringify({
+        hook_event_name: "on_session_start",
+        session_id: hostile,
+      });
+      expect(
+        buildHermesEventLine(raw, {}, TS, SESSION_PID, startTimeProbe),
+      ).toBeNull();
+    }
+  });
+
+  test("re-seeded same native id (replayed lifecycle) → identical id, no divergent identity", () => {
+    const raw = JSON.stringify({
+      hook_event_name: "on_session_start",
+      session_id: NATIVE_ID,
+      cwd: "/repo",
+    });
+    const first = buildHermesEventLine(
+      raw,
+      selfSeedTmuxEnv(),
+      TS,
+      SESSION_PID,
+      startTimeProbe,
+    );
+    const second = buildHermesEventLine(
+      raw,
+      selfSeedTmuxEnv(),
+      TS,
+      SESSION_PID,
+      startTimeProbe,
+    );
+    // Deterministic: the native id is the job id, so a replayed lifecycle folds as
+    // a resume onto the SAME row (byte-identical line), never a divergent identity.
+    expect(second).toBe(first as string);
+    const parsed = JSON.parse(first as string);
+    expect(parsed.bindings.session_id).toBe(NATIVE_ID);
+    expect(parsed.bindings.resume_target).toBe(NATIVE_ID);
+    expect(parsed.bindings.adopted).toBe(1);
+  });
+
+  test("self-seeded line is exactly ONE bounded JSON line (no tearing on a hostile-but-valid-charset payload)", () => {
+    const nasty = 'echo `whoami`\nSECOND{"fake":"binding"}';
+    const raw = JSON.stringify({
+      hook_event_name: "pre_tool_call",
+      session_id: NATIVE_ID,
+      tool_name: "terminal",
+      tool_input: { command: nasty },
+    });
+    const line = buildHermesEventLine(
+      raw,
+      selfSeedTmuxEnv(),
+      TS,
+      SESSION_PID,
+      throwingProbe,
+    ) as string;
+    expect(line.endsWith("\n")).toBe(true);
+    expect(line.slice(0, -1).includes("\n")).toBe(false);
+    const parsed = JSON.parse(line);
+    expect(parsed.bindings.session_id).toBe(NATIVE_ID);
+    expect(parsed.bindings.adopted).toBe(1);
+    expect(parsed.bindings.fake).toBeUndefined();
+  });
+});
+
+describe("buildHermesEventLine — launcher-owned XOR (byte-identical to pre-adoption)", () => {
+  test("KEEPER_JOB_ID present → no adoption fields, and the start_time probe never fires", () => {
+    const raw = JSON.stringify({
+      hook_event_name: "on_session_start",
+      session_id: NATIVE_ID,
+      cwd: "/repo",
+    });
+    // A throwing probe + a real session pid: the launcher-owned path must ignore
+    // BOTH — no adopted / pid / start_time / coords / shim_version, and no fork.
+    const line = buildHermesEventLine(
+      raw,
+      selfSeedTmuxEnv({ KEEPER_JOB_ID: JOB_ID }),
+      TS,
+      SESSION_PID,
+      throwingProbe,
+    );
+    expect(line).toBe(
+      expectedLine({
+        ts: TS,
+        session_id: JOB_ID, // the keeper job id, NOT the native id
+        hook_event: "SessionStart",
+        event_type: "session_start",
+        data: raw,
+        cwd: "/repo",
+        harness: "hermes",
+        resume_target: NATIVE_ID,
+      }),
+    );
+    const parsed = JSON.parse(line as string);
+    expect(parsed.bindings.adopted).toBeUndefined();
+    expect(parsed.bindings.pid).toBeUndefined();
+    expect(parsed.bindings.start_time).toBeUndefined();
+    expect(parsed.bindings.backend_exec_type).toBeUndefined();
+    expect(parsed.bindings.shim_version).toBeUndefined();
+  });
+
+  test("opt-out env has NO effect on a launcher-owned session", () => {
+    const raw = JSON.stringify({ hook_event_name: "pre_llm_call" });
+    const withOptOut = buildHermesEventLine(
+      raw,
+      env({ [HERMES_ADOPT_OPT_OUT_ENV]: "1" }),
+      TS,
+    );
+    const without = buildHermesEventLine(raw, env(), TS);
+    expect(withOptOut).toBe(without as string);
+    expect(withOptOut).not.toBeNull();
   });
 });
