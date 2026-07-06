@@ -61,8 +61,8 @@ to Reading a transcript — they are bounded and pre-shaped:
 |---|---|
 | `keeper find-file-history <path-fragment>` | Which sessions mutated a file, most-recent-first (session, time, op, source). |
 | `keeper search-history <term>` | The prompt where something was discussed (ts, session, snippet); includes compacted events. |
-| `keeper show-session-events --session-id <id>` | One session's prompt/tool-call spine, chronological. |
-| `keeper session-summary <session-id>` | A bounded one-shot summary of a session — title, lifecycle, plan linkage, first/last prompt, event counts. Use instead of Reading the transcript. |
+| `keeper session events --session-id <id>` | One session's prompt/tool-call spine, chronological. |
+| `keeper session summary <session-id>` | A bounded one-shot summary of a session — title, lifecycle, plan linkage, first/last prompt, event counts. Use instead of Reading the transcript. |
 | `keeper show-job [selectors]` | One job's full metadata from the `jobs` projection; no selector auto-detects your own job. |
 
 ### Tier 2 — live projections (query / status)
@@ -110,7 +110,7 @@ orient step run `keeper prompt render engineering/orient`.
 Tier-1 verbs turn "when did this regress / who touched it" into a query:
 `keeper find-file-history <path-fragment>` lists the sessions that mutated a file
 most-recent-first, `keeper search-history <term>` finds the prompt where a change
-was discussed, and `keeper show-session-events --session-id <id>` replays what
+was discussed, and `keeper session events --session-id <id>` replays what
 that session actually did. Run `keeper prompt render
 engineering/keeper-history-forensics` for the full recipe set.
 

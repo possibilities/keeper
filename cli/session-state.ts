@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `keeper session-state` — emit the current session's git context (branch,
+ * `keeper session state` — emit the current session's git context (branch,
  * head sha, porcelain status, recent log) plus its on-hook dirty file list as a
  * pretty JSON envelope. The native port of jobctl's `run_session_state.py`
  * (epic fn-715 task 3).
@@ -37,7 +37,7 @@ export interface SessionStateDeps {
   attribution?: AttributionDeps;
 }
 
-const HELP = `keeper session-state [options]
+const HELP = `keeper session state [options]
 
 Emit the current session's git context (branch, head sha, porcelain status,
 recent log) plus its on-hook dirty files as a pretty JSON envelope. Purely
@@ -77,7 +77,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       parsed.logCount = parseLogCount(a.slice("--log-count=".length));
     } else {
       process.stderr.write(
-        `keeper session-state: unexpected argument '${a}'\n`,
+        `keeper session state: unexpected argument '${a}'\n`,
       );
       process.exit(2);
     }
@@ -88,14 +88,14 @@ function parseArgs(argv: string[]): ParsedArgs {
 function parseLogCount(raw: string | undefined): number {
   if (raw === undefined) {
     process.stderr.write(
-      "keeper session-state: --log-count requires a value\n",
+      "keeper session state: --log-count requires a value\n",
     );
     process.exit(2);
   }
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
     process.stderr.write(
-      `keeper session-state: --log-count must be a positive integer (got '${raw}')\n`,
+      `keeper session state: --log-count must be a positive integer (got '${raw}')\n`,
     );
     process.exit(2);
   }

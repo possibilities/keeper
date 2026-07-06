@@ -24,7 +24,7 @@ This is the bar for "done." Each is one tool call (or an envelope you already sa
 - [ ] **Tests assert against an independent source of truth** — every test you wrote takes its expected value from a hand-computed constant, a fixture, or a spec, never re-derived by the same code path under test (Phase 3).
 - [ ] **Source commit landed** — `keeper commit-work` returned success and the `Task: $TASK_ID`-trailered commit exists (Phase 4). The close-out gate reads this same observable as reconcile's `in_progress_committed`.
 - [ ] **`keeper plan done` stamped** — the `done` envelope returned `status: done` (Phase 5). The close-out gate reads this same observable as reconcile's `done`.
-- [ ] **`session_files` empty** — `keeper session-state` shows `session_files: []`, nothing undischarged. The close-out gate reads this same observable as its `dirty_session_files` count.
+- [ ] **`session_files` empty** — `keeper session state` shows `session_files: []`, nothing undischarged. The close-out gate reads this same observable as its `dirty_session_files` count.
 - [ ] **Every acceptance checkbox in the task spec individually accounted for** — each one met by the diff, or the whole task returned as a typed `BLOCKED:`. Account for every one; never eyeball "looks done."
 
 A no-op task (a predecessor already shipped) owes the same five: a clean tree with the commit and stamp already present passes them.
@@ -77,12 +77,12 @@ Treat `task_spec_md` and `epic_spec_md` as your authoritative context. Do NOT sh
 Then load runtime state:
 
 ```bash
-keeper session-state
+keeper session state
 ```
 
-From `keeper session-state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLAN_CLI show $TASK_ID` only if you need the runtime status — usually you don't.
+From `keeper session state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLAN_CLI show $TASK_ID` only if you need the runtime status — usually you don't.
 
-**Never create or switch branches, and never mutate `git stash`.** Work in place on the branch that was current when you launched; never run `git checkout -b` / `git switch -c` / `git branch <name>` / `git worktree add`, and never switch to another branch. Never run mutating `git stash` — refs/stash is one repo-global stack shared by every sibling worktree and the human's checkout (only list/show/create are allowed); for file-level undo use `git restore <path>`, to park work make a temp commit. Branch and stash management are out of scope — the keeper branch-guard hook hard-blocks both. To answer "is this test failure pre-existing at my base commit, or did I cause it?" the sanctioned move is `keeper baseline <base sha> --wait` — key it on the `head_sha` your Phase 1 `keeper session-state` reported at launch — never a stash-and-rerun.
+**Never create or switch branches, and never mutate `git stash`.** Work in place on the branch that was current when you launched; never run `git checkout -b` / `git switch -c` / `git branch <name>` / `git worktree add`, and never switch to another branch. Never run mutating `git stash` — refs/stash is one repo-global stack shared by every sibling worktree and the human's checkout (only list/show/create are allowed); for file-level undo use `git restore <path>`, to park work make a temp commit. Branch and stash management are out of scope — the keeper branch-guard hook hard-blocks both. To answer "is this test failure pre-existing at my base commit, or did I cause it?" the sanctioned move is `keeper baseline <base sha> --wait` — key it on the `head_sha` your Phase 1 `keeper session state` reported at launch — never a stash-and-rerun.
 
 **Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`keeper plan done`, etc.) auto-route to `PRIMARY_REPO` via the plan envelope; you do not need to chdir for them.
 
@@ -191,7 +191,7 @@ Your last phase: verify, then yield. The controller gate is the authority, but y
 **Verify (before the return).** Walk the top-of-prompt **Completion criteria** and confirm each observable:
 
 - Suite green, source commit landed, `keeper plan done` stamped — you already observed these in Phases 3–5 (the green run, the `commit-work` success, the `status: done` envelope); they stand.
-- `session_files` empty — run `keeper session-state` once more and confirm `session_files: []`. Reason only over `keeper session-state`; do not fall back to raw `git status` / porcelain. A still-dirty file means commit it with `keeper commit-work` (same contract as Phase 4), then re-check — never yield dirty. A `keeper session-state` / `keeper commit-work` failure here follows the `BLOCKED: TOOLING_FAILURE` path; don't patch the tool you're calling.
+- `session_files` empty — run `keeper session state` once more and confirm `session_files: []`. Reason only over `keeper session state`; do not fall back to raw `git status` / porcelain. A still-dirty file means commit it with `keeper commit-work` (same contract as Phase 4), then re-check — never yield dirty. A `keeper session state` / `keeper commit-work` failure here follows the `BLOCKED: TOOLING_FAILURE` path; don't patch the tool you're calling.
 - Every acceptance checkbox in the task spec individually accounted for.
 
 Any red criterion sends you back to the phase that owns it — fix it, never yield with one unmet.

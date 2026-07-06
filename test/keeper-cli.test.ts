@@ -46,6 +46,7 @@ import {
   type Subcommand,
   USAGE,
 } from "../cli/keeper";
+import { main as sessionMain } from "../cli/session";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import type { Row } from "../src/protocol";
 
@@ -90,13 +91,10 @@ function makeHarness(): Harness {
       baseline: mkHandler("baseline"),
       "setup-tmux": mkHandler("setup-tmux"),
       tabs: mkHandler("tabs"),
-      "session-state": mkHandler("session-state"),
-      "show-session-files": mkHandler("show-session-files"),
+      session: mkHandler("session"),
       "search-history": mkHandler("search-history"),
       "find-file-history": mkHandler("find-file-history"),
-      "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
-      "session-summary": mkHandler("session-summary"),
       "escalation-brief": mkHandler("escalation-brief"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
@@ -229,11 +227,9 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("await")).toBe(true);
     expect(isSubcommand("commit-work")).toBe(true);
     expect(isSubcommand("setup-tmux")).toBe(true);
-    expect(isSubcommand("session-state")).toBe(true);
-    expect(isSubcommand("show-session-files")).toBe(true);
+    expect(isSubcommand("session")).toBe(true);
     expect(isSubcommand("search-history")).toBe(true);
     expect(isSubcommand("find-file-history")).toBe(true);
-    expect(isSubcommand("show-session-events")).toBe(true);
     expect(isSubcommand("show-job")).toBe(true);
     expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("prompt")).toBe(true);
@@ -256,6 +252,45 @@ describe("cli/keeper dispatch", () => {
     expect(h.calls).toEqual([{ sub: "tabs", argv: ["restore", "--apply"] }]);
     // The verb list is published for the machine-readable command index.
     expect(SUBCOMMAND_META.tabs.verbs).toEqual(["list", "restore", "dump"]);
+  });
+
+  test("session is a registered two-level subcommand routed to its handler", async () => {
+    const h = makeHarness();
+    expect(isSubcommand("session")).toBe(true);
+    // The subverb + its args ride in the residual, verb token first — the group
+    // dispatcher (cli/session.ts) owns routing to the leaf main.
+    await dispatch(["session", "summary", "abc", "--max-snippet", "9"], h.deps);
+    expect(h.calls).toEqual([
+      { sub: "session", argv: ["summary", "abc", "--max-snippet", "9"] },
+    ]);
+    // The four session-scoped reads are the group's published verbs.
+    expect(SUBCOMMAND_META.session.verbs).toEqual([
+      "state",
+      "files",
+      "events",
+      "summary",
+    ]);
+  });
+
+  test("the retired flat session leaf names hard-fail as unknown subcommands", async () => {
+    for (const retired of [
+      "session-state",
+      "show-session-files",
+      "show-session-events",
+      "session-summary",
+    ]) {
+      const h = makeHarness();
+      let caught: unknown;
+      try {
+        await dispatch([retired], h.deps);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ExitError);
+      expect((caught as ExitError).code).toBe(1);
+      expect(h.stderr.join("")).toContain(`unknown subcommand '${retired}'`);
+      expect(h.calls).toEqual([]);
+    }
   });
 
   test("--help --json emits the machine-readable command index, exit 0", async () => {
@@ -409,6 +444,96 @@ describe("cli/keeper Clerc proxy routing", () => {
     }
     // No stray commands beyond the public surface (aliases would show here).
     expect(registered.size).toBe(SUBCOMMANDS.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli/session group dispatcher — `keeper session <state|files|events|summary>`
+// maps each verb to its leaf main (session-state / show-session-files /
+// show-session-events / session-summary), preserving that leaf's flags,
+// envelope, and exit codes; only the invocation spelling is the group. These
+// assert the group's own routing decisions: pure group help, leaf-specific help
+// (proving the verb reaches its leaf), and an unknown-verb exit 2. Full help
+// purity across every leaf rides the descriptor walk in help-purity.test.ts.
+// ---------------------------------------------------------------------------
+describe("cli/session group dispatcher", () => {
+  interface Captured {
+    out: string;
+    err: string;
+    code: number | null;
+  }
+
+  /** Run sessionMain with process stdout/stderr/exit captured. `exit` throws so
+   *  a never-returning arg-fault branch unwinds to a captured code. */
+  async function runSession(argv: string[]): Promise<Captured> {
+    const out: string[] = [];
+    const err: string[] = [];
+    let code: number | null = null;
+    const orig = {
+      stdout: process.stdout.write,
+      stderr: process.stderr.write,
+      exit: process.exit,
+    };
+    process.stdout.write = ((s: string | Uint8Array) => {
+      out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((s: string | Uint8Array) => {
+      err.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stderr.write;
+    process.exit = ((c?: number) => {
+      code = c ?? 0;
+      throw new ExitError(c ?? 0);
+    }) as typeof process.exit;
+    try {
+      await sessionMain(argv);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      process.stdout.write = orig.stdout;
+      process.stderr.write = orig.stderr;
+      process.exit = orig.exit;
+    }
+    return { out: out.join(""), err: err.join(""), code };
+  }
+
+  test("bare `keeper session` prints pure group help, no exit", async () => {
+    const r = await runSession([]);
+    expect(r.code).toBeNull();
+    expect(r.out).toContain("keeper session <state|files|events|summary>");
+    expect(r.err).toBe("");
+  });
+
+  test("`keeper session --help` lists every verb, no exit", async () => {
+    const r = await runSession(["--help"]);
+    expect(r.code).toBeNull();
+    for (const verb of ["state", "files", "events", "summary"]) {
+      expect(r.out).toContain(verb);
+    }
+  });
+
+  test("a subverb's --help reaches its leaf and renders leaf-specific help", async () => {
+    // The leaf help usage line names the grouped spelling, proving the group
+    // routed to that exact leaf (and that the leaf help cites no retired name).
+    expect((await runSession(["state", "--help"])).out).toContain(
+      "keeper session state",
+    );
+    expect((await runSession(["files", "--help"])).out).toContain(
+      "keeper session files",
+    );
+    expect((await runSession(["events", "--help"])).out).toContain(
+      "keeper session events",
+    );
+    expect((await runSession(["summary", "--help"])).out).toContain(
+      "keeper session summary",
+    );
+  });
+
+  test("an unknown subverb is an argument fault (exit 2)", async () => {
+    const r = await runSession(["bogus"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown verb 'bogus'");
   });
 });
 

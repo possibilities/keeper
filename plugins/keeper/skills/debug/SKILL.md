@@ -93,7 +93,7 @@ With a red loop in hand:
 Keeper's read-only history subcommands turn "when did this regress" into a
 query: `keeper find-file-history <path-fragment>` gives the sessions that
 mutated a file most-recent-first, `keeper search-history <term>` finds the
-prompt where a change was discussed, and `keeper show-session-events
+prompt where a change was discussed, and `keeper session events
 --session-id <id>` replays what that session actually did. Run `keeper prompt
 render engineering/keeper-history-forensics` for the full recipe set.
 
