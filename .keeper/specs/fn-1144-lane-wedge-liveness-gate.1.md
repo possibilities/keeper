@@ -74,5 +74,5 @@ are grep-binary — use `grep -a`.*
   alive-no-escalation and dead/stalled-escalation branches.
 
 ## Done summary
-
+Gated the graced lane-wedge needs_human escalation on owning-worker liveness+progress: a running worker's naturally-dirty fan-in base is withheld (quiet self-clearing note), only a dead/stalled owner or a hard immediate abort-failed lane escalates. Producer-side probe, never a fold; degraded livePaneIds falls back to pre-gate escalate.
 ## Evidence
