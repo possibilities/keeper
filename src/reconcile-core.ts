@@ -424,6 +424,17 @@ export interface ReconcileSnapshot {
    */
   sharedWedgeDistressDirs?: Set<string>;
   /**
+   * The `repoDir`s that currently have an OPEN per-repo shared-checkout-DIRTY
+   * distress row (synthetic `daemon::shared-checkout-dirty:<repoHash>`, collected off
+   * the row's `dir`). The SIBLING of {@link sharedWedgeDistressDirs} on a distinct id
+   * prefix — PRODUCER-ONLY, read by the recover pass's dirt grace tracker to
+   * level-clear a dirt distress row whose checkout has since gone clean, NOT by the
+   * pure `reconcile`. Off the durable projection so a restarted worker still clears a
+   * distress it minted before the restart. Optional for call-site back-compat; an
+   * absent field is an empty set (no open dirt distress).
+   */
+  sharedDirtyDistressDirs?: Set<string>;
+  /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
    * BEFORE `launch()` and the discharging `SessionStart` has not folded yet (the

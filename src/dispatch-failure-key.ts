@@ -160,6 +160,42 @@ export function isSharedWedgeDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/**
+ * The SIBLING synthetic PER-REPO distress signal for a shared MAIN checkout that
+ * stays DIRTY — a non-clean working tree with NO MERGE_HEAD — past the recover grace
+ * watermark. A dirty (non-mid-merge) checkout degrades every epic finalize into a
+ * silent non-sticky retry skip; this is the escalation layer ON TOP of the immediate
+ * per-cycle `worktree-recover-dirty-checkout` recover reason, mirroring the
+ * mid-merge {@link SHARED_WEDGE_DISTRESS_VERB} idiom EXACTLY but on its own id/reason
+ * so the two never cross-clear. Shares the un-retryable synthetic `daemon` verb
+ * (routes as {@link routeDispatchFailure}'s `unknown` arm, never in `failedKeys`,
+ * never `retry_dispatch`-clearable), the boot orphan-GC exemption, and the recover
+ * level-clear; the per-repo `id` (`shared-checkout-dirty:<repoHash>`) keeps two
+ * checkouts on a multi-repo board independent. Its ONLY clear is the recover pass's
+ * level-trigger observing the checkout clean (the `reason` lives OUTSIDE {@link
+ * WORKTREE_RECOVER_REASON_PREFIX}). In-memory grace tracking, so a daemon restart
+ * re-emits at most once per still-present dirt.
+ */
+export const SHARED_DIRTY_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const SHARED_DIRTY_DISTRESS_ID_PREFIX = "shared-checkout-dirty:";
+export const SHARED_DIRTY_DISTRESS_REASON = "shared-checkout-dirty";
+
+/**
+ * True iff `(verb, id)` is a shared-checkout-DIRTY distress key — the synthetic
+ * `daemon` verb plus the {@link SHARED_DIRTY_DISTRESS_ID_PREFIX} per-repo id. The
+ * boot orphan-GC exempts it (like the mid-merge wedge + crash-loop keys) since the
+ * operator surface never clears it; pure, dep-free, NEVER throws. Disjoint from
+ * {@link isSharedWedgeDistressKey}: the id prefixes (`shared-checkout-dirty:` vs
+ * `shared-checkout-wedge:`) never mutually match, so the two distress rows never
+ * cross-classify or cross-clear.
+ */
+export function isSharedDirtyDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === SHARED_DIRTY_DISTRESS_VERB &&
+    id.startsWith(SHARED_DIRTY_DISTRESS_ID_PREFIX)
+  );
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -172,7 +208,8 @@ export type DispatchFailureDisplayKind =
   | "slot-occupied"
   | "instant-death"
   | "crash-loop"
-  | "shared-wedge";
+  | "shared-wedge"
+  | "shared-dirty";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -197,6 +234,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: INSTANT_DEATH_BREAKER_REASON, kind: "instant-death" },
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
   { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
+  { prefix: SHARED_DIRTY_DISTRESS_REASON, kind: "shared-dirty" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

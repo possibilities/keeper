@@ -84,9 +84,12 @@ import {
 } from "./db";
 import {
   assertNever,
+  isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   routeDispatchFailure,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   WORKTREE_FINALIZE_ID_PREFIX,
@@ -174,9 +177,13 @@ import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 // `from "./autopilot-worker"` import (tests, daemon) keeps resolving. The snapshot
 // loader routes recover/finalize failure rows through `routeDispatchFailure`.
 export {
+  isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isWorktreeRecoverReason,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_REASON,
+  SHARED_DIRTY_DISTRESS_VERB,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -1032,6 +1039,18 @@ export function createDispatchFailedGate(
 export const SHARED_CHECKOUT_WEDGE_GRACE_SEC = 5 * 60;
 
 /**
+ * The SIBLING grace window (producer-`ts` seconds) a shared MAIN checkout may stay
+ * plain-DIRTY (a non-clean working tree, no MERGE_HEAD) before the recover pass
+ * escalates the sustained dirt into a visible per-repo distress row — the same short
+ * ~5min watermark the mid-merge wedge uses: long enough that a transient in-flight
+ * commit-work settles inside the window, short enough that persistent operator dirt
+ * (the incident where one stray file dirt-skipped four epics' finalizes invisibly)
+ * surfaces fast. Injectable so the fast tier drives the grace-crossing without a
+ * real clock. Kept a DISTINCT const from the wedge grace so the two can diverge.
+ */
+export const SHARED_CHECKOUT_DIRTY_GRACE_SEC = 5 * 60;
+
+/**
  * The `worktree-recover-*` reason prefixes that denote an UNHEALED shared-checkout
  * mid-merge wedge — the foreign/ambiguous residue keeper never auto-aborts, the
  * keeper-owned residue whose guarded `git merge --abort` keeps failing, and the
@@ -1059,6 +1078,27 @@ export function isSharedCheckoutWedgeReason(reason: string): boolean {
 }
 
 /**
+ * The `worktree-recover-*` reason a recover-pass merge skips on because the shared
+ * MAIN checkout has a plain-DIRTY working tree (a non-clean tree with NO MERGE_HEAD
+ * — the `dirty` merge verdict, NOT the distinctly-classified `mid-merge` wedge). It
+ * is the natural feed for BOTH the dirt grace clock and the clean-observation clear.
+ * A SIBLING of {@link isSharedCheckoutWedgeReason}, never a widening of it: the two
+ * predicates are disjoint (a `worktree-recover-dirty-checkout` reason is excluded
+ * from the wedge prefixes by design), so the mid-merge and dirt escalations never
+ * feed off each other's reasons.
+ */
+const SHARED_CHECKOUT_DIRTY_REASON_PREFIX = "worktree-recover-dirty-checkout";
+
+/**
+ * True iff a `worktree-recover-*` reason denotes a plain-dirty shared-checkout skip
+ * (see {@link SHARED_CHECKOUT_DIRTY_REASON_PREFIX}). Pure; a non-matching reason
+ * yields false. Disjoint from {@link isSharedCheckoutWedgeReason} by construction.
+ */
+export function isSharedCheckoutDirtyReason(reason: string): boolean {
+  return reason.startsWith(SHARED_CHECKOUT_DIRTY_REASON_PREFIX);
+}
+
+/**
  * The `dispatch_failures` id a per-repo shared-checkout-wedge distress row keys on
  * — `shared-checkout-wedge:<repoDirHash(repoDir)>`. Reuses the base36 {@link
  * repoDirHash} so the mint and the level-clear target the SAME row across cycles,
@@ -1068,6 +1108,20 @@ export function isSharedCheckoutWedgeReason(reason: string): boolean {
  */
 export function sharedWedgeDistressId(repoDir: string): string {
   return `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
+}
+
+/**
+ * The `dispatch_failures` id a per-repo shared-checkout-DIRTY distress row keys on —
+ * `shared-checkout-dirty:<repoDirHash(repoDir)>`. The SIBLING of {@link
+ * sharedWedgeDistressId} on a DISTINCT prefix, so a mid-merge wedge row and a
+ * plain-dirt row for the SAME repo are two independent rows that never cross-clear,
+ * yet each is per-repo stable across cycles (the mint and the level-clear hit the
+ * same row) and distinct across repos on a multi-repo board. The composite
+ * `daemon::shared-checkout-dirty:<hash>` fails the `retry_dispatch` wire validator
+ * (synthetic `daemon` verb), so only the level-trigger clears it.
+ */
+export function sharedDirtyDistressId(repoDir: string): string {
+  return `${SHARED_DIRTY_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
 }
 
 /** A shared-checkout-wedge distress row to mint (past grace) or clear (recovered). */
@@ -1158,6 +1212,82 @@ export function createSharedCheckoutWedgeTracker(
       for (const dir of openDistressDirs) {
         if (!wedged.has(dir)) {
           decision.clear.push({ id: sharedWedgeDistressId(dir), dir });
+        }
+      }
+      return decision;
+    },
+  };
+}
+
+/**
+ * Per-repo grace tracker for the shared-checkout plain-DIRTY distress — the SIBLING
+ * of {@link SharedCheckoutWedgeTracker} on its own id/reason, never a widening of the
+ * mid-merge machinery. Identical contract (pure of keeper.db / IO / the wall clock —
+ * the producer `ts` is the only clock; in-memory grace + minted-latch for an
+ * exactly-once mint per dirt episode; projection-driven level-clear robust across a
+ * restart), threaded off the plain-dirty `worktree-recover-dirty-checkout` recover
+ * reason instead of the mid-merge wedge reasons. Reuses the verb-neutral {@link
+ * SharedWedgeDistressAction} / {@link SharedWedgeDistressDecision} shapes.
+ */
+export interface SharedCheckoutDirtyTracker {
+  step(input: {
+    /** This cycle's plain-dirty shared checkouts: `repoDir` → the recover-dirty reason. */
+    dirty: ReadonlyMap<string, string>;
+    /** `repoDir`s that currently have an OPEN dirt distress row (from the projection). */
+    openDistressDirs: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+/**
+ * Build a {@link SharedCheckoutDirtyTracker}. `graceSec` is injectable for the
+ * cadence test. A near-verbatim sibling of {@link createSharedCheckoutWedgeTracker}
+ * keyed on {@link sharedDirtyDistressId} + the dirt reason, so the mid-merge path
+ * stays byte-untouched and the two distress surfaces never share a row.
+ */
+export function createSharedCheckoutDirtyTracker(
+  graceSec: number = SHARED_CHECKOUT_DIRTY_GRACE_SEC,
+): SharedCheckoutDirtyTracker {
+  // repoDir → the first cycle-ts it was seen dirty + whether we have minted the
+  // distress for THIS continuous dirt episode. In-worker memory only.
+  const firstDirty = new Map<string, { sinceSec: number; minted: boolean }>();
+  const graceMin = Math.round(graceSec / 60);
+  return {
+    step({ dirty, openDistressDirs, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: track each dirty repo's grace clock; cross the watermark once.
+      for (const [dir, reason] of dirty) {
+        let entry = firstDirty.get(dir);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstDirty.set(dir, entry);
+        }
+        if (!entry.minted && nowSec - entry.sinceSec >= graceSec) {
+          entry.minted = true;
+          decision.mint.push({
+            id: sharedDirtyDistressId(dir),
+            dir,
+            reason:
+              `${SHARED_DIRTY_DISTRESS_REASON}: ${dir} has stayed dirty past ` +
+              `the ${graceMin}min recovery grace — the shared checkout's working ` +
+              `tree is not clean (no merge in flight) and every epic finalize ` +
+              `there skip-retries invisibly until it is hand-cleaned (commit, ` +
+              `stash, or discard the changes). Last recover verdict: ${reason}`,
+          });
+        }
+      }
+      // Re-arm any repo no longer dirty this cycle so a future re-dirty waits the
+      // full grace again (the in-memory episode is closed).
+      for (const dir of firstDirty.keys()) {
+        if (!dirty.has(dir)) {
+          firstDirty.delete(dir);
+        }
+      }
+      // CLEAR layer: level-trigger off the durable open-distress set — any open row
+      // whose checkout is clean this cycle clears (robust across a restart).
+      for (const dir of openDistressDirs) {
+        if (!dirty.has(dir)) {
+          decision.clear.push({ id: sharedDirtyDistressId(dir), dir });
         }
       }
       return decision;
@@ -4379,6 +4509,10 @@ export async function loadReconcileSnapshot(
   // clean this cycle). Off the row's `dir` so a restarted worker still clears a
   // distress it minted before the restart.
   const sharedWedgeDistressDirs = new Set<string>();
+  // The SIBLING set for the plain-dirty distress rows — kept DISJOINT from the wedge
+  // set (each keys on its own `daemon` id prefix) so a mid-merge wedge clear and a
+  // dirt clear never target each other's row.
+  const sharedDirtyDistressDirs = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
@@ -4390,6 +4524,12 @@ export async function loadReconcileSnapshot(
         const dir = (row as { dir?: unknown }).dir;
         if (typeof dir === "string" && dir.length > 0) {
           sharedWedgeDistressDirs.add(dir);
+        }
+      }
+      if (isSharedDirtyDistressKey(verb, id)) {
+        const dir = (row as { dir?: unknown }).dir;
+        if (typeof dir === "string" && dir.length > 0) {
+          sharedDirtyDistressDirs.add(dir);
         }
       }
       // Slot-occupancy rows (`slot-reclaimed` / `slot-occupied`, on the NATURAL key)
@@ -4622,6 +4762,7 @@ export async function loadReconcileSnapshot(
     finalizeFailureIds,
     slotOccupancyFailures,
     sharedWedgeDistressDirs,
+    sharedDirtyDistressDirs,
     liveTabKeys,
     livePaneIds,
     paneCommandById,
@@ -4740,6 +4881,11 @@ function main(): void {
   // outlives the recover pass's self-heal window into a visible distress row. In-
   // worker memory only, mirroring `dispatchFailedGate` — a restart re-arms it.
   const sharedWedgeTracker = createSharedCheckoutWedgeTracker();
+  // Sibling per-repo grace tracker escalating a plain-DIRTY shared checkout (no
+  // MERGE_HEAD) that keeps dirt-skipping every epic finalize past the grace into its
+  // own visible distress row. In-worker memory only; a restart re-arms it. Distinct
+  // from `sharedWedgeTracker` so the mid-merge and dirt rows never cross-clear.
+  const sharedDirtyTracker = createSharedCheckoutDirtyTracker();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -5248,6 +5394,43 @@ function main(): void {
               });
             }
             for (const c of wedgeDecision.clear) {
+              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+            }
+            // Sibling plain-DIRTY escalation: the same shape, fed off the recover
+            // pass's `worktree-recover-dirty-checkout` reason on a KNOWN shared repo
+            // (a dirty tree with no merge in flight — the mid-merge case is classified
+            // distinctly above and never reaches this reason). A shared checkout that
+            // keeps dirt-skipping finalize past the grace mints a per-repo dirt
+            // distress row; the level-clear fires the cycle the checkout goes clean.
+            // Reuses the SAME verb-neutral distress message channel — the `id` carries
+            // the dirt prefix, so main mints/clears the right synthetic-verb row.
+            const dirtyRepos = new Map<string, string>();
+            for (const f of failures) {
+              if (
+                f.dir != null &&
+                isSharedCheckoutDirtyReason(f.reason) &&
+                recoveryRepoKeys.has(stripTrailingSlashPath(f.dir.trim()))
+              ) {
+                // First matching reason per repo wins (both passes key one dir).
+                if (!dirtyRepos.has(f.dir)) {
+                  dirtyRepos.set(f.dir, f.reason);
+                }
+              }
+            }
+            const dirtyDecision = sharedDirtyTracker.step({
+              dirty: dirtyRepos,
+              openDistressDirs: snapshot.sharedDirtyDistressDirs ?? new Set(),
+              nowSec: deps.now(),
+            });
+            for (const m of dirtyDecision.mint) {
+              deps.emitSharedWedgeDistress?.({
+                id: m.id,
+                dir: m.dir,
+                reason: m.reason ?? SHARED_DIRTY_DISTRESS_REASON,
+                ts: deps.now(),
+              });
+            }
+            for (const c of dirtyDecision.clear) {
               deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
             }
           } catch (err) {

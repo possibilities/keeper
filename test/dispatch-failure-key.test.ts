@@ -16,12 +16,16 @@ import {
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
   isMergeEscalationReason,
+  isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isWorktreeRecoverReason,
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
   routeDispatchFailure,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_REASON,
+  SHARED_DIRTY_DISTRESS_VERB,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -307,6 +311,65 @@ describe("routeDispatchFailure: representative variant kinds", () => {
     expect(SHARED_WEDGE_DISTRESS_VERB).not.toBe("work");
     expect(SHARED_WEDGE_DISTRESS_VERB).not.toBe("close");
   });
+
+  test("shared-checkout-dirty distress key → unknown (never enters failedKeys)", () => {
+    // The SIBLING plain-dirty distress: same synthetic-verb discipline as the wedge,
+    // per-repo id carrying the DIRT prefix. It must route as `unknown` for every repo
+    // hash so no dirt row ever suppresses a real dispatch key.
+    for (const hash of ["abc123", "0", "zzz999"]) {
+      const id = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}${hash}`;
+      expect(
+        routeDispatchFailure(
+          row(
+            SHARED_DIRTY_DISTRESS_VERB,
+            id,
+            `${SHARED_DIRTY_DISTRESS_REASON}: /repo has stayed dirty`,
+          ),
+        ).kind,
+      ).toBe("unknown");
+      expect(isSharedDirtyDistressKey(SHARED_DIRTY_DISTRESS_VERB, id)).toBe(
+        true,
+      );
+    }
+  });
+
+  test("isSharedDirtyDistressKey is DISJOINT from the wedge + crash-loop keys", () => {
+    // The two distress prefixes never mutually match, so a mid-merge wedge row and a
+    // plain-dirt row for the same repo are two independent rows that never
+    // cross-classify. A real close/work row and the crash-loop id are neither.
+    const hash = "abc123";
+    const dirtyId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}${hash}`;
+    const wedgeId = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${hash}`;
+    // A dirt id is a dirt key but NOT a wedge key, and vice versa.
+    expect(isSharedDirtyDistressKey(SHARED_DIRTY_DISTRESS_VERB, dirtyId)).toBe(
+      true,
+    );
+    expect(isSharedWedgeDistressKey(SHARED_WEDGE_DISTRESS_VERB, dirtyId)).toBe(
+      false,
+    );
+    expect(isSharedDirtyDistressKey(SHARED_DIRTY_DISTRESS_VERB, wedgeId)).toBe(
+      false,
+    );
+    expect(isSharedWedgeDistressKey(SHARED_WEDGE_DISTRESS_VERB, wedgeId)).toBe(
+      true,
+    );
+    // Not a dirt key: a real close/work row and the crash-loop key (shares the verb,
+    // lacks the dirt prefix).
+    expect(
+      isSharedDirtyDistressKey("close", `${WORKTREE_RECOVER_KEY_PREFIX}fn-1-x`),
+    ).toBe(false);
+    expect(isSharedDirtyDistressKey("work", "fn-1-x.2")).toBe(false);
+    expect(
+      isSharedDirtyDistressKey(
+        CRASH_LOOP_DISTRESS_VERB,
+        CRASH_LOOP_DISTRESS_ID,
+      ),
+    ).toBe(false);
+    // The dirt distress shares the un-retryable synthetic verb by design.
+    expect(SHARED_DIRTY_DISTRESS_VERB).toBe(CRASH_LOOP_DISTRESS_VERB);
+    expect(SHARED_DIRTY_DISTRESS_VERB).not.toBe("work");
+    expect(SHARED_DIRTY_DISTRESS_VERB).not.toBe("close");
+  });
 });
 
 describe("historical recover/finalize collision shapes stay DISJOINT", () => {
@@ -462,6 +525,36 @@ describe("preserved predicate helpers", () => {
       SHARED_WEDGE_DISTRESS_ID_PREFIX.startsWith(SHARED_WEDGE_DISTRESS_REASON),
     ).toBe(true);
   });
+
+  test("shared-checkout-dirty distress reason is collision-free + display-mapped", () => {
+    expect(SHARED_DIRTY_DISTRESS_REASON).toBe("shared-checkout-dirty");
+    expect(SHARED_DIRTY_DISTRESS_ID_PREFIX).toBe("shared-checkout-dirty:");
+    // No OTHER display-rule prefix is a prefix of the dirt reason, nor it of them, so
+    // the pill classifies a dirt row to its OWN kind (never shadowed by the wedge
+    // rule, which shares the `shared-checkout-` stem but is not a prefix of it).
+    for (const { prefix } of DISPATCH_FAILURE_DISPLAY_RULES) {
+      if (prefix === SHARED_DIRTY_DISTRESS_REASON) continue;
+      expect(SHARED_DIRTY_DISTRESS_REASON.startsWith(prefix)).toBe(false);
+      expect(prefix.startsWith(SHARED_DIRTY_DISTRESS_REASON)).toBe(false);
+    }
+    // A dirt row's reason must NOT route as a recover reason (it lives OUTSIDE the
+    // `worktree-recover*` auto-clear prefix — its only clear is the level-trigger).
+    expect(isWorktreeRecoverReason(`${SHARED_DIRTY_DISTRESS_REASON}: x`)).toBe(
+      false,
+    );
+    // The id prefix is itself a well-formed `shared-checkout-dirty` display match.
+    expect(
+      SHARED_DIRTY_DISTRESS_ID_PREFIX.startsWith(SHARED_DIRTY_DISTRESS_REASON),
+    ).toBe(true);
+    // Disjoint from the wedge reason: the `shared-checkout-` stem is shared but
+    // neither reason is a prefix of the other, so their pills never collide.
+    expect(
+      SHARED_DIRTY_DISTRESS_REASON.startsWith(SHARED_WEDGE_DISTRESS_REASON),
+    ).toBe(false);
+    expect(
+      SHARED_WEDGE_DISTRESS_REASON.startsWith(SHARED_DIRTY_DISTRESS_REASON),
+    ).toBe(false);
+  });
 });
 
 describe("single vocabulary source", () => {
@@ -496,6 +589,7 @@ describe("single vocabulary source", () => {
       ["instant-death-breaker", "instant-death"],
       ["daemon-crash-loop", "crash-loop"],
       ["shared-checkout-wedge", "shared-wedge"],
+      ["shared-checkout-dirty", "shared-dirty"],
     ]);
   });
 });
