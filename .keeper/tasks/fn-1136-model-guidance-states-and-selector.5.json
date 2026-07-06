@@ -1,0 +1,18 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T02:13:49.123000Z",
+  "depends_on": [
+    "fn-1136-model-guidance-states-and-selector.2",
+    "fn-1136-model-guidance-states-and-selector.3",
+    "fn-1136-model-guidance-states-and-selector.4"
+  ],
+  "epic": "fn-1136-model-guidance-states-and-selector",
+  "id": "fn-1136-model-guidance-states-and-selector.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Close skill pre-select beat",
+  "updated_at": "2026-07-06T02:13:49.123000Z"
+}
