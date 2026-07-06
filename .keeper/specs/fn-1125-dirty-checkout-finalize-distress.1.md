@@ -35,5 +35,5 @@ Mirror the shared-checkout-wedge machinery with a SIBLING dirt surface — never
 - [ ] The autopilot and dispatch-failure-key fast suites pass with new tracker-lifecycle tests mirroring the wedge suite
 
 ## Done summary
-
+Added a sibling shared-checkout plain-dirty distress escalation mirroring the mid-merge wedge: a per-repo self-clearing needs_human row (createSharedCheckoutDirtyTracker) minted past a grace watermark on a distinct id/reason so the two never cross-clear, wired through the snapshot loader, pill map, and boot orphan-GC exemption.
 ## Evidence
