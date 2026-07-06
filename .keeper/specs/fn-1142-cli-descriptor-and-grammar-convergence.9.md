@@ -33,5 +33,5 @@ Grep the _partials tree for each retired spelling → zero hits; snippet index r
 - [ ] No snippet contains rename narration; prose states current behavior only
 
 ## Done summary
-
+Updated the keeper-history-forensics snippet source to cite post-cutover session verbs (session events/summary) and show-job --session-title; rebuilt the snippet index. No other _partials snippets cited the retired spellings.
 ## Evidence
