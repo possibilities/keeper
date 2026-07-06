@@ -1987,9 +1987,10 @@ export async function computeDeferredEpicIds(
  * A `clustered` multi-repo epic (rollout flag ON) emits its SINGLE `epic_id`-keyed
  * row (no schema change) ONLY once EVERY group has landed — never early on the
  * first group merging. "Landed" per group: a `worktree` group's lane merged into
- * its repo's local default (the same per-group probe as `ok`); a `serial` group
- * (cuts no lane, lands incrementally on the shared checkout) when ALL its tasks are
- * administratively done (`worker_phase === "done"`). The producer holds the full
+ * its repo's local default AND its own tasks done (the same lane-merge + done-evidence
+ * probe as `ok`, applied per group, so a fresh/empty group lane never false-fires);
+ * a `serial` group (cuts no lane, lands incrementally on the shared checkout) when
+ * ALL its tasks are administratively done (`worker_phase === "done"`). The producer holds the full
  * classification, so it knows the group denominator; the consumer
  * ({@link computeLandedEpicIds}, pure/non-git) keeps its unchanged "row → landed"
  * logic. Per-repo lane observability continues to ride `worktree_repo_status` — the
@@ -2149,24 +2150,34 @@ export async function computeMergedLaneEntries(
         continue;
       }
       // CLUSTERED: aggregate ALL groups before emitting the epic's single row (no
-      // early emit on the first group merging). `worktree` group → its lane merged;
-      // `serial` group → all its tasks administratively done (`worker_phase` — the
-      // signal readiness's terminal-completed keys on; liveness is irrelevant to a
-      // landed milestone). The row's `repo_dir` carries `primaryRepoDir`
-      // (observational only — the projection is keyed on epic_id).
+      // early emit on the first group merging). Each group takes the SAME per-group
+      // done-evidence the `ok` arm applies epic-wide (`worker_phase`, or the absorbing
+      // force-closed `status === "done"` disjunct): a `worktree` group is landed only
+      // when its lane merged into its repo's default AND its own tasks are done, a
+      // `serial` group when its tasks are done. Passing that evidence as
+      // `laneCarriesLandedWork` subjects the worktree arm to the empty-lane guard, so
+      // an absent/empty base lane on a started-but-unworked group no longer reads a
+      // VACUOUS merge (the absent arm off bare `started`, the present-empty arm off a
+      // fork-point ancestor) and false-fires `landed` at epic start. The row's
+      // `repo_dir` carries `primaryRepoDir` (observational — the projection keys on
+      // epic_id).
       const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
       let allLanded = true;
       for (const group of resolution.groups) {
+        const groupTasksDone =
+          epic.status === "done" ||
+          group.taskIds.every(
+            (id) => taskById.get(id)?.worker_phase === "done",
+          );
         const groupLanded =
           group.mode === "worktree"
-            ? // A `worktree` group's landed verdict rides the lane-merge signal per
-              // the clustered aggregation contract (`laneCarriesLandedWork: true`);
-              // the empty-lane guard is scoped to the single-lane `ok` waiter, and
-              // shifting the clustered per-group contract is out of scope here.
-              await laneMergedInRepo(group.repoDir, laneBranch, started, true)
-            : group.taskIds.every(
-                (id) => taskById.get(id)?.worker_phase === "done",
-              );
+            ? await laneMergedInRepo(
+                group.repoDir,
+                laneBranch,
+                started,
+                groupTasksDone,
+              )
+            : groupTasksDone;
         if (!groupLanded) {
           allLanded = false;
           break;
