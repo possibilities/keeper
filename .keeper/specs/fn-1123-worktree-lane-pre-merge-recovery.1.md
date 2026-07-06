@@ -90,5 +90,5 @@ task lands the probe, the lossless clean, and the retry-skip so the common
 - [ ] A real-git slow test reproduces the redundant-leak incident shape and demonstrates the clean is lossless under `.gitattributes`, `autocrlf`, and a mode-only change; the fast suites remain green.
 
 ## Done summary
-
+Fan-in provision now probes mergeReadiness before each rib merge and losslessly restores a provably-redundant, unattributed leaked dirty base to HEAD (git hash-object --path filtered-blob equality, flock-guarded), degrading every other not-ready state to a non-sticky retry-skip honored by both provision consumers; live-job attribution is producer-computed in loadReconcileSnapshot. Fast unit + real-git slow proof (lossless under .gitattributes/autocrlf/mode-flip) green.
 ## Evidence
