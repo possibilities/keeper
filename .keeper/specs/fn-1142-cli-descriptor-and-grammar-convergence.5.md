@@ -34,5 +34,5 @@ The walk is the acceptance; also assert `keeper --help --json` plan verb count e
 - [ ] A help-purity test walks every descriptor leaf/verb under throwing stub deps and passes
 
 ## Done summary
-
+Merged plan/prompt plugin verb sets live into keeper --help --json + completions (ADR 0008); retired the static verb lists in cli/descriptor.ts. Sync merge via static import of the pure-data plugin descriptors (forced by keeper-cli.test.ts requiring buildHelpIndex() sync). Added keeper completions --help. New test/help-purity.test.ts walks every descriptor leaf/verb --help (and --agent-help) in-process under throwing db/socket/fs/subprocess stubs; test/descriptor-purity.test.ts pins all three descriptors dependency-free.
 ## Evidence
