@@ -85,5 +85,5 @@ confirm no BAKE-guard drift.
 - [ ] `cd plugins/plan && bun test`, `bun run lint`, and `bun run typecheck` all pass
 
 ## Done summary
-
+Made last_validated_at a strict arm-exclusive one-way latch: the 12 integrity-gate verbs (renamed validation_restamp.ts/VALIDATION_RESTAMP_VERBS/restampEpicOrFail -> integrity_gate.ts/INTEGRITY_GATE_VERBS/integrityGateOrFail) keep their post-write integrity check but never touch the marker, closing the ghost-arming race; arming stays exclusive to validate --epic, un-arming to the two invalidate paths. Flipped all encode-the-bug tests to ghost-stays-null / armed-byte-identical, added the incident regression, and rewrote the CLAUDE.md/README/SKILL latch docs.
 ## Evidence
