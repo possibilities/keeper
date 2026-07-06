@@ -1102,7 +1102,7 @@ test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot p
     { pane_id: "%1", session_name: "work", window_index: 1, job_id: "agent-a" },
     { pane_id: "%2", session_name: "work", window_index: 0, job_id: "agent-b" },
   ]);
-  // G_now is a fresh server pid != gen-dead.
+  // G_now is a fresh server generation != gen-dead.
   const res = deriveTopo("gen-now");
   // Ordered by window_index ascending (beta=0 before alpha=1).
   expect(res.candidates.map((c) => c.job_id)).toEqual(["agent-b", "agent-a"]);
@@ -1419,7 +1419,7 @@ test("deriveLastGenerationSetFromTopology: an unowned pane (no job_id, no projec
 
 test("deriveLastGenerationSetFromTopology: REGRESSION — respawned server + day-old killed rows offers ONLY the live windows", () => {
   // The real-incident scenario this epic fixes: the tmux server respawned (so
-  // G_now is the NEW pid), and a full day of historically-closed killed rows
+  // G_now is the NEW generation), and a full day of historically-closed killed rows
   // sits in the DB. The retrospective killed-cohort model swept those in; the
   // topology-anchored model offers ONLY the dying generation's 2 live panes.
 

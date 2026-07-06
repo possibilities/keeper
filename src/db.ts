@@ -1870,8 +1870,8 @@ CREATE TABLE IF NOT EXISTS tmux_projection_state (
  * rewinding migration wipes it via {@link rewindLiveProjection}, never a bare
  * DELETE, and it is excluded from the byte-identical re-fold charter.
  *
- * `generation_id` is the tmux server pid the focus was read under (discarded +
- * re-read on every reconnect); `window_index` is the focused window's position;
+ * `generation_id` is the tmux server generation the focus was read under
+ * (discarded + re-read on every reconnect); `window_index` is the focused window's position;
  * `status` carries the worker's connection liveness ('connected' / 'disconnected'
  * / 'none'). `last_event_id` / `updated_at` are event id/ts, never wall-clock.
  */

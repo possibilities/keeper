@@ -3271,11 +3271,10 @@ export interface TmuxTopologyPaneEntry {
 
 /**
  * The decoded `TmuxTopologySnapshot` payload: the server `generation_id` (the
- * tmux server pid — the recycle-guard handle) and the whole-server pane map.
- * `generation_id` is a validated non-empty string; an absent / non-string
- * generation drops the WHOLE snapshot (a paneless generation bump still has a
- * generation, but without one the recycle guard cannot run, so the fold must not
- * touch live location).
+ * recycle-guard handle) and the whole-server pane map. `generation_id` is a
+ * validated non-empty string; an absent / non-string generation drops the WHOLE
+ * snapshot (a paneless generation bump still has a generation, but without one
+ * the recycle guard cannot run, so the fold must not touch live location).
  */
 export interface TmuxTopologySnapshot {
   generation_id: string;
@@ -3358,6 +3357,15 @@ export function extractTmuxTopologySnapshot(
   return { generation_id: generationId, panes };
 }
 
+function tmuxGenerationPidPart(generationId: string): string | null {
+  const colon = generationId.indexOf(":");
+  if (colon <= 0) {
+    return null;
+  }
+  const pid = generationId.slice(0, colon);
+  return /^\d+$/.test(pid) ? pid : null;
+}
+
 /**
  * Fold one synthetic `TmuxTopologySnapshot` event (epic fn-907) — the SOLE owner
  * of a tmux job's LIVE location (`backend_exec_session_id` + `window_index`). The
@@ -3405,13 +3413,15 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
   if (snapshot === null || snapshot.panes.length === 0) {
     return;
   }
+  const pidGenerationId = tmuxGenerationPidPart(snapshot.generation_id);
   for (const pane of snapshot.panes) {
     // OVERWRITE session (always present per validated pane); COALESCE the
     // window_index so a NULL-in-payload preserves the last-known good index
     // (crash-restore sorting depends on it). ADOPT the snapshot generation on a
-    // first match (`backend_exec_generation_id IS NULL`); a non-NULL generation
-    // must EQUAL the snapshot's (recycle guard). Live-state filter blocks a
-    // killed job from adopting a recycled pane's new generation.
+    // first match (`backend_exec_generation_id IS NULL`) or a pid-only generation
+    // that names this same server; otherwise the generation must EQUAL the
+    // snapshot's recycle guard. Live-state filter blocks a killed job from
+    // adopting a recycled pane's new generation.
     db.run(
       `UPDATE jobs SET
          backend_exec_session_id = ?,
@@ -3423,7 +3433,8 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
          AND backend_exec_pane_id = ?
          AND state NOT IN ('${ENDED}','${KILLED}')
          AND (backend_exec_generation_id = ?
-              OR backend_exec_generation_id IS NULL)`,
+              OR backend_exec_generation_id IS NULL
+              OR backend_exec_generation_id = ?)`,
       [
         pane.session_name,
         snapshot.generation_id,
@@ -3432,6 +3443,7 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
         event.ts,
         pane.pane_id,
         snapshot.generation_id,
+        pidGenerationId,
       ],
     );
   }
@@ -3442,8 +3454,8 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
  * (non-control) tmux client's focused location, as observed by keeperd's
  * persistent `tmux -C` control worker. `status` is the worker's connection
  * liveness ('connected' / 'disconnected' / 'none'); `generation_id` is the tmux
- * server pid the focus was read under (discarded + re-read on every reconnect);
- * `session_name` / `pane_id` identify the focused pane and `window_index` is its
+ * server generation the focus was read under (discarded + re-read on every
+ * reconnect); `session_name` / `pane_id` identify the focused pane and `window_index` is its
  * window's left-to-right position. Every field is nullable — an idle / no-focus /
  * disconnected snapshot carries a `status` with the location fields NULL, which
  * the fold writes verbatim (the singleton is last-write-wins, never fill-only).
@@ -9219,8 +9231,8 @@ export function applyEvent(
       // events into projectJobsRow. The producer no longer posts this kind.
     } else if (event.hook_event === "BackendExecStart") {
       // epic fn-819 — a backend generation boundary (restore-worker mints one on
-      // a server-pid change). NO-OP fold: the boundary lives in the event-log
-      // `id` order (read at restore time by `deriveLastGenerationSet`), not a
+      // a server-generation change). NO-OP fold: the boundary lives in the
+      // event-log `id` order (read at restore time by `deriveLastGenerationSet`), not a
       // projection column. MUST stay an explicit empty arm — the final `else`
       // runs projectJobsRow, so deleting this arm would route BackendExecStart
       // into the jobs projection and corrupt it. A DISTINCT name from the retired

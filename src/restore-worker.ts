@@ -48,8 +48,9 @@
  *
  * **Generation-boundary probe (epic fn-819).** Riding the SAME data_version
  * pulse (plus a ~1s idle wake so a post-crash respawn is caught even when
- * keeper's DB is idle), the worker runs ONE cheap `display-message -p '#{pid}'`
- * server-generation probe — UNGATED by any live tmux job, since a post-crash
+ * keeper's DB is idle), the worker runs ONE cheap
+ * `display-message -p '#{pid}:#{start_time}'` server-generation probe — UNGATED
+ * by any live tmux job, since a post-crash
  * respawn must be recorded precisely when no job is live. On a generation
  * CHANGE it posts `{kind:"backend-exec-start"}` to main, which mints the
  * `BackendExecStart` synthetic event (folded via an explicit no-op arm — the
@@ -101,7 +102,7 @@ import {
   sortObjectKeys,
 } from "./db";
 import {
-  buildTmuxServerPidArgs,
+  buildTmuxServerGenerationArgs,
   DEFAULT_EXEC_BACKEND,
   localeDefaultedEnv,
 } from "./exec-backend";
@@ -157,9 +158,10 @@ export interface TmuxPanePair {
  * event writer — mints ONE `BackendExecStart` event carrying `backend_type` +
  * `generation_id`; the reducer folds it via an explicit NO-OP dispatcher arm
  * (the boundary lives in the event log's `id` order, not a projection column).
- * `generation_id` is the backend's stable generation handle (the tmux server
- * pid); `backend_type` is {@link DEFAULT_EXEC_BACKEND} (the seam other backends
- * extend). A NEW event name — never reuses the retired `BackendExecSnapshot`.
+ * `generation_id` is the backend's stable generation handle (for tmux, the
+ * server pid plus server start time); `backend_type` is {@link
+ * DEFAULT_EXEC_BACKEND} (the seam other backends extend). A NEW event name —
+ * never reuses the retired `BackendExecSnapshot`.
  */
 export interface BackendExecStartMessage {
   kind: "backend-exec-start";
@@ -215,7 +217,8 @@ const TMUX_PROBE_TIMEOUT_MS = 5000;
  * respawn even when keeper's `data_version` is idle (a crash + respawn writes
  * nothing to keeper.db), so the loop pulses on a ~1s cadence regardless,
  * coalesced with the data_version wake (one probe per loop turn). The probe is a
- * single cheap `display-message -p '#{pid}'`, dedup-suppressed when unchanged.
+ * single cheap `display-message -p '#{pid}:#{start_time}'`, dedup-suppressed when
+ * unchanged.
  */
 const RESTORE_GENERATION_IDLE_MS = 1000;
 
@@ -713,11 +716,11 @@ export function probeTmuxTopology(spawnSync: SpawnSyncFn): TmuxTopologyProbe {
 }
 
 /**
- * Probe the backend's current generation handle (the tmux SERVER pid) via the
- * injected `spawnSync`. Returns the pid STRING when the probe yields a single
- * positive integer; `null` for every degraded case — ENOENT (no tmux binary),
- * a non-zero exit (no running server), or output that does not parse to a
- * positive integer (garbage / empty). NEVER throws. A `null` means "no
+ * Probe the backend's current generation handle via the injected `spawnSync`.
+ * Returns the generation STRING when the probe yields `pid:start_time` with both
+ * sides positive integers; `null` for every degraded case — ENOENT (no tmux
+ * binary), a non-zero exit (no running server), or output that does not parse to
+ * the expected shape (garbage / empty). NEVER throws. A `null` means "no
  * generation observed this pulse" and the caller emits nothing — a degraded
  * probe must NOT fire a spurious boundary. Pure relative to the injected
  * `spawnSync`.
@@ -725,7 +728,7 @@ export function probeTmuxTopology(spawnSync: SpawnSyncFn): TmuxTopologyProbe {
 export function probeServerGeneration(spawnSync: SpawnSyncFn): string | null {
   let res: ReturnType<SpawnSyncFn>;
   try {
-    res = spawnSync(buildTmuxServerPidArgs());
+    res = spawnSync(buildTmuxServerGenerationArgs());
   } catch {
     return null;
   }
@@ -736,16 +739,19 @@ export function probeServerGeneration(spawnSync: SpawnSyncFn): string | null {
   if (raw === "") {
     return null;
   }
-  // A positive integer ONLY: a pid is `> 0` and all-digits. `Number` would
-  // accept `"12.5"`, `"0x1f"`, `" 12 "`, or scientific notation, any of which
-  // would hash as a "generation" and fire a bogus boundary, so gate on a strict
-  // digit string then on `> 0`.
-  if (!/^\d+$/.test(raw)) {
+  const parts = raw.split(":");
+  if (parts.length !== 2) {
     return null;
   }
-  const pid = Number(raw);
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return null;
+  const [pid, startTime] = parts;
+  for (const part of [pid, startTime]) {
+    if (part == null || !/^\d+$/.test(part)) {
+      return null;
+    }
+    const n = Number(part);
+    if (!Number.isInteger(n) || n <= 0) {
+      return null;
+    }
   }
   return raw;
 }
@@ -845,7 +851,7 @@ export function seedLastGenerationHash(
  * `TmuxTopologySnapshot` (epic fn-968), and its fold keeps each tmux job's
  * `window_index` fresh on the `jobs` projection, which `buildRestoreTier` reads
  * directly. The ONLY tmux shell-out this pulse retains is the cheap
- * `display-message -p '#{pid}'` generation probe.
+ * `display-message -p '#{pid}:#{start_time}'` generation probe.
  *
  * Single-tier write semantics (epic fn-817): `current` is the DUMB continuous
  * live mirror — rebuilt every pulse and written whenever the hashed content

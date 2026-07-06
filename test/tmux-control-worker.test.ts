@@ -538,7 +538,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
         } else if (cmd.startsWith("copy-mode")) {
           h.pushStdout(replyBlock(cmdNum, []));
         } else if (cmd.startsWith("display-message")) {
-          h.pushStdout(replyBlock(cmdNum, ["48271"])); // the server pid
+          h.pushStdout(replyBlock(cmdNum, ["48271:10"]));
         } else if (cmd.startsWith("list-clients")) {
           h.pushStdout(replyBlock(cmdNum, clientsBody));
         } else if (cmd.startsWith("list-panes")) {
@@ -580,7 +580,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     expect(got).toEqual({
       kind: "tmux-client-focus-snapshot",
       status: "connected",
-      generation_id: "48271",
+      generation_id: "48271:10",
       session_name: "main",
       window_index: 3,
       pane_id: "%42",
@@ -591,7 +591,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     expect(commands).toEqual([
       "refresh-client -f no-output",
       "copy-mode -q",
-      "display-message -p '#{pid}'",
+      "display-message -p '#{pid}:#{start_time}'",
       "list-clients -F '#{client_name}\t#{client_control_mode}\t#{client_activity}\t#{client_created}\t#{client_session}'",
       "list-panes -a -F '#{window_active}\t#{pane_active}\t#{window_index}\t#{pane_id}\t#{session_name}'",
     ]);
@@ -622,7 +622,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
         if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
           h.pushStdout(replyBlock(cmdNum, []));
         } else if (cmd.startsWith("display-message")) {
-          h.pushStdout(replyBlock(cmdNum, ["77"]));
+          h.pushStdout(replyBlock(cmdNum, ["77:10"]));
         } else if (cmd.startsWith("list-clients")) {
           h.pushStdout(replyBlock(cmdNum, clientsBody));
         } else if (cmd.startsWith("list-panes")) {
@@ -659,7 +659,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     expect(second).toEqual({
       kind: "tmux-client-focus-snapshot",
       status: "connected",
-      generation_id: "77",
+      generation_id: "77:10",
       session_name: "main",
       window_index: 5,
       pane_id: "%99",
@@ -667,7 +667,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     expect(posted[0]).toEqual({
       kind: "tmux-client-focus-snapshot",
       status: "connected",
-      generation_id: "77",
+      generation_id: "77:10",
       session_name: "main",
       window_index: 3,
       pane_id: "%42",
@@ -857,10 +857,11 @@ describe("dual-source equivalence vs the restore-worker poll", () => {
 // ---------------------------------------------------------------------------
 
 /** Build a scripted child that replies to the bootstrap + framed re-read with a
- *  fixed pid / clients / panes transcript. `panesBody` lines are the 5-col focus
- *  `list-panes -a` rows. Returns the harness so the caller drives the handshake. */
+ *  fixed generation / clients / panes transcript. `panesBody` lines are the
+ *  5-col focus `list-panes -a` rows. Returns the harness so the caller drives the
+ *  handshake. */
 function scriptedReread(opts: {
-  pid: string;
+  generation: string;
   clients: string[];
   panes: string[];
 }): ReturnType<typeof makeScriptedChild> {
@@ -870,7 +871,7 @@ function scriptedReread(opts: {
     if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
       h.pushStdout(replyBlock(cmdNum, []));
     } else if (cmd.startsWith("display-message")) {
-      h.pushStdout(replyBlock(cmdNum, [opts.pid]));
+      h.pushStdout(replyBlock(cmdNum, [opts.generation]));
     } else if (cmd.startsWith("list-clients")) {
       h.pushStdout(replyBlock(cmdNum, opts.clients));
     } else if (cmd.startsWith("list-panes")) {
@@ -896,7 +897,7 @@ describe("runConnection — topology emit + skip-gates", () => {
   test("posts a topology snapshot with a live tmux job, byte-identical to the mapped shape", async () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     let stopping = false;
-    const child = scriptedReread({ pid: "48271", clients, panes });
+    const child = scriptedReread({ generation: "48271:10", clients, panes });
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
       postFocus: () => {},
@@ -912,7 +913,7 @@ describe("runConnection — topology emit + skip-gates", () => {
     );
     expect(got).toEqual({
       kind: "tmux-topology-snapshot",
-      generation_id: "48271",
+      generation_id: "48271:10",
       panes: [
         {
           pane_id: "%42",
@@ -933,7 +934,7 @@ describe("runConnection — topology emit + skip-gates", () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     const focus: TmuxClientFocusSnapshotMessage[] = [];
     let stopping = false;
-    const child = scriptedReread({ pid: "48271", clients, panes });
+    const child = scriptedReread({ generation: "48271:10", clients, panes });
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
       postFocus: (m) => focus.push(m),
@@ -958,7 +959,11 @@ describe("runConnection — topology emit + skip-gates", () => {
     const focus: TmuxClientFocusSnapshotMessage[] = [];
     let stopping = false;
     // Panes empty (server up, no panes) — focus derives `none`, topology skips.
-    const child = scriptedReread({ pid: "48271", clients: [], panes: [] });
+    const child = scriptedReread({
+      generation: "48271:10",
+      clients: [],
+      panes: [],
+    });
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
       postFocus: (m) => focus.push(m),
@@ -977,12 +982,12 @@ describe("runConnection — topology emit + skip-gates", () => {
     await conn;
   });
 
-  test("skip-gate: null generation (empty pid reply) → NO topology post", async () => {
+  test("skip-gate: null generation (empty generation reply) → NO topology post", async () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     const focus: TmuxClientFocusSnapshotMessage[] = [];
     let stopping = false;
-    // pid reply empty → generationId stays null → topology gated off (focus too).
-    const child = scriptedReread({ pid: "", clients, panes });
+    // Empty reply → generationId stays null → topology gated off (focus too).
+    const child = scriptedReread({ generation: "", clients, panes });
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
       postFocus: (m) => focus.push(m),
@@ -1013,7 +1018,7 @@ describe("runConnection — topology emit + skip-gates", () => {
       if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
         child.pushStdout(replyBlock(cmdNum, []));
       } else if (cmd.startsWith("display-message")) {
-        child.pushStdout(replyBlock(cmdNum, ["48271"]));
+        child.pushStdout(replyBlock(cmdNum, ["48271:10"]));
       } else if (cmd.startsWith("list-clients")) {
         child.pushStdout(replyBlock(cmdNum, clients));
       } else if (cmd.startsWith("list-panes")) {

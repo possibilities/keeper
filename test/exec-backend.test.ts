@@ -33,7 +33,7 @@ import {
   buildTmuxRenameWindowArgs,
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
-  buildTmuxServerPidArgs,
+  buildTmuxServerGenerationArgs,
   classifyCloseKind,
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
@@ -166,16 +166,16 @@ test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name la
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_start_time}\t#{pane_dead}\t#{session_name}\t#{window_name}",
+    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_name}",
   ]);
 });
 
-test("buildTmuxServerPidArgs: display-message -p of the server pid (generation handle)", () => {
-  expect(buildTmuxServerPidArgs()).toEqual([
+test("buildTmuxServerGenerationArgs: display-message -p of the server generation", () => {
+  expect(buildTmuxServerGenerationArgs()).toEqual([
     "tmux",
     "display-message",
     "-p",
-    "#{pid}",
+    "#{pid}:#{start_time}",
   ]);
 });
 
@@ -279,13 +279,13 @@ test("createTmuxPaneOps.focusPane: ENOENT throw → { ok: false }, never throws 
 // createTmuxPaneOps.listPanes — server-wide sweep, tab-safe parse, null degrade
 // ---------------------------------------------------------------------------
 
-test("createTmuxPaneOps.listPanes: parses (paneId, windowId, currentCommand, paneStartTime, paneDead, sessionName, windowName) from one -a sweep", async () => {
+test("createTmuxPaneOps.listPanes: parses (tmuxGenerationId, paneId, windowId, currentCommand, paneDead, sessionName, windowName) from one -a sweep", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
         stdout:
-          "%1\t@1\tclaude\t1700000001\t0\tautopilot\twork::fn-1-x.2\n%2\t@2\tzsh\t1700000002\t1\tmisc\tplain shell\n",
+          "900:1700000000\t%1\t@1\tclaude\t0\tautopilot\twork::fn-1-x.2\n900:1700000000\t%2\t@2\tzsh\t1\tmisc\tplain shell\n",
         exitCode: 0,
       },
     },
@@ -296,19 +296,19 @@ test("createTmuxPaneOps.listPanes: parses (paneId, windowId, currentCommand, pan
   expect(calls[0]).toEqual(buildTmuxListPanesArgs());
   expect(got).toEqual([
     {
+      tmuxGenerationId: "900:1700000000",
       paneId: "%1",
       windowId: "@1",
       currentCommand: "claude",
-      paneStartTime: "1700000001",
       paneDead: "0",
       sessionName: "autopilot",
       windowName: "work::fn-1-x.2",
     },
     {
+      tmuxGenerationId: "900:1700000000",
       paneId: "%2",
       windowId: "@2",
       currentCommand: "zsh",
-      paneStartTime: "1700000002",
       paneDead: "1",
       sessionName: "misc",
       windowName: "plain shell",
@@ -322,10 +322,10 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
     {
       "tmux:list-panes": {
         // window name itself contains a tab, a colon, and unicode; the six
-        // leading fixed fields (pane/window/command/start-time/dead/session) are
+        // leading fixed fields (generation/pane/window/command/dead/session) are
         // taken off the first six tabs, so a name-internal tab never bleeds into
         // them.
-        stdout: "%7\t@7\tzsh\t1700000007\t0\tsess\tweird:\tname é\n",
+        stdout: "900:1700000000\t%7\t@7\tzsh\t0\tsess\tweird:\tname é\n",
         exitCode: 0,
       },
     },
@@ -335,10 +335,10 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
   const got = await ops.listPanes();
   expect(got).toEqual([
     {
+      tmuxGenerationId: "900:1700000000",
       paneId: "%7",
       windowId: "@7",
       currentCommand: "zsh",
-      paneStartTime: "1700000007",
       paneDead: "0",
       sessionName: "sess",
       windowName: "weird:\tname é",
@@ -355,7 +355,7 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
         // fields); line 3 is 6-tab but has an empty pane id; line 4 is
         // well-formed (and a name may be empty — valid).
         stdout:
-          "garbage\n%2\t@2\tsh\t1\t0\tsess\n\t@3\tsh\t1\t0\tsess\tname\n%4\t@4\tsh\t1700000004\t0\tsess\t\n",
+          "garbage\n900:1\t%2\t@2\tsh\t0\tsess\n900:1\t\t@3\tsh\t0\tsess\tname\n900:1\t%4\t@4\tsh\t0\tsess\t\n",
         exitCode: 0,
       },
     },
@@ -365,10 +365,10 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
   const got = await ops.listPanes();
   expect(got).toEqual([
     {
+      tmuxGenerationId: "900:1",
       paneId: "%4",
       windowId: "@4",
       currentCommand: "sh",
-      paneStartTime: "1700000004",
       paneDead: "0",
       sessionName: "sess",
       windowName: "",
@@ -1414,14 +1414,15 @@ test("classifyCloseKind: success=false (timed-out spawn) → server_gone", () =>
 
 test("classifyCloseKind: server alive, pane still listed (dead pane) → pid_died", () => {
   const { probe } = makeSyncProbe({
-    stdout: "%4\t@1\twin-a\n%5\t@2\twin-b\n%6\t@3\twin-c\n",
+    stdout:
+      "900:1\t%4\t@1\twin-a\n900:1\t%5\t@2\twin-b\n900:1\t%6\t@3\twin-c\n",
   });
   expect(classifyCloseKind("%5", { spawnSync: probe })).toBe("pid_died");
 });
 
 test("classifyCloseKind: server alive, pane gone → window_gone_server_alive", () => {
   const { probe } = makeSyncProbe({
-    stdout: "%4\t@1\twin-a\n%6\t@3\twin-c\n",
+    stdout: "900:1\t%4\t@1\twin-a\n900:1\t%6\t@3\twin-c\n",
   });
   expect(classifyCloseKind("%5", { spawnSync: probe })).toBe(
     "window_gone_server_alive",
@@ -1436,18 +1437,18 @@ test("classifyCloseKind: probe throws (tmux binary missing) → unknown", () => 
 });
 
 test("classifyCloseKind: server alive but no recorded pane (null/empty) → unknown", () => {
-  const { probe } = makeSyncProbe({ stdout: "%4\t@1\twin-a\n" });
+  const { probe } = makeSyncProbe({ stdout: "900:1\t%4\t@1\twin-a\n" });
   expect(classifyCloseKind(null, { spawnSync: probe })).toBe("unknown");
   expect(classifyCloseKind("", { spawnSync: probe })).toBe("unknown");
 });
 
-test("classifyCloseKind: pane match is leading-field exact, not a substring spoof", () => {
+test("classifyCloseKind: pane match is exact, not a substring spoof", () => {
   // A window name containing the literal pane text must NOT read as present —
-  // only the FIRST tab-delimited field counts. Otherwise a crash-kill whose
-  // pane is truly gone would misclassify as pid_died and never be a clean
-  // user-close, or worse a user-close would masquerade as a live pane.
+  // only the pane-id field counts. Otherwise a crash-kill whose pane is truly
+  // gone would misclassify as pid_died and never be a clean user-close, or worse
+  // a user-close would masquerade as a live pane.
   const { probe } = makeSyncProbe({
-    stdout: "%4\t@1\tnamed %5 in the title\n",
+    stdout: "900:1\t%4\t@1\tnamed %5 in the title\n",
   });
   expect(classifyCloseKind("%5", { spawnSync: probe })).toBe(
     "window_gone_server_alive",

@@ -74,12 +74,12 @@ const panelLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   ...over,
 });
 
-/** A swept pane matching a job's pane id. */
+/** A swept pane matching a job's pane id and tmux generation. */
 const pane = (over: Partial<PaneInfo> = {}): PaneInfo => ({
+  tmuxGenerationId: "gen-1",
   paneId: "%1",
   windowId: "@1",
   currentCommand: "claude",
-  paneStartTime: "1700000000",
   paneDead: "0",
   sessionName: "autopilot",
   windowName: "work::fn-1-x.2",
@@ -156,6 +156,7 @@ test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
     readiness: { perTask: new Map(), perCloseRow: new Map() },
     panes: [
       pane({
+        tmuxGenerationId: "gen-3",
         paneId: "%3",
         windowId: "@3",
         sessionName: "panels",
@@ -289,15 +290,13 @@ test("OUT: dead pane (pane_dead = 1) → never reaped", () => {
   expect(reaps).toHaveLength(0);
 });
 
-test("OUT: insane pane_start_time → never reaped", () => {
-  for (const bad of ["", "0", "not-a-number"]) {
-    const { reaps } = run({
-      jobs: [autopilotWork()],
-      panes: [pane({ paneStartTime: bad })],
-      graceMap: elapsed("j-work"),
-    });
-    expect(reaps).toHaveLength(0);
-  }
+test("OUT: tmux generation mismatch → never reaped", () => {
+  const { reaps } = run({
+    jobs: [autopilotWork()],
+    panes: [pane({ tmuxGenerationId: "other-gen" })],
+    graceMap: elapsed("j-work"),
+  });
+  expect(reaps).toHaveLength(0);
 });
 
 test("OUT: session moved out of the managed session → never reaped", () => {
@@ -350,6 +349,7 @@ test("paused suspends the autopilot bucket but NOT the panel bucket", () => {
     panes: [
       pane(),
       pane({
+        tmuxGenerationId: "gen-3",
         paneId: "%3",
         windowId: "@3",
         sessionName: "panels",
@@ -567,6 +567,7 @@ test("autoclosePulse: a due panel leg posts one intent hint BEFORE the kill", as
   const backend = {
     listPanes: async (): Promise<PaneInfo[] | null> => [
       pane({
+        tmuxGenerationId: "gen-9",
         paneId: "%9",
         windowId: "@9",
         sessionName: "panels",

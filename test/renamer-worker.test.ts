@@ -133,9 +133,9 @@ const pane = (
   paneId,
   windowId,
   currentCommand: "zsh",
-  // The renamer never reads these three; fixed placeholders keep the sweep
+  // The renamer never reads these fields; fixed placeholders keep the sweep
   // shape complete so PaneInfo type-checks.
-  paneStartTime: "0",
+  tmuxGenerationId: "gen",
   paneDead: "0",
   sessionName: "autopilot",
   windowName,

@@ -7696,7 +7696,7 @@ test("retired WindowIndexSnapshot re-fold determinism: a history with snapshots 
 
 // ---------------------------------------------------------------------------
 // BackendExecStart — generation-boundary marker (fn-819 task .1). The
-// restore-worker mints one on a tmux-server-pid change; the reducer folds it
+// restore-worker mints one on a tmux server generation change; the reducer folds it
 // via an explicit NO-OP dispatcher arm (the boundary lives in the event-log
 // `id` order, NOT a projection column). The arm MUST be explicit: the
 // inner-switch default routes unknown events to `projectJobsRow`, which would

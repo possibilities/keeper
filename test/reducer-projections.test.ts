@@ -4788,6 +4788,26 @@ test("TmuxTopologySnapshot recycle guard: a NEW generation never overwrites a pr
   expect(guarded?.backend_exec_generation_id).toBe("gen-A");
 });
 
+test("TmuxTopologySnapshot upgrades a pid-only live generation for the same pane", () => {
+  seedTmuxJob("topo-generation-upgrade", "%8");
+  tmuxTopologyEvent("123", [
+    { pane_id: "%8", session_name: "pid-only", window_index: 1 },
+  ]);
+  drainAll();
+  expect(
+    getTmuxLocation("topo-generation-upgrade")?.backend_exec_generation_id,
+  ).toBe("123");
+
+  tmuxTopologyEvent("123:456", [
+    { pane_id: "%8", session_name: "composite", window_index: 2 },
+  ]);
+  drainAll();
+  const upgraded = getTmuxLocation("topo-generation-upgrade");
+  expect(upgraded?.backend_exec_session_id).toBe("composite");
+  expect(upgraded?.window_index).toBe(2);
+  expect(upgraded?.backend_exec_generation_id).toBe("123:456");
+});
+
 test("TmuxTopologySnapshot preserves last-known on an absent pane and a NULL window_index", () => {
   seedTmuxJob("topo-preserve", "%3");
   tmuxTopologyEvent("gen-X", [

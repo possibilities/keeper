@@ -8136,7 +8136,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // side-file, NOT a projection) only when the content hash differs. Write
   // failures are swallowed to stderr; only an unhandled throw escalates to
   // fatalExit. Riding the same pulse (plus a ~1s idle wake), it runs ONE cheap
-  // `display-message -p '#{pid}'` generation probe and posts
+  // `display-message -p '#{pid}:#{start_time}'` generation probe and posts
   // `{kind:"backend-exec-start"}` (its ONLY worker→main channel) — `rw.onmessage`
   // mints the `BackendExecStart` synthetic event below. The whole-server topology
   // is produced by the control-worker (epic fn-968), not here.

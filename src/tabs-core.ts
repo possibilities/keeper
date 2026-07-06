@@ -434,15 +434,15 @@ export function renderSnapshotScript(
 }
 
 // ---------------------------------------------------------------------------
-// G_now probe — the current tmux server pid, for topology-generation exclusion
+// G_now probe — the current tmux server generation, for topology-generation exclusion
 // ---------------------------------------------------------------------------
 
 /**
- * Probe `G_now` — the CURRENT tmux server pid — at restore time, wrapped in the
- * LOAD-BEARING locale default (a C-locale daemon client corrupts tmux output).
- * Returns the pid string, or `null` when no server is up / the probe degrades.
- * The topology deriver excludes the snapshot of this (still-running) generation,
- * isolating the dying one. Injectable for tests.
+ * Probe `G_now` — the CURRENT tmux server generation — at restore time, wrapped
+ * in the LOAD-BEARING locale default (a C-locale daemon client corrupts tmux
+ * output). Returns the generation string, or `null` when no server is up / the
+ * probe degrades. The topology deriver excludes the snapshot of this
+ * (still-running) generation, isolating the dying one. Injectable for tests.
  */
 export type ProbeGenerationFn = () => string | null;
 
@@ -576,7 +576,7 @@ export const KILLED_COHORT_FALLBACK_NOTE =
   "killed-cohort fallback (restore set may be approximate)";
 
 /** Knobs for {@link loadRestorePlan}: the explicit generation target + the
- *  injectable `G_now` probe (tests pass a fixed pid, production probes tmux). */
+ *  injectable `G_now` probe (tests pass a fixed generation, production probes tmux). */
 export interface LoadRestorePlanOptions {
   generationId?: string | null;
   probeNow?: ProbeGenerationFn;

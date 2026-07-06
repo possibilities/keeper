@@ -179,8 +179,8 @@ export function pickCurrentClient(
  * One pane of a whole-server topology snapshot: the durable `%N` `pane_id`, its
  * current `#{session_name}`, and its current `#{window_index}` (the window's
  * left-to-right POSITION). Keyed by `pane_id` within a single server generation —
- * `%N` is reused after a kill, so the generation handle (the server pid) is
- * carried alongside the panes, NOT inside each pane.
+ * `%N` is reused after a kill, so the generation handle is carried alongside the
+ * panes, NOT inside each pane.
  *
  * `job_id` is the keeper job that owns the pane at post time, resolved by the
  * producer's `(pane_id → jobs.backend_exec_pane_id)` join. OPTIONAL: a pane

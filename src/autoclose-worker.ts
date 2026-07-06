@@ -201,10 +201,8 @@ function classifyEligible(
   }
   // Generation present = the pane was resolved by the live topology fold; a row
   // whose pane was never live-resolved is not a safe kill target.
-  if (
-    job.backend_exec_generation_id == null ||
-    job.backend_exec_generation_id === ""
-  ) {
+  const jobGenerationId = job.backend_exec_generation_id;
+  if (jobGenerationId == null || jobGenerationId === "") {
     return null;
   }
   // Prompt-parked rail. `last_input_request_at` flips state to stopped and is
@@ -275,9 +273,9 @@ function classifyEligible(
   if (pane.paneDead !== "0") {
     return null;
   }
-  // Sane pane_start_time: a positive finite integer (garbage → skip).
-  const startTime = Number.parseInt(pane.paneStartTime, 10);
-  if (!Number.isFinite(startTime) || startTime <= 0) {
+  // Same tmux generation: `%N` pane ids are scoped to one server lifetime, so a
+  // generation mismatch means this live `%N` is not the job's pane.
+  if (pane.tmuxGenerationId !== jobGenerationId) {
     return null;
   }
   // Live session membership — a window moved out of the bucket's managed session

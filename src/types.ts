@@ -493,12 +493,12 @@ export interface Job {
    */
   backend_exec_pane_id: string | null;
   /**
-   * The tmux SERVER generation (`generation_id` — the server pid) the live pane
-   * was last resolved under: stamped by the `TmuxTopologySnapshot` live fold on
-   * first match and held equal thereafter, so a recycled `%N` from a NEW server
-   * generation never re-targets this row. Live-only + skip-floored like
-   * {@link Job.backend_exec_session_id}; NULL until the first topology snapshot
-   * resolves the pane. A recycle guard cross-checks it against the live
+   * The tmux SERVER generation the live pane was last resolved under: stamped by
+   * the `TmuxTopologySnapshot` live fold on first match and held equal
+   * thereafter, so a recycled `%N` from a NEW server generation never re-targets
+   * this row. Live-only + skip-floored like {@link Job.backend_exec_session_id};
+   * NULL until the first topology snapshot resolves the pane. A recycle guard
+   * cross-checks it against the live
    * snapshot's generation so a recycled `%N` is never mis-attributed to this
    * row. Optional at the projection boundary — not every `jobs` read selects it.
    */

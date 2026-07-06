@@ -665,14 +665,14 @@ export function deriveLastGenerationSet(
 /**
  * Injectable knobs for {@link deriveLastGenerationSetFromTopology}: the standard
  * idle/now knobs PLUS `currentGenerationId` — `G_now`, the CURRENT tmux server
- * pid the consumer probed at restore time (NEVER inside a fold). The deriver
- * selects the DYING generation as the newest `TmuxTopologySnapshot` whose
+ * generation the consumer probed at restore time (NEVER inside a fold). The
+ * deriver selects the DYING generation as the newest `TmuxTopologySnapshot` whose
  * `generation_id != G_now`. `null` means no server is up (the post-crash,
  * pre-respawn read), so the newest snapshot overall IS the dying generation.
  */
 export interface DeriveFromTopologyOptions extends DeriveRestoreSetOptions {
-  /** The current tmux server pid (`probeServerGeneration` result), or `null`
-   *  when no server is running. The dying generation is the newest snapshot
+  /** The current tmux server generation (`probeServerGeneration` result), or
+   *  `null` when no server is running. The dying generation is the newest snapshot
    *  whose `generation_id` differs from this. */
   currentGenerationId: string | null;
 }
@@ -713,8 +713,8 @@ interface PostTerminalBackendRow {
  * summaries — NOT "single newest non-current generation" (the defect that
  * restored a 1-pane skeleton over a 9-pane session).
  *
- * SELECTION. Probe `G_now` (the current server pid) in the CONSUMER and pass it
- * as `currentGenerationId`. {@link summarizeTopologyGenerations} ranks every
+ * SELECTION. Probe `G_now` (the current server generation) in the CONSUMER and
+ * pass it as `currentGenerationId`. {@link summarizeTopologyGenerations} ranks every
  * generation by recency (event rowid). Candidates are the newest
  * {@link RECENT_GENERATION_BOUND} DEAD (`generation_id != G_now`) generations
  * whose newest snapshot ts is inside the idle cutoff. A DEGENERATE generation (a

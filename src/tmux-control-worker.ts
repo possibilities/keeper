@@ -29,8 +29,8 @@
  *    task-1 parser, NEVER blocking on a DB write or a command round-trip — a
  *    notification burst against a stalled reader fills the (small, on macOS) pipe
  *    and trips `%exit "too far behind"`.
- *  - The server pid (generation) is read FIRST on every connect; ALL cached ids
- *    are discarded on `%exit`/EOF (tmux reuses pane/window/session ids across
+ *  - The server generation is read FIRST on every connect; ALL cached ids are
+ *    discarded on `%exit`/EOF (tmux reuses pane/window/session ids across
  *    restarts) and the surface is re-bootstrapped via a framed re-read.
  *
  * The PURE pieces below (`buildAttachArgs`, `pickAnchorSession`, `focusDedupKey`,
@@ -76,11 +76,12 @@ export interface ShutdownMessage {
 /**
  * Worker→main focus observation (epic fn-952). Carries the current real client's
  * focused location PLUS the connection `status` and the `generation_id` (the tmux
- * server pid) the focus was read under. Main mints ONE `TmuxClientFocusSnapshot`
- * event carrying exactly `{status, generation_id, session_name, window_index,
- * pane_id}` (the fold's `extractTmuxClientFocusSnapshot` shape). The location
- * fields are NULL on a `status:"none"` (0 real clients) observation; the worker
- * NEVER posts a wiping/empty snapshot on a mere disconnect.
+ * server pid plus server start time) the focus was read under. Main mints ONE
+ * `TmuxClientFocusSnapshot` event carrying exactly `{status, generation_id,
+ * session_name, window_index, pane_id}` (the fold's
+ * `extractTmuxClientFocusSnapshot` shape). The location fields are NULL on a
+ * `status:"none"` (0 real clients) observation; the worker NEVER posts a
+ * wiping/empty snapshot on a mere disconnect.
  */
 export interface TmuxClientFocusSnapshotMessage {
   kind: "tmux-client-focus-snapshot";
@@ -107,9 +108,9 @@ export interface TmuxControlLivenessMessage {
 
 /**
  * Worker→main whole-server tmux topology observation (epic fn-968). Carries the
- * server `generation_id` (the pid the topology was read under) and the live pane
- * map `{pane_id, session_name, window_index}`, MAPPED from the SAME framed
- * `list-panes -a` re-read that drives focus — no new tmux command, no subprocess.
+ * server `generation_id` and the live pane map `{pane_id, session_name,
+ * window_index}`, MAPPED from the SAME framed `list-panes -a` re-read that drives
+ * focus — no new tmux command, no subprocess.
  * Main mints ONE `TmuxTopologySnapshot` event carrying `{generation_id, panes}`,
  * byte-identical to the restore-worker poll's payload, which the live-location
  * fold OVERWRITES each matching tmux job's `backend_exec_session_id` +
@@ -664,7 +665,7 @@ function pickAnchorForConnect(jobs: readonly Job[]): string | null {
  * reader on a DB write or a command round-trip.
  *
  * Bootstrap order on connect: re-assert `no-output` (never toggle), defensive
- * `copy-mode -q`, read the server pid (generation) FIRST, then the initial framed
+ * `copy-mode -q`, read the server generation FIRST, then the initial framed
  * focus read. A notification landing mid-re-read re-arms dirty and re-reads once.
  */
 export async function runConnection(
@@ -837,7 +838,7 @@ export async function runConnection(
     rereadTimer.unref?.();
   }
 
-  /** The single-in-flight framed re-read: read the generation (pid) if unknown,
+  /** The single-in-flight framed re-read: read the server generation if unknown,
    *  then `list-clients` + `list-panes -a`, derive focus AND topology (one parse),
    *  dedup each, post on change. Re-arms once if a notification landed mid-read. */
   async function runReread(): Promise<void> {
@@ -849,13 +850,15 @@ export async function runConnection(
     rereadInFlight = true;
     dirty = false;
     try {
-      // Read the server pid (generation) FIRST if we do not have it yet — on a
-      // fresh connection all cached ids are gone, so the generation is read before
+      // Read the server generation FIRST if we do not have it yet — on a fresh
+      // connection all cached ids are gone, so the generation is read before
       // anything is posted.
       if (generationId === null) {
-        const pidLines = await sendCommand("display-message -p '#{pid}'");
-        const pid = (pidLines[0] ?? "").trim();
-        generationId = pid === "" ? null : pid;
+        const generationLines = await sendCommand(
+          "display-message -p '#{pid}:#{start_time}'",
+        );
+        const generation = (generationLines[0] ?? "").trim();
+        generationId = generation === "" ? null : generation;
       }
       const clientsBody = (
         await sendCommand(`list-clients -F '${LIST_CLIENTS_FORMAT}'`)

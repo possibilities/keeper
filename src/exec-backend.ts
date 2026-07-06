@@ -138,31 +138,30 @@ export interface LaunchSpec {
   readonly worktreeBranch?: string;
 }
 
-/** One row of a `list-panes -a` sweep: the server-global pane id, its window
- *  id (`@N`), the pane's current foreground command (`pane_current_command`),
- *  the pane's start time / dead flag / hosting session, and the window's current
- *  name. The renamer worker keys windows by `windowId` and compares `windowName`;
- *  the reconciler's slot-occupancy gate reads `currentCommand` to tell a live
- *  claude from the dead `exec $SHELL -l -i` shell tail holding a stopped
- *  session's pane.
+/** One row of a `list-panes -a` sweep: the tmux server generation, the
+ *  server-global pane id, its window id (`@N`), the pane's current foreground
+ *  command (`pane_current_command`), the pane's dead flag / hosting session, and
+ *  the window's current name. The renamer worker keys windows by `windowId` and
+ *  compares `windowName`; the reconciler's slot-occupancy gate reads
+ *  `currentCommand` to tell a live claude from the dead `exec $SHELL -l -i` shell
+ *  tail holding a stopped session's pane.
  *
- *  The three trailing-but-fixed fields are the autoclose kill path's per-pane
- *  discriminators (all carried verbatim as tmux emits them — no parse, no
- *  semantics applied here):
- *   - `paneStartTime` — `#{pane_start_time}`, unix EPOCH SECONDS the pane was
- *     created. Survives same-server pane-id reuse (ids recycle after destroy;
- *     the stored generation id is only the tmux server pid), so it is the tuple
- *     that identifies a pane across recycle.
+ *  The fixed fields include the autoclose kill path's per-pane discriminators
+ *  (all carried verbatim as tmux emits them — no parse, no semantics applied
+ *  here):
+ *   - `tmuxGenerationId` — the tmux server generation key, currently
+ *     `#{pid}:#{start_time}` so an OS pid reuse does not alias a new server to an
+ *     old one.
  *   - `paneDead` — `#{pane_dead}`, `"1"` when the pane's process has exited
  *     (a `remain-on-exit` dead pane) else `"0"`.
  *   - `sessionName` — `#{session_name}`, the tmux session hosting the pane; a
  *     LIVE session-membership signal (a window moved out of the managed session
  *     is skipped). */
 export interface PaneInfo {
+  readonly tmuxGenerationId: string;
   readonly paneId: string;
   readonly windowId: string;
   readonly currentCommand: string;
-  readonly paneStartTime: string;
   readonly paneDead: string;
   readonly sessionName: string;
   readonly windowName: string;
@@ -401,33 +400,32 @@ export function buildTmuxSelectPaneArgs(paneId: string): string[] {
 }
 
 /**
- * Build the tmux `display-message -p '#{pid}'` server-pid probe argv. Pure —
- * exported for tests. The tmux SERVER pid is the backend's "generation" handle:
- * it changes exactly when the server is killed and respawned (the boundary
- * crash-restore scopes to), and is stable across client attach/detach. `-p`
- * prints to stdout; no `-t` so it resolves against the default server. The
- * restore-worker pulse runs this via its injected sync `spawnSync`, parses the
- * single positive-int line, and hashes it into the `BackendExecStart`
- * generation id. Backend-agnostic seam: the only tmux-specific piece is this
- * argv; the pulse pairs the result with `DEFAULT_EXEC_BACKEND`.
+ * Build the tmux `display-message -p '#{pid}:#{start_time}'` server-generation
+ * probe argv. Pure — exported for tests. The generation combines the tmux SERVER
+ * pid with the server start time: it changes when the server is killed and
+ * respawned, stays stable across client attach/detach, and does not alias a new
+ * server that reuses an OS pid. `-p` prints to stdout; no `-t` so it resolves
+ * against the default server. The restore-worker pulse runs this via its
+ * injected sync `spawnSync`, parses the generation line, and hashes it into the
+ * `BackendExecStart` generation id. Backend-agnostic seam: the only
+ * tmux-specific piece is this argv; the pulse pairs the result with
+ * `DEFAULT_EXEC_BACKEND`.
  */
-export function buildTmuxServerPidArgs(): string[] {
-  return ["tmux", "display-message", "-p", "#{pid}"];
+export function buildTmuxServerGenerationArgs(): string[] {
+  return ["tmux", "display-message", "-p", "#{pid}:#{start_time}"];
 }
 
 /**
- * Build the tmux `list-panes -a -F '#{pane_id}\t#{window_id}\t
- * #{pane_current_command}\t#{pane_start_time}\t#{pane_dead}\t#{session_name}\t
+ * Build the tmux `list-panes -a -F '#{pid}:#{start_time}\t#{pane_id}\t
+ * #{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t
  * #{window_name}'` sweep argv. Pure — exported for tests. `-a` spans every
  * session on the server. The format is TAB-delimited with `window_name` LAST so
  * the parse's final split keeps a tab inside an arbitrary window name from
- * corrupting the SIX leading FIXED fields (pane id / window id / current command
- * / pane start time / pane dead flag / session name); names are free user text —
+ * corrupting the SIX leading FIXED fields (generation / pane id / window id /
+ * current command / pane dead flag / session name); names are free user text —
  * tabs, colons, unicode all survive. The six leading values are tab-free by
- * construction (`pane_current_command` is a bare process name; start-time is
- * digits; `pane_dead` is `0`/`1`; a tmux session name cannot contain a tab), so
- * each rides a fixed field. `pane_id` stays FIRST so `classifyCloseKind`'s
- * leading-field match is unaffected.
+ * construction (`pid:start_time`, pane/window ids, `pane_current_command`,
+ * `pane_dead`, and session names contain no tabs), so each rides a fixed field.
  */
 export function buildTmuxListPanesArgs(): string[] {
   return [
@@ -435,7 +433,7 @@ export function buildTmuxListPanesArgs(): string[] {
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_start_time}\t#{pane_dead}\t#{session_name}\t#{window_name}",
+    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_name}",
   ];
 }
 
@@ -581,15 +579,23 @@ export function classifyCloseKind(
     return "unknown";
   }
   const out = res.stdout?.toString() ?? "";
-  // The pane id is the FIRST tab-delimited field of each `list-panes -a` line.
-  // Match it exactly against the leading field — a substring scan would let a
-  // window name containing the literal pane text spoof presence.
+  // The pane id is the SECOND tab-delimited field of each `list-panes -a` line
+  // (the first is the tmux generation key). Match that field exactly — a
+  // substring scan would let a window name containing the literal pane text spoof
+  // presence.
   for (const line of out.split("\n")) {
     if (line === "") {
       continue;
     }
     const firstTab = line.indexOf("\t");
-    const candidate = firstTab < 0 ? line : line.slice(0, firstTab);
+    if (firstTab < 0) {
+      continue;
+    }
+    const secondTab = line.indexOf("\t", firstTab + 1);
+    const candidate =
+      secondTab < 0
+        ? line.slice(firstTab + 1)
+        : line.slice(firstTab + 1, secondTab);
     if (candidate === paneId) {
       // Pane still listed (held by the trailing login shell after `claude`
       // exits) → pid_died.
@@ -700,9 +706,9 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
     },
     async listPanes(): Promise<PaneInfo[] | null> {
       // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
-      // to skip this cycle. Parse takes the SIX leading fixed fields (pane id /
-      // window id / current command / pane start time / pane dead flag / session
-      // name) off the first six tabs, with `window_name` LAST so a tab inside an
+      // to skip this cycle. Parse takes the SIX leading fixed fields (generation
+      // / pane id / window id / current command / pane dead flag / session name)
+      // off the first six tabs, with `window_name` LAST so a tab inside an
       // arbitrary window name cannot bleed into them. Malformed lines (fewer than
       // six tabs) are dropped silently — a partial sweep is still a usable
       // snapshot. The locale-defaulted env is LOAD-BEARING: a C-locale client
@@ -737,10 +743,10 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
         if (tabs.length < FIXED_FIELDS) {
           continue;
         }
-        const paneId = line.slice(0, tabs[0]);
-        const windowId = line.slice(tabs[0] + 1, tabs[1]);
-        const currentCommand = line.slice(tabs[1] + 1, tabs[2]);
-        const paneStartTime = line.slice(tabs[2] + 1, tabs[3]);
+        const tmuxGenerationId = line.slice(0, tabs[0]);
+        const paneId = line.slice(tabs[0] + 1, tabs[1]);
+        const windowId = line.slice(tabs[1] + 1, tabs[2]);
+        const currentCommand = line.slice(tabs[2] + 1, tabs[3]);
         const paneDead = line.slice(tabs[3] + 1, tabs[4]);
         const sessionName = line.slice(tabs[4] + 1, tabs[5]);
         const windowName = line.slice(tabs[5] + 1);
@@ -748,10 +754,10 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
           continue;
         }
         panes.push({
+          tmuxGenerationId,
           paneId,
           windowId,
           currentCommand,
-          paneStartTime,
           paneDead,
           sessionName,
           windowName,

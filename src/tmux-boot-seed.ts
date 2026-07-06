@@ -89,7 +89,7 @@ export interface SeedTmuxProjectionOptions {
   drainToCompletion: (db: Database) => void;
   /**
    * The whole-server topology probe — the ONLY tmux-touching step. Defaults to
-   * the real producer path ({@link defaultBuildTopologySnapshot}: the server-pid
+   * the real producer path ({@link defaultBuildTopologySnapshot}: the server
    * generation probe + `tmux list-panes -a`). Returns `null` for every degraded
    * outcome (server gone, a transient failure, or an unresolvable generation).
    * Injectable so tests drive the seed's fold / floor / seed_required DECISIONS
@@ -138,8 +138,8 @@ const defaultSeedSpawnSync: SpawnSyncFn = (cmd) =>
  * whole-server pane topology, reusing the restore-worker's
  * {@link probeServerGeneration} + {@link probeTmuxTopology} (never reimplemented).
  * Returns `null` when:
- *   - the generation probe yields no pid (no server / garbage) — we can't stamp
- *     the recycle key, so don't seed an unkeyable topology; OR
+ *   - the generation probe yields no generation (no server / garbage) — we can't
+ *     stamp the recycle key, so don't seed an unkeyable topology; OR
  *   - the topology probe is degraded (`gone` server-down, or `transient`
  *     timeout/EPIPE/SIGKILL/ENOENT) — keep the last-known location.
  * A SUCCESSFUL probe with EMPTY panes still returns a snapshot (server up, no

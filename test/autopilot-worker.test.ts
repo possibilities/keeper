@@ -4143,19 +4143,19 @@ test("fn-811: loadReconcileSnapshot maps a listPanes probe into livePaneIds", as
   await withSeededDb(async (db) => {
     const snap = await loadReconcileSnapshot(db, async () => [
       {
+        tmuxGenerationId: "gen",
         paneId: "%1",
         windowId: "@1",
         currentCommand: "claude",
-        paneStartTime: "1700000001",
         paneDead: "0",
         sessionName: "autopilot",
         windowName: "w1",
       },
       {
+        tmuxGenerationId: "gen",
         paneId: "%2",
         windowId: "@2",
         currentCommand: "zsh",
-        paneStartTime: "1700000002",
         paneDead: "0",
         sessionName: "autopilot",
         windowName: "w2",
