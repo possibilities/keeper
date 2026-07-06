@@ -24,5 +24,5 @@ text at ~line 1750), `cli/duration.ts` (the shared grammar to import).
 - [ ] Help/usage text for both flags states the unit-required grammar
 
 ## Done summary
-
+Routed panel start --timeout and panel wait --chunk through the shared cli/duration.ts parseDuration grammar (unit-required, self-healing hint on bare numbers); updated help/usage text; preserved MAX_CHUNK_SECONDS ceiling and the ms stop-timeout translation.
 ## Evidence
