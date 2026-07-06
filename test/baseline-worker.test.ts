@@ -10,6 +10,8 @@
  */
 
 import { expect, test } from "bun:test";
+import type { ChildProcess, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -29,6 +31,7 @@ import {
   planBootPrune,
   planSpool,
   type RunClass,
+  runDetached,
   type SpoolEntry,
   shouldRetry,
   spoolFilesForKey,
@@ -217,6 +220,29 @@ test("timeoutOutcome derives a timeout leaf that is never green, partial runs ke
   if (res.status !== "timeout") throw new Error("unreachable");
   expect(res.deadlineMs).toBe(60_000);
   expect(res.runs.length).toBe(1);
+});
+
+// ── runDetached deadline→force-resolve liveness (injectable spawnFn seam) ────
+
+/** A fake detached child whose `close` never fires (a pipe-holding grandchild). */
+function fakeChildThatNeverCloses(): ChildProcess {
+  const child = Object.assign(new EventEmitter(), {
+    pid: undefined,
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+  });
+  return child as unknown as ChildProcess;
+}
+
+test("runDetached force-resolves to a timeout outcome within the kill grace when close never fires", async () => {
+  const fakeSpawn = (() =>
+    fakeChildThatNeverCloses()) as unknown as typeof spawn;
+  const result = await runDetached("suite", [], "/tmp", 5, {
+    spawnFn: fakeSpawn,
+    killGraceMs: 10,
+  });
+  expect(result.exitCode).toBe(124);
+  expect(result.timedOut).toBe(true);
 });
 
 test("toSuiteRun reports exit 124 for a timed-out run regardless of raw exit", () => {

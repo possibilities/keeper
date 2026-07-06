@@ -95,6 +95,12 @@ const MAX_SPOOL_SCAN = 1024;
 const MAX_CAPTURE_BYTES = 8 << 20;
 /** Bytes of suite output kept as an infra/crash message tail. */
 const MESSAGE_TAIL_BYTES = 1024;
+/**
+ * Grace after a deadline's `killGroup` before `runDetached` force-resolves to a
+ * timeout outcome even if `close` never fires (a double-forked grandchild can
+ * hold the pipe open past the SIGKILL). Overridable per-call (tests).
+ */
+const DEFAULT_KILL_GRACE_MS = 5_000;
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -162,7 +168,7 @@ export interface ScratchDir {
 }
 
 /** The raw outcome of one detached subprocess run (install or a suite run). */
-interface RawRun {
+export interface RawRun {
   startedAt: number;
   durationMs: number;
   exitCode: number;
@@ -422,13 +428,23 @@ function killGroup(pid: number | undefined): void {
  * both pipes into a size-capped buffer. On the deadline the whole group is
  * SIGKILLed and the exit consumed (no zombies). Never rejects — a spawn failure
  * resolves as exit 127 so the caller stays on its verdict path.
+ *
+ * A killed-but-pipe-holding grandchild (double-forked out of the group) can
+ * defer `close` indefinitely; a bounded grace timer after `killGroup` force-
+ * resolves to the same timeout outcome so the single-slot runner never wedges.
+ * `opts` is the injectable seam (tests): override the spawn function and the
+ * grace to exercise the deadline→force-resolve liveness path without a real
+ * double-forked grandchild.
  */
-function runDetached(
+export function runDetached(
   file: string,
   args: string[],
   cwd: string,
   deadlineMs: number,
+  opts?: { spawnFn?: typeof spawn; killGraceMs?: number },
 ): Promise<RawRun> {
+  const spawnFn = opts?.spawnFn ?? spawn;
+  const killGraceMs = opts?.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   return new Promise<RawRun>((resolve) => {
     const startedAt = Date.now();
     let settled = false;
@@ -437,6 +453,7 @@ function runDetached(
       settled = true;
       if (activeChild === child) activeChild = null;
       clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       resolve({
         startedAt,
         durationMs: Date.now() - startedAt,
@@ -448,7 +465,7 @@ function runDetached(
 
     let child: ChildProcess;
     try {
-      child = spawn(file, args, {
+      child = spawnFn(file, args, {
         cwd,
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
@@ -478,9 +495,15 @@ function runDetached(
     child.stderr?.on("data", onData);
 
     let timedOut = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
       timedOut = true;
       killGroup(child.pid);
+      // `close` can be deferred indefinitely by a pipe-holding grandchild;
+      // force the outcome after a bounded grace so the runner never wedges.
+      graceTimer = setTimeout(() => {
+        finish(124, true, output);
+      }, killGraceMs);
     }, deadlineMs);
 
     child.on("error", (err) => {
