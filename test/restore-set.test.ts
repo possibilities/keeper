@@ -82,6 +82,9 @@ interface SeedJob {
   /** Launching harness + its native resume target (v107/v108 columns). */
   harness?: string | null;
   resume_target?: string | null;
+  /** The harness-agnostic adopted marker (`jobs.adopted`); `1` marks a session a
+   *  non-launcher path minted, NULL a launcher-owned/legacy one. */
+  adopted?: number | null;
 }
 
 /** Insert one jobs row with sensible defaults; only the fields a test cares
@@ -92,8 +95,8 @@ function seedJob(db: Database, j: SeedJob): void {
        job_id, created_at, updated_at, state, title, close_kind, window_index,
        cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
        last_event_id, pid, backend_exec_type, backend_exec_pane_id,
-       backend_exec_generation_id, harness, resume_target
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       backend_exec_generation_id, harness, resume_target, adopted
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -117,6 +120,7 @@ function seedJob(db: Database, j: SeedJob): void {
       j.backend_exec_generation_id ?? null,
       j.harness ?? null,
       j.resume_target ?? null,
+      j.adopted ?? null,
     ],
   );
 }
@@ -656,6 +660,154 @@ test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED b
   const hermes = res.candidates.find((c) => c.job_id === "hermes-nobackfill");
   expect(hermes?.resume_target).toBe("");
   expect(isRestorableCandidate(hermes as RestoreCandidate)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Adopted-coordless surfacing — an ADOPTED job (jobs.adopted = 1: a hand-started
+// hermes self-seed or an adopted codex rollout) with no backend coords is COUNTED
+// on the result (adoptedCoordlessSkipCount), never silently dropped. Harness-
+// agnostic: classification keys on coord-absence PLUS the marker, so a coordless
+// adopted hermes job reports identically to codex, while a coordless NON-adopted
+// row keeps today's silent skip. Covered on BOTH the retrospective killed-cohort
+// path and the topology-anchored path.
+// ---------------------------------------------------------------------------
+
+test("deriveRestoreSet: a coordless adopted row is surfaced as a count while coordful/launched rows restore", () => {
+  // Coordless adopted (codex-by-design, or a hermes self-seed keeper never
+  // resolved coords for): crash-like but no backend coords ⇒ counted, not offered.
+  seedJob(kdb.db, {
+    job_id: "codex-coordless",
+    close_kind: "server_gone",
+    backend_exec_session_id: null,
+    adopted: 1,
+    harness: "codex",
+    resume_target: "codex-rollout",
+  });
+  // Coordful adopted (hermes self-seed with full pane coords) — restores like a
+  // launched session, its harness-native resume target intact.
+  seedJob(kdb.db, {
+    job_id: "hermes-coordful",
+    close_kind: "server_gone",
+    window_index: 0,
+    adopted: 1,
+    harness: "hermes",
+    resume_target: "hermes-session",
+    backend_exec_session_id: "work",
+  });
+  // A plain launched crash candidate — unaffected.
+  seedJob(kdb.db, {
+    job_id: "launched",
+    close_kind: "server_gone",
+    window_index: 1,
+    backend_exec_session_id: "work",
+  });
+  const res = derive();
+  expect(res.candidates.map((c) => c.job_id)).toEqual([
+    "hermes-coordful",
+    "launched",
+  ]);
+  expect(res.candidates[0]?.resume_target).toBe("hermes-session");
+  expect(res.adoptedCoordlessSkipCount).toBe(1);
+  expect(res.excludedIdleCount).toBe(0);
+});
+
+test("deriveRestoreSet: a coordless NON-adopted row keeps today's silent skip (not counted)", () => {
+  seedJob(kdb.db, {
+    job_id: "plain-coordless",
+    close_kind: "server_gone",
+    backend_exec_session_id: null,
+    // adopted absent (NULL) — launcher-owned or a legacy row.
+  });
+  const res = derive();
+  expect(res.candidates).toEqual([]);
+  expect(res.adoptedCoordlessSkipCount).toBe(0);
+});
+
+test("deriveRestoreSet: a user-closed coordless adopted row is not a crash candidate and not counted", () => {
+  // Membership (crash-like) is checked BEFORE the coords filter, so a deliberately
+  // closed adopted session never reaches the adopted-coordless counter — the count
+  // reflects only would-be candidates lost to missing coords.
+  seedJob(kdb.db, {
+    job_id: "closed-adopted",
+    close_kind: "window_gone_server_alive",
+    backend_exec_session_id: null,
+    adopted: 1,
+  });
+  const res = derive();
+  expect(res.candidates).toEqual([]);
+  expect(res.adoptedCoordlessSkipCount).toBe(0);
+});
+
+test("deriveLastGenerationSet: surfaces the adopted-coordless skip count (unbounded, mirrors excludedIdleCount)", () => {
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "kept",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+    backend_exec_session_id: "work",
+  });
+  seedJob(kdb.db, {
+    job_id: "codex-coordless",
+    close_kind: "server_gone",
+    last_event_id: 151,
+    backend_exec_session_id: null,
+    adopted: 1,
+  });
+  const res = deriveLastGen();
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["kept"]);
+  expect(res.adoptedCoordlessSkipCount).toBe(1);
+});
+
+test("deriveLastGenerationSetFromTopology: the killed-cohort fallback carries the adopted-coordless skip count", () => {
+  // A coordless adopted job (codex-by-design) has NO pane, so it never rides the
+  // topology-anchored path — it is surfaced only when the deriver degrades to the
+  // retrospective killed-cohort fallback (no dying-generation topology here). The
+  // fallback's count rides through `...fallback`, so it is never dropped.
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "kept",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+    backend_exec_session_id: "work",
+  });
+  seedJob(kdb.db, {
+    job_id: "codex-coordless",
+    close_kind: "server_gone",
+    last_event_id: 151,
+    backend_exec_session_id: null,
+    adopted: 1,
+  });
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["kept"]);
+  expect(res.fallbackNote).toBeDefined();
+  expect(res.adoptedCoordlessSkipCount).toBe(1);
+});
+
+test("deriveLastGenerationSetFromTopology: a coordful adopted pane restores like a launched one (no skip count)", () => {
+  seedJob(kdb.db, {
+    job_id: "hermes-adopted",
+    state: "killed",
+    title: "hermes-adopted",
+    adopted: 1,
+    harness: "hermes",
+    resume_target: "hermes-session",
+  });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 0,
+      job_id: "hermes-adopted",
+    },
+    PAD_PANE, // >1 pane so the generation clears the degenerate skeleton filter
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["hermes-adopted"]);
+  expect(res.candidates[0]?.resume_target).toBe("hermes-session");
+  expect(res.adoptedCoordlessSkipCount).toBe(0);
+  expect(res.fallbackNote).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------
