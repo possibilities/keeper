@@ -38,5 +38,5 @@ Deps-injected sweep tests: dispatch-once with marker stamped only on dispatched;
 - [ ] buildMergeEscalationBody is gone and the fast suite is green
 
 ## Done summary
-
+Rewired the merge-escalation sweep to dispatch a deconflict::<epic> session (tier 2) once the tier-1 resolver declines/dies, and added the stage-3 sweep that notifies the human once via botctl when the deconflict session also declines/dies. Introduced the shared escalation-dispatch helper (global cap + per-key occupancy guard), deleted buildMergeEscalationBody, and synced a stale SCHEMA_VERSION tripwire in db.test.ts left by task .1.
 ## Evidence
