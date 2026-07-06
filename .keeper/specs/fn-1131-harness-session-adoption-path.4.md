@@ -36,5 +36,5 @@ Restore suite: a coordless adopted row yields the surfaced count and note while 
 - [ ] The restore fast suite passes with the new classification coverage
 
 ## Done summary
-
+Restore surfaces adopted-coordless skips as a distinct count (adoptedCoordlessSkipCount on RestoreSetResult) via the retrospective deriver, harness-agnostic and never a silent drop; docs sweep across README, CLAUDE.md, CONTEXT.md, and a new positive-evidence adoption ADR.
 ## Evidence
