@@ -59,5 +59,5 @@ recapture; root fast suite green.
 - [ ] The prompt oracle parity suite is green with the recaptured fixture
 - [ ] No touched prose says cache, snapshot, or sidecar for the baseline surfaces, and no history narration appears
 ## Done summary
-
+Route worker + work-skill failure-triage at `keeper baseline <base sha> --wait` (task-start-sha contract + env-fidelity caveat) before classifying an out-of-scope test failure; add the verb to the README one-binary list, fold the spool/leaf sole-writer line into CLAUDE.md (under the byte cap), point plan CLAUDE.md's stash-deny at the sanctioned alternative, and regenerate the work skill + 4 worker manifests + recapture the prompt oracle fixture.
 ## Evidence
