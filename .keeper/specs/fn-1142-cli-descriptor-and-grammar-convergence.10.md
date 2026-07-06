@@ -37,5 +37,5 @@ Suites: grouped verbs dispatch to the same handlers (stub-level identity), retir
 - [ ] Every in-repo skill (prose + allowed-tools globs), template, and the vendored corpus cite only the grouped forms; vendor-corpus --check and the BAKE assertions are green
 
 ## Done summary
-
+Grouped the four session-scoped reads under `keeper session <state|files|events|summary>` via a new cli/session.ts dispatcher (pure group + per-leaf help, unknown subverb exit 2); retired flat names hard-fail. Migrated skill prose + allowed-tools globs, worker/work templates, and the vendored history-forensics corpus to grouped forms (vendor-corpus --check + BAKE green). Kept show-job --session as-is (grammar wave, not landed on this branch).
 ## Evidence
