@@ -9,8 +9,10 @@ import { expect, test } from "bun:test";
 import {
   buildDispatchLaunchArgv,
   defaultPlanPrompt,
+  isEscalationVerb,
   isRetryableDispatchKey,
   PROMPT_MAX_BYTES,
+  parseDispatchableKey,
   parseDispatchKey,
   validatePromptBytes,
 } from "../src/dispatch-command";
@@ -89,12 +91,92 @@ test("parseDispatchKey: rejects path-traversal tokens in the id half", () => {
 });
 
 // ---------------------------------------------------------------------------
+// parseDispatchableKey — the WIDER manual-dispatch verb set (escalation verbs)
+// ---------------------------------------------------------------------------
+
+test("parseDispatchableKey: accepts the escalation verbs unblock/deconflict", () => {
+  expect(parseDispatchableKey("unblock::fn-1-foo.3")).toEqual({
+    ok: true,
+    verb: "unblock",
+    id: "fn-1-foo.3",
+  });
+  expect(parseDispatchableKey("deconflict::fn-1-foo")).toEqual({
+    ok: true,
+    verb: "deconflict",
+    id: "fn-1-foo",
+  });
+});
+
+test("parseDispatchableKey: still accepts the retry-wire verbs (superset)", () => {
+  for (const [key, verb, id] of [
+    ["work::fn-1-foo.3", "work", "fn-1-foo.3"],
+    ["close::fn-1-foo", "close", "fn-1-foo"],
+    ["approve::fn-1-foo", "approve", "fn-1-foo"],
+  ] as const) {
+    expect(parseDispatchableKey(key)).toEqual({ ok: true, verb, id });
+  }
+});
+
+test("parseDispatchableKey: same id-shape rejections as parseDispatchKey", () => {
+  for (const bad of [
+    "",
+    undefined,
+    null,
+    42,
+    "no-sep",
+    "unblock::",
+    "unblock::fn-1::pwned",
+    "unblock::../etc/passwd",
+    "unblock::/abs/path",
+    "unblock::.hidden",
+    "unblock::a\0b",
+    "rm::fn-1-foo",
+  ]) {
+    expect(parseDispatchableKey(bad).ok).toBe(false);
+  }
+});
+
+test("retry wire byte-identical: parseDispatchKey REJECTS the escalation verbs", () => {
+  // The escalation verbs are dispatchable but NEVER sticky `dispatch_failures`
+  // rows, so the `retry_dispatch` wire validator must keep rejecting them —
+  // widening it would accept keys that never exist as rows.
+  expect(parseDispatchKey("unblock::fn-1-foo.3").ok).toBe(false);
+  expect(parseDispatchKey("deconflict::fn-1-foo").ok).toBe(false);
+});
+
+test("isEscalationVerb: true only for unblock/deconflict", () => {
+  expect(isEscalationVerb("unblock")).toBe(true);
+  expect(isEscalationVerb("deconflict")).toBe(true);
+  for (const v of ["work", "close", "approve", "resolve", "plan", ""]) {
+    expect(isEscalationVerb(v)).toBe(false);
+  }
+});
+
+test("isRetryableDispatchKey: an escalation key is NOT retry-wire (first-class job, not an orphan row)", () => {
+  // A live unblock::/deconflict:: job is a first-class `jobs` row (folded via the
+  // spawn-name deriver), never a `dispatch_failures` row — so it must never be a
+  // retry-wire key, and the boot orphan-GC (which only sweeps `dispatch_failures`)
+  // never sees it.
+  expect(isRetryableDispatchKey("unblock", "fn-1-foo.3")).toBe(false);
+  expect(isRetryableDispatchKey("deconflict", "fn-1-foo")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
 // defaultPlanPrompt
 // ---------------------------------------------------------------------------
 
 test("defaultPlanPrompt: composes the canonical /plan:<verb> <id> prompt", () => {
   expect(defaultPlanPrompt("work", "fn-1-foo.3")).toBe("/plan:work fn-1-foo.3");
   expect(defaultPlanPrompt("close", "fn-1-foo")).toBe("/plan:close fn-1-foo");
+});
+
+test("defaultPlanPrompt: composes the escalation slash-commands", () => {
+  expect(defaultPlanPrompt("unblock", "fn-1-foo.3")).toBe(
+    "/plan:unblock fn-1-foo.3",
+  );
+  expect(defaultPlanPrompt("deconflict", "fn-1-foo")).toBe(
+    "/plan:deconflict fn-1-foo",
+  );
 });
 
 // ---------------------------------------------------------------------------

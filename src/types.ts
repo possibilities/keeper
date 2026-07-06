@@ -1073,6 +1073,10 @@ export interface Task {
  * `status` state machine). The `status` advances `pending → requested →
  * attempted`; `outcome` records the helper's result on the `attempted` row.
  * `blocked_since` / `last_event_id` are event ids, never wall-clock.
+ * `human_notified_at` is the terminal once-marker (epoch seconds, `event.ts`)
+ * stamped when the `unblock::<task>` escalation session declines or dies and the
+ * human is notified exactly once; NULL until then, dropped with the row on the
+ * leave-blocked latch clear so an unblock→re-block re-arms it at NULL.
  */
 export interface BlockEscalation {
   epic_id: string;
@@ -1081,6 +1085,7 @@ export interface BlockEscalation {
   status: string;
   outcome: string | null;
   last_event_id: number;
+  human_notified_at: number | null;
 }
 
 /**
@@ -1120,18 +1125,45 @@ export interface BlockEscalationRequestedPayload {
 
 /**
  * Pre-flattened `BlockEscalationAttempted` synthetic event payload — the producer
- * mints it after the one-way bus-send helper resolves, advancing the latch
- * `requested → attempted` and recording the helper's `outcome` (e.g. `"sent"` /
- * `"skipped"` / `"failed"`). Keyed `(epic_id, task_id)`. The reducer fold reads
- * this event (KEEP-SET inline forever — never added to the retention shed
- * predicate).
+ * mints it after the block-escalation attempt resolves, recording the attempt's
+ * `outcome` onto the latch `outcome` column. Keyed `(epic_id, task_id)`. The
+ * outcome drives a STAGED latch transition (`foldBlockEscalationAttempted`): a
+ * TERMINAL outcome (the escalation-dispatch `"dispatched"`, or a delivered
+ * bus-send `"sent"` / `"queued_for_wake"`) advances the latch to `attempted`; a
+ * NON-TERMINAL outcome (`"dispatch_failed"` — the escalation launch failed — or
+ * the bus-send `"send_failed"`) RESETS the latch to `pending` so the sweep
+ * re-attempts on the next tick. The reducer fold reads this event (KEEP-SET
+ * inline forever — never added to the retention shed predicate).
  */
 export interface BlockEscalationAttemptedPayload {
   /** Parent epic id — part of the `block_escalations` pk. */
   epic_id: string;
   /** Blocked task id — part of the `block_escalations` pk. */
   task_id: string;
-  /** Producer-recorded helper outcome, recorded onto the latch `outcome` column. */
+  /** Producer-recorded attempt outcome, recorded onto the latch `outcome` column. */
+  outcome: string;
+}
+
+/**
+ * Pre-flattened `BlockHumanNotified` synthetic event payload — the terminal
+ * "human notified" stage of the UNBLOCK escalation path. The daemon sweep mints
+ * it after it observes the `unblock::<task>` escalation session reach a terminal
+ * decline/death and sends the one structured botctl notification, stamping the
+ * `block_escalations.human_notified_at` once-marker so the human is notified
+ * exactly once. Keyed `(epic_id, task_id)` — the latch pk. The TERMINAL
+ * `notified` outcome (the notification was delivered) stamps
+ * `human_notified_at = event.ts`; any other outcome (`notify_failed` / unknown)
+ * is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts. The fold reads ONLY the payload + `event.ts`, so re-fold stays
+ * byte-deterministic. The marker NEVER clears the latch — only the leave-blocked
+ * `TaskSnapshot` DELETE does, which re-arms it at NULL. KEEP-SET inline forever.
+ */
+export interface BlockHumanNotifiedPayload {
+  /** Parent epic id — part of the `block_escalations` pk. */
+  epic_id: string;
+  /** Blocked task id — part of the `block_escalations` pk. */
+  task_id: string;
+  /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
 }
 
@@ -1139,12 +1171,13 @@ export interface BlockEscalationAttemptedPayload {
  * Pre-flattened `MergeEscalationAttempted` synthetic event payload — the daemon
  * merge-escalation sweep mints it after the one-way `planner@<epic>` bus-send
  * helper resolves, stamping the `dispatch_failures.merge_escalated_at` once-marker
- * so the notify fires exactly once per sticky `worktree-merge-conflict` close
+ * so the escalation fires exactly once per sticky `worktree-merge-conflict` close
  * failure. Keyed by the close-row `id` (verb is always `close`). A TERMINAL
- * `outcome` (`sent` / `queued_for_wake`) stamps `merge_escalated_at = event.ts`;
- * the non-terminal `send_failed` outcome folds to a no-op, leaving the marker NULL
- * so the row stays re-sweepable (mirrors `BlockEscalationAttempted`'s
- * `send_failed`-is-non-terminal rule). The fold reads ONLY the payload + the
+ * `outcome` (the escalation-dispatch `dispatched`, or a delivered bus-send `sent`
+ * / `queued_for_wake`) stamps `merge_escalated_at = event.ts`; a non-terminal
+ * outcome (`dispatch_failed` / `send_failed`) folds to a no-op, leaving the marker
+ * NULL so the row stays re-sweepable (mirrors `BlockEscalationAttempted`'s
+ * non-terminal rule). The fold reads ONLY the payload + the
  * persisted row, so re-fold stays byte-deterministic. The marker NEVER clears the
  * sticky row — only `retry_dispatch` does. KEEP-SET inline forever (never added to
  * the retention shed predicate).
@@ -1177,5 +1210,30 @@ export interface ResolverDispatchAttemptedPayload {
   /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
   id: string;
   /** Producer-recorded launch outcome; only the terminal `dispatched` stamps the marker. */
+  outcome: string;
+}
+
+/**
+ * Pre-flattened `MergeHumanNotified` synthetic event payload — the terminal
+ * "human notified" stage of the DECONFLICT escalation path, sibling to
+ * `MergeEscalationAttempted` / `ResolverDispatchAttempted` on the same sticky
+ * `worktree-merge-conflict` close row. The daemon sweep mints it after it observes
+ * the `deconflict::<epic>` escalation session reach a terminal decline/death and
+ * sends the one structured botctl notification, stamping the
+ * `dispatch_failures.human_notified_at` once-marker so the human is notified
+ * exactly once. Keyed by the close-row `id` (verb is always `close`). The TERMINAL
+ * `notified` outcome stamps `human_notified_at = event.ts` (gated `IS NULL`); any
+ * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
+ * leaving the marker NULL so the sweep re-attempts. The fold reads ONLY the
+ * payload + `event.ts`, so re-fold stays byte-deterministic. The marker NEVER
+ * clears the sticky row — only `DispatchCleared` (`retry_dispatch`) does, which
+ * re-arms it at NULL. INDEPENDENT of `merge_escalated_at` / `resolver_dispatched_at`:
+ * the three consume the same sticky, each latched on its own column. KEEP-SET
+ * inline forever (never added to the retention shed predicate).
+ */
+export interface MergeHumanNotifiedPayload {
+  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
+  id: string;
+  /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
 }

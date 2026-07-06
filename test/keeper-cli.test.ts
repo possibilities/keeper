@@ -91,6 +91,7 @@ function makeHarness(): Harness {
       "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
       "session-summary": mkHandler("session-summary"),
+      "escalation-brief": mkHandler("escalation-brief"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
       dispatch: mkHandler("dispatch"),

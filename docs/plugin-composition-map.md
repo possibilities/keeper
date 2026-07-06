@@ -98,6 +98,18 @@ resolver-dispatch sweep on a stuck worktree fan-in close) rides this SAME
 autopilot/dispatch-worker channel, inheriting the identical additive base set, never a
 separate isolation channel.
 
+Two further daemon producers ride the same path: the **escalation dispatches** —
+`unblock::<task>` (the block-escalation sweep) and `deconflict::<epic>` (the
+merge-escalation sweep, sequenced behind the tier-1 `resolve::` resolver). Both inherit
+the identical additive base set plus their target `/plan:unblock` or `/plan:deconflict`
+skill. What sets them apart is the launch config, not the plugin channel: their
+`{model, effort}` comes from a SEPARATE `escalation` preset
+(`resolveEscalationLaunchConfig`, `src/escalation-config.ts`) — the `escalation` key in
+`presets.yaml` layered per-field over the `ESCALATION_*` constants, DELIBERATELY
+independent of the `worker` preset so an escalation session's tier moves without
+perturbing plan workers. Claude-only; a missing or malformed catalog swallows to the
+built-in escalation defaults, never a launch failure.
+
 ## The worker isolation gate (config-flagged, default OFF)
 
 The `worker_plugin_isolation` key in `~/.config/keeper/plugins.yaml` (parsed by

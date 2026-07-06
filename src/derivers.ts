@@ -23,10 +23,12 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
 
 /**
  * Anchored spawn-name → `{verb, ref}` match:
- * `{plan|work|close|resolve}::fn-\d+-[a-z0-9-]+(.\d+)?`. The verb whitelist is
- * locked — any other verb returns `(null, null)`; adding one is a deliberate edit
- * here. `resolve` is the daemon merge-resolver dispatch (`resolve::<epic>`): folding
- * its `plan_verb`/`plan_ref` makes the resolver a first-class dispatch key, so the
+ * `{plan|work|close|resolve|unblock|deconflict}::fn-\d+-[a-z0-9-]+(.\d+)?`. The
+ * verb whitelist is locked — any other verb returns `(null, null)`; adding one is
+ * a deliberate edit here. `resolve` is the daemon merge-resolver dispatch
+ * (`resolve::<epic>`); `unblock` (`unblock::<task>`) and `deconflict`
+ * (`deconflict::<epic>`) are the two autonomous ESCALATION dispatches. Folding
+ * each one's `plan_verb`/`plan_ref` makes it a first-class dispatch key, so the
  * jobs-keyed reaps + instant-death breaker apply to it like any work/close worker.
  * The `$` anchor rejects extra `::` segments so a typo never partial-matches and
  * lands wrong data in the projection. The ref matches both epic and task refs (the
@@ -35,7 +37,7 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
  * masking the error.
  */
 const SPAWN_VERB_REF_RE =
-  /^(plan|work|close|resolve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
+  /^(plan|work|close|resolve|unblock|deconflict)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
 
 /**
  * Anchored `handoff::<slug>` spawn-name match — the SEPARATE spawn-name class for
