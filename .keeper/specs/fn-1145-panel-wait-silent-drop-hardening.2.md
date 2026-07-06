@@ -36,5 +36,5 @@ The skill gains an explicit runner return contract: exactly two valid shapes, ea
 - [ ] The consistency test suite passes, including new assertions pinning the two-shape contract and the single same-slug re-drive in the skill prose
 
 ## Done summary
-
+Skill now documents the runner return contract: two first-line shapes (PANEL_ANSWER success, PANEL_RUN_FAILED failure), anything else a malformed return with one same-slug byte-identical re-drive then a verbatim failure surface. Consistency-skills pins the contract.
 ## Evidence
