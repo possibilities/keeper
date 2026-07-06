@@ -29,7 +29,7 @@
 
 import { expect, test } from "bun:test";
 import {
-  boardSummaryLabel,
+  boardSummaryLines,
   colorizePillsInLine,
   computeBoardSummary,
   epicNumFromIdOrBare,
@@ -1734,8 +1734,8 @@ const EPIC_NOT_VALIDATED: Verdict = {
   reason: { kind: "epic-not-validated" },
 };
 
-// Board summary banner counts visible open/running epics and tasks from the
-// same readiness verdicts the row renderer consumes.
+// Board summary counts visible open/running epics and tasks from the same
+// readiness verdicts the row renderer consumes.
 test("computeBoardSummary: counts open and running epics/tasks", () => {
   const taskRunning = makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" });
   const taskCompleted = makeTask({ task_id: "fn-1-a.2", epic_id: "fn-1-a" });
@@ -1775,9 +1775,11 @@ test("computeBoardSummary: counts open and running epics/tasks", () => {
     tasksOpen: 1,
     tasksRunning: 1,
   });
-  expect(boardSummaryLabel(counts)).toBe(
-    "board: epics 2 open/2 running · tasks 1 open/1 running",
-  );
+  expect(boardSummaryLines(counts)).toEqual([
+    "summary",
+    "  epics: 2 open / 2 running",
+    "  tasks: 1 open / 1 running",
+  ]);
 });
 
 // fn-713 follow-on: renderTaskPills appends runtime_status + worker_phase at

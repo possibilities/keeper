@@ -348,8 +348,12 @@ export function computeBoardSummary(
   return { epicsOpen, epicsRunning, tasksOpen, tasksRunning };
 }
 
-export function boardSummaryLabel(counts: BoardSummaryCounts): string {
-  return `board: epics ${counts.epicsOpen} open/${counts.epicsRunning} running · tasks ${counts.tasksOpen} open/${counts.tasksRunning} running`;
+export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
+  return [
+    "summary",
+    `  epics: ${counts.epicsOpen} open / ${counts.epicsRunning} running`,
+    `  tasks: ${counts.tasksOpen} open / ${counts.tasksRunning} running`,
+  ];
 }
 
 function taskNumFromId(id: string): number | null {
@@ -569,8 +573,8 @@ export async function main(argv: string[]): Promise<void> {
   const workFailures = new Map<string, string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
-  // Retain the last readiness snapshot so banner repaints can show board
-  // counts alongside autopilot metadata. Null until the first frame.
+  // Retain the last readiness snapshot so secondary stream edges can repaint
+  // the rows immediately. Null until the first frame.
   let lastSnap: ReadinessClientSnapshot | null = null;
 
   // Autopilot banner state — the metadata `keeper autopilot` pins at its top
@@ -578,9 +582,9 @@ export async function main(argv: string[]): Promise<void> {
   // `autopilot_state` singleton; the armed count reuses `armedSet` above.
   // Seeded to the daemon's boot-safe defaults (paused · yolo · max ∞ · per-root
   // 1 · worktree:off); the first `autopilot_state` edge overwrites them. The
-  // banner repaints from `boardBanner()` on every readiness, autopilot_state, or
-  // armed_epics edge, and the view-shell restores it after a copy-key flash via
-  // the `persistentBannerPill` below.
+  // banner repaints on every autopilot_state or armed_epics edge, and the
+  // view-shell restores it after a copy-key flash via the `persistentBannerPill`
+  // below.
   const apState = {
     paused: true,
     maxConcurrentJobs: null as number | null,
@@ -603,12 +607,6 @@ export async function main(argv: string[]): Promise<void> {
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,
     });
-  const boardBanner = (): string => {
-    if (lastSnap === null) {
-      return apBanner();
-    }
-    return `${boardSummaryLabel(computeBoardSummary(lastSnap))} · ${apBanner()}`;
-  };
 
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -844,8 +842,11 @@ export async function main(argv: string[]): Promise<void> {
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
+    const summary = boardSummaryLines(computeBoardSummary(snap));
     const body = renderEpicsBody(snap, subagentIndex);
-    return body === "" ? ["no epics"] : body.split("\n");
+    return body === ""
+      ? [...summary, "no epics"]
+      : [...summary, ...body.split("\n")];
   }
 
   // Lifecycle + sidecars + copy key + SIGINT live in `createViewShell`. Board's
@@ -863,9 +864,9 @@ export async function main(argv: string[]): Promise<void> {
     mode: mode === "snapshot" ? "snapshot" : "live",
     streamCount: 4,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    // The fixed banner row carries board counts plus autopilot metadata.
-    // Restored here after a copy-key flash expires.
-    persistentBannerPill: boardBanner,
+    // The fixed banner row carries autopilot metadata. Restored here after a
+    // copy-key flash expires.
+    persistentBannerPill: apBanner,
     renderBody: (snap) => {
       // Per-frame `job_id → invocations` index — re-entrant sub-agents within
       // one session share a bucket, ordered by `turn_seq asc`.
@@ -890,11 +891,10 @@ export async function main(argv: string[]): Promise<void> {
 
   // Seed the banner immediately so the autopilot metadata is on screen before
   // the first `autopilot_state` edge lands.
-  view.liveShell.setStatus(boardBanner());
+  view.liveShell.setStatus(apBanner());
 
   function emitFrame(snap: ReadinessClientSnapshot): void {
     lastSnap = snap;
-    view.liveShell.setStatus(boardBanner());
     // Drain diagnostics per-snapshot (not per-emit) so every observed ambiguity
     // is recorded even when the render is byte-stable and the view-shell's
     // `lastBody` short-circuits. Best-effort — `appendDiagnostic` swallows I/O
@@ -932,7 +932,7 @@ export async function main(argv: string[]): Promise<void> {
         }
       }
       // The armed count rides the banner — repaint it on every edge.
-      view.liveShell.setStatus(boardBanner());
+      view.liveShell.setStatus(apBanner());
       if (!armedStreamReported) {
         armedStreamReported = true;
         view.reportSnapshotStream();
@@ -971,7 +971,7 @@ export async function main(argv: string[]): Promise<void> {
       apState.maxConcurrentPerRootStored = projectMaxConcurrentPerRoot(rows);
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
-      view.liveShell.setStatus(boardBanner());
+      view.liveShell.setStatus(apBanner());
     },
     onLifecycle: view.emitLifecycle,
   });
