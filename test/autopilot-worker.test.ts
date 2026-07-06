@@ -54,6 +54,7 @@ import {
   computeSlotOccupancy,
   confirmRunning,
   createDispatchFailedGate,
+  createLaneWedgeTracker,
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
   createWorktreeDriver,
@@ -77,12 +78,19 @@ import {
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
+  isLaneWedgeDistressKey,
   isOccupyingJob,
   isSharedCheckoutDirtyReason,
   isSharedCheckoutWedgeReason,
   isWorktreeRecoverReason,
+  LANE_WEDGE_DISTRESS_ID_PREFIX,
+  LANE_WEDGE_DISTRESS_REASON,
+  LANE_WEDGE_GRACE_SEC,
+  type LaneWedgeObservation,
   type LaunchResult,
   type LiveDispatch,
+  laneFailuresToClear,
+  laneWedgeDistressId,
   loadReconcileSnapshot,
   mergeLaneBaseIntoDefault,
   prepareWorktreeGeometry,
@@ -8634,6 +8642,45 @@ test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async ()
   expect(calls.some((c) => c.args.startsWith("worktree prune"))).toBe(false);
 });
 
+test("fn-1123.2 recoverWorktrees: re-probes each keeper lane's base readiness — a not-ready lane surfaces as a graced wedge, keyed by lane path", async () => {
+  // The lane's HEAD is on `main` (the fake's global branch), not its lane branch —
+  // an off-branch base a fan-in would abort on. The recover pass re-probes it AFTER
+  // the mutating passes and surfaces it as a per-lane WEDGE observation (keyed by the
+  // lane PATH), so the escalation/clear rides the recover pass rather than a dispatch.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set(), // clean — the probe classifies off-branch, not mid-merge
+    epicBases: [],
+  });
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  // The outcome now carries the lane arms. The keeper lane is off-branch → a GRACED
+  // wedge (not immediate — that is reserved for a hard abort-failed mid-merge).
+  expect(outcome.laneWedged?.map((w) => w.path)).toEqual([lane]);
+  expect(outcome.laneWedged?.[0]?.immediate).toBe(false);
+  expect(outcome.laneWedged?.[0]?.reason.startsWith("off-branch")).toBe(true);
+  // The standalone /repo is not a keeper lane → never a lane observation.
+  expect(outcome.laneResolved ?? []).not.toContain("/repo");
+});
+
+test("fn-1123.2 recoverWorktrees: a hard abort-failed lane mid-merge surfaces as an IMMEDIATE wedge", async () => {
+  // The lane is mid-merge AND its guarded abort keeps failing — git cannot clear it.
+  // Pass-1 records its own abort failure; the lane readiness re-probe then sees the
+  // surviving MERGE_HEAD and surfaces an IMMEDIATE (un-graced) wedge for the distress.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set([lane]),
+    abortFailsAt: new Set([lane]), // the guarded abort fails → residue survives
+    epicBases: [],
+  });
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  const laneObs = outcome.laneWedged?.find((w) => w.path === lane);
+  expect(laneObs).toBeDefined();
+  expect(laneObs?.immediate).toBe(true);
+  expect(laneObs?.reason.startsWith("abort-failed")).toBe(true);
+});
+
 test("fn-972 BUG 4 recoverWorktrees: pass-1 skips a non-keeper `.claude/worktrees` lane, still recovers the keeper lane", async () => {
   // Pass-1 enumerates ALL registered linked worktrees; a FOREIGN lane (another
   // tool's `.claude/worktrees/<name>` on a non-`keeper/epic/*` branch) is never
@@ -13023,4 +13070,172 @@ test("dirty + wedge distress rows for the SAME repo never cross-clear (distinct 
   ]);
   // The two ids are distinct — neither clear could ever target the other's row.
   expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+});
+
+// ---------------------------------------------------------------------------
+// fn-1123.2 — the fan-in LANE pre-merge wedge escalation + verb-agnostic
+// reason-scoped clear. The lane tracker is the per-LANE sibling of the shared-
+// checkout wedge tracker (keyed by lane worktree PATH, own id/reason surface), with
+// an extra IMMEDIATE short-circuit for a hard `abort-failed` lane. All expected
+// values are hand-computed constants, never re-derived from the tracker/helper.
+// ---------------------------------------------------------------------------
+
+const LANE_A = "/Users/x/worktrees/lane-a";
+const LANE_B = "/Users/x/worktrees/lane-b";
+const LANE_DIRTY_OBS: LaneWedgeObservation = {
+  path: LANE_A,
+  reason: "dirty: /Users/x/worktrees/lane-a — M src/foo.ts",
+  immediate: false,
+};
+
+test("LANE_WEDGE_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(LANE_WEDGE_GRACE_SEC).toBe(5 * 60);
+});
+
+test("laneWedgeDistressId is per-lane stable, distinct across lanes + prefix-tagged, and yields a synthetic-verb distress key", () => {
+  const a = laneWedgeDistressId(LANE_A);
+  expect(a).toBe(laneWedgeDistressId(LANE_A)); // stable across calls
+  expect(a).not.toBe(laneWedgeDistressId(LANE_B)); // distinct across lanes
+  expect(a.startsWith(LANE_WEDGE_DISTRESS_ID_PREFIX)).toBe(true);
+  // The composite is a per-lane distress key the orphan-GC exempts + only a
+  // level-trigger clears (the synthetic `daemon` verb).
+  expect(isLaneWedgeDistressKey("daemon", a)).toBe(true);
+});
+
+test("lane wedge tracker: a divergent-dirty base past the grace mints EXACTLY once (graced)", () => {
+  const grace = 300;
+  const tracker = createLaneWedgeTracker(grace);
+  const wedged = new Map([[LANE_A, LANE_DIRTY_OBS]]);
+  const empty = new Set<string>();
+  // t=1000 first observed → grace clock starts, no mint.
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint (a transient dirt settles inside the window).
+  expect(
+    tracker.step({ wedged, openDistressDirs: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-lane, reason display-mapped.
+  const crossed = tracker.step({
+    wedged,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(laneWedgeDistressId(LANE_A));
+  expect(crossed.mint[0]?.dir).toBe(LANE_A);
+  expect(crossed.mint[0]?.reason?.startsWith(LANE_WEDGE_DISTRESS_REASON)).toBe(
+    true,
+  );
+  // O(1): never re-mint while still wedged.
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ wedged, openDistressDirs: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("lane wedge tracker: a hard abort-failed lane mints an IMMEDIATE distress (not graced)", () => {
+  const grace = 300;
+  const tracker = createLaneWedgeTracker(grace);
+  const immediateObs: LaneWedgeObservation = {
+    path: LANE_A,
+    reason:
+      "abort-failed: /Users/x/worktrees/lane-a is mid-merge (MERGE_HEAD=deadbeef) and could not be cleared",
+    immediate: true,
+  };
+  // FIRST observation, grace clock just started (sinceSec === nowSec) → an immediate
+  // lane mints AT ONCE, matching finalizeEpic's abort-failed precedent.
+  const first = tracker.step({
+    wedged: new Map([[LANE_A, immediateObs]]),
+    openDistressDirs: new Set<string>(),
+    nowSec: 1000,
+  });
+  expect(first.mint.length).toBe(1);
+  expect(first.mint[0]?.id).toBe(laneWedgeDistressId(LANE_A));
+  expect(first.mint[0]?.reason).toContain("hard-wedged");
+  // Still O(1): no re-mint while it stays wedged.
+  expect(
+    tracker.step({
+      wedged: new Map([[LANE_A, immediateObs]]),
+      openDistressDirs: new Set<string>(),
+      nowSec: 1001,
+    }).mint,
+  ).toEqual([]);
+});
+
+test("lane wedge tracker: a resolved lane level-clears its open distress EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createLaneWedgeTracker(grace);
+  const open = new Set([LANE_A]);
+  // Still wedged → no clear.
+  expect(
+    tracker.step({
+      wedged: new Map([[LANE_A, LANE_DIRTY_OBS]]),
+      openDistressDirs: open,
+      nowSec: 2000,
+    }).clear,
+  ).toEqual([]);
+  // Lane goes ready/gone (no fresh wedge) but the row is open → level-clear once.
+  const recovered = tracker.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 2001,
+  });
+  expect(recovered.clear.map((c) => c.id)).toEqual([
+    laneWedgeDistressId(LANE_A),
+  ]);
+  // Once folded, the row leaves openDistressDirs → no re-clear.
+  expect(
+    tracker.step({
+      wedged: new Map(),
+      openDistressDirs: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("lane wedge distress is a DISTINCT surface from the shared-checkout wedge — ids never collide", () => {
+  // Even for the same underlying string, the lane id prefix differs from the
+  // shared-checkout one, so the two distress surfaces never cross-classify/clear.
+  expect(laneWedgeDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+  expect(isLaneWedgeDistressKey("daemon", sharedWedgeDistressId(REPO_A))).toBe(
+    false,
+  );
+});
+
+test("laneFailuresToClear: positive-evidence — clears a resolved-and-not-wedged row, retains on absence, never clears a still-wedged one", () => {
+  const workRow = {
+    verb: "work" as const,
+    id: "fn-1-foo.2",
+    dir: LANE_A,
+  };
+  // Resolved AND not wedged → cleared (bypasses the router's dead work-task arm).
+  expect(laneFailuresToClear([workRow], new Set(), new Set([LANE_A]))).toEqual([
+    { verb: "work", id: "fn-1-foo.2" },
+  ]);
+  // Still wedged this cycle → NEVER clear (the never-clear-what-still-fails guard),
+  // even if it also appears resolved (a stale/duplicate observation).
+  expect(
+    laneFailuresToClear([workRow], new Set([LANE_A]), new Set([LANE_A])),
+  ).toEqual([]);
+  // No observation for it this cycle → RETAINED (absence is never resolution — the
+  // silent-skip defect the shared recover clear also closes).
+  expect(laneFailuresToClear([workRow], new Set(), new Set())).toEqual([]);
+});
+
+test("laneFailuresToClear is verb-agnostic — a work AND a close lane row both clear by lane path", () => {
+  const rows = [
+    { verb: "work" as const, id: "fn-1-foo.2", dir: LANE_A },
+    { verb: "close" as const, id: "fn-1-foo", dir: LANE_B },
+  ];
+  const cleared = laneFailuresToClear(
+    rows,
+    new Set(),
+    new Set([LANE_A, LANE_B]),
+  );
+  expect(cleared).toEqual([
+    { verb: "work", id: "fn-1-foo.2" },
+    { verb: "close", id: "fn-1-foo" },
+  ]);
 });

@@ -435,6 +435,28 @@ export interface ReconcileSnapshot {
    */
   sharedDirtyDistressDirs?: Set<string>;
   /**
+   * The `(verb, id, dir)` of every OPEN fan-in LANE pre-merge `dispatch_failures`
+   * row (its `reason` carries {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX}; minted by
+   * `provision()` on the NATURAL `work::<taskId>` key with the lane worktree path as
+   * `dir`). The recover pass's verb-agnostic reason-scoped level-clear clears any
+   * whose lane path is READY/gone this cycle, bypassing the router's `work-task`
+   * short-circuit — so the row is SELF-CLEARING. Collected off the REASON (verb-
+   * agnostic) so the clear scope stays disjoint from a genuine merge conflict on the
+   * same key. Optional for call-site back-compat; an absent field is empty.
+   */
+  laneFailures?: { verb: Verb; id: string; dir: string }[];
+  /**
+   * The lane worktree PATHS that currently have an OPEN per-lane wedge distress row
+   * (synthetic `daemon::worktree-lane-wedge:<laneHash>`, collected off the row's
+   * `dir`). PRODUCER-ONLY: read by the recover pass's lane grace tracker to
+   * level-clear a distress row whose lane has since gone ready/away — NOT by the pure
+   * `reconcile`. Off the durable projection so a restarted worker still clears a
+   * distress it minted before the restart. DISTINCT surface from {@link
+   * sharedWedgeDistressDirs} (default-branch checkout dirs). Optional for call-site
+   * back-compat; an absent field is an empty set (no open lane distress).
+   */
+  laneWedgeDistressDirs?: Set<string>;
+  /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
    * BEFORE `launch()` and the discharging `SessionStart` has not folded yet (the
@@ -1012,6 +1034,19 @@ export interface WorktreeRecoveryOutcome {
   failures: WorktreeRecoveryFailure[];
   escalations: WorktreeRecoveryEscalation[];
   resolved: WorktreeRecoveryResolution[];
+  /**
+   * Per-cycle fan-in LANE base-readiness observations, keyed by the lane worktree
+   * PATH — the evidence the lane-wedge grace tracker + the verb-agnostic reason-scoped
+   * clear consume. A keeper lane the recover sweep found NOT losslessly-mergeable
+   * (dirty / off-branch / would-clobber, or a hard mid-merge `abort-failed` git could
+   * not clear) is a `wedged` entry carrying its distress `reason` + whether it is
+   * `immediate` (an `abort-failed` mints distress at once, not graced); a lane found
+   * READY or torn down this cycle is a `resolved` path (the positive evidence that
+   * clears its self-clearing `work::<taskId>` row + any open distress). Empty on the
+   * OFF / no-lane path. Optional so a fake driver may omit them (→ no lane arm).
+   */
+  laneWedged?: { path: string; reason: string; immediate: boolean }[];
+  laneResolved?: string[];
 }
 /**
  * Translate a single readiness verdict on a row into the verb the

@@ -1887,7 +1887,7 @@ test("GENERATION_SUMMARY_SQL: the summary walk is served by the v107 partial ind
   }
   kdb.db.run("ANALYZE");
   const plan = kdb.db
-    .prepare("EXPLAIN QUERY PLAN " + GENERATION_SUMMARY_SQL)
+    .prepare(`EXPLAIN QUERY PLAN ${GENERATION_SUMMARY_SQL}`)
     .all() as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toContain("idx_events_tmux_generation");
