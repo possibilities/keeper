@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 109;
+export const SCHEMA_VERSION = 110;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -6024,6 +6024,35 @@ function migrate(db: Database): void {
       addColumnIfMissing(db, "events", "resume_target", "TEXT");
       addColumnIfMissing(db, "jobs", "harness", "TEXT");
       addColumnIfMissing(db, "jobs", "resume_target", "TEXT");
+
+      // v109→v110 (fn-1129.1): add the nullable `human_notified_at` once-marker
+      // (REAL, epoch seconds) to BOTH escalation surfaces — the terminal
+      // "human notified" stage of the two escalation paths, each stamped exactly
+      // once when its escalation session (deconflict::<epic> / unblock::<task>)
+      // declines or dies:
+      //
+      //   - `dispatch_failures.human_notified_at` — the DECONFLICT path, sibling
+      //     of `merge_escalated_at` / `resolver_dispatched_at` on the sticky
+      //     `worktree-merge-conflict` close row. Stamped by a terminal
+      //     `MergeHumanNotified` event, gated `IS NULL`; `foldDispatchFailed`
+      //     preserves it across the `ON CONFLICT` UPSERT and `DispatchCleared`
+      //     (retry_dispatch) drops it with the row so a fresh conflict re-arms.
+      //   - `block_escalations.human_notified_at` — the UNBLOCK path, on the
+      //     per-(epic_id, task_id) block latch. Stamped by a terminal
+      //     `BlockHumanNotified` event, gated `IS NULL`; the leave-blocked latch
+      //     DELETE drops it with the row so an unblock→re-block re-arms at NULL.
+      //
+      // APPEND-via-ALTER keeps existing rows NULL (the zero-event shape) and is
+      // re-fold-safe: a pre-v110 stream carries no `MergeHumanNotified` /
+      // `BlockHumanNotified` event, so a from-scratch re-fold leaves both columns
+      // NULL byte-identically (both folds read only the payload + `event.ts`).
+      // Kept OUT of the CREATE literals (mirrors the sibling marker adds) so a
+      // fresh DB gains the columns via this same idempotent ALTER on boot. NO
+      // cursor rewind. Whitelist-only Python read (keeper-py reads neither table)
+      // — this bump MUST add 110 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
+      // in the SAME commit; test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "dispatch_failures", "human_notified_at", "REAL");
+      addColumnIfMissing(db, "block_escalations", "human_notified_at", "REAL");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

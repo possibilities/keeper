@@ -420,6 +420,10 @@ from pathlib import Path
 # v109 (fn-1103 task .3) adds the nullable ``harness`` + ``resume_target`` TEXT
 # columns to BOTH the events and jobs surfaces (multi-harness agent maturity);
 # keeper-py reads neither column, so only the version whitelist gains 109.
+# v110 (fn-1129 task .1) adds the nullable ``human_notified_at`` once-marker to
+# BOTH ``dispatch_failures`` and ``block_escalations`` (the escalation-session
+# decline/death human-notify latch); keeper-py reads neither table, so only the
+# version whitelist gains 110.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -501,6 +505,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         107,
         108,
         109,
+        110,
     }
 )
 

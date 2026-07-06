@@ -1443,6 +1443,446 @@ test("ResolverDispatchAttempted with a malformed payload is a safe no-op (cursor
   expect(getResolverDispatchedAt("close", "fn-rd-mal")).toBeNull();
 });
 
+test("MergeEscalationAttempted also stamps merge_escalated_at on the terminal dispatched outcome (the deconflict-dispatch marker)", () => {
+  // fn-1129.1 repurposes the merge-escalation marker: the sweep now DISPATCHES a
+  // deconflict::<epic> session and records `dispatched` (terminal) instead of the
+  // old planner@ bus-send `sent`. The fold stamps on `dispatched` too.
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-dsp",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-dsp")).toBeNull();
+
+  const dispatchedId = mergeEscalationEvent("fn-mc-dsp", "dispatched", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getMergeEscalatedAt("close", "fn-mc-dsp")).toBe(1750);
+  expect(getCursor()).toBe(dispatchedId);
+
+  // The launch-failed `dispatch_failed` outcome is NON-terminal — marker stays NULL.
+  dispatchFailedEvent(
+    "close",
+    "fn-mc-dspf",
+    "worktree-merge-conflict",
+    "/r",
+    1760,
+  );
+  mergeEscalationEvent("fn-mc-dspf", "dispatch_failed", 1770);
+  drainAll();
+  expect(getMergeEscalatedAt("close", "fn-mc-dspf")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Schema v110 (fn-1129.1) — `MergeHumanNotified` folds the terminal human-notify
+// once-marker `dispatch_failures.human_notified_at` on a sticky
+// `worktree-merge-conflict` CLOSE row — the DECONFLICT path's third stage. The
+// TERMINAL `notified` outcome stamps `human_notified_at = event.ts` (gated IS
+// NULL); a `notify_failed` / unknown outcome leaves it NULL (re-sweepable). The
+// marker PERSISTS across a `DispatchFailed` re-UPSERT of an uncleared row and is
+// dropped with the row on `DispatchCleared`. INDEPENDENT of merge_escalated_at /
+// resolver_dispatched_at. Pure fold (event.ts + persisted row only).
+// ---------------------------------------------------------------------------
+
+function mergeHumanNotifiedEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "MergeHumanNotified",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome }),
+  });
+}
+
+function getHumanNotifiedAt(verb: string, id: string): number | null {
+  const row = db
+    .query(
+      "SELECT human_notified_at FROM dispatch_failures WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { human_notified_at: number | null } | null;
+  return row?.human_notified_at ?? null;
+}
+
+test("MergeHumanNotified stamps human_notified_at = event.ts on the terminal notified outcome", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-1",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-1")).toBeNull();
+
+  const notifiedId = mergeHumanNotifiedEvent("fn-hn-1", "notified", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getHumanNotifiedAt("close", "fn-hn-1")).toBe(1750);
+  expect(getCursor()).toBe(notifiedId);
+});
+
+test("MergeHumanNotified with a notify_failed / unknown outcome leaves human_notified_at NULL (re-sweepable)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-nf",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeHumanNotifiedEvent("fn-hn-nf", "notify_failed", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-nf")).toBeNull();
+
+  // An unknown / unexpected outcome is non-terminal too (terminal is a strict
+  // allow-list: only a CONFIRMED notification stamps the once-marker).
+  mergeHumanNotifiedEvent("fn-hn-nf", "weird_outcome", 1760);
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-nf")).toBeNull();
+
+  // A later terminal retry over the same still-uncleared row stamps it.
+  mergeHumanNotifiedEvent("fn-hn-nf", "notified", 1770);
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-nf")).toBe(1770);
+});
+
+test("MergeHumanNotified only stamps a CLOSE-verb row (a same-id work failure is untouched)", () => {
+  dispatchFailedEvent("work", "fn-hn-verb", "launch_failed", "/r", 1700);
+  mergeHumanNotifiedEvent("fn-hn-verb", "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt("work", "fn-hn-verb")).toBeNull();
+});
+
+test("MergeHumanNotified on a missing close row is a safe no-op (cursor still advances)", () => {
+  const id = mergeHumanNotifiedEvent("fn-hn-gone", "notified", 1750);
+  expect(drainAll()).toBe(1);
+  expect(getDispatchFailure("close", "fn-hn-gone")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("human_notified_at is INDEPENDENT of merge_escalated_at and resolver_dispatched_at (all three latch on the same sticky)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-ind",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  resolverDispatchEvent("fn-hn-ind", "dispatched", 1740);
+  mergeEscalationEvent("fn-hn-ind", "dispatched", 1750);
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-hn-ind")).toBe(1740);
+  expect(getMergeEscalatedAt("close", "fn-hn-ind")).toBe(1750);
+  // The human-notify marker is still its own NULL latch until notified.
+  expect(getHumanNotifiedAt("close", "fn-hn-ind")).toBeNull();
+
+  mergeHumanNotifiedEvent("fn-hn-ind", "notified", 1760);
+  drainAll();
+  // Stamping the human-notify marker leaves the other two untouched.
+  expect(getResolverDispatchedAt("close", "fn-hn-ind")).toBe(1740);
+  expect(getMergeEscalatedAt("close", "fn-hn-ind")).toBe(1750);
+  expect(getHumanNotifiedAt("close", "fn-hn-ind")).toBe(1760);
+});
+
+test("a DispatchFailed re-UPSERT of an uncleared close row preserves human_notified_at (notify-once)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-pres",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeHumanNotifiedEvent("fn-hn-pres", "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-pres")).toBe(1750);
+
+  // A re-failure of the SAME uncleared close row must NOT reset the notify-once
+  // marker — else the human-notify sweep would re-notify.
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-pres",
+    "worktree-merge-conflict",
+    "/r2",
+    1800,
+  );
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-pres")).toBe(1750);
+});
+
+test("DispatchCleared drops human_notified_at with the close row so a fresh conflict re-arms at NULL", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-clr",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeHumanNotifiedEvent("fn-hn-clr", "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-clr")).toBe(1750);
+
+  dispatchClearedEvent("close", "fn-hn-clr");
+  drainAll();
+  expect(getDispatchFailure("close", "fn-hn-clr")).toBeNull();
+
+  // A fresh conflict on the same key re-arms the marker at the column default.
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-clr",
+    "worktree-merge-conflict",
+    "/r",
+    1800,
+  );
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-hn-clr")).toBeNull();
+});
+
+test("MergeHumanNotified with a malformed payload is a safe no-op (cursor advances, marker untouched)", () => {
+  dispatchFailedEvent(
+    "close",
+    "fn-hn-mal",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  const malformed = [
+    "{ not json",
+    JSON.stringify({ outcome: "notified" }), // missing id
+    JSON.stringify({ id: "", outcome: "notified" }), // empty id
+    JSON.stringify({ id: "fn-hn-mal" }), // missing outcome
+    JSON.stringify({ id: "fn-hn-mal", outcome: "" }), // empty outcome
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "MergeHumanNotified",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  expect(getHumanNotifiedAt("close", "fn-hn-mal")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Schema v110 (fn-1129.1) — the `block_escalations` latch gains STAGED escalation-
+// dispatch outcomes and the terminal human-notify once-marker (the UNBLOCK path).
+// `BlockEscalationAttempted` records a TERMINAL `dispatched` (→ status
+// `attempted`) or a NON-TERMINAL `dispatch_failed` (→ status back to `pending`,
+// re-sweepable). `BlockHumanNotified`'s terminal `notified` stamps the latch's
+// `human_notified_at = event.ts` once-marker; the marker survives a
+// BlockEscalationAttempted re-emit and is dropped only when the leave-blocked
+// TaskSnapshot DELETE re-arms the whole latch. Latch armed via a TaskSnapshot
+// transition into `blocked` (the real arm path; a single blocked snapshot on a
+// first-sight task arms `pending`).
+// ---------------------------------------------------------------------------
+
+function armBlockLatch(epicId: string, taskId: string, ts?: number): number {
+  return taskSnapshotEvent(taskId, {
+    epic_id: epicId,
+    task_number: 1,
+    runtime_status: "blocked",
+    ...(ts != null ? { ts } : {}),
+  });
+}
+
+function unblockTask(
+  epicId: string,
+  taskId: string,
+  runtimeStatus = "todo",
+): number {
+  return taskSnapshotEvent(taskId, {
+    epic_id: epicId,
+    task_number: 1,
+    runtime_status: runtimeStatus,
+  });
+}
+
+function blockAttemptedEvent(
+  epicId: string,
+  taskId: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "BlockEscalationAttempted",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ epic_id: epicId, task_id: taskId, outcome }),
+  });
+}
+
+function blockHumanNotifiedEvent(
+  epicId: string,
+  taskId: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "BlockHumanNotified",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ epic_id: epicId, task_id: taskId, outcome }),
+  });
+}
+
+function getBlockLatch(
+  epicId: string,
+  taskId: string,
+): {
+  status: string;
+  outcome: string | null;
+  human_notified_at: number | null;
+} | null {
+  return db
+    .query(
+      "SELECT status, outcome, human_notified_at FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+    )
+    .get(epicId, taskId) as {
+    status: string;
+    outcome: string | null;
+    human_notified_at: number | null;
+  } | null;
+}
+
+test("BlockEscalationAttempted with the terminal dispatched outcome advances the latch to attempted", () => {
+  armBlockLatch("fn-be-1", "fn-be-1.1");
+  drainAll();
+  expect(getBlockLatch("fn-be-1", "fn-be-1.1")?.status).toBe("pending");
+
+  blockAttemptedEvent("fn-be-1", "fn-be-1.1", "dispatched", 1800);
+  drainAll();
+  const latch = getBlockLatch("fn-be-1", "fn-be-1.1");
+  expect(latch?.status).toBe("attempted");
+  expect(latch?.outcome).toBe("dispatched");
+});
+
+test("BlockEscalationAttempted with the non-terminal dispatch_failed outcome resets the latch to pending (re-sweepable)", () => {
+  armBlockLatch("fn-be-2", "fn-be-2.1");
+  drainAll();
+
+  blockAttemptedEvent("fn-be-2", "fn-be-2.1", "dispatch_failed", 1800);
+  drainAll();
+  const latch = getBlockLatch("fn-be-2", "fn-be-2.1");
+  // status back to pending so selectPendingBlockEscalations re-sweeps it, but the
+  // outcome is recorded so the failure is observable.
+  expect(latch?.status).toBe("pending");
+  expect(latch?.outcome).toBe("dispatch_failed");
+
+  // The bus-send `send_failed` outcome stays non-terminal too (backward compat).
+  blockAttemptedEvent("fn-be-2", "fn-be-2.1", "send_failed", 1810);
+  drainAll();
+  expect(getBlockLatch("fn-be-2", "fn-be-2.1")?.status).toBe("pending");
+});
+
+test("BlockHumanNotified stamps the latch human_notified_at on terminal notified; non-terminal leaves it NULL", () => {
+  armBlockLatch("fn-be-3", "fn-be-3.1");
+  blockAttemptedEvent("fn-be-3", "fn-be-3.1", "dispatched", 1800);
+  drainAll();
+  expect(getBlockLatch("fn-be-3", "fn-be-3.1")?.human_notified_at).toBeNull();
+
+  // A botctl failure is non-terminal — marker stays NULL, re-sweepable.
+  blockHumanNotifiedEvent("fn-be-3", "fn-be-3.1", "notify_failed", 1810);
+  drainAll();
+  expect(getBlockLatch("fn-be-3", "fn-be-3.1")?.human_notified_at).toBeNull();
+
+  const notifiedId = blockHumanNotifiedEvent(
+    "fn-be-3",
+    "fn-be-3.1",
+    "notified",
+    1820,
+  );
+  drainAll();
+  expect(getBlockLatch("fn-be-3", "fn-be-3.1")?.human_notified_at).toBe(1820);
+  expect(getCursor()).toBe(notifiedId);
+});
+
+test("BlockHumanNotified on a missing latch row is a safe no-op (cursor still advances)", () => {
+  const id = blockHumanNotifiedEvent(
+    "fn-be-gone",
+    "fn-be-gone.1",
+    "notified",
+    1800,
+  );
+  expect(drainAll()).toBe(1);
+  expect(getBlockLatch("fn-be-gone", "fn-be-gone.1")).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("a BlockEscalationAttempted re-emit preserves the latch human_notified_at once-marker (notify-once)", () => {
+  armBlockLatch("fn-be-4", "fn-be-4.1");
+  blockAttemptedEvent("fn-be-4", "fn-be-4.1", "dispatched", 1800);
+  blockHumanNotifiedEvent("fn-be-4", "fn-be-4.1", "notified", 1810);
+  drainAll();
+  expect(getBlockLatch("fn-be-4", "fn-be-4.1")?.human_notified_at).toBe(1810);
+
+  // A later escalation-dispatch attempt on the still-latched row (e.g. a
+  // re-sweep) UPDATEs status/outcome but must NOT reset the human-notify marker.
+  blockAttemptedEvent("fn-be-4", "fn-be-4.1", "dispatch_failed", 1820);
+  drainAll();
+  const latch = getBlockLatch("fn-be-4", "fn-be-4.1");
+  expect(latch?.status).toBe("pending");
+  expect(latch?.human_notified_at).toBe(1810);
+});
+
+test("leaving blocked drops the latch and its human_notified_at, and an unblock→re-block re-arms at NULL", () => {
+  armBlockLatch("fn-be-5", "fn-be-5.1");
+  blockAttemptedEvent("fn-be-5", "fn-be-5.1", "dispatched", 1800);
+  blockHumanNotifiedEvent("fn-be-5", "fn-be-5.1", "notified", 1810);
+  drainAll();
+  expect(getBlockLatch("fn-be-5", "fn-be-5.1")?.human_notified_at).toBe(1810);
+
+  // Leave blocked: the TaskSnapshot transition DELETEs the whole latch row.
+  unblockTask("fn-be-5", "fn-be-5.1", "done");
+  drainAll();
+  expect(getBlockLatch("fn-be-5", "fn-be-5.1")).toBeNull();
+
+  // Re-block: a fresh latch arms at pending with the once-marker back at NULL.
+  armBlockLatch("fn-be-5", "fn-be-5.1");
+  drainAll();
+  const rearmed = getBlockLatch("fn-be-5", "fn-be-5.1");
+  expect(rearmed?.status).toBe("pending");
+  expect(rearmed?.human_notified_at).toBeNull();
+});
+
+test("BlockHumanNotified with a malformed payload is a safe no-op (cursor advances, marker untouched)", () => {
+  armBlockLatch("fn-be-mal", "fn-be-mal.1");
+  blockAttemptedEvent("fn-be-mal", "fn-be-mal.1", "dispatched", 1800);
+  drainAll();
+  const malformed = [
+    "{ not json",
+    JSON.stringify({ task_id: "fn-be-mal.1", outcome: "notified" }), // missing epic_id
+    JSON.stringify({ epic_id: "fn-be-mal", outcome: "notified" }), // missing task_id
+    JSON.stringify({ epic_id: "fn-be-mal", task_id: "fn-be-mal.1" }), // missing outcome
+    JSON.stringify({
+      epic_id: "",
+      task_id: "fn-be-mal.1",
+      outcome: "notified",
+    }), // empty epic_id
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "BlockHumanNotified",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  expect(
+    getBlockLatch("fn-be-mal", "fn-be-mal.1")?.human_notified_at,
+  ).toBeNull();
+});
+
 test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => {
   const count = (
     db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {

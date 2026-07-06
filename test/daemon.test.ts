@@ -3220,8 +3220,15 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `harness`/`resume_target` columns to BOTH events — a five-place lockstep —
   // and jobs — migration-only; an additive ALTER, NO cursor rewind: a pre-v109
   // stream carries neither value, so a from-scratch re-fold folds both NULL
-  // byte-identical, and the fold never synthesizes a harness value).
-  expect(SCHEMA_VERSION).toBe(109);
+  // byte-identical, and the fold never synthesizes a harness value). And to 110
+  // via fn-1129 task .1 (appending the nullable `human_notified_at` once-marker to
+  // BOTH `dispatch_failures` and `block_escalations` — the terminal human-notify
+  // stage of the two escalation paths, stamped by `MergeHumanNotified` /
+  // `BlockHumanNotified` on a declined/dead escalation session; additive ALTERs,
+  // NO cursor rewind: a pre-v110 stream carries neither event, so a from-scratch
+  // re-fold leaves both columns NULL byte-identical, and `foldDispatchFailed`
+  // preserves the dispatch_failures marker across the UPSERT).
+  expect(SCHEMA_VERSION).toBe(110);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

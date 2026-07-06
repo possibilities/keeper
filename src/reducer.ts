@@ -66,12 +66,14 @@ import type {
   ApiErrorKind,
   BlockEscalationAttemptedPayload,
   BlockEscalationRequestedPayload,
+  BlockHumanNotifiedPayload,
   Epic,
   Event,
   HandoffLinkEntry,
   InputRequestKind,
   JobLinkEntry,
   MergeEscalationAttemptedPayload,
+  MergeHumanNotifiedPayload,
   PermissionPromptKind,
   ResolvedEpicDep,
   ResolverDispatchAttemptedPayload,
@@ -4000,8 +4002,8 @@ function foldDispatchFailed(db: Database, event: Event): void {
   db.run(
     `INSERT INTO dispatch_failures (
        verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-       merge_escalated_at, resolver_dispatched_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+       merge_escalated_at, resolver_dispatched_at, human_notified_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
@@ -4009,12 +4011,13 @@ function foldDispatchFailed(db: Database, event: Event): void {
        last_event_id = excluded.last_event_id,
        -- created_at preserved through UPSERT: the row's "sticky since"
        -- view is the FIRST observation of this failure, never the latest.
-       -- merge_escalated_at + resolver_dispatched_at preserved through UPSERT
-       -- (excluded from the SET clause, same as created_at): a re-failure of an
-       -- uncleared row must NOT reset either once-marker, or the daemon
-       -- merge-escalation sweep would re-notify the planner and the resolver
-       -- sweep would re-dispatch the resolver. Both markers re-arm only on a
-       -- DispatchCleared (retry_dispatch) DELETE dropping the row entirely.
+       -- merge_escalated_at + resolver_dispatched_at + human_notified_at
+       -- preserved through UPSERT (excluded from the SET clause, same as
+       -- created_at): a re-failure of an uncleared row must NOT reset any
+       -- once-marker, or the daemon merge-escalation sweep would re-dispatch the
+       -- deconflict session and the human-notify sweep would re-notify. All three
+       -- markers re-arm only on a DispatchCleared (retry_dispatch) DELETE
+       -- dropping the row entirely.
        updated_at = excluded.updated_at`,
     [
       payload.verb,
@@ -4555,24 +4558,28 @@ function extractBlockEscalationAttemptedPayload(
 }
 
 /**
- * Fold one synthetic `BlockEscalationAttempted` event. For a TERMINAL outcome
- * (every outcome except `send_failed`) it advances the `block_escalations` latch
- * `requested → attempted` and records the `outcome`. For the non-terminal
- * `send_failed` outcome (fn-948) it instead RESETS the latch to `pending` so
+ * Fold one synthetic `BlockEscalationAttempted` event with STAGED outcomes. For a
+ * TERMINAL outcome (the escalation-dispatch `dispatched`, or any outcome that is
+ * not in the non-terminal set) it advances the `block_escalations` latch
+ * `requested → attempted` and records the `outcome`. For a NON-TERMINAL outcome
+ * (`dispatch_failed` — the `unblock::<task>` launch failed — or the bus-send
+ * `send_failed`) it instead RESETS the latch to `pending` so
  * `selectPendingBlockEscalations` re-sweeps it on the next heartbeat tick — a
- * transient bus failure retries instead of dropping the escalation forever (the
- * latch otherwise only re-arms on an unblock→re-block `TaskSnapshot` transition).
- * The `outcome` is still recorded on the row so the failure is observable. The
- * branch reads ONLY the payload `outcome` + the persisted row (`event.id`, no
- * wall-clock/fs/liveness), so re-fold stays byte-deterministic. Idempotent on a
- * missing latch row (the UPDATE matches zero rows).
+ * transient dispatch failure retries instead of dropping the escalation forever
+ * (the latch otherwise only re-arms on an unblock→re-block `TaskSnapshot`
+ * transition). The `outcome` is still recorded on the row so the failure is
+ * observable. The branch reads ONLY the payload `outcome` + the persisted row
+ * (`event.id`, no wall-clock/fs/liveness), so re-fold stays byte-deterministic.
+ * Idempotent on a missing latch row (the UPDATE matches zero rows).
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);
   if (payload == null) {
     return;
   }
-  const status = payload.outcome === "send_failed" ? "pending" : "attempted";
+  const nonTerminal =
+    payload.outcome === "send_failed" || payload.outcome === "dispatch_failed";
+  const status = nonTerminal ? "pending" : "attempted";
   db.run(
     `UPDATE block_escalations
         SET status = ?, outcome = ?, last_event_id = ?
@@ -4613,17 +4620,18 @@ function extractMergeEscalationAttemptedPayload(
 
 /**
  * Fold one synthetic `MergeEscalationAttempted` event. For a TERMINAL outcome
- * (`sent` / `queued_for_wake` — a confirmed delivery) it stamps the once-marker
- * `merge_escalated_at = event.ts` on the sticky `worktree-merge-conflict` close
- * row, gated `merge_escalated_at IS NULL` so the first observation wins and a
- * re-fold reproduces it byte-identically. Every other outcome (`send_failed` /
- * undelivered / unknown) is NON-TERMINAL and folds to a no-op, leaving the marker
- * NULL so the sweep re-attempts on the next tick — mirroring
- * `foldBlockEscalationAttempted`'s `send_failed`-is-non-terminal rule. The branch
- * reads ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so
- * re-fold stays byte-deterministic. The UPDATE no-ops on a missing row (the
- * clear-before-mint race) and NEVER clears the row — only `DispatchCleared`
- * (`retry_dispatch`) does. Malformed/missing payload → safe no-op.
+ * (the escalation-dispatch `dispatched`, or a delivered bus-send `sent` /
+ * `queued_for_wake`) it stamps the once-marker `merge_escalated_at = event.ts` on
+ * the sticky `worktree-merge-conflict` close row, gated `merge_escalated_at IS
+ * NULL` so the first observation wins and a re-fold reproduces it byte-identically.
+ * Every other outcome (`dispatch_failed` / `send_failed` / undelivered / unknown)
+ * is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts on the next tick — mirroring `foldBlockEscalationAttempted`'s
+ * non-terminal rule. The branch reads ONLY the payload `outcome` + `event.ts` (no
+ * wall-clock/fs/liveness), so re-fold stays byte-deterministic. The UPDATE no-ops
+ * on a missing row (the clear-before-mint race) and NEVER clears the row — only
+ * `DispatchCleared` (`retry_dispatch`) does. Malformed/missing payload → safe
+ * no-op.
  */
 function foldMergeEscalationAttempted(db: Database, event: Event): void {
   const payload = extractMergeEscalationAttemptedPayload(event);
@@ -4631,7 +4639,9 @@ function foldMergeEscalationAttempted(db: Database, event: Event): void {
     return;
   }
   const terminal =
-    payload.outcome === "sent" || payload.outcome === "queued_for_wake";
+    payload.outcome === "dispatched" ||
+    payload.outcome === "sent" ||
+    payload.outcome === "queued_for_wake";
   if (!terminal) {
     return;
   }
@@ -4701,6 +4711,134 @@ function foldResolverDispatchAttempted(db: Database, event: Event): void {
         SET resolver_dispatched_at = ?
       WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL`,
     [event.ts, payload.id],
+  );
+}
+
+/**
+ * Parse a `MergeHumanNotified` event payload. Returns null on any structural miss
+ * ({@link foldMergeHumanNotified} folds null to a safe no-op); NEVER throws.
+ * Strict: `id` / `outcome` non-empty strings.
+ */
+function extractMergeHumanNotifiedPayload(
+  event: Event,
+): MergeHumanNotifiedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<MergeHumanNotifiedPayload>;
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return { id: parsed.id, outcome: parsed.outcome };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse MergeHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `MergeHumanNotified` event — the terminal "human notified"
+ * once-latch of the DECONFLICT path, sibling to {@link foldMergeEscalationAttempted}
+ * and {@link foldResolverDispatchAttempted}. For the TERMINAL `notified` outcome
+ * (the daemon delivered the one botctl notification about a declined/dead
+ * `deconflict::<epic>` session) it stamps `human_notified_at = event.ts` on the
+ * sticky `worktree-merge-conflict` close row, gated `human_notified_at IS NULL` so
+ * the first observation wins and a re-fold reproduces it byte-identically. Every
+ * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
+ * leaving the marker NULL so the sweep re-attempts on the next tick. The branch
+ * reads ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so
+ * re-fold stays byte-deterministic. The UPDATE no-ops on a missing row (the
+ * clear-before-mint race) and NEVER clears the row — only `DispatchCleared`
+ * (`retry_dispatch`) does, which re-arms the marker at NULL. Independent of
+ * `merge_escalated_at` / `resolver_dispatched_at`. Malformed/missing payload →
+ * safe no-op.
+ */
+function foldMergeHumanNotified(db: Database, event: Event): void {
+  const payload = extractMergeHumanNotifiedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.outcome !== "notified") {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET human_notified_at = ?
+      WHERE verb = 'close' AND id = ? AND human_notified_at IS NULL`,
+    [event.ts, payload.id],
+  );
+}
+
+/**
+ * Parse a `BlockHumanNotified` event payload. Returns null on any structural miss
+ * ({@link foldBlockHumanNotified} folds null to a safe no-op); NEVER throws.
+ * Strict: `epic_id` / `task_id` / `outcome` non-empty strings.
+ */
+function extractBlockHumanNotifiedPayload(
+  event: Event,
+): BlockHumanNotifiedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<BlockHumanNotifiedPayload>;
+    if (typeof parsed.epic_id !== "string" || parsed.epic_id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.task_id !== "string" || parsed.task_id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return {
+      epic_id: parsed.epic_id,
+      task_id: parsed.task_id,
+      outcome: parsed.outcome,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse BlockHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `BlockHumanNotified` event — the terminal "human notified"
+ * once-latch of the UNBLOCK path on the `block_escalations` latch, sibling in
+ * discipline to {@link foldMergeHumanNotified}. For the TERMINAL `notified`
+ * outcome (the daemon delivered the one botctl notification about a declined/dead
+ * `unblock::<task>` session) it stamps `human_notified_at = event.ts` on the
+ * `(epic_id, task_id)` latch row, gated `human_notified_at IS NULL` so the first
+ * observation wins and a re-fold reproduces it byte-identically. Every other
+ * outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
+ * leaving the marker NULL so the sweep re-attempts on the next tick. The branch
+ * reads ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so
+ * re-fold stays byte-deterministic. The UPDATE no-ops on a missing latch row (the
+ * leave-blocked DELETE already cleared it) and NEVER clears the latch — only the
+ * leave-blocked `TaskSnapshot` transition does, which re-arms the marker at NULL.
+ * Malformed/missing payload → safe no-op.
+ */
+function foldBlockHumanNotified(db: Database, event: Event): void {
+  const payload = extractBlockHumanNotifiedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.outcome !== "notified") {
+    return;
+  }
+  db.run(
+    `UPDATE block_escalations
+        SET human_notified_at = ?
+      WHERE epic_id = ? AND task_id = ? AND human_notified_at IS NULL`,
+    [event.ts, payload.epic_id, payload.task_id],
   );
 }
 
@@ -9140,6 +9278,10 @@ export function applyEvent(
       foldMergeEscalationAttempted(db, event);
     } else if (event.hook_event === "ResolverDispatchAttempted") {
       foldResolverDispatchAttempted(db, event);
+    } else if (event.hook_event === "MergeHumanNotified") {
+      foldMergeHumanNotified(db, event);
+    } else if (event.hook_event === "BlockHumanNotified") {
+      foldBlockHumanNotified(db, event);
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "AutopilotCapSet") {
