@@ -30,6 +30,10 @@ import {
   writeBirthRecord,
 } from "../src/birth-record";
 import {
+  DARWIN_LSTART_CASES,
+  LINUX_STAT_CASES,
+} from "./fixtures/start-time-parser-cases";
+import {
   expectExit,
   makeHarness,
   runAndCapture,
@@ -195,19 +199,15 @@ describe("resolveBirthDir", () => {
 
 describe("start_time parsers (pure — no ps fork)", () => {
   test("darwin lstart is platform-tagged and null on a bad shape", () => {
-    expect(darwinLstartToStartTime("Wed Jul  3 12:00:00 2026  ps args")).toBe(
-      "darwin:Wed Jul  3 12:00:00 2026",
-    );
-    expect(darwinLstartToStartTime("not an lstart line")).toBeNull();
-    expect(darwinLstartToStartTime("")).toBeNull();
+    for (const { input, expected } of DARWIN_LSTART_CASES) {
+      expect(darwinLstartToStartTime(input)).toBe(expected);
+    }
   });
 
   test("linux /proc stat field 22 is platform-tagged, comm-safe", () => {
-    // comm holds spaces + parens; the reader brackets on the LAST ')'.
-    const stat =
-      "4242 (my ) proc) S 1 4242 4242 0 -1 0 1 1 1 1 1 1 1 1 20 0 1 0 998877 0 0";
-    expect(linuxStatToStartTime(stat)).toBe("linux:998877");
-    expect(linuxStatToStartTime("no close paren")).toBeNull();
+    for (const { input, expected } of LINUX_STAT_CASES) {
+      expect(linuxStatToStartTime(input)).toBe(expected);
+    }
   });
 });
 
