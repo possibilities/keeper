@@ -60,6 +60,12 @@ import {
 } from "../src/tabs-core";
 import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 import {
+  buildParseOptions,
+  TABS_DUMP_FLAGS,
+  TABS_LIST_FLAGS,
+  TABS_RESTORE_FLAGS,
+} from "./descriptor";
+import {
   emitEnvelope,
   errorEnvelope,
   processEnvelopeSink,
@@ -198,10 +204,12 @@ export function parseTabsArgv(argv: string[]): TabsCommand {
   }
   const rest = argv.slice(1);
   try {
+    // Per-verb flag surfaces derived from the pure-data descriptor (ADR 0008),
+    // each verb's own `flags` in `NATIVE_COMMANDS`'s tabs entry.
     if (verb === "list") {
       const { values } = parseArgs({
         args: rest,
-        options: { db: { type: "string" } },
+        options: buildParseOptions(TABS_LIST_FLAGS),
         allowPositionals: false,
       });
       return { kind: "list", db: values.db ?? null };
@@ -209,14 +217,7 @@ export function parseTabsArgv(argv: string[]): TabsCommand {
     if (verb === "restore") {
       const { values } = parseArgs({
         args: rest,
-        options: {
-          apply: { type: "boolean", default: false },
-          generation: { type: "string" },
-          session: { type: "string" },
-          "allow-empty": { type: "boolean", default: false },
-          force: { type: "boolean", default: false },
-          db: { type: "string" },
-        },
+        options: buildParseOptions(TABS_RESTORE_FLAGS),
         allowPositionals: false,
       });
       return {
@@ -232,11 +233,7 @@ export function parseTabsArgv(argv: string[]): TabsCommand {
     // dump
     const { values } = parseArgs({
       args: rest,
-      options: {
-        "include-managed": { type: "boolean", default: false },
-        session: { type: "string" },
-        db: { type: "string" },
-      },
+      options: buildParseOptions(TABS_DUMP_FLAGS),
       allowPositionals: false,
     });
     return {

@@ -21,6 +21,7 @@
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import { buildParseOptions, DASH_FLAGS } from "./descriptor";
 
 const HELP = `keeper dash — read-only live robot job-card screen
 
@@ -47,10 +48,8 @@ It is read-only — no dispatch, no control, no DB open.
 export async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      help: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008).
+    options: buildParseOptions(DASH_FLAGS),
     allowPositionals: false,
   });
 

@@ -50,6 +50,7 @@ import {
 } from "../src/backup";
 import { resolveDbPath, resolveSockPath } from "../src/db";
 import { isPidAlive } from "../src/server-worker";
+import { parseOptions } from "./descriptor";
 
 export const HELP = `keeper reclaim — OFFLINE size-reclaim of the live keeper.db
 
@@ -98,13 +99,8 @@ export function parseReclaimArgs(argv: string[]): ParseFailure | ParseSuccess {
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        "agent-help": { type: "boolean" },
-        "dry-run": { type: "boolean" },
-        db: { type: "string" },
-        sock: { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("reclaim"),
       allowPositionals: false,
       strict: true,
     });

@@ -45,6 +45,7 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
+import { parseOptions } from "./descriptor";
 import {
   type Envelope,
   emitEnvelope,
@@ -452,12 +453,8 @@ export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        json: { type: "boolean" },
-        sock: { type: "string" },
-        "connect-timeout": { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("status"),
       allowPositionals: false,
       strict: true,
     });

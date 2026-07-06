@@ -29,6 +29,7 @@ import { resolveSockPath } from "../src/db";
 import { subscribeCollection } from "../src/readiness-client";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import { createViewShell } from "../src/view-shell";
+import { buildParseOptions, GIT_FLAGS } from "./descriptor";
 
 const COLLECTION = "git";
 
@@ -289,16 +290,9 @@ export function renderRowLines(rows: Record<string, unknown>[]): string[] {
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      "project-dir": { type: "string" },
-      snapshot: { type: "boolean", default: false },
-      watch: { type: "boolean", default: false },
-      // parseArgs has no number type — capture as a string and validate
-      // manually below (exit 2 on a non-positive / non-numeric value).
-      timeout: { type: "string" },
-      help: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008). parseArgs has no number
+    // type — `timeout` is a string, validated manually below.
+    options: buildParseOptions(GIT_FLAGS),
     allowPositionals: false,
   });
 

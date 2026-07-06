@@ -101,6 +101,7 @@ import { appendDiagnostic } from "../src/readiness-diagnostics";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import type { ScheduledTask, SubagentInvocation } from "../src/types";
 import { createViewShell, SELECTED_LINE_PREFIX } from "../src/view-shell";
+import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
 
 const HELP = `keeper jobs — live jobs list over the keeper subscribe server
 
@@ -567,15 +568,9 @@ export function renderJobsBody(
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      snapshot: { type: "boolean", default: false },
-      watch: { type: "boolean", default: false },
-      // parseArgs has no number type — capture as a string and validate
-      // manually below (exit 2 on a non-positive / non-numeric value).
-      timeout: { type: "string" },
-      help: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008). parseArgs has no number
+    // type — `timeout` is a string, validated manually below.
+    options: buildParseOptions(VIEWER_FLAGS),
     allowPositionals: false,
   });
 

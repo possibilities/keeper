@@ -96,6 +96,7 @@ import {
   projectMaxConcurrentPerRoot,
   projectWorktreeMode,
 } from "./autopilot";
+import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
 
 // Re-export shims: `test/board.test.ts` and `scripts/drain-dead-letters.ts`
 // import these symbols from `../cli/board`, but their definitions live in
@@ -495,15 +496,10 @@ export function renderHandoffLinkLines(handoffLinks: unknown): string[] {
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      snapshot: { type: "boolean", default: false },
-      watch: { type: "boolean", default: false },
-      // parseArgs has no number type — capture as a string and validate
-      // manually below (exit 2 on a non-positive / non-numeric value).
-      timeout: { type: "string" },
-      help: { type: "boolean", default: false },
-    },
+    // Options derived from the pure-data descriptor (ADR 0008) so the parsed
+    // flag surface cannot drift from `keeper --help --json`. parseArgs has no
+    // number type — `timeout` is captured as a string and validated below.
+    options: buildParseOptions(VIEWER_FLAGS),
     allowPositionals: false,
   });
 

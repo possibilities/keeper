@@ -33,6 +33,7 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
+import { parseOptions } from "./descriptor";
 import {
   emitEnvelope,
   errorEnvelope,
@@ -126,12 +127,8 @@ export function parseQueryArgs(argv: string[]): ParseFailure | ParseSuccess {
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        json: { type: "boolean" },
-        filter: { type: "string", multiple: true },
-        sock: { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("query"),
       allowPositionals: true,
       strict: true,
     });

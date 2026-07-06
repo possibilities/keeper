@@ -79,6 +79,7 @@ import {
 } from "../src/worker-cell";
 import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
 import { queryCollection } from "./control-rpc";
+import { buildParseOptions, DISPATCH_FLAGS } from "./descriptor";
 
 /**
  * The collection-read seam — `queryCollection`'s signature minus the `R` type
@@ -496,22 +497,8 @@ export function resolveSession(deps: ResolveSessionDeps): {
 export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   const parsed = parseArgs({
     args: argv,
-    options: {
-      prompt: { type: "string" },
-      "prompt-file": { type: "string" },
-      name: { type: "string" },
-      session: { type: "string" },
-      cwd: { type: "string" },
-      preset: { type: "string" },
-      model: { type: "string" },
-      effort: { type: "string" },
-      force: { type: "boolean", default: false },
-      "no-prefix": { type: "boolean", default: false },
-      "dry-run": { type: "boolean", default: false },
-      sock: { type: "string" },
-      help: { type: "boolean", default: false },
-      "agent-help": { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008).
+    options: buildParseOptions(DISPATCH_FLAGS),
     allowPositionals: true,
   });
 

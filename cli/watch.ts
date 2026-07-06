@@ -41,6 +41,7 @@ import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
+import { parseOptions } from "./descriptor";
 
 /** Envelope schema version for `keeper watch` lines. */
 export const WATCH_SCHEMA_VERSION = 1;
@@ -381,12 +382,8 @@ export function parseWatchArgs(argv: string[]): ParseFailure | ParseSuccess {
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        json: { type: "boolean" },
-        sock: { type: "string" },
-        filter: { type: "string", multiple: true },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("watch"),
       allowPositionals: false,
       strict: true,
     });

@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { NATIVE_COMMANDS } from "../cli/descriptor";
 import {
   buildHelpIndex,
   COMPLETION_RESPONDER,
@@ -89,6 +90,30 @@ describe("keeper complete responder candidates", () => {
       );
       for (const verb of SUBCOMMAND_META[name].verbs ?? []) {
         expect(values).toContain(verb);
+      }
+    }
+  });
+});
+
+describe("completions are generated from the descriptor tree (ADR 0008)", () => {
+  test("top-level TAB suggests exactly the dispatchable native surface", async () => {
+    // The candidate set is the descriptor's command names (minus the hidden
+    // responder, plus `completions` which the plugin registers itself).
+    const values = candidateValues(await completionResponder([""], VERSION));
+    for (const cmd of NATIVE_COMMANDS) {
+      expect(values).toContain(cmd.name);
+    }
+  });
+
+  test("second-level TAB enumerates a descriptor command's verbs", async () => {
+    const twoLevel = NATIVE_COMMANDS.filter((c) => (c.verbs?.length ?? 0) > 0);
+    expect(twoLevel.length).toBeGreaterThan(0);
+    for (const cmd of twoLevel) {
+      const values = candidateValues(
+        await completionResponder([cmd.name, ""], VERSION),
+      );
+      for (const verb of cmd.verbs ?? []) {
+        expect(values).toContain(verb.name);
       }
     }
   });

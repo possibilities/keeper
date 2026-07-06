@@ -56,6 +56,7 @@ import {
   writeRequest,
 } from "../src/baseline-store";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
+import { parseOptions } from "./descriptor";
 
 // ── exit codes ───────────────────────────────────────────────────────────────
 
@@ -151,13 +152,8 @@ export function parseBaselineArgs(argv: string[]): ParseFailure | ParseSuccess {
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        repo: { type: "string" },
-        wait: { type: "boolean" },
-        "timeout-ms": { type: "string" },
-        "poll-interval-ms": { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("baseline"),
       allowPositionals: true,
       strict: true,
     });

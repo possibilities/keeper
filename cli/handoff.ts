@@ -45,6 +45,7 @@ import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
 import { slugifyHandoffSlug } from "../src/handoff-slug";
 import type { ClientFrame, ServerFrame } from "../src/protocol";
 import { queryCollection, roundTrip } from "./control-rpc";
+import { buildParseOptions, HANDOFF_FLAGS } from "./descriptor";
 import { resolveSession } from "./dispatch";
 
 const HELP = `keeper handoff — enqueue a fire-and-forget claude worker with a contextful brief
@@ -246,17 +247,8 @@ function slugTaken(message: string): never {
 export async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
-    options: {
-      slug: { type: "string" },
-      prompt: { type: "string" },
-      "prompt-file": { type: "string" },
-      title: { type: "string" },
-      session: { type: "string" },
-      dir: { type: "string" },
-      sock: { type: "string" },
-      help: { type: "boolean", default: false },
-      "agent-help": { type: "boolean", default: false },
-    },
+    // Flag surface derived from the pure-data descriptor (ADR 0008).
+    options: buildParseOptions(HANDOFF_FLAGS),
     allowPositionals: true,
   });
 

@@ -21,6 +21,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildParseOptions,
+  NATIVE_COMMANDS,
+  nativeDescriptor,
+  parseOptions,
+} from "../cli/descriptor";
+import {
   checkRaceGuard,
   main as dispatchMain,
   type LaunchFn,
@@ -310,7 +316,7 @@ describe("cli/keeper command index", () => {
     ] as const) {
       const verbs = byName.get(name)?.verbs;
       expect(Array.isArray(verbs)).toBe(true);
-      expect((verbs as readonly string[]).length).toBeGreaterThan(0);
+      expect((verbs ?? []).length).toBeGreaterThan(0);
     }
     // A leaf (non-two-level) subcommand omits verbs entirely.
     expect(byName.get("status")?.verbs).toBeUndefined();
@@ -327,7 +333,9 @@ describe("cli/keeper command index", () => {
     );
     // The metadata source of truth agrees with the projected index.
     for (const s of index.subcommands) {
-      expect(s.agent_help).toBe(SUBCOMMAND_META[s.name].agentHelp === true);
+      expect(s.agent_help).toBe(
+        SUBCOMMAND_META[s.name as Subcommand].agentHelp === true,
+      );
     }
   });
 
@@ -1255,6 +1263,193 @@ describe("cli/dispatch launches via the keeper agent transport", () => {
       expect(s.readArgvLog()).toContain("agent claude --x-tmux");
     } finally {
       s.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli/descriptor — the pure-data descriptor tree (ADR 0008) is the single
+// source of truth `keeper --help --json`, USAGE, completions, and every derived
+// leaf's parseArgs read from. These pin: the module stays dependency-free; the
+// name tuple matches the descriptor order; parseArgs options are genuinely
+// derived (asserted against a HAND-WRITTEN expected — an independent source of
+// truth, never re-derived from the descriptor by the code under test); the JSON
+// index mirrors the descriptor recursively; USAGE hides internal commands the
+// index still carries.
+// ---------------------------------------------------------------------------
+describe("cli/descriptor purity + derivation", () => {
+  test("descriptor.ts is dependency-free (imports nothing)", () => {
+    const src = readFileSync(
+      join(import.meta.dir, "..", "cli", "descriptor.ts"),
+      "utf8",
+    );
+    // Strip block + line comments (the module's prose names `import` in its
+    // header) before scanning for real import statements.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    // ANY `import … from` / bare `import "…"` / dynamic `import(` is a
+    // dependency; the descriptor must have zero — it is pure data + types.
+    expect(code).not.toMatch(/\bimport\b[\s\S]*?\bfrom\b/);
+    expect(code).not.toMatch(/\bimport\s*['"(]/);
+  });
+
+  test("SUBCOMMANDS tuple matches the descriptor order exactly", () => {
+    // The one hand-maintained list (names, for the literal `Subcommand` union)
+    // is pinned to the descriptor so a divergence is a hard fail, not drift.
+    expect(NATIVE_COMMANDS.map((c) => c.name)).toEqual([...SUBCOMMANDS]);
+  });
+
+  test("buildParseOptions carries type/short/multiple/default, drops summary", () => {
+    // Hand-written expected: the mapping is behavior-critical, so it is asserted
+    // literally rather than by round-tripping the same builder.
+    expect(
+      buildParseOptions([
+        { name: "help", type: "boolean", short: "h", summary: "drop me" },
+        { name: "filter", type: "string", multiple: true },
+        { name: "snapshot", type: "boolean", default: false },
+        { name: "sock", type: "string" },
+      ]),
+    ).toEqual({
+      help: { type: "boolean", short: "h" },
+      filter: { type: "string", multiple: true },
+      snapshot: { type: "boolean", default: false },
+      sock: { type: "string" },
+    });
+  });
+
+  test("parseOptions('baseline') reproduces the leaf's original flag surface", () => {
+    // Independent source of truth: the options the leaf carried BEFORE the
+    // descriptor migration, hand-transcribed here.
+    expect(parseOptions("baseline")).toEqual({
+      help: { type: "boolean", short: "h" },
+      repo: { type: "string" },
+      wait: { type: "boolean" },
+      "timeout-ms": { type: "string" },
+      "poll-interval-ms": { type: "string" },
+    });
+  });
+
+  test("parseOptions('board') preserves the viewer defaults", () => {
+    expect(parseOptions("board")).toEqual({
+      sock: { type: "string" },
+      snapshot: { type: "boolean", default: false },
+      watch: { type: "boolean", default: false },
+      timeout: { type: "string" },
+      help: { type: "boolean", default: false },
+    });
+  });
+
+  test("parseOptions('query') preserves the repeatable filter", () => {
+    expect(parseOptions("query")).toEqual({
+      help: { type: "boolean", short: "h" },
+      json: { type: "boolean" },
+      filter: { type: "string", multiple: true },
+      sock: { type: "string" },
+    });
+  });
+
+  test("parseOptions('tabs', 'restore') derives the per-verb surface", () => {
+    expect(parseOptions("tabs", "restore")).toEqual({
+      apply: { type: "boolean", default: false },
+      generation: { type: "string" },
+      session: { type: "string" },
+      "allow-empty": { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
+      db: { type: "string" },
+    });
+  });
+
+  test("parseOptions throws on an unknown command/verb (a wiring bug)", () => {
+    expect(() => parseOptions("nope")).toThrow(/unknown native command/);
+    expect(() => parseOptions("tabs", "nope")).toThrow(/unknown verb/);
+  });
+
+  test("nativeDescriptor resolves a top-level command, undefined otherwise", () => {
+    expect(nativeDescriptor("baseline")?.name).toBe("baseline");
+    expect(nativeDescriptor("nope")).toBeUndefined();
+  });
+});
+
+describe("keeper --help --json recursive descriptor tree", () => {
+  test("index nodes mirror the descriptor's per-command metadata", () => {
+    const index = buildHelpIndex();
+    // Every descriptor command projects to an index node in the same order.
+    expect(index.subcommands.map((s) => s.name)).toEqual(
+      NATIVE_COMMANDS.map((c) => c.name),
+    );
+    for (const cmd of NATIVE_COMMANDS) {
+      const node = index.subcommands.find((s) => s.name === cmd.name);
+      expect(node).toBeDefined();
+      const n = node as NonNullable<typeof node>;
+      expect(n.visibility).toBe(cmd.visibility);
+      expect(n.mutates).toBe(cmd.mutates);
+      expect(n.requires_daemon).toBe(cmd.requires_daemon);
+      expect(n.requires_tty).toBe(cmd.requires_tty);
+      expect(n.agent_help).toBe(cmd.agent_help === true);
+      // Flags round-trip name+type from the descriptor.
+      expect(n.flags.map((f) => f.name)).toEqual(cmd.flags.map((f) => f.name));
+    }
+  });
+
+  test("carries a self-describing schema note", () => {
+    expect(buildHelpIndex().schema.length).toBeGreaterThan(0);
+  });
+
+  test("indexes exit 124 (panel wait re-issue) in the shared taxonomy", () => {
+    expect(buildHelpIndex().exit_codes["124"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("baseline node declares its format_modes, flags, and exit codes", () => {
+    const baseline = buildHelpIndex().subcommands.find(
+      (s) => s.name === "baseline",
+    );
+    expect(baseline?.format_modes).toEqual(["json"]);
+    expect(baseline?.flags.map((f) => f.name)).toEqual([
+      "help",
+      "repo",
+      "wait",
+      "timeout-ms",
+      "poll-interval-ms",
+    ]);
+    expect(baseline?.exit_codes?.["3"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("tabs node carries its verbs recursively with per-verb flags", () => {
+    const tabs = buildHelpIndex().subcommands.find((s) => s.name === "tabs");
+    expect(tabs?.verbs?.map((v) => v.name)).toEqual([
+      "list",
+      "restore",
+      "dump",
+    ]);
+    const restore = tabs?.verbs?.find((v) => v.name === "restore");
+    expect(restore?.flags.map((f) => f.name)).toContain("apply");
+  });
+});
+
+describe("USAGE hides internal commands the JSON index still carries", () => {
+  test("statusline-sink is visibility:internal, omitted from USAGE, present in --help --json", () => {
+    // Omitted from the human USAGE block…
+    expect(USAGE).not.toContain("statusline-sink");
+    // …but present in the machine index, tagged internal.
+    const node = buildHelpIndex().subcommands.find(
+      (s) => s.name === "statusline-sink",
+    );
+    expect(node).toBeDefined();
+    expect(node?.visibility).toBe("internal");
+  });
+
+  test("every PUBLIC descriptor command appears in USAGE", () => {
+    for (const cmd of NATIVE_COMMANDS) {
+      if (cmd.visibility === "internal") continue;
+      expect(USAGE).toContain(cmd.name);
+    }
+  });
+
+  test("every descriptor command name dispatches to its handler", async () => {
+    // The dispatchable native surface is exactly the descriptor tree's names.
+    for (const cmd of NATIVE_COMMANDS) {
+      const h = makeHarness();
+      await dispatch([cmd.name], h.deps);
+      expect(h.calls).toEqual([{ sub: cmd.name as Subcommand, argv: [] }]);
     }
   });
 });

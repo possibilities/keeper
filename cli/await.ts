@@ -81,6 +81,7 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import type { Epic, GitStatus, Job } from "../src/types";
+import { parseOptions } from "./descriptor";
 
 // ---------------------------------------------------------------------------
 // Help text
@@ -375,16 +376,8 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
   try {
     const parsed = parseArgs({
       args: argv,
-      options: {
-        help: { type: "boolean", short: "h" },
-        timeout: { type: "string" },
-        "connect-timeout": { type: "string" },
-        "fail-on-stuck": { type: "boolean" },
-        "no-armed-line": { type: "boolean" },
-        "require-transition": { type: "boolean" },
-        json: { type: "boolean" },
-        sock: { type: "string" },
-      },
+      // Derived from the pure-data descriptor (ADR 0008).
+      options: parseOptions("await"),
       allowPositionals: true,
       strict: true,
     });

@@ -52,6 +52,7 @@ import {
 import type { Epic, Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
 import { queryCollection, sendControlRpc } from "./control-rpc";
+import { AUTOPILOT_FLAGS, buildParseOptions } from "./descriptor";
 import {
   type Envelope,
   emitEnvelope,
@@ -1181,18 +1182,10 @@ export async function assertNoMidEpicDispatch(
 export async function main(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
-    options: {
-      sock: { type: "string" },
-      snapshot: { type: "boolean", default: false },
-      watch: { type: "boolean", default: false },
-      // parseArgs has no number type — capture as a string and validate
-      // manually below (exit 2 on a non-positive / non-numeric value).
-      timeout: { type: "string" },
-      help: { type: "boolean", default: false },
-      "agent-help": { type: "boolean", default: false },
-      // `worktree <on|off> --force` — bypass the mid-epic toggle guard.
-      force: { type: "boolean", default: false },
-    },
+    // Derived from the pure-data descriptor (ADR 0008). `timeout` is a string
+    // (parseArgs has no number type), validated below; `force` rides the
+    // `worktree <on|off>` mid-epic toggle-guard bypass.
+    options: buildParseOptions(AUTOPILOT_FLAGS),
     allowPositionals: true,
   });
 
