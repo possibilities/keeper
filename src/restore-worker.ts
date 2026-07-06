@@ -111,6 +111,7 @@ import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
 import { defaultLauncherPrefix, renderSnapshotScript } from "./tabs-core";
 import type { TmuxTopologyPane } from "./tmux-focus-derive";
+import { keeperTmuxSessionCwd } from "./tmux-session-cwd";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 
@@ -985,6 +986,7 @@ export function restorePulse(
       buildReviveScriptCandidates(jobs);
     const script = renderSnapshotScript(candidates, {
       prefix,
+      tmuxSessionCwd: keeperTmuxSessionCwd(process.env),
       sourcePath,
       excludedManagedCount,
     });

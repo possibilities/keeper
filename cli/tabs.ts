@@ -58,6 +58,7 @@ import {
   renderSnapshotScript,
   restorePlanTouchesManagedSession,
 } from "../src/tabs-core";
+import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 import {
   emitEnvelope,
   errorEnvelope,
@@ -481,6 +482,7 @@ function runDump(
     renderSnapshotScript(set.candidates, {
       sessionFilter: session,
       prefix: defaultLauncherPrefix(),
+      tmuxSessionCwd: keeperTmuxSessionCwd(process.env),
       sourcePath: dbPath,
       excludedManagedCount: set.excludedManagedCount,
     }),

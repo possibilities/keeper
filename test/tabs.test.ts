@@ -219,6 +219,7 @@ function enriched(
 }
 
 const RESTORE_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"];
+const RESTORE_TMUX_SESSION_CWD = "/home/tester";
 
 // ---------------------------------------------------------------------------
 // renderSnapshotScript — the dump revive script
@@ -243,12 +244,15 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE keeper agent
   ];
   const script = renderSnapshotScript(candidates, {
     prefix: RESTORE_PREFIX,
+    tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
     sourcePath: "/tmp/keeper.db",
   });
   expect(script.startsWith("#!/usr/bin/env bash\n")).toBe(true);
   expect(script).toContain("set -euo pipefail");
   expect(script).toContain("'tmux' 'has-session' '-t' '=work'");
-  expect(script).toContain("'tmux' 'new-session' '-d' '-s' 'work'");
+  expect(script).toContain(
+    "'tmux' 'new-session' '-d' '-s' 'work' '-c' '/home/tester'",
+  );
   // BARE keeper agent resume argv — no `tmux new-window` wrapper; cwd via `cd`.
   expect(script).not.toContain("'tmux' 'new-window'");
   expect(script).toContain("cd '/repo/a' && '/abs/bun' '/abs/cli/keeper.ts'");
@@ -268,6 +272,7 @@ test("renderSnapshotScript header reports captured + excluded-managed counts", (
     [fakeCandidate({ job_id: "j", resume_target: "n", label: "n" })],
     {
       prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
       sourcePath: "/tmp/keeper.db",
       excludedManagedCount: 3,
     },
@@ -289,7 +294,11 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper
         cwd: "/repo",
       }),
     ],
-    { prefix: RESTORE_PREFIX, sourcePath: "/tmp/keeper.db" },
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+    },
   );
   expect(script).toContain(
     "cd '/repo' && '/abs/bun' '/abs/cli/keeper.ts' 'agent' 'claude' " +
@@ -323,7 +332,11 @@ test("renderSnapshotScript: a resume target with shell metacharacters is single-
         cwd: "/repo",
       }),
     ],
-    { prefix: RESTORE_PREFIX, sourcePath: "/tmp/keeper.db" },
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+    },
   );
   const quoted = `'${nasty.replace(/'/g, `'\\''`)}'`;
   expect(script).toContain(`'--resume' ${quoted}`);
@@ -371,7 +384,11 @@ test("renderSnapshotScript: a newline in label AND session stays inside its # co
         backend_exec_session_id: "work\ntouch /tmp/pwned",
       }),
     ],
-    { prefix: RESTORE_PREFIX, sourcePath: "/tmp/keeper.db" },
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+    },
   );
   // Both agent-influenced values fold onto a single `#` comment line each.
   expect(script).toContain("# harmless rm -rf ~/precious");
@@ -456,6 +473,7 @@ test("renderSnapshotScript --session filter narrows to one bucket", () => {
   const script = renderSnapshotScript(candidates, {
     sessionFilter: "other",
     prefix: RESTORE_PREFIX,
+    tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
     sourcePath: "/tmp/keeper.db",
   });
   expect(script).toContain("'--resume' 'b-name'");
@@ -789,7 +807,11 @@ test("renderSnapshotScript: a codex candidate emits `agent codex … resume`, a 
         label: "hermes tab",
       }),
     ],
-    { prefix: RESTORE_PREFIX, sourcePath: "/tmp/keeper.db" },
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+    },
   );
   expect(script).toContain("'agent' 'codex'");
   expect(script).toContain("'resume' 'rollout-9'");

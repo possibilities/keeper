@@ -41,6 +41,7 @@ import { parseArgs } from "node:util";
 import { resolveDbPath, resolveRestorePath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
 import { loadRestorePlan } from "../src/tabs-core";
+import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 import { formatAge } from "./tabs";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
@@ -114,7 +115,8 @@ export const DASH_SUB_PANES = [
   "usage",
 ] as const;
 
-const KEEPER_DIR = `${process.env.HOME ?? ""}/code/keeper`;
+const HOME_DIR = keeperTmuxSessionCwd(process.env);
+const KEEPER_DIR = `${HOME_DIR}/code/keeper`;
 /** Detached-session fallback size when neither $TMUX nor `tput` yields one. */
 const FALLBACK_WIDTH = 200;
 const FALLBACK_HEIGHT = 50;
@@ -248,7 +250,7 @@ export function buildTputArgs(cap: string): string[] {
 }
 
 /**
- * `tmux -L dash new-session -d -s dash -c <dir> -e TMUX= -x <W> -y <H> -P -F
+ * `tmux -L dash new-session -d -s dash -c <home> -e TMUX= -x <W> -y <H> -P -F
  * '#{pane_id}' -- <argv...>`. Detached on the dedicated dash server, the board
  * pane's `zsh -ic` triple after `--`, explicitly sized so the detached session
  * does not boot at tmux's 80x24 default. `-e TMUX=` clears the inherited
@@ -266,7 +268,7 @@ export function buildDashNewSessionArgs(
     "-s",
     DASH_SESSION,
     "-c",
-    KEEPER_DIR,
+    HOME_DIR,
     "-e",
     "TMUX=",
     "-x",
@@ -297,7 +299,7 @@ export function buildSetMainPaneWidthArgs(): string[] {
 }
 
 /**
- * `split-window -d -t =dash -c <dir> -P -F '#{pane_id}' -- <argv...>`. `-d`
+ * `split-window -d -t =dash -c <home> -P -F '#{pane_id}' -- <argv...>`. `-d`
  * keeps the new pane unfocused; `-P -F '#{pane_id}'` prints the created pane's
  * id so we can re-select the board pane without positional pane targets.
  */
@@ -308,7 +310,7 @@ export function buildDashSplitArgs(sub: string): string[] {
     "-t",
     `=${DASH_SESSION}:`,
     "-c",
-    KEEPER_DIR,
+    HOME_DIR,
     "-P",
     "-F",
     "#{pane_id}",
@@ -331,7 +333,7 @@ export function buildSelectPaneArgs(paneId: string): string[] {
 }
 
 /**
- * `new-session -d -s <name> -c <dir> -e KEEPER_TMUX_SESSION=<name>` work-session
+ * `new-session -d -s <name> -c <home> -e KEEPER_TMUX_SESSION=<name>` work-session
  * mint. The `-e` stamp mirrors exec-backend's session mint so hook attribution
  * matches daemon-minted sessions.
  */
@@ -343,7 +345,7 @@ export function buildWorkNewSessionArgs(session: string): string[] {
     "-s",
     session,
     "-c",
-    KEEPER_DIR,
+    HOME_DIR,
     "-e",
     `KEEPER_TMUX_SESSION=${session}`,
   ];

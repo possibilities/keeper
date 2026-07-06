@@ -133,13 +133,15 @@ test("buildTmuxHasSessionArgs: `=`-prefixed exact-match target", () => {
   ]);
 });
 
-test("buildTmuxNewSessionArgs: detached mint injects KEEPER_TMUX_SESSION via -e", () => {
-  expect(buildTmuxNewSessionArgs("autopilot")).toEqual([
+test("buildTmuxNewSessionArgs: detached mint sets session cwd and injects KEEPER_TMUX_SESSION", () => {
+  expect(buildTmuxNewSessionArgs("autopilot", "/home/tester")).toEqual([
     "tmux",
     "new-session",
     "-d",
     "-s",
     "autopilot",
+    "-c",
+    "/home/tester",
     "-e",
     "KEEPER_TMUX_SESSION=autopilot",
   ]);

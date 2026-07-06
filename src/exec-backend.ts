@@ -365,19 +365,25 @@ export function buildTmuxHasSessionArgs(session: string): string[] {
 }
 
 /**
- * Build the tmux `new-session -d -s <session> -e KEEPER_TMUX_SESSION=<session>`
- * mint argv. Pure — exported for tests. `-d` detaches (no client attach);
- * `-e KEEPER_TMUX_SESSION=...` is process-scoped so the session's panes inherit
- * it for the hook's session-name stamp (NEVER `set-environment`, which is
- * server-wide). Requires tmux ≥3.2 for `new-session -e`.
+ * Build the tmux `new-session -d -s <session> -c <sessionCwd> -e
+ * KEEPER_TMUX_SESSION=<session>` mint argv. Pure — exported for tests. `-d`
+ * detaches (no client attach); `-e KEEPER_TMUX_SESSION=...` is process-scoped so
+ * the session's panes inherit it for the hook's session-name stamp (NEVER
+ * `set-environment`, which is server-wide). Requires tmux ≥3.2 for
+ * `new-session -e`.
  */
-export function buildTmuxNewSessionArgs(session: string): string[] {
+export function buildTmuxNewSessionArgs(
+  session: string,
+  sessionCwd: string,
+): string[] {
   return [
     "tmux",
     "new-session",
     "-d",
     "-s",
     session,
+    "-c",
+    sessionCwd,
     "-e",
     `KEEPER_TMUX_SESSION=${session}`,
   ];

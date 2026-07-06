@@ -312,6 +312,8 @@ export interface SnapshotScriptOptions {
   sessionFilter?: string | null;
   /** The absolute `keeper agent` launcher argv prefix (PATH-independent). */
   prefix: string[];
+  /** Working directory assigned to any tmux session the script creates. */
+  tmuxSessionCwd: string;
   /** Provenance line printed in the header (the keeper.db path the set came from). */
   sourcePath: string;
   /** Count of live panes EXCLUDED from this script (reconciler-managed workers by
@@ -327,7 +329,8 @@ export interface SnapshotScriptOptions {
  * new-window` wrapper (keeper agent creates its OWN session+window). A `cd <cwd>
  * &&` prefix sets the directory keeper agent reads from `process.cwd()`. Each
  * session is preceded by a redundant-but-explicit `has-session || new-session`
- * get-or-create guard so the script reads self-contained.
+ * get-or-create guard so the script reads self-contained. The guard sets tmux's
+ * session working directory to `options.tmuxSessionCwd`.
  *
  * Sessions emit in alpha order; candidates within a session in the visual window
  * order they arrived in. A `sleep 0.5` line separates consecutive launches
@@ -391,7 +394,7 @@ export function renderSnapshotScript(
     // from tripping when has-session exits non-zero (session absent).
     lines.push(
       `${quoteArgv(buildTmuxHasSessionArgs(sessionName))} 2>/dev/null || ` +
-        `${quoteArgv(buildTmuxNewSessionArgs(sessionName))}`,
+        `${quoteArgv(buildTmuxNewSessionArgs(sessionName, options.tmuxSessionCwd))}`,
     );
     for (const candidate of bucket) {
       // A non-claude agent keeper never back-filled a resume target for is

@@ -247,6 +247,7 @@ describe("--x-tmux", () => {
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
+      env: { HOME: "/fake-home" },
       cwd,
       randomUuid: () => sessionId,
       tmuxCommand: (cmd) => {
@@ -272,6 +273,10 @@ describe("--x-tmux", () => {
       "new-session",
       "select-window",
     ]);
+    const newSession = h.tmuxCommands.find((cmd) =>
+      cmd.includes("new-session"),
+    );
+    expect(newSession?.at(newSession.indexOf("-c") + 1)).toBe("/fake-home");
     expect(h.spawned).toEqual([]);
     expect(parseJsonOutput(h.out)).toMatchObject({
       schema_version: 1,

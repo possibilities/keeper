@@ -30,9 +30,9 @@ import {
   type SyncSpawnResult,
   sweepBusyPanes,
 } from "../cli/setup-tmux";
+import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 
-const HOME = process.env.HOME ?? "";
-const KEEPER_DIR = `${HOME}/code/keeper`;
+const HOME = keeperTmuxSessionCwd(process.env);
 
 /**
  * Sync-spawn stub matching the `Bun.spawnSync` Buffer shape. Records every
@@ -140,7 +140,7 @@ describe("dash build plan", () => {
       "-s",
       "dash",
       "-c",
-      KEEPER_DIR,
+      HOME,
       "-e",
       "TMUX=",
       "-x",
@@ -181,7 +181,7 @@ describe("dash build plan", () => {
       "-t",
       "=dash:",
       "-c",
-      KEEPER_DIR,
+      HOME,
       "-P",
       "-F",
       "#{pane_id}",
@@ -251,7 +251,7 @@ describe("work-session mint", () => {
       "-s",
       "work",
       "-c",
-      KEEPER_DIR,
+      HOME,
       "-e",
       "KEEPER_TMUX_SESSION=work",
     ]);

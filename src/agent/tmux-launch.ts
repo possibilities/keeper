@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { keeperTmuxSessionCwd } from "../tmux-session-cwd";
 import type { AgentKind } from "./dispatch";
 
 /**
@@ -494,6 +495,7 @@ export function launchKeeperAgentInTmux(
     req.options.env,
     req.transcriptSessionId,
   );
+  const sessionCwd = keeperTmuxSessionCwd(req.env);
 
   const newWindowCmd = [
     ...tmuxBase,
@@ -522,7 +524,7 @@ export function launchKeeperAgentInTmux(
     ...windowNameArgs(windowName),
     ...envArgs(paneEnv),
     "-c",
-    req.cwd,
+    sessionCwd,
     launchCommand,
   ];
 
