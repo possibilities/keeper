@@ -35,5 +35,5 @@ a clean-lane-reads-off-branch bug.
 - [ ] `bun test test/worktree-git.test.ts test/autopilot-worker.test.ts` is green
 
 ## Done summary
-
+Extracted exported shortBranchName(ref) helper in src/worktree-git.ts and routed all inline refs/heads/ strips (isKeeperLaneEntry, epicIdFromKeeperLaneEntry, and the lane-base readiness probe plus two additional drifted copies in src/autopilot-worker.ts) through it. Pure refactor; test/worktree-git.test.ts + test/autopilot-worker.test.ts green.
 ## Evidence
