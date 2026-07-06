@@ -82,6 +82,7 @@ import {
 } from "../src/readiness-client";
 import type { Epic, GitStatus, Job } from "../src/types";
 import { parseOptions } from "./descriptor";
+import { parseDuration } from "./duration";
 
 // ---------------------------------------------------------------------------
 // Help text
@@ -328,39 +329,15 @@ export function parseMonitorSelector(token: string): MonitorSelector | null {
   return { command: token };
 }
 
-/**
- * Parse a duration like `30s`, `5m`, `2h`, or a bare-ms integer
- * (`5000` → 5000ms). Returns `null` on parse error. Returns 0 only if
- * the caller literally writes `0` (we accept it; the main loop treats
- * 0 as "no deadline" via the caller-side null check, not here).
- */
-export function parseDurationMs(s: string): number | null {
-  const m = /^(\d+)(ms|s|m|h)?$/.exec(s.trim());
-  if (m === null) {
-    return null;
-  }
-  const n = Number.parseInt(m[1] ?? "", 10);
-  if (!Number.isFinite(n) || n < 0) {
-    return null;
-  }
-  const unit = m[2] ?? "ms";
-  switch (unit) {
-    case "ms":
-      return n;
-    case "s":
-      return n * 1000;
-    case "m":
-      return n * 60_000;
-    case "h":
-      return n * 3_600_000;
-    default:
-      return null;
-  }
-}
+/** Exit code for a usage/grammar fault (a bad flag value). */
+const EXIT_USAGE = 2;
 
 interface ParseFailure {
   ok: false;
   message: string;
+  /** Process exit code for `main` (default 1); a bad duration is a usage
+   *  fault → exit 2 under the shared grammar. */
+  exitCode?: number;
 }
 
 interface ParseSuccess {
@@ -642,29 +619,31 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
   let timeoutMs: number | null = null;
   const timeoutRaw = values.timeout;
   if (typeof timeoutRaw === "string" && timeoutRaw.length > 0) {
-    const parsed = parseDurationMs(timeoutRaw);
-    if (parsed === null) {
+    const parsed = parseDuration(timeoutRaw);
+    if (!parsed.ok) {
       return {
         ok: false,
-        message: `invalid --timeout '${timeoutRaw}' (expected e.g. 30s, 5m, 2h, or ms integer)`,
+        message: `--timeout ${parsed.message}`,
+        exitCode: EXIT_USAGE,
       };
     }
-    timeoutMs = parsed;
+    timeoutMs = parsed.ms;
   }
 
   // `--connect-timeout` clones the `--timeout` parse-and-validate block,
-  // reusing `parseDurationMs` (fn-757). `null`/`0`/absent = reconnect forever.
+  // reusing the shared duration grammar. Absent = reconnect forever.
   let connectTimeoutMs: number | null = null;
   const connectTimeoutRaw = values["connect-timeout"];
   if (typeof connectTimeoutRaw === "string" && connectTimeoutRaw.length > 0) {
-    const parsed = parseDurationMs(connectTimeoutRaw);
-    if (parsed === null) {
+    const parsed = parseDuration(connectTimeoutRaw);
+    if (!parsed.ok) {
       return {
         ok: false,
-        message: `invalid --connect-timeout '${connectTimeoutRaw}' (expected e.g. 30s, 5m, 2h, or ms integer)`,
+        message: `--connect-timeout ${parsed.message}`,
+        exitCode: EXIT_USAGE,
       };
     }
-    connectTimeoutMs = parsed;
+    connectTimeoutMs = parsed.ms;
   }
 
   const sock =
@@ -2234,7 +2213,7 @@ export async function main(argv: string[]): Promise<void> {
     }
     process.stderr.write(`keeper await: ${parsed.message}\n\n`);
     process.stderr.write(HELP);
-    process.exit(1);
+    process.exit(parsed.exitCode ?? 1);
   }
 
   // Side-effect reads (NOT the pure module): resolve cwd→git root only when

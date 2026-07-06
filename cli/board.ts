@@ -97,6 +97,7 @@ import {
   projectWorktreeMode,
 } from "./autopilot";
 import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
+import { parseDuration } from "./duration";
 
 // Re-export shims: `test/board.test.ts` and `scripts/drain-dead-letters.ts`
 // import these symbols from `../cli/board`, but their definitions live in
@@ -109,7 +110,7 @@ export {
   sendReplayDeadLetterRpc,
 } from "../src/board-render";
 
-const HELP = `keeper board [--sock <path>] [--snapshot | --watch] [--timeout <s>]
+const HELP = `keeper board [--sock <path>] [--snapshot | --watch] [--timeout <dur>]
 
 Epics-only UI over the keeper subscribe server: one block per open epic
 (header, task lines, nested job + sub-agent rows, close row), led by '---'.
@@ -120,7 +121,8 @@ Options:
   --snapshot       Force one-shot snapshot mode (one frame + a parseable
                    keeper-meta: line, then exit) even on a TTY
   --watch          Force the live subscribe stream even when piped
-  --timeout <s>    Snapshot wait before the timeout escape (default ~2s)
+  --timeout <dur>  Snapshot wait before the timeout escape (default ~2s;
+                   unit required, e.g. 500ms, 2s)
   --help           Show this help
 
 TUI keys: ←/h/k prev frame · →/l/j next · g oldest · G/End/Esc live ·
@@ -526,18 +528,16 @@ export async function main(argv: string[]): Promise<void> {
     throw err;
   }
 
-  // Validate `--timeout` (seconds) only when snapshotting — a bad value is
-  // CLI misuse (exit 2). Watch mode ignores it.
+  // Validate `--timeout` (shared duration grammar) only when snapshotting — a
+  // bad value is CLI misuse (exit 2). Watch mode ignores it.
   let timeoutMs: number | undefined;
   if (values.timeout !== undefined) {
-    const secs = Number(values.timeout);
-    if (!Number.isFinite(secs) || secs <= 0) {
-      process.stderr.write(
-        `keeper board: --timeout must be a positive number of seconds (got '${values.timeout}')\n`,
-      );
+    const parsed = parseDuration(values.timeout);
+    if (!parsed.ok) {
+      process.stderr.write(`keeper board: --timeout ${parsed.message}\n`);
       process.exit(2);
     }
-    timeoutMs = Math.round(secs * 1000);
+    timeoutMs = parsed.ms;
   }
 
   const sockPath = values.sock ?? resolveSockPath();

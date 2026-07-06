@@ -257,8 +257,8 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
     "panels",
     "--output",
     "/d/rA.yaml",
-    "--stop-timeout-ms",
-    "1800000",
+    "--stop-timeout",
+    "1800000ms",
     "--name",
     "panel::my-run::rA",
   ]);
@@ -287,7 +287,7 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
   const wrapper = buildDetachWrapperArgv(presetArgv);
   expect(wrapper.slice(0, 4)).toEqual(["sh", "-c", DETACH_SCRIPT, "--"]);
   // No coreutils detach/bound commands anywhere — not as the spawn binary, and
-  // not inside the detach script (keeper's own `--stop-timeout-ms` FLAG is fine —
+  // not inside the detach script (keeper's own `--stop-timeout` FLAG is fine —
   // it is a distinct token, never the bare `timeout` binary).
   expect(wrapper[0]).toBe("sh");
   for (const banned of ["setsid", "timeout", "gtimeout"]) {
@@ -340,11 +340,11 @@ test("start: persists + prints a manifest, launches every leg detached", async (
     expect(typeof s.env.PIDFILE).toBe("string");
     expect(s.env.PATH).toBe("/usr/bin"); // base env carried through
     // The wrapped leg is `agent run`, and the panel's --timeout (s) is translated
-    // to --stop-timeout-ms (900s → 900000ms).
+    // to a --stop-timeout ms duration (900s → 900000ms).
     const leg = s.argv.slice(4);
     expect(leg.slice(0, 4)).toEqual([KEEPER_BIN, KEEPER_AGENT, "agent", "run"]);
-    const tIdx = leg.indexOf("--stop-timeout-ms");
-    expect(leg[tIdx + 1]).toBe("900000");
+    const tIdx = leg.indexOf("--stop-timeout");
+    expect(leg[tIdx + 1]).toBe("900000ms");
     // Each leg is named panel::<slug>::<member> so the run + preset are visible.
     const nameIdx = leg.indexOf("--name");
     expect(leg[nameIdx + 1]).toMatch(/^panel::my-run::(rA|rB)$/);
