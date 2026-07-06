@@ -39,5 +39,5 @@ Prose-only change; verification is grep-shaped: no occurrence of reject-while-of
 - [ ] The orient snippet's autopilot envelope field list includes the stored field
 
 ## Done summary
-
+Brought autopilot SKILL.md and the orient snippet onto the stored-vs-effective per-root cap contract: explicit capture/restore rule (pin+restore max_concurrent_per_root_stored, never the effective field), updated status/show examples and field counts, and re-locked the vendored corpus hash.
 ## Evidence
