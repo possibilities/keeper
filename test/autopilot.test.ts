@@ -1133,6 +1133,34 @@ test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` seg
   ).toBe("[playing] · armed · 2 armed · max ∞ · per-root 1 · worktree:on");
 });
 
+test("autopilotBannerLabel — annotates the STORED intent only when it differs from effective (worktree-off floor)", () => {
+  // Worktree off ⇒ effective 1 while the stored intent stays 3: the latent cap
+  // is surfaced as `per-root 1 (stored 3)` so it is never invisible.
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
+      maxConcurrentPerRootStored: 3,
+      mode: "yolo",
+      armedCount: 0,
+      worktreeMode: false,
+    }),
+  ).toBe("[playing] · yolo · max ∞ · per-root 1 (stored 3) · worktree:off");
+  // Stored equal to effective (worktree on) → no annotation.
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 3,
+      maxConcurrentPerRootStored: 3,
+      mode: "yolo",
+      armedCount: 0,
+      worktreeMode: true,
+    }),
+  ).toBe("[playing] · yolo · max ∞ · per-root 3 · worktree:on");
+});
+
 // ---------------------------------------------------------------------------
 // projectMaxConcurrentPerRoot — coerce the singleton `autopilot_state.
 // max_concurrent_per_root` column to the banner's per-root count. Unlike the
@@ -1372,8 +1400,29 @@ describe("buildAutopilotShowEnvelope", () => {
       worktree_multi_repo: true,
       armed: ["fn-1-a", "fn-2-b"],
       max_concurrent_jobs: 5,
+      // worktree ON ⇒ effective equals stored.
       max_concurrent_per_root: 3,
+      max_concurrent_per_root_stored: 3,
     });
+  });
+
+  test("worktree OFF floors effective to 1 while stored keeps the intent", () => {
+    const env = buildAutopilotShowEnvelope(
+      [
+        {
+          paused: 0,
+          mode: "yolo",
+          worktree_mode: 0,
+          worktree_multi_repo: 0,
+          max_concurrent_jobs: null,
+          max_concurrent_per_root: 3,
+        },
+      ],
+      [],
+    );
+    expect(env.ok).toBe(true);
+    expect(env.data?.max_concurrent_per_root).toBe(1);
+    expect(env.data?.max_concurrent_per_root_stored).toBe(3);
   });
 
   test("a never-configured board defaults to the boot-safe singleton", () => {
@@ -1387,6 +1436,7 @@ describe("buildAutopilotShowEnvelope", () => {
       armed: [],
       max_concurrent_jobs: null,
       max_concurrent_per_root: 1,
+      max_concurrent_per_root_stored: 1,
     });
   });
 });

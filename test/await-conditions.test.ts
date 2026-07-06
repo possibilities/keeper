@@ -1728,7 +1728,7 @@ test("changedSignature: identical boards hash identically; a verdict move differ
       paused: false,
       worktreeMode: false,
       maxConcurrentJobs: null,
-      maxConcurrentPerRoot: 1,
+      maxConcurrentPerRootStored: 1,
     },
   };
   const same = changedSignature(base);
@@ -1748,4 +1748,30 @@ test("changedSignature: identical boards hash identically; a verdict move differ
   // an autopilot pause toggle moves the hash
   const paused = { ...base, autopilot: { ...base.autopilot, paused: true } };
   expect(changedSignature(paused)).not.toBe(same);
+});
+
+test("changedSignature: keys on STORED per-root — a stored change fires even while worktree is off; a reconnect re-paint stays stable", () => {
+  const base = {
+    epics: [{ epic_id: "fn-1-a", status: "open" as string | null }],
+    perTask: new Map<string, Verdict>([["fn-1-a.1", READY]]),
+    perCloseRow: new Map<string, Verdict>(),
+    perEpic: new Map<string, Verdict>([["fn-1-a", READY]]),
+    autopilot: {
+      mode: "yolo",
+      paused: false,
+      worktreeMode: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRootStored: 1,
+    },
+  };
+  const same = changedSignature(base);
+  // Re-paint of the identical (unchanged) board hashes identically — no edge.
+  expect(changedSignature({ ...base })).toBe(same);
+  // Setting the stored cap 1→3 while worktree is OFF (effective stays 1) still
+  // moves the hash — a visible board move.
+  const storedBumped = {
+    ...base,
+    autopilot: { ...base.autopilot, maxConcurrentPerRootStored: 3 },
+  };
+  expect(changedSignature(storedBumped)).not.toBe(same);
 });

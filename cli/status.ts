@@ -165,7 +165,14 @@ export interface StatusData {
     worktree_multi_repo: boolean;
     armed: readonly string[];
     max_concurrent_jobs: number | null;
+    // The EFFECTIVE per-root cap dispatch honors (boot-latched; floored to 1
+    // while worktree mode is off). Meaning-stable — the old regime published
+    // effective here too (stored always equaled it).
     max_concurrent_per_root: number;
+    // ADDITIVE: the durable STORED per-root intent, distinct from effective.
+    // `null` when the snapshot carries no autopilot rows — never fabricated
+    // from effective.
+    max_concurrent_per_root_stored: number | null;
   };
   board: { epics: EpicView[] };
   counts: {
@@ -360,6 +367,7 @@ export function buildStatusEnvelope(
       armed: snap.autopilotEligibleEpicIds ?? [],
       max_concurrent_jobs: snap.maxConcurrentJobs,
       max_concurrent_per_root: snap.maxConcurrentPerRoot,
+      max_concurrent_per_root_stored: snap.maxConcurrentPerRootStored ?? null,
     },
     board,
     counts: {

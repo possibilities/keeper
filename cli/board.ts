@@ -55,7 +55,11 @@ import {
   subagentLinesFor,
   validatedPill,
 } from "../src/board-render";
-import { DEFAULT_MAX_CONCURRENT_PER_ROOT, resolveSockPath } from "../src/db";
+import {
+  DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  effectivePerRootCap,
+  resolveSockPath,
+} from "../src/db";
 import { resolveFailureTarget } from "../src/dispatch-failure-pill";
 import type { EpicDepResolution } from "../src/epic-deps";
 import {
@@ -495,7 +499,9 @@ export async function main(argv: string[]): Promise<void> {
   const apState = {
     paused: true,
     maxConcurrentJobs: null as number | null,
-    maxConcurrentPerRoot: DEFAULT_MAX_CONCURRENT_PER_ROOT,
+    // Holds the durable STORED per-root intent (raw column); the banner derives
+    // the EFFECTIVE cap from it + `worktreeMode` through the shared helper.
+    maxConcurrentPerRootStored: DEFAULT_MAX_CONCURRENT_PER_ROOT,
     mode: "yolo" as "yolo" | "armed",
     worktreeMode: false,
   };
@@ -503,7 +509,11 @@ export async function main(argv: string[]): Promise<void> {
     autopilotBannerLabel({
       paused: apState.paused,
       maxConcurrentJobs: apState.maxConcurrentJobs,
-      maxConcurrentPerRoot: apState.maxConcurrentPerRoot,
+      maxConcurrentPerRoot: effectivePerRootCap(
+        apState.maxConcurrentPerRootStored,
+        apState.worktreeMode,
+      ),
+      maxConcurrentPerRootStored: apState.maxConcurrentPerRootStored,
       mode: apState.mode,
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,
@@ -872,7 +882,7 @@ export async function main(argv: string[]): Promise<void> {
       }
       apState.paused = paused;
       apState.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
-      apState.maxConcurrentPerRoot = projectMaxConcurrentPerRoot(rows);
+      apState.maxConcurrentPerRootStored = projectMaxConcurrentPerRoot(rows);
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
       view.liveShell.setStatus(apBanner());
