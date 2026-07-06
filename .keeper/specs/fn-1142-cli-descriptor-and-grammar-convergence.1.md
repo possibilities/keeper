@@ -38,5 +38,5 @@ Extend test/keeper-cli.test.ts and test/completions.test.ts: index tree matches 
 - [ ] Non-help behavior of every native leaf is unchanged (existing suites green without behavioral edits)
 
 ## Done summary
-
+Added cli/descriptor.ts (ADR 0008): dependency-free recursive native command tree feeding USAGE, keeper --help --json, completions, and every node:util leaf's parseArgs options via a generic literal-preserving buildParseOptions. Retired hand-maintained SUBCOMMAND_META (now derived); indexed exit 124; statusline-sink is visibility:internal. Hand-rolled leaves (session-*, show-job, commit-work, etc.) and pure dispatchers declare their flags with test-asserted conformance per the Early proof point.
 ## Evidence
