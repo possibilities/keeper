@@ -34,6 +34,7 @@ import {
   computeBoardSummary,
   epicNumFromIdOrBare,
   needsHumanLines,
+  orphanedFailureRows,
   renderDeadLetterPill,
   renderEpicDepPills,
   renderHandoffLinkLines,
@@ -1783,21 +1784,22 @@ test("computeBoardSummary: counts open and running epics/tasks", () => {
   ]);
 });
 
-test("needsHumanLines — a clean board (no daemon distress) renders no block", () => {
+test("needsHumanLines — a clean board (no distress) renders no block", () => {
   expect(needsHumanLines([])).toEqual([]);
 });
 
-test("needsHumanLines — folds each host-level distress row to KIND · dir — trimmed reason", () => {
+test("needsHumanLines — folds each row to KIND · locator — trimmed reason, sorted by locator", () => {
+  // Deliberately out of locator order to prove the byte-stable sort.
   const rows = [
     {
-      dir: "/Users/mike/code/keeper",
-      reason:
-        "shared-checkout-dirty: /Users/mike/code/keeper has stayed dirty\nsecond line dropped",
-    },
-    {
-      dir: "/Users/mike/code/other",
+      locator: "/Users/mike/code/other",
       reason:
         "worktree-lane-wedge: lane keeper/epic/fn-9 cannot merge its base",
+    },
+    {
+      locator: "/Users/mike/code/keeper",
+      reason:
+        "shared-checkout-dirty: /Users/mike/code/keeper has stayed dirty\nsecond line dropped",
     },
   ];
   expect(needsHumanLines(rows)).toEqual([
@@ -1809,9 +1811,83 @@ test("needsHumanLines — folds each host-level distress row to KIND · dir — 
 
 test("needsHumanLines — trims a reason first line past 120 chars with an ellipsis", () => {
   const long = `shared-checkout-dirty: ${"x".repeat(200)}`;
-  const [, line] = needsHumanLines([{ dir: "/repo", reason: long }]);
+  const [, line] = needsHumanLines([{ locator: "/repo", reason: long }]);
   // 119 chars kept + a single ellipsis after the ` — ` separator.
   expect(line).toBe(`  shared-dirty · /repo — ${long.slice(0, 119)}…`);
+});
+
+test("orphanedFailureRows — surfaces a close failure whose plan-closed epic left the board", () => {
+  // fn-1143 has dropped off the board (not in openEpicIds), so its stuck recover
+  // row is an orphan — the prefix is stripped for the locator.
+  const rows = orphanedFailureRows({
+    openEpicIds: ["fn-1142-cli-descriptor-and-grammar-convergence"],
+    openTaskIds: new Set<string>(),
+    closeFailures: new Map([
+      [
+        "worktree-recover:fn-1143-excise-dead-shared-checkout-distress-qzvs8i",
+        "worktree-recover-dirty-checkout: dirty checkout blocks the merge",
+      ],
+    ]),
+    workFailures: new Map(),
+  });
+  expect(rows).toEqual([
+    {
+      locator: "fn-1143-excise-dead-shared-checkout-distress-qzvs8i",
+      reason:
+        "worktree-recover-dirty-checkout: dirty checkout blocks the merge",
+    },
+  ]);
+});
+
+test("orphanedFailureRows — a close failure homed to an OPEN epic is NOT an orphan (its pill covers it)", () => {
+  const rows = orphanedFailureRows({
+    openEpicIds: ["fn-1142-cli-descriptor-and-grammar-convergence"],
+    openTaskIds: new Set<string>(),
+    closeFailures: new Map([
+      [
+        "fn-1142-cli-descriptor-and-grammar-convergence",
+        "worktree-finalize-conflict: merge conflict",
+      ],
+    ]),
+    workFailures: new Map(),
+  });
+  expect(rows).toEqual([]);
+});
+
+test("orphanedFailureRows — a null-epic path-slug close row is dropped, never surfaced as an epic", () => {
+  const rows = orphanedFailureRows({
+    openEpicIds: [],
+    openTaskIds: new Set<string>(),
+    closeFailures: new Map([
+      [
+        "worktree-recover:/Users/mike/code/keeper",
+        "worktree-recover-dirty-checkout: path-slug null-epic form",
+      ],
+    ]),
+    workFailures: new Map(),
+  });
+  expect(rows).toEqual([]);
+});
+
+test("orphanedFailureRows — an off-board work failure surfaces; an on-board task does not", () => {
+  const rows = orphanedFailureRows({
+    openEpicIds: [],
+    openTaskIds: new Set(["fn-1142-cli-descriptor-and-grammar-convergence.1"]),
+    closeFailures: new Map(),
+    workFailures: new Map([
+      [
+        "fn-1142-cli-descriptor-and-grammar-convergence.1",
+        "on-board — skipped",
+      ],
+      ["fn-999-gone.2", "instant-death-breaker: worker keeps dying"],
+    ]),
+  });
+  expect(rows).toEqual([
+    {
+      locator: "fn-999-gone.2",
+      reason: "instant-death-breaker: worker keeps dying",
+    },
+  ]);
 });
 
 // fn-713 follow-on: renderTaskPills appends runtime_status + worker_phase at

@@ -60,6 +60,7 @@ import {
   effectivePerRootCap,
   resolveSockPath,
 } from "../src/db";
+import { WORKTREE_CLOSE_KEY_PREFIXES } from "../src/dispatch-failure-key";
 import {
   classifyDispatchFailure,
   resolveFailureTarget,
@@ -359,29 +360,81 @@ export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
   ];
 }
 
+/** A stuck dispatch_failures row with no on-board home, folded for the
+ * `needs human` block: `locator` is the host dir (host-level distress) or the
+ * epic/task key (an orphaned close/work failure). */
+export type NeedsHumanRow = { locator: string; reason: string };
+
 /**
- * Render the top-of-board `needs human (N)` block for host-level `daemon`-verb
- * distress rows — shared-checkout dirty/wedge, lane wedge. These have no epic or
- * task home (`resolveFailureTarget` drops them), so the epics grid can hang no
- * `[failed:<kind>]` pill on them and the reason is otherwise invisible in the
- * TUI. Empty input renders nothing (no block on a clean board). Each row folds
- * to one scannable line: the classified KIND, the actionable `dir`, and the
- * reason's first line trimmed — the full multi-line reason lives in
- * `keeper query dispatch_failures`.
+ * Render the top-of-board `needs human (N)` block for stuck dispatch failures
+ * the epics grid cannot show — either host-level distress (shared-checkout
+ * dirty/wedge, lane wedge) or a close/work failure whose target epic/task has
+ * dropped off the board (a plan-closed epic whose finalize is still stuck). Both
+ * classes have no on-board row for a `[failed:<kind>]` pill, so the reason is
+ * otherwise invisible in the TUI. Empty input renders nothing. Each row folds to
+ * one scannable line: the classified KIND, its `locator`, and the reason's first
+ * line trimmed — the full multi-line reason lives in `keeper query
+ * dispatch_failures`. Sorted by locator so the block is byte-stable across edges.
  */
-export function needsHumanLines(
-  rows: readonly { dir: string; reason: string }[],
-): string[] {
+export function needsHumanLines(rows: readonly NeedsHumanRow[]): string[] {
   if (rows.length === 0) {
     return [];
   }
-  const out = [`needs human (${rows.length})`];
-  for (const r of rows) {
+  const ordered = [...rows].sort((a, b) => a.locator.localeCompare(b.locator));
+  const out = [`needs human (${ordered.length})`];
+  for (const r of ordered) {
     const kind = classifyDispatchFailure(r.reason);
     const first = (r.reason.split("\n", 1)[0] ?? "").trim();
     const reason = first.length > 120 ? `${first.slice(0, 119)}…` : first;
-    const dirSeg = r.dir === "" ? "" : ` · ${r.dir}`;
-    out.push(`  ${kind}${dirSeg} — ${reason}`);
+    const locSeg = r.locator === "" ? "" : ` · ${r.locator}`;
+    out.push(`  ${kind}${locSeg} — ${reason}`);
+  }
+  return out;
+}
+
+/**
+ * Detect close/work dispatch_failures whose target has dropped off the board —
+ * the orphan the `[failed:<kind>]` pill can never reach because it only attaches
+ * to an on-board epic/task. A `close` row that resolves to NO open epic (and is
+ * not the intentionally-dropped null-epic path-slug form) is a stuck finalize /
+ * recover for a plan-closed epic; a `work` row keyed on a task absent from the
+ * open set is its task-level sibling. Returns one {@link NeedsHumanRow} per
+ * orphan, the `locator` naming the epic (close key, prefix-stripped) or task id.
+ * A homed row is skipped here — the epic block already carries its pill.
+ */
+export function orphanedFailureRows(args: {
+  openEpicIds: readonly string[];
+  openTaskIds: ReadonlySet<string>;
+  closeFailures: ReadonlyMap<string, string>;
+  workFailures: ReadonlyMap<string, string>;
+}): NeedsHumanRow[] {
+  const out: NeedsHumanRow[] = [];
+  for (const [id, reason] of args.closeFailures) {
+    // Homed to an open epic → rendered as its close-row pill; not an orphan.
+    if (
+      resolveFailureTarget({ verb: "close", id, dir: "" }, args.openEpicIds)
+    ) {
+      continue;
+    }
+    // Strip the worktree key prefix; an empty or `/`-leading remainder is the
+    // null-epic path-slug form `resolveFailureTarget` deliberately drops — never
+    // an epic, so it is not surfaced here either.
+    let locator = id;
+    for (const prefix of WORKTREE_CLOSE_KEY_PREFIXES) {
+      if (locator.startsWith(prefix)) {
+        locator = locator.slice(prefix.length);
+        break;
+      }
+    }
+    if (locator === "" || locator.startsWith("/")) {
+      continue;
+    }
+    out.push({ locator, reason });
+  }
+  for (const [taskId, reason] of args.workFailures) {
+    if (!args.openTaskIds.has(taskId)) {
+      out.push({ locator: taskId, reason });
+    }
   }
   return out;
 }
@@ -601,13 +654,19 @@ export async function main(argv: string[]): Promise<void> {
   // renderer captured stays stable.
   const closeFailures = new Map<string, string>();
   const workFailures = new Map<string, string>();
-  // Host-level `daemon`-verb distress rows fed by the SAME `dispatch_failures`
-  // subscription below. `resolveFailureTarget` returns null for them (no epic /
-  // task home), so they carry no `[failed:]` pill — retained here to drive the
-  // banner's `[needs-human:N]` count and the top-of-board reason block. Mutated
-  // in place (length = 0 + push) each edge so the closure the renderer + banner
-  // captured stays stable.
-  const distress: { dir: string; reason: string }[] = [];
+  // Host-level distress rows (any non-close/non-work verb — shared-checkout
+  // dirty/wedge, lane wedge, crash-loop) fed by the SAME `dispatch_failures`
+  // subscription below. They have no epic / task home, so they carry no
+  // `[failed:]` pill — retained here to feed the top-of-board `needs human`
+  // block (joined with off-board orphan failures at render time). Mutated in
+  // place (length = 0 + push) each edge so the closure the renderer captured
+  // stays stable.
+  const distress: NeedsHumanRow[] = [];
+  // The last-rendered `needs human` row count (host distress + off-board
+  // orphans). Computed in `renderBody` (orphan detection needs the epic set) and
+  // read by `apBanner` for the `[needs-human:N]` pill — the banner resyncs
+  // post-emit, so it trails the body by at most one edge and self-heals.
+  let needsHumanCount = 0;
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // Retain the last readiness snapshot so secondary stream edges can repaint
@@ -643,7 +702,7 @@ export async function main(argv: string[]): Promise<void> {
       mode: apState.mode,
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,
-      needsHumanCount: distress.length,
+      needsHumanCount,
     });
 
   function renderJobLines(
@@ -880,10 +939,33 @@ export async function main(argv: string[]): Promise<void> {
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
-    // Host-level distress leads the frame — it is the board-global "autopilot
-    // is wedged on you" signal, above the per-epic summary.
+    // Stuck-work distress leads the frame — the board-global "autopilot is
+    // wedged on you" signal, above the per-epic summary. Two classes join here:
+    // host-level distress (no epic home) and off-board orphans — close/work
+    // failures whose plan-closed epic has dropped off the board, so the
+    // `[failed:]` pill has nothing to attach to. The open epic/task sets scope
+    // the orphan detection.
+    const openTaskIds = new Set<string>();
+    for (const e of snap.epics) {
+      for (const t of boardSummaryArray(e, "tasks")) {
+        const taskId = boardSummaryId(t, "task_id");
+        if (taskId !== "") {
+          openTaskIds.add(taskId);
+        }
+      }
+    }
+    const needsHuman = [
+      ...distress,
+      ...orphanedFailureRows({
+        openEpicIds: snap.epics.map((e) => String(e.epic_id)),
+        openTaskIds,
+        closeFailures,
+        workFailures,
+      }),
+    ];
+    needsHumanCount = needsHuman.length;
     const head = [
-      ...needsHumanLines(distress),
+      ...needsHumanLines(needsHuman),
       ...boardSummaryLines(computeBoardSummary(snap)),
     ];
     const body = renderEpicsBody(snap, subagentIndex);
@@ -944,6 +1026,10 @@ export async function main(argv: string[]): Promise<void> {
       appendDiagnostic(d, diagnosticsLogPath);
     }
     view.emit(snap);
+    // `view.emit` renders synchronously, refreshing `needsHumanCount` (orphan
+    // detection needs this frame's epic set) — resync the banner pill so its
+    // `[needs-human:N]` count tracks the block the frame just rendered.
+    view.liveShell.setStatus(apBanner());
   }
 
   const handle = subscribeReadiness({
@@ -1053,13 +1139,14 @@ export async function main(argv: string[]): Promise<void> {
           if (target?.kind === "task") {
             workFailures.set(target.taskId, reason);
           }
-        } else if (verb === "daemon") {
-          distress.push({ dir: seg(r.dir), reason });
+        } else {
+          // Any other verb is host-level distress (`daemon` shared-checkout /
+          // lane wedge, `crash-loop`, …) — no epic/task home, surfaced in the
+          // `needs human` block. The banner count is recomputed in `renderBody`
+          // (orphan detection needs the epic set) and resynced post-emit.
+          distress.push({ locator: seg(r.dir), reason });
         }
       }
-      // The distress count rides the banner — repaint it on every edge (the
-      // `[needs-human:N]` segment reads `distress.length`).
-      view.liveShell.setStatus(apBanner());
       // Re-emit BEFORE reporting the stream. `reportSnapshotStream` can resolve
       // the snapshot latch SYNCHRONOUSLY (this is the 4th of four reports), and
       // a resolve reads the captured frame and exits the process — so the
