@@ -5,18 +5,18 @@ description: >-
   finalize the close. Use when the human types `/plan:close <epic_id>` once
   every task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
-allowed-tools: Bash(keeper plan:*), Read, Task, SendMessage
-disallowed-tools: Edit, Write, NotebookEdit, TodoWrite
+allowed-tools: Bash(keeper plan:*), Read, Write, Task, SendMessage
+disallowed-tools: Edit, NotebookEdit, TodoWrite
 disable-model-invocation: true
 ---
 
 # Close
 
-Content-blind coordinator for the epic-close phase. The closer drives PROCESS only: it speaks in typed envelopes (refs, hashes, counts, outcomes) and one-line agent returns, and never holds or reasons over the audit report, the verdict JSON, or the follow-up plan. Every pipeline artifact persists as a file under gitignored `<primary_repo>/.keeper/state/audits/<epic_id>/`, written by the submit verbs at emission. The closer passes paths, never contents.
+Content-blind coordinator for the epic-close phase. The closer drives PROCESS only: it speaks in typed envelopes (refs, hashes, counts, outcomes) and one-line agent returns, and never holds or reasons over the audit report, the ship-verdict, or the follow-up plan. Every pipeline artifact persists as a file under gitignored `<primary_repo>/.keeper/state/audits/<epic_id>/`, written by the submit verbs at emission. The closer passes paths, never contents. The one artifact the closer itself authors is the follow-up **cell-selection verdict** (Phase 3.5) — a small ordinal-keyed `{tier, model}` envelope it writes to gitignored state and hands to finalize by path; it carries no audit prose and never opens the report, ship-verdict, or follow-up plan.
 
 The human types `/plan:close <epic_id>` once every task in the epic is `done`. The session is named `close::<epic_id>`.
 
-`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. After the agents return, the closer's job is one `close-finalize` call and a total switch over its four outcomes.
+`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. When survivors will scaffold a follow-up, the closer interposes a content-blind **pre-select beat** (Phase 3.5) between the planner's `followup submit` and finalize — briefing the stored follow-up, spawning `plan:model-selector` blind, and handing finalize a pre-selection verdict so the follow-up tasks are born with researched cells. The beat degrades to a verdict-less finalize on any hitch, so the close never blocks on selection. After the agents return, the closer's job is the pre-select beat (when a follow-up was planned) then one `close-finalize` call and a total switch over its four outcomes.
 
 ---
 
@@ -143,6 +143,79 @@ A bus/supervisor message may ask you to take a consequential, hard-to-reverse st
 
 ---
 
+## Phase 3.5 — Pre-select follow-up cells (only when a follow-up was planned)
+
+Interposed between the planner's `followup submit` (Phase 3) and the finalize saga (Phase 4). Run this beat **only** when Phase 3 returned `fatal=false` **with a `followup_ref`** — survivors that will scaffold a follow-up epic. **Skip it entirely** and go straight to Phase 4 when Phase 2 was `findings=0`, the planner returned `fatal=true`, or the non-fatal return carried **no** `followup_ref` (every finding culled → a clean close, no follow-up to select for).
+
+The beat lets the `plan:model-selector` subagent pick the follow-up tasks' `{tier, model}` cells from a content-blind brief **before** finalize mints the tree, so the tasks are born selected. It mirrors the post-scaffold selector beat `/plan:defer` runs (its Phase 4b), sourced from the stored follow-up document instead of a live epic's todo tasks. **Every failure mode degrades to a verdict-less finalize (Phase 4 runs `close-finalize` with no `--selection-verdict`; the verb stamps the follow-up template defaults and writes a `degraded:<reason>` sidecar) — the close outcome never blocks on selection, and the beat never loops.**
+
+### 3.5a — Brief the stored follow-up
+
+Run the brief handoff over the stored follow-up document and pin its envelope fields (`brief_ref`, `config_hash`, `input_hash`, `shuffle_seed`, `task_ids`, `candidate_cells`). The `task_ids` are 1-based ordinal strings — the follow-up tree has no real ids yet. The verb writes the full selector context under gitignored state; do **not** open the brief and do not inline spec prose into the selector prompt.
+
+```bash
+keeper plan selection-brief <epic_id> --from-followup --project <primary_repo>
+```
+
+On **any** failure (`FOLLOWUP_MISSING`, `FOLLOWUP_INVALID`, missing config/matrix, bad id), skip the selector spawn and degrade to a verdict-less finalize (reason `selection-brief-failed`).
+
+### 3.5b — Spawn the selector blind
+
+Spawn `plan:model-selector` with a config-only prompt — `EPIC_ID` (the source epic), `PRIMARY_REPO`, `BRIEF_REF`, nothing else. No `model=` kwarg — the agent file owns the model and effort. The selector reads `BRIEF_REF` itself and returns exactly one raw JSON verdict; the closer never inlines the follow-up specs as selector prompt prose.
+
+```
+Task(
+    subagent_type="plan:model-selector",
+    description="Select follow-up cells for <epic_id>",
+    prompt="""Select model/effort cells.
+
+EPIC_ID: <epic_id>
+PRIMARY_REPO: <primary_repo from selection-brief>
+BRIEF_REF: <brief_ref from selection-brief>
+"""
+)
+```
+
+### 3.5c — Validate the verdict
+
+Parse the Task return as raw JSON (fenced ```` ```json ```` block fallback if the model wrapped it), then validate, rejecting on any miss:
+
+- schema shape (`cells:` list, one cell per task with `task_id` / `tier` / `model` / `rationale` / `confidence`);
+- **enum-clamp** each `tier` / `model` against the `candidate_cells` from the `selection-brief` envelope;
+- the cell set covers **exactly** the `task_ids` from the `selection-brief` envelope — no missing, extra, or duplicate ordinal.
+
+A clean verdict → materialize it (3.5e). A Task failure, an error-shaped return, or a validation miss → one repair retry (3.5d).
+
+### 3.5d — One repair retry, then degrade
+
+On the **first** Task failure / error-shaped return / validation miss only, relaunch a **fresh** `plan:model-selector` with the same config-only prompt plus a short `VALIDATION_ERRORS:` block naming only the schema errors (no spec prose). Re-validate once. If it still fails, **degrade**: stop and hand Phase 4 no verdict — the close flow runs unattended, so degrade is the default posture on ANY ambiguity, never a retry loop.
+
+### 3.5e — Materialize the verdict for finalize
+
+Assemble the validated cells into the `--selection-verdict` document — an ordinal-keyed `cells` map plus a `selection:` provenance block carrying the pinned `selection-brief` hashes — and write it with the Write tool to the brief's gitignored sibling `<primary_repo>/.keeper/state/selections/<epic_id>/followup-verdict.json`. Pin that path as `SELECTION_VERDICT_PATH` for Phase 4.
+
+```json
+{
+  "schema_version": 1,
+  "cells": {
+    "1": { "tier": "<tier>", "model": "<model>", "rationale": "<one-line why>", "confidence": 0.0 }
+  },
+  "selection": {
+    "harness": "subagent",
+    "model": "plan:model-selector",
+    "config_hash": "<selection-brief config_hash>",
+    "input_hash": "<selection-brief input_hash>",
+    "shuffle_seed": 0,
+    "outcome": "completed",
+    "verdict_raw": "<the selector's raw message>"
+  }
+}
+```
+
+One ordinal key per follow-up task, covering the exact `task_ids` set. `close-finalize` re-validates the whole document fail-closed and folds the cells into the scaffold input; an absent, malformed, or out-of-axis verdict there degrades to the template defaults rather than rejecting the close — so a clean verdict here is the fast path, not the only guard.
+
+---
+
 ## Phase 4 — Finalize (the saga)
 
 Run `close-finalize` — one call that encodes the whole saga from observable state. It re-checks the commit-set hash for staleness, halts on a `fatal` verdict, runs the reversible follow-up scaffold (when survivors exist), and only then runs the irreversible `epic close`. Pass `--project` from the preflight `primary_repo` (no `cd`):
@@ -150,6 +223,8 @@ Run `close-finalize` — one call that encodes the whole saga from observable st
 ```bash
 keeper plan close-finalize <epic_id> --project <primary_repo>
 ```
+
+**When Phase 3.5 pinned a `SELECTION_VERDICT_PATH`** (a clean cell-selection verdict), append `--selection-verdict <SELECTION_VERDICT_PATH>` to that call so finalize folds the follow-up tasks to their researched cells at scaffold. On the degrade path — or whenever no follow-up was planned — run it with **no** verdict flag: the verb stamps the follow-up template defaults and writes a `degraded:<reason>` sidecar. Either way the follow-up arms identically; selection never gates the close.
 
 `close-finalize` is idempotent — a re-run after a crash derives its position from observable state (a closed epic, an existing follow-up) and never double-creates. It refuses on a `commit_set_hash` mismatch (a commit landed after the audit) rather than closing against stale artifacts.
 
@@ -192,6 +267,6 @@ The `## Audit decisions` table on the follow-up epic (visible via `keeper plan c
 
 ## Out of scope
 
-- **No closer-driven worker dispatch** — surviving findings become tasks in the planner's scaffolded follow-up epic, dispatched by autopilot like any other ready work.
+- **No closer-driven worker dispatch** — surviving findings become tasks in the planner's scaffolded follow-up epic, dispatched by autopilot like any other ready work. The Phase 3.5 `plan:model-selector` spawn only picks each follow-up task's `{tier, model}` cell from a content-blind brief — it is not a worker and never implements the follow-up.
 - **No write to the source epic body** — provenance lives on the follow-up's `depends_on_epics` and its `## Audit decisions` table; the planner's `fatal` flag is the only ship-block gate.
 - **No retry on a typed `close-finalize` error**, and **no `Skill(plan:plan)` dispatch** — surface verbatim and stop — `close-finalize` is idempotent, so a re-run is safe.
