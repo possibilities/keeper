@@ -26,5 +26,5 @@ Files:
 - [ ] `bun test` passes
 
 ## Done summary
-
+Removed the dead isSharedCheckoutWedgeReason/isSharedCheckoutDirtyReason predicates and their unused prefix constants (re-verified live against default after the fn-1140 merge landed); dropped their two unit tests. Live recover-pass git merge --abort self-heal untouched.
 ## Evidence

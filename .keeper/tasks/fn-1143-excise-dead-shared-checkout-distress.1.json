@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Remove dead distress predicates",
-  "updated_at": "2026-07-06T16:01:20.477000Z"
+  "updated_at": "2026-07-06T17:02:32.846000Z",
+  "worker_done_at": "2026-07-06T17:02:32.846000Z"
 }
