@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Tightly-specified two-file dead-code removal with named symbols and low blast radius, but the required judgment to distinguish genuinely-dead predicates from still-live merge --abort behavior in the recover pass warrants high over medium; sonnet fits the literal, well-scoped surface.",
+      "task_id": "fn-1143-excise-dead-shared-checkout-distress.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-06T16:01:20.650000Z",
+  "epic_id": "fn-1143-excise-dead-shared-checkout-distress",
+  "input_hash": "1f7427e80bf85bf35f081ab142a84d425f7fe315a5ce2c367f147a8993f5b0ad",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 527706088,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Tightly-specified two-file dead-code removal with named symbols and low blast radius, but the required judgment to distinguish genuinely-dead predicates from still-live merge --abort behavior in the recover pass warrants high over medium; sonnet fits the literal, well-scoped surface.\",\"confidence\":0.72}]}"
+}
