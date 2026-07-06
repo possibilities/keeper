@@ -34,5 +34,5 @@ Extend the consistency surface list to the refine copy; assert no remaining pros
 - [ ] The consistency suite pins the refine beat copy and is green
 
 ## Done summary
-
+Wired the R6 selection beat into the refine path: a refine now re-selects every remaining todo cell over the re-ghosted epic before arming, skips cleanly on zero todo tasks, and no prose claims the refine path skips selection. Extended the consistency suite to pin the refine beat copy.
 ## Evidence
