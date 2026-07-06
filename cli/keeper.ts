@@ -44,6 +44,7 @@ export const SUBCOMMANDS = [
   "show-session-events",
   "show-job",
   "session-summary",
+  "escalation-brief",
   "plan",
   "prompt",
   "dispatch",
@@ -155,6 +156,10 @@ export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> = {
   "session-summary": {
     summary:
       "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
+  },
+  "escalation-brief": {
+    summary:
+      "Read-only context envelope an autopilot escalation session loads at boot (JSON)",
   },
   plan: {
     summary:
@@ -590,6 +595,8 @@ export async function main(): Promise<void> {
     "show-job": async (argv) => (await import("./show-job")).main(argv),
     "session-summary": async (argv) =>
       (await import("./session-summary")).main(argv),
+    "escalation-brief": async (argv) =>
+      (await import("./escalation-brief")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
     prompt: async (argv) => (await import("./prompt")).main(argv),
     dispatch: async (argv) => (await import("./dispatch")).main(argv),
