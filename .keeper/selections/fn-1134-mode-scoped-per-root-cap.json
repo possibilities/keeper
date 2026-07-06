@@ -1,0 +1,40 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-adjacent: deletes an invariant, rewires event minting + two producer seams + wire-field semantics where a wrong seam silently mis-caps dispatch.",
+      "task_id": "fn-1134-mode-scoped-per-root-cap.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multi-file plumbing but with a contract-touching await-changed signature rekey and a board-vs-reconciler divergence seam needing cross-module care.",
+      "task_id": "fn-1134-mode-scoped-per-root-cap.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Doc-only, bounded, grep-verifiable; the one capture/restore-STORED judgment call is pre-resolved in the spec, so route down.",
+      "task_id": "fn-1134-mode-scoped-per-root-cap.3",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0f78fc31c0896a8db68ce0899843a2e4c6102f5d25e5fb9c630d74194ce144c8",
+  "created_at": "2026-07-06T01:17:56.104000Z",
+  "epic_id": "fn-1134-mode-scoped-per-root-cap",
+  "input_hash": "9cbf34bc7ab98a0e617cd87b79cf566a8098e8d6045b0397caad7023a93f3a8c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": "{\"fn-1134-mode-scoped-per-root-cap.1\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Contract-adjacent: deletes an invariant, rewires event minting + two producer seams + wire-field semantics where a wrong seam silently mis-caps dispatch.\", \"confidence\": 0.82}, \"fn-1134-mode-scoped-per-root-cap.2\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Multi-file plumbing but with a contract-touching await-changed signature rekey and a board-vs-reconciler divergence seam needing cross-module care.\", \"confidence\": 0.62}, \"fn-1134-mode-scoped-per-root-cap.3\": {\"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"Doc-only, bounded, grep-verifiable; the one capture/restore-STORED judgment call is pre-resolved in the spec, so route down.\", \"confidence\": 0.6}}\n"
+}

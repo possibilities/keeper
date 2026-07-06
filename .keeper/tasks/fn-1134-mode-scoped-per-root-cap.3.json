@@ -6,11 +6,11 @@
   ],
   "epic": "fn-1134-mode-scoped-per-root-cap",
   "id": "fn-1134-mode-scoped-per-root-cap.3",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Align autopilot skill docs",
-  "updated_at": "2026-07-06T01:15:14.377000Z"
+  "updated_at": "2026-07-06T01:17:56.104000Z"
 }
