@@ -38,5 +38,5 @@ Plan-side advice lands where each reader needs it: mechanics and framing in the 
 - [ ] The plan test suite, vendored-corpus drift check, and prompt suite pass; the skill-authoring doc's Phase 3c anchor still resolves
 
 ## Done summary
-
+Added research-epic and plan-time check-in advice to operator-orchestration.md plus reference-shaped pointer bullets in plan/SKILL.md's operator-branch cluster.
 ## Evidence
