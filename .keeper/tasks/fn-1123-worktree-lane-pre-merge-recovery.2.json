@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Route and escalate lane pre-merge failures",
-  "updated_at": "2026-07-05T17:07:19.873000Z"
+  "updated_at": "2026-07-06T03:43:59.707000Z",
+  "worker_done_at": "2026-07-06T03:43:59.707000Z"
 }

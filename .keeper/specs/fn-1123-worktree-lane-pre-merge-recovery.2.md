@@ -93,5 +93,5 @@ Behavioral contract:
 - [ ] The CLAUDE.md Autopilot section and the CONTEXT.md glossary reflect the lane pre-merge arm and corrected clear/escalate semantics, with the lint and consistency gates green; no problem-codes.md entry is added.
 
 ## Done summary
-
+Fan-in base lane a dependent task cannot losslessly merge now mints a self-clearing worktree-lane-premerge work:: row (verb-agnostic reason-scoped level-clear by lane path riding the recover pass, never the dead work-task arm), and a persistent/abort-failed wedge escalates to a per-lane worktree-lane-wedge daemon distress row (orphan-GC-exempt, distinct from the shared-checkout surface, recover-cleared). Router untouched; docs + CONTEXT.md updated.
 ## Evidence
