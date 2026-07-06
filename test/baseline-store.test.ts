@@ -118,6 +118,14 @@ test("key is filesystem-safe even for a malicious sha (traversal guard)", () => 
   expect(key).not.toContain("..");
 });
 
+test("key toolchain segment matches an independently hand-computed FNV-1a digest", () => {
+  // Hand-computed offline (NOT via the module under test) over the exact
+  // delimited byte sequence `${bunVersion}\x00${platform}` — pins the raw NUL
+  // delimiter byte-for-byte so a future edit can't silently widen/shrink it.
+  const key = baselineKey({ repoDir: REPO, sha: SHA, toolchain: TC_A });
+  expect(key).toBe(`${repoDirHash(REPO)}-${SHA}-i6ctkr`);
+});
+
 test("currentToolchain reports the live bun version and platform-arch", () => {
   const tc = currentToolchain();
   expect(tc.bunVersion).toBe(Bun.version);
