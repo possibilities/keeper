@@ -38,5 +38,5 @@ Drive the classifier core with hand-built inputs in the existing test style: abs
 - [ ] On the live config, sonnet classifies as stub and opus as fresh; a config lacking the efforts provenance key still classifies totally with no throw
 
 ## Done summary
-
+Added a fail-closed --state classifier beside the frozen --check gate: a pure total core maps every axis value to one state (models missing/stub/stale/fresh, efforts missing/present) via first-comment-block string-strict provenance parsing, with status stamps in both reference headers, re-hashed research shas, and an optional efforts_provenance config key.
 ## Evidence
