@@ -32,5 +32,5 @@ Purely additive branch in the merge-gate probe's per-dep loop: a dep in the bloc
 - [ ] The merge-gate documentation (probe doc comment + root CLAUDE.md clause) reads true forward-facing with the CLAUDE.md lint green
 
 ## Done summary
-
+Extended computeDeferredEpicIds so a blocked-incomplete (still-open) upstream that cut a same-resolved-repo worktree lane defers the dependent's lane cut probe-free, preventing a stale-base fork; satisfied ancestry/inconclusive/absent paths and cross-repo/no-lane not-gating stay byte-identical, pinned by new fn-1130 merge-gate tests.
 ## Evidence

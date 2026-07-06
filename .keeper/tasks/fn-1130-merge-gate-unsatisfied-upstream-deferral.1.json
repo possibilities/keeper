@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Merge gate unsatisfied upstream deferral",
-  "updated_at": "2026-07-05T22:25:21.307000Z"
+  "updated_at": "2026-07-06T05:37:16.316000Z",
+  "worker_done_at": "2026-07-06T05:37:16.316000Z"
 }
