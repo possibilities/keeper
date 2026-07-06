@@ -40,5 +40,5 @@ Extend the reducer jobs suite: adopted binds on SessionStart, COALESCE survives 
 - [ ] Both new columns are nullable with no DEFAULT, and re-fold over pre-existing history is byte-identical for untouched rows
 
 ## Done summary
-
+Added the harness-session adoption primitive: jobs.adopted marker + events.adopted event field (five-place lockstep, folded set-once via the SessionStart COALESCE arm) and the autopilot_state.codex_adoption config knob (strict-boolean RPC, defaults OFF, read by no fold). One SCHEMA_VERSION bump to 110 with the keeper-py whitelist updated same-commit.
 ## Evidence
