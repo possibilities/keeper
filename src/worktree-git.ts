@@ -389,6 +389,17 @@ export async function currentBranch(
   return r.stdout.trim();
 }
 
+/**
+ * Abbreviate a branch ref by stripping ONE leading `refs/heads/` prefix; a ref
+ * without that prefix passes through unchanged. Matches the abbreviated form
+ * {@link currentBranch} returns, so callers comparing a `git worktree list`
+ * entry's full ref against a `currentBranch` result compare like with like.
+ * Pure — no IO, no clock, never throws.
+ */
+export function shortBranchName(ref: string): string {
+  return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+}
+
 /** True IFF local branch `branch` exists (`git rev-parse --verify refs/heads/<branch>`). */
 export async function branchExists(
   cwd: string,
@@ -1187,9 +1198,7 @@ export function isKeeperLaneEntry(entry: WorktreeEntry): boolean {
   if (entry.branch === null) {
     return false;
   }
-  const short = entry.branch.startsWith("refs/heads/")
-    ? entry.branch.slice("refs/heads/".length)
-    : entry.branch;
+  const short = shortBranchName(entry.branch);
   return short.startsWith(KEEPER_EPIC_BRANCH_PREFIX);
 }
 
@@ -1206,9 +1215,7 @@ export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
   if (entry.branch === null) {
     return null;
   }
-  const short = entry.branch.startsWith("refs/heads/")
-    ? entry.branch.slice("refs/heads/".length)
-    : entry.branch;
+  const short = shortBranchName(entry.branch);
   if (!short.startsWith(KEEPER_EPIC_BRANCH_PREFIX)) {
     return null;
   }
