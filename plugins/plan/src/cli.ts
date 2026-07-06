@@ -11,8 +11,14 @@
 // done, the integrity-gate + close verbs, validate --epic on a fresh stamp) MERGE the
 // plan_invocation into their own single envelope via the emit.ts self-emitters.
 
+import { PLAN_COMMANDS, planCommand, SUBGROUP_NAMES } from "./descriptor.ts";
 import type { OutputFormat } from "./format.ts";
-import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
+import {
+  dispatchGroup,
+  type GroupSpec,
+  leafUsageError,
+  renderLeafHelp,
+} from "./subgroup.ts";
 import { runAssignCells } from "./verbs/assign_cells.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
@@ -70,178 +76,9 @@ export { emitMutating, emitReadonly } from "./emit.ts";
 const PROG = "keeper plan";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 
-// Subgroups ("keeper plan <group> <sub>"). A subgroup owns its own --help and
-// subcommand dispatch, so post-command --help is routed to the group, not the
-// top-level help.
-const SUBGROUP_NAMES = new Set([
-  "audit",
-  "epic",
-  "followup",
-  "task",
-  "verdict",
-  "worker",
-]);
-
-interface CommandSpec {
-  name: string;
-  shortHelp: string;
-  implemented: boolean;
-}
-
-// Registration order = help-listing order (alphabetical, matching click).
-const COMMANDS: CommandSpec[] = [
-  {
-    name: "assign-cells",
-    shortHelp:
-      "Batch-overwrite a ghost epic's tier/model cells + write a sidecar.",
-    implemented: true,
-  },
-  {
-    name: "audit",
-    shortHelp: "Close-phase audit-artifact submit verbs.",
-    implemented: true,
-  },
-  { name: "block", shortHelp: "Mark a task as blocked.", implemented: true },
-  {
-    name: "cat",
-    shortHelp: "Print the raw spec markdown for an epic or task.",
-    implemented: true,
-  },
-  {
-    name: "claim",
-    shortHelp: "Claim a task and return the worker briefing.",
-    implemented: true,
-  },
-  {
-    name: "close-finalize",
-    shortHelp: "Run the /plan:close saga to its outcome.",
-    implemented: true,
-  },
-  {
-    name: "close-preflight",
-    shortHelp: "Write the /plan:close brief and emit the handoff.",
-    implemented: true,
-  },
-  {
-    name: "detect",
-    shortHelp: "Check if cwd belongs to a plan project.",
-    implemented: true,
-  },
-  { name: "done", shortHelp: "Mark a task as complete.", implemented: true },
-  { name: "epic", shortHelp: "Manage epics.", implemented: true },
-  { name: "epics", shortHelp: "List all epics.", implemented: true },
-  {
-    name: "epic-question",
-    shortHelp: "Set or clear an epic-level parked question (board-visible).",
-    implemented: true,
-  },
-  {
-    name: "find-task-commit",
-    shortHelp: "Look up a task's source commits.",
-    implemented: true,
-  },
-  {
-    name: "followup",
-    shortHelp: "Close-phase follow-up-plan submit verb.",
-    implemented: true,
-  },
-  {
-    name: "gist",
-    shortHelp: "Create a multifile gist for an epic.",
-    implemented: true,
-  },
-  {
-    name: "init",
-    shortHelp: "Initialize a plan project for the current directory.",
-    implemented: true,
-  },
-  {
-    name: "list",
-    shortHelp: "List all epics and their tasks in a tree view.",
-    implemented: true,
-  },
-  {
-    name: "mv-repo",
-    shortHelp: "Rewrite stored board paths for a renamed repo (metadata only).",
-    implemented: true,
-  },
-  {
-    name: "ready",
-    shortHelp: "List tasks that are ready to be worked on.",
-    implemented: true,
-  },
-  {
-    name: "reconcile",
-    shortHelp: "Post-worker verdict for /plan:work (read-only).",
-    implemented: true,
-  },
-  {
-    name: "refine-apply",
-    shortHelp: "Apply a refine delta to an existing epic tree.",
-    implemented: true,
-  },
-  {
-    name: "refine-context",
-    shortHelp: "Fetch refine-state for /plan:plan (read-only).",
-    implemented: true,
-  },
-  {
-    name: "resolve-task",
-    shortHelp: "Routing lookup to launch /plan:work.",
-    implemented: true,
-  },
-  {
-    name: "scaffold",
-    shortHelp: "Materialize a whole epic tree from one YAML.",
-    implemented: true,
-  },
-  {
-    name: "selection-brief",
-    shortHelp: "Write the model/effort selector brief for an epic.",
-    implemented: true,
-  },
-  {
-    name: "show",
-    shortHelp: "Show detailed information about an epic or task.",
-    implemented: true,
-  },
-  {
-    name: "state-path",
-    shortHelp: "Print the resolved state directory path.",
-    implemented: true,
-  },
-  {
-    name: "status",
-    shortHelp: "Show overall project status.",
-    implemented: true,
-  },
-  { name: "task", shortHelp: "Manage tasks.", implemented: true },
-  {
-    name: "tasks",
-    shortHelp: "List tasks with optional filtering.",
-    implemented: true,
-  },
-  {
-    name: "unblock",
-    shortHelp: "Flip a blocked task back to todo.",
-    implemented: true,
-  },
-  {
-    name: "validate",
-    shortHelp: "Validate project data integrity.",
-    implemented: true,
-  },
-  {
-    name: "verdict",
-    shortHelp: "Close-phase verdict submit verb.",
-    implemented: true,
-  },
-  {
-    name: "worker",
-    shortHelp: "Worker resume helpers for dropped /plan:work invocations.",
-    implemented: true,
-  },
-];
+// Subgroups ("keeper plan <group> <sub>") own their own --help + subcommand
+// dispatch, so post-command --help routes to the group, not the top-level help.
+// The set is derived from the descriptor tree (SUBGROUP_NAMES).
 
 const DESCRIPTION =
   "File-based task tracking for structured development workflows.";
@@ -770,9 +607,9 @@ function printHelp(): void {
   lines.push("Every read verb still emits exactly one clean JSON value.");
   lines.push("");
   lines.push("Commands:");
-  const width = Math.max(...COMMANDS.map((c) => c.name.length));
-  for (const cmd of COMMANDS) {
-    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.shortHelp}`);
+  const width = Math.max(...PLAN_COMMANDS.map((c) => c.name.length));
+  for (const cmd of PLAN_COMMANDS) {
+    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.summary}`);
   }
   process.stdout.write(`${lines.join("\n")}\n`);
 }
@@ -784,8 +621,7 @@ function dispatch(parsed: ParsedArgs): number {
     return 0;
   }
 
-  const spec = COMMANDS.find((c) => c.name === command);
-  if (spec === undefined) {
+  if (planCommand(command) === undefined) {
     noSuchCommand(command);
   }
 
@@ -1128,7 +964,20 @@ function readPositional(rest: string[]): string {
 export function main(argv: string[]): number {
   const parsed = parseArgs(argv);
   if (parsed.help) {
-    printHelp();
+    // Bare `keeper plan --help` -> the top-level group help. `keeper plan <verb>
+    // --help` for a top-level (non-subgroup) verb -> that verb's leaf help through
+    // the shared descriptor-fed renderer (subgroup --help is handled in dispatch,
+    // where parseArgs leaves the flag in `rest` for dispatchGroup). An unknown
+    // verb errors like any no-such-command.
+    if (parsed.command === null) {
+      printHelp();
+      return 0;
+    }
+    const cmd = planCommand(parsed.command);
+    if (cmd === undefined) {
+      noSuchCommand(parsed.command);
+    }
+    renderLeafHelp(`${PROG} ${parsed.command}`, cmd);
     return 0;
   }
   return dispatch(parsed);
