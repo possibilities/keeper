@@ -22,5 +22,5 @@ Files: src/baseline-store.ts
 - [ ] baselineKey produces byte-identical output for the same input as before the change (fingerprint hash unchanged), covered by an existing or added pure unit assertion.
 
 ## Done summary
-
+Replaced the literal NUL toolchain-fingerprint delimiter in src/baseline-store.ts with a \x00 escape so the file is plain text (git diff/grep/blame now work); added a hand-computed FNV-1a fixture pinning baselineKey's exact output to prove the runtime hash is unchanged.
 ## Evidence
