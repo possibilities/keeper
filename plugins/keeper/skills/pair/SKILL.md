@@ -34,35 +34,44 @@ presence-only tracking if the seed can't be written).
 
 You wait with **blocking Bash calls**, never a Monitor — a blocking call bills
 zero tokens while it blocks (the model is suspended between emitting the tool_use
-and receiving the tool_result). There are two shapes:
+and receiving the tool_result). The Bash tool's *default* foreground window is
+only `120000`ms (2 min) — a call that runs past it auto-backgrounds instead of
+returning an error, silently ending the wait rather than raising it. Reaching
+the tool's `600000`ms (10 min) per-call ceiling requires passing the tool's
+`timeout` parameter explicitly on every blocking call below; there is no
+config or env var that raises the default, only the per-call parameter. There
+are two shapes:
 
-- **Quick single-shot** (`agent run`) — one blocking call that returns the answer
-  when the partner stops. Use it for a partner expected to finish within ~10
-  minutes.
+- **Quick single-shot** (`agent run`) — one blocking call, issued with
+  `timeout: 600000`, that returns the answer when the partner stops. Use it for
+  a partner expected to finish within ~10 minutes.
 - **Detached + chunked wait** (`agent panel start` + `agent panel wait`) — launch
-  the partner detached, then re-issue a bounded blocking `wait` loop. Use it for
-  a longer partner (past Bash's 10-minute single-call cap) or to fan the same ask
-  out to several models at once.
+  the partner detached, then re-issue one explicitly-timed blocking `wait` call
+  per chunk. Use it for a longer partner (past the 600000ms per-call ceiling) or
+  to fan the same ask out to several models at once.
 
 ## Quick single-shot (`agent run`)
 
 For a partner that will finish within ~10 minutes, one blocking Bash call does
 the whole job — it launches, waits for the partner to stop, and writes the JSON
-answer envelope to `--output`:
+answer envelope to `--output`. Issue it with the Bash tool's `timeout`
+parameter set explicitly to `600000`:
 
 ```bash
 keeper agent run codex "$(cat /tmp/ask.md)" --read-only --output /tmp/ans.json
-# blocks until the partner stops, then exits 0 — read /tmp/ans.json
+# issue with Bash tool timeout: 600000 — blocks until the partner stops, then
+# exits 0 — read /tmp/ans.json
 ```
 
 - Write any non-trivial ask to a file and pass its contents as the prompt
   positional — never hand-inline a long prompt (quoting, execve/ps limits).
 - `--output <path>` gets the uniform envelope (see *Reading the answer*) on EVERY
   outcome, exit-code-independent. Read it once the call returns 0.
-- The Bash tool caps one call at 10 minutes. For a partner that may run longer,
-  do NOT hold a blocking call open — use the detached shape below (or run the
-  `agent run` in the background and poll `--output`, which appears atomically
-  only once complete).
+- `600000`ms is the Bash tool's per-call ceiling even with the explicit
+  parameter. For a partner that may run longer, do NOT hold a blocking call
+  open — use the detached shape below (or run the `agent run` in the
+  background and poll `--output`, which appears atomically only once
+  complete).
 
 ## Detached + chunked wait (`agent panel start|wait`)
 
@@ -110,24 +119,37 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
   preset, a non-pairable harness, or an unreadable prompt exits 2 with no leg
   launched.
 
-**3. Wait token-free (re-issue loop).** Each `wait` blocks ONE `--chunk` window
-(default 540s ≤ 9 min, safely under Bash's 10-min single-call cap), then exits:
-**0** = every leg terminal (verdict JSON on stdout), **124** = the chunk elapsed
-(re-issue it), **2** = a missing/corrupt manifest or bad flags. Bound the loop
-with a backstop so a wedged leg never loops forever:
+**3. Wait token-free (re-issue loop).** Each `wait` call blocks ONE `--chunk`
+window (default 540s = 9 min), then exits: **0** = every leg terminal (verdict
+JSON on stdout), **124** = the chunk elapsed (re-issue it), **2** = a
+missing/corrupt manifest or bad flags. Issue every `wait` invocation with the
+Bash tool's `timeout` parameter set explicitly to `600000` — the tool's
+*default* foreground window is only `120000`ms, well short of a 540s chunk, and
+a call that outruns its window auto-backgrounds instead of returning 124,
+silently ending the wait rather than raising it. The explicit `600000`ms
+ceiling leaves ~60s of headroom over the 540s chunk.
+
+A multi-chunk wait is **one explicitly-timed Bash call per chunk, re-issued
+across separate calls — never a shell loop inside one call**: a `while` that
+re-issues `wait` on exit 124 cannot complete inside a single Bash call even at
+the 600000ms ceiling (six chunks alone is ~54 min), and shell state (loop
+counters, captured output) does not survive between separate Bash calls
+anyway. Track the re-issue count yourself and stop once it hits a backstop, so
+a wedged leg never loops forever:
 
 ```bash
-BACKSTOP=6      # ~54 min of 9-min chunks; a leg still running this late is wedged
-VERDICT=""
-n=0
-while [ "$n" -lt "$BACKSTOP" ]; do
-  VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540)
-  WAIT_RC=$?
-  [ "$WAIT_RC" -eq 0 ] && break                            # all legs terminal
-  [ "$WAIT_RC" -eq 124 ] && { n=$(( n + 1 )); continue; }  # chunk elapsed — re-issue
-  break                                                    # exit 2 — a failure
-done
+# Issue as its own Bash call, timeout: 600000:
+VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540)
+WAIT_RC=$?
+# exit 0   → every leg terminal; $VERDICT is the verdict JSON
+# exit 124 → chunk elapsed; issue the SAME command again as a NEW Bash call
+# exit 2   → a failure; stop and surface it
 ```
+
+Re-issue the identical command, one Bash call per chunk (`timeout: 600000`
+every time), until it returns 0 or 2, or until you've issued it `BACKSTOP`
+times — 6 re-issues ≈ 54 min of 9-min chunks; a leg still running this late is
+wedged, so treat it as a failure in step 4.
 
 Each `wait` is a single blocking Bash call — token-free while it blocks; the
 subcommand polls internally on a `Date.now()` deadline, so you never re-invoke
