@@ -4871,7 +4871,10 @@ async function probeLaneBaseReadiness(
     if (laneEpicId !== null && hasActiveResolver(laneEpicId)) {
       continue; // a resolver's deliberate in-progress merge is never a wedge
     }
-    const ready = await gitMergeReadiness(entry.path, entry.branch, run);
+    const expectedShort = entry.branch.startsWith("refs/heads/")
+      ? entry.branch.slice("refs/heads/".length)
+      : entry.branch;
+    const ready = await gitMergeReadiness(entry.path, expectedShort, run);
     if (ready.kind === "ready") {
       // Clean tracked tree on-branch — but a lingering UNTRACKED file is the
       // would-clobber hazard `mergeReadiness` skips. One extra untracked probe so a

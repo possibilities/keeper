@@ -8491,6 +8491,7 @@ function makeRecoveryGit(state: {
   originAncestors?: Set<string>; // branches already an ancestor of origin/<default> (defaults to `ancestors`: merged locally ⇒ on origin unless a test strands it)
   originUnresolved?: boolean; // the cached origin/<default> ref does not resolve (never-pushed default) → FF precheck "unknown"
   repoHead?: string; // main worktree current branch
+  headAt?: Map<string, string>; // cwd → that worktree's abbrev-ref HEAD (falls back to repoHead/defaultBranch)
   dirtyStatus?: string; // git status --porcelain stdout on the main checkout
   remoteAhead?: boolean; // cached origin ref NOT an ancestor of local → non-ff
   noRemote?: boolean; // `remote get-url origin` fails → not turn-key
@@ -8646,7 +8647,7 @@ function makeRecoveryGit(state: {
     if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
       return {
         code: 0,
-        stdout: `${state.repoHead ?? state.defaultBranch ?? "main"}\n`,
+        stdout: `${state.headAt?.get(cwd) ?? state.repoHead ?? state.defaultBranch ?? "main"}\n`,
         stderr: "",
       };
     }
@@ -8804,6 +8805,23 @@ test("fn-1123.2 recoverWorktrees: re-probes each keeper lane's base readiness �
   expect(outcome.laneWedged?.[0]?.reason.startsWith("off-branch")).toBe(true);
   // The standalone /repo is not a keeper lane → never a lane observation.
   expect(outcome.laneResolved ?? []).not.toContain("/repo");
+});
+
+test("recoverWorktrees: a healthy lane ON its own branch classifies resolved, never off-branch — the porcelain branch ref is refs/heads/-prefixed while abbrev-ref HEAD is short", async () => {
+  // The worktree-list porcelain carries the FULL ref (refs/heads/keeper/epic/…)
+  // while `rev-parse --abbrev-ref HEAD` answers the SHORT name; the readiness
+  // probe must compare shorts. A clean lane sitting on its own branch lands in
+  // laneResolved (the positive evidence that level-clears an open wedge row).
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const { run } = makeRecoveryGit({
+    worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+    mergeHeadAt: new Set(),
+    headAt: new Map([[lane, "keeper/epic/fn-1-foo--fn-1-foo.2"]]),
+    epicBases: [],
+  });
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(outcome.laneWedged ?? []).toEqual([]);
+  expect(outcome.laneResolved ?? []).toContain(lane);
 });
 
 test("fn-1123.2 recoverWorktrees: a hard abort-failed lane mid-merge surfaces as an IMMEDIATE wedge", async () => {
