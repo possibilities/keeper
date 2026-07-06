@@ -38,5 +38,5 @@ sandboxEnv + freshDbFile with hand-inserted jobs/epics rows and a tmp .keeper tr
 - [ ] The verb is read-only (no DB or .keeper writes) and registered in the keeper CLI with help text
 
 ## Done summary
-
+Add read-only 'keeper escalation-brief <unblock::task | deconflict::epic>' verb: assembles the cross-store (keeper.db + .keeper tree) context envelope a boot-time escalation session loads, resolving direct creator and walking created_by_close_of/plan_ref to the original creator, with degrade-at-exit-0 partial envelopes and exit-1 only for an unparseable key or unknown incident.
 ## Evidence
