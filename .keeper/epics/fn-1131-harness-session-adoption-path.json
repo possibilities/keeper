@@ -11,7 +11,7 @@
     "fn-1130-merge-gate-unsatisfied-upstream-deferral"
   ],
   "id": "fn-1131-harness-session-adoption-path",
-  "last_validated_at": "2026-07-06T00:37:25.000000Z",
+  "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -19,5 +19,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T00:37:25.000000Z"
+  "updated_at": "2026-07-06T01:32:00.686000Z"
 }
