@@ -225,7 +225,7 @@ function hermesBackendCoordsFromEnv(
  * `Day Mon DD HH:MM:SS YYYY` shape MUST match so the exit-watcher's verbatim
  * recycle compare holds.
  */
-function darwinLstartToStartTime(psStdout: string): string | null {
+export function darwinLstartToStartTime(psStdout: string): string | null {
   const trimmed = psStdout.replace(/^\s+|\s+$/g, "");
   if (trimmed.length < 24) {
     return null;
@@ -247,7 +247,7 @@ function darwinLstartToStartTime(psStdout: string): string | null {
  * spaces/parens, so bracket on the LAST `)` then split. DRIFT GUARD: mirrors
  * `birthRecord`'s `linuxStatToStartTime` byte-for-byte.
  */
-function linuxStatToStartTime(statText: string): string | null {
+export function linuxStatToStartTime(statText: string): string | null {
   const close = statText.lastIndexOf(")");
   if (close < 0) {
     return null;

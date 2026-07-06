@@ -13,11 +13,21 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildHermesEventLine,
+  darwinLstartToStartTime,
   HERMES_ADOPT_OPT_OUT_ENV,
   HERMES_SHIM_EVENTS,
   HERMES_SHIM_VERSION,
+  linuxStatToStartTime,
   validateNativeSessionId,
 } from "../plugins/keeper/plugin/hooks/hermes-events-shim";
+import {
+  darwinLstartToStartTime as birthDarwinLstartToStartTime,
+  linuxStatToStartTime as birthLinuxStatToStartTime,
+} from "../src/birth-record";
+import {
+  DARWIN_LSTART_CASES,
+  LINUX_STAT_CASES,
+} from "./fixtures/start-time-parser-cases";
 
 const JOB_ID = "job-abc-123";
 const NATIVE_ID = "hermes-sess-xyz";
@@ -521,5 +531,32 @@ describe("buildHermesEventLine — launcher-owned XOR (byte-identical to pre-ado
     const without = buildHermesEventLine(raw, env(), TS);
     expect(withOptOut).toBe(without as string);
     expect(withOptOut).not.toBeNull();
+  });
+});
+
+// DRIFT GUARD pin: the shim's darwin/linux start_time parsers are declared
+// byte-identical to `birthRecord`'s originals — this must be an assertion,
+// not just a comment. Both halves consume the SAME fixture cases
+// (test/fixtures/start-time-parser-cases.ts) as the birth-record originals'
+// own test, and the shim's outputs are directly compared against the
+// birth-record implementations' outputs on every case, so a silent drift in
+// either copy fails here regardless of which side changed.
+describe("start_time parsers — parity with birth-record (DRIFT GUARD)", () => {
+  test("darwin lstart parser matches the birth-record original on every fixture case", () => {
+    for (const { input, expected } of DARWIN_LSTART_CASES) {
+      expect(darwinLstartToStartTime(input)).toBe(expected);
+      expect(darwinLstartToStartTime(input)).toBe(
+        birthDarwinLstartToStartTime(input),
+      );
+    }
+  });
+
+  test("linux /proc stat parser matches the birth-record original on every fixture case", () => {
+    for (const { input, expected } of LINUX_STAT_CASES) {
+      expect(linuxStatToStartTime(input)).toBe(expected);
+      expect(linuxStatToStartTime(input)).toBe(
+        birthLinuxStatToStartTime(input),
+      );
+    }
   });
 });
