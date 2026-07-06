@@ -310,7 +310,9 @@ function isRunningVerdict(verdict: Verdict | undefined): boolean {
   return verdict?.tag === "running";
 }
 
-export function computeBoardSummary(input: BoardSummaryInput): BoardSummaryCounts {
+export function computeBoardSummary(
+  input: BoardSummaryInput,
+): BoardSummaryCounts {
   let epicsOpen = 0;
   let epicsRunning = 0;
   let tasksOpen = 0;
