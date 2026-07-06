@@ -427,7 +427,14 @@ describe("cli/dispatch resolvePlanCwd", () => {
       ],
     });
     const res = await resolvePlanCwd(q, "work", "fn-1-foo.2", () => true);
-    expect(res).toEqual({ ok: true, cwd: "/task/repo" });
+    // A work row now also carries the task's {model, tier} cell axes (null when
+    // the task file names neither) for the launcher's worker-cell resolution.
+    expect(res).toEqual({
+      ok: true,
+      cwd: "/task/repo",
+      model: null,
+      tier: null,
+    });
   });
 
   test("work: falls back to the epic project_dir when target_repo is empty/absent", async () => {
@@ -441,7 +448,12 @@ describe("cli/dispatch resolvePlanCwd", () => {
       ],
     });
     const res = await resolvePlanCwd(q, "work", "fn-1-foo.2", () => true);
-    expect(res).toEqual({ ok: true, cwd: "/epic/dir" });
+    expect(res).toEqual({
+      ok: true,
+      cwd: "/epic/dir",
+      model: null,
+      tier: null,
+    });
   });
 
   test("close: runs in the epic lane worktree when one is registered", async () => {

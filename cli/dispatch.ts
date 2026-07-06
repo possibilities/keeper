@@ -40,6 +40,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   ConfigError,
@@ -47,7 +48,10 @@ import {
   type Preset,
   resolvePreset,
 } from "../src/agent/config";
-import { resolveWorkerLaunchConfig } from "../src/autopilot-worker";
+import {
+  KEEPER_ROOT,
+  resolveWorkerLaunchConfig,
+} from "../src/autopilot-worker";
 import { GIT_LOCAL_TIMEOUT_MS, gitExec } from "../src/commit-work/git-exec";
 import {
   resolveConfig,
@@ -61,10 +65,16 @@ import {
   type RetryDispatchVerb,
   validatePromptBytes,
 } from "../src/dispatch-command";
+import { assertNever } from "../src/dispatch-failure-key";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
+import {
+  composeWorkerCellDir,
+  defaultShadowingWorkProbe,
+  resolveWorkerCell,
+} from "../src/worker-cell";
 import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
 import { queryCollection } from "./control-rpc";
 
@@ -121,6 +131,11 @@ export interface MainDeps {
     projectDir: string,
     epicId: string,
   ) => Promise<string | null>;
+  /** Scan-dir shadow probe for the `work::` worker-cell resolution. Defaults to
+   *  the fresh `defaultShadowingWorkProbe` (a real plugin-config scan); injected
+   *  so a test drives the shadowed-cell reject without live config. A dispatch
+   *  fires ONE worker, so a per-launch fresh scan is fine (no hot loop). */
+  readonly probeShadowingWorkManifest?: () => string | null;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -189,11 +204,19 @@ function argFault(message: string): never {
   process.exit(2);
 }
 
-/** Minimal shape of an `epics` row we read for cwd resolution. */
+/** Minimal shape of an `epics` row we read for cwd + worker-cell resolution.
+ *  The `model`/`tier` axes ride the epics-projection `tasks[]` elements the same
+ *  walk already reads (`src/reducer.ts` serializes both), so the launcher
+ *  resolves the task's `{model, tier}` cell from one fetch, one source. */
 interface EpicRow extends Row {
   epic_id?: string;
   project_dir?: string | null;
-  tasks?: Array<{ task_id?: string; target_repo?: string | null }> | null;
+  tasks?: Array<{
+    task_id?: string;
+    target_repo?: string | null;
+    model?: string | null;
+    tier?: string | null;
+  }> | null;
 }
 
 /**
@@ -260,7 +283,17 @@ export async function resolvePlanCwd(
     epicId: string,
   ) => Promise<string | null> = resolveEpicLaneWorktree,
 ): Promise<
-  { ok: true; cwd: string; warning?: string } | { ok: false; error: string }
+  | {
+      ok: true;
+      cwd: string;
+      warning?: string;
+      /** The matched `work` task's cell axes off the same `tasks[]` walk (both
+       *  serialized on the projection element) — the launcher resolves the
+       *  {model, tier} worker cell from these. Absent for `close` rows. */
+      model?: string | null;
+      tier?: string | null;
+    }
+  | { ok: false; error: string }
 > {
   // work: id is a task id `fn-N-slug.M` whose parent epic is the `fn-N-slug`
   // prefix. close: id IS the epic id. The epic filter resolves both.
@@ -329,7 +362,15 @@ export async function resolvePlanCwd(
   if (!dirExists(cwd)) {
     return { ok: false, error: `cwd-missing: ${cwd}` };
   }
-  return { ok: true, cwd };
+  // Carry the task's cell axes off the SAME element — the caller resolves the
+  // {model, tier} worker cell from these (single fetch, single source; main()
+  // never re-walks the projection).
+  return {
+    ok: true,
+    cwd,
+    model: task.model ?? null,
+    tier: task.tier ?? null,
+  };
 }
 
 /**
@@ -568,6 +609,10 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   // the free-form `--name` (which is a pure claude pass-through, not a keeper
   // labeling/correlation concept).
   let label: string;
+  // The resolved per-cell worker `--plugin-dir` for a `work::` plan launch whose
+  // task carries an in-matrix {model, tier}; undefined for a cell-less work row,
+  // and NEVER set for close / free-form launches (those stay byte-identical).
+  let workerPluginDir: string | undefined;
 
   if (hasPlanKey) {
     // ---- plan form ----
@@ -604,6 +649,91 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
         die(
           `refusing to dispatch ${claudeName}: ${tripped} (pass --force to override)`,
         );
+      }
+    }
+
+    // Worktree-mode refusal — `work::` only, AFTER the race guard. While the
+    // board runs worktree mode ON, autopilot gives each ready task its own lane
+    // worktree; a hand-fired worker into the shared checkout is wrong-topology
+    // (concurrent lanes collide). Refuse loud naming BOTH recoveries, unless
+    // `--force` deliberately launches into the shared checkout (the repo's
+    // fail-closed-unless-force precedent). Read the singleton `worktree_mode`
+    // client-side via the SAME query seam as the race guard (`worktree_mode === 1`
+    // is ON, every other value OFF); a daemon-unreachable read FAILS OPEN like
+    // the race guard — a down daemon means this manual hatch IS the recovery.
+    // Runs under `--dry-run` too, so the dry-run reflects the refusal a real run
+    // would hit rather than printing misleading argv. Ephemeral stderr only — no
+    // synthetic event, no board row. `close::`, resume, and free-form are untouched.
+    if (verb === "work" && !(v.force ?? false)) {
+      let worktreeMode = false;
+      try {
+        const st = await query("autopilot_state", { id: 1 });
+        worktreeMode = st[0]?.worktree_mode === 1;
+      } catch {
+        // Transient read failure — fail open, do not block a manual launch.
+      }
+      if (worktreeMode) {
+        die(
+          `refusing to dispatch ${claudeName} into the shared checkout: the board is in ` +
+            "worktree mode, so autopilot provisions a per-task lane worktree — let " +
+            "autopilot dispatch it (pause it and it resumes on play), or re-run with " +
+            "--force to deliberately launch in the shared checkout",
+        );
+      }
+    }
+
+    // Resolve the task's per-cell worker plugin — `work::` only. Compose the
+    // {model, tier} cell fresh from the projection axes `resolvePlanCwd` carried,
+    // then run the SAME resolution seam the autopilot producer uses (fresh
+    // filesystem probes here; the producer injects its per-cycle memoized shadow
+    // closure). A partial/absent cell (either axis null) launches cell-less
+    // exactly like the producer — parity, never a reject. Any reject exits 1 with
+    // a three-part actionable error (what was being launched, which cell/manifest
+    // is wrong, what to do next) instead of spawning a doomed worker. Runs under
+    // `--dry-run` too so it reflects the reject a real run would hit. The switch
+    // is closed by `assertNever` — a new reject kind fails compilation here.
+    if (verb === "work") {
+      const cell = resolveWorkerCell(
+        composeWorkerCellDir(cwdResult.model ?? null, cwdResult.tier ?? null),
+        {
+          dirExists: deps.dirExists ?? existsSync,
+          probeShadow:
+            deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
+        },
+      );
+      if (!cell.ok) {
+        switch (cell.kind) {
+          case "out-of-matrix":
+            die(
+              `refusing to launch ${claudeName}: its {model, tier} resolves no valid ` +
+                `worker cell — ${cell.message}; fix the task's model/tier in the plan ` +
+                "or regenerate the worker matrix",
+            );
+            break;
+          case "missing":
+            die(
+              `refusing to launch ${claudeName}: the worker-cell plugin manifest is ` +
+                `absent under ${cell.pluginDir} — regenerate via 'keeper prompt ` +
+                `render-plugin-templates --project-root ${join(KEEPER_ROOT, "plugins", "plan")}' ` +
+                "(without it claude --plugin-dir falls back to the dir basename and " +
+                "'/plan:work' cannot resolve 'work:worker')",
+            );
+            break;
+          case "shadowed":
+            die(
+              `refusing to launch ${claudeName}: a non-cell 'work'-named plugin at ` +
+                `${cell.shadowManifest} would steal 'work:worker' from the ` +
+                `'${cell.pluginDir}' cell at launch (silent wrong-worker spawn) — ` +
+                "remove or rename it, then retry",
+            );
+            break;
+          default:
+            assertNever(cell);
+        }
+      } else {
+        // null pluginDir = cell-less → no `--plugin-dir` (byte-identical to a
+        // close/free-form launch); a resolved cell threads its absolute dir.
+        workerPluginDir = cell.pluginDir ?? undefined;
       }
     }
   } else {
@@ -653,6 +783,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     prompt,
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort } : {}),
+    ...(workerPluginDir !== undefined ? { pluginDir: workerPluginDir } : {}),
     noConfirm: true,
   });
 
@@ -677,6 +808,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     ...(claudeName !== undefined ? { claudeName } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort } : {}),
+    ...(workerPluginDir !== undefined ? { pluginDir: workerPluginDir } : {}),
   };
 
   // UNNAMED window (empty `name`): the renamer worker labels plan-form windows

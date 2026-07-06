@@ -52,17 +52,22 @@ function writePresets(body: string): void {
 
 interface CapturedLaunch {
   spec: LaunchSpec | undefined;
+  /** The shell-wrapped launch argv the seam received (mirrors the dry-run line). */
+  launchArgv: string[] | undefined;
   code: number | undefined;
   stderr: string;
+  stdout: string;
 }
 
-/** Drive dispatchMain capturing the LaunchSpec the launch seam receives. */
+/** Drive dispatchMain capturing the LaunchSpec + argv the launch seam receives. */
 async function runDispatch(
   argv: string[],
   extraDeps: Partial<MainDeps> = {},
 ): Promise<CapturedLaunch> {
   let spec: LaunchSpec | undefined;
+  let launchArgv: string[] | undefined;
   const err: string[] = [];
+  const out: string[] = [];
   const realErr = process.stderr.write.bind(process.stderr);
   const realOut = process.stdout.write.bind(process.stdout);
   const realExit = process.exit.bind(process);
@@ -71,14 +76,18 @@ async function runDispatch(
     err.push(typeof s === "string" ? s : Buffer.from(s).toString());
     return true;
   }) as typeof process.stderr.write;
-  process.stdout.write = (() => true) as typeof process.stdout.write;
+  process.stdout.write = ((s: string | Uint8Array) => {
+    out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+    return true;
+  }) as typeof process.stdout.write;
   process.exit = ((c?: number) => {
     code = c ?? 0;
     throw new ExitError(code);
   }) as typeof process.exit;
   const deps: MainDeps = {
-    launch: async (_session, _argv, _cwd, _name, s): Promise<LaunchResult> => {
+    launch: async (_session, a, _cwd, _name, s): Promise<LaunchResult> => {
       spec = s;
+      launchArgv = a;
       return { ok: true } as LaunchResult;
     },
     ...extraDeps,
@@ -92,7 +101,50 @@ async function runDispatch(
     process.stdout.write = realOut;
     process.exit = realExit;
   }
-  return { spec, code, stderr: err.join("") };
+  return { spec, launchArgv, code, stderr: err.join(""), stdout: out.join("") };
+}
+
+/** Route a `query` stub by collection so a plan-form run drives the epics walk,
+ *  the race guard (pending_dispatches / autopilot_state / jobs), AND the
+ *  worktree-mode read off one canned board. Any collection defaults to `[]`. */
+function makeQuery(rows: {
+  epics?: Row[];
+  autopilotState?: Row[];
+  pending?: Row[];
+  jobs?: Row[];
+  throwOn?: string;
+}): MainDeps["query"] {
+  return async (collection: string): Promise<Row[]> => {
+    if (collection === rows.throwOn) {
+      throw new Error(`daemon unreachable (${collection})`);
+    }
+    switch (collection) {
+      case "epics":
+        return rows.epics ?? [];
+      case "autopilot_state":
+        return rows.autopilotState ?? [{ id: 1, paused: 1 } as unknown as Row];
+      case "pending_dispatches":
+        return rows.pending ?? [];
+      case "jobs":
+        return rows.jobs ?? [];
+      default:
+        return [];
+    }
+  };
+}
+
+/** One epics row whose sole task carries the given cell axes. */
+function epicWith(
+  taskDir: string,
+  cell: { model?: string | null; tier?: string | null } = {},
+): Row[] {
+  return [
+    {
+      epic_id: "fn-1-x",
+      project_dir: taskDir,
+      tasks: [{ task_id: "fn-1-x.1", target_repo: taskDir, ...cell }],
+    } as unknown as Row,
+  ];
 }
 
 test("free-form --preset supplies the spec model/effort", async () => {
@@ -176,4 +228,190 @@ test("a missing preset name fails loud (exit 2)", async () => {
   const r = await runDispatch(["--prompt", "x", "--preset", "nope"]);
   expect(r.code).toBe(2);
   expect(r.stderr).toContain("not found");
+});
+
+// ---------------------------------------------------------------------------
+// Worker-cell resolution — a manual work:: dispatch threads the task's cell
+// ---------------------------------------------------------------------------
+
+test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the argv", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBeUndefined(); // launched
+  expect(r.spec?.pluginDir).toContain("plugins/plan/workers/opus-max");
+  // The shell-wrapped argv mirrors it — `--plugin-dir` right after `--name`.
+  const argv = r.launchArgv ?? [];
+  const nameIdx = argv.indexOf("--name");
+  expect(nameIdx).toBeGreaterThanOrEqual(0);
+  expect(argv[nameIdx + 1]).toBe("work::fn-1-x.1");
+  expect(argv[nameIdx + 2]).toBe("--plugin-dir");
+  expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/opus-max");
+});
+
+test("plan work: a cell-less task (no model/tier) launches with NO --plugin-dir", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({ epics: epicWith(dir) }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBeUndefined();
+  expect(r.spec?.pluginDir).toBeUndefined();
+  expect(r.launchArgv ?? []).not.toContain("--plugin-dir");
+});
+
+test("plan work: an out-of-matrix cell refuses (exit 1, actionable), launches nothing", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "ludicrous" }),
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched
+  expect(r.stderr).toContain("no valid");
+  expect(r.stderr).toContain("model/tier");
+});
+
+test("plan work: a missing cell manifest refuses (exit 1) with the regenerate remedy", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
+    // cwd exists; the cell's `.claude-plugin/…` manifest does not.
+    dirExists: (p) => !p.includes(".claude-plugin"),
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined();
+  expect(r.stderr).toContain("manifest is");
+  expect(r.stderr).toContain("render-plugin-templates");
+});
+
+test("plan work: a shadowing work plugin refuses (exit 1) naming the offending manifest", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () =>
+      "/scan/arthack-work/.claude-plugin/plugin.json",
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined();
+  expect(r.stderr).toContain("work:worker");
+  expect(r.stderr).toContain("/scan/arthack-work/.claude-plugin/plugin.json");
+});
+
+// ---------------------------------------------------------------------------
+// Worktree-mode refusal — a shared-checkout work:: launch is wrong-topology
+// ---------------------------------------------------------------------------
+
+test("plan work: worktree mode ON refuses without --force, naming both recoveries", async () => {
+  const r = await runDispatch(["work::fn-1-x.1"], {
+    query: makeQuery({
+      epics: epicWith(dir),
+      autopilotState: [
+        { id: 1, paused: 1, worktree_mode: 1 } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched
+  expect(r.stderr).toContain("worktree mode");
+  expect(r.stderr).toContain("let autopilot dispatch"); // recovery 1
+  expect(r.stderr).toContain("--force"); // recovery 2
+});
+
+test("plan work: --force deliberately overrides the worktree-mode refusal and launches", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir),
+      autopilotState: [
+        { id: 1, paused: 1, worktree_mode: 1 } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBeUndefined(); // launched despite worktree mode
+  expect(r.spec).toBeDefined();
+});
+
+test("plan work: a daemon-unreachable worktree read FAILS OPEN (launches, no refusal)", async () => {
+  const r = await runDispatch(["work::fn-1-x.1"], {
+    query: makeQuery({ epics: epicWith(dir), throwOn: "autopilot_state" }),
+    dirExists: () => true,
+  });
+  // The race guard AND the worktree read both fail open on the throw — a manual
+  // dispatch is the recovery tool when the daemon is down, so it must not block.
+  expect(r.code).toBeUndefined();
+  expect(r.spec).toBeDefined();
+});
+
+test("plan close: worktree mode + a cell axis are BOTH ignored (no refusal, no --plugin-dir)", async () => {
+  const r = await runDispatch(["close::fn-1-x", "--force"], {
+    query: makeQuery({
+      epics: [
+        {
+          epic_id: "fn-1-x",
+          project_dir: dir,
+          // A stray model/tier on a task must not leak onto a close launch.
+          tasks: [
+            {
+              task_id: "fn-1-x.1",
+              target_repo: dir,
+              model: "opus",
+              tier: "max",
+            },
+          ],
+        } as unknown as Row,
+      ],
+      autopilotState: [
+        { id: 1, paused: 1, worktree_mode: 1 } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    resolveLaneDir: async () => null,
+  });
+  expect(r.code).toBeUndefined(); // launched
+  expect(r.spec?.pluginDir).toBeUndefined();
+  expect(r.launchArgv ?? []).not.toContain("--plugin-dir");
+});
+
+// ---------------------------------------------------------------------------
+// --dry-run reflects the outcome a real run would hit (never a misleading argv)
+// ---------------------------------------------------------------------------
+
+test("plan work: --dry-run reflects the worktree-mode refusal (exit 1, no argv line)", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--dry-run"], {
+    query: makeQuery({
+      epics: epicWith(dir),
+      autopilotState: [
+        { id: 1, paused: 1, worktree_mode: 1 } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("worktree mode");
+  expect(r.stdout).not.toContain("argv:"); // no misleading plan printed
+});
+
+test("plan work: --dry-run reflects a cell reject (exit 1) instead of printing argv", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--dry-run"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "ludicrous" }),
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBe(1);
+  expect(r.stdout).not.toContain("argv:");
+});
+
+test("plan work: --dry-run on an in-matrix cell PRINTS the resolved --plugin-dir argv", async () => {
+  const r = await runDispatch(["work::fn-1-x.1", "--force", "--dry-run"], {
+    query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBe(0);
+  expect(r.stdout).toContain("--plugin-dir");
+  expect(r.stdout).toContain("plugins/plan/workers/opus-max");
 });
