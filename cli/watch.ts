@@ -153,7 +153,12 @@ export interface CoarseBoard {
     paused: boolean;
     worktree_mode: boolean;
     max_concurrent_jobs: number | null;
+    // The EFFECTIVE per-root cap; `_stored` is the durable intent (ABSENT when
+    // the snapshot carries no autopilot rows — never fabricated). Both ride the
+    // coarse `autopilot-change` diff, so setting intent while worktree is off is
+    // a visible board move even though effective stays 1.
     max_concurrent_per_root: number;
+    max_concurrent_per_root_stored?: number;
   };
 }
 
@@ -207,6 +212,9 @@ export function projectCoarseBoard(snap: ReadinessClientSnapshot): CoarseBoard {
       worktree_mode: snap.worktreeMode,
       max_concurrent_jobs: snap.maxConcurrentJobs,
       max_concurrent_per_root: snap.maxConcurrentPerRoot,
+      ...(snap.maxConcurrentPerRootStored === undefined
+        ? {}
+        : { max_concurrent_per_root_stored: snap.maxConcurrentPerRootStored }),
     },
   };
 }

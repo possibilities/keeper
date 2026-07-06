@@ -1239,7 +1239,12 @@ export interface BoardSignatureInput {
     paused: boolean;
     worktreeMode: boolean;
     maxConcurrentJobs: number | null;
-    maxConcurrentPerRoot: number;
+    // Keyed on the STORED per-root intent, not the effective cap: setting intent
+    // while worktree mode is off is a real board move that must fire a `changed`
+    // edge even though effective stays 1. `worktreeMode` is already a signature
+    // input, so effective is fully derivable from the pair — no information loss.
+    // ABSENT (undefined) when the snapshot carries no autopilot rows.
+    maxConcurrentPerRootStored?: number;
   };
 }
 

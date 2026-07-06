@@ -252,11 +252,38 @@ export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
  * one-task-per-root mutex (N=1 is byte-identical to the pre-feature board);
  * a positive integer N grants up to N concurrent tasks per root, distributed
  * fairly across the root's epics (the allocator lands in task .2). Unlike the
- * global cap, this has NO unlimited sentinel — it is always a positive integer,
- * resolved `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT` by the reconciler + the
- * board. The reconciler/board resolve `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT`.
+ * global cap, this has NO unlimited sentinel — the stored column is durable
+ * intent, and the EFFECTIVE cap consumers dispatch against is derived through
+ * {@link effectivePerRootCap} (worktree off ⇒ 1; worktree on ⇒ the stored
+ * positive integer, else this default).
  */
 export const DEFAULT_MAX_CONCURRENT_PER_ROOT = 1;
+
+/**
+ * Derive the EFFECTIVE per-root dispatch concurrency cap from the durable STORED
+ * intent and the live worktree-mode toggle — the SINGLE derivation seam every
+ * dispatch-relevant consumer routes through (none re-interprets the raw column
+ * inline, so per-seam derivations can never drift). Worktree mode is the safety
+ * boundary: with it OFF every worker of a root shares the one main checkout, so
+ * the effective cap is ALWAYS 1 (concurrent same-checkout workers would corrupt
+ * each other's working tree + index); with it ON each task forks its own lane, so
+ * the stored intent is honored. The stored value is durable — it survives a
+ * worktree toggle untouched, so an OFF→ON flip restores the prior cap with no
+ * re-set. Fails closed: a missing / null / non-integer / non-positive stored
+ * value derives to 1, never permissive. No upper clamp — the ceiling is
+ * unbounded. Pure.
+ */
+export function effectivePerRootCap(
+  stored: unknown,
+  worktreeOn: boolean,
+): number {
+  if (!worktreeOn) {
+    return DEFAULT_MAX_CONCURRENT_PER_ROOT;
+  }
+  return typeof stored === "number" && Number.isInteger(stored) && stored > 0
+    ? stored
+    : DEFAULT_MAX_CONCURRENT_PER_ROOT;
+}
 
 /** `KEEPER_CONFIG` env wins; else `~/.config/keeper/config.yaml`. Pure. */
 export function resolveConfigPath(): string {

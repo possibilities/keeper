@@ -24,8 +24,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  enforceWorktreeConcurrencyInvariant,
   parseDispatchKey,
+  perRootStoredWhileOffNote,
   replayDeadLetterHandler,
   requestHandoffHandler,
   retryDispatchHandler,
@@ -192,7 +192,7 @@ function autopilotStubBridge(opts: {
   setPaused?: { ok: boolean; error?: string };
   retry?: { ok: boolean; error?: string };
   setMode?: { ok: boolean; error?: string };
-  setConfig?: { ok: boolean; error?: string };
+  setConfig?: { ok: boolean; error?: string; note?: string };
   setArmed?: { ok: boolean; error?: string };
   requestHandoff?: { ok: boolean; error?: string; conflict?: boolean };
 }): {
@@ -544,96 +544,79 @@ test("set_autopilot_config throws rpc_failed when the bridge reports ok:false", 
 });
 
 // ---------------------------------------------------------------------------
-// fn-972 — `enforceWorktreeConcurrencyInvariant`: worktree-off ⟹ per-root = 1.
-// Pure cross-field guard run producer-side (daemon main) before minting. The
-// second arg is the CURRENT folded worktree mode; the patch's own worktree_mode
-// wins when present. Coerce on the worktree-off transition; hard-reject per-root
-// > 1 while worktree is (or is being set) off — no --force.
+// `perRootStoredWhileOffNote` — the stored-vs-effective advisory. Storing a
+// per-root cap is ALWAYS legal (no reject, no coerce); this pure helper only
+// surfaces the gap when the folded worktree mode leaves the stored value dormant
+// (effective 1). `worktreeOn` is the folded mode AFTER the patch, read by main at
+// reply time. Inverts the old reject: the conditions that once threw now note.
 // ---------------------------------------------------------------------------
 
-const PER_ROOT_OFF_MSG =
-  /max_concurrent_per_root must be 1 while worktree mode is off/;
-
-test("invariant — worktree ON: per-root > 1 is allowed, patch returned unchanged (fn-972)", () => {
-  // Current on, lone per-root bump.
+test("note — worktree ON: a per-root > 1 patch is honored, so no note (fn-1134)", () => {
   expect(
-    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 3 }, true),
-  ).toEqual({ max_concurrent_per_root: 3 });
-  // Turning worktree ON in the same patch as a per-root bump.
+    perRootStoredWhileOffNote({ max_concurrent_per_root: 3 }, true),
+  ).toBeNull();
   expect(
-    enforceWorktreeConcurrencyInvariant(
+    perRootStoredWhileOffNote(
       { worktree_mode: true, max_concurrent_per_root: 5 },
+      true,
+    ),
+  ).toBeNull();
+});
+
+test("note — worktree OFF: a stored per-root > 1 is dormant, so a note rides the reply (fn-1134)", () => {
+  const note = perRootStoredWhileOffNote({ max_concurrent_per_root: 3 }, false);
+  expect(note).not.toBeNull();
+  expect(note).toContain("stored as 3");
+  expect(note).toContain("worktree mode is off");
+  // A single patch flipping worktree off AND setting per-root > 1 also notes.
+  expect(
+    perRootStoredWhileOffNote(
+      { worktree_mode: false, max_concurrent_per_root: 2 },
       false,
     ),
-  ).toEqual({ worktree_mode: true, max_concurrent_per_root: 5 });
-  // An unrelated cap change while worktree on is untouched.
-  expect(
-    enforceWorktreeConcurrencyInvariant({ max_concurrent_jobs: 8 }, true),
-  ).toEqual({ max_concurrent_jobs: 8 });
+  ).toContain("stored as 2");
 });
 
-test("invariant — coerce: flipping worktree OFF without naming per-root pins per-root to 1 (fn-972)", () => {
-  // ON → OFF transition: per-root coerced into the same patch.
+test("note — worktree OFF but no surprising per-root intent (1 / null / absent) → null (fn-1134)", () => {
+  // Effective already equals the requested value → nothing to clarify.
   expect(
-    enforceWorktreeConcurrencyInvariant({ worktree_mode: false }, true),
-  ).toEqual({ worktree_mode: false, max_concurrent_per_root: 1 });
-  // Re-issuing `worktree off` while already off still pins per-root (idempotent
-  // self-heal).
+    perRootStoredWhileOffNote({ max_concurrent_per_root: 1 }, false),
+  ).toBeNull();
   expect(
-    enforceWorktreeConcurrencyInvariant({ worktree_mode: false }, false),
-  ).toEqual({ worktree_mode: false, max_concurrent_per_root: 1 });
+    perRootStoredWhileOffNote({ max_concurrent_per_root: null }, false),
+  ).toBeNull();
+  // A lone unrelated config change never carries the per-root note.
+  expect(
+    perRootStoredWhileOffNote({ max_concurrent_jobs: 8 }, false),
+  ).toBeNull();
 });
 
-test("invariant — coerce no-op: an explicit per-root of 1 (or null) alongside worktree-off is left as-is (fn-972)", () => {
-  expect(
-    enforceWorktreeConcurrencyInvariant(
-      { worktree_mode: false, max_concurrent_per_root: 1 },
-      true,
-    ),
-  ).toEqual({ worktree_mode: false, max_concurrent_per_root: 1 });
-  // null = reset to the default 1 — consistent with worktree off, allowed.
-  expect(
-    enforceWorktreeConcurrencyInvariant(
-      { worktree_mode: false, max_concurrent_per_root: null },
-      true,
-    ),
-  ).toEqual({ worktree_mode: false, max_concurrent_per_root: null });
+test("set_autopilot_config forwards main's stored-vs-effective note onto the result (fn-1134)", async () => {
+  const { bridge } = autopilotStubBridge({
+    setConfig: {
+      ok: true,
+      note: "max_concurrent_per_root stored as 3; the effective per-root cap stays 1",
+    },
+  });
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_per_root: 3 },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { max_concurrent_per_root: 3 },
+    note: "max_concurrent_per_root stored as 3; the effective per-root cap stays 1",
+  });
 });
 
-test("invariant — reject: per-root > 1 with worktree currently off (untouched by the patch) throws (fn-972)", () => {
-  expect(() =>
-    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 3 }, false),
-  ).toThrow(PER_ROOT_OFF_MSG);
-  expect(() =>
-    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 2 }, false),
-  ).toThrow(BadParamsError);
-});
-
-test("invariant — reject: a single patch setting worktree OFF and per-root > 1 throws (reject wins over coerce) (fn-972)", () => {
-  expect(() =>
-    enforceWorktreeConcurrencyInvariant(
-      { worktree_mode: false, max_concurrent_per_root: 3 },
-      true,
-    ),
-  ).toThrow(PER_ROOT_OFF_MSG);
-});
-
-test("invariant — no coerce on an unrelated config change while worktree already off (per-root left as-is) (fn-972)", () => {
-  // A lone cap change while worktree off must NOT inject a per-root value — the
-  // invariant already held; only the explicit worktree-off flip coerces.
-  expect(
-    enforceWorktreeConcurrencyInvariant({ max_concurrent_jobs: 8 }, false),
-  ).toEqual({ max_concurrent_jobs: 8 });
-  // An explicit per-root of 1 / null while off is allowed and unchanged.
-  expect(
-    enforceWorktreeConcurrencyInvariant({ max_concurrent_per_root: 1 }, false),
-  ).toEqual({ max_concurrent_per_root: 1 });
-  expect(
-    enforceWorktreeConcurrencyInvariant(
-      { max_concurrent_per_root: null },
-      false,
-    ),
-  ).toEqual({ max_concurrent_per_root: null });
+test("set_autopilot_config omits the note field when main reports none (fn-1134)", async () => {
+  const { bridge } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { max_concurrent_per_root: 3 },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, patch: { max_concurrent_per_root: 3 } });
+  expect("note" in result).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

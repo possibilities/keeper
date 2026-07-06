@@ -64,6 +64,7 @@ interface SnapOverrides {
   autopilotEligibleEpicIds?: string[];
   maxConcurrentJobs?: number | null;
   maxConcurrentPerRoot?: number;
+  maxConcurrentPerRootStored?: number;
   worktreeMode?: boolean;
   worktreeMultiRepo?: boolean;
 }
@@ -102,6 +103,9 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
     maxConcurrentJobs:
       o.maxConcurrentJobs === undefined ? null : o.maxConcurrentJobs,
     maxConcurrentPerRoot: o.maxConcurrentPerRoot ?? 1,
+    ...(o.maxConcurrentPerRootStored === undefined
+      ? {}
+      : { maxConcurrentPerRootStored: o.maxConcurrentPerRootStored }),
     worktreeMode: o.worktreeMode ?? false,
     worktreeMultiRepo: o.worktreeMultiRepo ?? false,
     readiness: {
@@ -137,6 +141,7 @@ describe("buildStatusEnvelope shape", () => {
       autopilotEligibleEpicIds: ["fn-1-a"],
       maxConcurrentJobs: 3,
       maxConcurrentPerRoot: 2,
+      maxConcurrentPerRootStored: 2,
       worktreeMode: true,
       worktreeMultiRepo: true,
     });
@@ -156,6 +161,7 @@ describe("buildStatusEnvelope shape", () => {
       armed: ["fn-1-a"],
       max_concurrent_jobs: 3,
       max_concurrent_per_root: 2,
+      max_concurrent_per_root_stored: 2,
     });
     // board: epic + task + close verdict views
     expect(d.board.epics).toHaveLength(1);
@@ -190,6 +196,26 @@ describe("buildStatusEnvelope shape", () => {
     });
     expect(d.needs_human.total).toBe(0);
     expect(d.needs_human.parked_questions).toBe(0);
+  });
+
+  test("per-root: worktree off publishes effective 1 with the stored intent distinct", () => {
+    // The boot-latched effective floors to 1 while worktree is off; the locally
+    // re-projected stored keeps the operator's 3.
+    const snap = makeSnap({
+      maxConcurrentPerRoot: 1,
+      maxConcurrentPerRootStored: 3,
+      worktreeMode: false,
+    });
+    const ap = buildStatusEnvelope(snap, BOOT, []).data?.autopilot;
+    expect(ap?.max_concurrent_per_root).toBe(1);
+    expect(ap?.max_concurrent_per_root_stored).toBe(3);
+  });
+
+  test("per-root: a snapshot lacking a stored value nulls it, never fabricated from effective", () => {
+    const snap = makeSnap({ maxConcurrentPerRoot: 1 });
+    const ap = buildStatusEnvelope(snap, BOOT, []).data?.autopilot;
+    expect(ap?.max_concurrent_per_root).toBe(1);
+    expect(ap?.max_concurrent_per_root_stored).toBeNull();
   });
 
   test("a verdict-map miss renders the inert [blocked:unknown] view", () => {

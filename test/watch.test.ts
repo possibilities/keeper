@@ -32,6 +32,7 @@ interface SnapOverrides {
   worktreeMode?: boolean;
   maxConcurrentJobs?: number | null;
   maxConcurrentPerRoot?: number;
+  maxConcurrentPerRootStored?: number;
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
@@ -56,6 +57,9 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
     maxConcurrentJobs:
       o.maxConcurrentJobs === undefined ? null : o.maxConcurrentJobs,
     maxConcurrentPerRoot: o.maxConcurrentPerRoot ?? 1,
+    ...(o.maxConcurrentPerRootStored === undefined
+      ? {}
+      : { maxConcurrentPerRootStored: o.maxConcurrentPerRootStored }),
     worktreeMode: o.worktreeMode ?? false,
     readiness: {
       perTask: toMap(o.perTask),
@@ -280,6 +284,34 @@ test("diffCoarseBoard: an autopilot pause toggle → autopilot-change", () => {
   const deltas = diffCoarseBoard(a, b);
   expect(deltas).toHaveLength(1);
   expect(deltas[0]?.type).toBe("autopilot-change");
+});
+
+test("diffCoarseBoard: setting the STORED per-root cap while worktree is off → autopilot-change (effective unchanged at 1)", () => {
+  // Worktree off ⇒ effective stays 1, but the stored intent moving 1→3 is a real
+  // board move that must surface. Both snaps carry effective 1.
+  const a = projectCoarseBoard(
+    makeSnap({
+      worktreeMode: false,
+      maxConcurrentPerRoot: 1,
+      maxConcurrentPerRootStored: 1,
+    }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({
+      worktreeMode: false,
+      maxConcurrentPerRoot: 1,
+      maxConcurrentPerRootStored: 3,
+    }),
+  );
+  const deltas = diffCoarseBoard(a, b);
+  expect(deltas).toHaveLength(1);
+  expect(deltas[0]?.type).toBe("autopilot-change");
+});
+
+test("diffCoarseBoard: an absent stored value nulls the field, never fabricated from effective", () => {
+  const board = projectCoarseBoard(makeSnap({ maxConcurrentPerRoot: 1 }));
+  expect(board.autopilot.max_concurrent_per_root).toBe(1);
+  expect(board.autopilot.max_concurrent_per_root_stored).toBeUndefined();
 });
 
 test("diffCoarseBoard: git/subagent churn alone (no coarse field) → no deltas", () => {

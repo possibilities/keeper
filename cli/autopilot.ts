@@ -28,7 +28,11 @@
 
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
-import { DEFAULT_MAX_CONCURRENT_PER_ROOT, resolveSockPath } from "../src/db";
+import {
+  DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  effectivePerRootCap,
+  resolveSockPath,
+} from "../src/db";
 import type { ClientFrame } from "../src/protocol";
 import {
   isEpicStarted,
@@ -81,8 +85,11 @@ Subcommands:
   show     Print the durable autopilot config as ONE
            {schema_version, ok, error, data} JSON envelope and exit:
            {paused, mode, worktree_mode, worktree_multi_repo, armed,
-           max_concurrent_jobs, max_concurrent_per_root}. Read-only — the
-           capture surface for a take-over (every durable knob round-trips).
+           max_concurrent_jobs, max_concurrent_per_root,
+           max_concurrent_per_root_stored}. max_concurrent_per_root is the
+           EFFECTIVE cap (worktree off => 1); _stored is the durable intent you
+           set. Read-only — the capture surface for a take-over (every durable
+           knob round-trips; restore stored via 'config max_concurrent_per_root').
   pause    Send set_autopilot_paused {paused:true} and exit.
   play     Send set_autopilot_paused {paused:false} and exit.
   mode     Send set_autopilot_mode {mode:<yolo|armed>} and exit. yolo works
@@ -93,11 +100,14 @@ Subcommands:
            integer cap, or 'unlimited' to clear it); max_concurrent_per_root (a
            positive integer count of concurrent tasks per root, or 'default'/1);
            worktree_multi_repo (an on/off rollout flag — see below).
-           max_concurrent_per_root > 1 is REJECTED while worktree mode is off
-           (workers would share the main checkout) — enable worktree mode first;
-           no --force override. worktree_multi_repo on lets worktree mode CLUSTER a
-           >1-toplevel epic into independent per-repo lane groups instead of
-           rejecting it worktree-multi-repo (OFF by default).
+           max_concurrent_per_root is stored as durable INTENT and accepted
+           regardless of worktree mode; the EFFECTIVE cap dispatch honors is
+           derived — the stored value while worktree mode is on, floored to 1
+           while it is off (a root's workers share the one main checkout). Set it
+           while worktree is off and it is stored untouched at an effective cap of
+           1 until you turn worktree mode on. worktree_multi_repo on lets worktree
+           mode CLUSTER a >1-toplevel epic into independent per-repo lane groups
+           instead of rejecting it worktree-multi-repo (OFF by default).
            e.g. keeper autopilot config max_concurrent_jobs 8
                 keeper autopilot config max_concurrent_per_root 3
                 keeper autopilot config worktree_multi_repo on
@@ -108,8 +118,10 @@ Subcommands:
            REJECTED only when a started open epic is in flight (so a flip never
            half-migrates an in-progress epic); a drained / unstarted-open /
            zero-epic board toggles freely. Pass --force to override. Turning it
-           off also pins max_concurrent_per_root back to 1 (worktree-off workers
-           share the main checkout). Even with it ON, a not-worktree-friendly repo
+           off leaves the stored max_concurrent_per_root untouched but floors the
+           EFFECTIVE per-root cap to 1 (worktree-off workers share the main
+           checkout); turning it back on restores the stored cap with no re-set.
+           Even with it ON, a not-worktree-friendly repo
            (a workspace/monorepo marker, no language manifest, or submodules) falls
            back to sequential shared-checkout dispatch — a NEUTRAL state shown in
            the viewer's --- worktree --- section, never a failure. Also with it ON, a
@@ -516,7 +528,14 @@ export interface AutopilotShowData {
   worktree_multi_repo: boolean;
   armed: string[];
   max_concurrent_jobs: number | null;
+  // The EFFECTIVE per-root cap dispatch honors — derived from the stored intent
+  // and worktree mode (off ⇒ 1). Meaning-stable with the old regime, where
+  // stored always equaled effective.
   max_concurrent_per_root: number;
+  // ADDITIVE: the durable STORED per-root intent a take-over capture/restore
+  // round-trips. Equals effective while worktree mode is on; while off it holds
+  // the value the operator set even though effective floors to 1.
+  max_concurrent_per_root_stored: number;
 }
 
 export type AutopilotShowEnvelope = Envelope<AutopilotShowData>;
@@ -534,14 +553,20 @@ export function buildAutopilotShowEnvelope(
   autopilotRows: Record<string, unknown>[],
   armedRows: Record<string, unknown>[],
 ): AutopilotShowEnvelope {
+  const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
+  // The raw column IS the stored intent (post task-.1 inversion); derive the
+  // effective cap through the ONE shared helper so `show` never re-interprets
+  // the raw value inline and can't drift from `keeper status` / the reconciler.
+  const storedPerRoot = projectMaxConcurrentPerRoot(autopilotRows);
   return successEnvelope(AUTOPILOT_SHOW_SCHEMA_VERSION, {
     paused: projectAutopilotPaused(autopilotRows) ?? true,
     mode: projectAutopilotMode(autopilotRows) ?? "yolo",
-    worktree_mode: projectWorktreeMode(autopilotRows) ?? false,
+    worktree_mode: worktreeMode,
     worktree_multi_repo: projectWorktreeMultiRepo(autopilotRows) ?? false,
     armed: projectArmedEpics(armedRows),
     max_concurrent_jobs: projectMaxConcurrentJobs(autopilotRows),
-    max_concurrent_per_root: projectMaxConcurrentPerRoot(autopilotRows),
+    max_concurrent_per_root: effectivePerRootCap(storedPerRoot, worktreeMode),
+    max_concurrent_per_root_stored: storedPerRoot,
   });
 }
 
@@ -793,10 +818,12 @@ interface ViewerState {
   // The global concurrency cap, sourced over the socket from the
   // `autopilot_state` singleton (NEVER config.yaml). `null` = unlimited.
   maxConcurrentJobs: number | null;
-  // The per-root concurrency count, sourced over the socket from the
+  // The durable STORED per-root intent, sourced over the socket from the
   // `autopilot_state` singleton's `max_concurrent_per_root` column. Always a
-  // concrete positive integer (NULL = the default 1, never unlimited).
-  maxConcurrentPerRoot: number;
+  // concrete positive integer (NULL = the default 1, never unlimited). The
+  // banner derives the EFFECTIVE cap from this pairing with `worktreeMode`
+  // through the shared `effectivePerRootCap`.
+  maxConcurrentPerRootStored: number;
   // The explicit autopilot mode, sourced from the `autopilot_state` singleton's
   // `mode` column.
   mode: "yolo" | "armed";
@@ -815,12 +842,15 @@ interface ViewerState {
  * Render the persistent banner pill: the play/pause pill, the mode suffix, the
  * concurrency-cap suffix, (in `armed` mode) the armed-epic count, the per-root
  * count, and the worktree-mode suffix.
- * `[playing] · yolo · max 3 · per-root 2 · worktree:off` in yolo mode;
+ * `[playing] · yolo · max 3 · per-root 2 · worktree:on` in yolo mode;
  * `[playing] · armed · 2 armed · max ∞ · per-root 1 · worktree:on` with two
  * armed epics and worktree mode on. The empty-armed-set-in-armed-mode case
  * renders DISTINCTLY as `[playing] · armed · nothing armed · max ∞ · per-root 1`
- * so idle-by-design is never mistaken for a broken autopilot. The per-root and
- * worktree segments render ALWAYS so the live state is scannable.
+ * so idle-by-design is never mistaken for a broken autopilot. The per-root
+ * segment renders the EFFECTIVE cap; when the durable STORED intent differs
+ * (worktree off floors effective to 1 while a >1 value stays stored) it appends
+ * the intent as `per-root 1 (stored 3)`, so a latent cap is never invisible. The
+ * per-root and worktree segments render ALWAYS so the live state is scannable.
  *
  * Pure — exported for tests. All values are socket-sourced; the viewer never
  * reads config.
@@ -829,6 +859,9 @@ export function autopilotBannerLabel(state: {
   paused: boolean;
   maxConcurrentJobs: number | null;
   maxConcurrentPerRoot: number;
+  // The durable STORED intent. Omitted (undefined) reads as "equals effective"
+  // and suppresses the annotation; a value differing from effective appends it.
+  maxConcurrentPerRootStored?: number;
   mode: "yolo" | "armed";
   armedCount: number;
   worktreeMode: boolean;
@@ -844,9 +877,14 @@ export function autopilotBannerLabel(state: {
         ? " · nothing armed"
         : ` · ${state.armedCount} armed`
       : "";
-  // Per-root segment renders ALWAYS (always a concrete positive integer),
-  // positioned between the global cap and the worktree toggle.
-  const perRootSeg = ` · per-root ${state.maxConcurrentPerRoot}`;
+  // Per-root segment renders the EFFECTIVE cap ALWAYS, annotating the stored
+  // intent ONLY when it differs (worktree-off floor), positioned between the
+  // global cap and the worktree toggle.
+  const perRootSeg =
+    state.maxConcurrentPerRootStored === undefined ||
+    state.maxConcurrentPerRootStored === state.maxConcurrentPerRoot
+      ? ` · per-root ${state.maxConcurrentPerRoot}`
+      : ` · per-root ${state.maxConcurrentPerRoot} (stored ${state.maxConcurrentPerRootStored})`;
   // Worktree segment renders for BOTH states (terse `worktree:on`/`worktree:off`)
   // so the live durable toggle is always visible at a glance.
   const worktreeSeg = state.worktreeMode ? " · worktree:on" : " · worktree:off";
@@ -866,9 +904,9 @@ async function runViewer(
     paused: true,
     // Seed `null` (= unlimited) until the `autopilot_state` edge lands the cap.
     maxConcurrentJobs: null,
-    // Seed `1` (the default per-root count) until the `autopilot_state` edge
-    // lands the real value.
-    maxConcurrentPerRoot: DEFAULT_MAX_CONCURRENT_PER_ROOT,
+    // Seed `1` (the default stored per-root count) until the `autopilot_state`
+    // edge lands the real value.
+    maxConcurrentPerRootStored: DEFAULT_MAX_CONCURRENT_PER_ROOT,
     // Seed `'yolo'` (the work-everything default) until the edge lands the mode.
     mode: "yolo",
     // Seed `false` (OFF, the default) until the `autopilot_state` edge lands it.
@@ -899,7 +937,11 @@ async function runViewer(
       autopilotBannerLabel({
         paused: state.paused,
         maxConcurrentJobs: state.maxConcurrentJobs,
-        maxConcurrentPerRoot: state.maxConcurrentPerRoot,
+        maxConcurrentPerRoot: effectivePerRootCap(
+          state.maxConcurrentPerRootStored,
+          state.worktreeMode,
+        ),
+        maxConcurrentPerRootStored: state.maxConcurrentPerRootStored,
         mode: state.mode,
         armedCount: state.armedEpics.length,
         worktreeMode: state.worktreeMode,
@@ -936,13 +978,18 @@ async function runViewer(
     paused: boolean;
     maxConcurrentJobs: number | null;
     maxConcurrentPerRoot: number;
+    maxConcurrentPerRootStored: number;
     mode: "yolo" | "armed";
     armedCount: number;
     worktreeMode: boolean;
   } => ({
     paused: state.paused,
     maxConcurrentJobs: state.maxConcurrentJobs,
-    maxConcurrentPerRoot: state.maxConcurrentPerRoot,
+    maxConcurrentPerRoot: effectivePerRootCap(
+      state.maxConcurrentPerRootStored,
+      state.worktreeMode,
+    ),
+    maxConcurrentPerRootStored: state.maxConcurrentPerRootStored,
     mode: state.mode,
     armedCount: state.armedEpics.length,
     worktreeMode: state.worktreeMode,
@@ -1015,7 +1062,7 @@ async function runViewer(
       // `paused` — fold them on every edge so a config-change-then-restart and a
       // live toggle both land on the banner.
       state.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
-      state.maxConcurrentPerRoot = projectMaxConcurrentPerRoot(rows);
+      state.maxConcurrentPerRootStored = projectMaxConcurrentPerRoot(rows);
       state.mode = projectAutopilotMode(rows) ?? "yolo";
       state.worktreeMode = projectWorktreeMode(rows) ?? false;
       view.liveShell.setStatus(autopilotBannerLabel(bannerState()));

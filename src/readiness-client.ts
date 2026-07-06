@@ -59,6 +59,7 @@
 
 import {
   projectMaxConcurrentJobs,
+  projectMaxConcurrentPerRoot,
   projectWorktreeMode,
   projectWorktreeMultiRepo,
 } from "../cli/autopilot";
@@ -213,6 +214,14 @@ export interface ReadinessClientSnapshot {
   readonly autopilotEligibleEpicIds?: readonly string[];
   readonly maxConcurrentJobs: number | null;
   readonly maxConcurrentPerRoot: number;
+  // The durable STORED per-root intent — re-projected LOCALLY off the same
+  // `autopilot_state` rows this snapshot already subscribes (never crosses the
+  // boot wire, which carries only the effective cap). `maxConcurrentPerRoot`
+  // above is the EFFECTIVE cap (boot-latched, floored to 1 while worktree off);
+  // this is what the operator SET, honored while worktree mode is on. ABSENT
+  // (undefined) when no autopilot rows have folded — an older server / pre-fold
+  // singleton nulls it rather than FABRICATING a stored value from effective.
+  readonly maxConcurrentPerRootStored?: number;
   readonly worktreeMode: boolean;
   // The durable multi-repo worktree rollout flag off the same `autopilot_state`
   // singleton (`false` on an empty/malformed row). ADDITIVE alongside
@@ -1893,6 +1902,15 @@ export function subscribeReadiness(
     // a stable render and absent in yolo (no filter).
     const autopilotRows = projectRows<Record<string, unknown>>(autopilotState);
     const maxConcurrentJobs = projectMaxConcurrentJobs(autopilotRows);
+    // The STORED per-root intent — the shared raw-column projector IS the stored
+    // read (post-inversion). An EMPTY row set omits the field (undefined) rather
+    // than the projector's floor-to-1 default, so a snapshot lacking autopilot
+    // rows never FABRICATES a stored value; the boot-latched EFFECTIVE
+    // `maxConcurrentPerRoot` that feeds `computeReadiness` stays untouched.
+    const maxConcurrentPerRootStored =
+      autopilotRows.length === 0
+        ? undefined
+        : projectMaxConcurrentPerRoot(autopilotRows);
     const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
     const worktreeMultiRepo = projectWorktreeMultiRepo(autopilotRows) ?? false;
     const eligibleEpicIdsSorted =
@@ -1924,6 +1942,9 @@ export function subscribeReadiness(
         : { autopilotEligibleEpicIds: eligibleEpicIdsSorted }),
       maxConcurrentJobs,
       maxConcurrentPerRoot,
+      ...(maxConcurrentPerRootStored === undefined
+        ? {}
+        : { maxConcurrentPerRootStored }),
       worktreeMode,
       worktreeMultiRepo,
       ...(landedEpicIds === undefined ? {} : { landedEpicIds }),

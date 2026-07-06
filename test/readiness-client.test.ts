@@ -3124,9 +3124,13 @@ test("subscribeReadiness: snapshot un-drops autopilot mode/caps/worktree + armed
   expect(snap?.autopilotPaused).toBe(false);
   expect(snap?.autopilotMode).toBe("armed");
   expect(snap?.maxConcurrentJobs).toBe(8);
-  // The boot-header LATCH (3) wins over the autopilot_state column (99): the
-  // snapshot reports the per-root value the readiness pass actually used.
+  // The boot-header LATCH (3) wins over the autopilot_state column (99) for the
+  // EFFECTIVE per-root value the readiness pass actually used.
   expect(snap?.maxConcurrentPerRoot).toBe(3);
+  // The STORED intent is re-projected LOCALLY off the same autopilot_state rows
+  // (the raw column, 99) — a distinct source from the boot-latched effective, so
+  // the operator's intent surfaces even when it exceeds the effective cap.
+  expect(snap?.maxConcurrentPerRootStored).toBe(99);
   expect(snap?.worktreeMode).toBe(true);
   expect(snap?.autopilotEligibleEpicIds).toEqual(["fn-1-foo", "fn-2-bar"]);
 
@@ -3173,6 +3177,9 @@ test("subscribeReadiness: empty autopilot_state defaults the autopilot fields to
   expect(snap?.autopilotMode).toBe("yolo");
   expect(snap?.maxConcurrentJobs).toBeNull();
   expect(snap?.maxConcurrentPerRoot).toBe(1);
+  // No autopilot rows → the stored intent is OMITTED (undefined), never
+  // fabricated from the effective default.
+  expect(snap?.maxConcurrentPerRootStored).toBeUndefined();
   expect(snap?.worktreeMode).toBe(false);
   expect(snap?.autopilotEligibleEpicIds).toBeUndefined();
 

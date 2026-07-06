@@ -356,10 +356,14 @@ export interface SetAutopilotConfigParams {
   worktree_multi_repo?: boolean;
 }
 
-/** Successful return shape for `set_autopilot_config` — echoes the applied patch. */
+/** Successful return shape for `set_autopilot_config` — echoes the applied patch.
+ *  `note` is an OPTIONAL advisory (present only when the patch stores a per-root
+ *  cap intent dormant under the current worktree mode — see
+ *  {@link perRootStoredWhileOffNote}); absent when there is nothing to clarify. */
 export interface SetAutopilotConfigResult {
   ok: true;
   patch: SetAutopilotConfigParams;
+  note?: string;
 }
 
 function validateSetAutopilotConfigParams(
@@ -450,66 +454,33 @@ function validateSetAutopilotConfigParams(
 }
 
 /**
- * Cross-field invariant coupling worktree mode and per-root concurrency:
- * **worktree-off ⟹ `max_concurrent_per_root` = 1, always**. In worktree mode
- * each epic forks onto its own git worktree lane, so concurrent same-repo
- * workers never collide; with worktree mode OFF every worker of a repo runs in
- * the SAME main checkout, so `max_concurrent_per_root > 1` makes them step on
- * each other (shared working tree + index, interleaved commits, test runs seeing
- * each other's half-finished edits).
+ * Advisory note attached to a successful `set_autopilot_config` reply when the
+ * patch STORES a `max_concurrent_per_root` intent that the live worktree mode
+ * leaves dormant. `max_concurrent_per_root` is durable intent honored while
+ * worktree mode is ON; with worktree mode OFF the effective cap is always 1
+ * (concurrent workers share the one main checkout — see
+ * {@link effectivePerRootCap}), so a stored value > 1 sits latent until worktree
+ * mode turns on. Storing the value is always legal — this only surfaces the
+ * stored-vs-effective gap so the caller isn't surprised the cap didn't take.
  *
- * Enforced producer-side, BEFORE the `AutopilotConfigSet` event is minted: main
- * reads the current folded `worktree_mode` and passes it as `currentWorktreeOn`
- * (main folds each config append synchronously before the next message, so that
- * read is race-free). Two coupled rules:
- *
- * - **Reject (hard, no `--force`):** when worktree mode is effectively OFF — set
- *   OFF in this patch, or already OFF and untouched by it — and the patch sets
- *   `max_concurrent_per_root` to anything other than 1 (or `null` = reset to the
- *   default 1), throw {@link BadParamsError}. There is NO override.
- * - **Coerce:** a patch that flips worktree mode OFF (`worktree_mode === false`)
- *   without naming a per-root value forces `max_concurrent_per_root = 1` into the
- *   SAME patch, so an ON→OFF flip can never leave a stale per-root > 1 in the
- *   folded row.
- *
- * `max_concurrent_per_root > 1` is allowed ONLY while worktree mode is (or is
- * being set) ON. Returns the effective patch to mint (coerced when applicable);
- * throws on the hard reject. Pure — exported for direct unit tests.
+ * `worktreeOn` is the folded worktree mode AFTER the patch applies (main reads it
+ * post-fold, at reply time). Returns the advisory string, or `null` when there is
+ * nothing to clarify (worktree on, or no per-root intent > 1 in the patch — a
+ * `null`/1 value derives to the same effective 1 the caller asked for). Pure —
+ * exported for direct unit tests.
  */
-export function enforceWorktreeConcurrencyInvariant(
+export function perRootStoredWhileOffNote(
   patch: SetAutopilotConfigParams,
-  currentWorktreeOn: boolean,
-): SetAutopilotConfigParams {
-  // Effective worktree mode AFTER this patch: the patch's own value wins, else
-  // the current folded state.
-  const worktreeOff =
-    "worktree_mode" in patch
-      ? patch.worktree_mode !== true
-      : !currentWorktreeOn;
-  if (!worktreeOff) {
-    // Worktree ON (or being turned ON) — per-root > 1 is legal, no constraint.
-    return patch;
+  worktreeOn: boolean,
+): string | null {
+  if (worktreeOn || !("max_concurrent_per_root" in patch)) {
+    return null;
   }
-  // Worktree effectively OFF. An explicitly-set per-root must be 1 (or `null` =
-  // reset to the default 1); anything else is a hard reject with no escape hatch.
-  if ("max_concurrent_per_root" in patch) {
-    const v = patch.max_concurrent_per_root;
-    if (v !== null && v !== 1) {
-      throw new BadParamsError(
-        "set_autopilot_config: max_concurrent_per_root must be 1 while worktree mode is off — concurrent workers share the main checkout; enable worktree mode first",
-      );
-    }
-    return patch;
+  const v = patch.max_concurrent_per_root;
+  if (v == null || v === 1) {
+    return null;
   }
-  // Worktree being flipped OFF in this patch without naming a per-root value:
-  // coerce per-root → 1 in the same patch so the folded row can't keep a stale
-  // per-root > 1. (Worktree already OFF and untouched by the patch: nothing to
-  // coerce — the invariant already held, and a lone unrelated config change
-  // leaves per-root as-is.)
-  if (patch.worktree_mode === false) {
-    return { ...patch, max_concurrent_per_root: 1 };
-  }
-  return patch;
+  return `max_concurrent_per_root stored as ${v}; the effective per-root cap stays 1 while worktree mode is off and takes effect once worktree mode is turned on`;
 }
 
 /**
@@ -534,7 +505,11 @@ export async function setAutopilotConfigHandler(
       result.error ?? "set_autopilot_config: main reported failure",
     );
   }
-  return { ok: true, patch };
+  // Main derives the stored-vs-effective advisory from the folded worktree mode
+  // at reply time (the note rides the bridge result); forward it only when set.
+  return result.note != null
+    ? { ok: true, patch, note: result.note }
+    : { ok: true, patch };
 }
 
 // ---------------------------------------------------------------------------

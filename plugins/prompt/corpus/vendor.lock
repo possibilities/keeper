@@ -24,7 +24,7 @@ files:
   claude/arthack/template/_partials/snippets/engineering/landed-vs-complete.md.tmpl: f03b52e43b167d2a496ea1d5182a4717bb817b7d434b30c63044ade7c4451f5e
   claude/arthack/template/_partials/snippets/engineering/network-service-hardening.md.tmpl: 6d9a3470a9b956f06429d6be68457999fc71a5ed9af77fc6ce3e00df3c346d14
   claude/arthack/template/_partials/snippets/engineering/never-assume-tests-pass.md.tmpl: c1fc670fa48477d05131aec375095d55cd9aa404457b904620221e7b1c1117a3
-  claude/arthack/template/_partials/snippets/engineering/orient.md.tmpl: 9a39a73c6c3b5f0e1ab63724b11bbe9091a5a89f964be70f1df9896a3aa31b32
+  claude/arthack/template/_partials/snippets/engineering/orient.md.tmpl: be6dbc0533dda75a5e411bf5acec459c41abec376dad7543c9eae7124403eb3c
   claude/arthack/template/_partials/snippets/engineering/script-shebang-hygiene.md.tmpl: fcdb00c0dfe0e6d1476424c83d7b4fa5b517b3965261ea18c892338ac164cc24
   claude/arthack/template/_partials/snippets/engineering/tmp-file-unique-path.md.tmpl: 4f00bf6453ff15e20b08d7722f8e6d782f8adb9d12e4ca52ffe2b82ece91257f
   claude/arthack/template/_partials/snippets/source-dirs/docs-dir-and-gist-open.md.tmpl: 9d2e2850ec6d9789dfceb99b28f2bd16517798c30e62c2636f3d70fe38bae821

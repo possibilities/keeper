@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
+  DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  effectivePerRootCap,
   isTransientBootOpenError,
   MAX_IN_PARAMS,
   openDb,
@@ -9271,4 +9273,44 @@ test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold 
   expect(refoldEpicLinksRefiner).toBe(baselineEpicLinksRefiner);
   expect(refoldJobLinks).toBe(baselineJobLinks);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-1134 — `effectivePerRootCap`: the single stored-intent → effective-cap
+// derivation seam. Worktree off ⇒ always 1 (shared checkout safety); worktree on
+// ⇒ the stored positive integer, else the default (1). Fails closed on every
+// malformed shape; no upper clamp.
+// ---------------------------------------------------------------------------
+
+test("effectivePerRootCap — worktree ON passes a positive-integer stored value through unclamped (fn-1134)", () => {
+  expect(effectivePerRootCap(5, true)).toBe(5);
+  expect(effectivePerRootCap(1, true)).toBe(1);
+  // No upper clamp — a large stored value is honored verbatim.
+  expect(effectivePerRootCap(9999, true)).toBe(9999);
+});
+
+test("effectivePerRootCap — worktree OFF floors every stored value to 1 (fn-1134)", () => {
+  for (const stored of [5, 1, 3, 9999, null, undefined, 0, -1, 1.5]) {
+    expect(effectivePerRootCap(stored, false)).toBe(1);
+  }
+  expect(DEFAULT_MAX_CONCURRENT_PER_ROOT).toBe(1);
+});
+
+test("effectivePerRootCap — worktree ON with a malformed/absent stored value fails closed to 1 (fn-1134)", () => {
+  for (const bad of [
+    null,
+    undefined,
+    0,
+    -1,
+    -3,
+    1.5,
+    "3",
+    Number.NaN,
+    {},
+    [],
+  ]) {
+    expect(effectivePerRootCap(bad, true)).toBe(
+      DEFAULT_MAX_CONCURRENT_PER_ROOT,
+    );
+  }
 });

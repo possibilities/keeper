@@ -57,6 +57,7 @@ import {
 } from "./collections";
 import {
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
+  effectivePerRootCap,
   openDb,
   readGitProjectionFloor,
   resolveSockPath,
@@ -266,6 +267,10 @@ export interface SetAutopilotConfigResultMessage {
   id: string;
   ok: boolean;
   error?: string;
+  /** OPTIONAL stored-vs-effective advisory — set when the patch stores a per-root
+   *  cap intent left dormant by the folded worktree mode (main derives it at reply
+   *  time via `perRootStoredWhileOffNote`). Absent when there is nothing to note. */
+  note?: string;
 }
 
 /**
@@ -1480,6 +1485,8 @@ export interface ReplayBridge {
   }): Promise<{
     ok: boolean;
     error?: string;
+    /** OPTIONAL stored-vs-effective advisory forwarded from main's reply. */
+    note?: string;
   }>;
   /**
    * APPEND an `EpicArmed` synthetic event (folded into the `armed_epics` PRESENCE
@@ -2034,7 +2041,7 @@ export interface BootGate {
  * may still be partial. Pure read; never throws into the dispatch path (the caller
  * is no-self-heal), so each read defends against a missing row.
  */
-function readBootStatus(db: Database, gate: BootGate): BootStatus {
+export function readBootStatus(db: Database, gate: BootGate): BootStatus {
   let rev = 0;
   let head = 0;
   let seedRequired = false;
@@ -2069,23 +2076,29 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
   // `seed_required`-set window). Defensive: a probe failure degrades to an empty
   // set, which only over-dispatches in the brief unseeded window — never throws
   // into the read path (the caller is no-self-heal).
-  // fn-954: stamp the per-root dispatch concurrency count N so the board
-  // computes the SAME per-root demotions as the reconciler. Resolve the folded
-  // `autopilot_state.max_concurrent_per_root` column `?? DEFAULT` (= 1): an
-  // absent/never-set row, NULL, or a non-positive / non-integer value all fall
-  // back to the in-memory default. Defensive — a probe failure degrades to the
-  // default; never throws into the read path.
+  // fn-954: stamp the per-root dispatch concurrency count N so the board computes
+  // the SAME per-root demotions as the reconciler. This is the EFFECTIVE cap the
+  // wire field publishes (stored intent does NOT cross the wire): derive the
+  // folded `autopilot_state` stored `max_concurrent_per_root` through
+  // `effectivePerRootCap` against the SAME row's `worktree_mode` — worktree off ⇒
+  // 1, on ⇒ the stored positive integer, else the default. The SELECT MUST read
+  // `worktree_mode`; omit it and the derivation sees an absent column and floors
+  // to 1 forever. Defensive — a probe failure degrades to the default; never
+  // throws into the read path.
   let maxConcurrentPerRoot = DEFAULT_MAX_CONCURRENT_PER_ROOT;
   try {
     const a = db
       .prepare(
-        "SELECT max_concurrent_per_root FROM autopilot_state WHERE id = 1",
+        "SELECT max_concurrent_per_root, worktree_mode FROM autopilot_state WHERE id = 1",
       )
-      .get() as { max_concurrent_per_root: number | null } | null;
-    const raw = a?.max_concurrent_per_root;
-    if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
-      maxConcurrentPerRoot = raw;
-    }
+      .get() as {
+      max_concurrent_per_root: number | null;
+      worktree_mode: number | null;
+    } | null;
+    maxConcurrentPerRoot = effectivePerRootCap(
+      a?.max_concurrent_per_root,
+      a?.worktree_mode === 1,
+    );
   } catch {
     maxConcurrentPerRoot = DEFAULT_MAX_CONCURRENT_PER_ROOT;
   }
@@ -2119,8 +2132,8 @@ function readBootStatus(db: Database, gate: BootGate): BootStatus {
     // Per-root refinement so the board renders the SAME per-root `unknown` the
     // autopilot dispatches against.
     git_unseeded_roots: unseededRoots,
-    // fn-954: the per-root dispatch concurrency count so the board demotes the
-    // SAME way the reconciler does.
+    // fn-954: the EFFECTIVE per-root dispatch concurrency count so the board
+    // demotes the SAME way the reconciler does (stored intent stays server-side).
     max_concurrent_per_root: maxConcurrentPerRoot,
   };
 }
@@ -3329,6 +3342,7 @@ function main(): void {
     ok: boolean;
     error?: string;
     conflict?: boolean;
+    note?: string;
   };
   const pendingReplays = new Map<
     string,
@@ -3714,7 +3728,7 @@ function main(): void {
         if (!entry) return;
         pendingSetConfig.delete(r.id);
         clearTimeout(entry.timer);
-        entry.resolve({ ok: r.ok, error: r.error });
+        entry.resolve({ ok: r.ok, error: r.error, note: r.note });
         return;
       }
       if ((msg as SetEpicArmedResultMessage).type === "set-epic-armed-result") {

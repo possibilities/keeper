@@ -110,9 +110,11 @@ export interface BootStatus {
   git_seed_required: boolean;
   git_unseeded_roots?: string[];
   /**
-   * fn-954 — the per-root dispatch concurrency count N the board must apply so it
-   * computes the SAME per-root demotions as the reconciler. Stamped from the
-   * folded `autopilot_state.max_concurrent_per_root` column (`?? DEFAULT` = 1).
+   * fn-954 — the EFFECTIVE per-root dispatch concurrency count N the board must
+   * apply so it computes the SAME per-root demotions as the reconciler. Derived
+   * server-side from the folded `autopilot_state` stored intent and worktree mode
+   * (worktree off ⇒ 1); the durable stored intent does NOT cross the wire, so
+   * this field's meaning ("the cap dispatch uses") is stable for older clients.
    * Optional/additive — an older client ignoring it (or a frame omitting it)
    * falls back to N=1, today's one-task-per-root mutex.
    */

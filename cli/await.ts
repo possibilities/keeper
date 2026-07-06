@@ -1572,7 +1572,7 @@ export async function runAwait(
       paused: snap.autopilotPaused,
       worktreeMode: snap.worktreeMode,
       maxConcurrentJobs: snap.maxConcurrentJobs,
-      maxConcurrentPerRoot: snap.maxConcurrentPerRoot,
+      maxConcurrentPerRootStored: snap.maxConcurrentPerRootStored,
     },
   });
 

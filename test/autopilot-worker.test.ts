@@ -148,6 +148,7 @@ import {
 } from "../src/readiness";
 import { projectPendingDispatches } from "../src/readiness-client";
 import { loadReadinessInputs } from "../src/readiness-inputs";
+import { readBootStatus } from "../src/server-worker";
 import type {
   EmbeddedJob,
   Epic,
@@ -4055,10 +4056,13 @@ test("fn-1107: loadReadinessInputs and loadReconcileSnapshot produce identical r
     // window), and a non-default per-root cap — the read paths must agree on all.
     seedEpicRow(db, "fn-1-open", { epic_number: 1, status: "open" });
     seedEpicRow(db, "fn-2-done", { epic_number: 2, status: "done" });
+    // Worktree ON so the stored per-root 3 derives to an effective 3 (worktree off
+    // would floor the effective cap to 1 — see effectivePerRootCap); both read
+    // paths must agree on the derived value.
     db.run(
       `INSERT OR REPLACE INTO autopilot_state
-         (id, paused, last_event_id, created_at, updated_at, max_concurrent_per_root)
-       VALUES (1, 0, 0, 0, 0, 3)`,
+         (id, paused, last_event_id, created_at, updated_at, max_concurrent_per_root, worktree_mode)
+       VALUES (1, 0, 0, 0, 0, 3, 1)`,
     );
 
     // The MOVED loader and the reconciler's snapshot both read off the same db;
@@ -4080,6 +4084,50 @@ test("fn-1107: loadReadinessInputs and loadReconcileSnapshot produce identical r
     // The per-root cap is read off the SAME autopilot_state row by both paths.
     expect(inputs.maxConcurrentPerRoot).toBe(3);
     expect(snap.maxConcurrentPerRoot).toBe(3);
+  });
+});
+
+test("fn-1134: loadReadinessInputs derives the EFFECTIVE per-root cap through worktree mode (toggle round-trip)", async () => {
+  await withSeededDb((db) => {
+    // Stored intent 3 with worktree OFF (the default) → the effective cap floors
+    // to 1: the reconciler + autoclose (both read through this seam) never
+    // over-dispatch a shared checkout.
+    db.run(
+      `INSERT OR REPLACE INTO autopilot_state
+         (id, paused, last_event_id, created_at, updated_at, max_concurrent_per_root, worktree_mode)
+       VALUES (1, 0, 0, 0, 0, 3, 0)`,
+    );
+    expect(loadReadinessInputs(db).maxConcurrentPerRoot).toBe(1);
+    // Flip worktree ON — the stored intent (untouched) is now honored: effective 3.
+    db.run("UPDATE autopilot_state SET worktree_mode = 1 WHERE id = 1");
+    expect(loadReadinessInputs(db).maxConcurrentPerRoot).toBe(3);
+    // Flip back OFF — the derivation re-floors to 1, but the STORED column is
+    // preserved (no re-set): a subsequent ON flip restores 3 with no re-write.
+    db.run("UPDATE autopilot_state SET worktree_mode = 0 WHERE id = 1");
+    expect(loadReadinessInputs(db).maxConcurrentPerRoot).toBe(1);
+    const stored = db
+      .query(
+        "SELECT max_concurrent_per_root AS v FROM autopilot_state WHERE id = 1",
+      )
+      .get() as { v: number };
+    expect(stored.v).toBe(3);
+  });
+});
+
+test("fn-1134: readBootStatus publishes the EFFECTIVE per-root cap; the SELECT reads worktree_mode (worktree off + stored 3 → 1)", async () => {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT OR REPLACE INTO autopilot_state
+         (id, paused, last_event_id, created_at, updated_at, max_concurrent_per_root, worktree_mode)
+       VALUES (1, 0, 0, 0, 0, 3, 0)`,
+    );
+    // Worktree OFF → the wire field carries the effective 1, NOT the stored 3.
+    // This is the guard that catches a SELECT omitting `worktree_mode` (which
+    // would see an absent column and silently publish the stored 3).
+    expect(readBootStatus(db, { ready: true }).max_concurrent_per_root).toBe(1);
+    // Worktree ON → the wire field carries the stored 3.
+    db.run("UPDATE autopilot_state SET worktree_mode = 1 WHERE id = 1");
+    expect(readBootStatus(db, { ready: true }).max_concurrent_per_root).toBe(3);
   });
 });
 
