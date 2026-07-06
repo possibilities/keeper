@@ -34,5 +34,5 @@ The new pin should fail if either field line disappears from the template or the
 - [ ] Fast suite green
 
 ## Done summary
-
+Added the required model: field and widened tier: to the full configured axis in close-planner's follow-up template, required both in the task-spec rules prose, and added a consistency pin deriving expected enums from subagents.yaml.
 ## Evidence
