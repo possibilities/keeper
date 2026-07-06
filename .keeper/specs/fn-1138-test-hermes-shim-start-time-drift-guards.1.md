@@ -29,5 +29,5 @@ Files:
 - [ ] `bun test` stays green.
 
 ## Done summary
-
+Exported the shim's darwin/linux start_time parsers and added a shared fixture + direct equivalence test asserting parity with birth-record's originals, backing the DRIFT GUARD comments with a real assertion.
 ## Evidence
