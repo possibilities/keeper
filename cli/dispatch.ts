@@ -60,12 +60,14 @@ import {
 } from "../src/db";
 import {
   buildDispatchLaunchArgv,
+  type DispatchableVerb,
   defaultPlanPrompt,
-  parseDispatchKey,
-  type RetryDispatchVerb,
+  isEscalationVerb,
+  parseDispatchableKey,
   validatePromptBytes,
 } from "../src/dispatch-command";
 import { assertNever } from "../src/dispatch-failure-key";
+import { resolveEscalationLaunchConfig } from "../src/escalation-config";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
@@ -275,7 +277,7 @@ async function resolveEpicLaneWorktree(
  */
 export async function resolvePlanCwd(
   query: QueryFn,
-  verb: RetryDispatchVerb,
+  verb: DispatchableVerb,
   id: string,
   dirExists: (dir: string) => boolean = existsSync,
   resolveLaneDir: (
@@ -296,8 +298,15 @@ export async function resolvePlanCwd(
   | { ok: false; error: string }
 > {
   // work: id is a task id `fn-N-slug.M` whose parent epic is the `fn-N-slug`
-  // prefix. close: id IS the epic id. The epic filter resolves both.
-  const epicId = verb === "work" ? id.replace(/\.\d+$/, "") : id;
+  // prefix. close: id IS the epic id. The epic filter resolves both. The two
+  // escalation verbs mirror those shapes exactly — `unblock::<task>` is
+  // task-scoped like work, `deconflict::<epic>` is epic-scoped like close — so
+  // each resolves its cwd through the same branch (the unblock session runs in
+  // the blocked task's repo; the deconflict session runs in the epic lane where
+  // the merge conflict lives, exactly like the resolver).
+  const taskScoped = verb === "work" || verb === "unblock";
+  const epicScoped = verb === "close" || verb === "deconflict";
+  const epicId = taskScoped ? id.replace(/\.\d+$/, "") : id;
   let rows: EpicRow[];
   try {
     rows = (await query("epics", { epic_id: epicId })) as EpicRow[];
@@ -316,7 +325,7 @@ export async function resolvePlanCwd(
   }
   const projectDir =
     typeof epic.project_dir === "string" ? epic.project_dir : "";
-  if (verb === "close") {
+  if (epicScoped) {
     if (projectDir === "") {
       return { ok: false, error: `epic '${epicId}' has no project_dir` };
     }
@@ -341,7 +350,7 @@ export async function resolvePlanCwd(
       warning: `no epic lane worktree for '${epicId}'; launching close in ${projectDir}`,
     };
   }
-  // work: walk the parent epic's tasks for the matching task id.
+  // work / unblock: walk the parent epic's tasks for the matching task id.
   const task = (epic.tasks ?? []).find((t) => t.task_id === id);
   if (task === undefined) {
     return {
@@ -389,7 +398,7 @@ export async function resolvePlanCwd(
  */
 export async function checkRaceGuard(
   query: QueryFn,
-  verb: RetryDispatchVerb,
+  verb: DispatchableVerb,
   id: string,
 ): Promise<string | null> {
   const key = `${verb}::${id}`;
@@ -546,18 +555,37 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     );
   }
 
+  // Parse the plan-form key up-front (the WIDER dispatchable set, so the two
+  // escalation verbs are accepted) — the model/effort default below selects the
+  // escalation vs worker launch config by verb, and the plan-form block reuses
+  // the parsed pair. A malformed verb::id key is CLI misuse — exit 2.
+  let planVerb: DispatchableVerb | undefined;
+  let planId: string | undefined;
+  if (hasPlanKey) {
+    const keyResult = parseDispatchableKey(positional);
+    if (!keyResult.ok) {
+      argFault(keyResult.error);
+    }
+    planVerb = keyResult.verb;
+    planId = keyResult.id;
+  }
+
   // ---- resolve model/effort (claude-only) ----
-  // Precedence per field: explicit --model/--effort > --preset > worker preset
-  // (plan form only) > none. Dispatch widens to claude alone for now — LaunchSpec
-  // carries only claude model/effort (codex/pi dispatch is a follow-up). The
-  // plan-form default is the SAME `worker` preset the autopilot resolves, so a
-  // hand-fired plan worker is byte-identical to an automated one.
+  // Precedence per field: explicit --model/--effort > --preset > worker/escalation
+  // preset (plan form only) > none. Dispatch widens to claude alone for now —
+  // LaunchSpec carries only claude model/effort (codex/pi dispatch is a follow-up).
+  // A `work`/`close` plan default is the SAME `worker` preset the autopilot
+  // resolves (byte-identical to an automated launch); an `unblock`/`deconflict`
+  // escalation default resolves the SEPARATE escalation config (sonnet/high +
+  // `escalation` preset), matching what the daemon's escalation dispatch bakes in.
   let baseModel: string | undefined;
   let baseEffort: string | undefined;
   if (hasPlanKey) {
-    const worker = resolveWorkerLaunchConfig();
-    baseModel = worker.model;
-    baseEffort = worker.effort;
+    const base = isEscalationVerb(planVerb as DispatchableVerb)
+      ? resolveEscalationLaunchConfig()
+      : resolveWorkerLaunchConfig();
+    baseModel = base.model;
+    baseEffort = base.effort;
   }
   if (v.preset !== undefined && v.preset !== "") {
     let preset: Preset;
@@ -616,12 +644,9 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
 
   if (hasPlanKey) {
     // ---- plan form ----
-    const keyResult = parseDispatchKey(positional);
-    if (!keyResult.ok) {
-      // A malformed verb::id key is CLI misuse — exit 2.
-      argFault(keyResult.error);
-    }
-    const { verb, id } = keyResult;
+    // Parsed up-front (see the model/effort block) — reuse the pair here.
+    const verb = planVerb as DispatchableVerb;
+    const id = planId as string;
     const query: QueryFn =
       deps.query ??
       ((collection, filter) => queryCollection(sockPath, collection, filter));

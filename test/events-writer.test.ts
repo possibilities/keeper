@@ -425,6 +425,23 @@ test("planVerbRefFromSpawnName: resolve::<epic> → {resolve, epic-id} (fn-1088 
   });
 });
 
+test("planVerbRefFromSpawnName: unblock::<task> → {unblock, task-id} (escalation dispatch key)", () => {
+  // `unblock::<task>` is one of the two autonomous escalation dispatches; folding
+  // its plan_verb/plan_ref makes it a first-class dispatch key so reaps + the
+  // instant-death breaker apply to it like any work/close/resolve worker.
+  expect(planVerbRefFromSpawnName("unblock::fn-1129-escalate.2")).toEqual({
+    plan_verb: "unblock",
+    plan_ref: "fn-1129-escalate.2",
+  });
+});
+
+test("planVerbRefFromSpawnName: deconflict::<epic> → {deconflict, epic-id} (escalation dispatch key)", () => {
+  expect(planVerbRefFromSpawnName("deconflict::fn-1129-escalate")).toEqual({
+    plan_verb: "deconflict",
+    plan_ref: "fn-1129-escalate",
+  });
+});
+
 test("fn-756: approve::<epic-task> → {null, null} (approve dropped from the whitelist)", () => {
   // fn-756 removed `approve` from the locked verb whitelist along with the
   // verb. A stale `approve::` spawn name (from before the deploy) no longer

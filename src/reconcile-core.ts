@@ -256,6 +256,18 @@ export function buildWorkerCommand(
 export const WORKER_MODEL = "sonnet" as const;
 export const WORKER_EFFORT = "max" as const;
 /**
+ * Escalation-session `--model` / `--effort` — the launch defaults for the two
+ * autonomous escalation dispatches (`unblock::<task>`, `deconflict::<epic>`).
+ * DELIBERATELY independent of the `WORKER_*` worker knobs: an escalation session
+ * boots a purpose-built plan skill on a fresh sonnet/high context, so its defaults
+ * never track the worker cell's. These are pure constants (the re-fold-safe core
+ * may host them); the config-reading resolver that coalesces an `escalation`
+ * preset over them lives in `src/escalation-config.ts`, kept OUT of this pure
+ * verdict core — which never value-imports the `presets.yaml` reader (the
+ * `reconcile-core` depgraph pin bans the `node:fs` edge that would drag on). */
+export const ESCALATION_MODEL = "sonnet" as const;
+export const ESCALATION_EFFORT = "high" as const;
+/**
  * Build the structured {@link LaunchSpec} for a planned launch — the unwrapped
  * inputs {@link keeperAgentLaunch} builds its invocation from. Mirrors
  * {@link buildWorkerCommand}'s flag choices EXACTLY (same model/effort/name/

@@ -216,6 +216,80 @@ test("plan form with no worker preset falls back to sonnet/max", async () => {
   expect(r.spec?.effort).toBe("max");
 });
 
+test("plan form unblock:: defaults to the escalation config (sonnet/high), boots /plan:unblock", async () => {
+  // No presets.yaml → the escalation carve-out swallows the throw → escalation
+  // defaults. unblock is task-scoped, so it resolves the blocked task's repo.
+  const epicRows: Row[] = [
+    {
+      epic_id: "fn-1-x",
+      project_dir: dir,
+      tasks: [{ task_id: "fn-1-x.1", target_repo: dir }],
+    } as unknown as Row,
+  ];
+  const r = await runDispatch(["unblock::fn-1-x.1", "--force"], {
+    query: async () => epicRows,
+    dirExists: () => true,
+  });
+  expect(r.code).toBeUndefined();
+  expect(r.spec?.model).toBe("sonnet");
+  expect(r.spec?.effort).toBe("high");
+  expect(r.spec?.prompt).toBe("/plan:unblock fn-1-x.1");
+  expect(r.spec?.claudeName).toBe("unblock::fn-1-x.1");
+  // Escalation dispatches are never cell-based — no --plugin-dir.
+  expect(r.spec?.pluginDir).toBeUndefined();
+});
+
+test("plan form escalation config is independent of the worker preset", async () => {
+  // Both presets present → an escalation verb resolves the `escalation` preset,
+  // NEVER the `worker` one.
+  writePresets(
+    "presets:\n  worker:\n    harness: claude\n    model: opus\n    effort: low\n" +
+      "  escalation:\n    harness: claude\n    model: haiku\n    effort: max\n",
+  );
+  const epicRows: Row[] = [
+    {
+      epic_id: "fn-1-x",
+      project_dir: dir,
+      tasks: [{ task_id: "fn-1-x.1", target_repo: dir }],
+    } as unknown as Row,
+  ];
+  const r = await runDispatch(["unblock::fn-1-x.1", "--force"], {
+    query: async () => epicRows,
+    dirExists: () => true,
+  });
+  expect(r.spec?.model).toBe("haiku");
+  expect(r.spec?.effort).toBe("max");
+});
+
+test("plan form deconflict:: is epic-scoped — runs in the epic dir, boots /plan:deconflict", async () => {
+  const epicRows: Row[] = [
+    { epic_id: "fn-1-x", project_dir: dir, tasks: [] } as unknown as Row,
+  ];
+  const r = await runDispatch(["deconflict::fn-1-x", "--force"], {
+    query: async () => epicRows,
+    dirExists: () => true,
+    // No lane worktree → falls back to project_dir (a note on stderr), never a
+    // real git probe.
+    resolveLaneDir: async () => null,
+  });
+  expect(r.code).toBeUndefined();
+  expect(r.spec?.prompt).toBe("/plan:deconflict fn-1-x");
+  expect(r.spec?.claudeName).toBe("deconflict::fn-1-x");
+});
+
+test("plan form unblock:: honors the race guard (parity with work/close)", async () => {
+  const r = await runDispatch(["unblock::fn-1-x.1"], {
+    query: makeQuery({
+      epics: epicWith(dir),
+      pending: [{ verb: "unblock", id: "fn-1-x.1" } as unknown as Row],
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("already in flight");
+  expect(r.spec).toBeUndefined();
+});
+
 test("a codex preset handed to dispatch fails loud (claude-only, exit 2)", async () => {
   writePresets("presets:\n  cx:\n    harness: codex\n    model: gpt\n");
   const r = await runDispatch(["--prompt", "x", "--preset", "cx"]);
