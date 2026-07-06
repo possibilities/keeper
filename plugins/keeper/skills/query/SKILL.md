@@ -80,8 +80,8 @@ daemon's projections over its socket — a read-only round-trip:
 
 The everyday view is `keeper query tasks --json` — one row per open-epic task
 (epic_id, task_id, title, tier, model, depends_on, runtime_status, readiness
-verdict + pill), a derived view that retires the `query epics --json | jq` per-task
-pipeline.
+verdict + pill), the derived per-task read you'd otherwise hand-assemble from
+`query epics --json | jq`.
 
 ### Tier 3 — read-only sqlite (last resort)
 
