@@ -64,7 +64,7 @@ flags." Every control op below is a bare one-shot Bash call:
 | Arm an epic | "arm fn-X", "only work fn-X and its deps" — an epic id `fn-N-slug` | `keeper autopilot arm fn-N-slug` |
 | Disarm an epic | "disarm fn-X", "stop arming fn-X" | `keeper autopilot disarm fn-N-slug` |
 | Worktree mode on/off | "worktree mode on/off", "run lanes in worktrees" — durable toggle, rejected mid-epic (`--force` to override) | `keeper autopilot worktree on` / `keeper autopilot worktree off` |
-| Set a concurrency cap | "limit to N workers", "cap concurrency at N", "at most N per repo" — runtime config | `keeper autopilot config max_concurrent_jobs <N>` (or `unlimited`) / `keeper autopilot config max_concurrent_per_root <N>` |
+| Set a concurrency cap | "limit to N workers", "cap concurrency at N", "at most N per repo" — runtime config; per-root is legal to set any time (stores intent, effective floors to 1 while worktree mode is off) | `keeper autopilot config max_concurrent_jobs <N>` (or `unlimited`) / `keeper autopilot config max_concurrent_per_root <N>` |
 | Multi-repo worktree grouping | "cluster a multi-repo epic into per-repo lanes", "multi-repo worktree mode" — durable rollout flag, default OFF, only meaningful with worktree mode on | `keeper autopilot config worktree_multi_repo <on\|off>` |
 | Retry a stuck dispatch | A sticky failure key `<verb>::<id>`, verb one of `work\|close\|approve` | `keeper autopilot retry work::fn-N-slug.3` |
 | Clear / approve a phantom | "approve fn-X" — clears a resurrected/phantom approve pending (the reconciler never dispatches `approve` itself) | `keeper autopilot retry approve::fn-N-slug` |
@@ -94,10 +94,13 @@ snapshot dance, no reconnect loop. `data.autopilot` IS the global singleton
 (the same durable config `keeper autopilot show` returns as its own envelope):
 
 ```json
-{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "worktree_multi_repo": false, "max_concurrent_jobs": null, "max_concurrent_per_root": 1 }
+{ "paused": false, "mode": "yolo", "armed": [], "worktree_mode": false, "worktree_multi_repo": false, "max_concurrent_jobs": null, "max_concurrent_per_root": 1, "max_concurrent_per_root_stored": null }
 ```
 
-Read those seven fields to answer "what's it doing" and to capture before a
+`max_concurrent_per_root` is the EFFECTIVE cap dispatch honors (floors to 1
+while worktree mode is off); `max_concurrent_per_root_stored` is the durable
+intent you set, which survives a worktree-mode toggle untouched. Read those
+eight fields to answer "what's it doing" and to capture before a
 take-over. The same envelope's `data.drained` / `data.jammed`, `data.in_flight`
 (pending + running launches), and `data.needs_human` (dead-letters, escalations,
 stuck dispatches) cover what it's CURRENTLY doing — so one read covers both the
@@ -130,15 +133,25 @@ NEVER capture/restore (that would auto-undo a deliberate pause).
 you might change in your working context for the whole window:
 
 ```bash
-keeper status --json | jq .data.autopilot   # → {paused, mode, armed, worktree_mode, worktree_multi_repo, max_concurrent_jobs, max_concurrent_per_root}
+keeper status --json | jq .data.autopilot   # → {paused, mode, armed, worktree_mode, worktree_multi_repo, max_concurrent_jobs, max_concurrent_per_root, max_concurrent_per_root_stored}
 ```
 
 Capture `{paused, mode, armed, worktree_mode, worktree_multi_repo,
-max_concurrent_jobs, max_concurrent_per_root}` — capturing fewer than the fields
-your take-over touches produces a wrong GLOBAL state on restore. Pin them; do
-not re-derive from memory later. (`keeper autopilot show` returns the same seven
-durable fields as its own envelope; restore `worktree_multi_repo` via `keeper
-autopilot config worktree_multi_repo on|off`.)
+max_concurrent_jobs, max_concurrent_per_root_stored}` — capturing fewer than
+the fields your take-over touches produces a wrong GLOBAL state on restore.
+Pin them; do not re-derive from memory later. (`keeper autopilot show` returns
+the same eight fields as its own envelope; restore `worktree_multi_repo` via
+`keeper autopilot config worktree_multi_repo on|off`.)
+
+**Per-root cap: capture and restore the STORED field, never the effective
+one.** `max_concurrent_per_root` in the envelope is the derived EFFECTIVE cap
+(floors to 1 while worktree mode is off); `max_concurrent_per_root_stored` is
+the durable intent. Capture MUST pin `max_concurrent_per_root_stored`, and
+restore MUST write it back via `keeper autopilot config
+max_concurrent_per_root <stored>` — never the effective field. Capturing the
+effective value while worktree mode is off and restoring THAT would write 1
+into stored, silently clobbering the durable intent the human had set; this is
+the exact bug class this skill's per-root cap contract exists to prevent.
 
 **2 — Drive.** Run the control ops the take-over needs (pause, mode, arm, …).
 Wire the restore plan PER MUTATING PHASE as you go — track exactly which fields

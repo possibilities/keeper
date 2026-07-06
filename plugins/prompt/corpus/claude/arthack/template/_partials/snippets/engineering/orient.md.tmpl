@@ -18,7 +18,7 @@ keeper status --json
 
 It prints ONE `{schema_version, ok, error, data}` envelope and exits — no TUI snapshot dance, no reconnect loop. `data` carries:
 
-- `autopilot` — `{paused, mode, armed, worktree_mode, max_concurrent_jobs, max_concurrent_per_root}`, the global singleton.
+- `autopilot` — `{paused, mode, armed, worktree_mode, max_concurrent_jobs, max_concurrent_per_root, max_concurrent_per_root_stored}`, the global singleton. `max_concurrent_per_root` is the EFFECTIVE cap (floors to 1 while worktree mode is off); `max_concurrent_per_root_stored` is the durable intent, unaffected by the toggle.
 - `board.epics` — per-epic readiness verdicts, each with its task rows and close row.
 - `counts` — `{epics, tasks, close_rows}` tallies (`ready`/`running`/`completed`/`blocked`).
 - `drained` / `jammed` — the board is fully at rest / has an operator jam (a sticky `dispatch_failures` row).
