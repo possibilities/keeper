@@ -58,3 +58,5 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
 - **Handoff**: Passing a contextful piece of live work to a fresh fire-and-forget worker that boots and runs it independently. Avoid: delegation, assignment, transfer.
 - **Sidecar**: The private per-turn docs mirror a session maintains alongside its work, owned by hooks and never the doc body itself. Avoid: backup, shadow copy, cache.
+- **Adopted job**: A tracked session a non-launcher path minted — a hand-started hermes self-seed or a claimed codex rollout — rather than the keeper agent launcher, marked so the board pills it distinctly and restore surfaces it. Avoid: orphan, imported session, unmanaged job.
+- **Originator**: The ownership signal on a codex rollout marking it keeper-launched; strictly absent or empty means keeper never owned it, so a sole unambiguous rollout becomes adoptable. Avoid: owner tag, launch marker, origin flag.
