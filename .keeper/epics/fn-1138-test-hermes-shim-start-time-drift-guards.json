@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-06T11:04:46.146000Z",
+  "created_by_close_of": "fn-1131-harness-session-adoption-path",
+  "depends_on_epics": [
+    "fn-1131-harness-session-adoption-path"
+  ],
+  "id": "fn-1138-test-hermes-shim-start-time-drift-guards",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Test hermes shim start-time drift guards",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-06T11:04:46.146000Z"
+}
