@@ -48,5 +48,5 @@ Golden-line cases: absent KEEPER_JOB_ID + native id → full self-seeded Session
 - [ ] The shim suite passes with updated goldens covering all self-seed branches
 
 ## Done summary
-
+Hermes shim self-seeds a hand-started session as an adopted, tracked jobs row under its charset-validated native id — adopted marker, session (parent) pid on every line, (pid,start_time) recycle witness on SessionStart, full backend coords, shim-version stamp; KEEPER_HERMES_NO_ADOPT opt-out gates only the self-seed path; launcher-owned lines byte-identical. Bumped HERMES_SHIM_VERSION to 2.
 ## Evidence
