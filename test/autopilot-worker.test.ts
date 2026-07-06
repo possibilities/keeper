@@ -11414,6 +11414,11 @@ function satisfiedEpicDep(upstreamId: string): ResolvedEpicDep {
   };
 }
 
+/** A blocked-incomplete (upstream resolved but still OPEN) resolved-dep on `upstreamId`. */
+function blockedEpicDep(upstreamId: string): ResolvedEpicDep {
+  return { ...satisfiedEpicDep(upstreamId), state: "blocked-incomplete" };
+}
+
 /** Identity-resolved classification (raw root == toplevel) — same as makeSnapshot. */
 function classifyIdentity(epics: Epic[]): Map<string, WorktreeRepoResolution> {
   return classifyWorktreeRepos(epics, (r) => r);
@@ -11692,10 +11697,12 @@ test("fn-1014 computeDeferredEpicIds: B's OWN repo unresolved → skipped (never
   expect(calls.length).toBe(0); // a non-`ok` B is skipped before any git
 });
 
-test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked upstream never gates (folds to skip)", async () => {
+test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked-absent upstream never gates (folds to skip)", async () => {
   // A `disabled` upstream cut no lane (its work landed straight on shared-checkout
   // default → already contained); a reaped (absent) one, a dangling (null) edge, and
-  // a still-incomplete dep all fold to "skip this upstream" (not-gating).
+  // a still-open dep that cut NO same-repo lane all fold to "skip this upstream"
+  // (not-gating). A blocked-incomplete upstream WITH a same-repo lane DOES gate — see
+  // the fn-1130 tests below.
   const aDisabled = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
   const b = makeEpic({
     epic_id: "fn-2-b",
@@ -11704,7 +11711,7 @@ test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked u
       satisfiedEpicDep("fn-1-a"), // resolved to a `disabled` upstream below
       { ...satisfiedEpicDep("fn-1-gone"), resolved_epic_id: null }, // dangling
       { ...satisfiedEpicDep("fn-1-reaped") }, // absent from the classification map
-      { ...satisfiedEpicDep("fn-1-wip"), state: "blocked-incomplete" }, // not satisfied
+      blockedEpicDep("fn-1-wip"), // blocked-incomplete AND absent from the map → no lane
     ],
   });
   const epics = [aDisabled, b];
@@ -11713,6 +11720,98 @@ test("fn-1014 computeDeferredEpicIds: a DISABLED / reaped / dangling / blocked u
   const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"], ancestors: [] });
   const deferred = await computeDeferredEpicIds(epics, map, run);
   expect(deferred.has("fn-2-b")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1130 — a BLOCKED-INCOMPLETE (still-open) same-resolved-repo-lane upstream also
+// defers the dependent's lane cut, probe-free: an open upstream is trivially not yet
+// contained in LOCAL default, so cutting off it would fork a stale base. Cross-repo /
+// no-lane / dangling blocked upstreams stay not-gating exactly as a satisfied one.
+// ---------------------------------------------------------------------------
+
+test("fn-1130 computeDeferredEpicIds: a BLOCKED-INCOMPLETE same-repo-lane upstream DEFERS probe-free (no enumeration/ancestry git)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [blockedEpicDep("fn-1-a")], // A resolved but still OPEN
+  });
+  const epics = [a, b];
+  const { run, calls } = gateGit({ lanes: ["keeper/epic/fn-1-a"] });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.get("fn-2-b")?.has("/repo")).toBe(true);
+  // Probe-free: an open upstream is definitionally not-yet-merged, so NO git spawns.
+  expect(calls.length).toBe(0);
+});
+
+test("fn-1130 computeDeferredEpicIds: a BLOCKED-INCOMPLETE CROSS-REPO upstream never gates (lane in a different resolved repo)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/other" }); // a DIFFERENT toplevel
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [blockedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run, calls } = gateGit({ lanes: ["keeper/epic/fn-1-a"] });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(deferred.has("fn-2-b")).toBe(false);
+  expect(calls.length).toBe(0);
+});
+
+test("fn-1130 computeDeferredEpicIds: a BLOCKED-INCOMPLETE same-repo upstream that cut NO lane (disabled/serial) never gates", async () => {
+  const aDisabled = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [blockedEpicDep("fn-1-a")],
+  });
+  const epics = [aDisabled, b];
+  const map = classifyIdentity(epics);
+  // A is same-repo but SERIAL (no worktree lane) → never gates, open or done.
+  map.set("fn-1-a", { kind: "disabled", repoDir: "/repo", reason: "serial" });
+  const { run, calls } = gateGit({ lanes: [] });
+  const deferred = await computeDeferredEpicIds(epics, map, run);
+  expect(deferred.has("fn-2-b")).toBe(false);
+  expect(calls.length).toBe(0);
+});
+
+test("fn-1130 computeDeferredEpicIds: a CLUSTERED blocked-incomplete upstream defers ONLY the shared-repo group; the sibling group proceeds", async () => {
+  // Upstream A cut a lane only in /r1 and is still OPEN. Downstream B spans {/r1,/r2}:
+  // B's /r1 group shares A's open lane → defer probe-free; B's /r2 group has no
+  // same-repo upstream → proceed. Mirrors the satisfied-unmerged clustered split.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/r1",
+    tasks: [
+      makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a", target_repo: "/r1" }),
+    ],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/r1",
+    resolved_epic_deps: [blockedEpicDep("fn-1-a")],
+    tasks: [
+      makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b", target_repo: "/r1" }),
+      makeTask({ task_id: "fn-2-b.2", epic_id: "fn-2-b", target_repo: "/r2" }),
+    ],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({ lanes: ["keeper/epic/fn-1-a"] });
+  const deferred = await computeDeferredEpicIds(
+    epics,
+    classifyMultiRepo(epics),
+    run,
+  );
+  expect(deferred.get("fn-2-b")?.has("/r1")).toBe(true);
+  expect(deferred.get("fn-2-b")?.has("/r2") ?? false).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
