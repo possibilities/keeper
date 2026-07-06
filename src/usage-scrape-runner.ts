@@ -33,7 +33,9 @@
  * No `bun:sqlite` import — this is a db-free leaf shelled from the worker.
  */
 
-import { resolveUsageScraperRuntime } from "./db";
+import { dirname, isAbsolute, join } from "node:path";
+import { resolveTmuxBin } from "./agent/tmux-launch";
+import { resolveUsageScraperRuntime, type UsageScraperRuntime } from "./db";
 
 /** Schema version the util stamps on every JSON object; the worker gates on it. */
 export const SCRAPE_CONTRACT_SCHEMA_VERSION = 1;
@@ -211,36 +213,48 @@ export type ScrapeResult =
  */
 export type ScrapeRunner = (account: ScrapeAccount) => Promise<ScrapeResult>;
 
-/** Build the `uv run` argv (sans the `uv` binary itself) for one account. */
+/**
+ * Build the FULL argv (binary + args) for one scrape, per the resolved runtime.
+ *  - `uv`: `<uv> run --directory <dir> python -m agentusage.scrape_cli …` — plain
+ *    `run` sets the child cwd + pins the project env; NEVER `--python` (uv#11288
+ *    recreates the venv per call).
+ *  - `bun`: `<bun> <dir>/src/scrape-cli.ts …` — the agentusage bun entry under the
+ *    same project dir.
+ * Both thread an identical `--target`/`--profile` (+ optional
+ * `--command`/`--rows`/`--cols`) tail, so a flip changes only the launcher, not
+ * the request shape.
+ */
 export function buildScrapeArgs(
-  projectDir: string,
+  runtime: UsageScraperRuntime,
   account: ScrapeAccount,
 ): string[] {
-  // `--directory` sets the child's cwd so `python -m agentusage.scrape_cli`
-  // resolves the package AND pins the project env. Plain `run` — never
-  // `--python` (uv#11288 recreates the venv per call).
-  const args = [
+  const tail = ["--target", account.target, "--profile", account.profile];
+  if (account.command !== undefined) {
+    tail.push("--command", account.command);
+  }
+  if (account.rows !== undefined) {
+    tail.push("--rows", String(account.rows));
+  }
+  if (account.cols !== undefined) {
+    tail.push("--cols", String(account.cols));
+  }
+  if (runtime.runtime === "bun") {
+    return [
+      runtime.bunPath,
+      join(runtime.projectDir, "src", "scrape-cli.ts"),
+      ...tail,
+    ];
+  }
+  return [
+    runtime.uvPath,
     "run",
     "--directory",
-    projectDir,
+    runtime.projectDir,
     "python",
     "-m",
     "agentusage.scrape_cli",
-    "--target",
-    account.target,
-    "--profile",
-    account.profile,
+    ...tail,
   ];
-  if (account.command !== undefined) {
-    args.push("--command", account.command);
-  }
-  if (account.rows !== undefined) {
-    args.push("--rows", String(account.rows));
-  }
-  if (account.cols !== undefined) {
-    args.push("--cols", String(account.cols));
-  }
-  return args;
 }
 
 /**
@@ -364,10 +378,10 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 /** Options for {@link spawnScrape} — the resolved runtime + the per-call budget. */
 export interface SpawnScrapeOptions {
-  uvPath: string;
-  projectDir: string;
+  /** The resolved runtime (uv|bun): binary + project dir + which argv shape. */
+  runtime: UsageScraperRuntime;
   timeoutMs?: number;
-  /** Extra env merged over `process.env` for the child (e.g. `CLAUDE_CONFIG_DIR`). */
+  /** Extra env merged over `process.env` for the child (e.g. `PATH`, `CLAUDE_CONFIG_DIR`). */
   env?: Record<string, string>;
 }
 
@@ -383,17 +397,17 @@ export async function spawnScrape(
   opts: SpawnScrapeOptions,
 ): Promise<ScrapeResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SCRAPE_TIMEOUT_MS;
-  const args = buildScrapeArgs(opts.projectDir, account);
+  const argv = buildScrapeArgs(opts.runtime, account);
   // `const proc` (spawned INSIDE the try) keeps Bun.spawn's NARROWED stream
   // types — a pre-declared widened annotation erases them to the
   // `number | ReadableStream` union and breaks `new Response`. Bun.spawn throws
   // SYNCHRONOUSLY on a bad binary, so a spawn failure lands in the same catch.
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const proc = Bun.spawn([opts.uvPath, ...args], {
-      // cwd at the project dir is redundant with `--directory` but harmless, and
-      // keeps module resolution correct even if a uv flag is ever dropped.
-      cwd: opts.projectDir,
+    const proc = Bun.spawn(argv, {
+      // cwd at the project dir keeps module resolution correct (redundant with
+      // uv's `--directory`, load-bearing for the bun entry's relative imports).
+      cwd: opts.runtime.projectDir,
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -456,13 +470,42 @@ export const runScrape: ScrapeRunner = async (account) => {
     return {
       kind: "runner_failure",
       reason: "spawn_failed",
-      message: "usage-scraper runtime unresolved (uv path / project dir unset)",
+      message: "usage-scraper runtime unresolved (project dir / uv path unset)",
       stderr: "",
       exitCode: null,
     };
   }
+  // Both legs spawn `tmux` to drive the target TUI; launchd strips PATH, so the
+  // child needs tmux's directory injected or the scrape ENOENTs. Append (never
+  // prepend) so an operator PATH still wins.
   return spawnScrape(account, {
-    uvPath: runtime.uvPath,
-    projectDir: runtime.projectDir,
+    runtime,
+    env: { PATH: scrapeChildPath(process.env.PATH) },
   });
 };
+
+/**
+ * Append `tmux`'s resolved directory to the inherited PATH for a scrape child,
+ * so a bun/uv scrape can spawn tmux even under launchd's stripped PATH. A bare
+ * (unresolvable) tmux is left off — the scrape then ENOENTs loudly rather than
+ * polluting PATH with `.`.
+ */
+function scrapeChildPath(basePath: string | undefined): string {
+  const tmuxBin = resolveTmuxBin(process.env);
+  if (!isAbsolute(tmuxBin)) {
+    return basePath ?? "";
+  }
+  return withDirOnPath(basePath, dirname(tmuxBin));
+}
+
+/** Pure: append `dir` to a `:`-delimited PATH string unless already present. */
+export function withDirOnPath(
+  basePath: string | undefined,
+  dir: string,
+): string {
+  const base = basePath ?? "";
+  if (base.length === 0) {
+    return dir;
+  }
+  return base.split(":").includes(dir) ? base : `${base}:${dir}`;
+}

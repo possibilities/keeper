@@ -6,19 +6,28 @@
  *  - `parseScrapeStdout` over every discriminated arm: ok/subscribed (claude +
  *    codex), ok/no_subscription, error, and the runner_failure folds
  *    (empty stdout, non-JSON, schema mismatch, bad shape).
- *  - `buildScrapeArgs` argv assembly (plain `run --directory`, never `--python`).
- *  - `resolveUsageScraperRuntime` gate: both keys → resolve; either unset → null;
- *    env override + tilde-expansion.
+ *  - `buildScrapeArgs` argv assembly for BOTH legs — uv (`run --directory …`,
+ *    never `--python`) and bun (`<bun> <dir>/src/scrape-cli.ts …`).
+ *  - `resolveUsageScraperRuntimeKind`: env-over-config precedence, fail-closed to
+ *    uv on garbage, uv default.
+ *  - `resolveUsageScraperRuntime` gate: uv leg needs both keys; bun leg needs only
+ *    the project dir (execPath bun default), null otherwise; tilde-expansion.
+ *  - `withDirOnPath`: the tmux PATH augmentation the scrape child rides.
  *  - a synthetic `ScrapeRunner` stubbing the seam for the worker's branch logic.
  *  - the `KEEPER_AGENTUSAGE_ROOT` → `resolveUsageRoot()` override + picker
  *    `setStateDir` wiring, all sandbox-rooted (no real state dir touched).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveUsageRoot, resolveUsageScraperRuntime } from "../src/db";
+import {
+  resolveUsageRoot,
+  resolveUsageScraperRuntime,
+  resolveUsageScraperRuntimeKind,
+  type UsageScraperRuntime,
+} from "../src/db";
 import { getStateDir, setStateDir } from "../src/usage-picker";
 import {
   buildScrapeArgs,
@@ -27,6 +36,7 @@ import {
   type ScrapeAccount,
   type ScrapeResult,
   type ScrapeRunner,
+  withDirOnPath,
 } from "../src/usage-scrape-runner";
 
 // Env keys this suite mutates; saved/restored so it never leaks into siblings.
@@ -34,6 +44,8 @@ const ENV_KEYS = [
   "KEEPER_AGENTUSAGE_ROOT",
   "KEEPER_USAGE_SCRAPER_UV_PATH",
   "KEEPER_USAGE_SCRAPER_PROJECT_DIR",
+  "KEEPER_USAGE_SCRAPER_RUNTIME",
+  "KEEPER_USAGE_SCRAPER_BUN_PATH",
   "KEEPER_CONFIG",
 ];
 let saved: Record<string, string | undefined>;
@@ -263,11 +275,18 @@ describe("parseScrapeStdout — runner_failure folds (no throw)", () => {
   });
 });
 
-describe("buildScrapeArgs", () => {
-  test("plain `run --directory`, never `--python`; claude profile threaded", () => {
+describe("buildScrapeArgs — uv leg", () => {
+  const uv: UsageScraperRuntime = {
+    runtime: "uv",
+    uvPath: "/abs/uv",
+    projectDir: "/abs/agentusage",
+  };
+
+  test("full argv: <uv> run --directory … python -m agentusage.scrape_cli; never --python", () => {
     const acct: ScrapeAccount = { target: "claude", profile: "work" };
-    const args = buildScrapeArgs("/abs/agentusage", acct);
+    const args = buildScrapeArgs(uv, acct);
     expect(args).toEqual([
+      "/abs/uv",
       "run",
       "--directory",
       "/abs/agentusage",
@@ -290,7 +309,7 @@ describe("buildScrapeArgs", () => {
       rows: 50,
       cols: 120,
     };
-    const args = buildScrapeArgs("/p", acct);
+    const args = buildScrapeArgs(uv, acct);
     expect(args).toContain("--command");
     expect(args).toContain("/usr/bin/false");
     expect(args).toContain("--rows");
@@ -300,14 +319,99 @@ describe("buildScrapeArgs", () => {
   });
 });
 
-describe("resolveUsageScraperRuntime — no-default gate", () => {
-  test("both env keys set → resolves, tilde-expanded", () => {
+describe("buildScrapeArgs — bun leg", () => {
+  const bun: UsageScraperRuntime = {
+    runtime: "bun",
+    bunPath: "/abs/bun",
+    projectDir: "/abs/agentusage",
+  };
+
+  test("full argv: <bun> <dir>/src/scrape-cli.ts …; no uv `run`/`--python`", () => {
+    const acct: ScrapeAccount = { target: "claude", profile: "work" };
+    const args = buildScrapeArgs(bun, acct);
+    expect(args).toEqual([
+      "/abs/bun",
+      "/abs/agentusage/src/scrape-cli.ts",
+      "--target",
+      "claude",
+      "--profile",
+      "work",
+    ]);
+    expect(args).not.toContain("run");
+    expect(args).not.toContain("--python");
+  });
+
+  test("optional command/rows/cols passthrough preserved on the bun leg", () => {
+    const acct: ScrapeAccount = {
+      target: "codex",
+      profile: "default",
+      command: "/usr/bin/false",
+      rows: 50,
+      cols: 120,
+    };
+    const args = buildScrapeArgs(bun, acct);
+    expect(args[0]).toBe("/abs/bun");
+    expect(args[1]).toBe("/abs/agentusage/src/scrape-cli.ts");
+    expect(args).toContain("--command");
+    expect(args).toContain("/usr/bin/false");
+    expect(args).toContain("--rows");
+    expect(args).toContain("50");
+    expect(args).toContain("--cols");
+    expect(args).toContain("120");
+  });
+});
+
+describe("resolveUsageScraperRuntimeKind — env-over-config, fail-closed", () => {
+  function writeConfig(body: string): void {
+    const cfgPath = join(tmpDir, "config.yaml");
+    writeFileSync(cfgPath, body);
+    process.env.KEEPER_CONFIG = cfgPath;
+  }
+
+  test("absent env + no config → uv (the shipped default)", () => {
+    expect(resolveUsageScraperRuntimeKind()).toBe("uv");
+  });
+
+  test("env=bun → bun; env=uv → uv", () => {
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "bun";
+    expect(resolveUsageScraperRuntimeKind()).toBe("bun");
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "uv";
+    expect(resolveUsageScraperRuntimeKind()).toBe("uv");
+  });
+
+  test("an invalid env value fails closed to uv", () => {
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "python";
+    expect(resolveUsageScraperRuntimeKind()).toBe("uv");
+  });
+
+  test("config usage_scraper_runtime: bun → bun when env is absent", () => {
+    writeConfig("usage_scraper_runtime: bun\n");
+    expect(resolveUsageScraperRuntimeKind()).toBe("bun");
+  });
+
+  test("a garbage config value fails closed to uv", () => {
+    writeConfig("usage_scraper_runtime: nope\n");
+    expect(resolveUsageScraperRuntimeKind()).toBe("uv");
+  });
+
+  test("a present env shadows config: env=uv beats config bun, garbage env still uv", () => {
+    writeConfig("usage_scraper_runtime: bun\n");
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "uv";
+    expect(resolveUsageScraperRuntimeKind()).toBe("uv");
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "garbage";
+    expect(resolveUsageScraperRuntimeKind()).toBe("uv");
+  });
+});
+
+describe("resolveUsageScraperRuntime — default (uv) gate", () => {
+  test("both uv env keys set → resolves as the uv leg, tilde-expanded", () => {
     process.env.KEEPER_USAGE_SCRAPER_UV_PATH = "~/bin/uv";
     process.env.KEEPER_USAGE_SCRAPER_PROJECT_DIR = "/abs/agentusage";
     const rt = resolveUsageScraperRuntime();
     expect(rt).not.toBeNull();
-    expect(rt?.uvPath).toBe(join(homedir(), "bin/uv"));
-    expect(rt?.projectDir).toBe("/abs/agentusage");
+    if (rt?.runtime !== "uv") throw new Error("expected the uv leg");
+    expect(rt.uvPath).toBe(join(homedir(), "bin/uv"));
+    expect(rt.projectDir).toBe("/abs/agentusage");
   });
 
   test("uv path set but project dir unset → null (gate closed)", () => {
@@ -322,6 +426,68 @@ describe("resolveUsageScraperRuntime — no-default gate", () => {
 
   test("neither set → null", () => {
     expect(resolveUsageScraperRuntime()).toBeNull();
+  });
+});
+
+describe("resolveUsageScraperRuntime — bun leg (uv keys not required)", () => {
+  test("runtime=bun + project dir → resolves with the execPath default, no uv keys", () => {
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "bun";
+    process.env.KEEPER_USAGE_SCRAPER_PROJECT_DIR = "/abs/agentusage";
+    const rt = resolveUsageScraperRuntime();
+    expect(rt).not.toBeNull();
+    if (rt?.runtime !== "bun") throw new Error("expected the bun leg");
+    expect(rt.bunPath).toBe(process.execPath);
+    expect(rt.projectDir).toBe("/abs/agentusage");
+  });
+
+  test("runtime=bun honors KEEPER_USAGE_SCRAPER_BUN_PATH, tilde-expanded", () => {
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "bun";
+    process.env.KEEPER_USAGE_SCRAPER_PROJECT_DIR = "/abs/agentusage";
+    process.env.KEEPER_USAGE_SCRAPER_BUN_PATH = "~/bin/bun";
+    const rt = resolveUsageScraperRuntime();
+    if (rt?.runtime !== "bun") throw new Error("expected the bun leg");
+    expect(rt.bunPath).toBe(join(homedir(), "bin/bun"));
+  });
+
+  test("runtime=bun honors a usage_scraper_bun_path config override", () => {
+    const cfgPath = join(tmpDir, "config.yaml");
+    writeFileSync(
+      cfgPath,
+      "usage_scraper_runtime: bun\n" +
+        "usage_scraper_project_dir: /abs/agentusage\n" +
+        "usage_scraper_bun_path: /opt/bun/bin/bun\n",
+    );
+    process.env.KEEPER_CONFIG = cfgPath;
+    const rt = resolveUsageScraperRuntime();
+    if (rt?.runtime !== "bun") throw new Error("expected the bun leg");
+    expect(rt.bunPath).toBe("/opt/bun/bin/bun");
+    expect(rt.projectDir).toBe("/abs/agentusage");
+  });
+
+  test("runtime=bun still requires the project dir (gate closed without it)", () => {
+    process.env.KEEPER_USAGE_SCRAPER_RUNTIME = "bun";
+    expect(resolveUsageScraperRuntime()).toBeNull();
+  });
+});
+
+describe("withDirOnPath — tmux PATH augmentation (pure)", () => {
+  test("appends the dir when absent", () => {
+    expect(withDirOnPath("/usr/bin:/bin", "/opt/homebrew/bin")).toBe(
+      "/usr/bin:/bin:/opt/homebrew/bin",
+    );
+  });
+
+  test("does not duplicate a dir already on PATH", () => {
+    expect(
+      withDirOnPath("/usr/bin:/opt/homebrew/bin", "/opt/homebrew/bin"),
+    ).toBe("/usr/bin:/opt/homebrew/bin");
+  });
+
+  test("returns just the dir when the base PATH is empty or undefined", () => {
+    expect(withDirOnPath(undefined, "/opt/homebrew/bin")).toBe(
+      "/opt/homebrew/bin",
+    );
+    expect(withDirOnPath("", "/opt/homebrew/bin")).toBe("/opt/homebrew/bin");
   });
 });
 
