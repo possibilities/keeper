@@ -1,0 +1,56 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Early proof-point module custody move that must preserve load-bearing reset-time/envelope-compatibility invariants under toolchain drift \u2014 contract-shaped work where a dropped rationale silently breaks the wire contract.",
+      "task_id": "fn-1146-merge-usage-scraper-into-keeper.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Collapses the spawn seam and deletes a config-resolver family across runner/db/daemon with subtle launchd cwd/PATH correctness and a daemon worker-gate change \u2014 contract-touching with real blast radius.",
+      "task_id": "fn-1146-merge-usage-scraper-into-keeper.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Introduces a new fail-open config schema replacing three surfaces with id validation, import-graph cold-start hazards, and an intended behavior change \u2014 new-pattern contract work.",
+      "task_id": "fn-1146-merge-usage-scraper-into-keeper.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded subverb added by mirroring an established split pattern, but the descriptor tree's final shape is uncertain (sequenced behind a convergence epic), so keep opus over a literal-minded tier.",
+      "task_id": "fn-1146-merge-usage-scraper-into-keeper.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified, low-blast-radius, reversible doc/ADR revision with exact line refs where sonnet's precise spec-following fits and the genre discipline is clearly stated.",
+      "task_id": "fn-1146-merge-usage-scraper-into-keeper.5",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-06T20:29:24.784000Z",
+  "epic_id": "fn-1146-merge-usage-scraper-into-keeper",
+  "input_hash": "aa2ff982ea155197bea5732ab438705508b4fd664d6a5b8c966b86343574b9b2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2855270786,
+  "verdict_raw": null
+}

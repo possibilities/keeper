@@ -8,11 +8,11 @@
   ],
   "epic": "fn-1146-merge-usage-scraper-into-keeper",
   "id": "fn-1146-merge-usage-scraper-into-keeper.5",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Update docs and port ADR",
-  "updated_at": "2026-07-06T20:28:03.200000Z"
+  "updated_at": "2026-07-06T20:29:24.784000Z"
 }
