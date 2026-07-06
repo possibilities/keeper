@@ -20,6 +20,7 @@ import {
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
+  isStaleBaseDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
@@ -36,6 +37,9 @@ import {
   SHARED_WEDGE_DISTRESS_VERB,
   SLOT_OCCUPIED_REASON_PREFIX,
   SLOT_RECLAIMED_REASON_PREFIX,
+  STALE_BASE_DISTRESS_ID_PREFIX,
+  STALE_BASE_DISTRESS_REASON,
+  STALE_BASE_DISTRESS_VERB,
   WORKTREE_CLOSE_KEY_PREFIXES,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_NON_FF_REASON,
@@ -598,6 +602,7 @@ describe("single vocabulary source", () => {
       ["shared-checkout-dirty", "shared-dirty"],
       ["worktree-lane-wedge", "lane-wedge"],
       ["worktree-lane-premerge", "lane-premerge"],
+      ["stale-base-lane", "stale-base"],
     ]);
   });
 });
@@ -698,6 +703,106 @@ describe("fn-1123.2 worktree-lane pre-merge vocabulary", () => {
     expect(leadingReasonToken(laneRow.reason)).not.toBe(
       MERGE_ESCALATION_REASON_TOKEN,
     );
+  });
+});
+
+// ── fn-1127 — the stale-base lane distress family ───────────────────────────
+
+describe("fn-1127 stale-base-lane distress vocabulary", () => {
+  test("stale-base-lane distress key → unknown (never enters failedKeys)", () => {
+    // Same synthetic-verb discipline as the shared-checkout / lane distress rows, but
+    // per-(epic,repo): the id carries `<epicId>-<repoHash>`. It must route as `unknown`
+    // for EVERY shape so no stale-base row ever suppresses a real dispatch key.
+    for (const suffix of ["fn-1-foo-abc123", "fn-9-bar-0", "fn-2-baz-zzz999"]) {
+      const id = `${STALE_BASE_DISTRESS_ID_PREFIX}${suffix}`;
+      expect(
+        routeDispatchFailure(
+          row(
+            STALE_BASE_DISTRESS_VERB,
+            id,
+            `${STALE_BASE_DISTRESS_REASON}: epic fn-1-foo's lane is stale`,
+          ),
+        ).kind,
+      ).toBe("unknown");
+      expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, id)).toBe(true);
+    }
+  });
+
+  test("isStaleBaseDistressKey is the synthetic daemon-verb per-(epic,repo) surface only", () => {
+    const id = `${STALE_BASE_DISTRESS_ID_PREFIX}fn-1-foo-abc123`;
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, id)).toBe(true);
+    // Wrong verb, wrong id prefix, and a real close/work row all miss.
+    expect(isStaleBaseDistressKey("close", id)).toBe(false);
+    expect(isStaleBaseDistressKey("work", id)).toBe(false);
+    expect(
+      isStaleBaseDistressKey("close", `${WORKTREE_RECOVER_KEY_PREFIX}fn-1-x`),
+    ).toBe(false);
+    expect(isStaleBaseDistressKey("work", "fn-1-x.2")).toBe(false);
+    // The crash-loop id shares the verb but lacks the prefix.
+    expect(
+      isStaleBaseDistressKey(CRASH_LOOP_DISTRESS_VERB, CRASH_LOOP_DISTRESS_ID),
+    ).toBe(false);
+    // Shares the un-retryable synthetic `daemon` verb with the sibling distress rows.
+    expect(STALE_BASE_DISTRESS_VERB).toBe(CRASH_LOOP_DISTRESS_VERB);
+    expect(STALE_BASE_DISTRESS_VERB).not.toBe("work");
+    expect(STALE_BASE_DISTRESS_VERB).not.toBe("close");
+  });
+
+  test("stale-base-lane distress key is DISJOINT from the wedge / dirty / lane-wedge keys", () => {
+    // The four distress prefixes never mutually match, so their rows never
+    // cross-classify or cross-clear. A shared `<epicId>-<hash>` tail is deliberate.
+    const tail = "fn-1-foo-abc123";
+    const staleId = `${STALE_BASE_DISTRESS_ID_PREFIX}${tail}`;
+    const wedgeId = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${tail}`;
+    const dirtyId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}${tail}`;
+    const laneId = `${LANE_WEDGE_DISTRESS_ID_PREFIX}${tail}`;
+    // A stale id is a stale key but NONE of the others, and vice versa.
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, staleId)).toBe(
+      true,
+    );
+    expect(isSharedWedgeDistressKey(SHARED_WEDGE_DISTRESS_VERB, staleId)).toBe(
+      false,
+    );
+    expect(isSharedDirtyDistressKey(SHARED_DIRTY_DISTRESS_VERB, staleId)).toBe(
+      false,
+    );
+    expect(isLaneWedgeDistressKey(LANE_WEDGE_DISTRESS_VERB, staleId)).toBe(
+      false,
+    );
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, wedgeId)).toBe(
+      false,
+    );
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, dirtyId)).toBe(
+      false,
+    );
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, laneId)).toBe(
+      false,
+    );
+  });
+
+  test("stale-base-lane distress reason is collision-free + display-mapped", () => {
+    expect(STALE_BASE_DISTRESS_REASON).toBe("stale-base-lane");
+    expect(STALE_BASE_DISTRESS_ID_PREFIX).toBe("stale-base-lane:");
+    // No OTHER display-rule prefix is a prefix of the stale-base reason, nor it of
+    // them, so the pill classifies a stale-base row to its OWN kind (never shadowed).
+    for (const { prefix } of DISPATCH_FAILURE_DISPLAY_RULES) {
+      if (prefix === STALE_BASE_DISTRESS_REASON) continue;
+      expect(STALE_BASE_DISTRESS_REASON.startsWith(prefix)).toBe(false);
+      expect(prefix.startsWith(STALE_BASE_DISTRESS_REASON)).toBe(false);
+    }
+    // A stale-base row's reason must NOT route as a recover reason (it lives OUTSIDE
+    // the `worktree-recover*` auto-clear prefix — its only clear is the level-trigger).
+    expect(isWorktreeRecoverReason(`${STALE_BASE_DISTRESS_REASON}: x`)).toBe(
+      false,
+    );
+    // …nor as a lane pre-merge reason (a distinct `stale-base-lane` prefix).
+    expect(
+      isWorktreeLanePremergeReason(`${STALE_BASE_DISTRESS_REASON}: x`),
+    ).toBe(false);
+    // The id prefix is itself a well-formed `stale-base-lane` display match.
+    expect(
+      STALE_BASE_DISTRESS_ID_PREFIX.startsWith(STALE_BASE_DISTRESS_REASON),
+    ).toBe(true);
   });
 });
 
