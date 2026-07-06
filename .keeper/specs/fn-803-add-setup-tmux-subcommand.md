@@ -42,5 +42,5 @@ dotfiles script semantics verbatim minus the attach/switch-client tail.
 - **`=name` exact-match targets:** every `-t` uses `=<session>`; bare names fnmatch and can hit the wrong session [tmux(1)]
 - **`has-session` exit code conflates "no session" and "no server":** capture stderr, treat any non-zero as "absent → create"; never inherit stderr on existence probes [tmux #4026]
 - **Detached sizing:** `#{client_width}/#{client_height}` are valid only inside tmux with an attached client; outside, `tput cols/lines` needs `TERM` and numeric validation; always pass explicit `-x`/`-y` or detached sessions boot 80x24 [tmux wiki]
-- **Layout cadence:** `select-layout main-vertical` after EACH split or later splits fail "no space for new pane"; target panes by `#{pane_id}` (from `split-window -P`) — user configs commonly set `pane-base-index 1` [tmuxp #800]
+- **Layout cadence:** `select-layout main-vertical` after EACH split or later splits fail "no space for new pane"; target panes by `#{pane_id}` (from `split-window -P`) instead of positional pane indexes [tmuxp #800]
 - **`pane_current_command` is the foreground basename only:** backgrounded jobs behind an idle shell read as not-busy; never default a destructive confirm to yes on non-TTY [community]

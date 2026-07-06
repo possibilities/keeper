@@ -28,7 +28,7 @@ wrapper followed immediately by `select-layout main-vertical` (cadence is
 load-bearing — splitting all five then laying out once fails "no space
 for new pane"); select the board pane at the end via its `#{pane_id}`
 captured with `split-window -P -F '#{pane_id}'` / `display -p` rather
-than positional `.1` (user configs set `pane-base-index 1`). Then the
+than positional pane targets. Then the
 ensure-loop: for each of `autopilot`, `background`, `foreground`,
 `has-session -t =<name>` (stderr captured, any non-zero = absent) else
 `new-session -d -s <name> -c ~/code/keeper -e KEEPER_TMUX_SESSION=<name>`
@@ -92,7 +92,7 @@ the `isSubcommand` block asserts per name — both fail until updated.
 
 - `--kill-sessions` confirmed against a live `autopilot` session kills in-flight daemon-dispatched workers; the confirm table is the only gate, so the sweep's accuracy (locale, TAB parsing) is safety-critical.
 - A C-locale sweep silently classifies every pane idle — the localeDefaultedEnv wrap on the list-panes spawn is mandatory, not cosmetic.
-- Positional pane targets break under `pane-base-index 1` user configs — use captured pane ids.
+- Positional pane targets are brittle after layout changes — use captured pane ids.
 - Two concurrent setup-tmux runs can race on the dash kill/mint; accepted for an experiment, no lock.
 
 ### Test notes

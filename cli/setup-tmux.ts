@@ -299,8 +299,7 @@ export function buildSetMainPaneWidthArgs(): string[] {
 /**
  * `split-window -d -t =dash -c <dir> -P -F '#{pane_id}' -- <argv...>`. `-d`
  * keeps the new pane unfocused; `-P -F '#{pane_id}'` prints the created pane's
- * id so we can re-select the board pane positionally-independent of
- * `pane-base-index`.
+ * id so we can re-select the board pane without positional pane targets.
  */
 export function buildDashSplitArgs(sub: string): string[] {
   return dashTmux(
@@ -535,8 +534,8 @@ function rebuildDash(spawn: SyncSpawnFn): void {
     runChecked(spawn, buildSelectLayoutArgs());
   }
 
-  // Re-focus the board pane by its captured id (positional `.1` breaks under
-  // pane-base-index 1).
+  // Re-focus the board pane by its captured id; positional pane targets are
+  // brittle after layout changes.
   if (boardPaneId !== "") {
     runChecked(spawn, buildSelectPaneArgs(boardPaneId));
   }
