@@ -34,5 +34,5 @@ New cli-help.test.ts: every descriptor verb × `--help` renders usage naming the
 - [ ] The descriptor covers the full dispatchable verb set and the CLI's own parser consumes it
 
 ## Done summary
-
+Added plugins/plan/src/descriptor.ts (pure-data, dependency-free) carrying per-verb arg/option metadata for all 34 plan verbs plus subgroups; the CLI now derives its help listing, no-such-command validation, and subgroup set from it. Top-level and subgroup leaves both render --help through one shared descriptor-fed renderer (renderLeafHelp in subgroup.ts), fixing the defect where a top-level verb's --help printed group help. New test/cli-help.test.ts pins the full verb set against a hand-written list and asserts every verb renders leaf help without running a body.
 ## Evidence
