@@ -578,6 +578,12 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 **A work agent escalated a blocked task (operator branch).** When the daemon escalates a BLOCKED `/plan:work` worker to you over the Agent Bus, or a still-live worker messages you for help, read `references/operator-orchestration.md` for the resolve → `unblock` → bus-resume flow (bus-resume PRIMARY, cold-re-dispatch the exit-1-miss fallback).
 
+**A deliverable is knowledge, not code (operator branch).** Scaffold a research epic like any other — see `references/operator-orchestration.md` for the retrieval-path spec-time rule and the `complete`-gated follow-up.
+
+**Designing a deliberate check-in point.** A task spec may name a fork where the worker should stop and ask instead of guessing — see `references/operator-orchestration.md` for the `BLOCKED`-category mechanics and the escalation caveats.
+
+**Piloting execution by hand.** Only take the wheel — `keeper:autopilot`, `keeper:dispatch` — on explicit human request, or after asking; the planning flow's own wrap-up never pilots on its own initiative.
+
 ---
 
 ## Phase 6.5 — Select model+effort cells (create path only)
