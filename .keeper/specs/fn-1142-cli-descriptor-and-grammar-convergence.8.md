@@ -36,5 +36,5 @@ Existing dispatch/panel suites update invocations; add retired-spelling-fails ca
 - [ ] Every in-repo skill, agent doc, and docs/ citation uses the new spellings
 
 ## Done summary
-
+Disambiguated the dir/session flag families with hard cutover: handoff --dir→--cwd, agent panel --dir→--run-dir, show-job dropped --session-id (matched job_id) and renamed --session→--session-title (--job-id stays honest). Retired spellings hard-fail exit 2 before any daemon touch via parseHandoffArgs/parsePanelArgs guards. --session now means the tmux session everywhere it survives; migrated every in-repo citation (skills, panel-runner agent, problem-codes, vendored corpus+lock, source comments) and the native descriptors. Pre-existing prompt-suite render-golden drift (upstream ~/code/arthack ahead of render.json) is out of scope for this flag-grammar task.
 ## Evidence
