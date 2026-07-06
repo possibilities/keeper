@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded targeted-test addition with a named surface and clear acceptance \u2014 export two parsers and assert byte-identical parity against the birth-record originals \u2014 squarely in sonnet's mechanical-test wheelhouse at a do-exactly-this effort band.",
+      "task_id": "fn-1138-test-hermes-shim-start-time-drift-guards.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "1d3a118f5d4d8b07ad4a02fc3e496ccf4664b01f254bbfb6f290c9a67d2dd40a",
+  "created_at": "2026-07-06T11:04:46.500000Z",
+  "epic_id": "fn-1138-test-hermes-shim-start-time-drift-guards",
+  "input_hash": "17e7de51ec42eb468898fbdf0658108d03dc33f3422cce963881430340ec7d43",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 401071697,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded targeted-test addition with a named surface and clear acceptance \u2014 export two parsers and assert byte-identical parity against the birth-record originals \u2014 squarely in sonnet's mechanical-test wheelhouse at a do-exactly-this effort band.\",\"confidence\":0.76}]}"
+}
