@@ -567,13 +567,19 @@ async function runInner(
   }
 
   // Acquire the per-worktree commit lock for the full stage → lint → commit →
-  // push window, keyed on the worktree's OWN git dir. The git index, index.lock,
-  // and HEAD are per-worktree, so a commit-work serializes only against another
-  // commit-work (or an autopilot base-merge) in the SAME worktree; disjoint
-  // linked worktrees share no staging state and take distinct locks. In the
-  // main worktree `--git-dir` == `--git-common-dir`, so the path is unchanged.
-  // Identical argv to `commitWorkLockPath` in src/worktree-git.ts, so a lane's
-  // commit-work and the autopilot merge for that same worktree still collide.
+  // push window, keyed on the worktree's OWN git dir (`--git-dir`). The git index,
+  // index.lock, and HEAD are per-worktree, so a commit-work serializes only against
+  // another commit-work in the SAME worktree; disjoint linked worktrees share no
+  // staging state and take distinct locks. Argv-identical to `commitWorkLockPath`
+  // in src/worktree-git.ts, so a lane's commit-work and its fan-in lane merge
+  // (`mergeBranchInto`, same `--git-dir`) still collide in that lane.
+  //
+  // The autopilot base→default merge is the DELIBERATE exception: it keys its lock
+  // on `--git-common-dir` (`baseMergeLockPath`), because it advances the SHARED
+  // `refs/heads/<default>` rather than a per-worktree branch. In the MAIN checkout
+  // `--git-dir` == `--git-common-dir`, so a main-checkout commit-work still
+  // serializes against the base merge; a linked lane's commit-work (its own
+  // `--git-dir`) does not (correctly — the base merge never runs in a lane).
   const gitDirRes = await git(
     ["rev-parse", "--path-format=absolute", "--git-dir"],
     { cwd: worktree },

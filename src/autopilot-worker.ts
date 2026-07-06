@@ -146,6 +146,7 @@ import {
   type EpicLaneBranchSet,
   epicIdFromKeeperLaneEntry,
   abortInterruptedMerge as gitAbortInterruptedMerge,
+  baseMergeLockPath as gitBaseMergeLockPath,
   branchExists as gitBranchExists,
   classifyLinkedWorktree as gitClassifyLinkedWorktree,
   commitWorkLockPath as gitCommitWorkLockPath,
@@ -165,6 +166,7 @@ import {
   remotePushFastForwardable as gitRemotePushFastForwardable,
   removeWorktree as gitRemoveWorktree,
   resolveDefaultBranch as gitResolveDefaultBranch,
+  supportsMergeTreeWriteTree as gitSupportsMergeTreeWriteTree,
   isKeeperLaneEntry,
   type LockAcquirer,
   type MergeResult,
@@ -1313,6 +1315,27 @@ export function createSharedCheckoutDirtyTracker(
       return decision;
     },
   };
+}
+
+/**
+ * The shared-checkout mid-merge / plain-dirty distress observations the recover cycle
+ * feeds its {@link SharedCheckoutWedgeTracker} / {@link SharedCheckoutDirtyTracker} —
+ * the SINGLE documented neuter point post base-merge decouple.
+ *
+ * A dirty or mid-merge SHARED checkout no longer blocks the working-tree-free base
+ * merge (it lands via the plumbing merge-tree/commit-tree/update-ref-CAS/push pipeline
+ * regardless), so a `worktree-recover-mid-merge` / `worktree-recover-dirty-checkout`
+ * observation is a FALSE POSITIVE for a block that no longer exists. Yields EMPTY maps
+ * by construction: the trackers can only DRAIN (their level-clear off the OPEN distress
+ * set releases any row already open), never mint. Pure; NEVER throws. (The trackers +
+ * this seam are torn down in the sequenced follow-up; kept now so the neuter lives in
+ * exactly one place rather than scattered across the recover loop.)
+ */
+export function sharedCheckoutDistressObservations(): {
+  wedged: Map<string, string>;
+  dirty: Map<string, string>;
+} {
+  return { wedged: new Map(), dirty: new Map() };
 }
 
 /**
@@ -3410,6 +3433,11 @@ async function runWorktreeProducerStep(
  */
 export function createWorktreeDriver(
   run: WorktreeGitRunner = gitExec,
+  // Optional commit-work flock acquirer for the base merge's ref advance + resync
+  // (the finalize sibling of the acquirer the recover pass threads). Omitted in
+  // production → the default deadline-bounded FFI flock; the fast tier injects a
+  // stub so the plumbing merge never touches the real flock.
+  acquireLock?: LockAcquirer,
 ): WorktreeDriver {
   return {
     async provision(info, liveAttributedDirty) {
@@ -3621,6 +3649,7 @@ export function createWorktreeDriver(
           baseBranch,
           defaultBranch,
           run,
+          acquireLock,
         );
         switch (merge.kind) {
           case "off-branch":
@@ -3701,7 +3730,45 @@ export function createWorktreeDriver(
               ok: false,
               reason: `worktree-finalize-push-failed: ${merge.detail}`,
             };
-          // not-ahead (already merged) / merged → proceed to teardown.
+          case "cas-stale":
+            // The compare-and-swap ref advance found a stale `<old>` — a CONCURRENT
+            // local advance of default moved the ref (or the ref lock was contended).
+            // A TRANSIENT retry-skip (no sticky) OUTSIDE the recover auto-clear prefix;
+            // next cycle re-derives the merge off the advanced default tip.
+            return retrySkip(
+              `worktree-finalize-cas-stale: refs/heads/${defaultBranch} advanced concurrently while merging ${baseBranch} (update-ref CAS mismatch, no fetch/rebase/force) — retrying the base merge next cycle`,
+            );
+          case "merge-tree-unsupported":
+            // `git merge-tree --write-tree` needs git >= 2.38; an older git cannot run
+            // the working-tree-free merge. A TRANSIENT retry-skip (never a boot fatal —
+            // worktree mode is default-off) in case git is upgraded.
+            return retrySkip(
+              `worktree-finalize-merge-tree-unsupported: git < 2.38 has no \`merge-tree --write-tree\` for the working-tree-free base merge of ${baseBranch} into ${defaultBranch} in ${repoDir} — retrying next cycle`,
+            );
+          case "plumbing-failed":
+            // An UNEXPECTED plumbing git failure (a merge-tree hard error > 1, a
+            // commit-tree failure, an unparseable OID, an invalid ref name) — NOT a
+            // content conflict and NOT transient. A VISIBLE sticky (no `retry: true`)
+            // an operator reconciles, mirroring the conflict / push-failed arms.
+            return {
+              ok: false,
+              reason: `worktree-finalize-plumbing-failed: merging ${baseBranch} into ${defaultBranch} in ${repoDir} — ${merge.detail}`,
+            };
+          case "not-ahead":
+          case "merged":
+            break; // already merged / just merged → fall through to teardown below
+          default: {
+            // Compile-time exhaustiveness guard so a future MergeLaneResult kind can
+            // NEVER silently fall through to lane teardown on an un-merged base (the
+            // silent-strand class). The runtime arm is unreachable while the union is
+            // fully handled; a new kind surfaces as a VISIBLE sticky rather than a
+            // stranded teardown.
+            const _exhaustive: never = merge;
+            return {
+              ok: false,
+              reason: `worktree-finalize-unhandled-merge-kind: ${(_exhaustive as MergeLaneResult).kind} merging ${baseBranch} into ${defaultBranch} in ${repoDir}`,
+            };
+          }
         }
         // Enumerate EVERY rib of this epic — the snapshot's `laneOrder` ribs UNIONED
         // with EVERY live-git `keeper/epic/<id>--*` ref, so a rib forked in a cycle
@@ -3858,6 +3925,22 @@ export type MergeLaneResult =
   // (`worktree-finalize-*` / `worktree-recover-*`), never a freeze, never a sticky.
   | { kind: "lock-timeout" }
   | { kind: "local-timeout" }
+  // The compare-and-swap `update-ref refs/heads/<default> <new> <old>` found a
+  // stale `<old>` — a CONCURRENT local advance of default (an agent commit) moved
+  // the ref out from under the plumbing merge, or the ref lock was contended. A
+  // TRANSIENT retry-skip modeled like `lock-timeout`: NO strand, NEVER a sticky
+  // conflict — next cycle re-derives the merge off the advanced default tip.
+  | { kind: "cas-stale" }
+  // `git merge-tree --write-tree` is unsupported (git < 2.38) — the working-tree-
+  // free base merge cannot run. A DISTINCT transient skip (worktree mode is
+  // default-off, so NEVER a boot fatalExit); the caller retries in case git is
+  // upgraded, never a sticky conflict or a strand.
+  | { kind: "merge-tree-unsupported" }
+  // An UNEXPECTED plumbing git failure — a merge-tree hard error (exit > 1), a
+  // commit-tree failure, an unparseable tree/commit OID, or an invalid ref name.
+  // NOT a content conflict (exit 1) and NOT a transient stall: a genuine error the
+  // caller surfaces as a VISIBLE block for an operator rather than a silent skip.
+  | { kind: "plumbing-failed"; detail: string }
   | { kind: "merged" };
 
 /**
@@ -3950,21 +4033,117 @@ export async function pushDefaultToOrigin(
 }
 
 /**
+ * The pinned identity keeper stamps on a plumbing base-merge commit. A
+ * `commit-tree` merge commit is minted with NO working tree, so all four
+ * GIT_AUTHOR/COMMITTER NAME+EMAIL are pinned here (rather than inherited from the
+ * ambient repo config) and the commit DATES are pinned to the base tip's own
+ * committer date (never wall-clock) — together making the merge commit OID a pure
+ * function of its two parents + tree, so a crash-retry re-derives the SAME OID and
+ * the update-ref CAS is a clean no-op rather than minting a divergent duplicate.
+ */
+const BASE_MERGE_COMMIT_NAME = "keeper";
+const BASE_MERGE_COMMIT_EMAIL = "keeper@localhost";
+
+/**
+ * Parse a single git object id off the FIRST line of plumbing stdout
+ * (`merge-tree --write-tree`, `commit-tree`), hex-validated. Returns `null` on
+ * anything that is not a 7–64 char lowercase-hex OID so an unparseable / empty /
+ * garbage line degrades to a `plumbing-failed` rather than feeding a bogus value
+ * into `commit-tree` / `update-ref`.
+ */
+function parseGitOid(stdout: string): string | null {
+  const line = stdout.split("\n", 1)[0]?.trim() ?? "";
+  return /^[0-9a-f]{7,64}$/.test(line) ? line : null;
+}
+
+/**
+ * Resolve `refs/heads/<branch>` to its peeled commit OID (`^{commit}`), bounded and
+ * hex-validated. `null` on any non-zero exit / timeout / unparseable output so the
+ * plumbing merge degrades to `plumbing-failed` rather than shelling a bogus OID
+ * into `commit-tree`/`update-ref`. `--end-of-options` guards a `-`-leading name.
+ */
+async function revParseCommit(
+  repo: string,
+  branch: string,
+  run: WorktreeGitRunner,
+): Promise<string | null> {
+  const r = await run(
+    [
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      "--end-of-options",
+      `refs/heads/${branch}^{commit}`,
+    ],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (r.code !== 0) {
+    return null;
+  }
+  return parseGitOid(r.stdout);
+}
+
+/**
+ * Conservative pure ref-name validation for the plumbing `update-ref` arg
+ * (`refs/heads/<default>`). The default branch is producer-resolved (origin/HEAD
+ * or the fallback chain), not attacker-supplied, but the plumbing shells it into
+ * a ref WRITE — so belt-and-suspenders reject a name carrying whitespace / a
+ * control char, a leading `-` or `/`, a trailing `/`, a `..` / `@{` / `.lock`
+ * sequence, or any git ref metacharacter (`~^:?*[\`). An invalid name is a
+ * `plumbing-failed`, never a silent bad ref write.
+ */
+function isPlausibleBranchName(name: string): boolean {
+  if (name.length === 0 || name.length > 255) {
+    return false;
+  }
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) {
+      return false; // control char
+    }
+  }
+  if (/[\s~^:?*[\\]/.test(name)) {
+    return false;
+  }
+  if (name.startsWith("-") || name.startsWith("/") || name.endsWith("/")) {
+    return false;
+  }
+  if (name.includes("..") || name.includes("@{") || name.endsWith(".lock")) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * The ONE guarded lane-base→default merge sequence shared by
  * {@link WorktreeDriver.finalizeEpic} and {@link recoverWorktrees} pass-2. Runs IN
- * the main checkout (`repo`, already resolved to be on `defaultBranch`) and never
- * stamps a reason string — it returns a {@link MergeLaneResult} discriminant the
- * caller maps to its own reason family. Ordered ahead-check → mergeReadiness →
- * turn-key-push precheck → non-ff precheck → merge → push:
+ * the main checkout (`repo`) and never stamps a reason string — it returns a
+ * {@link MergeLaneResult} discriminant the caller maps to its own reason family.
+ *
+ * The merge is WORKING-TREE-FREE — a `merge-tree`/`commit-tree`/`update-ref`-CAS/
+ * push plumbing pipeline that never runs `git merge` in the shared checkout, so it
+ * lands even while the human's checkout is dirty or on a non-default branch (the
+ * incident this decouples). Ordered ahead-check → turn-key-push precheck → non-ff
+ * precheck → (fast-forward | plumbing merge) → CAS ref advance → push:
  *  - ahead-check: the base must carry real commits (NOT already an ancestor of
- *    default) → `not-ahead` is the idempotent already-merged no-op.
- *  - mergeReadiness degrades a dirty / off-branch / would-clobber shared checkout.
- *  - the AUTHORITATIVE turn-key probe runs FIRST (it admits a legitimate first
- *    push to a never-pushed default via its dry-run); the cached-ref non-ff
- *    precheck then blocks ONLY a PROVEN non-fast-forward (`"non-fast-forwardable"`)
- *    — an `"unknown"` unresolved `origin/<default>` defers to turn-key, never a
- *    permanent skip. Both gate BEFORE the local merge so a push that cannot land
- *    never advances local default into a merge-then-die state.
+ *    default) → `not-ahead` is the idempotent already-merged no-op (and re-pushes a
+ *    merge stranded off origin by a prior push timeout).
+ *  - the AUTHORITATIVE turn-key probe runs FIRST (it admits a legitimate first push
+ *    to a never-pushed default via its dry-run); the cached-ref non-ff precheck then
+ *    blocks ONLY a PROVEN non-fast-forward — an `"unknown"` unresolved
+ *    `origin/<default>` defers to turn-key. Both gate BEFORE the ref advance so a
+ *    push that cannot land never advances local default into an advance-then-die.
+ *  - a PURE fast-forward (default is an ancestor of base) advances the ref straight
+ *    to the base tip via CAS — NO `commit-tree` (feeding an FF tree to commit-tree
+ *    would mint a bogus 2-parent merge). A DIVERGENT base takes the real 3-way
+ *    plumbing merge: `merge-tree --write-tree` (exit 1 → `conflict`, > 1 →
+ *    `plumbing-failed`) → `commit-tree` with a pinned identity + base-tip date.
+ *  - the ref advance is a compare-and-swap `update-ref <ref> <new> <old>` under the
+ *    common-dir commit-work flock — a stale `<old>` (a concurrent local advance) is
+ *    the transient `cas-stale` retry-skip, never a strand or a sticky conflict.
+ *  - decision-B: after the ref lands, an idle-clean-on-default shared checkout is
+ *    best-effort fast-forwarded to carry the merged commit; a dirty / off-branch /
+ *    errored resync is skipped SILENTLY (cosmetic — the merge already landed).
  *  - the push runs with ssh `BatchMode`/`ConnectTimeout` + a spawn timeout; a
  *    timeout is a TRANSIENT `push-timeout`, distinct from a hard `push-failed`.
  * `acquireLock` is optional (recover passes the fast-tier-stubbable lock; finalize
@@ -4018,29 +4197,12 @@ export async function mergeLaneBaseIntoDefault(
     }
     return { kind: "push-unconfirmed" };
   }
-  const ready = await gitMergeReadiness(repo, defaultBranch, run, baseBranch);
-  if (ready.kind === "off-branch") {
-    return { kind: "off-branch", head: ready.head };
-  }
-  if (ready.kind === "dirty") {
-    return { kind: "dirty", detail: ready.detail };
-  }
-  // A mid-merge shared checkout is not-ready — surface the DISTINCT classification
-  // (mergeHead + ownership + autostash) so recover/finalize name it and recover
-  // pass-1 self-heals a keeper-owned one. NO LONGER folded into `dirty`: that fold
-  // was the incident's core regression — the wedge read as a generic dirty-checkout
-  // skip the recover/finalize pass retried forever without ever escalating.
-  if (ready.kind === "mid-merge") {
-    return {
-      kind: "mid-merge",
-      mergeHead: ready.mergeHead,
-      owner: ready.owner,
-      autostash: ready.autostash,
-    };
-  }
-  if (ready.kind === "would-clobber") {
-    return { kind: "would-clobber", paths: ready.paths };
-  }
+  // Working-tree-free base merge — mergeReadiness is INTENTIONALLY not consulted
+  // here: a dirty / off-branch / mid-merge shared checkout no longer blocks the base
+  // merge, because the plumbing below never runs `git merge` in the working tree, so
+  // it lands regardless (the incident this decouples). (mergeReadiness stays live for
+  // the fan-in lane pre-merge, which DOES run a working-tree merge in a lane.)
+  //
   // Authoritative turn-key probe FIRST — it admits a legitimate first push to a
   // never-pushed default via its dry-run and carries the accurate reason.
   const pushReady = await remotePushTurnKey(repo, run);
@@ -4049,52 +4211,205 @@ export async function mergeLaneBaseIntoDefault(
   }
   // Cached-ref non-ff precheck second: block ONLY a PROVEN non-fast-forward. An
   // `"unknown"` unresolved origin/<default> (never-pushed default) defers to the
-  // turn-key verdict above rather than minting a false permanent non-FF skip.
+  // turn-key verdict above rather than minting a false permanent non-FF skip. Both
+  // prechecks gate BEFORE the ref advance so a push that cannot land never advances
+  // local default into an advance-then-die state.
   if (
     (await gitRemotePushFastForwardable(repo, defaultBranch, run)) ===
     "non-fast-forwardable"
   ) {
     return { kind: "non-ff" };
   }
-  const merge: MergeResult = acquireLock
-    ? await gitMergeBranchInto(repo, baseBranch, run, acquireLock)
-    : await gitMergeBranchInto(repo, baseBranch, run);
-  if (merge.kind === "conflict") {
-    return { kind: "conflict", stderr: merge.stderr };
+  // Belt-and-suspenders ref-name validation before the plumbing WRITES the ref.
+  if (!isPlausibleBranchName(defaultBranch)) {
+    return {
+      kind: "plumbing-failed",
+      detail: `refusing to advance an implausible default ref name: ${JSON.stringify(defaultBranch)}`,
+    };
   }
-  // The guarded `git merge --abort` after a conflict/timeout ITSELF failed — the
-  // shared checkout is left mid-merge (MERGE_HEAD + unresolved paths), DISTINCT
-  // from a cleanly-aborted `conflict`. Surface it so the caller escalates the
-  // un-cleared wedge with its own reason rather than mislabeling it a conflict.
-  if (merge.kind === "abort-failed") {
-    return { kind: "abort-failed", stderr: merge.stderr };
+  // Resolve both tips to explicit OIDs: the CAS `<old>` needs the exact current
+  // default tip, and pinning the commit-tree parents to OIDs (not branch names)
+  // keeps the merge commit OID deterministic across a crash-retry.
+  const defaultTip = await revParseCommit(repo, defaultBranch, run);
+  if (defaultTip === null) {
+    return {
+      kind: "plumbing-failed",
+      detail: `cannot resolve the default tip refs/heads/${defaultBranch}`,
+    };
   }
-  // A bounded-lock or local-op (blocking hook) timeout means NO merge landed —
-  // surface the transient degrade so the caller skip-retries; NEVER fall through
-  // to the push (which would advance origin past an un-merged base).
-  if (merge.kind === "lock-timeout") {
+  const baseTip = await revParseCommit(repo, baseBranch, run);
+  if (baseTip === null) {
+    return {
+      kind: "plumbing-failed",
+      detail: `cannot resolve the base tip refs/heads/${baseBranch}`,
+    };
+  }
+  // The value the default ref will CAS to: a pure fast-forward (default is an
+  // ancestor of base) advances straight to the base tip — NO commit-tree, since
+  // feeding an FF tree to commit-tree mints a bogus 2-parent merge. A DIVERGENT base
+  // takes the real 3-way plumbing merge.
+  let newValue: string;
+  if (await gitIsAncestorOf(repo, defaultBranch, baseBranch, run)) {
+    newValue = baseTip; // pure fast-forward
+  } else {
+    // git >= 2.38's `merge-tree --write-tree`; an older git degrades to a DISTINCT
+    // transient skip rather than a hard error (worktree mode is default-off, so
+    // never a boot fatalExit).
+    if (!(await gitSupportsMergeTreeWriteTree(repo, run))) {
+      return { kind: "merge-tree-unsupported" };
+    }
+    const mt = await run(
+      ["merge-tree", "--write-tree", "--end-of-options", defaultTip, baseTip],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (mt.code === GIT_SPAWN_TIMEOUT_CODE) {
+      return { kind: "local-timeout" };
+    }
+    // Drive conflict off the EXIT CODE: 0 clean, 1 conflict → the EXISTING sticky
+    // conflict escalation, > 1 a hard error → the failure arm. merge-tree is
+    // tree-vs-tree, so it detects content conflicts equivalently to a porcelain
+    // merge without ever touching (or seeing) the working tree.
+    if (mt.code === 1) {
+      return { kind: "conflict", stderr: (mt.stdout + mt.stderr).trim() };
+    }
+    if (mt.code !== 0) {
+      return {
+        kind: "plumbing-failed",
+        detail: `git merge-tree --write-tree exited ${mt.code}: ${(mt.stdout + mt.stderr).trim()}`,
+      };
+    }
+    const tree = parseGitOid(mt.stdout); // OID is stdout line 1 in --write-tree mode
+    if (tree === null) {
+      return {
+        kind: "plumbing-failed",
+        detail: `git merge-tree --write-tree returned an unparseable tree oid: ${JSON.stringify(mt.stdout.slice(0, 200))}`,
+      };
+    }
+    // Pin the commit dates to the base tip's OWN committer date (never wall-clock)
+    // so the merge commit OID is deterministic across a crash-retry.
+    const dateRes = await run(
+      ["show", "-s", "--format=%cI", "--end-of-options", baseTip],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (dateRes.code === GIT_SPAWN_TIMEOUT_CODE) {
+      return { kind: "local-timeout" };
+    }
+    const pinnedDate = dateRes.stdout.trim();
+    if (dateRes.code !== 0 || pinnedDate.length === 0) {
+      return {
+        kind: "plumbing-failed",
+        detail: `cannot read the base-tip committer date for ${baseTip}: exit ${dateRes.code}`,
+      };
+    }
+    const ct = await run(
+      [
+        "commit-tree",
+        tree,
+        "-p",
+        defaultTip,
+        "-p",
+        baseTip,
+        "-m",
+        `Merge branch '${baseBranch}' into ${defaultBranch}`,
+      ],
+      {
+        cwd: repo,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        env: {
+          GIT_AUTHOR_NAME: BASE_MERGE_COMMIT_NAME,
+          GIT_AUTHOR_EMAIL: BASE_MERGE_COMMIT_EMAIL,
+          GIT_COMMITTER_NAME: BASE_MERGE_COMMIT_NAME,
+          GIT_COMMITTER_EMAIL: BASE_MERGE_COMMIT_EMAIL,
+          GIT_AUTHOR_DATE: pinnedDate,
+          GIT_COMMITTER_DATE: pinnedDate,
+        },
+      },
+    );
+    if (ct.code === GIT_SPAWN_TIMEOUT_CODE) {
+      return { kind: "local-timeout" };
+    }
+    if (ct.code !== 0) {
+      return {
+        kind: "plumbing-failed",
+        detail: `git commit-tree exited ${ct.code}: ${(ct.stdout + ct.stderr).trim()}`,
+      };
+    }
+    const newCommit = parseGitOid(ct.stdout);
+    if (newCommit === null) {
+      return {
+        kind: "plumbing-failed",
+        detail: `git commit-tree returned an unparseable commit oid: ${JSON.stringify(ct.stdout.slice(0, 200))}`,
+      };
+    }
+    newValue = newCommit;
+  }
+  // The ref advance + best-effort resync run under the COMMON-dir commit-work flock:
+  // the merge no longer sits IN the shared checkout, but it still advances the shared
+  // refs/heads/<default> and may resync the shared working tree, so it must not race
+  // a concurrent `keeper commit-work` in the main checkout. A bounded acquirer
+  // returning null → a transient lock-timeout skip, never a frozen cycle.
+  const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
+  const lock = await acquire(await gitBaseMergeLockPath(repo, run));
+  if (lock === null) {
     return { kind: "lock-timeout" };
   }
-  if (merge.kind === "local-timeout") {
-    return { kind: "local-timeout" };
+  try {
+    // Decision-B eligibility, re-checked UNDER the lock so a concurrent commit-work
+    // cannot dirty the tree between this probe and the resync below.
+    const status = await run(["status", "--porcelain"], {
+      cwd: repo,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    const idleCleanOnDefault =
+      (await gitCurrentBranch(repo, run)) === defaultBranch &&
+      status.code === 0 &&
+      status.stdout.trim().length === 0;
+    // Compare-and-swap the default ref: a stale `<old>` (a concurrent local advance
+    // moved default, or the ref lock was contended) is a TRANSIENT cas-stale skip,
+    // never a strand — next cycle re-derives off the advanced tip. `--end-of-options`
+    // guards the ref arg; `<new>`/`<old>` are hex OIDs.
+    const upd = await run(
+      [
+        "update-ref",
+        "--end-of-options",
+        `refs/heads/${defaultBranch}`,
+        newValue,
+        defaultTip,
+      ],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (upd.code === GIT_SPAWN_TIMEOUT_CODE) {
+      return { kind: "local-timeout" };
+    }
+    if (upd.code !== 0) {
+      return { kind: "cas-stale" };
+    }
+    // Decision-B: best-effort fast-forward the idle-clean shared checkout onto the
+    // merged commit. The ref moved out from under the working tree, so the tree now
+    // shows the merge delta as an inverse diff; a `reset --hard` to the new tip
+    // discards that inverse diff (== applies the merge to the tree). Gated on the
+    // pre-move clean probe so no real WIP is ever clobbered, held under the lock, and
+    // SILENTLY swallowed on any error — cosmetic, and the merge already landed. A
+    // dirty / off-branch checkout is the human's to resync (never blocks the merge).
+    if (idleCleanOnDefault) {
+      await run(["reset", "--hard", newValue], {
+        cwd: repo,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      });
+    }
+  } finally {
+    lock.release();
   }
-  // Branch-explicit push, NOT a bare `push`: under `push.default=simple` a
-  // no-refspec push targets the CURRENT HEAD's upstream, so off-default it would
-  // push the wrong ref (or "Everything up-to-date", exit 0) while origin/<default>
-  // never advances — then the caller tears down on a false `pushed` and strands the
-  // merge. pushDefaultToOrigin asserts HEAD==default, fails fast on a credential /
-  // connect stall (BatchMode + ConnectTimeout), and surfaces a timeout as the
-  // TRANSIENT push-timeout, never the sticky push-failed.
+  // Branch-explicit push (pushDefaultToOrigin asserts HEAD==default, uses BatchMode +
+  // ConnectTimeout, maps a spawn timeout to the TRANSIENT push-timeout) THEN a
+  // post-push origin-containment recheck: a push can exit 0 yet leave origin
+  // un-advanced ("Everything up-to-date" on a stale ref), so confirm `merged` ONLY
+  // once origin PROVABLY contains the base (cached remote-tracking ref, NO fetch);
+  // otherwise degrade to push-unconfirmed so the caller defers teardown.
   const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
   if (pushed.kind !== "pushed") {
     return pushed; // off-branch / non-ff / timeout / failed / not-turn-key → caller defers
   }
-  // Post-push origin-containment recheck — the SAME guard the not-ahead arm runs: a
-  // push can exit 0 yet leave origin/<default> un-advanced (e.g. "Everything
-  // up-to-date" on a stale ref). Confirm `merged` (teardown-safe) ONLY once origin
-  // PROVABLY contains the just-merged base (cached remote-tracking ref, NO fetch);
-  // otherwise degrade to the EXISTING push-unconfirmed retry-skip so the caller
-  // defers teardown, never tears the base down off a false `pushed`.
   if (
     await gitIsAncestorOf(
       repo,
@@ -4109,14 +4424,14 @@ export async function mergeLaneBaseIntoDefault(
 }
 
 /**
- * The default bounded commit-work flock acquirer for the recover pass's shared
- * main-checkout abort — the {@link recoverWorktrees} sibling of the acquirer
- * {@link mergeBranchInto} bakes in. Used when the caller injects no `acquireLock`
- * (production), so the abort ALWAYS serializes against a concurrent `keeper
- * commit-work` in the SAME checkout; a bounded deadline degrades a stuck holder to
- * a defer, never a frozen cycle. The fast tier injects a stub instead.
+ * The default bounded commit-work flock acquirer for the shared main-checkout git
+ * writes that must serialize against a concurrent `keeper commit-work` — the
+ * {@link mergeLaneBaseIntoDefault} plumbing ref advance + resync and the
+ * {@link recoverWorktrees} pass-1 mid-merge abort. Used when the caller injects no
+ * `acquireLock` (production); a bounded deadline degrades a stuck holder to a defer,
+ * never a frozen cycle. The fast tier injects a stub instead.
  */
-const defaultRecoverLockAcquirer: LockAcquirer = (lockPath) =>
+const defaultCommitWorkLockAcquirer: LockAcquirer = (lockPath) =>
   CommitWorkLock.acquireWithDeadline(lockPath);
 
 /**
@@ -4223,7 +4538,7 @@ async function recoverSharedCheckoutMidMerge(
   // Abort under the commit-work flock so it never races a concurrent agent commit in
   // the SAME shared checkout (the incident's hazard). A lock-timeout degrades to a
   // defer — NEVER a blind abort.
-  const acquire = acquireLock ?? defaultRecoverLockAcquirer;
+  const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
   const lockPath = await gitCommitWorkLockPath(repo, run);
   const lock = await acquire(lockPath);
   if (lock === null) {
@@ -4629,6 +4944,38 @@ export async function recoverWorktrees(
             failures.push({
               epicId: base.epicId,
               reason: `worktree-recover-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${base.branch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+              dir: repo,
+            });
+            continue;
+          case "cas-stale":
+            // A CONCURRENT local advance of default moved the ref out from under the
+            // plumbing merge's compare-and-swap. A TRANSIENT defer INSIDE the
+            // `worktree-recover-*` auto-clear prefix — next cycle re-derives off the
+            // advanced tip (no `retry_dispatch`).
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-cas-stale: refs/heads/${defaultBranch} advanced concurrently merging ${base.branch} (update-ref CAS mismatch, no fetch/rebase/force) — retrying next cycle`,
+              dir: repo,
+            });
+            continue;
+          case "merge-tree-unsupported":
+            // git < 2.38 has no `merge-tree --write-tree` for the working-tree-free
+            // merge. A TRANSIENT defer inside the auto-clear prefix (never a boot
+            // fatal — worktree mode is default-off) in case git is upgraded.
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-merge-tree-unsupported: git < 2.38 has no \`merge-tree --write-tree\` for the working-tree-free merge of ${base.branch} into ${defaultBranch} in ${repo} — retrying next cycle`,
+              dir: repo,
+            });
+            continue;
+          case "plumbing-failed":
+            // An UNEXPECTED plumbing git failure (a merge-tree hard error > 1, a
+            // commit-tree failure, an unparseable OID, an invalid ref name) — NOT a
+            // content conflict. Surfaced as its own recover reason (inside the
+            // level-clear prefix) rather than vanishing into a conflict.
+            failures.push({
+              epicId: base.epicId,
+              reason: `worktree-recover-plumbing-failed: merging ${base.branch} into ${defaultBranch} in ${repo} — ${merge.detail}`,
               dir: repo,
             });
             continue;
@@ -6279,32 +6626,18 @@ function main(): void {
             )) {
               deps.emitDispatchCleared({ verb: "close", id });
             }
-            // Sustained-wedge escalation: the per-epic reason above fires the first
-            // cycle, but a SHARED checkout stuck mid-merge past the grace watermark
-            // is a wedge keeper cannot heal (foreign residue, or a keeper-owned abort
-            // that keeps failing) — mint a per-repo distress row so it surfaces in
-            // needs_human instead of skip-retrying invisibly. Scoped to the recover-
-            // wedge reasons on a KNOWN shared-checkout dir (a linked-lane path is
-            // excluded — the wedge is the default-branch working tree). The grace +
-            // exactly-once mint live in the in-memory tracker; the clear is a level-
-            // trigger off the OPEN distress rows the snapshot carries (robust across
-            // a restart). No-op when the escalation deps are absent (fake-deps tests).
-            const recoveryRepoKeys = new Set(
-              repos.map((r) => stripTrailingSlashPath(r.trim())),
-            );
-            const wedgedRepos = new Map<string, string>();
-            for (const f of failures) {
-              if (
-                f.dir != null &&
-                isSharedCheckoutWedgeReason(f.reason) &&
-                recoveryRepoKeys.has(stripTrailingSlashPath(f.dir.trim()))
-              ) {
-                // First matching reason per repo wins (both passes key one dir).
-                if (!wedgedRepos.has(f.dir)) {
-                  wedgedRepos.set(f.dir, f.reason);
-                }
-              }
-            }
+            // Sustained-wedge escalation NEUTERED: a mid-merge (or plain-dirty, below)
+            // SHARED checkout no longer blocks the base merge — it lands via the
+            // working-tree-free plumbing pipeline regardless — so a
+            // `worktree-recover-mid-merge` observation is a FALSE POSITIVE for a block
+            // that no longer exists (a foreign in-flight merge in the human's checkout
+            // is now harmless). Feed the tracker NO observations: the mint never fires,
+            // and the level-clear (fed the OPEN distress set below) DRAINS any
+            // shared-checkout-wedge row already open so an operator is never left with
+            // an un-clearable daemon-verb row. The now-inert recoverSharedCheckoutMidMerge
+            // self-heal + this tracker machinery are torn down in the sequenced follow-up.
+            const { wedged: wedgedRepos, dirty: dirtyRepos } =
+              sharedCheckoutDistressObservations();
             const wedgeDecision = sharedWedgeTracker.step({
               wedged: wedgedRepos,
               openDistressDirs: snapshot.sharedWedgeDistressDirs ?? new Set(),
@@ -6321,27 +6654,12 @@ function main(): void {
             for (const c of wedgeDecision.clear) {
               deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
             }
-            // Sibling plain-DIRTY escalation: the same shape, fed off the recover
-            // pass's `worktree-recover-dirty-checkout` reason on a KNOWN shared repo
-            // (a dirty tree with no merge in flight — the mid-merge case is classified
-            // distinctly above and never reaches this reason). A shared checkout that
-            // keeps dirt-skipping finalize past the grace mints a per-repo dirt
-            // distress row; the level-clear fires the cycle the checkout goes clean.
-            // Reuses the SAME verb-neutral distress message channel — the `id` carries
-            // the dirt prefix, so main mints/clears the right synthetic-verb row.
-            const dirtyRepos = new Map<string, string>();
-            for (const f of failures) {
-              if (
-                f.dir != null &&
-                isSharedCheckoutDirtyReason(f.reason) &&
-                recoveryRepoKeys.has(stripTrailingSlashPath(f.dir.trim()))
-              ) {
-                // First matching reason per repo wins (both passes key one dir).
-                if (!dirtyRepos.has(f.dir)) {
-                  dirtyRepos.set(f.dir, f.reason);
-                }
-              }
-            }
+            // Sibling plain-DIRTY escalation NEUTERED for the same reason: the base
+            // merge is working-tree-free, so a dirty shared checkout no longer skips it.
+            // (Post-decouple the pass-2 `dirty` merge verdict is unreachable, so this
+            // observation source is already silent; feeding the tracker nothing keeps it
+            // that way and DRAINS any shared-checkout-dirty row already open. `dirtyRepos`
+            // is destructured with `wedgedRepos` from the one neuter seam above.)
             const dirtyDecision = sharedDirtyTracker.step({
               dirty: dirtyRepos,
               openDistressDirs: snapshot.sharedDirtyDistressDirs ?? new Set(),

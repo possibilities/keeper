@@ -119,6 +119,7 @@ import {
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
   type StaleBaseLaneObservation,
+  sharedCheckoutDistressObservations,
   sharedDirtyDistressId,
   sharedWedgeDistressId,
   staleBaseLaneDistressId,
@@ -7333,416 +7334,624 @@ test("fn-992 finalizeEpic: a stranded base (absent from origin) while HEAD is OF
   expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
 });
 
-test("fn-993 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → { kind: 'lock-timeout' }, NO merge, NO push (degrade, never freeze)", async () => {
-  // EDGE-2a: the bounded flock acquirer could not take the lock within its
-  // deadline (modeled by a null-returning acquirer). The shared core surfaces the
-  // raw `lock-timeout` discriminant — NO merge attempted, NO push, NO reason
-  // string (the caller maps it to its own `worktree-{finalize,recover}-*` family).
+// --- fn-1140 shared fake-git for the working-tree-free plumbing base merge.
+// Models the `merge-tree --write-tree` → `commit-tree` → `update-ref` CAS → push
+// pipeline with per-scenario knobs; the default path is a clean DIVERGENT merge
+// that lands and pushes. Distinct OIDs for the two tips + tree + merge commit make
+// the CAS + determinism observable, and every call's env is captured so a test can
+// assert the pinned commit-tree identity/date.
+const MG_DEFAULT_TIP = "1111111111111111111111111111111111111111";
+const MG_BASE_TIP = "2222222222222222222222222222222222222222";
+const MG_TREE_OID = "3333333333333333333333333333333333333333";
+const MG_MERGE_COMMIT = "4444444444444444444444444444444444444444";
+const MG_BASE_TIP_DATE = "2026-01-02T03:04:05+00:00";
+
+interface MergeGitOpts {
+  base?: string;
+  defaultBranch?: string;
+  baseAncestorOfDefault?: boolean; // ahead-check hit → the not-ahead path
+  defaultAncestorOfBase?: boolean; // pure fast-forward (no commit-tree)
+  originContainsBase?: boolean; // post-push origin-containment recheck (default true)
+  originContainsBaseBeforePush?: boolean; // not-ahead pre-push origin check (default false)
+  originUnresolved?: boolean; // origin/<default> ref unresolved → FF precheck "unknown"
+  remoteAhead?: boolean; // origin ahead of local default → non-ff
+  noRemote?: boolean;
+  noPushTarget?: boolean;
+  dryRunReject?: boolean;
+  gitVersion?: string; // `git version` stdout (set old to model unsupported)
+  mergeTreeExit?: number; // override merge-tree exit (1 conflict, > 1 hard error)
+  mergeTreeTimeout?: boolean;
+  commitTreeExit?: number;
+  commitTreeTimeout?: boolean;
+  updateRefExit?: number; // non-zero → cas-stale
+  updateRefTimeout?: boolean;
+  head?: string; // rev-parse --abbrev-ref HEAD (default = defaultBranch)
+  dirty?: boolean; // status --porcelain non-empty → decision-B resync skipped
+  pushExit?: number;
+  pushTimeout?: boolean;
+  pushStdout?: string;
+  // finalize teardown support (inert for the direct merge tests)
+  worktreeList?: string; // `worktree list --porcelain` stdout
+  epicLaneBranches?: string; // `for-each-ref refs/heads/keeper/epic` stdout
+  pruneNotAncestor?: boolean; // keep finalize's prune gate FALSE even post-merge
+}
+
+function makeMergeGit(opts: MergeGitOpts = {}): {
+  run: Parameters<typeof mergeLaneBaseIntoDefault>[3];
+  cmds: string[];
+  calls: { args: string; env?: Record<string, string> }[];
+} {
+  const def = opts.defaultBranch ?? "main";
+  const base = opts.base ?? "keeper/epic/fn-1-foo";
   const cmds: string[] = [];
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
+  const calls: { args: string; env?: Record<string, string> }[] = [];
+  let pushed = false;
+  let refAdvanced = false;
+  const run: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
     args,
+    o,
   ) => {
     const joined = args.join(" ");
     cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
+    calls.push({ args: joined, env: o?.env });
+    if (joined === `merge-base --is-ancestor ${base} ${def}`) {
+      // ahead-check (pre-merge) is the base an ancestor of LOCAL default? After the
+      // ref advance the SAME probe backs finalize's prune gate — the merged base is
+      // now an ancestor (deletable) unless a test pins it not-ancestor.
+      const ancestor =
+        opts.baseAncestorOfDefault || (refAdvanced && !opts.pruneNotAncestor);
+      return { code: ancestor ? 0 : 1, stdout: "", stderr: "" };
     }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
+    if (
+      joined === `merge-base --is-ancestor ${base} refs/remotes/origin/${def}`
+    ) {
+      // origin-containment (not-ahead pre-push + the post-push recheck).
+      const contains = pushed
+        ? (opts.originContainsBase ?? true)
+        : (opts.originContainsBaseBeforePush ?? false);
+      return { code: contains ? 0 : 1, stdout: "", stderr: "" };
     }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
+    if (
+      joined === `merge-base --is-ancestor refs/remotes/origin/${def} ${def}`
+    ) {
+      // non-ff precheck: origin/<default> ancestor of local default unless remoteAhead.
+      return { code: opts.remoteAhead ? 1 : 0, stdout: "", stderr: "" };
+    }
+    if (joined === `merge-base --is-ancestor ${def} ${base}`) {
+      // FF-case check: is default an ancestor of base? → pure fast-forward.
+      return {
+        code: opts.defaultAncestorOfBase ? 0 : 1,
+        stdout: "",
+        stderr: "",
+      };
+    }
+    if (joined === "remote get-url origin") {
+      return opts.noRemote
+        ? { code: 1, stdout: "", stderr: "no origin" }
+        : { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
+    ) {
+      return opts.noPushTarget
+        ? { code: 1, stdout: "", stderr: "no push target" }
+        : { code: 0, stdout: `origin/${def}\n`, stderr: "" };
+    }
+    if (joined.startsWith("push --dry-run")) {
+      return opts.dryRunReject
+        ? { code: 1, stdout: "", stderr: "dry-run rejected" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === `rev-parse --verify --quiet refs/remotes/origin/${def}`) {
+      return opts.originUnresolved
+        ? { code: 1, stdout: "", stderr: "" }
+        : { code: 0, stdout: "deadbeef\n", stderr: "" };
+    }
+    if (
+      joined ===
+      `rev-parse --verify --quiet --end-of-options refs/heads/${def}^{commit}`
+    ) {
+      return { code: 0, stdout: `${MG_DEFAULT_TIP}\n`, stderr: "" };
+    }
+    if (
+      joined ===
+      `rev-parse --verify --quiet --end-of-options refs/heads/${base}^{commit}`
+    ) {
+      return { code: 0, stdout: `${MG_BASE_TIP}\n`, stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --path-format=absolute --git-common-dir")
+    ) {
+      return { code: 0, stdout: `${o?.cwd ?? ""}/.git\n`, stderr: "" };
+    }
+    if (joined === "version") {
+      return {
+        code: 0,
+        stdout: `${opts.gitVersion ?? "git version 2.50.1 (Apple Git-155)"}\n`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "merge-tree") {
+      if (opts.mergeTreeTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
+      const exit = opts.mergeTreeExit ?? 0;
+      if (exit === 1) {
+        return {
+          code: 1,
+          stdout: `${MG_TREE_OID}\nCONFLICT (content): foo.ts\n`,
+          stderr: "",
+        };
+      }
+      if (exit !== 0) {
+        return { code: exit, stdout: "", stderr: "fatal: merge-tree boom" };
+      }
+      return { code: 0, stdout: `${MG_TREE_OID}\n`, stderr: "" };
+    }
+    if (args[0] === "show") {
+      return { code: 0, stdout: `${MG_BASE_TIP_DATE}\n`, stderr: "" };
+    }
+    if (args[0] === "commit-tree") {
+      if (opts.commitTreeTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
+      const exit = opts.commitTreeExit ?? 0;
+      if (exit !== 0) {
+        return { code: exit, stdout: "", stderr: "fatal: commit-tree boom" };
+      }
+      return { code: 0, stdout: `${MG_MERGE_COMMIT}\n`, stderr: "" };
     }
     if (joined.startsWith("status --porcelain")) {
+      return {
+        code: 0,
+        stdout: opts.dirty ? " M src/file.ts\n" : "",
+        stderr: "",
+      };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${opts.head ?? def}\n`, stderr: "" };
+    }
+    if (args[0] === "update-ref") {
+      if (opts.updateRefTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
+      const exit = opts.updateRefExit ?? 0;
+      if (exit !== 0) {
+        return {
+          code: exit,
+          stdout: "",
+          stderr: "cannot lock ref: is at X but expected Y",
+        };
+      }
+      refAdvanced = true; // local default now contains the base
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    if (joined.startsWith("reset --hard")) {
+      return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // base AHEAD / not already merged
+    if (joined === `push origin ${def}`) {
+      pushed = true;
+      if (opts.pushTimeout) {
+        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
+      }
+      const exit = opts.pushExit ?? 0;
+      if (exit !== 0) {
+        return { code: exit, stdout: "", stderr: "remote rejected" };
+      }
+      return { code: 0, stdout: opts.pushStdout ?? "", stderr: "" };
+    }
+    // --- finalize teardown support (inert for the direct merge tests) ---
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: `origin/${def}\n`, stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref") && joined.includes("keeper/epic")) {
+      return { code: 0, stdout: opts.epicLaneBranches ?? "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return { code: 0, stdout: opts.worktreeList ?? "", stderr: "" };
+    }
+    if (
+      joined.startsWith("worktree remove") ||
+      joined.startsWith("worktree prune") ||
+      joined.startsWith("branch -D")
+    ) {
+      return { code: 0, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
+  return { run, cmds, calls };
+}
+
+test("fn-1140 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → lock-timeout AFTER the merge is computed, NO ref advance, NO push", async () => {
+  // The bounded flock acquirer times out (a null-returning acquirer). The plumbing
+  // merge commit is computed first (idempotent, no side effects), then the lock is
+  // taken for the ref advance — a null lock degrades to `lock-timeout` with NO
+  // update-ref and NO push, never a freeze, never a raw recover reason.
+  const { run, cmds } = makeMergeGit();
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
-    // Bounded acquirer that TIMED OUT → null. mergeBranchInto maps it to lock-timeout.
+    run,
     () => null,
   );
   expect(res).toEqual({ kind: "lock-timeout" });
-  // A raw discriminant carries no reason — it can never auto-clear a finalize block.
   expect(isWorktreeRecoverReason((res as { kind: string }).kind)).toBe(false);
-  // The merge never ran (lock not held) and nothing was REALLY pushed (the
-  // turn-key `push --dry-run` probe is read-only and runs before the lock).
+  expect(cmds.some((c) => c.startsWith("commit-tree"))).toBe(true);
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
+  // NEVER a working-tree `git merge` in the shared checkout.
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
-  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
 });
 
-test("fn-993 mergeLaneBaseIntoDefault: a local `merge --no-edit` TIMEOUT (124) → { kind: 'local-timeout' }, NOT conflict, NO push", async () => {
-  // EDGE-2b: a blocking git hook makes the local merge spawn exceed its timeout →
-  // the GNU-timeout sentinel. It must degrade to a TRANSIENT local-timeout, NEVER
-  // be mistaken for a content conflict (which would be a sticky operator block).
-  const cmds: string[] = [];
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" }; // ff-able
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // base AHEAD / not already merged
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
+test("fn-1140 mergeLaneBaseIntoDefault: a plumbing `merge-tree` TIMEOUT (124) → { kind: 'local-timeout' }, NOT conflict, NO push", async () => {
+  // A blocking git hook makes the local merge-tree spawn exceed its timeout → the
+  // GNU-timeout sentinel. It must degrade to a TRANSIENT local-timeout, NEVER be
+  // mistaken for a content conflict (which would be a sticky operator block).
+  const { run, cmds } = makeMergeGit({ mergeTreeTimeout: true });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
+    run,
     () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "local-timeout" });
   expect(res.kind).not.toBe("conflict");
-  // The timed-out merge never advances origin behind an un-landed merge (the
-  // read-only turn-key `push --dry-run` may run; the real `push origin` must not).
-  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+  // A timed-out merge computation never advances the ref or pushes.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
 });
 
-test("fn-993 finalizeEpic: a local merge timeout → worktree-finalize-local-timeout retry-skip (NOT a recover reason), NO teardown", async () => {
+test("fn-1140 finalizeEpic: a plumbing merge-tree timeout → worktree-finalize-local-timeout retry-skip (NOT a recover reason), NO ref advance, NO teardown", async () => {
   // The finalize caller maps the shared core's local-timeout to a FINALIZE-side
   // reason (OUTSIDE the recover auto-clear prefix) with `retry: true` — a clean
-  // skip-and-retry, never a teardown behind an un-landed merge. The real bounded
-  // FFI flock is taken on a free temp lock file (acquires immediately), so the
-  // merge is reached; only the merge spawn times out.
-  const lockDir = mkdtempSync(join(tmpdir(), "kw-finalize-locktimeout-"));
-  try {
-    const cmds: string[] = [];
-    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
-      args,
-    ) => {
-      const joined = args.join(" ");
-      cmds.push(joined);
-      if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
-        return { code: 0, stdout: `${lockDir}\n`, stderr: "" }; // real, writable
-      }
-      if (joined === "rev-parse --abbrev-ref HEAD") {
-        return { code: 0, stdout: "main\n", stderr: "" }; // on default
-      }
-      if (isInProgressPseudoRefProbe(args)) {
-        return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-      }
-      if (args[0] === "rev-parse" && args.includes("--verify")) {
-        return { code: 0, stdout: "abc\n", stderr: "" }; // base/origin refs exist
-      }
-      if (joined.startsWith("symbolic-ref")) {
-        return { code: 0, stdout: "origin/main\n", stderr: "" };
-      }
-      if (joined.startsWith("status --porcelain")) {
-        return { code: 0, stdout: "", stderr: "" }; // clean checkout
-      }
-      if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
-        return { code: 1, stdout: "", stderr: "" }; // base AHEAD → merge it
-      }
-      if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-        return { code: 0, stdout: "", stderr: "" }; // ff-able
-      }
-      if (joined.startsWith("merge-base --is-ancestor")) {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      if (joined.startsWith("merge --no-edit")) {
-        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" }; // blocking hook
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    };
-    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
-      makeFinalizeInfo(),
-      async () => true,
-    );
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.reason).toMatch(/^worktree-finalize-local-timeout:/);
-      expect(res.retry).toBe(true);
-      // A finalize reason must NEVER satisfy the recover auto-clear prefix.
-      expect(isWorktreeRecoverReason(res.reason)).toBe(false);
-    }
-    // No real push behind the un-landed merge, no teardown (the read-only
-    // turn-key `push --dry-run` probe may run; the real `push origin` must not).
-    expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
-    expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
-    expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
-  } finally {
-    rmSync(lockDir, { recursive: true, force: true });
-  }
-});
-
-test("fn-990 mergeLaneBaseIntoDefault: a lane AHEAD of default merges + pushes (fake lock, no real flock)", async () => {
-  // The shared merge routine both finalize and recover pass-2 drive. A lane base
-  // that is NOT an ancestor of default carries real commits → it merges (under the
-  // injected fake lock, never the FFI flock) and pushes once → `{ kind: "merged" }`.
+  // skip-and-retry, never a teardown behind an un-landed merge. merge-tree runs
+  // BEFORE the ref-advance lock, so the timeout never even reaches update-ref.
   const cmds: string[] = [];
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
     cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs exist
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" }; // clean main checkout
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" }; // ff-able
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
     }
     if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
-      return { code: 1, stdout: "", stderr: "" }; // base is AHEAD → merge it
+      return { code: 1, stdout: "", stderr: "" }; // base AHEAD → merge it
+    }
+    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
+      return { code: 0, stdout: "", stderr: "" }; // non-ff precheck: ff-able
+    }
+    if (joined === "merge-base --is-ancestor main keeper/epic/fn-1-foo") {
+      return { code: 1, stdout: "", stderr: "" }; // divergent → real merge
+    }
+    if (joined === "remote get-url origin") {
+      return { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
     }
     if (
-      joined ===
-      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
     ) {
-      // Post-push origin recheck: origin PROVABLY contains the merge → teardown-safe.
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("push --dry-run")) {
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // not already-merged vs HEAD
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      // Valid hex OID (origin ref existence + the plumbing tip resolution).
+      return {
+        code: 0,
+        stdout: "0123456789abcdef0123456789abcdef01234567\n",
+        stderr: "",
+      };
     }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 0, stdout: "", stderr: "" };
+    if (joined === "version") {
+      return { code: 0, stdout: "git version 2.50.1\n", stderr: "" };
+    }
+    if (args[0] === "merge-tree") {
+      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" }; // blocking hook
     }
     return { code: 0, stdout: "", stderr: "" };
   };
-  const fakeLock = () => ({ release() {} });
+  const res = await createWorktreeDriver(fakeRun, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true);
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.reason).toMatch(/^worktree-finalize-local-timeout:/);
+    expect(res.retry).toBe(true);
+    // A finalize reason must NEVER satisfy the recover auto-clear prefix.
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // No ref advance, no push, no teardown behind the un-landed merge — and NEVER a
+  // working-tree `git merge` in the shared checkout.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: a DIVERGENT lane merges via merge-tree/commit-tree/update-ref-CAS + pushes → merged, NO working-tree git merge", async () => {
+  // A lane base that is NOT an ancestor of default and NOT a fast-forward → a real
+  // 3-way merge: merge-tree → commit-tree → update-ref CAS → push, all working-tree-
+  // free (never `git merge` in the shared checkout).
+  const { run, cmds } = makeMergeGit();
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
-    fakeLock,
+    run,
+    () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "merged" });
-  expect(cmds.some((c) => c === "merge --no-edit keeper/epic/fn-1-foo")).toBe(
-    true,
-  );
+  // The full plumbing pipeline ran, in order, with the ref advanced via a CAS whose
+  // `<old>` is the pre-merge default tip and `<new>` is the commit-tree merge commit.
+  expect(cmds.some((c) => c.startsWith("merge-tree --write-tree"))).toBe(true);
+  expect(
+    cmds.some((c) =>
+      c.startsWith(
+        `commit-tree ${MG_TREE_OID} -p ${MG_DEFAULT_TIP} -p ${MG_BASE_TIP} -m `,
+      ),
+    ),
+  ).toBe(true);
+  expect(
+    cmds.some(
+      (c) =>
+        c ===
+        `update-ref --end-of-options refs/heads/main ${MG_MERGE_COMMIT} ${MG_DEFAULT_TIP}`,
+    ),
+  ).toBe(true);
   // The push is branch-explicit (`push origin <default>`), NOT a bare `push`.
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
   expect(cmds.some((c) => c === "push")).toBe(false);
+  // NEVER a working-tree `git merge` in the shared checkout — the whole thesis.
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-test("fn-990 mergeLaneBaseIntoDefault: a real merge CONFLICT → { kind: 'conflict' }, no push (the shared core stamps no reason)", async () => {
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // base ahead + not already-merged
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
+test("fn-1140 mergeLaneBaseIntoDefault: a PURE fast-forward advances default straight to the base tip via CAS — NO commit-tree, no 2-parent merge", async () => {
+  // default IS an ancestor of base → a fast-forward. The ref advances straight to
+  // the base tip via update-ref CAS; feeding an FF tree to commit-tree would mint a
+  // bogus 2-parent merge, so commit-tree (and merge-tree) MUST NOT run.
+  const { run, cmds } = makeMergeGit({ defaultAncestorOfBase: true });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "merged" });
+  expect(cmds.some((c) => c.startsWith("merge-tree"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("commit-tree"))).toBe(false);
+  // update-ref advances straight to the BASE tip (not a new merge commit).
+  expect(
+    cmds.some(
+      (c) =>
+        c ===
+        `update-ref --end-of-options refs/heads/main ${MG_BASE_TIP} ${MG_DEFAULT_TIP}`,
+    ),
+  ).toBe(true);
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: the merge LANDS while the shared checkout is DIRTY on default — the regression this decouples — pushes, resync skipped", async () => {
+  // The incident: a dirty shared checkout silently retry-skipped the base merge,
+  // stranding a done epic unmerged. The plumbing merge never touches the working
+  // tree, so it lands + pushes regardless; only decision-B's cosmetic resync is
+  // skipped (the tree is dirty).
+  const { run, cmds } = makeMergeGit({ dirty: true });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "merged" });
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+  // Decision-B resync is SKIPPED on a dirty tree — never a `reset --hard` that would
+  // clobber the human's WIP — and NEVER a working-tree merge.
+  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: the merge advances LOCAL default while the shared checkout is OFF-default — the ref lands, the push defers off-branch, no working-tree merge", async () => {
+  // On a non-default branch the plumbing still advances refs/heads/<default> locally
+  // (the decoupling), but pushDefaultToOrigin's HEAD-safety refuses to push off the
+  // default branch (a no-refspec push would target the wrong upstream), so the push
+  // defers until the human returns to default. The merge is NOT stranded — the ref
+  // advanced, and next cycle's not-ahead re-push seam lands it once back on default.
+  const { run, cmds } = makeMergeGit({ head: "feature" });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "off-branch", head: "feature" });
+  // The LOCAL ref DID advance (the merge landed) even though HEAD is off-default.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
+  // No wrong-ref push, no resync onto a checkout that isn't on default, no `git merge`.
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: an IDLE-CLEAN-on-default shared checkout is best-effort fast-forwarded onto the merged commit (decision B)", async () => {
+  // The shared checkout is on default and clean → decision-B resyncs its working
+  // tree to carry the merged commit via a `reset --hard` to the new tip (under the
+  // lock, after the ref advance).
+  const { run, cmds } = makeMergeGit();
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "merged" });
+  expect(cmds.some((c) => c === `reset --hard ${MG_MERGE_COMMIT}`)).toBe(true);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: a CONCURRENT default advance (update-ref CAS mismatch) → { kind: 'cas-stale' }, a transient retry-skip, never a strand", async () => {
+  // The compare-and-swap `<old>` is stale — an agent commit advanced default out
+  // from under the merge. A DISTINCT transient retry-skip (modeled like lock-timeout),
+  // never a sticky conflict, never a teardown on an unmerged base.
+  const { run, cmds } = makeMergeGit({ updateRefExit: 1 });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "cas-stale" });
+  expect(isWorktreeRecoverReason((res as { kind: string }).kind)).toBe(false);
+  // The CAS failed, so nothing was pushed and nothing resynced.
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: git < 2.38 (no `merge-tree --write-tree`) → { kind: 'merge-tree-unsupported' }, a transient skip, never a merge/push", async () => {
+  const { run, cmds } = makeMergeGit({ gitVersion: "git version 2.30.2" });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "merge-tree-unsupported" });
+  expect(cmds.some((c) => c.startsWith("merge-tree"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: a merge-tree HARD error (exit > 1) → { kind: 'plumbing-failed' }, NOT a conflict, no ref advance", async () => {
+  const { run, cmds } = makeMergeGit({ mergeTreeExit: 128 });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res.kind).toBe("plumbing-failed");
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: the commit-tree merge commit is minted with a PINNED identity + base-tip date (deterministic OID across a crash-retry)", async () => {
+  // All four GIT_AUTHOR/COMMITTER NAME+EMAIL are pinned + both dates are pinned to
+  // the base-tip committer date, so a crash-retry re-derives the SAME commit OID and
+  // the update-ref CAS is a clean no-op instead of minting a divergent duplicate.
+  const { run, calls } = makeMergeGit();
+  await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  const ct = calls.find((c) => c.args.startsWith("commit-tree"));
+  expect(ct).toBeDefined();
+  expect(ct?.env).toMatchObject({
+    GIT_AUTHOR_NAME: "keeper",
+    GIT_AUTHOR_EMAIL: "keeper@localhost",
+    GIT_COMMITTER_NAME: "keeper",
+    GIT_COMMITTER_EMAIL: "keeper@localhost",
+    GIT_AUTHOR_DATE: MG_BASE_TIP_DATE,
+    GIT_COMMITTER_DATE: MG_BASE_TIP_DATE,
+  });
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: a crash-retry after the ref already landed → the ahead-check short-circuits to not-ahead (idempotent no-op)", async () => {
+  // A prior run advanced default (so base is now an ancestor of local default) AND
+  // pushed (origin already contains it). The re-run's ahead-check sees not-ahead and
+  // NEVER re-merges — no merge-tree, no commit-tree, no second update-ref.
+  const { run, cmds } = makeMergeGit({
+    baseAncestorOfDefault: true,
+    originContainsBaseBeforePush: true,
+  });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+  );
+  expect(res).toEqual({ kind: "not-ahead" });
+  expect(cmds.some((c) => c.startsWith("merge-tree"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("commit-tree"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+});
+
+test("fn-1140 mergeLaneBaseIntoDefault: a merge-tree CONFLICT (exit 1) → { kind: 'conflict' }, no ref advance, no push (the existing sticky escalation path)", async () => {
+  const { run, cmds } = makeMergeGit({ mergeTreeExit: 1 });
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
     () => ({ release() {} }),
   );
   expect(res.kind).toBe("conflict");
   if (res.kind === "conflict") {
     // A raw discriminant — never a reason string. The CALLER maps it (finalize →
-    // `worktree-finalize-conflict`, recover → `worktree-recover-conflict`), so the
-    // core can carry no `worktree-recover*` reason that would auto-clear a finalize.
+    // `worktree-finalize-conflict`, recover → `worktree-merge-conflict`), so the core
+    // can carry no `worktree-recover*` reason that would auto-clear a finalize.
     expect(isWorktreeRecoverReason(res.stderr)).toBe(false);
     expect(res.stderr).toContain("CONFLICT");
   }
+  // A conflict never advances the ref, never commits, never pushes.
+  expect(cmds.some((c) => c.startsWith("commit-tree"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
 });
 
-test("fn-990 mergeLaneBaseIntoDefault: a push failure on the merge → { kind: 'push-failed' }", async () => {
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "push origin main") {
-      return { code: 1, stdout: "", stderr: "remote rejected" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
+test("fn-1140 mergeLaneBaseIntoDefault: a push failure after the ref advance → { kind: 'push-failed' }", async () => {
+  const { run } = makeMergeGit({ pushExit: 1 });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
+    run,
     () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "push-failed", detail: "remote rejected" });
 });
 
-test("fn-990 mergeLaneBaseIntoDefault: a push TIMEOUT (spawn-timeout sentinel) → { kind: 'push-timeout' }, not push-failed", async () => {
-  // A bounded push spawn that exceeds its timeout surfaces the GNU-timeout
-  // sentinel exit code → a TRANSIENT push-timeout, distinct from a hard reject.
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "push origin main") {
-      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
+test("fn-1140 mergeLaneBaseIntoDefault: a push TIMEOUT (spawn-timeout sentinel) → { kind: 'push-timeout' }, not push-failed", async () => {
+  const { run } = makeMergeGit({ pushTimeout: true });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
+    run,
     () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "push-timeout" });
 });
 
-test("fn-990 mergeLaneBaseIntoDefault: turn-key probe runs BEFORE the FF precheck, and an UNRESOLVED origin/<default> (never-pushed) is admitted, not deadlocked", async () => {
+test("fn-1140 mergeLaneBaseIntoDefault: turn-key probe runs BEFORE the FF precheck, and an UNRESOLVED origin/<default> (never-pushed) is admitted, not deadlocked", async () => {
   // The never-pushed-default scenario: origin/<default> does not resolve, so the
   // cached-ref FF precheck is "unknown". With turn-key FIRST + admitting (its
-  // dry-run passes), the first finalize push proceeds rather than dead-locking.
-  const cmds: string[] = [];
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    cmds.push(joined);
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    // origin/<default> tracking ref does NOT resolve → FF precheck returns "unknown".
-    if (
-      args[0] === "rev-parse" &&
-      args.includes("--verify") &&
-      joined.includes("refs/remotes/origin/")
-    ) {
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" }; // base/source refs exist
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (
-      joined ===
-      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
-    ) {
-      // Post-push origin recheck: the push landed (and refreshed the cached
-      // origin/<default> ref), so origin now PROVABLY contains the merge → merged.
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // base ahead of default / not-yet-merged vs HEAD
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    // turn-key probe arms (remote get-url / @{push} / push --dry-run) + push all OK.
-    return { code: 0, stdout: "", stderr: "" };
-  };
+  // dry-run passes), the merge proceeds rather than dead-locking.
+  const { run, cmds } = makeMergeGit({ originUnresolved: true });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
+    run,
     () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "merged" });
-  // Ordering: the turn-key dry-run precedes the cached-ref FF probe.
+  // Ordering: the turn-key dry-run precedes the cached-ref FF (origin-ref) probe.
   const dryIdx = cmds.findIndex((c) => c.startsWith("push --dry-run"));
-  const ffIdx = cmds.findIndex(
-    (c) => c.includes("--verify") && c.includes("refs/remotes/origin/"),
+  const ffIdx = cmds.indexOf(
+    "rev-parse --verify --quiet refs/remotes/origin/main",
   );
   expect(dryIdx).toBeGreaterThanOrEqual(0);
   expect(ffIdx).toBeGreaterThanOrEqual(0);
@@ -7922,77 +8131,26 @@ test("fn-992 mergeLaneBaseIntoDefault: a re-push that exits 0 but leaves origin 
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
 });
 
-test("fn-993 mergeLaneBaseIntoDefault: the MERGED arm re-pushes branch-explicit + rechecks origin — exit 0 but origin un-advanced → `push-unconfirmed`, never `merged`", async () => {
-  // EDGE-1: the merged arm (base NOT yet an ancestor of local default → a real
-  // merge runs) must mirror the not-ahead arm — a branch-explicit push THEN a
-  // post-push origin-containment recheck. A push that exits 0 yet leaves
-  // origin/<default> un-advanced degrades to `push-unconfirmed` (the existing
-  // retry-skip), so the caller defers teardown rather than stranding the merge.
-  const base = "keeper/epic/fn-1-foo";
-  const cmds: string[] = [];
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" }; // HEAD on default
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" }; // clean checkout
-    }
-    if (joined === `merge-base --is-ancestor ${base} main`) {
-      return { code: 1, stdout: "", stderr: "" }; // base AHEAD of LOCAL default → merge it
-    }
-    if (
-      joined === `merge-base --is-ancestor ${base} refs/remotes/origin/main`
-    ) {
-      return { code: 1, stdout: "", stderr: "" }; // origin LACKS it, even after the push
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" }; // ff-able (not non-ff)
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      // base-vs-HEAD idempotent check → NOT already merged, so the real merge runs.
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (joined === "remote get-url origin") {
-      return { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
-    }
-    if (
-      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
-    ) {
-      return { code: 0, stdout: "origin/main\n", stderr: "" };
-    }
-    if (joined.startsWith("push --dry-run")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "push origin main") {
-      return { code: 0, stdout: "Everything up-to-date\n", stderr: "" }; // exit 0, no advance
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
+test("fn-1140 mergeLaneBaseIntoDefault: the real-merge arm re-checks origin post-push — ref advanced + pushed (exit 0) but origin un-advanced → push-unconfirmed, never merged", async () => {
+  // The real-merge arm (base NOT yet an ancestor of local default) must mirror the
+  // not-ahead arm — a branch-explicit push THEN a post-push origin-containment
+  // recheck. A push that exits 0 yet leaves origin/<default> un-advanced degrades to
+  // `push-unconfirmed` (the existing retry-skip), so the caller defers teardown
+  // rather than stranding the merge behind a false `pushed`.
+  const { run, cmds } = makeMergeGit({
+    originContainsBase: false, // origin still LACKS it even after the push
+    pushStdout: "Everything up-to-date\n",
+  });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
-    base,
+    "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
-    () => ({
-      release() {},
-    }),
+    run,
+    () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "push-unconfirmed" });
-  // The merge ran, and the push was branch-explicit — never a bare `push`.
-  expect(cmds.some((c) => c === `merge --no-edit ${base}`)).toBe(true);
+  // The merge landed (ref advanced) and the push was branch-explicit — never a bare `push`.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
   expect(cmds.some((c) => c === "push")).toBe(false);
 });
@@ -8497,8 +8655,11 @@ function makeRecoveryGit(state: {
   noRemote?: boolean; // `remote get-url origin` fails → not turn-key
   noPushTarget?: boolean; // `@{push}` does not resolve → not turn-key
   dryRunReject?: string; // `push --dry-run` stderr → not turn-key
-  mergeConflict?: boolean; // a real merge hits a conflict
-  mergeTimeout?: boolean; // the local `merge --no-edit` spawn times out (a blocking hook)
+  mergeConflict?: boolean; // the plumbing `merge-tree --write-tree` reports a conflict (exit 1)
+  mergeTimeout?: boolean; // the plumbing `merge-tree --write-tree` spawn times out (a blocking hook)
+  mergeTreeError?: boolean; // `merge-tree --write-tree` hard-errors (exit > 1) → plumbing-failed
+  oldGit?: boolean; // `git version` < 2.38 → merge-tree-unsupported
+  casStale?: boolean; // `update-ref` CAS finds a stale `<old>` (concurrent advance) → cas-stale
   pushFails?: boolean;
   pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
   pushUnconfirmed?: boolean; // push exits 0 but origin/<default> never advances ("up-to-date" on the wrong ref)
@@ -8519,6 +8680,10 @@ function makeRecoveryGit(state: {
   // — while the LOCAL is-ancestor check (which pass-3 reads) stays `state.ancestors`
   // only, so a just-merged base is not double-swept by pass-3 in the same cycle.
   const mergedLocally = new Set<string>();
+  // The base branch the plumbing merge is CURRENTLY landing (captured at its base-
+  // tip rev-parse), so a successful `update-ref` can mark it merged-into-local-
+  // default without the ref-advance argv carrying the branch name.
+  let mergingBase: string | null = null;
   // A no-op lock acquirer so the merge path never touches the real FFI flock
   // (the slow real-git test covers the actual flock-around-merge contract).
   const lock: NonNullable<Parameters<typeof recoverWorktrees>[3]> = () => ({
@@ -8699,21 +8864,86 @@ function makeRecoveryGit(state: {
         ? { code: 1, stdout: "", stderr: state.dryRunReject }
         : { code: 0, stdout: "", stderr: "" };
     }
-    if (joined.startsWith("merge --no-edit")) {
+    if (joined === "version") {
+      // Feature-detect gate for `merge-tree --write-tree` (git >= 2.38).
+      return {
+        code: 0,
+        stdout: `git version ${state.oldGit ? "2.30.2" : "2.50.1"}\n`,
+        stderr: "",
+      };
+    }
+    if (
+      joined.startsWith("rev-parse --verify --quiet --end-of-options") &&
+      joined.endsWith("^{commit}")
+    ) {
+      // Plumbing tip resolution (`refs/heads/<branch>^{commit}`). Capture the base
+      // being merged (the non-default ref) so a successful update-ref can mark it
+      // merged. A constant hex OID satisfies the pipeline's hex-validation.
+      const ref = args[4] ?? "";
+      const branch = ref
+        .replace(/^refs\/heads\//, "")
+        .replace(/\^\{commit\}$/, "");
+      if (branch !== (state.defaultBranch ?? "main")) {
+        mergingBase = branch;
+      }
+      return {
+        code: 0,
+        stdout: "0123456789abcdef0123456789abcdef01234567\n",
+        stderr: "",
+      };
+    }
+    if (args[0] === "merge-tree") {
+      // The working-tree-free 3-way merge. Exit 0 → tree OID on line 1, exit 1 →
+      // conflict (the existing sticky escalation), > 1 → a plumbing hard error.
       if (state.mergeTimeout) {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
       }
+      if (state.mergeTreeError) {
+        return { code: 128, stdout: "", stderr: "fatal: merge-tree boom" };
+      }
       if (state.mergeConflict) {
-        // A real merge conflict leaves the tree MID-MERGE (MERGE_HEAD present), so
-        // mergeBranchInto's guarded abort actually fires — modeling this lets a test
-        // drive the abort-failed path (abortFailsAt keeps the residue).
-        state.mergeHeadAt?.add(cwd);
-        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+        return {
+          code: 1,
+          stdout:
+            "0123456789abcdef0123456789abcdef01234567\nCONFLICT (content): foo\n",
+          stderr: "",
+        };
       }
-      const merged = args[2];
-      if (merged !== undefined) {
-        mergedLocally.add(merged); // now an ancestor of LOCAL default
+      return {
+        code: 0,
+        stdout: "0123456789abcdef0123456789abcdef01234567\n",
+        stderr: "",
+      };
+    }
+    if (args[0] === "show") {
+      // The pinned base-tip committer date fed to commit-tree's GIT_*_DATE.
+      return { code: 0, stdout: "2026-01-02T03:04:05+00:00\n", stderr: "" };
+    }
+    if (args[0] === "commit-tree") {
+      return {
+        code: 0,
+        stdout: "fedcba9876543210fedcba9876543210fedcba98\n",
+        stderr: "",
+      };
+    }
+    if (args[0] === "update-ref") {
+      // Compare-and-swap the default ref. A stale `<old>` (concurrent advance) →
+      // cas-stale; otherwise it advances local default to contain the merging base.
+      if (state.casStale) {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "cannot lock ref: is at X but expected Y",
+        };
       }
+      if (mergingBase !== null) {
+        mergedLocally.add(mergingBase); // now an ancestor of LOCAL default
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("reset --hard")) {
+      // Decision-B best-effort resync of an idle-clean shared checkout. Cosmetic —
+      // its result never changes the merge outcome.
       return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "push") {
@@ -8968,12 +9198,16 @@ test("fn-1114 recoverWorktrees: a keeper-owned mid-merge in the SHARED MAIN chec
         c.args === "rev-parse --path-format=absolute --git-dir",
     ),
   ).toBe(true);
-  // ...then pass-2 re-derived the base merge from the now-clean tree.
+  // ...then pass-2 re-derived the base merge from the now-clean tree, via the
+  // working-tree-free plumbing (a CAS ref advance), never a `git merge`.
   expect(
     calls.some(
-      (c) => c.cwd === "/repo" && c.args === `merge --no-edit ${base}`,
+      (c) =>
+        c.cwd === "/repo" &&
+        c.args.startsWith("update-ref --end-of-options refs/heads/main"),
     ),
   ).toBe(true);
+  expect(calls.some((c) => c.args === `merge --no-edit ${base}`)).toBe(false);
 });
 
 test("fn-1114 recoverWorktrees: a FOREIGN mid-merge in the main checkout is NEVER aborted; the reason names owner + MERGE_HEAD (not dirty-checkout), inside the recover prefix", async () => {
@@ -9200,7 +9434,11 @@ test("fn-1114 recoverWorktrees: a lock-timeout acquiring the flock for the main-
   expect(failures[0]?.reason).toContain("worktree-recover-lock-timeout");
 });
 
-test("fn-1114 recoverWorktrees pass-2: a foreign main-checkout wedge blocking a DONE base mints worktree-recover-mid-merge keyed on the epic (not dirty-checkout), no merge attempted", async () => {
+test("fn-1140 recoverWorktrees pass-2: a foreign main-checkout wedge NO LONGER blocks the DONE base merge — pass-2 advances it via plumbing (the decoupling), and the foreign wedge is never aborted", async () => {
+  // Pre-decoupling, a foreign mid-merge folded into a dirty-checkout skip that
+  // stranded the base merge forever. Now pass-2's working-tree-free plumbing advances
+  // refs/heads/<default> regardless of the shared checkout's merge state; pass-1 still
+  // refuses to touch the human's foreign merge (never aborts it).
   const base = "keeper/epic/fn-2-bar";
   const { run, calls, lock } = makeRecoveryGit({
     worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
@@ -9211,51 +9449,21 @@ test("fn-1114 recoverWorktrees pass-2: a foreign main-checkout wedge blocking a 
     ancestors: new Set(),
     repoHead: "main",
   });
-  const { failures } = await recoverWorktrees(
+  const { resolved } = await recoverWorktrees(
     ["/repo"],
-    async (id) => id === "fn-2-bar", // done → pass-2 attempts the base merge and hits the wedge
+    async (id) => id === "fn-2-bar", // done → pass-2 attempts the base merge
     run,
     lock,
   );
-  // The foreign wedge is never aborted, and its base merge is never attempted.
+  // The human's foreign merge is never keeper's to abort.
   expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
+  // pass-2 advanced the base merge via plumbing despite the wedge (never a `git merge`).
+  expect(
+    calls.some((c) => c.args.startsWith("update-ref --end-of-options")),
+  ).toBe(true);
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
-  // pass-2's shared merge routine names the wedge distinctly, keyed on the epic.
-  const epicMid = failures.filter(
-    (f) =>
-      f.epicId === "fn-2-bar" &&
-      f.reason.includes("worktree-recover-mid-merge"),
-  );
-  expect(epicMid).toHaveLength(1);
-  expect(epicMid[0]?.reason).toContain("owner=foreign");
-  expect(epicMid[0]?.reason).toContain("MERGE_HEAD=head");
-  expect(epicMid[0]?.reason).not.toContain("dirty-checkout");
-});
-
-test("fn-1114 recoverWorktrees pass-2: a base→default merge whose conflict-abort ITSELF fails surfaces worktree-recover-abort-failed (the un-cleared wedge), not a plain conflict", async () => {
-  const { run, calls, lock } = makeRecoveryGit({
-    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
-    mergeHeadAt: new Set(), // starts clean — the wedge is created by the failing merge below
-    epicBases: ["keeper/epic/fn-1-foo"],
-    defaultBranch: "main",
-    ancestors: new Set(),
-    repoHead: "main",
-    mergeConflict: true, // the base→default `merge --no-edit` conflicts (leaves MERGE_HEAD)
-    abortFailsAt: new Set(["/repo"]), // ...and the guarded `merge --abort` itself fails
-  });
-  const { failures } = await recoverWorktrees(
-    ["/repo"],
-    async () => true,
-    run,
-    lock,
-  );
-  expect(failures).toHaveLength(1);
-  expect(failures[0]?.epicId).toBe("fn-1-foo");
-  expect(failures[0]?.reason).toContain("worktree-recover-abort-failed");
-  expect(failures[0]?.reason).not.toContain("worktree-recover-conflict");
-  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
-  // No push on an un-cleared wedge.
-  expect(calls.some((c) => c.args === "push")).toBe(false);
+  // The base merge landed → a positive resolution observation for the epic.
+  expect(resolved.some((r) => r.epicId === "fn-2-bar")).toBe(true);
 });
 
 test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default + push", async () => {
@@ -9274,12 +9482,16 @@ test("fn-959.7 recoverWorktrees: done-but-unmerged base → merge into default +
     lock,
   );
   expect(failures).toEqual([]);
+  // The base merged into default via the WORKING-TREE-FREE plumbing (a CAS ref
+  // advance in the main checkout), never a `git merge` in the shared checkout.
   expect(
     calls.some(
       (c) =>
-        c.cwd === "/repo" && c.args === "merge --no-edit keeper/epic/fn-1-foo",
+        c.cwd === "/repo" &&
+        c.args.startsWith("update-ref --end-of-options refs/heads/main"),
     ),
   ).toBe(true);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
   // The single recover push leg is branch-explicit (`push origin <default>`) and
   // fails fast on a credential-needing origin — GIT_TERMINAL_PROMPT=0 keeps git
   // from opening /dev/tty, and ssh BatchMode + ConnectTimeout keep an SSH stall
@@ -10166,8 +10378,12 @@ test("fn-1119-durable-recover-conflict-escalation incident reproduction: one epi
   ).toEqual([]);
 });
 
-test("fn-959.7 recoverWorktrees: main worktree off the default branch → loud failure, no merge", async () => {
-  const { run, calls } = makeRecoveryGit({
+test("fn-1140 recoverWorktrees: an OFF-DEFAULT main checkout still advances the base merge locally, but the off-branch push defers (worktree-recover-not-on-default, auto-clearing)", async () => {
+  // The plumbing advances refs/heads/<default> regardless of the checkout branch
+  // (the decoupling), but pushDefaultToOrigin refuses to push off the default branch
+  // (@{push} would resolve the wrong upstream), so the push defers to a non-sticky
+  // worktree-recover-not-on-default that auto-clears once the human returns to default.
+  const { run, calls, lock } = makeRecoveryGit({
     worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/feature-x\n\n",
     mergeHeadAt: new Set(),
     epicBases: ["keeper/epic/fn-1-foo"],
@@ -10175,17 +10391,27 @@ test("fn-959.7 recoverWorktrees: main worktree off the default branch → loud f
     ancestors: new Set(),
     repoHead: "feature-x", // NOT on default
   });
-  const { failures } = await recoverWorktrees(["/repo"], async () => true, run);
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
   expect(failures).toHaveLength(1);
   expect(failures[0]?.reason).toContain("worktree-recover-not-on-default");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  // The LOCAL ref advanced (the merge landed) even off-default — NEVER a working-tree merge.
+  expect(
+    calls.some((c) => c.args.startsWith("update-ref --end-of-options")),
+  ).toBe(true);
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
 });
 
-test("fn-985 recoverWorktrees: a DIRTY main checkout → skip-and-retry (worktree-recover-dirty-checkout), no merge", async () => {
-  // The recover-side analogue of finalize's dirty skip: a `worktree-recover*` reason
-  // (so the level-triggered auto-clear lifts it the moment the tree is clean), never
-  // a stomp of the human's WIP.
-  const { run, calls } = makeRecoveryGit({
+test("fn-1140 recoverWorktrees: a DIRTY main checkout NO LONGER blocks the base merge — it lands via plumbing (the regression), resync skipped", async () => {
+  // The incident: a dirty shared checkout silently retry-skipped the base merge,
+  // stranding a done epic unmerged. The working-tree-free plumbing merge lands
+  // regardless of the dirty tree; only decision-B's cosmetic resync is skipped.
+  const { run, calls, lock } = makeRecoveryGit({
     worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
     mergeHeadAt: new Set(),
     epicBases: ["keeper/epic/fn-1-foo"],
@@ -10194,12 +10420,19 @@ test("fn-985 recoverWorktrees: a DIRTY main checkout → skip-and-retry (worktre
     repoHead: "main", // on default…
     dirtyStatus: " M src/foo.ts\n", // …but the human has uncommitted work
   });
-  const { failures } = await recoverWorktrees(["/repo"], async () => true, run);
-  expect(failures).toHaveLength(1);
-  expect(failures[0]?.epicId).toBe("fn-1-foo");
-  expect(failures[0]?.reason).toContain("worktree-recover-dirty-checkout");
-  // The reason stays inside the recover auto-clear scope (never sticky).
-  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+  );
+  expect(failures).toEqual([]); // the merge LANDED — no dirty-checkout skip
+  expect(
+    calls.some((c) => c.args.startsWith("update-ref --end-of-options")),
+  ).toBe(true);
+  // Decision-B resync is SKIPPED on a dirty tree (never a `reset --hard` clobbering
+  // WIP), and NEVER a working-tree `git merge`.
+  expect(calls.some((c) => c.args.startsWith("reset --hard"))).toBe(false);
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
 });
 
@@ -10325,12 +10558,24 @@ test("fn-959.7 recoverWorktrees: rib branches are excluded from the base backsto
     lock,
   );
   expect(failures).toEqual([]);
-  // Only the base merged — never the rib.
+  // Only the base reached the merge path — the rib is filtered out before pass-2, so
+  // only the BASE tip is resolved (never the rib's) and exactly one ref advance runs.
   expect(
-    calls
-      .filter((c) => c.args.startsWith("merge --no-edit"))
-      .map((c) => c.args),
-  ).toEqual(["merge --no-edit keeper/epic/fn-1-foo"]);
+    calls.some(
+      (c) =>
+        c.args ===
+        "rev-parse --verify --quiet --end-of-options refs/heads/keeper/epic/fn-1-foo^{commit}",
+    ),
+  ).toBe(true);
+  expect(
+    calls.some((c) =>
+      c.args.includes("refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2^{commit}"),
+    ),
+  ).toBe(false);
+  expect(
+    calls.filter((c) => c.args.startsWith("update-ref --end-of-options")),
+  ).toHaveLength(1);
+  expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
 });
 
 test("fn-959.7 recoverWorktrees: repos are deduped — one sweep per distinct repo", async () => {
@@ -10401,7 +10646,9 @@ test("fn-1050 recoverWorktrees: a main/standalone checkout is still swept (probe
   expect(failures).toEqual([]);
   expect(
     calls.some(
-      (c) => c.cwd === "/repo" && c.args.startsWith("merge --no-edit"),
+      (c) =>
+        c.cwd === "/repo" &&
+        c.args.startsWith("update-ref --end-of-options refs/heads/main"),
     ),
   ).toBe(true);
 });
@@ -10757,48 +11004,14 @@ test("fn-982 finalizeEpic: a fully-merged lane base is pruned (branch -D) after 
 });
 
 test("fn-982 finalizeEpic: prune is gated on is-ancestor — a base NOT an ancestor of default is never force-deleted", async () => {
-  // The prune re-checks is-ancestor against the resolved DEFAULT BRANCH as its
-  // gate (a distinct call from mergeBranchInto's internal is-ancestor-vs-HEAD
-  // skip). Force that gate FALSE — the base is not contained in default — and the
-  // branch survives: `branch -D` force-deletes regardless of merge state, so an
-  // unmerged/diverged base would lose work. (A real diverged base hits the merge-
-  // conflict early-return, which takes the FFI flock the fast tier stubs out — so
-  // this isolates the guard via the gate's own distinct arg.)
-  const cmds: string[] = [];
-  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
-    const joined = args.join(" ");
-    cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (args[0] === "show") {
-      return {
-        code: 0,
-        stdout: JSON.stringify({ id: "fn-1-foo", status: "done" }),
-        stderr: "",
-      };
-    }
-    if (joined.startsWith("symbolic-ref")) {
-      return { code: 0, stdout: "origin/main\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo HEAD") {
-      return { code: 0, stdout: "", stderr: "" }; // merge: already-merged skip (no flock)
-    }
-    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
-      return { code: 1, stdout: "", stderr: "" }; // prune gate: NOT an ancestor → skip
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
-  );
+  // After the base merges + pushes, teardown re-checks is-ancestor against the
+  // resolved DEFAULT BRANCH as the delete gate. Force that gate FALSE — the base is
+  // not contained in default — and the branch survives: `branch -D` force-deletes
+  // regardless of merge state, so an unmerged/diverged base would lose work.
+  const { run, cmds } = makeMergeGit({ pruneNotAncestor: true });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true);
   expect(res).toEqual({ ok: true });
   // The gate said "not an ancestor" → the branch was preserved, never deleted.
   expect(cmds.some((c) => c.startsWith("branch -D"))).toBe(false);
@@ -11096,145 +11309,47 @@ function makeFinalizeReadinessRun(opts: {
   return { run, cmds };
 }
 
-test("fn-985 finalizeEpic: a DIRTY main checkout → skip-and-retry (retry:true), distinct reason, no merge/push/teardown", async () => {
-  const { run, cmds } = makeFinalizeReadinessRun({ status: " M src/foo.ts\n" });
-  const res = await createWorktreeDriver(run).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
+test("fn-1140 finalizeEpic: a DIRTY main checkout NO LONGER blocks finalize — the base merge lands via plumbing and teardown proceeds (the regression), resync skipped", async () => {
+  // The incident: a dirty shared checkout silently retry-skipped the base merge,
+  // stranding a done epic unmerged. The working-tree-free plumbing merge lands
+  // regardless of the dirty tree, so finalize succeeds and tears the lanes down;
+  // only decision-B's cosmetic resync is skipped (never a `reset --hard` over WIP).
+  const { run, cmds } = makeMergeGit({ dirty: true });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true);
+  expect(res).toEqual({ ok: true });
+  expect(cmds.some((c) => c.startsWith("update-ref --end-of-options"))).toBe(
+    true,
   );
-  expect(res.ok).toBe(false);
-  if (!res.ok) {
-    expect(res.retry).toBe(true);
-    expect(res.reason).toContain("worktree-finalize-dirty-checkout");
-    // The finalize-side reason MUST NOT carry the recover prefix (else auto-cleared).
-    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
-  }
-  // A clean skip — the human's WIP is never stomped, the lanes survive for a retry.
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
-  expect(cmds.some((c) => c === "push")).toBe(false);
-  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
-test("fn-1114 finalizeEpic: a MID-MERGE main checkout → skip-and-retry naming the wedge (worktree-finalize-mid-merge), NOT dirty-checkout, never aborted by finalize", async () => {
-  // Finalize does NOT abort the shared checkout (only the recover pass does) — it
-  // names the wedge distinctly and retry-skips, so the recover pass self-heals a
-  // keeper-owned residue next cycle. The incident's core regression was this
-  // degrading to a generic dirty-checkout skip that never surfaced the mid-merge.
-  const { run, cmds } = makeFinalizeReadinessRun({
-    midMergeHead: "deadbeef",
-    midMergePointsAt: ["refs/heads/keeper/epic/fn-1-foo"], // keeper-owned
-  });
-  const res = await createWorktreeDriver(run).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
-  );
-  expect(res.ok).toBe(false);
-  if (!res.ok) {
-    expect(res.retry).toBe(true); // transient — the recover pass self-heals it
-    expect(res.reason).toContain("worktree-finalize-mid-merge");
-    expect(res.reason).toContain("owner=keeper");
-    expect(res.reason).toContain("MERGE_HEAD=deadbeef");
-    expect(res.reason).not.toContain("dirty-checkout");
-    // finalize-side reason stays OUT of the recover auto-clear prefix.
-    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
-  }
-  // finalize never touches the wedge — no abort, no merge, no teardown.
-  expect(cmds.some((c) => c === "merge --abort")).toBe(false);
-  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
-  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
-});
-
-test("fn-1114 finalizeEpic: a base→default merge whose conflict-abort ITSELF fails → VISIBLE sticky worktree-finalize-abort-failed (no retry), not a plain conflict", async () => {
-  // Reaches the real `merge --no-edit` (base ahead of default) under the real bounded
-  // FFI flock on a free temp lock file (acquires immediately); the merge conflicts,
-  // and the guarded `git merge --abort` ITSELF fails — the un-cleared wedge.
-  const lockDir = mkdtempSync(join(tmpdir(), "kw-finalize-abortfail-"));
-  try {
-    const cmds: string[] = [];
-    let mergeHeadPresent = false; // flips true once the conflict starts a merge
-    const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (
-      args,
-    ) => {
-      const joined = args.join(" ");
-      cmds.push(joined);
-      if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
-        return { code: 0, stdout: `${lockDir}\n`, stderr: "" }; // real, writable
-      }
-      if (joined === "rev-parse --abbrev-ref HEAD") {
-        return { code: 0, stdout: "main\n", stderr: "" }; // on default
-      }
-      if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
-        return mergeHeadPresent
-          ? { code: 0, stdout: "confhead\n", stderr: "" }
-          : { code: 1, stdout: "", stderr: "" };
-      }
-      if (
-        joined === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
-        joined === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
-        joined === "rev-parse --verify --quiet REVERT_HEAD"
-      ) {
-        return { code: 1, stdout: "", stderr: "" }; // clean: other in-progress refs absent
-      }
-      if (args[0] === "rev-parse" && args.includes("--verify")) {
-        return { code: 0, stdout: "abc\n", stderr: "" }; // base / source / origin refs exist
-      }
-      if (joined.startsWith("symbolic-ref")) {
-        return { code: 0, stdout: "origin/main\n", stderr: "" };
-      }
-      if (joined.startsWith("status --porcelain")) {
-        return { code: 0, stdout: "", stderr: "" }; // clean checkout
-      }
-      if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
-        return { code: 1, stdout: "", stderr: "" }; // base AHEAD → merge it
-      }
-      if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-        return { code: 0, stdout: "", stderr: "" }; // ff-able
-      }
-      if (joined.startsWith("merge-base --is-ancestor")) {
-        return { code: 1, stdout: "", stderr: "" }; // base vs HEAD: NOT merged → reach the merge
-      }
-      if (joined.startsWith("merge --no-edit")) {
-        mergeHeadPresent = true; // the conflict leaves the tree mid-merge
-        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
-      }
-      if (joined === "merge --abort") {
-        return { code: 1, stdout: "", stderr: "error: could not abort merge" }; // abort itself fails
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    };
-    const res = await createWorktreeDriver(fakeRun).finalizeEpic(
-      makeFinalizeInfo(),
-      async () => true,
-    );
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.retry).not.toBe(true); // STICKY — a real wedge needs an operator
-      expect(res.reason).toContain("worktree-finalize-abort-failed");
-      expect(res.reason).not.toContain("worktree-finalize-conflict");
-      expect(isWorktreeRecoverReason(res.reason)).toBe(false);
-    }
-    // The abort WAS attempted (the conflict left a MERGE_HEAD), and teardown is skipped.
-    expect(cmds.some((c) => c === "merge --abort")).toBe(true);
-    expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
-    expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
-  } finally {
-    rmSync(lockDir, { recursive: true, force: true });
-  }
-});
-
-test("fn-985 finalizeEpic: an OFF-BRANCH main checkout → skip-and-retry, no working-tree probe past the branch", async () => {
-  const { run, cmds } = makeFinalizeReadinessRun({ head: "feature-x" });
-  const res = await createWorktreeDriver(run).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
-  );
+test("fn-1140 finalizeEpic: an OFF-BRANCH main checkout advances the base merge locally but the off-branch push defers (worktree-finalize-off-branch retry-skip), no teardown", async () => {
+  // On a non-default branch the plumbing still advances refs/heads/<default> locally
+  // (the decoupling), but pushDefaultToOrigin refuses to push off the default branch,
+  // so finalize maps it to a non-sticky worktree-finalize-off-branch retry-skip and
+  // tears nothing down behind the deferred push.
+  const { run, cmds } = makeMergeGit({ head: "feature-x" });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true);
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true);
     expect(res.reason).toContain("worktree-finalize-off-branch");
     expect(isWorktreeRecoverReason(res.reason)).toBe(false);
   }
+  // The LOCAL ref advanced (the merge landed) even off-default — never a `git merge`.
+  expect(cmds.some((c) => c.startsWith("update-ref --end-of-options"))).toBe(
+    true,
+  );
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+  // No wrong-ref push, no teardown behind the deferred push.
+  expect(cmds.some((c) => c === "push origin main")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
 test("fn-993 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → operator-visible STICKY block (no retry), no merge/push/fetch", async () => {
@@ -11360,72 +11475,14 @@ test("fn-988 finalizeEpic: push --dry-run rejected (would-prompt) → non-sticky
   expect(cmds.some((c) => c === "push")).toBe(false);
 });
 
-test("fn-988 finalizeEpic: a would-clobber untracked file (incoming ∩ main-untracked) → non-sticky skip-retry, no merge", async () => {
-  const { run, cmds } = makeFinalizeReadinessRun({
-    untracked: "docs/new.md\nscratch.txt\n",
-    incomingTracked: "src/a.ts\ndocs/new.md\n", // docs/new.md collides
-  });
-  const res = await createWorktreeDriver(run).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
-  );
-  expect(res.ok).toBe(false);
-  if (!res.ok) {
-    expect(res.retry).toBe(true); // NON-sticky
-    expect(res.reason).toContain("worktree-finalize-would-clobber");
-    expect(res.reason).toContain("docs/new.md");
-    // Finalize-side reason MUST NOT carry the recover prefix (else auto-cleared).
-    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
-  }
-  // The base merge is skipped — `git merge` never hard-aborts on the would-clobber.
-  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
-  expect(cmds.some((c) => c === "push")).toBe(false);
-});
-
-test("fn-990 finalizeEpic: a push TIMEOUT → transient skip-retry (worktree-finalize-push-timeout), NOT the sticky push-failed", async () => {
-  // The merge lands locally but the push spawn times out (the GNU-timeout
-  // sentinel). That is a TRANSIENT stall → retry:true + a distinct timeout reason
-  // OUTSIDE the recover auto-clear scope, never the sticky push-failed block.
-  const cmds: string[] = [];
-  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
-    const joined = args.join(" ");
-    cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" };
-    }
-    if (joined.startsWith("symbolic-ref")) {
-      return { code: 0, stdout: "origin/main\n", stderr: "" };
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" }; // ff-able
-    }
-    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
-      return { code: 1, stdout: "", stderr: "" }; // base AHEAD of default → proceed
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      // base-vs-HEAD: already-merged → the inner merge takes the no-lock skip
-      // (the real FFI flock is the slow real-git test's contract), then the
-      // routine still runs the single branch-explicit push leg — which times out here.
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (joined === "push origin main") {
-      return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  const res = await createWorktreeDriver(run).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
-  );
+test("fn-1140 finalizeEpic: a push TIMEOUT after the ref advance → transient skip-retry (worktree-finalize-push-timeout), NOT the sticky push-failed, no teardown", async () => {
+  // The plumbing merge advances the ref locally but the push spawn times out (the
+  // GNU-timeout sentinel). That is a TRANSIENT stall → retry:true + a distinct
+  // timeout reason OUTSIDE the recover auto-clear scope, never the sticky push-failed.
+  const { run, cmds } = makeMergeGit({ pushTimeout: true });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true);
   expect(res.ok).toBe(false);
   if (!res.ok) {
     expect(res.retry).toBe(true); // TRANSIENT, never sticky
@@ -11435,20 +11492,6 @@ test("fn-990 finalizeEpic: a push TIMEOUT → transient skip-retry (worktree-fin
   }
   // No teardown after a failed push — the lanes survive for the retry.
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
-});
-
-test("fn-988 finalizeEpic: a benign untracked-only tree (no incoming overlap) → finalizes (no fn-987 regression)", async () => {
-  const { run, cmds } = makeFinalizeReadinessRun({
-    untracked: ".env\neditor.tmp\n", // benign — no incoming path collides
-    incomingTracked: "src/a.ts\ndocs/new.md\n",
-  });
-  const res = await createWorktreeDriver(run).finalizeEpic(
-    makeFinalizeInfo(),
-    async () => true,
-  );
-  expect(res).toEqual({ ok: true });
-  // The merge proceeded — a benign untracked file never blocks finalize.
-  expect(cmds.some((c) => c.startsWith("merge-base --is-ancestor"))).toBe(true);
 });
 
 test("fn-985 finalizeEpic idempotent: a re-run after a post-push partial failure RESUMES teardown (already-merged base, lane still registered)", async () => {
@@ -13145,61 +13188,31 @@ test("fn-1014 reconcile: an empty deferredEpicIds map is a byte-identical no-op 
   ).toBe(true);
 });
 
-test("fn-1014 regression: a lane base AHEAD of default merges via a TRUE `git merge --no-edit` (never --squash) — the absent-implies-merged premise", async () => {
-  // Locks the merge half of the gate premise: keeper places a base into default via
-  // a TRUE merge (so `merge-base --is-ancestor` stays valid afterward). A future
-  // switch to `--squash` (which INVALIDATES `--is-ancestor`, so an absent lane could
-  // be unmerged) must fail this test. Drives the shared routine both finalize and
-  // recover use, with the fast-tier fake lock (never the FFI flock).
-  const cmds: string[] = [];
-  const fakeRun: Parameters<typeof mergeLaneBaseIntoDefault>[3] = async (
-    args,
-  ) => {
-    const joined = args.join(" ");
-    cmds.push(joined);
-    if (isInProgressPseudoRefProbe(args)) {
-      return { code: 1, stdout: "", stderr: "" }; // clean: in-progress pseudo-ref absent
-    }
-    if (args[0] === "rev-parse" && args.includes("--verify")) {
-      return { code: 0, stdout: "abc\n", stderr: "" }; // source/origin refs resolve
-    }
-    if (joined === "rev-parse --abbrev-ref HEAD") {
-      return { code: 0, stdout: "main\n", stderr: "" };
-    }
-    if (joined.startsWith("status --porcelain")) {
-      return { code: 0, stdout: "", stderr: "" }; // clean shared checkout
-    }
-    if (joined === "merge-base --is-ancestor refs/remotes/origin/main main") {
-      return { code: 0, stdout: "", stderr: "" }; // ff-able
-    }
-    if (joined === "merge-base --is-ancestor keeper/epic/fn-1-foo main") {
-      return { code: 1, stdout: "", stderr: "" }; // base is AHEAD → merge it
-    }
-    if (
-      joined ===
-      "merge-base --is-ancestor keeper/epic/fn-1-foo refs/remotes/origin/main"
-    ) {
-      return { code: 0, stdout: "", stderr: "" }; // post-push origin contains it
-    }
-    if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // not already-merged vs HEAD
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
+test("fn-1014 regression: a divergent lane base merges via a TRUE 2-parent commit-tree merge (never --squash) — the absent-implies-merged premise", async () => {
+  // Locks the merge half of the gate premise: keeper places a base into default via a
+  // TRUE merge (a commit-tree merge commit with BOTH parents, so `merge-base
+  // --is-ancestor` stays valid afterward). A future switch to `--squash` (which
+  // INVALIDATES `--is-ancestor`, so an absent lane could be unmerged) must fail this.
+  const { run, cmds } = makeMergeGit();
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
     "main",
-    fakeRun,
+    run,
     () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "merged" });
-  // A TRUE merge ran — and NEVER a squash (which would break the gate's absent arm).
-  expect(cmds).toContain("merge --no-edit keeper/epic/fn-1-foo");
+  // A TRUE 2-parent merge commit (default tip AND base tip as parents) — the merge
+  // commit is-ancestor-valid; NEVER a squash (which would break the gate's absent arm).
+  expect(
+    cmds.some((c) =>
+      c.startsWith(
+        `commit-tree ${MG_TREE_OID} -p ${MG_DEFAULT_TIP} -p ${MG_BASE_TIP} -m `,
+      ),
+    ),
+  ).toBe(true);
   expect(cmds.some((c) => c.includes("--squash"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 
 test("fn-1014 regression: a MERGED keeper/epic base (an ancestor of default) IS deleted, is-ancestor-gated — so a later 'lane absent' reading is provably merged", async () => {
@@ -13855,6 +13868,40 @@ test("dirty + wedge distress rows for the SAME repo never cross-clear (distinct 
   ]);
   // The two ids are distinct — neither clear could ever target the other's row.
   expect(sharedDirtyDistressId(REPO_A)).not.toBe(sharedWedgeDistressId(REPO_A));
+});
+
+test("post base-merge decouple: the recover cycle derives NO shared-checkout wedge/dirty observation → the trackers can only drain, never mint", () => {
+  // The neuter seam the recover loop feeds its shared-checkout trackers now yields
+  // EMPTY maps unconditionally: a dirty/mid-merge shared checkout no longer blocks the
+  // working-tree-free base merge, so the mid-merge/dirty observation is a false positive.
+  const { wedged, dirty } = sharedCheckoutDistressObservations();
+  expect(wedged.size).toBe(0);
+  expect(dirty.size).toBe(0);
+  // Fed those empty observations — even with an OPEN distress row present for REPO_A —
+  // BOTH trackers mint NOTHING (no false positive) and level-clear the open row (the
+  // drain path so an operator is never left with an un-clearable daemon-verb row).
+  const grace = 300;
+  const wedgeTracker = createSharedCheckoutWedgeTracker(grace);
+  const dirtyTracker = createSharedCheckoutDirtyTracker(grace);
+  const open = new Set([REPO_A]);
+  const wedgeDecision = wedgeTracker.step({
+    wedged,
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  const dirtyDecision = dirtyTracker.step({
+    dirty,
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  expect(wedgeDecision.mint).toEqual([]);
+  expect(dirtyDecision.mint).toEqual([]);
+  expect(wedgeDecision.clear.map((c) => c.id)).toEqual([
+    sharedWedgeDistressId(REPO_A),
+  ]);
+  expect(dirtyDecision.clear.map((c) => c.id)).toEqual([
+    sharedDirtyDistressId(REPO_A),
+  ]);
 });
 
 // ---------------------------------------------------------------------------
