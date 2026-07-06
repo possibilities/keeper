@@ -4,11 +4,11 @@
   "depends_on": [],
   "epic": "fn-1139-consolidate-branch-ref-strip-helper",
   "id": "fn-1139-consolidate-branch-ref-strip-helper.1",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "consolidate branch-ref strip helper",
-  "updated_at": "2026-07-06T12:55:26.320000Z"
+  "updated_at": "2026-07-06T12:56:00.089000Z"
 }

@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded mechanical extraction of a pure helper routed through three named inline strips, byte-identical behavior, green-test acceptance.",
+      "task_id": "fn-1139-consolidate-branch-ref-strip-helper.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "1d3a118f5d4d8b07ad4a02fc3e496ccf4664b01f254bbfb6f290c9a67d2dd40a",
+  "created_at": "2026-07-06T12:56:00.089000Z",
+  "epic_id": "fn-1139-consolidate-branch-ref-strip-helper",
+  "input_hash": "1f9378c7b9a09cfbbf2a4f65186f9177c3d652c12bc14105aa294c56e1ed05cf",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 529758407,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1139-consolidate-branch-ref-strip-helper.1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded mechanical extraction of a pure helper routed through three named inline strips with byte-identical behavior and a green-test acceptance, exactly the clear-path work sonnet/medium handles.\",\"confidence\":0.86}]}"
+}
