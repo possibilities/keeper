@@ -36,5 +36,5 @@ Table-driven parser suite (valid/invalid/compound/bare-number-hint); per-surface
 - [ ] Descriptors and help text state the grammar for every duration flag
 
 ## Done summary
-
+Shared unit-required duration grammar (cli/duration.ts): ms/s/m/h + compounds, bare numbers rejected with a self-healing hint. Folded in status/await parseDurationMs, the six viewers' bare-seconds --timeout, and renamed baseline --timeout-ms/--poll-interval-ms + agent --stop-timeout-ms to unit-required --timeout/--poll-interval/--stop-timeout (hard cutover). Descriptors + help state the grammar per flag. Note: status/await route the duration rejection to exit 2 via a threaded exitCode (their other usage faults keep the legacy exit 1).
 ## Evidence
