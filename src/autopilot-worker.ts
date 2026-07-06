@@ -1056,54 +1056,6 @@ export const SHARED_CHECKOUT_WEDGE_GRACE_SEC = 5 * 60;
 export const SHARED_CHECKOUT_DIRTY_GRACE_SEC = 5 * 60;
 
 /**
- * The `worktree-recover-*` reason prefixes that denote an UNHEALED shared-checkout
- * mid-merge wedge — the foreign/ambiguous residue keeper never auto-aborts, the
- * keeper-owned residue whose guarded `git merge --abort` keeps failing, and the
- * sustained inability to take the commit-work flock to run that abort. The generic
- * `worktree-recover-dirty-checkout` / `-conflict` reasons are DELIBERATELY excluded
- * (a dirty tree or a genuine content conflict is not this wedge and has its own
- * escalation). The mid-merge prefix also subsumes `worktree-recover-mid-merge-failed`
- * (a probe that keeps throwing), itself a sustained wedge worth surfacing.
- */
-const SHARED_CHECKOUT_WEDGE_REASON_PREFIXES = [
-  "worktree-recover-mid-merge",
-  "worktree-recover-abort-failed",
-  "worktree-recover-lock-timeout",
-] as const;
-
-/**
- * True iff a `worktree-recover-*` reason denotes an unhealed shared-checkout
- * mid-merge wedge (see {@link SHARED_CHECKOUT_WEDGE_REASON_PREFIXES}). Pure; a
- * non-matching reason yields false.
- */
-export function isSharedCheckoutWedgeReason(reason: string): boolean {
-  return SHARED_CHECKOUT_WEDGE_REASON_PREFIXES.some((p) =>
-    reason.startsWith(p),
-  );
-}
-
-/**
- * The `worktree-recover-*` reason a recover-pass merge skips on because the shared
- * MAIN checkout has a plain-DIRTY working tree (a non-clean tree with NO MERGE_HEAD
- * — the `dirty` merge verdict, NOT the distinctly-classified `mid-merge` wedge). It
- * is the natural feed for BOTH the dirt grace clock and the clean-observation clear.
- * A SIBLING of {@link isSharedCheckoutWedgeReason}, never a widening of it: the two
- * predicates are disjoint (a `worktree-recover-dirty-checkout` reason is excluded
- * from the wedge prefixes by design), so the mid-merge and dirt escalations never
- * feed off each other's reasons.
- */
-const SHARED_CHECKOUT_DIRTY_REASON_PREFIX = "worktree-recover-dirty-checkout";
-
-/**
- * True iff a `worktree-recover-*` reason denotes a plain-dirty shared-checkout skip
- * (see {@link SHARED_CHECKOUT_DIRTY_REASON_PREFIX}). Pure; a non-matching reason
- * yields false. Disjoint from {@link isSharedCheckoutWedgeReason} by construction.
- */
-export function isSharedCheckoutDirtyReason(reason: string): boolean {
-  return reason.startsWith(SHARED_CHECKOUT_DIRTY_REASON_PREFIX);
-}
-
-/**
  * The `dispatch_failures` id a per-repo shared-checkout-wedge distress row keys on
  * — `shared-checkout-wedge:<repoDirHash(repoDir)>`. Reuses the base36 {@link
  * repoDirHash} so the mint and the level-clear target the SAME row across cycles,
