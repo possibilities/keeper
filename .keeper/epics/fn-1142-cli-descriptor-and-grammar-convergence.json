@@ -6,7 +6,7 @@
     "fn-1141-fix-landed-await-degenerate-fire"
   ],
   "id": "fn-1142-cli-descriptor-and-grammar-convergence",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-06T14:56:12.066000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T14:56:04.608000Z"
+  "updated_at": "2026-07-06T14:56:12.066000Z"
 }
