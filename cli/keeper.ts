@@ -50,13 +50,10 @@ export const SUBCOMMANDS = [
   "baseline",
   "setup-tmux",
   "tabs",
-  "session-state",
-  "show-session-files",
+  "session",
   "search-history",
   "find-file-history",
-  "show-session-events",
   "show-job",
-  "session-summary",
   "escalation-brief",
   "plan",
   "prompt",
@@ -578,19 +575,12 @@ export async function main(): Promise<void> {
     baseline: async (argv) => (await import("./baseline")).main(argv),
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
     tabs: async (argv) => (await import("./tabs")).main(argv),
-    "session-state": async (argv) =>
-      (await import("./session-state")).main(argv),
-    "show-session-files": async (argv) =>
-      (await import("./show-session-files")).main(argv),
+    session: async (argv) => (await import("./session")).main(argv),
     "search-history": async (argv) =>
       (await import("./search-history")).main(argv),
     "find-file-history": async (argv) =>
       (await import("./find-file-history")).main(argv),
-    "show-session-events": async (argv) =>
-      (await import("./show-session-events")).main(argv),
     "show-job": async (argv) => (await import("./show-job")).main(argv),
-    "session-summary": async (argv) =>
-      (await import("./session-summary")).main(argv),
     "escalation-brief": async (argv) =>
       (await import("./escalation-brief")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `keeper show-session-events --session-id <id>` — emit the prompt/tool-call
+ * `keeper session events --session-id <id>` — emit the prompt/tool-call
  * spine for one session as a pretty JSON envelope (epic fn-794): the ordered
  * UserPromptSubmit / PreToolUse rows with `ts`, `hook_event`, `tool_name`,
  * `slash_command`, `skill_name`, and `plan_op`. Read-only over keeper.db so
@@ -29,10 +29,10 @@ import {
   successEnvelope,
 } from "./envelope";
 
-/** Envelope schema version for `keeper show-session-events`. */
+/** Envelope schema version for `keeper session events`. */
 export const SHOW_SESSION_EVENTS_SCHEMA_VERSION = 1;
 
-const HELP = `keeper show-session-events --session-id <id> [options]
+const HELP = `keeper session events --session-id <id> [options]
 
 Emit the prompt/tool-call spine for one session (ts, hook_event, tool_name,
 slash_command, skill_name, plan_op) as a pretty JSON envelope, ordered
@@ -72,7 +72,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       parsed.limit = parseLimit(a.slice("--limit=".length));
     } else {
       process.stderr.write(
-        `keeper show-session-events: unexpected argument '${a}'\n`,
+        `keeper session events: unexpected argument '${a}'\n`,
       );
       process.exit(2);
     }
@@ -82,15 +82,13 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function parseLimit(raw: string | undefined): number {
   if (raw === undefined) {
-    process.stderr.write(
-      "keeper show-session-events: --limit requires a value\n",
-    );
+    process.stderr.write("keeper session events: --limit requires a value\n");
     process.exit(2);
   }
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
     process.stderr.write(
-      `keeper show-session-events: --limit must be a positive integer (got '${raw}')\n`,
+      `keeper session events: --limit must be a positive integer (got '${raw}')\n`,
     );
     process.exit(2);
   }
@@ -142,9 +140,7 @@ export function main(
     return;
   }
   if (args.sessionId === null) {
-    process.stderr.write(
-      "keeper show-session-events: --session-id is required\n\n",
-    );
+    process.stderr.write("keeper session events: --session-id is required\n\n");
     process.stderr.write(HELP);
     process.exit(2);
   }

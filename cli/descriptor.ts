@@ -772,46 +772,107 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    name: "session-state",
-    summary: "Current session git context + on-hook files (JSON)",
+    // The four session-scoped reads live under one group; each verb maps to its
+    // own leaf main (`cli/{session-state,show-session-files,show-session-events,
+    // session-summary}.ts`), preserving that leaf's flags, envelope, and exit
+    // codes byte-for-byte. `cli/session.ts` is the group dispatcher.
+    name: "session",
+    summary:
+      "Session-scoped reads: `keeper session <state|files|events|summary>`",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
     requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
+    flags: [],
+    verbs: [
       {
-        name: "session-id",
-        type: "string",
-        summary: "Session id (default: auto-detect)",
+        name: "state",
+        summary: "Current session git context + on-hook files (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Session id (default: auto-detect)",
+          },
+          {
+            name: "log-count",
+            type: "string",
+            summary: "Recent-commit count to include (positive int)",
+          },
+        ],
       },
       {
-        name: "log-count",
-        type: "string",
-        summary: "Recent-commit count to include (positive int)",
+        name: "files",
+        summary: "Session's on-hook dirty files grouped by repo (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Session id (default: auto-detect)",
+          },
+          {
+            name: "cwd",
+            type: "string",
+            summary: "Working directory to attribute against",
+          },
+        ],
       },
-    ],
-  },
-  {
-    name: "show-session-files",
-    summary: "Session's on-hook dirty files grouped by repo (JSON)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: false,
-    requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
       {
-        name: "session-id",
-        type: "string",
-        summary: "Session id (default: auto-detect)",
+        name: "events",
+        summary: "Prompt/tool-call spine for one session (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Session id (default: auto-detect)",
+          },
+          {
+            name: "limit",
+            type: "string",
+            summary: "Max events to return (positive int)",
+          },
+        ],
       },
       {
-        name: "cwd",
-        type: "string",
-        summary: "Working directory to attribute against",
+        name: "summary",
+        summary:
+          "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Session id (default: auto-detect)",
+          },
+          {
+            name: "max-snippet",
+            type: "string",
+            summary: "Per-prompt snippet cap in chars (positive int)",
+          },
+        ],
       },
     ],
   },
@@ -850,28 +911,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    name: "show-session-events",
-    summary: "Prompt/tool-call spine for one session (JSON)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: false,
-    requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
-      {
-        name: "session-id",
-        type: "string",
-        summary: "Session id (default: auto-detect)",
-      },
-      {
-        name: "limit",
-        type: "string",
-        summary: "Max events to return (positive int)",
-      },
-    ],
-  },
-  {
     name: "show-job",
     summary:
       "One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)",
@@ -902,29 +941,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         summary: "Pick the most-recent match",
       },
       { name: "raw", type: "boolean", summary: "Emit the raw row, unshaped" },
-    ],
-  },
-  {
-    name: "session-summary",
-    summary:
-      "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: false,
-    requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
-      {
-        name: "session-id",
-        type: "string",
-        summary: "Session id (default: auto-detect)",
-      },
-      {
-        name: "max-snippet",
-        type: "string",
-        summary: "Per-prompt snippet cap in chars (positive int)",
-      },
     ],
   },
   {

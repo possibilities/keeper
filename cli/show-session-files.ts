@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `keeper show-session-files` — emit the session's on-hook dirty files grouped
+ * `keeper session files` — emit the session's on-hook dirty files grouped
  * by repo as a pretty JSON envelope. The native port of jobctl's
  * `run_show_session_files.py` (epic fn-715 task 3).
  *
@@ -20,7 +20,7 @@
 
 import { getSessionDirtyFiles } from "../src/commit-work/attribution";
 
-const HELP = `keeper show-session-files --session-id <id> [options]
+const HELP = `keeper session files --session-id <id> [options]
 
 Emit the session's Claude-mutated files still dirty in git, grouped by repo, as
 a pretty JSON envelope \`{files_by_repo, cwd_repo}\`. Thin pass-through over the
@@ -54,7 +54,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       parsed.cwd = a.slice("--cwd=".length);
     } else {
       process.stderr.write(
-        `keeper show-session-files: unexpected argument '${a}'\n`,
+        `keeper session files: unexpected argument '${a}'\n`,
       );
       process.exit(2);
     }
@@ -74,9 +74,7 @@ export function main(argv: string[]): void {
     return;
   }
   if (args.sessionId === null) {
-    process.stderr.write(
-      "keeper show-session-files: --session-id is required\n\n",
-    );
+    process.stderr.write("keeper session files: --session-id is required\n\n");
     process.stderr.write(HELP);
     process.exit(2);
   }
