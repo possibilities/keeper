@@ -55,5 +55,5 @@ Pure in-process fast tier. Regression cases: (1) degenerate — epic open, lane 
 - [ ] `bun test test/autopilot-worker.test.ts` is green
 
 ## Done summary
-
+Root cause was DETECTOR-side: computeMergedLaneEntries' clustered multi-repo arm passed laneCarriesLandedWork:true unconditionally, bypassing the empty-lane guard so a started-but-unworked epic's absent/empty base lanes read a vacuous merge and fired 'landed' at epic start (branch_name:'main' was a projection artifact, not consumed by the detector). Fixed by passing the same per-group done-evidence the 'ok' arm uses; added pure-tier regression tests for the degenerate, vacuous-ancestor, partial, all-merged, torn-down, never-started, and worktree-off cases.
 ## Evidence
