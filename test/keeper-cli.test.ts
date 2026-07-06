@@ -1316,15 +1316,15 @@ describe("cli/descriptor purity + derivation", () => {
     });
   });
 
-  test("parseOptions('baseline') reproduces the leaf's original flag surface", () => {
-    // Independent source of truth: the options the leaf carried BEFORE the
-    // descriptor migration, hand-transcribed here.
+  test("parseOptions('baseline') reproduces the leaf's flag surface", () => {
+    // Independent source of truth: the baseline leaf's flag surface under the
+    // shared duration grammar (`-ms` spellings retired), hand-transcribed here.
     expect(parseOptions("baseline")).toEqual({
       help: { type: "boolean", short: "h" },
       repo: { type: "string" },
       wait: { type: "boolean" },
-      "timeout-ms": { type: "string" },
-      "poll-interval-ms": { type: "string" },
+      timeout: { type: "string" },
+      "poll-interval": { type: "string" },
     });
   });
 
@@ -1407,8 +1407,8 @@ describe("keeper --help --json recursive descriptor tree", () => {
       "help",
       "repo",
       "wait",
-      "timeout-ms",
-      "poll-interval-ms",
+      "timeout",
+      "poll-interval",
     ]);
     expect(baseline?.exit_codes?.["3"]?.length ?? 0).toBeGreaterThan(0);
   });

@@ -30,13 +30,14 @@ import { subscribeCollection } from "../src/readiness-client";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import { createViewShell } from "../src/view-shell";
 import { buildParseOptions, GIT_FLAGS } from "./descriptor";
+import { parseDuration } from "./duration";
 
 const COLLECTION = "git";
 
 const HELP = `keeper git — live git status frames over the keeper subscribe server
 
 Usage: keeper git [--sock <path>] [--project-dir <path>]
-                  [--snapshot | --watch] [--timeout <s>]
+                  [--snapshot | --watch] [--timeout <dur>]
 
   --sock <path>         Socket path override ($KEEPER_SOCK / default otherwise)
   --project-dir <path>  Filter to one git worktree root
@@ -44,7 +45,8 @@ Usage: keeper git [--sock <path>] [--project-dir <path>]
                         machine-parseable keeper-meta: line, then exit) even
                         on a TTY
   --watch               Force the live subscribe stream even when piped
-  --timeout <s>         Snapshot wait before the timeout escape (default ~2s)
+  --timeout <dur>       Snapshot wait before the timeout escape (default ~2s;
+                        unit required, e.g. 500ms, 2s)
   --help                Show this help
 
 By default, stdout that is NOT a TTY (piped into an agent) auto-detects
@@ -319,18 +321,16 @@ export async function main(argv: string[]): Promise<void> {
     throw err;
   }
 
-  // Validate `--timeout` (seconds) only when snapshotting — a bad value is
-  // CLI misuse (exit 2). Watch mode ignores it.
+  // Validate `--timeout` (shared duration grammar) only when snapshotting — a
+  // bad value is CLI misuse (exit 2). Watch mode ignores it.
   let timeoutMs: number | undefined;
   if (values.timeout !== undefined) {
-    const secs = Number(values.timeout);
-    if (!Number.isFinite(secs) || secs <= 0) {
-      process.stderr.write(
-        `keeper git: --timeout must be a positive number of seconds (got '${values.timeout}')\n`,
-      );
+    const parsed = parseDuration(values.timeout);
+    if (!parsed.ok) {
+      process.stderr.write(`keeper git: --timeout ${parsed.message}\n`);
       process.exit(2);
     }
-    timeoutMs = Math.round(secs * 1000);
+    timeoutMs = parsed.ms;
   }
 
   const sockPath = values.sock ?? resolveSockPath();

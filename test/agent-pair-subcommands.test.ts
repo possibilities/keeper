@@ -180,15 +180,9 @@ describe("resolveHandle", () => {
     expect(res.ok).toBe(false);
   });
 
-  test("--stop-timeout-ms (space form) lands on the handle, flag before handle", () => {
+  test("--stop-timeout (space form) lands on the handle, flag before handle", () => {
     const res = resolveHandle({
-      rest: [
-        "--stop-timeout-ms",
-        "1800000",
-        "/tmp/x.jsonl",
-        "--agent",
-        "codex",
-      ],
+      rest: ["--stop-timeout", "30m", "/tmp/x.jsonl", "--agent", "codex"],
       cwd: "/c",
       stateDir: tempDir(),
     });
@@ -198,9 +192,9 @@ describe("resolveHandle", () => {
     });
   });
 
-  test("--stop-timeout-ms=<n> (equals form) lands on the handle, flag after handle", () => {
+  test("--stop-timeout=<dur> (equals form) lands on the handle, flag after handle", () => {
     const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent=claude", "--stop-timeout-ms=1800000"],
+      rest: ["/tmp/x.jsonl", "--agent=claude", "--stop-timeout=30m"],
       cwd: "/c",
       stateDir: tempDir(),
     });
@@ -210,7 +204,7 @@ describe("resolveHandle", () => {
     });
   });
 
-  test("absent --stop-timeout-ms leaves stopTimeoutMs null", () => {
+  test("absent --stop-timeout leaves stopTimeoutMs null", () => {
     const res = resolveHandle({
       rest: ["/tmp/x.jsonl", "--agent", "codex"],
       cwd: "/c",
@@ -222,24 +216,33 @@ describe("resolveHandle", () => {
     });
   });
 
-  test.each(["abc", "0", "-5", "1.5", ""])(
-    "a malformed --stop-timeout-ms value (%p) errors",
+  test.each(["abc", "0", "1500", "-5", "1.5", ""])(
+    "a malformed --stop-timeout value (%p) errors",
     (value) => {
       const res = resolveHandle({
-        rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout-ms", value],
+        rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout", value],
         cwd: "/c",
         stateDir: tempDir(),
       });
       expect(res.ok).toBe(false);
       if (!res.ok) {
-        expect(res.error).toContain("--stop-timeout-ms must be a positive");
+        expect(res.error).toContain("--stop-timeout");
       }
     },
   );
 
-  test("--stop-timeout-ms with no value errors", () => {
+  test("--stop-timeout with no value errors", () => {
     const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout-ms"],
+      rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout"],
+      cwd: "/c",
+      stateDir: tempDir(),
+    });
+    expect(res.ok).toBe(false);
+  });
+
+  test("the retired --stop-timeout-ms spelling hard-fails", () => {
+    const res = resolveHandle({
+      rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout-ms=1800000"],
       cwd: "/c",
       stateDir: tempDir(),
     });
@@ -360,7 +363,7 @@ describe("keeper agent wait-for-stop", () => {
     });
   });
 
-  test("a malformed --stop-timeout-ms exits bad_args (2), never retryable (4)", async () => {
+  test("a malformed --stop-timeout exits bad_args (2), never retryable (4)", async () => {
     const stateDir = tempDir();
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -371,7 +374,7 @@ describe("keeper agent wait-for-stop", () => {
       startedAtMs: 0,
     });
     const h = makeHarness({
-      argv: ["wait-for-stop", "tmux-bad1", "--stop-timeout-ms", "abc"],
+      argv: ["wait-for-stop", "tmux-bad1", "--stop-timeout", "abc"],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -798,7 +801,7 @@ describe("waitForTranscriptStop is bounded", () => {
   });
 });
 
-describe("runWaitForStop forwards --stop-timeout-ms", () => {
+describe("runWaitForStop forwards --stop-timeout", () => {
   const PINNED_NO_STOP = "88888888-8888-8888-8888-888888888888";
 
   // A no-stop transcript so the wait always reaches its deadline. The parsed
@@ -817,7 +820,7 @@ describe("runWaitForStop forwards --stop-timeout-ms", () => {
       rest:
         stopTimeoutMs === null
           ? ["tmux-fwd"]
-          : ["tmux-fwd", "--stop-timeout-ms", String(stopTimeoutMs)],
+          : ["tmux-fwd", "--stop-timeout", `${stopTimeoutMs}ms`],
       cwd,
       stateDir: writeFwdRun(cwd),
     });

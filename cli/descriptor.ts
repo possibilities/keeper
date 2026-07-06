@@ -191,7 +191,8 @@ export const VIEWER_FLAGS = [
   {
     name: "timeout",
     type: "string",
-    summary: "Snapshot wait in seconds (~2s default)",
+    summary:
+      "Snapshot wait as a duration (~2s default; unit required, e.g. 500ms, 2s)",
   },
   FLAG_HELP_DEFAULTED,
 ] as const satisfies readonly FlagDescriptor[];
@@ -219,7 +220,8 @@ export const GIT_FLAGS = [
   {
     name: "timeout",
     type: "string",
-    summary: "Snapshot wait in seconds (~2s default)",
+    summary:
+      "Snapshot wait as a duration (~2s default; unit required, e.g. 500ms, 2s)",
   },
   FLAG_HELP_DEFAULTED,
 ] as const satisfies readonly FlagDescriptor[];
@@ -242,7 +244,8 @@ export const AUTOPILOT_FLAGS = [
   {
     name: "timeout",
     type: "string",
-    summary: "Snapshot wait in seconds (~2s default)",
+    summary:
+      "Snapshot wait as a duration (~2s default; unit required, e.g. 500ms, 2s)",
   },
   FLAG_HELP_DEFAULTED,
   FLAG_AGENT_HELP_DEFAULTED,
@@ -550,7 +553,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "connect-timeout",
         type: "string",
-        summary: "Daemon connect timeout in seconds",
+        summary: "Daemon connect timeout (duration, e.g. 30s, 5m)",
       },
     ],
   },
@@ -612,12 +615,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "timeout",
         type: "string",
-        summary: "Own-deadline in seconds before giving up",
+        summary: "Own-deadline before giving up (duration, e.g. 30s, 5m)",
       },
       {
         name: "connect-timeout",
         type: "string",
-        summary: "Daemon connect timeout in seconds",
+        summary: "Daemon connect timeout (duration, e.g. 30s, 5m)",
       },
       {
         name: "fail-on-stuck",
@@ -695,14 +698,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           "Trigger-and-await: spool ONE request, then poll to the deadline",
       },
       {
-        name: "timeout-ms",
+        name: "timeout",
         type: "string",
-        summary: "--wait deadline in ms",
+        summary: "--wait deadline (duration, e.g. 10m, 600s)",
       },
       {
-        name: "poll-interval-ms",
+        name: "poll-interval",
         type: "string",
-        summary: "--wait poll gap in ms",
+        summary: "--wait poll gap (duration, e.g. 1s, 500ms)",
       },
     ],
   },

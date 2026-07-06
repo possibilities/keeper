@@ -46,6 +46,7 @@ import {
 } from "../src/readiness-client";
 import { queryCollection } from "./control-rpc";
 import { parseOptions } from "./descriptor";
+import { parseDuration } from "./duration";
 import {
   type Envelope,
   emitEnvelope,
@@ -413,39 +414,20 @@ export interface ParsedStatusArgs {
   connectTimeoutMs: number;
 }
 
+/** Exit code for a usage/grammar fault (a bad flag value). */
+const EXIT_USAGE = 2;
+
 interface ParseFailure {
   ok: false;
   message: string;
+  /** Process exit code for `main` (default 1); a bad duration is a usage
+   *  fault → exit 2 under the shared grammar. */
+  exitCode?: number;
 }
 
 interface ParseSuccess {
   ok: true;
   args: ParsedStatusArgs;
-}
-
-/** Parse a duration like `30s`, `5m`, `2h`, or a bare-ms integer. `null` on a
- *  parse error. */
-function parseDurationMs(s: string): number | null {
-  const m = /^(\d+)(ms|s|m|h)?$/.exec(s.trim());
-  if (m === null) {
-    return null;
-  }
-  const n = Number.parseInt(m[1] ?? "", 10);
-  if (!Number.isFinite(n) || n <= 0) {
-    return null;
-  }
-  switch (m[2] ?? "ms") {
-    case "ms":
-      return n;
-    case "s":
-      return n * 1000;
-    case "m":
-      return n * 60_000;
-    case "h":
-      return n * 3_600_000;
-    default:
-      return null;
-  }
 }
 
 export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
@@ -473,14 +455,15 @@ export function parseStatusArgs(argv: string[]): ParseFailure | ParseSuccess {
   let connectTimeoutMs = DEFAULT_CONNECT_DEADLINE_MS;
   const raw = values["connect-timeout"];
   if (typeof raw === "string" && raw.length > 0) {
-    const parsed = parseDurationMs(raw);
-    if (parsed === null) {
+    const parsed = parseDuration(raw);
+    if (!parsed.ok) {
       return {
         ok: false,
-        message: `invalid --connect-timeout '${raw}' (expected e.g. 10s, 5m, or ms integer)`,
+        message: `--connect-timeout ${parsed.message}`,
+        exitCode: EXIT_USAGE,
       };
     }
-    connectTimeoutMs = parsed;
+    connectTimeoutMs = parsed.ms;
   }
 
   const sock =
@@ -596,7 +579,7 @@ export async function main(argv: string[]): Promise<void> {
     }
     process.stderr.write(`keeper status: ${parsed.message}\n\n`);
     process.stderr.write(HELP);
-    process.exit(1);
+    process.exit(parsed.exitCode ?? 1);
   }
 
   await runStatus(parsed.args, {

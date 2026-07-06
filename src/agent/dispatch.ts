@@ -66,10 +66,10 @@ Usage:
   keeper agent presets list [--json]   List configured presets + panels.
   keeper agent profiles check [--json] Report shadow/stray dirs + a ~/.claude whose
                                     tier metadata is missing (read-only).
-  keeper agent wait-for-stop <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait-for-stop <handle> [--stop-timeout <dur>]
                                     Block until a detached run's next stop.
   keeper agent show-last-message <h>   Print a detached run's final message.
-  keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
+  keeper agent run <cli> <prompt> [--read-only] [--stop-timeout <dur>]
                                   [--system-file <path> | --system <text>]
                                   [--preset <name>] [--session <name>]
                                   [--output <path>]
@@ -82,7 +82,7 @@ Usage:
                                     harness must == <cli>); --session names the
                                     tmux grouping; --output atomically writes the
                                     envelope to a file on every outcome.
-  keeper agent wait <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
@@ -180,16 +180,17 @@ tmux transport flags (any one implies tmux mode):
                                     trail; JSON result carries runDir:null.
 
 Post-launch transcript subcommands (composable with a detached launch):
-  keeper agent wait-for-stop <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait-for-stop <handle> [--stop-timeout <dur>]
                                         Block until the run's next stop event.
-                                        --stop-timeout-ms overrides the 600s
-                                        stop-wait ceiling (positive integer ms).
+                                        --stop-timeout overrides the 600s
+                                        stop-wait ceiling (duration, unit
+                                        required: e.g. 500ms, 30s, 10m).
   keeper agent show-last-message <handle>  Print the run's final assistant message.
                                         <handle> is the launch JSON's id (or a
                                         transcript path with --agent <kind>).
 
 Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
-  keeper agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]
+  keeper agent run <cli> <prompt> [--read-only] [--stop-timeout <dur>]
                                   [--system-file <path> | --system <text>]
                                   [--preset <name>] [--session <name>]
                                   [--output <path>]
@@ -225,7 +226,7 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         ambiguous means a concurrent same-cwd codex
                                         session collided and the leg refused to guess
                                         a foreign transcript.
-  keeper agent wait <handle> [--stop-timeout-ms <ms>]
+  keeper agent wait <handle> [--stop-timeout <dur>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with
                                         --agent <kind>); same uniform envelope.

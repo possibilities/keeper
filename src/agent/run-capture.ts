@@ -18,6 +18,7 @@
  * stays db-free (pinned by the hygiene import-scan test).
  */
 
+import { parseDuration } from "../../cli/duration";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_NAME_SET } from "./harness";
 import type {
@@ -164,7 +165,7 @@ export type ParseRunArgsResult =
   | { ok: false; error: string };
 
 /**
- * Parse `agent run <cli> <prompt> [--read-only] [--stop-timeout-ms <ms>]`. Two
+ * Parse `agent run <cli> <prompt> [--read-only] [--stop-timeout <dur>]`. Two
  * positionals — the partner CLI (claude|codex|pi) and the prompt — plus the
  * optional read-only posture and stop-wait override. A malformed/missing
  * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
@@ -198,32 +199,26 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       readOnly = true;
       continue;
     }
-    if (arg === "--stop-timeout-ms") {
+    if (arg === "--stop-timeout") {
       const value = rest[i + 1];
       if (value === undefined) {
-        return { ok: false, error: "--stop-timeout-ms requires a value" };
+        return { ok: false, error: "--stop-timeout requires a value" };
       }
-      const parsed = parsePositiveIntMs(value);
-      if (parsed === null) {
-        return {
-          ok: false,
-          error: `--stop-timeout-ms must be a positive integer ms: ${value}`,
-        };
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--stop-timeout ${parsed.message}` };
       }
-      stopTimeoutMs = parsed;
+      stopTimeoutMs = parsed.ms;
       i += 1;
       continue;
     }
-    if (arg.startsWith("--stop-timeout-ms=")) {
-      const value = arg.slice("--stop-timeout-ms=".length);
-      const parsed = parsePositiveIntMs(value);
-      if (parsed === null) {
-        return {
-          ok: false,
-          error: `--stop-timeout-ms must be a positive integer ms: ${value}`,
-        };
+    if (arg.startsWith("--stop-timeout=")) {
+      const value = arg.slice("--stop-timeout=".length);
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--stop-timeout ${parsed.message}` };
       }
-      stopTimeoutMs = parsed;
+      stopTimeoutMs = parsed.ms;
       continue;
     }
     if (arg === "--system-file") {
@@ -377,15 +372,6 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     output,
     name,
   };
-}
-
-/** A finite positive integer of ms, or null for anything malformed. */
-function parsePositiveIntMs(value: string): number | null {
-  if (!/^\d+$/.test(value.trim())) {
-    return null;
-  }
-  const n = Number(value);
-  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /** The seams the compose drives — the real wait/show primitives + a clock. */

@@ -75,7 +75,7 @@ import { FileLock } from "../usage-flock";
 // ---------------------------------------------------------------------------
 
 /** Per-leg `keeper agent run` stop-timeout default (seconds; translated to
- *  `--stop-timeout-ms` at launch). */
+ *  a `--stop-timeout` ms duration at launch). */
 export const DEFAULT_PANEL_TIMEOUT_SECONDS = 1800;
 /** Default `wait --chunk` (seconds) — the panel-runner's ≤9-min window. */
 export const DEFAULT_PANEL_CHUNK_SECONDS = 540;
@@ -456,7 +456,7 @@ export function resolveAdHocMember(
  * Build one leg's `keeper agent run` argv:
  *   `<bun> <keeper.ts> agent run <harness> <prompt> [--preset <m>]
  *     [--system <text>] [--model <m>] [--effort <e>] [--read-only]
- *     --session panels --output <dir>/<m>.yaml --stop-timeout-ms <ms>`.
+ *     --session panels --output <dir>/<m>.yaml --stop-timeout <dur>`.
  * The `[<bun>, <keeper.ts>]` prefix is the self-re-exec transport (daemon.ts
  * precedent); `<harness>` is the `agent run <cli>` positional and `<prompt>` the
  * task text passed inline (agent run takes the prompt literally, not a file);
@@ -511,8 +511,8 @@ export function buildPanelLegArgv(opts: {
     PANEL_SESSION,
     "--output",
     opts.yamlPath,
-    "--stop-timeout-ms",
-    String(opts.stopTimeoutMs),
+    "--stop-timeout",
+    `${opts.stopTimeoutMs}ms`,
     "--name",
     `panel::${opts.slug}::${m.name}`,
   ];
