@@ -52,5 +52,5 @@ Bigger bugs discovered while supervising → `keeper:handoff` a fire-and-forget 
 - [ ] Skill-id lint, vendored-corpus drift check, and the prompt test suite all pass
 
 ## Done summary
-
+Added the keeper:watch board-supervision skill (one observe-triage-fix/notify/escalate sweep, five-rung ladder ordered by reversibility, three-part wedge proof gating the daemon bounce, inline-brief-always plus additive deduped push, explicit-ask pilot mode referencing the autopilot take-over window) and routed ongoing-supervision intents off the autopilot skill's NOT-for tail.
 ## Evidence

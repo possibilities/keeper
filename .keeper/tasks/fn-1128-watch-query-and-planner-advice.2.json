@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Add keeper watch supervision skill",
-  "updated_at": "2026-07-05T22:26:14.993000Z"
+  "updated_at": "2026-07-06T00:34:05.851000Z",
+  "worker_done_at": "2026-07-06T00:34:05.851000Z"
 }
