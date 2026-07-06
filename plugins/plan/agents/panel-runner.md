@@ -113,7 +113,7 @@ retry), **leaves** a running leg alone, and **relaunches** only a leg with no re
 every non-terminal leg). A prompt- or member-set mismatch against the stored run exits 2 (a colliding slug,
 not a resume) — so the prompt must reproduce exactly.
 
-Then wait as in Step 3. If you still hold `$DIR` from this session, `wait --dir "$DIR"` works; after a
+Then wait as in Step 3. If you still hold `$DIR` from this session, `wait --run-dir "$DIR"` works; after a
 restart you have only the slug, so wait by it — `keeper agent panel wait --slug "$SLUG" --chunk 540` is the
 simple re-entry form (`keeper agent panel status --slug "$SLUG"` gives a one-shot non-blocking snapshot).
 Both resolve the same durable dir. A reboot mid-`wait` is detected in-band: the verdict returns promptly with
@@ -134,7 +134,7 @@ BACKSTOP=6      # ~54 min of 9-min chunks — comfortably past the 30-min per-le
 VERDICT=""
 n=0
 while [ "$n" -lt "$BACKSTOP" ]; do
-  VERDICT=$(keeper agent panel wait --dir "$DIR" --chunk 540)
+  VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540)
   WAIT_RC=$?
   [ "$WAIT_RC" -eq 0 ] && break                              # all legs terminal — verdict captured
   [ "$WAIT_RC" -eq 124 ] && { n=$(( n + 1 )); continue; }    # chunk elapsed — re-issue the next chunk

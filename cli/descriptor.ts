@@ -343,7 +343,7 @@ export const HANDOFF_FLAGS = [
   },
   { name: "session", type: "string", summary: "Target tmux session" },
   {
-    name: "dir",
+    name: "cwd",
     type: "string",
     summary: "Directory the handoff-ee launches in",
   },
@@ -892,7 +892,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "show-job",
     summary:
-      "One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)",
+      "One job's full metadata by job-id/title/cwd/pane or auto-detect (JSON)",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -900,13 +900,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     format_modes: ["json"],
     flags: [
       FLAG_HELP,
-      {
-        name: "session-id",
-        type: "string",
-        summary: "Match by Claude session id",
-      },
       { name: "job-id", type: "string", summary: "Match by job id" },
-      { name: "session", type: "string", summary: "Match by session title" },
+      {
+        name: "session-title",
+        type: "string",
+        summary: "Match by session title",
+      },
       { name: "cwd", type: "string", summary: "Match by working directory" },
       {
         name: "cwd-exact",

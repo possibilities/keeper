@@ -5336,7 +5336,7 @@ interface HandoffRequestedPayload {
   doc: string;
   title: string | null;
   target_session: string | null;
-  /** Resolved ABSOLUTE launch directory (null = pre-feature event / no `--dir`
+  /** Resolved ABSOLUTE launch directory (null = pre-feature event / no `--cwd`
    *  → the dispatcher coalesces to keeperd's cwd). */
   target_dir: string | null;
   initiator_session: string | null;

@@ -11,7 +11,7 @@
  * run legs and waits for them token-free (routed into `src/pair/panel.ts`
  * `runPanel`, which owns its stdout + exit code); `start` is idempotent by slug
  * (re-issuing RECONCILES the durable per-slug run instead of re-fanning-out),
- * `wait`/`status` address a run by `--slug` or `--dir`, and `prune` GCs abandoned
+ * `wait`/`status` address a run by `--slug` or `--run-dir`, and `prune` GCs abandoned
  * run dirs. `run
  * --read-only` prepends a
  * read-only directive to the prompt (prompting-only — keeper enforces nothing,

@@ -5,7 +5,7 @@
  * so consumers stop hand-writing sqlite against a schema keeper owns.
  *
  * The verb resolves a job by the cheapest available signal: explicit
- * `--session-id` / `--session` (the Claude session TITLE) / `--cwd` / `--pane`,
+ * `--job-id` / `--session-title` (the Claude session TITLE) / `--cwd` / `--pane`,
  * or zero-flag auto-detection that (a) shows your own job when run inside a
  * Claude session (`$CLAUDE_CODE_SESSION_ID`), (b) shows the single live agent
  * in your current tmux WINDOW when you split a shell pane beside it, else
@@ -57,8 +57,8 @@ With no selector, auto-detects: your own job inside a Claude session
 window (split a shell pane beside it), else the job whose cwd contains yours.
 
 Selectors (explicit flags AND together — they narrow):
-  --session-id <id>    Match job_id exactly (alias: --job-id)
-  --session <title>    Match the Claude session title (case-insensitive),
+  --job-id <id>        Match job_id exactly
+  --session-title <t>  Match the Claude session title (case-insensitive),
                        current title OR any name_history entry
   --cwd <dir>          Match jobs under <dir>'s git toplevel (default: cwd)
   --cwd-exact          Strict cwd equality instead of toplevel containment
@@ -156,7 +156,7 @@ function applyAmbiguity(
  * returns a discriminated result. No env / tmux / cwd / `Date.now()` reads —
  * those happen in `main` and arrive as plain data.
  *
- * Explicit selectors AND together: they NARROW. A `--session-id` paired with
+ * Explicit selectors AND together: they NARROW. A `--job-id` paired with
  * any other selector is a consistency check — a row failing it yields
  * `not_found`, never a blind-trust of the id.
  */
@@ -168,7 +168,7 @@ export function resolveJob(db: Database, sel: Selectors): ResolveResult {
   if (sel.jobId !== undefined) {
     where.push("job_id = ?");
     params.push(sel.jobId);
-    fields.push("session_id");
+    fields.push("job_id");
   }
 
   if (sel.title !== undefined) {
@@ -388,16 +388,12 @@ function parseArgs(argv: string[]): ParsedArgs {
     const a = argv[i];
     if (a === "--help" || a === "-h") {
       p.help = true;
-    } else if (a === "--session-id" || a.startsWith("--session-id=")) {
-      const r = takeValue(argv, i, "--session-id");
-      p.jobId = r.value;
-      i = r.next;
     } else if (a === "--job-id" || a.startsWith("--job-id=")) {
       const r = takeValue(argv, i, "--job-id");
       p.jobId = r.value;
       i = r.next;
-    } else if (a === "--session" || a.startsWith("--session=")) {
-      const r = takeValue(argv, i, "--session");
+    } else if (a === "--session-title" || a.startsWith("--session-title=")) {
+      const r = takeValue(argv, i, "--session-title");
       p.title = r.value;
       i = r.next;
     } else if (a === "--cwd" || a.startsWith("--cwd=")) {
@@ -532,7 +528,7 @@ export function main(
 
 /** Label the resolution method for an explicit-selector run. */
 function explicitMethod(sel: Selectors): string {
-  if (sel.jobId !== undefined) return "session-id";
+  if (sel.jobId !== undefined) return "job-id";
   if (sel.title !== undefined) return "session-title";
   if (sel.paneIds !== undefined) return "pane";
   if (sel.cwdExact !== undefined) return "cwd-exact";
@@ -608,7 +604,7 @@ export function buildEnvelope(
       code: "not_found",
       message: "no job matched the given selectors",
       recovery:
-        "Widen or correct the selector (--session-id / --session / --cwd / " +
+        "Widen or correct the selector (--job-id / --session-title / --cwd / " +
         "--pane), or run with no selector to auto-detect; this read never " +
         "mutates state.",
     });
@@ -618,7 +614,7 @@ export function buildEnvelope(
     code: "ambiguous",
     message: `the selectors matched ${result.candidates.length} jobs; narrow to one`,
     recovery:
-      "Add a narrowing selector (--session-id pins exactly one) or pass " +
+      "Add a narrowing selector (--job-id pins exactly one) or pass " +
       "--latest to take the most recent; the matches are on " +
       "error.details.candidates.",
     details: { candidates: result.candidates.map(candidateView) },
