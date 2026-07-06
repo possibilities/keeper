@@ -5,10 +5,11 @@
   "depends_on_epics": [
     "fn-1123-worktree-lane-pre-merge-recovery",
     "fn-1130-merge-gate-unsatisfied-upstream-deferral",
-    "fn-1125-dirty-checkout-finalize-distress"
+    "fn-1125-dirty-checkout-finalize-distress",
+    "fn-1126-launcher-worker-cell-resolver"
   ],
   "id": "fn-1127-stale-base-lane-distress",
-  "last_validated_at": "2026-07-05T22:38:14.633000Z",
+  "last_validated_at": "2026-07-06T00:33:38.330000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-05T22:38:13.489000Z"
+  "updated_at": "2026-07-06T00:33:38.067000Z"
 }
