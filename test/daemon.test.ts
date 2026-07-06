@@ -35,34 +35,42 @@ import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildBlockEscalationBody,
-  buildMergeEscalationBody,
+  buildDeconflictHumanNotifyBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   checkKeeperAgentPresence,
+  classifyEscalationOutcome,
+  countLiveEscalationSessions,
   type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
+  type DeconflictHumanNotifySweepDeps,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
   decideGitSeedWatchdog,
   decideServeLivenessWatchdog,
+  dispatchEscalationSession,
   drainToCompletion,
+  type EscalationDispatchDeps,
+  type EscalationDispatchOutcome,
   effectiveBlockEscalationRepo,
+  escalationSessionLiveFor,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
   isTransientBusyError,
+  MAX_LIVE_ESCALATION_SESSIONS,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
+  type MergeHumanNotifiedOutcome,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
   type PendingMergeEscalation,
   type PendingResolverDispatch,
-  type PlannerNotifyResult,
   parseBlockedCategory,
   parseRestartLedger,
   prewarmWatcherAddon,
@@ -71,7 +79,9 @@ import {
   type ResolverDispatchOutcome,
   type ResolverDispatchSweepDeps,
   recoverOneDeadLetter,
+  resolveEscalationJobsFor,
   runBlockEscalationSweep,
+  runDeconflictHumanNotifySweep,
   runMergeEscalationSweep,
   runResolverDispatchSweep,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -80,6 +90,7 @@ import {
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
+  selectPendingHumanNotifications,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
   serializeSessionTelemetry,
@@ -112,7 +123,7 @@ import type { ResolverOutcome } from "../src/reconcile-core";
 import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
-import type { Event } from "../src/types";
+import type { Event, Job } from "../src/types";
 import { worktreePathFor } from "../src/worktree-plan";
 import { sandboxEnv } from "./helpers/sandbox-env";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
@@ -4404,91 +4415,37 @@ test("selectPendingMergeEscalations: empty table returns []", () => {
   db.close();
 });
 
-// ---- buildMergeEscalationBody (pure body assembly + parse-miss degrade) ------
+// ---- buildDeconflictHumanNotifyBody (pure stage-3 notification body) ----------
 
-test("buildMergeEscalationBody: parses source/base, derives the worktree path, carries the --no-ff recipe + guardrails", () => {
-  const repoDir = "/Users/me/code/foo";
-  const base = "keeper/epic/fn-9-foo";
-  const source = "fn-9-foo.2";
-  const body = buildMergeEscalationBody({
+test("buildDeconflictHumanNotifyBody: names the epic, the declined verdict, and the unstick command", () => {
+  const body = buildDeconflictHumanNotifyBody({
     epicId: "fn-9-foo",
-    reason: mergeConflictReason(source, base),
-    repoDir,
-    resolverVerdict: "declined",
+    reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
+    verdict: "declined",
   });
-  // Names the resolver's verdict up top — the escalation fires only after the resolver
-  // reached a terminal outcome, so the human is the fallback, not a racer.
+  expect(body).toContain("deconflict::fn-9-foo");
+  // Names the deconflict session's verdict — both tiers gave up, so the human is the
+  // final fallback.
   expect(body).toContain("DECLINED");
-  // The pause caveat + defer-to-a-live-resolver runbook: pausing does NOT stop an
-  // in-flight resolver, so check for a live resolve:: job before merging by hand.
-  expect(body).toContain("does NOT stop an in-flight resolver");
-  expect(body).toContain("resolve::fn-9-foo");
-  expect(body).toContain("keeper query jobs");
-  // The exact base worktree path, derived from row.dir + the parsed base branch.
-  expect(body).toContain(worktreePathFor(repoDir, base));
-  // The merge-commit mechanic: --no-ff against the parsed source, never squash/rebase.
-  expect(body).toContain(`git merge --no-ff ${source}`);
-  expect(body).toContain("--squash");
-  expect(body).toContain("rebase");
-  // The guardrails: run the tests before retry, merge BOTH intents, escalate a
-  // semantically-dense conflict to a human.
-  expect(body).toContain("tests");
-  expect(body).toContain("BOTH");
-  expect(body).toContain("state machine");
-  expect(body).toContain("ping the human");
-  // Opens pause-first (step 0) — the recover sweep races the manual merge while
-  // autopilot is unpaused — and the pause precedes the merge recipe.
-  expect(body).toContain("keeper autopilot pause");
-  expect(body.indexOf("keeper autopilot pause")).toBeLessThan(
-    body.indexOf(`git merge --no-ff ${source}`),
-  );
-  // The unstick block keyed on the epic's close: retry the close, then play.
+  expect(body).toContain("close::fn-9-foo");
+  // The single unstick command the operator runs after resolving by hand.
   expect(body).toContain("keeper autopilot retry close::fn-9-foo");
-  expect(body).toContain("keeper autopilot play");
-  expect(body.indexOf("keeper autopilot retry close::fn-9-foo")).toBeLessThan(
-    body.indexOf("keeper autopilot play"),
-  );
   // The free-text reason rides as a body line.
   expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
 });
 
-test("buildMergeEscalationBody: a parse-miss degrades to a human-actionable manual body (never throws)", () => {
-  // A reason that does not match the `merging … into …` shape.
-  const body = buildMergeEscalationBody({
+test("buildDeconflictHumanNotifyBody: a died verdict names the death (never throws on an unparseable reason)", () => {
+  const body = buildDeconflictHumanNotifyBody({
     epicId: "fn-9-foo",
     reason: "worktree-merge-conflict: something unparseable happened",
-    repoDir: "/Users/me/code/foo",
-    resolverVerdict: "died",
+    verdict: "died",
   });
-  expect(body).toContain("close::fn-9-foo");
-  expect(body).toContain("--no-ff");
-  expect(body).toContain("ping the human");
-  // The died verdict + pause caveat survive the degrade.
+  expect(body).toContain("deconflict::fn-9-foo");
   expect(body).toContain("DIED");
-  expect(body).toContain("does NOT stop an in-flight resolver");
-  // Pause-first + play still frame the degrade body.
-  expect(body).toContain("keeper autopilot pause");
-  expect(body).toContain("keeper autopilot play");
-  // No source branch to interpolate, but still a manual recipe — and no throw.
   expect(body).toContain("keeper autopilot retry close::fn-9-foo");
 });
 
-test("buildMergeEscalationBody: a null/empty repoDir degrades to the manual body (never throws)", () => {
-  const body = buildMergeEscalationBody({
-    epicId: "fn-9-foo",
-    reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
-    repoDir: null,
-    resolverVerdict: "declined",
-  });
-  expect(body).toContain("close::fn-9-foo");
-  expect(body).toContain("--no-ff");
-  expect(body).toContain("DECLINED");
-  expect(body).toContain("does NOT stop an in-flight resolver");
-  expect(body).toContain("keeper autopilot pause");
-  expect(body).toContain("keeper autopilot play");
-});
-
-// ---- runMergeEscalationSweep (orchestration core, injected deps) ------------
+// ---- runMergeEscalationSweep (deconflict-dispatch core, injected deps) --------
 
 interface MergeMintCall {
   id: string;
@@ -4499,42 +4456,39 @@ function fakeMergeSweepDeps(opts: {
   pending: PendingMergeEscalation[];
   stillPending?: (id: string) => boolean;
   resolverOutcome?: (id: string) => ResolverOutcome;
-  notify?: (target: string, body: string) => Promise<PlannerNotifyResult>;
+  dispatch?: (
+    row: PendingMergeEscalation,
+  ) => Promise<EscalationDispatchOutcome>;
   selectThrows?: boolean;
 }): {
   deps: MergeEscalationSweepDeps;
   mints: MergeMintCall[];
-  notifies: { target: string; body: string }[];
+  dispatches: PendingMergeEscalation[];
 } {
   const mints: MergeMintCall[] = [];
-  const notifies: { target: string; body: string }[] = [];
+  const dispatches: PendingMergeEscalation[] = [];
   const deps: MergeEscalationSweepDeps = {
     selectPending: () => {
       if (opts.selectThrows) throw new Error("read boom");
       return opts.pending;
     },
     stillPending: opts.stillPending ?? (() => true),
-    // Default: the resolver already reached a terminal verdict, so the escalation
-    // fires (the pre-sequencing behaviour these tests assert). Cases that exercise
-    // the wait override this.
+    // Default: the resolver already reached a terminal verdict, so the deconflict
+    // dispatch fires (the pre-sequencing behaviour these tests assert). Cases that
+    // exercise the wait override this.
     resolverOutcome:
       opts.resolverOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
-    notifyPlanner: async (target, body) => {
-      notifies.push({ target, body });
-      return (
-        (await opts.notify?.(target, body)) ?? {
-          outcome: "sent",
-          detail: "sent",
-        }
-      );
+    dispatchDeconflict: async (row) => {
+      dispatches.push(row);
+      return (await opts.dispatch?.(row)) ?? "dispatched";
     },
     mintAttempted: (id, outcome) => mints.push({ id, outcome }),
   };
-  return { deps, mints, notifies };
+  return { deps, mints, dispatches };
 }
 
-test("runMergeEscalationSweep: an escalatable close sends the recipe to planner@<epic> once and mints attempted{sent}", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+test("runMergeEscalationSweep: a terminal-resolver close dispatches ONE deconflict and mints attempted{dispatched} (no planner@ send)", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [
       {
         id: "fn-1-foo",
@@ -4545,17 +4499,17 @@ test("runMergeEscalationSweep: an escalatable close sends the recipe to planner@
   });
   await runMergeEscalationSweep(deps);
 
-  expect(notifies.length).toBe(1);
-  expect(notifies[0]?.target).toBe("planner@fn-1-foo");
-  // The brief carried through the sweep includes the --no-ff recipe.
-  expect(notifies[0]?.body).toContain("git merge --no-ff fn-1-foo.2");
-  // Mints the attempt with the terminal outcome — and NEVER a DispatchCleared (the
-  // deps surface has no clear path; the sticky row is cleared only by retry_dispatch).
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "sent" }]);
+  // Exactly one deconflict dispatch for the epic — and no planner@ bus message (the
+  // deps surface has no notify path at all now).
+  expect(dispatches.length).toBe(1);
+  expect(dispatches[0]?.id).toBe("fn-1-foo");
+  // Mints the terminal outcome — and NEVER a DispatchCleared (the sticky row is cleared
+  // only by retry_dispatch).
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
 });
 
-test("runMergeEscalationSweep: a non-token reason in the pending set is NOT escalated (defense-in-depth gate)", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+test("runMergeEscalationSweep: a non-token reason in the pending set is NOT dispatched (defense-in-depth gate)", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [
       {
         id: "fn-1-foo",
@@ -4565,11 +4519,11 @@ test("runMergeEscalationSweep: a non-token reason in the pending set is NOT esca
     ],
   });
   await runMergeEscalationSweep(deps);
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
 });
 
-test("runMergeEscalationSweep: a send_failed outcome is recorded and leaves the marker unset (re-sweepable)", async () => {
+test("runMergeEscalationSweep: a dispatch_failed outcome is recorded and leaves the marker unset (re-sweepable)", async () => {
   const { deps, mints } = fakeMergeSweepDeps({
     pending: [
       {
@@ -4578,16 +4532,16 @@ test("runMergeEscalationSweep: a send_failed outcome is recorded and leaves the 
         dir: "/repo/root",
       },
     ],
-    notify: async () => ({ outcome: "send_failed", detail: "not_connected" }),
+    dispatch: async () => "dispatch_failed",
   });
   await runMergeEscalationSweep(deps);
-  // send_failed mints attempted{send_failed} — task .1's fold no-ops on it, so the
-  // marker stays NULL and the next sweep retries.
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "send_failed" }]);
+  // dispatch_failed mints attempted{dispatch_failed} — task .1's fold no-ops on it, so
+  // the marker stays NULL and the next sweep retries.
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
 });
 
-test("runMergeEscalationSweep: a queued_for_wake outcome escalates exactly once", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+test("runMergeEscalationSweep: an at_cap skip mints NOTHING (row stays pending, re-sweeps)", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [
       {
         id: "fn-1-foo",
@@ -4595,14 +4549,15 @@ test("runMergeEscalationSweep: a queued_for_wake outcome escalates exactly once"
         dir: "/repo/root",
       },
     ],
-    notify: async () => ({ outcome: "queued_for_wake", detail: "queued" }),
+    dispatch: async () => "at_cap",
   });
   await runMergeEscalationSweep(deps);
-  expect(notifies.length).toBe(1);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "queued_for_wake" }]);
+  // The dispatcher was consulted, but the cap skip mints no marker — the row re-sweeps.
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([]);
 });
 
-test("runMergeEscalationSweep: a THROWING notify never aborts the sweep (records send_failed)", async () => {
+test("runMergeEscalationSweep: an already_live skip (occupancy guard) mints NOTHING", async () => {
   const { deps, mints } = fakeMergeSweepDeps({
     pending: [
       {
@@ -4611,16 +4566,31 @@ test("runMergeEscalationSweep: a THROWING notify never aborts the sweep (records
         dir: "/repo/root",
       },
     ],
-    notify: async () => {
+    dispatch: async () => "already_live",
+  });
+  await runMergeEscalationSweep(deps);
+  expect(mints).toEqual([]);
+});
+
+test("runMergeEscalationSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
+  const { deps, mints } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    dispatch: async () => {
       throw new Error("boom");
     },
   });
   await runMergeEscalationSweep(deps);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "send_failed" }]);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
 });
 
-test("runMergeEscalationSweep: a row cleared mid-sweep (stillPending false) is skipped — no send, no mint", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+test("runMergeEscalationSweep: a row cleared mid-sweep (stillPending false) is skipped — no dispatch, no mint", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [
       {
         id: "fn-1-foo",
@@ -4631,30 +4601,30 @@ test("runMergeEscalationSweep: a row cleared mid-sweep (stillPending false) is s
     stillPending: () => false,
   });
   await runMergeEscalationSweep(deps);
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
 });
 
 test("runMergeEscalationSweep: an empty pending set is a no-op", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({ pending: [] });
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({ pending: [] });
   await runMergeEscalationSweep(deps);
   expect(mints).toEqual([]);
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
 });
 
 test("runMergeEscalationSweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [],
     selectThrows: true,
   });
   // MUST resolve (never throw) and do nothing.
   await runMergeEscalationSweep(deps);
   expect(mints).toEqual([]);
-  expect(notifies).toEqual([]);
+  expect(dispatches).toEqual([]);
 });
 
-test("runMergeEscalationSweep: a live/not-yet-terminal resolver defers the escalation — no send, no mint", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+test("runMergeEscalationSweep: a live/not-yet-terminal resolver defers the dispatch — no dispatch, no mint", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [
       {
         id: "fn-1-foo",
@@ -4662,17 +4632,17 @@ test("runMergeEscalationSweep: a live/not-yet-terminal resolver defers the escal
         dir: "/repo/root",
       },
     ],
-    // The resolver still owns the conflict (live, or its job has not folded yet).
+    // The resolver (tier 1) still owns the conflict (live, or its job has not folded yet).
     resolverOutcome: () => ({ terminal: false }),
   });
   await runMergeEscalationSweep(deps);
-  // The human notify waits for the resolver's verdict: nothing sent, marker untouched.
-  expect(notifies).toEqual([]);
+  // The deconflict dispatch waits for the resolver's verdict: nothing dispatched.
+  expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
 });
 
-test("runMergeEscalationSweep: a resolver that DIED escalates once and names the died verdict", async () => {
-  const { deps, mints, notifies } = fakeMergeSweepDeps({
+test("runMergeEscalationSweep: a resolver that DIED is terminal — the deconflict dispatches once", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
     pending: [
       {
         id: "fn-1-foo",
@@ -4683,12 +4653,8 @@ test("runMergeEscalationSweep: a resolver that DIED escalates once and names the
     resolverOutcome: () => ({ terminal: true, verdict: "died" }),
   });
   await runMergeEscalationSweep(deps);
-  expect(notifies.length).toBe(1);
-  expect(notifies[0]?.target).toBe("planner@fn-1-foo");
-  // The brief names the resolver's died verdict + the pause caveat.
-  expect(notifies[0]?.body).toContain("DIED");
-  expect(notifies[0]?.body).toContain("does NOT stop an in-flight resolver");
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "sent" }]);
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
 });
 
 // ---- selectPendingResolverDispatches (the resolver working-set read) ---------
@@ -5036,6 +5002,394 @@ test("runResolverDispatchSweep: a throwing selectPending degrades to a no-op (fa
   await runResolverDispatchSweep(deps);
   expect(mints).toEqual([]);
   expect(dispatches).toEqual([]);
+});
+
+// ---- fn-1129 escalation cap/occupancy/classify (pure helpers over a jobs set) --
+
+function escJob(planVerb: string, planRef: string, state: string): Job {
+  return {
+    plan_verb: planVerb,
+    plan_ref: planRef,
+    state,
+    backend_exec_pane_id: null,
+  } as unknown as Job;
+}
+
+test("countLiveEscalationSessions: counts live unblock:: + deconflict:: across both verbs, ignores terminal + non-escalation rows", () => {
+  const jobs: Job[] = [
+    escJob("deconflict", "fn-1-foo", "working"), // live
+    escJob("unblock", "fn-2-bar.3", "stopped"), // live (null probe → conservative)
+    escJob("deconflict", "fn-3-dead", "ended"), // terminal — not counted
+    escJob("deconflict", "fn-4-killed", "killed"), // terminal — not counted
+    escJob("resolve", "fn-5-res", "working"), // the resolver is NOT an escalation
+    escJob("work", "fn-6-work.1", "working"), // a plain worker — not counted
+  ];
+  expect(countLiveEscalationSessions(jobs)).toBe(2);
+  expect(countLiveEscalationSessions([])).toBe(0);
+});
+
+test("escalationSessionLiveFor: matches a live session for the exact verb+id only", () => {
+  const jobs: Job[] = [
+    escJob("deconflict", "fn-1-foo", "working"),
+    escJob("unblock", "fn-1-foo", "ended"), // same id, wrong verb + terminal
+  ];
+  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-1-foo")).toBe(true);
+  // The unblock row for the same id is terminal → not live.
+  expect(escalationSessionLiveFor(jobs, "unblock", "fn-1-foo")).toBe(false);
+  // No row for this key at all.
+  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-9-none")).toBe(false);
+});
+
+test("classifyEscalationOutcome: live → not terminal; ended → declined; killed → died; no row → not terminal", () => {
+  // A live session (working) → the notify waits.
+  expect(
+    classifyEscalationOutcome(
+      [escJob("deconflict", "fn-1-foo", "working")],
+      "deconflict",
+      "fn-1-foo",
+    ),
+  ).toEqual({ terminal: false });
+  // No `deconflict::fn-1-foo` row folded yet (launch window) → waits.
+  expect(classifyEscalationOutcome([], "deconflict", "fn-1-foo")).toEqual({
+    terminal: false,
+  });
+  // An `ended` row and none live → declined (clean exit / stamped BLOCKED).
+  expect(
+    classifyEscalationOutcome(
+      [escJob("deconflict", "fn-1-foo", "ended")],
+      "deconflict",
+      "fn-1-foo",
+    ),
+  ).toEqual({ terminal: true, verdict: "declined" });
+  // A `killed` row and none live → died (the session crashed).
+  expect(
+    classifyEscalationOutcome(
+      [escJob("deconflict", "fn-1-foo", "killed")],
+      "deconflict",
+      "fn-1-foo",
+    ),
+  ).toEqual({ terminal: true, verdict: "died" });
+});
+
+test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB → []", () => {
+  const { db } = freshMemDb();
+  expect(resolveEscalationJobsFor(db, "deconflict", "fn-1-foo")).toEqual([]);
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
+       VALUES (?, 0, 0, 'working', 'deconflict', 'fn-1-foo')`,
+    ["dc-job-1"],
+  );
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
+       VALUES (?, 0, 0, 'working', 'deconflict', 'fn-2-other')`,
+    ["dc-job-2"],
+  );
+  const rows = resolveEscalationJobsFor(db, "deconflict", "fn-1-foo");
+  expect(rows.map((r) => r.plan_ref)).toEqual(["fn-1-foo"]);
+  // The read feeds the classifier — a live row classifies as not-yet-terminal.
+  expect(classifyEscalationOutcome(rows, "deconflict", "fn-1-foo")).toEqual({
+    terminal: false,
+  });
+  db.close();
+});
+
+// ---- dispatchEscalationSession (shared cap + occupancy + launch) --------------
+
+function fakeEscalationDispatchDeps(opts: {
+  countLive?: number;
+  isLive?: boolean;
+  launchOk?: boolean;
+  launchThrows?: boolean;
+  config?: { model: string; effort: string };
+}): {
+  deps: EscalationDispatchDeps;
+  launches: { spec: unknown; cwd: string; label: string }[];
+} {
+  const launches: { spec: unknown; cwd: string; label: string }[] = [];
+  const deps: EscalationDispatchDeps = {
+    countLiveEscalations: () => opts.countLive ?? 0,
+    isEscalationLive: () => opts.isLive ?? false,
+    resolveConfig: () => opts.config ?? { model: "sonnet", effort: "high" },
+    launch: async (args) => {
+      if (opts.launchThrows) throw new Error("launch boom");
+      launches.push(args);
+      return { ok: opts.launchOk ?? true };
+    },
+  };
+  return { deps, launches };
+}
+
+test("dispatchEscalationSession: under cap + not live → launches ONE session at the config model/effort and returns dispatched", async () => {
+  const { deps, launches } = fakeEscalationDispatchDeps({
+    config: { model: "sonnet", effort: "high" },
+  });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-1-foo",
+    prompt: "/plan:deconflict fn-1-foo",
+    cwd: "/repo/wt",
+  });
+  expect(outcome).toBe("dispatched");
+  expect(launches.length).toBe(1);
+  expect(launches[0]?.label).toBe("deconflict::fn-1-foo");
+  expect(launches[0]?.cwd).toBe("/repo/wt");
+  expect(launches[0]?.spec).toEqual({
+    prompt: "/plan:deconflict fn-1-foo",
+    claudeName: "deconflict::fn-1-foo",
+    model: "sonnet",
+    effort: "high",
+  });
+});
+
+test("dispatchEscalationSession: a launch miss returns dispatch_failed", async () => {
+  const { deps } = fakeEscalationDispatchDeps({ launchOk: false });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-1-foo",
+    prompt: "/plan:deconflict fn-1-foo",
+    cwd: "/repo/wt",
+  });
+  expect(outcome).toBe("dispatch_failed");
+});
+
+test("dispatchEscalationSession: at the global cap → at_cap, launch NOT called (row stays pending)", async () => {
+  const { deps, launches } = fakeEscalationDispatchDeps({
+    countLive: MAX_LIVE_ESCALATION_SESSIONS,
+  });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "unblock",
+    id: "fn-1-foo.3",
+    prompt: "/plan:unblock fn-1-foo.3",
+    cwd: "/repo",
+  });
+  expect(outcome).toBe("at_cap");
+  expect(launches).toEqual([]);
+});
+
+test("dispatchEscalationSession: an already-live session → already_live, launch NOT called (occupancy guard wins over the cap)", async () => {
+  const { deps, launches } = fakeEscalationDispatchDeps({
+    isLive: true,
+    // Even under cap, occupancy short-circuits first.
+    countLive: 0,
+  });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-1-foo",
+    prompt: "/plan:deconflict fn-1-foo",
+    cwd: "/repo/wt",
+  });
+  expect(outcome).toBe("already_live");
+  expect(launches).toEqual([]);
+});
+
+test("dispatchEscalationSession: a THROWING launcher degrades to dispatch_failed (never throws)", async () => {
+  const { deps } = fakeEscalationDispatchDeps({ launchThrows: true });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-1-foo",
+    prompt: "/plan:deconflict fn-1-foo",
+    cwd: "/repo/wt",
+  });
+  expect(outcome).toBe("dispatch_failed");
+});
+
+// ---- selectPendingHumanNotifications (the stage-3 working-set read) -----------
+
+test("selectPendingHumanNotifications: picks only dispatched-but-not-notified close rows with the exact token", () => {
+  const { db } = freshMemDb();
+  // Deconflict dispatched, human not yet notified → SELECTED (the stage-3 working set).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-1-foo",
+    reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+    dir: "/repo/root",
+    mergeEscalatedAt: 111,
+  });
+  // Not yet dispatched (merge_escalated_at NULL) → dropped (stage 2 owns it still).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-2-pending",
+    reason: mergeConflictReason("fn-2-pending.1", "keeper/epic/fn-2-pending"),
+    dir: "/repo/root",
+  });
+  // Already human-notified → dropped (notify-once).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-3-notified",
+    reason: mergeConflictReason("fn-3-notified.1", "keeper/epic/fn-3-notified"),
+    dir: "/repo/root",
+    mergeEscalatedAt: 222,
+  });
+  db.run(
+    "UPDATE dispatch_failures SET human_notified_at = 333 WHERE verb = 'close' AND id = ?",
+    ["fn-3-notified"],
+  );
+  // Dispatched but an excluded reason token → dropped.
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-4-lock",
+    reason: "worktree-merge-lock-timeout: could not acquire the lock",
+    mergeEscalatedAt: 444,
+  });
+
+  const rows = selectPendingHumanNotifications(db);
+  expect(rows).toEqual([
+    {
+      id: "fn-1-foo",
+      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+      dir: "/repo/root",
+    },
+  ]);
+  db.close();
+});
+
+test("selectPendingHumanNotifications: empty table returns []", () => {
+  const { db } = freshMemDb();
+  expect(selectPendingHumanNotifications(db)).toEqual([]);
+  db.close();
+});
+
+// ---- runDeconflictHumanNotifySweep (stage-3 orchestration core, injected deps) -
+
+interface HumanNotifyMintCall {
+  id: string;
+  outcome: MergeHumanNotifiedOutcome;
+}
+
+function fakeHumanNotifySweepDeps(opts: {
+  pending: PendingMergeEscalation[];
+  stillPending?: (id: string) => boolean;
+  deconflictOutcome?: (id: string) => ResolverOutcome;
+  notify?: (
+    row: PendingMergeEscalation,
+    verdict: "declined" | "died",
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  selectThrows?: boolean;
+}): {
+  deps: DeconflictHumanNotifySweepDeps;
+  mints: HumanNotifyMintCall[];
+  notifies: { id: string; verdict: "declined" | "died" }[];
+} {
+  const mints: HumanNotifyMintCall[] = [];
+  const notifies: { id: string; verdict: "declined" | "died" }[] = [];
+  const deps: DeconflictHumanNotifySweepDeps = {
+    selectPending: () => {
+      if (opts.selectThrows) throw new Error("read boom");
+      return opts.pending;
+    },
+    stillPending: opts.stillPending ?? (() => true),
+    // Default: the deconflict session already declined (terminal), so the notify fires.
+    deconflictOutcome:
+      opts.deconflictOutcome ??
+      (() => ({ terminal: true, verdict: "declined" })),
+    notifyHuman: async (row, verdict) => {
+      notifies.push({ id: row.id, verdict });
+      return (await opts.notify?.(row, verdict)) ?? "notified";
+    },
+    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
+  };
+  return { deps, mints, notifies };
+}
+
+function humanNotifyPending(): PendingMergeEscalation[] {
+  return [
+    {
+      id: "fn-1-foo",
+      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+      dir: "/repo/root",
+    },
+  ];
+}
+
+test("runDeconflictHumanNotifySweep: a declined deconflict notifies the human ONCE and mints notified", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
+    pending: humanNotifyPending(),
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ id: "fn-1-foo", verdict: "declined" }]);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notified" }]);
+});
+
+test("runDeconflictHumanNotifySweep: a DIED deconflict notifies once and carries the died verdict", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
+    pending: humanNotifyPending(),
+    deconflictOutcome: () => ({ terminal: true, verdict: "died" }),
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ id: "fn-1-foo", verdict: "died" }]);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notified" }]);
+});
+
+test("runDeconflictHumanNotifySweep: a notify_failed leaves the marker unset (re-sweepable, never silent)", async () => {
+  const { deps, mints } = fakeHumanNotifySweepDeps({
+    pending: humanNotifyPending(),
+    notify: async () => "notify_failed",
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notify_failed" }]);
+});
+
+test("runDeconflictHumanNotifySweep: a THROWING notify never aborts the sweep (records notify_failed)", async () => {
+  const { deps, mints } = fakeHumanNotifySweepDeps({
+    pending: humanNotifyPending(),
+    notify: async () => {
+      throw new Error("botctl boom");
+    },
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notify_failed" }]);
+});
+
+test("runDeconflictHumanNotifySweep: a live/not-yet-terminal deconflict defers — no notify, no mint", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
+    pending: humanNotifyPending(),
+    deconflictOutcome: () => ({ terminal: false }),
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runDeconflictHumanNotifySweep: a row cleared mid-sweep (stillPending false, e.g. retry_dispatch) is skipped — no notify, no mint", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
+    pending: humanNotifyPending(),
+    stillPending: () => false,
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runDeconflictHumanNotifySweep: a non-token reason is skipped (defense-in-depth gate)", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: "worktree-merge-lock-timeout: could not acquire the lock",
+        dir: "/repo/root",
+      },
+    ],
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runDeconflictHumanNotifySweep: an empty pending set is a no-op", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({ pending: [] });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
+});
+
+test("runDeconflictHumanNotifySweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
+    pending: [],
+    selectThrows: true,
+  });
+  await runDeconflictHumanNotifySweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
 });
 
 // fn-701 task .3 — @parcel/watcher pre-warm. The native-addon dlopen race is

@@ -2625,8 +2625,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // additive ALTER, not an epics-shape change), fn-1107 task .1. v109 appends
   // the nullable `harness`/`resume_target` columns to BOTH events (five-place
   // lockstep) and jobs (migration-only) — an additive ALTER, not an epics-shape
-  // change, fn-1103 task .3.
-  expect(SCHEMA_VERSION).toBe(109);
+  // change, fn-1103 task .3. v110 appends the nullable `human_notified_at`
+  // once-marker to BOTH `dispatch_failures` and `block_escalations` (the terminal
+  // human-notify stage of the two escalation paths — additive ALTERs, not an
+  // epics-shape change), fn-1129 task .1.
+  expect(SCHEMA_VERSION).toBe(110);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

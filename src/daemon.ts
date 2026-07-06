@@ -118,7 +118,11 @@ import type {
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
 import { extractMutationPath } from "./derivers";
-import { isRetryableDispatchKey } from "./dispatch-command";
+import {
+  defaultPlanPrompt,
+  type EscalationVerb,
+  isRetryableDispatchKey,
+} from "./dispatch-command";
 import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
@@ -130,6 +134,7 @@ import {
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_WEDGE_DISTRESS_VERB,
 } from "./dispatch-failure-key";
+import { resolveEscalationLaunchConfig } from "./escalation-config";
 import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
@@ -160,7 +165,7 @@ import type {
   HandoffOutboundMessage,
   HandoffWorkerData,
 } from "./handoff-worker";
-import { livePage } from "./integrity-probe";
+import { KEEPER_TOPIC, livePage } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import type {
   BackupResultMessage,
@@ -174,6 +179,7 @@ import type {
   PlanWorkerOutbound,
   RecheckPendingMessage,
 } from "./plan-worker";
+import { isStoppedJobLive } from "./reconcile-core";
 import {
   DEFAULT_BATCH_SIZE,
   type DrainOptions,
@@ -1010,16 +1016,46 @@ export interface PendingMergeEscalation {
   dir: string | null;
 }
 
-/** The outcome the producer records on the `MergeEscalationAttempted` event. A
- *  TERMINAL `sent` / `queued_for_wake` stamps the `merge_escalated_at` once-marker
- *  (task .1's fold); `send_failed` is NON-terminal — the row stays re-sweepable. */
-export type MergeEscalationOutcome = "sent" | "queued_for_wake" | "send_failed";
+/** The outcome the deconflict-dispatch sweep records on the `MergeEscalationAttempted`
+ *  event. The TERMINAL `dispatched` (the `deconflict::<epic>` session launched) stamps
+ *  the `merge_escalated_at` once-marker (task .1's fold); `dispatch_failed` is
+ *  NON-terminal — the row stays re-sweepable. */
+export type MergeEscalationOutcome = "dispatched" | "dispatch_failed";
+
+/** The outcome the deconflict human-notify sweep (stage 3) records on the
+ *  `MergeHumanNotified` event. The TERMINAL `notified` (the one botctl notification
+ *  was delivered) stamps the `human_notified_at` once-marker; `notify_failed` is
+ *  NON-terminal — the row stays re-sweepable so the next tick retries. */
+export type MergeHumanNotifiedOutcome = "notified" | "notify_failed";
+
+/** The result of one shared-helper escalation dispatch. `dispatched` /
+ *  `dispatch_failed` are the two MINT outcomes ({@link MergeEscalationOutcome});
+ *  `at_cap` (the global concurrency cap is saturated) and `already_live` (a
+ *  `<verb>::<id>` session is already running, i.e. the mint fold has not caught up)
+ *  are SKIP outcomes — no marker is minted and the row re-sweeps next tick. */
+export type EscalationDispatchOutcome =
+  | MergeEscalationOutcome
+  | "at_cap"
+  | "already_live";
+
+/** Global cap on concurrent escalation sessions (`unblock::` + `deconflict::`
+ *  combined). At cap the dispatch is SKIPPED — the row stays pending and re-sweeps —
+ *  so a board with many stuck escalations never fans out an unbounded number of
+ *  sessions. A coarse safety valve read off the live jobs projection (plus the
+ *  producer's not-yet-folded in-flight memo). */
+export const MAX_LIVE_ESCALATION_SESSIONS = 3;
+
+/** TTL (ms) for the producer's in-flight escalation memo — a launched-but-not-yet-folded
+ *  `<verb>::<id>` key is pruned once its `jobs` row folds OR it ages past this ceiling
+ *  (a launch that reported `ok` but never folded a jobs row), so the memo can never
+ *  wedge a cap slot forever. Well above the launch → birth-ingest fold lag. */
+export const INFLIGHT_ESCALATION_TTL_MS = 5 * 60_000;
 
 /** The result of the shared `planner@<epic>` bus-notify core — the send + (on the
  *  offline-creator path) wake. Fail-open by contract: every error degrades to
- *  `send_failed`, never throws into a sweep. Shared by the block + merge producers. */
+ *  `send_failed`, never throws into a sweep. Used by the block-escalation producer. */
 export interface PlannerNotifyResult {
-  outcome: MergeEscalationOutcome;
+  outcome: "sent" | "queued_for_wake" | "send_failed";
   detail: string;
 }
 
@@ -1119,162 +1155,64 @@ function parseMergeConflictReason(
   return { source: m[1], base: m[2] };
 }
 
-/**
- * Build the resolve+unstick brief the merge-escalation producer sends to
- * `planner@<epic>`. Parses the source/base branches out of the reason and derives
- * the base worktree path via {@link worktreePathFor} (`row.dir` is the repo root).
- * The recipe: `cd <worktree>` → `git merge --no-ff <source>` (NEVER `--squash` /
- * rebase — a single-parent commit re-conflicts on the next fan-in) → resolve merging
- * BOTH intents (never pick a side) → run the epic's tests/build → commit the merge
- * commit → `keeper autopilot retry close::<epic>`, plus the escalate-to-human
- * guardrail for a semantically-dense conflict. A parse-miss (or a missing repo dir)
- * DEGRADES to a still-human-actionable manual body — the sweep never throws on a
- * reason it can't parse. The free-text reason rides as a body line, never a shell
- * arg (the notify helper passes the whole body via stdin). Pure.
- *
- * Opens by naming the resolver's `resolverVerdict` — the escalation fires only AFTER
- * the autonomous resolver reached a terminal outcome (`declined` = it stamped BLOCKED,
- * `died` = its job crashed), so the human is the fallback, never a racer. Carries the
- * pause caveat: pausing does NOT stop an in-flight resolver, so on a retry (or a
- * still-live resolver) the operator defers to the resolver's verdict before merging by
- * hand.
- */
-export function buildMergeEscalationBody(args: {
-  epicId: string;
-  reason: string;
-  repoDir: string | null;
-  resolverVerdict: "declined" | "died";
-}): string {
-  const epic = args.epicId;
-  const parsed = parseMergeConflictReason(args.reason);
-  const hasRepo = args.repoDir != null && args.repoDir !== "";
-  const verdictLine =
-    args.resolverVerdict === "died"
-      ? `An autonomous merge-resolver already ran on close::${epic} and its job DIED before resolving — it now needs you.`
-      : `An autonomous merge-resolver already ran on close::${epic} and DECLINED it (not mechanically clear — it stamped BLOCKED) — it now needs you.`;
-  const resolverPauseNote = [
-    `NOTE: pausing does NOT stop an in-flight resolver — it only stops the recover`,
-    `sweep and new dispatches. If you retry this close (which re-dispatches a fresh`,
-    `resolver) or one is otherwise live, WAIT for its verdict: check`,
-    `\`keeper query jobs\` for a live \`resolve::${epic}\` and defer to it. A manual`,
-    `merge racing a live resolver is the exact collision this flow prevents.`,
-  ];
-  if (parsed == null || !hasRepo) {
-    // Parse-miss / no repo dir → a human-actionable manual body, never a throw.
-    return [
-      verdictLine,
-      `The worktree fan-in close for epic ${epic} is STUCK on a merge conflict; the`,
-      `autopilot will NOT auto-retry it. Observable: the base worktree is left clean`,
-      `and the sticky close row is staged for retry.`,
-      ``,
-      ...resolverPauseNote,
-      ``,
-      `FIRST run \`keeper autopilot pause\` — the recover sweep races your manual merge`,
-      `otherwise (it runs only while autopilot is unpaused). Then resolve`,
-      `\`close::${epic}\` by hand: open the epic's base worktree, RE-RUN the failed`,
-      `\`git merge --no-ff <source>\` (NOT \`--squash\` or rebase — a single-parent`,
-      `commit re-conflicts on the next fan-in), resolve the conflict by merging BOTH`,
-      `sides (never pick one side and drop the other), run the epic's tests/build,`,
-      `commit the merge commit, then verify \`git branch --contains <source>\` lists`,
-      `the base branch and unstick the board:`,
-      `\`keeper autopilot retry close::${epic}\` then \`keeper autopilot play\`.`,
-      ``,
-      `GUARDRAIL — if the conflict is not mechanically clear (a state machine, schema,`,
-      `security, or transaction-boundary conflict), LEAVE it stuck and ping the human.`,
-      `A confident-but-wrong merge is worse than a stuck close.`,
-      ``,
-      `Failure reason:`,
-      args.reason.trim(),
-    ].join("\n");
-  }
-  const worktree = worktreePathFor(args.repoDir as string, parsed.base);
-  return [
-    verdictLine,
-    `The worktree fan-in close for epic ${epic} is STUCK on a merge conflict; the`,
-    `autopilot will NOT auto-retry it. Observable: the base worktree's merge was`,
-    `aborted CLEAN and the sticky close row is staged for retry.`,
-    ``,
-    ...resolverPauseNote,
-    ``,
-    `Resolve it:`,
-    `  0. keeper autopilot pause`,
-    `     (the recover sweep races your manual merge otherwise — it runs ONLY while`,
-    `     autopilot is unpaused.)`,
-    `  1. cd ${worktree}`,
-    `  2. git merge --no-ff ${parsed.source}`,
-    `     (NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the`,
-    `     next fan-in; \`--no-ff\` makes ${parsed.source} an ancestor so the retry`,
-    `     merge no-ops. The base worktree is left CLEAN after the abort, so RE-RUN`,
-    `     the merge to recreate the conflict markers.)`,
-    `  3. Resolve the conflict by merging BOTH intents — never pick one side and`,
-    `     drop the other.`,
-    `  4. Run the epic's tests/build; passing tests are necessary, not sufficient.`,
-    `  5. Commit the merge commit, then verify: \`git branch --contains ${parsed.source}\``,
-    `     lists the base branch (${parsed.source} is an ancestor now).`,
-    ``,
-    `Unstick the board when done:`,
-    `  keeper autopilot retry close::${epic}`,
-    `  keeper autopilot play`,
-    ``,
-    `GUARDRAIL — if the conflict is not mechanically clear (a state machine, schema,`,
-    `security, or transaction-boundary conflict), LEAVE it stuck and ping the human.`,
-    `A confident-but-wrong merge is worse than a stuck close.`,
-    ``,
-    `Failure reason:`,
-    args.reason.trim(),
-  ].join("\n");
-}
-
-/** Injectable dependency surface for {@link runMergeEscalationSweep}. Mirrors
- *  {@link BlockEscalationSweepDeps}'s fail-open injectable-deps discipline so the
- *  producer is testable with synthetic rows + an injected notify, and never throws
- *  into the daemon loop. */
+/** Injectable dependency surface for {@link runMergeEscalationSweep} — the daemon's
+ *  DECONFLICT-DISPATCH sweep (stage 2). Mirrors {@link ResolverDispatchSweepDeps}'s
+ *  fail-open injectable-deps discipline so the producer is testable with synthetic
+ *  rows + an injected dispatcher, and never throws into the daemon loop. */
 export interface MergeEscalationSweepDeps {
   /** The current-state pending working set (DELEGATES to
    *  {@link selectPendingMergeEscalations} in production). */
   readonly selectPending: () => PendingMergeEscalation[];
   /** Re-read that the sticky close row for `id` is STILL present with
-   *  `merge_escalated_at IS NULL` — checked immediately before the send to narrow
-   *  the clear-mid-sweep window (a `retry_dispatch` between select and send drops
+   *  `merge_escalated_at IS NULL` — checked immediately before the launch to narrow
+   *  the clear-mid-sweep window (a `retry_dispatch` between select and launch drops
    *  the row). Reads the live projection on the writable connection in production. */
   readonly stillPending: (id: string) => boolean;
   /** Classify the dispatched `resolve::<epic>` resolver's outcome for `id`
    *  (DELEGATES to {@link classifyResolverOutcome} over the live `jobs` map in
-   *  production). The escalation NOTIFIES only on a terminal verdict; while the
-   *  resolver is live or its job has not folded yet it returns `{terminal:false}` and
-   *  the sweep skips the row (the resolver owns the conflict first). */
+   *  production). The deconflict dispatches only after a TERMINAL resolver verdict;
+   *  while the resolver is live or its job has not folded yet it returns
+   *  `{terminal:false}` and the sweep skips the row (the resolver, tier 1, owns the
+   *  conflict first). */
   readonly resolverOutcome: (id: string) => ResolverOutcome;
-  /** Notify `planner@<epic>` with the prebuilt body (and wake on the offline-creator
-   *  path). Async + fail-open. */
-  readonly notifyPlanner: (
-    target: string,
-    body: string,
-  ) => Promise<PlannerNotifyResult>;
-  /** Mint a `MergeEscalationAttempted{outcome}` synthetic event. Task .1's fold
-   *  stamps `merge_escalated_at` ONLY on a terminal outcome; it NEVER clears the
-   *  sticky row — only `retry_dispatch` (`DispatchCleared`) does. */
+  /** Launch ONE `deconflict::<epic>` escalation session for the sticky row (into the
+   *  managed session, at the escalation model/effort, with the `/plan:deconflict`
+   *  prompt). DELEGATES to the shared {@link dispatchEscalationSession} in production,
+   *  so the global cap + per-key occupancy guard apply. Async + fail-open — every
+   *  error degrades to `dispatch_failed`, and a SKIP (`at_cap` / `already_live`) mints
+   *  nothing so the row re-sweeps. */
+  readonly dispatchDeconflict: (
+    row: PendingMergeEscalation,
+  ) => Promise<EscalationDispatchOutcome>;
+  /** Mint a `MergeEscalationAttempted{outcome}` synthetic event. Task .1's fold stamps
+   *  `merge_escalated_at` ONLY on the terminal `dispatched`; it NEVER clears the sticky
+   *  row — only `retry_dispatch` (`DispatchCleared`) does. */
   readonly mintAttempted: (id: string, outcome: MergeEscalationOutcome) => void;
   /** Warn sink for non-fatal diagnostics. */
   readonly noteLine?: (line: string) => void;
 }
 
 /**
- * Run one daemon merge-escalation sweep — the producer half of the escalate-once
- * loop for a stuck worktree fan-in close. Walk the sticky `worktree-merge-conflict`
- * close rows, gate each by {@link shouldEscalateMergeConflict} (defense-in-depth over
- * the selector's SQL filter), re-read that the row is STILL pending immediately
- * before the send (narrowing the clear-mid-sweep window), notify `planner@<epic>`
- * with the resolve+unstick brief, then mint `MergeEscalationAttempted{outcome}`.
+ * Run one daemon deconflict-dispatch sweep (stage 2) — the producer half of the
+ * dispatch-once loop for a stuck worktree fan-in close whose tier-1 resolver has
+ * DECLINED or DIED. Walk the sticky `worktree-merge-conflict` close rows, gate each by
+ * {@link shouldEscalateMergeConflict} (defense-in-depth over the selector's SQL
+ * filter), re-read that the row is STILL pending immediately before the launch
+ * (narrowing the clear-mid-sweep window), sequence behind the resolver's TERMINAL
+ * verdict, then launch ONE `deconflict::<epic>` session and mint
+ * `MergeEscalationAttempted{outcome}`.
  *
- * NOTIFIES ONLY — the sweep NEVER mints `DispatchCleared` and never clears the
- * sticky row; only `retry_dispatch` does. A TERMINAL `sent` / `queued_for_wake`
- * stamps the once-marker (task .1's fold), so the next sweep's selector drops the
- * row; a `send_failed` leaves the marker NULL so the row stays re-sweepable. Each
- * close failure keys on its own epic (`close::<epic>`), so there is one row per epic
- * and no coalescing is needed. NEVER throws — every helper edge degrades to a
- * recorded outcome (mirrors {@link runBlockEscalationSweep}). The spawn lives ONLY
- * here in the producer, never reachable from `applyEvent`, so a re-fold never
- * re-fires a send.
+ * DISPATCHES ONLY — the sweep NEVER mints `DispatchCleared` and never clears the
+ * sticky row; only `retry_dispatch` does (a successful deconflict session fires it on
+ * the clear path, dropping the row and every marker with it, so stage 3 never runs).
+ * The TERMINAL `dispatched` stamps the `merge_escalated_at` once-marker (task .1's
+ * fold), so the next sweep's selector drops the row; a `dispatch_failed` leaves the
+ * marker NULL so the row stays re-sweepable, and a SKIP (`at_cap` / `already_live`)
+ * mints nothing at all. Each close failure keys on its own epic (`close::<epic>`), so
+ * there is one row per epic and no coalescing is needed. NEVER throws — every helper
+ * edge degrades to a recorded outcome (mirrors {@link runResolverDispatchSweep}). The
+ * spawn lives ONLY here in the producer, never reachable from `applyEvent`, so a
+ * re-fold never re-fires a launch.
  */
 export async function runMergeEscalationSweep(
   deps: MergeEscalationSweepDeps,
@@ -1285,7 +1223,7 @@ export async function runMergeEscalationSweep(
     pending = deps.selectPending();
   } catch (err) {
     note(
-      `# warn: merge-escalation sweep read threw (non-fatal): ${
+      `# warn: deconflict-dispatch sweep read threw (non-fatal): ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
@@ -1295,46 +1233,212 @@ export async function runMergeEscalationSweep(
 
   for (const row of pending) {
     // Defense-in-depth gate: the selector already filters by the exact token, but
-    // re-apply the pure gate so an injected/loosened selector can never fan out a
-    // non-escalatable reason.
+    // re-apply the pure gate so an injected/loosened selector can never dispatch a
+    // deconflict session for a non-merge-conflict reason.
     if (!shouldEscalateMergeConflict(row.reason)) continue;
-    // Re-read immediately before the send: a `retry_dispatch` that cleared the row
-    // (or the escalation fold that stamped the marker) between select and send means
-    // there is nothing left to escalate — skip without minting.
+    // Re-read immediately before the launch: a `retry_dispatch` that cleared the row
+    // (or the fold that stamped the marker) between select and launch means there is
+    // nothing left to deconflict — skip without minting.
     if (!deps.stillPending(row.id)) continue;
-    // Sequence behind the resolver: the sibling resolver-dispatch sweep owns the
-    // conflict first (the selector already required `resolver_dispatched_at`), so the
-    // human notify waits until that resolver reaches a TERMINAL outcome. While it is
-    // live — or its job has not folded yet (the launch window) — skip without minting,
-    // so the row re-sweeps next tick. A terminal verdict names the resolver's fate in
-    // the brief. `retry_dispatch` re-arms the whole flow by deleting the row.
-    const outcome = deps.resolverOutcome(row.id);
-    if (!outcome.terminal) continue;
+    // Sequence behind the resolver (tier 1): the sibling resolver-dispatch sweep owns
+    // the conflict first (the selector already required `resolver_dispatched_at`), so
+    // the deconflict dispatch waits until that resolver reaches a TERMINAL outcome.
+    // While it is live — or its job has not folded yet (the launch window) — skip
+    // without minting, so the row re-sweeps next tick. `retry_dispatch` re-arms the
+    // whole flow by deleting the row.
+    if (!deps.resolverOutcome(row.id).terminal) continue;
 
-    const target = `planner@${row.id}`;
-    const body = buildMergeEscalationBody({
-      epicId: row.id,
-      reason: row.reason,
-      repoDir: row.dir,
-      resolverVerdict: outcome.verdict,
-    });
-    let result: PlannerNotifyResult;
+    let outcome: EscalationDispatchOutcome;
     try {
-      result = await deps.notifyPlanner(target, body);
+      outcome = await deps.dispatchDeconflict(row);
     } catch (err) {
-      // The helper is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a terminal outcome and never aborts the sweep.
+      // The dispatcher is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a non-terminal outcome and never aborts the sweep.
       note(
-        `# warn: merge-escalation notify threw for ${row.id} (non-fatal): ${
+        `# warn: deconflict dispatch threw for ${row.id} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-      result = { outcome: "send_failed", detail: "notify threw" };
+      outcome = "dispatch_failed";
     }
-    // Mint the attempt regardless of outcome: task .1's fold stamps the once-marker
-    // ONLY on a terminal `sent` / `queued_for_wake`, so a `send_failed` folds to a
-    // no-op and the row stays re-sweepable next tick.
-    deps.mintAttempted(row.id, result.outcome);
+    // A SKIP (`at_cap` / `already_live`) mints nothing: the marker stays NULL and the
+    // row re-sweeps next tick (at cap, or once the in-flight session folds). Only a
+    // real dispatch attempt (`dispatched` / `dispatch_failed`) mints — the fold stamps
+    // the once-marker ONLY on the terminal `dispatched`, so a `dispatch_failed` folds
+    // to a no-op and the row stays re-sweepable.
+    if (outcome === "at_cap" || outcome === "already_live") continue;
+    deps.mintAttempted(row.id, outcome);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// fn-1129 — daemon deconflict human-notify sweep (stage 3)
+// ---------------------------------------------------------------------------
+//
+// The TERMINAL stage of the deconflict escalation path. Where stage 2
+// (`runMergeEscalationSweep`) DISPATCHES a `deconflict::<epic>` session once its
+// tier-1 resolver declined/died, this sweep fires the ONE human notification — via
+// botctl — only once that deconflict session ALSO declines or dies. A successful
+// deconflict ends with its own `keeper autopilot retry close::<epic>`, which drops the
+// sticky row and every marker with it, so this sweep never sees a resolved close.
+
+/**
+ * Select every sticky `worktree-merge-conflict` close failure whose deconflict session
+ * has been DISPATCHED (`merge_escalated_at IS NOT NULL`) but whose human has NOT yet
+ * been notified (`human_notified_at IS NULL`) — the stage-3 working set. The SQL twin
+ * of {@link selectPendingMergeEscalations}, gated on the THIRD once-marker. The
+ * leading-token filter is identical (exact {@link MERGE_ESCALATION_REASON_TOKEN}), so a
+ * non-merge-conflict sibling never matches. A stamped `human_notified_at` (the terminal
+ * `notified` fold) drops the row out — the notify-once guarantee. `retry_dispatch`
+ * re-arms the whole chain by deleting the row (all three markers back to NULL).
+ */
+export function selectPendingHumanNotifications(
+  db: Database,
+): PendingMergeEscalation[] {
+  return db
+    .query(
+      `SELECT id, reason, dir FROM dispatch_failures
+         WHERE verb = 'close'
+           AND merge_escalated_at IS NOT NULL
+           AND human_notified_at IS NULL
+           AND reason IS NOT NULL
+           AND instr(reason, ':') > 0
+           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
+    )
+    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingMergeEscalation[];
+}
+
+/**
+ * Build the ONE structured operator notification the deconflict human-notify sweep
+ * sends over botctl when a `deconflict::<epic>` session DECLINES (stamped BLOCKED) or
+ * DIES. Short by design — the sticky close row already carries the full context on the
+ * board (`keeper status`); this is the courtesy ping that names the epic, the verdict,
+ * and the single unstick command. The free-text reason is trimmed onto its own line
+ * (it rides as a botctl argv element via an array-form spawn, never a shell string, so
+ * no interpolation fires). Pure.
+ */
+export function buildDeconflictHumanNotifyBody(args: {
+  epicId: string;
+  reason: string;
+  verdict: "declined" | "died";
+}): string {
+  const epic = args.epicId;
+  const verdictLine =
+    args.verdict === "died"
+      ? `its job DIED before resolving`
+      : `it DECLINED (not mechanically clear — stamped BLOCKED)`;
+  return [
+    `🔴 keeper: deconflict::${epic} needs you — the autonomous merge-resolver AND the`,
+    `deconflict escalation session both gave up on \`close::${epic}\` (${verdictLine});`,
+    `the worktree fan-in close is STUCK and will NOT auto-retry.`,
+    ``,
+    `Resolve the conflict by hand in the epic's base worktree (merge BOTH intents,`,
+    `never pick one side), then unstick the board:`,
+    `  keeper autopilot retry close::${epic}`,
+    ``,
+    `Failure reason: ${args.reason.trim()}`,
+  ].join("\n");
+}
+
+/** Injectable dependency surface for {@link runDeconflictHumanNotifySweep} — the
+ *  stage-3 human-notify sweep. Same fail-open injectable-deps discipline as
+ *  {@link MergeEscalationSweepDeps}. */
+export interface DeconflictHumanNotifySweepDeps {
+  /** The current-state pending working set (DELEGATES to
+   *  {@link selectPendingHumanNotifications} in production). */
+  readonly selectPending: () => PendingMergeEscalation[];
+  /** Re-read that the sticky close row for `id` is STILL present with
+   *  `human_notified_at IS NULL` — checked immediately before the notify to narrow the
+   *  clear-mid-sweep window (a `retry_dispatch` between select and notify drops the
+   *  row). Reads the live projection on the writable connection in production. */
+  readonly stillPending: (id: string) => boolean;
+  /** Classify the dispatched `deconflict::<epic>` session's outcome for `id`
+   *  (DELEGATES to {@link classifyEscalationOutcome} over the live `jobs` map in
+   *  production). The human is notified ONLY on a terminal verdict; while the deconflict
+   *  session is live or its job has not folded yet it returns `{terminal:false}` and the
+   *  sweep skips the row (a successful deconflict clears the sticky before this runs). */
+  readonly deconflictOutcome: (id: string) => ResolverOutcome;
+  /** Send the ONE botctl notification about the declined/dead deconflict session.
+   *  Async + fail-open — every error degrades to `notify_failed` so the row re-sweeps
+   *  (the sticky stays operator-visible meanwhile), never a wedge or a silent drop. */
+  readonly notifyHuman: (
+    row: PendingMergeEscalation,
+    verdict: "declined" | "died",
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  /** Mint a `MergeHumanNotified{outcome}` synthetic event. The fold stamps
+   *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the sticky
+   *  row — only `retry_dispatch` (`DispatchCleared`) does. */
+  readonly mintAttempted: (
+    id: string,
+    outcome: MergeHumanNotifiedOutcome,
+  ) => void;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one daemon deconflict human-notify sweep (stage 3) — the terminal "notify the
+ * human ONCE" half of the deconflict escalation path. Walk the sticky
+ * `worktree-merge-conflict` close rows whose deconflict session was dispatched but
+ * whose human is not yet notified, gate each by {@link shouldEscalateMergeConflict}
+ * (defense-in-depth), re-read that the row is STILL pending, sequence behind the
+ * deconflict session's TERMINAL decline/death, send ONE botctl notification, then mint
+ * `MergeHumanNotified{outcome}`.
+ *
+ * NOTIFIES ONCE — the sweep NEVER clears the sticky row; only `retry_dispatch` does. A
+ * TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next sweep's
+ * selector drops the row; a `notify_failed` (botctl absent / failed) leaves the marker
+ * NULL so the row re-sweeps and the notification is never lost (the sticky is
+ * operator-visible the whole time). NEVER throws — every helper edge degrades to a
+ * recorded outcome. The spawn lives ONLY here in the producer, never reachable from
+ * `applyEvent`.
+ */
+export async function runDeconflictHumanNotifySweep(
+  deps: DeconflictHumanNotifySweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let pending: PendingMergeEscalation[];
+  try {
+    pending = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: deconflict human-notify sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  if (pending.length === 0) return;
+
+  for (const row of pending) {
+    if (!shouldEscalateMergeConflict(row.reason)) continue;
+    // Re-read immediately before the notify: a `retry_dispatch` that cleared the row
+    // (or the fold that stamped the marker) between select and notify means there is
+    // nothing left to notify — skip without minting.
+    if (!deps.stillPending(row.id)) continue;
+    // Sequence behind the deconflict session: notify the human only once that session
+    // reached a TERMINAL decline/death. While it is live — or its job has not folded
+    // yet — skip without minting, so the row re-sweeps next tick. A CLEAR deconflict
+    // fires `retry_dispatch`, deleting the row before this sweep ever sees it.
+    const outcome = deps.deconflictOutcome(row.id);
+    if (!outcome.terminal) continue;
+
+    let result: MergeHumanNotifiedOutcome;
+    try {
+      result = await deps.notifyHuman(row, outcome.verdict);
+    } catch (err) {
+      // The helper is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a non-terminal outcome and never aborts the sweep.
+      note(
+        `# warn: deconflict human-notify threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      result = "notify_failed";
+    }
+    // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
+    // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
+    deps.mintAttempted(row.id, result);
   }
 }
 
@@ -1632,6 +1736,194 @@ export async function runResolverDispatchSweep(
     // re-sweepable next tick.
     deps.mintAttempted(row.id, outcome);
   }
+}
+
+// ---------------------------------------------------------------------------
+// fn-1129 — shared escalation-dispatch substrate (deconflict:: + unblock::)
+// ---------------------------------------------------------------------------
+//
+// The launch machinery both escalation sweeps use to fire a purpose-built plan-skill
+// session — the deconflict-dispatch sweep here, the unblock-dispatch sweep in the
+// sibling task. A `<verb>::<id>` escalation session is a fresh sonnet/high context that
+// boots `/plan:<verb>` and resolves the incident WITHOUT the creator's context; it is
+// NEVER a worker cell, so it reads the SEPARATE escalation launch config. The shared
+// helper enforces the two guards that keep the fan-out bounded: a global concurrency
+// cap across BOTH verbs, and a per-key occupancy guard so cadence + fold lag can never
+// double-dispatch the same key.
+
+/**
+ * Is this `jobs` row a LIVE escalation session? `working`, or `stopped` with a
+ * still-live backend (the shared {@link isStoppedJobLive} rule — the ONE liveness
+ * predicate, never forked). `livePaneIds` is `null` here (the daemon runs no per-tick
+ * pane probe on this path), so a `stopped` row conservatively counts as live until it
+ * reaps: the SAFE direction for a cap (never under-count) and an occupancy guard (never
+ * a double-dispatch). Pure.
+ */
+function escalationJobLive(job: Job): boolean {
+  if (job.state === "working") return true;
+  return job.state === "stopped" && isStoppedJobLive(job, null);
+}
+
+/**
+ * Count the LIVE escalation sessions (`unblock::` + `deconflict::` combined) in `jobs`
+ * — the global-cap denominator. Pure over the passed rows; exported for tests.
+ */
+export function countLiveEscalationSessions(jobs: readonly Job[]): number {
+  let n = 0;
+  for (const job of jobs) {
+    if (job.plan_verb !== "unblock" && job.plan_verb !== "deconflict") continue;
+    if (escalationJobLive(job)) n += 1;
+  }
+  return n;
+}
+
+/**
+ * Is a `<verb>::<id>` escalation session already LIVE in `jobs`? The per-key occupancy
+ * guard: after a dispatch mints its attempt, the once-marker fold may lag the next
+ * sweep tick, so the sweep re-reads a still-`NULL` marker — this catches the live
+ * session and skips the re-dispatch. Pure over the passed rows; exported for tests.
+ */
+export function escalationSessionLiveFor(
+  jobs: readonly Job[],
+  verb: EscalationVerb,
+  id: string,
+): boolean {
+  for (const job of jobs) {
+    if (job.plan_verb !== verb || job.plan_ref !== id) continue;
+    if (escalationJobLive(job)) return true;
+  }
+  return false;
+}
+
+/**
+ * Classify a `<verb>::<id>` escalation session's terminal outcome off `jobs` — the
+ * generalized twin of {@link classifyResolverOutcome} for the deconflict / unblock
+ * verbs (the resolver classifier is hard-keyed to `resolve`). `{terminal:false}` while
+ * a session is LIVE or no `<verb>::<id>` job row has folded yet (the launch window);
+ * `{terminal:true, verdict}` once a row folded and none is live — `declined` when any
+ * matching row is `ended` (a clean exit — it stamped BLOCKED / gave up), `died`
+ * otherwise (killed / stopped-dead). Coarse by design: the human notify only needs
+ * "declined vs died". Pure over the passed rows; exported for tests.
+ */
+export function classifyEscalationOutcome(
+  jobs: readonly Job[],
+  verb: EscalationVerb,
+  id: string,
+): ResolverOutcome {
+  let live = false;
+  let sawRow = false;
+  let sawEnded = false;
+  for (const job of jobs) {
+    if (job.plan_verb !== verb || job.plan_ref !== id) continue;
+    sawRow = true;
+    if (escalationJobLive(job)) live = true;
+    if (job.state === "ended") sawEnded = true;
+  }
+  if (live || !sawRow) return { terminal: false };
+  return { terminal: true, verdict: sawEnded ? "declined" : "died" };
+}
+
+/**
+ * Load the `<verb>::<id>` escalation job rows into the array shape
+ * {@link classifyEscalationOutcome} reads — the stage-3 human-notify sweep's terminal
+ * deconflict probe. Bounded (a handful of rows per key), selecting only the columns the
+ * liveness arms touch. A jobs read failure degrades to an EMPTY array, which classifies
+ * as `{terminal:false}` so the notify conservatively WAITS (never a premature notify on a
+ * transient error). Module-level twin of {@link resolveJobsForEpic}.
+ */
+export function resolveEscalationJobsFor(
+  db: Database,
+  verb: EscalationVerb,
+  id: string,
+): Job[] {
+  try {
+    return db
+      .query(
+        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb = ? AND plan_ref = ?",
+      )
+      .all(verb, id) as unknown as Job[];
+  } catch {
+    return [];
+  }
+}
+
+/** Injectable dependency surface for {@link dispatchEscalationSession}. Fail-open by
+ *  contract — no dep throws into a sweep. */
+export interface EscalationDispatchDeps {
+  /** Count of currently-live escalation sessions (both verbs) for the global cap.
+   *  Production: {@link countLiveEscalationSessions} over the live jobs read PLUS the
+   *  producer's not-yet-folded in-flight memo. */
+  readonly countLiveEscalations: () => number;
+  /** True iff a `<verb>::<id>` session is already live — the per-key occupancy guard.
+   *  Production: {@link escalationSessionLiveFor} over the same reads. */
+  readonly isEscalationLive: (verb: EscalationVerb, id: string) => boolean;
+  /** Resolve the escalation session's `{model, effort}` (DELEGATES to
+   *  {@link resolveEscalationLaunchConfig} in production). */
+  readonly resolveConfig: () => { model: string; effort: string };
+  /** Launch ONE `<verb>::<id>` session with the built {@link LaunchSpec} + cwd; returns
+   *  `{ ok }`. Async + fail-open (a throw is caught and mapped to `dispatch_failed`). */
+  readonly launch: (args: {
+    spec: LaunchSpec;
+    cwd: string;
+    label: string;
+  }) => Promise<{ ok: boolean }>;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Dispatch ONE `<verb>::<id>` escalation session — the shared launch path both the
+ * deconflict-dispatch sweep and the unblock-dispatch sweep call. Enforces, in order:
+ * the per-key occupancy guard ({@link EscalationDispatchDeps.isEscalationLive} — a
+ * still-live session means the mint fold has not caught up, so skip → `already_live`),
+ * then the global concurrency cap ({@link MAX_LIVE_ESCALATION_SESSIONS} — at cap the
+ * row stays pending and re-sweeps → `at_cap`). Only past both guards does it resolve
+ * the escalation `{model, effort}` and launch the session at `--name <verb>::<id>` +
+ * the `/plan:<verb>` prompt. Returns `dispatched` on a successful launch,
+ * `dispatch_failed` on a launch miss (or a launcher throw — caught), so the caller
+ * mints the once-marker ONLY on `dispatched` and re-sweeps otherwise. NEVER throws.
+ */
+export async function dispatchEscalationSession(
+  deps: EscalationDispatchDeps,
+  args: { verb: EscalationVerb; id: string; prompt: string; cwd: string },
+): Promise<EscalationDispatchOutcome> {
+  const note = deps.noteLine ?? (() => {});
+  const label = `${args.verb}::${args.id}`;
+  // Occupancy guard FIRST: a live session for this key means a prior tick already
+  // launched it and the marker fold is still catching up — skip without launching.
+  if (deps.isEscalationLive(args.verb, args.id)) {
+    note(`# escalation dispatch skipped — ${label} already live`);
+    return "already_live";
+  }
+  // Global cap: bound the total concurrent escalation sessions across BOTH verbs. At
+  // cap the row stays pending and re-sweeps once a session frees a slot.
+  if (deps.countLiveEscalations() >= MAX_LIVE_ESCALATION_SESSIONS) {
+    note(
+      `# escalation dispatch skipped — at cap (${MAX_LIVE_ESCALATION_SESSIONS}); ${label} stays pending`,
+    );
+    return "at_cap";
+  }
+  const { model, effort } = deps.resolveConfig();
+  const spec: LaunchSpec = {
+    prompt: args.prompt,
+    claudeName: label,
+    model,
+    effort,
+  };
+  let result: { ok: boolean };
+  try {
+    result = await deps.launch({ spec, cwd: args.cwd, label });
+  } catch (err) {
+    // The launcher is fail-open by contract; this catch is defense-in-depth so a
+    // surprise throw still records a non-terminal outcome and never aborts the sweep.
+    note(
+      `# warn: escalation launch threw for ${label} (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return "dispatch_failed";
+  }
+  return result.ok ? "dispatched" : "dispatch_failed";
 }
 
 /**
@@ -7252,6 +7544,67 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
+   * Mint one synthetic `MergeHumanNotified` event onto the writable connection — the
+   * deconflict human-notify sweep's (stage 3) only write path into the
+   * `dispatch_failures.human_notified_at` once-marker (it never UPDATEs the projection
+   * directly; the reducer fold owns that, stamping the marker ONLY on the terminal
+   * `notified` and NEVER clearing the sticky row). Sibling of
+   * {@link mintMergeEscalationEvent}. The close-row `id` rides the entity-key overload
+   * on `session_id` so a re-fold correlates the row WITHOUT re-parsing `data`; the full
+   * `{ id, outcome }` payload also rides `data` for the strict fold parser. NON-FATAL on
+   * insert failure — the next heartbeat sweep re-attempts (the marker stays NULL on a
+   * `notify_failed`).
+   */
+  function mintMergeHumanNotifiedEvent(
+    id: string,
+    outcome: MergeHumanNotifiedOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: id,
+        $pid: null,
+        $hook_event: "MergeHumanNotified",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ id, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] MergeHumanNotified mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
    * Read the task's `blocked_reason` from its plan state file
    * (`<project_dir>/.keeper/state/tasks/<task_id>.state.json`). Producer-side fs
    * read — legal OUTSIDE any fold. Returns null on every miss (no `project_dir`,
@@ -7550,22 +7903,148 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS);
 
-  // Producer-side merge-escalation sweep (fn-1009), sibling to the block-escalation
-  // sweep. Each heartbeat tick walks the sticky `worktree-merge-conflict` close
-  // rows (a fan-in content conflict the autopilot deliberately never auto-retries),
-  // sends `planner@<epic>` the resolve+unstick brief over the bus, and mints
-  // `MergeEscalationAttempted{outcome}`. NOTIFIES ONLY — it never clears the sticky
-  // row; only `retry_dispatch` does. A terminal `sent` / `queued_for_wake` stamps
-  // the `merge_escalated_at` once-marker (the escalation fold), so a daemon escalates a
-  // given stuck close ONCE. All wall-clock + spawn lives HERE in the producer, never
-  // in a fold; the spawn lives only here, so a re-fold never re-fires a notify.
-  //
-  // Rides the SAME 60s heartbeat as the block tick (a stuck close is not
-  // latency-sensitive on the order of seconds). `void` + `.catch` for the same
-  // reason as the block tick: the async notify must not block the heartbeat, and
-  // the sweep is fail-open by contract.
+  // Shared escalation-dispatch production wiring (fn-1129) — the deconflict-dispatch
+  // sweep here and the unblock-dispatch sweep in the sibling task both launch a
+  // `<verb>::<id>` plan-skill session through `dispatchEscalationSession`, bounded by the
+  // global concurrency cap + a per-key occupancy guard. `inFlightEscalations` is a
+  // producer-side memo of keys THIS process launched that may not have folded into the
+  // `jobs` projection yet (a session boots + emits a birth record + gets ingested SECONDS
+  // after launch), so the cap counts them until they fold and a within-tick burst can't
+  // over-dispatch. It is GC'd once a key appears in the jobs read (folded — live OR
+  // terminal) or ages past its TTL (a never-folded launch), so it stays bounded and is
+  // NEVER a fold input.
+  const inFlightEscalations = new Map<string, number>();
+  function readLiveEscalationJobs(): Job[] {
+    let jobs: Job[];
+    try {
+      jobs = db
+        .query(
+          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb IN ('unblock', 'deconflict')",
+        )
+        .all() as unknown as Job[];
+    } catch {
+      // A transient jobs read failure degrades to an empty set — the cap/occupancy
+      // guards then rely on the in-flight memo alone (never a false skip that loses a
+      // dispatch, never a false over-count that wedges the cap).
+      jobs = [];
+    }
+    if (inFlightEscalations.size > 0) {
+      const cutoff = Date.now() - INFLIGHT_ESCALATION_TTL_MS;
+      const folded = new Set(jobs.map((j) => `${j.plan_verb}::${j.plan_ref}`));
+      for (const [key, ts] of inFlightEscalations) {
+        if (folded.has(key) || ts < cutoff) inFlightEscalations.delete(key);
+      }
+    }
+    return jobs;
+  }
+  const liveEscalationDispatchDeps: EscalationDispatchDeps = {
+    countLiveEscalations: () =>
+      // GC-then-count: `readLiveEscalationJobs` prunes folded keys from the memo first,
+      // so the two summands are disjoint (folded-live jobs + not-yet-folded in-flight).
+      countLiveEscalationSessions(readLiveEscalationJobs()) +
+      inFlightEscalations.size,
+    isEscalationLive: (verb, id) => {
+      const jobs = readLiveEscalationJobs();
+      return (
+        inFlightEscalations.has(`${verb}::${id}`) ||
+        escalationSessionLiveFor(jobs, verb, id)
+      );
+    },
+    resolveConfig: () => resolveEscalationLaunchConfig(),
+    launch: async ({ spec, cwd, label }) => {
+      const result = await keeperAgentLaunch({
+        noteLine: (line) => console.error(`[keeperd] ${line}`),
+        launcherArgvPrefix,
+        session: MANAGED_EXEC_SESSION,
+        cwd,
+        label,
+        spec,
+      });
+      // Record the just-launched key so the cap counts it until its jobs row folds.
+      if (result.ok) inFlightEscalations.set(label, Date.now());
+      return { ok: result.ok };
+    },
+    noteLine: (line) => console.error(`[keeperd] ${line}`),
+  };
+
+  // Launch ONE `deconflict::<epic>` escalation session for a sticky close whose tier-1
+  // resolver declined/died. Mirrors `dispatchResolver`: cwd = the epic's base worktree
+  // (a parse-miss leaves the repo root; the skill re-derives context from its escalation
+  // brief), the prompt is `/plan:deconflict <epic>`, and the launch runs at the SEPARATE
+  // escalation model/effort via the shared `dispatchEscalationSession` (so the cap +
+  // occupancy guard apply). Producer-only — never reachable from a fold.
+  async function dispatchDeconflict(
+    row: PendingMergeEscalation,
+  ): Promise<EscalationDispatchOutcome> {
+    const parsed = parseMergeConflictReason(row.reason);
+    const hasRepo = row.dir != null && row.dir !== "";
+    const cwd =
+      parsed != null && hasRepo
+        ? worktreePathFor(row.dir as string, parsed.base)
+        : (row.dir ?? "");
+    return dispatchEscalationSession(liveEscalationDispatchDeps, {
+      verb: "deconflict",
+      id: row.id,
+      prompt: defaultPlanPrompt("deconflict", row.id),
+      cwd,
+    });
+  }
+
+  // Send the ONE botctl notification about a declined/dead `deconflict::<epic>` session
+  // (stage 3). ASYNC spawn (never `spawnSync` — that would block the main loop), array
+  // form so the free-text body rides as a literal argv element (no shell interpolation).
+  // A non-zero exit OR a missing botctl maps to `notify_failed` — NON-terminal, so the
+  // marker stays NULL and the row re-sweeps: the notification is never lost, and the
+  // sticky close row stays operator-visible via `keeper status` throughout, so it never
+  // goes silent.
+  async function notifyHumanOfDeconflict(
+    row: PendingMergeEscalation,
+    verdict: "declined" | "died",
+  ): Promise<MergeHumanNotifiedOutcome> {
+    const body = buildDeconflictHumanNotifyBody({
+      epicId: row.id,
+      reason: row.reason,
+      verdict,
+    });
+    try {
+      const proc = Bun.spawn(
+        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0 ? "notified" : "notify_failed";
+    } catch (err) {
+      console.error(
+        `[keeperd] deconflict human-notify spawn threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return "notify_failed";
+    }
+  }
+
+  // Producer-side deconflict-dispatch sweep (fn-1129 stage 2), the rewired successor to
+  // the merge-escalation planner@ notify. Each heartbeat tick walks the sticky
+  // `worktree-merge-conflict` close rows whose tier-1 resolver reached a TERMINAL
+  // verdict, and DISPATCHES one `deconflict::<epic>` escalation session per stuck close
+  // (never a planner@ bus message). A terminal `dispatched` stamps the
+  // `merge_escalated_at` once-marker (the reducer fold), so a daemon dispatches a given
+  // stuck close's deconflict ONCE; a `dispatch_failed` or a cap/occupancy SKIP leaves it
+  // re-sweepable. All wall-clock + spawn lives HERE in the producer; the spawn lives only
+  // here, so a re-fold never re-fires a launch. Rides the SAME 60s heartbeat as the block
+  // tick. `void` + `.catch`: the async launch must not block the heartbeat.
   async function runMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
+    // Paused = the human is in control (the `[paused]` banner is authoritative); a paused
+    // board never auto-dispatches a NEW escalation session, mirroring the resolver-
+    // dispatch + reconciler pause gate. So a fresh sticky on a paused board defers the
+    // deconflict dispatch (and, downstream, the human notify) until play.
+    if (autopilotPaused) return;
     await runMergeEscalationSweep({
       selectPending: () => selectPendingMergeEscalations(db),
       stillPending: (id) => {
@@ -7578,28 +8057,82 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               .get(id) != null
           );
         } catch {
-          // A point-read failure (unexpected) conservatively skips THIS tick's send
+          // A point-read failure (unexpected) conservatively skips THIS tick's launch
           // for the row — the selector already succeeded, the marker stays NULL, and
-          // the next heartbeat re-sweeps. Never a false escalation.
+          // the next heartbeat re-sweeps. Never a false dispatch.
           return false;
         }
       },
       resolverOutcome: (id) =>
         classifyResolverOutcome(resolveJobsForEpic(db, id), id, null),
-      notifyPlanner: (target, body) => notifyPlanner(target, body),
+      dispatchDeconflict: (row) => dispatchDeconflict(row),
       mintAttempted: (id, outcome) => mintMergeEscalationEvent(id, outcome),
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const mergeEscalationSweepTimer = setInterval(() => {
-    void runMergeEscalationSweepTick().catch((err) => {
-      console.error(
-        `[keeperd] merge-escalation sweep tick threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+  // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
+  // launcher is reachable (a server-only boot never dispatches). Rides the same 60s
+  // heartbeat as the resolver-dispatch sweep.
+  const mergeEscalationSweepTimer = want("autopilot")
+    ? setInterval(() => {
+        void runMergeEscalationSweepTick().catch((err) => {
+          console.error(
+            `[keeperd] deconflict-dispatch sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
+    : null;
+
+  // Producer-side deconflict human-notify sweep (fn-1129 stage 3). Each heartbeat tick
+  // walks the sticky closes whose deconflict session was dispatched but whose human is
+  // not yet notified, and sends ONE botctl notification once that session reaches a
+  // TERMINAL decline/death — then mints `MergeHumanNotified{outcome}`. A terminal
+  // `notified` stamps the `human_notified_at` once-marker so the human is notified ONCE;
+  // a `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
+  // `retry_dispatch`) before this ever fires. Same pause + autopilot-role gating as the
+  // dispatch sweep.
+  async function runDeconflictHumanNotifySweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    if (autopilotPaused) return;
+    await runDeconflictHumanNotifySweep({
+      selectPending: () => selectPendingHumanNotifications(db),
+      stillPending: (id) => {
+        try {
+          return (
+            db
+              .query(
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND human_notified_at IS NULL LIMIT 1",
+              )
+              .get(id) != null
+          );
+        } catch {
+          return false;
+        }
+      },
+      deconflictOutcome: (id) =>
+        classifyEscalationOutcome(
+          resolveEscalationJobsFor(db, "deconflict", id),
+          "deconflict",
+          id,
+        ),
+      notifyHuman: (row, verdict) => notifyHumanOfDeconflict(row, verdict),
+      mintAttempted: (id, outcome) => mintMergeHumanNotifiedEvent(id, outcome),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
-  }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS);
+  }
+  const deconflictHumanNotifySweepTimer = want("autopilot")
+    ? setInterval(() => {
+        void runDeconflictHumanNotifySweepTick().catch((err) => {
+          console.error(
+            `[keeperd] deconflict human-notify sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
+    : null;
 
   // Producer-side resolver-dispatch (fn-1088), the ACTIVE sibling of the
   // merge-escalation notify above. Where that sweep pings a human ONCE, this one
@@ -8758,7 +9291,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
     clearInterval(blockEscalationSweepTimer);
-    clearInterval(mergeEscalationSweepTimer);
+    if (mergeEscalationSweepTimer !== null) {
+      clearInterval(mergeEscalationSweepTimer);
+    }
+    if (deconflictHumanNotifySweepTimer !== null) {
+      clearInterval(deconflictHumanNotifySweepTimer);
+    }
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
     }
