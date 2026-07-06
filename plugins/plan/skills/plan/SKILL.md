@@ -670,9 +670,9 @@ Every path out of Phase 6.5 leaves the epic ready to arm: a real selection, a de
 
 Runs on **both** paths, unconditionally, after Phase 6 (on the create path, after the Phase 6.5 selector beat).
 
-**Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — `epic add-deps` re-stamps only when it writes ≥1 edge, so a dep-free epic reaches Phase 7 still a ghost and the arm is its only readiness step. `keeper plan watch` (and `dashctl` when it's on PATH) render a null-marker epic dashed until this runs.
+**Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — the marker is an arm-exclusive latch, so no mutation verb (add-deps included) ever arms it; a dep-free epic reaches Phase 7 still a ghost and this arm is its only readiness step. `keeper plan watch` (and `dashctl` when it's on PATH) render a null-marker epic dashed until this runs.
 
-**Refine path:** R1's `refine-context --invalidate` cleared the marker; this re-stamps it on success (`null → timestamp`).
+**Refine path:** R1's `refine-context --invalidate` cleared the marker; this arms it on success (`null → timestamp`).
 
 ```bash
 keeper plan validate --epic <epic_id>
@@ -716,7 +716,7 @@ Fire unconditionally the moment Phase 1 detects an `fn-N` id. One call clears `l
 keeper plan refine-context <epic_id> --invalidate   # task route: epic_id = task_id with .M stripped
 ```
 
-`--invalidate` flips the verb read-only → conditionally-mutating (mirrors `validate --epic`): when the marker is already `null` it short-circuits (no write, no commit) but still returns context; re-firing in-session is idempotent. Phase 7 re-stamps on success.
+`--invalidate` flips the verb read-only → conditionally-mutating (mirrors `validate --epic`): when the marker is already `null` it short-circuits (no write, no commit) but still returns context; re-firing in-session is idempotent. Phase 7 arms on success.
 
 Quote back a one-sentence summary so the human sees state loaded: *"loaded `fn-1-foo`: 4 tasks, epic spec ~N lines. refining now with: `<refine_note>`"*. If `refine_note` is empty, ask *"what should change? 1–3 sentences on the refinement direction"* and wait.
 
@@ -788,7 +788,7 @@ keeper plan refine-apply <epic_id> --file - <<'YAML_EOF'
 YAML_EOF
 ```
 
-`refine-apply` validates the whole post-delta tree (target/dep existence, cycles) before any write, clears `last_validated_at`, and emits one envelope. On success, run **Phase 6's auto-wire** additive-only against the pinned epic-scout report. The plan tooling has no `task rm` — to retire a task, `keeper plan task reset` it and mark it obsolete via a `rewrite_specs` entry.
+`refine-apply` validates the whole post-delta tree (target/dep existence, cycles) before any write and emits one envelope; it never touches `last_validated_at` (R1's `refine-context --invalidate` already nulled it, and Phase 7 arms). On success, run **Phase 6's auto-wire** additive-only against the pinned epic-scout report. The plan tooling has no `task rm` — to retire a task, `keeper plan task reset` it and mark it obsolete via a `rewrite_specs` entry.
 
 ### R5c. Task route — rewrite the single spec
 

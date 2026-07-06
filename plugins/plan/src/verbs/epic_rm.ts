@@ -14,8 +14,8 @@
 // locates cwd-then-global (or honors --project) then PHYSICALLY roots the unlink
 // set + commit at the epic's primary_repo, so a lane-run deletes PRIMARY's
 // artifacts rather than the lane's checked-out defs. epic.primary_repo is also
-// read off the def BEFORE the unlink for the commit's state_repo trailer. NOT a
-// restamp member — nothing to restamp once the epic ceases to exist. No
+// read off the def BEFORE the unlink for the commit's state_repo trailer. NOT an
+// integrity-gate member — nothing to gate once the epic ceases to exist. No
 // id-allocation lock (delete-only, no minting).
 
 import {

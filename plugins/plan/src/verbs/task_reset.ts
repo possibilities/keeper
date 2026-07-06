@@ -1,9 +1,9 @@
 // task reset — the port of run_task_reset.py. Resets a task to todo: clears the
 // runtime sidecar under the task lock, empties the spec's Done summary + Evidence
 // sections, nulls worker_done_at on the task JSON, and (with --cascade) resets
-// every dependent task too. Then the parent epic is restamped via the shared
-// gate. reset IS a restamp member, so the marker bumps to the frozen clock once
-// the post-write integrity check passes.
+// every dependent task too. Then the parent epic rides the shared post-write
+// integrity gate. reset IS a gate member: the gate re-validates the tree and the
+// spine bumps the epic's updated_at, but the marker is never touched.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { findDependents } from "../deps.ts";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { epicIdFromTask } from "../ids.ts";
+import { runSetter } from "../integrity_gate.ts";
 import { resolvePlanStateContext } from "../project.ts";
 import { ensureValidTaskSpec, patchTaskSection } from "../specs.ts";
 import {
@@ -22,7 +23,6 @@ import {
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
-import { runSetter } from "../validation_restamp.ts";
 
 interface ResetArgs {
   taskId: string;

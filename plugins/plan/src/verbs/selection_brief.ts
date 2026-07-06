@@ -19,8 +19,8 @@ import {
   resolvePlanStateContext,
   tryResolveOwningProjectForId,
 } from "../project.ts";
-import { loadSubagentsMatrixFromDisk } from "../subagents_config.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
+import { loadSubagentsMatrixFromDisk } from "../subagents_config.ts";
 import { loadYamlInput } from "../yaml_input.ts";
 
 export const SELECTION_BRIEF_SCHEMA_VERSION = 1;
@@ -156,11 +156,7 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
   const root = planPluginRoot();
   const configPath = join(root, "model-selector.yaml");
   const subagentsPath = join(root, "subagents.yaml");
-  const selectorConfigYaml = readUtf8(
-    configPath,
-    "CONFIG_MISSING",
-    format,
-  );
+  const selectorConfigYaml = readUtf8(configPath, "CONFIG_MISSING", format);
   validateYamlFile(configPath, "CONFIG_MISSING", format);
   const subagentsYaml = readUtf8(subagentsPath, "MATRIX_MISSING", format);
   validateYamlFile(subagentsPath, "MATRIX_MISSING", format);

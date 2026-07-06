@@ -7,7 +7,7 @@
 // the TWO distinct path-comparison semantics — os.path.samefile (dev+ino stat
 // equality) for the primary_repo mis-location check, and Path.resolve() string
 // compare for target_repo touched_repos coverage. The checkFilesystemRepos
-// toggle is wired through: the set-*-repo restamp callers pass false (warn-and-
+// toggle is wired through: the set-*-repo integrity-gate callers pass false (warn-and-
 // write on a not-yet-landed path), validate --epic passes true. The
 // spec-heading check is NOT forked — validateTaskSpecHeadings from specs.ts is
 // reused verbatim.

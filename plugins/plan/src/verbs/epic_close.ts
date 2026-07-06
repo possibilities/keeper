@@ -3,7 +3,7 @@
 // The ONLY self-committing verb in the close-saga wave: it stamps the epic done
 // (status / updated_at / closer_done_at / optional close_reason) and routes
 // through the mutating seam, landing a `chore(plan): close <epic>` data-dir
-// commit. NOT a restamp member — last_validated_at is left untouched.
+// commit. NOT an integrity-gate member — last_validated_at is left untouched.
 //
 // Gate order is load-bearing for message parity: not-found → "Epic not found:
 // <id>"; already-done → "Epic <id> is already done"; not-all-done without

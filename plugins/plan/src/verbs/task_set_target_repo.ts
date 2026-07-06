@@ -1,9 +1,9 @@
-// task set-target-repo — the port of run_task_set_target_repo.py. Persists the
-// resolved target_repo on the task JSON, then uses the pre-restamp hook to
-// recompute epic.touched_repos from the union of every DIRECT-child task's
-// target_repo (so the post-write integrity check sees the final tree) before the
-// shared gate stamps last_validated_at. The epic write and the task write ride
-// one auto-commit (two files in the pathspec).
+// task set-target-repo — persists the resolved target_repo on the task JSON, then
+// uses the pre-gate hook to recompute epic.touched_repos from the union of every
+// DIRECT-child task's target_repo (so the post-write integrity check sees the
+// final tree) before the shared integrity gate runs. The marker is left untouched
+// (arm-exclusive latch). The epic write and the task write ride one auto-commit
+// (two files in the pathspec).
 
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { epicIdFromTask } from "../ids.ts";
+import { runSetter } from "../integrity_gate.ts";
 import { resolveProject } from "../project.ts";
 import {
   atomicWriteJson,
@@ -19,7 +20,6 @@ import {
   nowIso,
   resolveUserPath,
 } from "../store.ts";
-import { runSetter } from "../validation_restamp.ts";
 
 interface SetTargetRepoArgs {
   taskId: string;
@@ -44,8 +44,8 @@ export function runTaskSetTargetRepo(args: SetTargetRepoArgs): void {
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
 
   // The parent epic may not exist — when it doesn't, the task write still lands
-  // and no recompute/restamp runs (the integrity gate would have nothing to
-  // re-stamp). primary_repo for the emit's state_repo is read from the epic.
+  // and no recompute/gate runs (there would be no epic tree to re-validate).
+  // primary_repo for the emit's state_repo is read from the epic.
   let primaryRepo: string | null = null;
 
   if (!existsSync(epicPath)) {
@@ -67,8 +67,8 @@ export function runTaskSetTargetRepo(args: SetTargetRepoArgs): void {
 
   runSetter(epicId, dataDir, {
     verb: "set-target-repo",
-    // updated_at is bumped in preRestamp (alongside touched_repos); the tail
-    // stamps last_validated_at only, never re-bumping updated_at.
+    // updated_at is bumped in preGate (alongside touched_repos), so the gate
+    // spine's tail is a no-op (stampUpdatedAt=false) and the marker is untouched.
     stampUpdatedAt: false,
     hooks: {
       apply: () => {
@@ -77,10 +77,10 @@ export function runTaskSetTargetRepo(args: SetTargetRepoArgs): void {
         taskDef.updated_at = nowIso();
         atomicWriteJson(taskPath, taskDef, dataDir);
       },
-      // Pre-restamp: recompute touched_repos from the union of direct-child
+      // Pre-gate: recompute touched_repos from the union of direct-child
       // target_repos (this task's new value included) and write it onto the
       // epic JSON BEFORE the integrity gate runs. updated_at bumps here too.
-      preRestamp: () => {
+      preGate: () => {
         const epicDef = loadJson(epicPath);
         const tasksDir = join(dataDir, "tasks");
         const prefix = `${epicId}.`;

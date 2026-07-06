@@ -8,7 +8,7 @@
 // Every read/inspection verb emits exactly ONE top-level JSON value on stdout —
 // no trailing provenance line rides the result stream (a two-value stream breaks
 // json.load and jq). Verbs that need provenance in the event log (claim, block,
-// done, the restamp + close verbs, validate --epic on a fresh stamp) MERGE the
+// done, the integrity-gate + close verbs, validate --epic on a fresh stamp) MERGE the
 // plan_invocation into their own single envelope via the emit.ts self-emitters.
 
 import type { OutputFormat } from "./format.ts";
@@ -901,7 +901,7 @@ function dispatch(parsed: ParsedArgs): number {
       dispatchGroup(TASK_GROUP, rest, format);
       return 0;
     case "assign-cells": {
-      // Self-emits (emitMutating on success / emitFailureEnvelope or the restamp
+      // Self-emits (emitMutating on success / emitFailureEnvelope or the integrity
       // gate's integrity_failed line on failure) and owns its exit code — return
       // it directly. Same arg shape as refine-apply: epic id positional, --file
       // value-taking so the positional scan skips its value.
@@ -912,7 +912,7 @@ function dispatch(parsed: ParsedArgs): number {
       });
     }
     case "refine-apply": {
-      // Self-emits (emitMutating on success / emitFailureEnvelope or the restamp
+      // Self-emits (emitMutating on success / emitFailureEnvelope or the integrity
       // gate's integrity_failed line on failure) and owns its exit code — return
       // it directly. The epic id is the positional; --file is value-taking, so the
       // positional scan must skip its value.

@@ -2,7 +2,8 @@
 // tests/test_refine_apply.py, every node mapped by a source-comment. The delta
 // applier over an existing epic: add_tasks / rewrite_specs / rewire_deps / epic-
 // spec rewrite, the mixed existing-id + new-ordinal dep resolver, post-delta cycle
-// rejection, the last_validated_at re-stamp, exactly-one invocation; the failure
+// rejection, the last_validated_at latch (an armed marker preserved byte-identical
+// — refine-apply never re-stamps), exactly-one invocation; the failure
 // family (epic_not_found / target_invalid / dep_invalid / spec_invalid / bad_yaml);
 // per-task target_repo persistence + touched_repos recompute (union / idempotent /
 // stale-reject) + the repo_invalid / bad_yaml guards; stdin; the per-task tier
@@ -225,7 +226,7 @@ describe("refine-apply happy path", () => {
     ]);
   });
 
-  test("re-stamps the validation marker to a strictly-newer value", () => {
+  test("leaves an armed validation marker byte-identical", () => {
     // test_refine_apply.py::test_refine_apply_restamps_validation_marker
     const epicId = seedTwoTaskEpic();
     stampMarker(epicId);
@@ -234,8 +235,9 @@ describe("refine-apply happy path", () => {
     const delta = "epic:\n  spec: |\n    ## Overview\n    touch it.\n";
     const r = run(["refine-apply", epicId, "--file", writeDelta(delta)]);
     expect(r.code).toBe(0);
-    const post = readEpic(epicId).last_validated_at as string;
-    expect(typeof post === "string" && post > pre).toBe(true);
+    // The arm-exclusive latch: refine-apply runs the integrity gate but never
+    // touches the marker, so it is exactly the prior value.
+    expect(readEpic(epicId).last_validated_at).toBe(pre);
   });
 });
 

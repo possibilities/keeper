@@ -1,14 +1,15 @@
-// Byte-parity unit tests for src/integrity.ts and src/validation_restamp.ts —
-// the integrity catalog + restamp pipeline ported in this wave.
+// Unit tests for src/integrity.ts and src/integrity_gate.ts —
+// the integrity catalog + the post-write integrity gate.
 //
-// The catalog cases pin the frozen check output (the executable spec the bun
-// catalog is held to): missing epic/task deps, the two graph cycles, the
-// samefile mis-location error, and the resolve() target_repo warning with its
-// repr quoting. The checkFilesystemRepos toggle is exercised both ways. The
-// restamp pipeline is
-// driven through a spawned bun harness (restampEpicOrFail / runSetter call
-// process.exit on integrity failure, which a child process makes observable),
-// proving fail-forward (write lands, marker stale) and add-dep's rollback hook.
+// The catalog cases pin the check output (the executable spec the catalog is
+// held to): missing epic/task deps, the two graph cycles, the samefile
+// mis-location error, and the resolve() target_repo warning with its repr
+// quoting. The checkFilesystemRepos toggle is exercised both ways. The integrity
+// gate is driven through a spawned bun harness (integrityGateOrFail / runSetter
+// call process.exit on integrity failure, which a child process makes
+// observable), proving fail-forward (write lands, marker untouched), the
+// arm-exclusive latch (ghost stays null, armed stays byte-identical), and
+// add-dep's rollback hook.
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -28,8 +29,8 @@ import {
   checkEpicTree,
   validateTaskSpecHeadings as headingsFromIntegrity,
 } from "../src/integrity.ts";
+import { INTEGRITY_GATE_VERBS } from "../src/integrity_gate.ts";
 import { validateTaskSpecHeadings as headingsFromSpecs } from "../src/specs.ts";
-import { VALIDATION_RESTAMP_VERBS } from "../src/validation_restamp.ts";
 
 const REPO = join(import.meta.dir, "..");
 const TASK_SPEC =
@@ -287,9 +288,8 @@ describe("checkEpicTree repo-path semantics + toggle byte-parity", () => {
   });
 });
 
-describe("VALIDATION_RESTAMP_VERBS membership", () => {
-  test("matches the frozen canonical list exactly (order included)", () => {
-    // Frozen from planctl.validation_restamp.VALIDATION_RESTAMP_VERBS.
+describe("INTEGRITY_GATE_VERBS membership", () => {
+  test("matches the canonical list exactly (order included)", () => {
     const canonical = [
       "set-description",
       "set-acceptance",
@@ -304,7 +304,7 @@ describe("VALIDATION_RESTAMP_VERBS membership", () => {
       "refine-apply",
       "assign-cells",
     ];
-    expect([...VALIDATION_RESTAMP_VERBS]).toEqual(canonical);
+    expect([...INTEGRITY_GATE_VERBS]).toEqual(canonical);
   });
 });
 
@@ -315,7 +315,7 @@ describe("spec-heading check is reused, never forked", () => {
 });
 
 // ---------------------------------------------------------------------------
-// restampEpicOrFail + runSetter — driven through a spawned bun harness because
+// integrityGateOrFail + runSetter — driven through a spawned bun harness because
 // the failure path calls process.exit(1). The harness writes a tree, applies a
 // structural change, then runs the pipeline and reports the post-state on stdout.
 // ---------------------------------------------------------------------------
@@ -341,28 +341,49 @@ function readEpicJson(dataDir: string, eid: string): Record<string, unknown> {
   );
 }
 
-describe("restampEpicOrFail + runSetter pipeline", () => {
-  test("runSetter: clean tree applies the write and re-stamps the marker", () => {
+describe("integrityGateOrFail + runSetter pipeline", () => {
+  test("runSetter: clean tree applies the write; the gate leaves the ghost null", () => {
     const fx = makeFixture();
     try {
       writeEpic(fx, "fn-1-clean", { last_validated_at: null });
       writeTask(fx, "fn-1-clean.1", {});
       const res = runHarness(fx.dataDir, "setter-clean");
       expect(res.exitCode).toBe(0);
-      // The per-verb apply landed its marker file...
+      // The per-verb apply landed its structural write...
       expect(readFileSync(join(fx.dir, "applied.txt"), "utf-8")).toBe(
         "setter-clean",
       );
-      // ...and the marker was re-stamped to the frozen clock.
-      expect(readEpicJson(fx.dataDir, "fn-1-clean").last_validated_at).toBe(
-        "2026-06-06T00:00:00.000000Z",
+      // ...and the marker was NOT armed — a ghost stays a ghost through the gate.
+      expect(
+        readEpicJson(fx.dataDir, "fn-1-clean").last_validated_at ?? null,
+      ).toBeNull();
+    } finally {
+      rmSync(fx.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("runSetter: an armed epic's marker is byte-identical after a clean setter", () => {
+    const fx = makeFixture();
+    try {
+      const armed = "2020-05-05T05:05:05.000000Z";
+      writeEpic(fx, "fn-1-armed", { last_validated_at: armed });
+      writeTask(fx, "fn-1-armed.1", {});
+      const res = runHarness(fx.dataDir, "armed-preserved");
+      expect(res.exitCode).toBe(0);
+      expect(readFileSync(join(fx.dir, "applied.txt"), "utf-8")).toBe(
+        "armed-preserved",
+      );
+      // The gate never refreshes an armed marker — it is exactly the prior value,
+      // not merely non-null (the frozen clock would be 2026-06-06 if it re-stamped).
+      expect(readEpicJson(fx.dataDir, "fn-1-armed").last_validated_at).toBe(
+        armed,
       );
     } finally {
       rmSync(fx.dir, { recursive: true, force: true });
     }
   });
 
-  test("restamp failure is fail-forward: write lands, marker stays stale, exit 1", () => {
+  test("integrity-gate failure is fail-forward: write lands, marker untouched, exit 1", () => {
     const fx = makeFixture();
     try {
       writeEpic(fx, "fn-1-ff", { last_validated_at: null });
@@ -375,7 +396,7 @@ describe("restampEpicOrFail + runSetter pipeline", () => {
       const env = JSON.parse(res.stdout.trim().split("\n").pop() as string);
       expect(env.success).toBe(false);
       expect(env.error.code).toBe("integrity_failed");
-      expect(env.error.message).toContain("last_validated_at NOT re-stamped");
+      expect(env.error.message).toContain("produced an invalid epic tree");
       expect(
         env.error.details.some((d: string) => d.includes("fn-1-ff.2")),
       ).toBe(true);
@@ -383,7 +404,7 @@ describe("restampEpicOrFail + runSetter pipeline", () => {
       expect(readFileSync(join(fx.dir, "applied.txt"), "utf-8")).toBe(
         "setter-fail-forward",
       );
-      // ...and the marker was never re-stamped.
+      // ...and the marker (null) was never touched.
       expect(readEpicJson(fx.dataDir, "fn-1-ff").last_validated_at).toBeNull();
     } finally {
       rmSync(fx.dir, { recursive: true, force: true });
@@ -416,7 +437,7 @@ describe("restampEpicOrFail + runSetter pipeline", () => {
     }
   });
 
-  test("set-target-repo pre-restamp hook recomputes touched_repos before the stamp", () => {
+  test("set-target-repo pre-gate hook recomputes touched_repos before the gate", () => {
     const fx = makeFixture();
     try {
       const repoA = join(fx.dir, "repo_a");
@@ -431,13 +452,13 @@ describe("restampEpicOrFail + runSetter pipeline", () => {
       });
       writeTask(fx, "fn-1-str.1", { target_repo: repoA });
       writeTask(fx, "fn-1-str.2", { target_repo: repoA });
-      // Harness repoints .1 at repoB and runs the pre-restamp touched_repos
-      // recompute -> touched becomes [repoA, repoB] sorted, then re-stamps.
+      // Harness repoints .1 at repoB and runs the pre-gate touched_repos
+      // recompute -> touched becomes [repoA, repoB] sorted; the marker is untouched.
       const res = runHarness(fx.dataDir, "set-target-repo");
       expect(res.exitCode).toBe(0);
       const epic = readEpicJson(fx.dataDir, "fn-1-str");
       expect(epic.touched_repos).toEqual([repoA, repoB].sort());
-      expect(epic.last_validated_at).toBe("2026-06-06T00:00:00.000000Z");
+      expect(epic.last_validated_at ?? null).toBeNull();
     } finally {
       rmSync(fx.dir, { recursive: true, force: true });
     }

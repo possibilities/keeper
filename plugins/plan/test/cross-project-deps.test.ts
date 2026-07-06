@@ -370,7 +370,7 @@ describe("cross-project epic deps (two/three projects under one root)", () => {
   });
 
   // test_cross_project_epic_deps.py::test_cross_project_cycle_rejected_and_rolled_back
-  test("an A->B->A cross-project cycle is rejected by the restamp gate + rolled back", () => {
+  test("an A->B->A cross-project cycle is rejected by the integrity gate + rolled back", () => {
     const mr = multiRepo(getRoot, getHome, ["proj-a", "proj-b"]);
     const { "proj-a": a, "proj-b": b } = mr.projects;
     const epicA = seedEpicIn(mr, a as string, "A");
@@ -381,8 +381,8 @@ describe("cross-project epic deps (two/three projects under one root)", () => {
     expect(r1.code).toBe(0);
     expect(epicJson(a as string, epicA).depends_on_epics).toEqual([epicB]);
 
-    // Leg 2: B -> A would close the cycle; the post-write restamp gate rejects
-    // and the BaseException rollback leaves B's dep list empty on disk.
+    // Leg 2: B -> A would close the cycle; the post-write integrity gate rejects
+    // and the rollback hook leaves B's dep list empty on disk.
     const r2 = invoke(mr, b as string, ["epic", "add-dep", epicB, epicA]);
     expect(r2.code).not.toBe(0);
     const payload = parseCliOutput(r2.output);

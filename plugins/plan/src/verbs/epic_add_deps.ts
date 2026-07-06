@@ -5,9 +5,10 @@
 // dep_cycle); --skip-invalid diverts per-edge classifier errors into SKIPPED_*
 // result statuses instead of failing. Idempotent: an already-wired edge is
 // ALREADY_PRESENT (a no-op, not an error). Writes once iff at least one new edge
-// lands; a pure all-no-op call writes nothing. After a write the shared restamp
-// gate re-stamps last_validated_at. The target-epic-not-found case fails loud
-// even under --skip-invalid (no place to wire any edge).
+// lands; a pure all-no-op call writes nothing. After a write the shared
+// post-write integrity gate re-validates the tree (it never touches the marker).
+// The target-epic-not-found case fails loud even under --skip-invalid (no place
+// to wire any edge).
 
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -21,10 +22,10 @@ import {
 import { emitMutating } from "../emit.ts";
 import { compactJson, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
+import { integrityGateOrFail } from "../integrity_gate.ts";
 import { resolveProject } from "../project.ts";
 import { resolveDataDir } from "../state_path.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
-import { restampEpicOrFail } from "../validation_restamp.ts";
 
 interface AddDepsArgs {
   epicId: string;
@@ -234,10 +235,7 @@ export function runEpicAddDeps(args: AddDepsArgs): void {
     epicDef.updated_at = nowIso();
     atomicWriteJson(epicPath, epicDef, dataDir);
 
-    const newStamp = restampEpicOrFail(epicId, dataDir, { verb: "add-deps" });
-    const reloaded = loadJson(epicPath);
-    reloaded.last_validated_at = newStamp;
-    atomicWriteJson(epicPath, reloaded, dataDir);
+    integrityGateOrFail(epicId, dataDir, { verb: "add-deps" });
   }
 
   emitMutating(

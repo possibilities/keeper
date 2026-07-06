@@ -1,11 +1,13 @@
 // Conformance spec for `keeper plan assign-cells` — the batch model-effort
 // selector write-path. Covers: the happy batch overwrite (cells applied + sidecar
-// present + single envelope + restamp + same-commit membership); every
-// cell_invalid variant (unknown / duplicate / missing coverage / non-todo target
-// / out-of-axis tier / out-of-axis model); the bad_yaml shape fork; the
-// degrade-shaped invocation (identical cells, degraded outcome, heuristic-default
-// provenance); re-run REPLACES the sidecar; epic_not_found; stdin; and the
-// canonical restamp-verb + problem-code registry membership.
+// present + single envelope + same-commit membership); the arm-exclusive latch
+// (an armed marker byte-identical after the write, a dep-less ghost still a ghost
+// that only the trailing validate arms); every cell_invalid variant (unknown /
+// duplicate / missing coverage / non-todo target / out-of-axis tier / out-of-axis
+// model); the bad_yaml shape fork; the degrade-shaped invocation (identical cells,
+// degraded outcome, heuristic-default provenance); re-run REPLACES the sidecar;
+// epic_not_found; stdin; and the canonical integrity-gate-verb + problem-code
+// registry membership.
 //
 // Every fixture is a withProject epic scaffolded through the binary (tasks land
 // tier=medium/model=opus), so assign-cells overwrites real committed defs.
@@ -15,7 +17,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { recoveryForPlanCode } from "../src/emit.ts";
-import { VALIDATION_RESTAMP_VERBS } from "../src/validation_restamp.ts";
+import { INTEGRITY_GATE_VERBS } from "../src/integrity_gate.ts";
 import {
   firstJsonPayload,
   gitFilesInHead,
@@ -238,7 +240,7 @@ describe("assign-cells happy path", () => {
     expect(files).toContain(`.keeper/selections/${epicId}.json`);
   });
 
-  test("re-stamps the validation marker to a strictly-newer value", () => {
+  test("leaves an armed validation marker byte-identical", () => {
     const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
     stampOldMarker(epicId);
     const pre = readEpic(epicId).last_validated_at as string;
@@ -247,8 +249,30 @@ describe("assign-cells happy path", () => {
     ]);
     const r = run(["assign-cells", epicId, "--file", writeInput(yaml)]);
     expect(r.code).toBe(0);
-    const post = readEpic(epicId).last_validated_at as string;
-    expect(typeof post === "string" && post > pre).toBe(true);
+    // The arm-exclusive latch: the select-window write never refreshes the marker.
+    expect(readEpic(epicId).last_validated_at).toBe(pre);
+  });
+
+  test("incident: a select-window write on a dep-less ghost leaves it a ghost; only validate arms it", () => {
+    // The dispatch-safety regression: assign-cells on a freshly-scaffolded epic
+    // whose depends_on_epics is still empty must NOT arm it — a ghost that armed
+    // here would let autopilot dispatch before deps are wired.
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    expect(readEpic(epicId).depends_on_epics ?? []).toEqual([]);
+    expect(readEpic(epicId).last_validated_at ?? null).toBeNull();
+
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "xhigh", model: "opus" },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)]);
+    expect(r.code).toBe(0);
+    // Still a ghost after the cell write.
+    expect(readEpic(epicId).last_validated_at ?? null).toBeNull();
+
+    // Only the trailing validate --epic arms it (null → timestamp).
+    const armed = run(["validate", "--epic", epicId]);
+    expect(armed.code).toBe(0);
+    expect(readEpic(epicId).last_validated_at).not.toBeNull();
   });
 
   test("a real runtime selection persists the canonical label_source", () => {
@@ -548,8 +572,8 @@ describe("assign-cells misc", () => {
     expect(errCode(r.output)).toBe("bad_yaml");
   });
 
-  test("assign-cells is a canonical restamp verb", () => {
-    expect(VALIDATION_RESTAMP_VERBS).toContain("assign-cells");
+  test("assign-cells is a canonical integrity-gate verb", () => {
+    expect(INTEGRITY_GATE_VERBS).toContain("assign-cells");
   });
 
   test("cell_invalid carries a registered (non-default) recovery", () => {

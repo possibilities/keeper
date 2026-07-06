@@ -97,9 +97,9 @@ describe("LocalFileStateStore.loadRuntime", () => {
 //     these shape-class assertions).
 //   test_now_iso_contract.py::test_unset_returns_wall_clock -> "wall-clock fallback ... 6-digit"
 //   test_now_iso_contract.py::test_boundary_stamped_field_equals_frozen_value -> end-to-end stamp
-//     equality (a verb stamps last_validated_at == frozen KEEPER_PLAN_NOW) is pinned
-//     by verbs-query.test.ts "validate --epic stamps on the None transition" and
-//     verbs-restamp.test.ts "add-dep wires + restamps" (both == FROZEN).
+//     equality (the sole arm stamps last_validated_at == frozen KEEPER_PLAN_NOW) is pinned
+//     by verbs-query.test.ts "validate --epic stamps on the None transition"; a gate
+//     verb's updated_at == FROZEN is pinned across verbs-restamp.test.ts.
 describe("nowIso KEEPER_PLAN_NOW contract", () => {
   test("a well-formed override is returned verbatim (no round-trip)", () => {
     process.env.KEEPER_PLAN_NOW = "2026-06-12T08:44:14.300970Z";

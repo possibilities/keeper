@@ -7,26 +7,29 @@
 // Two envelope shapes, routed EXPLICITLY (mirroring scaffold):
 //  - pre-commit failures (bad_yaml, epic_not_found, spec_invalid, repo_invalid,
 //    tier_invalid, target_invalid, dep_invalid, dep_cycle, id_collision,
-//    integrity_failed) -> emitFailureEnvelope / the restamp gate's own
+//    integrity_failed) -> emitFailureEnvelope / the integrity gate's own
 //    integrity_failed line, returning 1;
 //  - success -> emitMutating ({epic_id, added_task_ids, rewritten_specs,
 //    rewired_deps, epic_spec_rewritten}).
 //
 // THE ASYMMETRY WITH SCAFFOLD (do not collapse it):
 //  - the flock guards ONLY task-id allocation (scanMaxTaskId, two-pass ordinals,
-//    target/dep/cycle checks, the delta writes); the restamp runs OUTSIDE.
-//  - refine-apply IS a VALIDATION_RESTAMP_VERBS member — Phase 4.5 RE-stamps
-//    last_validated_at via restampEpicOrFail(verb refine-apply,
-//    checkFilesystemRepos=true) on the post-write tree. scaffold never restamps.
+//    target/dep/cycle checks, the delta writes); the integrity gate runs OUTSIDE.
+//  - refine-apply IS an INTEGRITY_GATE_VERBS member — Phase 4.5 re-validates the
+//    post-write tree via integrityGateOrFail(verb refine-apply,
+//    checkFilesystemRepos=true). It never touches last_validated_at: the marker
+//    is an arm-exclusive latch, so refine-apply leaves the (invalidate-nulled)
+//    epic a ghost for the trailing `validate --epic` arm to flip.
 //  - the mid-write / Phase-4.5 unwind unlinks ONLY the FRESH-MINT new-task paths
 //    (recorded in writtenPaths); existing-file rewrites (epic JSON, epic spec,
 //    rewrite_/rewire_ targets) are atomic_write rename-based and intentionally
 //    OMITTED from the unwind — unlinking them would destroy the user's data.
 //
-// Bun-specific seam: restampEpicOrFail prints integrity_failed and process.exit(1)
-// directly (it does NOT throw a catchable SystemExit the way Python's does), so
-// the Phase-4.5 fresh-mint unwind threads through its `onFailure` hook (the same
-// hook add-dep uses for rollback) — fires BEFORE the exit.
+// Bun-specific seam: integrityGateOrFail prints integrity_failed and
+// process.exit(1) directly (it does NOT throw a catchable SystemExit the way
+// Python's does), so the Phase-4.5 fresh-mint unwind threads through its
+// `onFailure` hook (the same hook add-dep uses for rollback) — fires BEFORE the
+// exit.
 
 import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -35,12 +38,12 @@ import { detectCycles } from "../deps.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { isEpicId, isTaskId, scanMaxTaskId } from "../ids.ts";
+import { integrityGateOrFail } from "../integrity_gate.ts";
 import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
 import { atomicWrite, atomicWriteJson, loadJson, nowIso } from "../store.ts";
-import { restampEpicOrFail } from "../validation_restamp.ts";
 import {
   parseYamlInput,
   readYamlBytes,
@@ -475,7 +478,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
   // concurrent task add to the same epic (the suffix is epic-scoped). On a
   // failure the closure returns a sentinel so the verb can emit + return OUTSIDE
   // the lock; success carries out the fields Phase 4.5 + emit() need. The
-  // restamp / emit NEVER run inside the lock.
+  // integrity gate / emit NEVER run inside the lock.
   // ------------------------------------------------------------------
   type FlockOutcome =
     | { kind: "failure"; code: string; message: string; details: string[] }
@@ -754,18 +757,19 @@ export function runRefineApply(args: RefineApplyArgs): number {
   const { newTaskIds, writtenPaths } = outcome;
 
   // ------------------------------------------------------------------
-  // Phase 4.5: post-write re-stamp of last_validated_at (OUTSIDE the lock).
+  // Phase 4.5: post-write integrity gate (OUTSIDE the lock).
   // ------------------------------------------------------------------
-  // refine-apply IS a VALIDATION_RESTAMP_VERBS member: validate the post-mutation
-  // tree (checkFilesystemRepos=true so no trailing `validate --epic` is needed)
-  // and re-stamp on a clean result. The restamp write targets the already-on-disk
-  // epicPath, so a re-stamp write itself leaves rename-atomic previous bytes in
-  // place. On integrity FAILURE restampEpicOrFail prints integrity_failed +
-  // process.exit(1); the `onFailure` hook fires BEFORE the exit and unwinds the
-  // FRESH-MINT new-task files (the epic / rewrite / rewire updates are OMITTED —
-  // rewrites of existing user data). This threads the Python try/except unwind
-  // through the hook, since the Bun gate exits rather than throwing.
-  const newStamp = restampEpicOrFail(epicId, dataDir, {
+  // refine-apply IS an INTEGRITY_GATE_VERBS member: re-validate the post-mutation
+  // tree (checkFilesystemRepos=true so the repo paths are re-probed). It never
+  // touches last_validated_at — the marker is an arm-exclusive latch, so
+  // refine-apply leaves the (Phase-R1-invalidated) epic a ghost for the trailing
+  // `validate --epic` arm to flip. On integrity FAILURE integrityGateOrFail prints
+  // integrity_failed + process.exit(1); the `onFailure` hook fires BEFORE the exit
+  // and unwinds the FRESH-MINT new-task files (the epic / rewrite / rewire updates
+  // are OMITTED — rewrites of existing user data). This threads the Python
+  // try/except unwind through the hook, since the Bun gate exits rather than
+  // throwing.
+  integrityGateOrFail(epicId, dataDir, {
     verb: "refine-apply",
     checkFilesystemRepos: true,
     onFailure: () => {
@@ -774,9 +778,6 @@ export function runRefineApply(args: RefineApplyArgs): number {
       }
     },
   });
-  const epicDefAfter = loadJson(epicPath);
-  epicDefAfter.last_validated_at = newStamp;
-  atomicWriteJson(epicPath, epicDefAfter, dataDir);
 
   // ------------------------------------------------------------------
   // Phase 5: emit ONE envelope covering the whole delta (OUTSIDE the lock).

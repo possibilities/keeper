@@ -195,14 +195,16 @@ describe("task reset resolves the overlay flip to primary from a lane", () => {
     expect(reread.worker_done_at).toBeNull();
     const spec = readFileSync(specPath, "utf-8");
     expect(spec).not.toContain("all shipped");
-    // ...the epic restamp landed in primary too...
+    // ...the epic write (reset rides the integrity gate, bumping updated_at)
+    // landed in primary too, and the marker stays null — a gate verb never arms...
     const epicDef = JSON.parse(
       readFileSync(
         join(primary, ".keeper", "epics", `${epicId}.json`),
         "utf-8",
       ),
     ) as Record<string, unknown>;
-    expect(epicDef.last_validated_at).toBe(FROZEN_CLOCK);
+    expect(epicDef.updated_at).toBe(FROZEN_CLOCK);
+    expect(epicDef.last_validated_at ?? null).toBeNull();
     // ...and the lane never gained a state overlay.
     expect(existsSync(statePath(lane, taskId))).toBe(false);
   });
