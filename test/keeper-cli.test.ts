@@ -81,6 +81,7 @@ function makeHarness(): Harness {
       watch: mkHandler("watch"),
       await: mkHandler("await"),
       "commit-work": mkHandler("commit-work"),
+      baseline: mkHandler("baseline"),
       "setup-tmux": mkHandler("setup-tmux"),
       tabs: mkHandler("tabs"),
       "session-state": mkHandler("session-state"),
