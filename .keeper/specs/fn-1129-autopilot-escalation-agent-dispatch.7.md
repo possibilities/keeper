@@ -35,5 +35,5 @@ bun scripts/lint-claude-md.ts green; grep the docs tree for leftover planner@ es
 - [ ] docs/adr/0006 records the autonomous-escalation decision in the existing template
 
 ## Done summary
-
+Rewrote operator docs to the autonomous unblock::/deconflict:: escalation-dispatch model with terminal once-only human notify; updated CLAUDE.md, CONTEXT.md glossary, operator-orchestration, plugin-composition-map, plan README, and the hack skill, and added ADR 0007 (0006 was taken).
 ## Evidence
