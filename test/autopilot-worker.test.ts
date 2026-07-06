@@ -161,7 +161,10 @@ import {
   type PendingDispatch,
   type Verdict,
 } from "../src/readiness";
-import { projectPendingDispatches } from "../src/readiness-client";
+import {
+  computeLandedEpicIds,
+  projectPendingDispatches,
+} from "../src/readiness-client";
 import { loadReadinessInputs } from "../src/readiness-inputs";
 import { readBootStatus } from "../src/server-worker";
 import type {
@@ -12404,7 +12407,28 @@ test("fn-1016 computeMergedLaneEntries: entries are sorted by epic_id (stable se
 // ---------------------------------------------------------------------------
 
 test("fn-1034.4 computeMergedLaneEntries: two worktree groups — NO row until BOTH bases merged (never early on the first)", async () => {
-  const epic = twoRepoEpic(); // .1→/repo-a, .2→/repo-b, both worktree
+  // Tasks done so a merged (present ∧ ancestor) lane genuinely carries landed work
+  // — else the empty-lane guard withholds the row per the fn-1097/fn-1141 contract.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
   const epics = [epic];
   const cls = classifyMultiRepo(epics);
   // /repo-a merged; /repo-b PRESENT but not an ancestor → NOT merged. Aggregate
@@ -12473,7 +12497,9 @@ test("fn-1034.4 computeMergedLaneEntries: mixed worktree + serial group — land
     await computeMergedLaneEntries([mixed], withSerialOpen, aMerged.run),
   ).toEqual([]);
 
-  // Flip the serial group's task done → both groups landed → the row appears.
+  // Flip BOTH groups' tasks done → both groups landed → the row appears. The
+  // worktree group's own task must be done too (its merged lane carries landed work
+  // only then — the fn-1097/fn-1141 empty-lane guard now scopes the clustered arm).
   const doneEpic = makeEpic({
     epic_id: "fn-1-foo",
     project_dir: "/repo-a",
@@ -12482,6 +12508,8 @@ test("fn-1034.4 computeMergedLaneEntries: mixed worktree + serial group — land
         task_id: "fn-1-foo.1",
         task_number: 1,
         target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
       }),
       makeTask({
         task_id: "fn-1-foo.2",
@@ -12540,6 +12568,200 @@ test("fn-1034.4 computeMergedLaneEntries: a single-repo epic is byte-identical w
   expect(await computeMergedLaneEntries([solo], cls, run)).toEqual([
     { epic_id: "fn-1-solo", repo_dir: "/repo-a" },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1141 — the CLUSTERED degenerate-fire guard. The per-`worktree`-group probe
+// used to pass `laneCarriesLandedWork: true`, bypassing the fn-1097 empty-lane
+// guard: a started-but-unworked group's ABSENT base lane (absent arm off bare
+// `started`) or PRESENT zero-commit base lane (a fork-point vacuous ancestor) read a
+// spurious merge, so `landed` fired the instant a fresh multi-repo epic's first task
+// wave dispatched — zero real merged work. The producer now takes the SAME per-group
+// done-evidence the `ok` arm does.
+// ---------------------------------------------------------------------------
+
+test("fn-1141 computeMergedLaneEntries: DEGENERATE — a just-dispatched clustered epic (started, 0 done, ABSENT base lanes) does NOT fire landed", async () => {
+  // The observed fire: an OPEN multi-repo epic, first task wave in flight (started),
+  // no task done, neither repo's base lane cut yet. Zero merged work → NO row.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "in_progress",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "in_progress",
+      }),
+    ],
+  });
+  const epics = [epic];
+  const { run } = clusterGit({
+    "/repo-a": { lanes: [] },
+    "/repo-b": { lanes: [] },
+  });
+  expect(
+    await computeMergedLaneEntries(epics, classifyMultiRepo(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1141 computeMergedLaneEntries: DEGENERATE — a started clustered epic with PRESENT zero-commit base lanes (vacuous ancestors of default) does NOT fire landed", async () => {
+  // The branch==default triviality: a freshly-cut base lane sits AT its fork point, a
+  // VACUOUS ancestor of default. With no group's tasks done the lanes carry no landed
+  // work, so ancestry alone must NOT read merged.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "in_progress",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "in_progress",
+      }),
+    ],
+  });
+  const epics = [epic];
+  const { run } = clusterGit({
+    "/repo-a": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+    "/repo-b": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+  });
+  expect(
+    await computeMergedLaneEntries(epics, classifyMultiRepo(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1141 computeMergedLaneEntries: PARTIAL — one group genuinely merged, the other started-but-unworked with an absent lane → does NOT fire", async () => {
+  // /repo-a's group finished and merged; /repo-b's group is still in flight with no
+  // lane cut. A partial landing must withhold the epic's single row.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "in_progress",
+      }),
+    ],
+  });
+  const epics = [epic];
+  const { run } = clusterGit({
+    "/repo-a": {
+      lanes: ["keeper/epic/fn-1-foo"],
+      ancestors: ["keeper/epic/fn-1-foo"],
+    },
+    "/repo-b": { lanes: [] },
+  });
+  expect(
+    await computeMergedLaneEntries(epics, classifyMultiRepo(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1141 computeMergedLaneEntries: a fully-done clustered epic with TORN-DOWN base lanes (absent, all tasks done) still fires landed", async () => {
+  // The preserved merged-and-torn-down window, per group: every group's tasks are
+  // administratively done and its lane was deleted after merging → still landed.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const epics = [epic];
+  const { run } = clusterGit({
+    "/repo-a": { lanes: [] },
+    "/repo-b": { lanes: [] },
+  });
+  expect(
+    await computeMergedLaneEntries(epics, classifyMultiRepo(epics), run),
+  ).toEqual([{ epic_id: "fn-1-foo", repo_dir: "/repo-a" }]);
+});
+
+test("fn-1141 computeMergedLaneEntries: a NEVER-STARTED clustered epic with absent base lanes keeps waiting (no spurious landed)", async () => {
+  // A freshly scaffolded, dep-blocked multi-repo epic: no task started, no lane cut.
+  // Absence proves nothing about merge → `landed` waits.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const epics = [epic];
+  const { run } = clusterGit({
+    "/repo-a": { lanes: [] },
+    "/repo-b": { lanes: [] },
+  });
+  expect(
+    await computeMergedLaneEntries(epics, classifyMultiRepo(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1141 computeLandedEpicIds: worktree mode OFF ignores the lane projection — an OPEN epic degrades to `complete` semantics (done-only), never landed", () => {
+  const open = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", runtime_status: "in_progress" })],
+  });
+  const done = makeEpic({
+    epic_id: "fn-2-bar",
+    project_dir: "/repo-a",
+    status: "done",
+  });
+  // Even a stale projection row naming the open epic is IGNORED when worktree is off;
+  // the set is merged ⇔ done, so only the done epic lands.
+  expect(
+    computeLandedEpicIds(false, ["fn-1-foo", "fn-2-bar"], [open, done]),
+  ).toEqual(["fn-2-bar"]);
 });
 
 // ---------------------------------------------------------------------------
