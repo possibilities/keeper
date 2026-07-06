@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-06T03:58:57.863000Z",
+  "created_by_close_of": "fn-1123-worktree-lane-pre-merge-recovery",
+  "depends_on_epics": [
+    "fn-1123-worktree-lane-pre-merge-recovery"
+  ],
+  "id": "fn-1137-fix-close-sink-lane-premerge-self-clear",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix close-sink lane-premerge self-clear",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-06T03:58:57.863000Z"
+}
