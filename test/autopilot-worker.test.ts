@@ -82,6 +82,7 @@ import {
   isOccupyingJob,
   isSharedCheckoutDirtyReason,
   isSharedCheckoutWedgeReason,
+  isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
@@ -4865,12 +4866,20 @@ interface FakeWorktreeLog {
 function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
   provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
+  // A fan-in LANE pre-merge failure — the self-clearing shape `{ ok:false, reason,
+  // dir }` (a `worktree-lane-premerge` reason + the base lane worktree path), NEVER
+  // `retry:true`. The real driver returns `dir: worktreePath` for it.
+  provisionPremerge?: (
+    info: WorktreeLaunchInfo,
+  ) => { reason: string; dir: string } | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeRetry?: (info: WorktreeLaunchInfo) => string | null;
   assertFail?: (cwd: string) => string | null;
   recoverFailures?: WorktreeRecoveryFailure[];
   recoverEscalations?: WorktreeRecoveryEscalation[];
   recoverResolved?: WorktreeRecoveryResolution[];
+  recoverLaneResolved?: string[];
+  recoverLaneWedged?: { path: string; reason: string; immediate: boolean }[];
 }): { driver: WorktreeDriver; log: FakeWorktreeLog } {
   const log: FakeWorktreeLog = {
     calls: [],
@@ -4886,10 +4895,15 @@ function makeFakeWorktreeDriver(opts?: {
       log.provisions.push(info);
       log.provisionAttributions.push(liveAttributedDirty);
       // `provisionRetry` wins first (a transient not-ready base → retry-skip, no
-      // sticky), mirroring `finalizeRetry`; `provisionFail` is a genuine block.
+      // sticky), mirroring `finalizeRetry`; `provisionPremerge` is a self-clearing
+      // lane row (carries a `dir`); `provisionFail` is a genuine block (no `dir`).
       const retry = opts?.provisionRetry?.(info) ?? null;
       if (retry !== null) {
         return { ok: false, retry: true, reason: retry };
+      }
+      const premerge = opts?.provisionPremerge?.(info) ?? null;
+      if (premerge !== null) {
+        return { ok: false, reason: premerge.reason, dir: premerge.dir };
       }
       const reason = opts?.provisionFail?.(info) ?? null;
       if (reason !== null) {
@@ -4926,6 +4940,8 @@ function makeFakeWorktreeDriver(opts?: {
         failures: opts?.recoverFailures ?? [],
         escalations: opts?.recoverEscalations ?? [],
         resolved: opts?.recoverResolved ?? [],
+        laneResolved: opts?.recoverLaneResolved ?? [],
+        laneWedged: opts?.recoverLaneWedged ?? [],
       };
     },
   };
@@ -6301,6 +6317,79 @@ test("fn-1123 runReconcileCycle: a non-primary sink fan-in RETRY mints NO sticky
   expect(depsLog.emissions).toEqual([]);
   // But the /repo-b base is un-assembled, so ONLY the primary group finalizes.
   expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
+});
+
+test("fn-1137 runReconcileCycle: a non-primary sink fan-in PRE-MERGE failure mints a SELF-CLEARING close row keyed on the sink LANE path (not the repo toplevel), so it clears once the lane resolves", async () => {
+  // The sink's own LANE worktree path — the real driver returns it as
+  // `provisioned.dir` for a fan-in pre-merge deferral. Deliberately distinct from the
+  // /repo-b toplevel so a repo-keyed row (the pre-fix bug) is observably different.
+  const sinkLane = "/repo-b/.worktrees/keeper-epic-fn-1-foo";
+  const { driver } = makeFakeWorktreeDriver({
+    provisionPremerge: (info) =>
+      info.repoDir === "/repo-b"
+        ? {
+            reason: `worktree-lane-premerge-not-ready: base ${sinkLane} is behind before merging a rib into keeper/epic/fn-1-foo — deferring the fan-in`,
+            dir: sinkLane,
+          }
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = multiRepoSnap([epic], abResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // MINT: the close-sink pre-merge row keys on the sink LANE path (the fix), NOT the
+  // /repo-b toplevel — the exact key `laneFailuresToClear` matches on. A row keyed on
+  // the repo toplevel (the bug) is never in the resolved-lane set, so it never clears.
+  expect(depsLog.emissions).toHaveLength(1);
+  const minted = depsLog.emissions[0];
+  expect(minted).toMatchObject({
+    verb: "close",
+    id: "fn-1-foo",
+    dir: sinkLane,
+  });
+  // Its reason qualifies it for the reason-scoped lane-failure collection.
+  expect(isWorktreeLanePremergeReason(minted?.reason ?? "")).toBe(true);
+  // SELF-CLEAR: fed the ACTUAL minted row, the reason-scoped level-clear drops it the
+  // cycle the recover pass reports the lane resolved (ready/gone) — no operator
+  // retry_dispatch. The clear keys on the SAME lane path the emit minted.
+  expect(
+    laneFailuresToClear(
+      depsLog.emissions.map((e) => ({
+        verb: e.verb,
+        id: e.id,
+        dir: e.dir ?? "",
+      })),
+      new Set(),
+      new Set([sinkLane]),
+    ),
+  ).toEqual([{ verb: "close", id: "fn-1-foo" }]);
 });
 
 // ---------------------------------------------------------------------------

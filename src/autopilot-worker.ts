@@ -2949,11 +2949,16 @@ export async function runReconcileCycle(
             `[autopilot-worker] provision close::${closeKeyEpicId(sink)} (${sink.repoDir}): ${provisioned.reason}`,
           );
         } else {
+          // `provisioned.dir` carries the sink's LANE worktree path for a fan-in
+          // pre-merge failure, so this `close::<epic>` row keys on the lane path the
+          // recover pass's reason-scoped level-clear matches on (a self-clearing
+          // `worktree-lane-premerge` row, mirroring the work-cell twin). A genuine
+          // conflict carries no `dir` → the repo toplevel, an operator-cleared sticky.
           deps.emitDispatchFailed({
             verb: "close",
             id: closeKeyEpicId(sink),
             reason: provisioned.reason,
-            dir: sink.repoDir,
+            dir: provisioned.dir ?? sink.repoDir,
             ts: deps.now(),
           });
         }
