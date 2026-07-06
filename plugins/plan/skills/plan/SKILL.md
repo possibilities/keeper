@@ -15,7 +15,7 @@ The human said "plan", "make a plan", "/plan", or asked to plan a feature, bug, 
 
 ## Phase map
 
-The create path runs Phase 0 → 8 top to bottom. The refine path (an `fn-N` id argument) branches at Phase 1 into **Phase R**, which reuses the shared **Phase 2** (recon, gap analysis, Priority Questions) and rejoins at Phase 7.
+The create path runs Phase 0 → 8 top to bottom. The refine path (an `fn-N` id argument) branches at Phase 1 into **Phase R**, which reuses the shared **Phase 2** (recon, gap analysis, Priority Questions), re-selects its remaining todo cells at **R6**, then arms at Phase 7.
 
 - **Phase 0** — Pre-flight: detect / init
 - **Phase 1** — Input handling & routing
@@ -27,7 +27,7 @@ The create path runs Phase 0 → 8 top to bottom. The refine path (an `fn-N` id 
 - **Phase 6.5** — Select model+effort cells *(create only — a content-blind selector subagent overwrites the stamped defaults before the arm)*
 - **Phase 7** — Validate & arm (both paths — arms the ghost scaffold minted)
 - **Phase 8** — Report
-- **Phase R** — Refine an existing id (branches from Phase 1; rejoins at Phase 7)
+- **Phase R** — Refine an existing id (branches from Phase 1; re-selects cells at R6, then arms at Phase 7)
 
 ---
 
@@ -588,7 +588,7 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 ## Phase 6.5 — Select model+effort cells (create path only)
 
-Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets the `plan:model-selector` subagent overwrite those cells with a researched {tier, model} per task, landing the writes plus a git-committed selection sidecar via `keeper plan assign-cells`. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path skips this beat entirely (it rejoins at Phase 7).
+Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets the `plan:model-selector` subagent overwrite those cells with a researched {tier, model} per task, landing the writes plus a git-committed selection sidecar via `keeper plan assign-cells`. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path runs the equivalent beat at **R6** over the re-ghosted epic's remaining todo tasks — the create-path mechanics documented here.
 
 ### 6.5a — Build the content-blind selector brief
 
@@ -668,11 +668,11 @@ Every path out of Phase 6.5 leaves the epic ready to arm: a real selection, a de
 
 ## Phase 7 — Validate & arm
 
-Runs on **both** paths, unconditionally, after Phase 6 (on the create path, after the Phase 6.5 selector beat).
+Runs on **both** paths, unconditionally, after each path's selector beat — the create path's Phase 6.5, or the refine path's R6.
 
 **Create path:** scaffold minted the epic as a null-marker **ghost**; this is the trailing arm that flips it `null → timestamp` so autopilot will dispatch its tasks in dependency order. Run it even when Phase 6 wired zero deps — the marker is an arm-exclusive latch, so no mutation verb (add-deps included) ever arms it; a dep-free epic reaches Phase 7 still a ghost and this arm is its only readiness step. `keeper plan watch` (and `dashctl` when it's on PATH) render a null-marker epic dashed until this runs.
 
-**Refine path:** R1's `refine-context --invalidate` cleared the marker; this arms it on success (`null → timestamp`).
+**Refine path:** R1's `refine-context --invalidate` cleared the marker and re-ghosted the epic; after the R6 re-select beat this arms it on success (`null → timestamp`).
 
 ```bash
 keeper plan validate --epic <epic_id>
@@ -706,7 +706,7 @@ Omit the `ran {}` side if zero ran; omit `skipped {}` if none were skipped. No m
 
 ## Phase R — Refine existing plan id
 
-Runs instead of the create path's Phase 2–7 when Phase 1 detected an `fn-N` id. Reuses the shared **Phase 2** and rejoins at **Phase 7 → 8**.
+Runs instead of the create path's Phase 2–7 when Phase 1 detected an `fn-N` id. Reuses the shared **Phase 2**, re-selects remaining todo cells at **R6**, then arms and reports at **Phase 7 → 8**.
 
 ### R1+R2. Invalidate + fetch current state (one call)
 
@@ -804,4 +804,14 @@ YAML_EOF
 
 Task route never touches the epic spec or other tasks. **Pin a short `refine_note` summary** (≤60 chars, imperative) for Phase 8.
 
-After R5b or R5c, jump to **Phase 7 (Validate)**.
+After R5b or R5c, run **R6** below, then jump to **Phase 7 (Validate)**.
+
+### R6. Re-select remaining todo cells
+
+Both routes converge here. Run the same content-blind selection beat the create path runs at **Phase 6.5** — `keeper plan selection-brief <epic_id>`, spawn `plan:model-selector` blind, validate the verdict, then `keeper plan assign-cells <epic_id>` — over the re-ghosted epic. R1's `refine-context --invalidate` already nulled the marker and re-ghosted the epic before the delta applied, so the beat is race-free: no task can dispatch mid-selection.
+
+`assign-cells` takes the **full todo set**, so a refine re-selects **every remaining todo task's cell**, not only the tasks this refine added or rewrote. This overwrites a deliberate earlier manual cell pick on an untouched todo task — an accepted, disclosed cost of one whole-epic content-blind re-selection, not a silent bug; there is no partial-set assign. Every failure mode degrades to the stamped defaults exactly as Phase 6.5 spells out, so no path leaves a stuck ghost.
+
+A refine that leaves **zero todo tasks** (every task already done or in progress) skips the beat cleanly: `selection-brief` returns `NO_TODO_TASKS`, and the flow proceeds straight to the Phase 7 arm with no selector spawn.
+
+After R6, proceed to **Phase 7 (Validate)**.

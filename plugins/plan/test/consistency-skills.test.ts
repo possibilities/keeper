@@ -212,7 +212,26 @@ for (const skill of BARE_VERB_SKILLS) {
 
 const PLAN_SKILL = join(REPO, "skills", "plan", "SKILL.md");
 const DEFER_SKILL = join(REPO, "skills", "defer", "SKILL.md");
+const CLOSE_SKILL = join(REPO, "skills", "close", "SKILL.md");
 const MODEL_SELECTOR_AGENT = join(REPO, "agents", "model-selector.md");
+const MODEL_GUIDANCE_SKILL = join(REPO, "skills", "model-guidance", "SKILL.md");
+
+describe("model-guidance skill frontmatter", () => {
+  test("name: is the bare verb model-guidance", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_GUIDANCE_SKILL));
+    expect(fm.name).toBe("model-guidance");
+  });
+
+  test("grants AskUserQuestion in allowed-tools", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_GUIDANCE_SKILL));
+    expect(fm["allowed-tools"]).toContain("AskUserQuestion");
+  });
+
+  test("stays slash-only", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_GUIDANCE_SKILL));
+    expect(fm["disable-model-invocation"]).toBe("true");
+  });
+});
 
 describe("model-selector agent frontmatter", () => {
   test("exists as a tracked agent named model-selector", () => {
@@ -232,10 +251,11 @@ describe("model-selector agent frontmatter", () => {
   });
 });
 
-describe("plan/defer selector handoff", () => {
+describe("plan/defer/close selector handoff", () => {
   for (const [label, path] of [
     ["plan", PLAN_SKILL],
     ["defer", DEFER_SKILL],
+    ["close", CLOSE_SKILL],
   ] as const) {
     test(`${label} uses selection-brief + plan:model-selector with no model=`, () => {
       const text = readFileSync(path, "utf-8");
@@ -250,6 +270,36 @@ describe("plan/defer selector handoff", () => {
       }
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// plan refine selection beat (R6): the refine path re-selects every remaining
+// todo cell before arming — pinned so the refine copy cannot drift back to
+// claiming it skips selection and rejoins the arm unselected.
+// ---------------------------------------------------------------------------
+
+describe("plan skill refine selection beat", () => {
+  test("R6 runs the selection beat over the re-ghosted epic before the arm", () => {
+    const text = readFileSync(PLAN_SKILL, "utf-8");
+    expect(text).toContain("### R6.");
+    expect(text).toContain("keeper plan selection-brief");
+    expect(text).toContain("keeper plan assign-cells");
+  });
+
+  test("states the full-set re-select and the clean zero-todo skip", () => {
+    const text = readFileSync(PLAN_SKILL, "utf-8");
+    // The full-set/todo-only contract is stated plainly.
+    expect(text).toContain("every remaining todo task's cell");
+    // The zero-todo skip keys on the selection-brief NO_TODO_TASKS error.
+    expect(text).toContain("NO_TODO_TASKS");
+  });
+
+  test("no prose claims the refine path skips selection or rejoins unselected", () => {
+    const text = readFileSync(PLAN_SKILL, "utf-8");
+    expect(text).not.toMatch(/refine path skips (this|the) beat/i);
+    expect(text).not.toMatch(/skips this beat entirely/i);
+    expect(text).not.toMatch(/rejoins at Phase 7/i);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -270,7 +320,6 @@ describe("defer skill board-priority discipline", () => {
 // close skill: agentId regex, blind spawns, total switch, no stale pointers
 // ---------------------------------------------------------------------------
 
-const CLOSE_SKILL = join(REPO, "skills", "close", "SKILL.md");
 const CLOSE_AGENT_ID_SAMPLE =
   "QUESTION pending.\n" +
   "agentId: a1b2c3d4e5f6 (use SendMessage with to: 'a1b2c3d4e5f6' " +
@@ -334,6 +383,68 @@ describe("close skill coordinator invariants", () => {
       "hookctl",
     ];
     expect(forbidden.filter((needle) => text.includes(needle))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// close skill pre-select beat: the interposed cell-selection beat briefs the
+// stored follow-up (--from-followup), spawns the selector blind, hands finalize
+// a --selection-verdict file, and degrades to a verdict-less finalize — pinned
+// so the close copy cannot drift out of parity with the defer Phase 4b beat.
+// ---------------------------------------------------------------------------
+
+describe("close skill pre-select beat", () => {
+  test("briefs the stored follow-up via selection-brief --from-followup", () => {
+    const text = readFileSync(CLOSE_SKILL, "utf-8");
+    expect(text).toContain("keeper plan selection-brief");
+    expect(text).toContain("--from-followup");
+  });
+
+  test("spawns the selector blind and hands finalize a --selection-verdict", () => {
+    const text = readFileSync(CLOSE_SKILL, "utf-8");
+    const selectorBlocks = extractTaskCallBlocks(text).filter((b) =>
+      b.includes("plan:model-selector"),
+    );
+    expect(selectorBlocks.length).toBeGreaterThanOrEqual(1);
+    for (const block of selectorBlocks) {
+      expect(block).not.toContain("model=");
+    }
+    expect(text).toContain("--selection-verdict");
+  });
+
+  test("degrades to a verdict-less finalize, never a retry loop", () => {
+    const text = readFileSync(CLOSE_SKILL, "utf-8");
+    expect(text).toContain("verdict-less");
+    expect(text).toContain("never a retry loop");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// close-planner: follow-up template stamps both tier and model, with the
+// full configured axes — derived from subagents.yaml so axis drift trips
+// this pin instead of silently rotting the template.
+// ---------------------------------------------------------------------------
+
+const CLOSE_PLANNER = join(REPO, "agents", "close-planner.md");
+
+describe("close-planner follow-up template tier/model shape", () => {
+  const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+
+  test("template block carries both `tier:` and `model:` lines with the full configured enums", () => {
+    const text = readFileSync(CLOSE_PLANNER, "utf-8");
+    const tierLine = new RegExp(
+      `tier: <${matrix.efforts.join("\\|")}>\\s+# REQUIRED`,
+    );
+    const modelLine = new RegExp(
+      `model: <${matrix.models.join("\\|")}>\\s+# REQUIRED`,
+    );
+    expect(text).toMatch(tierLine);
+    expect(text).toMatch(modelLine);
+  });
+
+  test("task-spec rules prose requires both tier and model", () => {
+    const text = readFileSync(CLOSE_PLANNER, "utf-8");
+    expect(text).toContain("`tier` and `model` are both required per task");
   });
 });
 

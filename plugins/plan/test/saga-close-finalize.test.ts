@@ -30,6 +30,7 @@ import {
   type CloseOutcome,
 } from "../src/verbs/close_finalize.ts";
 import {
+  fakeDirtyPaths,
   firstJsonPayload,
   gitInit,
   parseCliOutput,
@@ -397,6 +398,270 @@ describe("close-finalize closed_with_followup", () => {
     expect(env.outcome).toBe("closed_with_followup");
     expect(env.new_epic_id).toBe(followId);
     expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pre-selection: --selection-verdict folds researched cells into the follow-up.
+// ---------------------------------------------------------------------------
+
+// Read a minted task JSON's {tier, model}.
+function taskCell(
+  root: string,
+  taskId: string,
+): { tier: string; model: string } {
+  const def = JSON.parse(
+    readFileSync(join(root, ".keeper", "tasks", `${taskId}.json`), "utf-8"),
+  ) as Record<string, unknown>;
+  return { tier: def.tier as string, model: def.model as string };
+}
+
+// The committed selection sidecar for `epicId`, or null when none was written.
+function sidecar(root: string, epicId: string): Record<string, unknown> | null {
+  const p = join(root, ".keeper", "selections", `${epicId}.json`);
+  if (!require("node:fs").existsSync(p)) {
+    return null;
+  }
+  return JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
+}
+
+// Write a selection-verdict JSON file the CLI reads via --selection-verdict.
+function writeVerdict(
+  root: string,
+  cells: Record<string, Record<string, unknown>>,
+): string {
+  const p = join(root, "_selection_verdict.json");
+  const doc = {
+    schema_version: 1,
+    cells,
+    selection: {
+      harness: "claude",
+      model: "sonnet",
+      config_hash: "cfg-hash",
+      input_hash: "in-hash",
+      shuffle_seed: 42,
+      outcome: "completed",
+      verdict_raw: "picked cells",
+    },
+  };
+  writeFileSync(p, `${JSON.stringify(doc)}\n`, "utf-8");
+  return p;
+}
+
+// N distinct kept ordinals -> N expected follow-up tasks.
+function keptOrdinals(n: number): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (let i = 1; i <= n; i++) {
+    out.push({ fid: `f${i}`, action: "kept", task: i, rationale: "real" });
+  }
+  return out;
+}
+
+describe("close-finalize selection pre-selection", () => {
+  const getProj = withProject("planctl-cf-select-");
+
+  function finalizeWithVerdict(
+    proj: { root: string; home: string },
+    epicId: string,
+    verdictPath: string,
+  ): { code: number; env: Record<string, unknown> } {
+    const r = runCli(
+      [
+        "close-finalize",
+        epicId,
+        "--project",
+        proj.root,
+        "--selection-verdict",
+        verdictPath,
+      ],
+      { cwd: proj.root, home: proj.home },
+    );
+    return { code: r.code, env: parseCliOutput(r.output) };
+  }
+
+  test("verdict supplied -> tasks born selected + heuristic-guided sidecar", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      2,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(2) },
+      "Guided select",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 2);
+    const vp = writeVerdict(proj.root, {
+      "1": {
+        tier: "high",
+        model: "sonnet",
+        rationale: "task 1 is subtle",
+        confidence: 0.9,
+      },
+      "2": { tier: "max", model: "opus" },
+    });
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+
+    // Tasks are BORN with the verdict cells (not the document's medium/opus).
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "high",
+      model: "sonnet",
+    });
+    expect(taskCell(proj.root, `${newEpicId}.2`)).toEqual({
+      tier: "max",
+      model: "opus",
+    });
+
+    const side = sidecar(proj.root, newEpicId);
+    expect(side).not.toBeNull();
+    const s = side as Record<string, unknown>;
+    expect(s.schema_version).toBe(1);
+    expect(s.epic_id).toBe(newEpicId);
+    expect(s.outcome).toBe("completed");
+    expect(s.selector).toEqual({ harness: "claude", model: "sonnet" });
+    expect(s.config_hash).toBe("cfg-hash");
+    expect(s.input_hash).toBe("in-hash");
+    const sCells = s.cells as Array<Record<string, unknown>>;
+    expect(sCells).toHaveLength(2);
+    expect(sCells[0]).toMatchObject({
+      task_id: `${newEpicId}.1`,
+      tier: "high",
+      model: "sonnet",
+      rationale: "task 1 is subtle",
+      label_source: "heuristic-guided",
+    });
+    expect(sCells[1]).toMatchObject({
+      task_id: `${newEpicId}.2`,
+      tier: "max",
+      model: "opus",
+      label_source: "heuristic-guided",
+    });
+
+    // Committed: the sidecar is a top-level selections/ file swept clean by close.
+    expect(fakeDirtyPaths(proj.root)).not.toContain(
+      `.keeper/selections/${newEpicId}.json`,
+    );
+    // Armed identically to the no-verdict path.
+    const newDef = JSON.parse(
+      readFileSync(
+        join(proj.root, ".keeper", "epics", `${newEpicId}.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect(newDef.last_validated_at).not.toBeNull();
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("no verdict -> template defaults + degraded sidecar; arming identical", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Degraded default",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    // No --selection-verdict flag.
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+
+    // The document's stamped defaults (seedFollowupYaml stamps medium/opus).
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s).not.toBeNull();
+    expect(s.outcome).toBe("degraded:no-selection-verdict-supplied");
+    expect(s.selector).toEqual({ harness: "none", model: "none" });
+    const sCells = s.cells as Array<Record<string, unknown>>;
+    expect(sCells[0]).toMatchObject({
+      task_id: `${newEpicId}.1`,
+      tier: "medium",
+      model: "opus",
+      label_source: "heuristic-default",
+    });
+
+    const newDef = JSON.parse(
+      readFileSync(
+        join(proj.root, ".keeper", "epics", `${newEpicId}.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect(newDef.last_validated_at).not.toBeNull();
+  });
+
+  test("malformed verdict (out-of-axis cell) degrades, never rejects finalize", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Bad cell",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(proj.root, {
+      "1": { tier: "ultra", model: "sonnet" }, // "ultra" is not a configured effort
+    });
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    // Degrades rather than rejecting the whole finalize.
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-cell-out-of-axis");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      label_source: "heuristic-default",
+    });
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("adopt path runs no selection even with a verdict supplied", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Adopt no select",
+    );
+    // Pre-scaffold the follow-up (crash-resume adopt) with the provenance stamp.
+    const { epicId: followId } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: `Follow-up of ${epicId}`, nTasks: 1 },
+    );
+    const fPath = join(proj.root, ".keeper", "epics", `${followId}.json`);
+    const fDef = JSON.parse(readFileSync(fPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    fDef.depends_on_epics = [epicId];
+    fDef.created_by_close_of = epicId;
+    writeFileSync(fPath, JSON.stringify(fDef), "utf-8");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(proj.root, {
+      "1": { tier: "high", model: "sonnet" },
+    });
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    expect(env.new_epic_id).toBe(followId);
+    // Adopt writes NO sidecar and does not re-select the adopted tree.
+    expect(sidecar(proj.root, followId)).toBeNull();
+    expect(taskCell(proj.root, `${followId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
   });
 });
 

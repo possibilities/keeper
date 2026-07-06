@@ -5,6 +5,7 @@ provenance:
   model_id: opus            # subagents.yaml models: axis value
   resolves_to: claude-opus-4-8   # strongest Opus-tier alias at research time
   researched: 2026-07-04
+  status: researched             # provenance state: this cache reflects a real research pass
   method: model-capability review (Anthropic model docs via the claude-api skill) + in-repo worker experience
   sources:
     - Anthropic model catalog / migration guidance (Claude Opus 4.8): most-capable Opus-tier, adaptive-thinking-only surface, effort axis low..max
