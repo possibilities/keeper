@@ -213,6 +213,24 @@ for (const skill of BARE_VERB_SKILLS) {
 const PLAN_SKILL = join(REPO, "skills", "plan", "SKILL.md");
 const DEFER_SKILL = join(REPO, "skills", "defer", "SKILL.md");
 const MODEL_SELECTOR_AGENT = join(REPO, "agents", "model-selector.md");
+const MODEL_GUIDANCE_SKILL = join(REPO, "skills", "model-guidance", "SKILL.md");
+
+describe("model-guidance skill frontmatter", () => {
+  test("name: is the bare verb model-guidance", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_GUIDANCE_SKILL));
+    expect(fm.name).toBe("model-guidance");
+  });
+
+  test("grants AskUserQuestion in allowed-tools", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_GUIDANCE_SKILL));
+    expect(fm["allowed-tools"]).toContain("AskUserQuestion");
+  });
+
+  test("stays slash-only", () => {
+    const fm = parseFrontmatter(frontmatterBlock(MODEL_GUIDANCE_SKILL));
+    expect(fm["disable-model-invocation"]).toBe("true");
+  });
+});
 
 describe("model-selector agent frontmatter", () => {
   test("exists as a tracked agent named model-selector", () => {
