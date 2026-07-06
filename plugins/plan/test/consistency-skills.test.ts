@@ -273,6 +273,36 @@ describe("plan/defer/close selector handoff", () => {
 });
 
 // ---------------------------------------------------------------------------
+// plan refine selection beat (R6): the refine path re-selects every remaining
+// todo cell before arming — pinned so the refine copy cannot drift back to
+// claiming it skips selection and rejoins the arm unselected.
+// ---------------------------------------------------------------------------
+
+describe("plan skill refine selection beat", () => {
+  test("R6 runs the selection beat over the re-ghosted epic before the arm", () => {
+    const text = readFileSync(PLAN_SKILL, "utf-8");
+    expect(text).toContain("### R6.");
+    expect(text).toContain("keeper plan selection-brief");
+    expect(text).toContain("keeper plan assign-cells");
+  });
+
+  test("states the full-set re-select and the clean zero-todo skip", () => {
+    const text = readFileSync(PLAN_SKILL, "utf-8");
+    // The full-set/todo-only contract is stated plainly.
+    expect(text).toContain("every remaining todo task's cell");
+    // The zero-todo skip keys on the selection-brief NO_TODO_TASKS error.
+    expect(text).toContain("NO_TODO_TASKS");
+  });
+
+  test("no prose claims the refine path skips selection or rejoins unselected", () => {
+    const text = readFileSync(PLAN_SKILL, "utf-8");
+    expect(text).not.toMatch(/refine path skips (this|the) beat/i);
+    expect(text).not.toMatch(/skips this beat entirely/i);
+    expect(text).not.toMatch(/rejoins at Phase 7/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // defer-specific: carries no board-priority knob
 // ---------------------------------------------------------------------------
 
