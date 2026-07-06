@@ -7,7 +7,7 @@
  * `timeout`), and atomic same-dir temp-then-rename result files (EXDEV-safe on
  * macOS, where `os.tmpdir()` is a different APFS volume).
  *
- *   - `start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <s>]`
+ *   - `start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]`
  *     is idempotent-by-slug: it resolves the members in-process and derives the
  *     run's durable dir from the slug (or the `--run-dir` override), then under a
  *     per-slug advisory lock either fans out fresh (copy the prompt in, launch each
@@ -16,7 +16,7 @@
  *     an existing run — reusing terminal legs, leaving running legs, relaunching
  *     only no-result legs to a new-generation result path. Prints the manifest and
  *     exits 0; a colliding-slug prompt/member mismatch or lock contention exits 2.
- *   - `wait (--slug <slug> | --run-dir <d>) [--chunk <s>]` re-reads the manifest and
+ *   - `wait (--slug <slug> | --run-dir <d>) [--chunk <dur>]` re-reads the manifest and
  *     blocks ONE chunk polling each leg's terminality; exit 0 + verdict JSON when
  *     all legs are terminal, exit 124 when the chunk elapses (re-issuable), exit 2
  *     on a missing/corrupt manifest or bad flags. `--slug` resolves the durable
@@ -51,6 +51,7 @@ import {
 import { uptime } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { parseDuration } from "../../cli/duration";
 import {
   ConfigError,
   loadPanelSelections,
@@ -1699,10 +1700,10 @@ export function buildPanelDeps(): PanelDeps {
 export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait | status | prune)
 
 Usage:
-  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <s>]
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]
   keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|codex|pi>)
-       [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--run-dir <d>] [--timeout <s>]
-  keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <s>]
+       [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--run-dir <d>] [--timeout <dur>]
+  keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <dur>]
   keeper agent panel status (--slug <slug> | --run-dir <d>)
   keeper agent panel prune
 
@@ -1747,8 +1748,10 @@ Options:
   --run-dir <d>     Location override for the run dir. start: replaces the durable
                     slug dir; wait/status: an alternative to --slug (--run-dir wins
                     if both are given).
-  --timeout <s>     Per-leg keeper agent run stop-timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
-  --chunk <s>       wait window in seconds (default: ${DEFAULT_PANEL_CHUNK_SECONDS}, max ${MAX_CHUNK_SECONDS})
+  --timeout <dur>   Per-leg keeper agent run stop-timeout, unit-required (e.g. 30s,
+                    5m; default: ${DEFAULT_PANEL_TIMEOUT_SECONDS / 60}m)
+  --chunk <dur>     wait window, unit-required (e.g. 30s, 5m; default:
+                    ${DEFAULT_PANEL_CHUNK_SECONDS}s, max ${MAX_CHUNK_SECONDS}s)
   --help, -h        Show this help
 `;
 
@@ -1844,15 +1847,14 @@ export async function runPanel(argv: string[]): Promise<void> {
       );
       process.exit(2);
     }
-    const timeoutSeconds =
-      parsed.values.timeout !== undefined
-        ? Number(parsed.values.timeout)
-        : DEFAULT_PANEL_TIMEOUT_SECONDS;
-    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
-      process.stderr.write(
-        `pair panel start: --timeout must be a positive number (got ${parsed.values.timeout})\n`,
-      );
-      process.exit(2);
+    let timeoutSeconds = DEFAULT_PANEL_TIMEOUT_SECONDS;
+    if (parsed.values.timeout !== undefined) {
+      const dur = parseDuration(parsed.values.timeout);
+      if (!dur.ok) {
+        process.stderr.write(`pair panel start: --timeout ${dur.message}\n`);
+        process.exit(2);
+      }
+      timeoutSeconds = dur.ms / 1000;
     }
 
     // --slug is REQUIRED: it names the run, and each leg launches as
@@ -1998,10 +2000,15 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.stderr.write(`pair panel wait: ${resolved.msg}\n`);
     process.exit(2);
   }
-  const chunkSeconds =
-    parsed.values.chunk !== undefined
-      ? Number(parsed.values.chunk)
-      : DEFAULT_PANEL_CHUNK_SECONDS;
+  let chunkSeconds = DEFAULT_PANEL_CHUNK_SECONDS;
+  if (parsed.values.chunk !== undefined) {
+    const dur = parseDuration(parsed.values.chunk);
+    if (!dur.ok) {
+      process.stderr.write(`pair panel wait: --chunk ${dur.message}\n`);
+      process.exit(2);
+    }
+    chunkSeconds = dur.ms / 1000;
+  }
   const code = await panelWait({ dir: resolved.dir, chunkSeconds }, deps);
   process.exit(code);
 }

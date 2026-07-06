@@ -239,7 +239,7 @@ test("agent panel wait: terminal panel → exit 0 + verdict JSON (content-blind)
     "--run-dir",
     pdir,
     "--chunk",
-    "540",
+    "540s",
   ]);
   expect(r.code).toBe(0);
   const v: PanelVerdict = JSON.parse(r.stdout.trim());
@@ -271,7 +271,7 @@ test("agent panel wait: --chunk above the ceiling → exit 2", async () => {
     "--run-dir",
     pdir,
     "--chunk",
-    "9999",
+    "9999s",
   ]);
   expect(r.code).toBe(2);
   expect(r.stderr).toContain("ceiling");
@@ -1392,7 +1392,7 @@ test("agent panel wait --slug: resolves the durable slug dir", async () => {
     "--slug",
     "resolve-run",
     "--chunk",
-    "540",
+    "540s",
   ]);
   expect(r.code).toBe(0);
   const v: PanelVerdict = JSON.parse(r.stdout.trim());
@@ -1410,7 +1410,7 @@ test("agent panel wait: --run-dir wins when both --run-dir and --slug are given"
     "--slug",
     "nonexistent",
     "--chunk",
-    "540",
+    "540s",
   ]);
   expect(r.code).toBe(0);
   const v: PanelVerdict = JSON.parse(r.stdout.trim());
