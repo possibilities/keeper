@@ -140,6 +140,27 @@ check in-process, so a red gate is a red suite. Note the gate checks hash parity
 freshness: a `stub`-stamped value with a matching hash passes `--check` but reads as a gap in
 `--state`.
 
+## Commit the pass
+
+A pass that wrote anything ends with a commit, in the same turn the gate goes green — never hand
+the tree back dirty or punt the commit to the human. (The all-fresh zero-write exit has nothing to
+commit and skips this.) Commit via `keeper commit-work`, the standard commit seam (lint matrix +
+commit + push in one call), never raw `git commit`:
+
+```bash
+keeper commit-work --preview-files
+keeper commit-work "docs(plan): <what was researched or refreshed>"
+```
+
+The commit scope is exactly the pass's artifacts: `model-selector.yaml`, each touched
+`references/<model>.md`, and any test that pins the on-disk guidance state. Unrelated dirty files
+(concurrent workers often leave some) stay out — when the preview shows `commit-work` would sweep
+in files outside the pass or miss one of its artifacts, fall back to plain git with explicit paths
+(`git add <path> …`, never `-A` / `.`), then `git commit` + `git push`. On a `lint_failed`
+envelope: fix the named files, re-stage, re-invoke `keeper commit-work` with the same message —
+never bare `git commit` or `--no-verify` after a lint failure. Any other failure envelope surfaces
+verbatim to the human.
+
 ## Cadence
 
 The gate enforces hash *parity*, not *freshness* — a stale-but-consistent cache passes. Re-run the
