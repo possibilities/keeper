@@ -112,6 +112,7 @@ import {
   epicHasActiveResolver,
   FINALIZER_GUARD_S,
   isFinalizerVerb,
+  isStoppedJobLive,
   KEEPER_ROOT,
   type LaneMergedEntry,
   type PlannedLaunch,
@@ -136,7 +137,7 @@ import {
   worktreeRecoverDispatchId,
 } from "./reconcile-core";
 import { runQuery } from "./server-worker";
-import type { Epic } from "./types";
+import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
   ELIGIBLE_REASON,
@@ -158,6 +159,7 @@ import {
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
+  losslessPremergeClean as gitLosslessPremergeClean,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
@@ -829,12 +831,32 @@ export interface WorktreeDriver {
    * Provision the lane for one launch: ensure the worktree exists (lazily, off
    * the parent lane's committed tip), run the assignment's fan-in pre-merges in
    * order, then assert the worktree HEAD equals the derived branch. Returns the
-   * resolved worktree path on success (the producer overrides the launch cwd with
-   * it) or a `{ failed: <reason> }` the producer mints as a sticky DispatchFailed.
+   * resolved worktree path on success (the producer overrides the launch cwd with it).
+   *
+   * A failure is one of two kinds, distinguished by `retry`:
+   *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a fan-in content merge
+   *    conflict, an unregistered/HEAD-mismatch worktree). The producer mints a STICKY
+   *    `DispatchFailed` a human clears with `retry_dispatch`.
+   *  - `{ ok: false, retry: true, reason }` — a transient not-ready base lane the
+   *    fan-in pre-merge probe would blind-conflict on (dirty-but-not-losslessly-
+   *    cleanable / off-branch / mid-merge / would-clobber / lock-timeout). The
+   *    producer STOPS this launch but mints NO sticky; the next cycle retries once
+   *    the base settles. NEVER a blind merge.
+   *
+   * Before each fan-in merge the driver probes {@link mergeReadiness}: a `ready` base
+   * merges unchanged; a DIRTY base is losslessly cleaned ONLY when the dirt is a
+   * provably-redundant leak of the incoming rib AND none of it is in
+   * `liveAttributedDirty` (the reconciler-supplied set of repo-relative paths a LIVE
+   * job holds an undischarged mutation for in this base worktree; `null` ⇒ the
+   * attribution read failed ⇒ do-not-discard). The driver never reads attribution
+   * itself.
    */
   provision(
     info: WorktreeLaunchInfo,
-  ): Promise<{ ok: true; cwd: string } | { ok: false; reason: string }>;
+    liveAttributedDirty: ReadonlySet<string> | null,
+  ): Promise<
+    { ok: true; cwd: string } | { ok: false; reason: string; retry?: boolean }
+  >;
   /**
    * After the epic closer reaches done: merge the epic base branch into the repo's
    * resolved default branch (sequential pairwise, pushed once), then tear the lane
@@ -2300,6 +2322,96 @@ export async function confirmRunning(
   return "indoubt";
 }
 
+/** Shared empty set — the `liveAttrFor` fallback when a base worktree has no live-job
+ *  attribution, so a present map missing the key allocates nothing per launch. */
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Build the producer LIVE-JOB dirty-attribution map the fan-in pre-merge clean reads
+ * — `Map<laneWorktreePath, Set<repoRelPath>>` — so a running worker's uncommitted work
+ * is NEVER discarded as a "redundant leak". Reads undischarged `file_attributions`
+ * rows (`last_commit_at IS NULL OR last_commit_at < last_mutation_at`) whose
+ * `session_id` (== a job's `job_id`) belongs to a LIVE job — `working`, or `stopped`
+ * with a live backend pane (the SAME {@link isStoppedJobLive} rule the occupancy gate
+ * uses) — grouped by `project_dir` (the git toplevel a linked worktree resolves to ==
+ * the lane path), realpath + trailing-slash normalized to match the lookup key.
+ * Returns `null` on ANY read failure — the caller threads that as do-not-discard
+ * (assume live-attributed). A producer read (never a fold); the no-live-job fast path
+ * skips the SQL entirely.
+ */
+function computeLiveAttributedDirtyByWorktree(
+  db: Parameters<typeof runQuery>[0],
+  jobs: Map<string, Job>,
+  livePaneIds: ReadonlySet<string> | null,
+): Map<string, ReadonlySet<string>> | null {
+  try {
+    const liveSessions = new Set<string>();
+    for (const job of jobs.values()) {
+      const live =
+        job.state === "working" ||
+        (job.state === "stopped" && isStoppedJobLive(job, livePaneIds));
+      if (live) {
+        liveSessions.add(job.job_id);
+      }
+    }
+    if (liveSessions.size === 0) {
+      return new Map();
+    }
+    const rows = db
+      .query(
+        "SELECT project_dir, session_id, file_path FROM file_attributions " +
+          "WHERE last_commit_at IS NULL OR last_commit_at < last_mutation_at",
+      )
+      .all() as Array<{
+      project_dir: string;
+      session_id: string;
+      file_path: string;
+    }>;
+    const byWorktree = new Map<string, Set<string>>();
+    for (const r of rows) {
+      if (
+        typeof r.project_dir !== "string" ||
+        typeof r.session_id !== "string" ||
+        typeof r.file_path !== "string" ||
+        !liveSessions.has(r.session_id)
+      ) {
+        continue;
+      }
+      const key = normalizeWorktreeAttributionKey(r.project_dir);
+      let set = byWorktree.get(key);
+      if (set === undefined) {
+        set = new Set<string>();
+        byWorktree.set(key, set);
+      }
+      set.add(r.file_path);
+    }
+    return byWorktree;
+  } catch (err) {
+    console.error(
+      "[autopilot-worker] live-attributed dirty read threw (do-not-discard):",
+      err,
+    );
+    return null;
+  }
+}
+
+/**
+ * Normalize a worktree path to the pre-merge attribution map's key: realpath (so the
+ * macOS `/tmp`→`/private/tmp` + `/var`→`/private/var` symlinks collapse to the same
+ * form the lane-path lookup in `runReconcileCycle` produces), then strip a trailing
+ * slash. A realpath failure (a path already torn down) keeps the raw input, still
+ * trailing-slash-stripped.
+ */
+function normalizeWorktreeAttributionKey(p: string): string {
+  let resolved = p;
+  try {
+    resolved = realpathSync.native(p);
+  } catch {
+    // A torn-down worktree that no longer resolves — key on the raw path.
+  }
+  return stripTrailingSlashPath(resolved);
+}
+
 /**
  * Run one reconcile + dispatch cycle. Pure-glue — chains the decision's launches
  * one at a time through `confirmRunning` (the one-at-a-time stagger). Each launch
@@ -2313,6 +2425,14 @@ export async function runReconcileCycle(
   shell: string,
   signal: AbortSignal,
   deps: ConfirmRunningDeps,
+  // The producer LIVE-JOB dirty attribution from `loadReconcileSnapshot`, keyed by
+  // lane worktree path — threaded into every `provision` so the fan-in pre-merge
+  // clean never discards dirt a running worker owns. `null` (or omitted) = the read
+  // failed / no info → every base is treated do-not-discard.
+  liveAttributedDirtyByWorktree: ReadonlyMap<
+    string,
+    ReadonlySet<string>
+  > | null = null,
 ): Promise<void> {
   // Realpath-normalize the worktree lane before it rides the launch as the
   // KEEPER_PLAN_WORKTREE env (macOS /var→/private/var) — a PRODUCER fs read,
@@ -2327,6 +2447,20 @@ export async function runReconcileCycle(
         return p;
       }
     });
+  // The live-attributed dirty set for a launch's base lane worktree, keyed the SAME
+  // way the snapshot built the map (realpath + trailing-slash normalized). `null` ⇒
+  // do-not-discard (an OFF-mode launch with no geometry, or a failed attribution
+  // read); a present map missing the key ⇒ the empty set (nothing attributed there,
+  // so a provably-redundant leak is cleanable).
+  const liveAttrFor = (
+    info: WorktreeLaunchInfo | undefined,
+  ): ReadonlySet<string> | null => {
+    if (info === undefined || liveAttributedDirtyByWorktree === null) {
+      return null;
+    }
+    const key = stripTrailingSlashPath(realpath(info.assignment.worktreePath));
+    return liveAttributedDirtyByWorktree.get(key) ?? EMPTY_STRING_SET;
+  };
   // Scan-dir shadow probe — resolved once, memoized across the loop (the scan dirs
   // are cycle-invariant). `undefined` = not yet probed; a first `work`-cell launch
   // triggers the single on-disk scan, so a cycle with no cell launches never reads
@@ -2486,8 +2620,23 @@ export async function runReconcileCycle(
     // path so a serial/OFF launch leaves it undefined and stays byte-identical.
     let worktreeBranch: string | undefined;
     if (deps.worktree !== undefined) {
-      const wt = await runWorktreeProducerStep(plan, launchCwd, deps.worktree);
+      const wt = await runWorktreeProducerStep(
+        plan,
+        launchCwd,
+        deps.worktree,
+        liveAttrFor(plan.worktree),
+      );
       if (!wt.ok) {
+        if (wt.retry === true) {
+          // A transient not-ready base lane the fan-in pre-merge would blind-conflict
+          // on — retry-skip: mint NO sticky, and because this `continue` PRECEDES the
+          // inFlight / cooldown / pending-dispatch mint below, consume NO slot,
+          // cooldown, or pending row. Log so the silent skip stays diagnosable.
+          console.error(
+            `[autopilot-worker] provision ${plan.verb}::${plan.id}: ${wt.reason}`,
+          );
+          continue;
+        }
         deps.emitDispatchFailed({
           verb: plan.verb,
           id: plan.id,
@@ -2644,16 +2793,30 @@ export async function runReconcileCycle(
       if (signal.aborted) {
         return;
       }
-      const provisioned = await deps.worktree.provision(sink);
+      const provisioned = await deps.worktree.provision(
+        sink,
+        liveAttrFor(sink),
+      );
+      // A provision failure — genuine OR a transient retry-skip — ADDS to
+      // `provisionFailed` below so this group's finalize is skipped either way (its
+      // base is not assembled). Only a GENUINE block mints the sticky `close::<epic>`.
       if (!provisioned.ok) {
         provisionFailed.add(`${closeKeyEpicId(sink)} ${sink.repoDir}`);
-        deps.emitDispatchFailed({
-          verb: "close",
-          id: closeKeyEpicId(sink),
-          reason: provisioned.reason,
-          dir: sink.repoDir,
-          ts: deps.now(),
-        });
+        if (provisioned.retry === true) {
+          // A transient not-ready base lane — retry-skip: mint NO sticky
+          // `close::<epic>` row; the next cycle retries once the base settles.
+          console.error(
+            `[autopilot-worker] provision close::${closeKeyEpicId(sink)} (${sink.repoDir}): ${provisioned.reason}`,
+          );
+        } else {
+          deps.emitDispatchFailed({
+            verb: "close",
+            id: closeKeyEpicId(sink),
+            reason: provisioned.reason,
+            dir: sink.repoDir,
+            ts: deps.now(),
+          });
+        }
       }
     }
     // Track the per-repo finalize keys that finalized CLEAN this cycle so the
@@ -2740,13 +2903,25 @@ async function runWorktreeProducerStep(
   plan: PlannedLaunch,
   launchCwd: string,
   driver: WorktreeDriver,
+  liveAttributedDirty: ReadonlySet<string> | null,
 ): Promise<
-  { ok: true; cwd: string } | { ok: false; reason: string; dir: string }
+  | { ok: true; cwd: string }
+  | { ok: false; reason: string; dir: string; retry?: boolean }
 > {
   if (plan.worktree !== undefined) {
-    const provisioned = await driver.provision(plan.worktree);
+    const provisioned = await driver.provision(
+      plan.worktree,
+      liveAttributedDirty,
+    );
     if (!provisioned.ok) {
-      return { ok: false, reason: provisioned.reason, dir: launchCwd };
+      // `retry` propagates the fan-in pre-merge retry-skip (a transient not-ready base
+      // lane) so the caller mints NO sticky; a genuine block carries no `retry`.
+      return {
+        ok: false,
+        reason: provisioned.reason,
+        dir: launchCwd,
+        retry: provisioned.retry,
+      };
     }
     return { ok: true, cwd: provisioned.cwd };
   }
@@ -2775,7 +2950,7 @@ export function createWorktreeDriver(
   run: WorktreeGitRunner = gitExec,
 ): WorktreeDriver {
   return {
-    async provision(info) {
+    async provision(info, liveAttributedDirty) {
       const { assignment, repoDir, parentBranch } = info;
       const { branch, worktreePath, preMerges } = assignment;
       try {
@@ -2795,6 +2970,73 @@ export function createWorktreeDriver(
         // a `missing-source` phantom lane (a branch never created because its task's
         // work landed on the default branch) is a lossless no-op we skip.
         for (const source of preMerges) {
+          // Probe the base worktree BEFORE merging the rib in (as finalize/recover
+          // already do), but ONLY for a source that will ACTUALLY merge — a phantom
+          // (unresolvable) or already-merged (ancestor) source folds nothing, so
+          // probing the base for it would both add cost AND, on a dirty base, wrongly
+          // retry-skip against a no-op. These guards mirror gitMergeBranchInto's own
+          // (idempotent — it re-runs them); a probe TIMEOUT falls through to it, which
+          // surfaces the transient degrade. `resolves &&` short-circuits the ancestry
+          // probe for a phantom so it stays a single-read cheap skip.
+          const srcRef = await run(
+            [
+              "rev-parse",
+              "--quiet",
+              "--verify",
+              "--end-of-options",
+              `refs/heads/${source}^{commit}`,
+            ],
+            { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+          );
+          const resolves = srcRef.code === 0;
+          const alreadyMerged =
+            resolves &&
+            (
+              await run(["merge-base", "--is-ancestor", source, "HEAD"], {
+                cwd: worktreePath,
+                timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+              })
+            ).code === 0;
+          if (resolves && !alreadyMerged) {
+            // A `ready` base merges unchanged (byte-identical clean path). A DIRTY base
+            // is LOSSLESSLY cleaned ONLY when its dirt is a provably-redundant leak of
+            // THIS rib and none is attributed to a live job — else every not-ready
+            // state degrades to a NON-STICKY retry-skip so a dirty base never
+            // blind-conflicts (the wedge this arm fixes). Genuine-conflict escalation of
+            // the merge ITSELF stays today's sticky (Task 2 routes it).
+            const ready = await gitMergeReadiness(
+              worktreePath,
+              branch,
+              run,
+              source,
+            );
+            if (ready.kind === "dirty") {
+              const cleaned = await gitLosslessPremergeClean(
+                worktreePath,
+                branch,
+                source,
+                liveAttributedDirty,
+                run,
+              );
+              if (cleaned.kind === "retry") {
+                return {
+                  ok: false,
+                  retry: true,
+                  reason: `worktree-premerge-dirty-base: deferring the fan-in merge of ${source} into ${branch} — ${cleaned.reason}`,
+                };
+              }
+              // cleaned.kind === "ready" → the redundant leak was restored to HEAD; the
+              // merge below re-applies exactly that content, a true no-op on it.
+            } else if (ready.kind !== "ready") {
+              // A transient not-ready base lane (off-branch / mid-merge / would-clobber)
+              // the merge would abort on — retry-skip, NEVER a blind merge.
+              return {
+                ok: false,
+                retry: true,
+                reason: `worktree-premerge-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the fan-in`,
+              };
+            }
+          }
           const merge: MergeResult = await gitMergeBranchInto(
             worktreePath,
             source,
@@ -4743,6 +4985,15 @@ export async function loadReconcileSnapshot(
     ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
     : [];
 
+  // The producer LIVE-JOB dirty attribution the fan-in pre-merge clean consults so it
+  // never discards dirt a running worker owns — keyed by lane worktree path. A raw
+  // read of undischarged `file_attributions` filtered to LIVE sessions. `null` on ANY
+  // read failure → every base is treated do-not-discard. Gated on `worktreeMode` (an
+  // OFF cycle provisions no lanes). NEVER a fold input, NEVER read by pure `reconcile`.
+  const liveAttributedDirtyByWorktree = worktreeMode
+    ? computeLiveAttributedDirtyByWorktree(db, jobs, livePaneIds)
+    : new Map<string, ReadonlySet<string>>();
+
   // The worktrees root the pure lane geometry derives every lane path under —
   // resolved HERE (producer side) so the pure `reconcile` / `prepareWorktreeGeometry`
   // / `deriveWorktreePlan` chain reaches no `homedir()` on the verdict path (re-fold
@@ -4778,6 +5029,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     landedLaneEntries,
+    liveAttributedDirtyByWorktree,
     worktreesRoot,
   };
 }
@@ -5449,6 +5701,10 @@ function main(): void {
           // pause-abort + fresh controller doesn't retroactively un-abort this run.
           cycleController.signal,
           deps,
+          // The producer live-job dirty attribution (worktree mode only) — threaded
+          // into every `provision` so the fan-in pre-merge clean never discards dirt a
+          // running worker owns; `null` (a failed read) → do-not-discard.
+          snapshot.liveAttributedDirtyByWorktree ?? null,
         );
       } while (wakePending && !shutdown);
     } catch (err) {

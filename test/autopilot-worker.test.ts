@@ -4801,12 +4801,14 @@ test("reconcile yolo: dispatch is unchanged (mode arm is a no-op)", () => {
 interface FakeWorktreeLog {
   calls: string[];
   provisions: WorktreeLaunchInfo[];
+  provisionAttributions: (ReadonlySet<string> | null)[];
   finalizes: WorktreeLaunchInfo[];
   assertCwds: string[];
   recoverRepos: string[][];
 }
 function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
+  provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeRetry?: (info: WorktreeLaunchInfo) => string | null;
   assertFail?: (cwd: string) => string | null;
@@ -4817,14 +4819,22 @@ function makeFakeWorktreeDriver(opts?: {
   const log: FakeWorktreeLog = {
     calls: [],
     provisions: [],
+    provisionAttributions: [],
     finalizes: [],
     assertCwds: [],
     recoverRepos: [],
   };
   const driver: WorktreeDriver = {
-    async provision(info) {
+    async provision(info, liveAttributedDirty) {
       log.calls.push(`provision:${info.assignment.nodeId}`);
       log.provisions.push(info);
+      log.provisionAttributions.push(liveAttributedDirty);
+      // `provisionRetry` wins first (a transient not-ready base → retry-skip, no
+      // sticky), mirroring `finalizeRetry`; `provisionFail` is a genuine block.
+      const retry = opts?.provisionRetry?.(info) ?? null;
+      if (retry !== null) {
+        return { ok: false, retry: true, reason: retry };
+      }
       const reason = opts?.provisionFail?.(info) ?? null;
       if (reason !== null) {
         return { ok: false, reason };
@@ -6193,6 +6203,50 @@ test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a stick
   expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
 });
 
+test("fn-1123 runReconcileCycle: a non-primary sink fan-in RETRY mints NO sticky close row but still SKIPS that group's finalize", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    provisionRetry: (info) =>
+      info.repoDir === "/repo-b"
+        ? "worktree-premerge-dirty-base: base not losslessly cleanable"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = multiRepoSnap([epic], abResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The transient retry-skip minted NO sticky (unlike the conflict case above).
+  expect(depsLog.emissions).toEqual([]);
+  // But the /repo-b base is un-assembled, so ONLY the primary group finalizes.
+  expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
+});
+
 // ---------------------------------------------------------------------------
 // fn-1034.2 — per-repo finalize failure rows + producer level-clear
 // ---------------------------------------------------------------------------
@@ -6578,6 +6632,80 @@ test("fn-959 runReconcileCycle: worktree ON provision failure → sticky Dispatc
   });
   // Slot was never held (failed before inFlight.add).
   expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-1123 runReconcileCycle: a provision RETRY (transient dirty base) mints NO sticky and consumes no slot / cooldown", async () => {
+  const { driver, log } = makeFakeWorktreeDriver({
+    provisionRetry: () =>
+      "worktree-premerge-dirty-base: deferring the fan-in merge — base not losslessly cleanable",
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const state = makeState();
+
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    state,
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.calls).toEqual(["provision:fn-1-foo.1"]);
+  expect(depsLog.launches).toEqual([]); // never launched
+  expect(depsLog.emissions).toEqual([]); // NO sticky — the retry-skip is invisible
+  // No slot, cooldown, or pending consumed → re-dispatchable next cycle.
+  expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
+  expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-1123 runReconcileCycle: the live-attributed dirty set threads to provision (present map → set, omitted → null do-not-discard)", async () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+
+  // Omitted param → the driver receives `null` (do-not-discard).
+  {
+    const { driver, log } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+    expect(log.provisionAttributions).toEqual([null]);
+  }
+
+  // A present (even empty) map → the driver receives a non-null set (nothing
+  // attributed to this lane, so a provably-redundant leak is cleanable).
+  {
+    const { driver, log } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map<string, ReadonlySet<string>>(),
+    );
+    expect(log.provisionAttributions).toHaveLength(1);
+    expect(log.provisionAttributions[0]).not.toBeNull();
+    expect([...(log.provisionAttributions[0] ?? [])]).toEqual([]);
+  }
 });
 
 test("fn-959 runReconcileCycle: worktree OFF → on-default-branch assertion runs; a mismatch is sticky DispatchFailed", async () => {
@@ -7822,7 +7950,7 @@ test("fn-959 createWorktreeDriver: provision ensures the worktree off the parent
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo",
   };
-  const res = await driver.provision(info);
+  const res = await driver.provision(info, null);
   expect(res).toEqual({
     ok: true,
     cwd: "/repo.worktrees/keeper-epic-fn-1-foo",
@@ -7883,7 +8011,7 @@ test("fn-959 createWorktreeDriver: provision forks the BASE lane off the resolve
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo", // === branch: the base lane
   };
-  const res = await driver.provision(info);
+  const res = await driver.provision(info, null);
   expect(res.ok).toBe(true);
   // Forks off `main` (resolved default), NOT the uncreated base branch.
   expect(cmds).toContain(
@@ -7940,7 +8068,7 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
     laneOrder: [],
     parentBranch: "keeper/epic/fn-1-foo", // the parent lane (!== branch)
   };
-  const res = await driver.provision(info);
+  const res = await driver.provision(info, null);
   expect(res.ok).toBe(true);
   // Forks off the parent lane; the default-branch resolution is never consulted.
   expect(cmds).toContain(
@@ -7971,6 +8099,10 @@ function makePhantomFanInRun(opts: {
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   let added = false;
+  // Stateful MERGE_HEAD: absent until a `merge --no-edit` conflicts, so the pre-merge
+  // readiness probe sees a CLEAN base and only the guarded post-conflict abort finds
+  // the in-flight merge. Cleared by `merge --abort`.
+  let midMerge = false;
   const conflicts = new Set(opts.conflictSources ?? []);
   const phantoms = opts.phantomSources;
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
@@ -7998,14 +8130,19 @@ function makePhantomFanInRun(opts: {
     }
     if (joined.startsWith("merge --no-edit")) {
       const source = args[2] ?? "";
-      return conflicts.has(source)
-        ? { code: 1, stdout: "CONFLICT (content)\n", stderr: "" }
-        : { code: 0, stdout: "", stderr: "" };
+      if (conflicts.has(source)) {
+        midMerge = true; // a conflict leaves MERGE_HEAD for the guarded abort
+        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
-      return { code: 0, stdout: "head\n", stderr: "" }; // present → abort runs
+      return midMerge
+        ? { code: 0, stdout: "head\n", stderr: "" } // in-flight → abort runs
+        : { code: 1, stdout: "", stderr: "" }; // clean base → readiness sees no merge
     }
     if (joined.startsWith("merge --abort")) {
+      midMerge = false;
       return { code: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("worktree add")) {
@@ -8057,7 +8194,7 @@ test("fn-979 createWorktreeDriver: provision skips a phantom pre-merge (missing-
   const phantom = "keeper/epic/fn-1-foo--fn-1-foo.2";
   const { run, cmds } = makePhantomFanInRun({ phantomSources: [phantom] });
   const driver = createWorktreeDriver(run);
-  const res = await driver.provision(makeFanInInfo([phantom]));
+  const res = await driver.provision(makeFanInInfo([phantom]), null);
   expect(res).toEqual({
     ok: true,
     cwd: "/repo.worktrees/keeper-epic-fn-1-foo",
@@ -8085,7 +8222,10 @@ test("fn-979 createWorktreeDriver: provision skips a phantom but a LATER real co
       lockDir,
     });
     const driver = createWorktreeDriver(run);
-    const res = await driver.provision(makeFanInInfo([phantom, conflict]));
+    const res = await driver.provision(
+      makeFanInInfo([phantom, conflict]),
+      null,
+    );
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.reason).toContain("worktree-merge-conflict");
@@ -8111,7 +8251,10 @@ test("fn-979 createWorktreeDriver: a real conflict BEFORE a phantom fails loud i
       lockDir,
     });
     const driver = createWorktreeDriver(run);
-    const res = await driver.provision(makeFanInInfo([conflict, phantom]));
+    const res = await driver.provision(
+      makeFanInInfo([conflict, phantom]),
+      null,
+    );
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.reason).toContain("worktree-merge-conflict");

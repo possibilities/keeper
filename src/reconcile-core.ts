@@ -595,6 +595,22 @@ export interface ReconcileSnapshot {
    */
   landedLaneEntries?: readonly LaneMergedEntry[];
   /**
+   * Producer-side LIVE-JOB dirty attribution for the worktree pre-merge clean —
+   * keyed by lane worktree path (== `file_attributions.project_dir`, realpath +
+   * trailing-slash normalized), each value the repo-relative paths a currently-LIVE
+   * job holds an undischarged mutation for there. The fan-in pre-merge clean consults
+   * it to NEVER discard dirt a running worker owns. Computed ONCE per cycle in
+   * {@link loadReconcileSnapshot} (gated on {@link worktreeMode}); read PRODUCER-SIDE
+   * in `runReconcileCycle` and threaded into `provision`, NEVER by the pure
+   * `reconcile` and NEVER a fold input. `null` = the read FAILED → do-not-discard
+   * (every provision treats its base as live-attributed). Absent key = no live job
+   * attributed dirt there. Optional so a test snapshot may omit it (→ do-not-discard).
+   */
+  liveAttributedDirtyByWorktree?: ReadonlyMap<
+    string,
+    ReadonlySet<string>
+  > | null;
+  /**
    * The worktrees root the pure lane geometry derives every lane path under —
    * `${homedir()}/worktrees`, resolved PRODUCER-SIDE in
    * {@link loadReconcileSnapshot} and threaded through so `reconcile` /
@@ -1152,9 +1168,11 @@ export function classifyResolverOutcome(
 /**
  * Is a `stopped` job's backend session still LIVE? `null` `livePaneIds` (probe
  * unavailable) → assume live (the conservative pre-liveness fallback). A row
- * with no `backend_exec_pane_id` is not live-provable → not live here.
+ * with no `backend_exec_pane_id` is not live-provable → not live here. Exported so
+ * the producer live-job dirty-attribution pass (`loadReconcileSnapshot`) shares the
+ * ONE liveness rule instead of forking it.
  */
-function isStoppedJobLive(
+export function isStoppedJobLive(
   job: Job,
   livePaneIds: ReadonlySet<string> | null,
 ): boolean {
