@@ -1,10 +1,11 @@
-// epic add-dep / rm-dep — the port of run_epic_add_dep.py and the rm side of the
-// dep editors. add-dep resolves the dep id cwd-then-global (ambiguous -> hard
-// error), normalizes a number-only fn-N to the full slug, appends the edge,
-// bumps updated_at, then rides the shared restamp pipeline. The rollback hook
-// restores the pre-write epic JSON when the post-write integrity gate rejects an
+// epic add-dep / rm-dep — add-dep resolves the dep id cwd-then-global (ambiguous
+// -> hard error), normalizes a number-only fn-N to the full slug, appends the
+// edge, bumps updated_at, then rides the shared post-write integrity gate. The
+// rollback hook restores the pre-write epic JSON when the gate rejects an
 // introduced cycle, so a rejected dep leaves disk untouched. rm-dep is the
-// idempotent remove + restamp; removing a non-present dep is still success.
+// idempotent remove behind the same gate; removing a non-present dep is still
+// success. Neither touches last_validated_at — the marker is an arm-exclusive
+// latch, so wiring a dep never arms a ghost or refreshes an armed epic.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -12,9 +13,9 @@ import { join } from "node:path";
 import { resolveEpicGlobally } from "../discovery.ts";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
+import { runSetter } from "../integrity_gate.ts";
 import { resolveProject } from "../project.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
-import { runSetter } from "../validation_restamp.ts";
 
 interface DepEditArgs {
   epicId: string;
@@ -66,8 +67,8 @@ export function runEpicAddDep(args: DepEditArgs): void {
 
   runSetter(epicId, dataDir, {
     verb: "add-dep",
-    // add-dep stamps updated_at in its apply; the tail writes last_validated_at
-    // only (no re-bump). Mirrors run_epic_add_dep.py's post-restamp write.
+    // add-dep stamps updated_at in its apply, so the gate spine's tail is a no-op
+    // (stampUpdatedAt=false) and the marker is never touched.
     stampUpdatedAt: false,
     hooks: {
       apply: () => {

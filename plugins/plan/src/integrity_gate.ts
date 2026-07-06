@@ -1,14 +1,17 @@
-// Shared restamp pipeline — the byte-parity port of planctl/validation_restamp.py.
+// Shared post-write integrity gate for the structural mutation verbs.
 //
-// VALIDATION_RESTAMP_VERBS is the canonical in-wave member list; restampEpicOrFail
-// is the post-write gate every member rides AFTER its structural write lands:
-// re-load the on-disk tree, extend the epic universe across discovered projects
-// (fail-soft → empty global map), run the integrity check, and on a clean result
-// return nowIso() for the caller to stamp. On any error it prints the compact
-// integrity_failed envelope and exits 1, leaving the structural write on disk
-// (fail-FORWARD) — except add-dep, whose runSetter rollback hook restores prior
-// state BEFORE the exit. runSetter factors the load→gate→apply→write→pre-restamp
-// →restamp→stamp-write→emit spine with the two special-case hooks as callbacks.
+// INTEGRITY_GATE_VERBS is the canonical member list; integrityGateOrFail is the
+// gate every member rides AFTER its structural write lands: re-load the on-disk
+// tree, extend the epic universe across discovered projects (fail-soft → empty
+// global map), and run the integrity check. On a clean result it returns; on any
+// error it prints the compact integrity_failed envelope and exits 1, leaving the
+// structural write on disk (fail-FORWARD) — except add-dep, whose runSetter
+// rollback hook restores prior state BEFORE the exit. The gate NEVER reads or
+// writes last_validated_at: the marker is an arm-exclusive one-way latch owned
+// solely by armEpicValidated (arm) and the two invalidate paths (un-arm), so a
+// mutation verb can never arm a ghost or refresh an armed epic. runSetter factors
+// the apply→pre-gate→gate→updated_at spine with the two special-case hooks as
+// callbacks.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -23,9 +26,9 @@ import {
   nowIso,
 } from "./store.ts";
 
-/** Verbs that re-stamp last_validated_at on a structural mutation. The canonical
- * in-wave member list — mirrors validation_restamp.VALIDATION_RESTAMP_VERBS. */
-export const VALIDATION_RESTAMP_VERBS: readonly string[] = [
+/** The verbs that run the post-write integrity gate on a structural mutation.
+ * The canonical member list — none of them touch last_validated_at. */
+export const INTEGRITY_GATE_VERBS: readonly string[] = [
   "set-description",
   "set-acceptance",
   "reset",
@@ -40,7 +43,7 @@ export const VALIDATION_RESTAMP_VERBS: readonly string[] = [
   "assign-cells",
 ];
 
-/** The compact integrity_failed envelope shape the restamp gate prints. */
+/** The compact integrity_failed envelope shape the gate prints. */
 interface IntegrityFailure {
   success: false;
   error: {
@@ -51,9 +54,10 @@ interface IntegrityFailure {
 }
 
 /** Build the compact integrity_failed envelope — message exactly
- * "<verb> on <epic_id> produced an invalid epic tree; last_validated_at NOT
- * re-stamped". Mirrors _emit_restamp_failure's payload. */
-function buildRestampFailure(
+ * "<verb> on <epic_id> produced an invalid epic tree". The marker is left
+ * untouched on both the pass and fail paths, so the message names only the
+ * structural violation. */
+function buildIntegrityFailure(
   verb: string,
   epicId: string,
   errors: string[],
@@ -62,7 +66,7 @@ function buildRestampFailure(
     success: false,
     error: {
       code: "integrity_failed",
-      message: `${verb} on ${epicId} produced an invalid epic tree; last_validated_at NOT re-stamped`,
+      message: `${verb} on ${epicId} produced an invalid epic tree`,
       details: errors,
     },
   };
@@ -71,9 +75,8 @@ function buildRestampFailure(
 /** Print the compact integrity_failed envelope and exit 1 — the structural write
  * already landed, so a success envelope would mislead. An optional `onFailure`
  * hook fires BEFORE the print/exit so a caller (add-dep) can roll its write back
- * first; this is the Bun analogue of Python's catchable SystemExit, which add-dep
- * intercepts to restore prior state. Mirrors _emit_restamp_failure. */
-function emitRestampFailure(
+ * first. */
+function emitIntegrityFailure(
   verb: string,
   epicId: string,
   errors: string[],
@@ -83,19 +86,19 @@ function emitRestampFailure(
     onFailure();
   }
   process.stdout.write(
-    `${compactJson(buildRestampFailure(verb, epicId, errors))}\n`,
+    `${compactJson(buildIntegrityFailure(verb, epicId, errors))}\n`,
   );
   process.exit(1);
 }
 
-/** Re-validate the epic on disk post-write and return a fresh stamp, or print the
- * integrity_failed envelope and exit 1. The shared post-write gate the restamp
- * members ride: loads the on-disk tree, builds the project-local all-epics set +
- * dep map from one glob, extends the existence/cycle universe across discovered
- * projects (fail-soft → empty global map), runs the integrity check, and returns
- * nowIso() on a clean result. On error, `onFailure` (when supplied) fires before
- * the exit so add-dep can roll back. Mirrors restamp_epic_or_fail. */
-export function restampEpicOrFail(
+/** Re-validate the epic on disk post-write, or print the integrity_failed
+ * envelope and exit 1. The shared post-write gate the members ride: loads the
+ * on-disk tree, builds the project-local all-epics set + dep map from one glob,
+ * extends the existence/cycle universe across discovered projects (fail-soft →
+ * empty global map), and runs the integrity check. Returns on a clean result;
+ * NEVER touches last_validated_at. On error, `onFailure` (when supplied) fires
+ * before the exit so add-dep can roll back. */
+export function integrityGateOrFail(
   epicId: string,
   dataDir: string,
   opts: {
@@ -103,13 +106,13 @@ export function restampEpicOrFail(
     checkFilesystemRepos?: boolean;
     onFailure?: () => void;
   },
-): string {
+): void {
   const { verb, checkFilesystemRepos = false, onFailure } = opts;
 
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
   const epicData = loadJsonSafe(epicPath);
   if (epicData === null) {
-    emitRestampFailure(
+    emitIntegrityFailure(
       verb,
       epicId,
       [`Epic ${epicId}: definition file is missing or invalid JSON`],
@@ -227,34 +230,34 @@ export function restampEpicOrFail(
   );
   const errors = [...loadErrors, ...coreErrors];
   if (errors.length > 0) {
-    emitRestampFailure(verb, epicId, errors, onFailure);
+    emitIntegrityFailure(verb, epicId, errors, onFailure);
   }
-  return nowIso();
 }
 
 /** A setter's per-verb behaviour plugged into the shared runSetter spine. */
 export interface SetterHooks {
   /** Apply the structural change + write it to disk (task JSON, spec file, or
    * the epic JSON itself). The spine re-loads the epic from disk after the
-   * restamp gate, so an apply that wrote the epic stays the source of truth. */
+   * gate, so an apply that wrote the epic stays the source of truth. */
   apply: () => void;
-  /** Pre-restamp hook — runs after `apply`, before the restamp gate. Used by
+  /** Pre-gate hook — runs after `apply`, before the integrity gate. Used by
    * set-target-repo to recompute + write epic.touched_repos so the recompute
    * is covered by the same post-write integrity check. Optional. */
-  preRestamp?: () => void;
-  /** Rollback handler — fires (via restampEpicOrFail's onFailure) before the
+  preGate?: () => void;
+  /** Rollback handler — fires (via integrityGateOrFail's onFailure) before the
    * integrity_failed exit so add-dep restores its pre-write epic JSON. Optional. */
   rollback?: () => void;
 }
 
 /** The shared setter spine: apply the structural write, run the optional
- * pre-restamp hook, gate through restampEpicOrFail (which exits 1 on integrity
- * failure, firing `rollback` first when supplied), then stamp last_validated_at
- * + updated_at on the epic JSON and write it back. Returns the fresh stamp so the
- * caller can fold it into its emit payload. The setter verb owns the emit itself
- * (each carries a distinct payload + verb/target), so this spine stops at the
- * stamp-write. Mirrors the load→gate→apply→write→restamp→stamp-write spine the
- * setter family shares; the two hooks are the only divergences. */
+ * pre-gate hook, gate through integrityGateOrFail (which exits 1 on integrity
+ * failure, firing `rollback` first when supplied), then bump updated_at on the
+ * epic JSON for the setters whose apply did not touch it. NEVER writes
+ * last_validated_at — the marker is an arm-exclusive one-way latch, so a
+ * structural edit to an armed epic leaves the marker byte-identical and a ghost
+ * stays a ghost. The setters that bump updated_at in their own apply / pre-gate
+ * (add-dep, rm-dep, the repo setters, set-target-repo) pass stampUpdatedAt=false,
+ * so the tail is a no-op for them. The setter verb owns the emit itself. */
 export function runSetter(
   epicId: string,
   dataDir: string,
@@ -264,7 +267,7 @@ export function runSetter(
     stampUpdatedAt?: boolean;
     hooks: SetterHooks;
   },
-): string {
+): void {
   const {
     verb,
     checkFilesystemRepos = false,
@@ -273,27 +276,23 @@ export function runSetter(
   } = opts;
 
   hooks.apply();
-  if (hooks.preRestamp !== undefined) {
-    hooks.preRestamp();
+  if (hooks.preGate !== undefined) {
+    hooks.preGate();
   }
 
-  const newStamp = restampEpicOrFail(epicId, dataDir, {
+  integrityGateOrFail(epicId, dataDir, {
     verb,
     checkFilesystemRepos,
     onFailure: hooks.rollback,
   });
 
-  // Stamp last_validated_at onto the post-restamp epic JSON. updated_at rides
-  // the same write for the section/repo setters (their apply did not touch the
-  // epic JSON); add-dep already stamped updated_at in its apply, so it opts out
-  // via stampUpdatedAt=false to keep its post-restamp write last_validated_at-only.
-  const epicPath = join(dataDir, "epics", `${epicId}.json`);
-  const epicDef = loadJsonSafe(epicPath) ?? {};
+  // Bump updated_at on the post-gate epic JSON for the section/repo setters whose
+  // apply did not touch the epic JSON. The setters that already stamped updated_at
+  // in their apply / pre-gate opt out via stampUpdatedAt=false.
   if (stampUpdatedAt) {
+    const epicPath = join(dataDir, "epics", `${epicId}.json`);
+    const epicDef = loadJsonSafe(epicPath) ?? {};
     epicDef.updated_at = nowIso();
+    atomicWriteJson(epicPath, epicDef, dataDir);
   }
-  epicDef.last_validated_at = newStamp;
-  atomicWriteJson(epicPath, epicDef, dataDir);
-
-  return newStamp;
 }

@@ -1,11 +1,11 @@
 // Engine-agnostic conformance spec for the last_validated_at marker contract —
-// translated from tests/test_validate_marker.py, every node mapped by a source-
-// comment. validate --epic stamp-on-first-run / idempotent-on-stamped / no-stamp-
-// on-invalid / never-stamp-on-validate-all; the VALIDATION_RESTAMP_VERBS coverage
-// matrix (each structural verb leaves a strictly-newer stamp); the set-target-repo
-// touched_repos auto-roll (grow / shrink / idempotent) + the unchanged envelope
-// shape; the samefile mis-location reject + symlink accept; epic invalidate (the
-// sole null path) clear / short-circuit / updated_at bump.
+// the arm-exclusive one-way latch. validate --epic stamp-on-first-run /
+// idempotent-on-stamped / no-stamp-on-invalid / never-stamp-on-validate-all; the
+// INTEGRITY_GATE_VERBS coverage matrix (each structural verb leaves an armed
+// marker byte-identical); the set-target-repo touched_repos auto-roll (grow /
+// shrink / idempotent) + the unchanged envelope shape; the samefile mis-location
+// reject + symlink accept; epic invalidate (a sole null path) clear /
+// short-circuit / updated_at bump.
 //
 // Real-git divergence from the Python fixture: the Python _create_project writes a
 // BARE .git/ skeleton and leans on the fast bucket no-op'ing every git verb. The
@@ -77,12 +77,14 @@ function stampMarker(epicId: string, ts = PRE_STAMP): void {
   writeEpic(epicId, data);
 }
 
-// Assert the verb left last_validated_at strictly newer than pre_stamp. Port of
-// _assert_marker_restamped.
-function assertRestamped(epicId: string, verb: string, pre = PRE_STAMP): void {
-  const stamp = readEpic(epicId).last_validated_at;
-  expect(typeof stamp === "string" && stamp.length > 0).toBe(true);
-  expect((stamp as string) > pre).toBe(true);
+// Assert the verb left last_validated_at byte-identical to `pre` — the
+// arm-exclusive latch means a gate verb never refreshes an armed marker.
+function assertMarkerPreserved(
+  epicId: string,
+  verb: string,
+  pre = PRE_STAMP,
+): void {
+  expect(readEpic(epicId).last_validated_at).toBe(pre);
   void verb;
 }
 
@@ -216,13 +218,13 @@ describe("validate --epic marker writes", () => {
 });
 
 // ---------------------------------------------------------------------------
-// VALIDATION_RESTAMP_VERBS coverage — each structural verb leaves a strictly-
-// newer last_validated_at. Behavior overlaps verbs-restamp.test.ts (which pins
-// each verb's restamp/commit), but here the marker-timestamp lens is asserted.
+// INTEGRITY_GATE_VERBS coverage — each structural verb, run on an ARMED epic,
+// leaves last_validated_at byte-identical (the arm-exclusive latch). Behavior
+// overlaps verbs-restamp.test.ts, but here the marker-value lens is asserted.
 // ---------------------------------------------------------------------------
 
-describe("restamp coverage matrix", () => {
-  test("refine-apply add_tasks re-stamps", () => {
+describe("integrity-gate marker-preservation matrix", () => {
+  test("refine-apply add_tasks preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_refine_apply_adds_task
     const { epicId } = setupEpicAndTask();
     stampMarker(epicId);
@@ -236,10 +238,10 @@ describe("restamp coverage matrix", () => {
     );
     const r = run(["refine-apply", epicId, "--file", delta]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "refine-apply (add_tasks)");
+    assertMarkerPreserved(epicId, "refine-apply (add_tasks)");
   });
 
-  test("set-description re-stamps", () => {
+  test("set-description preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_set_description
     const { epicId, taskId } = setupEpicAndTask();
     stampMarker(epicId);
@@ -247,10 +249,10 @@ describe("restamp coverage matrix", () => {
     writeFileSync(descFile, "Updated description text.\n", "utf-8");
     const r = run(["task", "set-description", "--file", descFile, taskId]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "set-description");
+    assertMarkerPreserved(epicId, "set-description");
   });
 
-  test("set-acceptance re-stamps", () => {
+  test("set-acceptance preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_set_acceptance
     const { epicId, taskId } = setupEpicAndTask();
     stampMarker(epicId);
@@ -258,10 +260,10 @@ describe("restamp coverage matrix", () => {
     writeFileSync(accFile, "- [ ] Updated acceptance\n", "utf-8");
     const r = run(["task", "set-acceptance", "--file", accFile, taskId]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "set-acceptance");
+    assertMarkerPreserved(epicId, "set-acceptance");
   });
 
-  test("refine-apply rewire_deps re-stamps", () => {
+  test("refine-apply rewire_deps preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_refine_apply_rewires_deps
     const { epicId, taskId } = setupEpicAndTask();
     stampMarker(epicId);
@@ -273,39 +275,39 @@ describe("restamp coverage matrix", () => {
     );
     const r = run(["refine-apply", epicId, "--file", delta]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "refine-apply (rewire_deps)");
+    assertMarkerPreserved(epicId, "refine-apply (rewire_deps)");
   });
 
-  test("reset re-stamps", () => {
+  test("reset preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_reset
     const { epicId, taskId } = setupEpicAndTask();
     stampMarker(epicId);
     const r = run(["task", "reset", taskId]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "reset");
+    assertMarkerPreserved(epicId, "reset");
   });
 
-  test("epic add-dep re-stamps", () => {
+  test("epic add-dep preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_epic_add_dep
     const epicId = createEpic();
     const depId = createEpic("Dep epic");
     stampMarker(epicId);
     const r = run(["epic", "add-dep", epicId, depId]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "add-dep");
+    assertMarkerPreserved(epicId, "add-dep");
   });
 
-  test("epic add-deps re-stamps", () => {
+  test("epic add-deps preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_epic_add_deps
     const epicId = createEpic();
     const depId = createEpic("Dep epic");
     stampMarker(epicId);
     const r = run(["epic", "add-deps", epicId, depId]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "add-deps");
+    assertMarkerPreserved(epicId, "add-deps");
   });
 
-  test("epic rm-dep re-stamps", () => {
+  test("epic rm-dep preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_epic_rm_dep
     const epicId = createEpic();
     const depId = createEpic("Dep epic");
@@ -313,10 +315,10 @@ describe("restamp coverage matrix", () => {
     stampMarker(epicId);
     const r = run(["epic", "rm-dep", epicId, depId]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "rm-dep");
+    assertMarkerPreserved(epicId, "rm-dep");
   });
 
-  test("refine-apply epic-spec rewrite re-stamps", () => {
+  test("refine-apply epic-spec rewrite preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_refine_apply
     const epicId = createEpic();
     stampMarker(epicId);
@@ -328,19 +330,18 @@ describe("restamp coverage matrix", () => {
     );
     const r = run(["refine-apply", epicId, "--file", delta]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "refine-apply");
+    assertMarkerPreserved(epicId, "refine-apply");
   });
 
-  // test_all_restamp_verbs_covered — CITED: src-integrity.test.ts pins the
-  //   VALIDATION_RESTAMP_VERBS canonical set exactly (python_only in-process
-  //   import of planctl.validation_restamp).
+  // The canonical INTEGRITY_GATE_VERBS set is pinned exactly by
+  //   src-integrity.test.ts (scaffold + validate absent).
 });
 
 // ---------------------------------------------------------------------------
-// set-*-repo re-stamps + set-target-repo touched_repos auto-roll
+// set-*-repo marker-preservation + set-target-repo touched_repos auto-roll
 // ---------------------------------------------------------------------------
 
-describe("set-*-repo re-stamps + touched_repos auto-roll", () => {
+describe("set-*-repo marker-preservation + touched_repos auto-roll", () => {
   // Create an epic with primary_repo/touched_repos pinned to a real .git/ path.
   // Port of _create_epic_with_primary_repo.
   function createEpicWithPrimary(repoPath: string): string {
@@ -390,16 +391,16 @@ describe("set-*-repo re-stamps + touched_repos auto-roll", () => {
     return { epicId, taskIds };
   }
 
-  test("set-primary-repo re-stamps (samefile-pinned to project root)", () => {
+  test("set-primary-repo preserves the armed marker (samefile-pinned to project root)", () => {
     // test_validate_marker.py::test_restamp_on_set_primary_repo
     const epicId = createEpicWithPrimary(project.root);
     stampMarker(epicId);
     const r = run(["epic", "set-primary-repo", epicId, "--path", project.root]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "set-primary-repo");
+    assertMarkerPreserved(epicId, "set-primary-repo");
   });
 
-  test("set-touched-repos re-stamps", () => {
+  test("set-touched-repos preserves the armed marker", () => {
     // test_validate_marker.py::test_restamp_on_set_touched_repos
     const epicId = createEpicWithPrimary(project.root);
     stampMarker(epicId);
@@ -411,10 +412,10 @@ describe("set-*-repo re-stamps + touched_repos auto-roll", () => {
       project.root,
     ]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "set-touched-repos");
+    assertMarkerPreserved(epicId, "set-touched-repos");
   });
 
-  test("task set-target-repo re-stamps the parent epic", () => {
+  test("task set-target-repo preserves the parent epic's armed marker", () => {
     // test_validate_marker.py::test_restamp_on_set_target_repo
     const { epicId, taskIds } = scaffoldEpic(project, {
       title: "Validate marker repo test epic",
@@ -434,7 +435,7 @@ describe("set-*-repo re-stamps + touched_repos auto-roll", () => {
       project.root,
     ]);
     expect(r.code).toBe(0);
-    assertRestamped(epicId, "set-target-repo");
+    assertMarkerPreserved(epicId, "set-target-repo");
   });
 
   test("touched_repos grows to sorted [A, B]", () => {
@@ -581,7 +582,8 @@ describe("samefile defense", () => {
 });
 
 // ---------------------------------------------------------------------------
-// epic invalidate — the sole surviving null path
+// epic invalidate — one of the two un-arm null paths (the other is
+// refine-context --invalidate)
 // ---------------------------------------------------------------------------
 
 describe("epic invalidate", () => {
@@ -632,9 +634,8 @@ describe("epic invalidate", () => {
     expect((newUpdated as string) > PRE_STAMP).toBe(true);
   });
 
-  // test_invalidate_not_in_validation_restamp_verbs — CITED: src-integrity.test.ts
-  //   pins the canonical VALIDATION_RESTAMP_VERBS set (invalidate absent);
-  //   python_only in-process import.
+  // invalidate is NOT an INTEGRITY_GATE_VERBS member — src-integrity.test.ts pins
+  //   the canonical set (invalidate absent).
 });
 
 // ---------------------------------------------------------------------------

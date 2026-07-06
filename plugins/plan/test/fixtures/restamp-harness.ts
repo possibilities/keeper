@@ -1,15 +1,15 @@
-// Spawn harness for the restamp pipeline tests. Driven as a child process so the
-// process.exit(1) failure path is observable from the bun:test parent. Each
-// scenario seeds nothing — the parent pre-builds the `.planctl/` tree — and only
-// exercises one pipeline path: apply a structural write (recorded to
-// applied.txt so fail-forward is provable), then run runSetter / restampEpicOrFail
-// with the scenario's hooks. Usage: bun run restamp-harness.ts <dataDir> <scenario>
+// Spawn harness for the integrity-gate pipeline tests. Driven as a child process
+// so the process.exit(1) failure path is observable from the bun:test parent.
+// Each scenario seeds nothing — the parent pre-builds the `.keeper/` tree — and
+// only exercises one pipeline path: apply a structural write (recorded to
+// applied.txt so fail-forward is provable), then run runSetter with the
+// scenario's hooks. Usage: bun run restamp-harness.ts <dataDir> <scenario>
 
 import { rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { runSetter } from "../../src/integrity_gate.ts";
 import { atomicWriteJson, loadJsonSafe } from "../../src/store.ts";
-import { runSetter } from "../../src/validation_restamp.ts";
 
 const dataDir = process.argv[2] as string;
 const scenario = process.argv[3] as string;
@@ -25,8 +25,15 @@ function epicPath(eid: string): string {
 }
 
 if (scenario === "setter-clean") {
-  // Clean tree: apply a structural write, then re-stamp.
+  // Clean tree: apply a structural write, then run the gate (marker untouched).
   runSetter("fn-1-clean", dataDir, {
+    verb: "set-description",
+    hooks: { apply: recordApplied },
+  });
+} else if (scenario === "armed-preserved") {
+  // Armed epic (non-null marker seeded by the parent): a clean setter runs the
+  // gate + bumps updated_at but must leave last_validated_at byte-identical.
+  runSetter("fn-1-armed", dataDir, {
     verb: "set-description",
     hooks: { apply: recordApplied },
   });
@@ -63,8 +70,8 @@ if (scenario === "setter-clean") {
     },
   });
 } else if (scenario === "set-target-repo") {
-  // Repoint .1 at repo_b, then recompute touched_repos (pre-restamp hook) before
-  // the re-stamp — the set-target-repo special case.
+  // Repoint .1 at repo_b, then recompute touched_repos (pre-gate hook) before the
+  // integrity gate — the set-target-repo special case.
   const repoB = join(projectDir, "repo_b");
   runSetter("fn-1-str", dataDir, {
     verb: "set-target-repo",
@@ -75,7 +82,7 @@ if (scenario === "setter-clean") {
         t.target_repo = repoB;
         atomicWriteJson(tPath, t, dataDir);
       },
-      preRestamp: () => {
+      preGate: () => {
         // Recompute touched_repos from every task's target_repo, sorted.
         const touched = new Set<string>();
         for (const tid of ["fn-1-str.1", "fn-1-str.2"]) {

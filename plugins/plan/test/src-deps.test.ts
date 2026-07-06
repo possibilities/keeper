@@ -1,5 +1,5 @@
 // Unit tests for src/deps.ts — detectCycles / findDependents. The cycle path is
-// the load-bearing string the restamp + add-dep verbs surface, so the shape is
+// the load-bearing string the integrity-gate + add-dep verbs surface, so the shape is
 // pinned against the Python deps.py contract.
 
 import { describe, expect, test } from "bun:test";

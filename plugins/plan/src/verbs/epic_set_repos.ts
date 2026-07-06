@@ -3,8 +3,8 @@
 // repo setters: a non-`.git/` path produces a warning in the envelope's
 // `warnings: [...]` field AND a `WARN:` line on stderr, but the write still lands
 // and the exit code stays 0 (CWE-367 deferred-validation). Both ride the shared
-// restamp pipeline with check_filesystem_repos=false, so the post-write integrity
-// gate does not reject the bad path, and last_validated_at is re-stamped.
+// post-write integrity gate with check_filesystem_repos=false, so the gate does
+// not reject the bad path; the marker is left untouched (arm-exclusive latch).
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { validateRepoPath } from "../integrity.ts";
+import { runSetter } from "../integrity_gate.ts";
 import { resolveProject } from "../project.ts";
 import {
   atomicWriteJson,
@@ -20,7 +21,6 @@ import {
   nowIso,
   resolveUserPath,
 } from "../store.ts";
-import { runSetter } from "../validation_restamp.ts";
 
 /** Build the warn message + emit the WARN: stderr line for a bad repo path.
  * Mirrors the verb-side wrap of _validate_repo_path's error. */

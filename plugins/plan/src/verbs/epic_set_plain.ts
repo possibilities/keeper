@@ -1,6 +1,6 @@
 // epic set-branch / set-title — the port of run_epic_set_branch.py and
 // run_epic_set_title.py. Plain metadata writes: set the field, bump updated_at,
-// route straight through the mutating seam. NEITHER is a restamp member, so
+// route straight through the mutating seam. NEITHER is an integrity-gate member, so
 // last_validated_at is left untouched (the test pins set-branch leaving the
 // marker null).
 

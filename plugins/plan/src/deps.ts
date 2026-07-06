@@ -1,7 +1,7 @@
 // Dependency-graph operations — the byte-parity port of planctl/deps.py.
 //
 // detectCycles / findDependents reproduce the Python DFS exactly so the cycle
-// strings the restamp + add-dep verbs surface match across engines. Python's
+// strings the integrity-gate + add-dep verbs surface match across engines. Python's
 // dict iteration is insertion-ordered; readdir / object-key order is arbitrary
 // across engines, so callers that build the graph from a directory listing MUST
 // sort the node ids AND each adjacency list at the construction site (see the

@@ -1,10 +1,10 @@
-// task set-description / set-acceptance — the port of run_task_set_description.py
-// and run_task_set_acceptance.py. Both ride the shared restamp pipeline: read the
-// new section body from --file (or stdin), validate the current spec, patch the
-// named H2 section byte-stably, write the spec + bump the task JSON's updated_at,
-// then runSetter applies the post-write integrity gate + stamps last_validated_at
-// on the parent epic before the verb owns its emit. The only difference between
-// the two verbs is the section heading + the emitted `section` field.
+// task set-description / set-acceptance — both ride the shared post-write
+// integrity gate: read the new section body from --file (or stdin), validate the
+// current spec, patch the named H2 section byte-stably, write the spec + bump the
+// task JSON's updated_at, then runSetter re-validates the tree and bumps the
+// parent epic's updated_at (the marker is never touched) before the verb owns its
+// emit. The only difference between the two verbs is the section heading + the
+// emitted `section` field.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { epicIdFromTask } from "../ids.ts";
+import { runSetter } from "../integrity_gate.ts";
 import { resolveProject } from "../project.ts";
 import { ensureValidTaskSpec, patchTaskSection } from "../specs.ts";
 import {
@@ -21,7 +22,6 @@ import {
   nowIso,
   readFileOrStdin,
 } from "../store.ts";
-import { runSetter } from "../validation_restamp.ts";
 
 interface SetSectionArgs {
   taskId: string;

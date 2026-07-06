@@ -136,7 +136,7 @@ describe("brief assemble + write", () => {
       // 22-byte partial line 163; truncation backs up to the last newline, so
       // exactly 162 whole lines survive. Constants hand-computed from the input,
       // independent of the code path under test.
-      const line = "x".repeat(100) + "\n"; // 101 bytes
+      const line = `${"x".repeat(100)}\n`; // 101 bytes
       writeFileSync(join(repo, "CONTEXT.md"), line.repeat(200));
       const brief = assembleBrief({
         taskId: "fn-1-x.1",

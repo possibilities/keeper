@@ -6,9 +6,11 @@
 // task of the epic exactly once (choosing the default is an explicit cell) plus a
 // `selection:` provenance block, asserts the whole batch (assert-all,
 // collect-all), mutates every task JSON under the epic flock, writes the
-// provenance sidecar, then re-stamps last_validated_at through the shared restamp
-// gate. There is no single-task form, ever — that is what keeps assign-cells
-// outside the removed incremental `task set-tier` verb class.
+// provenance sidecar, then re-validates the tree through the shared post-write
+// integrity gate (the marker is left untouched — a ghost stays a ghost until the
+// trailing `validate --epic` arm). There is no single-task form, ever — that is
+// what keeps assign-cells outside the removed incremental `task set-tier` verb
+// class.
 //
 // Failure codes, priority-ordered:
 //   - bad_yaml     — shape/type errors (top-level not a mapping, cells not a
@@ -30,6 +32,7 @@ import { join } from "node:path";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
+import { integrityGateOrFail } from "../integrity_gate.ts";
 import {
   configuredEfforts,
   configuredModels,
@@ -48,7 +51,6 @@ import {
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
-import { restampEpicOrFail } from "../validation_restamp.ts";
 import {
   parseYamlInput,
   readYamlBytes,
@@ -272,7 +274,7 @@ export function runAssignCells(args: AssignCellsArgs): number {
   // Phase 3+4: assert membership/axis/coverage + mutate, under the epic flock.
   // The flock guards the enumerate-status -> validate -> write region so the
   // full-set + todo-only contract holds against a concurrently-claimed task. On
-  // any failure the closure returns a sentinel so emit/restamp run OUTSIDE the
+  // any failure the closure returns a sentinel so emit/gate run OUTSIDE the
   // lock; success carries out the applied task-id list for the emit payload.
   // ------------------------------------------------------------------
   const efforts = configuredEfforts();
@@ -392,22 +394,22 @@ export function runAssignCells(args: AssignCellsArgs): number {
   }
 
   // ------------------------------------------------------------------
-  // Phase 4.5: post-write re-stamp of last_validated_at (OUTSIDE the lock).
-  // assign-cells IS a VALIDATION_RESTAMP_VERBS member: validate the post-mutation
-  // tree and re-stamp on a clean result. checkFilesystemRepos stays false — the
-  // verb changes only tier/model, never repo paths, so re-probing repos on disk
-  // would add nothing but a spurious failure surface.
+  // Phase 4.5: post-write integrity gate (OUTSIDE the lock). assign-cells IS an
+  // INTEGRITY_GATE_VERBS member: re-validate the post-mutation tree and bump the
+  // epic's updated_at on a clean result — the marker stays untouched.
+  // checkFilesystemRepos stays false — the verb changes only tier/model, never
+  // repo paths, so re-probing repos on disk would add nothing but a spurious
+  // failure surface.
   // ------------------------------------------------------------------
-  const newStamp = restampEpicOrFail(epicId, dataDir, { verb: "assign-cells" });
+  integrityGateOrFail(epicId, dataDir, { verb: "assign-cells" });
   const epicDefAfter = loadJson(epicPath);
   epicDefAfter.updated_at = nowIso();
-  epicDefAfter.last_validated_at = newStamp;
   atomicWriteJson(epicPath, epicDefAfter, dataDir);
 
   // ------------------------------------------------------------------
   // Phase 5: emit ONE envelope covering the whole batch (OUTSIDE the lock). The
-  // auto-commit stages the mutated task JSONs, the epic re-stamp, AND the sidecar
-  // (a non-gitignored `selections/` path) in one commit before this prints.
+  // auto-commit stages the mutated task JSONs, the epic updated_at bump, AND the
+  // sidecar (a non-gitignored `selections/` path) in one commit before this prints.
   // ------------------------------------------------------------------
   emitMutating(
     {

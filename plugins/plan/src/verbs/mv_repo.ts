@@ -3,8 +3,9 @@
 // rewrites every stored board path that pointed at the old location so the board
 // reads the new one. Across the current project it rewrites each epic's
 // primary_repo, each epic's touched_repos entries, and each task's target_repo
-// matching <old> -> <new>, restamps every touched epic through the shared
-// integrity gate, and lands the whole rewrite in ONE auto-commit.
+// matching <old> -> <new>, re-validates every touched epic through the shared
+// post-write integrity gate (the marker is left untouched), and lands the whole
+// rewrite in ONE auto-commit.
 //
 // Matching is by the resolveUserPath-canonicalized STORED STRING, never a stat
 // of <old> (the old dir is gone by definition of a rename) and never lowercased
@@ -19,6 +20,7 @@ import { join } from "node:path";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { validateRepoPath } from "../integrity.ts";
+import { integrityGateOrFail } from "../integrity_gate.ts";
 import { resolveProject } from "../project.ts";
 import {
   atomicWriteJson,
@@ -26,7 +28,6 @@ import {
   nowIso,
   resolveUserPath,
 } from "../store.ts";
-import { restampEpicOrFail } from "../validation_restamp.ts";
 
 interface MvRepoArgs {
   oldPath: string;
@@ -87,7 +88,7 @@ export function runMvRepo(args: MvRepoArgs): number {
 
   // Pass 1: rewrite task target_repo == old → new (sorted, stable order).
   const rewrittenTasks: string[] = [];
-  // Epics whose JSON we touch (primary_repo / touched_repos) — restamp these.
+  // Epics whose JSON we touch (primary_repo / touched_repos) — gate these.
   const touchedEpics = new Set<string>();
 
   for (const taskStem of jsonStems(dataDir, "tasks")) {
@@ -137,8 +138,8 @@ export function runMvRepo(args: MvRepoArgs): number {
     }
   }
 
-  // A task rewrite whose owning epic JSON did not itself change still needs the
-  // epic restamped (its child tree changed). Derive owning epics from rewritten
+  // A task rewrite whose owning epic JSON did not itself change still needs its
+  // epic re-validated (its child tree changed). Derive owning epics from rewritten
   // task ids (the epic id is the prefix before the first dot segment).
   for (const taskStem of rewrittenTasks) {
     const dot = taskStem.indexOf(".");
@@ -147,21 +148,20 @@ export function runMvRepo(args: MvRepoArgs): number {
     }
   }
 
-  // Restamp every touched epic through the shared post-write integrity gate. A
-  // gate failure exits 1 (fail-forward: the structural writes already landed),
-  // matching the setter family. Stable order so a re-fold / re-run is
-  // deterministic.
+  // Re-validate every touched epic through the shared post-write integrity gate,
+  // then bump its updated_at (the marker is left untouched). A gate failure exits
+  // 1 (fail-forward: the structural writes already landed), matching the setter
+  // family. Stable order so a re-fold / re-run is deterministic.
   for (const epicStem of [...touchedEpics].sort()) {
     const epicPath = join(dataDir, "epics", `${epicStem}.json`);
     if (!existsSync(epicPath)) {
       // A rewritten task whose epic JSON is absent (orphan task) — nothing to
-      // restamp; its task write already landed and rides the commit.
+      // gate; its task write already landed and rides the commit.
       continue;
     }
-    const newStamp = restampEpicOrFail(epicStem, dataDir, { verb: "mv-repo" });
+    integrityGateOrFail(epicStem, dataDir, { verb: "mv-repo" });
     const epicDef = loadJsonSafe(epicPath) ?? {};
     epicDef.updated_at = nowIso();
-    epicDef.last_validated_at = newStamp;
     atomicWriteJson(epicPath, epicDef, dataDir);
   }
 

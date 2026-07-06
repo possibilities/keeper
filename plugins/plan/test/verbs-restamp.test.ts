@@ -1,17 +1,18 @@
-// Engine-agnostic conformance spec for the in-wave mutating verbs — translated
-// from tests/test_restamp_verbs.py, every node mapped by a source-comment. The
-// mutating-side companion to verbs-query: the restamping setters
-// (set-description / set-acceptance from file AND stdin, reset incl. --cascade,
-// set-target-repo's touched_repos recompute, the warn-and-write
-// set-primary-repo / set-touched-repos), the non-restamp setters (set-branch,
-// set-title), the short-circuiting verbs (invalidate /
-// refine-context --invalidate), the dep editors (add-dep fn-N normalization,
-// cross-project via roots, cycle rollback, idempotent rm-dep), add-deps
-// (skip-invalid statuses, error priority), and the fail-forward restamp-failure.
+// Engine-agnostic conformance spec for the integrity-gate mutating verbs — the
+// mutating-side companion to verbs-query. Each structural verb runs its post-write
+// integrity gate but leaves last_validated_at an arm-exclusive one-way latch: a
+// ghost stays a ghost and an armed marker stays byte-identical (only the trailing
+// `validate --epic` arm flips null→timestamp). Covers the setters (set-description
+// / set-acceptance from file AND stdin, reset incl. --cascade, set-target-repo's
+// touched_repos recompute, the warn-and-write set-primary-repo / set-touched-repos),
+// the plain non-gate setters (set-branch, set-title), the short-circuiting
+// invalidate paths (invalidate / refine-context --invalidate), the dep editors
+// (add-dep fn-N normalization, cross-project via roots, cycle rollback, idempotent
+// rm-dep), add-deps (skip-invalid statuses, error priority), mv-repo, and the
+// fail-forward integrity failure.
 //
-// Every fixture is seedState + gitBaseline (the _git_seed port); commit subjects
-// + two-file scope read off git log. Assertions on envelopes, .keeper/ files,
-// git — never internals.
+// Every fixture is seedState + gitBaseline; commit subjects + two-file scope read
+// off git log. Assertions on envelopes, .keeper/ files, git — never internals.
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -105,11 +106,11 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// set-description / set-acceptance — section patch + restamp (file + stdin)
+// set-description / set-acceptance — section patch, ghost stays a ghost (file + stdin)
 // ---------------------------------------------------------------------------
 
-describe("set-description / set-acceptance restamp", () => {
-  test("set-description from --file patches + restamps", () => {
+describe("set-description / set-acceptance leave the ghost null", () => {
+  test("set-description from --file patches without arming the ghost", () => {
     // test_restamp_verbs.py::test_set_description_from_file_patches_and_restamps
     seedState(root, { epicId: "fn-1-sd", nTasks: 1 });
     expect(epicDef(root, "fn-1-sd").last_validated_at).toBeNull();
@@ -128,10 +129,10 @@ describe("set-description / set-acceptance restamp", () => {
     expect(payload.task_id).toBe("fn-1-sd.1");
     expect(payload.section).toBe("Description");
     expect(specText(root, "fn-1-sd.1")).toContain("brand new description body");
-    expect(epicDef(root, "fn-1-sd").last_validated_at).toBe(FROZEN);
+    expect(epicDef(root, "fn-1-sd").last_validated_at).toBeNull();
   });
 
-  test("set-acceptance from stdin patches + restamps", () => {
+  test("set-acceptance from stdin patches without arming the ghost", () => {
     // test_restamp_verbs.py::test_set_acceptance_from_stdin_patches_and_restamps
     seedState(root, { epicId: "fn-1-sa", nTasks: 1 });
     const r = runCli(["task", "set-acceptance", "fn-1-sa.1"], {
@@ -142,7 +143,7 @@ describe("set-description / set-acceptance restamp", () => {
     expect(r.code).toBe(0);
     expect(parseCliOutput(r.output).section).toBe("Acceptance");
     expect(specText(root, "fn-1-sa.1")).toContain("new criterion from stdin");
-    expect(epicDef(root, "fn-1-sa").last_validated_at).toBe(FROZEN);
+    expect(epicDef(root, "fn-1-sa").last_validated_at).toBeNull();
   });
 
   test("set-description commit subject", () => {
@@ -166,7 +167,7 @@ describe("set-description / set-acceptance restamp", () => {
 // ---------------------------------------------------------------------------
 
 describe("reset", () => {
-  test("clears runtime + spec + worker_done_at + restamps", () => {
+  test("clears runtime + spec + worker_done_at, ghost stays null", () => {
     // test_restamp_verbs.py::test_reset_clears_runtime_and_spec_and_done_stamp
     seedState(root, { epicId: "fn-1-rst", nTasks: 1 });
     seedRuntime(root, "fn-1-rst.1", {
@@ -195,7 +196,7 @@ describe("reset", () => {
     const spec = specText(root, "fn-1-rst.1");
     expect(spec).not.toContain("all shipped");
     expect(spec).not.toContain("lots");
-    expect(epicDef(root, "fn-1-rst").last_validated_at).toBe(FROZEN);
+    expect(epicDef(root, "fn-1-rst").last_validated_at).toBeNull();
   });
 
   test("--cascade resets dependents", () => {
@@ -224,7 +225,7 @@ describe("reset", () => {
 // ---------------------------------------------------------------------------
 
 describe("set-target-repo", () => {
-  test("recomputes touched_repos before restamp", () => {
+  test("recomputes touched_repos, ghost stays null", () => {
     // test_restamp_verbs.py::test_set_target_repo_recomputes_touched_repos
     const repoA = realpathSync(mkdirRepo(join(root, "repo_a")));
     const repoB = realpathSync(mkdirRepo(join(root, "repo_b")));
@@ -238,7 +239,7 @@ describe("set-target-repo", () => {
     expect(taskDef(root, "fn-1-str.1").target_repo).toBe(repoB);
     const epic = epicDef(root, "fn-1-str");
     expect(epic.touched_repos).toEqual([repoA, repoB].sort());
-    expect(epic.last_validated_at).toBe(FROZEN);
+    expect(epic.last_validated_at).toBeNull();
   });
 
   test("commit scopes the task JSON + epic JSON in one commit", () => {
@@ -267,7 +268,7 @@ describe("set-target-repo", () => {
 // ---------------------------------------------------------------------------
 
 describe("set-primary-repo / set-touched-repos", () => {
-  test("set-primary-repo valid restamps", () => {
+  test("set-primary-repo valid, ghost stays null", () => {
     // test_restamp_verbs.py::test_set_primary_repo_valid_restamps
     const repo = realpathSync(mkdirRepo(join(root, "real_repo")));
     seedState(root, { epicId: "fn-1-spr", nTasks: 1, primaryRepo: root });
@@ -281,7 +282,7 @@ describe("set-primary-repo / set-touched-repos", () => {
     const payload = parseCliOutput(r.output);
     expect(payload.primary_repo).toBe(repo);
     expect(payload.warnings).toEqual([]);
-    expect(epicDef(root, "fn-1-spr").last_validated_at).toBe(FROZEN);
+    expect(epicDef(root, "fn-1-spr").last_validated_at).toBeNull();
   });
 
   test("set-touched-repos bad path warns and still writes", () => {
@@ -339,7 +340,7 @@ describe("mv-repo", () => {
     expect(epicDef(root, "fn-1-mv").touched_repos).toEqual([newRepo]);
     expect(taskDef(root, "fn-1-mv.1").target_repo).toBe(newRepo);
     expect(taskDef(root, "fn-1-mv.2").target_repo).toBe(newRepo);
-    expect(epicDef(root, "fn-1-mv").last_validated_at).toBe(FROZEN);
+    expect(epicDef(root, "fn-1-mv").last_validated_at).toBeNull();
 
     // Exactly one commit, scoping every rewritten file.
     expect(gitLogCount(root)).toBe(before + 1);
@@ -408,14 +409,42 @@ describe("mv-repo", () => {
     // Refused before any write — primary_repo unchanged.
     expect(epicDef(root, "fn-4-mv").primary_repo).toBe(oldRepo);
   });
+
+  test("mixed batch: armed marker byte-identical, ghost stays null", () => {
+    // Two epics on the same old repo — one armed, one a ghost. mv-repo rewrites
+    // both paths and gates both, but the arm-exclusive latch leaves each marker
+    // exactly as it was: the armed value byte-identical, the ghost still null.
+    const oldRepo = realpathSync(mkdirRepo(join(root, "r_old5")));
+    seedState(root, { epicId: "fn-5-mv", nTasks: 1, primaryRepo: oldRepo });
+    seedState(root, { epicId: "fn-6-mv", nTasks: 1, primaryRepo: oldRepo });
+    const armedTs = "2020-03-03T03:03:03.000000Z";
+    stampMarker(root, "fn-5-mv", armedTs);
+    expect(epicDef(root, "fn-6-mv").last_validated_at).toBeNull();
+    mkdirSync(join(root, ".git"), { recursive: true });
+    gitBaseline(root);
+    const newRepo = realpathSync(mkdirRepo(join(root, "r_new5")));
+    rmSync(join(root, "r_old5"), { recursive: true, force: true });
+
+    const r = runCli(["mv-repo", oldRepo, newRepo], {
+      cwd: root,
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+    });
+    expect(r.code).toBe(0);
+    // Both paths rewrote...
+    expect(epicDef(root, "fn-5-mv").primary_repo).toBe(newRepo);
+    expect(epicDef(root, "fn-6-mv").primary_repo).toBe(newRepo);
+    // ...but each marker is preserved independently.
+    expect(epicDef(root, "fn-5-mv").last_validated_at).toBe(armedTs);
+    expect(epicDef(root, "fn-6-mv").last_validated_at).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
-// set-branch / set-title — no restamp
+// set-branch / set-title — plain writes, no integrity gate
 // ---------------------------------------------------------------------------
 
-describe("non-restamp setters", () => {
-  test("set-branch plain write, no restamp", () => {
+describe("plain setters (no integrity gate)", () => {
+  test("set-branch plain write, marker stays null", () => {
     // test_restamp_verbs.py::test_set_branch_plain_write_no_restamp
     seedState(root, { epicId: "fn-1-br", nTasks: 1 });
     const r = runCli(["epic", "set-branch", "fn-1-br", "--branch", "feat/x"], {
@@ -517,7 +546,7 @@ describe("refine-context --invalidate", () => {
 // ---------------------------------------------------------------------------
 
 describe("epic add-dep", () => {
-  test("wires + restamps", () => {
+  test("wires the edge, ghost stays null", () => {
     // test_restamp_verbs.py::test_add_dep_wires_and_restamps
     seedState(root, { epicId: "fn-1-dep", nTasks: 1 });
     seedState(root, { epicId: "fn-2-dep", nTasks: 1 });
@@ -527,7 +556,7 @@ describe("epic add-dep", () => {
     });
     expect(r.code).toBe(0);
     expect(parseCliOutput(r.output).depends_on_epics).toEqual(["fn-2-dep"]);
-    expect(epicDef(root, "fn-1-dep").last_validated_at).toBe(FROZEN);
+    expect(epicDef(root, "fn-1-dep").last_validated_at).toBeNull();
   });
 
   test("normalizes a bare fn-N to the full slug", () => {
@@ -727,11 +756,11 @@ describe("epic rm-dep", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cross-cutting: restamp-failure fail-forward
+// Cross-cutting: integrity-gate failure is fail-forward
 // ---------------------------------------------------------------------------
 
-describe("restamp-failure fail-forward", () => {
-  test("write lands, marker stays stale, exit 1 with integrity_failed", () => {
+describe("integrity-gate failure fail-forward", () => {
+  test("write lands, marker untouched, exit 1 with integrity_failed", () => {
     // test_restamp_verbs.py::test_restamp_failure_is_fail_forward
     seedState(root, { epicId: "fn-1-ff", nTasks: 2 });
     unlinkSync(join(root, ".keeper", "specs", "fn-1-ff.2.md"));
@@ -747,13 +776,74 @@ describe("restamp-failure fail-forward", () => {
     expect(payload.success).toBe(false);
     const err = payload.error as Record<string, unknown>;
     expect(err.code).toBe("integrity_failed");
-    expect(err.message as string).toContain("last_validated_at NOT re-stamped");
+    expect(err.message as string).toContain("produced an invalid epic tree");
     expect((err.details as string[]).some((d) => d.includes("fn-1-ff.2"))).toBe(
       true,
     );
 
     expect(specText(root, "fn-1-ff.1")).toContain("forward write");
     expect(epicDef(root, "fn-1-ff").last_validated_at).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// arm-exclusive latch — ghost stays null, armed stays byte-identical, only the
+// trailing validate --epic arms (idempotently).
+// ---------------------------------------------------------------------------
+
+describe("arm-exclusive latch", () => {
+  test("headline: a gate verb on a dep-less ghost leaves the marker null", () => {
+    seedState(root, { epicId: "fn-1-latch", nTasks: 1 });
+    // A freshly-scaffolded ghost: no deps, null marker.
+    expect(epicDef(root, "fn-1-latch").depends_on_epics ?? []).toEqual([]);
+    expect(epicDef(root, "fn-1-latch").last_validated_at).toBeNull();
+
+    const r = runCli(["task", "set-description", "fn-1-latch.1"], {
+      cwd: root,
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      input: "body\n",
+    });
+    expect(r.code).toBe(0);
+    // The structural write landed but the ghost stays a ghost.
+    expect(specText(root, "fn-1-latch.1")).toContain("body");
+    expect(epicDef(root, "fn-1-latch").last_validated_at).toBeNull();
+  });
+
+  test("a gate verb on an armed epic leaves the marker byte-identical", () => {
+    seedState(root, { epicId: "fn-2-latch", nTasks: 1 });
+    const armedTs = "2021-07-07T07:07:07.000000Z";
+    stampMarker(root, "fn-2-latch", armedTs);
+
+    const r = runCli(["task", "set-description", "fn-2-latch.1"], {
+      cwd: root,
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      input: "body\n",
+    });
+    expect(r.code).toBe(0);
+    // Exact prior value — not merely non-null (FROZEN would show if it re-stamped).
+    expect(epicDef(root, "fn-2-latch").last_validated_at).toBe(armedTs);
+  });
+
+  test("validate --epic is the sole arm and is idempotent (one null→timestamp transition)", () => {
+    seedState(root, { epicId: "fn-3-latch", nTasks: 1, primaryRepo: root });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    expect(epicDef(root, "fn-3-latch").last_validated_at).toBeNull();
+
+    const first = runCli(["validate", "--epic", "fn-3-latch"], {
+      cwd: root,
+      env: SID,
+    });
+    expect(first.code).toBe(0);
+    const armed = epicDef(root, "fn-3-latch").last_validated_at;
+    expect(armed).not.toBeNull();
+
+    const second = runCli(["validate", "--epic", "fn-3-latch"], {
+      cwd: root,
+      env: SID,
+    });
+    expect(second.code).toBe(0);
+    // Idempotent: the second arm is a no-op, the stamp is byte-identical.
+    expect(epicDef(root, "fn-3-latch").last_validated_at).toBe(armed);
   });
 });
 

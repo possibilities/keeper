@@ -448,9 +448,8 @@ describe("scaffold failure shapes", () => {
   // test_scaffold_registered_in_verb_templates — CITED: the bun buildSubject is
   //   template-free; the happy-path subject assertion pins `chore(plan):
   //   scaffold <id>` (python_only VERB_TEMPLATES import).
-  // test_scaffold_not_in_validation_restamp_verbs — CITED: src-integrity.test.ts
-  //   pins the canonical VALIDATION_RESTAMP_VERBS set (scaffold absent;
-  //   python_only import).
+  // scaffold is NOT an INTEGRITY_GATE_VERBS member — src-integrity.test.ts pins
+  //   the canonical set (scaffold absent).
 });
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 // target state (last_validated_at already null), emit a readonly envelope and
 // write NOTHING (zero commits). Otherwise null the marker + bump updated_at and
 // route through the mutating seam so one chore(plan): <verb> <epic> commit
-// lands. Not a restamp member.
+// lands. Not an integrity-gate member.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
