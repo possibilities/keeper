@@ -59,6 +59,7 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { type BackupResult, liveBackupPage } from "./backup";
+import type { BaselineWorkerData } from "./baseline-worker";
 import type {
   BirthIngestWorkerData,
   BirthRecordsChangedMessage,
@@ -3504,7 +3505,8 @@ export type WorkerName =
   | "renamer"
   | "autoclose"
   | "bus"
-  | "tmuxControl";
+  | "tmuxControl"
+  | "baseline";
 
 /**
  * The full worker set, in spawn order — the production boot ({@link runDaemon}
@@ -3533,6 +3535,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "autoclose",
   "bus",
   "tmuxControl",
+  "baseline",
 ] as const;
 
 /**
@@ -8667,6 +8670,33 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }, SERVE_WATCHDOG_INTERVAL_MS);
   }
 
+  // Spawn the Baseline runner PRODUCER worker (docs/adr/0005). It consumes the
+  // CLI-written request spool, computes the fast-gate suite result once per key in
+  // a detached scratch worktree, and is the SOLE writer of the per-key result
+  // leafs — a pure on-disk producer, so like the usage-scraper it posts NO message
+  // to main (no synthetic event, no keeper.db write). It boot-prunes orphaned
+  // scratch worktrees itself.
+  const baselineWorker = want("baseline")
+    ? new Worker(new URL("./baseline-worker.ts", import.meta.url).href, {
+        workerData: {} satisfies BaselineWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (baselineWorker) {
+    const blw = baselineWorker;
+    // Same crash policy as every other worker: any thread failure → fatalExit →
+    // LaunchAgent restart (never an in-process respawn).
+    blw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] baseline worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+    // A worker `process.exit(1)` fires `close`, not `onerror`. `!shuttingDown`
+    // makes it inert on clean shutdown.
+    blw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   // Unrecoverable async errors that escape every guard also take the single
   // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
   // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
@@ -8755,6 +8785,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       autocloseWorker,
       busWorker,
       tmuxControlWorker,
+      baselineWorker,
     ].filter((w): w is Worker => w !== null);
 
     // Wrap each shutdown post per-worker: an already-exited worker makes
