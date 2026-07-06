@@ -7,7 +7,7 @@
     "fn-1140-decouple-base-merge-from-checkout"
   ],
   "id": "fn-1143-excise-dead-shared-checkout-distress",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-06T16:01:20.767000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T16:01:20.477000Z"
+  "updated_at": "2026-07-06T16:01:20.767000Z"
 }
