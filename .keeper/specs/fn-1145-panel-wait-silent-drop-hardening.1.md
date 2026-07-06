@@ -40,5 +40,5 @@ The runner's Step 3 wait discipline becomes: each `keeper agent panel wait --chu
 - [ ] The consistency test suite passes, including new assertions pinning the timeout parameter, the tripwire, and the marker in the runner prose
 
 ## Done summary
-
+Hardened panel-runner wait discipline: per-chunk blocking wait carries the explicit Bash timeout:600000 tool parameter with an auto-background tripwire and a backstop terminating in PANEL_RUN_FAILED, plus a first-line PANEL_ANSWER success marker in Step 6; new consistency-skills assertions pin the timeout parameter, tripwire, and marker.
 ## Evidence

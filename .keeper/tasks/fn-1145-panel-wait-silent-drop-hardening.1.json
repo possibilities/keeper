@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Harden panel-runner wait discipline",
-  "updated_at": "2026-07-06T20:12:09.228000Z"
+  "updated_at": "2026-07-06T23:48:08.370000Z",
+  "worker_done_at": "2026-07-06T23:48:08.370000Z"
 }
