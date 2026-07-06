@@ -13,7 +13,12 @@ A small TypeScript hook plugin appends one per-pid NDJSON line per Claude Code h
 (lock-free — it never opens SQLite). keeper drives other harnesses too — codex, pi, and hermes — and
 they feed the same events-log tree: a hermes shell shim and an ephemeral in-process pi extension
 write per-pid NDJSON directly, while non-claude presence (a launcher-dropped birth record) and codex
-live churn (a rollout-file tail) reach the log as main-minted synthetic events. A long-running Bun
+live churn (a rollout-file tail) reach the log as main-minted synthetic events. A hand-started
+session can be adopted as a tracked job rather than only a launcher-started one: the hermes shim
+self-seeds its identity from the native session id when no keeper job id is set, and an opt-in knob
+(off by default) adopts an unambiguous originator-less codex rollout timed from its own session-start;
+pi adoption is deliberately not built — its extension is ephemeral per launch with no durable artifact
+to adopt. A long-running Bun
 daemon (`keeperd`, run by a macOS LaunchAgent) runs an events-log ingester that tails those per-pid
 files and lands each line as one row in the append-only `events` table — the durable log and sole
 fold source. The reducer folds new

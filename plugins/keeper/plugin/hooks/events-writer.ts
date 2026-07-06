@@ -589,6 +589,7 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "worktree",
   "harness",
   "resume_target",
+  "adopted",
 ]);
 
 /**
@@ -767,6 +768,14 @@ export function buildEventBindings(
   const harness = hookEvent === "SessionStart" ? "claude" : null;
   const resumeTarget: string | null = null;
 
+  // The ADOPTED marker is ALWAYS NULL from this hook — claude sessions this hook
+  // fires for are launcher-owned (or claude-native), never "adopted". The marker
+  // is set only by the NON-launcher paths (the hand-started hermes self-seed / the
+  // codex rollout-adoption mint), so the fold copies it verbatim and this claude
+  // producer carries NULL. Present-as-a-key to satisfy the KNOWN_EVENT_COLUMNS
+  // lockstep (a bare-NULL binding, mirroring resume_target).
+  const adopted: number | null = null;
+
   // Backend-exec coordinates: captured on EVERY hook event, not SessionStart-
   // gated. A pure synchronous `process.env` read (no fork/fs/PPID-walk), so it
   // stays inside the cold-start budget on every fire. Absent sentinel
@@ -843,6 +852,7 @@ export function buildEventBindings(
     worktree,
     harness,
     resume_target: resumeTarget,
+    adopted,
   };
   return bindings;
 }

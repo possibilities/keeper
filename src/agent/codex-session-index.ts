@@ -158,6 +158,138 @@ export function resolveCodexResumeTarget(
 }
 
 /**
+ * A codex rollout eligible for adoption this tick (see
+ * {@link findAdoptableCodexRollouts}) — an originator-less, sole-for-its-cwd
+ * session the daemon can mint as a tracked adopted job. Carries only the fields
+ * the mint needs; the raw `cwd` is canonicalized by MAIN before it enters the row.
+ */
+export interface AdoptableCodexRollout {
+  /** The rollout uuid — the adopted job's id AND its resume target. */
+  uuid: string;
+  /** The rollout's SessionMeta `cwd`, RAW — MAIN canonicalizes before the mint. */
+  cwd: string;
+  /** The rollout's immutable session-start instant (ms), from SessionMeta. */
+  sessionStartMs: number;
+}
+
+/**
+ * Enumerate the codex rollouts eligible for ADOPTION this tick — the pull-side
+ * discovery for a hand-started codex session that no keeper launcher owns. A
+ * rollout qualifies only when ALL hold:
+ *
+ *  - its SessionMeta `originator` is STRICTLY absent or empty — a present (even
+ *    unmatched) originator is a launched or foreign session, NEVER adopted (no
+ *    stale-originator recovery in the dark v2);
+ *  - its SessionMeta head parses to a valid uuid + a parseable session-start
+ *    timestamp (a half-written / unparseable meta is skipped, never adopted);
+ *  - it carries a non-null cwd AND is the SOLE such candidate for that cwd — the
+ *    same refuse-to-guess-on-same-cwd-collision rule {@link resolveCodexResumeTarget}
+ *    uses: two originator-less rollouts in one cwd adopt NEITHER.
+ *
+ * Bounded by the recency window: only rollout day-dirs within `recentWindowSec`
+ * of `nowSec` are walked, and a file whose mtime predates the window floor is
+ * skipped without a head read — so scan cost is a function of the window, never
+ * of how long codex has been installed. Reads ONLY each rollout's SessionMeta
+ * head line (never session content). Returned newest-session-start-first (uuid
+ * tiebreak) so a per-tick mint cap drains the freshest sessions first,
+ * deterministically. Pure over the filesystem + clock; MAIN owns the mint.
+ */
+export function findAdoptableCodexRollouts(
+  codexHome: string,
+  nowSec: number,
+  recentWindowSec: number,
+): AdoptableCodexRollout[] {
+  const nowMs = nowSec * 1000;
+  const floorMs = nowMs - recentWindowSec * 1000;
+  const root = join(codexHome, "sessions");
+  const candidates: Candidate[] = [];
+  for (const dir of windowDayDirs(root, nowMs, recentWindowSec * 1000)) {
+    if (!existsSync(dir)) {
+      continue;
+    }
+    for (const name of safeReadDir(dir)) {
+      if (!name.startsWith("rollout-") || !name.endsWith(".jsonl")) {
+        continue;
+      }
+      const path = join(dir, name);
+      const stat = safeStat(path);
+      // mtime >= session-start always, so an mtime before the floor cannot be a
+      // recent session — skip the head read entirely (bounds scan to the window).
+      if (stat === null || stat.mtimeMs < floorMs) {
+        continue;
+      }
+      const meta = readSessionMeta(path);
+      if (meta === null) {
+        continue; // unparseable / partial meta / bad uuid — skip, never adopt.
+      }
+      if (meta.createdAtMs < floorMs) {
+        continue; // session-start outside the recency window.
+      }
+      // STRICT ownership predicate: adopt ONLY an absent/empty originator.
+      if (meta.originator !== null && meta.originator.trim() !== "") {
+        continue;
+      }
+      if (meta.cwd === null) {
+        continue; // no cwd — cannot be "the sole candidate for its cwd".
+      }
+      candidates.push(meta);
+    }
+  }
+  // Sole-unambiguous-per-cwd refuse: group by RAW cwd; a cwd with >1 candidate is
+  // a collision — adopt NONE from it (mirrors pickCandidateByCwd's `>1 → refuse`).
+  const byCwd = new Map<string, Candidate[]>();
+  for (const candidate of candidates) {
+    const cwd = candidate.cwd as string; // non-null (filtered above)
+    const list = byCwd.get(cwd);
+    if (list === undefined) {
+      byCwd.set(cwd, [candidate]);
+    } else {
+      list.push(candidate);
+    }
+  }
+  const out: AdoptableCodexRollout[] = [];
+  for (const [cwd, list] of byCwd) {
+    if (list.length !== 1) {
+      continue; // same-cwd collision → refuse to guess.
+    }
+    const sole = list[0] as Candidate;
+    out.push({ uuid: sole.id, cwd, sessionStartMs: sole.createdAtMs });
+  }
+  out.sort(
+    (a, b) =>
+      b.sessionStartMs - a.sessionStartMs ||
+      (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0),
+  );
+  return out;
+}
+
+/**
+ * The rollout day-dirs (`<root>/YYYY/MM/DD`) touched by the window
+ * `[nowMs - windowMs, nowMs]`, one per LOCAL calendar day it spans (matching
+ * codex's local-date dir layout, same as {@link sessionDayDirs}). The span is a
+ * function of the window constant, never of harness lifetime.
+ */
+function windowDayDirs(
+  root: string,
+  nowMs: number,
+  windowMs: number,
+): string[] {
+  const dirs: string[] = [];
+  const cursor = new Date(nowMs - windowMs);
+  cursor.setHours(0, 0, 0, 0);
+  const endDay = new Date(nowMs);
+  endDay.setHours(0, 0, 0, 0);
+  while (cursor.getTime() <= endDay.getTime()) {
+    const year = String(cursor.getFullYear());
+    const month = String(cursor.getMonth() + 1).padStart(2, "0");
+    const day = String(cursor.getDate()).padStart(2, "0");
+    dirs.push(join(root, year, month, day));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dirs;
+}
+
+/**
  * Pick the one candidate whose cwd matches, refusing to guess on a same-cwd
  * collision (naming the wrong session's rollout is worse than leaving it
  * unnamed — never a newest-by-mtime pick). With no cwd constraint, a sole

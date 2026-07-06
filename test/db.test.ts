@@ -259,14 +259,14 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3)", () => {
+test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `harness`/`resume_target` (v109)
-  // are the current final appended columns, trailing `dispatch_origin` (v108),
-  // `kill_reason` (v103), and the v100 telemetry six.
+  // re-fold determinism charter depends on. `adopted` (v110) is the current final
+  // appended column, trailing `harness`/`resume_target` (v109), `dispatch_origin`
+  // (v108), `kill_reason` (v103), and the v100 telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -278,6 +278,7 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
     "dispatch_origin",
     "harness",
     "resume_target",
+    "adopted",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -351,6 +352,57 @@ test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1
     .get() as { harness: string | null; resume_target: string | null };
   expect(r.harness).toBeNull();
   expect(r.resume_target).toBeNull();
+  db.close();
+});
+
+test("openDb adds nullable adopted to BOTH events and jobs + codex_adoption to autopilot_state (fn-1131 task .1)", () => {
+  // The v109->v110 step adds the adoption primitive across three surfaces:
+  // `events.adopted` via the FIVE-place lockstep (CREATE literal + migration
+  // append), `jobs.adopted` migration-only, and `autopilot_state.codex_adoption`
+  // (CREATE literal + migration append). All INTEGER, nullable, NO default (the
+  // NULL=absent + re-fold byte-identity invariant). A bare-inserted row reads NULL.
+  const { db } = openDb(":memory:");
+  for (const table of ["events", "jobs"] as const) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[];
+    const col = cols.find((c) => c.name === "adopted");
+    expect(col).toBeDefined();
+    expect(col?.type).toBe("INTEGER");
+    expect(col?.notnull).toBe(0);
+    expect(col?.dflt_value).toBeNull();
+  }
+  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const knob = stateCols.find((c) => c.name === "codex_adoption");
+  expect(knob).toBeDefined();
+  expect(knob?.type).toBe("INTEGER");
+  expect(knob?.notnull).toBe(0);
+  expect(knob?.dflt_value).toBeNull();
+
+  // A bare-inserted jobs row reads NULL for adopted (the zero-event shape).
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('ja', 1, 0, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT adopted FROM jobs WHERE job_id = 'ja'")
+    .get() as { adopted: number | null };
+  expect(r.adopted).toBeNull();
+  // A bare autopilot_state row omitting codex_adoption reads NULL (= OFF).
+  db.prepare(
+    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
+  ).run();
+  const s = db
+    .prepare("SELECT codex_adoption FROM autopilot_state WHERE id = 1")
+    .get() as { codex_adoption: number | null };
+  expect(s.codex_adoption).toBeNull();
   db.close();
 });
 
@@ -2629,7 +2681,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // once-marker to BOTH `dispatch_failures` and `block_escalations` (the terminal
   // human-notify stage of the two escalation paths — additive ALTERs, not an
   // epics-shape change), fn-1129 task .1.
-  expect(SCHEMA_VERSION).toBe(110);
+  // v111 appends the nullable `adopted` INTEGER column
+  // to BOTH events (five-place lockstep) and jobs (migration-only) plus the
+  // `autopilot_state.codex_adoption` knob — additive ALTERs, none touching the
+  // epics shape, fn-1131 task .1.
+  expect(SCHEMA_VERSION).toBe(111);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

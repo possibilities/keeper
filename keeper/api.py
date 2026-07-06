@@ -424,6 +424,10 @@ from pathlib import Path
 # BOTH ``dispatch_failures`` and ``block_escalations`` (the escalation-session
 # decline/death human-notify latch); keeper-py reads neither table, so only the
 # version whitelist gains 110.
+# v111 (fn-1131 task .1) adds the nullable ``adopted`` INTEGER column to BOTH the
+# events and jobs surfaces (the harness-session adoption marker) and the
+# ``autopilot_state.codex_adoption`` INTEGER knob; keeper-py reads none of the
+# three, so only the version whitelist gains 111.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -506,6 +510,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         108,
         109,
         110,
+        111,
     }
 )
 

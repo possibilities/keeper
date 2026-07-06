@@ -177,6 +177,12 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // `sortable` / `filters` / `jsonColumns` key.
     "harness",
     "resume_target",
+    // `adopted`: the harness-agnostic "a non-launcher path minted this session"
+    // marker (schema v110 / fn-1131), 1 on an adopted session (hand-started
+    // hermes self-seed / codex rollout mint), NULL otherwise. Served so the board
+    // can pill an adopted job distinctly. Display-only — never a `sortable` /
+    // `filters` / `jsonColumns` key.
+    "adopted",
   ],
   pk: "job_id",
   version: "last_event_id",
@@ -678,6 +684,10 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // Durable multi-repo worktree rollout flag (INTEGER 0/1), read by the
     // reconciler's `classifyWorktreeRepos` partition each cycle. NOT a jsonColumn.
     "worktree_multi_repo",
+    // Durable codex rollout-adoption knob (INTEGER 0/1, DEFAULT NULL/absent =
+    // OFF), served so `keeper query autopilot_state` reflects the real durable
+    // state. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
+    "codex_adoption",
   ],
   pk: "id",
   version: "last_event_id",

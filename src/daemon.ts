@@ -24,7 +24,11 @@ import { basename, join, resolve as resolvePath, sep } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
-import { resolveCodexResumeTarget } from "./agent/codex-session-index";
+import {
+  type AdoptableCodexRollout,
+  findAdoptableCodexRollouts,
+  resolveCodexResumeTarget,
+} from "./agent/codex-session-index";
 import type {
   AutocloseIntentMessage,
   AutocloseWorkerData,
@@ -622,6 +626,25 @@ export const CODEX_RESUME_SWEEP_INTERVAL_MS = 5_000;
  * unaffected — it simply stays `resume_target` NULL (not-resumable).
  */
 export const CODEX_RESUME_RECENT_WINDOW_SEC = 600;
+
+/**
+ * Recency window for codex rollout-ADOPTION discovery (fn-1131). Only rollout
+ * day-dirs whose sessions started within this window are scanned, so a knob-flip
+ * on a codex install with months of history reads a bounded, fixed number of
+ * day-dirs — scan cost is a function of THIS window, never of harness lifetime.
+ * A day old enough that its whole rollout set predates the floor is skipped. A
+ * genuinely stale session (started before the window) is simply never adopted.
+ */
+export const CODEX_ADOPTION_RECENT_WINDOW_SEC = 24 * 60 * 60;
+
+/**
+ * Per-tick adoption mint cap (fn-1131). Bounds how many adopted jobs one sweep
+ * tick mints, so a knob-flip that finds a burst of eligible rollouts drains
+ * gradually across ticks rather than minting them all under one write lock. The
+ * window bounds the scan; this bounds the mints — both invariants are
+ * acceptance-bound, the constants themselves are tunable.
+ */
+export const CODEX_ADOPTION_MINT_CAP_PER_TICK = 8;
 
 /**
  * The ONE blocked category that does NOT escalate to the planner: a
@@ -2979,6 +3002,7 @@ export const INGEST_EVENTS_COLUMNS = [
   "worktree",
   "harness",
   "resume_target",
+  "adopted",
 ] as const;
 
 /**
@@ -3431,8 +3455,9 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
        plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id, mutation_path, worktree, harness, resume_target
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path, worktree, harness, resume_target,
+       adopted
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       birthEventTs(record),
       record.session_id,
@@ -3470,6 +3495,8 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
       record.worktree,
       record.harness,
       record.resume_target,
+      // adopted: births are launcher-owned by definition, so the marker is NULL.
+      null,
     ],
   );
 }
@@ -3606,6 +3633,196 @@ export function findLiveCodexStateJobs(db: Database): LiveCodexJob[] {
     resumeTarget: r.resume_target,
     createdAtMs: r.created_at * 1000,
   }));
+}
+
+/**
+ * Read the durable codex rollout-adoption knob off the `autopilot_state`
+ * singleton. Absent row / NULL / 0 all resolve to OFF (the byte-identical
+ * default — no fold reads this column). Re-read every sweep tick so a knob flip
+ * is a live kill-switch: flipping OFF stops adoption within one tick.
+ */
+export function isCodexAdoptionEnabled(db: Database): boolean {
+  const row = db
+    .query("SELECT codex_adoption FROM autopilot_state WHERE id = 1")
+    .get() as { codex_adoption: number | null } | null;
+  return row?.codex_adoption === 1;
+}
+
+/**
+ * The dedup predicate for codex adoption: does ANY tracked job already claim this
+ * rollout uuid — either as its own `job_id` (a prior adoption of the same
+ * rollout) or as its `resume_target` (a launcher-owned session the resume
+ * back-fill attributed to this rollout)? Reads the folded `jobs` projection, so
+ * it enforces the "discovery never adopts a launcher-owned session" +
+ * idempotent-re-mint invariants across ticks.
+ */
+function codexRolloutClaimed(db: Database, uuid: string): boolean {
+  return (
+    db
+      .query("SELECT 1 FROM jobs WHERE job_id = ? OR resume_target = ? LIMIT 1")
+      .get(uuid, uuid) != null
+  );
+}
+
+/**
+ * Canonicalize a rollout's RAW cwd before it enters the adopted `jobs` row —
+ * `realpathSync` to defeat symlink escapes when the path exists, falling back to
+ * a lexical `resolve` (collapsing `.`/`..`) when it does not. The raw value is
+ * user-writable (a rollout file is untrusted input), so canonicalizing here
+ * neutralizes path-traversal / injection before the value is stored.
+ */
+export function canonicalizeAdoptedCwd(rawCwd: string): string {
+  try {
+    return realpathSync(rawCwd);
+  } catch {
+    return resolvePath(rawCwd);
+  }
+}
+
+/**
+ * Mint ONE synthetic `SessionStart` for an ADOPTED codex rollout — the pull-side
+ * sibling of {@link insertBirthSessionStart}. COORDLESS by design: main mints
+ * from a rollout FILE, owning no process and no tmux pane, so `pid`,
+ * `start_time`, and every `backend_exec_*`/`worktree` coord bind NULL. The job id
+ * AND `resume_target` are both the rollout `uuid` (so the live-state tailer keys
+ * on it immediately), `harness` is `codex`, `adopted` is 1 (the non-launcher
+ * marker the SessionStart COALESCE arm preserves set-once), `cwd` is the
+ * pre-canonicalized value, and `ts` is the rollout's OWN immutable session-start
+ * (seconds) — never file mtime, never wall-clock — so a from-scratch re-fold
+ * reproduces a byte-identical row. Column list matches CREATE_EVENTS verbatim
+ * (a future column add updates this site alongside its `insertBirthSessionStart`
+ * sibling); values bind positionally. MUST run on `db` = main's WRITER connection.
+ */
+export function insertAdoptedCodexSessionStart(
+  db: Database,
+  uuid: string,
+  canonicalCwd: string,
+  sessionStartSec: number,
+): void {
+  db.run(
+    `INSERT INTO events (
+       ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+       cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+       subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+       background_task_id, mutation_path, worktree, harness, resume_target,
+       adopted
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      sessionStartSec, // ts — the rollout's own immutable session-start
+      uuid, // session_id — the adopted job id
+      null, // pid — coordless/pidless: main owns no process for this session
+      "SessionStart",
+      "session_start",
+      null, // tool_name
+      null, // matcher
+      canonicalCwd, // cwd — canonicalized on the raw rollout value
+      null, // permission_mode
+      null, // agent_id
+      null, // agent_type
+      null, // stop_hook_active
+      null, // data (no transcript captured at adoption)
+      null, // subagent_agent_id
+      null, // spawn_name
+      null, // start_time
+      null, // slash_command
+      null, // skill_name
+      null, // plan_op
+      null, // plan_target
+      null, // plan_epic_id
+      null, // plan_task_id
+      null, // plan_subject_present
+      null, // tool_use_id
+      null, // config_dir
+      null, // bash_mutation_kind
+      null, // bash_mutation_targets
+      null, // plan_files
+      null, // backend_exec_type — COORDLESS
+      null, // backend_exec_session_id — COORDLESS
+      null, // backend_exec_pane_id — COORDLESS
+      null, // background_task_id
+      null, // mutation_path
+      null, // worktree
+      "codex", // harness
+      uuid, // resume_target — the native rollout uuid (== job id)
+      1, // adopted — the non-launcher adoption marker
+    ],
+  );
+}
+
+/**
+ * One codex rollout-adoption sweep tick (fn-1131) — the pull-side sibling of the
+ * resume back-fill. Knob-gated (re-read each tick, so OFF stops adoption within
+ * one tick), it discovers originator-less, sole-for-their-cwd rollouts within the
+ * recency window ({@link findAdoptableCodexRollouts}), then for each — newest
+ * first, up to `mintCap` — has MAIN mint a coordless adopted SessionStart inside
+ * a `BEGIN IMMEDIATE` guarded by a re-read of {@link codexRolloutClaimed} (skip
+ * if any job already claims the uuid). cwd is canonicalized BEFORE the
+ * transaction so the write lock never spans that IO. A mint throw rolls its own
+ * row back and is logged non-fatally; the tick continues. Returns the number of
+ * jobs minted (the caller wakes the fold when > 0). MUST run on `db` = main's
+ * WRITER connection.
+ */
+export function runCodexAdoptionSweep(
+  db: Database,
+  codexHome: string,
+  nowSec: number,
+  recentWindowSec: number,
+  mintCap: number,
+): number {
+  if (!isCodexAdoptionEnabled(db)) {
+    return 0; // knob OFF — nothing scanned, nothing minted (the default).
+  }
+  const candidates: AdoptableCodexRollout[] = findAdoptableCodexRollouts(
+    codexHome,
+    nowSec,
+    recentWindowSec,
+  );
+  let minted = 0;
+  for (const candidate of candidates) {
+    if (minted >= mintCap) {
+      break; // per-tick cap reached — the rest drains on later ticks.
+    }
+    // Cheap pre-filter (single-threaded main is the sole writer, so the folded
+    // `jobs` view is authoritative between ticks): skip an already-claimed uuid
+    // WITHOUT a write lock so re-scanned adopted rollouts never churn a txn.
+    if (codexRolloutClaimed(db, candidate.uuid)) {
+      continue;
+    }
+    const canonicalCwd = canonicalizeAdoptedCwd(candidate.cwd);
+    db.run("BEGIN IMMEDIATE");
+    try {
+      // Authoritative re-read INSIDE the write lock — the mint is idempotent even
+      // against a racing resume back-fill that attributed the same rollout.
+      if (codexRolloutClaimed(db, candidate.uuid)) {
+        db.run("COMMIT");
+        continue;
+      }
+      insertAdoptedCodexSessionStart(
+        db,
+        candidate.uuid,
+        canonicalCwd,
+        candidate.sessionStartMs / 1000,
+      );
+      db.run("COMMIT");
+      minted += 1;
+    } catch (err) {
+      try {
+        db.run("ROLLBACK");
+      } catch {
+        // best-effort — a rollback failure never escalates a sweep tick.
+      }
+      console.error(
+        `[keeperd] codex-adoption mint failed for ${candidate.uuid} (skipped this tick): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+  return minted;
 }
 
 /**
@@ -8542,6 +8759,32 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           console.error(
             `[keeperd] codex-state sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        // Codex rollout-ADOPTION discovery (fn-1131) rides the same tick under its
+        // OWN guard, so a scan/mint throw here never skips the resume/state mints
+        // above (and vice versa). Knob-gated OFF by default and re-read inside the
+        // sweep (a live kill-switch); when ON it discovers originator-less,
+        // sole-for-cwd rollouts within the recency window and has MAIN mint each,
+        // capped, as a coordless adopted job. A just-adopted job (resume_target =
+        // its own uuid) is picked up by the live-state tailer on a later tick.
+        try {
+          const adopted = runCodexAdoptionSweep(
+            db,
+            codexResumeHome,
+            Date.now() / 1000,
+            CODEX_ADOPTION_RECENT_WINDOW_SEC,
+            CODEX_ADOPTION_MINT_CAP_PER_TICK,
+          );
+          if (adopted > 0) {
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          console.error(
+            `[keeperd] codex-adoption sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );

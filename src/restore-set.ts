@@ -99,6 +99,17 @@ const CRASH_LIKE: ReadonlySet<CloseKind> = new Set<CloseKind>([
 const USER_CLOSED: CloseKind = "window_gone_server_alive";
 
 /**
+ * True when a jobs row carries the harness-agnostic ADOPTED marker
+ * (`jobs.adopted = 1`) — a session a NON-launcher path minted: a hand-started
+ * hermes self-seed or an adopted codex rollout. A NULL marker (launcher-owned)
+ * reads false. Used at the coordless-skip paths to SURFACE an adopted session
+ * keeper cannot auto-restore rather than silently drop it. Pure.
+ */
+function isAdopted(adopted: number | null): boolean {
+  return adopted === 1;
+}
+
+/**
  * Raw `jobs`-row shape the derivation reads. A read-only projection of the
  * columns the membership/filter/order logic needs — NOT the full {@link Job}.
  * `close_kind` and `window_index` are the fn-817 producer-stamped columns
@@ -126,6 +137,10 @@ interface KilledJobRow {
   /** Harness-native resume target (`jobs.resume_target`); NULL/empty ⇒ the
    *  candidate is not-resumable for a non-claude harness. */
   resume_target: string | null;
+  /** The harness-agnostic adopted marker (`jobs.adopted`); `1` on an adopted
+   *  session, NULL otherwise. Read at the coordless-skip path to surface an
+   *  adopted coordless job rather than silently drop it. */
+  adopted: number | null;
 }
 
 /**
@@ -176,6 +191,15 @@ export interface RestoreSetResult {
   /** Count of crash-like rows excluded ONLY because they were idle past the
    *  cutoff (a false-negative risk we make visible — never a silent drop). */
   excludedIdleCount: number;
+  /**
+   * Count of ADOPTED jobs (`jobs.adopted = 1` — a hand-started hermes self-seed or
+   * an adopted codex rollout) dropped from candidacy ONLY because they carry no
+   * backend coords (coordless-by-design for codex; harness-agnostic here). Surfaced
+   * like {@link excludedIdleCount} so an adopted session keeper cannot auto-restore
+   * is VISIBLE, never a silent drop. Classification keys on coord-absence PLUS the
+   * marker — a coordless NON-adopted row keeps today's silent skip (never counted).
+   */
+  adoptedCoordlessSkipCount: number;
   /**
    * A human-readable note set ONLY when {@link deriveLastGenerationSetFromTopology}
    * degraded to the retrospective {@link deriveLastGenerationSet} fallback (no
@@ -413,7 +437,7 @@ function loadRows(db: Database): {
               window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                 AS backend_exec_session_id,
-              plan_verb, last_event_id, harness, resume_target
+              plan_verb, last_event_id, harness, resume_target, adopted
          FROM jobs
         WHERE state = 'killed'`,
     )
@@ -445,10 +469,11 @@ export function deriveRestoreSet(
   db: Database,
   options: DeriveRestoreSetOptions = {},
 ): RestoreSetResult {
-  const { collected, excludedIdleCount } = collectCrashCandidates(db, options);
+  const { collected, excludedIdleCount, adoptedCoordlessSkipCount } =
+    collectCrashCandidates(db, options);
   const candidates = collected.map((c) => c.candidate);
   candidates.sort(compareCandidates);
-  return { candidates, excludedIdleCount };
+  return { candidates, excludedIdleCount, adoptedCoordlessSkipCount };
 }
 
 /**
@@ -463,7 +488,11 @@ export function deriveRestoreSet(
 function collectCrashCandidates(
   db: Database,
   options: DeriveRestoreSetOptions,
-): { collected: CandidateWithEventId[]; excludedIdleCount: number } {
+): {
+  collected: CandidateWithEventId[];
+  excludedIdleCount: number;
+  adoptedCoordlessSkipCount: number;
+} {
   const now = options.now ?? Date.now() / 1000;
   const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
   const idleBefore = now - idleCutoffSecs;
@@ -477,6 +506,7 @@ function collectCrashCandidates(
 
   const collected: CandidateWithEventId[] = [];
   let excludedIdleCount = 0;
+  let adoptedCoordlessSkipCount = 0;
 
   for (const row of killed) {
     const jobId = seg(row.job_id);
@@ -488,9 +518,15 @@ function collectCrashCandidates(
     if (!isCrashLike(row.close_kind, inBurst)) {
       continue; // user-closed, or isolated unknown/legacy — not a candidate.
     }
-    // Filter: no backend coords ⇒ nothing to replay.
+    // Filter: no backend coords ⇒ nothing to replay. An ADOPTED coordless row
+    // (codex-by-design, or a hermes self-seed keeper never resolved coords for) is
+    // COUNTED and surfaced rather than silently dropped; a non-adopted coordless
+    // row keeps today's silent skip.
     const backendSession = row.backend_exec_session_id;
     if (backendSession == null || backendSession === "") {
+      if (isAdopted(row.adopted)) {
+        adoptedCoordlessSkipCount++;
+      }
       continue;
     }
     // Filter: autopilot workers are reconciler-managed; never restore them.
@@ -541,7 +577,7 @@ function collectCrashCandidates(
     });
   }
 
-  return { collected, excludedIdleCount };
+  return { collected, excludedIdleCount, adoptedCoordlessSkipCount };
 }
 
 /**
@@ -590,9 +626,10 @@ export function deriveLastGenerationSet(
   db: Database,
   options: DeriveRestoreSetOptions = {},
 ): RestoreSetResult {
-  const { collected, excludedIdleCount } = collectCrashCandidates(db, options);
+  const { collected, excludedIdleCount, adoptedCoordlessSkipCount } =
+    collectCrashCandidates(db, options);
   if (collected.length === 0) {
-    return { candidates: [], excludedIdleCount };
+    return { candidates: [], excludedIdleCount, adoptedCoordlessSkipCount };
   }
 
   // K_max: the most-recent Killed-event rowid among the candidates. A candidate
@@ -602,7 +639,7 @@ export function deriveLastGenerationSet(
     .filter((x): x is number => typeof x === "number" && Number.isFinite(x));
   if (eventIds.length === 0) {
     // No positioned candidate at all — no window to bound. Empty, cleanly.
-    return { candidates: [], excludedIdleCount };
+    return { candidates: [], excludedIdleCount, adoptedCoordlessSkipCount };
   }
   const kMax = Math.max(...eventIds);
 
@@ -659,7 +696,7 @@ export function deriveLastGenerationSet(
 
   const candidates = kept.map((c) => c.candidate);
   candidates.sort(compareCandidates);
-  return { candidates, excludedIdleCount };
+  return { candidates, excludedIdleCount, adoptedCoordlessSkipCount };
 }
 
 /**
@@ -802,11 +839,15 @@ export function deriveLastGenerationSetFromTopology(
     pick.summary.generation_id !== newestEligible.summary.generation_id ||
     pick.summary.first_event_id !== newestEligible.summary.first_event_id;
 
-  // The topology path has no idle-cutoff concept for the panes themselves (they
-  // were all live at crash time); excludedIdleCount is 0 on this path.
+  // The topology path is pane-based positive evidence: the panes were all live at
+  // crash time, so it surfaces neither idle-cutoff nor coordless-cohort counts
+  // (excludedIdleCount / adoptedCoordlessSkipCount are 0 here — a coordless adopted
+  // job has no pane, so it is surfaced only by the retrospective fallback above,
+  // whose `...fallback` carries its count).
   return {
     candidates: pick.candidates,
     excludedIdleCount: 0,
+    adoptedCoordlessSkipCount: 0,
     ...(ambiguous ? { ambiguous: true } : {}),
   };
 }
@@ -1068,6 +1109,13 @@ function readGenerationSnapshotsDesc(
  * `plan_verb='work'` excluded, live-UUID excluded), and sort by
  * {@link compareCandidates}. Returns `[]` when no pane yields a candidate — the
  * signal {@link enrichGeneration} uses to step back to the attributed sibling.
+ *
+ * A coordless job never reaches here as a pane: {@link extractTmuxTopologySnapshot}
+ * drops any pane with an empty `session_name`, so the no-coords guard below is a
+ * defensive backstop, not the adopted-coordless surface. Coordless ADOPTED jobs
+ * (codex-by-design) carry no pane at all and are surfaced by the retrospective
+ * {@link collectCrashCandidates} path (`adoptedCoordlessSkipCount`), which the
+ * topology deriver's fallback carries through.
  */
 function buildCandidatesFromSnapshot(
   db: Database,

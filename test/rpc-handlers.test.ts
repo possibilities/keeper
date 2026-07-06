@@ -206,6 +206,7 @@ function autopilotStubBridge(opts: {
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
       worktree_multi_repo?: boolean;
+      codex_adoption?: boolean;
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
@@ -228,6 +229,7 @@ function autopilotStubBridge(opts: {
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
       worktree_multi_repo?: boolean;
+      codex_adoption?: boolean;
     }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
@@ -526,6 +528,36 @@ test("set_autopilot_config rejects a non-boolean worktree_multi_repo (fn-1034)",
     { worktree_multi_repo: 0 },
     { worktree_multi_repo: "true" },
     { worktree_multi_repo: null },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config forwards a codex_adoption boolean patch (fn-1131)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const on = await setAutopilotConfigHandler({ codex_adoption: true }, bridge);
+  expect(on).toEqual({ ok: true, patch: { codex_adoption: true } });
+  const off = await setAutopilotConfigHandler(
+    { codex_adoption: false },
+    bridge,
+  );
+  expect(off).toEqual({ ok: true, patch: { codex_adoption: false } });
+  expect(state.setConfigCalls).toEqual([
+    { codex_adoption: true },
+    { codex_adoption: false },
+  ]);
+});
+
+test("set_autopilot_config rejects a non-boolean codex_adoption (fn-1131)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { codex_adoption: 1 },
+    { codex_adoption: 0 },
+    { codex_adoption: "true" },
+    { codex_adoption: null },
   ]) {
     expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,

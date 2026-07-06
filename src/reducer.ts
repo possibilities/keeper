@@ -5019,6 +5019,7 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   max_concurrent_per_root: "max_concurrent_per_root",
   worktree_mode: "worktree_mode",
   worktree_multi_repo: "worktree_multi_repo",
+  codex_adoption: "codex_adoption",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -5055,6 +5056,14 @@ interface AutopilotConfigSetPayload {
    *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
    *  resolves to a concrete 0/1. */
   worktree_multi_repo?: number;
+  /** The durable codex rollout-adoption knob, stored as INTEGER 0/1 (`1` = ON =
+   *  positive-evidence codex rollout adoption enabled, `0` = OFF = the
+   *  byte-identical default, nothing adopted). Same shape/coercion as
+   *  {@link worktree_mode}: the wire field is a BOOLEAN; the parser coerces
+   *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
+   *  resolves to a concrete 0/1. No fold reads it — the codex adoption producer
+   *  resolves an absent column `?? OFF` at read time. */
+  codex_adoption?: number;
 }
 
 /**
@@ -5115,6 +5124,14 @@ function extractAutopilotConfigSetPayload(
       // present field always resolves to a concrete 0/1 — the reconciler resolves
       // an absent column `?? OFF`.
       patch.worktree_multi_repo = raw === true ? 1 : 0;
+    }
+    if ("codex_adoption" in parsed) {
+      const raw = parsed.codex_adoption;
+      // BOOLEAN wire field stored as INTEGER 0/1, mirroring `worktree_multi_repo`:
+      // `true` → 1 (ON), anything else (false / null / non-boolean) → 0 (OFF). A
+      // present field always resolves to a concrete 0/1 — the codex adoption
+      // producer resolves an absent column `?? OFF` at read time.
+      patch.codex_adoption = raw === true ? 1 : 0;
     }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;
@@ -7973,8 +7990,8 @@ function projectJobsRow(db: Database, event: Event): void {
         const spawnNameHistory =
           event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target, adopted)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
@@ -8000,6 +8017,14 @@ function projectJobsRow(db: Database, event: Event): void {
              -- terminal-row revive (killed -> stopped) semantics.
              harness = COALESCE(excluded.harness, jobs.harness),
              resume_target = COALESCE(excluded.resume_target, jobs.resume_target),
+             -- v110 (fn-1131.1): set-once ADOPTED marker, mirroring worktree. The
+             -- claude hook + every birth mint carry excluded.adopted NULL
+             -- (launcher-owned), so COALESCE preserves an adopted marker a prior
+             -- non-launcher mint (hermes self-seed / codex rollout) set — a later
+             -- resume or a racing launcher re-mint NEVER clobbers it. The fold
+             -- copies the event value verbatim and never synthesizes, so a NULL
+             -- excluded leaves the prior value (NULL stays NULL, 1 stays 1).
+             adopted = COALESCE(excluded.adopted, jobs.adopted),
              -- Schema v36: track config_dir's nullability — a resume carrying
              -- a NULL config_dir derives a NULL excluded.profile_name, so
              -- COALESCE preserves the seeded name (mirrors config_dir above).
@@ -8063,6 +8088,7 @@ function projectJobsRow(db: Database, event: Event): void {
             event.worktree,
             event.harness,
             event.resume_target,
+            event.adopted,
           ],
         );
         // Seed a visible `profiles` row for this session's `config_dir` bucket.
@@ -9633,7 +9659,7 @@ export function drain(
               plan_op, plan_target, plan_epic_id, plan_task_id,
               plan_subject_present, tool_use_id, config_dir, plan_files,
               backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-              worktree, harness, resume_target
+              worktree, harness, resume_target, adopted
          FROM events
         WHERE id > ?
         ORDER BY id ASC

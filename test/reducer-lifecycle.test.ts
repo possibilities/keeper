@@ -148,6 +148,10 @@ function insertEvent(
     // ResumeTargetResolved tests set them via overrides.
     harness: overrides.harness ?? null,
     resume_target: overrides.resume_target ?? null,
+    // Schema v110 / fn-1131: the harness-agnostic ADOPTED marker. NULL by default
+    // so a claude/launcher SessionStart folds jobs.adopted NULL; adoption-fold
+    // tests set it (1) via overrides.
+    adopted: overrides.adopted ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -158,8 +162,9 @@ function insertEvent(
        plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id, mutation_path, worktree, harness, resume_target
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path, worktree, harness, resume_target,
+       adopted
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -197,6 +202,7 @@ function insertEvent(
       row.worktree,
       row.harness,
       row.resume_target,
+      row.adopted,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -922,6 +928,91 @@ test("fn-1103 ResumeTargetResolved with a NULL target or no jobs row is a safe n
   });
   expect(drainAll()).toBeGreaterThan(0);
   expect(resumeTargetOf("sess-nt")).toBe("seed-nt");
+});
+
+// ---------------------------------------------------------------------------
+// Schema v110 / fn-1131 — the harness-agnostic ADOPTED marker. The SessionStart
+// arm folds `events.adopted` verbatim into `jobs.adopted` and COALESCE-preserves
+// it (set-once, like worktree): a later resume or launcher re-mint carrying NULL
+// never clobbers a `1` a non-launcher mint set. Birth/killed rows carry NULL.
+// ---------------------------------------------------------------------------
+
+const adoptedOf = (jobId: string): number | null =>
+  (
+    db.query("SELECT adopted FROM jobs WHERE job_id = ?").get(jobId) as {
+      adopted: number | null;
+    }
+  ).adopted;
+
+test("fn-1131 a SessionStart carrying adopted=1 folds the marker onto the row", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-adopted",
+    spawn_name: "hermes-hand-started",
+    harness: "hermes",
+    adopted: 1,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(adoptedOf("sess-adopted")).toBe(1);
+});
+
+test("fn-1131 a launcher SessionStart (adopted NULL) leaves the marker NULL (fold never synthesizes)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-launched",
+    spawn_name: "work::fn-1-x.1",
+    harness: "claude",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(adoptedOf("sess-launched")).toBeNull();
+});
+
+test("fn-1131 a resume (adopted NULL) preserves the seeded marker via COALESCE", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-ra",
+    spawn_name: "codex-hand-started",
+    harness: "codex",
+    adopted: 1,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(adoptedOf("sess-ra")).toBe(1);
+
+  // A resume SessionStart emitting NULL adopted must NOT clobber the marker.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-ra",
+    spawn_name: "codex-hand-started",
+    harness: "codex",
+    adopted: null,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(adoptedOf("sess-ra")).toBe(1);
+});
+
+test("fn-1131 a launcher re-mint (adopted NULL) over an adopted row preserves the marker", () => {
+  // The dedup-race case: a session first minted adopted (push/pull adoption),
+  // then a racing launcher re-mint SessionStart carrying NULL adopted must fold
+  // as a resume WITHOUT clobbering the marker — the set-once COALESCE guarantee.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-remint",
+    spawn_name: "hermes-hand-started",
+    harness: "hermes",
+    adopted: 1,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(adoptedOf("sess-remint")).toBe(1);
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-remint",
+    spawn_name: "work::fn-1-remint.1",
+    harness: "claude",
+    adopted: null,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(adoptedOf("sess-remint")).toBe(1);
 });
 
 // ---------------------------------------------------------------------------
