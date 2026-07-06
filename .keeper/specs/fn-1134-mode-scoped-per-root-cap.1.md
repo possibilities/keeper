@@ -52,5 +52,5 @@ Helper unit tests (worktree on + 5 → 5; off + 5 → 1; on + each of null/0/-1/
 - [ ] `bun test` fast tier green
 
 ## Done summary
-
+max_concurrent_per_root is now durable stored intent; effectivePerRootCap derives the effective cap (worktree off => 1) at the readiness-inputs and boot-status seams. Deleted the write-time enforceWorktreeConcurrencyInvariant; a cap set while worktree is off is accepted and carries a stored-vs-effective note.
 ## Evidence
