@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-06T23:17:23.766000Z",
+  "created_by_close_of": "fn-1142-cli-descriptor-and-grammar-convergence",
+  "depends_on_epics": [
+    "fn-1142-cli-descriptor-and-grammar-convergence"
+  ],
+  "id": "fn-1147-converge-agent-panel-duration-flags",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Converge agent-panel duration flags",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-06T23:17:23.766000Z"
+}

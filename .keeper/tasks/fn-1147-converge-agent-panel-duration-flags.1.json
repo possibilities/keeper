@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T23:17:23.766000Z",
+  "depends_on": [],
+  "epic": "fn-1147-converge-agent-panel-duration-flags",
+  "id": "fn-1147-converge-agent-panel-duration-flags.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Route panel durations through grammar",
+  "updated_at": "2026-07-06T23:17:23.766000Z"
+}
