@@ -3,13 +3,13 @@
 <!--
 provenance:
   model_id: sonnet            # subagents.yaml models: axis value
-  resolves_to: Claude Sonnet-tier alias
-  researched: 2026-07-05
-  status: stub                   # provenance state: hand-authored placeholder, not yet a real research pass
-  method: model-capability review from available Anthropic guidance + in-repo worker routing needs
+  resolves_to: claude-sonnet-5   # current Sonnet-tier alias at research time
+  researched: 2026-07-06
+  status: researched             # provenance state: this cache reflects a real research pass
+  method: model-capability review (Anthropic model docs + Sonnet 5 migration guide via the claude-api skill) + in-repo worker dispatch history
   sources:
-    - Anthropic model guidance for Sonnet-tier models: balanced capability, lower cost/latency than Opus-tier, suitable for most coding tasks
-    - keeper worker experience: plan tasks vary from mechanical edits to contract-sensitive autonomous work; model routing should protect the latter
+    - Anthropic model catalog / migration guide (Claude Sonnet 5): near-Opus coding+agentic quality, full low..max effort axis incl. xhigh, adaptive thinking on by default, literal instruction following, $3/$15 per MTok vs Opus 4.8 $5/$25, 1M context / 128K output
+    - keeper worker dispatch history: nine sonnet×medium plan tasks (bounded refactors, targeted tests, doc/consolidation work) all completed same-day with worker_done_at stamped — routing bounded work down to sonnet holds in practice
 -->
 
 This file is the raw research backing the distilled `models.sonnet` guidance block in
@@ -23,35 +23,44 @@ Re-run this research when the `sonnet` alias is re-pointed to a newer model, or 
 
 ## What `sonnet` is
 
-`sonnet` is keeper's balanced Claude worker-model axis value. It is meant to be cheaper and faster
-than `opus` while remaining capable enough for bounded implementation work, local refactors, and
-straightforward bug fixes. In this selector, `sonnet` is a deliberate routing-down option: it should
-win when the task has a clear path and low coordination risk, not merely because the task is short.
+`sonnet` is keeper's balanced Claude worker-model axis value, resolving to Claude Sonnet 5
+(`claude-sonnet-5` at research time): 1M-token context, 128K max output, adaptive thinking on by
+default, and — first for a Sonnet-tier model — the full `low | medium | high | xhigh | max` effort
+axis, so every keeper effort cell renders on it. It reaches what was previously Opus-tier quality
+on many coding and agentic tasks at ~60% of Opus 4.8's per-token price and lower latency. In this
+selector, `sonnet` is the deliberate routing-down option: it wins when the task is bounded and
+well-specified, not merely because it is short.
 
 ## Strengths (worker-relevant)
 
-- **High throughput on bounded coding work.** Good fit for tasks with explicit acceptance criteria,
-  known in-repo patterns, and a small or moderate file set.
-- **Cost/latency efficiency.** A better default than Opus for mechanical edits, test additions,
-  polish, and template-following work where deeper reasoning is unlikely to change the outcome.
-- **Instruction following on scoped specs.** Performs well when the work is framed as concrete steps
-  with observable acceptance and little ambiguity.
-- **Adequate debugging for named causes.** Can handle ordinary bug fixes when the likely root cause
-  or failing surface is already identified.
+- **Near-Opus quality on bounded coding work.** The largest generational gains are exactly in
+  coding and agentic execution — routine implementation, template-following, mechanical refactors,
+  targeted tests, and fixes with a named surface perform at or near Opus level.
+- **Cost/latency efficiency.** Sonnet-tier pricing at roughly 60% of Opus per token, with faster
+  turnaround — the right trade for work where deeper reasoning would not change the outcome.
+- **Literal, precise instruction following.** Follows a tightly-scoped spec exactly and does not
+  silently generalize; strong fit for plan tasks with concrete observable acceptance.
+- **More agentic by default.** Reaches for tools and runs self-verification loops readily; gives
+  good in-progress updates without scaffolding.
+- **In-repo evidence.** Every sonnet-routed plan task dispatched so far (all at `medium` effort:
+  bounded refactors, straight test additions, doc/consolidation work) completed its worker turn.
 
 ## Weaknesses / failure modes (worker-relevant)
 
-- **Lower ceiling on ambiguous design.** More likely than Opus to miss a subtle abstraction boundary
-  or choose a locally-correct fix that conflicts with a wider contract.
-- **Less margin on cross-repo or schema work.** Avoid for migrations, wire formats, public APIs,
-  event-sourcing invariants, and changes where a wrong call propagates beyond the touched files.
-- **Weaker on gnarly debugging.** When the task needs hypothesis generation, flake triage, or
-  security-style adversarial review, route to Opus instead.
+- **Less margin on ambiguous design.** More likely than Opus to pick a locally-correct fix that
+  conflicts with a wider contract, or to miss a subtle abstraction boundary on open-ended work.
+- **Literalism cuts both ways.** An under-specified task fails harder here — Sonnet will not infer
+  the unstated intent Opus often recovers. Route ambiguity up, don't prompt around it.
+- **Strict effort adherence at the low end.** At `low`/`medium` it scopes work to exactly what was
+  asked; a task that hides multi-step or cross-module reasoning under-thinks rather than escalating.
+- **Avoid for the highest-blast-radius work.** Migrations, wire formats, event-sourcing invariants,
+  cross-repo changes, and gnarly no-hypothesis debugging keep more margin on Opus.
 
 ## When to pick (against Opus)
 
-Pick `sonnet` for routine implementation where the path is clear: single-file or small multi-file
-edits, obvious tests, straightforward UI/text polish, mechanical refactors, or applying an existing
-pattern. Keep `opus` for contract-touching work, new patterns, cross-module architecture, high-blast
-radius changes, or any task where a wrong routing-down would likely fail the worker turn. When
-uncertain, route up to `opus`.
+Pick `sonnet` for bounded, well-specified, low-blast-radius work: single-file or small multi-file
+edits with concrete acceptance, obvious tests, mechanical refactors, applying an existing in-repo
+pattern. Keep `opus` for contract-touching work, new patterns, cross-module architecture,
+ambiguous or under-specified specs, and any task where a wrong routing-down likely fails the worker
+turn. When uncertain, route up to `opus` — a wrong routing-up costs tokens; a wrong routing-down
+costs a failed task.

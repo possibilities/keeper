@@ -58,14 +58,15 @@ describe("on-disk selector config", () => {
     expect(text).toContain("model-selector.yaml");
   });
 
-  test("state mode classifies opus fresh, sonnet stub, and every effort present", () => {
+  test("state mode classifies every model fresh and every effort present", () => {
     const matrix = loadSubagentsMatrixFromDisk(
       join(PLAN_ROOT, "subagents.yaml"),
     );
     const state = classifyModelGuidanceFromDisk(PLAN_ROOT);
     expect(state.models.opus.state).toBe("fresh");
     expect(state.models.opus.hash_parity).toBe(true);
-    expect(state.models.sonnet.state).toBe("stub");
+    expect(state.models.sonnet.state).toBe("fresh");
+    expect(state.models.sonnet.hash_parity).toBe(true);
     for (const effort of matrix.efforts) {
       expect(state.efforts[effort].state).toBe("present");
     }

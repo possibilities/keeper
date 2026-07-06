@@ -39,7 +39,7 @@ usage: |
 # guidance in `--state`. Read only by the state mode, never the `--check` gate.
 efforts_provenance:
   last_reviewed: 2026-07-06
-  status: stub
+  status: researched
 
 # One guidance block per configured `efforts:` axis value (subagents.yaml).
 # Concrete, behavioral, worker-facing selection advice — when to route a task to
@@ -47,27 +47,30 @@ efforts_provenance:
 # brief.
 efforts:
   low: |
-    Tiny, reversible, near-mechanical edits: text/config polish, one obvious
-    assertion, or a trivial rename where the acceptance leaves no design choice.
-    No investigation, no multi-file coordination, and no contract surface.
+    Tiny, reversible, near-mechanical edits where the acceptance leaves no
+    design choice: text/config polish, one obvious assertion, a trivial rename.
+    Cheapest and fastest band; the worker scopes strictly to what was asked, so
+    anything needing investigation or multi-step reasoning under-thinks here.
   medium: |
-    Single-file edit, mechanical refactor, or a straight test addition where the
-    acceptance is "do exactly this." No abstraction to get wrong, no cross-module
-    reasoning. Route here only when the task is genuinely bounded.
+    Bounded single-surface work with a "do exactly this" acceptance: one-file
+    edits, mechanical refactors, straight test additions. The cost-saving step
+    down from high. Risk is under-thinking when the task hides cross-module
+    reasoning — route up rather than prompt around it.
   high: |
-    Multi-file feature in a known pattern, a typical bug fix with the root cause
-    already named, or anything following an obvious in-repo template. The path is
-    clear; the work is applying it correctly across a few files.
+    The model-default band and the usual sweet spot: multi-file features in a
+    known pattern, typical bug fixes with the root cause named, obvious in-repo
+    template-following. Balances depth against token spend; pick it when the
+    path is clear but execution spans a few files.
   xhigh: |
-    Multi-step refactor, new-pattern introduction, or contract-touching work
-    (RPC, schema, public API, wire format) — anything where a wrong abstraction
-    propagates past the task. The default when in doubt: the highest-capability
-    band that is not reserved.
+    The band for hard coding and agentic work: multi-step refactors, new-pattern
+    introduction, contract-touching changes (RPC, schema, public API, wire
+    format) — anywhere a wrong abstraction propagates past the task. The default
+    when in doubt: the highest band that is not reserved.
   max: |
-    Gnarly debugging with no clear hypothesis, evals, or security review —
-    reserved for where deeper reasoning measurably lifts quality. Prone to
-    overthinking; do not reach for it casually, and never as a generic "be
-    careful" upgrade over xhigh.
+    Reserved ceiling: gnarly debugging with no clear hypothesis, evals, or
+    security-shaped review — where deeper reasoning measurably lifts quality.
+    Diminishing returns and overthinking risk on anything routine; never a
+    generic "be careful" upgrade over xhigh.
 
 # One guidance block per configured `models:` axis value (subagents.yaml).
 # Distilled from the skill's references/ research — strengths, weaknesses,
@@ -85,13 +88,15 @@ models:
     mechanical work when a cheaper tier exists on the axis. When uncertain, keep
     opus.
   sonnet: |
-    Balanced Claude tier for bounded coding work where cost/latency matters and
-    the path is clear. Strengths: routine implementation, template-following,
-    mechanical refactors, targeted tests, and straightforward fixes with a named
-    surface. Weaknesses: less margin than opus on ambiguous design, cross-repo or
-    contract-touching changes, migrations, schema/wire/API work, and gnarly
-    debugging. When to pick: route clearly mechanical or low-blast-radius work to
-    sonnet; keep opus for intelligence-sensitive tasks or any uncertainty.
+    Balanced Claude tier: near-opus quality on bounded coding and agentic work
+    at a fraction of the cost and latency, with every effort band available.
+    Strengths: routine implementation, template-following, mechanical refactors,
+    targeted tests, and fixes with a named surface; follows a tightly-scoped
+    spec literally and precisely. Weaknesses: that literalism means an
+    under-specified task fails harder here — less margin than opus on ambiguous
+    design, contract/schema/wire work, cross-repo changes, migrations, and
+    gnarly debugging. When to pick: bounded, well-specified, low-blast-radius
+    work; keep opus for intelligence-sensitive tasks or any uncertainty.
 
 # Research provenance map: per configured model, the references/ cache file
 # (path relative to the plan plugin root) and its sha256. The drift gate asserts
@@ -103,4 +108,4 @@ research:
     sha256: 7f4a160d704ae0f05e4543f3c37d61be3d1d6f89e6d76dd044486ac38997a6c4
   sonnet:
     reference: skills/model-guidance/references/sonnet.md
-    sha256: 8cccf80012d386b6a2cbbe1f72d3569364413312eff496fa1cb4aeee0bcb6be5
+    sha256: cf88409ab1dafa43569e41b5c73d04bc6b9f18a3c3e52b78a9a3c2df3ad2990e
