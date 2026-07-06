@@ -388,9 +388,12 @@ export const TABS_DUMP_FLAGS = [
 
 /**
  * The keeper-native command surface, authored in the canonical subcommand order
- * (`SUBCOMMANDS` is derived from this). Plan/prompt stay summary+verbs only here
- * (their own descriptor modules and leaf flag surfaces land in a later ordinal);
- * the native leaves carry their full derived flag sets.
+ * (`SUBCOMMANDS` is derived from this). Plan/prompt carry summary + top-level
+ * metadata only: their verb sets are the plugin CLIs' own responsibility, sourced
+ * live from `plugins/{plan,prompt}/src/descriptor.ts` at the `keeper --help --json`
+ * and completion merge in `cli/keeper.ts` — never restated here, so a plugin verb
+ * can never drift from a stale native copy. The native leaves carry their full
+ * derived flag sets.
  */
 export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
@@ -936,6 +939,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     flags: [FLAG_HELP],
   },
   {
+    // Verbs OMITTED by design: `cli/keeper.ts` merges the live set from
+    // `plugins/plan/src/descriptor.ts` for `--help --json` + completions.
     name: "plan",
     summary:
       "The plan CLI: `keeper plan <verb>` runs the plan dispatcher in-process",
@@ -944,32 +949,9 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: false,
     requires_tty: false,
     flags: [],
-    verbs: [
-      "status",
-      "epics",
-      "tasks",
-      "ready",
-      "show",
-      "cat",
-      "list",
-      "scaffold",
-      "init",
-      "claim",
-      "done",
-      "block",
-      "unblock",
-      "verdict",
-      "close-preflight",
-      "close-finalize",
-      "validate",
-      "audit",
-      "reconcile",
-      "gist",
-      "mv-repo",
-      "followup",
-    ].map(nameOnlyVerb),
   },
   {
+    // Verbs OMITTED by design: merged from `plugins/prompt/src/descriptor.ts`.
     name: "prompt",
     summary:
       "Snippet/bundle substrate engine: `keeper prompt <verb>` runs the prompt CLI in-process",
@@ -978,18 +960,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: false,
     requires_tty: false,
     flags: [],
-    verbs: [
-      "render",
-      "check-generated",
-      "render-plugin-templates",
-      "build-snippets",
-      "find-snippets",
-      "save-snippet",
-      "save-bundle",
-      "validate-bundles",
-      "list-bundles",
-      "show-bundle",
-    ].map(nameOnlyVerb),
   },
   {
     name: "dispatch",

@@ -26,6 +26,8 @@ import {
   SUBCOMMANDS,
   type Subcommand,
 } from "../cli/keeper";
+import { PLAN_COMMANDS } from "../plugins/plan/src/descriptor";
+import { PROMPT_COMMANDS } from "../plugins/prompt/src/descriptor";
 
 const VERSION = "9.9.9";
 
@@ -115,6 +117,26 @@ describe("completions are generated from the descriptor tree (ADR 0008)", () => 
       for (const verb of cmd.verbs ?? []) {
         expect(values).toContain(verb.name);
       }
+    }
+  });
+
+  test("plan TAB enumerates the PLAN plugin descriptor's verbs (merged, not restated)", async () => {
+    // The `plan` node carries no verbs in NATIVE_COMMANDS; its completion
+    // candidates are merged live from plugins/plan/src/descriptor.ts.
+    const values = candidateValues(
+      await completionResponder(["plan", ""], VERSION),
+    );
+    for (const cmd of PLAN_COMMANDS) {
+      expect(values).toContain(cmd.name);
+    }
+  });
+
+  test("prompt TAB enumerates the PROMPT plugin descriptor's verbs (merged)", async () => {
+    const values = candidateValues(
+      await completionResponder(["prompt", ""], VERSION),
+    );
+    for (const cmd of PROMPT_COMMANDS) {
+      expect(values).toContain(cmd.name);
     }
   });
 });
@@ -259,7 +281,7 @@ describe("dispatch routes the hidden complete responder", () => {
     expect(h.stderr).toEqual([]);
   });
 
-  test("`keeper complete -- plan <TAB>` emits the plan verbs", async () => {
+  test("`keeper complete -- plan <TAB>` emits the plan verbs from the plugin descriptor", async () => {
     const h = makeHarness();
     try {
       await dispatch([COMPLETION_RESPONDER, "--", "plan", ""], h.deps);
@@ -267,8 +289,11 @@ describe("dispatch routes the hidden complete responder", () => {
       /* swallow ExitError */
     }
     const values = candidateValues(h.stdout.join(""));
-    for (const verb of SUBCOMMAND_META.plan.verbs ?? []) {
-      expect(values).toContain(verb);
+    // Sourced live from plugins/plan/src/descriptor.ts — the plan node no longer
+    // restates its verbs in SUBCOMMAND_META.
+    expect(SUBCOMMAND_META.plan.verbs).toBeUndefined();
+    for (const cmd of PLAN_COMMANDS) {
+      expect(values).toContain(cmd.name);
     }
   });
 });
