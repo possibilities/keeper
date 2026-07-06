@@ -40,5 +40,6 @@
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
   "voiceEnabled": true,
-  "autoCompactEnabled": false
+  "autoCompactEnabled": false,
+  "model": "fable"
 }
