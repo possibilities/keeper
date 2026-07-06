@@ -24,5 +24,5 @@ Files: src/baseline-worker.ts
 - [ ] A test drives the deadline->force-resolve liveness path through the runner's injectable seam.
 
 ## Done summary
-
+runDetached now arms a bounded grace timer after killGroup so a deadline force-resolves to a timeout outcome even if child close never fires; runDetached exports an injectable spawnFn/killGraceMs seam and a test drives the deadline->force-resolve liveness path directly.
 ## Evidence
