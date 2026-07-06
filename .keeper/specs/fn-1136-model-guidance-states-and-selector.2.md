@@ -35,5 +35,5 @@ Consistency-skills frontmatter checks must pass; if a frontmatter pin for this s
 - [ ] Fast suite green
 
 ## Done summary
-
+Rewrote the model-guidance skill to derive its scope from the model-guidance-check --state envelope: at most two AskUserQuestion calls (fill-gaps / refresh-specific / wipe, never defaulting to wipe, never typing a model name), a blank / axis-value / missing / all arg contract, and sole-writer status:researched discipline. Added a frontmatter pin test and refreshed the README row.
 ## Evidence
