@@ -7,7 +7,7 @@
     "fn-1122-suite-baseline-store"
   ],
   "id": "fn-1135-harden-suite-baseline-store-hygiene-and",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-06T01:29:17.639000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T01:29:17.118000Z"
+  "updated_at": "2026-07-06T01:29:17.639000Z"
 }
