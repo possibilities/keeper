@@ -34,5 +34,5 @@ Extend the selector-handoff consistency test surface list; assert the close skil
 - [ ] The README close row narrates the interposed beat
 
 ## Done summary
-
+Interposed a content-blind pre-select beat (Phase 3.5) in the close skill: briefs the stored follow-up via selection-brief --from-followup, spawns plan:model-selector blind, validates + materializes a --selection-verdict file for close-finalize, and degrades to a verdict-less finalize on any hitch (one repair retry, never a loop). Pinned the beat in the consistency suite and narrated it in the README /plan:close row.
 ## Evidence
