@@ -162,3 +162,18 @@ describe("the parser validates the command set against the descriptor", () => {
     expect(r.stderr).toContain("Error: No such command 'frobnicate'.");
   });
 });
+
+describe("keeper plan --agent-help serves the operator runbook purely", () => {
+  const CWD = tmpdir();
+
+  test("--agent-help exits 0 with the runbook and no verb body", () => {
+    const r = runCli(["--agent-help"], { cwd: CWD });
+    expect(r.code).toBe(0);
+    // Content assertion (catches an empty stub): names its primary verb form.
+    expect(r.stdout).toContain("operator runbook");
+    expect(r.stdout).toContain("keeper plan status");
+    // No verb body ran: zero JSON roots, no auto-commit provenance.
+    expect(r.stdout).not.toContain("{");
+    expect(r.stdout).not.toContain("plan_invocation");
+  });
+});

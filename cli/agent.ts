@@ -50,6 +50,7 @@
 
 import {
   KEEPER_AGENT_HELP,
+  KEEPER_AGENT_RUNBOOK,
   splitSubcommand,
   USAGE,
   VERSION,
@@ -71,12 +72,13 @@ function isSpawnNotFound(err: unknown): err is { path: string } {
 }
 
 /**
- * Route the pure meta modes — top-level help, version, and the leading
- * wrapper-help (`--x-help`) — that render from static text alone, returning true
- * when handled. These MUST short-circuit before {@link realDeps}, which runs the
- * launcher state-dir migration: `keeper agent --help`/`--version` touch no state
- * dir, db, or daemon, so the argv intent is classified BEFORE any dependency is
- * built. `splitSubcommand` is pure (db.ts stays off this path).
+ * Route the pure meta modes — top-level help, version, the leading wrapper-help
+ * (`--x-help`), and the operator runbook (`--agent-help`) — that render from static
+ * text alone, returning true when handled. These MUST short-circuit before
+ * {@link realDeps}, which runs the launcher state-dir migration: `keeper agent
+ * --help`/`--version`/`--agent-help` touch no state dir, db, or daemon, so the argv
+ * intent is classified BEFORE any dependency is built. `splitSubcommand` is pure
+ * (db.ts stays off this path).
  */
 export function routeMetaBeforeDeps(
   argv: string[],
@@ -91,6 +93,9 @@ export function routeMetaBeforeDeps(
       return true;
     case "help-wrapper":
       write(KEEPER_AGENT_HELP);
+      return true;
+    case "agent-help":
+      write(KEEPER_AGENT_RUNBOOK);
       return true;
     default:
       return false;

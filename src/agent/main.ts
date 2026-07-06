@@ -57,6 +57,7 @@ import {
   type AgentKind,
   hasKeeperAgentHelpFlag,
   KEEPER_AGENT_HELP,
+  KEEPER_AGENT_RUNBOOK,
   type SubcommandKind,
   splitSubcommand,
   USAGE,
@@ -1616,6 +1617,13 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "help-wrapper") {
     deps.write(KEEPER_AGENT_HELP);
+    return deps.exit(0);
+  }
+  if (dispatch.kind === "agent-help") {
+    // Meta mode: the operator runbook. cli/agent.ts routes it before deps are
+    // built; handling it here too keeps the launcher self-consistent when main()
+    // is driven directly, and never falls through to the harness-launch branch.
+    deps.write(KEEPER_AGENT_RUNBOOK);
     return deps.exit(0);
   }
   if (dispatch.kind === "version") {

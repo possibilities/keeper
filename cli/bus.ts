@@ -159,6 +159,26 @@ Flags:
   --help, -h    Show this help
 `;
 
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+export const AGENT_HELP = `keeper bus — operator runbook (agent-facing)
+
+Local inter-agent message bus. Your inbox is ALREADY open (the keeper plugin arms
+'keeper bus watch' as a session Monitor) — never start a watcher, never pre-check
+'list' before a send, just send and yield.
+
+  keeper bus chat send <target> "<msg>"   # <target>: current/former name, session/channel id, or planner@<epic>
+  keeper bus chat send <target> -         # read the message body from stdin
+  keeper bus list                         # who's on the bus (JSON, informational)
+  keeper bus wake <planner@epic>          # resume an offline epic-creator so a queued escalation redelivers
+
+Send outcomes (printed; exit code set): delivered / queued_for_wake → exit 0;
+not_connected / unknown_target / ambiguous_target / delivery_failed → exit 1. A miss
+is an immediate exit-1, never a silent exit-0. Footguns: only a planner@<epic> role
+send to a known-but-offline creator queues (queued_for_wake) — a generic offline name
+never does; a 'chat send' does NOT join the bus registry, only a subscribed 'watch'
+establishes presence.
+`;
+
 // ---------------------------------------------------------------------------
 // Pure decision functions (fast-tier unit tests)
 // ---------------------------------------------------------------------------
@@ -166,6 +186,7 @@ Flags:
 /** A parsed `keeper bus` invocation, or a usage/help signal. */
 export type BusCommand =
   | { kind: "help" }
+  | { kind: "agent-help" }
   | { kind: "usage"; error: string }
   | { kind: "list" }
   | { kind: "watch" }
@@ -182,6 +203,9 @@ export type BusCommand =
 export function parseBusArgv(argv: string[]): BusCommand {
   if (argv.some((a) => a === "--help" || a === "-h")) {
     return { kind: "help" };
+  }
+  if (argv.some((a) => a === "--agent-help")) {
+    return { kind: "agent-help" };
   }
   const verb = argv[0];
   if (verb === undefined) {
@@ -1063,6 +1087,10 @@ export async function main(argv: string[]): Promise<void> {
   const cmd = parseBusArgv(argv);
   if (cmd.kind === "help") {
     process.stdout.write(HELP);
+    process.exit(0);
+  }
+  if (cmd.kind === "agent-help") {
+    process.stdout.write(AGENT_HELP);
     process.exit(0);
   }
   if (cmd.kind === "usage") {

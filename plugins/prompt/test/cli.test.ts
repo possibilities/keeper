@@ -147,6 +147,17 @@ describe("keeper prompt dispatcher contract", () => {
     expect(r.stdout).toContain("Commands:");
   });
 
+  test("--agent-help prints the operator runbook to stdout and returns 0", () => {
+    const r = run(["--agent-help"]);
+    expect(r.ret).toBe(0);
+    expect(r.code).toBeUndefined();
+    // Content assertion (catches an empty stub): names its primary verb form.
+    expect(r.stdout).toContain("operator runbook");
+    expect(r.stdout).toContain("keeper prompt render");
+    // Pure: no verb body ran, so no corpus read faults reach stderr.
+    expect(r.stderr).toBe("");
+  });
+
   test("an unknown verb errors on stderr and exits 2", () => {
     const r = run(["bogus-verb"]);
     expect(r.code).toBe(2);

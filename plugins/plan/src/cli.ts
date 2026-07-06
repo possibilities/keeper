@@ -83,6 +83,26 @@ const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 const DESCRIPTION =
   "File-based task tracking for structured development workflows.";
 
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. Pure —
+ *  routed before any verb body so it never reads state or auto-commits. */
+const AGENT_HELP = `keeper plan — operator runbook (agent-facing)
+
+File-based epic/task board. Every read verb emits exactly ONE top-level JSON value;
+--format json|yaml|human (default json). Every mutating verb auto-commits its own
+.keeper/ scope inline.
+
+  keeper plan status                      # board snapshot (prefer 'keeper status' to orient)
+  keeper plan tasks                       # per-task rows (prefer 'keeper query tasks' for detail)
+  keeper plan show <id>                   # one epic/task's spec markdown
+  keeper plan claim <id> / done <id>      # task lifecycle (each auto-commits .keeper/)
+  keeper plan --format yaml <verb>        # yaml/human render of any read
+
+Exit codes: 0 ok (a bad board state is still ok:true data at exit 0, never nonzero) ·
+1 verb error · 2 unknown verb / arg fault (Click parity). Footguns: board-orient with
+'keeper status' and read per-task detail with 'keeper query tasks' — never hand-parse a
+plan read. Plans are READ-ONLY to the reducer; no verb writes a projection field.
+`;
+
 // Leaf-arg parsing for subgroup verbs. A leaf receives the post-name argv (its
 // own positionals + options). Options are `--name value` / `--name=value`;
 // `--flag` is a bare boolean. Positionals are everything that is not an option
@@ -507,15 +527,18 @@ const FOLLOWUP_GROUP: GroupSpec = {
 interface ParsedArgs {
   format: OutputFormat | null;
   help: boolean;
+  agentHelp: boolean;
   command: string | null;
   rest: string[];
 }
 
-/** Split argv into the top-level --format/--help and the command + its args.
- * --format is accepted before OR after the command name. */
+/** Split argv into the top-level --format/--help/--agent-help and the command + its
+ * args. --format is accepted before OR after the command name; --agent-help is a
+ * top-level runbook request honored in the pre-command position. */
 function parseArgs(argv: string[]): ParsedArgs {
   let format: OutputFormat | null = null;
   let help = false;
+  let agentHelp = false;
   let command: string | null = null;
   const rest: string[] = [];
 
@@ -525,6 +548,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (command === null) {
       if (arg === "--help") {
         help = true;
+        i += 1;
+      } else if (arg === "--agent-help") {
+        agentHelp = true;
         i += 1;
       } else if (arg === "--format") {
         format = readFormat(argv[i + 1]);
@@ -558,7 +584,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { format, help, command, rest };
+  return { format, help, agentHelp, command, rest };
 }
 
 function readFormat(value: string | undefined): OutputFormat {
@@ -963,6 +989,12 @@ function readPositional(rest: string[]): string {
 
 export function main(argv: string[]): number {
   const parsed = parseArgs(argv);
+  if (parsed.agentHelp) {
+    // Pure: the operator runbook renders from static text before any verb body,
+    // so it never reads state or auto-commits.
+    process.stdout.write(AGENT_HELP);
+    return 0;
+  }
   if (parsed.help) {
     // Bare `keeper plan --help` -> the top-level group help. `keeper plan <verb>
     // --help` for a top-level (non-subgroup) verb -> that verb's leaf help through

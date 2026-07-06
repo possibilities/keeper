@@ -22,6 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  AGENT_HELP as BUS_AGENT_HELP,
   buildPublishFrame,
   CHAT_NAMESPACE,
   emitMessage,
@@ -107,6 +108,13 @@ describe("parseBusArgv routing", () => {
   test("--help anywhere → help", () => {
     expect(parseBusArgv(["--help"]).kind).toBe("help");
     expect(parseBusArgv(["chat", "send", "-h"]).kind).toBe("help");
+  });
+
+  test("--agent-help routes to the operator runbook (pure, no send)", () => {
+    expect(parseBusArgv(["--agent-help"]).kind).toBe("agent-help");
+    // Content assertion (catches an empty stub): names its primary verb form.
+    expect(BUS_AGENT_HELP).toContain("operator runbook");
+    expect(BUS_AGENT_HELP).toContain("keeper bus chat send");
   });
 
   test("wake <planner@epic>", () => {

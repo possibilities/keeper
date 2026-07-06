@@ -156,6 +156,24 @@ excluded.
   --help, -h          Show this help
 `;
 
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+export const AGENT_HELP = `keeper tabs — operator runbook (agent-facing)
+
+Restore keeper-managed Claude Code agents after a crash. Every read opens keeper.db
+read-only (daemon-down OK); restore is DRY-RUN until --apply.
+
+  keeper tabs list                        # ranked dead-generation summaries + live set (JSON)
+  keeper tabs restore                     # print the resolved restore plan (touches nothing)
+  keeper tabs restore --apply             # relaunch the auto-picked generation
+  keeper tabs restore --apply --generation <id>   # disambiguate a contested pick
+  keeper tabs dump                        # a runnable revive script for the CURRENT live set
+
+Exit codes: 0 ok · 1 generic · 6 refused a non-TTY ambiguous pick (re-run with
+--generation <id> or on a TTY) · 7 --apply found ZERO candidates (pass --allow-empty)
+· 8 --apply PARTIAL launch failure. Footgun: --apply fails CLOSED (exit 1, launches
+nothing) while autopilot is UNPAUSED unless you pass --force.
+`;
+
 // ---------------------------------------------------------------------------
 // Pure argv routing
 // ---------------------------------------------------------------------------
@@ -163,6 +181,7 @@ excluded.
 /** A parsed `keeper tabs` invocation, or a usage/help signal. Pure shape. */
 export type TabsCommand =
   | { kind: "help"; verb: "" | "list" | "restore" | "dump" }
+  | { kind: "agent-help" }
   | { kind: "usage"; error: string }
   | { kind: "list"; db: string | null }
   | {
@@ -192,6 +211,10 @@ const VERBS = new Set(["list", "restore", "dump"]);
  */
 export function parseTabsArgv(argv: string[]): TabsCommand {
   const verb = argv[0];
+  // `--agent-help` anywhere is a top-level runbook request (never per-verb).
+  if (argv.some((a) => a === "--agent-help")) {
+    return { kind: "agent-help" };
+  }
   const wantsHelp = argv.some((a) => a === "--help" || a === "-h");
   if (verb === undefined || verb === "--help" || verb === "-h") {
     return { kind: "help", verb: "" };
@@ -419,6 +442,10 @@ export async function main(argv: string[]): Promise<void> {
             ? HELP_DUMP
             : HELP_OVERVIEW;
     process.stdout.write(text);
+    return process.exit(0);
+  }
+  if (cmd.kind === "agent-help") {
+    process.stdout.write(AGENT_HELP);
     return process.exit(0);
   }
   if (cmd.kind === "usage") {

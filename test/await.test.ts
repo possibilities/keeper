@@ -21,6 +21,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  AGENT_HELP as AWAIT_AGENT_HELP,
   HELP as AWAIT_HELP,
   parseAwaitArgs,
   parseMonitorSelector,
@@ -44,6 +45,17 @@ test("HELP documents complete as done-AND-idle and lists the landed condition", 
   expect(AWAIT_HELP).toContain("landed <epic>");
   const landed = parseAwaitArgs(["landed", "fn-1-foo"]);
   expect(landed.ok).toBe(true);
+});
+
+test("--agent-help routes to the runbook signal before any I/O", () => {
+  // Pure routing: the flag is classified into the meta signal `main` prints,
+  // never a condition — so no git-root resolve, no socket, no subscribe.
+  const r = parseAwaitArgs(["--agent-help"]);
+  expect(r.ok).toBe(false);
+  expect((r as { message: string }).message).toBe("__agent_help__");
+  // Content assertion (catches an empty stub): names its primary verb form.
+  expect(AWAIT_AGENT_HELP).toContain("operator runbook");
+  expect(AWAIT_AGENT_HELP).toContain("keeper await complete");
 });
 
 // ---------------------------------------------------------------------------

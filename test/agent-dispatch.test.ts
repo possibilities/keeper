@@ -372,19 +372,25 @@ describe("cli/agent.ts meta routing precedes deps construction", () => {
     const wrapper = run(["--x-help"]);
     expect(wrapper.handled).toBe(true);
     expect(wrapper.out).toContain("Wrapper flags:");
+    // `--agent-help` is a distinct meta mode: the operator runbook, not the
+    // wrapper-flag overlay. Content assertion names its primary verb form.
+    const runbook = run(["--agent-help"]);
+    expect(runbook.handled).toBe(true);
+    expect(runbook.out).toContain("operator runbook");
+    expect(runbook.out).toContain("keeper agent run");
     // A launch token is not a meta mode — routing declines it so deps get built.
     const launch = run(["claude"]);
     expect(launch.handled).toBe(false);
     expect(launch.out).toBe("");
   });
 
-  test("agent --help / --version exit 0 with output and NEVER construct deps", async () => {
+  test("agent --help / --version / --agent-help exit 0 with output and NEVER construct deps", async () => {
     // realDeps() runs the launcher state-dir migration; a buildDeps that throws
     // when called proves the meta path never reaches it (no db/daemon/state dir).
     const throwingBuild = (): never => {
       throw new Error("realDeps constructed — state-dir migration ran");
     };
-    for (const flag of ["--help", "--version"]) {
+    for (const flag of ["--help", "--version", "--agent-help"]) {
       const out: string[] = [];
       const realOut = process.stdout.write.bind(process.stdout);
       const realExit = process.exit.bind(process);

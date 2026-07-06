@@ -31,18 +31,40 @@ const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 const DESCRIPTION =
   "Runtime snippet/bundle substrate — find, read, compose, and persist context.";
 
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. Pure —
+ *  routed before any verb body so it never reads the corpus or writes. */
+const AGENT_HELP = `keeper prompt — operator runbook (agent-facing)
+
+Runtime snippet/bundle substrate — find, read, compose, and persist context. Every
+read verb emits exactly ONE top-level JSON value; --format json|yaml|human (default json).
+
+  keeper prompt render <ref>              # render a snippet/bundle to stdout (verbatim body)
+  keeper prompt find-snippets "<query>" [--domain <d>] [--limit <n>]
+  keeper prompt list-bundles              # available bundles (JSON)
+  keeper prompt build-snippets --check    # verify _index.yaml is current (drift gate; no write)
+  keeper prompt save-snippet --name <n> --domain <d> --summary <s>
+
+Exit codes: 0 ok · 1 verb error · 2 unknown verb / bad option (Click parity). Footguns:
+'build-snippets --check' is the drift gate — it exits non-zero on a stale index and
+writes nothing (drop --check to rebuild); warnings go to stderr so --format stdout stays
+clean for jq.
+`;
+
 interface ParsedArgs {
   format: OutputFormat | null;
   help: boolean;
+  agentHelp: boolean;
   command: string | null;
   rest: string[];
 }
 
-/** Split argv into the top-level --format/--help and the command + its args.
- * --format is accepted before OR after the command name (mirrors plan's cli). */
+/** Split argv into the top-level --format/--help/--agent-help and the command + its
+ * args. --format is accepted before OR after the command name (mirrors plan's cli);
+ * --agent-help is a top-level runbook request honored pre-command. */
 function parseArgs(argv: string[]): ParsedArgs {
   let format: OutputFormat | null = null;
   let help = false;
+  let agentHelp = false;
   let command: string | null = null;
   const rest: string[] = [];
 
@@ -52,6 +74,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (command === null) {
       if (arg === "--help" || arg === "-h") {
         help = true;
+        i += 1;
+      } else if (arg === "--agent-help") {
+        agentHelp = true;
         i += 1;
       } else if (arg === "--format") {
         format = readFormat(argv[i + 1]);
@@ -80,7 +105,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { format, help, command, rest };
+  return { format, help, agentHelp, command, rest };
 }
 
 function readFormat(value: string | undefined): OutputFormat {
@@ -344,7 +369,13 @@ function readOption(rest: string[], name: string): string | undefined {
 }
 
 export function main(argv: string[]): number {
-  return dispatch(parseArgs(argv));
+  const parsed = parseArgs(argv);
+  if (parsed.agentHelp) {
+    // Pure: static runbook text, rendered before any verb body or corpus read.
+    process.stdout.write(AGENT_HELP);
+    return 0;
+  }
+  return dispatch(parsed);
 }
 
 if (import.meta.main) {
