@@ -532,6 +532,29 @@ describe("panel skill shim", () => {
   });
 });
 
+describe("panel skill validates the runner return contract", () => {
+  const body = () => readFileSync(PANEL_SKILL, "utf-8");
+
+  test("documents both first-line return shapes (PANEL_ANSWER success, PANEL_RUN_FAILED failure)", () => {
+    const text = body();
+    expect(text).toContain("PANEL_ANSWER");
+    expect(text).toContain("PANEL_RUN_FAILED");
+    expect(text).toContain("first line");
+  });
+
+  test("treats anything else as a malformed return, never absorbed as an answer", () => {
+    expect(body()).toContain("malformed return");
+  });
+
+  test("documents a single same-slug byte-identical re-drive, then surfaces failure", () => {
+    const text = body();
+    expect(text).toContain("re-drive once");
+    expect(text).toContain("byte-identical");
+    expect(text).toContain("Slug:");
+    expect(text).toContain("no further retries");
+  });
+});
+
 describe("panel prose drops the stale subagent claim", () => {
   const surfaces: [string, string][] = [
     ["panel/SKILL.md", PANEL_SKILL],
