@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-06T05:40:05.815000Z",
   "created_at": "2026-07-05T22:23:20.529000Z",
   "depends_on_epics": [
     "fn-1123-worktree-lane-pre-merge-recovery",
@@ -11,10 +12,10 @@
   "last_validated_at": "2026-07-05T22:25:33.812000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Merge gate unsatisfied upstream deferral",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-05T22:25:32.468000Z"
+  "updated_at": "2026-07-06T05:40:05.815000Z"
 }
