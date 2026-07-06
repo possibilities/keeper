@@ -36,8 +36,8 @@ is `ok:false` at exit 1, still on stdout. Messages are corrective — never a ra
 | code          | emitted by        | meaning                                                            | recovery                                                                          | retry-safe |
 | ------------- | ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------- | ---------- |
 | `read_failed` | the bare readers  | keeper.db could not be opened / read for this one-shot read.       | Retry — the read opens keeper.db read-only and never mutates. If it persists, confirm the daemon is healthy. | yes (read-only) |
-| `not_found`   | `keeper show-job` | No job matched the given selectors.                               | Widen or correct the selector (--session-id / --session / --cwd / --pane), or run with no selector to auto-detect. | yes (read-only) |
-| `ambiguous`   | `keeper show-job` | The selectors matched more than one job; `error.details.candidates` lists them. | Add a narrowing selector (--session-id pins one) or pass --latest to take the most recent. | yes (read-only) |
+| `not_found`   | `keeper show-job` | No job matched the given selectors.                               | Widen or correct the selector (--job-id / --session-title / --cwd / --pane), or run with no selector to auto-detect. | yes (read-only) |
+| `ambiguous`   | `keeper show-job` | The selectors matched more than one job; `error.details.candidates` lists them. | Add a narrowing selector (--job-id pins one) or pass --latest to take the most recent. | yes (read-only) |
 
 **Compatibility note:** the bare readers previously emitted
 `{success:false, error:"<String(e)>"}` on failure. The `error` field is now the

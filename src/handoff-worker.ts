@@ -274,7 +274,7 @@ export async function dispatchOneHandoff(
     prompt: deps.buildPrompt(row.doc),
     claudeName: `handoff::${row.handoff_id}`,
   };
-  // PER-ROW launch cwd: the handoff's resolved `--dir` (an absolute path the CLI
+  // PER-ROW launch cwd: the handoff's resolved `--cwd` (an absolute path the CLI
   // validated) wins; a NULL/empty value coalesces to the worker-global `cwd`
   // (`data.cwd ?? process.cwd()` = keeperd's cwd) BEFORE the spawn — exec-backend
   // treats `""` as undefined and would otherwise drop to keeperd's cwd anyway,

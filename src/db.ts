@@ -5846,7 +5846,7 @@ function migrate(db: Database): void {
       addColumnIfMissing(db, "usage", "error_kind", "TEXT");
 
       // v95→v96 (fn-1003.2): add the nullable `handoffs.target_dir` column — the
-      // resolved ABSOLUTE directory a `keeper handoff --dir <path>` launches the
+      // resolved ABSOLUTE directory a `keeper handoff --cwd <path>` launches the
       // handoff-ee in (default = the caller's cwd, resolved CLI-side). The
       // dispatcher reads it per-row as the launch cwd, coalescing NULL/empty to
       // keeperd's cwd. APPEND-via-ALTER keeps existing rows NULL (the zero-event

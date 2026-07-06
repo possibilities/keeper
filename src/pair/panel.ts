@@ -7,21 +7,21 @@
  * `timeout`), and atomic same-dir temp-then-rename result files (EXDEV-safe on
  * macOS, where `os.tmpdir()` is a different APFS volume).
  *
- *   - `start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]`
+ *   - `start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <s>]`
  *     is idempotent-by-slug: it resolves the members in-process and derives the
- *     run's durable dir from the slug (or the `--dir` override), then under a
+ *     run's durable dir from the slug (or the `--run-dir` override), then under a
  *     per-slug advisory lock either fans out fresh (copy the prompt in, launch each
  *     member as a DETACHED `keeper agent run` leg writing its own uniform JSON
  *     result envelope via `--output`, persist `<dir>/manifest.json`) or RECONCILES
  *     an existing run — reusing terminal legs, leaving running legs, relaunching
  *     only no-result legs to a new-generation result path. Prints the manifest and
  *     exits 0; a colliding-slug prompt/member mismatch or lock contention exits 2.
- *   - `wait (--slug <slug> | --dir <d>) [--chunk <s>]` re-reads the manifest and
+ *   - `wait (--slug <slug> | --run-dir <d>) [--chunk <s>]` re-reads the manifest and
  *     blocks ONE chunk polling each leg's terminality; exit 0 + verdict JSON when
  *     all legs are terminal, exit 124 when the chunk elapses (re-issuable), exit 2
  *     on a missing/corrupt manifest or bad flags. `--slug` resolves the durable
- *     dir; `--dir` wins if both are given.
- *   - `status (--slug <slug> | --dir <d>)` prints a read-only, non-blocking per-leg
+ *     dir; `--run-dir` wins if both are given.
+ *   - `status (--slug <slug> | --run-dir <d>)` prints a read-only, non-blocking per-leg
  *     snapshot (completed|running|failed|absent); exit 2 on a missing manifest.
  *   - `prune` GCs abandoned run dirs under the durable panels root — lock-free AND
  *     no live leg pid AND past the started-at TTL, via a TOCTOU-safe rename-to-trash.
@@ -1019,7 +1019,7 @@ export interface PanelStartArgs {
 /**
  * `start` — idempotent-by-slug. Resolve members → derive the run's durable dir
  * (the deterministic slug-keyed `~/.local/state/keeper/panels/<slug>/`, or the
- * `--dir` location override) → mkdir 0700 → acquire the per-slug advisory lock
+ * `--run-dir` location override) → mkdir 0700 → acquire the per-slug advisory lock
  * (non-blocking; contention fails fast exit 2, never blocks the caller's single
  * Bash call). With the lock held, either FRESH-START (no prior manifest: copy the
  * prompt in, write the SKELETON — members + boot-epoch + generation 1 — BEFORE the
@@ -1082,8 +1082,8 @@ export async function panelStart(
     return 2;
   }
 
-  // Derive the run's dir. `--dir` is a location override; without it the run lives
-  // at the deterministic, slug-keyed durable path (0700) so a restarted driver
+  // Derive the run's dir. `--run-dir` is a location override; without it the run
+  // lives at the deterministic, slug-keyed durable path (0700) so a restarted driver
   // rediscovers it from the slug alone. Either way every sentinel + output stays
   // inside it, keeping the legs' same-dir `--output` renames EXDEV-safe.
   const dir =
@@ -1699,17 +1699,17 @@ export function buildPanelDeps(): PanelDeps {
 export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait | status | prune)
 
 Usage:
-  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <s>]
   keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|codex|pi>)
-       [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--dir <d>] [--timeout <s>]
-  keeper agent panel wait   (--slug <slug> | --dir <d>) [--chunk <s>]
-  keeper agent panel status (--slug <slug> | --dir <d>)
+       [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--run-dir <d>] [--timeout <s>]
+  keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <s>]
+  keeper agent panel status (--slug <slug> | --run-dir <d>)
   keeper agent panel prune
 
 start  idempotent-by-slug. Resolves the panel members (a panel.yaml panel or a
        single catalog preset; an absent/empty --slug, or a missing/invalid catalog
        or panel.yaml, is fail-loud exit 2), derives the run's DURABLE dir from the
-       slug (~/.local/state/keeper/panels/<slug>/, 0700 — or the --dir override),
+       slug (~/.local/state/keeper/panels/<slug>/, 0700 — or the --run-dir override),
        and under a per-slug advisory lock either fans out fresh (launch each member
        as a DETACHED read-only \`keeper agent run\` leg named \`panel::<slug>::<preset>\`
        in the 'panels' session) or RECONCILES an existing run — reuse terminal legs
@@ -1718,7 +1718,7 @@ start  idempotent-by-slug. Resolves the panel members (a panel.yaml panel or a
        mismatch or lock contention exits 2. An ad-hoc --preset/--cli builds a
        1-member panel (pairing = a panel of one); --panel and --preset/--cli are
        mutually exclusive.
-wait   re-reads the manifest (by --slug or --dir) and blocks ONE --chunk window
+wait   re-reads the manifest (by --slug or --run-dir) and blocks ONE --chunk window
        polling each leg. Exit 0 + verdict JSON {dir, ok, members:[…]} when all legs
        are terminal; exit 124 when the chunk elapses (re-issue it); exit 2 on a
        missing/corrupt manifest (an unknown/pruned slug) or bad flags. Exit 0 means
@@ -1744,24 +1744,25 @@ Options:
   --model <m>       Ad-hoc model override (rides onto the leg)
   --effort <e>      Ad-hoc reasoning effort (codex only)
   --read-only       Ad-hoc read-only posture (forwarded to the leg)
-  --dir <d>         Location override for the run dir. start: replaces the durable
-                    slug dir; wait/status: an alternative to --slug (--dir wins if
-                    both are given).
+  --run-dir <d>     Location override for the run dir. start: replaces the durable
+                    slug dir; wait/status: an alternative to --slug (--run-dir wins
+                    if both are given).
   --timeout <s>     Per-leg keeper agent run stop-timeout (default: ${DEFAULT_PANEL_TIMEOUT_SECONDS})
   --chunk <s>       wait window in seconds (default: ${DEFAULT_PANEL_CHUNK_SECONDS}, max ${MAX_CHUNK_SECONDS})
   --help, -h        Show this help
 `;
 
-/** Resolve a `wait`/`status` run dir from its flags: `--dir` is an explicit
+/** Resolve a `wait`/`status` run dir from its flags: `--run-dir` is an explicit
  *  location override and WINS when both are given; otherwise `--slug` resolves the
  *  durable slug-keyed dir. A slug that slugifies to nothing, or neither flag, is a
  *  bad-flags fault (the caller exits 2). Pure. */
 function resolvePanelDir(values: {
-  dir?: string;
+  "run-dir"?: string;
   slug?: string;
 }): { ok: true; dir: string } | { ok: false; msg: string } {
-  if (values.dir !== undefined && values.dir !== "") {
-    return { ok: true, dir: values.dir };
+  const runDir = values["run-dir"];
+  if (runDir !== undefined && runDir !== "") {
+    return { ok: true, dir: runDir };
   }
   if (values.slug !== undefined && values.slug !== "") {
     const slug = slugify(values.slug);
@@ -1773,7 +1774,22 @@ function resolvePanelDir(values: {
     }
     return { ok: true, dir: join(keeperStateDir(), "panels", slug) };
   }
-  return { ok: false, msg: "--dir <d> or --slug <slug> is required" };
+  return { ok: false, msg: "--run-dir <d> or --slug <slug> is required" };
+}
+
+/**
+ * Run one panel sub-verb's `parseArgs` under a fault guard. An unknown flag (e.g. a
+ * retired spelling) or a value-shape fault is CLI misuse → exit 2 with the parser's
+ * own message, never the uncaught-throw exit 1. The thunk preserves `parseArgs`'s
+ * own precise per-flag `values` typing (the `never` from `process.exit` unions
+ * away). */
+function parsePanelArgs<R>(op: string, parse: () => R): R {
+  try {
+    return parse();
+  } catch (err) {
+    process.stderr.write(`pair panel ${op}: ${(err as Error).message}\n`);
+    process.exit(2);
+  }
 }
 
 /**
@@ -1798,23 +1814,25 @@ export async function runPanel(argv: string[]): Promise<void> {
   const deps = buildPanelDeps();
 
   if (op === "start") {
-    const parsed = parseArgs({
-      args: argv.slice(1),
-      options: {
-        slug: { type: "string" },
-        panel: { type: "string" },
-        preset: { type: "string" },
-        cli: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" },
-        role: { type: "string" },
-        "read-only": { type: "boolean", default: false },
-        dir: { type: "string" },
-        timeout: { type: "string" },
-        help: { type: "boolean", default: false },
-      },
-      allowPositionals: true,
-    });
+    const parsed = parsePanelArgs("start", () =>
+      parseArgs({
+        args: argv.slice(1),
+        options: {
+          slug: { type: "string" },
+          panel: { type: "string" },
+          preset: { type: "string" },
+          cli: { type: "string" },
+          model: { type: "string" },
+          effort: { type: "string" },
+          role: { type: "string" },
+          "read-only": { type: "boolean", default: false },
+          "run-dir": { type: "string" },
+          timeout: { type: "string" },
+          help: { type: "boolean", default: false },
+        },
+        allowPositionals: true,
+      }),
+    );
     if (parsed.values.help) {
       process.stdout.write(PANEL_HELP);
       process.exit(0);
@@ -1912,7 +1930,7 @@ export async function runPanel(argv: string[]): Promise<void> {
         slug,
         panel: parsed.values.panel,
         adHoc,
-        dir: parsed.values.dir,
+        dir: parsed.values["run-dir"],
         timeoutSeconds,
       },
       deps,
@@ -1921,11 +1939,13 @@ export async function runPanel(argv: string[]): Promise<void> {
   }
 
   if (op === "prune") {
-    const parsed = parseArgs({
-      args: argv.slice(1),
-      options: { help: { type: "boolean", default: false } },
-      allowPositionals: true,
-    });
+    const parsed = parsePanelArgs("prune", () =>
+      parseArgs({
+        args: argv.slice(1),
+        options: { help: { type: "boolean", default: false } },
+        allowPositionals: true,
+      }),
+    );
     if (parsed.values.help) {
       process.stdout.write(PANEL_HELP);
       process.exit(0);
@@ -1934,15 +1954,17 @@ export async function runPanel(argv: string[]): Promise<void> {
   }
 
   if (op === "status") {
-    const parsed = parseArgs({
-      args: argv.slice(1),
-      options: {
-        slug: { type: "string" },
-        dir: { type: "string" },
-        help: { type: "boolean", default: false },
-      },
-      allowPositionals: true,
-    });
+    const parsed = parsePanelArgs("status", () =>
+      parseArgs({
+        args: argv.slice(1),
+        options: {
+          slug: { type: "string" },
+          "run-dir": { type: "string" },
+          help: { type: "boolean", default: false },
+        },
+        allowPositionals: true,
+      }),
+    );
     if (parsed.values.help) {
       process.stdout.write(PANEL_HELP);
       process.exit(0);
@@ -1955,16 +1977,18 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.exit(panelStatus({ dir: resolved.dir }, deps));
   }
 
-  const parsed = parseArgs({
-    args: argv.slice(1),
-    options: {
-      slug: { type: "string" },
-      dir: { type: "string" },
-      chunk: { type: "string" },
-      help: { type: "boolean", default: false },
-    },
-    allowPositionals: true,
-  });
+  const parsed = parsePanelArgs("wait", () =>
+    parseArgs({
+      args: argv.slice(1),
+      options: {
+        slug: { type: "string" },
+        "run-dir": { type: "string" },
+        chunk: { type: "string" },
+        help: { type: "boolean", default: false },
+      },
+      allowPositionals: true,
+    }),
+  );
   if (parsed.values.help) {
     process.stdout.write(PANEL_HELP);
     process.exit(0);

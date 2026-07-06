@@ -4,7 +4,7 @@ description: >-
   Hand a piece of work off to a fresh fire-and-forget claude worker via `keeper
   handoff` (one call; a keeperd worker boots it inline in your tmux session). Use
   whenever the human imperatively says "handoff" — "hand this off", "send a
-  handoff", "handoff to/in the <repo> project" (cross-repo is just `--dir`, still
+  handoff", "handoff to/in the <repo> project" (cross-repo is just `--cwd`, still
   a handoff), "create handoffs", "spawn someone to investigate X" — or otherwise
   wants to pass a contextful task to a separate worker and walk away, even when
   they never say "keeper". This passes LIVE work to a worker; it is NOT authoring
@@ -14,7 +14,7 @@ description: >-
   (`keeper:dispatch` — `work::fn-N.M` / `close::fn-N`), NOT messaging a running
   agent (`keeper:bus`), NOT planning (`/plan:plan`).
 allowed-tools: Bash
-argument-hint: --slug <slug> --prompt "<brief>" [--dir <path>] [--title "<t>"]
+argument-hint: --slug <slug> --prompt "<brief>" [--cwd <path>] [--title "<t>"]
 ---
 
 # handoff
@@ -43,7 +43,7 @@ move on:
 - *"Hand this off."* / *"Hand off this work to a fresh worker."*
 - *"Create a handoff."* / *"Create handoffs for X and Y."*
 - *"Spawn someone to investigate X."* / *"Kick off a worker to dig into Y; here's the context."*
-- *"Send a handoff in the arthack project to work on it."* — a handoff launched in another repo via `--dir`; a cross-repo target is not a reason to defer.
+- *"Send a handoff in the arthack project to work on it."* — a handoff launched in another repo via `--cwd`; a cross-repo target is not a reason to defer.
 
 Each distinct handoff is ONE `keeper handoff` call — the one-call rule is
 per-handoff, so "create handoffs for X and Y" is two calls (different `--slug`
@@ -95,8 +95,8 @@ Assemble these from the conversation:
    live instead. If you've already written it to a file, use `--prompt-file`.
 3. **A title** (`--title`) — a short human label for the handoff (optional but
    recommended; it surfaces on the board).
-4. **The launch directory** (`--dir`, optional) — the directory the handoff-ee
-   launches in; defaults to YOUR current cwd. Pass `--dir` only when the human
+4. **The launch directory** (`--cwd`, optional) — the directory the handoff-ee
+   launches in; defaults to YOUR current cwd. Pass `--cwd` only when the human
    wants the worker to start in a different repo/dir. Expands `~` and resolves a
    relative path; a non-existent / non-directory path is rejected (exit 2).
 5. **The target session** (`--session`, optional) — defaults to
@@ -126,7 +126,7 @@ Flags:
 | `--prompt <doc>` | The brief inline. Mutually exclusive with `--prompt-file`. |
 | `--prompt-file <path>` | Read the brief from a file (use for large briefs). |
 | `--title <t>` | Human title for the handoff (surfaces on the board). |
-| `--dir <path>` | Directory the handoff-ee launches in. Default: your cwd. Expands `~`, resolves relatives; bad path → exit 2. |
+| `--cwd <path>` | Directory the handoff-ee launches in. Default: your cwd. Expands `~`, resolves relatives; bad path → exit 2. |
 | `--session <s>` | Target tmux session. Default: `$KEEPER_TMUX_SESSION` > current > `work`. |
 
 On success it prints the `handoff_id` (as `{ok, handoff_id}`) and exits 0. The
@@ -154,5 +154,5 @@ Then stop. This is fire-and-forget — do not wait on or monitor the handoff-ee.
 |---|---|---|
 | 0 | Enqueued. | Surface the `handoff_id` + how to inspect. |
 | 1 | Enqueue failure (e.g. daemon unreachable). | Read the message and surface it — keeperd may be down. |
-| 2 | Arg fault: missing/empty `--slug`, both `--prompt` and `--prompt-file`, neither, an over-64KB brief, a NUL byte, or a bad `--dir`. | Fix the named arg; for a large brief use `--prompt-file`. |
+| 2 | Arg fault: missing/empty `--slug`, both `--prompt` and `--prompt-file`, neither, an over-64KB brief, a NUL byte, or a bad `--cwd`. | Fix the named arg; for a large brief use `--prompt-file`. |
 | 3 | Slug already in use (host-global). | Pick a new `--slug` and re-run. |

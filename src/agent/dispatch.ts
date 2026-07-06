@@ -85,9 +85,9 @@ Usage:
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
-  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
-  keeper agent panel wait   (--slug <slug> | --dir <d>) [--chunk <s>]
-  keeper agent panel status (--slug <slug> | --dir <d>)
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <s>]
+  keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <s>]
+  keeper agent panel status (--slug <slug> | --run-dir <d>)
   keeper agent panel prune
                                     Fan a question to a panel of detached
                                     read-only run legs (members from a configured
@@ -95,7 +95,7 @@ Usage:
                                     --slug is REQUIRED on start — each leg launches
                                     as panel::<slug>::<preset>. start is idempotent
                                     by slug (reconciles on re-issue); wait/status
-                                    address a run by --slug or --dir. status prints
+                                    address a run by --slug or --run-dir. status prints
                                     a non-blocking per-leg snapshot; prune GCs
                                     abandoned run dirs. Exit 0 all-terminal / 124
                                     chunk-elapsed / 2 absent-slug-or-bad-config.
@@ -232,9 +232,9 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         --agent <kind>); same uniform envelope.
 
 Panel fan-out (start | wait | status | prune):
-  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--dir <d>] [--timeout <s>]
-  keeper agent panel wait   (--slug <slug> | --dir <d>) [--chunk <s>]
-  keeper agent panel status (--slug <slug> | --dir <d>)
+  keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <s>]
+  keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <s>]
+  keeper agent panel status (--slug <slug> | --run-dir <d>)
   keeper agent panel prune
                                         Fan a question to a panel of models as
                                         detached read-only \`keeper agent run\`
@@ -249,7 +249,7 @@ Panel fan-out (start | wait | status | prune):
                                         line RECONCILES (reuse terminal legs, leave
                                         running, relaunch no-result), never a blind
                                         re-fan-out. wait/status address a run by
-                                        --slug (or --dir; --dir wins). wait blocks
+                                        --slug (or --run-dir; --run-dir wins). wait blocks
                                         ONE --chunk window + prints the N-of-N
                                         verdict; status prints a non-blocking per-leg
                                         snapshot (completed|running|failed|absent);

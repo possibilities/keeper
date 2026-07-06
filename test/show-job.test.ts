@@ -13,6 +13,7 @@ import {
   decodeFor,
   type ResolveResult,
   resolveJob,
+  main as showJobMain,
 } from "../cli/show-job";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -63,12 +64,12 @@ function okRow(r: ResolveResult): Record<string, unknown> {
   return r.row;
 }
 
-describe("resolveJob — session-id / job-id", () => {
+describe("resolveJob — job-id", () => {
   test("exact match returns the full row", () => {
     seed({ job_id: "sess-A", title: "Alpha" });
     const r = resolveJob(db, { jobId: "sess-A" });
     expect(okRow(r).job_id).toBe("sess-A");
-    if (r.kind === "ok") expect(r.matchedField).toBe("session_id");
+    if (r.kind === "ok") expect(r.matchedField).toBe("job_id");
   });
 
   test("unknown id → not_found", () => {
@@ -313,11 +314,7 @@ describe("decodeFor — JSON-TEXT columns", () => {
 describe("buildEnvelope: envelope mapping", () => {
   test("ok → data:{job,resolution}, ok:true, error:null", () => {
     seed({ job_id: "j1", title: "T", cwd: "/x", state: "working" });
-    const env = buildEnvelope(
-      resolveJob(db, { jobId: "j1" }),
-      "session-id",
-      false,
-    );
+    const env = buildEnvelope(resolveJob(db, { jobId: "j1" }), "job-id", false);
     expect(env.ok).toBe(true);
     expect(env.error).toBeNull();
     const data = env.data as {
@@ -325,12 +322,12 @@ describe("buildEnvelope: envelope mapping", () => {
       resolution: Record<string, unknown>;
     };
     expect(data.job.job_id).toBe("j1");
-    expect(data.resolution.method).toBe("session-id");
-    expect(data.resolution.matched_field).toBe("session_id");
+    expect(data.resolution.method).toBe("job-id");
+    expect(data.resolution.matched_field).toBe("job_id");
   });
 
   test("not_found → ok:false with a stable code + recovery, data:null", () => {
-    const env = buildEnvelope({ kind: "not_found" }, "session-id", false);
+    const env = buildEnvelope({ kind: "not_found" }, "job-id", false);
     expect(env.ok).toBe(false);
     expect(env.data).toBeNull();
     expect(env.error?.code).toBe("not_found");
@@ -355,4 +352,46 @@ describe("buildEnvelope: envelope mapping", () => {
       "j2",
     ]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Retired spellings — the selectors are --job-id and --session-title; the old
+// --session-id and --session hard-fail (unknown argument → exit 2) at parse,
+// before any keeper.db open.
+// ---------------------------------------------------------------------------
+
+describe("main: retired selector spellings hard-fail exit 2", () => {
+  /** Drive show-job's main() capturing the exit code + stderr, patching the
+   *  process globals it writes through directly. Parse dies before DB open. */
+  function runMain(argv: string[]): { code: number | undefined; err: string } {
+    const realExit = process.exit;
+    const realErr = process.stderr.write.bind(process.stderr);
+    let code: number | undefined;
+    let err = "";
+    process.exit = ((c?: number) => {
+      code = c ?? 0;
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+    process.stderr.write = ((s: string | Uint8Array) => {
+      err += typeof s === "string" ? s : Buffer.from(s).toString();
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      showJobMain(argv);
+    } catch {
+      // the patched process.exit throws to unwind — expected
+    } finally {
+      process.exit = realExit;
+      process.stderr.write = realErr;
+    }
+    return { code, err };
+  }
+
+  for (const flag of ["--session-id", "--session"] as const) {
+    test(`${flag} is a retired spelling → exit 2`, () => {
+      const r = runMain([flag, "abc"]);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain(flag);
+    });
+  }
 });

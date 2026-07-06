@@ -13,6 +13,7 @@ import { MAX_CONTROL_FRAME_BYTES } from "../cli/control-rpc";
 import {
   buildRequestHandoffFrame,
   HANDOFF_DOC_MAX_BYTES,
+  main as handoffMain,
   resolveTargetDir,
   spillHandoffDoc,
   validateHandoffDoc,
@@ -121,7 +122,7 @@ test("spillHandoffDoc: writes the doc to a file under the spill dir and returns 
   }
 });
 
-// ── resolveTargetDir (the `--dir` resolver; exit-2 logic) ───────────────────
+// ── resolveTargetDir (the `--cwd` resolver; exit-2 logic) ───────────────────
 
 const okStat = () => ({ isDirectory: () => true });
 const fileStat = () => ({ isDirectory: () => false });
@@ -129,7 +130,7 @@ const missingStat = () => {
   throw new Error("ENOENT");
 };
 
-test("resolveTargetDir: absent --dir defaults to the caller's cwd", () => {
+test("resolveTargetDir: absent --cwd defaults to the caller's cwd", () => {
   expect(resolveTargetDir(undefined, "/Users/dev/code/keeper", okStat)).toEqual(
     {
       ok: true,
@@ -138,20 +139,20 @@ test("resolveTargetDir: absent --dir defaults to the caller's cwd", () => {
   );
 });
 
-test("resolveTargetDir: empty --dir defaults to the caller's cwd", () => {
+test("resolveTargetDir: empty --cwd defaults to the caller's cwd", () => {
   expect(resolveTargetDir("", "/Users/dev/code/keeper", okStat)).toEqual({
     ok: true,
     dir: "/Users/dev/code/keeper",
   });
 });
 
-test("resolveTargetDir: an absolute --dir passes through (validated)", () => {
+test("resolveTargetDir: an absolute --cwd passes through (validated)", () => {
   expect(
     resolveTargetDir("/Users/dev/code/other", "/Users/dev/code/keeper", okStat),
   ).toEqual({ ok: true, dir: "/Users/dev/code/other" });
 });
 
-test("resolveTargetDir: a relative --dir resolves against the caller's cwd to an absolute path", () => {
+test("resolveTargetDir: a relative --cwd resolves against the caller's cwd to an absolute path", () => {
   expect(
     resolveTargetDir("../sibling", "/Users/dev/code/keeper", okStat),
   ).toEqual({ ok: true, dir: "/Users/dev/code/sibling" });
@@ -166,7 +167,7 @@ test("resolveTargetDir: a leading ~ expands against the home dir", () => {
   }
 });
 
-test("resolveTargetDir: a non-existent --dir is a miss (CLI exits 2)", () => {
+test("resolveTargetDir: a non-existent --cwd is a miss (CLI exits 2)", () => {
   const r = resolveTargetDir(
     "/no/such/dir",
     "/Users/dev/code/keeper",
@@ -178,7 +179,7 @@ test("resolveTargetDir: a non-existent --dir is a miss (CLI exits 2)", () => {
   }
 });
 
-test("resolveTargetDir: a --dir pointing at a file (not a directory) is a miss (CLI exits 2)", () => {
+test("resolveTargetDir: a --cwd pointing at a file (not a directory) is a miss (CLI exits 2)", () => {
   const r = resolveTargetDir(
     "/some/file.txt",
     "/Users/dev/code/keeper",
@@ -188,4 +189,33 @@ test("resolveTargetDir: a --dir pointing at a file (not a directory) is a miss (
   if (!r.ok) {
     expect(r.error).toContain("not a directory");
   }
+});
+
+// ── retired spelling: the launch dir is --cwd; the old --dir hard-fails ──────
+
+test("handoff main: the retired --dir spelling hard-fails exit 2 (unknown flag, no daemon touch)", async () => {
+  // The unknown flag throws at parseArgs BEFORE any daemon connection, so this
+  // drives no RPC and mutates nothing — it exits 2 at the arg-fault boundary.
+  const realExit = process.exit;
+  const realErr = process.stderr.write.bind(process.stderr);
+  let code: number | undefined;
+  let err = "";
+  process.exit = ((c?: number) => {
+    code = c ?? 0;
+    throw new Error(`exit ${code}`);
+  }) as typeof process.exit;
+  process.stderr.write = ((s: string | Uint8Array) => {
+    err += typeof s === "string" ? s : Buffer.from(s).toString();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await handoffMain(["--slug", "x", "--prompt", "p", "--dir", "/tmp"]);
+  } catch {
+    // the patched process.exit throws to unwind — expected
+  } finally {
+    process.exit = realExit;
+    process.stderr.write = realErr;
+  }
+  expect(code).toBe(2);
+  expect(err).toContain("--dir");
 });

@@ -92,7 +92,7 @@ keeper session-summary <session-id>   # bounded envelope: title, lifecycle, plan
 **One job's metadata / failed-worker forensics**:
 
 ```bash
-keeper show-job --session <title>   # the full jobs-projection row (auto-detects your own job with no selector)
+keeper show-job --session-title <title>   # the full jobs-projection row (auto-detects your own job with no selector)
 ```
 
 `subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.
