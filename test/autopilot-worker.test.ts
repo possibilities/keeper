@@ -74,6 +74,7 @@ import {
   FINALIZER_GUARD_S,
   type FoundJob,
   findShadowingWorkManifest,
+  gateWedgedLanesByLiveness,
   isBareShellCommand,
   isEpicDoneById,
   isEpicInFlight,
@@ -84,6 +85,7 @@ import {
   isOccupyingJob,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
+  LANE_OWNER_STALL_GRACE_SEC,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_GRACE_SEC,
@@ -91,6 +93,7 @@ import {
   type LaunchResult,
   type LiveDispatch,
   laneFailuresToClear,
+  laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
   loadReconcileSnapshot,
   mergeLaneBaseIntoDefault,
@@ -14233,4 +14236,300 @@ test("laneFailuresToClear is verb-agnostic — a work AND a close lane row both 
     { verb: "work", id: "fn-1-foo.2" },
     { verb: "close", id: "fn-1-foo" },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1144 — the owning-worker liveness gate on the GRACED lane-wedge escalation.
+// A healthy running worker's fan-in base is naturally dirty with WIP, so the graced
+// wedge must NOT page a human while its owner is alive+progressing; only a dead/stalled
+// owner (or a hard `immediate` abort-failed lane) still escalates. Grace / now /
+// updated_at are hand-picked constants; idle = now - updated_at reasoned by hand
+// against LANE_OWNER_STALL_GRACE (300), never re-derived from the helper.
+// ---------------------------------------------------------------------------
+
+const LANE_OWNER_GRACE = 300;
+// A live `work` owner in LANE_A, folding events at `updated_at`; `state`/`pane`/`ts`
+// per case. Pane "%1" is the live backend pane a stopped-arm owner is probed against.
+function laneOwnerJobs(over: Partial<Job>): Map<string, Job> {
+  return new Map([
+    [
+      "j",
+      makeJob({
+        job_id: "j",
+        plan_verb: "work",
+        plan_ref: "fn-1-foo.1",
+        cwd: LANE_A,
+        state: "working",
+        backend_exec_pane_id: "%1",
+        updated_at: 1000,
+        ...over,
+      }),
+    ],
+  ]);
+}
+
+test("LANE_OWNER_STALL_GRACE_SEC is the ~5min owner-progress watermark", () => {
+  expect(LANE_OWNER_STALL_GRACE_SEC).toBe(5 * 60);
+});
+
+test("laneOwnerAliveAndProgressing: a WORKING owner folding within grace → true (withhold)", () => {
+  // idle 200 < 300 → progressing. A `working` owner needs no pane probe.
+  const jobs = laneOwnerJobs({ state: "working", updated_at: 1000 });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      jobs,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(true);
+});
+
+test("laneOwnerAliveAndProgressing: a STOPPED-but-live owner folding within grace → true", () => {
+  // stopped + its backend pane still live + idle 200 < 300 → progressing (parked-alive).
+  const jobs = laneOwnerJobs({
+    state: "stopped",
+    backend_exec_pane_id: "%1",
+    updated_at: 1000,
+  });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      jobs,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(true);
+});
+
+test("laneOwnerAliveAndProgressing: NO owner in the lane → false (dead → escalate)", () => {
+  // Empty jobs, and a live work job in a DIFFERENT lane, both read dead for LANE_A.
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      new Map(),
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+  const elsewhere = laneOwnerJobs({
+    cwd: LANE_B,
+    state: "working",
+    updated_at: 1200,
+  });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      elsewhere,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+});
+
+test("laneOwnerAliveAndProgressing: a STOPPED owner whose pane is GONE → false (dead)", () => {
+  // stopped + pane absent from the live set → not a live occupant, even fresh.
+  const jobs = laneOwnerJobs({
+    state: "stopped",
+    backend_exec_pane_id: "%1",
+    updated_at: 1150,
+  });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      jobs,
+      new Set(["%other"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+});
+
+test("laneOwnerAliveAndProgressing: a terminal (ended) owner → false (dead)", () => {
+  const jobs = laneOwnerJobs({ state: "ended", updated_at: 1200 });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      jobs,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+});
+
+test("laneOwnerAliveAndProgressing: a live owner STALLED past grace → false (escalate)", () => {
+  // idle 400 >= 300 → stalled, whether it is `working` or `stopped`-and-live.
+  const working = laneOwnerJobs({ state: "working", updated_at: 800 });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      working,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+  const parked = laneOwnerJobs({
+    state: "stopped",
+    backend_exec_pane_id: "%1",
+    updated_at: 800,
+  });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      parked,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+});
+
+test("laneOwnerAliveAndProgressing: stall grace boundary — idle === grace stalls, idle < grace progresses", () => {
+  // now 1300, updated 1000 → idle 300 === grace → stalled (>=) → false.
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      laneOwnerJobs({ state: "working", updated_at: 1000 }),
+      new Set(["%1"]),
+      1300,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+  // now 1299 → idle 299 < grace → progressing → true.
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      laneOwnerJobs({ state: "working", updated_at: 1000 }),
+      new Set(["%1"]),
+      1299,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(true);
+});
+
+test("laneOwnerAliveAndProgressing: DEGRADED probe (livePaneIds null) → false even for a fresh working owner", () => {
+  // No trustworthy liveness picture → fall back to the pre-gate behavior (escalate),
+  // never suppress a genuine distress signal on an unprobeable cycle.
+  const jobs = laneOwnerJobs({ state: "working", updated_at: 1200 });
+  expect(
+    laneOwnerAliveAndProgressing(LANE_A, jobs, null, 1200, LANE_OWNER_GRACE),
+  ).toBe(false);
+});
+
+test("laneOwnerAliveAndProgressing: only a `work` owner counts — a close/resolve session in the lane does not", () => {
+  const closer = laneOwnerJobs({
+    plan_verb: "close",
+    state: "working",
+    updated_at: 1200,
+  });
+  expect(
+    laneOwnerAliveAndProgressing(
+      LANE_A,
+      closer,
+      new Set(["%1"]),
+      1200,
+      LANE_OWNER_GRACE,
+    ),
+  ).toBe(false);
+});
+
+test("gateWedgedLanesByLiveness: a graced lane under a live+progressing owner is WITHHELD (no mint feed)", () => {
+  const jobs = laneOwnerJobs({ state: "working", updated_at: 1000 }); // idle 200 < 300
+  const out = gateWedgedLanesByLiveness(
+    [LANE_DIRTY_OBS],
+    jobs,
+    new Set(["%1"]),
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(out.size).toBe(0);
+});
+
+test("gateWedgedLanesByLiveness: a graced lane under a DEAD owner is INCLUDED (escalates)", () => {
+  const out = gateWedgedLanesByLiveness(
+    [LANE_DIRTY_OBS],
+    new Map(),
+    new Set(["%1"]),
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(out.get(LANE_A)?.immediate).toBe(false);
+  expect(out.get(LANE_A)?.reason).toBe(LANE_DIRTY_OBS.reason);
+});
+
+test("gateWedgedLanesByLiveness: a graced lane under a STALLED owner is INCLUDED", () => {
+  const jobs = laneOwnerJobs({ state: "working", updated_at: 800 }); // idle 400 >= 300
+  const out = gateWedgedLanesByLiveness(
+    [LANE_DIRTY_OBS],
+    jobs,
+    new Set(["%1"]),
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(out.has(LANE_A)).toBe(true);
+});
+
+test("gateWedgedLanesByLiveness: a hard IMMEDIATE lane bypasses the gate — INCLUDED under a live+progressing owner", () => {
+  const immediateObs: LaneWedgeObservation = {
+    path: LANE_A,
+    reason:
+      "abort-failed: /Users/x/worktrees/lane-a is mid-merge (MERGE_HEAD=deadbeef) and could not be cleared",
+    immediate: true,
+  };
+  const jobs = laneOwnerJobs({ state: "working", updated_at: 1000 }); // alive+progressing
+  const out = gateWedgedLanesByLiveness(
+    [immediateObs],
+    jobs,
+    new Set(["%1"]),
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(out.get(LANE_A)?.immediate).toBe(true);
+});
+
+test("gateWedgedLanesByLiveness: DEGRADED probe → graced lane INCLUDED (pre-gate behavior)", () => {
+  const jobs = laneOwnerJobs({ state: "working", updated_at: 1200 });
+  const out = gateWedgedLanesByLiveness(
+    [LANE_DIRTY_OBS],
+    jobs,
+    null,
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(out.has(LANE_A)).toBe(true);
+});
+
+test("gateWedgedLanesByLiveness: dedup preserved — an immediate beats a graced entry for the same lane, gate withholds only the graced one", () => {
+  const immediateObs: LaneWedgeObservation = {
+    path: LANE_A,
+    reason: "abort-failed: /Users/x/worktrees/lane-a mid-merge",
+    immediate: true,
+  };
+  // Live+progressing owner: the graced obs is withheld, the immediate obs still lands →
+  // exactly one entry, immediate.
+  const alive = laneOwnerJobs({ state: "working", updated_at: 1000 });
+  const gated = gateWedgedLanesByLiveness(
+    [LANE_DIRTY_OBS, immediateObs],
+    alive,
+    new Set(["%1"]),
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(gated.size).toBe(1);
+  expect(gated.get(LANE_A)?.immediate).toBe(true);
+  // Dead owner: the graced obs lands first, the immediate obs upgrades it → immediate.
+  const upgraded = gateWedgedLanesByLiveness(
+    [LANE_DIRTY_OBS, immediateObs],
+    new Map(),
+    new Set(["%1"]),
+    1200,
+    LANE_OWNER_GRACE,
+  );
+  expect(upgraded.get(LANE_A)?.immediate).toBe(true);
 });
