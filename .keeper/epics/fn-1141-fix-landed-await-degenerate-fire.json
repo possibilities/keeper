@@ -6,7 +6,7 @@
     "fn-1140-decouple-base-merge-from-checkout"
   ],
   "id": "fn-1141-fix-landed-await-degenerate-fire",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-06T14:24:18.743000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T14:24:18.018000Z"
+  "updated_at": "2026-07-06T14:24:18.743000Z"
 }
