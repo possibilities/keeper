@@ -49,5 +49,5 @@ Pure fast tier: assert a dirty/mid-merge shared-checkout observation no longer p
 - [ ] `bun test test/autopilot-worker.test.ts` is green
 
 ## Done summary
-
+Neutered the shared-checkout dirty/mid-merge distress false positives: the recover cycle now feeds the wedge/dirty trackers no observations (single sharedCheckoutDistressObservations seam, no false-positive mint, level-clear still drains) and the boot orphan-GC drains any open shared-checkout-wedge/-dirty row (lane-wedge/stale-base/crash-loop stay exempt). Recover pass-1 lane abort unchanged.
 ## Evidence
