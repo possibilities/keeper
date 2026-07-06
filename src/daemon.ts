@@ -127,6 +127,7 @@ import {
   isMergeEscalationReason,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
+  isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_WEDGE_DISTRESS_VERB,
 } from "./dispatch-failure-key";
@@ -347,11 +348,13 @@ export function drainToCompletion(
  *
  * EXEMPTS the crash-loop distress key AND every per-repo shared-checkout-wedge
  * ({@link isSharedWedgeDistressKey}) / shared-checkout-dirty ({@link
- * isSharedDirtyDistressKey}) / per-lane fan-in wedge ({@link isLaneWedgeDistressKey})
- * distress key: their synthetic `daemon` verb is un-retryable by the wire validator BY
- * DESIGN (an operator never clears them), and a level-trigger (main's boot recovery /
- * the recover pass observing the checkout or lane clean) owns dropping them — so the
- * orphan sweep must never reap a self-managed distress row out from under its signal.
+ * isSharedDirtyDistressKey}) / per-lane fan-in wedge ({@link isLaneWedgeDistressKey}) /
+ * per-(epic,repo) stale-base-lane ({@link isStaleBaseDistressKey}) distress key: their
+ * synthetic `daemon` verb is un-retryable by the wire validator BY DESIGN (an operator
+ * never clears them), and a level-trigger (main's boot recovery / the recover pass
+ * observing the checkout or lane clean / the stale-base probe observing the lane
+ * re-based or torn down) owns dropping them — so the orphan sweep must never reap a
+ * self-managed distress row out from under its signal.
  */
 export function gcUnretryableDispatchFailures(
   db: Database,
@@ -387,6 +390,12 @@ export function gcUnretryableDispatchFailures(
     // recover-pass level-clear discipline on its own `worktree-lane-wedge:` id prefix;
     // the operator surface never clears it, so the orphan sweep must not reap it.
     if (isLaneWedgeDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the per-(epic,repo) stale-base-lane distress row — same synthetic `daemon`-
+    // verb / probe level-clear discipline on its own `stale-base-lane:` id prefix; the
+    // operator surface never clears it, so the orphan sweep must not reap it.
+    if (isStaleBaseDistressKey(row.verb, row.id)) {
       continue;
     }
     mintClear(row.verb, row.id);

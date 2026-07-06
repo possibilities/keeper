@@ -81,6 +81,21 @@ export interface LaneMergedEntry {
 }
 
 /**
+ * One flagged STALE-BASE lane — an epic whose ALREADY-CUT worktree lane
+ * (`keeper/epic/<id>`) in `repo_dir` was forked off a base MISSING the landed work of
+ * a satisfied same-resolved-repo upstream (the lane was cut before the upstream
+ * landed, so its workers hit DEPENDENCY_BLOCKED with nothing naming the cause). The
+ * producer probe here and the per-(epic,repo) distress escalation share this one
+ * contract. Purely observational — drives NO dispatch arm and mints no `dispatch_
+ * failures` row itself (the grace tracker escalates it to the `stale-base-lane`
+ * distress family).
+ */
+export interface StaleBaseLaneEntry {
+  epic_id: string;
+  repo_dir: string;
+}
+
+/**
  * The two `keeper plan` verbs the reconciler dispatches: `work` for a `ready` task
  * row, `close` for a `ready` close row. The argv shape's single source of truth
  * is `cli/autopilot.ts`.
@@ -616,6 +631,31 @@ export interface ReconcileSnapshot {
    * consumer degrades `landed` to `done`). Optional so a test snapshot may omit it.
    */
   landedLaneEntries?: readonly LaneMergedEntry[];
+  /**
+   * The STALE-BASE lane set (fn-1127) — every epic whose already-cut worktree lane
+   * `keeper/epic/<id>` was forked off a base DEFINITIVELY MISSING a satisfied
+   * same-resolved-repo upstream's landed work (probed via
+   * {@link computeStaleBaseLaneEntries}). Producer-only, gated on {@link
+   * worktreeMode}, read by the stale-base grace tracker to escalate a lane stale past
+   * the grace into a per-(epic,repo) distress row — NEVER by the pure `reconcile`,
+   * NEVER a fold input. Detection + surfacing ONLY: the merge-gate's cut-deferral is
+   * untouched. Every inconclusive probe arm (enum failure, ancestry timeout, absent
+   * refs) DEFERS to no-flag — a false distress is worse than a late one. EMPTY
+   * whenever worktree mode is OFF. Optional so a test snapshot may omit it.
+   */
+  staleBaseLaneEntries?: readonly StaleBaseLaneEntry[];
+  /**
+   * The `dispatch_failures.id`s that currently have an OPEN per-(epic,repo)
+   * stale-base-lane distress row (synthetic `daemon::stale-base-lane:<epicId>-
+   * <repoHash>`, collected off the row's `id`). PRODUCER-ONLY: read by the stale-base
+   * grace tracker to level-clear a distress row whose lane has since been re-based
+   * past the upstream or torn down (the probe stops reporting it stale) — NOT by the
+   * pure `reconcile`. Off the durable projection (not in-memory) so a restarted worker
+   * still clears a distress it minted before the restart. Keyed on the ID directly
+   * (the per-(epic,repo) hash is one-way, unlike the shared-checkout dir sets).
+   * Optional for call-site back-compat; an absent field is an empty set.
+   */
+  staleBaseDistressIds?: Set<string>;
   /**
    * Producer-side LIVE-JOB dirty attribution for the worktree pre-merge clean —
    * keyed by lane worktree path (== `file_attributions.project_dir`, realpath +

@@ -261,6 +261,46 @@ export function isLaneWedgeDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/**
+ * The synthetic PER-(EPIC,REPO) distress signal for an already-cut worktree lane
+ * whose base is STALE — a lane forked off its repo's default BEFORE a satisfied
+ * same-resolved-repo upstream landed, so the base is missing that upstream's work and
+ * the lane's workers hit DEPENDENCY_BLOCKED with nothing on the board naming the
+ * cause. The merge-gate only DEFERS a cut; by construction it can never see a lane
+ * ALREADY cut stale, so this producer probe surfaces it. DETECTION + LOUD SURFACING
+ * ONLY — never auto-remediation, never touching the cut-deferral. Mirrors the
+ * shared-checkout-wedge idiom EXACTLY but on its own id/reason so the surfaces never
+ * cross-clear: it shares the un-retryable synthetic `daemon` verb (routes as {@link
+ * routeDispatchFailure}'s `unknown` arm — never in `failedKeys`, never
+ * `retry_dispatch`-clearable), the boot orphan-GC exemption, and a level-clear — but
+ * the `id` is per-(epic,repo) (`stale-base-lane:<epicId>-<repoHash>`), so a lane cut
+ * stale in two repos of one clustered epic surfaces independently. Its ONLY clear is
+ * the probe's level-trigger observing the lane re-based past the upstream or torn down
+ * (the `reason` lives OUTSIDE {@link WORKTREE_RECOVER_REASON_PREFIX}). In-memory grace
+ * tracking, so a daemon restart re-emits at most once per still-present stale episode.
+ * Prefix-disjoint from every existing family (recover/finalize/shared-wedge/shared-
+ * dirty/slot/crash-loop/lane-premerge/lane-wedge).
+ */
+export const STALE_BASE_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const STALE_BASE_DISTRESS_ID_PREFIX = "stale-base-lane:";
+export const STALE_BASE_DISTRESS_REASON = "stale-base-lane";
+
+/**
+ * True iff `(verb, id)` is a stale-base-lane distress key — the synthetic `daemon`
+ * verb plus the {@link STALE_BASE_DISTRESS_ID_PREFIX} per-(epic,repo) id. The boot
+ * orphan-GC exempts it (like the shared-checkout-wedge / -dirty / lane-wedge +
+ * crash-loop keys) since the operator surface never clears it; pure, dep-free, NEVER
+ * throws. Disjoint from {@link isSharedWedgeDistressKey} / {@link
+ * isSharedDirtyDistressKey} / {@link isLaneWedgeDistressKey}: the id prefixes never
+ * mutually match, so the four distress rows never cross-classify or cross-clear.
+ */
+export function isStaleBaseDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === STALE_BASE_DISTRESS_VERB &&
+    id.startsWith(STALE_BASE_DISTRESS_ID_PREFIX)
+  );
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -276,7 +316,8 @@ export type DispatchFailureDisplayKind =
   | "shared-wedge"
   | "shared-dirty"
   | "lane-premerge"
-  | "lane-wedge";
+  | "lane-wedge"
+  | "stale-base";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -308,6 +349,9 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // if a future rename shortens one.
   { prefix: LANE_WEDGE_DISTRESS_REASON, kind: "lane-wedge" },
   { prefix: WORKTREE_LANE_PREMERGE_REASON_PREFIX, kind: "lane-premerge" },
+  // Prefix-disjoint from every rule above (`stale-base-lane` shares no stem), so
+  // ordering is not load-bearing here — appended last, its own kind.
+  { prefix: STALE_BASE_DISTRESS_REASON, kind: "stale-base" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

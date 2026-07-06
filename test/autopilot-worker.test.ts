@@ -52,11 +52,13 @@ import {
   computeDeferredEpicIds,
   computeMergedLaneEntries,
   computeSlotOccupancy,
+  computeStaleBaseLaneEntries,
   confirmRunning,
   createDispatchFailedGate,
   createLaneWedgeTracker,
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
+  createStaleBaseLaneTracker,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
   DISPATCH_FAILED_WATERMARK_SEC,
@@ -113,8 +115,12 @@ import {
   SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
   type SlotOccupancySignal,
+  STALE_BASE_DISTRESS_REASON,
+  STALE_BASE_LANE_GRACE_SEC,
+  type StaleBaseLaneObservation,
   sharedDirtyDistressId,
   sharedWedgeDistressId,
+  staleBaseLaneDistressId,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
@@ -12427,6 +12433,531 @@ test("fn-1034.4 computeMergedLaneEntries: a single-repo epic is byte-identical w
   expect(await computeMergedLaneEntries([solo], cls, run)).toEqual([
     { epic_id: "fn-1-solo", repo_dir: "/repo-a" },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1127 — the STALE-BASE lane probe (computeStaleBaseLaneEntries). A SIBLING to
+// the merge-gate / merge-landed probes (never modifying them): an already-cut lane
+// whose satisfied same-repo upstream's landed work is DEFINITIVELY missing from its
+// base is flagged. THE REF TEST DIRECTION is chosen against the fn-1097 vacuous-
+// ancestor precedent — `isAncestorOf(A_lane, B_base)` — so an empty/fresh lane reads
+// NOT stale, never a false stale; only a definitive not-ancestor (exit 1) flags.
+// `gateGit`'s ancestry keys on the ANCESTOR arg (a[2] = A's lane), so its
+// `ancestors` list reads here as "A-lanes CONTAINED in B's base" (exit 0 → not
+// stale). Every inconclusive arm (enum failure, ancestry timeout, absent refs)
+// DEFERS to no-flag. All expected values are hand-computed constants.
+// ---------------------------------------------------------------------------
+
+test("fn-1127 computeStaleBaseLaneEntries: a satisfied same-repo upstream DEFINITIVELY MISSING from the lane base → FLAGGED stale", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  // Both lanes present; A's lane is NOT contained in B's base (ancestors: []) → exit 1.
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: [],
+  });
+  const stale = await computeStaleBaseLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(stale).toEqual([{ epic_id: "fn-2-b", repo_dir: "/repo" }]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: the upstream's work IS contained in the base → NOT stale", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  // A's lane IS contained in B's base (exit 0) → B's base has the upstream's work.
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: ["keeper/epic/fn-1-a"],
+  });
+  const stale = await computeStaleBaseLaneEntries(
+    epics,
+    classifyIdentity(epics),
+    run,
+  );
+  expect(stale).toEqual([]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: a freshly-cut lane at its fork point (upstream already in base) is NEVER mis-verdicted stale", async () => {
+  // The vacuous-ancestor trap the ref direction defends against: a fresh B whose base
+  // already contains A reads CONTAINED (exit 0), never a false stale. (The inverse
+  // ancestry direction would vacuously pass and MISS a real stale instead.)
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: ["keeper/epic/fn-1-a"], // A contained in B's fresh base
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: the upstream's lane is TORN DOWN (absent) → inconclusive, NO flag, no ancestry probe", async () => {
+  // Upstream lanes are deleted after true merge; its ref is gone so the ancestry test
+  // is unrunnable → skip this upstream (an absent-ref defer, never a false flag).
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run, calls } = gateGit({ lanes: ["keeper/epic/fn-2-b"] }); // A's lane gone
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+  // No ancestry probe fires for an absent upstream ref.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: B's OWN lane torn-down / never cut (absent) → skipped, never probed", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  // A present, B's lane ABSENT → B has no cut lane, so no stale base to surface.
+  const { run, calls } = gateGit({ lanes: ["keeper/epic/fn-1-a"] });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: an enumeration FAILURE → NO flag (never claim stale off an inconclusive probe)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({ enumError: true });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: an ancestry TIMEOUT (124) on a present pair → inconclusive, NO flag", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestryTimeout: true, // every ancestry probe surfaces the 124 SIGKILL sentinel
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: multi-upstream UNION — ONE missing same-repo upstream flags the lane", async () => {
+  const a1 = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const a2 = makeEpic({ epic_id: "fn-1-c", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [
+      satisfiedEpicDep("fn-1-a"),
+      satisfiedEpicDep("fn-1-c"),
+    ],
+  });
+  const epics = [a1, a2, b];
+  // a1 contained in B's base, a2 NOT → union flags B stale.
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-1-c", "keeper/epic/fn-2-b"],
+    ancestors: ["keeper/epic/fn-1-a"],
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([{ epic_id: "fn-2-b", repo_dir: "/repo" }]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: ALL same-repo upstreams contained → NOT stale", async () => {
+  const a1 = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const a2 = makeEpic({ epic_id: "fn-1-c", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [
+      satisfiedEpicDep("fn-1-a"),
+      satisfiedEpicDep("fn-1-c"),
+    ],
+  });
+  const epics = [a1, a2, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-1-c", "keeper/epic/fn-2-b"],
+    ancestors: ["keeper/epic/fn-1-a", "keeper/epic/fn-1-c"],
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: a CROSS-REPO upstream never contributes (decided by resolved toplevel, not cross_project)", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/other" }); // different toplevel
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const { run, calls } = gateGit({
+    lanes: ["keeper/epic/fn-2-b"],
+    ancestors: [],
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+  // The same-repo gate skips a cross-repo upstream BEFORE any ancestry probe.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: a BLOCKED-INCOMPLETE / dangling / disabled / reaped upstream never flags (folds to skip)", async () => {
+  // A blocked-incomplete (still-open) upstream has NOT landed → never a stale-base
+  // source (the readiness gate / merge-gate own it); a dangling (null-resolved) edge,
+  // a reaped (absent from the map) upstream, and a satisfied dep whose upstream has no
+  // same-repo lane all fold to skip — mirroring computeDeferredEpicIds.
+  const blockedA = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [
+      blockedEpicDep("fn-1-a"), // still open → not landed → skip
+      { ...satisfiedEpicDep("fn-9-x"), resolved_epic_id: null }, // dangling → skip
+      satisfiedEpicDep("fn-1-gone"), // reaped (absent from the map) → skip
+    ],
+  });
+  const epics = [blockedA, b];
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: [], // if any of these upstreams reached the probe it would flag — none do
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: B's OWN repo unresolved / non-lane → skipped, never probed", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const map = classifyIdentity(epics);
+  map.set("fn-2-b", { kind: "unresolved", reason: "test: B unresolved" });
+  const { run, calls } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: [],
+  });
+  expect(await computeStaleBaseLaneEntries(epics, map, run)).toEqual([]);
+  // A non-lane B is skipped before any git spawn.
+  expect(calls.length).toBe(0);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: entries are sorted by (epic_id, repo_dir) for a stable serialization", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b1 = makeEpic({
+    epic_id: "fn-3-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const b2 = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b1, b2]; // deliberately NOT epic-id order
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-3-b", "keeper/epic/fn-2-b"],
+    ancestors: [], // both B's stale
+  });
+  expect(
+    await computeStaleBaseLaneEntries(epics, classifyIdentity(epics), run),
+  ).toEqual([
+    { epic_id: "fn-2-b", repo_dir: "/repo" },
+    { epic_id: "fn-3-b", repo_dir: "/repo" },
+  ]);
+});
+
+test("fn-1127 computeStaleBaseLaneEntries: a CLUSTERED epic is flagged PER-REPO — one group stale, its clean sibling proceeds", async () => {
+  // B clusters into /repo-a + /repo-b; upstream A cuts a worktree lane in both. A's
+  // work is missing from B's base in /repo-a (stale) but contained in /repo-b (clean).
+  const twoRepoTasks = (epicId: string) => [
+    makeTask({
+      task_id: `${epicId}.1`,
+      task_number: 1,
+      target_repo: "/repo-a",
+    }),
+    makeTask({
+      task_id: `${epicId}.2`,
+      task_number: 2,
+      target_repo: "/repo-b",
+    }),
+  ];
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo-a",
+    tasks: twoRepoTasks("fn-1-a"),
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-a",
+    tasks: twoRepoTasks("fn-2-b"),
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const cls = classifyMultiRepo(epics); // flag ON → both cluster into worktree groups
+  expect(cls.get("fn-2-b")?.kind).toBe("clustered");
+  const { run } = clusterGit({
+    "/repo-a": {
+      lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+      ancestors: [], // A missing from B's base in /repo-a → stale
+    },
+    "/repo-b": {
+      lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+      ancestors: ["keeper/epic/fn-1-a"], // A contained in /repo-b → clean
+    },
+  });
+  expect(await computeStaleBaseLaneEntries(epics, cls, run)).toEqual([
+    { epic_id: "fn-2-b", repo_dir: "/repo-a" },
+  ]);
+});
+
+test("fn-1127 the merge-gate cut-deferral is byte-identical with the stale-base probe (independent passes, orthogonal refs)", async () => {
+  // The SAME fixture drives BOTH probes off the SAME git fake: a satisfied same-repo
+  // upstream A present + not-ancestor. The merge-gate reads A-vs-DEFAULT (defers B's
+  // cut); the stale probe reads A-vs-B's-BASE (flags the already-cut lane). Neither
+  // pass touches the other's output — pinned so a stale-probe change can never perturb
+  // the cut-deferral.
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [satisfiedEpicDep("fn-1-a")],
+  });
+  const epics = [a, b];
+  const cls = classifyIdentity(epics);
+  const { run } = gateGit({
+    lanes: ["keeper/epic/fn-1-a", "keeper/epic/fn-2-b"],
+    ancestors: [], // A not-ancestor of default AND not-contained in B's base
+  });
+  const deferredBefore = await computeDeferredEpicIds(epics, cls, run);
+  expect(deferredBefore.get("fn-2-b")).toEqual(new Set(["/repo"]));
+  // The stale probe flags B, using the SAME git fake…
+  expect(await computeStaleBaseLaneEntries(epics, cls, run)).toEqual([
+    { epic_id: "fn-2-b", repo_dir: "/repo" },
+  ]);
+  // …and the merge-gate deferral is byte-identical afterward (independent passes).
+  const deferredAfter = await computeDeferredEpicIds(epics, cls, run);
+  expect(deferredAfter).toEqual(deferredBefore);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1127 — the stale-base lane grace tracker (createStaleBaseLaneTracker). A CLONE
+// of the shared-checkout-wedge tracker, keyed on the per-(epic,repo) distress ID
+// (not a dir): exactly-once mint per continuous stale episode past the grace, the
+// projection-driven level-clear robust across a restart. All expected values are
+// hand-computed constants, never re-derived from the tracker.
+// ---------------------------------------------------------------------------
+
+const STALE_ID_A = staleBaseLaneDistressId("fn-2-b", "/repo");
+const STALE_OBS_A: StaleBaseLaneObservation = {
+  epicId: "fn-2-b",
+  repoDir: "/repo",
+};
+const STALE_ID_B = staleBaseLaneDistressId("fn-3-c", "/repo");
+const STALE_OBS_B: StaleBaseLaneObservation = {
+  epicId: "fn-3-c",
+  repoDir: "/repo",
+};
+
+test("STALE_BASE_LANE_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(STALE_BASE_LANE_GRACE_SEC).toBe(5 * 60);
+});
+
+test("stale tracker: a lane stale past the grace watermark mints EXACTLY once, keyed per-(epic,repo)", () => {
+  const grace = 300;
+  const tracker = createStaleBaseLaneTracker(grace);
+  const stale = new Map([[STALE_ID_A, STALE_OBS_A]]);
+  const empty = new Set<string>();
+  // t=1000 first observed stale → no mint (grace clock starts here).
+  expect(
+    tracker.step({ stale, openDistressIds: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint.
+  expect(
+    tracker.step({ stale, openDistressIds: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-(epic,repo), reason display-mapped.
+  const crossed = tracker.step({
+    stale,
+    openDistressIds: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(STALE_ID_A);
+  expect(crossed.mint[0]?.dir).toBe("/repo");
+  expect(crossed.mint[0]?.reason?.startsWith(STALE_BASE_DISTRESS_REASON)).toBe(
+    true,
+  );
+  expect(crossed.mint[0]?.reason).toContain("fn-2-b");
+  // Subsequent cycles while still stale → NEVER re-mint (O(1) per episode).
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ stale, openDistressIds: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("stale tracker: the storm shape — one persistent stale lane over many cycles yields exactly ONE mint", () => {
+  const grace = 300;
+  const tracker = createStaleBaseLaneTracker(grace);
+  const stale = new Map([[STALE_ID_A, STALE_OBS_A]]);
+  const empty = new Set<string>();
+  let mints = 0;
+  for (let ts = 1000; ts < 5000; ts++) {
+    mints += tracker.step({ stale, openDistressIds: empty, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("stale tracker: a re-based / torn-down lane level-clears the open distress row EXACTLY once", () => {
+  const grace = 300;
+  const tracker = createStaleBaseLaneTracker(grace);
+  const stale = new Map([[STALE_ID_A, STALE_OBS_A]]);
+  const open = new Set([STALE_ID_A]); // the durable open distress row
+  // Still stale → no clear (the row belongs, the base is still stale).
+  expect(
+    tracker.step({ stale, openDistressIds: open, nowSec: 2000 }).clear,
+  ).toEqual([]);
+  // The probe stops reporting it stale (re-based past the upstream or torn down) but
+  // the row is still open → level-clear it once, keyed on the same per-(epic,repo) id.
+  const cleared = tracker.step({
+    stale: new Map(),
+    openDistressIds: open,
+    nowSec: 2001,
+  });
+  expect(cleared.clear.length).toBe(1);
+  expect(cleared.clear[0]?.id).toBe(STALE_ID_A);
+  // Once main folds the clear the row is gone → no re-clear.
+  expect(
+    tracker.step({
+      stale: new Map(),
+      openDistressIds: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("stale tracker: two (epic,repo) lanes stale independently — distinct rows, no collision", () => {
+  const grace = 300;
+  const tracker = createStaleBaseLaneTracker(grace);
+  const empty = new Set<string>();
+  // A stale at t=1000; B stale later at t=1200.
+  tracker.step({
+    stale: new Map([[STALE_ID_A, STALE_OBS_A]]),
+    openDistressIds: empty,
+    nowSec: 1000,
+  });
+  const both = new Map([
+    [STALE_ID_A, STALE_OBS_A],
+    [STALE_ID_B, STALE_OBS_B],
+  ]);
+  tracker.step({ stale: both, openDistressIds: empty, nowSec: 1200 });
+  // At t=1300, A has crossed its grace (started 1000) but B has not (started 1200).
+  const atA = tracker.step({
+    stale: both,
+    openDistressIds: empty,
+    nowSec: 1300,
+  });
+  expect(atA.mint.map((m) => m.id)).toEqual([STALE_ID_A]);
+  // At t=1500, B crosses its own grace — its own distinct row, A does not re-mint.
+  const atB = tracker.step({
+    stale: both,
+    openDistressIds: empty,
+    nowSec: 1500,
+  });
+  expect(atB.mint.map((m) => m.id)).toEqual([STALE_ID_B]);
+  expect(STALE_ID_A).not.toBe(STALE_ID_B);
+});
+
+test("stale tracker: a lane that recovers then re-goes-stale waits the FULL grace again", () => {
+  const grace = 300;
+  const tracker = createStaleBaseLaneTracker(grace);
+  const stale = new Map([[STALE_ID_A, STALE_OBS_A]]);
+  const empty = new Set<string>();
+  // First episode: mint at 1300.
+  tracker.step({ stale, openDistressIds: empty, nowSec: 1000 });
+  expect(
+    tracker.step({ stale, openDistressIds: empty, nowSec: 1300 }).mint.length,
+  ).toBe(1);
+  // Recovers at 1400 (re-arms the in-memory grace clock).
+  tracker.step({ stale: new Map(), openDistressIds: empty, nowSec: 1400 });
+  // Re-goes-stale at 1500 — a NEW episode: no mint until a fresh full grace elapses.
+  expect(
+    tracker.step({ stale, openDistressIds: empty, nowSec: 1500 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ stale, openDistressIds: empty, nowSec: 1799 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ stale, openDistressIds: empty, nowSec: 1800 }).mint.length,
+  ).toBe(1);
+});
+
+test("stale tracker: a restart (fresh tracker) still level-clears a row minted before it, and re-mints at most once", () => {
+  const grace = 300;
+  // Simulate a daemon restart: a brand-new tracker with an empty in-memory clock, but
+  // the durable distress row is still open in the projection.
+  const fresh = createStaleBaseLaneTracker(grace);
+  const open = new Set([STALE_ID_A]);
+  // The lane was re-based/torn down during downtime: not stale now, row still open →
+  // the projection-driven clear fires even though this instance never minted it.
+  const cleared = fresh.step({
+    stale: new Map(),
+    openDistressIds: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([STALE_ID_A]);
+
+  // Alternatively, still stale after the restart: the fresh clock re-arms and re-mints
+  // ONCE after a full grace (the accepted bounded per-restart burst).
+  const fresh2 = createStaleBaseLaneTracker(grace);
+  const stale = new Map([[STALE_ID_A, STALE_OBS_A]]);
+  let mints = 0;
+  for (let ts = 9000; ts < 9000 + 2 * grace; ts++) {
+    mints += fresh2.step({ stale, openDistressIds: open, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
 });
 
 test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH suppressed; a non-deferred sibling still launches (no sticky / dispatch_failures minted)", () => {

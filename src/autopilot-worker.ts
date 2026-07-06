@@ -76,6 +76,7 @@ import {
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
+  isStaleBaseDistressKey,
   isWorktreeLanePremergeReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
@@ -84,6 +85,8 @@ import {
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
+  STALE_BASE_DISTRESS_ID_PREFIX,
+  STALE_BASE_DISTRESS_REASON,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_LANE_PREMERGE_REASON_PREFIX,
 } from "./dispatch-failure-key";
@@ -116,6 +119,7 @@ import {
   type ReconcileState,
   reconcile,
   recoverFailureDispatchId,
+  type StaleBaseLaneEntry,
   type Verb,
   WORKER_EFFORT,
   WORKER_MODEL,
@@ -177,6 +181,7 @@ export {
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
+  isStaleBaseDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
@@ -188,6 +193,9 @@ export {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_VERB,
+  STALE_BASE_DISTRESS_ID_PREFIX,
+  STALE_BASE_DISTRESS_REASON,
+  STALE_BASE_DISTRESS_VERB,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
@@ -203,6 +211,7 @@ export type {
   SlotOccupancyDecision,
   SlotOccupancyInput,
   SlotOccupancySignal,
+  StaleBaseLaneEntry,
   Verb,
   WorktreeLaunchInfo,
   WorktreeRecoveryEscalation,
@@ -1117,6 +1126,23 @@ export function sharedDirtyDistressId(repoDir: string): string {
   return `${SHARED_DIRTY_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
 }
 
+/**
+ * The `dispatch_failures` id a PER-(EPIC,REPO) stale-base-lane distress row keys on —
+ * `stale-base-lane:<epicId>-<repoDirHash(repoDir)>` (composed
+ * `daemon::stale-base-lane:<epicId>-<hash>`). Mirrors {@link
+ * worktreeFinalizeDispatchId}'s per-(epic,repo) shape so an epic whose lane is cut
+ * stale in two repos of a clustered epic keys two DISTINCT rows, and the mint + the
+ * level-clear target the SAME row across cycles (the epic id is dispatch-safe and
+ * {@link repoDirHash} is base36). The synthetic `daemon` verb fails the
+ * `retry_dispatch` wire validator, so only the probe's level-trigger clears it.
+ */
+export function staleBaseLaneDistressId(
+  epicId: string,
+  repoDir: string,
+): string {
+  return `${STALE_BASE_DISTRESS_ID_PREFIX}${epicId}-${repoDirHash(repoDir)}`;
+}
+
 /** A shared-checkout-wedge distress row to mint (past grace) or clear (recovered). */
 export interface SharedWedgeDistressAction {
   id: string;
@@ -1405,6 +1431,104 @@ export function createLaneWedgeTracker(
       for (const dir of openDistressDirs) {
         if (!wedged.has(dir)) {
           decision.clear.push({ id: laneWedgeDistressId(dir), dir });
+        }
+      }
+      return decision;
+    },
+  };
+}
+
+/**
+ * Grace window (producer-`ts` seconds) an already-cut lane may read STALE-BASE before
+ * the probe escalates it into a visible per-(epic,repo) distress row. ~5min — long
+ * enough that a transient mid-finalize window (an upstream landing while its lane is
+ * briefly not-yet-ancestor) settles, short enough that a genuine stale fork surfaces
+ * fast. Injectable so the fast tier drives the grace-crossing without a real clock.
+ * Kept a DISTINCT const from the shared-checkout / lane grace so the two can diverge.
+ */
+export const STALE_BASE_LANE_GRACE_SEC = 5 * 60;
+
+/** One flagged stale-base lane the probe hands the tracker (its `id` context). */
+export interface StaleBaseLaneObservation {
+  /** The epic whose lane is stale — mint attribution. */
+  epicId: string;
+  /** The RESOLVED lane repo — the row's `dir` column + mint attribution. */
+  repoDir: string;
+}
+
+/**
+ * Per-(epic,repo) grace tracker for the stale-base lane distress — a CLONE of {@link
+ * createSharedCheckoutWedgeTracker} on its own id/reason/surface, so the shared-
+ * checkout and lane escalations stay byte-untouched and the surfaces never share a
+ * row. Identical contract: pure of keeper.db / IO / the wall clock (the producer `ts`
+ * is the only clock); in-memory grace + per-key minted-latch for an exactly-once mint
+ * per continuous stale episode; projection-driven level-clear robust across a restart.
+ * KEYED ON THE DISTRESS ID directly (`stale-base-lane:<epicId>-<repoHash>`), unlike the
+ * shared-checkout tracker's dir key: the per-(epic,repo) hash is one-way, so the OPEN
+ * set carries the ids, and the level-clear compares ids without recomputing a hash.
+ */
+export interface StaleBaseLaneTracker {
+  step(input: {
+    /** This cycle's stale lanes, keyed by distress id → its (epic, repo) context. */
+    stale: ReadonlyMap<string, StaleBaseLaneObservation>;
+    /** The distress IDS with an OPEN row (from the projection). */
+    openDistressIds: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+/**
+ * Build a {@link StaleBaseLaneTracker}. `graceSec` is injectable for the cadence test.
+ * A near-verbatim sibling of {@link createSharedCheckoutWedgeTracker} keyed on the
+ * per-(epic,repo) distress id (never a dir), so the mid-merge path stays byte-untouched
+ * and the two distress surfaces never share a row.
+ */
+export function createStaleBaseLaneTracker(
+  graceSec: number = STALE_BASE_LANE_GRACE_SEC,
+): StaleBaseLaneTracker {
+  // distress id → the first cycle-ts it was seen stale + whether we have minted the
+  // distress for THIS continuous stale episode. In-worker memory only.
+  const firstStale = new Map<string, { sinceSec: number; minted: boolean }>();
+  const graceMin = Math.round(graceSec / 60);
+  return {
+    step({ stale, openDistressIds, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: track each stale lane's grace clock; cross the watermark once.
+      for (const [id, obs] of stale) {
+        let entry = firstStale.get(id);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstStale.set(id, entry);
+        }
+        if (!entry.minted && nowSec - entry.sinceSec >= graceSec) {
+          entry.minted = true;
+          decision.mint.push({
+            id,
+            dir: obs.repoDir,
+            reason:
+              `${STALE_BASE_DISTRESS_REASON}: epic ${obs.epicId}'s worktree lane in ` +
+              `${obs.repoDir} has stayed forked off a STALE base past the ${graceMin}min ` +
+              `grace — the lane was cut before a landed same-repo upstream merged, so its ` +
+              `base is missing that upstream's work and its workers hit DEPENDENCY_BLOCKED ` +
+              `with nothing naming the cause. The autopilot will NOT auto-rebase it: tear ` +
+              `the stale lane down (keeper autopilot retry / force-close the epic) so it ` +
+              `re-provisions off fresh default, or hand-rebase the base.`,
+          });
+        }
+      }
+      // Re-arm any lane no longer stale this cycle so a future re-stale waits the full
+      // grace again (the in-memory episode is closed).
+      for (const id of firstStale.keys()) {
+        if (!stale.has(id)) {
+          firstStale.delete(id);
+        }
+      }
+      // CLEAR layer: level-trigger off the durable open-distress set — any open row no
+      // longer reported stale this cycle (re-based past the upstream or torn down)
+      // clears (robust across a restart).
+      for (const id of openDistressIds) {
+        if (!stale.has(id)) {
+          decision.clear.push({ id, dir: "" });
         }
       }
       return decision;
@@ -2088,6 +2212,195 @@ export async function computeMergedLaneEntries(
     }
   }
   out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
+  return out;
+}
+
+/**
+ * Compute the EPHEMERAL STALE-BASE lane set (fn-1127): every epic whose ALREADY-CUT
+ * worktree lane `keeper/epic/<id>` was forked off a base DEFINITIVELY MISSING a
+ * satisfied same-resolved-repo upstream's landed work. The merge-gate ({@link
+ * computeDeferredEpicIds}) only DEFERS a cut; by construction it can never see a lane
+ * ALREADY cut stale (a race, a lane that predates the upstream's landing), so its
+ * workers hit DEPENDENCY_BLOCKED with nothing on the board naming the cause. This
+ * producer probe — a SIBLING to the merge-gate probes, NEVER modifying them — surfaces
+ * it. Producer-side + git-touching, probed ONCE per cycle in {@link
+ * loadReconcileSnapshot} (gated on {@link worktreeMode}); read back by the stale-base
+ * grace tracker as plain {@link ReconcileSnapshot.staleBaseLaneEntries} data. NEVER a
+ * fold input; mints NO `dispatch_failures` row itself (the tracker escalates it).
+ * DETECTION + LOUD SURFACING ONLY — never auto-remediation, never touching the
+ * cut-deferral, never enriching the worker-authored DEPENDENCY_BLOCKED prose.
+ *
+ * Per epic B with a PRESENT lane in `repoR`, walk its DIRECT satisfied same-resolved-
+ * repo upstreams A and verdict whether A's landed work is present in B's base. THE REF
+ * TEST IS THE DESIGN CORE, chosen deliberately AGAINST the {@link
+ * computeMergedLaneEntries} vacuous-ancestor precedent: `isAncestorOf(A_lane, B_base)`
+ * puts A's lane as the maybeANCESTOR and B's base as the ref. A freshly-cut / empty
+ * lane is a vacuous ancestor of everything DOWNSTREAM of its fork, so this direction
+ * resolves the vacuous case to `ancestor` → NOT stale (the SAFE outcome — an empty A
+ * contributes nothing) rather than a false stale; the INVERSE direction
+ * (`isAncestorOf(B_base, A_lane)`) would vacuously pass a fresh B and MISS a real
+ * stale. Only a DEFINITIVE not-ancestor (git exit 1 — A's real commits are absent from
+ * B's base) flags stale. Every inconclusive arm DEFERS to no-flag (a false distress is
+ * worse than a late one):
+ *  - enumeration FAILED / timed out → no flag (never read as "the lane is absent");
+ *  - B's lane DEFINITIVELY ABSENT (a successful enumeration that omits it) → torn-down
+ *    / serial B, no stale base to surface → skip;
+ *  - upstream A's lane DEFINITIVELY ABSENT → merged-and-torn-down (its ref is gone, so
+ *    the ancestry test is unrunnable) → inconclusive → skip this upstream;
+ *  - ancestry TIMEOUT (124) / ambiguous-ref error (128) → inconclusive → skip;
+ *  - a thrown git probe degrades THAT (epic, repo) to no-flag; NEVER throws out of the
+ *    snapshot build.
+ * UNION over upstreams: B's `repoR` lane is flagged stale IFF ANY direct satisfied
+ * same-repo upstream is DEFINITIVELY missing. A dangling / null / cross-repo / non-lane
+ * / reaped / disabled / serial upstream folds to skip (mirroring {@link
+ * computeDeferredEpicIds}). The per-repo lane-enumeration is memoized so N epics
+ * sharing one repo enumerate once; A's toplevel reuses the classification map.
+ */
+export async function computeStaleBaseLaneEntries(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+): Promise<StaleBaseLaneEntry[]> {
+  // Per-repo lane-enumeration memo — N same-repo epics enumerate ONCE. A throwing
+  // probe degrades to `{ ok: false }` (→ no flag for this repo), never out of build.
+  const laneSetByRepo = new Map<string, EpicLaneBranchSet>();
+  const enumerateLanes = async (
+    repoDir: string,
+  ): Promise<EpicLaneBranchSet> => {
+    const hit = laneSetByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: EpicLaneBranchSet;
+    try {
+      value = await gitEnumerateEpicLaneBranches(repoDir, run);
+    } catch {
+      value = { ok: false }; // enumeration error → no flag for this repo's epics
+    }
+    laneSetByRepo.set(repoDir, value);
+    return value;
+  };
+
+  // TRI-STATE containment probe: is `maybeAncestor` DEFINITIVELY contained in `ref`?
+  //  - exit 0 → `contained` (A's landed work is in B's base → NOT stale);
+  //  - exit 1 → `missing` (A's real commits are DEFINITIVELY absent → STALE);
+  //  - any other exit (124 timeout / 128 ambiguous ref / spawn fail / throw) →
+  //    `inconclusive` → DEFER to no-flag. The boolean {@link gitIsAncestorOf} collapses
+  //    exit-1 and timeout to the same `false`, which would turn an inconclusive probe
+  //    into a false stale — so the flag arm needs this three-way distinction directly.
+  const containment = async (
+    cwd: string,
+    maybeAncestor: string,
+    ref: string,
+  ): Promise<"contained" | "missing" | "inconclusive"> => {
+    let code: number;
+    try {
+      const r = await run(["merge-base", "--is-ancestor", maybeAncestor, ref], {
+        cwd,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      });
+      code = r.code;
+    } catch {
+      return "inconclusive";
+    }
+    if (code === 0) {
+      return "contained";
+    }
+    if (code === 1) {
+      return "missing";
+    }
+    return "inconclusive";
+  };
+
+  const out: StaleBaseLaneEntry[] = [];
+  for (const epic of epics) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution === undefined) {
+      continue;
+    }
+    // The repos where B cuts a WORKTREE lane forked off a base — the only lanes a
+    // stale base can afflict. A serial / multi-repo / unresolved / reject cuts none.
+    const laneRepos = worktreeLaneRepoDirs(resolution);
+    if (laneRepos.length === 0) {
+      continue;
+    }
+    const deps = epic.resolved_epic_deps;
+    if (deps === null) {
+      continue;
+    }
+    const bBase = baseBranchFor(epic.epic_id);
+    for (const repoR of laneRepos) {
+      try {
+        const lanes = await enumerateLanes(repoR);
+        if (!lanes.ok) {
+          continue; // enumeration inconclusive → never claim stale off a failed probe
+        }
+        // B's OWN lane must be PRESENT to be stale: a torn-down / never-cut base
+        // carries no stale workers to surface. (A definitive absence, distinct from a
+        // failed enumeration handled above.)
+        if (!lanes.branches.has(bBase)) {
+          continue;
+        }
+        let stale = false;
+        for (const dep of deps) {
+          // Only a SATISFIED (landed) upstream can leave a stale base — the bug is
+          // "cut before the upstream LANDED". A blocked-incomplete / dangling dep is
+          // the readiness gate's / merge-gate's concern, never a stale-base source.
+          if (dep.state !== "satisfied") {
+            continue;
+          }
+          const upstreamId = dep.resolved_epic_id;
+          if (upstreamId === null) {
+            continue; // dangling/ambiguous — skip (mirrors computeDeferredEpicIds)
+          }
+          const upstreamRes = worktreeRepoByEpicId.get(upstreamId);
+          // Same-resolved-repo gate: A must have cut a WORKTREE lane in B's exact
+          // `repoR` (decided by the RESOLVED toplevel, NEVER `dep.cross_project`). A
+          // reaped / non-lane / serial / cross-repo upstream never affects B's base.
+          if (
+            upstreamRes === undefined ||
+            !hasWorktreeLaneInRepo(upstreamRes, repoR)
+          ) {
+            continue;
+          }
+          const aLane = baseBranchFor(upstreamId);
+          if (!lanes.branches.has(aLane)) {
+            // A's lane is DEFINITIVELY absent (merged-and-torn-down): its ref is gone,
+            // so `isAncestorOf(A_lane, B_base)` is unrunnable → inconclusive → skip
+            // this upstream (never flag off an absent ref — an ambiguous-ref defer).
+            continue;
+          }
+          const verdict = await containment(repoR, aLane, bBase);
+          if (verdict === "missing") {
+            // A's real landed commits are DEFINITIVELY absent from B's base → the lane
+            // was cut off a stale base. UNION: one missing upstream flags the lane.
+            console.error(
+              `[autopilot-worker] stale-base probe: flagging ${epic.epic_id}@${repoR} — lane base (${bBase}) is missing landed upstream ${upstreamId} (${aLane})`,
+            );
+            stale = true;
+            break;
+          }
+          // `contained` (A in B's base) or `inconclusive` (timeout/ambiguous) → this
+          // upstream contributes no flag; a sibling upstream may still flag.
+        }
+        if (stale) {
+          out.push({ epic_id: epic.epic_id, repo_dir: repoR });
+        }
+      } catch (err) {
+        // A git probe threw — NO flag for this (epic, repo) (a false distress is worse
+        // than a late one). The snapshot build never sees the throw.
+        console.error(
+          `[autopilot-worker] stale-base probe: skipping ${epic.epic_id}@${repoR} — probe threw:`,
+          err,
+        );
+      }
+    }
+  }
+  out.sort((a, b) =>
+    a.epic_id === b.epic_id
+      ? a.repo_dir.localeCompare(b.repo_dir)
+      : a.epic_id.localeCompare(b.epic_id),
+  );
   return out;
 }
 
@@ -5047,6 +5360,12 @@ export async function loadReconcileSnapshot(
   // The lane PATHS with an OPEN per-lane wedge distress row — the level-clear set the
   // recover pass's lane grace tracker clears against (a lane ready/gone this cycle).
   const laneWedgeDistressDirs = new Set<string>();
+  // The distress IDS with an OPEN per-(epic,repo) stale-base-lane distress row — the
+  // level-clear set the stale-base grace tracker clears against (a lane re-based past
+  // its upstream or torn down this cycle). Collected off the row's ID (the
+  // per-(epic,repo) hash is one-way), so a restarted worker still clears a stale-base
+  // distress it minted before the restart.
+  const staleBaseDistressIds = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
@@ -5071,6 +5390,12 @@ export async function loadReconcileSnapshot(
         if (typeof dir === "string" && dir.length > 0) {
           laneWedgeDistressDirs.add(dir);
         }
+      }
+      if (isStaleBaseDistressKey(verb, id)) {
+        // Collected off the ID (the level-clear compares ids, not a recomputed hash);
+        // disjoint from every dir-keyed distress set above by the `stale-base-lane:`
+        // id prefix, so the four distress surfaces never cross-classify.
+        staleBaseDistressIds.add(id);
       }
       // A fan-in LANE pre-merge row (its REASON, verb-agnostic — the `daemon`-verb
       // lane WEDGE distress reason is excluded by `isLaneWedgeDistressKey` above and by
@@ -5299,6 +5624,18 @@ export async function loadReconcileSnapshot(
     ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
     : [];
 
+  // The STALE-BASE lane set (fn-1127) — every already-cut lane forked off a base
+  // missing a landed same-repo upstream's work. A SIBLING probe to the merge-gate /
+  // merge-landed passes (never modifying them), reusing `worktreeRepoByEpicId`'s
+  // already-resolved toplevels (no extra toplevel spawns — only per-repo
+  // lane-enumeration + ancestry reads, memoized inside). Gated on `worktreeMode` so an
+  // OFF cycle adds ZERO git spawns + emits an empty set. Detection + surfacing ONLY:
+  // the merge-gate's cut-deferral is untouched. NEVER throws (every arm degrades to
+  // no-flag).
+  const staleBaseLaneEntries = worktreeMode
+    ? await computeStaleBaseLaneEntries(epics, worktreeRepoByEpicId)
+    : [];
+
   // The producer LIVE-JOB dirty attribution the fan-in pre-merge clean consults so it
   // never discards dirt a running worker owns — keyed by lane worktree path. A raw
   // read of undischarged `file_attributions` filtered to LIVE sessions. `null` on ANY
@@ -5329,6 +5666,7 @@ export async function loadReconcileSnapshot(
     sharedDirtyDistressDirs,
     laneFailures,
     laneWedgeDistressDirs,
+    staleBaseDistressIds,
     liveTabKeys,
     livePaneIds,
     paneCommandById,
@@ -5345,6 +5683,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     landedLaneEntries,
+    staleBaseLaneEntries,
     liveAttributedDirtyByWorktree,
     worktreesRoot,
   };
@@ -5458,6 +5797,12 @@ function main(): void {
   // per-lane distress row. In-worker memory only; a restart re-arms it. Distinct
   // surface from the shared-checkout trackers so the rows never cross-clear.
   const laneWedgeTracker = createLaneWedgeTracker();
+  // Per-(epic,repo) grace tracker escalating an already-cut lane whose base is STALE
+  // (forked before a landed same-repo upstream merged) past the grace into its own
+  // per-(epic,repo) distress row. Fed off the producer probe on the snapshot (NOT the
+  // recover pass), so it runs independent of `deps.worktree`. In-worker memory only; a
+  // restart re-arms it. Distinct surface so the rows never cross-clear.
+  const staleBaseLaneTracker = createStaleBaseLaneTracker();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -6068,6 +6413,52 @@ function main(): void {
           } catch (err) {
             console.error(
               "[autopilot-worker] worktree recovery threw (non-fatal):",
+              err,
+            );
+          }
+        }
+        // Stale-base lane distress escalation (fn-1127): the producer probe (gated on
+        // worktree mode, on the snapshot) flagged each already-cut lane whose satisfied
+        // same-repo upstream's landed work is DEFINITIVELY missing from its base.
+        // DETECTION-ONLY — never touches the merge-gate cut-deferral, never enriches the
+        // worker-authored DEPENDENCY_BLOCKED prose. A lane stale past the grace mints a
+        // per-(epic,repo) distress row; the level-clear off the OPEN distress ids fires
+        // the cycle the probe stops reporting it stale (re-based past the upstream or
+        // torn down). Runs OUTSIDE the recover-pass block (its input is the snapshot,
+        // not `deps.worktree`), gated on worktree mode + not-paused (a synthetic write,
+        // mirroring the recover escalations); the level-trigger resumes on unpause. The
+        // SAME verb-neutral distress channel as the shared-checkout / lane rows — the
+        // `id` carries the `stale-base-lane` prefix, so main mints/clears the right
+        // synthetic-verb row. No-op when the escalation deps are absent (fake-deps).
+        if (snapshot.worktreeMode && !state.paused) {
+          try {
+            const staleObs = new Map<string, StaleBaseLaneObservation>();
+            for (const e of snapshot.staleBaseLaneEntries ?? []) {
+              const id = staleBaseLaneDistressId(e.epic_id, e.repo_dir);
+              // First entry per id wins (the probe already dedupes per (epic,repo)).
+              if (!staleObs.has(id)) {
+                staleObs.set(id, { epicId: e.epic_id, repoDir: e.repo_dir });
+              }
+            }
+            const staleDecision = staleBaseLaneTracker.step({
+              stale: staleObs,
+              openDistressIds: snapshot.staleBaseDistressIds ?? new Set(),
+              nowSec: deps.now(),
+            });
+            for (const m of staleDecision.mint) {
+              deps.emitSharedWedgeDistress?.({
+                id: m.id,
+                dir: m.dir,
+                reason: m.reason ?? STALE_BASE_DISTRESS_REASON,
+                ts: deps.now(),
+              });
+            }
+            for (const c of staleDecision.clear) {
+              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] stale-base lane distress step threw (non-fatal):",
               err,
             );
           }
