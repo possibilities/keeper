@@ -1635,9 +1635,12 @@ export function buildWorktreeStatusEntries(
 /**
  * Compute the EPHEMERAL cross-epic merge-gate defer map, keyed PER (epic, repoDir):
  * epic id → the set of its lane repos whose lane MUST NOT be cut this cycle because a
- * SATISFIED same-resolved-repo upstream GROUP is not yet contained in that repo's
- * LOCAL default branch (so cutting the lane would fork it off a stale base, inverting
- * merge order). Producer-side + git-touching — probed ONCE per cycle in
+ * same-resolved-repo upstream GROUP is not yet contained in that repo's LOCAL default
+ * branch — either a SATISFIED upstream whose lane is not yet an ancestor of default,
+ * or a BLOCKED-INCOMPLETE (still-open) upstream that cut a same-repo lane (trivially
+ * not-yet-contained, deferred probe-free). Cutting the lane off such a base would
+ * fork it off a stale base, inverting merge order. Producer-side + git-touching —
+ * probed ONCE per cycle in
  * {@link loadReconcileSnapshot}, read back by the pure `reconcile` as plain
  * {@link ReconcileSnapshot.deferredEpicIds} data. NEVER a fold input; mints NO
  * sticky / `dispatch_failures` row — a deferred group re-evaluates every cycle and
@@ -1653,10 +1656,13 @@ export function buildWorktreeStatusEntries(
  * ({@link hasWorktreeLaneInRepo}; same-resolved-repo is decided by the RESOLVED git
  * toplevel from {@link classifyWorktreeRepos} — the shared per-cycle memo — NEVER
  * `dep.cross_project`: two epics can share a repo across project basenames), probe A's
- * `keeper/epic/A` merge state in `repoR`. UNION semantics — B defers `repoR` if ANY
- * such upstream group is unmerged OR its probe is inconclusive. A downstream group
- * whose repo has NO matching upstream group is absent from the map and proceeds; a
- * cross-repo upstream (a lane in a DIFFERENT repo) never gates `repoR`.
+ * `keeper/epic/A` merge state in `repoR`. A `blocked-incomplete` dep whose resolved
+ * upstream cut a same-repo lane defers `repoR` IMMEDIATELY — probe-free — because a
+ * still-open upstream is definitionally not yet an ancestor of default. UNION
+ * semantics — B defers `repoR` if ANY such upstream group is unmerged, still open, OR
+ * its probe is inconclusive. A downstream group whose repo has NO matching upstream
+ * group is absent from the map and proceeds; a cross-repo upstream (a lane in a
+ * DIFFERENT repo) never gates `repoR`.
  *  - lane `keeper/epic/A` PRESENT ∧ an ancestor of LOCAL default → merged;
  *  - PRESENT ∧ NOT an ancestor (or the ancestry probe errored/timed out — both
  *    collapse to `isAncestorOf`→`false`) → DEFER;
@@ -1669,7 +1675,9 @@ export function buildWorktreeStatusEntries(
  * Conservative-degrade: in this level-triggered reconciler an inconclusive VCS probe
  * DEFERS (self-heals next cycle) — a stale fork would be permanent. A dangling /
  * null / cross-repo / non-lane / reaped upstream folds to "skip this upstream"
- * (not-gating), mirroring {@link computeEligibleEpics}; the probe NEVER throws out of
+ * (not-gating) whether it is satisfied OR blocked-incomplete — a blocked upstream
+ * gates ONLY when it cut a lane in `repoR`, mirroring {@link computeEligibleEpics};
+ * the probe NEVER throws out of
  * the snapshot build (a thrown git probe degrades THAT (epic, repo) group to DEFER).
  * The LOCAL default is the same {@link gitResolveDefaultBranch} the provision
  * fork-source uses (NOT `origin/<default>`) so the ancestry ref matches the base a
@@ -1754,9 +1762,36 @@ export async function computeDeferredEpicIds(
     for (const repoR of laneRepos) {
       try {
         for (const dep of deps) {
-          // Only a SATISFIED (done) upstream can already carry a lane to merge; a
-          // blocked-incomplete / dangling dep blocks B through the normal readiness
-          // gate, never here.
+          // A BLOCKED-INCOMPLETE upstream that cut a same-resolved-repo worktree lane
+          // is trivially not-yet-contained in LOCAL default (its `keeper/epic/A` lane
+          // is still open), so cutting B's lane off that base forks it off a stale
+          // base and inverts merge order exactly as an unmerged satisfied upstream
+          // would — defer probe-free (an open epic is definitionally unmerged; no
+          // enumeration/ancestry needed). Dangling (null id), reaped (absent from the
+          // map), disabled/serial, cross-repo, and no-lane-in-`repoR` blocked
+          // upstreams fold to skip, identically to a satisfied one in the same shape.
+          if (dep.state === "blocked-incomplete") {
+            const blockedUpstreamId = dep.resolved_epic_id;
+            if (blockedUpstreamId === null) {
+              continue; // dangling-shaped blocked edge — not-gating
+            }
+            const blockedUpstreamRes =
+              worktreeRepoByEpicId.get(blockedUpstreamId);
+            if (
+              blockedUpstreamRes !== undefined &&
+              hasWorktreeLaneInRepo(blockedUpstreamRes, repoR)
+            ) {
+              console.error(
+                `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — upstream ${blockedUpstreamId} still open (blocked-incomplete lane not yet merged into LOCAL default)`,
+              );
+              markDeferred(epic.epic_id, repoR);
+              break;
+            }
+            continue;
+          }
+          // Only a SATISFIED (done) upstream reaches the merge probe below; a
+          // `dangling` dep (blocked-incomplete is handled just above) blocks B
+          // through the normal readiness gate, never here.
           if (dep.state !== "satisfied") {
             continue;
           }
