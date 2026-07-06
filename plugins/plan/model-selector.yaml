@@ -33,6 +33,14 @@ usage: |
   pick UP: the higher-capability model and xhigh effort. A wrong routing-up costs
   tokens; a wrong routing-down costs a failed task.
 
+# Provenance for the efforts guidance blocks as a whole — the effort axis has no
+# per-value research cache, so one review stamp covers the set. OPTIONAL and
+# fail-closed: an absent key or a non-"researched" status reads as stub effort
+# guidance in `--state`. Read only by the state mode, never the `--check` gate.
+efforts_provenance:
+  last_reviewed: 2026-07-06
+  status: stub
+
 # One guidance block per configured `efforts:` axis value (subagents.yaml).
 # Concrete, behavioral, worker-facing selection advice — when to route a task to
 # this effort. Keep each block short: the whole config rides in every selector
@@ -92,7 +100,7 @@ models:
 research:
   opus:
     reference: skills/model-guidance/references/opus.md
-    sha256: 8af8eaa19f62a59684796458b50a98cbd3cea95202a9cb1a65d8873e48a4e11e
+    sha256: 7f4a160d704ae0f05e4543f3c37d61be3d1d6f89e6d76dd044486ac38997a6c4
   sonnet:
     reference: skills/model-guidance/references/sonnet.md
-    sha256: 482f0932135f95b41b81df37c6bc8677a8a8ccb99aaf6137e0bedd244047537e
+    sha256: 8cccf80012d386b6a2cbbe1f72d3569364413312eff496fa1cb4aeee0bcb6be5

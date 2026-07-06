@@ -12,8 +12,12 @@ import { join, resolve } from "node:path";
 import {
   checkModelGuidance,
   checkModelGuidanceFromDisk,
+  classifyModelGuidance,
+  classifyModelGuidanceFromDisk,
   type GuidanceCheckInput,
+  type GuidanceStateInput,
   loadModelSelectorConfig,
+  type ModelSelectorConfig,
 } from "../scripts/model-guidance-check.ts";
 import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 
@@ -52,6 +56,19 @@ describe("on-disk selector config", () => {
   test("subagents.yaml header cross-references model-selector.yaml", () => {
     const text = readFileSync(join(PLAN_ROOT, "subagents.yaml"), "utf-8");
     expect(text).toContain("model-selector.yaml");
+  });
+
+  test("state mode classifies opus fresh, sonnet stub, and every effort present", () => {
+    const matrix = loadSubagentsMatrixFromDisk(
+      join(PLAN_ROOT, "subagents.yaml"),
+    );
+    const state = classifyModelGuidanceFromDisk(PLAN_ROOT);
+    expect(state.models.opus.state).toBe("fresh");
+    expect(state.models.opus.hash_parity).toBe(true);
+    expect(state.models.sonnet.state).toBe("stub");
+    for (const effort of matrix.efforts) {
+      expect(state.efforts[effort].state).toBe("present");
+    }
   });
 });
 
@@ -167,5 +184,204 @@ describe("model-guidance check core", () => {
     });
     expect(result.ok).toBe(false);
     expect(result.errors.some((e) => e.includes("ghost"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// state classifier core — fail-closed lattice driven by hand-built independent
+// inputs (reference text + hash + expected state all authored here, never
+// re-derived from the config or reference file under test).
+// ---------------------------------------------------------------------------
+
+const STATE_HASH = "c".repeat(64);
+const STATE_OTHER_HASH = "d".repeat(64);
+const STATE_REF = "skills/model-guidance/references/opus.md";
+
+// A reference file with the given provenance body inside its first comment
+// block. The H1 precedes the block (the parser is not byte-0-anchored) and the
+// prose body deliberately contains `status:` / `resolves_to:` bait to prove only
+// the first comment block is read, never body text.
+function refWith(provenanceBody: string): string {
+  return [
+    "# Research cache — `opus`",
+    "",
+    "<!--",
+    "provenance:",
+    provenanceBody,
+    "-->",
+    "",
+    "This prose body mentions status: researched and resolves_to: wrong as bait",
+    "— only the first comment block is trusted, never the body.",
+    "",
+  ].join("\n");
+}
+
+// `researched: 2026-07-04` is a YAML 1.1 timestamp (parses to a Date), so this
+// fixture also exercises the Date-typed date field.
+const RESEARCHED_REF = refWith(
+  "  resolves_to: claude-opus-4-8\n  researched: 2026-07-04\n  status: researched",
+);
+const STUB_REF = refWith(
+  "  resolves_to: claude-opus-4-8\n  researched: 2026-07-04\n  status: stub",
+);
+// `status: no` is the Norway problem — YAML 1.1 coerces it to a boolean.
+const COERCED_STATUS_REF = refWith("  researched: 2026-07-04\n  status: no");
+const NO_HEADER_REF =
+  "# Research cache — `opus`\n\nNo provenance comment block at all, only prose.\n";
+const HEADER_NOT_FIRST_REF = [
+  "# Research cache — `opus`",
+  "",
+  "<!-- editorial note, not provenance -->",
+  "",
+  "<!--",
+  "provenance:",
+  "  status: researched",
+  "-->",
+  "",
+].join("\n");
+
+function baseStateInput(): GuidanceStateInput {
+  return {
+    efforts: ["medium", "high"],
+    models: ["opus"],
+    config: {
+      selector: { harness: "claude", model: "opus" },
+      usage: "weigh model then effort",
+      efforts: { medium: "m", high: "h" },
+      models: { opus: "o" },
+      research: { opus: { reference: STATE_REF, sha256: STATE_HASH } },
+      efforts_provenance: { status: "researched", last_reviewed: "2026-07-06" },
+    },
+    referenceText: () => RESEARCHED_REF,
+    referenceHash: () => STATE_HASH,
+  };
+}
+
+describe("model-guidance state core", () => {
+  test("researched status with hash parity is fresh, emitting the parsed facts", () => {
+    const result = classifyModelGuidance(baseStateInput());
+    expect(result.models.opus).toEqual({
+      state: "fresh",
+      hash_parity: true,
+      status: "researched",
+      researched: "2026-07-04",
+      resolves_to: "claude-opus-4-8",
+    });
+  });
+
+  test("researched status with a drifted hash is stale, never fresh", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceHash: () => STATE_OTHER_HASH,
+    });
+    expect(result.models.opus.state).toBe("stale");
+    expect(result.models.opus.hash_parity).toBe(false);
+  });
+
+  test("an explicit stub status is stub even with hash parity", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceText: () => STUB_REF,
+    });
+    expect(result.models.opus.state).toBe("stub");
+    expect(result.models.opus.status).toBe("stub");
+  });
+
+  test("a coerced (non-string) status classifies as stub with a null status fact", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceText: () => COERCED_STATUS_REF,
+    });
+    expect(result.models.opus.state).toBe("stub");
+    expect(result.models.opus.status).toBeNull();
+  });
+
+  test("a reference with no comment block is stub with all-null facts", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceText: () => NO_HEADER_REF,
+    });
+    expect(result.models.opus.state).toBe("stub");
+    expect(result.models.opus.status).toBeNull();
+    expect(result.models.opus.researched).toBeNull();
+    expect(result.models.opus.resolves_to).toBeNull();
+  });
+
+  test("provenance in a later comment block is ignored — only the first is read", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceText: () => HEADER_NOT_FIRST_REF,
+    });
+    expect(result.models.opus.state).toBe("stub");
+    expect(result.models.opus.status).toBeNull();
+  });
+
+  test("a model with no guidance block is missing", () => {
+    const input = baseStateInput();
+    const result = classifyModelGuidance({
+      ...input,
+      config: { ...input.config, models: {} },
+    });
+    expect(result.models.opus.state).toBe("missing");
+  });
+
+  test("a model with no research entry is missing", () => {
+    const input = baseStateInput();
+    const result = classifyModelGuidance({
+      ...input,
+      config: { ...input.config, research: {} },
+    });
+    expect(result.models.opus.state).toBe("missing");
+  });
+
+  test("a model whose reference file is absent on disk is missing", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceText: () => null,
+    });
+    expect(result.models.opus.state).toBe("missing");
+    expect(result.models.opus.hash_parity).toBeNull();
+  });
+
+  test("effort values are present when a block exists, missing otherwise", () => {
+    const input = baseStateInput();
+    const result = classifyModelGuidance({
+      ...input,
+      efforts: ["medium", "high", "max"], // config has no `max` block
+    });
+    expect(result.efforts.medium.state).toBe("present");
+    expect(result.efforts.high.state).toBe("present");
+    expect(result.efforts.max.state).toBe("missing");
+  });
+
+  test("the config's efforts provenance stamp passes through", () => {
+    const result = classifyModelGuidance(baseStateInput());
+    expect(result.efforts_provenance).toEqual({
+      status: "researched",
+      last_reviewed: "2026-07-06",
+    });
+  });
+
+  test("a config lacking the efforts provenance key classifies totally, defaulting to stub", () => {
+    const config: ModelSelectorConfig = {
+      selector: { harness: "claude", model: "opus" },
+      usage: "u",
+      efforts: { medium: "m", high: "h" },
+      models: { opus: "o" },
+      research: { opus: { reference: STATE_REF, sha256: STATE_HASH } },
+    };
+    const result = classifyModelGuidance({
+      efforts: ["medium", "high"],
+      models: ["opus"],
+      config,
+      referenceText: () => RESEARCHED_REF,
+      referenceHash: () => STATE_HASH,
+    });
+    expect(result.efforts_provenance).toEqual({
+      status: "stub",
+      last_reviewed: null,
+    });
+    expect(result.models.opus.state).toBe("fresh");
+    expect(result.efforts.medium.state).toBe("present");
   });
 });

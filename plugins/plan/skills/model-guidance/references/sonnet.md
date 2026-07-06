@@ -5,6 +5,7 @@ provenance:
   model_id: sonnet            # subagents.yaml models: axis value
   resolves_to: Claude Sonnet-tier alias
   researched: 2026-07-05
+  status: stub                   # provenance state: hand-authored placeholder, not yet a real research pass
   method: model-capability review from available Anthropic guidance + in-repo worker routing needs
   sources:
     - Anthropic model guidance for Sonnet-tier models: balanced capability, lower cost/latency than Opus-tier, suitable for most coding tasks
