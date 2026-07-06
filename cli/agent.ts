@@ -48,7 +48,17 @@
  * dependency.
  */
 
-import { main as launcherMain, realDeps } from "../src/agent/main";
+import {
+  KEEPER_AGENT_HELP,
+  splitSubcommand,
+  USAGE,
+  VERSION,
+} from "../src/agent/dispatch";
+import {
+  main as launcherMain,
+  type MainDeps,
+  realDeps,
+} from "../src/agent/main";
 
 /** Bun 1.3 throws this shape when posix_spawn cannot resolve the target. */
 function isSpawnNotFound(err: unknown): err is { path: string } {
@@ -61,12 +71,48 @@ function isSpawnNotFound(err: unknown): err is { path: string } {
 }
 
 /**
- * Subcommand entry. `cli/keeper.ts` routes `keeper agent <rest...>` here with
- * `argv` already stripped of the `agent` token; the launcher's own
- * `splitSubcommand` pre-pass then classifies the leading agent/verb token.
+ * Route the pure meta modes — top-level help, version, and the leading
+ * wrapper-help (`--x-help`) — that render from static text alone, returning true
+ * when handled. These MUST short-circuit before {@link realDeps}, which runs the
+ * launcher state-dir migration: `keeper agent --help`/`--version` touch no state
+ * dir, db, or daemon, so the argv intent is classified BEFORE any dependency is
+ * built. `splitSubcommand` is pure (db.ts stays off this path).
  */
-export async function main(argv: string[]): Promise<void> {
-  const deps = { ...realDeps(), argv };
+export function routeMetaBeforeDeps(
+  argv: string[],
+  write: (s: string) => void,
+): boolean {
+  switch (splitSubcommand(argv).kind) {
+    case "help":
+      write(USAGE);
+      return true;
+    case "version":
+      write(VERSION);
+      return true;
+    case "help-wrapper":
+      write(KEEPER_AGENT_HELP);
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Subcommand entry. `cli/keeper.ts` routes `keeper agent <rest...>` here with
+ * `argv` already stripped of the `agent` token; help/version short-circuit
+ * before deps (see {@link routeMetaBeforeDeps}), and every launch path builds
+ * the production deps and hands to the launcher, whose own `splitSubcommand`
+ * pre-pass then classifies the leading agent/verb token. `buildDeps` is a seam
+ * so a test can prove the meta path never constructs deps.
+ */
+export async function main(
+  argv: string[],
+  buildDeps: () => MainDeps = realDeps,
+): Promise<void> {
+  if (routeMetaBeforeDeps(argv, (s) => process.stdout.write(s))) {
+    process.exit(0);
+  }
+  const deps = { ...buildDeps(), argv };
   await launcherMain(deps).catch((err: unknown) => {
     if (isSpawnNotFound(err)) {
       process.stderr.write(

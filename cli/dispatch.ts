@@ -144,15 +144,20 @@ export interface MainDeps {
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
 
 Usage:
-  keeper dispatch <work|close>::<id> [options]      # plan form
+  keeper dispatch <work|close|unblock|deconflict>::<id> [options]  # plan form
   keeper dispatch --prompt "<text>" [options]       # free form
   keeper dispatch --prompt-file <path> [options]    # free form
   keeper dispatch --help
 
 Plan form resolves the /plan:<verb> <id> prompt + cwd from the daemon and bakes
---name <verb>::<id> so the hook binds a board-visible jobs row. Free form
-launches an arbitrary prompt; --name is OPTIONAL and forwarded verbatim to
-claude (no keeper labeling). When omitted, no --name is passed at all.
+--name <verb>::<id> so the hook binds a board-visible jobs row. The four
+plan-form verbs, by id scope:
+  work::fn-N.M       task-scoped  fire the worker in the task's repo
+  unblock::fn-N.M    task-scoped  escalation session for a blocked task
+  close::fn-N        epic-scoped  close the epic (its lane worktree when present)
+  deconflict::fn-N   epic-scoped  escalation session for an epic merge conflict
+Free form launches an arbitrary prompt; --name is OPTIONAL and forwarded
+verbatim to claude (no keeper labeling). When omitted, no --name is passed at all.
 
 Options:
   --prompt <text>      Free-form prompt (mutually exclusive with the positional)
@@ -182,9 +187,11 @@ Run \`keeper dispatch --agent-help\` for the terse operator runbook.
 const AGENT_HELP = `keeper dispatch — operator runbook (agent-facing)
 
 Fire ONE claude worker by hand. Two forms:
-  Plan form:  keeper dispatch work::fn-N.M    (or close::fn-N)
-              Resolves the /plan:<verb> <id> prompt + cwd from the daemon and
-              bakes --name so the hook binds a board-visible jobs row.
+  Plan form:  keeper dispatch <work|close|unblock|deconflict>::<id>
+              work::fn-N.M and unblock::fn-N.M are task-scoped; close::fn-N and
+              deconflict::fn-N are epic-scoped (unblock/deconflict boot the
+              escalation session). Resolves the /plan:<verb> <id> prompt + cwd
+              from the daemon and bakes --name so the hook binds a jobs row.
   Free form:  keeper dispatch --prompt "<text>" [--name <n>] [--cwd <dir>]
               Arbitrary prompt; --name is an OPTIONAL verbatim pass-through.
 
