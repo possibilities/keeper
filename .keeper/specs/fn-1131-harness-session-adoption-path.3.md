@@ -38,5 +38,5 @@ Fixture-driven: originator-absent rollout alone in cwd → adopted (coordless, a
 - [ ] With the knob OFF nothing observable changes anywhere, and the codex fast suites pass with the new adoption coverage
 
 ## Done summary
-
+Added knob-gated codex rollout adoption: a recency-window-bounded discovery of originator-strictly-absent, sole-for-cwd rollouts (findAdoptableCodexRollouts) and a MAIN-side sweep (runCodexAdoptionSweep) that mints each as a coordless adopted job (id + resume_target = rollout uuid, ts = session-start), capped per tick, re-read-guarded inside BEGIN IMMEDIATE, gated behind the default-OFF codex_adoption knob.
 ## Evidence
