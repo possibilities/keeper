@@ -1,0 +1,48 @@
+{
+  "cells": [
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "Selector leg timed out; stamped mechanical default stands.",
+      "task_id": "fn-1131-harness-session-adoption-path.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "Selector leg timed out; stamped mechanical default stands.",
+      "task_id": "fn-1131-harness-session-adoption-path.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "Selector leg timed out; stamped mechanical default stands.",
+      "task_id": "fn-1131-harness-session-adoption-path.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "Selector leg timed out; stamped mechanical default stands.",
+      "task_id": "fn-1131-harness-session-adoption-path.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f13de6d57d3c13b224947d240eab782cd0710c52ce1d162d3bd729778eb77cf",
+  "created_at": "2026-07-06T00:37:24.907000Z",
+  "epic_id": "fn-1131-harness-session-adoption-path",
+  "input_hash": "8ce8abda2072e1c86022affa152c5543e6b3dbfa73063fee64e12911d2856a41",
+  "outcome": "degraded:timed_out",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}
