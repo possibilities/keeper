@@ -37,5 +37,5 @@ Frontmatter parses and the skills list under the plan plugin (smoke: claude --pl
 - [ ] unblock ends with the keeper plan unblock board verb plus bus-resume of the live worker, falling back to keeper dispatch work::<task> on a delivery miss
 
 ## Done summary
-
+Added two static plan skills — /plan:unblock and /plan:deconflict — that an autopilot escalation session boots from keeper escalation-brief, carrying untrusted-transcript, verify-by-exit-code, bounded-attempts, and decline-to-human guardrails; unblock ends with the keeper plan unblock board verb plus bus-resume (dispatch fallback), deconflict with both-intents reconciliation, lockfile regen, abort-on-branch-move, and keeper autopilot retry close::<epic>.
 ## Evidence
