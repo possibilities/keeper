@@ -80,7 +80,8 @@ Arguments:
 Flags:
   --filter k=v   Exact-match filter (repeatable; ANDed). Keys resolve against
                  the collection's declared filters server-side
-  --json         Emit JSON (default; accepted for symmetry with the viewers)
+  --json         Emit JSON (the default; a documented alias accepted for parity
+                 with the other JSON-reader subcommands)
   --sock <path>  Socket override ($KEEPER_SOCK / default)
   --help         Show this help
 
