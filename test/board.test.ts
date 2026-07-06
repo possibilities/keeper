@@ -33,6 +33,7 @@ import {
   colorizePillsInLine,
   computeBoardSummary,
   epicNumFromIdOrBare,
+  needsHumanLines,
   renderDeadLetterPill,
   renderEpicDepPills,
   renderHandoffLinkLines,
@@ -1780,6 +1781,37 @@ test("computeBoardSummary: counts open and running epics/tasks", () => {
     "  epics: 2 open / 2 running",
     "  tasks: 1 open / 1 running",
   ]);
+});
+
+test("needsHumanLines — a clean board (no daemon distress) renders no block", () => {
+  expect(needsHumanLines([])).toEqual([]);
+});
+
+test("needsHumanLines — folds each host-level distress row to KIND · dir — trimmed reason", () => {
+  const rows = [
+    {
+      dir: "/Users/mike/code/keeper",
+      reason:
+        "shared-checkout-dirty: /Users/mike/code/keeper has stayed dirty\nsecond line dropped",
+    },
+    {
+      dir: "/Users/mike/code/other",
+      reason:
+        "worktree-lane-wedge: lane keeper/epic/fn-9 cannot merge its base",
+    },
+  ];
+  expect(needsHumanLines(rows)).toEqual([
+    "needs human (2)",
+    "  shared-dirty · /Users/mike/code/keeper — shared-checkout-dirty: /Users/mike/code/keeper has stayed dirty",
+    "  lane-wedge · /Users/mike/code/other — worktree-lane-wedge: lane keeper/epic/fn-9 cannot merge its base",
+  ]);
+});
+
+test("needsHumanLines — trims a reason first line past 120 chars with an ellipsis", () => {
+  const long = `shared-checkout-dirty: ${"x".repeat(200)}`;
+  const [, line] = needsHumanLines([{ dir: "/repo", reason: long }]);
+  // 119 chars kept + a single ellipsis after the ` — ` separator.
+  expect(line).toBe(`  shared-dirty · /repo — ${long.slice(0, 119)}…`);
 });
 
 // fn-713 follow-on: renderTaskPills appends runtime_status + worker_phase at

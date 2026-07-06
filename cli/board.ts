@@ -60,7 +60,10 @@ import {
   effectivePerRootCap,
   resolveSockPath,
 } from "../src/db";
-import { resolveFailureTarget } from "../src/dispatch-failure-pill";
+import {
+  classifyDispatchFailure,
+  resolveFailureTarget,
+} from "../src/dispatch-failure-pill";
 import type { EpicDepResolution } from "../src/epic-deps";
 import {
   formatPill,
@@ -356,6 +359,33 @@ export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
   ];
 }
 
+/**
+ * Render the top-of-board `needs human (N)` block for host-level `daemon`-verb
+ * distress rows — shared-checkout dirty/wedge, lane wedge. These have no epic or
+ * task home (`resolveFailureTarget` drops them), so the epics grid can hang no
+ * `[failed:<kind>]` pill on them and the reason is otherwise invisible in the
+ * TUI. Empty input renders nothing (no block on a clean board). Each row folds
+ * to one scannable line: the classified KIND, the actionable `dir`, and the
+ * reason's first line trimmed — the full multi-line reason lives in
+ * `keeper query dispatch_failures`.
+ */
+export function needsHumanLines(
+  rows: readonly { dir: string; reason: string }[],
+): string[] {
+  if (rows.length === 0) {
+    return [];
+  }
+  const out = [`needs human (${rows.length})`];
+  for (const r of rows) {
+    const kind = classifyDispatchFailure(r.reason);
+    const first = (r.reason.split("\n", 1)[0] ?? "").trim();
+    const reason = first.length > 120 ? `${first.slice(0, 119)}…` : first;
+    const dirSeg = r.dir === "" ? "" : ` · ${r.dir}`;
+    out.push(`  ${kind}${dirSeg} — ${reason}`);
+  }
+  return out;
+}
+
 function taskNumFromId(id: string): number | null {
   const m = /\.(\d+)$/.exec(id);
   return m ? Number.parseInt(m[1], 10) : null;
@@ -571,6 +601,13 @@ export async function main(argv: string[]): Promise<void> {
   // renderer captured stays stable.
   const closeFailures = new Map<string, string>();
   const workFailures = new Map<string, string>();
+  // Host-level `daemon`-verb distress rows fed by the SAME `dispatch_failures`
+  // subscription below. `resolveFailureTarget` returns null for them (no epic /
+  // task home), so they carry no `[failed:]` pill — retained here to drive the
+  // banner's `[needs-human:N]` count and the top-of-board reason block. Mutated
+  // in place (length = 0 + push) each edge so the closure the renderer + banner
+  // captured stays stable.
+  const distress: { dir: string; reason: string }[] = [];
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // Retain the last readiness snapshot so secondary stream edges can repaint
@@ -606,6 +643,7 @@ export async function main(argv: string[]): Promise<void> {
       mode: apState.mode,
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,
+      needsHumanCount: distress.length,
     });
 
   function renderJobLines(
@@ -842,11 +880,14 @@ export async function main(argv: string[]): Promise<void> {
     snap: ReadinessClientSnapshot,
     subagentIndex: Map<string, SubagentInvocation[]>,
   ): string[] {
-    const summary = boardSummaryLines(computeBoardSummary(snap));
+    // Host-level distress leads the frame — it is the board-global "autopilot
+    // is wedged on you" signal, above the per-epic summary.
+    const head = [
+      ...needsHumanLines(distress),
+      ...boardSummaryLines(computeBoardSummary(snap)),
+    ];
     const body = renderEpicsBody(snap, subagentIndex);
-    return body === ""
-      ? [...summary, "no epics"]
-      : [...summary, ...body.split("\n")];
+    return body === "" ? [...head, "no epics"] : [...head, ...body.split("\n")];
   }
 
   // Lifecycle + sidecars + copy key + SIGINT live in `createViewShell`. Board's
@@ -994,6 +1035,7 @@ export async function main(argv: string[]): Promise<void> {
     onRows: (rows) => {
       closeFailures.clear();
       workFailures.clear();
+      distress.length = 0;
       for (const r of rows) {
         const verb = seg(r.verb);
         const id = seg(r.id);
@@ -1011,8 +1053,13 @@ export async function main(argv: string[]): Promise<void> {
           if (target?.kind === "task") {
             workFailures.set(target.taskId, reason);
           }
+        } else if (verb === "daemon") {
+          distress.push({ dir: seg(r.dir), reason });
         }
       }
+      // The distress count rides the banner — repaint it on every edge (the
+      // `[needs-human:N]` segment reads `distress.length`).
+      view.liveShell.setStatus(apBanner());
       // Re-emit BEFORE reporting the stream. `reportSnapshotStream` can resolve
       // the snapshot latch SYNCHRONOUSLY (this is the 4th of four reports), and
       // a resolve reads the captured frame and exits the process — so the

@@ -865,8 +865,18 @@ export function autopilotBannerLabel(state: {
   mode: "yolo" | "armed";
   armedCount: number;
   worktreeMode: boolean;
+  // Count of host-level `daemon`-verb distress rows (shared-checkout dirty/wedge,
+  // lane wedge) that have no epic/task home and so carry no `[failed:]` pill.
+  // Omitted or 0 suppresses the segment; > 0 surfaces the board-global signal.
+  needsHumanCount?: number;
 }): string {
   const pill = state.paused ? "[paused]" : "[playing]";
+  // The needs-human pill sits directly after the play/pause pill — an operator
+  // must see "N things are wedged on you" before any cap/mode metadata.
+  const needsHumanSeg =
+    state.needsHumanCount !== undefined && state.needsHumanCount > 0
+      ? ` · [needs-human:${state.needsHumanCount}]`
+      : "";
   const cap =
     state.maxConcurrentJobs === null ? "∞" : String(state.maxConcurrentJobs);
   // In armed mode surface the armed count — and call out the empty set
@@ -888,7 +898,7 @@ export function autopilotBannerLabel(state: {
   // Worktree segment renders for BOTH states (terse `worktree:on`/`worktree:off`)
   // so the live durable toggle is always visible at a glance.
   const worktreeSeg = state.worktreeMode ? " · worktree:on" : " · worktree:off";
-  return `${pill} · ${state.mode}${armedSeg} · max ${cap}${perRootSeg}${worktreeSeg}`;
+  return `${pill}${needsHumanSeg} · ${state.mode}${armedSeg} · max ${cap}${perRootSeg}${worktreeSeg}`;
 }
 
 async function runViewer(

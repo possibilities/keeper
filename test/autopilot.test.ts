@@ -1161,6 +1161,46 @@ test("autopilotBannerLabel — annotates the STORED intent only when it differs 
   ).toBe("[playing] · yolo · max ∞ · per-root 3 · worktree:on");
 });
 
+test("autopilotBannerLabel — needs-human count surfaces a pill right after play/pause; 0 or omitted suppresses it", () => {
+  // > 0 ⇒ the `[needs-human:N]` pill sits between the play/pause pill and mode.
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
+      mode: "yolo",
+      armedCount: 0,
+      worktreeMode: true,
+      needsHumanCount: 3,
+    }),
+  ).toBe(
+    "[playing] · [needs-human:3] · yolo · max ∞ · per-root 1 · worktree:on",
+  );
+  // Explicit 0 and omitted both render the historical banner byte-for-byte.
+  const clean = "[playing] · yolo · max ∞ · per-root 1 · worktree:on";
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
+      mode: "yolo",
+      armedCount: 0,
+      worktreeMode: true,
+      needsHumanCount: 0,
+    }),
+  ).toBe(clean);
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      maxConcurrentPerRoot: 1,
+      mode: "yolo",
+      armedCount: 0,
+      worktreeMode: true,
+    }),
+  ).toBe(clean);
+});
+
 // ---------------------------------------------------------------------------
 // projectMaxConcurrentPerRoot — coerce the singleton `autopilot_state.
 // max_concurrent_per_root` column to the banner's per-root count. Unlike the
