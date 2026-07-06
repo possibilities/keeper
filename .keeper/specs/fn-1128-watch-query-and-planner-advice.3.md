@@ -39,5 +39,5 @@ Three surgical prose additions to the hack skill, all reference-shaped (point at
 - [ ] All six BAKE guards are byte-identical (vendored-corpus check green), zero new render cites, prompt suite green
 
 ## Done summary
-
+Added three reference-shaped prose additions to plugins/plan/skills/hack/SKILL.md: a research-epic bullet (complete-gated, ~/docs/<slug>.md retrieval path, epic-vs-handoff/pair sizing), a creator-side blocked-worker collaboration bullet (wakeup contract with TOOLING_FAILURE/unparseable and creator-edge caveats), and a preamble powers-inventory + ask-first piloting clause. All six BAKE guards stay byte-identical; vendor-corpus check and full prompt suite are green.
 ## Evidence
