@@ -364,7 +364,19 @@ describe("cli/keeper command index", () => {
       .map((s) => String(s.name))
       .sort();
     expect(flagged).toEqual(
-      ["autopilot", "commit-work", "dispatch", "handoff", "reclaim"].sort(),
+      [
+        "agent",
+        "autopilot",
+        "await",
+        "bus",
+        "commit-work",
+        "dispatch",
+        "handoff",
+        "plan",
+        "prompt",
+        "reclaim",
+        "tabs",
+      ].sort(),
     );
     // The metadata source of truth agrees with the projected index.
     for (const s of index.subcommands) {

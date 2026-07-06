@@ -30,6 +30,7 @@ import {
   formatRestoreConfirmSummary,
   parsePickerChoice,
   parseTabsArgv,
+  AGENT_HELP as TABS_AGENT_HELP,
   TABS_EXIT_PARTIAL_FAILURE,
   TABS_EXIT_ZERO_CANDIDATES,
 } from "../cli/tabs";
@@ -1174,6 +1175,18 @@ test("parseTabsArgv: help + unknown verb signals", () => {
   expect(bogus.kind).toBe("usage");
   const badflag = parseTabsArgv(["list", "--nope"]);
   expect(badflag.kind).toBe("usage");
+});
+
+test("parseTabsArgv: --agent-help routes to the operator runbook (pure)", () => {
+  // Top-level runbook request, honored anywhere and never per-verb — so no
+  // keeper.db open, no restore side effect.
+  expect(parseTabsArgv(["--agent-help"])).toEqual({ kind: "agent-help" });
+  expect(parseTabsArgv(["restore", "--agent-help"])).toEqual({
+    kind: "agent-help",
+  });
+  // Content assertion (catches an empty stub): names its primary verb form.
+  expect(TABS_AGENT_HELP).toContain("operator runbook");
+  expect(TABS_AGENT_HELP).toContain("keeper tabs restore");
 });
 
 // ---------------------------------------------------------------------------

@@ -142,6 +142,25 @@ Reason glossary, reconnect/give-up semantics, and the agent workflow live in
 skills/await/SKILL.md.
 `;
 
+/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
+export const AGENT_HELP = `keeper await — operator runbook (agent-facing)
+
+Block until a plan/git/job condition holds, then act. Join conditions with the
+literal 'and' to wait for ALL. Durations are unit-required (30s, 5m).
+
+  keeper await complete fn-N.M            # task/epic done+approved AND its session idle
+  keeper await landed fn-N                # epic's lane merged into LOCAL default (later than complete)
+  keeper await git-clean and agents-idle  # cwd's git root quiet + no OTHER working session
+  keeper await drained --fail-on-stuck    # whole board at rest; exit 5 on an operator jam
+  keeper await server-up                  # keeperd is serving (reconnects forever)
+  keeper await <cond> --timeout 5m --json # own deadline + JSON envelope lines
+
+Exit codes: 0 met · 1 not-found/usage/connect/unreachable · 3 timeout · 4 target
+deleted · 5 stuck (only under --fail-on-stuck). Footguns: server-up can't be ANDed
+or take --connect-timeout (no id); epic-added/epic-removed/changed are edge-triggered
+(never fire on first paint); 'complete' is done+idle, 'landed' is the later merge.
+`;
+
 // ---------------------------------------------------------------------------
 // Sanitization for the stdout event channel
 // ---------------------------------------------------------------------------
@@ -369,6 +388,9 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
 
   if (values.help === true) {
     return { ok: false, message: "__help__" };
+  }
+  if (values["agent-help"] === true) {
+    return { ok: false, message: "__agent_help__" };
   }
 
   // Split the positionals on the literal `and` token into per-condition
@@ -2209,6 +2231,10 @@ export async function main(argv: string[]): Promise<void> {
   if (!parsed.ok) {
     if (parsed.message === "__help__") {
       process.stdout.write(HELP);
+      process.exit(0);
+    }
+    if (parsed.message === "__agent_help__") {
+      process.stdout.write(AGENT_HELP);
       process.exit(0);
     }
     process.stderr.write(`keeper await: ${parsed.message}\n\n`);

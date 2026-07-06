@@ -625,6 +625,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: false,
     requires_daemon: true,
     requires_tty: false,
+    agent_help: true,
     format_modes: ["human", "json"],
     exit_codes: {
       "3": "own-deadline timeout",
@@ -633,6 +634,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     },
     flags: [
       FLAG_HELP,
+      FLAG_AGENT_HELP_DEFAULTED,
       {
         name: "timeout",
         type: "string",
@@ -755,6 +757,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: true,
     requires_daemon: false,
     requires_tty: false,
+    agent_help: true,
     exit_codes: {
       "6": "restore refused a non-TTY AMBIGUOUS selection (ranked table on stderr)",
       "7": "restore --apply found ZERO candidates without --allow-empty",
@@ -984,6 +987,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: true,
     requires_daemon: false,
     requires_tty: false,
+    agent_help: true,
     flags: [],
   },
   {
@@ -995,6 +999,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: true,
     requires_daemon: false,
     requires_tty: false,
+    agent_help: true,
     flags: [],
   },
   {
@@ -1029,6 +1034,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: true,
     requires_daemon: false,
     requires_tty: false,
+    agent_help: true,
     exit_codes: {
       "124":
         "agent panel wait: chunk elapsed with no terminal answer — re-issue the wait (a signal, not a failure)",
@@ -1077,6 +1083,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     mutates: true,
     requires_daemon: false,
     requires_tty: false,
+    agent_help: true,
     flags: [],
     verbs: ["list", "watch", "wake", "chat"].map(nameOnlyVerb),
   },
