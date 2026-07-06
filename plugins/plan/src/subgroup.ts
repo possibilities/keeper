@@ -13,9 +13,21 @@
 // dispatch is data-driven so each verb wave plugs its leaf in without touching
 // the dispatch seam.
 
+import {
+  type ArgDescriptor,
+  DEFAULT_FORMAT_MODES,
+  type PlanCommand,
+  planCommand,
+} from "./descriptor.ts";
 import type { OutputFormat } from "./format.ts";
 
 const PROG = "keeper plan";
+
+/** The injected `--format [modes]` help label for a leaf, narrowed to whatever
+ *  the verb actually renders (default `[json|human|yaml]`). */
+function formatOptionLabel(cmd: PlanCommand): string {
+  return `--format [${(cmd.formatModes ?? DEFAULT_FORMAT_MODES).join("|")}]`;
+}
 // click's effective help wrap width: max_content_width (80) minus its 2-column
 // right margin. Verified against the Python binary's group-help wrap points.
 const HELP_WIDTH = 78;
@@ -104,7 +116,7 @@ export function printGroupHelp(group: GroupSpec): void {
   lines.push(`  ${group.description}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
+  lines.push("  --format [json|human|yaml]  Output format (default: json)");
   lines.push("  --help                      Show this message and exit.");
   lines.push("");
   lines.push("Commands:");
@@ -123,31 +135,72 @@ export function printGroupHelp(group: GroupSpec): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-/** Render a leaf subcommand's `--help` as click does: a Usage line, the
- * subcommand's short help paragraph, and the injected Options section. Exits via
- * the caller after printing (the verb body never runs). No conformance test pins
- * the exact leaf-help text — only that `--help` exits 0 — so the structural shape
- * (Usage + short help + Options) is the contract. */
-export function printLeafHelp(group: string, spec: SubcommandSpec): void {
+/** One positional argument as it appears in a usage line / Arguments listing:
+ * `NAME`, `NAME...` (variadic), `[NAME]` (optional). */
+function fmtArg(arg: ArgDescriptor): string {
+  const base = arg.variadic ? `${arg.name}...` : arg.name;
+  return arg.optional ? `[${base}]` : base;
+}
+
+/** The ONE shared leaf-help renderer, fed by a pure-data {@link PlanCommand}
+ * descriptor. Both a top-level verb (`keeper plan show --help`) and a subgroup
+ * verb (`keeper plan epic create --help`) render through this so their documented
+ * argument/option surface cannot drift from a second table. `progPath` is the
+ * full command path up to and including the verb (e.g. `keeper plan epic create`).
+ *
+ * Structural shape (Usage + summary + Arguments + Options) is the contract; no
+ * conformance test pins the exact bytes, only that `--help` exits 0. The `--format`
+ * / `--help` options are injected (click's FormattedGroup convention) after the
+ * verb's own options. Exits via the caller after printing — the verb body never
+ * runs. */
+export function renderLeafHelp(progPath: string, cmd: PlanCommand): void {
+  const args = cmd.args ?? [];
+  const options = cmd.options ?? [];
   const lines: string[] = [];
-  lines.push(`Usage: ${PROG} ${group} ${spec.name} [OPTIONS] [ARGS]...`);
+
+  const argsTail = args.map(fmtArg).join(" ");
+  lines.push(`Usage: ${progPath} [OPTIONS]${argsTail ? ` ${argsTail}` : ""}`);
   lines.push("");
-  for (const wrapped of wrapHelp(spec.shortHelp, 2, HELP_WIDTH)) {
+  for (const wrapped of wrapHelp(cmd.summary, 2, HELP_WIDTH)) {
     lines.push(`  ${wrapped}`);
   }
+
+  if (args.length > 0) {
+    lines.push("");
+    lines.push("Arguments:");
+    for (const arg of args) {
+      lines.push(`  ${fmtArg(arg)}`);
+    }
+  }
+
+  // Verb options first, then the two injected meta options — one uniform column.
+  const rows = [
+    ...options.map((o) => ({
+      label: o.takesValue ? `${o.name} TEXT` : o.name,
+      summary: o.summary,
+    })),
+    {
+      label: formatOptionLabel(cmd),
+      summary: "Output format (default: json)",
+    },
+    { label: "--help", summary: "Show this message and exit." },
+  ];
+  const width = Math.max(...rows.map((r) => r.label.length));
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
-  lines.push("  --help                      Show this message and exit.");
+  for (const row of rows) {
+    lines.push(`  ${row.label.padEnd(width)}  ${row.summary}`);
+  }
+
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
 /** Dispatch `keeper plan <group> <sub> [args]`. `groupArgs` is everything after the
  * group name (the global --format is intercepted before this and passed in).
- * `--help` with no subcommand (or as the first token) prints the group help and
- * returns true to signal the caller to stop. A known subcommand whose args carry
- * `--help` prints the leaf help (exit 0). An unknown subcommand exits 2; a known
- * one runs its leaf. Returns true when handled. */
+ * `--help` with no subcommand (or as the first token) prints the group help. A
+ * known subcommand whose args carry `--help` renders the descriptor-fed leaf help
+ * (exit 0) through the shared renderer. An unknown subcommand exits 2; a known one
+ * runs its leaf. */
 export function dispatchGroup(
   group: GroupSpec,
   groupArgs: string[],
@@ -167,7 +220,16 @@ export function dispatchGroup(
   // A known leaf with --help in its args renders the leaf help (exit 0) — click
   // intercepts --help before the verb body runs.
   if (groupArgs.slice(1).includes("--help")) {
-    printLeafHelp(group.name, spec);
+    const subDesc = planCommand(group.name)?.subcommands?.find(
+      (s) => s.name === first,
+    );
+    // The descriptor tree carries every dispatchable subgroup verb, so a missing
+    // entry is a wiring bug; fall back to the spec's short help so `--help` still
+    // renders (never a crash) while the leaf's arg surface stays undocumented.
+    renderLeafHelp(
+      `${PROG} ${group.name} ${spec.name}`,
+      subDesc ?? { name: spec.name, summary: spec.shortHelp },
+    );
     return;
   }
   spec.run(groupArgs.slice(1), format);

@@ -608,7 +608,7 @@ describe("runQueryCommand", () => {
   async function run(h: ReturnType<typeof harness>): Promise<void> {
     try {
       await runQueryCommand(
-        { collection: "epics", filter: {}, sock: "/tmp/s" },
+        { collection: "epics", filter: {}, sock: "/tmp/s", format: "json" },
         h.deps,
       );
     } catch (e) {
@@ -740,7 +740,7 @@ describe("keeper query tasks routing + runner", () => {
     const out: string[] = [];
     let code: number | null = null;
     await runTasksCommand(
-      { collection: "tasks", filter: {}, sock: "/tmp/s" },
+      { collection: "tasks", filter: {}, sock: "/tmp/s", format: "json" },
       {
         fetchSnapshot: () => Promise.resolve(taskSnap()),
         writeStdout: (s) => out.push(s),
@@ -764,7 +764,7 @@ describe("keeper query tasks routing + runner", () => {
     const out: string[] = [];
     let code: number | null = null;
     await runTasksCommand(
-      { collection: "tasks", filter: {}, sock: "/tmp/s" },
+      { collection: "tasks", filter: {}, sock: "/tmp/s", format: "json" },
       {
         fetchSnapshot: () => Promise.reject(new Error("unreachable: down")),
         writeStdout: (s) => out.push(s),

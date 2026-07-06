@@ -9,10 +9,19 @@
 // a tagged throw so the never-return branches stop).
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main, positional } from "../src/cli.ts";
+import { PROMPT_COMMANDS } from "../src/descriptor.ts";
 
 // These probes drive real verb runners with no args purely to prove dispatch
 // wiring. Pin the corpus fallback at an empty tmpdir so a verb that resolves the
@@ -220,5 +229,80 @@ describe("positional() option-before-positional ordering", () => {
     const r = run(["save-bundle", "--summary", "x", "nope/sub/ref"]);
     expect(r.stderr).toContain("nope/sub/ref");
     expect(r.stderr).not.toContain("Error: unknown ref prefix in 'x'");
+  });
+});
+
+// Snapshot every regular file under `root` as a relative-path -> UTF-8-content
+// map, so a byte-for-byte "the corpus tree did not change" assertion is a plain
+// object equality against a pre-computed snapshot (independent of the code under
+// test — the expected map is the tree observed BEFORE the help call).
+function snapshotTree(root: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (dir: string, prefix: string): void => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const rel = prefix ? `${prefix}/${name}` : name;
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) {
+        walk(full, rel);
+      } else {
+        out[rel] = readFileSync(full, "utf-8");
+      }
+    }
+  };
+  walk(root, "");
+  return out;
+}
+
+// Help purity: `keeper prompt <verb> --help` (the defect was build-snippets
+// EXECUTING the write on `--help`) must render verb-specific leaf help, exit 0,
+// and touch nothing on disk. Every descriptor verb is walked under a sandboxed
+// corpus so a stray write would surface as a tree diff.
+describe("keeper prompt leaf help is pure", () => {
+  for (const spec of PROMPT_COMMANDS) {
+    for (const helpFlag of ["--help", "-h"] as const) {
+      test(`'${spec.name} ${helpFlag}' prints leaf help, exits 0, writes nothing`, () => {
+        const before = snapshotTree(corpusHome);
+        const r = run([spec.name, helpFlag]);
+        expect(r.ret).toBe(0);
+        expect(r.code).toBeUndefined();
+        expect(r.stdout).toContain(`Usage: keeper prompt ${spec.name}`);
+        expect(r.stdout).toContain("Options:");
+        expect(r.stderr).toBe("");
+        expect(snapshotTree(corpusHome)).toEqual(before);
+      });
+    }
+  }
+
+  // The regression case: build-snippets' write path targets
+  // <corpus>/claude/arthack/template/_partials/snippets/_index.yaml. Seed a
+  // sentinel there — the pre-fix `--help` overwrote it; the fixed CLI must leave
+  // the hand-authored bytes untouched.
+  test("build-snippets --help leaves a seeded _index.yaml byte-identical", () => {
+    const snippetsDir = join(
+      corpusHome,
+      "claude",
+      "arthack",
+      "template",
+      "_partials",
+      "snippets",
+    );
+    const indexPath = join(snippetsDir, "_index.yaml");
+    const sentinel = "# hand-authored sentinel — help must not overwrite\n";
+    mkdirSync(snippetsDir, { recursive: true });
+    writeFileSync(indexPath, sentinel);
+    try {
+      const r = run(["build-snippets", "--help"]);
+      expect(r.ret).toBe(0);
+      expect(r.stdout).toContain("Usage: keeper prompt build-snippets");
+      expect(readFileSync(indexPath, "utf-8")).toBe(sentinel);
+    } finally {
+      rmSync(join(corpusHome, "claude"), { recursive: true, force: true });
+    }
   });
 });

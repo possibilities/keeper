@@ -14,6 +14,7 @@
 import { formatOutput, type OutputFormat } from "../../plan/src/format.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { run as runCheckGenerated } from "./check_generated.ts";
+import { PROMPT_COMMANDS, type PromptCommandDescriptor } from "./descriptor.ts";
 import { runFindSnippets } from "./find_snippets.ts";
 import { runListBundles } from "./list_bundles.ts";
 import { runListSnippets } from "./list_snippets.ts";
@@ -29,60 +30,6 @@ const PROG = "keeper prompt";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 const DESCRIPTION =
   "Runtime snippet/bundle substrate — find, read, compose, and persist context.";
-
-interface CommandSpec {
-  name: string;
-  shortHelp: string;
-}
-
-// Registration order = help-listing order (alphabetical, matching click).
-const COMMANDS: CommandSpec[] = [
-  {
-    name: "build-snippets",
-    shortHelp: "Build _partials/snippets/_index.yaml from classified snippets.",
-  },
-  {
-    name: "check-generated",
-    shortHelp:
-      "Detect the managed-file sidecar; emit the generated-guard message.",
-  },
-  {
-    name: "find-snippets",
-    shortHelp: "BM25-rank snippets against a query, with excerpts.",
-  },
-  {
-    name: "list-bundles",
-    shortHelp: "List bundles across one or all runtime namespaces.",
-  },
-  {
-    name: "list-snippets",
-    shortHelp: "Enumerate every snippet id (unranked), optionally by --domain.",
-  },
-  {
-    name: "render",
-    shortHelp: "Render a substrate ref (bundle/, sketch/, or bare snippet id).",
-  },
-  {
-    name: "render-plugin-templates",
-    shortHelp: "Render every plugin's command/skill/agent templates.",
-  },
-  {
-    name: "save-bundle",
-    shortHelp: "Atomically write a runtime bundle (bundle/ or sketch/).",
-  },
-  {
-    name: "save-snippet",
-    shortHelp: "Atomically write a snippet and update _index.yaml.",
-  },
-  {
-    name: "show-bundle",
-    shortHelp: "Load and emit a single bundle YAML by ref.",
-  },
-  {
-    name: "validate-bundles",
-    shortHelp: "Resolve every bundle snippet_id; non-zero on any miss.",
-  },
-];
 
 interface ParsedArgs {
   format: OutputFormat | null;
@@ -103,7 +50,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   while (i < argv.length) {
     const arg = argv[i] as string;
     if (command === null) {
-      if (arg === "--help") {
+      if (arg === "--help" || arg === "-h") {
         help = true;
         i += 1;
       } else if (arg === "--format") {
@@ -124,7 +71,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (arg.startsWith("--format=")) {
       format = readFormat(arg.slice("--format=".length));
       i += 1;
-    } else if (arg === "--help") {
+    } else if (arg === "--help" || arg === "-h") {
       help = true;
       i += 1;
     } else {
@@ -137,11 +84,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function readFormat(value: string | undefined): OutputFormat {
-  if (value === "json" || value === "human") {
+  if (value === "json" || value === "yaml" || value === "human") {
     return value;
   }
   usageError(
-    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'human'.`,
+    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'yaml', 'human'.`,
   );
 }
 
@@ -167,13 +114,53 @@ function printHelp(): void {
   lines.push(`  ${DESCRIPTION}`);
   lines.push("");
   lines.push("Options:");
-  lines.push("  --format [json|human]       Output format (default: json)");
-  lines.push("  --help                      Show this message and exit.");
+  lines.push("  --format [json|human|yaml]  Output format (default: json)");
+  lines.push("  --help, -h                  Show this message and exit.");
   lines.push("");
   lines.push("Commands:");
-  const width = Math.max(...COMMANDS.map((c) => c.name.length));
-  for (const cmd of COMMANDS) {
-    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.shortHelp}`);
+  const width = Math.max(...PROMPT_COMMANDS.map((c) => c.name.length));
+  for (const cmd of PROMPT_COMMANDS) {
+    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.summary}`);
+  }
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+/** Render one verb's `--help` leaf help from its descriptor: a Usage line naming
+ * the verb, its summary, an Arguments section (when it takes positionals), and an
+ * Options section listing its own flags plus the injected `--format` and
+ * `--help`. The verb body never runs — help short-circuits dispatch. */
+function printLeafHelp(spec: PromptCommandDescriptor): void {
+  const args = spec.args ?? [];
+  const usageTail = args
+    .map((a) => (a.required ? a.name : `[${a.name}]`))
+    .join(" ");
+  const lines: string[] = [];
+  lines.push(
+    `Usage: ${PROG} ${spec.name} [OPTIONS]${usageTail ? ` ${usageTail}` : ""}`,
+  );
+  lines.push("");
+  lines.push(`  ${spec.summary}`);
+
+  if (args.length > 0) {
+    lines.push("");
+    lines.push("Arguments:");
+    const argWidth = Math.max(...args.map((a) => a.name.length));
+    for (const a of args) {
+      lines.push(`  ${a.name.padEnd(argWidth)}  ${a.summary}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("Options:");
+  const rows: [string, string][] = spec.flags.map((f) => [
+    `--${f.name}${f.type === "string" ? " TEXT" : ""}`,
+    f.summary ?? "",
+  ]);
+  rows.push(["--format [json|human|yaml]", "Output format (default: json)"]);
+  rows.push(["--help, -h", "Show this message and exit."]);
+  const optWidth = Math.max(...rows.map(([left]) => left.length));
+  for (const [left, right] of rows) {
+    lines.push(`  ${left.padEnd(optWidth)}  ${right}`);
   }
   process.stdout.write(`${lines.join("\n")}\n`);
 }
@@ -185,13 +172,19 @@ function dispatch(parsed: ParsedArgs): number {
     return 0;
   }
 
-  const spec = COMMANDS.find((c) => c.name === command);
+  const spec = PROMPT_COMMANDS.find((c) => c.name === command);
   if (spec === undefined) {
     noSuchCommand(command);
   }
 
-  // Every keep-verb is pre-wired to a stub. Verb-port tasks (3/4/5) replace the
-  // matching case body with a call into its `src/<verb>.ts` runner.
+  // `--help`/`-h` on ANY resolved verb renders its leaf help and stops before the
+  // verb body — never a write, never a daemon touch. An unknown verb is rejected
+  // above (exit 2) before help is considered, matching click's group dispatch.
+  if (parsed.help) {
+    printLeafHelp(spec);
+    return 0;
+  }
+
   switch (command) {
     case "render": {
       const ref = positional(parsed.rest, ["--project-root"]);
@@ -351,12 +344,7 @@ function readOption(rest: string[], name: string): string | undefined {
 }
 
 export function main(argv: string[]): number {
-  const parsed = parseArgs(argv);
-  if (parsed.help && parsed.command === null) {
-    printHelp();
-    return 0;
-  }
-  return dispatch(parsed);
+  return dispatch(parseArgs(argv));
 }
 
 if (import.meta.main) {
