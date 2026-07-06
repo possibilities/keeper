@@ -51,5 +51,5 @@ spool-request composition; poll logic tested with injected clock/reader
 - [ ] The suite is green via the sanctioned fast gate
 
 ## Done summary
-
+Added the keeper baseline read verb (cli/baseline.ts) over the task-1 store contract: a bare read resolves sha+repo and prints the hit/miss/computing union as clean JSON without mutating; --wait writes exactly one spool request and polls the leaf to a caller-owned deadline, exiting 0 on any terminal envelope and non-zero with a distinct report on deadline. Registered in the dispatcher.
 ## Evidence
