@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-file test addition reusing an existing capture harness with a precise, literal acceptance spec \u2014 a straight-test-additions fit for medium sonnet.",
+      "task_id": "fn-1148-cover-agent-panel-duration-flag-grammar.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-06T23:54:23.452000Z",
+  "epic_id": "fn-1148-cover-agent-panel-duration-flag-grammar",
+  "input_hash": "7c9bc10afe28f4deacfde9249000a5cf9f45e6119433322efc7a8ed142e2e3d0",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2090582282,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-file test addition reusing an existing capture harness with a precise, literal acceptance spec \u2014 a straight-test-additions fit for medium sonnet.\",\"confidence\":0.82}]}"
+}
