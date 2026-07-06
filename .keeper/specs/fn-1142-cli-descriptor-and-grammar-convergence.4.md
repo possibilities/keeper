@@ -34,5 +34,5 @@ Under throwing stub deps, `agent --help` and `agent --version` exit 0 with outpu
 - [ ] `keeper query --help` makes no false symmetry claim
 
 ## Done summary
-
+Routed keeper agent --help/--version before realDeps() so the launcher state-dir migration never runs on the meta path (no state dir/db/daemon); documented all four dispatch plan-form verbs (work/close/unblock/deconflict) with task/epic id scoping in --help and --agent-help; dropped query's false 'symmetry with the viewers' claim. No ordinal-1 descriptor metadata changed — the help text is hand-rolled per leaf and the descriptor flag summaries were already accurate.
 ## Evidence
