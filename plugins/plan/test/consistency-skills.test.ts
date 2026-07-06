@@ -476,6 +476,44 @@ describe("panel-runner agent frontmatter", () => {
   });
 });
 
+describe("panel-runner wait discipline is drop-hardened", () => {
+  const body = () => readFileSync(PANEL_RUNNER, "utf-8");
+
+  test("the wait example carries the explicit Bash tool timeout parameter at its 10-min ceiling", () => {
+    expect(body()).toContain("timeout: 600000");
+  });
+
+  test("states the verified harness defaults (120s default window, 600000ms ceiling)", () => {
+    const text = body();
+    expect(text).toContain("120000ms");
+    expect(text).toContain("600000ms");
+  });
+
+  test("documents the auto-background envelope as a tripwire", () => {
+    const text = body();
+    expect(text).toContain("tripwire");
+    expect(text).toContain("Command running in background");
+  });
+
+  test("bounds all re-issues with a stated backstop terminating in PANEL_RUN_FAILED", () => {
+    const text = body();
+    expect(text).toContain("backstop");
+    expect(text).toContain("PANEL_RUN_FAILED");
+  });
+
+  test("forbids ending the turn while legs are non-terminal (house wording)", () => {
+    expect(body()).toContain("never end a turn text-only to wait");
+  });
+
+  test("Step 6 return is positively marked with a first-line PANEL_ANSWER", () => {
+    expect(body()).toContain("PANEL_ANSWER");
+  });
+
+  test("drops the false claim that a chunk is safe without the explicit timeout parameter", () => {
+    expect(body()).not.toContain("safely under Bash's hard 10-min");
+  });
+});
+
 describe("panel skill shim", () => {
   test("spawns plan:panel-runner with no model= kwarg", () => {
     const text = readFileSync(PANEL_SKILL, "utf-8");
