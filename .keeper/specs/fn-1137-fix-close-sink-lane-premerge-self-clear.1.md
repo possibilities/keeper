@@ -32,5 +32,5 @@ Files: src/autopilot-worker.ts (the close-sink emit), test/autopilot-worker.test
 - [ ] Fast suite green.
 
 ## Done summary
-
+Keyed the non-primary close-sink fan-in pre-merge DispatchFailed on the sink LANE worktree path (provisioned.dir ?? sink.repoDir) so it self-clears like the work-cell twin instead of lingering until a manual retry_dispatch, and added a regression test driving a real close-sink premerge failure that asserts both the emitted lane-path dir and the reason-scoped self-clear.
 ## Evidence
