@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T20:28:03.200000Z",
+  "depends_on": [
+    "fn-1146-merge-usage-scraper-into-keeper.1"
+  ],
+  "epic": "fn-1146-merge-usage-scraper-into-keeper",
+  "id": "fn-1146-merge-usage-scraper-into-keeper.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Collapse runner to internal entry",
+  "updated_at": "2026-07-06T20:28:03.200000Z"
+}
