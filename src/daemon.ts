@@ -2543,6 +2543,7 @@ export const INGEST_EVENTS_COLUMNS = [
   "worktree",
   "harness",
   "resume_target",
+  "adopted",
 ] as const;
 
 /**
@@ -2995,8 +2996,9 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
        plan_subject_present, tool_use_id, config_dir,
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id, mutation_path, worktree, harness, resume_target
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path, worktree, harness, resume_target,
+       adopted
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       birthEventTs(record),
       record.session_id,
@@ -3034,6 +3036,8 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
       record.worktree,
       record.harness,
       record.resume_target,
+      // adopted: births are launcher-owned by definition, so the marker is NULL.
+      null,
     ],
   );
 }

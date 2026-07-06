@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 109;
+export const SCHEMA_VERSION = 110;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -768,7 +768,18 @@ CREATE TABLE IF NOT EXISTS events (
     -- back-fill (codex/hermes). Declared AFTER worktree so a fresh CREATE and a
     -- migrated ALTER (which appends) keep table_info byte-identical.
     harness TEXT,
-    resume_target TEXT
+    resume_target TEXT,
+    -- v109->v110 (fn-1131.1): the harness-agnostic ADOPTED marker — 1 on a
+    -- SessionStart a NON-launcher path minted (the hand-started hermes self-seed
+    -- or the codex rollout-adoption mint), NULL otherwise. INTEGER, nullable, NO
+    -- default (the NULL=absent + re-fold byte-identity invariant). Part of the
+    -- SAME FIVE-place events lockstep as harness/resume_target (this literal,
+    -- KNOWN_EVENT_COLUMNS, the hook insertBindings, INGEST_EVENTS_COLUMNS, the
+    -- insertEvent prepared statement). The claude hook + every birth mint bind it
+    -- NULL (launcher-owned by definition); the fold copies the value verbatim and
+    -- never synthesizes one. Declared AFTER resume_target so a fresh CREATE and a
+    -- migrated ALTER (which appends) keep table_info byte-identical.
+    adopted INTEGER
 )
 `;
 
@@ -1621,7 +1632,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     mode TEXT NOT NULL DEFAULT 'yolo',
     max_concurrent_per_root INTEGER,
     worktree_mode INTEGER,
-    worktree_multi_repo INTEGER
+    worktree_multi_repo INTEGER,
+    codex_adoption INTEGER
 )
 `;
 
@@ -6025,6 +6037,40 @@ function migrate(db: Database): void {
       addColumnIfMissing(db, "jobs", "harness", "TEXT");
       addColumnIfMissing(db, "jobs", "resume_target", "TEXT");
 
+      // v109->v110 (fn-1131.1): the harness-session ADOPTION primitive — TWO
+      // surfaces, ONE bump.
+      //
+      //   - `events.adopted` + `jobs.adopted` (INTEGER): the harness-agnostic
+      //     "a NON-launcher path minted this session" marker. `events.adopted`
+      //     rides the SAME FIVE-place lockstep as harness/resume_target (CREATE
+      //     literal, KNOWN_EVENT_COLUMNS, the hook insertBindings,
+      //     INGEST_EVENTS_COLUMNS, the insertEvent prepared statement); the two
+      //     events-column lockstep tests pin them equal. `jobs.adopted` is
+      //     migration-ONLY (the `:1012` convention) — NOT in CREATE_JOBS,
+      //     appended here AFTER `resume_target` (the current final jobs column)
+      //     so fresh-vs-migrated `PRAGMA table_info(jobs)` stays byte-identical.
+      //     The SessionStart fold binds `events.adopted` into the INSERT and
+      //     COALESCE-preserves it on the ON-CONFLICT set (like worktree), so a
+      //     later resume or launcher re-mint never clobbers the marker; the claude
+      //     hook + every birth mint bind it NULL (launcher-owned by definition).
+      //   - `autopilot_state.codex_adoption` (INTEGER: NULL/0 = OFF, 1 = ON): the
+      //     durable codex rollout-adoption knob, the FIFTH scalar config column
+      //     riding the generic `AutopilotConfigSet` fold (mirrors
+      //     `worktree_multi_repo`). Declared in CREATE_AUTOPILOT_STATE too; the
+      //     reconciler/producer resolve `?? OFF` at read time — never in a fold.
+      //
+      // NULL rule: all three nullable, NO default (a DEFAULT poisons the
+      // NULL=absent invariant and breaks re-fold byte-identity). NO backfill — the
+      // folds copy `events.adopted` verbatim and never synthesize, and no fold
+      // reads `codex_adoption`, so a from-scratch re-fold over any pre-v110 stream
+      // leaves all three NULL byte-identically. NO cursor rewind (mirrors
+      // `worktree`/`harness`). Whitelist-only Python read (keeper-py reads none of
+      // the three) — this bump MUST add 110 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "events", "adopted", "INTEGER");
+      addColumnIfMissing(db, "jobs", "adopted", "INTEGER");
+      addColumnIfMissing(db, "autopilot_state", "codex_adoption", "INTEGER");
+
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       ).run(String(SCHEMA_VERSION));
@@ -6065,7 +6111,8 @@ export function prepareStmts(db: Database): Stmts {
         plan_subject_present, tool_use_id, config_dir,
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-        background_task_id, mutation_path, worktree, harness, resume_target
+        background_task_id, mutation_path, worktree, harness, resume_target,
+        adopted
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -6074,7 +6121,8 @@ export function prepareStmts(db: Database): Stmts {
         $plan_subject_present, $tool_use_id, $config_dir,
         $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
-        $background_task_id, $mutation_path, $worktree, $harness, $resume_target
+        $background_task_id, $mutation_path, $worktree, $harness, $resume_target,
+        $adopted
       )
     `),
     selectWorldRev: db.prepare(

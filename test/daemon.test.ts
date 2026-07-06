@@ -3220,8 +3220,14 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `harness`/`resume_target` columns to BOTH events — a five-place lockstep —
   // and jobs — migration-only; an additive ALTER, NO cursor rewind: a pre-v109
   // stream carries neither value, so a from-scratch re-fold folds both NULL
-  // byte-identical, and the fold never synthesizes a harness value).
-  expect(SCHEMA_VERSION).toBe(109);
+  // byte-identical, and the fold never synthesizes a harness value). And to 110
+  // via fn-1131 task .1 (appending the nullable `adopted` INTEGER column to BOTH
+  // events — a five-place lockstep — and jobs — migration-only, plus the
+  // `autopilot_state.codex_adoption` knob; additive ALTERs, NO cursor rewind: a
+  // pre-v110 stream carries no adopted value and no fold reads codex_adoption, so
+  // a from-scratch re-fold folds all three NULL byte-identical, and the fold never
+  // synthesizes an adopted value).
+  expect(SCHEMA_VERSION).toBe(110);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

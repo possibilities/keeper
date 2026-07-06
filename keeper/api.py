@@ -420,6 +420,10 @@ from pathlib import Path
 # v109 (fn-1103 task .3) adds the nullable ``harness`` + ``resume_target`` TEXT
 # columns to BOTH the events and jobs surfaces (multi-harness agent maturity);
 # keeper-py reads neither column, so only the version whitelist gains 109.
+# v110 (fn-1131 task .1) adds the nullable ``adopted`` INTEGER column to BOTH the
+# events and jobs surfaces (the harness-session adoption marker) and the
+# ``autopilot_state.codex_adoption`` INTEGER knob; keeper-py reads none of the
+# three, so only the version whitelist gains 110.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -501,6 +505,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         107,
         108,
         109,
+        110,
     }
 )
 

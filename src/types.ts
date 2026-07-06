@@ -303,6 +303,16 @@ export interface Event {
    * touches lifecycle state. NULL on rows that carry no resume identity.
    */
   resume_target: string | null;
+  /**
+   * The harness-agnostic ADOPTED marker — `1` on a SessionStart a NON-launcher
+   * path minted (the hand-started hermes self-seed or the codex rollout-adoption
+   * mint), NULL otherwise. An EXPLICIT field, never derived: the claude hook and
+   * every birth mint bind it NULL (launcher-owned by definition), so the fold
+   * copies it verbatim and never synthesizes a value. Folded onto `jobs.adopted`
+   * via the SessionStart COALESCE arm (set-once — a later resume or launcher
+   * re-mint preserves the marker). NULL on every non-SessionStart row.
+   */
+  adopted: number | null;
 }
 
 /**
