@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-06T16:01:20.477000Z",
+  "depends_on": [],
+  "epic": "fn-1143-excise-dead-shared-checkout-distress",
+  "id": "fn-1143-excise-dead-shared-checkout-distress.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Remove dead distress predicates",
+  "updated_at": "2026-07-06T16:01:20.477000Z"
+}
