@@ -4,11 +4,11 @@
   "depends_on": [],
   "epic": "fn-1136-model-guidance-states-and-selector",
   "id": "fn-1136-model-guidance-states-and-selector.3",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Close planner template fix",
-  "updated_at": "2026-07-06T02:13:49.123000Z"
+  "updated_at": "2026-07-06T02:20:15.747000Z"
 }

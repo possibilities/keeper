@@ -7,7 +7,7 @@
     "fn-1133-arm-exclusive-validation-marker-latch"
   ],
   "id": "fn-1136-model-guidance-states-and-selector",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-06T02:20:15.881000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T02:13:49.123000Z"
+  "updated_at": "2026-07-06T02:20:15.881000Z"
 }
