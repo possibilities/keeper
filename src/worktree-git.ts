@@ -347,6 +347,61 @@ export async function commitWorkLockPath(
   return joinPath(dir, "keeper-commit-work.lock");
 }
 
+/**
+ * The base-merge flock path, keyed on the repo's COMMON git dir
+ * (`--git-common-dir`) rather than the per-worktree `--git-dir` that
+ * {@link commitWorkLockPath} keys on. The plumbing base merge advances
+ * `refs/heads/<default>` — a ref that lives in the SHARED common dir, not a
+ * per-worktree store — so the common dir is its serialization domain. In the
+ * main worktree `--git-common-dir` == `--git-dir`, so this resolves to the SAME
+ * `keeper-commit-work.lock` a `keeper commit-work` in that main checkout takes,
+ * and the two still collide; a linked lane's commit-work (keyed on its own
+ * `--git-dir`) is a distinct path and stays isolated (a lane commit touches its
+ * own branch, never default). On a git error / empty stdout, falls back to the
+ * worktree-anchored absolute `<cwd>/.git/keeper-commit-work.lock` — never a bare
+ * relative `.git`.
+ */
+export async function baseMergeLockPath(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<string> {
+  const res = await run(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { cwd },
+  );
+  const commonDir = res.stdout.trim();
+  const dir =
+    res.code === 0 && commonDir.length > 0 ? commonDir : joinPath(cwd, ".git");
+  return joinPath(dir, "keeper-commit-work.lock");
+}
+
+/**
+ * Feature-detect `git merge-tree --write-tree` — the write-tree plumbing mode
+ * that lands in git 2.38. The working-tree-free base merge needs it; an older
+ * git rejects `--write-tree` (its `merge-tree` speaks only the legacy
+ * trivial-merge format the pipeline cannot drive). Parses `git version`
+ * (major.minor ≥ 2.38). A failed / unparseable probe reads as UNSUPPORTED so the
+ * caller degrades to a transient skip rather than feeding an old git a flag it
+ * rejects as an indistinguishable hard error. Bounded so a wedged git never
+ * freezes the reconcile cycle.
+ */
+export async function supportsMergeTreeWriteTree(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<boolean> {
+  const r = await run(["version"], { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS });
+  if (r.code !== 0) {
+    return false;
+  }
+  const m = r.stdout.match(/(\d+)\.(\d+)(?:\.\d+)?/);
+  if (m === null) {
+    return false;
+  }
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  return major > 2 || (major === 2 && minor >= 38);
+}
+
 /** Resolve the repo's default branch (origin/HEAD, else fallback chain). */
 export async function resolveDefaultBranch(
   cwd: string,
