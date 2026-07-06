@@ -2,7 +2,9 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-06T20:28:03.200000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1142-cli-descriptor-and-grammar-convergence"
+  ],
   "id": "fn-1146-merge-usage-scraper-into-keeper",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-06T20:28:03.200000Z"
+  "updated_at": "2026-07-06T20:28:10.497000Z"
 }
