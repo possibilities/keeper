@@ -38,5 +38,5 @@ freshMemDb over a full migrate(); fold the new events and assert marker stamping
 - [ ] SCHEMA_VERSION is bumped with a forward-only migration and keeper/api.py SUPPORTED_SCHEMA_VERSIONS is updated in the same commit; fast suite green
 
 ## Done summary
-
+Added the human-notify once-marker substrate for both escalation paths: v109→v110 adds nullable human_notified_at to dispatch_failures (deconflict) and block_escalations (unblock), with MergeHumanNotified/BlockHumanNotified folds, staged dispatched/dispatch_failed block-latch outcomes, UPSERT preservation, and SUPPORTED_SCHEMA_VERSIONS += 110.
 ## Evidence
