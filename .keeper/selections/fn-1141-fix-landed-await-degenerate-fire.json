@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Root-causing a degenerate landed-detector fire across subtle started-gate guards and multi-repo lane aggregation is contract-touching, high-blast-radius work where a wrong fix regresses legitimate merged-and-torn-down cases.",
+      "task_id": "fn-1141-fix-landed-await-degenerate-fire.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "1d3a118f5d4d8b07ad4a02fc3e496ccf4664b01f254bbfb6f290c9a67d2dd40a",
+  "created_at": "2026-07-06T14:24:17.845000Z",
+  "epic_id": "fn-1141-fix-landed-await-degenerate-fire",
+  "input_hash": "b50f142c166c70c60c50c0ddfec5dd97a298274bb0430167c57a8806adf72219",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3037664300,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1141-fix-landed-await-degenerate-fire.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Root-causing a degenerate landed-detector fire\",\"confidence\":0.86}]}"
+}
