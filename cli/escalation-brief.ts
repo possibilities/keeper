@@ -46,7 +46,7 @@ export const MAX_LINEAGE_HOPS = 5;
 /** The typed escalation categories a worker stamps on a `BLOCKED:` return; the
  *  unblock incident lifts the category out of the blocked reason for the session. */
 const ESCALATION_CATEGORY_RE =
-  /\b(SPEC_UNCLEAR|DEPENDENCY_BLOCKED|DESIGN_CONFLICT|SCOPE_EXCEEDED|TOOLING_FAILURE|EXTERNAL_BLOCKED|RESUME_EXHAUSTED)\b/;
+  /\b(SPEC_UNCLEAR|DEPENDENCY_BLOCKED|DESIGN_CONFLICT|SCOPE_EXCEEDED|TOOLING_FAILURE|EXTERNAL_BLOCKED|RESUME_EXHAUSTED|SHARED_BASE_BROKEN)\b/;
 
 const HELP = `keeper escalation-brief <key> [options]
 
