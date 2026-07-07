@@ -75,5 +75,5 @@ Pure in-process `bun test`, sandbox state via `setStateDir`, poll-don't-sleep, o
 - [ ] `src/usage-picker.ts` header + `chooseByLadder` docs describe the latched model (forward-facing); `docs/adr/0012-latched-reserve-profile-balancer.md` and a new disjoint `CONTEXT.md` "Usage picker" glossary section land with the change.
 
 ## Done summary
-
+Replaced the stateless admission ladder in src/usage-picker.ts with a latched-reserve state machine (healthy-only latched, same-call fast-open, conservative re-latch under the 50 re-arm mark), persisting reserve_open in picker.json (schema v2, absent=latched). Reworked the picker suite to tier-based assertions and added the anti-flap/open/re-latch/boundary/absent-flag/backstop cases; landed ADR 0012 and a new CONTEXT.md Usage picker glossary section.
 ## Evidence

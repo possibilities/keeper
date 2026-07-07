@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "latched reserve state machine",
-  "updated_at": "2026-07-07T03:42:29.525000Z"
+  "updated_at": "2026-07-07T04:04:31.304000Z",
+  "worker_done_at": "2026-07-07T04:04:31.304000Z"
 }
