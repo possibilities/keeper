@@ -913,6 +913,86 @@ test("deriveCurrentSet: terminal row with later live-pid backend evidence is cur
   expect(cur[0].window_index).toBe(5);
 });
 
+test("deriveCurrentSet: a terminal row whose stale pane id was recycled to a DIFFERENT job is NOT resurrected", () => {
+  // The phantom-window incident: a terminal job's last event named pid P and
+  // pane %57. Both got recycled — P to an unrelated live process (pidAlive still
+  // true) and %57, after a tmux generation bump, to another live job. Attributing
+  // by the stale pane id would revive the dead job wearing the live job's coords.
+  const livePid = process.pid;
+  seedJob(kdb.db, {
+    job_id: "phantom",
+    state: "ended",
+    title: "phantom",
+    window_index: 7,
+    backend_exec_session_id: "work",
+    last_event_id: 10,
+    pid: livePid,
+  });
+  // The live job that legitimately owns %57 now (comes through the primary path).
+  seedJob(kdb.db, {
+    job_id: "owner-live",
+    state: "working",
+    title: "owner",
+    window_index: 7,
+    backend_exec_session_id: "work",
+  });
+  kdb.db.run(
+    `INSERT INTO events (
+       id, ts, session_id, pid, hook_event, event_type, data,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+     ) VALUES (?, ?, ?, ?, 'Notification', 'idle_prompt', '{}', 'tmux', 'work', ?)`,
+    [11, NOW, "phantom", livePid, "%57"],
+  );
+  // Latest snapshot: %57 is now owned by owner-live, not phantom.
+  seedTmuxTopologySnapshot(kdb.db, 13, "gen-now", [
+    {
+      pane_id: "%57",
+      session_name: "work",
+      window_index: 7,
+      job_id: "owner-live",
+    },
+  ]);
+
+  const cur = deriveCurrentSet(kdb.db);
+  const ids = cur.map((c) => c.job_id);
+  expect(ids).toContain("owner-live");
+  expect(ids).not.toContain("phantom");
+});
+
+test("deriveCurrentSet: a terminal row whose pane id still owns its OWN job_id in the latest snapshot is resurrected", () => {
+  // The guard must not over-reject: when the snapshot confirms the pane still
+  // belongs to THIS job, the premature-terminal recovery stands.
+  const livePid = process.pid;
+  seedJob(kdb.db, {
+    job_id: "resumed-own",
+    state: "ended",
+    title: "own",
+    window_index: 9,
+    backend_exec_session_id: "work",
+    last_event_id: 10,
+    pid: livePid,
+  });
+  kdb.db.run(
+    `INSERT INTO events (
+       id, ts, session_id, pid, hook_event, event_type, data,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+     ) VALUES (?, ?, ?, ?, 'Notification', 'idle_prompt', '{}', 'tmux', 'work', ?)`,
+    [11, NOW, "resumed-own", livePid, "%mine"],
+  );
+  seedTmuxTopologySnapshot(kdb.db, 13, "gen-now", [
+    {
+      pane_id: "%mine",
+      session_name: "work",
+      window_index: 5,
+      job_id: "resumed-own",
+    },
+  ]);
+
+  const cur = deriveCurrentSet(kdb.db);
+  expect(cur.map((c) => c.job_id)).toEqual(["resumed-own"]);
+  expect(cur[0].window_index).toBe(5);
+});
+
 test("deriveRestoreSet: carries cwd (the resume `cd` target); empty/NULL → null", () => {
   seedJob(kdb.db, {
     job_id: "with-cwd",

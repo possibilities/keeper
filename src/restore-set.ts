@@ -1191,6 +1191,11 @@ interface TmuxTopologyPaneLike {
 interface LatestTopologyPaneLocation {
   session_name: string;
   window_index: number | null;
+  // The keeper job owning this pane in the snapshot (producer-stamped via the
+  // recycle-guarded `(generation_id, pane_id)` join), or `null` when unstamped.
+  // The post-terminal deriver reads it to reject a pane id recycled to a
+  // DIFFERENT job — see {@link derivePostTerminalCurrentSet}.
+  job_id: string | null;
 }
 
 /**
@@ -1300,6 +1305,7 @@ function loadLatestTopologyPaneLocations(
       byPane.set(pane.pane_id, {
         session_name: pane.session_name,
         window_index: pane.window_index,
+        job_id: pane.job_id ?? null,
       });
     }
     return byPane;
@@ -1356,6 +1362,18 @@ function derivePostTerminalCurrentSet(
       continue;
     }
     const paneLocation = locations.get(seg(row.event_backend_exec_pane_id));
+    // Identity guard against resource-id reuse. The row's `pid` and pane id come
+    // from the last pre-terminal event; both get recycled after the process
+    // exits (the OS reassigns the pid, a new tmux generation reuses `%N`), so
+    // `pidAlive` alone can pass for an unrelated live process. If the latest
+    // snapshot says this pane is now owned by a DIFFERENT job, the terminal row
+    // is a phantom, not a still-attached process — skip it. An absent or
+    // unstamped `job_id` leaves the existing pid-liveness path intact, so a
+    // genuine premature-terminal job never drops.
+    const paneJobId = seg(paneLocation?.job_id ?? "");
+    if (paneJobId !== "" && paneJobId !== jobId) {
+      continue;
+    }
     const backendSession =
       paneLocation?.session_name !== undefined &&
       paneLocation.session_name !== ""
