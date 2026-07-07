@@ -33,6 +33,11 @@ import {
   effectivePerRootCap,
   resolveSockPath,
 } from "../src/db";
+import {
+  createFramesEmitter,
+  defaultDiffFn,
+  defaultFramesIo,
+} from "../src/frames-emitter";
 import type { ClientFrame } from "../src/protocol";
 import {
   isEpicStarted,
@@ -900,11 +905,52 @@ export function autopilotBannerLabel(state: {
   return `${pill}${needsHumanSeg} · ${state.mode}${armedSeg} · max ${cap}${perRootSeg}${worktreeSeg}`;
 }
 
+/** Data-frame bound + `--prev-frame` seed for `keeper frames --view autopilot`. */
+export interface AutopilotFramesConfig {
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}
+
+/**
+ * Drive the autopilot viewer in `frames` mode — the entry `keeper frames --view
+ * autopilot` dispatch calls. Mirrors `runBoardFrames` on the frames flag grammar
+ * (`maxFrames` / `durationMs` / `prevFrameText`), never `resolveSnapshotMode`.
+ */
+export async function runAutopilotFrames(config: {
+  sockPath?: string;
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}): Promise<void> {
+  await runViewer(config.sockPath ?? resolveSockPath(), "frames", undefined, {
+    maxFrames: config.maxFrames ?? null,
+    durationMs: config.durationMs ?? null,
+    prevFrameText: config.prevFrameText ?? null,
+  });
+}
+
 async function runViewer(
   sockPath: string,
-  mode: SnapshotMode = "watch",
+  mode: SnapshotMode | "frames" = "watch",
   timeoutMs?: number,
+  frames?: AutopilotFramesConfig,
 ): Promise<void> {
+  // Frames mode: build the prod emitter (view `autopilot`, `diff -u` seam, real
+  // sidecar IO, the caller's chunk bounds + `--prev-frame` seed). Inert
+  // otherwise.
+  const framesEmitter =
+    mode === "frames"
+      ? createFramesEmitter({
+          view: "autopilot",
+          writeStdout: (line) => void process.stdout.write(line),
+          diffFn: defaultDiffFn,
+          io: defaultFramesIo(),
+          maxFrames: frames?.maxFrames ?? null,
+          durationMs: frames?.durationMs ?? null,
+          prevFrameText: frames?.prevFrameText ?? null,
+        })
+      : null;
   const state: ViewerState = {
     snap: null,
     failed: [],
@@ -935,13 +981,21 @@ async function runViewer(
     // The latch holds the snapshot until ALL FIVE report (readiness auto-reports
     // via `view.emit`, the other four via `reportSnapshotStream` below) so the
     // captured frame reflects the FOLDED state rather than the seed values.
-    mode: mode === "snapshot" ? "snapshot" : "live",
+    mode: mode === "watch" ? "live" : mode,
     streamCount: 5,
     // A healthy but fully-idle board (no working/stopped/failed dispatch, no
     // armed epics, no open-task DAG) renders zero body lines — emit an honest
     // idle line so the snapshot frame is never bare separators.
     snapshotEmptyLine: "idle — no active dispatches, failures, or armed epics",
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(framesEmitter !== null
+      ? {
+          frames: {
+            emitter: framesEmitter,
+            durationMs: frames?.durationMs ?? null,
+          },
+        }
+      : {}),
     persistentBannerPill: () =>
       autopilotBannerLabel({
         paused: state.paused,
@@ -1024,6 +1078,9 @@ async function runViewer(
       view.emit(state);
     },
     onLifecycle: view.emitLifecycle,
+    // Thread the daemon fold cursor into the frames resume-cursor seam
+    // (fn-1161). Inert in live/snapshot.
+    onBootStatus: (boot) => view.noteCursor(String(boot.rev)),
   });
 
   const failuresHandle = subscribeCollection({
@@ -1127,6 +1184,8 @@ async function runViewer(
 
   if (mode === "snapshot") {
     view.runSnapshot(disposeAll);
+  } else if (mode === "frames") {
+    view.runFrames(disposeAll);
   } else {
     view.installSigintHandler(disposeAll);
   }

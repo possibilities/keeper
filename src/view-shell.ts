@@ -844,12 +844,21 @@ export function createViewShell<TSnap>(
       clearTimeoutFn(framesTimer);
       framesTimer = null;
     }
-    // The trailer is ALWAYS the final line — resume cursor + honest coverage.
+    // The trailer is ALWAYS the final line — resume cursor + honest coverage —
+    // even when the daemon was never reachable, so a consumer can always parse a
+    // terminal record. The EXIT CODE, though, mirrors snapshot's daemon-
+    // unreachable precedent (`src/snapshot.ts` runSnapshot): a run that emitted
+    // at least one frame (`framesBaselineEmitted`) reached the daemon → exit 0
+    // (an idle zero-DATA-frame chunk still emits its baseline, so it is a
+    // reachable exit 0); a run that ended having never rendered a frame never
+    // connected → exit 1.
     framesEmitter.emitTrailer({ reason });
     stopConnectingSpinner();
     liveShell.dispose();
     framesOnDispose();
-    (framesRunIo.exit ?? ((code: number) => process.exit(code)))(0);
+    (framesRunIo.exit ?? ((code: number) => process.exit(code)))(
+      framesBaselineEmitted ? 0 : 1,
+    );
   }
 
   // After an accepted frame, flush the trailer if a bound has tripped.

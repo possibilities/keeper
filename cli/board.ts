@@ -632,6 +632,8 @@ export interface BoardFramesConfig {
   maxFrames?: number | null;
   /** Duration bound in millis; `null`/omitted ⇒ unbounded. */
   durationMs?: number | null;
+  /** Prior chunk's last frame text (`--prev-frame`) — seeds the baseline diff. */
+  prevFrameText?: string | null;
 }
 
 export interface RunBoardConfig {
@@ -705,6 +707,7 @@ export async function runBoardFrames(config: {
   sockPath?: string;
   maxFrames?: number | null;
   durationMs?: number | null;
+  prevFrameText?: string | null;
 }): Promise<void> {
   await runBoard({
     mode: "frames",
@@ -712,6 +715,7 @@ export async function runBoardFrames(config: {
     frames: {
       maxFrames: config.maxFrames ?? null,
       durationMs: config.durationMs ?? null,
+      prevFrameText: config.prevFrameText ?? null,
     },
   });
 }
@@ -1078,6 +1082,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
           io: defaultFramesIo(),
           maxFrames: config.frames?.maxFrames ?? null,
           durationMs: config.frames?.durationMs ?? null,
+          prevFrameText: config.frames?.prevFrameText ?? null,
         })
       : null;
 

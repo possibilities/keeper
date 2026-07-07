@@ -143,6 +143,14 @@ export interface FramesEmitterDeps {
   durationMs?: number | null;
   maxDiffBytes?: number;
   maxDiffLines?: number;
+  /**
+   * A prior chunk's last frame text (`keeper frames --prev-frame <path>`). When
+   * set, the FIRST `baseline` is rendered as a net diff against this seed rather
+   * than a null-diff ground state, so a resumed chunk shows what changed since
+   * the previous chunk ended. `null`/omitted ⇒ the baseline is the ground state
+   * (`diff: null`), today's behavior.
+   */
+  prevFrameText?: string | null;
   /** Sidecar triples to retain (floored at 1 so the current frame survives). */
   ringSize?: number;
   /** Sidecar directory (default `/tmp`). */
@@ -302,7 +310,9 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
   let sidecarIndex = 0;
   let reconnected = false;
   let lastCursor: string | null = null;
-  let lastFrameText: string | null = null;
+  // Seeded from `--prev-frame` when supplied so the first baseline diffs against
+  // the prior chunk's last frame; `null` otherwise (a null-diff ground state).
+  let lastFrameText: string | null = deps.prevFrameText ?? null;
   // Each entry is the paths this process wrote for one sidecar-bearing emit.
   // The ring only ever unlinks paths it itself recorded here — it never scans a
   // directory and never touches a path it did not write.
@@ -339,7 +349,27 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
       `${JSON.stringify(input.stateJson, null, 2)}\n`,
     );
     deps.io.writeFile(framePath, `${input.frameText}\n`);
-    ring.push([statePath, framePath]);
+
+    // With a `--prev-frame` seed, `lastFrameText` is non-null on the FIRST
+    // baseline, so the baseline is a NET DIFF against the prior chunk's last
+    // frame (with a diff sidecar), rather than the null-diff ground state. A
+    // reconnect re-baseline (the sole other seeded case) legitimately shows the
+    // net change across the gap. Unseeded first baseline ⇒ `diff: null`.
+    const seeded = lastFrameText !== null;
+    let diffPath: string | null = null;
+    let bounded: BoundedDiff | null = null;
+    if (seeded) {
+      diffPath = sidecarPath("diff", index, "txt");
+      const raw = deps.diffFn(lastFrameText ?? "", input.frameText);
+      bounded = boundDiff(raw, {
+        maxBytes: maxDiffBytes,
+        maxLines: maxDiffLines,
+      });
+      deps.io.writeFile(diffPath, raw);
+      ring.push([statePath, framePath, diffPath]);
+    } else {
+      ring.push([statePath, framePath]);
+    }
     pruneRing();
 
     lastCursor = input.cursor;
@@ -351,11 +381,11 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
       ts: deps.io.nowIso(),
       view,
       cursor: input.cursor,
-      diff: null,
-      diff_truncated: false,
+      diff: bounded === null ? null : bounded.diff,
+      diff_truncated: bounded?.truncated ?? false,
       frame_path: framePath,
       state_path: statePath,
-      diff_path: null,
+      diff_path: diffPath,
     });
   }
 

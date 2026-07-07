@@ -38,6 +38,11 @@
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import {
+  createFramesEmitter,
+  defaultDiffFn,
+  defaultFramesIo,
+} from "../src/frames-emitter";
 import { subscribeCollection } from "../src/readiness-client";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import { createViewShell } from "../src/view-shell";
@@ -270,6 +275,69 @@ export async function main(argv: string[]): Promise<void> {
 
   const sockPath = values.sock ?? resolveSockPath();
 
+  await runBuilds({
+    mode: mode === "snapshot" ? "snapshot" : "live",
+    sockPath,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
+}
+
+/** Data-frame bound + `--prev-frame` seed for `keeper frames --view builds`. */
+export interface BuildsFramesConfig {
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}
+
+export interface RunBuildsConfig {
+  mode: "live" | "snapshot" | "frames";
+  sockPath: string;
+  timeoutMs?: number;
+  frames?: BuildsFramesConfig;
+}
+
+/**
+ * Drive the builds viewer in `frames` mode — the entry `keeper frames --view
+ * builds` dispatch calls. Mirrors `runBoardFrames` on the frames flag grammar
+ * (`maxFrames` / `durationMs` / `prevFrameText`), never `resolveSnapshotMode`.
+ */
+export async function runBuildsFrames(config: {
+  sockPath?: string;
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}): Promise<void> {
+  await runBuilds({
+    mode: "frames",
+    sockPath: config.sockPath ?? resolveSockPath(),
+    frames: {
+      maxFrames: config.maxFrames ?? null,
+      durationMs: config.durationMs ?? null,
+      prevFrameText: config.prevFrameText ?? null,
+    },
+  });
+}
+
+/**
+ * Shared builds-viewer runner. `main` drives it in `live` / `snapshot`;
+ * `runBuildsFrames` drives it in `frames`. All three share ONE
+ * `subscribeCollection` wiring so the row fold cannot drift between modes.
+ */
+export async function runBuilds(config: RunBuildsConfig): Promise<void> {
+  const { mode, sockPath, timeoutMs } = config;
+  const framesEmitter =
+    mode === "frames"
+      ? createFramesEmitter({
+          view: "builds",
+          writeStdout: (line) => void process.stdout.write(line),
+          diffFn: defaultDiffFn,
+          io: defaultFramesIo(),
+          maxFrames: config.frames?.maxFrames ?? null,
+          durationMs: config.frames?.durationMs ?? null,
+          prevFrameText: config.frames?.prevFrameText ?? null,
+        })
+      : null;
+
   const view = createViewShell<Record<string, unknown>[]>({
     script: "builds",
     title: "builds",
@@ -277,9 +345,17 @@ export async function main(argv: string[]): Promise<void> {
       bodyLines: renderRowLines(rows, Date.now()),
       stateJson: rows,
     }),
-    mode: mode === "snapshot" ? "snapshot" : "live",
+    mode,
     streamCount: 1,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(framesEmitter !== null
+      ? {
+          frames: {
+            emitter: framesEmitter,
+            durationMs: config.frames?.durationMs ?? null,
+          },
+        }
+      : {}),
   });
 
   const handle = subscribeCollection({
@@ -290,10 +366,15 @@ export async function main(argv: string[]): Promise<void> {
     sort: { column: "project", dir: "asc" },
     onRows: (rows) => view.emit(rows),
     onLifecycle: view.emitLifecycle,
+    // Thread the daemon fold cursor into the frames resume-cursor seam
+    // (fn-1161). Inert in live/snapshot.
+    onBootStatus: (boot) => view.noteCursor(String(boot.rev)),
   });
 
   if (mode === "snapshot") {
     view.runSnapshot(() => handle.dispose());
+  } else if (mode === "frames") {
+    view.runFrames(() => handle.dispose());
   } else {
     view.installSigintHandler(() => handle.dispose());
   }

@@ -26,6 +26,11 @@
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
+import {
+  createFramesEmitter,
+  defaultDiffFn,
+  defaultFramesIo,
+} from "../src/frames-emitter";
 import { subscribeCollection } from "../src/readiness-client";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import { createViewShell } from "../src/view-shell";
@@ -336,9 +341,83 @@ export async function main(argv: string[]): Promise<void> {
   const sockPath = values.sock ?? resolveSockPath();
   const projectDir = values["project-dir"];
 
-  // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into
-  // `createViewShell` — see `src/view-shell.ts`. fn-772 adds the snapshot
-  // branch: a single-stream view, so `streamCount: 1`.
+  await runGit({
+    mode: mode === "snapshot" ? "snapshot" : "live",
+    sockPath,
+    ...(projectDir === undefined ? {} : { projectDir }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
+}
+
+/** Data-frame bound + `--prev-frame` seed for `keeper frames --view git`. */
+export interface GitFramesConfig {
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}
+
+export interface RunGitConfig {
+  mode: "live" | "snapshot" | "frames";
+  sockPath: string;
+  projectDir?: string;
+  timeoutMs?: number;
+  frames?: GitFramesConfig;
+}
+
+/**
+ * Drive the git viewer in `frames` mode — the entry `keeper frames --view git`
+ * dispatch calls. Mirrors `runBoardFrames`: builds the prod frames emitter
+ * (view `git`, `diff -u` seam, real sidecar IO, the caller's chunk bounds) and
+ * hands it to the shared runner on its OWN flag grammar (`maxFrames` /
+ * `durationMs` / `prevFrameText`), never `resolveSnapshotMode`.
+ */
+export async function runGitFrames(config: {
+  sockPath?: string;
+  projectDir?: string;
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}): Promise<void> {
+  await runGit({
+    mode: "frames",
+    sockPath: config.sockPath ?? resolveSockPath(),
+    ...(config.projectDir === undefined
+      ? {}
+      : { projectDir: config.projectDir }),
+    frames: {
+      maxFrames: config.maxFrames ?? null,
+      durationMs: config.durationMs ?? null,
+      prevFrameText: config.prevFrameText ?? null,
+    },
+  });
+}
+
+/**
+ * Shared git-viewer runner. `main` drives it in `live` / `snapshot`;
+ * `runGitFrames` drives it in `frames`. All three share ONE `subscribeCollection`
+ * wiring so the row fold, sort, and diagnostics cannot drift between modes.
+ */
+export async function runGit(config: RunGitConfig): Promise<void> {
+  const { mode, sockPath, projectDir, timeoutMs } = config;
+  // Frames mode: build the prod emitter (view `git`, `diff -u` seam, real
+  // sidecar IO, the caller's chunk bounds + `--prev-frame` seed). Inert in
+  // live/snapshot.
+  const framesEmitter =
+    mode === "frames"
+      ? createFramesEmitter({
+          view: "git",
+          writeStdout: (line) => void process.stdout.write(line),
+          diffFn: defaultDiffFn,
+          io: defaultFramesIo(),
+          maxFrames: config.frames?.maxFrames ?? null,
+          durationMs: config.frames?.durationMs ?? null,
+          prevFrameText: config.frames?.prevFrameText ?? null,
+        })
+      : null;
+
+  // fn-660.1: lifecycle + sidecars + copy key + SIGINT live in `createViewShell`.
+  // fn-772 added the snapshot branch; fn-1161 adds the frames branch. Git is a
+  // single-stream view, so `streamCount: 1`.
   const view = createViewShell<Record<string, unknown>[]>({
     script: "git",
     title: "git",
@@ -346,9 +425,17 @@ export async function main(argv: string[]): Promise<void> {
       bodyLines: renderRowLines(rows),
       stateJson: rows,
     }),
-    mode: mode === "snapshot" ? "snapshot" : "live",
+    mode,
     streamCount: 1,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(framesEmitter !== null
+      ? {
+          frames: {
+            emitter: framesEmitter,
+            durationMs: config.frames?.durationMs ?? null,
+          },
+        }
+      : {}),
   });
 
   const handle = subscribeCollection({
@@ -362,10 +449,15 @@ export async function main(argv: string[]): Promise<void> {
       : { filter: { project_dir: projectDir } }),
     onRows: (rows) => view.emit(rows),
     onLifecycle: view.emitLifecycle,
+    // Thread the daemon fold cursor into the frames resume-cursor seam
+    // (fn-1161). Inert in live/snapshot (the stored cursor is never read).
+    onBootStatus: (boot) => view.noteCursor(String(boot.rev)),
   });
 
   if (mode === "snapshot") {
     view.runSnapshot(() => handle.dispose());
+  } else if (mode === "frames") {
+    view.runFrames(() => handle.dispose());
   } else {
     view.installSigintHandler(() => handle.dispose());
   }
