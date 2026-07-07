@@ -42,5 +42,5 @@ isolation rules).
 - [ ] `bun test` stays green.
 
 ## Done summary
-
+Fixed the keeperJson stdout/exit backpressure deadlock (drain concurrently) and checkMonitors' unverifiable-vs-dead conflation (absent own job row / null monitors snapshot now holds green); added test/watch-watchdog.test.ts covering runWatchdogLoop's miss->miss->recover->miss debounce/latch/recovery cycle and the --no-bus filter.
 ## Evidence

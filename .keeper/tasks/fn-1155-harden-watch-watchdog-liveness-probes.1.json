@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Harden and test watch-watchdog probes",
-  "updated_at": "2026-07-07T03:21:40.102000Z"
+  "updated_at": "2026-07-07T03:40:11.938000Z",
+  "worker_done_at": "2026-07-07T03:40:11.938000Z"
 }
