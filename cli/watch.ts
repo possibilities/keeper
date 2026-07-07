@@ -35,6 +35,7 @@
 import { parseArgs } from "node:util";
 import { verdictKey } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
+import { classifyNeedsHumanRow, projectNeedsHuman } from "../src/needs-human";
 import {
   type ConnectFactory,
   type ReadinessClientHandle,
@@ -72,13 +73,21 @@ export const KEEPALIVE_MS = 30_000;
 export const FLAP_SETTLE_MS = 750;
 
 /** The coarse delta type names — the `--filter` allowlist (minus baseline,
- *  which is always emitted, and keepalive). */
+ *  which is always emitted, and keepalive). The trailing six are the additive
+ *  needs-human families (ADR 0011): each a NEW top-level type an old consumer
+ *  no-op-skips, never a new kind routed through an existing type's shape. */
 export const WATCH_DELTA_TYPES = [
   "epic-added",
   "epic-removed",
   "verdict-change",
   "job-state-change",
   "autopilot-change",
+  "dead-letter",
+  "block-escalation",
+  "parked-question",
+  "stuck-dispatch",
+  "finalize-non-ff",
+  "instant-death-wall",
 ] as const;
 export type WatchDeltaType = (typeof WATCH_DELTA_TYPES)[number];
 
@@ -108,7 +117,18 @@ Delta types (also the --filter allowlist):
                     keeper plan block/unblock flipped a task's runtime overlay
   job-state-change  a job's state changed (added / removed / transitioned)
   autopilot-change  autopilot mode / pause / worktree / caps changed
+  dead-letter       a parked dead letter appeared / cleared
+  block-escalation  a block escalation appeared / cleared
+  parked-question   an epic's parked closer question appeared / cleared
+  stuck-dispatch    an operator-jam dispatch failure appeared / cleared
+  finalize-non-ff   an origin-ahead non-fast-forward finalize jam appeared /
+                    cleared (the most-specific stuck-dispatch subset)
+  instant-death-wall  the board crossed the instant-death quota-wall threshold
   keepalive         idle liveness line (filterable)
+
+The needs-human deltas fire on the OPERATOR-JAM class only (a self-clearing
+occupancy blip never emits); each names its key, op (appeared/cleared), and
+reason. The instant-death-wall delta flips on threshold crossing, not per row.
 
 Flags:
   --filter <type>  Emit only the named delta type(s) (repeatable; allowlist
@@ -163,6 +183,32 @@ export interface CoarseBoard {
     max_concurrent_per_root: number;
     max_concurrent_per_root_stored?: number;
   };
+  // The needs-human keyed categorical members (ADR 0011), derived through the
+  // ONE shared projector ({@link projectNeedsHuman}) so watch never drifts from
+  // status/await on what "stuck"/"jammed" means. Every member is a stable-key
+  // presence set carrying NO churn-bearing column (no last_event_id / ts) — a
+  // reducer re-write with no net state change projects to the same board and
+  // diffs to zero.
+  /** dl_id → true. A parked dead letter awaiting replay. */
+  deadLetters: Record<string, true>;
+  /** task_id → true. An open block escalation. */
+  blockEscalations: Record<string, true>;
+  /** epic_id → true. An epic carrying a parked closer question. */
+  parkedQuestions: Record<string, true>;
+  /**
+   * `${verb}\0${id}` → the sticky row's raw reason. OPERATOR-JAM rows ONLY
+   * ({@link projectNeedsHuman} `isJam`) — a self-clearing occupancy blip never
+   * projects, so it never emits. The emitted delta type is derived from the
+   * reason via the shared {@link classifyNeedsHumanRow}: a finalize-non-ff jam
+   * routes to its own `finalize-non-ff` type (most-specific), every other jam to
+   * `stuck-dispatch`. Instant-death-breaker rows are NOT jams and never land here
+   * — they surface ONLY via {@link instantDeathWall}.
+   */
+  dispatchJams: Record<string, string>;
+  /** The board-wide instant-death quota-wall threshold verdict
+   *  ({@link projectNeedsHuman} `instantDeathWallTripped`). A bool that flips on
+   *  crossing, NOT one entry per breaker row. */
+  instantDeathWall: boolean;
 }
 
 /** One coarse delta line's payload. */
@@ -171,10 +217,39 @@ export interface WatchDelta {
   data: Record<string, unknown>;
 }
 
+/** NUL-joins a dispatch-failure `(verb, id)` composite key. NUL because no
+ *  keeper verb / id token contains it, so two distinct rows can never collide
+ *  into one key — the same collision-free separator {@link projectNeedsHuman}'s
+ *  signature uses. Recovered by {@link splitJamKey} on the diff path. */
+const JAM_KEY_SEP = String.fromCharCode(0);
+
+/** Recover the `(verb, id)` a {@link JAM_KEY_SEP}-joined dispatchJams key holds. */
+function splitJamKey(key: string): { verb: string; id: string } {
+  const i = key.indexOf(JAM_KEY_SEP);
+  return i < 0
+    ? { verb: key, id: "" }
+    : { verb: key.slice(0, i), id: key.slice(i + JAM_KEY_SEP.length) };
+}
+
+/** The needs-human delta type a jam row's raw reason routes to — its
+ *  most-specific class via the shared {@link classifyNeedsHumanRow}: a
+ *  finalize-non-ff jam gets its own type, every other jam is a stuck-dispatch. */
+function jamDeltaType(reason: string): "finalize-non-ff" | "stuck-dispatch" {
+  return classifyNeedsHumanRow(reason) === "finalize-non-ff"
+    ? "finalize-non-ff"
+    : "stuck-dispatch";
+}
+
 /**
  * Project a readiness snapshot into the coarse board the tail diffs over.
- * Deliberately drops git_status / subagent / dead-letter churn — those are
- * heartbeat noise an orienting agent does not want one line per.
+ * Deliberately drops git_status / subagent churn — heartbeat noise an orienting
+ * agent does not want one line per. The needs-human families (dead letters,
+ * block escalations, parked questions, operator-jam dispatch failures, the
+ * instant-death wall) DO project, but as stable-key presence sets carrying no
+ * churn-bearing column (no last_event_id / ts): a reducer re-write with no net
+ * state change projects to the same board and diffs to zero. The whole
+ * needs-human classification comes from the ONE shared projector so watch,
+ * status, and await never drift on "stuck"/"jammed" (ADR 0011).
  */
 export function projectCoarseBoard(snap: ReadinessClientSnapshot): CoarseBoard {
   const epics: Record<string, string | null> = {};
@@ -203,6 +278,46 @@ export function projectCoarseBoard(snap: ReadinessClientSnapshot): CoarseBoard {
       }
     }
   }
+
+  // The needs-human families (ADR 0011). Parked-closer questions mint no
+  // `dispatch_failures` row, so they feed the shared projector by epic id — the
+  // same set that keys the `parkedQuestions` presence member. The dispatch
+  // failures ride the `includeDispatchFailures` opt-in (`keeper watch` always
+  // opts in); ABSENT for a non-opt-in consumer, coerced to empty here.
+  const parkedQuestionEpicIds = snap.epics
+    .filter((e) => (e.question ?? null) !== null)
+    .map((e) => e.epic_id);
+  const needsHuman = projectNeedsHuman({
+    dispatchFailures: snap.dispatchFailures ?? [],
+    deadLetters: snap.deadLetters.length,
+    blockEscalations: snap.blockEscalations.length,
+    parkedQuestionEpicIds,
+    epicIds: snap.epics.map((e) => e.epic_id),
+  });
+
+  const deadLetters: Record<string, true> = {};
+  for (const d of snap.deadLetters) {
+    deadLetters[d.dl_id] = true;
+  }
+  const blockEscalations: Record<string, true> = {};
+  for (const b of snap.blockEscalations) {
+    blockEscalations[b.task_id] = true;
+  }
+  const parkedQuestions: Record<string, true> = {};
+  for (const epicId of parkedQuestionEpicIds) {
+    parkedQuestions[epicId] = true;
+  }
+  // OPERATOR-JAM rows only (a self-clearing occupancy blip has `isJam` false, so
+  // it never projects and never emits). Keyed on the `(verb, id)` composite; the
+  // value is the raw reason (the delta type derives from it via the shared
+  // classifier). No churn-bearing column rides along, so a re-write diffs to zero.
+  const dispatchJams: Record<string, string> = {};
+  for (const r of needsHuman.rows) {
+    if (r.isJam) {
+      dispatchJams[`${r.verb}${JAM_KEY_SEP}${r.id}`] = r.reason;
+    }
+  }
+
   return {
     epics,
     taskVerdicts,
@@ -219,6 +334,11 @@ export function projectCoarseBoard(snap: ReadinessClientSnapshot): CoarseBoard {
         ? {}
         : { max_concurrent_per_root_stored: snap.maxConcurrentPerRootStored }),
     },
+    deadLetters,
+    blockEscalations,
+    parkedQuestions,
+    dispatchJams,
+    instantDeathWall: needsHuman.instantDeathWallTripped,
   };
 }
 
@@ -253,8 +373,10 @@ function diffRecords<V>(
  * Pure coarse diff. Returns one {@link WatchDelta} per real change between
  * `prev` and `next`; an empty array means a null-diff (the caller emits
  * NOTHING). Deterministic ordering: epics, then verdicts, then jobs, then
- * autopilot — keys sorted within each family so a reconnect re-paint of an
- * unchanged board produces the same (empty) result.
+ * autopilot, then the needs-human families (dead letters, block escalations,
+ * parked questions, operator-jam dispatches, the instant-death wall) — keys
+ * sorted within each family so a reconnect re-paint of an unchanged board
+ * produces the same (empty) result.
  */
 export function diffCoarseBoard(
   prev: CoarseBoard,
@@ -353,6 +475,77 @@ export function diffCoarseBoard(
     out.push({
       type: "autopilot-change",
       data: { from: prev.autopilot, to: next.autopilot },
+    });
+  }
+
+  // The needs-human families (ADR 0011) — each an additive top-level type an old
+  // consumer no-op-skips. `data` names the key, the op (appeared/cleared), and
+  // (for jams) the reason, so a supervisor triages from the delta alone.
+  const dlDiff = diffRecords(prev.deadLetters, next.deadLetters);
+  for (const [id] of dlDiff.added) {
+    out.push({ type: "dead-letter", data: { id, op: "appeared" } });
+  }
+  for (const [id] of dlDiff.removed) {
+    out.push({ type: "dead-letter", data: { id, op: "cleared" } });
+  }
+
+  const beDiff = diffRecords(prev.blockEscalations, next.blockEscalations);
+  for (const [id] of beDiff.added) {
+    out.push({ type: "block-escalation", data: { id, op: "appeared" } });
+  }
+  for (const [id] of beDiff.removed) {
+    out.push({ type: "block-escalation", data: { id, op: "cleared" } });
+  }
+
+  const pqDiff = diffRecords(prev.parkedQuestions, next.parkedQuestions);
+  for (const [epic_id] of pqDiff.added) {
+    out.push({ type: "parked-question", data: { epic_id, op: "appeared" } });
+  }
+  for (const [epic_id] of pqDiff.removed) {
+    out.push({ type: "parked-question", data: { epic_id, op: "cleared" } });
+  }
+
+  // Operator-jam dispatch failures, keyed `(verb, id)` → raw reason. The delta
+  // type is the row's MOST-SPECIFIC class via the shared classifier: a
+  // finalize-non-ff jam gets its own `finalize-non-ff` type, every other jam a
+  // `stuck-dispatch`. A reason reclassification (same key, new reason) reads as a
+  // clear of the old type and an appearance of the new.
+  const jamDiff = diffRecords(prev.dispatchJams, next.dispatchJams);
+  for (const [key, reason] of jamDiff.added) {
+    const { verb, id } = splitJamKey(key);
+    out.push({
+      type: jamDeltaType(reason),
+      data: { verb, id, op: "appeared", reason },
+    });
+  }
+  for (const [key, reason] of jamDiff.removed) {
+    const { verb, id } = splitJamKey(key);
+    out.push({
+      type: jamDeltaType(reason),
+      data: { verb, id, op: "cleared", reason },
+    });
+  }
+  for (const [key, from, to] of jamDiff.changed) {
+    const { verb, id } = splitJamKey(key);
+    out.push({
+      type: jamDeltaType(from),
+      data: { verb, id, op: "cleared", reason: from },
+    });
+    out.push({
+      type: jamDeltaType(to),
+      data: { verb, id, op: "appeared", reason: to },
+    });
+  }
+
+  // The instant-death quota-wall threshold — a bool that flips on CROSSING, not
+  // one entry per breaker row (a same-cycle 1↔2↔1 recross nets out via settle).
+  if (prev.instantDeathWall !== next.instantDeathWall) {
+    out.push({
+      type: "instant-death-wall",
+      data: {
+        op: next.instantDeathWall ? "appeared" : "cleared",
+        tripped: next.instantDeathWall,
+      },
     });
   }
 
@@ -622,6 +815,10 @@ export function runWatch(
     sockPath: args.sock,
     idPrefix: `watch-${process.pid}`,
     onSnapshot: emitter.onSnapshot,
+    // Opt into the gated `dispatch_failures` fold (ADR 0011) unconditionally —
+    // the needs-human jam / finalize-non-ff / instant-death-wall deltas ride the
+    // snapshot's `dispatchFailures` member off the same socket status/await share.
+    includeDispatchFailures: true,
     // Reconnect-forever: NO give-up policy. A daemon bounce must not end the
     // tail, so we never pass `giveUpPolicy` — the default subscribe behavior.
     ...(deps.connect === undefined ? {} : { connect: deps.connect }),
