@@ -11,11 +11,47 @@
  */
 
 import { expect, test } from "bun:test";
-import { runWatchdogLoop } from "../scripts/watch-watchdog";
+import {
+  classifyMonitors,
+  deriveChecks,
+  parseArgv,
+  runWatchdogLoop,
+} from "../scripts/watch-watchdog";
+import type { Job } from "../src/types";
 
 interface Verdict {
   ok: boolean;
   detail: string;
+}
+
+function makeJob(overrides: Partial<Job>): Job {
+  return {
+    job_id: "j-1",
+    created_at: 0,
+    cwd: null,
+    pid: null,
+    state: "working",
+    last_event_id: 0,
+    updated_at: 0,
+    title: null,
+    title_source: null,
+    transcript_path: null,
+    start_time: null,
+    plan_verb: null,
+    plan_ref: null,
+    epic_links: [],
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
+    git_dirty_count: 0,
+    git_unattributed_to_live_count: 0,
+    git_orphan_count: 0,
+    monitors: null,
+    ...overrides,
+  } as Job;
 }
 
 test("runWatchdogLoop: miss -> miss -> recover -> miss fires exactly one anomaly per episode", async () => {
@@ -118,4 +154,61 @@ test("runWatchdogLoop: --no-bus filter — an omitted check never runs and never
   expect(anomalies).toHaveLength(2);
   expect(anomalies.some((l) => l.includes("check=monitors"))).toBe(true);
   expect(anomalies.some((l) => l.includes("check=status"))).toBe(true);
+});
+
+test("classifyMonitors: own job row absent -> unverifiable, holds green (not dead)", () => {
+  const rows = [makeJob({ job_id: "someone-else", monitors: "[]" })];
+  const result = classifyMonitors(["keeper watch --json"], "me", rows);
+  expect(result.ok).toBe(true);
+  expect(result.detail).toContain("unverifiable");
+});
+
+test("classifyMonitors: own job's monitors snapshot still null -> unverifiable, holds green", () => {
+  const rows = [makeJob({ job_id: "me", monitors: null })];
+  const result = classifyMonitors(["keeper watch --json"], "me", rows);
+  expect(result.ok).toBe(true);
+  expect(result.detail).toContain("unverifiable");
+});
+
+test("classifyMonitors: matching sibling command present -> ok (live)", () => {
+  const rows = [
+    makeJob({
+      job_id: "me",
+      monitors: JSON.stringify([
+        { id: "m-1", kind: "monitor", command: "keeper watch --json" },
+      ]),
+    }),
+  ];
+  const result = classifyMonitors(["keeper watch --json"], "me", rows);
+  expect(result.ok).toBe(true);
+  expect(result.detail).toContain("live");
+});
+
+test("classifyMonitors: sibling monitor missing from a non-null snapshot -> dead, anomaly", () => {
+  const rows = [makeJob({ job_id: "me", monitors: JSON.stringify([]) })];
+  const result = classifyMonitors(["keeper watch --json"], "me", rows);
+  expect(result.ok).toBe(false);
+  expect(result.detail).toContain("sibling monitor(s) not running");
+  expect(result.detail).toContain("keeper watch --json");
+});
+
+test("parseArgv: --no-bus yields bus:false and deriveChecks drops 'bus'", () => {
+  const parsed = parseArgv(["--monitor", "keeper watch --json", "--no-bus"]);
+  if (!("bus" in parsed)) {
+    throw new Error(`expected a parsed Options, got ${JSON.stringify(parsed)}`);
+  }
+  expect(parsed.bus).toBe(false);
+  const checks = deriveChecks(parsed.bus);
+  expect(checks).not.toContain("bus");
+  expect(checks).toEqual(["monitors", "status"]);
+});
+
+test("parseArgv: bus defaults true (no --no-bus) and deriveChecks keeps 'bus'", () => {
+  const parsed = parseArgv(["--monitor", "keeper watch --json"]);
+  if (!("bus" in parsed)) {
+    throw new Error(`expected a parsed Options, got ${JSON.stringify(parsed)}`);
+  }
+  expect(parsed.bus).toBe(true);
+  const checks = deriveChecks(parsed.bus);
+  expect(checks).toEqual(["monitors", "bus", "status"]);
 });

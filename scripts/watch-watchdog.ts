@@ -118,7 +118,7 @@ interface Parsed {
   sock: string | null;
 }
 
-function parseArgv(
+export function parseArgv(
   argv: string[],
 ): Parsed | { help: true } | { error: string } {
   let values: Record<string, unknown>;
@@ -130,6 +130,7 @@ function parseArgv(
         interval: { type: "string" },
         "max-ticks": { type: "string" },
         bus: { type: "boolean", default: true },
+        "no-bus": { type: "boolean", default: false },
         sock: { type: "string" },
         help: { type: "boolean", default: false },
       },
@@ -176,7 +177,10 @@ function parseArgv(
     monitors,
     intervalMs,
     maxTicks,
-    bus: values.bus !== false,
+    // `--no-bus` is registered as its own boolean (node:util's `parseArgs`
+    // does not auto-negate a `bus`-named option into a `--no-bus` flag) —
+    // either it or an explicit `--bus false`-style false turns the check off.
+    bus: values.bus !== false && values["no-bus"] !== true,
     sock: typeof values.sock === "string" ? (values.sock as string) : null,
   };
 }
@@ -208,13 +212,17 @@ async function keeperJson(
   let exitCode: number;
   let text: string;
   try {
-    // Drain stdout CONCURRENTLY with the exit await, never sequentially after
-    // it — a child whose output exceeds the OS pipe buffer blocks on write
-    // while a parent that awaits `proc.exited` first blocks on read, a
+    // Drain BOTH pipes CONCURRENTLY with the exit await, never sequentially
+    // after it — a child whose output exceeds the OS pipe buffer blocks on
+    // write while a parent that awaits `proc.exited` first blocks on read, a
     // backpressure deadlock (`keeper query jobs` on a busy board can exceed
-    // it).
-    const [stdoutText, code] = await Promise.all([
+    // it on stdout; a noisy stderr writer re-seats the exact same class on
+    // the sibling pipe). stderr's text is discarded — this probe only surfaces
+    // stdout's JSON envelope — but it MUST still be read concurrently so its
+    // pipe never backs up.
+    const [stdoutText, , code] = await Promise.all([
       new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
       proc.exited,
     ]);
     text = stdoutText;
@@ -248,26 +256,17 @@ async function keeperJson(
  * and is checked directly here rather than through `monitorRunningState` (whose
  * `met` verdict conflates both cases).
  */
-async function checkMonitors(
+/**
+ * Pure classification over an already-fetched `Job[]` snapshot — factored out
+ * of {@link checkMonitors} so the unverifiable-own-job branch (the epic's
+ * headline fix) and the dead-sibling path are both directly testable without
+ * a real subprocess. No I/O, no `Date.now()`.
+ */
+export function classifyMonitors(
   monitors: string[],
-  ownSessionId: string | null,
-  sock: string | null,
-): Promise<CheckResult> {
-  if (ownSessionId === null) {
-    // No own-session id to scope the jobs row → can't tell a live sibling from a
-    // dead one. Never emit a false anomaly; degrade to unverifiable (a stderr
-    // note fired once at startup) and hold this check green.
-    return { ok: true, detail: "own session id unset — monitor check skipped" };
-  }
-  const res = await keeperJson(["query", "jobs"], sock);
-  if (!res.ok) {
-    return { ok: false, detail: `jobs unreachable: ${res.error}` };
-  }
-  const data = (res.json as { data?: unknown }).data;
-  if (!Array.isArray(data)) {
-    return { ok: false, detail: "jobs query returned no rows array" };
-  }
-  const rows = data as Job[];
+  ownSessionId: string,
+  rows: readonly Job[],
+): CheckResult {
   const ownJob = rows.find((j) => j.job_id === ownSessionId);
   if (ownJob === undefined || ownJob.monitors === null) {
     // Own job row not yet in the projection, or its `monitors` snapshot is
@@ -275,7 +274,7 @@ async function checkMonitors(
     // NOT dead. `monitorRunningState` folds both into the same `met` verdict
     // as a truly-absent sibling; distinguish here rather than false-paging
     // every armed watch in the arm window (mirrors the ownSessionId===null
-    // degrade above).
+    // degrade in {@link checkMonitors}).
     return {
       ok: true,
       detail:
@@ -299,6 +298,28 @@ async function checkMonitors(
     };
   }
   return { ok: true, detail: `${monitors.length} sibling monitor(s) live` };
+}
+
+async function checkMonitors(
+  monitors: string[],
+  ownSessionId: string | null,
+  sock: string | null,
+): Promise<CheckResult> {
+  if (ownSessionId === null) {
+    // No own-session id to scope the jobs row → can't tell a live sibling from a
+    // dead one. Never emit a false anomaly; degrade to unverifiable (a stderr
+    // note fired once at startup) and hold this check green.
+    return { ok: true, detail: "own session id unset — monitor check skipped" };
+  }
+  const res = await keeperJson(["query", "jobs"], sock);
+  if (!res.ok) {
+    return { ok: false, detail: `jobs unreachable: ${res.error}` };
+  }
+  const data = (res.json as { data?: unknown }).data;
+  if (!Array.isArray(data)) {
+    return { ok: false, detail: "jobs query returned no rows array" };
+  }
+  return classifyMonitors(monitors, ownSessionId, data as Job[]);
 }
 
 /**
@@ -399,6 +420,14 @@ export async function runWatchdogLoop(
   }
 }
 
+/** Derive the tick's check list from the parsed `--no-bus` flag — the exact
+ *  wiring `main` applies. Factored out (rather than inlined in `main`) so
+ *  the flag-to-filter mapping is directly testable without booting `main`'s
+ *  real subprocess loop. */
+export function deriveChecks(bus: boolean): CheckName[] {
+  return bus ? [...CHECK_NAMES] : CHECK_NAMES.filter((c) => c !== "bus");
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgv(Bun.argv.slice(2));
   if ("help" in parsed) {
@@ -411,9 +440,7 @@ async function main(): Promise<void> {
   }
 
   const ownSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? null;
-  const checks: CheckName[] = parsed.bus
-    ? [...CHECK_NAMES]
-    : CHECK_NAMES.filter((c) => c !== "bus");
+  const checks: CheckName[] = deriveChecks(parsed.bus);
 
   process.stderr.write(
     `[watch-watchdog] armed monitors=${parsed.monitors.length} interval=${parsed.intervalMs}ms bus=${parsed.bus ? "on" : "off"} session=${ownSessionId ?? "none"}\n`,
