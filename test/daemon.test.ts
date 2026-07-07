@@ -68,6 +68,7 @@ import {
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
   type MergeHumanNotifiedOutcome,
+  mergeConflictBaseCheckout,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
@@ -5028,6 +5029,36 @@ test("fn-1119 recover-origin escalation: a bare close::<epic> row with a recover
 });
 
 // ---- buildResolverBrief (the autonomous resolver worker prompt) --------------
+
+test("mergeConflictBaseCheckout: a default-branch base resolves to the repo root (never a nonexistent lane path); a keeper/epic lane base to its worktree", () => {
+  const repoDir = "/Users/me/code/foo";
+  // A lane→default finalize (base = the default branch) is NEVER laned: the cwd is the
+  // repo root itself (the shared default checkout). `worktreePathFor(repoDir, "main")`
+  // would be a lane dir that does not exist, so a launch cd'ing there ENOENTs and the
+  // resolver never dispatches — the regression this pins.
+  expect(mergeConflictBaseCheckout(repoDir, "main")).toBe(repoDir);
+  expect(mergeConflictBaseCheckout(repoDir, "master")).toBe(repoDir);
+  // A rib→lane fan-in (base = the epic lane) resolves to that lane's worktree.
+  const lane = "keeper/epic/fn-9-foo";
+  expect(mergeConflictBaseCheckout(repoDir, lane)).toBe(
+    worktreePathFor(repoDir, lane),
+  );
+});
+
+test("buildResolverBrief: a lane→default finalize (base = the default branch) cd's into the repo root, NOT a nonexistent <repo>--<default> lane", () => {
+  const repoDir = "/Users/me/code/foo";
+  const brief = buildResolverBrief({
+    epicId: "fn-9-foo",
+    // The production shape: the epic base branch merged INTO the default branch.
+    reason: mergeConflictReason("keeper/epic/fn-9-foo", "main"),
+    repoDir,
+  });
+  // The worker cd's into the repo root (the shared default checkout finalize merged in),
+  // never the fabricated lane dir that made the resolver launch ENOENT.
+  expect(brief).toContain(`cd ${repoDir}`);
+  expect(brief).not.toContain(worktreePathFor(repoDir, "main"));
+  expect(brief).toContain("git merge --no-ff keeper/epic/fn-9-foo");
+});
 
 test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on the clear path, BLOCKED + unstick on everything else", () => {
   const repoDir = "/Users/me/code/foo";

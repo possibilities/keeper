@@ -1175,7 +1175,7 @@ export interface PendingMergeEscalation {
   id: string;
   /** The close failure reason — the `worktree-merge-conflict: …` string to parse. */
   reason: string;
-  /** The close row's `dir` — the repo root, for {@link worktreePathFor}. */
+  /** The close row's `dir` — the repo root, for {@link mergeConflictBaseCheckout}. */
   dir: string | null;
 }
 
@@ -1308,6 +1308,26 @@ function parseMergeConflictReason(
   );
   if (m == null) return null;
   return { source: m[1], base: m[2] };
+}
+
+/**
+ * The checkout directory where a merge-conflict reason's BASE branch lives — the cwd
+ * where finalize ran the failing merge, so the conflict physically sits there. A
+ * `keeper/epic/…` lane base (a rib fan-in into the epic lane) resolves to its worktree
+ * lane; the DEFAULT-branch base (a lane→default finalize, e.g. `main`) is NEVER laned,
+ * so it resolves to the repo root itself — the shared default checkout `mergeBranchInto`
+ * lands in. Passing the default branch to {@link worktreePathFor} would fabricate a
+ * nonexistent `<repo>--<default>` dir, and the launch would then ENOENT on the cwd (the
+ * whole escalation ladder wedges — the resolver never dispatches, so the human is never
+ * paged). Pure.
+ */
+export function mergeConflictBaseCheckout(
+  repoDir: string,
+  base: string,
+): string {
+  return base.startsWith("keeper/epic/")
+    ? worktreePathFor(repoDir, base)
+    : repoDir;
 }
 
 /** Injectable dependency surface for {@link runMergeEscalationSweep} — the daemon's
@@ -1629,7 +1649,7 @@ export interface PendingResolverDispatch {
   id: string;
   /** The close failure reason — the `worktree-merge-conflict: …` string to parse. */
   reason: string;
-  /** The close row's `dir` — the repo root, for {@link worktreePathFor}. */
+  /** The close row's `dir` — the repo root, for {@link mergeConflictBaseCheckout}. */
   dir: string | null;
 }
 
@@ -1759,7 +1779,13 @@ export function buildResolverBrief(args: {
       args.reason.trim(),
     ].join("\n");
   }
-  const worktree = worktreePathFor(args.repoDir as string, parsed.base);
+  // The checkout where finalize ran the failing merge, for the worker's `cd`: a
+  // default-branch base resolves to the repo root (the shared default checkout, never
+  // laned), a `keeper/epic/…` lane base to its worktree.
+  const worktree = mergeConflictBaseCheckout(
+    args.repoDir as string,
+    parsed.base,
+  );
   return [
     `You are the autopilot merge-resolver for epic ${epic}. A worktree fan-in close is`,
     `STUCK on a merge conflict (\`close::${epic}\`) — the base worktree's merge was`,
@@ -8230,11 +8256,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function dispatchDeconflict(
     row: PendingMergeEscalation,
   ): Promise<EscalationDispatchOutcome> {
+    // The checkout where finalize ran the failing merge — see `dispatchResolver`:
+    // `mergeConflictBaseCheckout` maps a default-branch base to the repo root (never
+    // laned) and a `keeper/epic/…` lane base to its worktree, so Bun.spawn never ENOENTs.
     const parsed = parseMergeConflictReason(row.reason);
     const hasRepo = row.dir != null && row.dir !== "";
     const cwd =
       parsed != null && hasRepo
-        ? worktreePathFor(row.dir as string, parsed.base)
+        ? mergeConflictBaseCheckout(row.dir as string, parsed.base)
         : (row.dir ?? "");
     return dispatchEscalationSession(liveEscalationDispatchDeps, {
       verb: "deconflict",
@@ -8608,13 +8637,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function dispatchResolver(
     row: PendingResolverDispatch,
   ): Promise<ResolverDispatchOutcome> {
-    // The base worktree path (where the fan-in conflict lives). A parse-miss leaves it
-    // null — spawn in the repo root and let the degraded brief guide the worker.
+    // The checkout where finalize ran the failing merge (the conflict lives there):
+    // `mergeConflictBaseCheckout` maps a default-branch base to the repo root (the shared
+    // default checkout, never laned) and a `keeper/epic/…` lane base to its worktree. A
+    // parse-miss / no repo dir degrades to the repo root; the brief guides the worker.
     const parsed = parseMergeConflictReason(row.reason);
     const hasRepo = row.dir != null && row.dir !== "";
     const cwd =
       parsed != null && hasRepo
-        ? worktreePathFor(row.dir as string, parsed.base)
+        ? mergeConflictBaseCheckout(row.dir as string, parsed.base)
         : (row.dir ?? "");
     const spec: LaunchSpec = {
       prompt: buildResolverBrief({
