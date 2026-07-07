@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T17:22:29.591000Z",
+  "created_by_close_of": "fn-1163-matt-skills-plugin",
+  "depends_on_epics": [
+    "fn-1163-matt-skills-plugin"
+  ],
+  "id": "fn-1165-sync-matt-plugin-skill-inventories",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Sync matt plugin skill inventories",
+  "touched_repos": [
+    "/Users/mike/code/arthack"
+  ],
+  "updated_at": "2026-07-07T17:22:29.591000Z"
+}
