@@ -540,14 +540,14 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
   },
   {
     name: "selection-audit-brief",
-    summary: "Write the close-time selection-audit brief for an epic.",
+    summary: "Write the committed selection-audit brief for a closed epic.",
     args: [{ name: "EPIC_ID" }],
     options: [
       OPT_PROJECT,
       {
         name: "--force",
         takesValue: false,
-        summary: "Re-assemble despite an existing committed review",
+        summary: "Re-derive despite an existing committed brief",
       },
     ],
   },

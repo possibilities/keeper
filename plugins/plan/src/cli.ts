@@ -801,9 +801,10 @@ function dispatch(parsed: ParsedArgs): number {
         createdByCloseOf: null,
       });
     case "selection-audit-brief":
-      // Commit-free audit handoff: writes gitignored state/ and emits one
-      // content-blind envelope; the selection-auditor subagent reads the brief.
-      // --force re-assembles despite an existing committed review.
+      // Committed capture beat: writes a top-level data-dir sibling and rides
+      // the verb's auto-commit; a later out-of-band grading run reads the brief.
+      // Write-once on the brief's own existence — a re-close is idempotent;
+      // --force re-derives despite an existing committed brief.
       runSelectionAuditBrief({
         epicId: readPositionalSkipping(rest, new Set(["--project"])),
         project: readOption(rest, "--project"),
@@ -841,9 +842,9 @@ function dispatch(parsed: ParsedArgs): number {
       break;
     }
     case "selection-review-submit": {
-      // Mutating verb: validates the auditor verdict on stdin (--file -), writes
-      // the committed review file (auto-committed), and sets the display-only
-      // misfit flag only on a non-right-sized verdict. Self-emits its envelope.
+      // Mutating verb: validates the auditor verdict on stdin (--file -) and
+      // writes the committed review file (auto-committed); no board/overlay
+      // state is written. Self-emits its envelope.
       const epicId = readPositionalSkipping(
         rest,
         new Set(["--file", "--project"]),

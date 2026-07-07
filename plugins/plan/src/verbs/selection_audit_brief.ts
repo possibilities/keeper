@@ -1,14 +1,14 @@
-// selection-audit-brief verb — the content-blind handoff for the close-time
-// selection auditor.
+// selection-audit-brief verb — the mechanical, committed capture beat a
+// human-invoked out-of-band grading skill later hands its auditor.
 //
-// Assembles, under gitignored state, the grading context for one closed epic: for
-// each AUDITABLE completed task it carries the task spec, the assigned {tier,
-// model}, the selection sidecar's rationale / confidence / label_source plus the
-// run's config + input hashes, per-task diff stats derived from the Task-trailer
-// source commits (files touched + line counts), and the done summary. The
-// `plan:selection-auditor` subagent reads only the brief path; the coordinator
-// stays content-blind to the grading context exactly like /plan:work and
-// /plan:close.
+// Assembles, for one closed epic, the grading context for each AUDITABLE
+// completed task: the task spec, the assigned {tier, model}, the selection
+// run's config + input hashes, per-task diff stats derived from the
+// Task-trailer source commits (files touched + line counts), and the done
+// summary. The brief carries no selector rationale/confidence/label_source —
+// those stay in the selection sidecar for calibration only, kept out of the
+// blinded grading pass. The brief lands committed so a future grading run has a
+// stable, git-recoverable snapshot to grade from; no auditor runs at close time.
 //
 // AUDITABLE excludes two non-decisions whose grading would poison the dataset:
 //   - a task whose cell was a degraded default (sidecar label_source
@@ -17,15 +17,16 @@
 //     claim) — nothing exercised the cell.
 // Every other done task is auditable; the brief also lists the exclusions + why.
 //
-// Write-once: the verb refuses when a committed review file already exists (a
-// second audit would race the dataset), unless `--force`. It writes the brief
-// commit-free (state/ is gitignored) and emits one content-blind envelope.
+// Write-once on the brief's OWN existence: a re-close after a brief already
+// landed is idempotent — success, no rewrite, no second commit — since a
+// re-close is not a re-audit. `--force` deliberately re-derives it.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import { AllReposBrokenError, findCommitGroups } from "../commit_lookup.ts";
+import { emitMutating } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
 import {
@@ -34,16 +35,16 @@ import {
 } from "../project.ts";
 import {
   SELECTION_AUDIT_BRIEF_SCHEMA_VERSION,
+  selectionAuditBriefExists,
   selectionAuditBriefPath,
-  selectionReviewExists,
-  serializeAuditBrief,
+  writeSelectionAuditBriefFile,
 } from "../selection_review_file.ts";
 import {
   readSelectionSidecar,
   type SidecarCell,
 } from "../selection_sidecar.ts";
 import { getTaskSection } from "../specs.ts";
-import { atomicWriteRaw, nowIso } from "../store.ts";
+import { nowIso } from "../store.ts";
 import { getVcs } from "../vcs.ts";
 
 export interface SelectionAuditBriefArgs {
@@ -208,16 +209,23 @@ export function runSelectionAuditBrief(args: SelectionAuditBriefArgs): void {
   const ctx = resolvePlanStateContext(epicId, project, format);
   const dataDir = ctx.dataDir;
 
-  // Write-once guard: a committed review file already present means this epic was
-  // audited; a fresh brief would invite a racing second dataset write.
-  if (!force && selectionReviewExists(dataDir, epicId)) {
-    emitAuditBriefError(
-      "REVIEW_EXISTS",
-      `a committed selection review already exists for ${epicId}; ` +
-        "pass --force to re-assemble the audit brief",
-      format,
-      { epic_id: epicId },
+  // Write-once guard on the brief's OWN existence: a re-close after a brief
+  // already landed is idempotent (a re-close is not a re-audit), not an error.
+  if (!force && selectionAuditBriefExists(dataDir, epicId)) {
+    emitMutating(
+      {
+        epic_id: epicId,
+        brief_ref: selectionAuditBriefPath(dataDir, epicId),
+        skipped: true,
+      },
+      {
+        verb: "selection-audit-brief",
+        target: epicId,
+        repoRoot: ctx.projectPath,
+        primaryRepo: ctx.projectPath,
+      },
     );
+    return;
   }
 
   // The selection sidecar is the grading provenance — no sidecar means the epic
@@ -291,9 +299,6 @@ export function runSelectionAuditBrief(args: SelectionAuditBriefArgs): void {
       title: asString(t.title),
       tier: cell.tier,
       model: cell.model,
-      rationale: cell.rationale,
-      confidence: cell.confidence,
-      label_source: cell.label_source,
       config_hash: sidecar.config_hash,
       input_hash: sidecar.input_hash,
       spec_chars: specMd.length,
@@ -315,12 +320,10 @@ export function runSelectionAuditBrief(args: SelectionAuditBriefArgs): void {
     excluded_tasks: excluded,
   };
 
-  const briefRef = selectionAuditBriefPath(ctx.stateDir, epicId);
-  atomicWriteRaw(briefRef, serializeAuditBrief(brief));
+  const briefRef = writeSelectionAuditBriefFile(dataDir, epicId, brief);
 
-  formatOutput(
+  emitMutating(
     {
-      success: true,
       epic_id: epicId,
       primary_repo: primaryRepo,
       brief_ref: briefRef,
@@ -329,6 +332,11 @@ export function runSelectionAuditBrief(args: SelectionAuditBriefArgs): void {
       selection_config_hash: sidecar.config_hash,
       selection_input_hash: sidecar.input_hash,
     },
-    format,
+    {
+      verb: "selection-audit-brief",
+      target: epicId,
+      repoRoot: ctx.projectPath,
+      primaryRepo: ctx.projectPath,
+    },
   );
 }

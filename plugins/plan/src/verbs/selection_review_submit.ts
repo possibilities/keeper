@@ -1,22 +1,23 @@
-// selection-review-submit verb — validate the auditor's verdict JSON and land the
-// committed per-epic review dataset (plus the board-visible misfit flag).
+// selection-review-submit verb — validate an out-of-band auditor's verdict JSON
+// and land the committed per-epic review dataset.
 //
 // Reads the verdict on stdin (`--file -`), validates it against the audit brief:
-// the 3-way categorical enum, exact coverage of the brief's auditable task set
-// (no missing, no extra, no duplicate), and a non-empty evidence sentence per
-// verdict. A malformed verdict is rejected with the single distinct VERDICT_INVALID
-// code, leaving NO file and NO flag.
+// a non-empty top-level rubric_version/judge_model_version/prompt_hash (the
+// grading run's own provenance keys), the 3-way categorical enum, exact
+// coverage of the brief's auditable task set (no missing, no extra, no
+// duplicate), and a non-empty evidence sentence per verdict. A malformed
+// verdict is rejected with the single distinct VERDICT_INVALID code, leaving no
+// file.
 //
 // On a clean verdict it writes the committed review file at
-// `<data-dir>/selection-reviews/<epic>.json` — schema-versioned, each verdict
-// snapshotting the graded {tier, model} + the selection config/input hashes so a
-// future re-select cannot orphan the join — riding the verb's auto-commit. It then
-// sets the task-2 selection-review overlay flag (a display-only needs-human signal)
-// ONLY when at least one verdict is non-right-sized, carrying the verdict counts as
-// payload. A fully right-sized epic writes the dataset and raises no flag.
+// `<data-dir>/selection-reviews/<epic>.json` — schema-versioned, stamped with
+// rubric_version/judge_model_version/prompt_hash, each verdict snapshotting the
+// graded {tier, model} + the selection config/input hashes so a future
+// re-select cannot orphan the join — riding the verb's auto-commit. The verb
+// writes no board/overlay state; the envelope carries counts + graded task ids.
 //
 // Write-once: a second submit without `--force` is refused (REVIEW_EXISTS) so a
-// committed dataset is never silently clobbered.
+// committed dataset is never silently clobbered — the deliberate re-grade path.
 
 import { existsSync, readFileSync } from "node:fs";
 
@@ -38,7 +39,7 @@ import {
   selectionReviewExists,
   writeSelectionReviewFile,
 } from "../selection_review_file.ts";
-import { LocalFileStateStore, nowIso } from "../store.ts";
+import { nowIso } from "../store.ts";
 import {
   emitSubmitError,
   readPayloadCapped,
@@ -130,7 +131,7 @@ export function runSelectionReviewSubmit(
 
   // The audit brief pins the auditable task set + each cell's snapshot fields; a
   // missing brief means selection-audit-brief was never run.
-  const briefRef = selectionAuditBriefPath(ctx.stateDir, epicId);
+  const briefRef = selectionAuditBriefPath(dataDir, epicId);
   if (!existsSync(briefRef)) {
     emitSubmitErrorLocal(
       "BRIEF_MISSING",
@@ -235,10 +236,32 @@ export function runSelectionReviewSubmit(
     );
   }
 
-  const verdictNodes = (payload as Record<string, unknown>)
-    .verdicts as unknown[];
+  const payloadObj = payload as Record<string, unknown>;
+  const verdictNodes = payloadObj.verdicts as unknown[];
   const seen = new Set<string>();
   const parsed: { taskId: string; verdict: string; evidence: string }[] = [];
+
+  // The grading run's own provenance keys — required alongside the verdicts so
+  // a rubric or judge-model change never masquerades as a policy shift.
+  const rubricVersion =
+    typeof payloadObj.rubric_version === "string"
+      ? payloadObj.rubric_version
+      : "";
+  if (rubricVersion.trim() === "") {
+    errors.push("top-level `rubric_version` must be a non-empty string");
+  }
+  const judgeModelVersion =
+    typeof payloadObj.judge_model_version === "string"
+      ? payloadObj.judge_model_version
+      : "";
+  if (judgeModelVersion.trim() === "") {
+    errors.push("top-level `judge_model_version` must be a non-empty string");
+  }
+  const promptHash =
+    typeof payloadObj.prompt_hash === "string" ? payloadObj.prompt_hash : "";
+  if (promptHash.trim() === "") {
+    errors.push("top-level `prompt_hash` must be a non-empty string");
+  }
 
   for (let i = 0; i < verdictNodes.length; i += 1) {
     const prefix = `verdicts #${i + 1}`;
@@ -333,41 +356,19 @@ export function runSelectionReviewSubmit(
       typeof brief.selection_input_hash === "string"
         ? brief.selection_input_hash
         : "",
+    rubric_version: rubricVersion,
+    judge_model_version: judgeModelVersion,
+    prompt_hash: promptHash,
     counts,
     verdicts,
   };
   const reviewRef = writeSelectionReviewFile(dataDir, reviewFile);
-
-  // The misfit flag fires ONLY on a non-right-sized verdict; a fully right-sized
-  // epic writes the dataset silently. The overlay is the task-2 display-only
-  // needs-human signal (gitignored state, never committed — the auto-commit only
-  // sweeps the review file).
-  const misfit = counts.underpowered + counts.overpowered > 0;
-  if (misfit) {
-    const overlayPayload = JSON.stringify({
-      underpowered: counts.underpowered,
-      right_sized: counts.right_sized,
-      overpowered: counts.overpowered,
-      reviewed_at: now,
-    });
-    const stateStore = new LocalFileStateStore(ctx.stateDir);
-    stateStore.withEpicLock(epicId, () => {
-      // Preserve any sibling overlay field (e.g. a parked question).
-      const runtime = stateStore.loadEpicRuntime(epicId) ?? {};
-      stateStore.saveEpicRuntime(epicId, {
-        ...runtime,
-        selection_review: overlayPayload,
-        updated_at: now,
-      });
-    });
-  }
 
   emitMutating(
     {
       epic_id: epicId,
       review_ref: reviewRef,
       counts,
-      flag_set: misfit,
       graded_task_ids: verdicts.map((v) => v.task_id),
     },
     {
