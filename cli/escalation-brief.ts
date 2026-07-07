@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
 /**
- * `keeper escalation-brief <unblock::fn-N-slug.M | deconflict::fn-N-slug>` — the
- * read-only context envelope an autopilot escalation session loads at boot, so it
- * resolves the incident without the original creator's session context.
+ * `keeper escalation-brief <unblock::fn-N-slug.M | deconflict::fn-N-slug |
+ * repair::<repo-token>>` — the read-only context envelope an autopilot
+ * escalation session loads at boot, so it resolves the incident without the
+ * original creator's session context.
  *
  * The payload spans BOTH stores, which is why the verb lives in keeper core:
  *   - keeper.db (`jobs.transcript_path` / `plan_verb` / `plan_ref`,
  *     `epics.job_links` creator edges, the `dispatch_failures` reason row,
- *     the `resolve::<epic>` resolver jobs);
+ *     the `resolve::<epic>` resolver jobs, and — for `repair` — the FULL
+ *     `epics` table scanned by repo token);
  *   - the repo's `.keeper` tree (`epics/<id>.json.created_by_close_of` +
  *     `primary_repo`, and the gitignored `state/tasks/<id>.state.json` blocked
  *     overlay). The `.keeper` schema is OWNED by the plan plugin — this verb reads
@@ -19,13 +21,17 @@
  * `{…, data}`-nested one-shot envelope (`cli/envelope.ts`): the consuming skill
  * reads `jq .lineage` / `jq .incident` directly, so the payload spreads at the
  * root the way the plan `emit()` family does. `degraded` is the explicit,
- * machine-matchable list of every field that could not be resolved.
+ * machine-matchable list of every field that could not be resolved. `repair` is
+ * REPO-scoped, not epic-scoped: `epic_id`/`task_id` are `null` and `lineage` is
+ * the neutral empty shape (a repair incident spans every epic on the repo, so
+ * no single creator lineage applies).
  *
  * Exit model: a FOUND incident whose lineage or transcript is partial still emits
  * `ok:true` at exit 0 with `degraded` flags — a session must always get a brief.
- * Only an unparseable key or an unknown incident (no epic anywhere) is `ok:false`
- * exit 1; a keeper.db open failure is the sole transport `ok:false` exit 1. The
- * verb is strictly READ-ONLY (readonly DB handle, no `.keeper` writes).
+ * Only an unparseable key or an unknown incident (no epic, or for `repair` no
+ * repo, anywhere) is `ok:false` exit 1; a keeper.db open failure is the sole
+ * transport `ok:false` exit 1. The verb is strictly READ-ONLY (readonly DB
+ * handle, no `.keeper` writes).
  */
 
 import type { Database } from "bun:sqlite";
@@ -33,8 +39,9 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { roleJobIds } from "../src/bus-identity";
 import { openDb, resolveDbPath } from "../src/db";
-import { parsePlanRef } from "../src/derivers";
+import { parsePlanRef, REPO_TOKEN_RE } from "../src/derivers";
 import { isMergeEscalationReason } from "../src/dispatch-failure-key";
+import { repoToken as deriveRepoToken } from "../src/worktree-plan";
 
 /** Envelope schema version for `keeper escalation-brief`. */
 export const ESCALATION_BRIEF_SCHEMA_VERSION = 1;
@@ -58,14 +65,17 @@ the .keeper tree — no daemon, no commit, no lock, no writes.
 Keys:
   unblock::<task-id>     A blocked plan task (e.g. unblock::fn-12-add-oauth.3)
   deconflict::<epic-id>  A sticky worktree-merge-conflict close (e.g. deconflict::fn-12-add-oauth)
+  repair::<repo-token>   A shared-base-broken repo (e.g. repair::keeper-qzvs8i)
 
 The incident block is kind-specific (unblock: blocked reason + CATEGORY + other
 blocked siblings; deconflict: the merge-conflict reason with source/target branch
-and stderr + the resolver jobs). lineage carries the direct creator and — when
-the creator is a closer — the original creator resolved by walking
-created_by_close_of, each with session_id + transcript_path. A partial lineage
-degrades to explicit 'degraded' flags at exit 0; only an unparseable key or an
-unknown incident exits non-zero.
+and stderr + the resolver jobs; repair: the resolved repo dir + fingerprint +
+base evidence + every SHARED_BASE_BROKEN blocked task across every epic on that
+repo). lineage carries the direct creator and — when the creator is a closer —
+the original creator resolved by walking created_by_close_of, each with
+session_id + transcript_path (repair carries the neutral empty lineage — it is
+repo-scoped, not epic-scoped). A partial lineage degrades to explicit 'degraded'
+flags at exit 0; only an unparseable key or an unknown incident exits non-zero.
 
 Options:
   --help, -h             Show this help
@@ -130,13 +140,43 @@ export interface UnblockIncident {
   blocked_siblings: string[];
 }
 
+/** One task affected by a repair incident — repo-scoped, so it carries its
+ *  OWN epic id (unlike unblock's siblings, which share the incident epic). */
+export interface RepairAffectedTask {
+  epic_id: string;
+  task_id: string;
+  blocked_reason: string | null;
+}
+
+/** Best-effort evidence lifted from a SHARED_BASE_BROKEN blocked reason's free
+ *  text — the worker template's rule names "base sha, failing command/test",
+ *  so both are optional; a structural miss on one or both degrades rather
+ *  than throwing (mirrors {@link DeconflictIncident}'s reason parse). */
+export interface RepairBaseEvidence {
+  base_sha: string | null;
+  failing_command: string | null;
+}
+
+/** The repair incident: the resolved repo + fingerprint (lifted from the
+ *  sticky `dispatch_failures` row a SHARED_BASE_BROKEN sweep mints, when
+ *  present) + best-effort base evidence + every SHARED_BASE_BROKEN blocked
+ *  task across every epic whose repo hashes to the same token. */
+export interface RepairIncident {
+  repo_token: string;
+  repo: string | null;
+  fingerprint: string | null;
+  base_evidence: RepairBaseEvidence | null;
+  affected_tasks: RepairAffectedTask[];
+}
+
 /** The assembled brief (minus `schema_version`/`ok`, added by the emitter). */
 export interface EscalationBrief {
-  kind: "unblock" | "deconflict";
-  epic_id: string;
+  kind: "unblock" | "deconflict" | "repair";
+  /** `null` for `repair` — repo-scoped, not epic-scoped. */
+  epic_id: string | null;
   task_id: string | null;
   primary_repo: string | null;
-  incident: DeconflictIncident | UnblockIncident;
+  incident: DeconflictIncident | UnblockIncident | RepairIncident;
   lineage: Lineage;
   degraded: string[];
 }
@@ -154,15 +194,24 @@ export type EscalationBriefResult =
 
 type ParsedKey =
   | { kind: "deconflict"; epic_id: string }
-  | { kind: "unblock"; epic_id: string; task_id: string };
+  | { kind: "unblock"; epic_id: string; task_id: string }
+  | { kind: "repair"; repo_token: string };
 
 /** Parse an escalation key into its kind + ids. `deconflict::` requires an
  *  epic-form ref, `unblock::` a task-form ref (a shape mismatch is unparseable).
- *  Returns null for anything not a valid key. */
+ *  `repair::` does NOT route through {@link parsePlanRef} at all — it is
+ *  repo-scoped, not epic/task-scoped, so its id half is validated against
+ *  {@link REPO_TOKEN_RE} (the same repo-token shape `dispatch-command.ts` and
+ *  `derivers.ts` share) instead. Returns null for anything not a valid key. */
 export function parseEscalationKey(key: string): ParsedKey | null {
-  const m = /^(unblock|deconflict)::(.+)$/.exec(key);
+  const m = /^(unblock|deconflict|repair)::(.+)$/.exec(key);
   if (m == null) {
     return null;
+  }
+  if (m[1] === "repair") {
+    return REPO_TOKEN_RE.test(m[2])
+      ? { kind: "repair", repo_token: m[2] }
+      : null;
   }
   const ref = parsePlanRef(m[2]);
   if (ref == null) {
@@ -528,6 +577,218 @@ function buildUnblockIncident(
   };
 }
 
+// ── repair (repo-scoped) ────────────────────────────────────────────────────
+
+/** The fixed prefix a repair session's sticky `dispatch_failures` row (verb
+ *  `repair`, id the repo token) carries in its `reason` column —
+ *  `shared-base-broken:<fingerprint>`. Established here — AHEAD of the
+ *  daemon-side SHARED_BASE_BROKEN sweep this incident type otherwise depends
+ *  on — as the contract that sweep must mint the row with; a row present
+ *  under a different shape degrades (`incident_reason_unparsed`) rather than
+ *  mis-parsing, and no row at all degrades (`incident_repair_row_missing`)
+ *  rather than failing the whole brief — a session must always get a brief. */
+const REPAIR_REASON_RE = /^shared-base-broken:\s*(\S+)/;
+
+/** Best-effort extraction of a SHARED_BASE_BROKEN blocked reason's "base sha"
+ *  and failing-command evidence — mirrors {@link parseMergeConflictReason}'s
+ *  best-effort text parse: a structural miss degrades rather than throwing.
+ *  The worker template's SHARED_BASE_BROKEN rule instructs "naming the repo,
+ *  base sha, failing command/test" in free prose, so either half may be
+ *  absent. */
+function parseSharedBaseEvidence(reason: string): RepairBaseEvidence {
+  const shaMatch = /\bbase sha[:\s]+([0-9a-f]{7,40})\b/i.exec(reason);
+  const cmdMatch = /`([^`]+)`/.exec(reason);
+  return {
+    base_sha: shaMatch != null ? shaMatch[1] : null,
+    failing_command: cmdMatch != null ? cmdMatch[1] : null,
+  };
+}
+
+/** One task-shaped element off an `epics.tasks` JSON blob — the handful of
+ *  fields {@link scanReposForToken} reads, defensively (a malformed/legacy
+ *  blob element degrades a field to its safe default rather than throwing). */
+interface RepoScanTaskElement {
+  task_id?: unknown;
+  target_repo?: unknown;
+  runtime_status?: unknown;
+}
+
+/** The result of scanning every epic in keeper.db for a repo hashing to
+ *  `token` — {@link RepairIncident.repo} (the first matching dir found, epic
+ *  `project_dir` or any task `target_repo`) + every SHARED_BASE_BROKEN
+ *  blocked task across every epic whose resolved repo matches, sorted
+ *  `(epic_id, task_id)` for determinism. */
+interface RepoScanResult {
+  repo: string | null;
+  affected: RepairAffectedTask[];
+}
+
+/** Scan the FULL `epics` table (no `token` index exists — this is a manual,
+ *  rarely-invoked CLI read, not a fold, so an O(epics) scan is fine) for every
+ *  repo dir (an epic's `project_dir`, or a task's own `target_repo` when set)
+ *  hashing to `token` via {@link deriveRepoToken} — the SAME derivation
+ *  `worktreePathFor` bakes into every lane dir name, so a repair token
+ *  resolves the identical repo a lane path would. A task's `.keeper` overlay
+ *  is read from ITS OWN epic's `project_dir` (each epic/worktree carries its
+ *  own checked-in `.keeper` tree), never a single shared root. */
+function scanReposForToken(db: Database, token: string): RepoScanResult {
+  const rows = db
+    .query("SELECT epic_id, project_dir, tasks FROM epics")
+    .all() as Array<{
+    epic_id: string;
+    project_dir: string | null;
+    tasks: string | null;
+  }>;
+
+  let repo: string | null = null;
+  const affected: RepairAffectedTask[] = [];
+
+  for (const row of rows) {
+    const epicDir =
+      typeof row.project_dir === "string" && row.project_dir !== ""
+        ? row.project_dir
+        : null;
+    if (repo == null && epicDir != null && deriveRepoToken(epicDir) === token) {
+      repo = epicDir;
+    }
+
+    let tasks: RepoScanTaskElement[];
+    try {
+      const parsed: unknown = JSON.parse(row.tasks ?? "[]");
+      tasks = Array.isArray(parsed) ? (parsed as RepoScanTaskElement[]) : [];
+    } catch {
+      tasks = [];
+    }
+
+    for (const t of tasks) {
+      const taskId = typeof t.task_id === "string" ? t.task_id : null;
+      if (taskId == null) {
+        continue;
+      }
+      const dir =
+        typeof t.target_repo === "string" && t.target_repo !== ""
+          ? t.target_repo
+          : epicDir;
+      if (dir == null) {
+        continue;
+      }
+      const dirToken = deriveRepoToken(dir);
+      if (repo == null && dirToken === token) {
+        repo = dir;
+      }
+      if (t.runtime_status !== "blocked" || dirToken !== token) {
+        continue;
+      }
+      const state = readJsonSafe(
+        join(
+          epicDir ?? dir,
+          ".keeper",
+          "state",
+          "tasks",
+          `${taskId}.state.json`,
+        ),
+      );
+      const blockedReason =
+        typeof state?.blocked_reason === "string" ? state.blocked_reason : null;
+      if (blockedReason == null) {
+        continue;
+      }
+      const catMatch = ESCALATION_CATEGORY_RE.exec(blockedReason);
+      if (catMatch == null || catMatch[1] !== "SHARED_BASE_BROKEN") {
+        continue;
+      }
+      affected.push({
+        epic_id: row.epic_id,
+        task_id: taskId,
+        blocked_reason: blockedReason,
+      });
+    }
+  }
+
+  affected.sort(
+    (a, b) =>
+      a.epic_id.localeCompare(b.epic_id) || a.task_id.localeCompare(b.task_id),
+  );
+  return { repo, affected };
+}
+
+/** Assemble the repair brief for `repoToken` — REPO-scoped, so unlike
+ *  unblock/deconflict this never touches a single epic's `project_dir` up
+ *  front; {@link scanReposForToken} resolves the repo (and its affected
+ *  tasks) by scanning every epic. An unresolvable token (no epic's repo
+ *  hashes to it anywhere) is `unknown_incident`, mirroring the "epic exists
+ *  NOWHERE" miss for unblock/deconflict. A resolved repo with no `dispatch_failures`
+ *  row yet, or no currently-matching blocked task, still emits `ok:true` with
+ *  `degraded` flags — a session must always get a brief. */
+function buildRepairBrief(
+  db: Database,
+  repoToken: string,
+): EscalationBriefResult {
+  const scan = scanReposForToken(db, repoToken);
+  if (scan.repo == null) {
+    return {
+      kind: "error",
+      code: "unknown_incident",
+      message: `no repo in keeper.db hashes to repair token '${repoToken}'`,
+      recovery:
+        "Confirm the token names a real repo's project_dir or task target_repo " +
+        "(see `keeper query epics`); this read never mutates state.",
+    };
+  }
+
+  const degraded: string[] = [];
+
+  const dfRow = db
+    .query(
+      "SELECT reason FROM dispatch_failures WHERE verb = 'repair' AND id = ?",
+    )
+    .get(repoToken) as { reason: string } | null;
+  let fingerprint: string | null = null;
+  if (dfRow == null) {
+    degraded.push("incident_repair_row_missing");
+  } else {
+    const m = REPAIR_REASON_RE.exec(dfRow.reason);
+    if (m == null) {
+      degraded.push("incident_reason_unparsed");
+    } else {
+      fingerprint = m[1];
+    }
+  }
+
+  if (scan.affected.length === 0) {
+    degraded.push("incident_no_affected_tasks");
+  }
+
+  let baseEvidence: RepairBaseEvidence | null = null;
+  if (scan.affected.length > 0) {
+    baseEvidence = parseSharedBaseEvidence(
+      scan.affected[0].blocked_reason ?? "",
+    );
+    if (baseEvidence.base_sha == null && baseEvidence.failing_command == null) {
+      degraded.push("incident_base_evidence_unparsed");
+    }
+  }
+
+  return {
+    kind: "ok",
+    brief: {
+      kind: "repair",
+      epic_id: null,
+      task_id: null,
+      primary_repo: scan.repo,
+      incident: {
+        repo_token: repoToken,
+        repo: scan.repo,
+        fingerprint,
+        base_evidence: baseEvidence,
+        affected_tasks: scan.affected,
+      },
+      lineage: { creator: null, original_creator: null, chain: [] },
+      degraded,
+    },
+  };
+}
+
 // ── Orchestration ──────────────────────────────────────────────────────────
 
 /** Assemble the escalation brief for `key`. PURE over `(db, cwd)` — no clock, no
@@ -545,9 +806,17 @@ export function buildEscalationBrief(
       code: "unparseable_key",
       message: `not a valid escalation key: '${key}'`,
       recovery:
-        "Pass an 'unblock::<task-id>' or 'deconflict::<epic-id>' key " +
-        "(e.g. deconflict::fn-12-add-oauth or unblock::fn-12-add-oauth.3).",
+        "Pass an 'unblock::<task-id>', 'deconflict::<epic-id>', or " +
+        "'repair::<repo-token>' key (e.g. deconflict::fn-12-add-oauth, " +
+        "unblock::fn-12-add-oauth.3, or repair::keeper-qzvs8i).",
     };
+  }
+
+  // repair:: is REPO-scoped, not epic-scoped — resolved by scanning every
+  // epic rather than looking one up by id, so it branches out here before
+  // the epic-keyed flow below (which every other kind shares byte-for-byte).
+  if (parsed.kind === "repair") {
+    return buildRepairBrief(db, parsed.repo_token);
   }
 
   const epicId = parsed.epic_id;

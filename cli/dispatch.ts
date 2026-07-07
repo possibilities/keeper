@@ -80,6 +80,7 @@ import {
   resolveWorkerCell,
 } from "../src/worker-cell";
 import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
+import { repoToken } from "../src/worktree-plan";
 import { queryCollection } from "./control-rpc";
 import { buildParseOptions, DISPATCH_FLAGS } from "./descriptor";
 
@@ -146,18 +147,23 @@ export interface MainDeps {
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
 
 Usage:
-  keeper dispatch <work|close|unblock|deconflict>::<id> [options]  # plan form
+  keeper dispatch <work|close|unblock|deconflict|repair>::<id> [options]  # plan form
   keeper dispatch --prompt "<text>" [options]       # free form
   keeper dispatch --prompt-file <path> [options]    # free form
   keeper dispatch --help
 
 Plan form resolves the /plan:<verb> <id> prompt + cwd from the daemon and bakes
---name <verb>::<id> so the hook binds a board-visible jobs row. The four
+--name <verb>::<id> so the hook binds a board-visible jobs row. The five
 plan-form verbs, by id scope:
-  work::fn-N.M       task-scoped  fire the worker in the task's repo
-  unblock::fn-N.M    task-scoped  escalation session for a blocked task
-  close::fn-N        epic-scoped  close the epic (its lane worktree when present)
-  deconflict::fn-N   epic-scoped  escalation session for an epic merge conflict
+  work::fn-N.M      task-scoped  fire the worker in the task's repo
+  unblock::fn-N.M   task-scoped  escalation session for a blocked task
+  close::fn-N       epic-scoped  close the epic (its lane worktree when present)
+  deconflict::fn-N  epic-scoped  escalation session for an epic merge conflict
+  repair::<token>   repo-scoped  escalation session for a shared-base-broken repo;
+                     <token> is a '<slug>-<hash>' repo token (the SAME convention
+                     worktree lane dirs use), resolved to a repo by hashing every
+                     epic's project_dir/task target_repo — an unresolvable token
+                     is a typed error, never a guess
 Free form launches an arbitrary prompt; --name is OPTIONAL and forwarded
 verbatim to claude (no keeper labeling). When omitted, no --name is passed at all.
 
@@ -190,10 +196,12 @@ const AGENT_HELP = `keeper dispatch — operator runbook (agent-facing)
 
 Fire ONE claude worker by hand. Two forms:
   Plan form:  keeper dispatch <work|close|unblock|deconflict>::<id>
+              keeper dispatch repair::<repo-token>
               work::fn-N.M and unblock::fn-N.M are task-scoped; close::fn-N and
-              deconflict::fn-N are epic-scoped (unblock/deconflict boot the
-              escalation session). Resolves the /plan:<verb> <id> prompt + cwd
-              from the daemon and bakes --name so the hook binds a jobs row.
+              deconflict::fn-N are epic-scoped; repair::<token> is REPO-scoped
+              (unblock/deconflict/repair boot the escalation session). Resolves
+              the /plan:<verb> <id> prompt + cwd from the daemon and bakes
+              --name so the hook binds a jobs row.
   Free form:  keeper dispatch --prompt "<text>" [--name <n>] [--cwd <dir>]
               Arbitrary prompt; --name is an OPTIONAL verbatim pass-through.
 
@@ -307,13 +315,63 @@ export async function resolvePlanCwd(
     }
   | { ok: false; error: string }
 > {
+  // repair::<repo-token> is REPO-scoped, not epic/task-scoped — id is a repo
+  // token, never an fn-shaped ref, so it can't join the `epics` filter below by
+  // epic_id. Resolve it by scanning every epic for a project_dir or task
+  // target_repo that hashes to the token (the SAME `repoToken` derivation
+  // worktree lane paths use), landing the session in that repo's SHARED
+  // checkout — never a lane-or-project resolution. An unresolvable token is a
+  // typed error, never a guess.
+  if (verb === "repair") {
+    let allRows: EpicRow[];
+    try {
+      allRows = (await query("epics")) as EpicRow[];
+    } catch (err) {
+      return {
+        ok: false,
+        error: `cannot reach daemon to resolve cwd (${(err as Error).message})`,
+      };
+    }
+    const seen = new Set<string>();
+    for (const epic of allRows) {
+      const candidates: string[] = [];
+      if (typeof epic.project_dir === "string" && epic.project_dir !== "") {
+        candidates.push(epic.project_dir);
+      }
+      for (const t of epic.tasks ?? []) {
+        if (typeof t.target_repo === "string" && t.target_repo !== "") {
+          candidates.push(t.target_repo);
+        }
+      }
+      for (const dir of candidates) {
+        if (seen.has(dir)) {
+          continue;
+        }
+        seen.add(dir);
+        if (repoToken(dir) === id) {
+          if (!dirExists(dir)) {
+            return { ok: false, error: `cwd-missing: ${dir}` };
+          }
+          return { ok: true, cwd: dir };
+        }
+      }
+    }
+    return {
+      ok: false,
+      error:
+        `unknown repo token '${id}': no epic's project_dir or task target_repo ` +
+        "hashes to it (see `keeper query epics`)",
+    };
+  }
+
   // work: id is a task id `fn-N-slug.M` whose parent epic is the `fn-N-slug`
   // prefix. close: id IS the epic id. The epic filter resolves both. The two
-  // escalation verbs mirror those shapes exactly — `unblock::<task>` is
-  // task-scoped like work, `deconflict::<epic>` is epic-scoped like close — so
-  // each resolves its cwd through the same branch (the unblock session runs in
-  // the blocked task's repo; the deconflict session runs in the epic lane where
-  // the merge conflict lives, exactly like the resolver).
+  // epic/task-scoped escalation verbs mirror those shapes exactly —
+  // `unblock::<task>` is task-scoped like work, `deconflict::<epic>` is
+  // epic-scoped like close — so each resolves its cwd through the same branch
+  // (the unblock session runs in the blocked task's repo; the deconflict
+  // session runs in the epic lane where the merge conflict lives, exactly
+  // like the resolver).
   const taskScoped = verb === "work" || verb === "unblock";
   const epicScoped = verb === "close" || verb === "deconflict";
   const epicId = taskScoped ? id.replace(/\.\d+$/, "") : id;

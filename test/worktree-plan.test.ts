@@ -21,6 +21,7 @@ import {
   baseBranchFor,
   CLOSE_SINK_ID,
   deriveWorktreePlan,
+  repoToken,
   ribBranchFor,
   WorktreeCycleError,
   worktreePathFor,
@@ -244,6 +245,24 @@ test("worktreePathFor disambiguates same-basename repos; stable + pure", () => {
   // Same repo + same branch → byte-identical across calls (pure, deterministic):
   // the producer (provision) and teardown (removeWorktree) derive one path.
   expect(worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo")).toBe(a);
+});
+
+test("repoToken is the `<repoName>-<hash>` prefix worktreePathFor bakes into every lane path", () => {
+  // The `repair::<repo-token>` escalation key (src/dispatch-command.ts,
+  // cli/escalation-brief.ts) reuses THIS derivation rather than a second
+  // hand-rolled one — so it must match the leading segment of a lane path
+  // byte-for-byte, not merely look similar.
+  const token = repoToken("/Users/x/code/foo");
+  expect(token).toMatch(/^foo-[0-9a-z]+$/);
+  const lane = worktreePathFor("/Users/x/code/foo", "keeper/epic/fn-1-foo");
+  expect(lane).toBe(`${homedir()}/worktrees/${token}--keeper-epic-fn-1-foo`);
+
+  // Pure + trailing-slash-insensitive, same as worktreePathFor.
+  expect(repoToken("/Users/x/code/foo/")).toBe(token);
+  expect(repoToken("/Users/x/code/foo")).toBe(token);
+
+  // Disambiguates same-basename repos the identical way worktreePathFor does.
+  expect(repoToken("/Users/y/work/foo")).not.toBe(token);
 });
 
 test("re-derivation from the same DAG is byte-identical", () => {

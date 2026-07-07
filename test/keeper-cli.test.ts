@@ -49,6 +49,7 @@ import {
 import { main as sessionMain } from "../cli/session";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import type { Row } from "../src/protocol";
+import { repoToken } from "../src/worktree-plan";
 
 class ExitError extends Error {
   readonly code: number;
@@ -720,6 +721,71 @@ describe("cli/dispatch resolvePlanCwd", () => {
   test("daemon-unreachable (query throws) is distinguished from not-found", async () => {
     const q: QueryFn = () => Promise.reject(new Error("connect ECONNREFUSED"));
     const res = await resolvePlanCwd(q, "close", "fn-1-foo");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain("cannot reach daemon");
+  });
+
+  // repair::<repo-token> is REPO-scoped: it never joins the `epics` filter by
+  // epic_id (there is no epic id in the key), so it resolves cwd by scanning
+  // every epic's project_dir + every task's target_repo for one hashing to
+  // the token — landing in the repo's SHARED checkout, never a lane.
+  test("repair: resolves cwd to the epic project_dir whose token matches", async () => {
+    const q = stubQuery({
+      epics: [
+        { epic_id: "fn-1-foo", project_dir: "/repo/one", tasks: [] },
+        { epic_id: "fn-2-bar", project_dir: "/repo/two", tasks: [] },
+      ],
+    });
+    const token = repoToken("/repo/two");
+    const res = await resolvePlanCwd(q, "repair", token, () => true);
+    expect(res).toEqual({ ok: true, cwd: "/repo/two" });
+  });
+
+  test("repair: resolves cwd via a TASK's own target_repo when the epic's project_dir doesn't match", async () => {
+    const q = stubQuery({
+      epics: [
+        {
+          epic_id: "fn-1-foo",
+          project_dir: "/repo/epic-dir",
+          tasks: [{ task_id: "fn-1-foo.1", target_repo: "/repo/task-repo" }],
+        },
+      ],
+    });
+    const token = repoToken("/repo/task-repo");
+    const res = await resolvePlanCwd(q, "repair", token, () => true);
+    expect(res).toEqual({ ok: true, cwd: "/repo/task-repo" });
+  });
+
+  test("repair: unknown token → typed error, never a guess", async () => {
+    const q = stubQuery({
+      epics: [{ epic_id: "fn-1-foo", project_dir: "/repo/one", tasks: [] }],
+    });
+    const res = await resolvePlanCwd(
+      q,
+      "repair",
+      "nonexistent-abc123",
+      () => true,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toContain("unknown repo token");
+      expect(res.error).toContain("nonexistent-abc123");
+    }
+  });
+
+  test("repair: resolved repo missing on disk → cwd-missing miss (not a silent launch)", async () => {
+    const q = stubQuery({
+      epics: [{ epic_id: "fn-1-foo", project_dir: "/repo/gone", tasks: [] }],
+    });
+    const token = repoToken("/repo/gone");
+    const res = await resolvePlanCwd(q, "repair", token, () => false);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe("cwd-missing: /repo/gone");
+  });
+
+  test("repair: daemon-unreachable (query throws) is distinguished from unknown token", async () => {
+    const q: QueryFn = () => Promise.reject(new Error("connect ECONNREFUSED"));
+    const res = await resolvePlanCwd(q, "repair", "keeper-qzvs8i");
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain("cannot reach daemon");
   });

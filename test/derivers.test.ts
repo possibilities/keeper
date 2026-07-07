@@ -15,6 +15,8 @@ import {
   extractToolUseId,
   isKilledTaskNotification,
   parsePlanRef,
+  planVerbRefFromSpawnName,
+  REPO_TOKEN_RE,
 } from "../src/derivers";
 
 // Minimal helper to build a PostToolUse:Bash deriver call shape.
@@ -101,6 +103,84 @@ test("parsePlanRef accepts numeric slug bodies", () => {
   expect(parsePlanRef("fn-1-2")).toEqual({
     kind: "epic",
     epic_id: "fn-1-2",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REPO_TOKEN_RE — the `repair::<repo-token>` id-half shape
+// ---------------------------------------------------------------------------
+
+test("REPO_TOKEN_RE accepts '<slug>-<hash>' tokens (the worktree lane-dir convention)", () => {
+  for (const token of [
+    "keeper-qzvs8i",
+    "my-repo-ab12",
+    "Repo.name_v2-z",
+    "a-1",
+    "repo123-1z141z3", // max uint32 base36 digest (7 chars)
+  ]) {
+    expect(REPO_TOKEN_RE.test(token)).toBe(true);
+  }
+});
+
+test("REPO_TOKEN_RE rejects a token with no hash suffix, a leading hyphen, or an uppercase hash", () => {
+  for (const bad of ["noHash", "-leadinghyphen", "repo-AB12", "repo-", ""]) {
+    expect(REPO_TOKEN_RE.test(bad)).toBe(false);
+  }
+});
+
+test("REPO_TOKEN_RE rejects a path-shaped token", () => {
+  for (const bad of ["../etc/passwd", "/abs/path", "a/b-12"]) {
+    expect(REPO_TOKEN_RE.test(bad)).toBe(false);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// planVerbRefFromSpawnName — repair::<repo-token> (repo-scoped escalation)
+// ---------------------------------------------------------------------------
+
+test("planVerbRefFromSpawnName: repair::<repo-token> → {repair, token} (repo-scoped escalation dispatch key)", () => {
+  // `repair::<repo-token>` is the THIRD autonomous escalation dispatch,
+  // repo-scoped rather than epic/task-scoped — folding its plan_verb/plan_ref
+  // makes it a first-class dispatch key like unblock/deconflict.
+  expect(planVerbRefFromSpawnName("repair::keeper-qzvs8i")).toEqual({
+    plan_verb: "repair",
+    plan_ref: "keeper-qzvs8i",
+  });
+});
+
+test("planVerbRefFromSpawnName: repair rejects a malformed (non-token-shaped) ref", () => {
+  // No hyphen at all → no `-<hash>` suffix can be carved out.
+  expect(planVerbRefFromSpawnName("repair::nohyphenatall")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+  // Uppercase in the trailing hash-shaped segment → the hash class is
+  // lowercase-alnum only (base36 from `(h >>> 0).toString(36)`).
+  expect(planVerbRefFromSpawnName("repair::trailing-UPPERCASE")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: repair extra ::segment rejected (no partial match)", () => {
+  expect(planVerbRefFromSpawnName("repair::keeper-qzvs8i::extra")).toEqual({
+    plan_verb: null,
+    plan_ref: null,
+  });
+});
+
+test("planVerbRefFromSpawnName: existing fn-shaped verbs are unaffected by the repair arm", () => {
+  expect(planVerbRefFromSpawnName("work::fn-575-osc-parser.3")).toEqual({
+    plan_verb: "work",
+    plan_ref: "fn-575-osc-parser.3",
+  });
+  expect(planVerbRefFromSpawnName("unblock::fn-1129-escalate.2")).toEqual({
+    plan_verb: "unblock",
+    plan_ref: "fn-1129-escalate.2",
+  });
+  expect(planVerbRefFromSpawnName("deconflict::fn-1129-escalate")).toEqual({
+    plan_verb: "deconflict",
+    plan_ref: "fn-1129-escalate",
   });
 });
 
