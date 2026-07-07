@@ -49,5 +49,5 @@ gates pass in the plan suite.
 - [ ] Root and plan fast suites green
 
 ## Done summary
-
+Added SHARED_BASE_BROKEN escalation category (worker template + escalation-brief regex) and fixed the pre-existing RESUME_EXHAUSTED template drift; added a category-parse test.
 ## Evidence
