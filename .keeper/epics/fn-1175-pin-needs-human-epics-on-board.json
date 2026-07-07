@@ -2,7 +2,10 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-07T22:50:06.658000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1171-turn-active-escalation-lifecycle",
+    "fn-1172-out-of-band-selection-review-skill"
+  ],
   "id": "fn-1175-pin-needs-human-epics-on-board",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T22:50:06.658000Z"
+  "updated_at": "2026-07-07T22:50:14.411000Z"
 }
