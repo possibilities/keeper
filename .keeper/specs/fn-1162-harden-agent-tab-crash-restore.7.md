@@ -83,5 +83,5 @@ repaired; a two-candidate case mints nothing.
       lines whose targets all exist on disk.
 
 ## Done summary
-
+Added read-only 'keeper tabs repair' reporting rotted non-claude resume targets with disk-anchored re-pin proposals (single plausible resolves, 2+ ambiguous); the re-pin is landed by a daemon twin pass beside the codex back-fill, minting the same ResumeTargetResolved event — no direct jobs write, no new RPC.
 ## Evidence
