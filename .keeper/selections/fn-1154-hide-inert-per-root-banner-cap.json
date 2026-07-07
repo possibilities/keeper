@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-file banner edit with explicit do-exactly-this acceptance, named file:line targets, low blast radius, no contract change.",
+      "task_id": "fn-1154-hide-inert-per-root-banner-cap.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T02:56:39.072000Z",
+  "epic_id": "fn-1154-hide-inert-per-root-banner-cap",
+  "input_hash": "7705a13d31b2d575ff6e6a6a7acd28b575473d17bd7c576d9ef36d4a97899cc3",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1996857661,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1154-hide-inert-per-root-banner-cap.1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-file banner edit with an explicit do-exactly-this acceptance, named file:line targets, low blast radius, and no contract change, fitting sonnet/medium.\",\"confidence\":0.83}]}"
+}
