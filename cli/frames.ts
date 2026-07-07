@@ -159,24 +159,10 @@ COVERAGE IS HONEST BY CONSTRUCTION
   truthfully promise gapless coverage across separate runs.
 `;
 
-/**
- * Usage-view placeholder. The usage viewer's frames entry (its open-coded
- * dual-stream shell path) is owned by the NEXT task; the dispatch ARM is wired
- * here now so the view set is complete. Until that entry lands, invoking
- * `--view usage` reports the pending state rather than silently doing nothing.
- * Replace this with `(await import("./usage")).runUsageFrames(config)` when it
- * lands.
- */
-async function usageFramesPending(_config: FramesEntryConfig): Promise<void> {
-  process.stderr.write(
-    "keeper frames --view usage: not yet available (its frames entry lands in the usage task)\n",
-  );
-  process.exit(1);
-}
-
 /** Prod dispatch table — each viewer's `run<View>Frames` entry, lazy-imported so
  *  a `frames` invocation never pays to load a viewer it will not stream (mirrors
- *  the lazy handler map in `cli/keeper.ts`). */
+ *  the lazy handler map in `cli/keeper.ts`). The usage entry drives the viewer's
+ *  open-coded dual-stream shell in frames mode over the SAME wire contract. */
 export function defaultFramesEntries(): Record<FramesView, FramesEntry> {
   return {
     board: async (c) => (await import("./board")).runBoardFrames(c),
@@ -184,7 +170,7 @@ export function defaultFramesEntries(): Record<FramesView, FramesEntry> {
     git: async (c) => (await import("./git")).runGitFrames(c),
     autopilot: async (c) => (await import("./autopilot")).runAutopilotFrames(c),
     builds: async (c) => (await import("./builds")).runBuildsFrames(c),
-    usage: usageFramesPending,
+    usage: async (c) => (await import("./usage")).runUsageFrames(c),
   };
 }
 

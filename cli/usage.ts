@@ -38,6 +38,13 @@ import {
 } from "../src/agent/shadow-profiles";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveConfig, resolveSockPath } from "../src/db";
+import {
+  createFramesEmitter,
+  defaultDiffFn,
+  defaultFramesIo,
+  type FramesEmitter,
+  type TrailerReason,
+} from "../src/frames-emitter";
 import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
 import {
@@ -902,9 +909,39 @@ export async function main(argv: string[]): Promise<void> {
     }
     timeoutMs = parsed.ms;
   }
-  const isSnapshot = mode === "snapshot";
-
   const sockPath = values.sock ?? resolveSockPath();
+  await runUsageView({ mode, sockPath, timeoutMs });
+}
+
+/** Resolved run config for the usage view shell. `frames` is present ONLY on
+ *  the `keeper frames --view usage` path; live/snapshot leave it undefined. */
+interface RunUsageConfig {
+  mode: "snapshot" | "watch" | "frames";
+  sockPath: string;
+  timeoutMs: number;
+  frames?: {
+    /** The prod frames emitter (view `usage`, `diff -u` seam, real sidecar IO). */
+    emitter: FramesEmitter;
+    /** Duration bound in millis; `null` ⇒ unbounded (`--follow`). */
+    durationMs?: number | null;
+  };
+}
+
+/**
+ * Drive the usage view shell in `live` / `snapshot` / `frames`. usage is the
+ * open-coded outlier that cannot adopt `createViewShell` (it blends TWO
+ * subscribe streams into one composed body, runs a 30s relative-time tick, and
+ * gates emit on raw projection-subset hashes), so the frames path is open-coded
+ * here too — the SAME `src/frames-emitter.ts` wire contract the shared shell
+ * drives, plugged into the composed-frame emit site (the dual-consumer
+ * invariant: one wire contract, two integration points, no re-open-coding).
+ * `main` calls this in live/snapshot; `runUsageFrames` calls it in frames.
+ */
+async function runUsageView(config: RunUsageConfig): Promise<void> {
+  const { mode, sockPath, timeoutMs } = config;
+  const isSnapshot = mode === "snapshot";
+  const isFrames = mode === "frames";
+  const framesEmitter = config.frames?.emitter ?? null;
   // Account display aliases (cosmetic) derived once at startup from the
   // `usage_models` registry in ~/.config/keeper/config.yaml — the values carrying
   // a non-null alias. Best-effort — a missing/bad config yields `{}` (no
@@ -923,52 +960,64 @@ export async function main(argv: string[]): Promise<void> {
   // Forward-reference slot for the `c`-key copy handler — wired further
   // down once sidecar paths and the last frame text are in scope.
   let onKey: ((key: string) => void) | undefined;
-  // Snapshot mode never paints a live frame: `enabled: false` makes the shell's
-  // `pushFrame` / `refreshLive` / `dispose` inert no-ops so nothing reaches
-  // stdout to corrupt the single-frame snapshot output.
+  // Only the live TUI (`watch`) paints. Snapshot and frames both pass
+  // `enabled: false` so the shell's `pushFrame` / `refreshLive` / `dispose` are
+  // inert no-ops — nothing reaches stdout to corrupt the single-frame snapshot
+  // output OR the frames NDJSON stream.
   const liveShell = createLiveShell({
-    enabled: !isSnapshot,
+    enabled: mode === "watch",
     title: "usage",
     onUnhandledKey: (key) => onKey?.(key),
   });
   let lastFrame: string | null = null;
   let frameCount = 0;
-  // Module-local row cache for the single `usage` subscription. Cleared
-  // on `disconnected` (via `lastUsageRowsKey`) so the next first-paint
-  // always emits.
-  let lastUsageRows: Record<string, unknown>[] = [];
-  // Module-local row cache for the single `jobs` subscription (the "recent
-  // sessions" log). Same change-gate discipline as the usage cache.
-  let lastJobsRows: Record<string, unknown>[] = [];
-  // Projection-meaningful subset of the last emit. Gating `emitFrame` on
-  // this — not on the rendered text — keeps a fetch-only refresh that
-  // bumps `last_event_id` / `updated_at` from flapping a new frame, AND
-  // keeps minute-tick relative-time bleed from forging one either.
-  // Cleared on `disconnected` so a post-reconnect first emit always paints.
-  let lastUsageRowsKey: string | null = null;
-  // The same gate for the `jobs` stream — hashes RAW unrendered fields
-  // (`created_at` as unix-seconds, never the minute-rounded `<rel> ago`
-  // tail) so a relative-time tick or a fetch-only `last_event_id` bump
-  // never forges a concrete frame; only real data movement does.
-  let lastJobsRowsKey: string | null = null;
-  // Last lines we pushed/refreshed to the live shell. Lets the 30s tick
-  // skip the `refreshLive` call when minute-rounding produced identical
-  // text — avoids even the cost of constructing the overlay (the
-  // OpenTUI paint layer's diff would short-circuit too, but skipping
-  // here is cheaper and clearer, AND it's the documented load-bearing
-  // no-flicker guard for the live-tick path).
-  let lastLiveLines: string[] = [];
-
+  // The freshest daemon fold cursor (`BootStatus.rev`) fed by both streams'
+  // `onBootStatus` — stamped on every frames envelope + the trailer's resume
+  // cursor (the shared shell's `noteCursor` analog). `null` until the first boot
+  // header lands; never read outside frames mode.
+  let latestCursor: string | null = null;
   // Snapshot-mode wiring. Forward-reference report slots wired by `runSnapshot`
-  // to the latch's `reportStream`; no-ops until then, replayed via the
-  // once-flags below. Per-stream once-guards keep the latch's report count
-  // honest (one per stream). `sawConnected` lets the no-frame trailer
-  // distinguish `timeout` from `daemon-unreachable`.
+  // to the latch's `reportStream`; no-ops until then, replayed via the engine's
+  // once-guards. `sawConnected` lets the no-frame trailer distinguish `timeout`
+  // from `daemon-unreachable`.
   let reportUsageStream: () => void = () => {};
   let reportJobsStream: () => void = () => {};
-  let usageStreamReported = false;
-  let jobsStreamReported = false;
   let sawConnected = false;
+  // Frames-mode driver state — the open-coded analog of the shared shell's
+  // `finishFrames`. The trailer flushes exactly ONCE, on the first of a tripped
+  // bound (`maybeStopFrames`), the duration timer, or SIGINT / parent-death.
+  let framesFinished = false;
+  let framesTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // The composed-frame emit engine — the hash-gated dual-stream emit path,
+  // shared by every mode. It owns the row caches, the raw-field change-gate
+  // keys, and the frames baseline/frame routing; the shell owns the impure
+  // sinks it calls (`onLiveFrame` history+sidecars, `onTickRefresh` the live
+  // overlay, `onMaybeStop` the bound check) plus the snapshot latch reports.
+  const engine = createUsageEmitEngine({
+    mode,
+    accountAliases,
+    shadowAdvisory,
+    framesEmitter,
+    latestCursor: () => latestCursor,
+    onMaybeStop: maybeStopFrames,
+    onLiveFrame,
+    onTickRefresh: (bodyLines) => liveShell.refreshLive(bodyLines),
+    reportUsageStream: () => reportUsageStream(),
+    reportJobsStream: () => reportJobsStream(),
+    nowMs: () => Date.now(),
+  });
+
+  // Live-mode frame sink: append to scroll-back history + write the per-frame
+  // sidecars. `frameCount` names the sidecar files; `lastFrame` seeds the next
+  // diff. Never reached in snapshot/frames (the engine routes those elsewhere).
+  function onLiveFrame(bodyLines: string[]): void {
+    const frameText = ["---", ...bodyLines].join("\n");
+    frameCount += 1;
+    liveShell.pushFrame(bodyLines);
+    writeSidecars(frameText);
+    lastFrame = frameText;
+  }
 
   const prevFrameTmp = `/tmp/keeper-usage.${process.pid}.prev.frame.txt`;
   const metaSidecar = `/tmp/keeper-usage.${process.pid}.meta.txt`;
@@ -1024,7 +1073,7 @@ export async function main(argv: string[]): Promise<void> {
     // `profile_name` the jobs row).
     writeFileSync(
       sState,
-      `${JSON.stringify({ usage: lastUsageRows, jobs: lastJobsRows }, null, 2)}\n`,
+      `${JSON.stringify({ usage: engine.getUsageRows(), jobs: engine.getJobsRows() }, null, 2)}\n`,
     );
     writeFileSync(sFrame, `${frameText}\n`);
     let diff = "# first frame - no previous to diff against\n";
@@ -1043,199 +1092,43 @@ export async function main(argv: string[]): Promise<void> {
     );
   }
 
-  /**
-   * Stringify the projection-meaningful subset of the `usage` row set into a
-   * stable hash key. Excludes `last_event_id` / `updated_at` (they bump on
-   * every fetch-only refresh) and keys off raw ISO timestamps + percents, not
-   * minute-rounded prose, so the gate is insensitive to relative-time bleed.
-   */
-  function usageRowsHashKey(rows: Record<string, unknown>[]): string {
-    return JSON.stringify(
-      rows.map((r) => [
-        r.id,
-        r.target,
-        r.multiplier,
-        r.session_percent,
-        r.session_resets_at,
-        r.week_percent,
-        r.week_resets_at,
-        r.sonnet_week_percent,
-        r.sonnet_week_resets_at,
-        r.last_rate_limit_at,
-        // Envelope status / subscription / error axes. `error_at` is safe to
-        // include — the worker's change-gate suppresses synthetic-event churn,
-        // so the wire-side `error_at` only moves when gated fields move.
-        r.status,
-        r.subscription_active,
-        // Stable account-state axis — a flip (signed_out ⇄ no_subscription ⇄
-        // subscribed) changes which annotation line vs bars render, so the
-        // gate must repaint on it.
-        r.account_state,
-        r.error_type,
-        r.error_message,
-        r.error_at,
-        // The lift instant + freshness stamp drive renderer-visible state (the
-        // `limited` countdown, the `stale Nm` warning, the staleness anchor)
-        // but aren't in the gate above, so a lift- or freshness-only change
-        // would fail to repaint without these. Raw ISO + unix-seconds, never
-        // rendered prose, so a clock tick can't forge a frame.
-        r.rate_limit_lifts_at,
-        r.last_usage_fold_at,
-      ]),
-    );
-  }
+  // 30s relative-time tick: re-render the live view's countdown cells against
+  // the wall clock and overlay via `engine.tick` → `onTickRefresh` — no history
+  // growth, no sidecar writes, and CRITICALLY no frames envelope (the emitter is
+  // hooked at the hash-gated emit site, never the tick, so a countdown repaint
+  // is never minted as a frame). Armed ONLY in the live TUI (`watch`): snapshot
+  // is one-shot and frames streams NDJSON, so neither has a live overlay to
+  // refresh, and arming the interval there would outlive the one-shot exit.
+  const tickHandle =
+    mode === "watch" ? setInterval(() => engine.tick(), 30_000) : undefined;
 
-  /**
-   * Stringify the projection-meaningful subset of the `jobs` row set into a
-   * stable hash key. Hashes ONLY the RAW unrendered fields the session log
-   * reads (`job_id`, `profile_name`, `created_at`, `state`, `title`),
-   * excluding `last_event_id` / `updated_at` and keying off raw `created_at` so
-   * neither a fetch-only refresh nor a minute-boundary crossing forges a frame.
-   */
-  function jobsRowsHashKey(rows: Record<string, unknown>[]): string {
-    return JSON.stringify(
-      rows.map((r) => [
-        r.job_id,
-        r.profile_name,
-        r.created_at,
-        r.state,
-        r.title,
-      ]),
-    );
-  }
-
-  /**
-   * Compose the full frame body against `nowMs`: an optional shadow-profile
-   * advisory banner on top (when an auth-bearing reserved shadow exists), then
-   * the per-profile usage stacks, then — when at least one job is present — a
-   * blank-line-separated `recent sessions` block. Both streams render against
-   * the SAME clock so a single 30s tick keeps every relative-time cell (quota
-   * resets, rate-limit annotations, AND session ages) fresh together; the
-   * advisory is frame-static (computed once at startup, not per redraw).
-   */
-  function composeBody(nowMs: number): string[] {
-    const usageLines = renderRowLines(lastUsageRows, nowMs, accountAliases);
-    const sessionLines = renderSessionLines(
-      lastJobsRows,
-      nowMs,
-      accountAliases,
-    );
-    let body: string[];
-    if (sessionLines.length === 0) {
-      body = usageLines;
-    } else if (usageLines.length === 0) {
-      body = ["recent sessions", ...sessionLines];
-    } else {
-      body = [...usageLines, "", "recent sessions", ...sessionLines];
+  // Frames-mode teardown: flush the always-final trailer (resume cursor +
+  // honest coverage), tear down, and exit — mirroring the shared shell's
+  // `finishFrames`. Exit code mirrors snapshot's daemon-unreachable precedent: a
+  // run that emitted its baseline reached the daemon → 0; a run that never
+  // rendered a frame never connected → 1. Idempotent across the SIGINT /
+  // parent-death / duration-timer / bound-tripped triggers.
+  function finishFrames(reason: TrailerReason): void {
+    if (framesEmitter === null || framesFinished) return;
+    framesFinished = true;
+    if (framesTimer !== undefined) {
+      clearTimeout(framesTimer);
+      framesTimer = undefined;
     }
-    // Prepend the shadow advisory as a top banner separated by a blank line.
-    // It sits ABOVE the stacks on its own lines, so it never feeds the
-    // account-row width pools (renderRowLines derives column widths from rows
-    // alone) and can't shift the table alignment.
-    if (shadowAdvisory.length === 0) return body;
-    if (body.length === 0) return [...shadowAdvisory];
-    return [...shadowAdvisory, "", ...body];
+    framesEmitter.emitTrailer({ reason });
+    liveShell.dispose();
+    usageHandle.dispose();
+    jobsHandle.dispose();
+    process.exit(engine.framesBaselineEmitted() ? 0 : 1);
   }
 
-  /**
-   * Composed emitter. Renders both streams against `Date.now()` so the frozen
-   * at-capture text in history reflects what was on screen the moment the data
-   * landed; the 30s tick keeps the live view ticking forward via `refreshLive`
-   * without growing history.
-   */
-  function emitFrame(): void {
-    // Snapshot mode captures rows only — the composition + sidecar write +
-    // stdout print all happen ONCE at latch resolution (`finishSnapshot`),
-    // never per-emit. The row caches (`lastUsageRows` / `lastJobsRows`) are
-    // already updated by the stream callbacks before this fires, so there's
-    // nothing to do here; the per-stream latch report lives in the callbacks.
-    if (isSnapshot) {
-      return;
-    }
-    const now = Date.now();
-    const bodyLines = composeBody(now);
-    const frameText = ["---", ...bodyLines].join("\n");
-    frameCount += 1;
-    liveShell.pushFrame(bodyLines);
-    lastLiveLines = bodyLines;
-    writeSidecars(frameText);
-    lastFrame = frameText;
+  // After a frames data emit, flush the trailer if a bound (`--max-frames` /
+  // `--for`) has tripped. Passed to the engine as `onMaybeStop`.
+  function maybeStopFrames(): void {
+    if (framesEmitter === null) return;
+    const reason = framesEmitter.shouldStop();
+    if (reason !== null) finishFrames(reason);
   }
-
-  /**
-   * `usage`-stream row callback. Gates on the raw projection subset (see
-   * {@link usageRowsHashKey}) — NOT on rendered text — so a fetch-only
-   * refresh that bumps `last_event_id` / `updated_at` produces no new
-   * frame, and a minute-boundary crossing between two same-data emits
-   * can't forge one either.
-   */
-  function emitUsage(rows: Record<string, unknown>[]): void {
-    const rowsKey = usageRowsHashKey(rows);
-    if (rowsKey === lastUsageRowsKey) return;
-    lastUsageRowsKey = rowsKey;
-    lastUsageRows = rows;
-    // Snapshot mode: report the `usage` stream to the latch exactly once on
-    // its first delivery. The readiness client's first paint always passes
-    // the change-gate (initial key is `null`), so this fires on the first
-    // real frame; the once-guard keeps a later changed delivery from
-    // over-reporting. Inert in live mode (`reportUsageStream` is a no-op).
-    if (isSnapshot && !usageStreamReported) {
-      usageStreamReported = true;
-      reportUsageStream();
-    }
-    emitFrame();
-  }
-
-  /**
-   * `jobs`-stream row callback for the "recent sessions" log. Same change-gate
-   * contract as {@link emitUsage} — gates on {@link jobsRowsHashKey} (raw
-   * fields, not rendered text), so a fetch-only refresh or a minute-boundary
-   * crossing produces no new frame.
-   */
-  function emitJobs(rows: Record<string, unknown>[]): void {
-    const rowsKey = jobsRowsHashKey(rows);
-    if (rowsKey === lastJobsRowsKey) return;
-    lastJobsRowsKey = rowsKey;
-    lastJobsRows = rows;
-    // Snapshot mode: report the `jobs` stream to the latch exactly once on
-    // its first delivery (mirrors `emitUsage`). Both streams reporting
-    // satisfies the `streamCount: 2` latch — the composed frame reflects the
-    // fully-folded usage + jobs blend, not fold-ordering luck.
-    if (isSnapshot && !jobsStreamReported) {
-      jobsStreamReported = true;
-      reportJobsStream();
-    }
-    emitFrame();
-  }
-
-  function linesEqual(a: string[], b: string[]): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return false;
-    }
-    return true;
-  }
-
-  // 30s tick: re-render the live view's relative-time cells against the wall
-  // clock and overlay via `refreshLive` — no history growth, no sidecar writes,
-  // so scroll-back keeps each frame's at-capture text. Skipped when there's no
-  // data or the rendered text is unchanged (minute-rounding holds for most
-  // ticks, so the tick is a true no-op and never flickers). `refreshLive`
-  // updates the LIVE slot only; when scrolled back it's dormant.
-  //
-  // NEVER armed in snapshot mode: skipping the interval entirely is the
-  // load-bearing tick-leak fix (a live tick would outlive the one-shot exit and
-  // could corrupt the single-frame stdout); `clearInterval` alone wouldn't help
-  // if the snapshot path never reached teardown.
-  const tickHandle = isSnapshot
-    ? undefined
-    : setInterval(() => {
-        if (lastUsageRows.length === 0 && lastJobsRows.length === 0) return;
-        const bodyLines = composeBody(Date.now());
-        if (linesEqual(bodyLines, lastLiveLines)) return;
-        lastLiveLines = bodyLines;
-        liveShell.refreshLive(bodyLines);
-      }, 30_000);
 
   function emitLifecycle(
     event: string,
@@ -1251,13 +1144,14 @@ export async function main(argv: string[]): Promise<void> {
     } catch {
       // best-effort
     }
-    // On disconnect, clear the change-gate so the next first-paint
-    // always emits — even if the post-reconnect snapshot matches the
-    // last pre-disconnect row set (raw or rendered) byte-for-byte.
+    // On disconnect, clear the change-gate so the next first-paint always emits
+    // — even if the post-reconnect snapshot matches the last pre-disconnect row
+    // set byte-for-byte — and downgrade frames coverage to `gap_possible` (a
+    // reconnect is the sole gap source the emitter's contiguous seq can't see).
+    // The engine owns the change-gate keys + the emitter, so it clears both.
     if (event === "disconnected") {
       lastFrame = null;
-      lastUsageRowsKey = null;
-      lastJobsRowsKey = null;
+      engine.noteDisconnect();
     }
     // Snapshot mode: latch whether we ever reached `connected` so the
     // no-frame trailer reports `timeout` vs `daemon-unreachable` honestly.
@@ -1275,8 +1169,14 @@ export async function main(argv: string[]): Promise<void> {
     collection: COLLECTION,
     limit: 0,
     sort: { column: "id", dir: "asc" },
-    onRows: emitUsage,
+    onRows: engine.emitUsage,
     onLifecycle: emitLifecycle,
+    // Thread the freshest daemon fold cursor into the frames resume-cursor seam
+    // — every frames envelope + the trailer stamp `String(rev)`. Inert in
+    // live/snapshot (the stored cursor is never read).
+    onBootStatus: (boot) => {
+      latestCursor = String(boot.rev);
+    },
   });
 
   // Second subscription: the `jobs` collection drives the "recent sessions"
@@ -1292,8 +1192,11 @@ export async function main(argv: string[]): Promise<void> {
     limit: SESSION_LOG_LIMIT,
     sort: { column: "created_at", dir: "desc" },
     filter: { state: { not_in: [] } },
-    onRows: emitJobs,
+    onRows: engine.emitJobs,
     onLifecycle: emitLifecycle,
+    onBootStatus: (boot) => {
+      latestCursor = String(boot.rev);
+    },
   });
 
   // Snapshot mode: one-shot. Wait (via the shared `streamCount: 2` latch) until
@@ -1304,6 +1207,23 @@ export async function main(argv: string[]): Promise<void> {
   // `createViewShell` siblings — only `script: "usage"` differs.
   if (isSnapshot) {
     runSnapshot();
+    return;
+  }
+
+  // Frames mode: one process, one `--view usage` NDJSON stream. The subscriptions
+  // above already drive the engine's baseline/frame routing; here we arm the
+  // trailer-flush triggers — SIGINT + the parent-death / TTY-close triggers, and
+  // (when bounded) a duration teardown timer so a quiet stream past `--for`
+  // still terminates with a resumable trailer. A `--max-frames` bound flushes
+  // from inside the engine via `onMaybeStop`.
+  if (isFrames) {
+    const onInterrupt = (): void => finishFrames("interrupt");
+    process.on("SIGINT", onInterrupt);
+    armViewerExitTriggers(onInterrupt);
+    const durationMs = config.frames?.durationMs ?? null;
+    if (durationMs !== null) {
+      framesTimer = setTimeout(() => finishFrames("duration"), durationMs);
+    }
     return;
   }
 
@@ -1387,14 +1307,15 @@ export async function main(argv: string[]): Promise<void> {
       // A frame is available iff at least one stream reported — i.e. we have
       // real row data to compose. `ready` (both streams) and a timeout-degrade
       // (≥1 stream) both compose; only a 0-report timeout is the no-frame case.
-      const haveFrame = usageStreamReported || jobsStreamReported;
+      const haveFrame =
+        engine.usageStreamReported() || engine.jobsStreamReported();
       if (haveFrame) {
         const truncated = outcome.kind === "timeout";
         // Compose the body ONCE against the current clock — same renderer the
         // live path uses, so the snapshot text matches a live frame captured
         // at the same instant. `writeSidecars` reads `frameCount` for the
         // filenames, so bump to 1 first.
-        const bodyLines = composeBody(Date.now());
+        const bodyLines = engine.composeBody(Date.now());
         const frameText = ["---", ...bodyLines].join("\n");
         frameCount = 1;
         const stateSidecar = `/tmp/keeper-usage.${process.pid}.state.${frameCount}.json`;
@@ -1451,13 +1372,313 @@ export async function main(argv: string[]): Promise<void> {
     // this synchronous open path).
     reportUsageStream = () => latch.reportStream();
     reportJobsStream = () => latch.reportStream();
-    if (usageStreamReported) {
+    if (engine.usageStreamReported()) {
       latch.reportStream();
     }
-    if (jobsStreamReported) {
+    if (engine.jobsStreamReported()) {
       latch.reportStream();
     }
   }
+}
+
+/** The frames entry `keeper frames --view usage` dispatches to. Builds the prod
+ *  frames emitter (view `usage`, `diff -u` seam, real sidecar IO, the caller's
+ *  chunk bounds) and drives the shared usage view shell in `frames` mode — the
+ *  open-coded analog of `runBoardFrames`, over the SAME `src/frames-emitter.ts`
+ *  wire contract. In prod it never returns (the shell owns `process.exit`). */
+export async function runUsageFrames(config: {
+  sockPath?: string;
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}): Promise<void> {
+  const emitter = createFramesEmitter({
+    view: "usage",
+    writeStdout: (line) => void process.stdout.write(line),
+    diffFn: defaultDiffFn,
+    io: defaultFramesIo(),
+    maxFrames: config.maxFrames ?? null,
+    durationMs: config.durationMs ?? null,
+    prevFrameText: config.prevFrameText ?? null,
+  });
+  await runUsageView({
+    mode: "frames",
+    sockPath: config.sockPath ?? resolveSockPath(),
+    timeoutMs: DEFAULT_SNAPSHOT_TIMEOUT_MS,
+    frames: { emitter, durationMs: config.durationMs ?? null },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The composed-frame emit engine
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Injected sinks + config for {@link createUsageEmitEngine}. The engine is pure
+ * of subscribe / liveShell / process / clock — the shell wires the impure sinks
+ * — so the whole hash-gate + compose + emit-decision path is covered in the
+ * pure test tier with no daemon boot.
+ */
+export interface UsageEmitEngineDeps {
+  mode: "snapshot" | "watch" | "frames";
+  accountAliases: Record<string, string>;
+  shadowAdvisory: string[];
+  /** The prod frames emitter in `frames` mode; `null` in live/snapshot. */
+  framesEmitter: FramesEmitter | null;
+  /** Freshest daemon fold cursor for the frames resume seam, read per emit. */
+  latestCursor: () => string | null;
+  /** Called after a frames data emit so a tripped bound flushes the trailer. */
+  onMaybeStop: () => void;
+  /** Live-mode frame sink (history + sidecars). Never called in snapshot/frames. */
+  onLiveFrame: (bodyLines: string[]) => void;
+  /** Live-mode relative-time refresh sink (the 30s tick's overlay). */
+  onTickRefresh: (bodyLines: string[]) => void;
+  /** Snapshot latch per-stream reports (once-guarded here); no-ops elsewhere. */
+  reportUsageStream: () => void;
+  reportJobsStream: () => void;
+  /** Wall clock for relative-time rendering (`Date.now` in prod). */
+  nowMs: () => number;
+}
+
+/** The engine's surface — the stream callbacks + the tick, plus the accessors
+ *  the shell's snapshot driver / sidecar writer read. */
+export interface UsageEmitEngine {
+  emitUsage: (rows: Record<string, unknown>[]) => void;
+  emitJobs: (rows: Record<string, unknown>[]) => void;
+  /** The 30s relative-time tick — re-renders, NEVER mints a frame. */
+  tick: () => void;
+  /** A disconnect edge: clear the change-gate + downgrade frames coverage. */
+  noteDisconnect: () => void;
+  composeBody: (nowMs: number) => string[];
+  getUsageRows: () => Record<string, unknown>[];
+  getJobsRows: () => Record<string, unknown>[];
+  usageStreamReported: () => boolean;
+  jobsStreamReported: () => boolean;
+  /** Whether the frames baseline has been emitted (drives the exit code). */
+  framesBaselineEmitted: () => boolean;
+}
+
+/**
+ * Build the composed-frame emit engine — usage's open-coded analog of the shared
+ * shell's emit path. Both subscribe streams feed ONE composed body; each is
+ * change-gated on its own RAW-field hash (never rendered text), so a relative-
+ * time tick or a fetch-only refresh never forges a frame. On a hash change it
+ * routes to the active sink: live history+sidecars, a snapshot row-capture, or —
+ * in frames mode — the shared `src/frames-emitter.ts` (baseline on the first
+ * accepted frame, `frame` thereafter). The 30s tick re-renders the live overlay
+ * only and never touches the emitter, so a countdown repaint is never a frame.
+ */
+export function createUsageEmitEngine(
+  deps: UsageEmitEngineDeps,
+): UsageEmitEngine {
+  const isSnapshot = deps.mode === "snapshot";
+  const framesEmitter = deps.framesEmitter;
+  // Row caches for the two subscriptions, cleared-of-gate on `disconnected` so
+  // the next first-paint always emits.
+  let usageRows: Record<string, unknown>[] = [];
+  let jobsRows: Record<string, unknown>[] = [];
+  // Projection-meaningful RAW-field hashes — gating on these, NOT rendered text,
+  // keeps a fetch-only `last_event_id` / `updated_at` bump AND a minute-tick
+  // relative-time bleed from forging a frame; only real data movement does.
+  let usageRowsKey: string | null = null;
+  let jobsRowsKey: string | null = null;
+  // Last lines painted to the live overlay — lets the tick skip an identical
+  // re-render (the load-bearing no-flicker guard for the live-tick path).
+  let lastLiveLines: string[] = [];
+  // Per-stream once-guards keep the snapshot latch's report count honest (one
+  // per stream); also gate the frames-mode coverage report.
+  let usageReported = false;
+  let jobsReported = false;
+  // Frames mode: the FIRST accepted frame is the `baseline`, the rest `frame`s.
+  let baselineEmitted = false;
+
+  /**
+   * Stringify the projection-meaningful subset of the `usage` row set into a
+   * stable hash key. Excludes `last_event_id` / `updated_at` (they bump on
+   * every fetch-only refresh) and keys off raw ISO timestamps + percents, not
+   * minute-rounded prose, so the gate is insensitive to relative-time bleed.
+   */
+  function usageRowsHashKey(rows: Record<string, unknown>[]): string {
+    return JSON.stringify(
+      rows.map((r) => [
+        r.id,
+        r.target,
+        r.multiplier,
+        r.session_percent,
+        r.session_resets_at,
+        r.week_percent,
+        r.week_resets_at,
+        r.sonnet_week_percent,
+        r.sonnet_week_resets_at,
+        r.last_rate_limit_at,
+        // Envelope status / subscription / error axes. `error_at` is safe to
+        // include — the worker's change-gate suppresses synthetic-event churn,
+        // so the wire-side `error_at` only moves when gated fields move.
+        r.status,
+        r.subscription_active,
+        // Stable account-state axis — a flip (signed_out ⇄ no_subscription ⇄
+        // subscribed) changes which annotation line vs bars render, so the
+        // gate must repaint on it.
+        r.account_state,
+        r.error_type,
+        r.error_message,
+        r.error_at,
+        // The lift instant + freshness stamp drive renderer-visible state (the
+        // `limited` countdown, the `stale Nm` warning, the staleness anchor)
+        // but aren't in the gate above, so a lift- or freshness-only change
+        // would fail to repaint without these. Raw ISO + unix-seconds, never
+        // rendered prose, so a clock tick can't forge a frame.
+        r.rate_limit_lifts_at,
+        r.last_usage_fold_at,
+      ]),
+    );
+  }
+
+  /**
+   * Stringify the projection-meaningful subset of the `jobs` row set into a
+   * stable hash key. Hashes ONLY the RAW unrendered fields the session log
+   * reads (`job_id`, `profile_name`, `created_at`, `state`, `title`),
+   * excluding `last_event_id` / `updated_at` and keying off raw `created_at` so
+   * neither a fetch-only refresh nor a minute-boundary crossing forges a frame.
+   */
+  function jobsRowsHashKey(rows: Record<string, unknown>[]): string {
+    return JSON.stringify(
+      rows.map((r) => [
+        r.job_id,
+        r.profile_name,
+        r.created_at,
+        r.state,
+        r.title,
+      ]),
+    );
+  }
+
+  /**
+   * Compose the full frame body against `nowMs`: an optional shadow-profile
+   * advisory banner on top (when an auth-bearing reserved shadow exists), then
+   * the per-profile usage stacks, then — when at least one job is present — a
+   * blank-line-separated `recent sessions` block. Both streams render against
+   * the SAME clock so a single 30s tick keeps every relative-time cell (quota
+   * resets, rate-limit annotations, AND session ages) fresh together; the
+   * advisory is frame-static (computed once at startup, not per redraw).
+   */
+  function composeBody(nowMs: number): string[] {
+    const usageLines = renderRowLines(usageRows, nowMs, deps.accountAliases);
+    const sessionLines = renderSessionLines(
+      jobsRows,
+      nowMs,
+      deps.accountAliases,
+    );
+    let body: string[];
+    if (sessionLines.length === 0) {
+      body = usageLines;
+    } else if (usageLines.length === 0) {
+      body = ["recent sessions", ...sessionLines];
+    } else {
+      body = [...usageLines, "", "recent sessions", ...sessionLines];
+    }
+    // Prepend the shadow advisory as a top banner separated by a blank line.
+    // It sits ABOVE the stacks on its own lines, so it never feeds the
+    // account-row width pools (renderRowLines derives column widths from rows
+    // alone) and can't shift the table alignment.
+    if (deps.shadowAdvisory.length === 0) return body;
+    if (body.length === 0) return [...deps.shadowAdvisory];
+    return [...deps.shadowAdvisory, "", ...body];
+  }
+
+  /**
+   * Emit one composed frame to the active sink. Snapshot mode captures rows
+   * only (the compose + print happen once at latch resolution). Frames mode
+   * routes to the shared emitter — baseline first, `frame` thereafter, then a
+   * bound check. Live mode appends to history + writes sidecars. The frame text
+   * carries NO `---` lead — that is a live-sidecar artifact, not the wire frame.
+   */
+  function emitFrame(): void {
+    if (isSnapshot) return;
+    const bodyLines = composeBody(deps.nowMs());
+    if (framesEmitter !== null) {
+      const input = {
+        cursor: deps.latestCursor(),
+        frameText: bodyLines.join("\n"),
+        stateJson: { usage: usageRows, jobs: jobsRows },
+      };
+      if (!baselineEmitted) {
+        baselineEmitted = true;
+        framesEmitter.emitBaseline(input);
+      } else {
+        framesEmitter.emitFrame(input);
+      }
+      deps.onMaybeStop();
+      return;
+    }
+    // Live mode: keep `lastLiveLines` in sync so the next tick suppresses an
+    // identical re-render, then hand the body to the history+sidecar sink.
+    lastLiveLines = bodyLines;
+    deps.onLiveFrame(bodyLines);
+  }
+
+  function emitUsage(rows: Record<string, unknown>[]): void {
+    const rowsKey = usageRowsHashKey(rows);
+    if (rowsKey === usageRowsKey) return;
+    usageRowsKey = rowsKey;
+    usageRows = rows;
+    // Report the `usage` stream to the snapshot latch exactly once, on its first
+    // delivery (the readiness client's first paint always passes the change-gate
+    // — initial key is `null`). The once-guard keeps a later changed delivery
+    // from over-reporting. Inert outside snapshot (`reportUsageStream` no-ops).
+    if (!usageReported) {
+      usageReported = true;
+      deps.reportUsageStream();
+    }
+    emitFrame();
+  }
+
+  function emitJobs(rows: Record<string, unknown>[]): void {
+    const rowsKey = jobsRowsHashKey(rows);
+    if (rowsKey === jobsRowsKey) return;
+    jobsRowsKey = rowsKey;
+    jobsRows = rows;
+    if (!jobsReported) {
+      jobsReported = true;
+      deps.reportJobsStream();
+    }
+    emitFrame();
+  }
+
+  function linesEqual(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  return {
+    emitUsage,
+    emitJobs,
+    // The tick re-renders the live overlay against the wall clock and NEVER
+    // calls `emitFrame` — the raw-field hash gate stays the sole emit trigger,
+    // so a countdown repaint is never minted as a frame (in frames mode the
+    // overlay sink is inert, so the tick is a pure no-op).
+    tick: () => {
+      if (usageRows.length === 0 && jobsRows.length === 0) return;
+      const bodyLines = composeBody(deps.nowMs());
+      if (linesEqual(bodyLines, lastLiveLines)) return;
+      lastLiveLines = bodyLines;
+      deps.onTickRefresh(bodyLines);
+    },
+    noteDisconnect: () => {
+      usageRowsKey = null;
+      jobsRowsKey = null;
+      framesEmitter?.noteReconnect();
+    },
+    composeBody,
+    getUsageRows: () => usageRows,
+    getJobsRows: () => jobsRows,
+    usageStreamReported: () => usageReported,
+    jobsStreamReported: () => jobsReported,
+    framesBaselineEmitted: () => baselineEmitted,
+  };
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the canonical
