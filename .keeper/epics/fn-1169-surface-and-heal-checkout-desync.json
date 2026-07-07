@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T18:17:56.959000Z",
+  "depends_on_epics": [],
+  "id": "fn-1169-surface-and-heal-checkout-desync",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Surface and heal checkout desync",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-07T18:17:56.959000Z"
+}
