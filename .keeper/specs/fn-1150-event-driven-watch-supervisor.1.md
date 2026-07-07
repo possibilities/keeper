@@ -38,5 +38,5 @@ Fixture tests over hand-written Row[] literals per the status.test.ts pattern (h
 - [ ] Fixture tests pin classification, subset rules, threshold boundary, and signature stability/change behavior
 
 ## Done summary
-
+Added src/needs-human.ts, the shared pure projector owning the needs-human classification (broad stuck count, operator-jam class single-sourced from isJamReason, most-specific per-row class, wall-threshold verdict, subset-safe umbrella total, stable signature hash). keeper status now derives its needs_human envelope from the projector, byte-identical at schema v5, dropping its duplicated reason constant.
 ## Evidence
