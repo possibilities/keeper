@@ -38,5 +38,5 @@ Skill lints (lint-skill-ids, lint-retired-name) green. Watchdog script: run it a
 - [ ] Frontmatter allows the Monitor tool, the skill lint gates pass, and the glossary noun discipline holds throughout
 
 ## Done summary
-
+Rewrote keeper:watch to arm-once/event-driven/hand-back over persistent Monitors (needs-human delta tail, umbrella jam alarm with signature re-arm, bus inbox, watchdog); removed the one-sweep/​/loop framing while keeping the five-rung ladder, guardrails, attacker-input rule, and pilot mode intact. Added scripts/watch-watchdog.ts verifying sibling liveness (shared exact-match monitorRunningState), bus presence, and status sanity with debounced anomaly-only emit.
 ## Evidence
