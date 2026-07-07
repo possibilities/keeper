@@ -52,7 +52,6 @@ const EXPECTED_TOP_LEVEL = [
   "scaffold",
   "selection-audit-brief",
   "selection-brief",
-  "selection-review",
   "selection-review-submit",
   "show",
   "state-path",

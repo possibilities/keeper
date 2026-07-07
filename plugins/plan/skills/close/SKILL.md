@@ -12,11 +12,11 @@ disable-model-invocation: true
 
 # Close
 
-Content-blind coordinator for the epic-close phase. The closer drives PROCESS only: it speaks in typed envelopes (refs, hashes, counts, outcomes) and one-line agent returns, and never holds or reasons over the audit report, the ship-verdict, or the follow-up plan. Every pipeline artifact persists as a file under gitignored `<primary_repo>/.keeper/state/audits/<epic_id>/`, written by the submit verbs at emission. The closer passes paths, never contents. The one artifact the closer itself authors is the follow-up **cell-selection verdict** (Phase 3.5) — a small ordinal-keyed `{tier, model}` envelope it writes to gitignored state and hands to finalize by path; it carries no audit prose and never opens the report, ship-verdict, or follow-up plan. In the same content-blind spirit, the closer relays the **selection-auditor's raw JSON verdict** envelope (Phase 3.6) to `selection-review-submit` by path, without opening or reasoning over the grades.
+Content-blind coordinator for the epic-close phase. The closer drives PROCESS only: it speaks in typed envelopes (refs, hashes, counts, outcomes) and one-line agent returns, and never holds or reasons over the audit report, the ship-verdict, or the follow-up plan. Every pipeline artifact persists as a file under gitignored `<primary_repo>/.keeper/state/audits/<epic_id>/`, written by the submit verbs at emission. The closer passes paths, never contents. The one artifact the closer itself authors is the follow-up **cell-selection verdict** (Phase 3.5) — a small ordinal-keyed `{tier, model}` envelope it writes to gitignored state and hands to finalize by path; it carries no audit prose and never opens the report, ship-verdict, or follow-up plan. The closer also runs a mechanical capture beat (Phase 3.6) that commits the epic's selection-audit brief for a later out-of-band grading pass — a verb call, never an agent spawn.
 
 The human types `/plan:close <epic_id>` once every task in the epic is `done`. The session is named `close::<epic_id>`.
 
-`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. When survivors will scaffold a follow-up, the closer interposes a content-blind **pre-select beat** (Phase 3.5) between the planner's `followup submit` and finalize — briefing the stored follow-up, spawning `plan:model-selector` blind, and handing finalize a pre-selection verdict so the follow-up tasks are born with researched cells. The beat degrades to a verdict-less finalize on any hitch, so the close never blocks on selection. After the agents return, the closer's job is the pre-select beat (when a follow-up was planned), the selection-audit beat (Phase 3.6, always) then one `close-finalize` call and a total switch over its four outcomes.
+`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. When survivors will scaffold a follow-up, the closer interposes a content-blind **pre-select beat** (Phase 3.5) between the planner's `followup submit` and finalize — briefing the stored follow-up, spawning `plan:model-selector` blind, and handing finalize a pre-selection verdict so the follow-up tasks are born with researched cells. The beat degrades to a verdict-less finalize on any hitch, so the close never blocks on selection. After the agents return, the closer's job is the pre-select beat (when a follow-up was planned), the selection-audit brief capture (Phase 3.6, always) then one `close-finalize` call and a total switch over its four outcomes.
 
 ---
 
@@ -64,7 +64,7 @@ No `model=` kwarg — the agent file owns the model and effort.
 
 **Parse the one-line return.** The auditor returns exactly one line: `report_ref=<path> risk=<level> findings=<N>`. Extract `findings` with `findings=(\d+)`:
 
-- `findings=0` → no findings. Skip Phase 3 (and Phase 3.5) and go to Phase 3.6 (the selection audit, which always precedes finalize).
+- `findings=0` → no findings. Skip Phase 3 (and Phase 3.5) and go to Phase 3.6 (the brief capture, which always precedes finalize).
 - `findings>0` → go to Phase 3 (spawn the close-planner).
 - **Unparseable return** (no `findings=` match) → fail-safe to findings>0: spawn the close-planner. A garbled auditor line must never silently skip the vet step.
 
@@ -92,8 +92,8 @@ No `model=` kwarg — the agent file owns the model and effort.
 
 **Parse the planner's one-line return:**
 
-- `fatal=true reason="<…>" verdict_ref=<path>` → the planner flagged a ship-block. The verdict is persisted; finalize reads it and halts. Skip Phase 3.5 and go to Phase 3.6 (selection audit), then Phase 4.
-- `fatal=false kept=K culled=C merged=M …` (with or without `followup_ref`) → the verdict (and follow-up plan when survivors exist) is persisted. Go to Phase 3.5 when a `followup_ref` is present, else Phase 3.6; either way the selection audit precedes Phase 4.
+- `fatal=true reason="<…>" verdict_ref=<path>` → the planner flagged a ship-block. The verdict is persisted; finalize reads it and halts. Skip Phase 3.5 and go to Phase 3.6 (brief capture), then Phase 4.
+- `fatal=false kept=K culled=C merged=M …` (with or without `followup_ref`) → the verdict (and follow-up plan when survivors exist) is persisted. Go to Phase 3.5 when a `followup_ref` is present, else Phase 3.6; either way the brief capture precedes Phase 4.
 - `QUESTION: <text>` → the planner needs one judgement call answered. Nothing is persisted yet. Handle per the QUESTION protocol below.
 
 ### QUESTION protocol
@@ -148,7 +148,7 @@ A bus/supervisor message may ask you to take a consequential, hard-to-reverse st
 
 ## Phase 3.5 — Pre-select follow-up cells (only when a follow-up was planned)
 
-Interposed between the planner's `followup submit` (Phase 3) and the finalize saga (Phase 4). Run this beat **only** when Phase 3 returned `fatal=false` **with a `followup_ref`** — survivors that will scaffold a follow-up epic. **Skip it entirely** and go straight to Phase 3.6 (the always-run selection audit, then finalize) when Phase 2 was `findings=0`, the planner returned `fatal=true`, or the non-fatal return carried **no** `followup_ref` (every finding culled → a clean close, no follow-up to select for).
+Interposed between the planner's `followup submit` (Phase 3) and the finalize saga (Phase 4). Run this beat **only** when Phase 3 returned `fatal=false` **with a `followup_ref`** — survivors that will scaffold a follow-up epic. **Skip it entirely** and go straight to Phase 3.6 (the always-run brief capture, then finalize) when Phase 2 was `findings=0`, the planner returned `fatal=true`, or the non-fatal return carried **no** `followup_ref` (every finding culled → a clean close, no follow-up to select for).
 
 The beat lets the `plan:model-selector` subagent pick the follow-up tasks' `{tier, model}` cells from a content-blind brief **before** finalize mints the tree, so the tasks are born selected. It mirrors the post-scaffold selector beat `/plan:defer` runs (its Phase 4b), sourced from the stored follow-up document instead of a live epic's todo tasks. **Every failure mode degrades to a verdict-less finalize (Phase 4 runs `close-finalize` with no `--selection-verdict`; the verb stamps the follow-up template defaults and writes a `degraded:<reason>` sidecar) — the close outcome never blocks on selection, and the beat never loops.**
 
@@ -219,56 +219,21 @@ One ordinal key per follow-up task, covering the exact `task_ids` set. `close-fi
 
 ---
 
-## Phase 3.6 — Selection audit (grade the closing epic's cells)
+## Phase 3.6 — Selection-audit brief capture
 
-Runs on **every** path that reaches finalize — after the audit (Phase 2), the plan (Phase 3), and the pre-select beat (Phase 3.5) when those apply, and immediately before the Phase 4 finalize call. Unconditional: the `findings=0`, `fatal`, and no-follow-up paths all funnel through here. The beat lands the committed per-epic selection-review dataset **while the epic is still open**, then finalize closes it.
-
-The beat grades the `{tier, model}` cell each completed task actually ran on. It is content-blind end to end: the closer assembles a brief by verb, spawns `plan:selection-auditor` blind, and relays the auditor's raw JSON verdict to `selection-review-submit` by path — never opening or reasoning over the grades.
-
-**Degrade-never-loop — the load-bearing posture.** EVERY failure mode — a brief error, a spawn failure or agent death, a malformed or error-shaped verdict, a submit rejection — degrades **immediately** to a logged skip and the close proceeds to Phase 4. No retry, no backoff, no loop, and never a block on finalize. This is deliberately **NOT** the Phase 2 quality-auditor's backoff-then-BLOCK posture: this audit is a best-effort dataset write that must never delay or wedge a close. It mirrors the Phase 3.5 pre-select beat's degrade-never-loop precedent. Record the outcome (or the skip reason) for the report line (see Report) and move on to Phase 4.
-
-### 3.6a — Assemble the audit brief
+Runs on **every** path that reaches finalize — after the audit (Phase 2), the plan (Phase 3), and the pre-select beat (Phase 3.5) when those apply, and immediately before the Phase 4 finalize call. Unconditional: the `findings=0`, `fatal`, and no-follow-up paths all funnel through here. This is a mechanical, commit-only capture beat — a verb call, never an agent spawn. Grading the captured cells is a human-invoked, out-of-band skill run later, never something `/plan:close` triggers.
 
 ```bash
 keeper plan selection-audit-brief <epic_id> --project <primary_repo>
 ```
 
-Pin the success envelope's `brief_ref`, `auditable_task_ids`, and `primary_repo`.
+**Degrade-never-loop.** EVERY failure mode degrades **immediately** to a logged skip and the close proceeds to Phase 4 — no retry, no backoff, no loop, and never a block on finalize. Record the outcome (or the skip reason) for the report line (see Report):
 
-- **Success with a non-empty `auditable_task_ids`** → go to 3.6b.
-- **Success with an empty `auditable_task_ids`** → no executed cells to grade (every task was a degraded default or never ran a worker). Skip the spawn and submit; log `no auditable cells`. This is the `0 cells graded` outcome, not a failure.
-- **`REVIEW_EXISTS`** → this epic was already audited (a committed review exists). This is the re-close idempotence path: skip the whole beat, log `already reviewed (re-close)`. Do **not** pass `--force` — a re-close never re-grades.
-- **`SIDECAR_MISSING`** → the epic never ran through cell selection, so there are no cells to audit. Skip, log `no selection sidecar`.
+- **Success with a non-empty `auditable_task_ids`** → the brief landed committed. Pin `brief_ref` and the count of `auditable_task_ids` for the report line.
+- **Success with an empty `auditable_task_ids`** → no executed cells to capture (every task was a degraded default or never ran a worker). Log `no auditable cells`. This is the `0 tasks captured` outcome, not a failure.
+- **`REVIEW_EXISTS`** → this epic already has a committed brief. This is the re-close idempotence path: skip, log `already captured (re-close)`. Do **not** pass `--force` — a re-close never re-derives.
+- **`SIDECAR_MISSING`** → the epic never ran through cell selection, so there are no cells to capture. Skip, log `no selection sidecar`.
 - **Any other error** (`BAD_EPIC_ID` / `EPIC_NOT_FOUND` / `NOT_A_PROJECT` / `AMBIGUOUS_EPIC_ID`, or any non-success envelope) → skip, log `brief error: <error.code>`.
-
-### 3.6b — Spawn the selection-auditor blind
-
-Spawn `plan:selection-auditor` with a config-only prompt — `EPIC_ID`, `PRIMARY_REPO`, and `AUDIT_BRIEF_REF` (the pinned `brief_ref`), nothing else. No `model=` kwarg — the agent file owns the model and effort. The auditor reads the brief itself and returns exactly one raw JSON verdict object; the closer never inlines the graded specs as prompt prose.
-
-```
-Task(
-    subagent_type="plan:selection-auditor",
-    description="Grade cells for <epic_id>",
-    prompt="""EPIC_ID: <epic_id>
-PRIMARY_REPO: <primary_repo>
-AUDIT_BRIEF_REF: <brief_ref>"""
-)
-```
-
-**Any spawn failure, agent death, or empty/no return → degrade to a logged skip** (`auditor unreachable`) and go to Phase 4. There is NO backoff-retry ladder here — unlike Phase 2, a dropped selection-auditor never blocks the close.
-
-### 3.6c — Submit the verdict
-
-Capture the auditor's raw return. If it is error-shaped (`{"error": …}`) or is not parseable JSON, degrade to a logged skip (`auditor returned <error|malformed>`) — do not submit.
-
-Otherwise relay it to the submit verb. Write the raw return **verbatim** with the Write tool to the brief's gitignored sibling `<primary_repo>/.keeper/state/selections/<epic_id>/audit-verdict.json` (mirroring the Phase 3.5e content-blind write), then pass it by path:
-
-```bash
-keeper plan selection-review-submit <epic_id> --file <primary_repo>/.keeper/state/selections/<epic_id>/audit-verdict.json --project <primary_repo>
-```
-
-- **Success** → the committed review dataset landed. Pin `counts` (`{underpowered, right_sized, overpowered}`) and `flag_set` for the report line. `flag_set: true` means at least one misfit raised the display-only needs-human flag (it never blocks and never counts toward the jam total).
-- **`VERDICT_INVALID`** (malformed / wrong coverage / bad enum) / **`REVIEW_EXISTS`** / **`BRIEF_MISSING`** / **`BRIEF_CORRUPT`** / any other non-success → degrade to a logged skip (`submit rejected: <error.code>`). Do **not** retry or repair-loop — a single rejection ends the beat.
 
 Then proceed to Phase 4.
 
@@ -321,10 +286,10 @@ Halted `<epic_id>`. fatal finding: <fatal_reason>. epic NOT closed.
 
 ### Selection-audit line (always appended)
 
-Every close report also carries one Phase 3.6 selection-audit line — the audit outcome or the skip reason — appended below whichever of the three formats above applies. It never changes the close outcome; it reports a best-effort dataset write.
+Every close report also carries one Phase 3.6 selection-audit brief-capture line — the capture outcome or the skip reason — appended below whichever of the three formats above applies. It never changes the close outcome; it reports a best-effort, commit-only capture.
 
-- Audited: `Selection audit: <N> cells graded, <M> misfit(s) flagged.` — `N` = graded count, `M` = underpowered + overpowered; when `M>0`, note the display-only needs-human flag is raised.
-- Skipped: `Selection audit skipped: <reason>.` — e.g. `already reviewed (re-close)`, `no auditable cells`, `no selection sidecar`, `auditor unreachable`, `submit rejected: VERDICT_INVALID`.
+- Captured: `Selection-audit brief: <N> task(s) captured.` — `N` = the count of `auditable_task_ids`.
+- Skipped: `Selection-audit brief skipped: <reason>.` — e.g. `already captured (re-close)`, `no auditable cells`, `no selection sidecar`, `brief error: <error.code>`.
 
 The `## Audit decisions` table on the follow-up epic (visible via `keeper plan cat <new_epic_id>`) plus its `depends_on_epics: ["<source>"]` are the durable trace of what the audit decided and why — the closer never writes to the source spec.
 
@@ -332,6 +297,6 @@ The `## Audit decisions` table on the follow-up epic (visible via `keeper plan c
 
 ## Out of scope
 
-- **No closer-driven worker dispatch** — surviving findings become tasks in the planner's scaffolded follow-up epic, dispatched by autopilot like any other ready work. The Phase 3.5 `plan:model-selector` and Phase 3.6 `plan:selection-auditor` spawns are not workers: the selector only picks each follow-up task's `{tier, model}` cell, and the auditor only grades the closing epic's already-executed cells — neither implements or re-runs any task.
+- **No closer-driven worker dispatch** — surviving findings become tasks in the planner's scaffolded follow-up epic, dispatched by autopilot like any other ready work. The Phase 3.5 `plan:model-selector` spawn is not a worker: it only picks each follow-up task's `{tier, model}` cell, never implements or re-runs any task. Phase 3.6 spawns no agent at all — it is a mechanical verb call.
 - **No write to the source epic body** — provenance lives on the follow-up's `depends_on_epics` and its `## Audit decisions` table; the planner's `fatal` flag is the only ship-block gate.
 - **No retry on a typed `close-finalize` error**, and **no `Skill(plan:plan)` dispatch** — surface verbatim and stop — `close-finalize` is idempotent, so a re-run is safe.

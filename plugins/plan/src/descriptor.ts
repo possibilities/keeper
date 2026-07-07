@@ -566,25 +566,6 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
     ],
   },
   {
-    name: "selection-review",
-    summary:
-      "Set or clear an epic-level selection-review record (board-visible).",
-    args: [{ name: "EPIC_ID" }],
-    options: [
-      {
-        name: "--set",
-        takesValue: true,
-        summary: "Store the review payload (a small JSON verdict summary)",
-      },
-      {
-        name: "--clear",
-        takesValue: false,
-        summary: "Clear the selection-review record",
-      },
-      OPT_PROJECT,
-    ],
-  },
-  {
     name: "selection-review-submit",
     summary:
       "Validate the auditor verdict + land the committed selection-review dataset.",

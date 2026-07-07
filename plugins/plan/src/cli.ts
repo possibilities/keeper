@@ -55,7 +55,6 @@ import { runResolveTask } from "./verbs/resolve_task.ts";
 import { runScaffold } from "./verbs/scaffold.ts";
 import { runSelectionAuditBrief } from "./verbs/selection_audit_brief.ts";
 import { runSelectionBrief } from "./verbs/selection_brief.ts";
-import { runSelectionReview } from "./verbs/selection_review.ts";
 import { runSelectionReviewSubmit } from "./verbs/selection_review_submit.ts";
 import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
@@ -824,23 +823,6 @@ function dispatch(parsed: ParsedArgs): number {
         fromFollowup: readFlag(rest, "--from-followup"),
       });
       break;
-    case "selection-review": {
-      // Positional epic id, then either --set <json> or --clear. --set and
-      // --project are value-taking, so they must be skipped when scanning for
-      // the id positional. Readonly overlay write (mirrors epic-question).
-      const epicId = readPositionalSkipping(
-        rest,
-        new Set(["--set", "--project"]),
-      );
-      runSelectionReview({
-        epicId,
-        payload: readOption(rest, "--set"),
-        clear: readFlag(rest, "--clear"),
-        project: readOption(rest, "--project"),
-        format,
-      });
-      break;
-    }
     case "selection-review-submit": {
       // Mutating verb: validates the auditor verdict on stdin (--file -) and
       // writes the committed review file (auto-committed); no board/overlay
