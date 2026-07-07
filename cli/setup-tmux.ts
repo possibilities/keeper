@@ -40,10 +40,11 @@ import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { resolveDbPath, resolveRestorePath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
-import { loadRestorePlan } from "../src/tabs-core";
+import type { GenerationSummary } from "../src/restore-set";
+import { loadRestorePlan, type RestoreSelection } from "../src/tabs-core";
 import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 import { parseOptions } from "./descriptor";
-import { formatAge } from "./tabs";
+import { formatAge, formatGenerationMenu, parsePickerChoice } from "./tabs";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
 
@@ -78,6 +79,13 @@ cleared only after a successful restore; a marked retry is offered even when the
 session now exists. The managed 'autopilot' session is never offered. A present
 session without a retry marker, zero candidates, or a non-TTY skips that
 session's offer.
+
+A CONTESTED auto-pick — the richest generation isn't the freshest, or the
+derived cohort disagrees with the last non-empty disaster mirror — never silently
+restores: on a TTY it presents a numbered generation picker; off a TTY it prints
+a visible refusal naming 'keeper tabs restore' and restores nothing (never
+blocking provisioning). Retry markers (already-disambiguated picks) bypass this
+gate.
 
 Options:
   --kill-sessions  Kill the default-server 'work'/'autopilot' sessions before
@@ -658,6 +666,21 @@ async function confirm(
   }
 }
 
+/** Read one raw line on a confirmed TTY (the ambiguity picker's numbered choice).
+ *  EOF/Ctrl-D / close resolves empty (⇒ abort). Mirrors {@link confirm}'s
+ *  readline lifecycle — created after the TTY gate, always closed. */
+async function promptLine(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await new Promise<string>((resolve) => {
+      rl.question(prompt, resolve);
+      rl.on("close", () => resolve(""));
+    });
+  } finally {
+    rl.close();
+  }
+}
+
 /** Human work sessions eligible for the restore offer: every sweep/kill session
  *  except the reconciler-managed `autopilot` (= [work], iterated in
  *  SWEEP_KILL_SESSIONS order for deterministic prompt/spawn output). Derived
@@ -684,39 +707,146 @@ export interface RestoreOffer {
 }
 
 /**
- * Injectable provider for the per-session restore offers, keyed by backend
- * session name. Default runs {@link loadRestorePlan} ONCE (read-only `keeper.db`,
- * NO tmux drive — it probes `G_now` read-only itself) and groups the picked
- * generation's candidates by `backend_exec_session_id`, stamping each session's
- * offer with the shared generation context. Routing the offer through the SAME
- * seam the applied restore reads keeps the promised count and the restored set in
- * lockstep. Tests inject a fake so they need no real DB. Daemon-down is fine
- * (read-only); any open/read failure degrades to `{}` (skip every offer rather
- * than crash setup) — exactly the old count-path catch.
+ * The restore-offer envelope the boot flow escalates on: the per-session offers
+ * PLUS the generation-level metadata the escalate-or-refuse contract needs.
+ * `ambiguous` forces the picker (TTY) / refusal (non-TTY) instead of a silent
+ * auto-pick; `eligible` is the picker menu (newest-first); `fallbackNote` is the
+ * VISIBLE degraded-restore banner. `offers` is keyed by backend session name.
  */
-export type RestoreOfferFn = () => Record<string, RestoreOffer>;
+export interface RestoreOfferBundle {
+  offers: Record<string, RestoreOffer>;
+  ambiguous: boolean;
+  eligible: GenerationSummary[];
+  fallbackNote?: string;
+}
 
-const defaultRestoreOffer: RestoreOfferFn = () => {
+/**
+ * Injectable provider for the restore-offer bundle. Default runs
+ * {@link loadRestorePlan} ONCE (read-only `keeper.db`, NO tmux drive — it probes
+ * `G_now` read-only itself) and groups the picked generation's candidates by
+ * `backend_exec_session_id`, stamping each session's offer with the shared
+ * generation context. Routing the offer through the SAME seam the applied restore
+ * reads keeps the promised count and the restored set in lockstep. An optional
+ * `generationId` re-resolves THAT generation verbatim (the picker's second pass),
+ * bypassing the auto-pick and the mirror cross-check. Tests inject a fake so they
+ * need no real DB. Daemon-down is fine (read-only); any open/read failure
+ * degrades to an empty non-ambiguous bundle (skip every offer rather than crash
+ * setup) — exactly the old count-path catch.
+ */
+export type RestoreOfferFn = (
+  generationId?: string | null,
+) => RestoreOfferBundle;
+
+/**
+ * Collect the last NON-EMPTY restore.json mirror's job-id set (every session
+ * bucket's agents). Absent / garbage / empty-set mirror ⇒ empty set (no
+ * cross-check). Read-only, best-effort — the mirror is a disaster-fallback
+ * cross-check, never the restore source.
+ */
+export function readMirrorJobIds(mirrorPath: string): Set<string> {
+  const ids = new Set<string>();
   try {
-    const selection = loadRestorePlan(resolveDbPath());
-    const gen = selection.pickedGeneration;
-    const offers: Record<string, RestoreOffer> = {};
-    for (const c of selection.candidates) {
-      const existing = offers[c.backend_exec_session_id];
-      if (existing !== undefined) {
-        existing.count += 1;
-      } else {
-        offers[c.backend_exec_session_id] = {
-          count: 1,
-          generationId: gen?.generation_id ?? null,
-          generationLastTs: gen?.last_ts ?? null,
-          generationMaxPanes: gen?.max_pane_count ?? null,
-        };
+    const parsed = JSON.parse(fs.readFileSync(mirrorPath, "utf8")) as {
+      current?: {
+        sessions?: Record<string, { agents?: { job_id?: unknown }[] }>;
+      } | null;
+    };
+    const sessions = parsed?.current?.sessions;
+    if (sessions != null && typeof sessions === "object") {
+      for (const bucket of Object.values(sessions)) {
+        for (const agent of bucket?.agents ?? []) {
+          if (typeof agent?.job_id === "string" && agent.job_id !== "") {
+            ids.add(agent.job_id);
+          }
+        }
       }
     }
-    return offers;
   } catch {
-    return {};
+    // Absent / unreadable / non-JSON mirror ⇒ empty set ⇒ no cross-check.
+  }
+  return ids;
+}
+
+/**
+ * Pure: fold a {@link RestoreSelection} into the offer bundle, applying the
+ * disaster-mirror cross-check. A derived cohort that DISAGREES with the last
+ * non-empty restore.json job-id set forces `ambiguous` (so a divergence between
+ * the live derivation and the pre-crash mirror escalates rather than silently
+ * auto-picking). The cross-check runs only for an auto-pick
+ * (`enableMirrorCrossCheck`); an explicit `--generation` pick — the picker's
+ * second pass — is already disambiguated and bypasses it. An empty mirror set
+ * never forces ambiguity.
+ */
+export function selectionToOfferBundle(
+  selection: RestoreSelection,
+  mirrorJobIds: ReadonlySet<string>,
+  enableMirrorCrossCheck: boolean,
+): RestoreOfferBundle {
+  const gen = selection.pickedGeneration;
+  const offers: Record<string, RestoreOffer> = {};
+  for (const c of selection.candidates) {
+    const key = c.backend_exec_session_id ?? "";
+    const existing = offers[key];
+    if (existing !== undefined) {
+      existing.count += 1;
+    } else {
+      offers[key] = {
+        count: 1,
+        generationId: gen?.generation_id ?? null,
+        generationLastTs: gen?.last_ts ?? null,
+        generationMaxPanes: gen?.max_pane_count ?? null,
+      };
+    }
+  }
+  const mirrorDisagrees =
+    enableMirrorCrossCheck &&
+    !selection.ambiguous &&
+    selection.candidates.length > 0 &&
+    jobIdSetsDiffer(
+      new Set(selection.candidates.map((c) => c.job_id)),
+      mirrorJobIds,
+    );
+  return {
+    offers,
+    ambiguous: selection.ambiguous || mirrorDisagrees,
+    eligible: selection.eligible,
+    fallbackNote: selection.fallbackNote,
+  };
+}
+
+/** Pure: does the derived job-id set disagree with a NON-EMPTY mirror set? An
+ *  empty mirror is not a disagreement (nothing to cross-check against). */
+function jobIdSetsDiffer(
+  derived: ReadonlySet<string>,
+  mirror: ReadonlySet<string>,
+): boolean {
+  if (mirror.size === 0) {
+    return false;
+  }
+  if (derived.size !== mirror.size) {
+    return true;
+  }
+  for (const id of derived) {
+    if (!mirror.has(id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const defaultRestoreOffer: RestoreOfferFn = (generationId?: string | null) => {
+  try {
+    const gid = generationId ?? null;
+    const selection = loadRestorePlan(resolveDbPath(), { generationId: gid });
+    // Auto-pick cross-checks the disaster mirror; an explicit --generation pick
+    // (the picker's second pass) is already disambiguated and skips it.
+    const enableCrossCheck = gid === null || gid === "";
+    const mirrorJobIds = enableCrossCheck
+      ? readMirrorJobIds(resolveRestorePath())
+      : new Set<string>();
+    return selectionToOfferBundle(selection, mirrorJobIds, enableCrossCheck);
+  } catch {
+    return { offers: {}, ambiguous: false, eligible: [] };
   }
 };
 
@@ -979,10 +1109,65 @@ export async function main(
     // the apply reads, and RESTORABLE (not the offer-map keys) is the iteration
     // source so a stale or non-provisioned `backend_exec_session_id` can't leak
     // into the prompt.
-    const freshOffers = restoreOffer();
+    const bundle = restoreOffer();
     const retryOffers = retryStore.read();
-    const offers = { ...freshOffers, ...retryOffers };
     const nowSecs = Date.now() / 1000;
+    const tty = process.stdout.isTTY === true && process.stdin.isTTY === true;
+
+    // Escalate-or-refuse a CONTESTED fresh auto-pick BEFORE anything is restored
+    // — never a silent auto-pick, never a silent drop. `ambiguous` fires when the
+    // richest generation isn't the freshest OR the derived cohort disagrees with
+    // the disaster mirror. TTY ⇒ the numbered generation picker (reusing the
+    // tabs.ts menu + choice parser); non-TTY ⇒ a VISIBLE stderr refusal naming
+    // `keeper tabs restore` (never blocking provisioning — setup-tmux runs at
+    // shell boot where non-TTY is common). Retry offers (already-accepted,
+    // disambiguated picks) are untouched by this gate.
+    let freshOffers = bundle.offers;
+    // A successful picker choice IS the confirmation — the picked fresh offers
+    // skip the generic y/N confirm below (asking twice would be redundant).
+    let pickerConfirmed = false;
+    const freshHasOffer = Object.values(freshOffers).some((o) => o.count > 0);
+    if (bundle.ambiguous && freshHasOffer) {
+      if (tty) {
+        process.stdout.write(
+          "keeper setup-tmux: ambiguous last-session restore — the newest " +
+            "generation isn't unambiguously the one to restore (a richer older " +
+            "cohort, or a disaster-mirror disagreement). Choose one:\n",
+        );
+        process.stdout.write(
+          `${formatGenerationMenu(bundle.eligible, nowSecs)}\n`,
+        );
+        const answer = await promptLine(
+          "Generation to restore (number, or blank to abort): ",
+        );
+        const idx = parsePickerChoice(answer, bundle.eligible.length);
+        if (idx === null) {
+          freshOffers = {};
+          process.stderr.write(
+            "keeper setup-tmux: ambiguous restore aborted — restored nothing " +
+              "(re-run `keeper tabs restore` to choose)\n",
+          );
+        } else {
+          const chosen = bundle.eligible[idx] as GenerationSummary;
+          // Re-resolve THAT generation verbatim (disambiguated, no cross-check).
+          freshOffers = restoreOffer(chosen.generation_id).offers;
+          pickerConfirmed = true;
+        }
+      } else {
+        process.stderr.write(
+          "keeper setup-tmux: refusing an AMBIGUOUS last-session restore " +
+            "(non-TTY) — the newest generation isn't unambiguously the one to " +
+            "restore. Run `keeper tabs restore` on a TTY (or with " +
+            "--generation <id>) to choose:\n",
+        );
+        process.stderr.write(
+          `${formatGenerationMenu(bundle.eligible, nowSecs)}\n`,
+        );
+        freshOffers = {};
+      }
+    }
+
+    const offers = { ...freshOffers, ...retryOffers };
     const offered = RESTORABLE.filter((session) => {
       const offer = offers[session];
       if ((offer?.count ?? 0) <= 0) {
@@ -995,11 +1180,22 @@ export async function main(
     });
     let restoreSessions: readonly string[] = [];
     if (offered.length > 0) {
-      const tty = process.stdout.isTTY === true && process.stdin.isTTY === true;
-      // Non-empty offer AND TTY ⇒ ONE combined prompt naming each session with
-      // its agent count + the picked generation's age (a skeleton is
-      // recognizable here); non-TTY NEVER auto-restores.
-      if (tty) {
+      // A picker-confirmed set restores WITHOUT a second y/N prompt (the pick was
+      // the confirmation), marking each for retry exactly as the confirm path does.
+      if (pickerConfirmed) {
+        restoreSessions = offered;
+        retryStore.mark(
+          Object.fromEntries(
+            restoreSessions.map((session) => [
+              session,
+              offers[session] as RestoreOffer,
+            ]),
+          ),
+        );
+      } else if (tty) {
+        // Non-empty offer AND TTY ⇒ ONE combined prompt naming each session with
+        // its agent count + the picked generation's age (a skeleton is
+        // recognizable here); non-TTY NEVER auto-restores.
         const detail = offered
           .map((s) => {
             const o = offers[s] as RestoreOffer;

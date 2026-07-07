@@ -53,7 +53,10 @@ import {
   RESTORE_SCHEMA_VERSION,
   type RestoreDescriptor,
   type RestoreTier,
+  restoreJsonMirrorsNonEmptySet,
   restorePulse,
+  restoreSetIsEmpty,
+  reviveScriptMirrorsNonEmptySet,
   type SpawnSyncFn,
   seedLastGenerationHash,
   serializeForHash,
@@ -665,21 +668,38 @@ test("restorePulse skips the write when the hashed content is unchanged", () => 
   expect(statSync(restorePath).mtimeMs).toBe(firstMtime);
 });
 
-test("restorePulse mirrors an emptied live set to an empty current tier (no freeze)", () => {
+test("restorePulse refuses to blank a non-empty mirror when the live set empties", () => {
   // Populated pulse writes the file (current=[a]).
   insertJob({ job_id: "a", backend_exec_session_id: "s1" });
   const state = freshState();
   restorePulse(db, restorePath, state, () => 1000);
   expect(tierKeys(readFile(restorePath).current)).toEqual({ s1: ["a"] });
 
-  // Drain the live set → current mirrors empty. There is NO frozen last_session
-  // anymore — the file is just rewritten with an empty current tier.
+  // Drain the live set → an EMPTY set must NOT clobber the non-empty mirror (the
+  // disaster fallback has to survive a zero-agent state). The file keeps its
+  // pre-drain content.
   db.run("UPDATE jobs SET state='ended' WHERE job_id='a'");
   restorePulse(db, restorePath, state, () => 9999);
+  expect(tierKeys(readFile(restorePath).current)).toEqual({ s1: ["a"] });
 
-  const parsed = readFile(restorePath);
-  expect(tierKeys(parsed.current)).toEqual({});
-  expect("last_session" in parsed).toBe(false);
+  // A genuinely NON-EMPTY set replaces the stale mirror normally.
+  insertJob({ job_id: "b", backend_exec_session_id: "s2" });
+  restorePulse(db, restorePath, state, () => 9999);
+  expect(tierKeys(readFile(restorePath).current)).toEqual({ s2: ["b"] });
+});
+
+test("restorePulse: a fresh-state (post-restart) empty pulse cannot blank a non-empty on-disk mirror", () => {
+  // Seed a non-empty mirror.
+  insertJob({ job_id: "a", backend_exec_session_id: "s1" });
+  restorePulse(db, restorePath, freshState(), () => 1000);
+  expect(tierKeys(readFile(restorePath).current)).toEqual({ s1: ["a"] });
+
+  // Simulate a keeperd restart: a BRAND-NEW pulse state (lastHash null) with a
+  // ZERO-agent live set. The clobber guard reads the on-disk mirror, not memory,
+  // so the fallback survives.
+  db.run("UPDATE jobs SET state='ended' WHERE job_id='a'");
+  restorePulse(db, restorePath, freshState(), () => 9999);
+  expect(tierKeys(readFile(restorePath).current)).toEqual({ s1: ["a"] });
 });
 
 test("restorePulse rewrites when the current tier genuinely changes", () => {
@@ -1295,6 +1315,96 @@ test("a failed revive.sh write does not block the restore.json write", () => {
   expect(existsSync(deadScriptPath)).toBe(false);
   expect(existsSync(restorePath)).toBe(true);
   expect(tierKeys(readFile(restorePath).current)).toEqual({ s1: ["a"] });
+});
+
+// ---------------------------------------------------------------------------
+// Refuse-to-clobber guard (fn-1162): an empty set never blanks a non-empty
+// on-disk mirror.
+// ---------------------------------------------------------------------------
+
+test("restorePulse refuses to blank a non-empty revive.sh when the agent set empties", () => {
+  insertJob({ job_id: "a", backend_exec_session_id: "s1", title: "keep-me" });
+  const revivePath = join(tmpDir, "revive.sh");
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  expect(readFileSync(revivePath, "utf8")).toContain("keep-me");
+
+  // Drain → an empty candidate set must NOT clobber the non-empty script.
+  db.run("UPDATE jobs SET state='ended' WHERE job_id='a'");
+  restorePulse(db, restorePath, freshState(), () => 9999, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  expect(readFileSync(revivePath, "utf8")).toContain("keep-me");
+  expect(readFileSync(revivePath, "utf8")).toContain("captured 1 keeper agent");
+});
+
+test("restorePulse writes a first-ever empty revive.sh (no mirror to protect)", () => {
+  const revivePath = join(tmpDir, "revive.sh");
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    postBackendExecStart: () => {},
+    script: scriptCfg(revivePath),
+  });
+  expect(existsSync(revivePath)).toBe(true);
+  expect(readFileSync(revivePath, "utf8")).toContain("captured 0 keeper agent");
+});
+
+test("restoreSetIsEmpty distinguishes an empty tier from a populated one", () => {
+  expect(
+    restoreSetIsEmpty({
+      schema_version: RESTORE_SCHEMA_VERSION,
+      current: null,
+    }),
+  ).toBe(true);
+  expect(
+    restoreSetIsEmpty({
+      schema_version: RESTORE_SCHEMA_VERSION,
+      current: { captured_at: 1, sessions: {} },
+    }),
+  ).toBe(true);
+  expect(
+    restoreSetIsEmpty({
+      schema_version: RESTORE_SCHEMA_VERSION,
+      current: {
+        captured_at: 1,
+        sessions: { s1: { agents: [] } },
+      },
+    }),
+  ).toBe(false);
+});
+
+test("restoreJsonMirrorsNonEmptySet reads the on-disk session set", () => {
+  const p = join(tmpDir, "mirror.json");
+  writeFileSync(
+    p,
+    JSON.stringify({
+      current: { sessions: { s1: { agents: [{ job_id: "a" }] } } },
+    }),
+  );
+  expect(restoreJsonMirrorsNonEmptySet(p)).toBe(true);
+
+  writeFileSync(p, JSON.stringify({ current: { sessions: {} } }));
+  expect(restoreJsonMirrorsNonEmptySet(p)).toBe(false);
+
+  expect(restoreJsonMirrorsNonEmptySet(join(tmpDir, "absent.json"))).toBe(
+    false,
+  );
+});
+
+test("reviveScriptMirrorsNonEmptySet parses the captured-count header", () => {
+  const p = join(tmpDir, "revive-probe.sh");
+  writeFileSync(p, "#!/usr/bin/env bash\n# captured 3 keeper agent(s); x.\n");
+  expect(reviveScriptMirrorsNonEmptySet(p)).toBe(true);
+
+  writeFileSync(p, "#!/usr/bin/env bash\n# captured 0 keeper agent(s); x.\n");
+  expect(reviveScriptMirrorsNonEmptySet(p)).toBe(false);
+
+  expect(reviveScriptMirrorsNonEmptySet(join(tmpDir, "no-such.sh"))).toBe(
+    false,
+  );
 });
 
 test("the revive.sh sibling leaves the JSON mirror's membership and schema unchanged", () => {

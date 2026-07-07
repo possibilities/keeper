@@ -87,9 +87,18 @@
  * restore-agents util can show a wall-clock timestamp) but EXCLUDED from the
  * hashed shape — otherwise every tick would churn the file. Same trick the
  * autopilot's snapshot does with its own informational timestamps.
+ *
+ * Refuse-to-clobber: an EMPTY live set never overwrites a NON-EMPTY on-disk
+ * mirror (restore.json OR revive.sh). A post-crash keeperd restart boots with
+ * zero live agents, and blanking the mirror there would destroy the very
+ * disaster-fallback a restore reads — so the pulse keeps the last non-empty
+ * snapshot until a genuinely non-empty set replaces it. Sticky staleness is the
+ * accepted trade for a fallback surface (a human who intentionally closed every
+ * tab keeps a stale mirror until the next agent launches); the header on each
+ * side-file, not silent freshness, is the source of truth for a reader.
  */
 
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { harnessOrClaude } from "./agent/harness";
@@ -573,6 +582,49 @@ export function serializeForWrite(descriptor: RestoreDescriptor): string {
   return serializePlanJson(sortObjectKeys(descriptor));
 }
 
+/** True iff the descriptor's live set is EMPTY (no session buckets). An empty
+ *  set must never clobber a NON-EMPTY on-disk mirror (see the pulse's
+ *  refuse-to-clobber guard). */
+export function restoreSetIsEmpty(descriptor: RestoreDescriptor): boolean {
+  return (
+    descriptor.current == null ||
+    Object.keys(descriptor.current.sessions).length === 0
+  );
+}
+
+/** True iff the on-disk restore.json currently mirrors a NON-EMPTY live set.
+ *  Missing / unreadable / non-JSON / empty-set ⇒ false — the clobber guard fires
+ *  only to protect a REAL pre-crash mirror. */
+export function restoreJsonMirrorsNonEmptySet(path: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      current?: { sessions?: Record<string, unknown> } | null;
+    };
+    const sessions = parsed?.current?.sessions;
+    return (
+      sessions != null &&
+      typeof sessions === "object" &&
+      Object.keys(sessions).length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** True iff the on-disk revive.sh currently captures a NON-EMPTY agent set, read
+ *  off its authored `# captured <n> keeper agent(s)` header line. Missing /
+ *  unreadable / count 0 ⇒ false. */
+export function reviveScriptMirrorsNonEmptySet(path: string): boolean {
+  try {
+    const m = readFileSync(path, "utf8").match(
+      /^# captured (\d+) keeper agent/m,
+    );
+    return m != null && Number.parseInt(m[1] as string, 10) > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * One restore pulse's mutable state (epic fn-817 single-tier model):
  *
@@ -950,7 +1002,21 @@ export function restorePulse(
   // (retry next pulse); it NEVER skips the revive.sh write below — the two
   // side-files are INDEPENDENT.
   const jsonHash = String(Bun.hash(serializeForHash(descriptor)));
-  if (state.lastHash !== jsonHash) {
+  if (
+    state.lastHash !== jsonHash &&
+    !(
+      // Refuse-to-clobber: an EMPTY live set must never blank a NON-EMPTY
+      // pre-crash mirror — protects the disaster fallback from a post-crash
+      // keeperd restart that boots with zero live agents. The next non-empty
+      // set writes normally; sticky-when-empty is accepted for a fallback
+      // surface. `lastHash` is left UNADVANCED so a later real change still
+      // writes.
+      (
+        restoreSetIsEmpty(descriptor) &&
+        restoreJsonMirrorsNonEmptySet(restorePath)
+      )
+    )
+  ) {
     ensureParentDir(dirname(restorePath));
     try {
       atomicWriteFile(restorePath, serializeForWrite(descriptor));
@@ -984,7 +1050,13 @@ export function restorePulse(
       resolver,
     });
     const scriptHash = String(Bun.hash(script));
-    if (state.lastScriptHash !== scriptHash) {
+    if (
+      state.lastScriptHash !== scriptHash &&
+      // Refuse-to-clobber (mirror of the restore.json guard): an EMPTY agent set
+      // must never blank a NON-EMPTY pre-crash revive.sh. `lastScriptHash` stays
+      // UNADVANCED so a later non-empty set still writes.
+      !(candidates.length === 0 && reviveScriptMirrorsNonEmptySet(scriptPath))
+    ) {
       ensureParentDir(dirname(scriptPath));
       try {
         atomicWriteFile(scriptPath, script, REVIVE_SCRIPT_MODE);
