@@ -2,7 +2,9 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-07T23:58:16.149000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1175-pin-needs-human-epics-on-board"
+  ],
   "id": "fn-1180-gate-tuis-on-daemon-readiness",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T23:58:16.149000Z"
+  "updated_at": "2026-07-07T23:58:25.357000Z"
 }
