@@ -42,5 +42,5 @@ Extend the rail matrix: IN for each verb with resolved instance; OUT for open in
 - [ ] The reap decision and kill ride one pulse's fresh read
 
 ## Done summary
-
+Add the escalation autoclose bucket: unblock/deconflict/resolve sessions are reaped once their block/conflict instance is provably resolved, via an instance-precise fail-closed done-signal read each pulse. Rails, grace, blast-cap and pause-suspension mirror the autopilot bucket.
 ## Evidence
