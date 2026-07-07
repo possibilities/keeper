@@ -187,6 +187,16 @@ test("neither bound nor --follow applies the default duration (bounded by defaul
   expect(cfg?.maxFrames).toBeNull();
 });
 
+test("--max-frames alone still gets the default duration as a wall-clock floor (an idle board terminates)", async () => {
+  const h = makeHarness();
+  await run(h, ["--max-frames", "20"]);
+  const cfg = h.calls[0]?.config;
+  expect(cfg?.maxFrames).toBe(20);
+  // Without this floor durationMs would stay null and an idle stream that
+  // never reaches 20 data frames would hang until SIGINT.
+  expect(cfg?.durationMs).toBe(30_000);
+});
+
 test("--follow leaves both bounds null (reconnect-forever, no default duration)", async () => {
   const h = makeHarness();
   await run(h, ["--follow"]);
