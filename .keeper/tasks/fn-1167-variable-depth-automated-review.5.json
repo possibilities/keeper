@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T17:29:10.898000Z",
+  "depends_on": [],
+  "epic": "fn-1167-variable-depth-automated-review",
+  "id": "fn-1167-variable-depth-automated-review.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Escalation grace for audit blocks",
+  "updated_at": "2026-07-07T17:29:10.898000Z"
+}
