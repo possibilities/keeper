@@ -1,0 +1,40 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Schema-bumping rewinding migration plus a polarity-aware fold gate whose re-fold determinism and DELETE-list correctness are sacred contract surfaces where a wrong abstraction corrupts every projection.",
+      "task_id": "fn-1164-phantom-working-lifecycle-fix.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Smaller but still fold-contract work - a new discriminated event_type composing with the stamp helper and subagent-yield guard where re-fold determinism and equal-ts tie semantics are intelligence-sensitive.",
+      "task_id": "fn-1164-phantom-working-lifecycle-fix.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multi-surface producer-side sentinel with synthetic corrective events, change-gated sticky-until-ack distress rows, and injected clock/liveness probes - high blast radius contract work where a false-positive stop or double-producer race is costly.",
+      "task_id": "fn-1164-phantom-working-lifecycle-fix.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T17:02:13.455000Z",
+  "epic_id": "fn-1164-phantom-working-lifecycle-fix",
+  "input_hash": "4948e7f29a6be3d6fcaeb5b4b8c6ec5328d56992abb4f28ec88f873136c478b1",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1229514738,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1164-phantom-working-lifecycle-fix.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.9},{\"task_id\":\"fn-1164-phantom-working-lifecycle-fix.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.78},{\"task_id\":\"fn-1164-phantom-working-lifecycle-fix.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.85}]}"
+}
