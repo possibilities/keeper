@@ -69,15 +69,6 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Usage-model registry**: The `usage_models` keeper-config map declaring which claude profiles and codex the usage scraper produces envelopes for, keyed by envelope id with an optional display alias per entry; an absent or malformed map idles the producer rather than erroring. Avoid: profile catalog, account list, scrape targets.
 - **agentusage**: The frozen on-disk namespace the usage scraper writes and reads — the envelope root, the tmux socket, and the path-filter token that share this name — pinned as a fixed wire/on-disk contract independent of any project directory. Avoid: the agentusage project, external scraper.
 
-## Usage picker
-
-- **Latched reserve**: The picker's two-state balancer over subscribed Claude accounts — latched to the healthy set while any healthy account exists, opening to the full unparked set when none remain, and re-latching only on a genuine sub-re-arm-mark recovery; the persisted latch is the anti-flap memory the stateless per-pick decision lacked. Avoid: overflow tier, admission ladder, failover pool.
-- **Reserve**: The viable set the picker balances over while the latch is open — every not-rate-limited account, each balanced up to its real rate limit rather than held at a threshold. Avoid: overflow, backup account, spillover.
-- **Healthy account**: A subscribed account that is unparked and under both the session and week thresholds on effective usage; the healthy set is the only viable pool while the latch is closed. Avoid: admitted account, primary account, under-buffer account.
-- **Re-arm mark**: The lower session threshold an account must recover under before the open latch re-latches to healthy-only; the gap between it and the main threshold is the hysteresis dead-band that keeps a recovering account from flapping the latch. Avoid: reset point, lower buffer, close threshold.
-- **Viable account**: An account eligible to be picked in the current latch state — the healthy set when latched, the full unparked set when the reserve is open; non-viable accounts are excluded from selection but still counted. Avoid: eligible account, admitted account, candidate.
-- **Parked account** (picker sense): A subscribed account the picker holds non-viable because it is rate-limited — a future `lift_at` cooldown or a usage-endpoint throttle — handed out only via the all-included fail-open backstop. Avoid: blocked account; conflating with the dead-letter / dispatch `parked` sense of a stuck job awaiting a human.
-
 ## Bus, presence, and session surface
 
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
@@ -88,6 +79,13 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Sidecar**: The private per-turn docs mirror a session maintains alongside its work, owned by hooks and never the doc body itself. Avoid: backup, shadow copy, cache.
 - **Adopted job**: A tracked session a non-launcher path minted — a hand-started hermes self-seed or a claimed codex rollout — rather than the keeper agent launcher, marked so the board pills it distinctly and restore surfaces it. Avoid: orphan, imported session, unmanaged job.
 - **Originator**: The ownership signal on a codex rollout marking it keeper-launched; strictly absent or empty means keeper never owned it, so a sole unambiguous rollout becomes adoptable. Avoid: owner tag, launch marker, origin flag.
+
+## Frame stream and supervision
+
+- **Frame**: One rendered snapshot of a viewer's body text, minted only when the rendered content actually changes; the unit the frame stream emits and a sidecar triple records. Avoid: screen, repaint, delta (that is the coarse tail's unit).
+- **Resume cursor**: The fold-cursor checkpoint stamped on frames and trailers so a later chunk can anchor where the last one left off; a non-unique checkpoint, never a per-frame id. Avoid: offset, timestamp cursor, seq.
+- **Coverage verdict**: The trailer's honest claim about frame completeness — continuous only when one uninterrupted run provably dropped nothing, gap_possible otherwise. Avoid: gapless guarantee, completeness flag.
+- **Hyper mode**: The supervision mode that consumes one bounded frame chunk per pass and judges each change as a human proxy — truthful, legible, stable — filing UI defects rather than editing renderers. Avoid: frame mode, firehose mode, vigilant mode.
 
 ## Panels and presets
 
