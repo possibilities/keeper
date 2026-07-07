@@ -55,5 +55,5 @@ renamed from, fn-) over the touched docs comes back clean.
 - [ ] The CLAUDE.md lint gate passes and no touched doc carries backward-facing narration
 
 ## Done summary
-
+Folded the escalation guard + repair posture into CLAUDE.md (six hooks, revised Autopilot narrative), plugins/plan/CLAUDE.md (skills inventory), CONTEXT.md (Repair session/SHARED_BASE_BROKEN/Escalation role entries), and docs/plugin-composition-map.md (repair:: + sixth hook), keeping the CLAUDE.md size/lint gate green.
 ## Evidence
