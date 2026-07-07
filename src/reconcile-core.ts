@@ -871,14 +871,6 @@ export interface PlannedLaunch {
   /** Task `tier`, only set for `work` rows. */
   tier: string | null;
   /**
-   * The task's capability `model` (the cell's model axis, NOT the orchestrator
-   * {@link model}), only set for `work` rows. Threaded onto the launch so the
-   * producer can route a wrapped-candidate cell (one the compiled subagents
-   * matrix rejected) through the host-matrix probe without re-reading the
-   * projection. Null for a `close` row or a task carrying no model.
-   */
-  cellModel: string | null;
-  /**
    * The resolved ABSOLUTE per-cell worker plugin dir for a `work` row whose task
    * carries an in-matrix {model, effort} pair
    * (`${KEEPER_ROOT}/plugins/plan/workers/<model>-<effort>`), else `null` (a
@@ -1778,7 +1770,6 @@ export function reconcile(
         model: snapshot.workerModel,
         effort: snapshot.workerEffort,
         tier: verb === "work" ? task.tier : null,
-        cellModel: verb === "work" ? (task.model ?? null) : null,
         pluginDir,
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
       });
@@ -1855,7 +1846,6 @@ export function reconcile(
           model: snapshot.workerModel,
           effort: snapshot.workerEffort,
           tier: null,
-          cellModel: null,
           // A `close` row is cell-less — it loads no per-cell worker plugin.
           pluginDir: null,
           // Every close-row launch is an epic finalizer (`close`);

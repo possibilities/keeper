@@ -45,7 +45,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { ConfigError, loadPresetCatalog, type Preset } from "./agent/config";
-import { matrixConfigPath } from "./agent/matrix";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
 import {
@@ -137,11 +136,7 @@ import {
 import { runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
-import {
-  defaultRouteProbe,
-  defaultShadowingWorkProbe,
-  resolveWorkerCell,
-} from "./worker-cell";
+import { defaultShadowingWorkProbe, resolveWorkerCell } from "./worker-cell";
 import {
   ELIGIBLE_REASON,
   memoizedAssessRepo,
@@ -3126,15 +3121,7 @@ export async function runReconcileCycle(
           ? { reject: plan.pluginDirReject }
           : {}),
       },
-      {
-        dirExists,
-        probeShadow: probeShadowMemoized,
-        // Route a wrapped-candidate cell (an out-of-matrix compose) through the
-        // host matrix. Producer posture: a malformed matrix DEGRADES to a visible
-        // no-route sticky, never a fatalExit — `defaultRouteProbe` swallows the
-        // parse fault. Native cells never reach this probe.
-        probeRoute: () => defaultRouteProbe(plan.cellModel ?? ""),
-      },
+      { dirExists, probeShadow: probeShadowMemoized },
     );
     if (!cell.ok) {
       let reason: string;
@@ -3142,16 +3129,6 @@ export async function runReconcileCycle(
         // (1) an out-of-matrix {model, effort} the pure compose flagged.
         case "out-of-matrix":
           reason = `worker-cell-invalid: ${cell.message}`;
-          break;
-        // (1b) a WRAPPED cell (a model claude does not serve) the host matrix
-        //      routes to zero providers, or a malformed matrix at probe time.
-        //      Names matrix.yaml; cleared by `retry_dispatch` after the config fix.
-        case "no-route":
-          reason =
-            `worker-cell-no-route: '${cell.model}' is a wrapped model with no ` +
-            `configured provider in ${matrixConfigPath()} — add a provider ` +
-            `serving it to the roster (or fix the matrix), then ` +
-            "'keeper retry-dispatch'";
           break;
         // (2) a cell whose generated plugin manifest is absent — `claude
         //     --plugin-dir` would fall back to the dir basename and `/plan:work`

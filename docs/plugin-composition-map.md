@@ -63,30 +63,20 @@ vanilla session at the repo root's `CONTEXT.md` glossary when present + non-empt
 Both work-launch producers — the autopilot reconciler (`src/autopilot-worker.ts`
 `runReconcileCycle`) and the manual `keeper dispatch work::<id>` (`cli/dispatch.ts`)
 — resolve the launch's per-cell `work` plugin through ONE shared seam,
-`resolveWorkerCell` (`src/worker-cell.ts`): it returns a closed machine-kind union
-over one precedence. A compose that falls outside the embedded claude-only matrix is
-first re-classified by a host-matrix route probe (`defaultRouteProbe` reads
-`~/.config/keeper/matrix.yaml`, ADR 0010): a wrapped capability model no configured
-provider serves — or a malformed matrix — becomes a `no-route` reject naming the
-config file, ranked ahead of the generic out-of-matrix; a composed cell then falls
-through missing-manifest → shadowed-plugin. Each caller owns its own failure surface —
-autopilot mints a sticky `DispatchFailed`, dispatch exits non-zero with an actionable
-error — but the decision is identical, so a hand-fired plan worker loads the byte-same
-cell an automated one does. The producer injects a per-cycle memoized shadow probe;
-dispatch injects a fresh scan (it fires one worker).
+`resolveWorkerCell` (`src/worker-cell.ts`): it applies the same
+out-of-matrix → missing-manifest → shadowed-plugin precedence and returns a closed
+machine-kind union. Each caller owns its own failure surface — autopilot mints a
+sticky `DispatchFailed`, dispatch exits non-zero with an actionable error — but the
+decision is identical, so a hand-fired plan worker loads the byte-same cell an
+automated one does. The producer injects a per-cycle memoized shadow probe; dispatch
+injects a fresh scan (it fires one worker).
 
-The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`) is rendered
-from `subagents.yaml` composed with the host provider matrix
-(`~/.config/keeper/matrix.yaml`, ADR 0010) and appended via `--plugin-dir` AFTER
-`--name` (`exec-backend.ts:968-974`). With no matrix the roster is the embedded
-claude-only default — no wrapped cells, byte-identical launch argv; a matrix grows the model axis with
-**wrapped cells** whose worker runs the fixed wrapper driver (a claude model/effort)
-and delegates implementation to a provider resolved at run time via
-`keeper agent run`, beside the **native** claude cells — both kinds emitted from the
-single composed worker template, so the launch path stays identical. The
-`--plugin-dir` pair is **additive, not isolating**: the worker still inherits
-everything above. Stripping it from a worker argv recovers the byte-identical
-interactive argv — pinned by the additive test.
+The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`, rendered from
+`subagents.yaml`) is appended via `--plugin-dir` AFTER `--name`
+(`exec-backend.ts:968-974`). It is **additive, not isolating**: the worker still
+inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
+worker argv recovers the byte-identical interactive argv — pinned by the additive
+test.
 
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —

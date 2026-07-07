@@ -167,7 +167,7 @@ Control the server-side reconciler (the viewer is read-only). It boots PAUSED.
   keeper autopilot mode <yolo|armed>      # armed works ONLY armed epics + their dep-closure
   keeper autopilot arm <epic> | disarm <epic>
   keeper autopilot retry <verb::id>       # clear a sticky dispatch-failure row
-  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo
+  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption
   keeper autopilot worktree <on|off> [--force]
 
 Read state from the [paused]/mode/armed banner (\`keeper autopilot --snapshot\`).
@@ -787,6 +787,7 @@ export function buildSetConfigFrame(
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
+    codex_adoption?: boolean;
   },
 ): ClientFrame {
   return {
@@ -844,18 +845,16 @@ interface ViewerState {
 /**
  * Render the persistent banner pill: the play/pause pill, the mode suffix, the
  * concurrency-cap suffix, (in `armed` mode) the armed-epic count, the per-root
- * count (worktree mode off only), and the worktree-mode suffix.
- * `[playing] · yolo · max 3 · per-root 1 · worktree:off` with worktree mode
- * off; `[playing] · armed · 2 armed · max ∞ · worktree:on` with two armed
- * epics and worktree mode on. The empty-armed-set-in-armed-mode case renders
- * DISTINCTLY as `[playing] · armed · nothing armed · max ∞ · per-root 1 ·
- * worktree:off` so idle-by-design is never mistaken for a broken autopilot.
- * The per-root cap governs dispatch ONLY while worktree mode is off (each
- * ready task gets its own cap-1 lane under worktree mode, so the cap is
- * deliberately ignored there) — the segment renders ONLY in that mode,
- * showing the effective cap (always 1). The raw stored intent stays out of
- * the banner and is still readable via `keeper status` / `keeper watch` JSON.
- * The worktree segment renders ALWAYS so the live state is scannable.
+ * count, and the worktree-mode suffix.
+ * `[playing] · yolo · max 3 · per-root 2 · worktree:on` in yolo mode;
+ * `[playing] · armed · 2 armed · max ∞ · per-root 1 · worktree:on` with two
+ * armed epics and worktree mode on. The empty-armed-set-in-armed-mode case
+ * renders DISTINCTLY as `[playing] · armed · nothing armed · max ∞ · per-root 1`
+ * so idle-by-design is never mistaken for a broken autopilot. The per-root
+ * segment renders the EFFECTIVE cap; when the durable STORED intent differs
+ * (worktree off floors effective to 1 while a >1 value stays stored) it appends
+ * the intent as `per-root 1 (stored 3)`, so a latent cap is never invisible. The
+ * per-root and worktree segments render ALWAYS so the live state is scannable.
  *
  * Pure — exported for tests. All values are socket-sourced; the viewer never
  * reads config.
@@ -864,6 +863,9 @@ export function autopilotBannerLabel(state: {
   paused: boolean;
   maxConcurrentJobs: number | null;
   maxConcurrentPerRoot: number;
+  // The durable STORED intent. Omitted (undefined) reads as "equals effective"
+  // and suppresses the annotation; a value differing from effective appends it.
+  maxConcurrentPerRootStored?: number;
   mode: "yolo" | "armed";
   armedCount: number;
   worktreeMode: boolean;
@@ -889,11 +891,14 @@ export function autopilotBannerLabel(state: {
         ? " · nothing armed"
         : ` · ${state.armedCount} armed`
       : "";
-  // Per-root segment renders ONLY while worktree mode is off — the only mode
-  // where the cap governs dispatch — showing the effective cap (always 1).
-  const perRootSeg = state.worktreeMode
-    ? ""
-    : ` · per-root ${state.maxConcurrentPerRoot}`;
+  // Per-root segment renders the EFFECTIVE cap ALWAYS, annotating the stored
+  // intent ONLY when it differs (worktree-off floor), positioned between the
+  // global cap and the worktree toggle.
+  const perRootSeg =
+    state.maxConcurrentPerRootStored === undefined ||
+    state.maxConcurrentPerRootStored === state.maxConcurrentPerRoot
+      ? ` · per-root ${state.maxConcurrentPerRoot}`
+      : ` · per-root ${state.maxConcurrentPerRoot} (stored ${state.maxConcurrentPerRootStored})`;
   // Worktree segment renders for BOTH states (terse `worktree:on`/`worktree:off`)
   // so the live durable toggle is always visible at a glance.
   const worktreeSeg = state.worktreeMode ? " · worktree:on" : " · worktree:off";
@@ -950,6 +955,7 @@ async function runViewer(
           state.maxConcurrentPerRootStored,
           state.worktreeMode,
         ),
+        maxConcurrentPerRootStored: state.maxConcurrentPerRootStored,
         mode: state.mode,
         armedCount: state.armedEpics.length,
         worktreeMode: state.worktreeMode,
@@ -986,6 +992,7 @@ async function runViewer(
     paused: boolean;
     maxConcurrentJobs: number | null;
     maxConcurrentPerRoot: number;
+    maxConcurrentPerRootStored: number;
     mode: "yolo" | "armed";
     armedCount: number;
     worktreeMode: boolean;
@@ -996,6 +1003,7 @@ async function runViewer(
       state.maxConcurrentPerRootStored,
       state.worktreeMode,
     ),
+    maxConcurrentPerRootStored: state.maxConcurrentPerRootStored,
     mode: state.mode,
     armedCount: state.armedEpics.length,
     worktreeMode: state.worktreeMode,
@@ -1324,9 +1332,11 @@ export async function main(argv: string[]): Promise<void> {
     // round-trip (the server re-validates). Keys: `max_concurrent_jobs` (a
     // positive integer cap, `unlimited`/`null` → unlimited), `max_concurrent_per_root`
     // (a positive integer count, `default`/`null` → the in-memory default = 1; NO
-    // 'unlimited'), and `worktree_multi_repo` (an on/off boolean — the durable
+    // 'unlimited'), `worktree_multi_repo` (an on/off boolean — the durable
     // rollout flag that clusters a >1-toplevel epic into per-repo lane groups
-    // instead of rejecting it; mirrors the `worktree` verb's on/off parsing).
+    // instead of rejecting it; mirrors the `worktree` verb's on/off parsing),
+    // and `codex_adoption` (an on/off boolean — the durable codex
+    // rollout-adoption knob).
     if (rest.length !== 2) {
       die(
         `'config' takes exactly two positionals <key> <value> (got ${rest.length}); pass --help for usage.`,
@@ -1392,8 +1402,24 @@ export async function main(argv: string[]): Promise<void> {
       );
       return;
     }
+    if (key === "codex_adoption") {
+      // The durable codex rollout-adoption knob — same on/off boolean shape as
+      // worktree_multi_repo, patched through the same generic RPC.
+      if (value !== "on" && value !== "off") {
+        die(
+          `'config codex_adoption' value must be one of on | off (got ${JSON.stringify(value)})`,
+        );
+      }
+      await sendControlRpc(
+        sockPath,
+        buildSetConfigFrame(id, { codex_adoption: value === "on" }),
+        id,
+        AUTOPILOT_CONTROL_SCHEMA_VERSION,
+      );
+      return;
+    }
     die(
-      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo (got ${JSON.stringify(key)})`,
+      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption (got ${JSON.stringify(key)})`,
     );
   }
 
