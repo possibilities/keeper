@@ -1,0 +1,68 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 6,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T23:37:39.342000Z",
+  "epic_id": "fn-1173-escalation-posture-repair-and-guard",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Security-critical bypass-resistant Bash allowlist guard (1106 insertions across 6 files) with adversarial tokenization and fail-closed envelope semantics warrants the opus/xhigh cell; clean done summary shows no struggle.",
+      "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+      "model": "opus",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.1",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Small mechanical two-surface category addition (34 insertions, 3 files) plus a template re-point matches sonnet/medium, and the done summary reports clean completion.",
+      "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+      "model": "sonnet",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.2",
+      "tier": "medium",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Contract-touching ref/parse/brief plumbing across leaf modules (1056 insertions across 10 files) but mirroring existing incident-builder shapes fits sonnet at the top xhigh effort with no thrash signal in the record.",
+      "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+      "model": "sonnet",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.3",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Re-fold-deterministic fingerprint fold, schema v113 bump, and sticky-latch event-sourcing invariants (1554 insertions across 10 files) are the epic's most correctness-subtle work, matching opus/xhigh.",
+      "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+      "model": "opus",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.4",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Prose-only skill authoring cloned from the deconflict precedent plus sibling hardening (141 insertions, 5 files) requiring guard-allowlist cross-check fits sonnet/high with no novel design in the record.",
+      "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+      "model": "sonnet",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.5",
+      "tier": "high",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Prune-first documentation and glossary edits in existing styles (28 insertions, 16 deletions, 4 files) against a lint gate matches sonnet/medium.",
+      "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+      "model": "sonnet",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.6",
+      "tier": "medium",
+      "verdict": "right_sized"
+    }
+  ]
+}
