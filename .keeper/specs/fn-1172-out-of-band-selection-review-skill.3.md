@@ -37,5 +37,5 @@ The ten root suites listed in Files reference the field; update fixtures and ass
 - [ ] `bun test` (root) green
 
 ## Done summary
-
+Swept epics.selection_review out of the projection and every consumer (reducer fold, plan-worker overlay chain, epics_selection_review collection, readiness/board/status surfaces, status envelope schema v7); DROP-COLUMN + rewind-and-redrain migration bumps SCHEMA_VERSION to 114 with the api.py whitelist entry.
 ## Evidence
