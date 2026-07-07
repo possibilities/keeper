@@ -48,7 +48,7 @@ import { parseUsageModels, type UsageModels } from "./usage-models";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 112;
+export const SCHEMA_VERSION = 113;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -6125,6 +6125,33 @@ function migrate(db: Database): void {
       // jobs`, so this bump MUST add 112 to `SUPPORTED_SCHEMA_VERSIONS` there in
       // the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "epics", "selection_review", "TEXT");
+
+      // v112→v113 (fn-1173 task .4): add the nullable
+      // `dispatch_failures.repair_dispatched_at` once-marker (REAL, epoch
+      // seconds) — the dispatch-once latch of the REPAIR escalation path, the
+      // fourth marker on a `dispatch_failures` row and the sibling of
+      // `merge_escalated_at` / `resolver_dispatched_at`. It hangs on the sticky
+      // `repair::<repo-token>` row (verb `repair`, id the repo token) the daemon
+      // SHARED_BASE_BROKEN sweep mints; a terminal `RepairDispatched` event stamps
+      // it (gated `IS NULL`) once the `repair::<token>` session launches, so the
+      // repair dispatches ONCE per condition instance, and the reused
+      // `human_notified_at` marker pages the decline exactly once. `foldDispatchFailed`
+      // preserves it across the `ON CONFLICT` UPSERT (a re-failure must not reset the
+      // marker) and `DispatchCleared` (retry_dispatch OR the sweep's positive-evidence
+      // clear) drops it with the row so a fresh breakage re-arms at NULL. APPEND-via-
+      // ALTER keeps existing rows NULL (the zero-event shape) and is re-fold-safe: a
+      // pre-v113 stream carries no `RepairDispatched` event, so a from-scratch re-fold
+      // leaves the column NULL byte-identically (the fold reads only the payload +
+      // `event.ts`). Kept OUT of the CREATE literal (mirrors the sibling marker adds).
+      // NO cursor rewind. Whitelist-only Python read (keeper-py never reads
+      // `dispatch_failures`) — this bump MUST add 113 to `SUPPORTED_SCHEMA_VERSIONS`
+      // in `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
+      addColumnIfMissing(
+        db,
+        "dispatch_failures",
+        "repair_dispatched_at",
+        "REAL",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

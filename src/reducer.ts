@@ -75,6 +75,8 @@ import type {
   MergeEscalationAttemptedPayload,
   MergeHumanNotifiedPayload,
   PermissionPromptKind,
+  RepairDispatchedPayload,
+  RepairHumanNotifiedPayload,
   ResolvedEpicDep,
   ResolverDispatchAttemptedPayload,
   SessionTelemetryPayload,
@@ -4027,8 +4029,9 @@ function foldDispatchFailed(db: Database, event: Event): void {
   db.run(
     `INSERT INTO dispatch_failures (
        verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-       merge_escalated_at, resolver_dispatched_at, human_notified_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+       merge_escalated_at, resolver_dispatched_at, human_notified_at,
+       repair_dispatched_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
@@ -4036,13 +4039,13 @@ function foldDispatchFailed(db: Database, event: Event): void {
        last_event_id = excluded.last_event_id,
        -- created_at preserved through UPSERT: the row's "sticky since"
        -- view is the FIRST observation of this failure, never the latest.
-       -- merge_escalated_at + resolver_dispatched_at + human_notified_at
-       -- preserved through UPSERT (excluded from the SET clause, same as
-       -- created_at): a re-failure of an uncleared row must NOT reset any
-       -- once-marker, or the daemon merge-escalation sweep would re-dispatch the
-       -- deconflict session and the human-notify sweep would re-notify. All three
-       -- markers re-arm only on a DispatchCleared (retry_dispatch) DELETE
-       -- dropping the row entirely.
+       -- merge_escalated_at + resolver_dispatched_at + human_notified_at +
+       -- repair_dispatched_at preserved through UPSERT (excluded from the SET
+       -- clause, same as created_at): a re-failure of an uncleared row must NOT
+       -- reset any once-marker, or the daemon merge-escalation sweep would
+       -- re-dispatch the deconflict session, the repair sweep would re-dispatch
+       -- the repair session, and the human-notify sweeps would re-notify. All four
+       -- markers re-arm only on a DispatchCleared DELETE dropping the row entirely.
        updated_at = excluded.updated_at`,
     [
       payload.verb,
@@ -4796,6 +4799,126 @@ function foldMergeHumanNotified(db: Database, event: Event): void {
     `UPDATE dispatch_failures
         SET human_notified_at = ?
       WHERE verb = 'close' AND id = ? AND human_notified_at IS NULL`,
+    [event.ts, payload.id],
+  );
+}
+
+/**
+ * Parse a `RepairDispatched` event payload. Returns null on any structural miss
+ * ({@link foldRepairDispatched} folds null to a safe no-op); NEVER throws. Strict:
+ * `id` / `outcome` non-empty strings.
+ */
+function extractRepairDispatchedPayload(
+  event: Event,
+): RepairDispatchedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<RepairDispatchedPayload>;
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return { id: parsed.id, outcome: parsed.outcome };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse RepairDispatched payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `RepairDispatched` event — the repair-dispatch once-latch,
+ * sibling to {@link foldResolverDispatchAttempted} but on the sticky
+ * `repair::<repo-token>` row (verb `repair`). For the TERMINAL `dispatched` outcome
+ * (the daemon SHARED_BASE_BROKEN sweep launched the `repair::<token>` session) it
+ * stamps `repair_dispatched_at = event.ts` on the repair row, gated
+ * `repair_dispatched_at IS NULL` so the first observation wins and a re-fold
+ * reproduces it byte-identically. Every other outcome (`dispatch_failed` / unknown)
+ * is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts on the next tick. The branch reads ONLY the payload `outcome` +
+ * `event.ts` (no wall-clock/fs/liveness), so re-fold stays byte-deterministic. The
+ * UPDATE no-ops on a missing row (the clear-before-mint race) and NEVER clears the
+ * row — only `DispatchCleared` does (retry_dispatch OR the sweep's positive-evidence
+ * clear), which re-arms the marker at NULL. Independent of the merge/resolver markers
+ * (a different verb keys a different row). Malformed/missing payload → safe no-op.
+ */
+function foldRepairDispatched(db: Database, event: Event): void {
+  const payload = extractRepairDispatchedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.outcome !== "dispatched") {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET repair_dispatched_at = ?
+      WHERE verb = 'repair' AND id = ? AND repair_dispatched_at IS NULL`,
+    [event.ts, payload.id],
+  );
+}
+
+/**
+ * Parse a `RepairHumanNotified` event payload. Returns null on any structural miss
+ * ({@link foldRepairHumanNotified} folds null to a safe no-op); NEVER throws. Strict:
+ * `id` / `outcome` non-empty strings.
+ */
+function extractRepairHumanNotifiedPayload(
+  event: Event,
+): RepairHumanNotifiedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<RepairHumanNotifiedPayload>;
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return { id: parsed.id, outcome: parsed.outcome };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse RepairHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `RepairHumanNotified` event — the terminal "human notified"
+ * once-latch of the REPAIR path, sibling to {@link foldMergeHumanNotified} but on the
+ * sticky `repair::<repo-token>` row (verb `repair`). For the TERMINAL `notified`
+ * outcome (the daemon paged the human about a declined/dead `repair::<token>` session)
+ * it stamps `human_notified_at = event.ts` on the repair row, gated
+ * `human_notified_at IS NULL` so the page fires exactly once and a re-fold reproduces
+ * it byte-identically. Every other outcome (`notify_failed` / unknown) is
+ * NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep re-attempts.
+ * The branch reads ONLY the payload `outcome` + `event.ts`, so re-fold stays
+ * byte-deterministic. The UPDATE no-ops on a missing row and NEVER clears the row —
+ * only `DispatchCleared` does, which re-arms it at NULL. Malformed/missing payload →
+ * safe no-op.
+ */
+function foldRepairHumanNotified(db: Database, event: Event): void {
+  const payload = extractRepairHumanNotifiedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.outcome !== "notified") {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET human_notified_at = ?
+      WHERE verb = 'repair' AND id = ? AND human_notified_at IS NULL`,
     [event.ts, payload.id],
   );
 }
@@ -9332,6 +9455,10 @@ export function applyEvent(
       foldResolverDispatchAttempted(db, event);
     } else if (event.hook_event === "MergeHumanNotified") {
       foldMergeHumanNotified(db, event);
+    } else if (event.hook_event === "RepairDispatched") {
+      foldRepairDispatched(db, event);
+    } else if (event.hook_event === "RepairHumanNotified") {
+      foldRepairHumanNotified(db, event);
     } else if (event.hook_event === "BlockHumanNotified") {
       foldBlockHumanNotified(db, event);
     } else if (event.hook_event === "AutopilotPaused") {

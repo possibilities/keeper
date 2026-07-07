@@ -2701,7 +2701,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // so column order stays fresh-vs-migrated identical); it widens the epics row
   // shape but does not touch the v62→v63 `default_visible`/`approval` rewrite
   // this test exercises, fn-1151 task .2.
-  expect(SCHEMA_VERSION).toBe(112);
+  // v113 appends the nullable `dispatch_failures.repair_dispatched_at`
+  // once-marker for the daemon SHARED_BASE_BROKEN repair sweep (an additive
+  // ALTER, not an epics-shape change), fn-1173 task .4.
+  expect(SCHEMA_VERSION).toBe(113);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
