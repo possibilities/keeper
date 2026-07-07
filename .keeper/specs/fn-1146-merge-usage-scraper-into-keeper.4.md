@@ -48,5 +48,5 @@ suite green.
 - [ ] Full fast suite green
 
 ## Done summary
-
+Added the `keeper usage scrape` subverb: a leading-token pre-pass routes to the merged scrape CLI via a lazy import ahead of the view's parseArgs (bare usage/snapshot/--help byte-unchanged), owns `scrape --help` spawn-free, and registers the scrape leaf in the CLI descriptor tree.
 ## Evidence
