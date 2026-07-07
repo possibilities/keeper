@@ -51,5 +51,5 @@ matrix → degrade-not-throw, sticky mint + retry_dispatch clear via existing fi
       surfaces the same reject with a documented code.
 
 ## Done summary
-
+Added a no-route WorkerCellResult reject: resolveWorkerCell probes the host matrix down the compose-reject arm only (native cells bypass it, malformed matrix degrades to a visible sticky), the autopilot producer mints a retry_dispatch-clearable sticky naming matrix.yaml, and manual dispatch exits non-zero with the documented worker-cell-no-route code.
 ## Evidence
