@@ -35,11 +35,17 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import {
+  createFramesEmitter,
+  type FramesEmitter,
+  type FramesIo,
+} from "../src/frames-emitter";
 import type { RefoldProgressPoller } from "../src/refold-progress";
 import {
   armViewerExitTriggers,
   createViewShell,
   DEFAULT_SNAPSHOT_EMPTY_LINE,
+  type FramesRunIo,
   snapshotBodyLines,
   type ViewerExitProc,
   type ViewRender,
@@ -1122,4 +1128,242 @@ test("snapshot: reportSnapshotStream is inert in live mode (no latch armed)", ()
     mode: "live",
   });
   expect(() => view?.reportSnapshotStream()).not.toThrow();
+});
+
+// ---------------------------------------------------------------------------
+// fn-1161: frames mode. Each accepted frame (after the byte-compare gate)
+// becomes one NDJSON envelope through the injected emitter instead of
+// painting; the max-frames / duration bounds and an interrupt all flush a
+// terminal trailer as the FINAL line. We drive it with a real
+// `createFramesEmitter` over captured sinks + a fake clock, and a
+// `FramesRunIo` that injects the exit / timer / process seams so neither
+// `process.exit` nor a real handler escapes into the runner.
+// ---------------------------------------------------------------------------
+
+interface FramesHarness {
+  stdout: string[];
+  exits: number[];
+  setNow: (ms: number) => void;
+  fireTimeout: () => void;
+  timeoutClears: () => number;
+  makeEmitter: (o?: {
+    maxFrames?: number | null;
+    durationMs?: number | null;
+  }) => FramesEmitter;
+  runIo: FramesRunIo;
+  records: () => Array<Record<string, unknown>>;
+}
+
+function makeFramesHarness(proc?: ViewerExitProc): FramesHarness {
+  const stdout: string[] = [];
+  const exits: number[] = [];
+  let now = 0;
+  let timeoutCb: (() => void) | null = null;
+  let timeoutClears = 0;
+  const io: FramesIo = {
+    // Sidecar writes are irrelevant to the wire contract under test — no-op
+    // them so the pure tier writes zero files.
+    writeFile: () => {},
+    unlink: () => {},
+    nowIso: () => "2026-06-10T00:00:00.000Z",
+    nowMs: () => now,
+  };
+  const runIo: FramesRunIo = {
+    exit: ((code: number): never => {
+      exits.push(code);
+      // Throw to stop execution exactly where `process.exit` would.
+      throw new Error(`__FRAMES_EXIT_${code}__`);
+    }) as (code: number) => never,
+    setTimeoutFn: (cb) => {
+      timeoutCb = cb;
+      return 1;
+    },
+    clearTimeoutFn: () => {
+      timeoutClears += 1;
+    },
+    ...(proc === undefined ? {} : { proc }),
+  };
+  return {
+    stdout,
+    exits,
+    setNow: (ms) => {
+      now = ms;
+    },
+    fireTimeout: () => timeoutCb?.(),
+    timeoutClears: () => timeoutClears,
+    makeEmitter: (o = {}) =>
+      createFramesEmitter({
+        view: "board",
+        writeStdout: (line) => stdout.push(line),
+        diffFn: () => "@@ fake diff @@\n",
+        io,
+        maxFrames: o.maxFrames ?? null,
+        durationMs: o.durationMs ?? null,
+      }),
+    runIo,
+    records: () =>
+      stdout.map((l) => JSON.parse(l.trim()) as Record<string, unknown>),
+  };
+}
+
+test("frames: envelopes carry monotonic contiguous seq + the freshest cursor", () => {
+  const h = makeFramesHarness();
+  const emitter = h.makeEmitter();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, io: h.runIo },
+  });
+
+  // A lifecycle event in frames mode must NOT arm the connecting spinner
+  // (its overlay would corrupt the NDJSON stream).
+  view.emitLifecycle("connecting", {});
+  expect(intervals.callbacks).toHaveLength(0);
+
+  view.noteCursor("42");
+  expect(view.emit({ body: ["a"] })).toBe(true); // baseline
+  expect(view.emit({ body: ["a", "b"] })).toBe(true); // frame
+  view.noteCursor("43");
+  expect(view.emit({ body: ["a", "b", "c"] })).toBe(true); // frame, new cursor
+  // An unchanged body is suppressed by the byte-compare gate — no envelope,
+  // no seq bump (a multi-stream view's redundant re-emit can't inflate the
+  // frame / coverage accounting).
+  expect(view.emit({ body: ["a", "b", "c"] })).toBe(false);
+
+  const recs = h.records();
+  expect(recs.map((r) => r.type)).toEqual(["baseline", "frame", "frame"]);
+  expect(recs.map((r) => r.seq)).toEqual([0, 1, 2]);
+  expect(recs.map((r) => r.cursor)).toEqual(["42", "42", "43"]);
+  expect(recs.every((r) => r.view === "board")).toBe(true);
+  expect(recs.every((r) => r.schema_version === 1)).toBe(true);
+});
+
+test("frames: max-frames bound terminates with a trailer as the final line", () => {
+  const h = makeFramesHarness();
+  const emitter = h.makeEmitter({ maxFrames: 2 });
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, io: h.runIo },
+  });
+  view.noteCursor("7");
+  view.emit({ body: ["a"] }); // baseline (not counted toward maxFrames)
+  view.emit({ body: ["a", "b"] }); // data frame 1
+  // The 2nd data frame trips the bound → the trailer flushes + exit fires
+  // from inside `emit`.
+  expect(() => view?.emit({ body: ["a", "b", "c"] })).toThrow(
+    "__FRAMES_EXIT_0__",
+  );
+  expect(h.exits).toEqual([0]);
+
+  const recs = h.records();
+  const last = recs.at(-1);
+  expect(last?.type).toBe("trailer");
+  expect(last?.reason).toBe("max_frames");
+  expect(last?.frames_emitted).toBe(2);
+  expect(last?.resume_cursor).toBe("7");
+  expect(last?.coverage).toBe("continuous");
+  // seq stays contiguous across ALL record types: baseline 0, frames 1+2,
+  // trailer 3.
+  expect(last?.seq).toBe(3);
+});
+
+test("frames: the duration bound flushes a trailer when the stream goes quiet", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: false });
+  const h = makeFramesHarness(proc as unknown as ViewerExitProc);
+  const emitter = h.makeEmitter({ durationMs: 10_000 });
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, durationMs: 10_000, io: h.runIo },
+  });
+  view.noteCursor("5");
+  view.emit({ body: ["a"] }); // baseline
+  view.runFrames(() => {}); // arms the duration teardown timer
+
+  // Fire the captured duration timer → a `duration` trailer, exit 0.
+  expect(() => h.fireTimeout()).toThrow("__FRAMES_EXIT_0__");
+  const last = h.records().at(-1);
+  expect(last?.type).toBe("trailer");
+  expect(last?.reason).toBe("duration");
+  expect(last?.resume_cursor).toBe("5");
+  expect(last?.frames_emitted).toBe(0);
+});
+
+test("frames: an interrupt flushes the trailer as the final line, once", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: false });
+  const h = makeFramesHarness(proc as unknown as ViewerExitProc);
+  const emitter = h.makeEmitter();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, io: h.runIo },
+  });
+  view.noteCursor("9");
+  view.emit({ body: ["hello"] }); // baseline
+  view.emit({ body: ["hello", "world"] }); // frame
+  let disposed = 0;
+  view.runFrames(() => {
+    disposed += 1;
+  });
+
+  // SIGINT during the run → the trailer is the final line.
+  expect(() => proc.fire("SIGINT")).toThrow("__FRAMES_EXIT_0__");
+  expect(disposed).toBe(1);
+  const last = h.records().at(-1);
+  expect(last?.type).toBe("trailer");
+  expect(last?.reason).toBe("interrupt");
+  expect(last?.resume_cursor).toBe("9");
+  expect(last?.frames_emitted).toBe(1);
+
+  // Idempotent: a re-fired interrupt must NOT emit a second trailer / re-exit.
+  proc.fire("SIGINT");
+  expect(h.records().filter((r) => r.type === "trailer")).toHaveLength(1);
+  expect(h.exits).toEqual([0]);
+});
+
+test("frames: a reconnect downgrades the trailer coverage to gap_possible", () => {
+  const proc = makeFakeProc({ ppid: 4242, isTTY: false });
+  const h = makeFramesHarness(proc as unknown as ViewerExitProc);
+  const emitter = h.makeEmitter();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, io: h.runIo },
+  });
+  view.noteCursor("2");
+  view.emit({ body: ["a"] }); // baseline, one uninterrupted run so far
+  // A disconnect is the sole gap source the emitter's contiguous seq can't
+  // see — it must downgrade coverage.
+  view.emitLifecycle("disconnected", {});
+  view.runFrames(() => {});
+  expect(() => proc.fire("SIGINT")).toThrow("__FRAMES_EXIT_0__");
+
+  const last = h.records().at(-1);
+  expect(last?.type).toBe("trailer");
+  expect(last?.coverage).toBe("gap_possible");
+});
+
+test("frames: reportSnapshotStream is inert (no coverage accounting to drift)", () => {
+  const h = makeFramesHarness();
+  const emitter = h.makeEmitter();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, io: h.runIo },
+  });
+  view.noteCursor("1");
+  expect(view.emit({ body: ["x"] })).toBe(true); // baseline emitted exactly once
+  // A multi-stream view's secondary reports are no-ops in frames mode.
+  expect(() => view?.reportSnapshotStream()).not.toThrow();
+  view.reportSnapshotStream();
+  const recs = h.records();
+  expect(recs).toHaveLength(1);
+  expect(recs[0]?.type).toBe("baseline");
 });

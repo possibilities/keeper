@@ -55,6 +55,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { SELECTION_BG_SGR } from "./ansi-to-styled";
 import { colorizePillsInLine } from "./board-render";
 import { buildDebugSnapshot, copyToClipboard } from "./clipboard-debug";
+import type { FramesEmitter, TrailerReason } from "./frames-emitter";
 import { createLiveShell, type LiveShell } from "./live-shell";
 import {
   createRefoldProgressPoller,
@@ -266,8 +267,28 @@ export interface ViewShellOptions<TSnap> {
    * composite frame, prints it + a `keeper-meta:` trailer, and exits. The
    * caller computes this via `resolveSnapshotMode` (flag > env > isTTY) and
    * drives `runSnapshot` instead of `installSigintHandler`.
+   *
+   * `"frames"` is the agent-facing NDJSON stream: each accepted frame (after
+   * the byte-compare gate) is emitted as one wire envelope through the injected
+   * {@link FramesEmitterConfig.emitter} instead of painting, honoring the
+   * emitter's max-frames / duration bounds with a guaranteed trailer flush on
+   * every exit path (bound tripped OR SIGINT). Like snapshot it never paints a
+   * live frame and never arms the connecting spinner. The caller drives
+   * `runFrames` instead of `installSigintHandler`, hands the freshest boot
+   * `rev` in via `noteCursor`, and provides the pre-built emitter in
+   * {@link ViewShellOptions.frames}.
    */
-  mode?: "live" | "snapshot";
+  mode?: "live" | "snapshot" | "frames";
+  /**
+   * Frames-mode wiring (required when `mode === "frames"`, ignored otherwise).
+   * The emitter is pre-built by the caller (it owns the view identity, diff
+   * seam, sidecar IO, and the max-frames / duration bounds); the shell only
+   * drives it. `durationMs` is the SAME bound the emitter was built with — the
+   * shell re-uses it to arm a single teardown timer so a run with no further
+   * frames still terminates and flushes its trailer. `io` injects the exit +
+   * timer + process seams for tests (prod omits it).
+   */
+  frames?: FramesEmitterConfig;
   /**
    * Snapshot mode only: how many subscribed streams must each deliver a
    * first frame before the composite is trustworthy (1 for a single-stream
@@ -315,6 +336,37 @@ export interface SnapshotIo {
   setTimeoutFn?: (cb: () => void, ms: number) => SnapshotTimerHandle;
   /** Timer clear for the latch (default global `clearTimeout`). */
   clearTimeoutFn?: (handle: SnapshotTimerHandle) => void;
+}
+
+/** Frames-mode wiring (see {@link ViewShellOptions.frames}). */
+export interface FramesEmitterConfig {
+  /** Pre-built emitter the shell drives (owns view id, diff, sidecar IO, bounds). */
+  emitter: FramesEmitter;
+  /**
+   * The emitter's duration bound (ms), re-supplied so the shell can arm a
+   * single teardown timer that flushes a `duration` trailer when no further
+   * frame arrives. `null`/omitted ⇒ no timer (unbounded by time; ends on
+   * max-frames or SIGINT). MUST match the value the emitter was built with.
+   */
+  durationMs?: number | null;
+  /** Injectable exit + timer + process seams for tests; prod omits. */
+  io?: FramesRunIo;
+}
+
+/** Injectable exit + timer + process seams for the frames run (tests only). */
+export interface FramesRunIo {
+  /** Process exit (default `process.exit`; tests inject a thrower). */
+  exit?: (code: number) => never;
+  /** Timer set for the duration teardown (default global `setTimeout`). */
+  setTimeoutFn?: (cb: () => void, ms: number) => SnapshotTimerHandle;
+  /** Timer clear for the duration teardown (default global `clearTimeout`). */
+  clearTimeoutFn?: (handle: SnapshotTimerHandle) => void;
+  /**
+   * Process seam for the SIGINT + parent-death exit triggers (default the real
+   * `process`). Tests inject a fake so no real process-level handler is
+   * registered.
+   */
+  proc?: ViewerExitProc;
 }
 
 export interface ViewShell<TSnap> {
@@ -389,6 +441,25 @@ export interface ViewShell<TSnap> {
    */
   runSnapshot: (onDispose: () => void) => void;
   /**
+   * Frames-mode driver — the frames analog of `installSigintHandler` /
+   * `runSnapshot`. The caller wires its subscription(s) (whose data callbacks
+   * call `view.emit`), then calls this with the subscription teardown. It arms
+   * the SIGINT + parent-death triggers and (when a `durationMs` bound is set)
+   * one teardown timer, each routing to a single idempotent trailer-flush:
+   * emit the terminal trailer, dispose, run `onDispose`, exit 0. A bound
+   * tripped mid-`emit` (max-frames / duration-with-frames) flushes through the
+   * same path. Only meaningful when `mode === "frames"`.
+   */
+  runFrames: (onDispose: () => void) => void;
+  /**
+   * Frames-mode resume-cursor seam. The caller hands the shell the freshest
+   * daemon fold cursor per tick (board threads `String(BootStatus.rev)` from
+   * its `onBootStatus`), and the shell stamps it on every subsequent envelope's
+   * `cursor` and the trailer's `resume_cursor`. `null` until the first boot
+   * header lands. Inert outside frames mode (stored but never read).
+   */
+  noteCursor: (cursor: string | null) => void;
+  /**
    * Multi-stream snapshot readiness report (fn-772). `view.emit` auto-reports
    * the FIRST stream to the latch (covers single-stream views like git/jobs
    * with zero extra wiring). A multi-stream view (board=2, autopilot=4)
@@ -419,6 +490,7 @@ export function createViewShell<TSnap>(
   const title = opts.title ?? script;
   const mode = opts.mode ?? "live";
   const isSnapshot = mode === "snapshot";
+  const isFrames = mode === "frames";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
   const snapshotEmptyLine =
     opts.snapshotEmptyLine ?? DEFAULT_SNAPSHOT_EMPTY_LINE;
@@ -484,6 +556,24 @@ export function createViewShell<TSnap>(
   // state (identity compare) and buffer a secondary report for replay.
   const noopReportLatch = (): void => {};
   let reportLatch: () => void = noopReportLatch;
+
+  // Frames-mode state (see `mode === "frames"`). The emitter is pre-built by
+  // the caller; the shell drives it: baseline on the FIRST accepted frame,
+  // `frame` thereafter, and one idempotent trailer flush on any exit path.
+  const framesEmitter: FramesEmitter | null = opts.frames?.emitter ?? null;
+  const framesDurationMs = opts.frames?.durationMs ?? null;
+  const framesRunIo: FramesRunIo = opts.frames?.io ?? {};
+  // The freshest daemon fold cursor handed in via `noteCursor` — stamped on
+  // every frames envelope + the trailer's resume cursor. `null` until the first
+  // boot header lands. Stored (never read) outside frames mode.
+  let latestCursor: string | null = null;
+  let framesBaselineEmitted = false;
+  // Trailer-flush guard: SIGINT, the duration timer, and a bound tripped
+  // mid-emit can all reach the flush — it must emit the trailer + exit exactly
+  // once (mirrors the snapshot `settled` / SIGINT `toreDown` idempotency).
+  let framesFinished = false;
+  let framesOnDispose: () => void = () => {};
+  let framesTimer: SnapshotTimerHandle | null = null;
 
   // Connecting-indicator spinner state. A single `setInterval` (~125ms)
   // animates the braille dots and re-polls the re-fold poller until the
@@ -627,14 +717,14 @@ export function createViewShell<TSnap>(
   }
 
   const liveShell: LiveShell = createLiveShell({
-    // Snapshot mode never paints a live frame: pass `enabled: false` so no
-    // OpenTUI renderer is constructed and the shell is a clean no-op (its
-    // `pushFrame`/`refreshLive`/`dispose` are inert). The snapshot path
-    // short-circuits before any `pushFrame` anyway, but a disabled shell is
-    // the belt-and-suspenders guarantee that the connecting-spinner overlay
-    // (`refreshLive`) and the passthrough frame write can never reach
-    // stdout and corrupt the single-frame snapshot output.
-    enabled: !isSnapshot,
+    // Only LIVE mode paints. Snapshot and frames both pass `enabled: false` so
+    // no OpenTUI renderer is constructed and the shell is a clean no-op (its
+    // `pushFrame`/`refreshLive`/`dispose` are inert). Both paths short-circuit
+    // before any `pushFrame` anyway, but a disabled shell is the belt-and-
+    // suspenders guarantee that the connecting-spinner overlay (`refreshLive`)
+    // and the passthrough frame write can never reach stdout and corrupt the
+    // single-frame snapshot output or the frames NDJSON stream.
+    enabled: mode === "live",
     title,
     captureKeys: opts.captureKeys,
     onUnhandledKey: (key) => {
@@ -730,6 +820,49 @@ export function createViewShell<TSnap>(
     );
   }
 
+  // The human-facing frame text for the frames stream: selection-prefix
+  // stripped, NO `---` sidecar lead (the emitter owns its own sidecar files;
+  // the wire frame text is "what the human saw", matching the snapshot
+  // `printedFrame`).
+  function plainBodyText(bodyLines: string[]): string {
+    return bodyLines.map((l) => stripSelectionPrefix(l).text).join("\n");
+  }
+
+  // Flush the terminal trailer + tear down, exactly once. Reached from the
+  // SIGINT / parent-death triggers (`interrupt`), the duration timer
+  // (`duration`), and a bound tripped mid-emit (`max_frames` / `duration`).
+  function finishFrames(reason: TrailerReason): void {
+    if (framesEmitter === null || framesFinished) {
+      return;
+    }
+    framesFinished = true;
+    if (framesTimer !== null) {
+      const clearTimeoutFn: (handle: SnapshotTimerHandle) => void =
+        framesRunIo.clearTimeoutFn ??
+        ((handle) =>
+          clearTimeout(handle as Parameters<typeof clearTimeout>[0]));
+      clearTimeoutFn(framesTimer);
+      framesTimer = null;
+    }
+    // The trailer is ALWAYS the final line — resume cursor + honest coverage.
+    framesEmitter.emitTrailer({ reason });
+    stopConnectingSpinner();
+    liveShell.dispose();
+    framesOnDispose();
+    (framesRunIo.exit ?? ((code: number) => process.exit(code)))(0);
+  }
+
+  // After an accepted frame, flush the trailer if a bound has tripped.
+  function maybeStopFrames(): void {
+    if (framesEmitter === null) {
+      return;
+    }
+    const reason = framesEmitter.shouldStop();
+    if (reason !== null) {
+      finishFrames(reason);
+    }
+  }
+
   function emit(snap: TSnap): boolean {
     const { bodyLines, stateJson } = renderBody(snap);
     // Snapshot mode: capture the latest composite + report the latch on the
@@ -744,6 +877,36 @@ export function createViewShell<TSnap>(
         latchReported = true;
         reportLatch();
       }
+      return true;
+    }
+    // Frames mode: emit one wire envelope per ACCEPTED frame instead of
+    // painting. The byte-compare gate is the SAME as live (an unchanged body
+    // from any of a multi-stream view's re-emits is suppressed, so per-stream
+    // re-emits can never inflate the frame/coverage accounting). The first
+    // accepted frame is the `baseline`; the rest are `frame`s diffed against
+    // the prior. A tripped bound flushes the trailer through `maybeStopFrames`.
+    if (isFrames) {
+      if (framesEmitter === null) {
+        return false;
+      }
+      const body = bodyLines.join("\n");
+      if (body === lastBody) {
+        return false;
+      }
+      lastBody = body;
+      frameCount += 1;
+      const input = {
+        cursor: latestCursor,
+        frameText: plainBodyText(bodyLines),
+        stateJson,
+      };
+      if (!framesBaselineEmitted) {
+        framesBaselineEmitted = true;
+        framesEmitter.emitBaseline(input);
+      } else {
+        framesEmitter.emitFrame(input);
+      }
+      maybeStopFrames();
       return true;
     }
     // The byte-compare body KEEPS the selection prefix so moving the
@@ -799,6 +962,12 @@ export function createViewShell<TSnap>(
     // pre-disconnect body byte-for-byte.
     if (event === "disconnected") {
       lastBody = null;
+      // Frames coverage honesty: a reconnect is the sole gap source the
+      // emitter cannot see (its own `seq` stays contiguous), so a disconnect
+      // downgrades the trailer's coverage verdict to `gap_possible`.
+      if (isFrames && framesEmitter !== null) {
+        framesEmitter.noteReconnect();
+      }
     }
     // Snapshot mode: latch whether we ever reached `connected` so the
     // no-frame trailer reports `timeout` vs `daemon-unreachable` honestly.
@@ -815,11 +984,12 @@ export function createViewShell<TSnap>(
     // line. The `frameCount === 0` gate means a transient disconnect
     // after data is on screen keeps the last good frame rather than
     // flicking back to "connecting". Self-stops on first frame; also
-    // cleared from the SIGINT teardown. NEVER armed in snapshot mode — the
-    // spinner's `refreshLive` overlay would write `connecting…` lines to
-    // stdout and corrupt the single-frame snapshot output (the open-coded
-    // passthrough that snapshot mode replaces had exactly this spam bug).
-    if (!isSnapshot && frameCount === 0 && event !== "connected") {
+    // cleared from the SIGINT teardown. Armed ONLY in live mode — in snapshot
+    // and frames modes the spinner's `refreshLive` overlay would write
+    // `connecting…` lines to stdout and corrupt the single-frame snapshot
+    // output / the frames NDJSON stream (the open-coded passthrough that
+    // snapshot mode replaces had exactly this spam bug).
+    if (mode === "live" && frameCount === 0 && event !== "connected") {
       armConnectingSpinner();
     }
   }
@@ -998,6 +1168,39 @@ export function createViewShell<TSnap>(
     pendingExtraReports = 0;
   }
 
+  function noteCursor(cursor: string | null): void {
+    latestCursor = cursor;
+  }
+
+  function runFrames(onDispose: () => void): void {
+    framesOnDispose = onDispose;
+    // SIGINT (Ctrl-C) and the fn-723 parent-death / TTY-close triggers all
+    // route through the one idempotent trailer flush — the trailer stays the
+    // final line even on interrupt (today's live SIGINT path only logs sidecar
+    // paths; frames MUST leave a resumable trailer). The `proc` seam lets tests
+    // drive these without registering real process-level handlers.
+    const proc: ViewerExitProc = framesRunIo.proc ?? process;
+    const onInterrupt = (): void => {
+      finishFrames("interrupt");
+    };
+    proc.on("SIGINT", onInterrupt);
+    armViewerExitTriggers(
+      onInterrupt,
+      framesRunIo.proc !== undefined ? { proc: framesRunIo.proc } : {},
+    );
+    // Duration bound: `shouldStop()` only re-checks on an accepted frame, so a
+    // run whose stream goes quiet past the deadline would never terminate.
+    // Arm one teardown timer to flush the `duration` trailer in that case; a
+    // max-frames stop (or SIGINT) that fires first clears it via `finishFrames`.
+    if (framesDurationMs !== null) {
+      const setTimeoutFn: (cb: () => void, ms: number) => SnapshotTimerHandle =
+        framesRunIo.setTimeoutFn ?? ((cb, ms) => setTimeout(cb, ms));
+      framesTimer = setTimeoutFn(() => {
+        finishFrames("duration");
+      }, framesDurationMs);
+    }
+  }
+
   // fn-772: a multi-stream view's SECONDARY stream reports its first frame
   // here. `emit` covers the first stream's report; each additional stream
   // calls this once so the latch holds until the WHOLE composite is folded.
@@ -1027,6 +1230,8 @@ export function createViewShell<TSnap>(
     colorEnabled,
     installSigintHandler,
     runSnapshot,
+    runFrames,
+    noteCursor,
     reportSnapshotStream,
     getLastFrameText: () => lastFrameText,
     getFrameCount: () => frameCount,

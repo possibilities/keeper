@@ -68,6 +68,11 @@ import {
 } from "../src/dispatch-failure-pill";
 import type { EpicDepResolution } from "../src/epic-deps";
 import {
+  createFramesEmitter,
+  defaultDiffFn,
+  defaultFramesIo,
+} from "../src/frames-emitter";
+import {
   formatPill,
   isEpicStarted,
   orderEpicsForScheduling,
@@ -579,6 +584,63 @@ export function renderHandoffLinkLines(handoffLinks: unknown): string[] {
   return out;
 }
 
+/** One serialized `job_id → invocations` entry in a board frame's state JSON. */
+export interface SerializedSubagentEntry {
+  job_id: string;
+  invocations: SubagentInvocation[];
+}
+
+/**
+ * Serialize the per-frame `job_id → invocations` index (a `Map`, JSON-invisible
+ * and in snapshot-row insertion order) as a STABLE-ordered array of entries,
+ * sorted by `job_id`. Each entry's `invocations` keep the index's own
+ * `turn_seq asc` order. A frames consumer reads this off the state sidecar as
+ * ground truth for stale-pill truthfulness checks by pointer, so the ordering
+ * must not drift with wire arrival order.
+ */
+export function serializeSubagentIndex(
+  index: ReadonlyMap<string, SubagentInvocation[]>,
+): SerializedSubagentEntry[] {
+  return [...index.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([job_id, invocations]) => ({ job_id, invocations }));
+}
+
+/**
+ * The board's per-frame state JSON: the open epics alongside the STABLE-ordered
+ * subagent index (see {@link serializeSubagentIndex}). Written to the per-frame
+ * state sidecar in every mode; a frames consumer dereferences it to check the
+ * board's stale-pill truthfulness against ground truth.
+ */
+export function boardFrameStateJson(
+  epics: readonly unknown[],
+  subagentIndex: ReadonlyMap<string, SubagentInvocation[]>,
+): { epics: readonly unknown[]; subagents: SerializedSubagentEntry[] } {
+  return { epics, subagents: serializeSubagentIndex(subagentIndex) };
+}
+
+/**
+ * Shared board runner. `main` resolves flags then drives this in `live` /
+ * `snapshot`; `runBoardFrames` drives it in `frames` (the entry the future
+ * `keeper frames --view board` subcommand dispatch calls, on its OWN flag
+ * grammar — never `resolveSnapshotMode`). All three share ONE subscription
+ * wiring so the board's four-stream fold, banner, and diagnostics drain cannot
+ * drift between modes.
+ */
+export interface BoardFramesConfig {
+  /** Data-frame bound; `null`/omitted ⇒ unbounded. */
+  maxFrames?: number | null;
+  /** Duration bound in millis; `null`/omitted ⇒ unbounded. */
+  durationMs?: number | null;
+}
+
+export interface RunBoardConfig {
+  mode: "live" | "snapshot" | "frames";
+  sockPath: string;
+  timeoutMs?: number;
+  frames?: BoardFramesConfig;
+}
+
 export async function main(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -625,6 +687,37 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+  await runBoard({
+    mode: mode === "snapshot" ? "snapshot" : "live",
+    sockPath,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
+}
+
+/**
+ * Drive the board in `frames` mode — the entry the future
+ * `keeper frames --view board` subcommand dispatch calls. Builds the prod
+ * frames emitter (view `board`, `diff -u` seam, real sidecar IO, the caller's
+ * chunk bounds) and hands it to the shared runner. Its own flag grammar
+ * (`maxFrames` / `durationMs`) — NOT `resolveSnapshotMode`.
+ */
+export async function runBoardFrames(config: {
+  sockPath?: string;
+  maxFrames?: number | null;
+  durationMs?: number | null;
+}): Promise<void> {
+  await runBoard({
+    mode: "frames",
+    sockPath: config.sockPath ?? resolveSockPath(),
+    frames: {
+      maxFrames: config.maxFrames ?? null,
+      durationMs: config.durationMs ?? null,
+    },
+  });
+}
+
+export async function runBoard(config: RunBoardConfig): Promise<void> {
+  const { mode, sockPath, timeoutMs } = config;
   // Readiness diagnostics JSONL log, a sibling of the sock in the state dir.
   // Two processes (board + autopilot) can append concurrently; POSIX O_APPEND
   // under PIPE_BUF gives the atomicity guarantee, no flock.
@@ -973,6 +1066,21 @@ export async function main(argv: string[]): Promise<void> {
     return body === "" ? [...head, "no epics"] : [...head, ...body.split("\n")];
   }
 
+  // Frames mode: build the prod emitter (view `board`, `diff -u` seam, real
+  // sidecar IO, the caller's chunk bounds). The shell drives it — baseline on
+  // the first accepted frame, `frame` thereafter, trailer on every exit path.
+  const framesEmitter =
+    mode === "frames"
+      ? createFramesEmitter({
+          view: "board",
+          writeStdout: (line) => void process.stdout.write(line),
+          diffFn: defaultDiffFn,
+          io: defaultFramesIo(),
+          maxFrames: config.frames?.maxFrames ?? null,
+          durationMs: config.frames?.durationMs ?? null,
+        })
+      : null;
+
   // Lifecycle + sidecars + copy key + SIGINT live in `createViewShell`. Board's
   // only sibling-specific bits are the renderer, the `subscribeReadiness`
   // wiring, and the diagnostics drain.
@@ -985,9 +1093,17 @@ export async function main(argv: string[]): Promise<void> {
     // sticky-failure pill) — so the snapshot latch holds until ALL FOUR report
     // (readiness via the auto-report in `view.emit`; the other three via the
     // explicit `reportSnapshotStream` calls below).
-    mode: mode === "snapshot" ? "snapshot" : "live",
+    mode,
     streamCount: 4,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(framesEmitter !== null
+      ? {
+          frames: {
+            emitter: framesEmitter,
+            durationMs: config.frames?.durationMs ?? null,
+          },
+        }
+      : {}),
     // The fixed banner row carries autopilot metadata. Restored here after a
     // copy-key flash expires.
     persistentBannerPill: apBanner,
@@ -1008,7 +1124,11 @@ export async function main(argv: string[]): Promise<void> {
       }
       return {
         bodyLines: renderBody(snap, subagentIndex),
-        stateJson: { epics: snap.epics },
+        // The per-frame state sidecar carries the epics AND the stable-ordered
+        // subagent index — a frames consumer's ground truth for stale-pill
+        // truthfulness. Written in every mode (sidecar-only; the painted /
+        // snapshot output is unchanged).
+        stateJson: boardFrameStateJson(snap.epics, subagentIndex),
       };
     },
   });
@@ -1043,6 +1163,14 @@ export async function main(argv: string[]): Promise<void> {
     // a flagged CLOSED epic that has dropped off the open board. The first-paint
     // gate holds until the collection paints (empty clears it).
     includeSelectionReviewEpics: true,
+    // Thread the freshest daemon fold cursor into the frames resume-cursor seam
+    // (fn-1161) — every frames envelope + the trailer stamp `String(rev)`. The
+    // header rides every `result`, so this tracks catch-up: a frame minted
+    // while `rev < head_event_id` carries a below-head cursor rather than being
+    // suppressed. Inert in live/snapshot (the stored cursor is never read).
+    onBootStatus: (boot) => {
+      view.noteCursor(String(boot.rev));
+    },
   });
 
   // A parallel `armed_epics` presence-table subscription — the readiness
@@ -1171,20 +1299,18 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
+  const disposeAll = (): void => {
+    handle.dispose();
+    armedHandle.dispose();
+    autopilotHandle.dispose();
+    closeFailHandle.dispose();
+  };
   if (mode === "snapshot") {
-    view.runSnapshot(() => {
-      handle.dispose();
-      armedHandle.dispose();
-      autopilotHandle.dispose();
-      closeFailHandle.dispose();
-    });
+    view.runSnapshot(disposeAll);
+  } else if (mode === "frames") {
+    view.runFrames(disposeAll);
   } else {
-    view.installSigintHandler(() => {
-      handle.dispose();
-      armedHandle.dispose();
-      autopilotHandle.dispose();
-      closeFailHandle.dispose();
-    });
+    view.installSigintHandler(disposeAll);
   }
 }
 
