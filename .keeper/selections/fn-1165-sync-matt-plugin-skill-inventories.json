@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Docs-only sync appending named skills to two explicit enumerations \u2014 mechanical, reversible, low blast radius, and precisely specified, ideal for sonnet/low.",
+      "task_id": "fn-1165-sync-matt-plugin-skill-inventories.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T17:22:30.089000Z",
+  "epic_id": "fn-1165-sync-matt-plugin-skill-inventories",
+  "input_hash": "ee9add5a8dadc68d8f77e1bfc90f1c07044299aef77b7dc174414f61b7e0cf09",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4003126618,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"sonnet\",\"rationale\":\"Docs-only sync appending named skills to two explicit enumerations \u2014 mechanical, reversible, low blast radius, and precisely specified, ideal for sonnet/low.\",\"confidence\":0.9}]}"
+}
