@@ -286,6 +286,24 @@ snippets:
     path: _partials/snippets/engineering/orient.md.tmpl
     token-estimate: 473
     used-in: []
+  - name: panel-strength
+    summary: 'Reads panel strength from member count and harness diversity, then picks a panel: pass a human-named panel verbatim; use the configured default for an ordinary panel-worthy question; pick a broader panel via keeper agent presets list when the stakes are high; skip the panel and flag the config gap when roster discovery fails or no default is set.'
+    domain: engineering
+    audience: agent
+    severity: default
+    tags:
+      - panel
+      - presets
+      - panel-strength
+      - routing
+    scope:
+      - any
+    phase:
+      - planning
+      - executing
+    path: _partials/snippets/engineering/panel-strength.md.tmpl
+    token-estimate: 457
+    used-in: []
   - name: script-shebang-hygiene
     summary: Script hygiene — never zsh shebangs; shebanged scripts need .sh/.py extension and chmod +x.
     domain: engineering

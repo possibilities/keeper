@@ -50,10 +50,24 @@ diversity comes from running the panel's preset spread cold (see "No lenses, no 
 
 **Config is required.** With no catalog, no `panel.yaml`, or an unknown panel name, `presets resolve`
 exits 2 with a specific message (file path + bad name + sorted available names) — there is no silent
-fallback. Run `keeper agent presets list` to see what is configured. An example catalog
-(`~/.config/keeper/presets.yaml`): `presets: { claude-opus-xhigh: {harness: claude, model: opus, effort:
-xhigh}, codex-gpt55-high: {harness: codex, model: gpt-5.5, effort: high} }`, with the panel selection in
-`~/.config/keeper/panel.yaml`: `panels: { default: [claude-opus-xhigh, codex-gpt55-high] }`.
+fallback. The one reserved name is `default`: `keeper agent presets resolve default` aliases to whichever
+panel the top-level `default:` pointer names (it is never itself a panel name), and stays fail-loud with a
+message naming what was typed when no default is configured. Run `keeper agent presets list` to see what is
+configured. An example pair — the catalog (`~/.config/keeper/presets.yaml`) mapping each preset name to a
+`{harness, model, effort}` triple, and the panel file (`~/.config/keeper/panel.yaml`) naming one or more
+panels over those presets with a top-level `default:` pointer at one of them:
+
+```yaml
+# ~/.config/keeper/presets.yaml — preset name -> {harness, model, effort}
+presets:
+  fast-claude: {harness: claude, model: <model>, effort: <effort>}
+  cross-codex: {harness: codex,  model: <model>, effort: <effort>}
+
+# ~/.config/keeper/panel.yaml — panels over those presets, plus the default pointer
+panels:
+  core: [fast-claude, cross-codex]
+default: core   # the literal `default` resolves here; never name a panel `default`
+```
 
 The judge is kept separate from the panelists — it runs in the `plan:panel-judge` subagent, reading
 both answer files fresh in its own context rather than defending an answer it wrote itself.
