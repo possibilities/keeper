@@ -202,6 +202,39 @@ describe("splitSubcommand", () => {
     });
   });
 
+  test("providers resolve <model> <effort> classifies", () => {
+    expect(
+      splitSubcommand(["providers", "resolve", "gpt-5.5", "high"]),
+    ).toEqual({ kind: "providers-resolve", model: "gpt-5.5", effort: "high" });
+  });
+
+  test("providers resolve missing effort is usage", () => {
+    expect(splitSubcommand(["providers", "resolve", "gpt-5.5"])).toEqual({
+      kind: "usage",
+      unknown: "providers resolve",
+    });
+  });
+
+  test("providers check classifies", () => {
+    expect(splitSubcommand(["providers", "check"])).toEqual({
+      kind: "providers-check",
+    });
+  });
+
+  test("providers with an unknown verb is usage", () => {
+    expect(splitSubcommand(["providers", "frobnicate"])).toEqual({
+      kind: "usage",
+      unknown: "providers frobnicate",
+    });
+  });
+
+  test("bare providers is usage", () => {
+    expect(splitSubcommand(["providers"])).toEqual({
+      kind: "usage",
+      unknown: "providers",
+    });
+  });
+
   test("empty argv is bare usage (no unknown)", () => {
     expect(splitSubcommand([])).toEqual({ kind: "usage" });
   });

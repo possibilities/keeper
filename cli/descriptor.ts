@@ -1090,6 +1090,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_tty: false,
     agent_help: true,
     exit_codes: {
+      "3": "agent providers resolve: a wrapped model has no configured provider in the matrix roster (no_route) — add a serving provider to ~/.config/keeper/matrix.yaml or correct the model token",
+      "9": "agent providers check: one or more roster/preset/reachability drift findings",
       "124":
         "agent panel wait: chunk elapsed with no terminal answer — re-issue the wait (a signal, not a failure)",
     },
@@ -1102,6 +1104,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       "wait",
       "panel",
       "presets",
+      "providers",
       "transcript",
     ].map(nameOnlyVerb),
   },

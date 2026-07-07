@@ -11,7 +11,9 @@
 
 import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
+import type { HarnessName } from "../../src/agent/harness";
 import type { MainDeps } from "../../src/agent/main";
+import type { Matrix } from "../../src/agent/matrix";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
@@ -139,6 +141,10 @@ export interface HarnessOptions {
   panelSelections?: PanelSelections;
   /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
   findShadowProfileDirs?: () => ShadowProfileFinding[];
+  /** Host matrix loadMatrixFn returns (default null → claude-only world). */
+  matrix?: Matrix | null;
+  /** Provider-binary reachability probe (default: every provider reachable). */
+  providerReachable?: (harness: HarnessName) => boolean;
   spawn?: SpawnFn;
   nextCwdOrdinal?: (dirName: string) => number;
   randomUuid?: () => string;
@@ -225,6 +231,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
       return [profileDir, false];
     },
     findShadowProfileDirsFn: opts.findShadowProfileDirs ?? (() => []),
+    loadMatrixFn: () => opts.matrix ?? null,
+    providerReachableFn: opts.providerReachable ?? (() => true),
     startCodexSessionNameIndexerFn: (opts: CodexSessionNameIndexerOptions) => {
       codexSessionNameIndexers.push(opts);
       return () => {};

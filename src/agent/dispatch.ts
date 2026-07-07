@@ -28,6 +28,11 @@ export type Dispatch =
   | { kind: "presets-resolve"; presetName: string }
   | { kind: "presets-list"; json: boolean }
   | { kind: "profiles-check"; json: boolean }
+  // The host-matrix provider doctor. `providers resolve <model> <effort>` emits
+  // the cost-ordered serving candidates; `providers check` reports roster/preset/
+  // reachability drift.
+  | { kind: "providers-resolve"; model: string; effort: string }
+  | { kind: "providers-check" }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   // The blocking run-and-capture verbs. `run-capture` composes launch→wait→show
   // in one process; `wait-capture` runs wait→show on an already-launched handle.
@@ -67,6 +72,11 @@ Usage:
   keeper agent presets list [--json]   List configured presets + panels.
   keeper agent profiles check [--json] Report shadow/stray dirs + a ~/.claude whose
                                     tier metadata is missing (read-only).
+  keeper agent providers resolve <model> <effort>
+                                    Emit the cost-ordered serving candidates for a
+                                    model from the host matrix (no_route exit 3 for
+                                    an unroutable wrapped model; exit 2 bad tokens).
+  keeper agent providers check         Doctor: roster/preset/reachability drift.
   keeper agent wait-for-stop <handle> [--stop-timeout <dur>]
                                     Block until a detached run's next stop.
   keeper agent show-last-message <h>   Print a detached run's final message.
@@ -344,6 +354,29 @@ export function splitSubcommand(argv: string[]): Dispatch {
       return { kind: "profiles-check", json: argv.slice(2).includes("--json") };
     }
     return { kind: "usage", unknown: `profiles ${argv[1] ?? ""}`.trim() };
+  }
+  if (head === "providers") {
+    if (argv[1] === "resolve") {
+      const model = argv[2];
+      const effort = argv[3];
+      if (
+        model === undefined ||
+        model.trim() === "" ||
+        effort === undefined ||
+        effort.trim() === ""
+      ) {
+        return { kind: "usage", unknown: "providers resolve" };
+      }
+      return {
+        kind: "providers-resolve",
+        model: model.trim(),
+        effort: effort.trim(),
+      };
+    }
+    if (argv[1] === "check") {
+      return { kind: "providers-check" };
+    }
+    return { kind: "usage", unknown: `providers ${argv[1] ?? ""}`.trim() };
   }
   if (head === "--x-preset" || head.startsWith("--x-preset=")) {
     // Harnessless launch: harness comes from the named preset. Keep the WHOLE
