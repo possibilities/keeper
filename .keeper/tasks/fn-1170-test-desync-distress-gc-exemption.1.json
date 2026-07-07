@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "low",
   "title": "Cover desync GC exemption",
-  "updated_at": "2026-07-07T19:45:10.094000Z"
+  "updated_at": "2026-07-07T19:48:10.116000Z",
+  "worker_done_at": "2026-07-07T19:48:10.116000Z"
 }

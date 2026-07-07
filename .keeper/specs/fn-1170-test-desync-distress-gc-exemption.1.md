@@ -17,5 +17,5 @@ Files:
 - [ ] `bun test test/daemon.test.ts` passes.
 
 ## Done summary
-
+Extended the gcUnretryableDispatchFailures exemption test to seed a shared-checkout-desync distress row, asserting it survives the sweep alongside the existing lane-wedge/crash-loop exemptions.
 ## Evidence
