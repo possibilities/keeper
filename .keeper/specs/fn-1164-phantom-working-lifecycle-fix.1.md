@@ -83,5 +83,5 @@ retryUntil only.
 - [ ] The full fast suite (`bun test`) is green
 
 ## Done summary
-
+Add the jobs lifecycle stamp (ADR 0013): jobs.last_lifecycle_ts, a per-row event-time high-water mark all 11 lifecycle-state-writing arms route through one polarity-aware gate (quiescing >=stamp, activating >stamp, terminal exempt), so stale out-of-order events annotate but never resurrect state (phantom-working). Rewinding v113 migration back-derives the stamp by replay so existing phantom rows self-heal; SUPPORTED_SCHEMA_VERSIONS gains 113. Folded in the upstream probeRoute fix (825830b9) to green the pre-existing tsc break.
 ## Evidence
