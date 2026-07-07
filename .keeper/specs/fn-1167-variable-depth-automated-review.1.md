@@ -35,5 +35,5 @@ Consistency test drives the drift gate; brief tests cover flagged/unflagged/abse
 - [ ] Plan suite green
 
 ## Done summary
-
+Add drift-gated audit-policy.yaml (tier_audit map + close-depth bands); assign-cells reads it degrade-soft to stamp audit_required on policy-flagged tiers and records applied/degraded provenance in the selection sidecar; the claim/resume brief carries the flag as a stable key.
 ## Evidence
