@@ -2,7 +2,10 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-07T20:38:33.846000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1167-variable-depth-automated-review",
+    "fn-1164-phantom-working-lifecycle-fix"
+  ],
   "id": "fn-1172-out-of-band-selection-review-skill",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T20:38:33.846000Z"
+  "updated_at": "2026-07-07T20:38:43.828000Z"
 }
