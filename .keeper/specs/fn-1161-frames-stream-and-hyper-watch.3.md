@@ -62,5 +62,5 @@ injected IO. No daemon boot.
 - [ ] README names keeper frames in the CLI roster and acknowledges the NDJSON inspection surface
 
 ## Done summary
-
+Added the keeper frames subcommand (own flag grammar, --agent-help runbook, view dispatch table, 0/1/2 exit taxonomy) plus parallel frames entries in jobs/git/autopilot/builds and the wired usage arm; README names it and acknowledges the NDJSON surface.
 ## Evidence
