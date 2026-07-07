@@ -14,6 +14,7 @@ import {
   checkModelGuidanceFromDisk,
   classifyModelGuidance,
   classifyModelGuidanceFromDisk,
+  coerceModelSelectorConfig,
   type GuidanceCheckInput,
   type GuidanceStateInput,
   loadModelSelectorConfig,
@@ -53,12 +54,13 @@ describe("on-disk selector config", () => {
     }
   });
 
-  test("the launch-model guidance blocks exist and carry no cost or provider language", () => {
+  test("no guidance prose carries cost or provider language (capability-shaped only)", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
     // Content-blind selector guidance must stay capability-shaped: cost and
-    // provider ordering live in the host matrix, never in a guidance block.
+    // provider ordering live in the host matrix, never in the usage rule, the
+    // hand_tuned policy, or any efforts/models guidance block.
     const forbidden = [
       "cost",
       "cheap",
@@ -71,14 +73,68 @@ describe("on-disk selector config", () => {
       "subscription",
       "pecking",
     ];
-    for (const model of ["gpt-5.5", "gpt-5.3-codex-spark"]) {
-      const block = config.models[model] ?? "";
+    const blocks = [
+      config.usage,
+      config.hand_tuned,
+      ...Object.values(config.efforts),
+      ...Object.values(config.models),
+    ];
+    for (const block of blocks) {
       expect(block.length).toBeGreaterThan(0);
       const lower = block.toLowerCase();
       for (const word of forbidden) {
         expect(lower).not.toContain(word);
       }
     }
+  });
+
+  test("carries a hand_tuned section retained verbatim through coercion", () => {
+    const config = loadModelSelectorConfig(
+      join(PLAN_ROOT, "model-selector.yaml"),
+    );
+    expect(config.hand_tuned.length).toBeGreaterThan(0);
+    const lower = config.hand_tuned.toLowerCase();
+    expect(lower).toContain("burden of proof");
+    expect(lower).toContain("sonnet");
+    expect(lower).toContain("opus");
+    expect(lower).toContain("anti-anchor");
+  });
+
+  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the sonnet-first burden-of-proof + anti-anchor rule", () => {
+    const config = loadModelSelectorConfig(
+      join(PLAN_ROOT, "model-selector.yaml"),
+    );
+    const agentPrompt = readFileSync(
+      join(PLAN_ROOT, "agents/model-selector.md"),
+      "utf-8",
+    );
+    // Grep-level: the inverted policy leaves no default-up escape hatch in either
+    // the config guidance prose or the selector agent prompt.
+    const forbiddenPhrases = [
+      "pick up",
+      "keep opus",
+      "route up",
+      "when in doubt",
+    ];
+    const configProse = [
+      config.usage,
+      config.hand_tuned,
+      ...Object.values(config.efforts),
+      ...Object.values(config.models),
+    ]
+      .join("\n")
+      .toLowerCase();
+    const agentLower = agentPrompt.toLowerCase();
+    for (const phrase of forbiddenPhrases) {
+      expect(configProse).not.toContain(phrase);
+      expect(agentLower).not.toContain(phrase);
+    }
+    // Positive: both surfaces state the sonnet-first burden-of-proof rule and the
+    // anti-anchor clause (spec length/adjectives are not difficulty).
+    expect(config.hand_tuned.toLowerCase()).toContain("burden of proof");
+    expect(agentLower).toContain("burden of proof");
+    expect(agentLower).toContain("intelligence-bound");
+    expect(agentLower).toContain("not difficulty");
   });
 
   test("subagents.yaml header cross-references model-selector.yaml", () => {
@@ -119,6 +175,7 @@ function baseInput(): GuidanceCheckInput {
     config: {
       selector: { harness: "claude", model: "opus" },
       usage: "weigh model then effort",
+      hand_tuned: "burden of proof on opus; sonnet by default",
       efforts: { medium: "m", high: "h", xhigh: "x", max: "M" },
       models: { opus: "o" },
       research: { opus: { reference: REF, sha256: HASH } },
@@ -130,6 +187,24 @@ function baseInput(): GuidanceCheckInput {
 describe("model-guidance check core", () => {
   test("a fully-covered config with matching hashes passes", () => {
     expect(checkModelGuidance(baseInput())).toEqual({ ok: true, errors: [] });
+  });
+
+  test("coercion requires hand_tuned — a dropped section fails loud, never silently passes", () => {
+    // Independent fixture: a structurally complete config document minus the
+    // hand_tuned key. The silent-drop failure mode is exactly a config that
+    // parses and passes the gate without carrying the binding policy.
+    const doc = {
+      selector: { harness: "claude", model: "opus" },
+      usage: "u",
+      efforts: { low: "l" },
+      models: { opus: "o" },
+      research: { opus: { reference: "x", sha256: "y" } },
+    };
+    expect(() => coerceModelSelectorConfig(doc)).toThrow("hand_tuned");
+    expect(
+      coerceModelSelectorConfig({ ...doc, hand_tuned: "policy text" })
+        .hand_tuned,
+    ).toBe("policy text");
   });
 
   test("a missing effort guidance block fails coverage", () => {
@@ -306,6 +381,7 @@ function baseStateInput(): GuidanceStateInput {
     config: {
       selector: { harness: "claude", model: "opus" },
       usage: "weigh model then effort",
+      hand_tuned: "burden of proof on opus; sonnet by default",
       efforts: { medium: "m", high: "h" },
       models: { opus: "o" },
       research: { opus: { reference: STATE_REF, sha256: STATE_HASH } },
@@ -425,6 +501,7 @@ describe("model-guidance state core", () => {
     const config: ModelSelectorConfig = {
       selector: { harness: "claude", model: "opus" },
       usage: "u",
+      hand_tuned: "burden of proof on opus; sonnet by default",
       efforts: { medium: "m", high: "h" },
       models: { opus: "o" },
       research: { opus: { reference: STATE_REF, sha256: STATE_HASH } },
