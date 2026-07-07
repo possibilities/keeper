@@ -79,3 +79,10 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Sidecar**: The private per-turn docs mirror a session maintains alongside its work, owned by hooks and never the doc body itself. Avoid: backup, shadow copy, cache.
 - **Adopted job**: A tracked session a non-launcher path minted — a hand-started hermes self-seed or a claimed codex rollout — rather than the keeper agent launcher, marked so the board pills it distinctly and restore surfaces it. Avoid: orphan, imported session, unmanaged job.
 - **Originator**: The ownership signal on a codex rollout marking it keeper-launched; strictly absent or empty means keeper never owned it, so a sole unambiguous rollout becomes adoptable. Avoid: owner tag, launch marker, origin flag.
+
+## Panels and presets
+
+- **Preset**: A named harness-and-model combination in the agent catalog that launches and pairs consistently wherever it is referenced. Avoid: profile, config, model alias.
+- **Panel**: A named, ordered selection of presets convened to answer one question in parallel, each member blind to the others, with a judge fusing the answers. Avoid: ensemble, quorum, committee.
+- **Panel strength**: A panel's capacity for independent cross-checking, read from its member count and harness diversity; a stronger panel costs proportionally more and runs as slow as its slowest member. Avoid: level, size, tier.
+- **Default panel**: The panel the config's top-level `default` pointer names, used whenever no panel is chosen; the reserved word `default` always resolves to it and is never a panel's own name. Avoid: fallback panel, primary panel, default level.
