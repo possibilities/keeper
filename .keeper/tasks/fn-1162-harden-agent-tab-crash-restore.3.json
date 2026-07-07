@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Recency-first selection canonical generation",
-  "updated_at": "2026-07-07T16:30:36.607000Z"
+  "updated_at": "2026-07-07T18:07:05.156000Z",
+  "worker_done_at": "2026-07-07T18:07:05.156000Z"
 }

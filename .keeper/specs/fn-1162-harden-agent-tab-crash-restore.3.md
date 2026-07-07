@@ -39,5 +39,5 @@ Seed two dead generations: just-killed with N restorable and 2-day-old with M > 
 - [ ] An ADR records the canonical generation-identity decision.
 
 ## Done summary
-
+Consolidated the generation auto-pick into one exported selectGenerationFromEnriched consumed by both the deriver and list view, flipped it to recency-first (newest eligible wins; older-substantially-richer flags ambiguous), and made generation identity keeper-owned via a single buildGenerationId producer plus a read-time canonicalizer that folds a boot seen under two probe formats into one. Recorded ADR 0013.
 ## Evidence
