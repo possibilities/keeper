@@ -53,5 +53,5 @@ Slow tier only; assert the envelope outcome, the worktree-anchored diff, and leg
       described, no stale claude-only or single-source claims, and every docs lint gate green.
 
 ## Done summary
-
+Added a KEEPER_RUN_SLOW e2e (test/wrapped-cell-e2e.slow.test.ts) proving the wrapped-cell pipe render->resolve->providers->detached-run with a worktree-anchored foreign edit + completed envelope (stub harness, skips loud without tmux), and consolidated the matrix/wrapped-cell docs (plugin-composition-map, plan README, root README) including the first-wrapped-task operator checklist in the README keeper-agent section.
 ## Evidence
