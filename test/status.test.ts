@@ -61,7 +61,6 @@ interface FixtureEpic {
   status: string | null;
   tasks: FixtureTask[];
   question?: string | null;
-  selection_review?: string | null;
 }
 
 interface SnapOverrides {
@@ -81,10 +80,6 @@ interface SnapOverrides {
   maxConcurrentPerRootStored?: number;
   worktreeMode?: boolean;
   worktreeMultiRepo?: boolean;
-  // The narrow unfiltered flagged-epic read (any status) behind the display-only
-  // `needs_human.selection_reviews` count. Each entry carries a `selection_review`
-  // blob; a cleared entry (null) is filtered out by the count.
-  selectionReviewEpics?: FixtureEpic[];
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
@@ -97,12 +92,6 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
   ): Map<string, Verdict> => new Map(Object.entries(rec ?? {}));
   return {
     epics: (o.epics ?? []) as unknown as ReadinessClientSnapshot["epics"],
-    ...(o.selectionReviewEpics === undefined
-      ? {}
-      : {
-          selectionReviewEpics:
-            o.selectionReviewEpics as unknown as ReadinessClientSnapshot["selectionReviewEpics"],
-        }),
     jobs: jobs as unknown as ReadinessClientSnapshot["jobs"],
     subagentInvocations: [],
     scheduledTasks: [],
@@ -476,81 +465,6 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.needs_human.instant_death_wall).toBe(0);
   });
 
-  test("selection_reviews counts flagged epics of ANY status off the narrow read; a flagged CLOSED epic still counts (ADR 0011)", () => {
-    // The narrow read carries an OPEN flagged epic and a CLOSED flagged epic —
-    // the closed one is absent from `board.epics` (open-filtered) but must still
-    // count. Hand-computed: selection_reviews = 2.
-    const flag = '{"counts":{"underpowered":1,"overpowered":2}}';
-    const snap = makeSnap({
-      epics: [{ epic_id: "fn-1-open", status: "open", tasks: [] }],
-      perEpic: { "fn-1-open": { tag: "ready" } },
-      selectionReviewEpics: [
-        {
-          epic_id: "fn-1-open",
-          status: "open",
-          tasks: [],
-          selection_review: flag,
-        },
-        {
-          epic_id: "fn-9-closed",
-          status: "done",
-          tasks: [],
-          selection_review: flag,
-        },
-      ],
-    });
-    const d = buildStatusEnvelope(snap, BOOT, []).data;
-    expect(d?.needs_human.selection_reviews).toBe(2);
-  });
-
-  test("the selection-review flag contributes ZERO to total and never flips jammed, across flagged/cleared variants (ADR 0011)", () => {
-    const flag = '{"counts":{"overpowered":1}}';
-    // A board fully at rest (one done epic, no other needs-human signal) with a
-    // flagged closed epic on the narrow read: drained, NOT jammed, total 0.
-    const flagged = makeSnap({
-      epics: [{ epic_id: "fn-1-a", status: "done", tasks: [] }],
-      perEpic: { "fn-1-a": { tag: "completed" } },
-      selectionReviewEpics: [
-        {
-          epic_id: "fn-9-closed",
-          status: "done",
-          tasks: [],
-          selection_review: flag,
-        },
-      ],
-    });
-    const df = buildStatusEnvelope(flagged, BOOT, []).data;
-    expect(df?.needs_human.selection_reviews).toBe(1);
-    expect(df?.needs_human.total).toBe(0);
-    expect(df?.jammed).toBe(false);
-    expect(df?.drained).toBe(true);
-
-    // Same board with the review CLEARED (the narrow read drops to a null blob):
-    // selection_reviews falls to 0, total/jammed/drained unchanged.
-    const cleared = makeSnap({
-      epics: [{ epic_id: "fn-1-a", status: "done", tasks: [] }],
-      perEpic: { "fn-1-a": { tag: "completed" } },
-      selectionReviewEpics: [
-        {
-          epic_id: "fn-9-closed",
-          status: "done",
-          tasks: [],
-          selection_review: null,
-        },
-      ],
-    });
-    const dc = buildStatusEnvelope(cleared, BOOT, []).data;
-    expect(dc?.needs_human.selection_reviews).toBe(0);
-    expect(dc?.needs_human.total).toBe(0);
-    expect(dc?.jammed).toBe(false);
-    expect(dc?.drained).toBe(true);
-  });
-
-  test("selection_reviews defaults to 0 when the narrow read is absent (opt-in off)", () => {
-    const d = buildStatusEnvelope(makeSnap(), BOOT, []).data;
-    expect(d?.needs_human.selection_reviews).toBe(0);
-  });
-
   test("the whole needs_human block is byte-identical off the shared projector (fields + order)", () => {
     // A mixed board: 2 dead letters, 1 block escalation, 1 parked question, and
     // 4 sticky rows — one finalize-non-ff subset + two breaker subsets + one
@@ -587,7 +501,6 @@ describe("buildStatusEnvelope drained/jammed", () => {
       "finalize_non_ff",
       "parked_questions",
       "instant_death_wall",
-      "selection_reviews",
       "total",
     ]);
     expect(d?.needs_human).toEqual({
@@ -597,7 +510,6 @@ describe("buildStatusEnvelope drained/jammed", () => {
       finalize_non_ff: 1,
       parked_questions: 1,
       instant_death_wall: 2,
-      selection_reviews: 0,
       total: 8,
     });
   });
@@ -672,13 +584,11 @@ function makeStatusMockConnect(): {
   return { factory, sockets };
 }
 
-/** The eleven base readiness collections + the `dispatch_failures` and
- *  `epics_selection_review` opt-ins, as a single `result` batch. Routed by
- *  collection, so no idPrefix bookkeeping. */
+/** The eleven base readiness collections + the `dispatch_failures` opt-in, as a
+ *  single `result` batch. Routed by collection, so no idPrefix bookkeeping. */
 function statusReadinessFrames(
   dispatchFailures: Record<string, unknown>[],
   epics: Record<string, unknown>[] = [],
-  selectionReviewEpics: Record<string, unknown>[] = [],
 ): ServerFrame[] {
   const empty = (collection: string): ServerFrame => ({
     type: "result",
@@ -714,14 +624,6 @@ function statusReadinessFrames(
       rev: 1,
       total: dispatchFailures.length,
       rows: dispatchFailures,
-    },
-    {
-      type: "result",
-      id: "epics_selection_review",
-      collection: "epics_selection_review",
-      rev: 1,
-      total: selectionReviewEpics.length,
-      rows: selectionReviewEpics,
     },
   ];
 }
@@ -815,52 +717,6 @@ describe("runStatus dispatch_failures snapshot sourcing (ADR 0011)", () => {
     const env = JSON.parse(cap.stdout[0] ?? "{}") as {
       data: { jammed: boolean; drained: boolean };
     };
-    expect(env.data.jammed).toBe(false);
-    expect(env.data.drained).toBe(true);
-  });
-
-  test("opts into includeSelectionReviewEpics — a flagged CLOSED epic (absent from board.epics) counts, adds zero to total/jammed (ADR 0011)", async () => {
-    const { factory, sockets } = makeStatusMockConnect();
-    const { deps, cap } = makeStatusDeps(factory);
-
-    await runStatus(statusArgs(), deps);
-    const sock = sockets[0];
-    if (!sock) {
-      throw new Error("mock socket never installed");
-    }
-    const collections = sock.outbound.map((line) => {
-      const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
-      return (JSON.parse(trimmed) as { collection: string }).collection;
-    });
-    // The flagged-epic read rides the SAME subscribe — one round-trip.
-    expect(collections).toContain("epics_selection_review");
-    expect(sockets).toHaveLength(1);
-
-    // Board otherwise at rest (no open epics), one flagged CLOSED epic on the
-    // narrow read only. It counts, but stays out of total and never jams.
-    sock.deliver(
-      statusReadinessFrames(
-        [],
-        [],
-        [
-          {
-            epic_id: "fn-9-closed",
-            status: "done",
-            selection_review: '{"counts":{"overpowered":1}}',
-          },
-        ],
-      ),
-    );
-    expect(cap.exitCode).toBe(0);
-    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
-      data: {
-        jammed: boolean;
-        drained: boolean;
-        needs_human: { selection_reviews: number; total: number };
-      };
-    };
-    expect(env.data.needs_human.selection_reviews).toBe(1);
-    expect(env.data.needs_human.total).toBe(0);
     expect(env.data.jammed).toBe(false);
     expect(env.data.drained).toBe(true);
   });

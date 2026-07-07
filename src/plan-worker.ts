@@ -147,15 +147,6 @@ export interface PlanEpicMessage {
    * `null` when no question is parked (never-observed / cleared).
    */
   question: string | null;
-  /**
-   * The epic-level selection-review record, ingested from
-   * `.keeper/state/epics/<epic_id>.state.json` (top-level `selection_review`
-   * field) — a small JSON verdict summary, carried alongside {@link question}
-   * in the scanner's per-epic cache so a def change composes against the latest
-   * observed review and vice versa. `null` when none is stamped
-   * (never-observed / cleared).
-   */
-  selectionReview: string | null;
 }
 
 /** Snapshot message for one `.keeper/tasks/*.json` file. */
@@ -615,12 +606,11 @@ interface RawTaskState {
 /**
  * Raw plan epic runtime-state JSON shape — only the field we project. The
  * state file (`.keeper/state/epics/<epic_id>.state.json`) is written by plan
- * `LocalFileStateStore.saveEpicRuntime` (`keeper plan epic-question` /
- * `selection-review`); keeper ingests `question` + `selection_review`.
+ * `LocalFileStateStore.saveEpicRuntime` (`keeper plan epic-question`); keeper
+ * ingests `question`.
  */
 interface RawEpicState {
   question?: unknown;
-  selection_review?: unknown;
 }
 
 /** Coerce a value to a non-empty string, else null. */
@@ -797,51 +787,6 @@ export function coerceEpicQuestion(
   return null;
 }
 
-/** Upper bound on the coerced selection-review payload (mirrors the verb's
- * write-boundary cap). An overlay value longer than this folds to `null` rather
- * than bloating the deterministic-replayed epics row — the acceptance's
- * "oversize overlay content folds to null" invariant, enforced here so a
- * hand-corrupted state file can never widen the projection. */
-export const SELECTION_REVIEW_MAX_CHARS = 4000;
-
-/**
- * Coerce a value off an epic state file to the selection-review field. A
- * non-empty, in-cap, JSON-parseable string passes through; a
- * missing/`null`/empty-string field defaults silently to `null` (no review);
- * any other value — wrong type, oversize, or malformed JSON — coerces to `null`
- * with a stderr log via `onInvalid`. Mirrors {@link coerceEpicQuestion} but
- * adds the size + JSON-shape guards the acceptance demands: malformed or
- * oversize overlay content folds to null (never throws, never dead-letters).
- * Runs producer-side, so the JSON.parse validation keeps the reducer fold a
- * trivial pass-through and re-fold determinism intact.
- */
-export function coerceSelectionReview(
-  v: unknown,
-  onInvalid?: (raw: unknown) => void,
-): string | null {
-  if (v === undefined || v === null) {
-    return null; // missing/explicit-null field — quiet default, no log
-  }
-  if (typeof v === "string") {
-    if (v.length === 0) {
-      return null; // empty — quiet default, no log
-    }
-    if (v.length <= SELECTION_REVIEW_MAX_CHARS) {
-      try {
-        JSON.parse(v);
-        return v;
-      } catch {
-        // malformed JSON — fall through to the onInvalid path
-      }
-    }
-    // oversize or malformed JSON string
-  }
-  if (onInvalid) {
-    onInvalid(v);
-  }
-  return null;
-}
-
 /**
  * Parse a stored JSON-TEXT array column (`epics.depends_on_epics`) back into a
  * clean `string[]` — JSON.parse then {@link asStringArray}. A NULL/empty/
@@ -944,16 +889,6 @@ export class PlanScanner {
    * path — the cache is the state file's projection.
    */
   private readonly epicQuestionCache = new Map<string, string | null>();
-  /**
-   * Per-epic cache of the latest selection-review payload observed in
-   * `.keeper/state/epics/<epic_id>.state.json` (top-level `selection_review`
-   * field) — the sibling of {@link epicQuestionCache}, carried in the same
-   * `epic-state` overlay. Keyed by plan epic id; an epic never observed reads
-   * `null` (no review). Updated by an `onChange` over an `epic-state` path
-   * AFTER the file coerce-parses cleanly, and reset to `null` by `onDelete`
-   * over the same path. NEVER mutated from an `epic` (definition) path.
-   */
-  private readonly epicSelectionReviewCache = new Map<string, string | null>();
   /**
    * The set of plan ids whose backing `.json` file was actually enumerated
    * on disk by a boot scan ({@link markSeen}, called from `scanPlanDir` for
@@ -1284,19 +1219,6 @@ export class PlanScanner {
   }
 
   /**
-   * Prime the per-epic selection-review cache from a boot enumeration of
-   * `.keeper/state/epics/<epic_id>.state.json` — the sibling of
-   * {@link primeEpicQuestion}, sharing the same overlay file. Pure cache write:
-   * emits no snapshot, touches neither `pathToId` nor the on-disk census.
-   */
-  primeEpicSelectionReview(
-    epicId: string,
-    selectionReview: string | null,
-  ): void {
-    this.epicSelectionReviewCache.set(epicId, selectionReview);
-  }
-
-  /**
    * Process a delete for `path`. Emits a tombstone so the projection retracts,
    * then drops the change-gate entry (so a re-created file re-emits). A path
    * with no change-gate entry (never folded) emits nothing — nothing to retract.
@@ -1340,23 +1262,19 @@ export class PlanScanner {
       return;
     }
     if (kind === "epic-state") {
-      // Sidecar delete: reset the question + selection-review caches to `null`
-      // (reverts to "no parked question / no review") and re-emit an
-      // EpicSnapshot from the still-present epic-definition file. A state-file
-      // path is NOT tracked in `pathToId` (the cache key is the epic id
-      // directly), so there is no entry to drop there. Mirrors the `task-state`
-      // arm above.
+      // Sidecar delete: reset the question cache to `null` (reverts to "no
+      // parked question") and re-emit an EpicSnapshot from the still-present
+      // epic-definition file. A state-file path is NOT tracked in `pathToId`
+      // (the cache key is the epic id directly), so there is no entry to drop
+      // there. Mirrors the `task-state` arm above.
       const epicId = epicIdFromStatePath(path);
       if (epicId === null) {
         return;
       }
-      const hadCache =
-        this.epicQuestionCache.has(epicId) ||
-        this.epicSelectionReviewCache.has(epicId);
+      const hadCache = this.epicQuestionCache.has(epicId);
       this.epicQuestionCache.delete(epicId);
-      this.epicSelectionReviewCache.delete(epicId);
       if (!hadCache) {
-        // Both caches were already empty (reading the default null); deleting a
+        // The cache was already empty (reading the default null); deleting a
         // never-cached sidecar can't change the projection. Skip the re-emit.
         return;
       }
@@ -1490,10 +1408,10 @@ export class PlanScanner {
 
   /**
    * Read the epic-definition file at `defPath` (if present) and re-emit an
-   * EpicSnapshot composed with the latest cached parked question +
-   * selection-review. Used by the `epic-state` change/delete arms — the sidecar
-   * carries only the overlay fields (`question`, `selection_review`), but the
-   * snapshot the reducer folds is full. Mirrors {@link reemitTaskFromDef}.
+   * EpicSnapshot composed with the latest cached parked question. Used by the
+   * `epic-state` change/delete arms — the sidecar carries only the overlay
+   * field (`question`), but the snapshot the reducer folds is full. Mirrors
+   * {@link reemitTaskFromDef}.
    *
    * A missing/unreadable/malformed definition file is skip-and-logged without
    * emitting; the next true `epic` event will replay through the same path.
@@ -1543,8 +1461,7 @@ export class PlanScanner {
       return false;
     }
     const question = this.epicQuestionCache.get(id) ?? null;
-    const selectionReview = this.epicSelectionReviewCache.get(id) ?? null;
-    const msg = buildEpicMessage(raw, question, selectionReview, this.log);
+    const msg = buildEpicMessage(raw, question, this.log);
     if (msg === null) {
       return false;
     }
@@ -1669,11 +1586,10 @@ export class PlanScanner {
       return this.reemitTaskFromDef(defPath);
     }
 
-    // `epic-state` (sidecar) updates the per-epic question + selection-review
-    // caches and re-emits an EpicSnapshot composed against the sibling
-    // definition file. Mirrors the `task-state` arm above; the sidecar carries
-    // the overlay fields, so the def file is read and merged in
-    // `reemitEpicFromDef`.
+    // `epic-state` (sidecar) updates the per-epic question cache and re-emits
+    // an EpicSnapshot composed against the sibling definition file. Mirrors the
+    // `task-state` arm above; the sidecar carries the overlay field, so the def
+    // file is read and merged in `reemitEpicFromDef`.
     if (kind === "epic-state") {
       const epicId = epicIdFromStatePath(path);
       if (epicId === null) {
@@ -1685,24 +1601,10 @@ export class PlanScanner {
           `[plan-worker] invalid epic question in ${path}: ${JSON.stringify(bad)}; defaulting to null`,
         );
       });
-      const selectionReview = coerceSelectionReview(
-        raw.selection_review,
-        (bad) => {
-          this.log(
-            `[plan-worker] invalid epic selection_review in ${path}: ${JSON.stringify(bad)}; defaulting to null`,
-          );
-        },
-      );
       const priorQuestion = this.epicQuestionCache.get(epicId) ?? null;
-      const priorSelectionReview =
-        this.epicSelectionReviewCache.get(epicId) ?? null;
       this.epicQuestionCache.set(epicId, question);
-      this.epicSelectionReviewCache.set(epicId, selectionReview);
-      if (
-        priorQuestion === question &&
-        priorSelectionReview === selectionReview
-      ) {
-        // Both cached values are unchanged: the composed EpicSnapshot wouldn't
+      if (priorQuestion === question) {
+        // The cached value is unchanged: the composed EpicSnapshot wouldn't
         // change and the change-gate would suppress it anyway.
         return false;
       }
@@ -1722,9 +1624,7 @@ export class PlanScanner {
       const id = asString(raw.id);
       const question =
         id !== null ? (this.epicQuestionCache.get(id) ?? null) : null;
-      const selectionReview =
-        id !== null ? (this.epicSelectionReviewCache.get(id) ?? null) : null;
-      msg = buildEpicMessage(raw, question, selectionReview, this.log);
+      msg = buildEpicMessage(raw, question, this.log);
     } else {
       // `kind === "task"`: thread the cached runtime status (default `"todo"`
       // when never observed) so the composed TaskSnapshot carries the sidecar
@@ -2097,18 +1997,12 @@ export function isWithinRoots(
 }
 
 /**
- * Build a `plan-epic` message from a parsed epic JSON, or null when the file
- * has no usable id (the projection pk). The number is derived from the id; every
- * other field is taken verbatim (coerced to string-or-null).
- */
-/**
  * Build a `plan-epic` message from a parsed epic JSON + the epic's current
- * parked question and selection-review (both carried in the sibling
- * `.keeper/state/epics/<id>.state.json` overlay), or null when the file has no
- * usable id. `question` / `selectionReview` are passed in by the caller (the
- * {@link PlanScanner}, which caches the last per-epic values) mirroring
- * {@link buildTaskMessage}'s `runtimeStatus` parameter; absent / never-observed
- * defaults to `null`.
+ * parked question (carried in the sibling `.keeper/state/epics/<id>.state.json`
+ * overlay), or null when the file has no usable id. `question` is passed in by
+ * the caller (the {@link PlanScanner}, which caches the last per-epic value)
+ * mirroring {@link buildTaskMessage}'s `runtimeStatus` parameter; absent /
+ * never-observed defaults to `null`.
  *
  * The OBJECT-LITERAL SLOT ORDER below is load-bearing — the change-gate
  * compares `JSON.stringify` output byte-for-byte, and the seed reconstruction
@@ -2118,7 +2012,6 @@ export function isWithinRoots(
 export function buildEpicMessage(
   raw: RawEpic,
   question: string | null = null,
-  selectionReview: string | null = null,
   // `log` is retained in the signature for call-site parity (the scanner passes
   // its own logger positionally) even though no field currently coerces.
   _log: (msg: string) => void = (m) => console.error(m),
@@ -2137,7 +2030,6 @@ export function buildEpicMessage(
     dependsOnEpics: asStringArray(raw.depends_on_epics),
     lastValidatedAt: asString(raw.last_validated_at),
     question,
-    selectionReview,
   };
 }
 
@@ -2706,16 +2598,6 @@ function scanPlanDir(
     if (primed) {
       scanner.primeEpicQuestion(epicId, coerced);
     }
-    let primedReview = true;
-    const coercedReview = coerceSelectionReview(raw.selection_review, (bad) => {
-      console.error(
-        `[plan-worker] boot scan invalid epic selection_review in ${full}: ${JSON.stringify(bad)}; skipping cache prime`,
-      );
-      primedReview = false;
-    });
-    if (primedReview) {
-      scanner.primeEpicSelectionReview(epicId, coercedReview);
-    }
   }
 
   // Pass 2: enumerate the canonical definition trees. Tasks now read the
@@ -2944,7 +2826,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
   // (the worst-case feedback loop documented in the epic's Risks section).
   const epics = db
     .query(
-      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, selection_review, tasks FROM epics",
+      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, tasks FROM epics",
     )
     .all() as {
     epic_id: string;
@@ -2955,7 +2837,6 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     depends_on_epics: string | null;
     last_validated_at: string | null;
     question: string | null;
-    selection_review: string | null;
     tasks: string | null;
   }[];
   for (const e of epics) {
@@ -2980,12 +2861,6 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       // always a non-empty string or NULL, so this is defensive-only). Slot
       // position MUST match `buildEpicMessage`'s return.
       question: asString(e.question),
-      // `selection_review` is a nullable TEXT column; `asString` collapses any
-      // non-string / empty-string stored value to `null`, mirroring
-      // `coerceSelectionReview`'s producer-side contract (a valid stored value
-      // is always a non-empty JSON string or NULL). Slot position (last) MUST
-      // match `buildEpicMessage`'s return.
-      selectionReview: asString(e.selection_review),
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
 

@@ -195,14 +195,6 @@ export interface ReadinessClientSnapshot {
   // distinctly and `keeper await` reads it (with `autopilotPaused`) to soften an
   // escalated-but-paused stall from `stuck` to `waiting`.
   readonly blockEscalations: BlockEscalation[];
-  // ADR 0011 OPT-IN: every epic carrying a non-null `selection_review` flag,
-  // ANY status — the NARROW unfiltered read behind the display-only
-  // selection-review needs-human class (`keeper status`, the board's needs-human
-  // block). Sourced from the `epics_selection_review` collection so a flagged
-  // CLOSED epic still appears (the open-filtered `epics` field drops it).
-  // `undefined` when the `includeSelectionReviewEpics` flag is off (board/dash's
-  // non-opt-in snapshot stays byte-identical).
-  readonly selectionReviewEpics?: readonly Epic[];
   // fn-941: the autopilot reconciler's paused flag, read off the `autopilot_state`
   // singleton (number column coerced to boolean; a missing/malformed row defaults
   // to PAUSED, mirroring `cli/autopilot.ts`'s coercion). Pairs with
@@ -1521,17 +1513,6 @@ export interface SubscribeOptions {
    * BYTE-IDENTICAL. Default `false`.
    */
   readonly includeDispatchFailures?: boolean;
-  /**
-   * ADR 0011 OPT-IN: also subscribe the `epics_selection_review` collection
-   * (every epic with a non-null `selection_review` flag, ANY status — UNBOUNDED,
-   * `limit: 0`) and carry the rows on the snapshot's `selectionReviewEpics`
-   * member. Set by the surfaces that render the display-only selection-review
-   * needs-human class (`keeper status`, `keeper board`) so a flagged CLOSED epic
-   * — dropped from the open-filtered `epics` field — is still visible. Board/dash
-   * leave it OFF, keeping the `states`/first-paint gate and the snapshot's member
-   * set BYTE-IDENTICAL. Default `false`.
-   */
-  readonly includeSelectionReviewEpics?: boolean;
 }
 
 /**
@@ -1758,27 +1739,6 @@ export function subscribeReadiness(
           limit: DISPATCH_FAILURES_PAGE_LIMIT,
         })
       : null;
-  // ADR 0011 OPT-IN: the `epics_selection_review` collection — every epic with a
-  // non-null `selection_review` flag, ANY status. Created, gated, and projected
-  // ONLY when `includeSelectionReviewEpics` is set; `null` otherwise (never added
-  // to `states`, never gated, never projected) so board/dash first-paint stays
-  // byte-identical. Subscribes UNBOUNDED (`EPICS_PAGE_LIMIT` = 0) — the
-  // `selection_review IS NOT NULL` descriptor filter is the natural bound.
-  const epicsSelectionReviewSubId = `${idPrefix}-epics-selection-review`;
-  const epicsSelectionReview =
-    opts.includeSelectionReviewEpics === true
-      ? makeState(
-          "epics_selection_review",
-          epicsSelectionReviewSubId,
-          "epic_id",
-          {
-            type: "query",
-            collection: "epics_selection_review",
-            id: epicsSelectionReviewSubId,
-            limit: EPICS_PAGE_LIMIT,
-          },
-        )
-      : null;
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1800,9 +1760,6 @@ export function subscribeReadiness(
   }
   if (dispatchFailures !== null) {
     states.push(dispatchFailures);
-  }
-  if (epicsSelectionReview !== null) {
-    states.push(epicsSelectionReview);
   }
 
   function emitSnapshotIfReady(): void {
@@ -1844,11 +1801,7 @@ export function subscribeReadiness(
       // painted snapshot always carries the REAL jam rows — a transient fold
       // failure can never read as "no jam". Empty produces a `result` with
       // `rows: []`, so it clears.
-      (dispatchFailures !== null && !dispatchFailures.gotResult) ||
-      // ADR 0011 OPT-IN: gate on the `epics_selection_review` collection ONLY
-      // when opted in (`null` otherwise). Empty produces a `result` with
-      // `rows: []`, so it clears.
-      (epicsSelectionReview !== null && !epicsSelectionReview.gotResult)
+      (dispatchFailures !== null && !dispatchFailures.gotResult)
     ) {
       return;
     }
@@ -2032,20 +1985,6 @@ export function subscribeReadiness(
       dispatchFailures === null
         ? undefined
         : projectRows<Row>(dispatchFailures);
-    // ADR 0011 OPT-IN: the flagged-epic rows for the display-only
-    // selection-review needs-human class — every epic with a non-null
-    // `selection_review`, ANY status. Projected off `byId` (single-column
-    // `epic_id` pk, no collapse). `undefined` when un-opted so board/dash's
-    // snapshot member set stays byte-identical.
-    const selectionReviewEpicsTyped =
-      epicsSelectionReview === null
-        ? undefined
-        : epicsSelectionReview.order.map(
-            (id) =>
-              (epicsSelectionReview.byId.get(id) ?? {
-                [epicsSelectionReview.pk]: id,
-              }) as unknown as Epic,
-          );
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -2073,9 +2012,6 @@ export function subscribeReadiness(
       ...(dispatchFailuresTyped === undefined
         ? {}
         : { dispatchFailures: dispatchFailuresTyped }),
-      ...(selectionReviewEpicsTyped === undefined
-        ? {}
-        : { selectionReviewEpics: selectionReviewEpicsTyped }),
       ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,
     });

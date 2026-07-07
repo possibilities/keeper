@@ -41,7 +41,6 @@ import {
   classifyPlanPath,
   coerceEpicQuestion,
   coerceRuntimeStatus,
-  coerceSelectionReview,
   decidePlanResubscribe,
   desiredReflogRepos,
   discoverPlanDirs,
@@ -61,7 +60,6 @@ import {
   reflogWatchDiff,
   repoRootFromPlanPath,
   resolveReflogTarget,
-  SELECTION_REVIEW_MAX_CHARS,
   scanRepoDataDirs,
   scanRoot,
   seedFromDb,
@@ -446,36 +444,6 @@ test("buildEpicMessage carries question passed in by the caller; defaults to nul
   expect(epicB?.question).toBe("ship or hold?");
 });
 
-test("coerceSelectionReview: valid in-cap JSON string passes; missing/null/empty → null silently; malformed JSON / oversize / wrong type → null with log (fn-1151.2)", () => {
-  const logs: unknown[] = [];
-  const good =
-    '{"counts":{"underpowered":1},"reviewed_at":"2026-07-07T00:00:00Z"}';
-  expect(coerceSelectionReview(good, (bad) => logs.push(bad))).toBe(good);
-  // Missing / null / empty-string silently default to null — no onInvalid fire.
-  expect(coerceSelectionReview(undefined, (bad) => logs.push(bad))).toBeNull();
-  expect(coerceSelectionReview(null, (bad) => logs.push(bad))).toBeNull();
-  expect(coerceSelectionReview("", (bad) => logs.push(bad))).toBeNull();
-  expect(logs).toEqual([]);
-  // Malformed JSON, oversize, and wrong-type all coerce to null AND fire onInvalid.
-  const malformed = "{not valid json";
-  expect(coerceSelectionReview(malformed, (bad) => logs.push(bad))).toBeNull();
-  const oversize = `"${"x".repeat(SELECTION_REVIEW_MAX_CHARS + 1)}"`;
-  expect(coerceSelectionReview(oversize, (bad) => logs.push(bad))).toBeNull();
-  expect(coerceSelectionReview(42, (bad) => logs.push(bad))).toBeNull();
-  expect(coerceSelectionReview({ x: 1 }, (bad) => logs.push(bad))).toBeNull();
-  expect(logs).toEqual([malformed, oversize, 42, { x: 1 }]);
-});
-
-test("buildEpicMessage carries selectionReview passed in by the caller; defaults to null when omitted (fn-1151.2)", () => {
-  const epicA = buildEpicMessage({ id: "fn-1-x" });
-  expect(epicA?.selectionReview).toBeNull();
-  const payload = '{"counts":{"overpowered":2}}';
-  const epicB = buildEpicMessage({ id: "fn-1-x" }, null, payload);
-  expect(epicB?.selectionReview).toBe(payload);
-  // question and selectionReview are independent slots.
-  expect(epicB?.question).toBeNull();
-});
-
 test("epicNumberFromId / taskNumberFromId: parse + null on no match", () => {
   expect(epicNumberFromId("fn-558-keeper-plans")).toBe(558);
   expect(epicNumberFromId("fn-1-x")).toBe(1);
@@ -516,8 +484,6 @@ test("buildEpicMessage maps primary_repo → projectDir, parses number", () => {
     lastValidatedAt: null,
     // No `question` arg passed — defaults to null (no parked question).
     question: null,
-    // No `selectionReview` arg passed — defaults to null (no review).
-    selectionReview: null,
   });
   expect(buildEpicMessage({})).toBeNull();
 });
@@ -582,7 +548,6 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
       dependsOnEpics: [],
       lastValidatedAt: null,
       question: null,
-      selectionReview: null,
     },
   ]);
 
@@ -1005,7 +970,6 @@ test("seedFromDb reconstructs last_validated_at field-identically (no synthetic 
     dependsOnEpics: [],
     lastValidatedAt: "2026-05-24T00:00:00Z",
     question: null,
-    selectionReview: null,
   };
   expect(JSON.stringify(fromBuild)).toBe(JSON.stringify(fromSeed));
 
@@ -2274,7 +2238,6 @@ test("fn-759: boot-seed asymmetry — seeded lastEmitted + empty pathToId → un
     dependsOnEpics: [],
     lastValidatedAt: null,
     question: null,
-    selectionReview: null,
   };
   scanner.seed("fn-3-demo", JSON.stringify(expectedMsg));
 

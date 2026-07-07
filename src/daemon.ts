@@ -6135,10 +6135,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // blob like every other plan-native field (no schema surprise; the
           // reducer folds it onto `epics.question`).
           question: msg.question,
-          // The epic-level selection-review record, sourced from the same
-          // gitignored `.state.json` overlay — rides free in the blob; the
-          // reducer folds it onto `epics.selection_review`.
-          selection_review: msg.selectionReview,
         });
       } else if (msg.kind === "plan-task") {
         hookEvent = "TaskSnapshot";

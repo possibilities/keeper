@@ -435,6 +435,9 @@ from pathlib import Path
 # v113 (fn-1164 task .1) appends the nullable ``jobs.last_lifecycle_ts`` REAL
 # column (the per-row lifecycle stamp) via a REWINDING migration; keeper-py reads
 # no jobs projection internals, so only the version whitelist gains 113.
+# v114 (fn-1172 task .3) drops the ``epics.selection_review`` TEXT column (the
+# close-time selection-review record retires) via a REWINDING migration; the fixed
+# epics SELECT never named it, so only the version whitelist gains 114.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -520,6 +523,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         111,
         112,
         113,
+        114,
     }
 )
 

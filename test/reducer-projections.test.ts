@@ -4467,81 +4467,44 @@ test("EpicSnapshot ON CONFLICT update never wipes tasks/jobs when setting questi
 });
 
 // ---------------------------------------------------------------------------
-// Schema v112 / fn-1151 task .2 — epics.selection_review (close-time review)
+// A historical EpicSnapshot blob still carrying a retired `selection_review`
+// key folds safely to the current (narrower) epics shape — the fold reads
+// around the unknown key, never throws, and re-fold stays deterministic.
 // ---------------------------------------------------------------------------
 
-function getEpicSelectionReview(epicId: string): string | null {
-  const row = db
-    .query("SELECT selection_review FROM epics WHERE epic_id = ?")
-    .get(epicId) as { selection_review: string | null } | null;
-  return row?.selection_review ?? null;
-}
-
-const REVIEW_PAYLOAD =
-  '{"counts":{"underpowered":1,"overpowered":2},"reviewed_at":"2026-07-07T00:00:00Z"}';
-
-test("EpicSnapshot with a selection_review folds onto epics.selection_review; absent folds to NULL (fn-1151.2)", () => {
-  epicSnapshotEvent("fn-40-review", {
+test("a historical EpicSnapshot carrying a retired selection_review key folds safely and re-folds byte-identically", () => {
+  const legacyReview =
+    '{"counts":{"underpowered":1,"overpowered":2},"reviewed_at":"2026-07-07T00:00:00Z"}';
+  // A pre-removal event shape: the blob still carries `selection_review`. The
+  // fold ignores the unknown key (never throws, never dead-letters) and the
+  // epic row lands with its live fields intact.
+  epicSnapshotEvent("fn-40-legacy-review", {
     epic_number: 40,
     status: "open",
-    selection_review: REVIEW_PAYLOAD,
+    question: "ship or hold?",
+    selection_review: legacyReview,
   });
+  epicSnapshotEvent("fn-41-clean", { epic_number: 41, status: "open" });
   drainAll();
-  expect(getEpicSelectionReview("fn-40-review")).toBe(REVIEW_PAYLOAD);
+  expect(getEpicQuestion("fn-40-legacy-review")).toBe("ship or hold?");
 
-  // A later EpicSnapshot with no `selection_review` key folds to NULL (clears
-  // it) — the fold is a pure function of the CURRENT blob, not a merge.
-  epicSnapshotEvent("fn-40-review", { epic_number: 40, status: "open" });
-  drainAll();
-  expect(getEpicSelectionReview("fn-40-review")).toBeNull();
-});
-
-test("a fresh epic row with no EpicSnapshot.selection_review reads NULL (zero-event default) (fn-1151.2)", () => {
-  epicSnapshotEvent("fn-41-no-review", { epic_number: 41, status: "open" });
-  drainAll();
-  expect(getEpicSelectionReview("fn-41-no-review")).toBeNull();
-});
-
-test("from-scratch re-fold reproduces epics.selection_review byte-identically (fn-1151.2)", () => {
-  epicSnapshotEvent("fn-42-replay-r", {
-    epic_number: 42,
-    status: "open",
-    selection_review: REVIEW_PAYLOAD,
-  });
-  epicSnapshotEvent("fn-43-replay-nor", { epic_number: 43, status: "open" });
-  drainAll();
   const before = db
-    .query("SELECT epic_id, selection_review FROM epics ORDER BY epic_id ASC")
+    .query(
+      "SELECT epic_id, epic_number, status, question FROM epics ORDER BY epic_id ASC",
+    )
     .all();
+  // From-scratch re-fold over the same log (still carrying the legacy key)
+  // reproduces the projection byte-identically.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
   db.run("DELETE FROM epic_tombstones");
   drainAll();
   const after = db
-    .query("SELECT epic_id, selection_review FROM epics ORDER BY epic_id ASC")
+    .query(
+      "SELECT epic_id, epic_number, status, question FROM epics ORDER BY epic_id ASC",
+    )
     .all();
   expect(after).toEqual(before);
-  expect(getEpicSelectionReview("fn-42-replay-r")).toBe(REVIEW_PAYLOAD);
-  expect(getEpicSelectionReview("fn-43-replay-nor")).toBeNull();
-});
-
-test("EpicSnapshot ON CONFLICT update never wipes tasks/jobs when setting selection_review (fn-1151.2)", () => {
-  taskSnapshotEvent("fn-44-r-with-tasks.1", {
-    epic_id: "fn-44-r-with-tasks",
-    task_number: 1,
-    title: "t1",
-  });
-  drainAll();
-  expect(getTask("fn-44-r-with-tasks.1")).not.toBeNull();
-
-  epicSnapshotEvent("fn-44-r-with-tasks", {
-    epic_number: 44,
-    status: "open",
-    selection_review: REVIEW_PAYLOAD,
-  });
-  drainAll();
-  expect(getEpicSelectionReview("fn-44-r-with-tasks")).toBe(REVIEW_PAYLOAD);
-  expect(getTask("fn-44-r-with-tasks.1")).not.toBeNull();
 });
 
 // ---------------------------------------------------------------------------
