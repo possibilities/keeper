@@ -212,10 +212,39 @@ test("resolvePanelMembers: a single preset → a one-member panel", () => {
 });
 
 test("resolvePanelMembers: an unknown name is fail-loud (no fallback)", () => {
-  const r = resolvePanelMembers({ presets: {} }, EMPTY_SELECTIONS, "default");
+  const r = resolvePanelMembers({ presets: {} }, EMPTY_SELECTIONS, "nonesuch");
   expect(r.ok).toBe(false);
   if (r.ok) return;
-  expect(r.error).toContain("default");
+  expect(r.error).toContain("nonesuch");
+});
+
+test("resolvePanelMembers: 'default' dereferences the configured default panel", () => {
+  // The default pointer names a panel called `reviewers`, not one literally
+  // named `default` — proving `default` is a symbolic pointer, not a frozen name.
+  const catalog: PresetCatalog = {
+    presets: { rA: preset("claude"), rB: preset("codex") },
+  };
+  const sel: PanelSelections = {
+    panels: { reviewers: ["rA", "rB"] },
+    default: "reviewers",
+  };
+  const r = resolvePanelMembers(catalog, sel, "default");
+  expect(r.ok).toBe(true);
+  if (!r.ok) return;
+  expect(r.members).toEqual([
+    { name: "rA", harness: "claude", preset: "rA" },
+    { name: "rB", harness: "codex", preset: "rB" },
+  ]);
+});
+
+test("resolvePanelMembers: 'default' with no configured default is fail-loud naming 'default'", () => {
+  const catalog: PresetCatalog = { presets: { rA: preset("claude") } };
+  const sel: PanelSelections = { panels: { reviewers: ["rA"] }, default: null };
+  const r = resolvePanelMembers(catalog, sel, "default");
+  expect(r.ok).toBe(false);
+  if (r.ok) return;
+  expect(r.error).toContain("--panel default");
+  expect(r.error).toContain("panel.yaml");
 });
 
 test("resolvePanelMembers: a pi single-preset is accepted (pair-launchable)", () => {
@@ -408,6 +437,52 @@ test("start: no --panel and no default panel is fail-loud (exit 2)", async () =>
   );
   expect(code).toBe(2);
   expect(stderr()).toContain("no default panel");
+});
+
+test("start: an explicit --panel default resolves the configured default panel", async () => {
+  // The default pointer names `reviewers`, so `--panel default` must dereference
+  // it (git-HEAD style) rather than look for a panel literally named `default`.
+  const { deps, spawns } = makeDeps({
+    catalog: { presets: { opus: preset("claude"), codex: preset("codex") } },
+    selections: {
+      panels: { reviewers: ["opus", "codex"] },
+      default: "reviewers",
+    },
+  });
+  const code = await panelStart(
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 1800,
+    },
+    deps,
+  );
+  expect(code).toBe(0);
+  expect(spawns.length).toBe(2);
+  expect(spawns[0]?.argv).toContain("opus");
+  expect(spawns[1]?.argv).toContain("codex");
+});
+
+test("start: --panel default with no configured default is fail-loud naming what was typed", async () => {
+  const { deps, stderr } = makeDeps({
+    catalog: DEFAULT_CATALOG,
+    selections: { panels: { reviewers: ["opus", "codex"] }, default: null },
+  });
+  const code = await panelStart(
+    {
+      promptFile: writePrompt(),
+      slug: "run-x",
+      panel: "default",
+      dir,
+      timeoutSeconds: 1800,
+    },
+    deps,
+  );
+  expect(code).toBe(2);
+  // Distinct from the no-flag guard: this message names `--panel default`.
+  expect(stderr()).toContain("--panel default given");
 });
 
 test("start: a per-leg spawn failure records a null pidfile (no crash)", async () => {

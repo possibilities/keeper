@@ -297,17 +297,34 @@ export type ResolveMembersResult =
 
 /**
  * Resolve a panel name to its members against the catalog + panel selections.
- * Precedence: a PANEL hit → its members (each named by its preset); else a
- * single catalog PRESET hit → a one-member panel; else an unknown name → fail
- * loud (the caller exits 2 — there is no zero-config fallback). A member pinning
- * a harness outside claude|codex|pi fails loud. Pure.
+ * The reserved name `default` is a symbolic pointer to the configured default
+ * panel (git-HEAD semantics), dereferenced to `selections.default` before the
+ * lookup; a null default fails loud naming what was typed. Otherwise: a PANEL
+ * hit → its members (each named by its preset); else a single catalog PRESET hit
+ * → a one-member panel; else an unknown name → fail loud (the caller exits 2 —
+ * there is no zero-config fallback). A member pinning a harness outside
+ * claude|codex|pi fails loud. Pure.
  */
 export function resolvePanelMembers(
   catalog: PresetCatalog,
   selections: PanelSelections,
   name: string,
 ): ResolveMembersResult {
-  const panelMembers = selections.panels[name];
+  // `default` is load-reserved (never a panel's or preset's own name), so it
+  // aliases the configured default panel — dereferenced here so the explicit
+  // `--panel default` path converges with the no-flag default path.
+  let lookup = name;
+  if (name === "default") {
+    if (selections.default === null || selections.default === "") {
+      return {
+        ok: false,
+        error: "--panel default given but no default panel set in panel.yaml",
+      };
+    }
+    lookup = selections.default;
+  }
+
+  const panelMembers = selections.panels[lookup];
   if (panelMembers !== undefined) {
     const members: PanelMember[] = [];
     for (const memberName of panelMembers) {
@@ -315,13 +332,13 @@ export function resolvePanelMembers(
       if (preset === undefined) {
         return {
           ok: false,
-          error: `panel '${name}' references undefined preset '${memberName}'`,
+          error: `panel '${lookup}' references undefined preset '${memberName}'`,
         };
       }
       if (!AGENT_CLIS.has(preset.harness)) {
         return {
           ok: false,
-          error: `panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
+          error: `panel '${lookup}' member '${memberName}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
         };
       }
       members.push({
@@ -331,26 +348,28 @@ export function resolvePanelMembers(
       });
     }
     if (members.length === 0) {
-      return { ok: false, error: `panel '${name}' resolved to zero members` };
+      return { ok: false, error: `panel '${lookup}' resolved to zero members` };
     }
     return { ok: true, members };
   }
 
-  const preset = catalog.presets[name];
+  const preset = catalog.presets[lookup];
   if (preset !== undefined) {
     if (!AGENT_CLIS.has(preset.harness)) {
       return {
         ok: false,
-        error: `preset '${name}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
+        error: `preset '${lookup}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
       };
     }
     return {
       ok: true,
-      members: [{ name, harness: preset.harness as AgentCli, preset: name }],
+      members: [
+        { name: lookup, harness: preset.harness as AgentCli, preset: lookup },
+      ],
     };
   }
 
-  return { ok: false, error: `'${name}' is not a known panel or preset` };
+  return { ok: false, error: `'${lookup}' is not a known panel or preset` };
 }
 
 /** The ad-hoc single-member selector (pairing = a panel of one). Exactly ONE of
@@ -1737,7 +1756,8 @@ Options:
   --slug <slug>     start: REQUIRED run id (each leg launches as
                     panel::<slug>::<preset>). wait/status: resolves the durable
                     slug dir. Slugified to [a-z0-9-]; empties-to-nothing → exit 2.
-  --panel <name>    Panel/preset name (default: the 'default' panel in panel.yaml)
+  --panel <name>    Panel name, catalog preset (panel of one), or 'default' to
+                    resolve the configured default panel in panel.yaml
   --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
   --cli <x>         Ad-hoc single member harness: claude|codex|pi
   --role <r>        Ad-hoc role prompt: default|planner|codereviewer|coplanner

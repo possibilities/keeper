@@ -1335,7 +1335,9 @@ async function runWaitCaptureSubcommand(
  * name matching a single preset emits `{kind:"preset", name, harness, model,
  * effort, thinking, role}` (absent fields null); a name matching a panel emits
  * `{kind:"panel", name, members:[{name, harness}, ...]}` in declaration order —
- * every member harness (claude|codex|pi) is pair-launchable. A `kind`
+ * every member harness (claude|codex|pi) is pair-launchable. The reserved name
+ * `default` dereferences to the configured default panel and reports that
+ * panel's real name (a null default is fail-loud naming `default`). A `kind`
  * discriminator pins the contract task 4's panel SKILL parses with jq. A name
  * matching neither is fail-loud (exit 2).
  */
@@ -1380,7 +1382,21 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
     throw exc;
   }
 
-  const panelMembers = selections.panels[name];
+  // `default` is reserved and can never be a catalog preset (the direct lookup
+  // above misses it), so here it aliases the configured default panel —
+  // dereferenced to its real name so the envelope reports the target panel.
+  let lookup = name;
+  if (name === "default") {
+    if (selections.default === null || selections.default === "") {
+      deps.writeErr(
+        "Error: 'default' given but no default panel set in panel.yaml.\n",
+      );
+      return deps.exit(2);
+    }
+    lookup = selections.default;
+  }
+
+  const panelMembers = selections.panels[lookup];
   if (panelMembers !== undefined) {
     // Load-time validation already guarantees each member resolves to a
     // panel-launchable (claude|codex) catalog preset.
@@ -1388,7 +1404,7 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
       const preset = catalog.presets[memberName] as Preset;
       return { name: memberName, harness: preset.harness };
     });
-    deps.write(`${JSON.stringify({ kind: "panel", name, members })}\n`);
+    deps.write(`${JSON.stringify({ kind: "panel", name: lookup, members })}\n`);
     return deps.exit(0);
   }
 

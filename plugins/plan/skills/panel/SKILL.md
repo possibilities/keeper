@@ -32,13 +32,34 @@ yourself.
 ## Spawn the runner
 
 Pass the human's task **verbatim** — never summarize, reframe, or pre-read referenced content into it; that
-corrupts the independence the panel runs on. If the human named a specific panel, name it; otherwise the
-runner defaults to the `default` panel. Also **auto-derive a short run slug** — a few kebab words drawn from
+corrupts the independence the panel runs on. Put the panel the wielding context or the human already chose on
+the `Panel:` line; omit it to let the configured default resolve — the same inference drives a routing skill
+and this one, so a wielder's choice flows straight into the spawn template. Also **auto-derive a short run
+slug** — a few kebab words drawn from
 the task (`[a-z0-9-]`, e.g. `oauth-token-refresh`); pick a sensible default, don't stall or ask. Inject it
 as a `Slug:` line so the runner forwards it (each panelist leg launches as `panel::<slug>::<preset>`, keeping
 the run identifiable in tmux + forensics). **Capture that slug verbatim** — you replay it byte-for-byte if the
 runner's return is malformed and you re-drive (see *Validate the runner's return*), so the same slug
 reconciles the existing run instead of fanning out a second one.
+
+Which panel to name, and when a broader one earns its cost, follows the strength rubric:
+
+<!-- BAKE:BEGIN keeper prompt render engineering/panel-strength -->
+
+**The configured panel roster lives in `~/.config/keeper/panel.yaml`.** It defines one or more named panels — each an ordered selection of presets — and an optional top-level `default` pointer naming the panel to convene when none is chosen. Panels may be defined, renamed, or removed at any time, so never hard-code a panel name or assume a particular one exists; read the live roster with `keeper agent presets list` (`--json` for structure) at decision time.
+
+**A panel's strength is read from its member count and harness diversity.** More members across more distinct harnesses buy more independent cross-checking — at proportional cost, and the panel runs as slow as its slowest member. Reach for a broader panel only when the stakes below justify that cost.
+
+Pick where a panel-worthy question lands:
+
+- **The human named a panel** — pass that name through as the panel argument, verbatim. Their choice stands; don't second-guess it against the roster.
+- **An ordinary panel-worthy question** — convene the configured default: omit the panel argument and let the `default` pointer resolve. This is the common path.
+- **The answer anchors above-inline work, or being confidently wrong is expensive** — run `keeper agent presets list` (`--json` for structure), read the roster, and pass a broader configured panel for the extra cross-checking.
+- **Ambiguous which way it leans** — take the configured default. A redundant fan-out is cheaper than an under-checked answer, and the default is the calibrated middle.
+
+**When roster discovery fails, or no default is configured** — skip the panel: answer the question directly without one, and tell the human about the config gap so they can fix `panel.yaml`. A missing roster or default is a configuration problem to surface, never a reason to stall or to invent a panel name.
+
+<!-- BAKE:END keeper prompt render engineering/panel-strength -->
 
 ```
 Task(

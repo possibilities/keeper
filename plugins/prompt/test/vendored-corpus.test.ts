@@ -35,14 +35,9 @@ const REPO_ROOT = resolve(
   "..",
 );
 const CORPUS = vendoredCorpusRoot();
-const HACK_SKILL = join(
-  REPO_ROOT,
-  "plugins",
-  "plan",
-  "skills",
-  "hack",
-  "SKILL.md",
-);
+const SKILLS_ROOT = join(REPO_ROOT, "plugins", "plan", "skills");
+const HACK_SKILL = join(SKILLS_ROOT, "hack", "SKILL.md");
+const PANEL_SKILL = join(SKILLS_ROOT, "panel", "SKILL.md");
 // The worker/skill-reachable surfaces a render cite can appear on: keeper + plan
 // skill bodies, the plan agent briefs (worker + practice-scout templates), and
 // the vendored snippet bodies themselves (a cite inside a rendered snippet is
@@ -111,14 +106,21 @@ describe("vendor.lock manifest", () => {
 });
 
 describe("baked snippets", () => {
-  test("every BAKE guard equals its render; every POINTER ref resolves", () => {
+  test("every hack BAKE guard equals its render; every POINTER ref resolves", () => {
     const { ok, errors } = verifyBakes(HACK_SKILL, CORPUS);
     expect(errors).toEqual([]);
     expect(ok).toBe(true);
   });
 
-  test("the six byte-verbatim bake guards are all present", () => {
-    expect(bakeCount(readFileSync(HACK_SKILL, "utf-8"))).toBe(6);
+  test("every panel BAKE guard equals its render; every POINTER ref resolves", () => {
+    const { ok, errors } = verifyBakes(PANEL_SKILL, CORPUS);
+    expect(errors).toEqual([]);
+    expect(ok).toBe(true);
+  });
+
+  test("the seven hack + one panel byte-verbatim bake guards are all present", () => {
+    expect(bakeCount(readFileSync(HACK_SKILL, "utf-8"))).toBe(7);
+    expect(bakeCount(readFileSync(PANEL_SKILL, "utf-8"))).toBe(1);
   });
 });
 

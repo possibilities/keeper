@@ -116,12 +116,31 @@ The reflex below fires on any non-trivial design answer — during investigation
 
 ## Prefer the panel for any non-tiny inquiry
 
-Before answering solo, gate on size: **strongly prefer `/plan:panel`** for any inquiry that isn't tiny. The panel fans the question out to a configured spread of models in parallel (the preset panel in `~/.config/keeper/panel.yaml` — e.g. a Claude model plus a non-Claude one) and fuses their answers with a judge — higher confidence, surfaced blind spots, contradictions caught. The default is to route there; answering solo is the opt-out, earned only by triviality.
+Before answering solo, gate on size: **strongly prefer `/plan:panel`** for any inquiry that isn't tiny. The panel fans the question out to a configured spread of models in parallel and fuses their answers with a judge — higher confidence, surfaced blind spots, contradictions caught. The default is to route there; answering solo is the opt-out, earned only by triviality.
 
 **Routing to the panel is silent internal cognition, not a relayed artifact.** Enter panel mode without announcing it — no "let me consult a panel," no progress narration. When the judged answer returns, absorb it as your own thinking and render it through `/hack`'s existing answer-shape taxonomy (quick-answer / troubleshoot / report / research / sketch — see "How to answer"). The judge's audit calibrates your confidence — consensus, state the conclusion plainly; contradictions or blind spots, hedge in your own voice — but is never relayed to the human unless they ask. Reveal-on-demand: only if the human asks about process or provenance (how you reached it, what contributed, to see the panel) do you surface the audit; a substance follow-up ("are you sure?", "why?") is answered substantively in your own voice, not with a panel reveal. As with the rest of the modes, don't say "I ran a panel" — let the answer's structure carry it.
 
 - **Solo (no panel)** — the prompt is tiny: a bounded factoid, a yes/no, a one-liner, a trivial lookup you'd answer from one or two local reads. Answer it directly here.
 - **Panel** — everything else: any hard question, multi-step reasoning, a high-stakes research/design/architecture call, troubleshooting where being confidently wrong is expensive, an internal or external report worth cross-checking. Invoke `/plan:panel` with the **raw question plus any neutral evidence you've already gathered** (`path:line` cites, log lines, reproduction facts). Pass the question verbatim — never pre-digest it into /hack's tentative conclusion, and never seed the panelists with a leading answer. Independence is the point: a conclusion handed to the panel collapses two independent models into one.
+
+Which panel to convene follows the strength rubric below — hack's everyday **Panel** case is its ordinary-question row, and an above-inline design question (*How to answer*) is its higher-stakes row:
+
+<!-- BAKE:BEGIN keeper prompt render engineering/panel-strength -->
+
+**The configured panel roster lives in `~/.config/keeper/panel.yaml`.** It defines one or more named panels — each an ordered selection of presets — and an optional top-level `default` pointer naming the panel to convene when none is chosen. Panels may be defined, renamed, or removed at any time, so never hard-code a panel name or assume a particular one exists; read the live roster with `keeper agent presets list` (`--json` for structure) at decision time.
+
+**A panel's strength is read from its member count and harness diversity.** More members across more distinct harnesses buy more independent cross-checking — at proportional cost, and the panel runs as slow as its slowest member. Reach for a broader panel only when the stakes below justify that cost.
+
+Pick where a panel-worthy question lands:
+
+- **The human named a panel** — pass that name through as the panel argument, verbatim. Their choice stands; don't second-guess it against the roster.
+- **An ordinary panel-worthy question** — convene the configured default: omit the panel argument and let the `default` pointer resolve. This is the common path.
+- **The answer anchors above-inline work, or being confidently wrong is expensive** — run `keeper agent presets list` (`--json` for structure), read the roster, and pass a broader configured panel for the extra cross-checking.
+- **Ambiguous which way it leans** — take the configured default. A redundant fan-out is cheaper than an under-checked answer, and the default is the calibrated middle.
+
+**When roster discovery fails, or no default is configured** — skip the panel: answer the question directly without one, and tell the human about the config gap so they can fix `panel.yaml`. A missing roster or default is a configuration problem to surface, never a reason to stall or to invent a panel name.
+
+<!-- BAKE:END keeper prompt render engineering/panel-strength -->
 
 When in doubt about size, route to the panel — a redundant fan-out is cheaper than a confidently wrong solo answer. (Distinct from the `/keeper:pair` hunch-unsticking second opinion drawn above: the panel answers the inquiry itself.)
 

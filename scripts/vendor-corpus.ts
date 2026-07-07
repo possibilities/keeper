@@ -42,8 +42,8 @@ import {
 /** Templates dir relative to a corpus root, where snippet `path`s resolve. */
 const TEMPLATES = ["claude", "arthack", "template"];
 const CORPUS = vendoredCorpusRoot();
-/** Skill body carrying the byte-verbatim bake guards this gate re-renders. */
-const HACK_SKILL = resolve(
+/** Skill bodies carrying the byte-verbatim bake guards this gate re-renders. */
+const SKILLS_ROOT = resolve(
   CORPUS,
   "..",
   "..",
@@ -51,9 +51,9 @@ const HACK_SKILL = resolve(
   "plugins",
   "plan",
   "skills",
-  "hack",
-  "SKILL.md",
 );
+const HACK_SKILL = resolve(SKILLS_ROOT, "hack", "SKILL.md");
+const PANEL_SKILL = resolve(SKILLS_ROOT, "panel", "SKILL.md");
 
 interface IndexRow {
   name: string;
@@ -173,8 +173,12 @@ function main(argv: string[]): void {
   }
   const lockResult = verifyVendorLock(CORPUS);
   reportOrExit("vendored corpus drifted from vendor.lock", lockResult);
-  const bakeResult = verifyBakes(HACK_SKILL, CORPUS);
-  reportOrExit("baked snippets drifted from the vendored corpus", bakeResult);
+  for (const skill of [HACK_SKILL, PANEL_SKILL]) {
+    reportOrExit(
+      "baked snippets drifted from the vendored corpus",
+      verifyBakes(skill, CORPUS),
+    );
+  }
   process.stdout.write(
     "vendor-corpus: vendored corpus matches vendor.lock; bakes match renders\n",
   );
