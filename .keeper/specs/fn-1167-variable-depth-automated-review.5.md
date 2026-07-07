@@ -31,5 +31,5 @@ Daemon tests drive the producer with synthetic rows: fresh AUDIT_READY + live jo
 - [ ] Daemon suite green
 
 ## Done summary
-
+Daemon block-escalation producer learns the audit categories: AUDIT_READY blocks self-handle (no page) while the owning work/close orchestrator is live or within a post-death grace, escalating like any block only past grace after a witnessed orchestrator death; AUDIT_SEVERE pages immediately via the existing path. Autopilot skill documents the variable-depth close audit and the per-task gate.
 ## Evidence
