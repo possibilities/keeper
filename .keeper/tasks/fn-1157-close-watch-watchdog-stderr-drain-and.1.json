@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T03:47:52.143000Z",
+  "depends_on": [],
+  "epic": "fn-1157-close-watch-watchdog-stderr-drain-and",
+  "id": "fn-1157-close-watch-watchdog-stderr-drain-and.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Fix stderr drain, close coverage",
+  "updated_at": "2026-07-07T03:47:52.143000Z"
+}
