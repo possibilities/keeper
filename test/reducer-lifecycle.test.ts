@@ -6980,6 +6980,205 @@ test("lifecycle stamp: a duplicate SessionStart re-opens a terminal row only on 
 });
 
 // ---------------------------------------------------------------------------
+// fn-1164 (task .2): `idle_prompt` as positive idle evidence (ADR 0013 layer 2).
+// The Notification arm folds `event_type='idle_prompt'` from working -> stopped
+// behind the SAME terminal, sub-agent-yield, and lifecycle-stamp guards as the
+// Stop arm — a claude-authored explicit "the session is idle at the prompt"
+// signal, not absence-of-events. The two stamp-only kinds (permission_prompt,
+// elicitation_dialog) keep their never-flip-state behavior; unknowns short-circuit.
+// ---------------------------------------------------------------------------
+
+/** Read the permission-prompt kind annotation (never on the getJob type). */
+function getPermissionKind(jobId = "sess-a"): string | null {
+  const r = db
+    .query("SELECT last_permission_prompt_kind AS k FROM jobs WHERE job_id = ?")
+    .get(jobId) as { k: string | null } | null;
+  return r?.k ?? null;
+}
+
+test("idle_prompt: an idle Notification folds a working, non-terminal row (no fresh in-flight subagent) to stopped", () => {
+  // The core positive case: a claude idle_prompt Notification on a live working
+  // row with no sub-agent in flight is a quiescence — it folds to stopped and
+  // advances the lifecycle stamp to the event ts, exactly like a Stop. Expected
+  // values are hand-fixed, not re-derived from the fold under test.
+  insertEvent({ hook_event: "SessionStart", ts: 100 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 101 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(101);
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "idle_prompt",
+    ts: 102,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(102);
+});
+
+test("idle_prompt: a fresh in-flight sub-agent yield suppresses the flip (parent stays working, stamp untouched)", () => {
+  // Cloned from the Stop-arm sub-agent-yield guard: while a fresh in-flight
+  // sub-agent survives (SubagentStart with no SubagentStop), the parent is
+  // conceptually still working even though it emitted an idle Notification.
+  // Honoring the mid-yield idle_prompt would re-open the dup-fire window the
+  // guard closes — so the flip is suppressed and the lifecycle stamp (set by the
+  // prompt at 201, never advanced by SubagentStart) stays put.
+  insertEvent({ hook_event: "SessionStart", ts: 200 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 201 });
+  insertEvent({
+    hook_event: "SubagentStart",
+    agent_id: "sub-1",
+    agent_type: "Explore",
+    ts: 202,
+  });
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "idle_prompt",
+    ts: 203,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(201);
+});
+
+test("idle_prompt: a stale timestamp is swallowed — never stops a session a newer event proved live", () => {
+  // The stale-straggler direction: a Stop idles the row, a fresh PostToolUse
+  // (ts=410 > stamp) proves the session live again and pins the stamp to 410,
+  // then a stale idle_prompt straggler (ts=405 < 410) arrives. The quiescence
+  // gate (`ts >= stamp`) swallows it entirely — no flip, no stamp regression —
+  // so it can never re-stop a session that a newer event already proved working.
+  insertEvent({ hook_event: "SessionStart", ts: 400 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 401 });
+  insertEvent({ hook_event: "Stop", ts: 402 });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(402);
+
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 410 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(410);
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "idle_prompt",
+    ts: 405,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("working"); // stale idle_prompt swallowed
+  expect(getStamp()).toBe(410); // stamp never regressed
+});
+
+test("idle_prompt: a terminal row is untouched (shared terminal guard)", () => {
+  // The terminal guard (`state NOT IN ('ended','killed')`) is shared with the
+  // Stop arm: a late idle_prompt on an already-ended session must not re-touch
+  // it. The row stays 'ended' and the terminal event's stamp (502) is unchanged.
+  insertEvent({ hook_event: "SessionStart", ts: 500 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 501 });
+  insertEvent({ hook_event: "SessionEnd", ts: 502 });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  expect(getStamp()).toBe(502);
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "idle_prompt",
+    ts: 503,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  expect(getStamp()).toBe(502);
+});
+
+test("idle_prompt does not change the two stamp-only kinds: permission_prompt / elicitation_dialog still stamp their annotation, never flip state or the lifecycle stamp", () => {
+  // The separate-discriminator invariant: adding idle_prompt must leave the two
+  // whitelisted stamp kinds byte-identical — they annotate
+  // `last_permission_prompt_kind`, never flip `state`, and never touch
+  // `last_lifecycle_ts`. Drive both after a prompt (working, stamp 601) and
+  // assert the row stays working with the lifecycle stamp frozen at 601.
+  insertEvent({ hook_event: "SessionStart", ts: 600 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 601 });
+  drainAll();
+  expect(getStamp()).toBe(601);
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    ts: 602,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getPermissionKind()).toBe("permission");
+  expect(getStamp()).toBe(601); // lifecycle stamp untouched by a stamp-only kind
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "elicitation_dialog",
+    ts: 603,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getPermissionKind()).toBe("elicitation");
+  expect(getStamp()).toBe(601);
+});
+
+test("Notification: an unknown event_type still short-circuits (no flip, no stamp, no annotation)", () => {
+  // A non-whitelisted, non-idle Notification event_type (a real live value like
+  // `auth_success`) folds to nothing: permissionPromptKindFromEventType returns
+  // null and the arm short-circuits, leaving state, the lifecycle stamp, and the
+  // permission annotation all untouched.
+  insertEvent({ hook_event: "SessionStart", ts: 700 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 701 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(701);
+
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "auth_success",
+    ts: 702,
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(701);
+  expect(getPermissionKind()).toBeNull();
+});
+
+test("idle_prompt permutation: every ingest ordering of a turn whose max-ts event is idle_prompt folds to the SAME stopped state (extends the stamp permutation set)", () => {
+  // The previous task's permutation proof with idle_prompt as the turn-final
+  // quiescence in place of Stop. The max-ts event is the idle_prompt (ts=103), a
+  // quiescence, so the final state is 'stopped' with the stamp at 103 in EVERY
+  // ingest ordering — a straggler PostToolUse (ts=102 < 103) ingested LAST can no
+  // longer un-stop the correctly-idle row. Expected values are hand-fixed.
+  const turn = [
+    { hook_event: "UserPromptSubmit", ts: 100 },
+    { hook_event: "PreToolUse", tool_name: "Bash", ts: 101 },
+    { hook_event: "PostToolUse", tool_name: "Bash", ts: 102 }, // straggler
+    { hook_event: "Notification", event_type: "idle_prompt", ts: 103 },
+  ];
+  const label = (e: (typeof turn)[number]) =>
+    `${e.event_type ?? e.hook_event}@${e.ts}`;
+  const orderings = permutations(turn);
+  expect(orderings.length).toBe(24);
+  for (const ordering of orderings) {
+    resetForOrdering();
+    insertEvent({ hook_event: "SessionStart", ts: 99 });
+    for (const e of ordering) insertEvent(e);
+    drainAll();
+    expect({
+      order: ordering.map(label).join(","),
+      state: getJob()?.state,
+      stamp: getStamp(),
+    }).toEqual({
+      order: ordering.map(label).join(","),
+      state: "stopped",
+      stamp: 103,
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // fn-1008: canonical open-turn liveness — the `updated_at` activity re-base,
 // the open-`ok` background-hold, the ApiError guard's new freshness + collapse,
 // and the sweep widening.

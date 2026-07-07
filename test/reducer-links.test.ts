@@ -4826,17 +4826,16 @@ test("Notification:elicitation_dialog fold: stamps kind='elicitation' and does N
   expect(after?.last_permission_prompt_kind).toBe("elicitation");
 });
 
-test.each([
-  ["idle_prompt"],
-  ["auth_success"],
-  ["totally-unknown-subtype"],
-  [""],
-])(
+test.each([["auth_success"], ["totally-unknown-subtype"], [""]])(
   "Notification:%s does NOT stamp (strict gate — only permission_prompt + elicitation_dialog stamp)",
   (eventType: string) => {
-    // Strict gate: the four `event_type` values outside the allow-list
-    // are no-ops. Pin every one explicitly so a future code path that
-    // widens the map without widening the allow-list gets caught.
+    // Strict gate: these `event_type` values outside the allow-list are no-ops.
+    // Pin every one explicitly so a future code path that widens the map without
+    // widening the allow-list gets caught. `idle_prompt` is deliberately NOT in
+    // this set: it is a claude-authored POSITIVE idle signal that folds working
+    // -> stopped as a quiescence (ADR 0013 layer 2), a separate discriminator
+    // that never stamps the permission-prompt pair — its fold is exercised in
+    // test/reducer-lifecycle.test.ts, not here.
     const sessionId = `sess-pp-gate-${eventType || "empty"}`;
     insertEvent({ hook_event: "SessionStart", session_id: sessionId });
     insertEvent({ hook_event: "UserPromptSubmit", session_id: sessionId });

@@ -8969,15 +8969,66 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "Notification": {
+      // Three discriminated `event.event_type` values fold here: `idle_prompt`
+      // is a QUIESCING lifecycle signal (flips state), the other two are
+      // stamp-only annotations (never flip state).
+      //
+      // `idle_prompt` (ADR 0013 layer 2): a claude-authored POSITIVE assertion
+      // that the session is idle at the prompt — done as an explicit signal, not
+      // absence-of-events. It folds working -> stopped behind the SAME terminal,
+      // sub-agent-yield, and lifecycle-stamp guards as the Stop arm; drop any one
+      // and it re-opens the dup-fire window the sub-agent guard closes. Helper
+      // signal ONLY — claude is the sole harness emitting it, so no other arm may
+      // come to depend on it as the primary done signal. Handled via a SEPARATE
+      // discriminator (never routed through `permissionPromptKindFromEventType`)
+      // so the two stamp-only kinds stay byte-identical and the idle flip stays
+      // orthogonal to them.
+      if (event.event_type === "idle_prompt") {
+        // Sub-agent-yield guard, cloned from the Stop arm: while a fresh
+        // in-flight sub-agent survives, the parent session is conceptually still
+        // working even though it emitted an idle Notification, so skip the flip
+        // (the same open-turn predicate + same-name collapse +
+        // `MAX_STOP_YIELD_GAP_SEC` freshness bound anchored on `updated_at`).
+        if (
+          findFreshInFlightSubagentAnchor(
+            db,
+            jobId,
+            MAX_STOP_YIELD_GAP_SEC,
+            event.ts,
+          )
+        ) {
+          break;
+        }
+        // Quiescence gate (ADR 0013): applies at `ts >= stamp`, so a stale
+        // replayed idle_prompt straggler whose ts has regressed behind the stamp
+        // is swallowed entirely — no flip, no stamp advance, no re-fan. It can
+        // never stop a session a newer event already proved live, and (being
+        // quiescing) never resurrects one. Terminal guard shared with the Stop
+        // arm. Stamp value is `event.ts` only — re-fold deterministic.
+        const res = db.run(
+          `UPDATE jobs SET state = 'stopped', last_lifecycle_ts = ?,
+                           last_event_id = ?, updated_at = ?
+             WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')
+               AND ${lifecycleStampGate("quiesce")}`,
+          [ts, event.id, ts, jobId, ts],
+        );
+        // Sync only when the UPDATE actually wrote — a guarded no-op (terminal,
+        // stale straggler, or already-stopped row) must NOT re-fan a
+        // stale-but-unchanged element with the new event_id.
+        if (res.changes > 0) {
+          syncIfPlanRef(db, jobId, event.id, ts);
+        }
+        break;
+      }
       // Hook-event-driven fold of `Notification:permission_prompt` (the
       // tool-permission dialog) and `:elicitation_dialog` (an MCP input
       // request). The discriminator rides `event.event_type`. STRICT gate: only
-      // the two whitelisted values stamp; everything else short-circuits via
-      // `permissionPromptKindFromEventType` returning null (the post-switch
-      // fan-outs still fire). The stamp does NOT flip `state` — the pill layers
-      // `[awaiting:…]` on top of the live state without firing a Stop.
-      // Terminal-row guard cloned from the InputRequest arm. Stamp value is
-      // `event.ts` only — re-fold deterministic.
+      // the two whitelisted values stamp; every other value (idle_prompt handled
+      // above; unknowns) short-circuits via `permissionPromptKindFromEventType`
+      // returning null (the post-switch fan-outs still fire). The stamp does NOT
+      // flip `state` — the pill layers `[awaiting:…]` on top of the live state
+      // without firing a Stop. Terminal-row guard cloned from the InputRequest
+      // arm. Stamp value is `event.ts` only — re-fold deterministic.
       const kind = permissionPromptKindFromEventType(event.event_type);
       if (kind === null) {
         break;
