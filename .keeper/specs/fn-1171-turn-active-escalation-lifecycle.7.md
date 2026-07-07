@@ -37,5 +37,5 @@ Reconcile every surface that states the old behavior — revise clauses in place
 - [ ] README autoclose section mentions escalation-window reaping in one line
 
 ## Done summary
-
+Reconciled CONTEXT.md, CLAUDE.md, README.md, and the autopilot skill to turn-active occupancy / blocked-work needs-human phrasing; confirmed watch skill's six-delta-type wording already accurate.
 ## Evidence
