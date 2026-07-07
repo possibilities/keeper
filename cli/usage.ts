@@ -9,9 +9,9 @@
  * sessions` log (bottom). Each is change-gated on its own raw-field hash, so a
  * relative-time tick or a fetch-only refresh never forges a frame. Each usage
  * row is a stacked block — a header chip plus one indented body line per quota
- * window (session, week, sonnet, codex-spark), a Claude picker reserve line,
- * and, when present, a `limited lifts in <rel>` line and a `stale Nm` line. The
- * daemon-side usage worker folds synthetic
+ * window (session, week, sonnet, codex-spark), reserve annotations for Claude
+ * bars at the picker threshold, and, when present, a `limited lifts in <rel>`
+ * line and a `stale Nm` line. The daemon-side usage worker folds synthetic
  * `UsageSnapshot` / `UsageDeleted` events into the `usage` collection; the
  * reducer's fan-out mirrors `last_rate_limit_at` onto the usage row in the same
  * `BEGIN IMMEDIATE`. This module renders rows + writes sidecars;
@@ -113,9 +113,9 @@ On a keeper-STALE row every reset countdown renders \`—\` (a frozen
 snapshot's predicted times have all passed) and the \`limited\` line is
 dropped. A weekly-depleted row (week >= 100%) suppresses its \`session\`
 line — the panel collapses the session window to a reset-less 0%. An active
-Claude quota stack gets a \`balance · reserve at session ≥${SESSION_THRESHOLD}% / week ≥${WEEK_THRESHOLD}%\`
-line under its bars, making the picker reserve visible before the hard quota.
-A stack with a known FUTURE lift (\`rate_limit_lifts_at\`, schema v41 / fn-651)
+Claude quota stack with a session or week bar at the picker reserve gets a
+\`session · at reserve of ${SESSION_THRESHOLD}%\` and/or \`week · at reserve of ${WEEK_THRESHOLD}%\`
+line under its bars. A stack with a known FUTURE lift (\`rate_limit_lifts_at\`, schema v41 / fn-651)
 gets a colocated \`limited lifts in <rel>\` line under its quota lines
 (\`limited lifts now\` within the rounding gap). The line is OMITTED when
 the lift is past/unknown, when the row is stale, and for codex stacks.
@@ -399,20 +399,20 @@ function bar(v: unknown): string {
  *                    session  [█████░░░░░░░░░░░░░░░░░░░░░░░░░]  16% 29m
  *                    week     [███████████░░░░░░░░░░░░░░░░░░░]  36% 4d 5h
  *                    sonnet   [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   8% 4d 5h
- *                    balance  · reserve at session ≥80% / week ≥95%
+ *                    week     · at reserve of 95%
  *                    limited  · lifts in 1h 2m
  *                    stale    17m
  *
  * Body indent equals `wId + 1` so labels line up under the chip's `[`. Labels
  * padEnd to the widest label ACTUALLY rendered across the row set — `sonnet` /
- * `balance` / `limited` / `stale` only join that pool when at least one row
- * renders them — so a sonnet-less / limit-less / fresh screen still aligns pct cleanly. The
+ * `limited` / `stale` only join that pool when at least one row renders them —
+ * so a sonnet-less / limit-less / fresh screen still aligns pct cleanly. The
  * bar is fixed `BAR_WIDTH + 2` cols; pct cells padStart to the widest pct
  * across every rendered body line. The relative-time tail is unpadded; a row
  * whose reset ISO was empty renders no tail.
  *
- * The `balance` line renders under active Claude quota rows so the picker
- * reserve threshold is visible beside the hard-quota bars.
+ * A reserve annotation renders under an active Claude `session` / `week` bar
+ * only when that bar has reached the picker's reserve threshold.
  * The `limited` line renders ONLY when a non-codex row has a parseable FUTURE
  * lift (`rate_limit_lifts_at`) — NOT the fired-time `last_rate_limit_at`, so a
  * depleted-but-quiet row still surfaces its countdown. `lifts in <rel>` while
@@ -469,9 +469,10 @@ export function renderRowLines(
     cswBar: string | null;
     cswPct: string | null;
     cswReset: string;
-    // Empty when no `balance` line renders. Otherwise the static picker-policy
-    // note that makes the reserve threshold visible below the Claude bars.
-    balanceText: string;
+    // Empty when the corresponding bar is below the picker reserve. Otherwise
+    // the annotation body rendered under that bar.
+    sessionReserveText: string;
+    weekReserveText: string;
     // Empty when no `limited` line renders. Otherwise its tail: `lifts in
     // <rel>` while `rate_limit_lifts_at` is future, `lifts now` within the ±30s
     // gap. Gated on the future lift itself, not the fired-time
@@ -576,9 +577,28 @@ export function renderRowLines(
     const rawMult = typeof row.multiplier === "number" ? row.multiplier : null;
     const mult =
       rawMult === null && stableState !== null ? "" : formatMultiplier(rawMult);
-    const balanceText =
-      row.target === "claude" && stableState === null
-        ? `reserve at session ≥${SESSION_THRESHOLD}% / week ≥${WEEK_THRESHOLD}%`
+    const weekDepleted =
+      typeof row.week_percent === "number" && row.week_percent >= 100;
+    const sessionPercent =
+      typeof row.session_percent === "number" &&
+      Number.isFinite(row.session_percent)
+        ? row.session_percent
+        : null;
+    const weekPercent =
+      typeof row.week_percent === "number" && Number.isFinite(row.week_percent)
+        ? row.week_percent
+        : null;
+    const canRenderReserve = row.target === "claude" && stableState === null;
+    const sessionReserveText =
+      canRenderReserve &&
+      !weekDepleted &&
+      sessionPercent != null &&
+      sessionPercent >= SESSION_THRESHOLD
+        ? `at reserve of ${SESSION_THRESHOLD}%`
+        : "";
+    const weekReserveText =
+      canRenderReserve && weekPercent != null && weekPercent >= WEEK_THRESHOLD
+        ? `at reserve of ${WEEK_THRESHOLD}%`
         : "";
     return {
       id: `(${aliasOf(seg(row.id), aliases)})`,
@@ -591,8 +611,7 @@ export function renderRowLines(
       wBar: bar(row.week_percent),
       wPct: pct(row.week_percent),
       wReset: resetCell(seg(row.week_resets_at), nowMs, isStale),
-      weekDepleted:
-        typeof row.week_percent === "number" && row.week_percent >= 100,
+      weekDepleted,
       swBar: hasSonnet ? bar(row.sonnet_week_percent) : null,
       swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
       swReset: hasSonnet
@@ -612,7 +631,8 @@ export function renderRowLines(
       cswReset: hasCodexSparkWeek
         ? resetCell(seg(row.codex_spark_week_resets_at), nowMs, isStale)
         : "",
-      balanceText,
+      sessionReserveText,
+      weekReserveText,
       rlRel,
       staleRel,
       errContent,
@@ -657,7 +677,6 @@ export function renderRowLines(
   if (barCells.some((c) => c.swPct != null)) labels.push("sonnet");
   if (barCells.some((c) => c.cssPct != null)) labels.push("spark-5h");
   if (barCells.some((c) => c.cswPct != null)) labels.push("spark-week");
-  if (barCells.some((c) => c.balanceText !== "")) labels.push("balance");
   if (barCells.some((c) => c.rlRel !== "")) labels.push("limited");
   if (barCells.some((c) => c.staleRel !== "")) labels.push("stale");
   for (const c of barCells) {
@@ -678,8 +697,8 @@ export function renderRowLines(
     return rel === "" ? head : `${head} ${rel}`;
   };
 
-  // The `balance` and `limited` lines have no bar/pct — just `label · text`,
-  // indent and label-padding matching the quota body lines.
+  // Reserve and limited lines have no bar/pct — just `label · text`, indent
+  // and label-padding matching the quota body lines.
   const renderAnnotation = (label: string, text: string): string =>
     `${indent}${label.padEnd(wLabel, " ")} · ${text}`;
 
@@ -747,8 +766,11 @@ export function renderRowLines(
     if (c.cswPct != null && c.cswBar != null) {
       lines.push(renderBody("spark-week", c.cswBar, c.cswPct, c.cswReset));
     }
-    if (c.balanceText !== "") {
-      lines.push(renderAnnotation("balance", c.balanceText));
+    if (c.sessionReserveText !== "") {
+      lines.push(renderAnnotation("session", c.sessionReserveText));
+    }
+    if (c.weekReserveText !== "") {
+      lines.push(renderAnnotation("week", c.weekReserveText));
     }
     if (c.rlRel !== "") {
       lines.push(renderAnnotation("limited", c.rlRel));

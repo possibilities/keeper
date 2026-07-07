@@ -323,8 +323,8 @@ test("sonnet body line appears only on rows with sonnet_week data", () => {
     NOW_MS,
   );
   // codex block has 3 lines (header + session + week); claude block has
-  // 5 (header + session + week + sonnet + balance). Total = 8.
-  expect(lines).toHaveLength(8);
+  // 4 (header + session + week + sonnet). Total = 7.
+  expect(lines).toHaveLength(7);
   // No sonnet line anywhere in the codex block (the first 3 lines).
   expect(lines.slice(0, 3).join("\n")).not.toContain("sonnet");
   // claude block carries a sonnet body line with the proper format.
@@ -445,8 +445,12 @@ test("pct cells right-align to the widest pct across all body lines", () => {
   // padStart(4) gives "100%" / "  3%" / "  9%" / "  8%", which in the
   // body line lands as `] 100%` / `]   3%` etc. — `]` from the bar's
   // closing bracket + 1 separator + the padStart-padded pct.
-  const sessionRows = lines.filter((l) => l.trimStart().startsWith("session "));
-  const weekRows = lines.filter((l) => l.trimStart().startsWith("week "));
+  const sessionRows = lines.filter(
+    (l) => l.trimStart().startsWith("session ") && l.includes("["),
+  );
+  const weekRows = lines.filter(
+    (l) => l.trimStart().startsWith("week ") && l.includes("["),
+  );
   expect(sessionRows[0]).toContain("] 100%");
   expect(sessionRows[1]).toContain("]   3%");
   expect(weekRows[0]).toContain("]   9%");
@@ -473,41 +477,85 @@ function bodyLineExact(lines: string[], label: string): string | undefined {
   return lines.find((l) => l.trimStart().startsWith(`${label} `));
 }
 
-test("active Claude quota rows render the picker reserve balance line", () => {
+test("Claude quota rows render reserve notes only for windows at the picker threshold", () => {
   const lines = renderRowLines(
     [
       {
         id: "p",
         target: "claude",
         multiplier: 1,
-        session_percent: 10,
+        session_percent: 80,
         session_resets_at: isoOffset(60),
-        week_percent: 20,
+        week_percent: 95,
         week_resets_at: isoOffset(2 * 24 * 60),
       },
     ],
     NOW_MS,
   );
-  const balance = bodyLineExact(lines, "balance");
-  expect(balance).toBeDefined();
-  expect(balance as string).toMatch(
-    /balance · reserve at session ≥80% \/ week ≥95%$/,
-  );
-  expect(lines.indexOf(balance as string)).toBeGreaterThan(
+  const reserveLines = lines.filter((l) => l.includes("at reserve"));
+  expect(reserveLines).toHaveLength(2);
+  expect(reserveLines[0]).toMatch(/session · at reserve of 80%$/);
+  expect(reserveLines[1]).toMatch(/week {4}· at reserve of 95%$/);
+  expect(lines.indexOf(reserveLines[0] as string)).toBeGreaterThan(
     lines.findIndex((l) => l.trimStart().startsWith("week ")),
   );
 });
 
-test("balance line is omitted for codex and account-state annotation rows", () => {
+test("session and week reserve notes render independently", () => {
+  const sessionOnly = renderRowLines(
+    [
+      {
+        id: "session-hot",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 80,
+        session_resets_at: isoOffset(60),
+        week_percent: 94,
+        week_resets_at: isoOffset(2 * 24 * 60),
+      },
+    ],
+    NOW_MS,
+  ).filter((l) => l.includes("at reserve"));
+  expect(sessionOnly).toHaveLength(1);
+  expect(sessionOnly[0]).toMatch(/session · at reserve of 80%$/);
+
+  const weekOnly = renderRowLines(
+    [
+      {
+        id: "week-hot",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 79,
+        session_resets_at: isoOffset(60),
+        week_percent: 95,
+        week_resets_at: isoOffset(2 * 24 * 60),
+      },
+    ],
+    NOW_MS,
+  ).filter((l) => l.includes("at reserve"));
+  expect(weekOnly).toHaveLength(1);
+  expect(weekOnly[0]).toMatch(/week {4}· at reserve of 95%$/);
+});
+
+test("reserve notes are omitted below threshold, and for codex and account-state rows", () => {
   const lines = renderRowLines(
     [
+      {
+        id: "below",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 79,
+        session_resets_at: isoOffset(60),
+        week_percent: 94,
+        week_resets_at: isoOffset(2 * 24 * 60),
+      },
       {
         id: "codex",
         target: "codex",
         multiplier: 1,
-        session_percent: 10,
+        session_percent: 100,
         session_resets_at: isoOffset(60),
-        week_percent: 20,
+        week_percent: 100,
         week_resets_at: isoOffset(2 * 24 * 60),
       },
       {
@@ -520,7 +568,7 @@ test("balance line is omitted for codex and account-state annotation rows", () =
     ],
     NOW_MS,
   );
-  expect(bodyLineExact(lines, "balance")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("at reserve");
 });
 
 test("emits 'limited lifts in <rel>' when rate_limit_lifts_at is known and future (fn-754)", () => {
@@ -545,8 +593,8 @@ test("emits 'limited lifts in <rel>' when rate_limit_lifts_at is known and futur
     ],
     NOW_MS,
   );
-  // header + session + week + balance + limited = 5 lines.
-  expect(lines).toHaveLength(5);
+  // header + session + week + limited = 4 lines.
+  expect(lines).toHaveLength(4);
   const row = bodyLineExact(lines, "limited");
   expect(row, "expected a limited line").toBeDefined();
   expect(row as string).toMatch(/ lifts in 1h 2m$/);
@@ -999,8 +1047,8 @@ test("a keeper-stale row drops the limited line entirely", () => {
     ],
     NOW_MS,
   );
-  // header + session + week + balance + stale = 5 lines; no limited line.
-  expect(lines).toHaveLength(5);
+  // header + session + week + stale = 4 lines; no limited line.
+  expect(lines).toHaveLength(4);
   expect(bodyLineExact(lines, "limited")).toBeUndefined();
   expect(lines.join("\n")).not.toContain("limited");
   const stale = bodyLineExact(lines, "stale") as string;
@@ -1058,7 +1106,7 @@ test("omits the session line when the weekly window is depleted (>=100%)", () =>
     ],
     NOW_MS,
   );
-  // header + week + balance — the session body line is gone.
+  // header + week + week-reserve — the session body line is gone.
   expect(lines).toHaveLength(3);
   expect(bodyLineExact(lines, "session")).toBeUndefined();
   expect(bodyLine(lines, "week")).toMatch(/ 100%/);
@@ -1642,8 +1690,8 @@ test("stale error renders as an indented body line with type:message and ticking
     ],
     NOW_MS,
   );
-  // header + session + week + balance + error = 5 lines.
-  expect(lines).toHaveLength(5);
+  // header + session + week + error = 4 lines.
+  expect(lines).toHaveLength(4);
   const errLine = lines.find((l) => l.trimStart().startsWith("error "));
   expect(errLine).toBeDefined();
   expect(errLine).toContain("ParseError: label not found");
@@ -1697,8 +1745,8 @@ test("error line omitted when error_type is NULL (no stale error to show)", () =
     ],
     NOW_MS,
   );
-  // header + session + week + balance = 4 lines; no error.
-  expect(lines).toHaveLength(4);
+  // header + session + week = 3 lines; no error.
+  expect(lines).toHaveLength(3);
   expect(lines.find((l) => l.trimStart().startsWith("error "))).toBeUndefined();
 });
 
