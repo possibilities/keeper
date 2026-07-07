@@ -39,6 +39,25 @@
  * the fix, never a doomed `--resume` line); the load-bearing `cd` prefix is
  * repaired to the disk-anchored cwd, never dropped.
  *
+ * VERIFIED APPLY. `applyRestore` trusts window creation (the legacy `restored`
+ * outcome); `applyRestoreVerified` upgrades each tab to a durable, evidence-proven
+ * transaction (`src/restore-verify.ts`): it writes the intent BEFORE the launch,
+ * then settles it against on-disk attach evidence — `verified` (cleared),
+ * `launched-unverified` (a live pane with no evidence, a warn), or `failed` (a
+ * launch or a died resume, resurfaced in `keeper tabs list` until it verifies). An
+ * already-live session is an idempotent no-op (never a double-spawn).
+ *
+ * RESUME-TARGET REPAIR. A pre-fix resume cycle could leave a non-claude job's
+ * recorded `resume_target` pointing at a session id no on-disk artifact backs (the
+ * rot this epic closes). {@link proposePiRepair} is the shared confidence gate:
+ * for a rotted pi row it enumerates the same-cwd pi session files and, on exactly
+ * ONE plausible match within the proximity window, proposes the re-pin — two or
+ * more is AMBIGUOUS and never resolved. `keeper tabs repair` REPORTS these
+ * proposals read-only ({@link loadRepairProposals}); the actual re-pin is landed
+ * by the daemon's resume-target back-fill producer (a twin pass beside the codex
+ * back-fill), which mints the sanctioned `ResumeTargetResolved` synthetic event —
+ * never a direct `jobs` write, never a new RPC surface.
+ *
  * This module imports ONLY `src/` peers (no `cli/`), so both `cli/tabs.ts` and the
  * in-daemon restore-worker consume it. Every renderer is pure; the `load*` readers
  * open `keeper.db` read-only in one span; `applyRestore` routes each candidate
@@ -47,6 +66,8 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { harnessOrClaude } from "./agent/harness";
 import { openDb } from "./db";
 import {
@@ -71,9 +92,16 @@ import {
   type RestoreCandidate,
   selectGenerationFromEnriched,
 } from "./restore-set";
+import type { AttachVerdict, RestoreIntent } from "./restore-verify";
 import { probeServerGeneration } from "./restore-worker";
 import { buildResumeCommand } from "./resume-descriptor";
-import { defaultResumeResolver, type ResumeResolver } from "./resume-resolve";
+import {
+  defaultResumeResolver,
+  nodeResumeResolveFs,
+  type ResumeResolveFs,
+  type ResumeResolver,
+  resolveNonClaudeArtifact,
+} from "./resume-resolve";
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
@@ -92,6 +120,17 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
 export type AgentOutcome =
   | { kind: "would-restore"; candidate: RestoreCandidate }
   | { kind: "restored"; candidate: RestoreCandidate }
+  // A launch that verified against on-disk ATTACH EVIDENCE (a claude SessionStart
+  // for the requested session id, or a non-claude birth record on the carried job
+  // id) — the only outcome that grants "the tab re-attached". `restored` is the
+  // unverified legacy peer (window created, evidence not consulted); `verified` is
+  // the {@link applyRestoreVerified} upgrade.
+  | { kind: "verified"; candidate: RestoreCandidate }
+  // Launched, but no attach evidence appeared inside the verify bound and the pane
+  // is still alive — unconfirmed, surfaced as a WARN (never a false verified or a
+  // false failed). The tab's intent artifact survives so it resurfaces until it
+  // verifies.
+  | { kind: "launched-unverified"; candidate: RestoreCandidate; reason: string }
   | { kind: "failed"; candidate: RestoreCandidate; error: string }
   // A candidate keeper cannot resume — a non-claude harness whose native resume
   // target was never resolved, or whose target names no on-disk artifact.
@@ -257,31 +296,191 @@ export async function applyRestore(
   return out;
 }
 
-/** Count restored / failed / would-restore / not-resumable / preflight-failed
- *  outcomes in one pass. Exported so the consumer picks the partial-failure exit
- *  code without re-scanning. Neither `notResumable` nor `preflightFailed` is a
- *  launch failure — both are expected, reported skips that never trip the
- *  partial-failure exit (which keys on `failed` alone). */
+// ---------------------------------------------------------------------------
+// Verified apply — the per-tab durable, evidence-verified transaction
+// ---------------------------------------------------------------------------
+
+/** Verify one launched candidate against on-disk attach evidence — the injected
+ *  seam production wires to {@link import("./restore-verify").verifyAttach} and
+ *  tests fake with a fixed verdict. `launchStartMs` is the wall-clock captured
+ *  BEFORE the launch, so the real verify gates evidence on records at/after it
+ *  (rejecting a stale pre-crash SessionStart for the same session id). */
+export type AttachVerifyFn = (
+  candidate: RestoreCandidate,
+  launchStartMs: number,
+) => Promise<AttachVerdict>;
+
+/** The durable intent side of the transaction: persist the intent (write-before-
+ *  launch, overwrite on each state transition). A `verified` write drops the tab
+ *  off the resurface list (verified ∉ the OPEN states) — the "clear" the artifact
+ *  contract calls for — while leaving the marker on disk for the live-UUID no-op
+ *  (GC reaps it past the idle cutoff). */
+export interface IntentSink {
+  write(intent: RestoreIntent): void;
+}
+
+/** Injected deps for {@link applyRestoreVerified} — every non-pure seam, so the
+ *  transaction's state matrix is unit-tested with zero fs / tmux. `makeIntent`
+ *  builds the base (attempt-stamped) intent for a candidate; the loop drives its
+ *  `state`/`reason` transitions and hands it to `intent`. */
+export interface VerifiedApplyDeps {
+  ensureLaunched: EnsureLaunchedFn;
+  verify: AttachVerifyFn;
+  intent: IntentSink;
+  makeIntent: (candidate: RestoreCandidate) => RestoreIntent;
+  /** Idempotency gate: `true` when the candidate's session is ALREADY LIVE (a
+   *  recent attach for its id). A live session is a no-op — the tab is reported
+   *  `verified` WITHOUT a relaunch (never a double-spawn) and its intent cleared.
+   *  Absent ⇒ always attempt. */
+  isLive?: (candidate: RestoreCandidate) => boolean;
+  /** Wall-clock (ms) captured before each launch and handed to `verify` as the
+   *  evidence recency floor. Default `Date.now`. */
+  now?: () => number;
+  sleep?: SleepFn;
+}
+
+/** The reason strings the verified transaction stamps into a non-verified intent
+ *  + its outcome — exported so the CLI + tests key on ONE source of truth. */
+export const VERIFY_FAILED_REASON =
+  "resume attach failed — pane died with no attach evidence";
+export const VERIFY_UNVERIFIED_REASON =
+  "launched but attach unconfirmed within the verify bound (pane still alive)";
+
+/**
+ * The per-tab VERIFIED restore transaction: for each would-restore candidate,
+ * write the durable intent BEFORE the launch (`launched`), drive keeper's launch
+ * transport, then VERIFY the attach against on-disk evidence and settle the
+ * intent — cleared on `verified`, rewritten `failed` / `launched-unverified`
+ * otherwise so the tab resurfaces in `keeper tabs list` until it verifies. A
+ * transport failure (or a thrown launch) is `failed` with no verify. Continues
+ * past a single tab's failure, and paces {@link INTER_WINDOW_PAUSE_MS} between
+ * consecutive launches (outside the per-tab try, like {@link applyRestore}).
+ */
+export async function applyRestoreVerified(
+  plan: AgentOutcome[],
+  deps: VerifiedApplyDeps,
+): Promise<AgentOutcome[]> {
+  const sleep = deps.sleep ?? defaultSleep;
+  const now = deps.now ?? Date.now;
+  const out: AgentOutcome[] = [];
+  let launched = 0;
+  for (const entry of plan) {
+    if (entry.kind !== "would-restore") {
+      out.push(entry);
+      continue;
+    }
+    const candidate = entry.candidate;
+    const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
+    const session = candidate.backend_exec_session_id;
+    const base = deps.makeIntent(candidate);
+    // Idempotent no-op: an already-live session is reported verified WITHOUT a
+    // relaunch, so a repeated apply never double-spawns it. Checked BEFORE the
+    // inter-window pause + launch counter so a no-op costs no pacing; the existing
+    // verified marker is left untouched.
+    if (deps.isLive?.(candidate) === true) {
+      out.push({ kind: "verified", candidate });
+      continue;
+    }
+    if (launched > 0) {
+      await sleep(INTER_WINDOW_PAUSE_MS);
+    }
+    launched++;
+    // Write-before-launch: the fsynced intent is the crash-safe record of what we
+    // are about to do, so a death mid-launch leaves a resumable artifact.
+    const launchedIntent = touchIntent(base, "launched", "");
+    deps.intent.write(launchedIntent);
+    // Capture the evidence floor BEFORE the launch so a SessionStart that fires
+    // during the launch still counts (and a stale pre-crash one never does).
+    const launchStartMs = now();
+    try {
+      const res = await deps.ensureLaunched(
+        session,
+        candidate.resume_target,
+        cwd,
+        harnessOrClaude(candidate.harness),
+        candidate.job_id,
+      );
+      if (!res.ok) {
+        deps.intent.write(touchIntent(base, "failed", res.error));
+        out.push({ kind: "failed", candidate, error: res.error });
+        continue;
+      }
+      const verdict = await deps.verify(candidate, launchStartMs);
+      if (verdict === "verified") {
+        deps.intent.write(touchIntent(base, "verified", ""));
+        out.push({ kind: "verified", candidate });
+      } else if (verdict === "failed") {
+        deps.intent.write(touchIntent(base, "failed", VERIFY_FAILED_REASON));
+        out.push({ kind: "failed", candidate, error: VERIFY_FAILED_REASON });
+      } else {
+        deps.intent.write(
+          touchIntent(base, "launched-unverified", VERIFY_UNVERIFIED_REASON),
+        );
+        out.push({
+          kind: "launched-unverified",
+          candidate,
+          reason: VERIFY_UNVERIFIED_REASON,
+        });
+      }
+    } catch (err) {
+      const reason = (err as Error).message;
+      deps.intent.write(touchIntent(base, "failed", reason));
+      out.push({ kind: "failed", candidate, error: reason });
+    }
+  }
+  return out;
+}
+
+/** Transition an intent to a new state/reason, stamping `updated_at` (a side-file
+ *  wall-clock, never a fold input). Pure over its inputs. */
+function touchIntent(
+  base: RestoreIntent,
+  state: RestoreIntent["state"],
+  reason: string,
+): RestoreIntent {
+  return { ...base, state, reason, updated_at: new Date().toISOString() };
+}
+
+/** Count each outcome kind in one pass. Exported so the consumer picks the
+ *  partial-failure exit code without re-scanning. `verified` is the evidence-proven
+ *  peer of the unverified `restored`; `unverified` (launched-unverified) is a WARN,
+ *  not a failure. Only `failed` trips the partial-failure exit — neither
+ *  `notResumable`, `preflightFailed`, nor `unverified` does (all are expected,
+ *  reported non-launch-failures). */
 export function countOutcomes(outcomes: AgentOutcome[]): {
   restored: number;
+  verified: number;
   failed: number;
   wouldRestore: number;
+  unverified: number;
   notResumable: number;
   preflightFailed: number;
 } {
   let restored = 0;
+  let verified = 0;
   let failed = 0;
   let wouldRestore = 0;
+  let unverified = 0;
   let notResumable = 0;
   let preflightFailed = 0;
   for (const o of outcomes) {
     if (o.kind === "restored") restored++;
+    else if (o.kind === "verified") verified++;
     else if (o.kind === "failed") failed++;
+    else if (o.kind === "launched-unverified") unverified++;
     else if (o.kind === "not-resumable") notResumable++;
     else if (o.kind === "preflight-failed") preflightFailed++;
     else wouldRestore++;
   }
-  return { restored, failed, wouldRestore, notResumable, preflightFailed };
+  return {
+    restored,
+    verified,
+    failed,
+    wouldRestore,
+    unverified,
+    notResumable,
+    preflightFailed,
+  };
 }
 
 /**
@@ -307,8 +506,15 @@ export function renderOutcomes(
   excludedIdleCount: number,
 ): string {
   const stanzas: string[] = [];
-  const { restored, failed, wouldRestore, notResumable, preflightFailed } =
-    countOutcomes(outcomes);
+  const {
+    restored,
+    verified,
+    failed,
+    wouldRestore,
+    unverified,
+    notResumable,
+    preflightFailed,
+  } = countOutcomes(outcomes);
 
   for (const o of outcomes) {
     const c = o.candidate;
@@ -343,6 +549,12 @@ export function renderOutcomes(
       stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);
     } else if (o.kind === "restored") {
       stanzas.push(`# (${session}) restored ${label}\n${cmd}`);
+    } else if (o.kind === "verified") {
+      stanzas.push(`# (${session}) VERIFIED ${label}\n${cmd}`);
+    } else if (o.kind === "launched-unverified") {
+      stanzas.push(
+        `# (${session}) UNVERIFIED ${label}: ${commentSafe(o.reason)}\n${cmd}`,
+      );
     } else {
       stanzas.push(
         `# (${session}) FAILED ${label}: ${commentSafe(o.error)}\n${cmd}`,
@@ -354,8 +566,12 @@ export function renderOutcomes(
     notResumable > 0 ? ` not-resumable=${notResumable}` : "";
   const preflightNote =
     preflightFailed > 0 ? ` preflight-failed=${preflightFailed}` : "";
+  const unverifiedNote = unverified > 0 ? ` unverified=${unverified}` : "";
+  // On the verified apply path `verified` supersedes `restored`; sum them so the
+  // summary's restored count stays meaningful whichever apply path produced it.
+  const applyRestored = restored + verified;
   const summary = apply
-    ? `# summary: restored=${restored} failed=${failed}${notResumableNote}${preflightNote}`
+    ? `# summary: restored=${applyRestored} failed=${failed}${unverifiedNote}${notResumableNote}${preflightNote}`
     : `# summary: would-restore=${wouldRestore}${notResumableNote}${preflightNote}`;
   const idleNote =
     excludedIdleCount > 0
@@ -974,4 +1190,334 @@ export function makeEnsureLaunched(
       label: `restore resume ${harness} ${resumeTarget}`,
       spec: { prompt: "", resumeTarget, jobId, harness },
     });
+}
+
+// ---------------------------------------------------------------------------
+// Resume-target repair — the rotted-pi confidence gate (report + producer share)
+// ---------------------------------------------------------------------------
+
+/**
+ * Proximity window (ms) a candidate pi session file must fall within of a job's
+ * launch instant to be a PLAUSIBLE resume-target replacement. A pi session file
+ * is written at launch (≈ the job's `created_at`), so a real match sits within
+ * seconds; the window tolerates clock skew + launch latency without admitting an
+ * unrelated later session in the same cwd. Exactly one candidate inside the window
+ * resolves; two or more is AMBIGUOUS and never auto-resolved (repair must refuse
+ * rather than become a new poisoning vector).
+ */
+export const PI_REPAIR_MATCH_WINDOW_MS = 15 * 60 * 1000;
+
+/** Mirror of the pi transcript-watch producer's cwd → sessions-subdir encoding
+ *  (identical to resume-resolve's private `encodePiCwd`): trim the outer slashes,
+ *  every `/` → `-`, wrapped in `--…--`. Kept local so this module adds no new
+ *  export to resume-resolve. Pure. */
+function encodePiRepairCwd(cwd: string): string {
+  const trimmed = cwd.replace(/^\/+|\/+$/g, "");
+  return `--${trimmed.replace(/\//g, "-")}--`;
+}
+
+/** The pi `sessions/` dirs the existence gate + the matcher share —
+ *  `PI_CODING_AGENT_DIR` first (when set), then `~/.pi/agent`. Mirrors
+ *  resume-resolve's private `piArtifact` root derivation so a match and its gate
+ *  read the same layout. Pure. */
+function piRepairSessionsDirs(
+  homeDir: string,
+  env: Record<string, string | undefined>,
+): string[] {
+  const roots = [
+    (env.PI_CODING_AGENT_DIR ?? "").trim(),
+    join(homeDir, ".pi", "agent"),
+  ];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const r of roots) {
+    if (r === "") {
+      continue;
+    }
+    const d = join(r, "sessions");
+    if (!seen.has(d)) {
+      seen.add(d);
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+/** Humanize a duration (ms) to a compact `<n>{s,m,h,d}` token for confidence
+ *  notes. Pure. */
+function humanizeMs(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+/**
+ * Parse a pi session filename `<iso-ts>_<uuid>.jsonl` (e.g.
+ * `2026-06-27T02-31-45-766Z_019f06eb-3566-7a6b-a149-f5b6996e30e5.jsonl`) into its
+ * resume uuid + the session-start instant the filename encodes. Pi writes the
+ * timestamp with `-` for the illegal-in-a-filename time separators (`:` / `.`), so
+ * it is rewritten to a parseable ISO string. Returns null for any name that is not
+ * this exact shape or whose timestamp does not parse — an untimed file cannot be
+ * scored for proximity, so it is never a candidate. Pure.
+ */
+export function parsePiSessionFileName(
+  name: string,
+): { uuid: string; createdAtMs: number } | null {
+  const m = name.match(
+    /^(.+)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i,
+  );
+  if (m === null) {
+    return null;
+  }
+  const rawTs = m[1] as string;
+  const uuid = m[2] as string;
+  // `YYYY-MM-DDTHH-MM-SS-mmmZ` → `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+  const isoTs = rawTs.replace(
+    /T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
+    "T$1:$2:$3.$4Z",
+  );
+  const ms = Date.parse(isoTs);
+  if (Number.isNaN(ms)) {
+    return null;
+  }
+  return { uuid, createdAtMs: ms };
+}
+
+/** One pi session file scored as a resume-target replacement candidate. */
+export interface PiRepairCandidate {
+  /** The pi session uuid — the resume target a resolved repair re-pins to. */
+  uuid: string;
+  /** The session-start instant the filename encodes (ms). */
+  createdAtMs: number;
+  /** `|file start − job start|` (ms) — the proximity score. */
+  deltaMs: number;
+}
+
+/**
+ * Enumerate the pi session files under a job cwd's pi project dir across the pi
+ * roots, parsed + scored by proximity to the job's launch instant. Deduped by
+ * uuid (a profile may symlink stores) with the CLOSEST occurrence winning; sorted
+ * nearest-first (uuid tiebreak). Pure relative to `fs`.
+ */
+export function collectPiRepairCandidates(
+  fs: ResumeResolveFs,
+  homeDir: string,
+  env: Record<string, string | undefined>,
+  cwd: string,
+  jobCreatedAtMs: number,
+): PiRepairCandidate[] {
+  const byUuid = new Map<string, PiRepairCandidate>();
+  const sub = encodePiRepairCwd(cwd);
+  for (const sessionsDir of piRepairSessionsDirs(homeDir, env)) {
+    for (const name of fs.listDir(join(sessionsDir, sub))) {
+      const parsed = parsePiSessionFileName(name);
+      if (parsed === null) {
+        continue;
+      }
+      const deltaMs = Math.abs(parsed.createdAtMs - jobCreatedAtMs);
+      const prev = byUuid.get(parsed.uuid);
+      if (prev === undefined || deltaMs < prev.deltaMs) {
+        byUuid.set(parsed.uuid, {
+          uuid: parsed.uuid,
+          createdAtMs: parsed.createdAtMs,
+          deltaMs,
+        });
+      }
+    }
+  }
+  return [...byUuid.values()].sort(
+    (a, b) =>
+      a.deltaMs - b.deltaMs || (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0),
+  );
+}
+
+/** One pi job the repair sweep considers — a harness-pi row carrying a recorded
+ *  resume target that may or may not still name an on-disk artifact. */
+export interface PiRepairJob {
+  jobId: string;
+  /** Display label (latest title, falling back to the job id). */
+  label: string;
+  cwd: string | null;
+  /** The currently recorded resume target (non-empty for a rot candidate). */
+  resumeTarget: string;
+  /** Job launch instant (ms) — the proximity anchor. */
+  createdAtMs: number;
+}
+
+/** A resume-target repair proposal for one rotted pi job. `resolved` carries the
+ *  single unambiguous re-pin; `ambiguous` lists the plausible candidates but never
+ *  resolves; `unmatched` found no plausible replacement. */
+export type PiRepairProposal = {
+  jobId: string;
+  label: string;
+  harness: "pi";
+  cwd: string | null;
+  oldTarget: string;
+  note: string;
+} & (
+  | { kind: "resolved"; newTarget: string; candidate: PiRepairCandidate }
+  | { kind: "ambiguous"; candidates: PiRepairCandidate[] }
+  | { kind: "unmatched" }
+);
+
+/** Options for {@link proposePiRepair} — the home dir + env the pi roots derive
+ *  from, plus a test-only proximity-window override. */
+export interface PiRepairOptions {
+  homeDir: string;
+  env: Record<string, string | undefined>;
+  /** Proximity-window override (ms); defaults to {@link PI_REPAIR_MATCH_WINDOW_MS}. */
+  matchWindowMs?: number;
+}
+
+/**
+ * The shared confidence gate BOTH `keeper tabs repair` and the daemon back-fill
+ * producer read. Returns null when the job's recorded target is NOT rotted (still
+ * names an on-disk artifact) or the job carries no target. For a rotted target:
+ * exactly ONE plausible same-cwd session within the proximity window `resolved`s;
+ * two or more is `ambiguous` (reported, NEVER applied); none is `unmatched`. Pure
+ * relative to `fs`.
+ */
+export function proposePiRepair(
+  fs: ResumeResolveFs,
+  job: PiRepairJob,
+  opts: PiRepairOptions,
+): PiRepairProposal | null {
+  if (job.resumeTarget === "") {
+    return null; // never resolved — no recorded target to re-pin.
+  }
+  const gate = resolveNonClaudeArtifact(fs, {
+    harness: "pi",
+    resumeTarget: job.resumeTarget,
+    cwd: job.cwd,
+    homeDir: opts.homeDir,
+    env: opts.env,
+  });
+  if (gate.kind === "resumable") {
+    return null; // target still exists on disk — not rotted.
+  }
+  const base = {
+    jobId: job.jobId,
+    label: job.label,
+    harness: "pi" as const,
+    cwd: job.cwd,
+    oldTarget: job.resumeTarget,
+  };
+  const window = opts.matchWindowMs ?? PI_REPAIR_MATCH_WINDOW_MS;
+  const candidates =
+    job.cwd == null || job.cwd === ""
+      ? []
+      : collectPiRepairCandidates(
+          fs,
+          opts.homeDir,
+          opts.env,
+          job.cwd,
+          job.createdAtMs,
+        ).filter((c) => c.uuid !== job.resumeTarget && c.deltaMs <= window);
+  if (candidates.length === 1) {
+    const c = candidates[0] as PiRepairCandidate;
+    return {
+      ...base,
+      kind: "resolved",
+      newTarget: c.uuid,
+      candidate: c,
+      note: `pi session ${c.uuid} created ${humanizeMs(c.deltaMs)} from job start`,
+    };
+  }
+  if (candidates.length > 1) {
+    return {
+      ...base,
+      kind: "ambiguous",
+      candidates,
+      note: `${candidates.length} plausible pi sessions within ${humanizeMs(window)} of job start — refusing to auto-resolve`,
+    };
+  }
+  return {
+    ...base,
+    kind: "unmatched",
+    note: `recorded target ${job.resumeTarget} names no on-disk pi session and no plausible replacement was found`,
+  };
+}
+
+/** Map a rotted-pi job set to its proposals, dropping the non-rotted rows
+ *  ({@link proposePiRepair} returns null). Pure relative to `fs`. */
+export function sweepPiRepairProposals(
+  jobs: PiRepairJob[],
+  fs: ResumeResolveFs,
+  opts: PiRepairOptions,
+): PiRepairProposal[] {
+  const out: PiRepairProposal[] = [];
+  for (const job of jobs) {
+    const proposal = proposePiRepair(fs, job, opts);
+    if (proposal !== null) {
+      out.push(proposal);
+    }
+  }
+  return out;
+}
+
+/** The pi jobs a repair sweep considers: harness pi with a non-empty recorded
+ *  resume target (only a set target can rot). LIVE and killed both — the report
+ *  surfaces every rotted tab. Newest-first. Pure over the db. */
+export function loadPiRepairJobs(db: Database): PiRepairJob[] {
+  const rows = db
+    .query(
+      `SELECT job_id, title, cwd, resume_target, created_at FROM jobs
+         WHERE harness = 'pi' AND resume_target IS NOT NULL AND resume_target != ''
+         ORDER BY created_at DESC`,
+    )
+    .all() as {
+    job_id: string;
+    title: string | null;
+    cwd: string | null;
+    resume_target: string;
+    created_at: number;
+  }[];
+  return rows.map((r) => ({
+    jobId: r.job_id,
+    label: r.title ?? r.job_id,
+    cwd: r.cwd,
+    resumeTarget: r.resume_target,
+    createdAtMs: r.created_at * 1000,
+  }));
+}
+
+/** Options for {@link loadRepairProposals} — all defaulted to production (real fs,
+ *  `$HOME`, `process.env`); tests inject a fixture root + fake fs. */
+export interface RepairSweepOptions {
+  fs?: ResumeResolveFs;
+  homeDir?: string;
+  env?: Record<string, string | undefined>;
+  matchWindowMs?: number;
+}
+
+/**
+ * `keeper tabs repair`'s read-only sweep: open `keeper.db` read-only in one span,
+ * load the pi rot candidates, and return each rotted job's proposal. Daemon-down
+ * by design (no socket) — the report never mutates; the re-pin is the daemon
+ * producer's job. Re-throws on an open failure.
+ */
+export function loadRepairProposals(
+  dbPath: string,
+  opts: RepairSweepOptions = {},
+): PiRepairProposal[] {
+  const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
+  try {
+    return sweepPiRepairProposals(
+      loadPiRepairJobs(db),
+      opts.fs ?? nodeResumeResolveFs(),
+      {
+        homeDir: opts.homeDir ?? homedir(),
+        env: opts.env ?? (process.env as Record<string, string | undefined>),
+        matchWindowMs: opts.matchWindowMs,
+      },
+    );
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // best-effort; the reader is one-shot.
+    }
+  }
 }

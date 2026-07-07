@@ -20,7 +20,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -35,20 +35,33 @@ import {
   TABS_EXIT_ZERO_CANDIDATES,
 } from "../cli/tabs";
 import { harnessOrClaude } from "../src/agent/harness";
+import {
+  PI_RESUME_REPAIR_RECENT_WINDOW_SEC,
+  resolvePiResumeRepairs,
+} from "../src/daemon";
+import { drain } from "../src/reducer";
 import type {
   EnrichedGeneration,
   GenerationSummary,
   RestoreCandidate,
 } from "../src/restore-set";
+import {
+  RESTORE_INTENT_SCHEMA_VERSION,
+  type RestoreIntent,
+} from "../src/restore-verify";
 import type { ResumeResolver } from "../src/resume-resolve";
 import {
   type AgentOutcome,
   applyRestore,
+  applyRestoreVerified,
   autopilotGateDecision,
   countOutcomes,
+  type IntentSink,
   loadCurrentSetForDump,
   loadGenerationList,
+  loadRepairProposals,
   loadRestorePlan,
+  parsePiSessionFileName,
   planRestore as planRestoreRaw,
   type RestoreSelection,
   readAutopilotPaused,
@@ -56,6 +69,8 @@ import {
   renderSnapshotScript as renderSnapshotScriptRaw,
   restorePlanTouchesManagedSession,
   selectRestoreGeneration,
+  VERIFY_FAILED_REASON,
+  VERIFY_UNVERIFIED_REASON,
 } from "../src/tabs-core";
 import { freshDbFile } from "./helpers/template-db";
 
@@ -745,11 +760,17 @@ test("renderOutcomes surfaces / omits the idle-excluded note", () => {
   expect(renderOutcomes(plan, false, 0)).not.toContain("excluded as idle");
 });
 
-test("countOutcomes tallies restored / failed / would-restore / not-resumable", () => {
+test("countOutcomes tallies every kind incl. verified / launched-unverified", () => {
   const outcomes: AgentOutcome[] = [
     { kind: "restored", candidate: fakeCandidate({ job_id: "a" }) },
+    { kind: "verified", candidate: fakeCandidate({ job_id: "v" }) },
     { kind: "failed", candidate: fakeCandidate({ job_id: "b" }), error: "x" },
     { kind: "would-restore", candidate: fakeCandidate({ job_id: "c" }) },
+    {
+      kind: "launched-unverified",
+      candidate: fakeCandidate({ job_id: "u" }),
+      reason: "pane alive, no evidence",
+    },
     {
       kind: "not-resumable",
       candidate: fakeCandidate({ job_id: "d" }),
@@ -758,11 +779,171 @@ test("countOutcomes tallies restored / failed / would-restore / not-resumable", 
   ];
   expect(countOutcomes(outcomes)).toEqual({
     restored: 1,
+    verified: 1,
     failed: 1,
     wouldRestore: 1,
+    unverified: 1,
     notResumable: 1,
     preflightFailed: 0,
   });
+});
+
+// ---------------------------------------------------------------------------
+// applyRestoreVerified — the per-tab durable, evidence-verified transaction
+// ---------------------------------------------------------------------------
+
+/** A recording intent sink + a base-intent builder for the verified-apply tests. */
+function recordingIntent(): { writes: RestoreIntent[]; sink: IntentSink } {
+  const writes: RestoreIntent[] = [];
+  return { writes, sink: { write: (i) => writes.push({ ...i }) } };
+}
+
+function baseIntentFor(candidate: RestoreCandidate): RestoreIntent {
+  return {
+    schema_version: RESTORE_INTENT_SCHEMA_VERSION,
+    generation_id: "gen-1",
+    job_id: candidate.job_id,
+    session_uuid: candidate.resume_target,
+    harness: harnessOrClaude(candidate.harness),
+    resume_target: candidate.resume_target,
+    cwd: candidate.cwd ?? "",
+    backend_exec_session_id: candidate.backend_exec_session_id,
+    argv: ["keeper", "agent", "claude", "--resume", candidate.resume_target],
+    rerun_command: "keeper tabs restore --apply --session work",
+    attempt: 1,
+    state: "planned",
+    reason: "",
+    created_at: "2026-07-07T00:00:00.000Z",
+    updated_at: "2026-07-07T00:00:00.000Z",
+  };
+}
+
+test("applyRestoreVerified: a verified verdict → verified outcome + a verified intent", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: true }),
+    verify: async () => "verified",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out.map((o) => o.kind)).toEqual(["verified"]);
+  // Write-before-launch then a terminal verified write.
+  expect(writes.map((w) => w.state)).toEqual(["launched", "verified"]);
+});
+
+test("applyRestoreVerified: a launch failure → failed outcome, verify never runs", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  let verifyCalled = false;
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: false, error: "exit 3 NOOP" }),
+    verify: async () => {
+      verifyCalled = true;
+      return "verified";
+    },
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out[0].kind).toBe("failed");
+  expect((out[0] as { error: string }).error).toBe("exit 3 NOOP");
+  expect(verifyCalled).toBe(false);
+  expect(writes.at(-1)?.state).toBe("failed");
+  expect(writes.at(-1)?.reason).toBe("exit 3 NOOP");
+});
+
+test("applyRestoreVerified: died resume (verify failed) → failed + resurfacing intent", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: true }),
+    verify: async () => "failed",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out[0].kind).toBe("failed");
+  expect((out[0] as { error: string }).error).toBe(VERIFY_FAILED_REASON);
+  expect(writes.at(-1)?.state).toBe("failed");
+});
+
+test("applyRestoreVerified: no evidence + live pane → launched-unverified warn", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: true }),
+    verify: async () => "launched-unverified",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out[0].kind).toBe("launched-unverified");
+  expect((out[0] as { reason: string }).reason).toBe(VERIFY_UNVERIFIED_REASON);
+  expect(writes.at(-1)?.state).toBe("launched-unverified");
+});
+
+test("applyRestoreVerified: an already-live session no-ops (never launches)", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  let launched = false;
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => {
+      launched = true;
+      return { ok: true };
+    },
+    verify: async () => "failed",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    isLive: () => true,
+    sleep: async () => {},
+  });
+  expect(out.map((o) => o.kind)).toEqual(["verified"]);
+  // No launch, no intent churn — the existing verified marker is left untouched.
+  expect(launched).toBe(false);
+  expect(writes).toEqual([]);
+});
+
+test("applyRestoreVerified: hands verify the pre-launch floor + carries the launch id", async () => {
+  const plan = planRestore(
+    [fakeCandidate({ job_id: "a", resume_target: "sess-a", cwd: "/repo/a" })],
+    null,
+  );
+  const { sink } = recordingIntent();
+  const launchCalls: { resumeTarget: string; jobId: string }[] = [];
+  const floors: number[] = [];
+  await applyRestoreVerified(plan, {
+    ensureLaunched: async (_s, resumeTarget, _c, _h, jobId) => {
+      launchCalls.push({ resumeTarget, jobId });
+      return { ok: true };
+    },
+    verify: async (_candidate, launchStartMs) => {
+      floors.push(launchStartMs);
+      return "verified";
+    },
+    intent: sink,
+    makeIntent: baseIntentFor,
+    now: () => 4242,
+    sleep: async () => {},
+  });
+  expect(launchCalls).toEqual([{ resumeTarget: "sess-a", jobId: "a" }]);
+  expect(floors).toEqual([4242]);
+});
+
+test("renderOutcomes apply summary counts verified as restored, notes unverified", () => {
+  const outcomes: AgentOutcome[] = [
+    { kind: "verified", candidate: fakeCandidate({ job_id: "v" }) },
+    {
+      kind: "launched-unverified",
+      candidate: fakeCandidate({ job_id: "u" }),
+      reason: "pane alive",
+    },
+  ];
+  const rendered = renderOutcomes(outcomes, true, 0);
+  expect(rendered).toContain("VERIFIED");
+  expect(rendered).toContain("UNVERIFIED");
+  expect(rendered).toContain("# summary: restored=1 failed=0 unverified=1");
 });
 
 // ---------------------------------------------------------------------------
@@ -1589,4 +1770,262 @@ test("formatRestoreConfirmSummary reports the killed-cohort fallback when there 
 test("tabs restore exit codes sit outside the 0–5 core/await range", () => {
   expect(TABS_EXIT_ZERO_CANDIDATES).toBe(7);
   expect(TABS_EXIT_PARTIAL_FAILURE).toBe(8);
+});
+
+// ---------------------------------------------------------------------------
+// Resume-target repair — the rotted-pi report (`keeper tabs repair`) + the
+// daemon-side back-fill producer pass (driven unit-level, no daemon boot).
+// ---------------------------------------------------------------------------
+
+const ROT_TARGET = "aaaaaaaa-0000-0000-0000-000000000000";
+const PLAUSIBLE_UUID = "11111111-2222-3333-4444-555555555555";
+const PLAUSIBLE_UUID_2 = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+const PI_CWD = "/repo/pi";
+
+/** Mirror of the pi transcript-watch producer's cwd → sessions-subdir encoding. */
+function encodePiCwd(cwd: string): string {
+  const trimmed = cwd.replace(/^\/+|\/+$/g, "");
+  return `--${trimmed.replace(/\//g, "-")}--`;
+}
+
+/** Build a real pi session filename `<iso-ts>_<uuid>.jsonl` for a given instant. */
+function piFileName(uuid: string, ms: number): string {
+  return `${new Date(ms).toISOString().replace(/[:.]/g, "-")}_${uuid}.jsonl`;
+}
+
+/** Write a pi session file under the fixture store's cwd project dir. */
+function writePiSession(
+  piRoot: string,
+  cwd: string,
+  uuid: string,
+  createdAtMs: number,
+): void {
+  const dir = join(piRoot, "sessions", encodePiCwd(cwd));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, piFileName(uuid, createdAtMs)), "{}\n");
+}
+
+/** Insert a raw event row (all columns default NULL; overrides win) — mirrors the
+ *  codex-resume harness so the reducer folds it exactly as MAIN would. */
+function insertRawEvent(
+  db: Database,
+  overrides: {
+    hook_event: string;
+    session_id: string;
+    ts: number;
+    cwd?: string | null;
+    harness?: string | null;
+    resume_target?: string | null;
+  },
+): void {
+  db.run(
+    `INSERT INTO events (
+       ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+       cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+       subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+       background_task_id, mutation_path, worktree, harness, resume_target
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      overrides.ts,
+      overrides.session_id,
+      4242,
+      overrides.hook_event,
+      overrides.hook_event,
+      null,
+      null,
+      overrides.cwd ?? null,
+      null,
+      null,
+      null,
+      null,
+      "{}",
+      null,
+      overrides.session_id,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      overrides.harness ?? null,
+      overrides.resume_target ?? null,
+    ],
+  );
+}
+
+function drainAll(db: Database): void {
+  let n: number;
+  do {
+    n = drain(db);
+  } while (n > 0);
+}
+
+/** Seed a tracked pi job (SessionStart) carrying a recorded resume target and fold
+ *  it into a `jobs` row (state `stopped`, harness `pi`). */
+function seedPiJob(
+  db: Database,
+  jobId: string,
+  cwd: string,
+  resumeTarget: string,
+  ts: number,
+): void {
+  insertRawEvent(db, {
+    hook_event: "SessionStart",
+    session_id: jobId,
+    ts,
+    cwd,
+    harness: "pi",
+    resume_target: resumeTarget,
+  });
+  drainAll(db);
+}
+
+function resumeTargetOf(db: Database, jobId: string): string | null {
+  const row = db
+    .query("SELECT resume_target FROM jobs WHERE job_id = ?")
+    .get(jobId) as { resume_target: string | null } | null;
+  return row?.resume_target ?? null;
+}
+
+/** The fixture pi store + an isolated home (no real `~/.pi`) for a repair run. */
+function repairEnv(): {
+  homeDir: string;
+  env: Record<string, string | undefined>;
+  piRoot: string;
+} {
+  const piRoot = join(tmpDir, "pi");
+  return {
+    homeDir: join(tmpDir, "home"),
+    env: { PI_CODING_AGENT_DIR: piRoot },
+    piRoot,
+  };
+}
+
+test("parsePiSessionFileName extracts the uuid + session-start instant", () => {
+  const parsed = parsePiSessionFileName(
+    "2026-06-27T02-31-45-766Z_019f06eb-3566-7a6b-a149-f5b6996e30e5.jsonl",
+  );
+  expect(parsed).toEqual({
+    uuid: "019f06eb-3566-7a6b-a149-f5b6996e30e5",
+    createdAtMs: Date.parse("2026-06-27T02:31:45.766Z"),
+  });
+  // A non-session filename (no uuid / wrong extension) is never a candidate.
+  expect(parsePiSessionFileName("index.jsonl")).toBeNull();
+  expect(parsePiSessionFileName("2026-06-27_notauuid.jsonl")).toBeNull();
+});
+
+test("repair reports the sole plausible pi session, excluding the distant one", () => {
+  const { homeDir, env, piRoot } = repairEnv();
+  seedPiJob(kdb.db, "pi-job-1", PI_CWD, ROT_TARGET, RECENT);
+  // One session at job start (plausible) and one two days earlier (implausible).
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID, RECENT * 1000);
+  writePiSession(
+    piRoot,
+    PI_CWD,
+    PLAUSIBLE_UUID_2,
+    RECENT * 1000 - 2 * 86400_000,
+  );
+
+  const proposals = loadRepairProposals(dbPath, { homeDir, env });
+  expect(proposals).toHaveLength(1);
+  const p = proposals[0];
+  expect(p?.kind).toBe("resolved");
+  expect(p?.oldTarget).toBe(ROT_TARGET);
+  if (p?.kind === "resolved") {
+    expect(p.newTarget).toBe(PLAUSIBLE_UUID);
+  }
+  expect(p?.note).toContain("from job start");
+});
+
+test("repair surfaces two plausible candidates as ambiguous, never resolved", () => {
+  const { homeDir, env, piRoot } = repairEnv();
+  seedPiJob(kdb.db, "pi-job-1", PI_CWD, ROT_TARGET, RECENT);
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID, RECENT * 1000);
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID_2, RECENT * 1000);
+
+  const proposals = loadRepairProposals(dbPath, { homeDir, env });
+  expect(proposals).toHaveLength(1);
+  const p = proposals[0];
+  expect(p?.kind).toBe("ambiguous");
+  if (p?.kind === "ambiguous") {
+    expect(p.candidates.map((c) => c.uuid).sort()).toEqual(
+      [PLAUSIBLE_UUID, PLAUSIBLE_UUID_2].sort(),
+    );
+  }
+});
+
+test("repair never reports a pi row whose recorded target still exists on disk", () => {
+  const { homeDir, env, piRoot } = repairEnv();
+  // The recorded target itself is on disk — not rotted, so nothing to repair.
+  seedPiJob(kdb.db, "pi-job-1", PI_CWD, PLAUSIBLE_UUID, RECENT);
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID, RECENT * 1000);
+
+  expect(loadRepairProposals(dbPath, { homeDir, env })).toEqual([]);
+});
+
+test("the producer pass applies a single-candidate re-pin and the projection re-reads repaired", () => {
+  const { homeDir, env, piRoot } = repairEnv();
+  seedPiJob(kdb.db, "pi-job-1", PI_CWD, ROT_TARGET, RECENT);
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID, RECENT * 1000);
+  expect(resumeTargetOf(kdb.db, "pi-job-1")).toBe(ROT_TARGET);
+
+  const now = Date.now() / 1000;
+  const repairs = resolvePiResumeRepairs(
+    kdb.db,
+    homeDir,
+    env,
+    now,
+    PI_RESUME_REPAIR_RECENT_WINDOW_SEC,
+  );
+  expect(repairs).toEqual([
+    { jobId: "pi-job-1", oldTarget: ROT_TARGET, newTarget: PLAUSIBLE_UUID },
+  ]);
+
+  // Feed the producer's output as MAIN would: a ResumeTargetResolved event whose
+  // fold overwrites jobs.resume_target without touching lifecycle state.
+  insertRawEvent(kdb.db, {
+    hook_event: "ResumeTargetResolved",
+    session_id: "pi-job-1",
+    ts: now + 1,
+    resume_target: PLAUSIBLE_UUID,
+  });
+  drainAll(kdb.db);
+  expect(resumeTargetOf(kdb.db, "pi-job-1")).toBe(PLAUSIBLE_UUID);
+  // The rot is healed: the repaired target now exists on disk, so the report is
+  // clean and `keeper tabs dump` would emit an on-disk-backed resume line.
+  expect(loadRepairProposals(dbPath, { homeDir, env })).toEqual([]);
+});
+
+test("the producer pass mints nothing for an ambiguous two-candidate job", () => {
+  const { homeDir, env, piRoot } = repairEnv();
+  seedPiJob(kdb.db, "pi-job-1", PI_CWD, ROT_TARGET, RECENT);
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID, RECENT * 1000);
+  writePiSession(piRoot, PI_CWD, PLAUSIBLE_UUID_2, RECENT * 1000);
+
+  const repairs = resolvePiResumeRepairs(
+    kdb.db,
+    homeDir,
+    env,
+    Date.now() / 1000,
+    PI_RESUME_REPAIR_RECENT_WINDOW_SEC,
+  );
+  expect(repairs).toEqual([]);
+  expect(resumeTargetOf(kdb.db, "pi-job-1")).toBe(ROT_TARGET);
 });

@@ -863,8 +863,24 @@ function launchScriptEnv(env: NodeJS.ProcessEnv): [string, string][] {
   });
 }
 
+/**
+ * The inner login-shell body: run the harness argv (`"$@"`), then DROP to an
+ * interactive login shell so the pane stays visible whatever the harness did.
+ *
+ * The harness is NOT `exec`ed (that would mask its exit code and kill the drop),
+ * so `$?` is captured on the very next statement: on a non-zero exit the pane
+ * prints a diagnosis (the exit code — a signal death surfaces as 128+n) pointing
+ * at `keeper tabs list`, where a failed restore's durable artifact carries the
+ * exact rerun command. A clean exit is byte-silent (the diagnosis branch is
+ * skipped). The whole body is embedded inside single quotes in `launch.sh`, so it
+ * must contain NO single quote — the double quotes reach bash literally.
+ */
 function tmuxShellBody(): string {
-  return '"$@"; exec "$0" -l -i';
+  return (
+    '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || ' +
+    'printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; ' +
+    'exec "$0" -l -i'
+  );
 }
 
 function shellQuote(value: string): string {

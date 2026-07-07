@@ -390,6 +390,11 @@ export const TABS_RESTORE_FLAGS = [
   { name: "db", type: "string", summary: "keeper.db path override" },
 ] as const satisfies readonly FlagDescriptor[];
 
+/** `keeper tabs repair` flags. */
+export const TABS_REPAIR_FLAGS = [
+  { name: "db", type: "string", summary: "keeper.db path override" },
+] as const satisfies readonly FlagDescriptor[];
+
 /** `keeper tabs dump` flags. */
 export const TABS_DUMP_FLAGS = [
   {
@@ -813,6 +818,17 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         requires_daemon: false,
         requires_tty: false,
         flags: TABS_RESTORE_FLAGS,
+      },
+      {
+        name: "repair",
+        summary:
+          "Report non-claude tabs whose recorded resume target rotted (read-only)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: TABS_REPAIR_FLAGS,
       },
       {
         name: "dump",

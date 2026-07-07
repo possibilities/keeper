@@ -33,6 +33,7 @@ import {
   selectionToOfferBundle,
   sweepBusyPanes,
 } from "../cli/setup-tmux";
+import { TABS_EXIT_PARTIAL_FAILURE } from "../cli/tabs";
 import type { GenerationSummary } from "../src/restore-set";
 import type { RestoreSelection } from "../src/tabs-core";
 import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
@@ -746,6 +747,34 @@ describe("renderRestoreOutcome", () => {
       okResult("# summary: restored=2 failed=0\n"),
     );
     expect(line).toBe("keeper setup-tmux: 'work' restored 2 agent(s)");
+  });
+
+  test("exit 0 with unverified>0 ⇒ success line carries an unverified note (a launched-unverified warn is not a failure)", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      okResult("# summary: restored=3 failed=0 unverified=1\n"),
+      1000 + 120,
+    );
+    expect(line).toBe(
+      "keeper setup-tmux: 'work' restored 3 agent(s) (unverified=1) from generation 999 (2m ago)",
+    );
+  });
+
+  test("TABS_EXIT_PARTIAL_FAILURE ⇒ PARTIAL line with the restored/failed/unverified breakdown from the child summary", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      {
+        exitCode: TABS_EXIT_PARTIAL_FAILURE,
+        stdout: Buffer.from("# summary: restored=2 failed=1 unverified=1\n"),
+        stderr: Buffer.from(""),
+      },
+      1000 + 120,
+    );
+    expect(line).toBe(
+      `keeper setup-tmux: 'work' restore PARTIAL (exit ${TABS_EXIT_PARTIAL_FAILURE}): restored=2 failed=1 unverified=1 from generation 999 (2m ago)`,
+    );
   });
 });
 
