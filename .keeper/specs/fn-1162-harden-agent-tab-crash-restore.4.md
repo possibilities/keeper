@@ -37,5 +37,5 @@ Fake offers with ambiguous set/unset × TTY/non-TTY: assert picker spawn, refusa
 - [ ] A keeperd restart with zero live agents can no longer blank a non-empty restore.json or revive.sh.
 
 ## Done summary
-
+setup-tmux boot offer now escalates a contested auto-pick (TTY numbered picker / non-TTY visible refusal naming keeper tabs restore) with a disaster-mirror cross-check forcing ambiguity on cohort disagreement; restore-worker refuses to blank a non-empty restore.json/revive.sh with an empty live set.
 ## Evidence
