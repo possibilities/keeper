@@ -72,10 +72,13 @@ efforts:
     Diminishing returns and overthinking risk on anything routine; never a
     generic "be careful" upgrade over xhigh.
 
-# One guidance block per configured `models:` axis value (subagents.yaml).
+# One guidance block per configured `models:` axis value (subagents.yaml), plus
+# pre-provisioned blocks for host-roster capability models a matrix.yaml may add
+# (the runtime selection-brief seam enforces one block per effective model).
 # Distilled from the skill's references/ research — strengths, weaknesses,
-# when-to-pick. Raw research stays in references/, never in this prompt-sized
-# block.
+# when-to-pick. Blocks are strictly capability-shaped: never cost or provider
+# ordering, which live in the host matrix and stay invisible to the content-blind
+# selector. Raw research stays in references/, never in this prompt-sized block.
 models:
   opus: |
     The strongest widely released Opus-tier model and keeper's highest-capability
@@ -97,6 +100,29 @@ models:
     design, contract/schema/wire work, cross-repo changes, migrations, and
     gnarly debugging. When to pick: bounded, well-specified, low-blast-radius
     work; keep opus for intelligence-sensitive tasks or any uncertainty.
+  gpt-5.5: |
+    A high-capability generalist coding model with broad current knowledge and
+    strong multi-step reasoning. Strengths: from-scratch implementation against a
+    clear spec, algorithmic and data-transformation work, breadth across
+    languages and frameworks, and sustained progress on well-scoped agentic
+    tasks. Weaknesses: leans literal on an under-specified spec and can drift from
+    a codebase's established idioms unless the task names the pattern to follow;
+    less sure than the top capability tier at separating a real failure from a
+    flake in open-ended debugging. When to pick: bounded-to-moderate features and
+    mechanical-to-medium refactors with an explicit acceptance and a named
+    surface. When to avoid: contract-, schema-, or wire-shaped changes where a
+    wrong abstraction propagates, and hypothesis-free debugging — route those up.
+  gpt-5.3-codex-spark: |
+    A fast, lightweight coding model tuned for quick, tightly-scoped edits.
+    Strengths: snappy single-file changes, straight test additions, mechanical
+    refactors, and literal execution of an unambiguous spec that leaves no design
+    choice. Weaknesses: a lower reasoning ceiling than the heavier tiers —
+    multi-file design, cross-module reasoning, and ambiguous acceptance
+    under-resolve here, and it holds less context across a long agentic loop. When
+    to pick: small, reversible, near-mechanical work with a fully-specified
+    acceptance. When to avoid: anything needing investigation, contract-shaped
+    reasoning, or judgment spanning more than one surface — route those up to a
+    higher-capability model.
 
 # Research provenance map: per configured model, the references/ cache file
 # (path relative to the plan plugin root) and its sha256. The drift gate asserts

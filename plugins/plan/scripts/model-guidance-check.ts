@@ -154,11 +154,18 @@ export function loadModelSelectorConfig(path: string): ModelSelectorConfig {
   return coerceModelSelectorConfig(loadYamlInput(path));
 }
 
-/** Both-directions coverage between an axis and its guidance-block keys. */
+/** Coverage between an axis and its guidance-block keys. The forward direction
+ * (every axis value has a block) always holds. The reverse direction (no block
+ * beyond the axis) holds only when `allowExtraBlocks` is false: the models axis
+ * tolerates extra blocks because the committed config pre-provisions guidance for
+ * host-roster capability models absent from the embedded axis, and the runtime
+ * selection-brief seam — not this host-blind gate — enforces effective-matrix
+ * coverage. The efforts axis keeps exact both-directions parity. */
 function coverageErrors(
   label: string,
   axis: readonly string[],
   blocks: readonly string[],
+  allowExtraBlocks = false,
 ): string[] {
   const errors: string[] = [];
   const axisSet = new Set(axis);
@@ -170,11 +177,13 @@ function coverageErrors(
       );
     }
   }
-  for (const value of blocks) {
-    if (!axisSet.has(value)) {
-      errors.push(
-        `${label}: guidance block "${value}" is not a configured axis value`,
-      );
+  if (!allowExtraBlocks) {
+    for (const value of blocks) {
+      if (!axisSet.has(value)) {
+        errors.push(
+          `${label}: guidance block "${value}" is not a configured axis value`,
+        );
+      }
     }
   }
   return errors;
@@ -197,7 +206,12 @@ export function checkModelGuidance(input: GuidanceCheckInput): GuidanceCheckResu
     ...coverageErrors("efforts", input.efforts, Object.keys(input.config.efforts)),
   );
   errors.push(
-    ...coverageErrors("models", input.models, Object.keys(input.config.models)),
+    ...coverageErrors(
+      "models",
+      input.models,
+      Object.keys(input.config.models),
+      true,
+    ),
   );
 
   const modelSet = new Set(input.models);
