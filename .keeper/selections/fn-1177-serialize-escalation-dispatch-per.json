@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A subtle concurrency-correctness invariant in the autopilot escalation dispatch path \u2014 a per-checkout occupancy guard that must serialize same-checkout sessions yet stay non-terminal, marker-free, row-free, re-sweepable, and role-keyed \u2014 is a named intelligence-bound opus gate, at the model-default effort band since it extends an existing single-file skip-outcome pattern.",
+      "task_id": "fn-1177-serialize-escalation-dispatch-per.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T23:46:52.208000Z",
+  "epic_id": "fn-1177-serialize-escalation-dispatch-per",
+  "input_hash": "b384a0bce9cc09332d51bf26c075873243e0d237e8d8524696ffbc5731d1b2a2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3011813564,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1177-serialize-escalation-dispatch-per.1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"A subtle concurrency-correctness invariant in the autopilot escalation dispatch path \u2014 a per-checkout occupancy guard that must serialize same-checkout sessions yet stay non-terminal, marker-free, row-free, re-sweepable, and role-keyed \u2014 is a named intelligence-bound opus gate, at the model-default effort band since it extends an existing single-file skip-outcome pattern.\",\"confidence\":0.7}]}"
+}
