@@ -45,5 +45,5 @@ verb behaviors (skip-if-exists, distinct rejection codes).
 - [ ] The close report line carries the audit outcome or the skip reason.
 
 ## Done summary
-
+Added Phase 3.6 selection-audit beat to /plan:close: assemble audit brief, spawn plan:selection-auditor blind, relay verdict to selection-review-submit before finalize. Every failure degrades to a logged skip (no retry/block), and the close report gains a selection-audit line.
 ## Evidence
