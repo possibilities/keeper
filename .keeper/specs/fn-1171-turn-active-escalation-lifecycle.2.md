@@ -44,5 +44,5 @@ Parallel the getDispatchOrigin suite: escalation stamp lands for each of the thr
 - [ ] From-scratch re-fold reproduces all stamps (and misses) byte-identically
 
 ## Done summary
-
+Migration v114 adds nullable jobs.escalation_instance + dispatch_failures.instance_event_id (no DEFAULT, whitelist-only Python read). dispatch_failures folds stamp instance_event_id first-appearance-stable (preserved on UPSERT, reborn on clear+re-mint); a new SessionStart branch binds unblock/deconflict/resolve sessions to their block instance via prior-projection corroboration, stamping dispatch_origin='escalation' + escalation_instance both-or-neither, set-once. Re-fold reproduces stamps and misses byte-identically.
 ## Evidence
