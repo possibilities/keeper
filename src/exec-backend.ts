@@ -92,6 +92,14 @@ export interface LaunchSpec {
    *  re-attach rather than a fresh prompted session. Omitted for the prompt-mode
    *  worker/dispatch launch (the byte-unchanged default). */
   readonly resumeTarget?: string;
+  /** The ORIGINAL keeper job id a resume launch re-attaches under. When set in
+   *  resume mode ({@link resumeTarget}), the launch carries it as a
+   *  `--x-tmux-env KEEPER_JOB_ID=<id>` pane env so the revived non-claude harness
+   *  folds onto its existing `jobs` row (never minting an orphan). Prompt mode
+   *  ignores it — a fresh launch always emits the empty overwrite carrier so a
+   *  stale identity in a reused tmux session env can never poison it. Omitted for
+   *  the prompt-mode worker/dispatch launch. */
+  readonly jobId?: string;
   /** Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). Absent/NULL ⇒
    *  claude: the agent token stays `claude` and the claude worker-permission
    *  posture is emitted (byte-unchanged). A non-claude value routes `keeper agent
@@ -419,6 +427,73 @@ export function buildTmuxSelectPaneArgs(paneId: string): string[] {
  */
 export function buildTmuxServerGenerationArgs(): string[] {
   return ["tmux", "display-message", "-p", "#{pid}:#{start_time}"];
+}
+
+/**
+ * The parsed shape of a generation id. The CURRENT format carries the tmux
+ * server `pid` PLUS its `startTime` (`pid:start_time`); a LEGACY bare-pid id
+ * carries only `pid` with `startTime: null` — a read-only artifact the
+ * canonicalizer aliases onto its full-form sibling, never a freshly minted id.
+ */
+export interface ParsedGenerationId {
+  pid: string;
+  startTime: string | null;
+}
+
+/** A tmux `#{pid}` / `#{start_time}` field is a positive integer; anything else
+ *  (empty, non-digit, non-positive, float, hex) is a degraded probe field. */
+function isPositiveIntField(s: string | undefined): boolean {
+  if (s == null || !/^\d+$/.test(s)) {
+    return false;
+  }
+  const n = Number(s);
+  return Number.isInteger(n) && n > 0;
+}
+
+/**
+ * Parse a generation id into `{pid, startTime}`. Accepts the CURRENT
+ * `pid:start_time` form (both positive integers) and the LEGACY bare-pid form
+ * (`pid` alone → `startTime: null`), so the read-time canonicalizer can alias a
+ * bare id onto its full-form sibling. Returns `null` for any other shape (empty,
+ * >2 segments, a non-positive-integer field). Pure — the sole parser of a
+ * generation-id string.
+ */
+export function parseGenerationId(id: string): ParsedGenerationId | null {
+  const raw = id.trim();
+  if (raw === "") {
+    return null;
+  }
+  const parts = raw.split(":");
+  if (parts.length === 1) {
+    return isPositiveIntField(parts[0])
+      ? { pid: parts[0], startTime: null }
+      : null;
+  }
+  if (parts.length === 2) {
+    const [pid, startTime] = parts;
+    return isPositiveIntField(pid) && isPositiveIntField(startTime)
+      ? { pid, startTime }
+      : null;
+  }
+  return null;
+}
+
+/**
+ * The SOLE producer of a generation-id string from a raw `#{pid}:#{start_time}`
+ * probe. Every emitter mints through this one builder — the restore-worker
+ * boundary pulse, the boot seed, and the tmux-control-worker topology stream —
+ * so a probe-format change can never fork one server boot into two competing
+ * generations. Returns the canonical `pid:start_time` form; `null` for a
+ * degraded probe (empty / non-zero-exit output / a bare-pid or garbage line),
+ * meaning "no generation observed" so the caller emits nothing. A bare-pid parse
+ * is never minted — it is a read-time legacy artifact only. Pure.
+ */
+export function buildGenerationId(rawProbeOutput: string): string | null {
+  const parsed = parseGenerationId(rawProbeOutput);
+  if (parsed === null || parsed.startTime === null) {
+    return null;
+  }
+  return `${parsed.pid}:${parsed.startTime}`;
 }
 
 /**
@@ -887,6 +962,13 @@ export interface KeeperAgentLaunchOpts {
    *  {@link harness}) and NO trailing prompt positional. Omitted for the
    *  prompt-mode worker/dispatch launch. */
   readonly resumeTarget?: string;
+  /** The ORIGINAL keeper job id a resume launch re-attaches under, emitted as a
+   *  FOURTH repeated `--x-tmux-env KEEPER_JOB_ID=<id>` carrier so the revived
+   *  harness folds onto its existing job row. Only carries a value in resume mode
+   *  ({@link resumeTarget} set); a prompt-mode launch ALWAYS emits the empty
+   *  `KEEPER_JOB_ID=` overwrite (never this value) so a stale identity a prior
+   *  resume left in a reused tmux session env can never poison a fresh launch. */
+  readonly jobId?: string;
   /** Launching harness. Absent/NULL ⇒ claude (agent token `claude`, claude
    *  worker-permission flags emitted — byte-unchanged). A non-claude value swaps
    *  the agent token to `<harness>`, drops the claude permission flags (keeper
@@ -935,6 +1017,7 @@ export interface KeeperAgentLaunchOpts {
  *     --x-tmux-env KEEPER_TMUX_SESSION=<session>
  *     --x-tmux-env KEEPER_PLAN_WORKTREE=<lane>
  *     --x-tmux-env KEEPER_PLAN_WORKTREE_BRANCH=<branch>
+ *     --x-tmux-env KEEPER_JOB_ID=<id-on-resume-else-empty>
  *     [--model <m>] [--effort <e>] [--x-no-confirm]
  *     [--name <claudeName>] (<prompt> | --resume <resumeTarget>)`
  *
@@ -959,7 +1042,12 @@ export interface KeeperAgentLaunchOpts {
  * prior worktree launch left in a reused session (an empty value resolves
  * identically to unset, so serial resolution is unchanged). It rides BOTH prompt
  * and resume launches (a resumed worktree worker must not re-resolve to the main
- * checkout). Pure — exported for byte-pin tests.
+ * checkout). A FOURTH `--x-tmux-env KEEPER_JOB_ID=<id-or-empty>` rides the same
+ * always-present pattern: the ORIGINAL job id ({@link KeeperAgentLaunchOpts.jobId})
+ * on a RESUME launch so the revived harness folds onto its existing row, EMPTY on
+ * a prompt launch so a stale identity in a reused session env can never poison a
+ * fresh launch into folding onto someone else's row. Pure — exported for byte-pin
+ * tests.
  */
 export function buildKeeperAgentLaunchArgv(
   opts: KeeperAgentLaunchOpts,
@@ -991,10 +1079,10 @@ export function buildKeeperAgentLaunchArgv(
   // <t>`) sourced from the descriptor registry — never a re-inlined switch.
   // Prompt mode keeps the prompt as the UNCONDITIONAL final positional, so the
   // claude worker/dispatch argv is byte-unchanged.
-  const tail =
-    opts.resumeTarget !== undefined && opts.resumeTarget !== ""
-      ? buildHarnessResumeArgv(harness, opts.resumeTarget)
-      : [opts.prompt];
+  const isResume = opts.resumeTarget !== undefined && opts.resumeTarget !== "";
+  const tail = isResume
+    ? buildHarnessResumeArgv(harness, opts.resumeTarget as string)
+    : [opts.prompt];
   // The claude worker-permission posture (`--permission-mode acceptEdits
   // --dangerously-skip-permissions`) is CLAUDE-native and forwarded to the claude
   // CLI. A non-claude harness omits it — keeper agent applies that harness's own
@@ -1026,6 +1114,14 @@ export function buildKeeperAgentLaunchArgv(
     // hook's SessionStart capture.
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE_BRANCH=${opts.worktreeBranch ?? ""}`,
+    // Job-identity carrier — ALWAYS a FOURTH repeated `--x-tmux-env` (keeper agent
+    // last-wins per dup key): the ORIGINAL keeper job id on a RESUME launch so the
+    // revived non-claude harness folds onto its existing row instead of minting an
+    // orphan, EMPTY on a prompt launch. Always present so the `-e` OVERWRITES any
+    // stale identity a prior resume launch left in a reused tmux session env — a
+    // fresh prompted launch can never inherit and fold onto someone else's row.
+    "--x-tmux-env",
+    `KEEPER_JOB_ID=${isResume ? (opts.jobId ?? "") : ""}`,
     // Keeper-owned worker permission posture, mirroring the pair-launch precedent
     // (`nativeClaudeArgs`): every claude launch this builder mints is a detached
     // automated worker with NO human to answer a prompt, so it skips permission
@@ -1229,6 +1325,7 @@ export async function keeperAgentLaunch(
     ...(deps.spec.resumeTarget !== undefined
       ? { resumeTarget: deps.spec.resumeTarget }
       : {}),
+    ...(deps.spec.jobId !== undefined ? { jobId: deps.spec.jobId } : {}),
     ...(deps.spec.harness !== undefined ? { harness: deps.spec.harness } : {}),
     ...(deps.spec.claudeName !== undefined
       ? { claudeName: deps.spec.claudeName }

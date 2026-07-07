@@ -42,7 +42,7 @@
 import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
-import { localeDefaultedEnv } from "./exec-backend";
+import { buildGenerationId, localeDefaultedEnv } from "./exec-backend";
 import { LineBuffer, OversizedLineError } from "./protocol";
 import { runQuery } from "./server-worker";
 import { createControlStreamParser } from "./tmux-control-parser";
@@ -857,8 +857,10 @@ export async function runConnection(
         const generationLines = await sendCommand(
           "display-message -p '#{pid}:#{start_time}'",
         );
-        const generation = (generationLines[0] ?? "").trim();
-        generationId = generation === "" ? null : generation;
+        // Mint through the SOLE builder — the topology stream and the
+        // restore-worker boundary pulse share one format, so a probe-format
+        // change can never fork one server boot into two generations.
+        generationId = buildGenerationId(generationLines[0] ?? "");
       }
       const clientsBody = (
         await sendCommand(`list-clients -F '${LIST_CLIENTS_FORMAT}'`)

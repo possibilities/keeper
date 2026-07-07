@@ -38,5 +38,5 @@ Board: homed blocked row renders one top-block line + keeps its pill; worktree-r
 - [ ] isJamReason and watch delta types are unchanged
 
 ## Done summary
-
+Promoted homed blocked:-prefix work:: rows into the top-of-board needs-human block (task-id locator, pill stays for locality); keeper status needs_human gained a blocked_work named subset member mirroring finalize_non_ff's never-double-count pattern.
 ## Evidence

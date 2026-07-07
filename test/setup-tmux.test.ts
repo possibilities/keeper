@@ -22,14 +22,20 @@ import {
   main,
   parseBusyPanes,
   type RestoreOffer,
+  type RestoreOfferBundle,
   type RestoreRetryStore,
+  readMirrorJobIds,
   renderBusyTable,
   renderRestoreOutcome,
   resolveDashSize,
   type SyncSpawnFn,
   type SyncSpawnResult,
+  selectionToOfferBundle,
   sweepBusyPanes,
 } from "../cli/setup-tmux";
+import { TABS_EXIT_PARTIAL_FAILURE } from "../cli/tabs";
+import type { GenerationSummary } from "../src/restore-set";
+import type { RestoreSelection } from "../src/tabs-core";
 import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 
 const HOME = keeperTmuxSessionCwd(process.env);
@@ -605,7 +611,11 @@ describe("main() --kill-sessions busy-pane gate", () => {
       // Must NOT throw (no exit), must complete setup. The restore offer is
       // stubbed empty — the default reads the live keeper.db and probes the
       // real tmux server, whose latency under load breaches the test timeout.
-      await main(["--kill-sessions"], spawn, () => ({}));
+      await main(["--kill-sessions"], spawn, () => ({
+        offers: {},
+        ambiguous: false,
+        eligible: [],
+      }));
     } finally {
       process.stdout.write = savedOut;
     }
@@ -738,6 +748,34 @@ describe("renderRestoreOutcome", () => {
     );
     expect(line).toBe("keeper setup-tmux: 'work' restored 2 agent(s)");
   });
+
+  test("exit 0 with unverified>0 ⇒ success line carries an unverified note (a launched-unverified warn is not a failure)", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      okResult("# summary: restored=3 failed=0 unverified=1\n"),
+      1000 + 120,
+    );
+    expect(line).toBe(
+      "keeper setup-tmux: 'work' restored 3 agent(s) (unverified=1) from generation 999 (2m ago)",
+    );
+  });
+
+  test("TABS_EXIT_PARTIAL_FAILURE ⇒ PARTIAL line with the restored/failed/unverified breakdown from the child summary", () => {
+    const line = renderRestoreOutcome(
+      "work",
+      offer,
+      {
+        exitCode: TABS_EXIT_PARTIAL_FAILURE,
+        stdout: Buffer.from("# summary: restored=2 failed=1 unverified=1\n"),
+        stderr: Buffer.from(""),
+      },
+      1000 + 120,
+    );
+    expect(line).toBe(
+      `keeper setup-tmux: 'work' restore PARTIAL (exit ${TABS_EXIT_PARTIAL_FAILURE}): restored=2 failed=1 unverified=1 from generation 999 (2m ago)`,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -840,7 +878,14 @@ async function runWithTTY(opts: {
   offers: Record<string, RestoreOffer>;
   tty: boolean;
   answer: string;
+  /** Multi-prompt input (picker choice THEN confirm y/N); overrides `answer`. */
+  answers?: string[];
   retryStore?: RestoreRetryStore;
+  /** Force the escalate-or-refuse path; `eligible` is the picker menu. */
+  ambiguous?: boolean;
+  eligible?: GenerationSummary[];
+  /** Offers returned when the picker re-resolves an explicit generation id. */
+  pickedOffers?: Record<string, RestoreOffer>;
 }): Promise<string[]> {
   const savedStdin = process.stdin;
   const savedStdinTTY = process.stdin.isTTY;
@@ -849,9 +894,10 @@ async function runWithTTY(opts: {
   const writes: string[] = [];
 
   const { Readable } = await import("node:stream");
-  // A line of input resolves rl.question; [] (EOF) resolves via "close".
+  // Each line resolves one rl.question in order; [] (EOF) resolves via "close".
+  const inputLines = opts.answers ?? (opts.answer === "" ? [] : [opts.answer]);
   const fakeStdin = Readable.from(
-    opts.answer === "" ? [] : [`${opts.answer}\n`],
+    inputLines.length === 0 ? [] : [inputLines.map((l) => `${l}\n`).join("")],
   ) as unknown as typeof process.stdin;
   Object.defineProperty(process, "stdin", {
     value: fakeStdin,
@@ -873,10 +919,20 @@ async function runWithTTY(opts: {
   }) as typeof process.stdout.write;
 
   try {
+    const restoreOfferFake = (
+      generationId?: string | null,
+    ): RestoreOfferBundle =>
+      generationId != null && generationId !== ""
+        ? { offers: opts.pickedOffers ?? {}, ambiguous: false, eligible: [] }
+        : {
+            offers: opts.offers,
+            ambiguous: opts.ambiguous ?? false,
+            eligible: opts.eligible ?? [],
+          };
     await main(
       [],
       opts.spawn,
-      () => opts.offers,
+      restoreOfferFake,
       undefined,
       opts.retryStore ?? memoryRetryStore(),
     );
@@ -1091,6 +1147,201 @@ describe("main() restore-last-session offer", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Escalate-or-refuse a CONTESTED auto-pick (the fn-1162 ambiguity gate).
+// ---------------------------------------------------------------------------
+
+/** Build a GenerationSummary for picker-menu tests. */
+const genSummary = (
+  id: string,
+  over: Partial<GenerationSummary> = {},
+): GenerationSummary => ({
+  generation_id: id,
+  first_event_id: 1,
+  last_event_id: 100,
+  snapshot_count: 1,
+  first_ts: 1000,
+  last_ts: 1000,
+  max_pane_count: 3,
+  is_current: false,
+  degenerate: false,
+  restorable: 2,
+  ...over,
+});
+
+describe("main() ambiguous restore escalate-or-refuse", () => {
+  test("ambiguous + TTY ⇒ numbered picker, chosen generation's offers apply", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls);
+    // Picker menu of two generations; picking #2 IS the confirmation.
+    const writes = await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      ambiguous: true,
+      eligible: [genSummary("111"), genSummary("222")],
+      pickedOffers: { work: offerFor(5) },
+      tty: true,
+      answer: "2",
+    });
+
+    // The picker menu rendered both generations, and the picked generation's
+    // re-resolved offers drove the actual restore.
+    expect(
+      writes.some((w) => w.includes("ambiguous last-session restore")),
+    ).toBe(true);
+    expect(
+      writes.some((w) => w.includes("gen 111") && w.includes("gen 222")),
+    ).toBe(true);
+    expect(spawnedRestoreFor(calls, "work")).toBe(true);
+  });
+
+  test("ambiguous + TTY + blank ⇒ abort, restores nothing", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls);
+    await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      ambiguous: true,
+      eligible: [genSummary("111"), genSummary("222")],
+      tty: true,
+      answer: "",
+      answers: [""],
+    });
+    expect(spawnedAnyRestore(calls)).toBe(false);
+  });
+
+  test("ambiguous + non-TTY ⇒ visible refusal naming the recovery command, no spawn", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls);
+    const savedErr = process.stderr.write;
+    const errWrites: string[] = [];
+    process.stderr.write = ((s: string | Uint8Array) => {
+      errWrites.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await runWithTTY({
+        spawn,
+        offers: { work: offerFor(2) },
+        ambiguous: true,
+        eligible: [genSummary("111"), genSummary("222")],
+        tty: false,
+        answer: "y",
+      });
+    } finally {
+      process.stderr.write = savedErr;
+    }
+    expect(spawnedAnyRestore(calls)).toBe(false);
+    const refusal = errWrites.find((w) => w.includes("refusing an AMBIGUOUS"));
+    expect(refusal).toBeDefined();
+    expect(errWrites.some((w) => w.includes("keeper tabs restore"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pure: selectionToOfferBundle mirror cross-check + readMirrorJobIds.
+// ---------------------------------------------------------------------------
+
+const candidate = (
+  jobId: string,
+  session = "work",
+): import("../src/restore-set").RestoreCandidate => ({
+  job_id: jobId,
+  resume_target: jobId,
+  label: jobId,
+  window_index: 0,
+  cwd: null,
+  backend_exec_session_id: session,
+  created_at: 1000,
+});
+
+const selectionOf = (
+  jobIds: string[],
+  over: Partial<RestoreSelection> = {},
+): RestoreSelection => ({
+  candidates: jobIds.map((id) => candidate(id)),
+  pickedGeneration: {
+    generation_id: "g1",
+    last_ts: 1000,
+    max_pane_count: 3,
+  } as unknown as RestoreSelection["pickedGeneration"],
+  eligible: [genSummary("g1")],
+  ambiguous: false,
+  ...over,
+});
+
+describe("selectionToOfferBundle mirror cross-check", () => {
+  test("derived cohort disagreeing with a non-empty mirror forces ambiguous", () => {
+    const bundle = selectionToOfferBundle(
+      selectionOf(["a", "b"]),
+      new Set(["a", "c"]),
+      true,
+    );
+    expect(bundle.ambiguous).toBe(true);
+  });
+
+  test("derived cohort matching the mirror stays unambiguous", () => {
+    const bundle = selectionToOfferBundle(
+      selectionOf(["a", "b"]),
+      new Set(["b", "a"]),
+      true,
+    );
+    expect(bundle.ambiguous).toBe(false);
+  });
+
+  test("an empty mirror never forces ambiguity", () => {
+    const bundle = selectionToOfferBundle(
+      selectionOf(["a", "b"]),
+      new Set<string>(),
+      true,
+    );
+    expect(bundle.ambiguous).toBe(false);
+  });
+
+  test("cross-check disabled (explicit --generation pick) never forces ambiguity", () => {
+    const bundle = selectionToOfferBundle(
+      selectionOf(["a", "b"]),
+      new Set(["x", "y"]),
+      false,
+    );
+    expect(bundle.ambiguous).toBe(false);
+  });
+
+  test("an already-ambiguous selection stays ambiguous regardless of the mirror", () => {
+    const bundle = selectionToOfferBundle(
+      selectionOf(["a"], { ambiguous: true }),
+      new Set(["a"]),
+      true,
+    );
+    expect(bundle.ambiguous).toBe(true);
+  });
+});
+
+describe("readMirrorJobIds", () => {
+  test("collects every session bucket's agent job ids", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(`${tmpdir()}/keeper-mirror-`);
+    const path = `${dir}/restore.json`;
+    writeFileSync(
+      path,
+      JSON.stringify({
+        current: {
+          sessions: {
+            work: { agents: [{ job_id: "a" }, { job_id: "b" }] },
+            other: { agents: [{ job_id: "c" }] },
+          },
+        },
+      }),
+    );
+    expect([...readMirrorJobIds(path)].sort()).toEqual(["a", "b", "c"]);
+  });
+
+  test("a missing / unreadable mirror yields an empty set", () => {
+    expect(readMirrorJobIds("/no/such/keeper-restore.json").size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // main() provision / sweep / teardown roles. setup-tmux provisions ONLY `work`;
 // `autopilot` is swept-not-created; the dash server is torn down with
 // `tmux -L dash kill-server` on EVERY run regardless of --kill-sessions; a dash
@@ -1142,7 +1393,11 @@ async function runProvision(opts: {
   process.stdout.write = (() => true) as typeof process.stdout.write;
   process.stderr.write = (() => true) as typeof process.stderr.write;
   try {
-    await main(opts.argv ?? [], opts.spawn, () => ({}));
+    await main(opts.argv ?? [], opts.spawn, () => ({
+      offers: {},
+      ambiguous: false,
+      eligible: [],
+    }));
   } finally {
     Object.defineProperty(process.stdin, "isTTY", {
       value: savedStdinTTY,
@@ -1328,7 +1583,12 @@ async function runWithGuardFs(
   process.stdout.write = (() => true) as typeof process.stdout.write;
   process.stderr.write = (() => true) as typeof process.stderr.write;
   try {
-    await main([], spawn, () => ({}), guardFs);
+    await main(
+      [],
+      spawn,
+      () => ({ offers: {}, ambiguous: false, eligible: [] }),
+      guardFs,
+    );
   } finally {
     Object.defineProperty(process.stdin, "isTTY", {
       value: savedStdinTTY,

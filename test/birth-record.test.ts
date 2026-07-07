@@ -352,6 +352,54 @@ describe("main() emits birth records for non-claude launches", () => {
     expect(draft.session_id).toBe("orig-job-id");
     expect(h.deps.env.KEEPER_JOB_ID).toBe("orig-job-id");
   });
+
+  test("a pi resume folds onto the carried job id AND stamps resume_target from the --session argv (identity ≠ resume key)", async () => {
+    // The incident exemplar: keeper job `45f94c4d…` runs pi session `d98a2d54…`.
+    // On resume the transport carries the ORIGINAL job id back in KEEPER_JOB_ID and
+    // the harness-native `--session <native>` in the argv. The record must fold
+    // onto the carried job id (no orphan) yet re-emit the NATIVE session as its
+    // resume key — never the job id.
+    const h = makeHarness({
+      argv: ["pi", "--session", "d98a2d54-native"],
+      rawArgv: true,
+      env: { KEEPER_JOB_ID: "45f94c4d-orig" },
+    });
+    await runAndCapture(h, main);
+    expect(h.birthRecords).toHaveLength(1);
+    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
+    expect(draft.harness).toBe("pi");
+    // Identity: folds onto the carried job id, no orphan minted.
+    expect(draft.session_id).toBe("45f94c4d-orig");
+    expect(h.deps.env.KEEPER_JOB_ID).toBe("45f94c4d-orig");
+    // Resume key: the harness-native target from the argv, NOT the job id.
+    expect(draft.resume_target).toBe("d98a2d54-native");
+  });
+
+  test("a codex resume stamps resume_target from the `resume <target>` subcommand argv", async () => {
+    const h = makeHarness({
+      argv: ["codex", "resume", "rollout-uuid-7"],
+      rawArgv: true,
+      env: { KEEPER_JOB_ID: "codex-orig" },
+    });
+    await runAndCapture(h, main);
+    expect(h.birthRecords).toHaveLength(1);
+    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
+    expect(draft.session_id).toBe("codex-orig");
+    expect(draft.resume_target).toBe("rollout-uuid-7");
+  });
+
+  test("a hermes resume stamps resume_target from the `--resume <target>` argv", async () => {
+    const h = makeHarness({
+      argv: ["hermes", "--resume", "hermes-native-9"],
+      rawArgv: true,
+      env: { KEEPER_JOB_ID: "hermes-orig" },
+    });
+    await runAndCapture(h, main);
+    expect(h.birthRecords).toHaveLength(1);
+    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
+    expect(draft.session_id).toBe("hermes-orig");
+    expect(draft.resume_target).toBe("hermes-native-9");
+  });
 });
 
 describe("the detached OUTER wrapper writes no birth record", () => {

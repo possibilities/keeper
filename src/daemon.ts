@@ -197,6 +197,7 @@ import type {
   BackendExecStartMessage,
   RestoreWorkerData,
 } from "./restore-worker";
+import { nodeResumeResolveFs } from "./resume-resolve";
 import { perRootStoredWhileOffNote } from "./rpc-handlers";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
@@ -219,6 +220,7 @@ import type {
   SetEpicArmedResultMessage,
 } from "./server-worker";
 import type { StatuslineWorkerData } from "./statusline-worker";
+import { type PiRepairJob, proposePiRepair } from "./tabs-core";
 import { seedTmuxProjection } from "./tmux-boot-seed";
 import type {
   TmuxClientFocusSnapshotMessage,
@@ -3755,6 +3757,100 @@ export function resolveCodexResumeCandidates(
 }
 
 /**
+ * The recency floor (seconds) for the pi resume-target REPAIR pass — a live pi
+ * job launched within this window whose recorded target rotted (names no on-disk
+ * artifact) is eligible for an auto-repair. Generous relative to the codex NULL
+ * back-fill window because rot is discovered over a session's life, not at launch;
+ * the non-terminal state filter already bounds the pass to live jobs, so this is a
+ * belt-and-suspenders cap keeping a permanently-unmatchable old job from
+ * re-scanning its store forever.
+ */
+export const PI_RESUME_REPAIR_RECENT_WINDOW_SEC = 7 * 24 * 60 * 60;
+
+/**
+ * A rotted-and-repaired pi resume target: the job, the rotted target the proposal
+ * was computed against, and the disk-anchored replacement. `oldTarget` is the
+ * re-mint's concurrency guard — MAIN re-reads `resume_target` and mints only while
+ * it still equals `oldTarget`, so a concurrent fix is never clobbered.
+ */
+export interface PiResumeRepair {
+  jobId: string;
+  oldTarget: string;
+  newTarget: string;
+}
+
+/**
+ * The live pi jobs whose recorded resume target may have rotted: harness `pi`, a
+ * non-empty `resume_target`, a non-terminal (`working`/`stopped`) state, and
+ * launched within `recentWindowSec` of `nowSec`. Same shape as
+ * {@link findCodexResumeCandidates} — the recency floor keeps the sweep quiet. The
+ * rot check itself (target names no artifact) is deferred to {@link proposePiRepair}.
+ * Pure over the db + clock.
+ */
+export function findRottedPiResumeCandidates(
+  db: Database,
+  nowSec: number,
+  recentWindowSec: number,
+): PiRepairJob[] {
+  const rows = db
+    .query(
+      `SELECT job_id, title, cwd, resume_target, created_at FROM jobs
+         WHERE harness = 'pi' AND resume_target IS NOT NULL AND resume_target != ''
+           AND state IN ('working', 'stopped')
+           AND created_at >= ?`,
+    )
+    .all(nowSec - recentWindowSec) as {
+    job_id: string;
+    title: string | null;
+    cwd: string | null;
+    resume_target: string;
+    created_at: number;
+  }[];
+  return rows.map((r) => ({
+    jobId: r.job_id,
+    label: r.title ?? r.job_id,
+    cwd: r.cwd,
+    resumeTarget: r.resume_target,
+    createdAtMs: r.created_at * 1000,
+  }));
+}
+
+/**
+ * Resolve the disk-anchored replacement for every current rotted-pi candidate,
+ * gating each through {@link proposePiRepair} (the SAME confidence gate
+ * `keeper tabs repair` reports with) and keeping ONLY the unambiguous
+ * single-candidate `resolved` proposals — an `ambiguous` or `unmatched` job is
+ * omitted (it stays surfaced by `keeper tabs repair` until it resolves or a human
+ * corrects it). Reads the pi session stores via the real fs seam; returns [] with
+ * NO store read when there are no candidates (the sweep's idle path).
+ */
+export function resolvePiResumeRepairs(
+  db: Database,
+  homeDir: string,
+  env: Record<string, string | undefined>,
+  nowSec: number,
+  recentWindowSec: number,
+): PiResumeRepair[] {
+  const candidates = findRottedPiResumeCandidates(db, nowSec, recentWindowSec);
+  if (candidates.length === 0) {
+    return [];
+  }
+  const fs = nodeResumeResolveFs();
+  const repairs: PiResumeRepair[] = [];
+  for (const job of candidates) {
+    const proposal = proposePiRepair(fs, job, { homeDir, env });
+    if (proposal !== null && proposal.kind === "resolved") {
+      repairs.push({
+        jobId: job.jobId,
+        oldTarget: proposal.oldTarget,
+        newTarget: proposal.newTarget,
+      });
+    }
+  }
+  return repairs;
+}
+
+/**
  * The tracked codex jobs whose live stop-churn the state producer tails: harness
  * `codex`, a resolved (non-NULL) `resume_target` — the attributed rollout uuid
  * the tailer keys on, so an unattributed job idles presence-only — and a
@@ -4928,18 +5024,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * and runs before the event insert so a clear is never swallowed.
    */
   /**
-   * Mint ONE `ResumeTargetResolved` synthetic event (fn-1103) that back-fills a
-   * tracked codex job's `resume_target` with its resolved native rollout uuid.
-   * MAIN is the sole event writer, so the daemon-side codex rollout producer mints
-   * here rather than writing `jobs` directly — the fold's dedicated
+   * Mint ONE `ResumeTargetResolved` synthetic event that back-fills a job's
+   * `resume_target`. Two producers ride this seam: the codex rollout back-fill (a
+   * NULL target → its resolved native rollout uuid) and the pi rot repair (a
+   * rotted target → its disk-anchored replacement). MAIN is the sole event writer,
+   * so both mint here rather than writing `jobs` directly — the fold's dedicated
    * `ResumeTargetResolved` arm folds ONLY `jobs.resume_target` (never lifecycle
    * state, so a late back-fill can never revive a terminal row) and a from-scratch
    * re-fold reproduces it from the event's `resume_target` COLUMN. The caller sets
    * `wakePending` + pumps.
    */
-  function mintCodexResumeTargetResolved(
-    resolution: CodexResumeResolution,
-  ): void {
+  function mintResumeTargetResolved(resolution: {
+    jobId: string;
+    resumeTarget: string;
+  }): void {
     stmts.insertEvent.run({
       $ts: Date.now() / 1000,
       $session_id: resolution.jobId,
@@ -9014,7 +9112,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             if (!row || row.resume_target != null) {
               continue;
             }
-            mintCodexResumeTargetResolved(resolution);
+            mintResumeTargetResolved(resolution);
             minted = true;
           }
           if (minted) {
@@ -9024,6 +9122,50 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           console.error(
             `[keeperd] codex-resume sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        // Pi resume-target REPAIR (fn-1162) — the twin pass beside the codex NULL
+        // back-fill, under its OWN guard so a pi store throw never skips the codex
+        // mints (and vice versa). Heals a LIVE pi job whose recorded resume target
+        // rotted (names no on-disk artifact) by disk-anchoring a same-cwd session
+        // via the SAME confidence gate `keeper tabs repair` reports with — only an
+        // UNAMBIGUOUS single-candidate match. Re-reads resume_target before minting
+        // and applies only while it still equals the rotted target the proposal was
+        // computed against, so a concurrent fix is never clobbered.
+        try {
+          const repairs = resolvePiResumeRepairs(
+            db,
+            homedir(),
+            process.env as Record<string, string | undefined>,
+            Date.now() / 1000,
+            PI_RESUME_REPAIR_RECENT_WINDOW_SEC,
+          );
+          let repaired = false;
+          for (const repair of repairs) {
+            if (repair.newTarget === repair.oldTarget) {
+              continue; // no-op — never mint an identity re-pin.
+            }
+            const row = db
+              .query("SELECT resume_target FROM jobs WHERE job_id = ?")
+              .get(repair.jobId) as { resume_target: string | null } | null;
+            if (!row || row.resume_target !== repair.oldTarget) {
+              continue; // changed concurrently — never clobber a resolved target.
+            }
+            mintResumeTargetResolved({
+              jobId: repair.jobId,
+              resumeTarget: repair.newTarget,
+            });
+            repaired = true;
+          }
+          if (repaired) {
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          console.error(
+            `[keeperd] pi-resume repair sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );

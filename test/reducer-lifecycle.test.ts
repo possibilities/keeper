@@ -8647,3 +8647,147 @@ test("malformed data blob logs to stderr and advances cursor without halting", (
     console.error = originalError;
   }
 });
+
+// ---------------------------------------------------------------------------
+// fn-1162.6 — activity-gated transcript_path clobber guard. A non-null
+// transcript_path is seeded once at the first-sight INSERT and thereafter moves
+// ONLY on a proven-live, KEEP-SET activity event (UserPromptSubmit / Stop) that
+// carries the field. A bare SessionStart — including the SessionStart(+
+// SessionEnd) pair a FAILED resume emits — never moves it, so a predicted-but-
+// never-created resume target can never clobber the last good path. Pre/
+// PostToolUse is deliberately NOT a source: its body sheds and transcript_path
+// has no promoted column, so reading it there would diverge on a post-shed
+// re-fold.
+// ---------------------------------------------------------------------------
+
+function getTranscript(jobId = "sess-a"): {
+  transcript_path: string | null;
+  last_event_id: number;
+} {
+  return db
+    .query("SELECT transcript_path, last_event_id FROM jobs WHERE job_id = ?")
+    .get(jobId) as { transcript_path: string | null; last_event_id: number };
+}
+
+test("fn-1162.6 a failed resume (SessionStart+SessionEnd, no activity) leaves transcript_path intact", () => {
+  // Seed the good path at first-sight INSERT.
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({ transcript_path: "/good/a.jsonl" }),
+  });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/good/a.jsonl");
+
+  // A failed resume re-emits SessionStart carrying the PREDICTED-but-never-
+  // created path, then SessionEnd — no activity in between. The predicted path
+  // must not clobber the seeded good one.
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({ transcript_path: "/predicted/never-created.jsonl" }),
+  });
+  insertEvent({ hook_event: "SessionEnd" });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/good/a.jsonl");
+});
+
+test("fn-1162.6 a keep-set activity event updates transcript_path; one lacking the field changes nothing", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({ transcript_path: "/seed/a.jsonl" }),
+  });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/seed/a.jsonl");
+
+  // UserPromptSubmit carrying a drifted path moves the column to the live value.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ transcript_path: "/live/ups.jsonl" }),
+  });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/live/ups.jsonl");
+
+  // An activity event LACKING the field must never null the column.
+  insertEvent({ hook_event: "UserPromptSubmit", data: "{}" });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/live/ups.jsonl");
+
+  // Stop is equally proven-live + keep-set and moves the column too.
+  insertEvent({
+    hook_event: "Stop",
+    data: JSON.stringify({ transcript_path: "/live/stop.jsonl" }),
+  });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/live/stop.jsonl");
+});
+
+test("fn-1162.6 a Pre/PostToolUse tool event is NOT a transcript_path source (shed-safety guard)", () => {
+  // A tool event is proven-live, but its body sheds for the mutation tools and
+  // transcript_path has no promoted column, so the fold must NOT read it here —
+  // otherwise a post-shed re-fold would diverge. A tool event carrying a drifted
+  // path must therefore leave transcript_path untouched.
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({ transcript_path: "/seed/a.jsonl" }),
+  });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/seed/a.jsonl");
+
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    data: JSON.stringify({ transcript_path: "/drifted/via-tool.jsonl" }),
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Read",
+    data: JSON.stringify({ transcript_path: "/drifted/via-pre.jsonl" }),
+  });
+  drainAll();
+  expect(getTranscript().transcript_path).toBe("/seed/a.jsonl");
+});
+
+test("fn-1162.6 re-fold determinism: seed + failed-resume + genuine-resume-activity stream re-folds byte-identical", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({ transcript_path: "/good/a.jsonl" }),
+  });
+  // Failed resume: predicted path + close, no activity.
+  insertEvent({
+    hook_event: "SessionStart",
+    data: JSON.stringify({ transcript_path: "/predicted/never.jsonl" }),
+  });
+  insertEvent({ hook_event: "SessionEnd" });
+  // Genuine resume re-opens, then proves live via a prompt + a (non-source)
+  // tool event + a Stop carrying the drifted (rehomed) path.
+  insertEvent({ hook_event: "SessionStart", data: "{}" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ transcript_path: "/good/a.jsonl" }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    data: JSON.stringify({ transcript_path: "/ignored/via-tool.jsonl" }),
+  });
+  insertEvent({
+    hook_event: "Stop",
+    data: JSON.stringify({ transcript_path: "/rehomed/a.jsonl" }),
+  });
+  const folded = drainAll();
+  expect(folded).toBeGreaterThan(0);
+  expect(getTranscript().transcript_path).toBe("/rehomed/a.jsonl");
+
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  // Re-fold from cursor=0 over the same event log — projections must be
+  // byte-identical (the guard reads only event.data, no wall-clock/fs/env).
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+});
