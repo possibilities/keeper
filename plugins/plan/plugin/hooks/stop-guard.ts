@@ -9,11 +9,14 @@
 // a resume checklist; every other outcome passes through.
 //
 // Fail open is absolute: any internal error, unparseable stdin, null/typed-error
-// reconcile envelope, or `tooling_error` verdict allows the stop. The close
-// branch is deliberately lenient — it allows on either of two zero-subprocess
-// gates: a sanctioned typed-stop message (QUESTION, BLOCKED, typed errors,
-// fatal/partial reports), or an in-flight subagent it spawned and is awaiting —
-// and blocks only a bare mid-saga stop that matches neither.
+// reconcile envelope, or `tooling_error` verdict allows the stop. Both branches
+// share a zero-subprocess in-flight-subagent allow gate: a stop while a spawned
+// subagent is still running is a legitimate await (the harness resumes the
+// session on the child's completion), so the work checklist fires only at
+// worker-done time — a stop with the task unfinished and NO live worker. The
+// close branch adds a second zero-subprocess gate — a sanctioned typed-stop
+// message (QUESTION, BLOCKED, typed errors, fatal/partial reports) — and blocks
+// only a bare mid-saga stop that matches neither.
 
 import {
   emitBlock,
@@ -51,17 +54,18 @@ export function closeStopAllowed(message: unknown): boolean {
   return CLOSE_ALLOW_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-/** True when the close session's Stop payload carries an in-flight subagent it
- * spawned and is awaiting (the quality-auditor or close-planner) — the harness
- * resumes the session on the child's completion notification, so this stop is a
- * legitimate await, not a mid-saga drop. Reads the TOP-LEVEL `background_tasks`
- * array the Stop payload attaches; a parked child appears as
- * `{type:"subagent", status:"running", agent_type:"plan:…"}`. Gates on subagent
- * PRESENCE, never array length — a bus-subscribed close session always carries a
+/** True when the session's Stop payload carries an in-flight subagent it
+ * spawned and is awaiting — the work orchestrator's backgrounded `work:worker`,
+ * or the closer's quality-auditor / close-planner. The harness resumes the
+ * session on the child's completion notification, so this stop is a legitimate
+ * await, not a drop. Reads the TOP-LEVEL `background_tasks` array the Stop
+ * payload attaches; a parked child appears as
+ * `{type:"subagent", status:"running", agent_type:"…"}`. Gates on subagent
+ * PRESENCE, never array length — a bus-subscribed session always carries a
  * shell `keeper bus watch` entry, so the array is never empty. Non-throwing: any
- * shape mismatch degrades to `false` (fall through to the message gate, then
- * block), never an abort. */
-export function closeChildInFlight(bg: unknown): boolean {
+ * shape mismatch degrades to `false` (fall through to the branch's remaining
+ * gates), never an abort. */
+export function childInFlight(bg: unknown): boolean {
   if (!Array.isArray(bg)) return false;
   return bg.some(
     (t) =>
@@ -127,6 +131,11 @@ async function main(): Promise<void> {
 
   if (marker.kind === "work") {
     if (!marker.task_id) return;
+    // A backgrounded worker in flight is a legitimate await — the harness
+    // resumes this session on its completion; the checklist belongs to the
+    // stop that happens with NO live worker and the task unfinished. Checked
+    // before reconcile so the wait path stays zero-subprocess.
+    if (childInFlight(payload.background_tasks)) return;
     // Read-only live state — never trust the marker for a block. A null
     // envelope, a typed error (no `verdict` key), or `tooling_error` all fail
     // open. Terminal verdicts settle the task; `done`/`blocked` allow and the
@@ -163,7 +172,7 @@ async function main(): Promise<void> {
     // and is awaiting (the harness resumes on its completion), or a sanctioned
     // typed stop in the last message. A bare mid-saga stop matching neither
     // blocks.
-    if (closeChildInFlight(payload.background_tasks)) return;
+    if (childInFlight(payload.background_tasks)) return;
     if (closeStopAllowed(payload.last_assistant_message)) return;
     emitBlock(closeBlockReason(marker.epic_id));
     return;

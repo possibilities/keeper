@@ -21,8 +21,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  childInFlight,
   closeBlockReason,
-  closeChildInFlight,
   closeStopAllowed,
   workBlockReason,
 } from "../plugin/hooks/stop-guard.ts";
@@ -101,7 +101,7 @@ describe("closeBlockReason", () => {
   });
 });
 
-describe("closeChildInFlight", () => {
+describe("childInFlight", () => {
   const running = {
     id: "a1",
     type: "subagent",
@@ -146,7 +146,7 @@ describe("closeChildInFlight", () => {
   ];
   for (const [label, bg, expected] of cases) {
     test(`${label} → ${expected}`, () => {
-      expect(closeChildInFlight(bg)).toBe(expected);
+      expect(childInFlight(bg)).toBe(expected);
     });
   }
 });
@@ -312,6 +312,60 @@ describe("stop-guard ladder", () => {
     expect(env.reason).toContain("fn-1-x.2");
     expect(env.reason).toContain("not finished");
     expect(env.reason).toContain("keeper plan worker resume fn-1-x.2");
+  });
+
+  test("work marker + in-flight worker subagent → allow with zero keeper calls", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({ verdict: "in_progress_uncommitted" });
+
+    const { stdout, planCliCalled } = await run(
+      stopPayload({
+        background_tasks: [
+          {
+            id: "s1",
+            type: "shell",
+            status: "running",
+            command: "keeper bus watch",
+          },
+          {
+            id: "a1",
+            type: "subagent",
+            status: "running",
+            agent_type: "work:worker",
+          },
+        ],
+      }),
+    );
+    expect(stdout).toBe("");
+    expect(planCliCalled).toBe(false);
+  });
+
+  test("work marker + shell bus-watch only + unfinished verdict → block (worker-done catch preserved)", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({ verdict: "in_progress_uncommitted" });
+
+    const { stdout, planCliCalled } = await run(
+      stopPayload({
+        background_tasks: [
+          {
+            id: "s1",
+            type: "shell",
+            status: "running",
+            command: "keeper bus watch",
+          },
+          {
+            id: "a1",
+            type: "subagent",
+            status: "completed",
+            agent_type: "work:worker",
+          },
+        ],
+      }),
+    );
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("fn-1-x.2");
+    expect(planCliCalled).toBe(true);
   });
 
   test("work marker + null probe → block AND a visible fail-open signal", async () => {
