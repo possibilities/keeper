@@ -1,0 +1,40 @@
+{
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded single-snippet authoring, but the config-agnostic wording contract that the whole epic single-sources from is quality-sensitive, so keep opus at the model-default band.",
+      "task_id": "fn-1153-panel-strength-awareness-and-default.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-touching change to a resolver at two non-shared entry points with fail-loud invariants to preserve and drift risk between sites, so route up to opus xhigh.",
+      "task_id": "fn-1153-panel-strength-awareness-and-default.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Atomic multi-file integration with byte-exact bakes, drift-gate extension, CI red-window and worktree reachability hazards demands the highest non-reserved band on opus.",
+      "task_id": "fn-1153-panel-strength-awareness-and-default.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T02:46:33.787000Z",
+  "epic_id": "fn-1153-panel-strength-awareness-and-default",
+  "input_hash": "054e6558f57ecda577cb8b38359e318dda94b72711ea4da8a4c0d37fd6c5ff47",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 89023832,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1153-panel-strength-awareness-and-default.1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Bounded single-snippet authoring, but the config-agnostic wording contract that the whole epic single-sources from is quality-sensitive, so keep opus at the model-default band.\",\"confidence\":0.7},{\"task_id\":\"fn-1153-panel-strength-awareness-and-default.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-touching change to a resolver at two non-shared entry points with fail-loud invariants to preserve and drift risk between sites, so route up to opus xhigh.\",\"confidence\":0.82},{\"task_id\":\"fn-1153-panel-strength-awareness-and-default.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Atomic multi-file integration with byte-exact bakes, drift-gate extension, CI red-window and worktree reachability hazards demands the highest non-reserved band on opus.\",\"confidence\":0.8}]}"
+}
