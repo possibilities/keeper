@@ -27,7 +27,7 @@ Discovery (`src/agent/plugins.ts` `discoverPlugins`) composes, from
   `install.sh`-written default carries NONE (keeper-only, no third-party sources); a
   machine opts a set in by appending its parent — e.g. arthack via
   `~/code/arthack/apps`, `~/code/arthack/claude`, whose manifest-bearing children are
-  `arthack`, `internal`, `lsp`.
+  `arthack`, `internal`, `lsp`, `matt`.
 
 So a fresh machine inherits keeper + plan only; a machine that has opted arthack in
 inherits keeper + plan + the scanned arthack third-party set (see the gate below to
