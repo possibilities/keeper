@@ -53,5 +53,5 @@ oversize payload); fold determinism unit; schema-version pairing test.
       the schema-version pairing test passes.
 
 ## Done summary
-
+Added keeper plan selection-review overlay verb (--set/--clear, readonly, zero-commit) and folded a new nullable epics.selection_review TEXT column through plan-worker (fail-safe coerce), reducer, collections, and daemon; schema v112 whitelisted in keeper-py.
 ## Evidence
