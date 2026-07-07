@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T03:21:40.102000Z",
+  "depends_on": [],
+  "epic": "fn-1155-harden-watch-watchdog-liveness-probes",
+  "id": "fn-1155-harden-watch-watchdog-liveness-probes.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Harden and test watch-watchdog probes",
+  "updated_at": "2026-07-07T03:21:40.102000Z"
+}
