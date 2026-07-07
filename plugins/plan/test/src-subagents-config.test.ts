@@ -5,16 +5,24 @@
 // with a typed SubagentsConfigError rather than a soft default.
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { loadMatrix } from "../../../src/agent/matrix.ts";
 import {
   configuredEfforts,
   configuredModels,
   workerAgentFor,
 } from "../src/models.ts";
 import {
+  loadHostMatrix,
   loadSubagentsMatrixFromDisk,
   parseSubagentsMatrix,
   SubagentsConfigError,
@@ -141,5 +149,102 @@ describe("subagents matrix loader", () => {
     expect(() =>
       loadSubagentsMatrixFromDisk(join(tmp(), "does-not-exist.yaml")),
     ).toThrow(YamlInputError);
+  });
+});
+
+// Cross-island parity: `loadHostMatrix` (plan island, this file) and `loadMatrix`
+// (src/agent/matrix.ts, the launcher island) are two hand-written parsers of the
+// same matrix.yaml shape. They drifted once on the present-but-unreadable path
+// (F1) — this pins them together so the next drift is caught mechanically.
+describe("loadHostMatrix / loadMatrix cross-island parity", () => {
+  // A minimal roster both islands accept: claude native (opus), codex wrapped
+  // (gpt-5.5), a valid harness name recognized by the launcher's registry.
+  const ACCEPTED_ROSTER = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    models: [gpt-5.5]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  // An empty `efforts` list — both parsers require a non-empty token list.
+  const REJECTED_ROSTER = [
+    "efforts: []",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  test("both parsers accept the same valid fixture roster", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "matrix.yaml");
+      writeFileSync(path, ACCEPTED_ROSTER);
+      const host = loadHostMatrix(path);
+      const launcher = loadMatrix(path);
+      expect(host).not.toBeNull();
+      expect(launcher).not.toBeNull();
+      expect(host?.efforts).toEqual(launcher?.efforts);
+      // The model axis: distinct capability tokens in pecking-order first
+      // appearance — both parsers derive it the same way from the provider list.
+      expect(host?.models).toEqual(["opus", "gpt-5.5"]);
+      expect(launcher?.providers.flatMap((p) => [...p.models.keys()])).toEqual([
+        "opus",
+        "gpt-5.5",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("both parsers reject the same invalid fixture roster (empty efforts)", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "matrix.yaml");
+      writeFileSync(path, REJECTED_ROSTER);
+      expect(() => loadHostMatrix(path)).toThrow(SubagentsConfigError);
+      expect(() => loadMatrix(path)).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an absent file returns null in both islands (fall back to embedded defaults)", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "nope.yaml");
+      expect(loadHostMatrix(path)).toBeNull();
+      expect(loadMatrix(path)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a present-but-unreadable matrix.yaml fails loud (typed) in the plan island, matching the launcher island", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "matrix.yaml");
+      writeFileSync(path, ACCEPTED_ROSTER);
+      chmodSync(path, 0o000);
+      try {
+        expect(() => loadHostMatrix(path)).toThrow(SubagentsConfigError);
+        expect(() => loadMatrix(path)).toThrow();
+      } finally {
+        chmodSync(path, 0o600);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
