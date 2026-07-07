@@ -1,0 +1,64 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Keystone pure projector every surface derives from with byte-identity and single-source-of-truth constraints \u2014 a wrong abstraction propagates repo-wide.",
+      "task_id": "fn-1150-event-driven-watch-supervisor.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.87,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "ADR-0011 gated snapshot fold touches the shared readiness-client wire contract with a strict first-paint byte-identity invariant, so a subtle miswire silently corrupts every consumer.",
+      "task_id": "fn-1150-event-driven-watch-supervisor.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Additive NDJSON delta-vocabulary evolution with coalesce/flap-settle and no-op-churn semantics is contract-shaped wire work where a shape mistake breaks old consumers.",
+      "task_id": "fn-1150-event-driven-watch-supervisor.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.84,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Seven await conditions with signature-anchored re-arm grammar, derived fold opt-in, and a structural no-silent-wait invariant span multiple surfaces with contract-grade correctness risk.",
+      "task_id": "fn-1150-event-driven-watch-supervisor.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "New-pattern checked-in watchdog with debounced anomaly/liveness logic plus an invariant-preserving skill rewrite is agentic new-pattern work, not mechanical prose.",
+      "task_id": "fn-1150-event-driven-watch-supervisor.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded, well-specified forward-facing doc alignment plus a regenerated baked index via the existing bake flow \u2014 literal template-following that sonnet handles precisely.",
+      "task_id": "fn-1150-event-driven-watch-supervisor.6",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T00:47:05.932000Z",
+  "epic_id": "fn-1150-event-driven-watch-supervisor",
+  "input_hash": "dfc24ec80a2e7de1ce501266850aa597a817ddbf23ffd807185188bb69d95041",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3754053320,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1150-event-driven-watch-supervisor.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Keystone pure projector every surface derives from with byte-identity and single-source-of-truth constraints \u2014 a wrong abstraction propagates repo-wide.\",\"confidence\":0.86},{\"task_id\":\"fn-1150-event-driven-watch-supervisor.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"ADR-0011 gated snapshot fold touches the shared readiness-client wire contract with a strict first-paint byte-identity invariant, so a subtle miswire silently corrupts every consumer.\",\"confidence\":0.87},{\"task_id\":\"fn-1150-event-driven-watch-supervisor.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Additive NDJSON delta-vocabulary evolution with coalesce/flap-settle and no-op-churn semantics is contract-shaped wire work where a shape mistake breaks old consumers.\",\"confidence\":0.83},{\"task_id\":\"fn-1150-event-driven-watch-supervisor.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Seven await conditions with signature-anchored re-arm grammar, derived fold opt-in, and a structural no-silent-wait invariant span multiple surfaces with contract-grade correctness risk.\",\"confidence\":0.84},{\"task_id\":\"fn-1150-event-driven-watch-supervisor.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"New-pattern checked-in watchdog with debounced anomaly/liveness logic plus an invariant-preserving skill rewrite is agentic new-pattern work, not mechanical prose.\",\"confidence\":0.78},{\"task_id\":\"fn-1150-event-driven-watch-supervisor.6\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded, well-specified forward-facing doc alignment plus a regenerated baked index via the existing bake flow \u2014 literal template-following that sonnet handles precisely.\",\"confidence\":0.74}]}\n"
+}

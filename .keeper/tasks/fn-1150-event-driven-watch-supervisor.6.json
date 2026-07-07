@@ -7,11 +7,11 @@
   ],
   "epic": "fn-1150-event-driven-watch-supervisor",
   "id": "fn-1150-event-driven-watch-supervisor.6",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Align sibling docs and orient snippet",
-  "updated_at": "2026-07-07T00:45:44.852000Z"
+  "updated_at": "2026-07-07T00:47:05.932000Z"
 }
