@@ -67,5 +67,5 @@ flag-set-only-on-misfit; snapshot fields present in the written file.
 - [ ] Malformed auditor output is rejected with a distinct code, leaving no flag and no file.
 
 ## Done summary
-
+Added selection-audit-brief (content-blind grading record: spec, cell, sidecar provenance+hashes, Task-trailer diff stats, done summary; excludes degraded-default + never-executed), the selection-auditor subagent (3-way grade grounded in the outcome record), and selection-review-submit (validates verdict, lands the committed per-epic review dataset snapshotting graded cell+hashes, sets the display-only misfit flag only on a non-right-sized verdict). Added commitNumstat to the PlanVcs facade+fake.
 ## Evidence
