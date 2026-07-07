@@ -34,6 +34,9 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Wrapped cell**: A worker cell whose model claude does not serve natively; its worker is a claude wrapper that delegates implementation to the model's provider and owns the keeper close-out. Avoid: foreign cell, proxy worker, delegated task.
 - **Wrapper driver**: The fixed claude model-and-effort every wrapped cell's wrapper runs at, set in the host matrix config. Avoid: chaperone, host model.
 - **Baseline**: The daemon-computed suite result at a commit sha that a worker consults to attribute a test failure as pre-existing or self-inflicted. Avoid: cache, snapshot, golden.
+- **Audit depth**: The lean, standard, or deep band a close audit runs at, derived from plan signals through the audit policy. Avoid: review level, thoroughness, rigor.
+- **Audited task**: A task whose selected tier is policy-flagged for review, parking AUDIT_READY instead of stamping done until its audit clears. Avoid: keystone task, gated task, flagged task.
+- **Audit gate**: The block-machinery hold between a worker finishing and its done-stamp, where the task-scoped audit decides resume or escalation. Avoid: review gate, done gate, checkpoint.
 
 ## Autopilot and dispatch
 

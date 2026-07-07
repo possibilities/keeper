@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { ConfigError, loadPresetCatalog, type Preset } from "./agent/config";
+import { matrixConfigPath } from "./agent/matrix";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
 import {
@@ -136,7 +137,11 @@ import {
 import { runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
-import { defaultShadowingWorkProbe, resolveWorkerCell } from "./worker-cell";
+import {
+  defaultRouteProbe,
+  defaultShadowingWorkProbe,
+  resolveWorkerCell,
+} from "./worker-cell";
 import {
   ELIGIBLE_REASON,
   memoizedAssessRepo,
@@ -3121,7 +3126,11 @@ export async function runReconcileCycle(
           ? { reject: plan.pluginDirReject }
           : {}),
       },
-      { dirExists, probeShadow: probeShadowMemoized },
+      {
+        dirExists,
+        probeShadow: probeShadowMemoized,
+        probeRoute: () => defaultRouteProbe(plan.model),
+      },
     );
     if (!cell.ok) {
       let reason: string;
@@ -3150,6 +3159,14 @@ export async function runReconcileCycle(
             `plugin in a claude plugin_scan_dir would steal 'work:worker' from ` +
             `the '${cell.pluginDir}' cell at launch (silent wrong-worker spawn); ` +
             "remove or rename it, then 'keeper retry-dispatch'";
+          break;
+        // (4) a wrapped capability model the host matrix routes to zero
+        //     configured providers (or a malformed matrix.yaml).
+        case "no-route":
+          reason =
+            `worker-cell-no-route: '${cell.model}' is a wrapped model with no ` +
+            `configured provider in ${matrixConfigPath()} — add a provider serving ` +
+            "it to the roster (or correct the task's model), then 'keeper retry-dispatch'";
           break;
         default:
           assertNever(cell);

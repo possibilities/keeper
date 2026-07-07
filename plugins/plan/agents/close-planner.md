@@ -30,6 +30,7 @@ Read `BRIEF_REF` with the Read tool, parse the JSON, and read these fields:
 - `tasks` — `[{id, title, status, target_repo, done_summary}, ...]`, ordinal-ordered. The done summaries are your first evidence rung: what each task claims it shipped. Each task's `target_repo` is the git tree its code lives in (`null` when the task inherits the epic default).
 - `touched_repos` — on the brief root: the repos this epic's code spans (`null`/absent for a single-repo source). When this lists more than one repo, the source is MULTI-repo and each follow-up task MUST carry an explicit, in-set `target_repo` (Phase 5).
 - `commit_set_hash` — provenance pin; you don't act on it.
+- `depth.band` — the depth this close audited at (`lean` / `standard` / `deep`). The auditor's report Summary echoes the same value; a mismatch is a signal the auditor ran a different pass than directed (note it, don't block the vet on it). At `deep`, every `Critical`-severity finding the auditor kept for you carries a `[REFUTE]` tag — see the refute step in Phase 2.
 
 **Brief self-check:** `schema_version` must be `1` and `epic_id` must equal your `EPIC_ID`. On mismatch, stop and say so verbatim.
 
@@ -66,6 +67,15 @@ Issue exactly one of:
 - `merged-into-<fid>` — same root cause as another finding; folded into that finding's task. The `<fid>` is the target finding's id.
 
 Assign each finding a stable id (`F1`, `F2`, ... in report order, or a short slug). Track every verdict as a `(fid, action, rationale)` tuple — these become both the verdict JSON `decisions` and the follow-up epic's `## Audit decisions` table, so keep them consistent.
+
+### 2d. Refute (deep band, `[REFUTE]`-tagged findings only)
+
+A finding the auditor tagged `[REFUTE]` (deep band, gating-grade) that you are about to verdict `kept` must survive one explicit refutation attempt first — you, not a second agent, run it inline as part of this vet (no new spawn). Actively search for a reason the finding is WRONG, not more evidence it's right: a guard already covering the case, a test that already exercises the path, a default that neutralizes the risk, a caller that never reaches the flagged branch. This is distinct from 2b's evidence-path step, which substantiates the claim — refutation tries to break it.
+
+- **Refutation fails** (the finding survives your best attempt to disprove it) → verdict stays `kept`. Its `rationale` (Phase 4) states what you tried to refute it with and why the attempt failed — the refutation attempt is the record, not a new field.
+- **Refutation succeeds** (you find the guard/test/default that neutralizes it) → flip the verdict to `culled`, with `rationale` naming what refuted it.
+
+A finding NOT tagged `[REFUTE]` (any lean/standard finding, or a deep-band non-Critical one) skips this step — 2a–2c already cover it.
 
 ### Fatal check
 
@@ -107,6 +117,7 @@ Invariants the verb enforces at emission — hold to them so you don't waste a s
 - The set of distinct non-null `task` ordinals = the number of follow-up tasks you author in Phase 5. The follow-up submit cross-checks this — keep them aligned.
 - Use ASCII structural punctuation inside the JSON (`,` `:` `"`). Em dashes inside string values are fine.
 - Emit the JSON pretty-printed (indent=2 multi-line), matching the example block above exactly — one key per line, nested objects indented. The submit verb parses the indented shape identically.
+- Not verb-enforced but load-bearing: a `kept` row for a `[REFUTE]`-tagged finding (deep band) must have its `rationale` state the refutation attempt and its outcome (2d) — the verb doesn't validate this, your own vet is incomplete without it.
 
 Pipe it via a quoted heredoc:
 

@@ -40,7 +40,7 @@ export const DEFAULT_MAX_DIFF_LINES = 400;
 export const DEFAULT_SIDECAR_RING = 32;
 
 /** Record type discriminator on the wire. */
-export type FramesRecordType = "baseline" | "frame" | "keepalive" | "trailer";
+export type FramesRecordType = "baseline" | "frame" | "trailer";
 
 /**
  * Coverage verdict — the trailer's honest claim about completeness.
@@ -57,7 +57,7 @@ export type FrameCoverage = "continuous" | "gap_possible";
 export type TrailerReason = "max_frames" | "duration" | "interrupt" | "eof";
 
 /**
- * The data-record envelope, shared by `baseline`, `frame`, and `keepalive`.
+ * The data-record envelope, shared by `baseline` and `frame`.
  * One single-line JSON object per record. `cursor` is the daemon's opaque,
  * non-unique fold checkpoint (wall-clock staleness repaints legally share a
  * `rev`) — never a per-record id and never a wall-clock timestamp. Full frame
@@ -72,7 +72,7 @@ export interface FrameRecord {
   ts: string;
   view: string;
   cursor: string | null;
-  /** `null` for baseline/keepalive; a unified diff or truncation marker for a frame. */
+  /** `null` for baseline; a unified diff or truncation marker for a frame. */
   diff: string | null;
   /** `true` when `diff` is a marker and the full diff is at `diff_path`. */
   diff_truncated: boolean;
@@ -95,7 +95,7 @@ export interface TrailerRecord {
   /** The opaque checkpoint a follow-on chunk anchors on. */
   resume_cursor: string | null;
   coverage: FrameCoverage;
-  /** Data frames emitted this run (baseline and keepalives excluded). */
+  /** Data frames emitted this run (baseline excluded). */
   frames_emitted: number;
   reason: TrailerReason;
 }
@@ -164,8 +164,6 @@ export interface FramesEmitter {
   emitBaseline: (input: FrameInput) => void;
   /** Emit a change frame: diff vs the last frame, bounded, sidecars written. */
   emitFrame: (input: FrameInput) => void;
-  /** Emit a liveness keepalive carrying the current `seq`; never counts. */
-  emitKeepalive: (cursor: string | null) => void;
   /** Emit the terminal trailer with the resume cursor + coverage verdict. */
   emitTrailer: (input: {
     reason: TrailerReason;
@@ -430,24 +428,6 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
     });
   }
 
-  function emitKeepalive(cursor: string | null): void {
-    // Carries the current seq like every record and never touches the sidecar
-    // ring or the data-frame budget.
-    writeStdout({
-      schema_version: FRAMES_SCHEMA_VERSION,
-      type: "keepalive",
-      seq: seq++,
-      ts: deps.io.nowIso(),
-      view,
-      cursor: cursor ?? lastCursor,
-      diff: null,
-      diff_truncated: false,
-      frame_path: null,
-      state_path: null,
-      diff_path: null,
-    });
-  }
-
   function emitTrailer(input: {
     reason: TrailerReason;
     cursor?: string | null;
@@ -481,7 +461,6 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
   return {
     emitBaseline,
     emitFrame,
-    emitKeepalive,
     emitTrailer,
     noteReconnect: () => {
       reconnected = true;

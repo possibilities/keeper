@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T18:17:56.959000Z",
+  "depends_on": [
+    "fn-1169-surface-and-heal-checkout-desync.1"
+  ],
+  "epic": "fn-1169-surface-and-heal-checkout-desync",
+  "id": "fn-1169-surface-and-heal-checkout-desync.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Stale-aware decision-B catch-up",
+  "updated_at": "2026-07-07T18:19:02.512000Z"
+}

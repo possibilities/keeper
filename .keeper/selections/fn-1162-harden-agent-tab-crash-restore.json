@@ -1,80 +1,48 @@
 {
   "cells": [
     {
-      "confidence": 0.82,
+      "confidence": 0.72,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Touches the resume identity contract and byte-pinned launch argv where a stale env carrier propagates past the task, so it needs contract-shaped reasoning.",
-      "task_id": "fn-1162-harden-agent-tab-crash-restore.1",
-      "tier": "xhigh"
+      "rationale": "Escalate-or-refuse contract plus a refuse-to-clobber guard that must not blank the pre-crash mirror is a subtle crash-recovery correctness invariant, but the surface is a bounded two-file edit with a clear approach.",
+      "task_id": "fn-1162-harden-agent-tab-crash-restore.4",
+      "tier": "high"
     },
     {
       "confidence": 0.85,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Keystone inversion introducing a new resolver module with defensive torn-tail parsing and multiple typed failure modes, high uncertainty and blast radius.",
-      "task_id": "fn-1162-harden-agent-tab-crash-restore.2",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.8,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Consolidates duplicated selection logic and re-owns generation identity (a canonical contract) while preserving a DB index path, a wrong abstraction here forks boots.",
-      "task_id": "fn-1162-harden-agent-tab-crash-restore.3",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.72,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Carries the escalate-or-refuse contract plus a clobber guard whose failure silently loses the pre-crash restore mirror, correctness-sensitive beyond its surface.",
-      "task_id": "fn-1162-harden-agent-tab-crash-restore.4",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.86,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Largest task: a verified-restore state machine with flock idempotency, crash-loop bounds, evidence reads, and byte-pins where a false verified corrupts trust.",
+      "rationale": "Keystone verified-transaction engine: a new module, a multi-state machine with a never-false-verified invariant, torn-tail evidence reads, flock idempotency, and byte-pin cascades \u2014 a cross-cutting correctness-critical change.",
       "task_id": "fn-1162-harden-agent-tab-crash-restore.5",
       "tier": "xhigh"
-    },
-    {
-      "confidence": 0.68,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Single-file event-sourced fold guard with a named root cause and precise spec, but re-fold determinism and projection poisoning keep it on the strongest model.",
-      "task_id": "fn-1162-harden-agent-tab-crash-restore.6",
-      "tier": "high"
-    },
-    {
-      "confidence": 0.7,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "New CLI verb reusing the existing back-fill seam along a clear path, but the heuristic proximity matching risks becoming a poisoning vector so honesty/ambiguity handling needs strong judgment.",
-      "task_id": "fn-1162-harden-agent-tab-crash-restore.7",
-      "tier": "high"
     },
     {
       "confidence": 0.66,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Test instruments plus a docs sweep following existing slow-test conventions, but the hermetic real-tmux e2e with a fake harness carries real leaked-launch risk warranting careful execution.",
+      "rationale": "Heuristic re-pinning through the event-sourced back-fill write path is correctness-critical because a dishonest match becomes a poisoning vector, though it reuses a sanctioned seam at S size.",
+      "task_id": "fn-1162-harden-agent-tab-crash-restore.7",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Pattern-following fast sim, a copied slow-tier e2e convention, and forward-facing docs consolidation are workhorse test-and-docs work with no nameable intelligence-bound reason.",
       "task_id": "fn-1162-harden-agent-tab-crash-restore.8",
       "tier": "high"
     }
   ],
-  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
-  "created_at": "2026-07-07T16:30:36.607000Z",
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T17:48:07.074000Z",
   "epic_id": "fn-1162-harden-agent-tab-crash-restore",
-  "input_hash": "63d3d6a51098552eca2a31a04afd772424ba4ad26a19a7e03db0d548eef2d67d",
+  "input_hash": "6cc85043462f4687bc7e584f6747e44d57cc2df6abcb4b611bdc26592e1a2396",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 1674827429,
-  "verdict_raw": "All self-checks pass (schema_version 1, ids match, non-empty axes/tasks). Selecting cells.\nThe epic is a contract-heavy crash-restore hardening effort where a wrong routing-down risks corrupting identity/projection contracts, so I keep the higher-capability model throughout and reserve xhigh for the contract- and blast-radius-heavy tasks, dropping to high for the genuinely bounded single-surface ones.\nCells: .1 xhigh/opus 0.82; .2 xhigh/opus 0.85; .3 xhigh/opus 0.80; .4 xhigh/opus 0.72; .5 xhigh/opus 0.86; .6 high/opus 0.68; .7 high/opus 0.70; .8 high/opus 0.66.\n"
+  "shuffle_seed": 1825067075,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1162-harden-agent-tab-crash-restore.4\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Escalate-or-refuse contract plus a refuse-to-clobber guard that must not blank the pre-crash mirror is a subtle crash-recovery correctness invariant, but the surface is a bounded two-file edit with a clear approach.\",\"confidence\":0.72},{\"task_id\":\"fn-1162-harden-agent-tab-crash-restore.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Keystone verified-transaction engine: a new module, a multi-state machine with a never-false-verified invariant, torn-tail evidence reads, flock idempotency, and byte-pin cascades \u2014 a cross-cutting correctness-critical change.\",\"confidence\":0.85},{\"task_id\":\"fn-1162-harden-agent-tab-crash-restore.7\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Heuristic re-pinning through the event-sourced back-fill write path is correctness-critical because a dishonest match becomes a poisoning vector, though it reuses a sanctioned seam at S size.\",\"confidence\":0.66},{\"task_id\":\"fn-1162-harden-agent-tab-crash-restore.8\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Pattern-following fast sim, a copied slow-tier e2e convention, and forward-facing docs consolidation are workhorse test-and-docs work with no nameable intelligence-bound reason.\",\"confidence\":0.7}]}"
 }

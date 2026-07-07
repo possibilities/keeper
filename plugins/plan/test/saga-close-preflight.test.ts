@@ -25,17 +25,30 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { briefPath, computeCommitSetHash } from "../src/audit_artifacts.ts";
+import { dirname, join } from "node:path";
+import {
+  auditsRoot,
+  briefPath,
+  computeCommitSetHash,
+} from "../src/audit_artifacts.ts";
 import {
   AllReposBrokenError,
   findCommitGroups,
   laneBranchFor,
 } from "../src/commit_lookup.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
-import { initRepo as fakeInitRepo, fakeVcs } from "./fake-vcs.ts";
+import {
+  deriveDepthBand,
+  readAuditPolicyDoc,
+} from "../src/verbs/close_preflight.ts";
+import {
+  initRepo as fakeInitRepo,
+  fakeVcs,
+  setNumstatError,
+} from "./fake-vcs.ts";
 import {
   fakeSourceCommit,
   gitHeadSha,
@@ -595,5 +608,343 @@ describe("findCommitGroups unit (test_close_preflight.py TestCommitLookup)", () 
       missing,
       realpathSync(notGit),
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// commit-set numstat facade (fake twin) — the aggregate the depth signal reads,
+// no test touches real git.
+// ---------------------------------------------------------------------------
+
+describe("commitSetNumstat fake twin", () => {
+  let repo: string;
+  beforeEach(() => {
+    setVcs(fakeVcs);
+    repo = realpathSync(mkdtempSync(join(tmpdir(), "planctl-cpf-numstat-")));
+    fakeInitRepo(repo);
+  });
+  afterEach(() => {
+    resetVcs();
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test("sums per-commit numstat across the set (a path in two commits counts twice)", () => {
+    const shaA = fakeSourceCommit(repo, "feat: a\n\nTask: fn-1-x.1\n", {
+      numstat: [
+        { path: "src/a.ts", insertions: 10, deletions: 2 },
+        { path: "src/b.ts", insertions: 5, deletions: 0 },
+      ],
+    });
+    const shaB = fakeSourceCommit(repo, "feat: b\n\nTask: fn-1-x.2\n", {
+      numstat: [{ path: "src/a.ts", insertions: 3, deletions: 1 }],
+    });
+    // Hand-summed: insertions 10+5+3, deletions 2+0+1, rows 2+1.
+    expect(fakeVcs.commitSetNumstat([shaA, shaB], repo)).toEqual({
+      insertions: 18,
+      deletions: 3,
+      files: 3,
+      error: false,
+    });
+  });
+
+  test("empty sha list is a clean zero, never an error", () => {
+    expect(fakeVcs.commitSetNumstat([], repo)).toEqual({
+      insertions: 0,
+      deletions: 0,
+      files: 0,
+      error: false,
+    });
+  });
+
+  test("an unknown sha contributes nothing (skipped, not an error)", () => {
+    const sha = fakeSourceCommit(repo, "feat: a\n\nTask: fn-1-x.1\n", {
+      numstat: [{ path: "src/a.ts", insertions: 4, deletions: 4 }],
+    });
+    expect(fakeVcs.commitSetNumstat([sha, "f".repeat(40)], repo)).toEqual({
+      insertions: 4,
+      deletions: 4,
+      files: 1,
+      error: false,
+    });
+  });
+
+  test("an armed numstat error reports error:true with zero totals", () => {
+    const sha = fakeSourceCommit(repo, "feat: a\n\nTask: fn-1-x.1\n", {
+      numstat: [{ path: "src/a.ts", insertions: 9, deletions: 9 }],
+    });
+    setNumstatError(repo, true);
+    expect(fakeVcs.commitSetNumstat([sha], repo)).toEqual({
+      insertions: 0,
+      deletions: 0,
+      files: 0,
+      error: true,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveDepthBand — the pure policy → band derivation, fixture-driven.
+// ---------------------------------------------------------------------------
+
+describe("deriveDepthBand (pure policy derivation)", () => {
+  const policy = {
+    close_depth: {
+      standard: { min_tasks: 3, min_diff_lines: 400, min_touched_repos: 1 },
+      deep: { min_tasks: 8, min_diff_lines: 2000, min_touched_repos: 2 },
+    },
+  };
+
+  test("null policy → lean, no reason (the file reason is the caller's)", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 99, diff_lines: 99999, touched_repo_count: 9 },
+        null,
+      ),
+    ).toEqual({ band: "lean", reasons: [] });
+  });
+
+  test("policy without a close_depth section → lean, policy_no_depth_bands", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 99, diff_lines: 99999, touched_repo_count: 9 },
+        { unrelated: true },
+      ),
+    ).toEqual({ band: "lean", reasons: ["policy_no_depth_bands"] });
+  });
+
+  test("signals below every band → lean (legitimate, not degraded)", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 2, diff_lines: 100, touched_repo_count: 1 },
+        policy,
+      ),
+    ).toEqual({ band: "lean", reasons: [] });
+  });
+
+  test("signals meeting standard but not deep → standard", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 4, diff_lines: 500, touched_repo_count: 1 },
+        policy,
+      ),
+    ).toEqual({ band: "standard", reasons: [] });
+  });
+
+  test("signals meeting deep → deep (deepest-first wins)", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 10, diff_lines: 3000, touched_repo_count: 3 },
+        policy,
+      ),
+    ).toEqual({ band: "deep", reasons: [] });
+  });
+
+  test("one unmet minimum drops a band (AND within a band): deep's repo count fails → standard", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 20, diff_lines: 5000, touched_repo_count: 1 },
+        policy,
+      ),
+    ).toEqual({ band: "standard", reasons: [] });
+  });
+
+  test("a present-but-non-numeric threshold makes its band never match (bias lean)", () => {
+    const bad = {
+      close_depth: { standard: { min_tasks: "lots", min_diff_lines: 1 } },
+    };
+    expect(
+      deriveDepthBand(
+        { task_count: 100, diff_lines: 100, touched_repo_count: 100 },
+        bad,
+      ),
+    ).toEqual({ band: "lean", reasons: [] });
+  });
+
+  test("an empty band never matches", () => {
+    const empty = { close_depth: { standard: {}, deep: {} } };
+    expect(
+      deriveDepthBand(
+        { task_count: 100, diff_lines: 100000, touched_repo_count: 50 },
+        empty,
+      ),
+    ).toEqual({ band: "lean", reasons: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readAuditPolicyDoc — best-effort policy read, each degrade arm.
+// ---------------------------------------------------------------------------
+
+describe("readAuditPolicyDoc (best-effort policy read)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), "planctl-cpf-policy-")));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("absent file → policy_missing", () => {
+    const res = readAuditPolicyDoc(join(dir, "nope.yaml"));
+    expect(res.doc).toBeNull();
+    expect(res.reason).toBe("policy_missing");
+  });
+
+  test("valid YAML mapping → parsed doc, no reason", () => {
+    const p = join(dir, "audit-policy.yaml");
+    writeFileSync(p, "close_depth:\n  deep:\n    min_tasks: 8\n", "utf-8");
+    const res = readAuditPolicyDoc(p);
+    expect(res.reason).toBeNull();
+    expect(res.doc).toEqual({ close_depth: { deep: { min_tasks: 8 } } });
+  });
+
+  test("syntactically invalid YAML → policy_malformed", () => {
+    const p = join(dir, "audit-policy.yaml");
+    writeFileSync(p, "close_depth: [1, 2\n", "utf-8");
+    const res = readAuditPolicyDoc(p);
+    expect(res.doc).toBeNull();
+    expect(res.reason).toBe("policy_malformed");
+  });
+
+  test("a non-mapping document (a bare list) → policy_malformed", () => {
+    const p = join(dir, "audit-policy.yaml");
+    writeFileSync(p, "- a\n- b\n", "utf-8");
+    const res = readAuditPolicyDoc(p);
+    expect(res.doc).toBeNull();
+    expect(res.reason).toBe("policy_malformed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Verb-level depth enrichment + degrade arms.
+// ---------------------------------------------------------------------------
+
+describe("close-preflight depth enrichment", () => {
+  const getProj = withProject("planctl-cpf-depth-");
+
+  function setTaskTier(root: string, taskId: string, tier: string): void {
+    const p = join(root, ".keeper", "tasks", `${taskId}.json`);
+    const t = JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
+    t.tier = tier;
+    writeFileSync(p, JSON.stringify(t, null, 2), "utf-8");
+  }
+
+  function writeFindingArtifact(
+    root: string,
+    epicId: string,
+    taskId: string,
+    content: string,
+  ): string {
+    const p = join(auditsRoot(root), epicId, "tasks", `${taskId}.json`);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, content, "utf-8");
+    return p;
+  }
+
+  test("brief carries tier, per-repo diff stats, finding refs, and a depth band; schema unchanged", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done", "done"]);
+    setTaskTier(proj.root, taskIds[0] as string, "xhigh");
+    setTaskTier(proj.root, taskIds[1] as string, "low");
+    fakeSourceCommit(proj.root, `feat: a\n\nTask: ${taskIds[0]}\n`, {
+      numstat: [
+        { path: "src/a.ts", insertions: 20, deletions: 5 },
+        { path: "src/b.ts", insertions: 10, deletions: 0 },
+      ],
+    });
+    fakeSourceCommit(proj.root, `feat: b\n\nTask: ${taskIds[1]}\n`, {
+      numstat: [{ path: "src/c.ts", insertions: 7, deletions: 3 }],
+    });
+    const findingPath = writeFindingArtifact(
+      proj.root,
+      epicId,
+      taskIds[0] as string,
+      JSON.stringify({ status: "open", findings: [{ id: "f1" }] }),
+    );
+
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const brief = loadBrief(proj.root, epicId);
+
+    // Additive fields only — the audit schema version is unchanged.
+    expect(brief.schema_version).toBe(1);
+
+    const briefTasks = brief.tasks as Array<Record<string, unknown>>;
+    expect(briefTasks.map((t) => t.tier)).toEqual(["xhigh", "low"]);
+    expect(briefTasks[0]?.finding_ref).toEqual({
+      path: findingPath,
+      status: "open",
+    });
+    expect(briefTasks[1]?.finding_ref).toBeNull();
+
+    const primary = realpathSync(proj.root);
+    // Hand-summed over both source commits in the one repo: insertions
+    // 20+10+7, deletions 5+0+3, rows 3, commit_count 2.
+    expect(brief.diff_stats_by_repo).toEqual([
+      {
+        repo: primary,
+        commit_count: 2,
+        insertions: 37,
+        deletions: 8,
+        files: 3,
+      },
+    ]);
+
+    const depth = brief.depth as Record<string, unknown>;
+    expect(["lean", "standard", "deep"]).toContain(depth.band);
+    expect(depth.signals).toEqual({
+      task_count: 2,
+      diff_lines: 45,
+      touched_repo_count: 1,
+    });
+    expect(Array.isArray(depth.degrade_reasons)).toBe(true);
+    expect(typeof depth.degraded).toBe("boolean");
+  });
+
+  test("a numstat git error degrades to lean with the reason; close still succeeds", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done"]);
+    fakeSourceCommit(proj.root, `feat: a\n\nTask: ${taskIds[0]}\n`, {
+      numstat: [{ path: "src/a.ts", insertions: 5000, deletions: 5000 }],
+    });
+    setNumstatError(proj.root, true);
+
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const depth = loadBrief(proj.root, epicId).depth as Record<string, unknown>;
+    expect(depth.band).toBe("lean");
+    expect(depth.degraded).toBe(true);
+    const primary = realpathSync(proj.root);
+    expect(depth.degrade_reasons).toContain(`numstat_error:${primary}`);
+    // The errored read contributes zero churn — never the un-read 10000.
+    expect((depth.signals as Record<string, unknown>).diff_lines).toBe(0);
+  });
+
+  test("an unreadable finding artifact degrades with a reason; the ref still surfaces", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done"]);
+    writeFindingArtifact(proj.root, epicId, taskIds[0] as string, "{not json");
+
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const brief = loadBrief(proj.root, epicId);
+    const depth = brief.depth as Record<string, unknown>;
+    expect(depth.degraded).toBe(true);
+    expect(depth.degrade_reasons).toContain(
+      `finding_ref_unreadable:${taskIds[0]}`,
+    );
+    const briefTasks = brief.tasks as Array<Record<string, unknown>>;
+    const ref = briefTasks[0]?.finding_ref as Record<string, unknown>;
+    expect(ref.status).toBeNull();
+    expect(typeof ref.path).toBe("string");
   });
 });

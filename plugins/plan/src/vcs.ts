@@ -50,6 +50,21 @@ export interface NumstatRow {
   deletions: number;
 }
 
+/** The straight-summed diff totals over a SET of source commits — the only
+ * well-defined aggregate over a non-linear commit_group (the commits share no
+ * single range, so per-commit numstat is summed, a path touched in two commits
+ * counting twice). `files` is the total changed-path row count across the set.
+ * `error` is true when the underlying `git show` failed for at least one sha
+ * (shallow clone / rewritten or missing sha): the totals are then best-effort
+ * partial and the close brief records the numstat degrade. The close-brief
+ * depth signal consumes this per repo. */
+export interface NumstatTotals {
+  insertions: number;
+  deletions: number;
+  files: number;
+  error: boolean;
+}
+
 /** The git operations plan-state persistence performs. A real implementation
  * shells `git`; the test fake records commits + snapshot-diffs the data dir. */
 export interface PlanVcs {
@@ -135,6 +150,14 @@ export interface PlanVcs {
    * throw). The selection-audit brief consumes this to derive per-task diff
    * stats from the Task-trailer source commits. */
   commitNumstat(sha: string, repo: string): NumstatRow[];
+
+  /** The per-commit numstat of every sha in `shas` SUMMED into one diff-total
+   * (insertions / deletions / changed-path rows). An empty list is a clean zero
+   * (no git spawn). A per-sha `git show` failure leaves `error` true with the
+   * partial totals — the close brief lands the depth band at lean and records
+   * the numstat degrade rather than trusting an under-counted diff. The
+   * close-preflight depth signal consumes this once per commit_group. */
+  commitSetNumstat(shas: string[], repo: string): NumstatTotals;
 
   /** The committed `HEAD:<dataDir>/tasks/<taskId>.json` parsed object for the
    * FIRST data dir under which it resolves, or null when the path is absent from
@@ -381,34 +404,28 @@ export const realGitVcs: PlanVcs = {
   },
 
   commitNumstat(sha, repo): NumstatRow[] {
-    // `--format=` suppresses the commit header so stdout is numstat rows only;
-    // each row is `<added>\t<deleted>\t<path>` (binary files show `-`/`-`).
-    const proc = runReadGit(["show", "--numstat", "--format=", sha], repo);
-    if (proc.exitCode !== 0) {
-      return [];
+    return showNumstat(sha, repo).rows;
+  },
+
+  commitSetNumstat(shas, repo): NumstatTotals {
+    const totals: NumstatTotals = {
+      insertions: 0,
+      deletions: 0,
+      files: 0,
+      error: false,
+    };
+    for (const sha of shas) {
+      const { rows, ok } = showNumstat(sha, repo);
+      if (!ok) {
+        totals.error = true;
+      }
+      for (const row of rows) {
+        totals.insertions += row.insertions;
+        totals.deletions += row.deletions;
+        totals.files += 1;
+      }
     }
-    const rows: NumstatRow[] = [];
-    for (const line of proc.stdout.split("\n")) {
-      if (line.trim() === "") {
-        continue;
-      }
-      const parts = line.split("\t");
-      if (parts.length < 3) {
-        continue;
-      }
-      const addRaw = parts[0] as string;
-      const delRaw = parts[1] as string;
-      const path = parts.slice(2).join("\t");
-      if (path === "") {
-        continue;
-      }
-      rows.push({
-        path,
-        insertions: addRaw === "-" ? 0 : Number.parseInt(addRaw, 10) || 0,
-        deletions: delRaw === "-" ? 0 : Number.parseInt(delRaw, 10) || 0,
-      });
-    }
-    return rows;
+    return totals;
   },
 
   committedTaskJson(stateRepo, taskId, dataDirNames) {
@@ -514,6 +531,43 @@ function runReadGit(args: string[], repo: string, input?: string): GitResult {
   } catch (exc) {
     return { exitCode: 1, stdout: "", stderr: (exc as Error).message };
   }
+}
+
+/** Run `git show --numstat --format=` for one commit and parse its rows. The
+ * empty `--format=` suppresses the commit header so stdout is numstat rows only;
+ * each row is `<added>\t<deleted>\t<path>` (binary files show `-`/`-`, folding to
+ * 0 lines but still one changed path). `ok` is false on a non-zero exit (missing
+ * / rewritten / shallow sha) so a caller summing a set can flag the degrade. */
+function showNumstat(
+  sha: string,
+  repo: string,
+): { rows: NumstatRow[]; ok: boolean } {
+  const proc = runReadGit(["show", "--numstat", "--format=", sha], repo);
+  if (proc.exitCode !== 0) {
+    return { rows: [], ok: false };
+  }
+  const rows: NumstatRow[] = [];
+  for (const line of proc.stdout.split("\n")) {
+    if (line.trim() === "") {
+      continue;
+    }
+    const parts = line.split("\t");
+    if (parts.length < 3) {
+      continue;
+    }
+    const addRaw = parts[0] as string;
+    const delRaw = parts[1] as string;
+    const path = parts.slice(2).join("\t");
+    if (path === "") {
+      continue;
+    }
+    rows.push({
+      path,
+      insertions: addRaw === "-" ? 0 : Number.parseInt(addRaw, 10) || 0,
+      deletions: delRaw === "-" ? 0 : Number.parseInt(delRaw, 10) || 0,
+    });
+  }
+  return { rows, ok: true };
 }
 
 /** Confirm a real `Task: <taskId>` trailer on `sha` via

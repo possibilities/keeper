@@ -32,5 +32,5 @@ Files: cli/frames.ts (teardown gate + AGENT_HELP), src/frames-emitter.ts
 - [ ] A pure-tier test documents the chosen `--max-frames`-alone teardown behavior.
 
 ## Done summary
-
+Floor --max-frames alone on the default ~30s duration so an idle board that never reaches N still terminates; drop the unused emitKeepalive method + keepalive record type so AGENT_HELP matches production. Pure-tier test documents the floor behavior.
 ## Evidence

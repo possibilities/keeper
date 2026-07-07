@@ -6,11 +6,11 @@
   ],
   "epic": "fn-1167-variable-depth-automated-review",
   "id": "fn-1167-variable-depth-automated-review.3",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Depth-directed close audit",
-  "updated_at": "2026-07-07T17:30:15.189000Z"
+  "updated_at": "2026-07-07T17:47:51.673000Z"
 }
