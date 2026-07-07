@@ -85,7 +85,9 @@ and codex the usage scraper produces envelopes for and their display aliases (an
 map idles the producer rather than erroring). The autoclose worker force-closes the tmux window of a done-and-idle
 keeper-dispatched agent (an autopilot `work::`/`close::` worker or a finished claude panel leg) after a
 grace: `autoclose_enabled` (default `true`; set `false`/`off`/`no`/`0` to disable — re-read every pulse,
-so a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`) govern it.
+so a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`) govern it. A finished
+`unblock`/`deconflict`/`resolve` escalation window is reaped under the same knobs once its block or
+conflict instance is resolved.
 
 `keeper agent` loads keeper's own two plugins (`plugins/keeper`, `plugins/plan`) from
 `~/.config/keeper/plugins.yaml`, which `install.sh` writes on a fresh machine (keeper-only, no
