@@ -48,5 +48,5 @@ Fast tier only (pure seam, no real git): tracker cadence clone (mint after grace
 - [ ] No SCHEMA_VERSION change; `bun test` green including the extended consistency suites
 
 ## Done summary
-
+Added the shared-checkout-desync distress family: event-seeded by a base->default merge whose post-merge resync is skipped/aborted, level-cleared by a per-cycle content probe (on-default + index/worktree carry HEAD). Orphan-GC-exempt, un-retryable, out of the jam allowlist, no schema change.
 ## Evidence
