@@ -192,7 +192,7 @@ async function keeperJson(
   sock: string | null,
 ): Promise<{ ok: true; json: unknown } | { ok: false; error: string }> {
   const full = [...args, "--json", ...(sock !== null ? ["--sock", sock] : [])];
-  let proc: ReturnType<typeof Bun.spawn>;
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
   try {
     proc = Bun.spawn(["keeper", ...full], { stdout: "pipe", stderr: "pipe" });
   } catch (err) {
@@ -206,22 +206,29 @@ async function keeperJson(
     }
   }, PROBE_TIMEOUT_MS);
   let exitCode: number;
-  try {
-    exitCode = await proc.exited;
-  } finally {
-    clearTimeout(timer);
-  }
-  if (exitCode !== 0) {
-    return { ok: false, error: `keeper ${args.join(" ")} exited ${exitCode}` };
-  }
   let text: string;
   try {
-    text = await new Response(proc.stdout).text();
+    // Drain stdout CONCURRENTLY with the exit await, never sequentially after
+    // it — a child whose output exceeds the OS pipe buffer blocks on write
+    // while a parent that awaits `proc.exited` first blocks on read, a
+    // backpressure deadlock (`keeper query jobs` on a busy board can exceed
+    // it).
+    const [stdoutText, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]);
+    text = stdoutText;
+    exitCode = code;
   } catch (err) {
     return {
       ok: false,
       error: `read stdout failed: ${(err as Error).message}`,
     };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (exitCode !== 0) {
+    return { ok: false, error: `keeper ${args.join(" ")} exited ${exitCode}` };
   }
   try {
     return { ok: true, json: JSON.parse(text) };
@@ -235,7 +242,11 @@ async function keeperJson(
  * Reuses the authoritative {@link monitorRunningState} (the exact-equality match
  * `keeper await monitor-running` uses) so the watchdog can never drift from what
  * counts as "still running". A `waiting` verdict means ≥1 matching entry is live;
- * anything else means the sibling is gone.
+ * anything else means the sibling is gone — but only once the own job row is
+ * itself verifiable: an absent row or a null `monitors` snapshot (the arming
+ * turn's Stop hook hasn't written it yet) is "cannot verify yet", NOT "dead",
+ * and is checked directly here rather than through `monitorRunningState` (whose
+ * `met` verdict conflates both cases).
  */
 async function checkMonitors(
   monitors: string[],
@@ -257,6 +268,20 @@ async function checkMonitors(
     return { ok: false, detail: "jobs query returned no rows array" };
   }
   const rows = data as Job[];
+  const ownJob = rows.find((j) => j.job_id === ownSessionId);
+  if (ownJob === undefined || ownJob.monitors === null) {
+    // Own job row not yet in the projection, or its `monitors` snapshot is
+    // still null (only the arming turn's Stop hook writes it) — unverifiable,
+    // NOT dead. `monitorRunningState` folds both into the same `met` verdict
+    // as a truly-absent sibling; distinguish here rather than false-paging
+    // every armed watch in the arm window (mirrors the ownSessionId===null
+    // degrade above).
+    return {
+      ok: true,
+      detail:
+        "own job row unverifiable (absent or monitors unset) — monitor check skipped",
+    };
+  }
   const dead: string[] = [];
   for (const command of monitors) {
     const selector: MonitorSelector = { command };
