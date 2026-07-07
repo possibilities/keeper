@@ -2052,16 +2052,22 @@ export async function runResolverDispatchSweep(
 // double-dispatch the same key.
 
 /**
- * Is this `jobs` row a LIVE escalation session? `working`, or `stopped` with a
- * still-live backend (the shared {@link isStoppedJobLive} rule — the ONE liveness
- * predicate, never forked). `livePaneIds` is `null` here (the daemon runs no per-tick
- * pane probe on this path), so a `stopped` row conservatively counts as live until it
- * reaps: the SAFE direction for a cap (never under-count) and an occupancy guard (never
- * a double-dispatch). Pure.
+ * Is this `jobs` row a TURN-ACTIVE escalation session — occupying its slot RIGHT NOW?
+ * TRUE iff `state === 'working'` (a live turn). An escalation session is a one-shot
+ * interactive session that idles forever after its turn ends, so pane/pid liveness
+ * (the shared {@link isStoppedJobLive} rule, unconditionally `true` on this path's
+ * `null` probe) would count a FINISHED-but-idling session as live and starve the guards
+ * indefinitely — the ghost-worker pitfall (liveness is not progress). Turn-activity is
+ * the fix: a `stopped` escalation session has yielded its turn and no longer occupies,
+ * so its cap / occupancy / per-epic slot frees. A mid-turn permission prompt STAMPS
+ * `last_permission_prompt_at` but never flips `state` off `working` (the reducer's
+ * Notification arm layers the `[awaiting:…]` pill on top of the live state), so a parked
+ * session stays turn-active here without a marker arm. {@link isStoppedJobLive} is left
+ * untouched — every other verb (work / close / resolve / audit) keeps the pane-liveness
+ * rule. Pure.
  */
 function escalationJobLive(job: Job): boolean {
-  if (job.state === "working") return true;
-  return job.state === "stopped" && isStoppedJobLive(job, null);
+  return job.state === "working";
 }
 
 /**
@@ -2118,31 +2124,45 @@ export function epicHasLiveUnblock(
 }
 
 /**
- * Classify a `<verb>::<id>` escalation session's terminal outcome off `jobs` — the
- * generalized twin of {@link classifyResolverOutcome} for the deconflict / unblock
- * verbs (the resolver classifier is hard-keyed to `resolve`). `{terminal:false}` while
- * a session is LIVE or no `<verb>::<id>` job row has folded yet (the launch window);
- * `{terminal:true, verdict}` once a row folded and none is live — `declined` when any
- * matching row is `ended` (a clean exit — it stamped BLOCKED / gave up), `died`
- * otherwise (killed / stopped-dead). Coarse by design: the human notify only needs
- * "declined vs died". Pure over the passed rows; exported for tests.
+ * Classify a `<verb>::<id>` escalation session's terminal outcome off `jobs` PLUS the
+ * caller's board-state `incidentOpen` — the generalized twin of {@link
+ * classifyResolverOutcome} for the deconflict / unblock verbs (the resolver classifier
+ * is hard-keyed to `resolve`). `{terminal:false}` while any matching row is TURN-ACTIVE
+ * or no `<verb>::<id>` row has folded yet (the launch window), AND while the incident is
+ * already closed (`incidentOpen === false` — the escalation resolved it, so there is
+ * nothing to page). Otherwise `{terminal:true, verdict}`: `died` when a `killed`/`ended`
+ * row is present (the session process terminated abnormally — a one-shot escalation
+ * session should idle `stopped` after its turn, never exit the CLI); else `declined`
+ * (the session ran its turn, ended `stopped`, and the incident is still open — it
+ * attempted and gave up). The old `ended → declined` derivation was UNREACHABLE: a clean
+ * decline STOPS the turn, it never exits the CLI. `incidentOpen` is the board-state
+ * verdict the caller pre-computes (unblock: the `attempted` block latch survives;
+ * deconflict: the sticky close row survives), keeping this pure over its inputs. Coarse
+ * by design — the notify only needs "declined vs died". Pure over the passed rows;
+ * exported for tests.
  */
 export function classifyEscalationOutcome(
   jobs: readonly Job[],
   verb: EscalationVerb,
   id: string,
+  incidentOpen: boolean,
 ): ResolverOutcome {
   let live = false;
   let sawRow = false;
-  let sawEnded = false;
+  let sawDead = false;
   for (const job of jobs) {
     if (job.plan_verb !== verb || job.plan_ref !== id) continue;
     sawRow = true;
     if (escalationJobLive(job)) live = true;
-    if (job.state === "ended") sawEnded = true;
+    if (job.state === "killed" || job.state === "ended") sawDead = true;
   }
+  // Invariant: wait while any row is turn-active or none has folded yet (launch window).
   if (live || !sawRow) return { terminal: false };
-  return { terminal: true, verdict: sawEnded ? "declined" : "died" };
+  // Incident already resolved (task unblocked / sticky cleared) → the escalation
+  // succeeded, so there is no decline/death to page — wait it out (the row drops when
+  // its latch clears). Guards the classifier against paging a resolved incident.
+  if (!incidentOpen) return { terminal: false };
+  return { terminal: true, verdict: sawDead ? "died" : "declined" };
 }
 
 /**
@@ -8618,6 +8638,27 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
+  // The stage-3 board-state gate for the deconflict notify: is the epic's sticky
+  // `close::<epic>` merge-conflict row still present? A successful deconflict clears it
+  // (its own `retry_dispatch`) before the notify fires, so a surviving row means the
+  // conflict is unresolved — the incident {@link classifyEscalationOutcome} may page on.
+  // A read miss degrades to `false` (incident treated closed → the notify WAITS, never a
+  // premature page on a transient error), mirroring the empty-jobs `{terminal:false}`
+  // fallback.
+  function deconflictIncidentOpen(id: string): boolean {
+    try {
+      return (
+        db
+          .query(
+            "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? LIMIT 1",
+          )
+          .get(id) != null
+      );
+    } catch {
+      return false;
+    }
+  }
+
   // Producer-side deconflict human-notify sweep (fn-1129 stage 3). Each heartbeat tick
   // walks the sticky closes whose deconflict session was dispatched but whose human is
   // not yet notified, and sends ONE botctl notification once that session reaches a
@@ -8649,6 +8690,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           resolveEscalationJobsFor(db, "deconflict", id),
           "deconflict",
           id,
+          deconflictIncidentOpen(id),
         ),
       notifyHuman: (row, verdict) => notifyHumanOfDeconflict(row, verdict),
       mintAttempted: (id, outcome) => mintMergeHumanNotifiedEvent(id, outcome),
@@ -8822,6 +8864,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
+  // The stage-3 board-state gate for the unblock notify: is the task's block still OPEN
+  // under an `attempted` latch? The `block_escalations` latch is DELETED the moment the
+  // task leaves `blocked`, so a surviving `status='attempted'` row means the escalation
+  // was dispatched AND the task is still blocked — the incident {@link
+  // classifyEscalationOutcome} may page on. A read miss degrades to `false` (incident
+  // treated closed → the notify WAITS, never a premature page on a transient error).
+  // `task_id` is globally unique (`<epic>.<ordinal>`), so it keys the (epic_id, task_id)
+  // latch alone.
+  function unblockIncidentOpen(taskId: string): boolean {
+    try {
+      return (
+        db
+          .query(
+            "SELECT 1 FROM block_escalations WHERE task_id = ? AND status = 'attempted' LIMIT 1",
+          )
+          .get(taskId) != null
+      );
+    } catch {
+      return false;
+    }
+  }
+
   // Producer-side unblock human-notify sweep (fn-1129 stage 3). Each heartbeat tick walks
   // the block latches whose `unblock::<task>` session was dispatched but whose human is
   // not yet notified, and sends ONE botctl notification once that session reaches a
@@ -8853,6 +8917,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           resolveEscalationJobsFor(db, "unblock", taskId),
           "unblock",
           taskId,
+          unblockIncidentOpen(taskId),
         ),
       notifyHuman: (row, verdict) => notifyHumanOfBlock(row, verdict),
       mintAttempted: (epicId, taskId, outcome) =>

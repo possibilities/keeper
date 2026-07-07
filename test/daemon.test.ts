@@ -4505,6 +4505,15 @@ test("epicHasLiveUnblock: true iff a LIVE unblock:: session exists for a task in
   // No unblock session maps to this epic.
   expect(epicHasLiveUnblock(jobs, "fn-9-none")).toBe(false);
   expect(epicHasLiveUnblock([], "fn-1-foo")).toBe(false);
+  // A stopped (finished, idling) unblock session no longer serializes its epic —
+  // turn-active occupancy releases the per-epic slot on turn end, so a sibling re-block
+  // in the same epic can dispatch.
+  expect(
+    epicHasLiveUnblock(
+      [escJob("unblock", "fn-1-foo.5", "stopped")],
+      "fn-1-foo",
+    ),
+  ).toBe(false);
 });
 
 // ---- buildBlockHumanNotifyBody (pure stage-3 notification body) --------------
@@ -5514,15 +5523,18 @@ function escJob(planVerb: string, planRef: string, state: string): Job {
   } as unknown as Job;
 }
 
-test("countLiveEscalationSessions: counts live unblock:: + deconflict:: across both verbs, ignores terminal + non-escalation rows", () => {
+test("countLiveEscalationSessions: counts only TURN-ACTIVE (working) unblock:: + deconflict:: rows; a stopped/terminal escalation frees its cap slot", () => {
   const jobs: Job[] = [
-    escJob("deconflict", "fn-1-foo", "working"), // live
-    escJob("unblock", "fn-2-bar.3", "stopped"), // live (null probe → conservative)
+    escJob("deconflict", "fn-1-foo", "working"), // turn-active → counts
+    escJob("unblock", "fn-2-bar.3", "working"), // turn-active → counts
+    escJob("unblock", "fn-7-idle.1", "stopped"), // finished-but-idling → no longer counts
     escJob("deconflict", "fn-3-dead", "ended"), // terminal — not counted
     escJob("deconflict", "fn-4-killed", "killed"), // terminal — not counted
     escJob("resolve", "fn-5-res", "working"), // the resolver is NOT an escalation
     escJob("work", "fn-6-work.1", "working"), // a plain worker — not counted
   ];
+  // Turn-active occupancy: only the two `working` escalation rows count — the stopped
+  // (idling) session released its cap slot, so a re-block can re-dispatch under the cap.
   expect(countLiveEscalationSessions(jobs)).toBe(2);
   expect(countLiveEscalationSessions([])).toBe(0);
 });
@@ -5537,37 +5549,125 @@ test("escalationSessionLiveFor: matches a live session for the exact verb+id onl
   expect(escalationSessionLiveFor(jobs, "unblock", "fn-1-foo")).toBe(false);
   // No row for this key at all.
   expect(escalationSessionLiveFor(jobs, "deconflict", "fn-9-none")).toBe(false);
+  // A finished-but-idling (stopped) session no longer occupies its per-key slot —
+  // turn-active occupancy releases it so a re-block re-dispatches instead of starving.
+  expect(
+    escalationSessionLiveFor(
+      [escJob("unblock", "fn-8-idle.2", "stopped")],
+      "unblock",
+      "fn-8-idle.2",
+    ),
+  ).toBe(false);
 });
 
-test("classifyEscalationOutcome: live → not terminal; ended → declined; killed → died; no row → not terminal", () => {
-  // A live session (working) → the notify waits.
+test("classifyEscalationOutcome: turn-active + launch-window → not terminal; stopped+open → declined; killed/ended+open → died; incident closed → not terminal", () => {
+  // A turn-active session (working) → the notify waits, even with the incident open.
   expect(
     classifyEscalationOutcome(
       [escJob("deconflict", "fn-1-foo", "working")],
       "deconflict",
       "fn-1-foo",
+      true,
     ),
   ).toEqual({ terminal: false });
   // No `deconflict::fn-1-foo` row folded yet (launch window) → waits.
-  expect(classifyEscalationOutcome([], "deconflict", "fn-1-foo")).toEqual({
-    terminal: false,
-  });
-  // An `ended` row and none live → declined (clean exit / stamped BLOCKED).
+  expect(classifyEscalationOutcome([], "deconflict", "fn-1-foo", true)).toEqual(
+    {
+      terminal: false,
+    },
+  );
+  // A stopped session (turn ended, idling) with the incident still open → declined:
+  // it ran its turn and gave up. The OLD derivation keyed declined on `ended`, which a
+  // clean decline never reaches — a decline STOPS the turn, it never exits the CLI.
   expect(
     classifyEscalationOutcome(
-      [escJob("deconflict", "fn-1-foo", "ended")],
-      "deconflict",
-      "fn-1-foo",
+      [escJob("unblock", "fn-2-bar.3", "stopped")],
+      "unblock",
+      "fn-2-bar.3",
+      true,
     ),
   ).toEqual({ terminal: true, verdict: "declined" });
-  // A `killed` row and none live → died (the session crashed).
+  // A `killed` row + open incident → died (the session process was killed).
   expect(
     classifyEscalationOutcome(
       [escJob("deconflict", "fn-1-foo", "killed")],
       "deconflict",
       "fn-1-foo",
+      true,
     ),
   ).toEqual({ terminal: true, verdict: "died" });
+  // An `ended` row + open incident → died: a one-shot escalation session idles
+  // `stopped` after its turn, so a CLI exit is an abnormal death, never a clean decline.
+  expect(
+    classifyEscalationOutcome(
+      [escJob("deconflict", "fn-1-foo", "ended")],
+      "deconflict",
+      "fn-1-foo",
+      true,
+    ),
+  ).toEqual({ terminal: true, verdict: "died" });
+  // Incident already resolved (the escalation succeeded → latch/sticky cleared): a
+  // stopped row with `incidentOpen === false` classifies non-terminal — pages nobody.
+  expect(
+    classifyEscalationOutcome(
+      [escJob("unblock", "fn-2-bar.3", "stopped")],
+      "unblock",
+      "fn-2-bar.3",
+      false,
+    ),
+  ).toEqual({ terminal: false });
+});
+
+test("permission-parked pin: a session parked on a mid-turn permission prompt stays 'working' until Stop, so turn-active occupancy is NOT freed while parked", () => {
+  // The load-bearing pin for turn-active occupancy: `escalationJobLive` keys on
+  // `state === 'working'`, so a session that STOPPED off `working` mid-turn while parked
+  // on a permission prompt would prematurely free its escalation slot. Fold a real
+  // permission-prompt lifecycle through the reducer and prove the parked session never
+  // leaves `working` before its turn-final Stop — so no parked-marker live arm is needed.
+  const { db } = freshMemDb();
+  seedEvent(db, "esc-sess", "SessionStart", 1);
+  seedEvent(db, "esc-sess", "UserPromptSubmit", 2);
+  // A tool-permission dialog: `Notification` with event_type `permission_prompt`. The
+  // reducer STAMPS `last_permission_prompt_at` but never flips `state` (the pill layers
+  // `[awaiting:…]` on top of the live turn).
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (3, 'esc-sess', 4242, 'Notification', 'permission_prompt', '{}')`,
+  );
+  drainToCompletion(db);
+
+  const parked = db
+    .query(
+      "SELECT state, last_permission_prompt_at FROM jobs WHERE job_id = 'esc-sess'",
+    )
+    .get() as { state: string; last_permission_prompt_at: number | null };
+  // The prompt folded (marker stamped) yet the session is STILL turn-active.
+  expect(parked.last_permission_prompt_at).not.toBeNull();
+  expect(parked.state).toBe("working");
+  // The exported per-key guard the dispatch sweep consults sees the parked session as
+  // occupying its slot — it must NOT be freed mid-turn.
+  const parkedJob = {
+    plan_verb: "unblock",
+    plan_ref: "esc-sess",
+    state: parked.state,
+    backend_exec_pane_id: null,
+  } as unknown as Job;
+  expect(escalationSessionLiveFor([parkedJob], "unblock", "esc-sess")).toBe(
+    true,
+  );
+
+  // The turn-final Stop is the ONLY thing that frees occupancy.
+  seedEvent(db, "esc-sess", "Stop", 4);
+  drainToCompletion(db);
+  const stopped = db
+    .query("SELECT state FROM jobs WHERE job_id = 'esc-sess'")
+    .get() as { state: string };
+  expect(stopped.state).toBe("stopped");
+  const stoppedJob = { ...parkedJob, state: stopped.state } as unknown as Job;
+  expect(escalationSessionLiveFor([stoppedJob], "unblock", "esc-sess")).toBe(
+    false,
+  );
+  db.close();
 });
 
 test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB → []", () => {
@@ -5585,8 +5685,10 @@ test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB �
   );
   const rows = resolveEscalationJobsFor(db, "deconflict", "fn-1-foo");
   expect(rows.map((r) => r.plan_ref)).toEqual(["fn-1-foo"]);
-  // The read feeds the classifier — a live row classifies as not-yet-terminal.
-  expect(classifyEscalationOutcome(rows, "deconflict", "fn-1-foo")).toEqual({
+  // The read feeds the classifier — a turn-active row classifies as not-yet-terminal.
+  expect(
+    classifyEscalationOutcome(rows, "deconflict", "fn-1-foo", true),
+  ).toEqual({
     terminal: false,
   });
   db.close();
