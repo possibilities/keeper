@@ -1897,6 +1897,10 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
     // `CREATE_EPICS` so a fresh CREATE and a migrated `ALTER TABLE ADD
     // COLUMN` (which always appends) produce the same trailing column order.
     "question",
+    // Schema v112 (fn-1151 task .2): nullable TEXT carrying the epic-level
+    // selection-review record. Declared AFTER `question` in `CREATE_EPICS`, same
+    // append-after rule so fresh-vs-migrated column order stays byte-identical.
+    "selection_review",
   ]);
 
   // Schema v11 rewind-and-redrain wipes the directly-inserted `old` jobs
@@ -2691,7 +2695,13 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // to BOTH events (five-place lockstep) and jobs (migration-only) plus the
   // `autopilot_state.codex_adoption` knob — additive ALTERs, none touching the
   // epics shape, fn-1131 task .1.
-  expect(SCHEMA_VERSION).toBe(111);
+  // v112 appends the nullable `epics.selection_review` TEXT column (the
+  // epic-level close-time selection-review record) — an additive ALTER (both in
+  // the migration AND the fresh `CREATE_EPICS` literal, placed after `question`
+  // so column order stays fresh-vs-migrated identical); it widens the epics row
+  // shape but does not touch the v62→v63 `default_visible`/`approval` rewrite
+  // this test exercises, fn-1151 task .2.
+  expect(SCHEMA_VERSION).toBe(112);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

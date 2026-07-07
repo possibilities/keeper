@@ -3312,7 +3312,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // pre-v111 stream carries no adopted value and no fold reads codex_adoption, so
   // a from-scratch re-fold folds all three NULL byte-identical, and the fold never
   // synthesizes an adopted value).
-  expect(SCHEMA_VERSION).toBe(111);
+  // And to 112 via fn-1151 task .2 (appending the nullable `epics.selection_review`
+  // TEXT column — the epic-level selection-review record; an additive ALTER, NO
+  // cursor rewind: a pre-v112 EpicSnapshot carries no `selection_review` key, so a
+  // from-scratch re-fold folds it NULL byte-identical, and the producer coerces the
+  // value before it ever reaches the fold).
+  expect(SCHEMA_VERSION).toBe(112);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

@@ -51,6 +51,7 @@ const EXPECTED_TOP_LEVEL = [
   "resolve-task",
   "scaffold",
   "selection-brief",
+  "selection-review",
   "show",
   "state-path",
   "status",

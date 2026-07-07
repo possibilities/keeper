@@ -248,6 +248,11 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // Display-only (out of `jsonColumns`/`sortable`/`filters`) — `keeper
     // status` reads it to render the needs-human board pill.
     "question",
+    // `selection_review`: nullable scalar TEXT, the epic-level close-time
+    // selection-review record (a small JSON verdict summary, stored verbatim).
+    // Served RAW like `question` — out of `jsonColumns`/`sortable`/`filters`; a
+    // consumer parses the JSON string itself.
+    "selection_review",
   ],
   pk: "epic_id",
   version: "last_event_id",
