@@ -70,5 +70,5 @@ unmarked). Byte-pin updates for the new argv element. No real tmux/git/daemon.
 - [ ] The hook is registered in the keeper plugin hooks manifest and the fast suite is green including the new guard tests
 
 ## Done summary
-
+Added role-keyed escalation-guard PreToolUse(Bash) hook (allowlist per role, fail-closed for marked sessions), registered it in the keeper hooks manifest, and emitted an always-present KEEPER_ESCALATION_ROLE launch carrier from buildKeeperAgentLaunchArgv.
 ## Evidence
