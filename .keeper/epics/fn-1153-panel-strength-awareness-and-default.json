@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-07T07:14:51.625000Z",
   "created_at": "2026-07-07T02:45:30.174000Z",
   "depends_on_epics": [
     "fn-1149-multi-harness-wrapped-worker-cells",
@@ -10,11 +11,11 @@
   "last_validated_at": "2026-07-07T02:46:40.726000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Panel strength awareness and default alias",
   "touched_repos": [
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T02:46:40.730000Z"
+  "updated_at": "2026-07-07T07:14:51.625000Z"
 }
