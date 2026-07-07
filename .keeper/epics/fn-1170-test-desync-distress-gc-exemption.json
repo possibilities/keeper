@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T19:45:10.094000Z",
+  "created_by_close_of": "fn-1169-surface-and-heal-checkout-desync",
+  "depends_on_epics": [
+    "fn-1169-surface-and-heal-checkout-desync"
+  ],
+  "id": "fn-1170-test-desync-distress-gc-exemption",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Test desync distress GC exemption",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-07T19:45:10.094000Z"
+}
