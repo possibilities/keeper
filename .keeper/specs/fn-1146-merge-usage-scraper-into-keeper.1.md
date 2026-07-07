@@ -64,5 +64,5 @@ no sandbox classes needed beyond a tmpdir.
 - [ ] The Temporal polyfill is exact-pinned in package.json
 
 ## Done summary
-
+Moved the six usage-scraper modules + their in-process suites and the 14-case conformance corpus into src/usage-scrape/ and test/ as first-class keeper source; converged tmux resolution on resolveTmuxBin, exact-pinned @js-temporal/polyfill 0.5.1, dropped external-project/Python/ADR comment provenance while retaining reset-time timezone invariants, and renamed the internal --agentwrap-profile token off the retired name. Full fast suite + typecheck + lint green.
 ## Evidence
