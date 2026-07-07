@@ -40,5 +40,5 @@ sites, and rewrite the function doc comment to state the mode-gated rule
 - [ ] `bun test test/autopilot.test.ts` passes.
 
 ## Done summary
-
+Gated the per-root banner segment on worktree mode (visible only when off, showing the effective cap) and dropped the (stored N) annotation entirely; removed the now-unused maxConcurrentPerRootStored param from autopilotBannerLabel and its call sites.
 ## Evidence
