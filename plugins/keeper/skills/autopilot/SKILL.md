@@ -102,9 +102,10 @@ while worktree mode is off); `max_concurrent_per_root_stored` is the durable
 intent you set, which survives a worktree-mode toggle untouched. Read those
 eight fields to answer "what's it doing" and to capture before a
 take-over. The same envelope's `data.drained` / `data.jammed`, `data.in_flight`
-(pending + running launches), and `data.needs_human` (dead-letters, escalations,
-stuck dispatches) cover what it's CURRENTLY doing — so one read covers both the
-config and the activity. Exit 0 on any board state; exit 1 only on
+(pending + running launches), and `data.needs_human` (the six families — dead
+letters, block escalations, parked questions, stuck dispatches, finalize-non-ff,
+instant-death-wall) cover what it's CURRENTLY doing — so one read covers both
+the config and the activity. Exit 0 on any board state; exit 1 only on
 transport/usage. For the full orient step run `keeper prompt render
 engineering/orient`. (The dispatch-log TUI `keeper autopilot --snapshot` still
 exists for a human-readable frame; for a machine read prefer the status envelope,
