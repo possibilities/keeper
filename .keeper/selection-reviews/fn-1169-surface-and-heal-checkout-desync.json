@@ -1,0 +1,32 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 2,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T19:45:05.099000Z",
+  "epic_id": "fn-1169-surface-and-heal-checkout-desync",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "d18566e84c6129ad06829e00aeab3bfb162d8ded3a098683d2d7c7a8e67aa69d",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "A 1076-insertion, 9-file new distress family spanning dispatch-failure keys, reconcile snapshot threading and restart-survivable latching with subtle cross-file correctness invariants fits the xhigh/opus cell, and selector confidence was 0.83.",
+      "input_hash": "d18566e84c6129ad06829e00aeab3bfb162d8ded3a098683d2d7c7a8e67aa69d",
+      "model": "opus",
+      "task_id": "fn-1169-surface-and-heal-checkout-desync.1",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "A 426-insertion, 5-file plumbing rewrite (read-tree/update-index with all-or-nothing abort) carrying genuine data-loss and path-traversal safety invariants warrants a top cell, and selector confidence was 0.82.",
+      "input_hash": "d18566e84c6129ad06829e00aeab3bfb162d8ded3a098683d2d7c7a8e67aa69d",
+      "model": "opus",
+      "task_id": "fn-1169-surface-and-heal-checkout-desync.2",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    }
+  ]
+}
