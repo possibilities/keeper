@@ -53,5 +53,5 @@ Parity + check-generated + oracle fixtures green in both.
       plan binary's embedded fallback still works from an arbitrary cwd.
 
 ## Done summary
-
+Plan island learns the effective matrix: subagents_config parses the host matrix.yaml and composes effectiveMatrix() over the embedded claude-only defaults; the renderer fans out over it binding current_driver/wrapper_model/wrapper_effort per cell. No-matrix output is byte-identical; a fixture matrix emits wrapped capability cells. Parity tests sandbox the config dir.
 ## Evidence
