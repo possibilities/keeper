@@ -63,6 +63,11 @@ const COLLECTION = "usage";
 const HELP = `keeper usage — live usage frames over the keeper subscribe server
 
 Usage: keeper usage [--sock <path>] [--snapshot | --watch] [--timeout <dur>]
+       keeper usage scrape --target <claude|codex> --profile <name> [...]
+
+Subcommands:
+  scrape         One-shot TUI usage scrape → schema-1 JSON contract
+                 (\`keeper usage scrape --help\` for its flags)
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
   --snapshot     Force one-shot snapshot mode (print one composed frame + a
@@ -123,6 +128,59 @@ An auth-bearing reserved profile-shadow dir (e.g. a login stranded in
 \`~/.claude-profiles/default\`) surfaces a one-line advisory banner above the
 stacks; run \`keeper agent profiles check\` to inspect and reconcile it.
 `;
+
+/**
+ * Help for the `keeper usage scrape` subverb. Owned here rather than in the
+ * merged scrape CLI so `keeper usage scrape --help` stays a pure, spawn-free
+ * help path — the scrape entry (which spawns a TUI and writes stdout) is never
+ * imported on the help route.
+ */
+export const SCRAPE_HELP = `keeper usage scrape — one-shot TUI usage scrape (schema-1 JSON contract)
+
+Usage: keeper usage scrape --target <claude|codex> --profile <name>
+                           [--command <path>] [--rows <n>] [--cols <m>]
+
+  --target <claude|codex>  Which agent's usage panel to scrape
+  --profile <name>         Account profile ('default' = native ~/.claude)
+  --command <path>         Override the agent binary path
+  --rows <n>               PTY row count for the scrape
+  --cols <m>               PTY column count for the scrape
+  --help                   Show this help
+
+Prints ONE discriminated JSON object on stdout (all diagnostics to stderr)
+and mirrors the entry's exit codes: 0 ok, 1 scrape/parse error, 2 bad args.
+`;
+
+/**
+ * Routing decision for a `keeper usage` invocation. The `scrape` subverb is
+ * owned by this leading-token pre-pass ahead of the view's own `parseArgs`,
+ * mirroring the established multi-subverb split: bare `keeper usage`, its
+ * snapshot modes, and `keeper usage --help` stay byte-unchanged, and the view's
+ * cold-start import set gains nothing — `main` pulls the scrape entry in via a
+ * lazy import in the `scrape` arm only.
+ */
+export type UsageRoute =
+  | { kind: "view" }
+  | { kind: "scrape-help" }
+  | { kind: "scrape"; argv: string[] };
+
+/**
+ * Classify a `keeper usage` argv. A leading `scrape` token routes to the merged
+ * scrape CLI, forwarding the remaining argv verbatim; a `--help`/`-h` anywhere
+ * in the scrape tail is the subverb's own pure help. Any other leading token
+ * (including a bare argv or a leading flag like `--snapshot` / `--help`) is the
+ * view path, unchanged.
+ */
+export function routeUsage(argv: string[]): UsageRoute {
+  if (argv[0] !== "scrape") {
+    return { kind: "view" };
+  }
+  const rest = argv.slice(1);
+  if (rest.includes("--help") || rest.includes("-h")) {
+    return { kind: "scrape-help" };
+  }
+  return { kind: "scrape", argv: rest };
+}
 
 function seg(v: unknown): string {
   return v == null ? "" : String(v);
@@ -786,6 +844,20 @@ export function formatShadowAdvisory(
 }
 
 export async function main(argv: string[]): Promise<void> {
+  // Subverb pre-pass — routes `keeper usage scrape ...` to the merged scrape
+  // CLI before the view's parseArgs ever sees the argv. The scrape entry loads
+  // via a LAZY import in this arm only, so the view's cold-start import set is
+  // unchanged and `keeper usage scrape --help` stays spawn-free.
+  const route = routeUsage(argv);
+  if (route.kind === "scrape-help") {
+    process.stdout.write(SCRAPE_HELP);
+    process.exit(0);
+  }
+  if (route.kind === "scrape") {
+    const { main: scrapeMain } = await import("../src/usage-scrape/scrape-cli");
+    process.exit(await scrapeMain(route.argv));
+  }
+
   const { values } = parseArgs({
     args: argv,
     // Derived from the pure-data descriptor (ADR 0008). parseArgs has no number
