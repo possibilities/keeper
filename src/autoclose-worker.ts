@@ -2,11 +2,13 @@
  * autoclose worker. A daemon Bun Worker thread that force-closes
  * the tmux window of a done-and-idle agent keeper itself dispatched — an
  * autopilot `work::`/`close::` worker whose plan row reached a `completed`
- * verdict, or a finished claude `/plan:panel` leg — ~grace after it is provably
- * done. Every other window (a manual session, a hand-run `keeper dispatch`, a
- * handoff, a pair partner, a bus-woken planner) keeps its stay-open-until-
- * hand-closed behavior. Off-switch: `autoclose_enabled: false` in the config,
- * re-read every pulse (a flip lands with no restart).
+ * verdict, a finished claude `/plan:panel` leg, or an
+ * `unblock::`/`deconflict::`/`resolve::` escalation session whose block/conflict
+ * INSTANCE is provably resolved — ~grace after it is provably done. Every other
+ * window (a manual session, a hand-run `keeper dispatch`, a handoff, a pair
+ * partner, a bus-woken planner) keeps its stay-open-until-hand-closed behavior.
+ * Off-switch: `autoclose_enabled: false` in the config, re-read every pulse (a
+ * flip lands with no restart).
  *
  * A PURE EXTERNAL ACTUATOR, cloned from the renamer worker's shape: it opens its
  * own read-only connection, watches the projection (level-triggered on `PRAGMA
@@ -21,10 +23,14 @@
  * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic: the
  * autopilot bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only
  * when a SessionStart discharged a real `pending_dispatches` row), the panel
- * bucket on the `panels` birth-session + the `panel::x::y` name shape. The
- * `completed` verdict is read through the SHARED {@link loadReadinessInputs} +
- * {@link computeReadiness} seam so autoclose's notion of "done" can never drift
- * from the reconciler's.
+ * bucket on the `panels` birth-session + the `panel::x::y` name shape, and the
+ * escalation bucket on `jobs.dispatch_origin === 'escalation'` + one of the three
+ * escalation verbs + a non-null `escalation_instance` stamp (never the window
+ * title). The autopilot bucket's `completed` verdict is read through the SHARED
+ * {@link loadReadinessInputs} + {@link computeReadiness} seam so autoclose's
+ * notion of "done" can never drift from the reconciler's; the escalation bucket's
+ * done-signal is instance-precise, read fail-closed in the pulse (see
+ * {@link readEscalationDoneJobIds}).
  *
  * Every tmux/DB probe is a NEGATIVE safety gate that fails CLOSED: a degraded or
  * empty pane sweep skips the whole pulse and mints nothing; a mismatch is a
@@ -103,9 +109,9 @@ export interface AutocloseIntentMessage {
   ref: string | null;
 }
 
-/** Which ownership bucket a reap belongs to — the two provably-keeper-owned
+/** Which ownership bucket a reap belongs to — the three provably-keeper-owned
  *  window classes. */
-export type AutocloseBucket = "autopilot" | "panel";
+export type AutocloseBucket = "autopilot" | "panel" | "escalation";
 
 /**
  * The narrow `jobs` row the decision core reads. A PURPOSE-BUILT projection, not
@@ -130,6 +136,11 @@ export interface AutocloseJob {
   backend_exec_generation_id: string | null;
   last_input_request_at: number | null;
   last_permission_prompt_at: number | null;
+  /** The block-instance id an escalation session is bound to (`unblock` →
+   *  `block_escalations.blocked_since`; `deconflict`/`resolve` →
+   *  `dispatch_failures.instance_event_id`). Non-null only on the escalation
+   *  bucket's members; the instance-precise done-signal keys on it. */
+  escalation_instance: number | null;
 }
 
 /** One window the decision core owes a close. Mirrors the intent hint's identity
@@ -152,6 +163,12 @@ export interface ComputeAutocloseReapsArgs {
   /** The shared readiness snapshot — `perTask` (work, keyed by task id) and
    *  `perCloseRow` (close, keyed by epic id) carry the `completed` verdict. */
   readiness: Pick<ReadinessSnapshot, "perTask" | "perCloseRow">;
+  /** Job ids whose escalation-bucket instance is provably RESOLVED — the
+   *  escalation done-signal, read instance-precise + fail-closed on the worker's
+   *  read-only connection in the pulse and passed in as a plain set so the core
+   *  stays pure. An absent id ⇒ the incident still stands ⇒ never reaped (a
+   *  declined session's window persists as intended evidence). */
+  escalationDone: ReadonlySet<string>;
   /** One pane sweep. `null` (degraded tmux) OR empty (a suspiciously empty
    *  server) → skip the whole pulse, mint nothing, preserve the grace map. */
   panes: readonly PaneInfo[] | null;
@@ -173,6 +190,21 @@ export interface AutocloseReapsResult {
   graceMap: Map<string, number>;
 }
 
+/** The escalation bucket's membership predicate — POSITIVE provenance only
+ *  (`dispatch_origin='escalation'` + one of the three escalation verbs + a
+ *  non-null instance stamp), NEVER the window title. Shared by the pulse's
+ *  done-signal reader (which candidates it reads for) and the pure classifier
+ *  (bucket membership) so the two can never drift. */
+function isEscalationCandidate(job: AutocloseJob): boolean {
+  return (
+    job.dispatch_origin === "escalation" &&
+    (job.plan_verb === "unblock" ||
+      job.plan_verb === "deconflict" ||
+      job.plan_verb === "resolve") &&
+    job.escalation_instance != null
+  );
+}
+
 /**
  * Decide, for one bucket-membership + rail check, whether a job is eligible NOW
  * (every gate EXCEPT grace-elapsed). Returns the `{bucket, ref}` on a pass, or
@@ -183,6 +215,7 @@ export interface AutocloseReapsResult {
 function classifyEligible(
   job: AutocloseJob,
   readiness: Pick<ReadinessSnapshot, "perTask" | "perCloseRow">,
+  escalationDone: ReadonlySet<string>,
   paneById: ReadonlyMap<string, PaneInfo>,
   paneCountByWindow: ReadonlyMap<string, number>,
   autopilotPaused: boolean,
@@ -256,9 +289,29 @@ function classifyEligible(
     bucket = "panel";
     managedSession = PANELS_EXEC_SESSION;
     ref = job.title;
+  } else if (isEscalationCandidate(job)) {
+    // Escalation bucket: an `unblock::`/`deconflict::`/`resolve::` session
+    // (launched into MANAGED_EXEC_SESSION, like the autopilot bucket). Pause
+    // suspends it too.
+    if (autopilotPaused) {
+      return null;
+    }
+    // Done-signal: the block/conflict INSTANCE this session was bound to must be
+    // provably resolved. Computed instance-precise + fail-closed in the pulse and
+    // passed in — an absent id means the incident still stands (so a declined
+    // session's window persists as intended evidence until its instance clears;
+    // its escalation SLOT is already freed by turn-activity). Never key a kill on
+    // the board flip alone: the `stopped` rail above plus this signal protect the
+    // skill's in-turn final bus-resume message.
+    if (!escalationDone.has(job.job_id)) {
+      return null;
+    }
+    bucket = "escalation";
+    managedSession = MANAGED_EXEC_SESSION;
+    ref = `${job.plan_verb}::${job.plan_ref}`;
   } else {
-    // Everything else — manual (origin NULL), handoff, pair/agentbus,
-    // resolve/plan/approve verbs — is out of scope.
+    // Everything else — manual (origin NULL), handoff, pair/agentbus, a plan/
+    // approve verb — is out of scope.
     return null;
   }
 
@@ -309,8 +362,16 @@ function classifyEligible(
 export function computeAutocloseReaps(
   args: ComputeAutocloseReapsArgs,
 ): AutocloseReapsResult {
-  const { jobs, readiness, panes, graceMap, config, autopilotPaused, now } =
-    args;
+  const {
+    jobs,
+    readiness,
+    escalationDone,
+    panes,
+    graceMap,
+    config,
+    autopilotPaused,
+    now,
+  } = args;
 
   // Config off-switch: disabled ⇒ clear state, mint nothing (a re-enable then
   // restarts every grace clock — a flip only ever DELAYS a close).
@@ -340,6 +401,7 @@ export function computeAutocloseReaps(
     const elig = classifyEligible(
       job,
       readiness,
+      escalationDone,
       paneById,
       paneCountByWindow,
       autopilotPaused,
@@ -412,11 +474,53 @@ function readAutocloseJobs(db: Database): AutocloseJob[] {
       `SELECT job_id, state, pid, start_time, plan_verb, plan_ref, title,
               dispatch_origin, backend_exec_type, backend_exec_pane_id,
               backend_exec_birth_session_id, backend_exec_generation_id,
-              last_input_request_at, last_permission_prompt_at
+              last_input_request_at, last_permission_prompt_at, escalation_instance
          FROM jobs
         WHERE state = 'stopped'`,
     )
     .all() as AutocloseJob[];
+}
+
+/**
+ * Read the escalation bucket's instance-precise done-signal on the worker's
+ * read-only connection, for every escalation candidate among `jobs`. Returns the
+ * set of job_ids whose bound block/conflict INSTANCE is provably resolved.
+ *
+ * Done per verb (the instance id is `jobs.escalation_instance`, a globally-unique
+ * event id):
+ *  - `unblock`  — no `block_escalations` row still carries this `blocked_since`
+ *    (leaving blocked DELETEs the latch; a re-block re-arms a NEW instance id).
+ *  - `deconflict`/`resolve` — no `close::<epic>` `dispatch_failures` row still
+ *    carries this `instance_event_id` (a `DispatchCleared` DELETEs the sticky; a
+ *    new incident re-mints a fresh instance id).
+ *
+ * FAIL-CLOSED: a read error THROWS and the pulse catches it, skips, and reaps
+ * nothing — the reap decision and the kill ride this ONE fresh read (the TOCTOU
+ * guard), never a prior pulse's verdict or the board flip alone.
+ */
+function readEscalationDoneJobIds(
+  db: Database,
+  jobs: readonly AutocloseJob[],
+): Set<string> {
+  const done = new Set<string>();
+  const blockInstanceOpen = db.prepare(
+    "SELECT 1 FROM block_escalations WHERE blocked_since = ? LIMIT 1",
+  );
+  const closeInstanceOpen = db.prepare(
+    "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND instance_event_id = ? LIMIT 1",
+  );
+  for (const job of jobs) {
+    if (!isEscalationCandidate(job)) {
+      continue;
+    }
+    const instance = job.escalation_instance as number;
+    const stmt =
+      job.plan_verb === "unblock" ? blockInstanceOpen : closeInstanceOpen;
+    if (stmt.get(instance) == null) {
+      done.add(job.job_id);
+    }
+  }
+  return done;
 }
 
 /**
@@ -468,9 +572,26 @@ export async function autoclosePulse(
   const autopilotPaused = readAutopilotPaused(db);
   const jobs = readAutocloseJobs(db);
 
+  // The escalation bucket's done-signal — read fail-closed on this ONE pulse's
+  // fresh connection. A degraded read skips the WHOLE pulse and reaps nothing;
+  // returning before the grace-map write preserves it (a non-observation),
+  // matching the degraded-sweep rail.
+  let escalationDone: ReadonlySet<string>;
+  try {
+    escalationDone = readEscalationDoneJobIds(db, jobs);
+  } catch (err) {
+    deps.noteLine(
+      `escalation done-signal read failed — skipping pulse: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+
   const { reaps, graceMap } = computeAutocloseReaps({
     jobs,
     readiness,
+    escalationDone,
     panes,
     graceMap: state.graceMap,
     config,

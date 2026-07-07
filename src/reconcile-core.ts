@@ -1213,27 +1213,35 @@ export function epicHasActiveResolver(
 
 /**
  * The terminal-outcome verdict of the autonomous `resolve::<epic>` merge-resolver,
- * or the not-yet-terminal signal — the gate the daemon merge-escalation sweep reads
- * so it NOTIFIES the human ONLY after the resolver has had its turn (the resolver
- * owns a mechanically-clear conflict; the human is the fallback). Read off the SAME
- * `jobs` map + liveness arms as {@link epicHasActiveResolver}:
+ * or the not-yet-terminal signal — the gate the daemon deconflict-dispatch sweep reads
+ * so it SEQUENCES the `deconflict::<epic>` session behind the resolver (the resolver,
+ * tier 1, owns a mechanically-clear conflict; the deconflict is the judgment fallback).
  *
- *  - `{ terminal: false }` — a resolver is still LIVE (working / stopped-alive) OR no
- *    `resolve::<epic>` job row has folded yet (the launch → SessionStart window). The
- *    escalation WAITS.
- *  - `{ terminal: true, verdict }` — a resolver job row folded AND none is live, so
+ * TURN-ACTIVE occupancy, mirroring {@link classifyEscalationOutcome}'s
+ * `escalationJobLive`: a `resolve::<epic>` session is a one-shot interactive
+ * `/plan:resolve` session that idles forever after its turn ends, so pane/pid liveness
+ * (the {@link epicHasActiveResolver} rule) would count a FINISHED-but-idling resolver as
+ * live and STARVE the deconflict dispatch indefinitely — the ghost-worker pitfall
+ * (liveness is not progress). A resolver occupies only while `state === 'working'` (a
+ * live turn); a `stopped` resolver has yielded its turn and reads TERMINAL. A mid-turn
+ * permission prompt stamps `last_permission_prompt_at` but never flips `state` off
+ * `working`, so a parked resolver stays turn-active here without a marker arm.
+ * {@link epicHasActiveResolver} is left untouched — the recover pass's MERGE_HEAD-race
+ * guard keeps the pane-liveness rule (a mid-merge resolver may not be re-`git merge`d
+ * out from under, a distinct concern from terminal-outcome sequencing).
+ *
+ *  - `{ terminal: false }` — a resolver is still turn-active (`working`) OR no
+ *    `resolve::<epic>` row has folded yet (the launch → SessionStart window). The
+ *    deconflict WAITS.
+ *  - `{ terminal: true, verdict }` — a resolver row folded AND none is turn-active, so
  *    the resolver reached a terminal outcome WITHOUT clearing the sticky (a CLEAR
  *    resolution retries the close, deleting the row, so this sweep never sees it).
- *    `verdict` is `"declined"` when any matching row is `ended` (a clean exit — it
- *    stamped BLOCKED / gave up) and `"died"` otherwise (killed / stopped-dead — the
- *    job crashed). Coarse by design: the human brief only needs "declined vs died".
- *
- * A `null` `livePaneIds` (degraded probe) keeps a `stopped` resolver LIVE via
- * {@link epicHasActiveResolver}, so terminal fires only on `ended`/`killed` — the
- * reap flips a truly-dead job to one of those and the next tick escalates,
- * conservatively bounding the wait without a new timer class and never a premature
- * escalation. Pure: reads only the passed jobs + live-pane set (never wall-clock /
- * fs / a liveness re-probe), so it stays re-fold-safe when a fold consults it.
+ *    `verdict` is `"died"` when any matching row is `killed`/`ended` (the CLI process
+ *    terminated — a one-shot session should idle `stopped` after its turn, never exit),
+ *    else `"declined"` (it ran its turn, ended `stopped`, and the sticky survives — it
+ *    attempted and gave up). Coarse by design and DIAGNOSTIC only: the deconflict-
+ *    dispatch gate reads `.terminal`, never the verdict. Pure: reads only the passed
+ *    jobs (never wall-clock / fs / a liveness re-probe), so it stays re-fold-safe.
  */
 export type ResolverOutcome =
   | { terminal: false }
@@ -1242,26 +1250,26 @@ export type ResolverOutcome =
 export function classifyResolverOutcome(
   jobs: Map<string, Job>,
   epicId: string,
-  livePaneIds: ReadonlySet<string> | null,
 ): ResolverOutcome {
-  if (epicHasActiveResolver(jobs, epicId, livePaneIds)) {
-    return { terminal: false };
-  }
+  let live = false;
   let sawRow = false;
-  let sawEnded = false;
+  let sawDead = false;
   for (const job of jobs.values()) {
     if (job.plan_verb !== "resolve" || job.plan_ref !== epicId) {
       continue;
     }
     sawRow = true;
-    if (job.state === "ended") {
-      sawEnded = true;
+    if (job.state === "working") {
+      live = true;
+    }
+    if (job.state === "killed" || job.state === "ended") {
+      sawDead = true;
     }
   }
-  if (!sawRow) {
+  if (live || !sawRow) {
     return { terminal: false };
   }
-  return { terminal: true, verdict: sawEnded ? "declined" : "died" };
+  return { terminal: true, verdict: sawDead ? "died" : "declined" };
 }
 
 /**

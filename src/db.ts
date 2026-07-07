@@ -48,7 +48,7 @@ import { parseUsageModels, type UsageModels } from "./usage-models";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 113;
+export const SCHEMA_VERSION = 114;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -6214,6 +6214,47 @@ function migrate(db: Database): void {
             WHERE id = 1`,
         );
       }
+
+      // v113→v114 (fn-1171 task .2): bind each escalation session to its block
+      // INSTANCE, jobs-side. TWO nullable INTEGER columns, no DEFAULT, one bump.
+      //
+      //   - `jobs.escalation_instance` — the block-instance id an
+      //     `unblock`/`deconflict`/`resolve` escalation SESSION is bound to at its
+      //     binding SessionStart, stamped TOGETHER with `dispatch_origin`
+      //     ='escalation' only when the spawn name corroborates against the prior
+      //     projection (the unblock latch dispatched / the merge sticky escalated /
+      //     resolver-dispatched); a corroboration miss leaves BOTH NULL. Set-once,
+      //     COALESCE-preserved on resume. Migration-ONLY (kept OUT of the
+      //     CREATE_JOBS literal, NOT in LIVE_ONLY_JOBS_COLUMNS — it is
+      //     deterministic-replayed), appended AFTER every prior jobs ALTER so
+      //     fresh-vs-migrated `PRAGMA table_info(jobs)` stays byte-identical.
+      //   - `dispatch_failures.instance_event_id` — the sticky row's FIRST-
+      //     appearance event id, stamped on the first INSERT and preserved across
+      //     every UPSERT re-emit of the same open row (excluded from the ON-CONFLICT
+      //     SET, same as `created_at`/`merge_escalated_at`), reborn fresh only when
+      //     a `DispatchCleared` DELETE + re-mint opens a new incident instance. It
+      //     is the fencing token the deconflict/resolve corroboration reads to
+      //     identify the instance. Kept OUT of the CREATE_DISPATCH_FAILURES literal
+      //     (mirrors the sibling `merge_escalated_at`/`resolver_dispatched_at`/
+      //     `human_notified_at` marker adds), appended here so its column order is
+      //     fresh-vs-migrated identical.
+      //
+      // NULL rule: both nullable, NO DEFAULT — a DEFAULT poisons the NULL=absent
+      // invariant and breaks re-fold byte-identity. NO backfill: the jobs stamp is
+      // only ever written by the binding-SessionStart fold (COALESCE-preserved) and
+      // `instance_event_id` copies the event's own id, so a from-scratch re-fold
+      // over any pre-v114 stream reproduces every stamp (and every corroboration
+      // miss) byte-identically. NO cursor rewind (a plain additive ALTER, unlike the
+      // v113 stamp). Whitelist-only Python read (keeper-py reads neither column) —
+      // this bump MUST add 114 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in
+      // the SAME commit; test/schema-version.test.ts enforces it.
+      addColumnIfMissing(db, "jobs", "escalation_instance", "INTEGER");
+      addColumnIfMissing(
+        db,
+        "dispatch_failures",
+        "instance_event_id",
+        "INTEGER",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

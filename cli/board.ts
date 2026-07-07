@@ -72,6 +72,7 @@ import {
   defaultDiffFn,
   defaultFramesIo,
 } from "../src/frames-emitter";
+import { BLOCKED_WORK_REASON_PREFIX } from "../src/needs-human";
 import {
   formatPill,
   isEpicStarted,
@@ -453,6 +454,33 @@ export function orphanedFailureRows(args: {
   }
   for (const [taskId, reason] of args.workFailures) {
     if (!args.openTaskIds.has(taskId)) {
+      out.push({ locator: taskId, reason });
+    }
+  }
+  return out;
+}
+
+/**
+ * Homed `work::` blocked-task rows — the surface-and-stop suppression a
+ * non-escalatable blocked category mints ({@link BLOCKED_WORK_REASON_PREFIX})
+ * on a task still ON the board. Unlike {@link orphanedFailureRows} (off-board
+ * only), these stay homed: the task's `[failed:blocked]` pill keeps rendering
+ * in its epic row too — top line for attention, pill for in-epic locality,
+ * double-display intended. Every OTHER homed work failure (worktree reasons,
+ * …) stays pill-only; the promotion predicate is the `blocked:` prefix,
+ * nothing broader. Returns one {@link NeedsHumanRow} per match, `locator` the
+ * task id.
+ */
+export function homedBlockedWorkRows(args: {
+  openTaskIds: ReadonlySet<string>;
+  workFailures: ReadonlyMap<string, string>;
+}): NeedsHumanRow[] {
+  const out: NeedsHumanRow[] = [];
+  for (const [taskId, reason] of args.workFailures) {
+    if (
+      args.openTaskIds.has(taskId) &&
+      reason.startsWith(BLOCKED_WORK_REASON_PREFIX)
+    ) {
       out.push({ locator: taskId, reason });
     }
   }
@@ -1066,6 +1094,10 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
         closeFailures,
         workFailures,
       }),
+      // Homed `work::` rows promoted by the `blocked:` prefix — mutually
+      // exclusive with `orphanedFailureRows`' work arm (on-board vs off-board),
+      // so no row can double-render here.
+      ...homedBlockedWorkRows({ openTaskIds, workFailures }),
     ];
     needsHumanCount = needsHuman.length;
     // ADR 0011 DISPLAY-ONLY: the close-time selection-review block, sourced from

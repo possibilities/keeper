@@ -194,6 +194,12 @@ export interface StatusData {
     // board-wide SESSION/QUOTA-WALL signal (multiple keys tripping in a window);
     // a single one is the per-key breaker working. Signal only — no auto-pause.
     instant_death_wall: number;
+    // Count of homed `work::` surface-and-stop rows whose reason carries the
+    // `blocked:` prefix (a non-escalatable blocked category that never
+    // dispatches an unblock session and never pages). Additive, a SUBSET of
+    // `stuck_dispatches` (never double-counted into `total`, like
+    // `finalize_non_ff` / `instant_death_wall`).
+    blocked_work: number;
     // Count of epics carrying a non-null close-time `selection_review` flag,
     // ANY status (a flagged CLOSED epic still counts — the review outlives its
     // epic's close). ADR 0011 DISPLAY-ONLY member (v6): contributes ZERO to
@@ -391,6 +397,7 @@ export function buildStatusEnvelope(
       finalize_non_ff: needsHuman.finalizeNonFf,
       parked_questions: needsHuman.parkedQuestions,
       instant_death_wall: needsHuman.instantDeathWall,
+      blocked_work: needsHuman.blockedWork,
       selection_reviews: selectionReviews,
       total: needsHuman.total,
     },

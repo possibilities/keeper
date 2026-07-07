@@ -26,7 +26,6 @@ import {
   reprobeLoop,
   type SentinelMemoEntry,
   type SentinelRow,
-  STUCK_SENTINEL_REEMIT_MS,
   STUCK_SENTINEL_SKEW_EPSILON_SECS,
   STUCK_TIER1_MIN_AGE_SECS,
   STUCK_TIER2_MIN_AGE_SECS,
