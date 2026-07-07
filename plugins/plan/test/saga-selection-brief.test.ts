@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { followupPath, writeArtifact } from "../src/audit_artifacts.ts";
@@ -168,6 +169,119 @@ describe("selection-brief --from-followup", () => {
     expect(payload.success).toBe(false);
     expect((payload.error as Record<string, unknown>).code).toBe(
       "FOLLOWUP_MISSING",
+    );
+  });
+});
+
+describe("selection-brief with a host provider matrix", () => {
+  const cfgDirs: string[] = [];
+  afterAll(() => {
+    for (const d of cfgDirs) {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /** A tracked temp config dir carrying a `matrix.yaml`, so effectiveMatrix()
+   *  reads it via KEEPER_CONFIG_DIR (os.homedir ignores $HOME on macOS). */
+  function cfgWithMatrix(matrixYaml: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "selbrief-cfg-"));
+    cfgDirs.push(dir);
+    writeFileSync(join(dir, "matrix.yaml"), matrixYaml);
+    return dir;
+  }
+
+  // A guided roster: claude serves opus (native), codex serves the wrapped
+  // capability gpt-5.5 (a committed guidance block covers it).
+  const GUIDED_MATRIX = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    models:",
+    "      - gpt-5.5: gpt-5.5-codex",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: xhigh",
+    "",
+  ].join("\n");
+
+  // A roster naming a wrapped capability with NO model-selector.yaml block.
+  const UNGUIDED_MATRIX = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    models: [mystery-model]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: xhigh",
+    "",
+  ].join("\n");
+
+  test("offers wrapped-model candidate cells from the effective matrix", () => {
+    const project = getProject();
+    const { epicId, taskIds } = scaffoldEpic(project, {
+      title: "Wrapped select",
+      nTasks: 1,
+    });
+    const cfg = cfgWithMatrix(GUIDED_MATRIX);
+
+    const r = runCli(["selection-brief", epicId, "--project", project.root], {
+      cwd: project.root,
+      home: project.home,
+      env: { KEEPER_CONFIG_DIR: cfg },
+    });
+    expect(r.code).toBe(0);
+    const payload = parseCliOutput(r.output);
+    expect(payload.success).toBe(true);
+
+    const brief = JSON.parse(
+      readFileSync(payload.brief_ref as string, "utf-8"),
+    ) as Record<string, unknown>;
+    // The host matrix overrides the embedded claude-only axes.
+    expect(brief.efforts).toEqual(["medium", "high"]);
+    expect(brief.models).toEqual(["opus", "gpt-5.5"]);
+    // model axis {opus, gpt-5.5} × efforts {medium, high} = 4 cells; the wrapped
+    // model is now selectable.
+    expect(payload.candidate_cells).toHaveLength(4);
+    const cellModels = new Set(
+      (payload.candidate_cells as Array<{ model: string }>).map((c) => c.model),
+    );
+    expect(cellModels).toEqual(new Set(["opus", "gpt-5.5"]));
+
+    const tasks = brief.tasks as Array<Record<string, unknown>>;
+    expect(tasks.map((t) => t.task_id)).toEqual(taskIds);
+    for (const task of tasks) {
+      expect(task.candidate_cells).toHaveLength(4);
+    }
+  });
+
+  test("a roster model with no guidance block fails loud, naming the model and file", () => {
+    const project = getProject();
+    const { epicId } = scaffoldEpic(project, {
+      title: "Unguided select",
+      nTasks: 1,
+    });
+    const cfg = cfgWithMatrix(UNGUIDED_MATRIX);
+
+    const r = runCli(["selection-brief", epicId, "--project", project.root], {
+      cwd: project.root,
+      home: project.home,
+      env: { KEEPER_CONFIG_DIR: cfg },
+    });
+    expect(r.code).toBe(1);
+    const payload = parseCliOutput(r.output);
+    expect(payload.success).toBe(false);
+    const error = payload.error as Record<string, unknown>;
+    expect(error.code).toBe("MODEL_GUIDANCE_MISSING");
+    expect(error.message as string).toContain("mystery-model");
+    expect(error.message as string).toContain("model-selector.yaml");
+    expect((error.details as Record<string, unknown>).model).toBe(
+      "mystery-model",
     );
   });
 });
