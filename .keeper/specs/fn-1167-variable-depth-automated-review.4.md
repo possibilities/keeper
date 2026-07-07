@@ -37,5 +37,5 @@ audit-artifacts tests cover the task-scoped layout + staleness key; stop-guard t
 - [ ] Generated surfaces re-rendered, sidecars and oracle fixtures updated, plan and prompt suites green
 
 ## Done summary
-
+Per-task audit gate on the block machinery: audit-flagged workers park AUDIT_READY after committing (Phase 4.5), /plan:work runs a task-scoped content-blind audit routing clean/mild to resume and verified-severe to AUDIT_SEVERE, with audit-artifacts per-task finding/staleness helpers and an AUDIT_READY-aware stop-guard. Re-rendered the plan work skill + worker cells.
 ## Evidence
