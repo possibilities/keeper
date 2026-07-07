@@ -284,6 +284,8 @@ export interface BoardSummaryCounts {
   readonly epicsRunning: number;
   readonly tasksOpen: number;
   readonly tasksRunning: number;
+  readonly closersOpen: number;
+  readonly closersRunning: number;
 }
 
 export interface BoardSummaryInput {
@@ -325,6 +327,8 @@ export function computeBoardSummary(
   let epicsRunning = 0;
   let tasksOpen = 0;
   let tasksRunning = 0;
+  let closersOpen = 0;
+  let closersRunning = 0;
 
   for (const epic of input.epics) {
     const epicId = boardSummaryId(epic, "epic_id");
@@ -332,9 +336,13 @@ export function computeBoardSummary(
       epicId === "" ? undefined : input.readiness.perCloseRow.get(epicId);
     if (isOpenVerdict(closeVerdict)) {
       epicsOpen += 1;
+      closersOpen += 1;
     }
 
     let epicRunning = isRunningVerdict(closeVerdict);
+    if (epicRunning) {
+      closersRunning += 1;
+    }
     for (const task of boardSummaryArray(epic, "tasks")) {
       const taskId = boardSummaryId(task, "task_id");
       const taskVerdict =
@@ -353,7 +361,14 @@ export function computeBoardSummary(
     }
   }
 
-  return { epicsOpen, epicsRunning, tasksOpen, tasksRunning };
+  return {
+    epicsOpen,
+    epicsRunning,
+    tasksOpen,
+    tasksRunning,
+    closersOpen,
+    closersRunning,
+  };
 }
 
 export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
@@ -361,6 +376,7 @@ export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
     "summary",
     `  epics: ${counts.epicsOpen} open / ${counts.epicsRunning} running`,
     `  tasks: ${counts.tasksOpen} open / ${counts.tasksRunning} running`,
+    `  closers: ${counts.closersOpen} open / ${counts.closersRunning} running`,
   ];
 }
 
