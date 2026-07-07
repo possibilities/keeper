@@ -1,13 +1,15 @@
 /**
- * Behavior pins for the buffered-LRU profile picker (`src/usage-picker.ts`):
+ * Behavior pins for the latched-reserve profile picker (`src/usage-picker.ts`):
  * pure LRU rotation (name ties, new-entrant catch-up, corrupt-stamp ordering),
- * the five-rung admission ladder (buffer → overflow → any-unparked →
- * all-subscribed → DEFAULT), the `pending` burst reservation and its
- * scrape-driven reset, rollover grace, multiplier coercion as the reservation
- * divisor, the v2 ledger shape + `last_pick` forensic blob, and the fail-open
- * / never-throws contract (corrupt state, unreadable state dir, rate-limit
- * cooldown). Every scenario pins deterministically under `installMonotonicClock`
- * — no statistical sampling, no real daemon, per-test tmpdir only.
+ * the latched reserve (healthy-only while any healthy account exists, same-call
+ * fast-open when none remain, conservative re-latch under the re-arm mark, the
+ * anti-flap hysteresis band, and the all-included backstop), the `pending`
+ * burst reservation and its scrape-driven reset, rollover grace, multiplier
+ * coercion as the reservation divisor, the v2 ledger shape + `last_pick`
+ * forensic blob carrying `tier`/`reserve_open`, and the fail-open / never-throws
+ * contract (corrupt state, unreadable state dir, rate-limit cooldown). Every
+ * scenario pins deterministically under `installMonotonicClock` — no
+ * statistical sampling, no real daemon, per-test tmpdir only.
  *
  * The picker reads two sources redirected into tmp: per-account envelopes under
  * the state dir (via `setStateDir`) and the `usage_models` registry in keeper's
@@ -262,24 +264,25 @@ describe("LRU rotation", () => {
   });
 });
 
-// ---------- admission ladder ------------------------------------------------
+// ---------- healthy-tier admission ------------------------------------------
 
-describe("admission ladder", () => {
-  test("rung 1: account at the buffer excluded, just-under admitted", () => {
+describe("healthy-tier admission", () => {
+  test("over-threshold account is held non-viable while a healthy account exists", () => {
     installMonotonicClock();
     writeConfig(["over", "under"]);
-    // over: session 85 (>= 80) — never admitted. under: session 0 — stays
-    // admitted for many picks (pending inflation < 80).
+    // over: session 85 (>= 80) — non-viable while `under` is healthy. under:
+    // session 0 — stays healthy for many picks (pending inflation < 80).
     writeEnvelope("over", { subscription_active: true, session_percent: 85 });
     writeEnvelope("under", { subscription_active: true, session_percent: 0 });
 
     const picks = Array.from({ length: 5 }, () => pickProfile());
 
     expect(picks.every((p) => p === "under")).toBe(true);
-    expect(readState().last_pick.rung).toBe(1);
+    expect(readState().last_pick.tier).toBe("healthy");
+    expect(readState().reserve_open).toBe(false);
   });
 
-  test("rung 1: the weekly buffer also gates", () => {
+  test("the weekly threshold also gates the healthy set", () => {
     installMonotonicClock();
     writeConfig(["weekhot", "fine"]);
     writeEnvelope("weekhot", { subscription_active: true, week_percent: 95 });
@@ -288,74 +291,10 @@ describe("admission ladder", () => {
     const picks = Array.from({ length: 4 }, () => pickProfile());
 
     expect(picks.every((p) => p === "fine")).toBe(true);
+    expect(readState().last_pick.tier).toBe("healthy");
   });
 
-  test("rung 2: overflow when every unparked profile exceeds the buffer", () => {
-    installMonotonicClock();
-    writeConfig(["a", "b"]);
-    // Both over the 80 buffer, both under the 90 overflow cap.
-    writeEnvelope("a", { subscription_active: true, session_percent: 85 });
-    writeEnvelope("b", { subscription_active: true, session_percent: 82 });
-
-    const chosen = pickProfile();
-
-    expect(["a", "b"]).toContain(chosen);
-    expect(readState().last_pick.rung).toBe(2);
-  });
-
-  test("rung 3: any-unparked when every profile exceeds overflow", () => {
-    installMonotonicClock();
-    writeConfig(["a", "b"]);
-    writeEnvelope("a", { subscription_active: true, session_percent: 92 });
-    writeEnvelope("b", { subscription_active: true, session_percent: 95 });
-
-    const chosen = pickProfile();
-
-    expect(["a", "b"]).toContain(chosen);
-    expect(readState().last_pick.rung).toBe(3);
-  });
-
-  test("rung 3: a stalled scraper degrades the fleet to plain LRU rotation", () => {
-    installMonotonicClock();
-    writeConfig(["a", "b"]);
-    // Frozen fetch stamp: pending never resets, so it accumulates without
-    // bound and eventually drives effective usage past overflow for everyone.
-    for (const name of ["a", "b"]) {
-      writeEnvelope(name, {
-        subscription_active: true,
-        session_percent: 0,
-        last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
-      });
-    }
-
-    const picks = Array.from({ length: 50 }, () => pickProfile());
-
-    // Never throws, keeps rotating across both profiles, and the reservation
-    // pressure has demoted the fleet to the any-unparked backstop.
-    expect(picks.filter((p) => p === "a").length).toBeGreaterThan(0);
-    expect(picks.filter((p) => p === "b").length).toBeGreaterThan(0);
-    expect(readState().last_pick.rung).toBe(3);
-  });
-
-  test("rung 4: parked profiles are included when nothing is unparked", () => {
-    installMonotonicClock();
-    writeConfig(["p1", "p2"]);
-    writeEnvelope("p1", {
-      subscription_active: true,
-      lift_at: isoOffset(3600),
-    });
-    writeEnvelope("p2", {
-      subscription_active: true,
-      lift_at: isoOffset(7200),
-    });
-
-    const picks = Array.from({ length: 4 }, () => pickProfile());
-
-    expect(picks.every((p) => ["p1", "p2"].includes(p))).toBe(true);
-    expect(readState().last_pick.rung).toBe(4);
-  });
-
-  test("rung 5: zero subscribed returns DEFAULT with NO state write", () => {
+  test("zero subscribed returns DEFAULT with NO state write", () => {
     writeConfig(["p1", "p2"]);
     writeEnvelope("p1", { subscription_active: false });
     // p2 has no envelope at all.
@@ -397,7 +336,7 @@ describe("admission ladder", () => {
     expect(picks).toEqual(new Set(["burned20x", "fresh1x"]));
   });
 
-  test("usage-endpoint throttle parks a profile out of the primary rungs", () => {
+  test("usage-endpoint throttle parks a profile out of the healthy and reserve tiers", () => {
     installMonotonicClock();
     writeConfig(["ok", "throttled"]);
     writeEnvelope("ok", { subscription_active: true, session_percent: 0 });
@@ -427,6 +366,237 @@ describe("admission ladder", () => {
     const picks = new Set(Array.from({ length: 5 }, () => pickProfile()));
 
     expect(picks).toEqual(new Set(["sub"]));
+  });
+});
+
+// ---------- latched reserve -------------------------------------------------
+
+describe("latched reserve", () => {
+  test("anti-flap: a recovery under the threshold but over the re-arm mark keeps the reserve open", () => {
+    // THE proof point: reserve open, an account recovers 85 → 79 (under the 80
+    // threshold, still over the 50 re-arm mark). The latch must STAY open; only
+    // a genuine sub-re-arm-mark recovery re-latches.
+    installMonotonicClock();
+    seedState({ schema_version: 2, reserve_open: true, picks: {} });
+    writeConfig(["a", "b"]);
+    // Both start hot → the open reserve is legitimate.
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 85,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+    writeEnvelope("b", {
+      subscription_active: true,
+      session_percent: 90,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+
+    pickProfile();
+    expect(readState().reserve_open).toBe(true);
+    expect(readState().last_pick.tier).toBe("reserve");
+
+    // a recovers to 79 — under 80 but above the 50 re-arm mark. (Fresh fetch
+    // stamp zeroes pending so effective usage equals the scraped percent.)
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 79,
+      last_successful_fetch_at: "2026-01-01T01:00:00+00:00",
+    });
+    pickProfile();
+    expect(readState().reserve_open).toBe(true);
+
+    // a drops under the re-arm mark → NOW the latch closes.
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 45,
+      last_successful_fetch_at: "2026-01-01T02:00:00+00:00",
+    });
+    pickProfile();
+    expect(readState().reserve_open).toBe(false);
+    expect(readState().last_pick.tier).toBe("healthy");
+  });
+
+  test("same-call fast-open: the pick that empties the healthy set is served from the reserve", () => {
+    installMonotonicClock();
+    writeConfig(["a", "b"]);
+    // Fresh ledger → latch closed. Both over the threshold → no healthy account,
+    // so this very pick opens the reserve and resolves from it (not backstop).
+    writeEnvelope("a", { subscription_active: true, session_percent: 85 });
+    writeEnvelope("b", { subscription_active: true, session_percent: 82 });
+
+    const chosen = pickProfile();
+
+    expect(["a", "b"]).toContain(chosen);
+    expect(readState().reserve_open).toBe(true);
+    expect(readState().last_pick.tier).toBe("reserve");
+  });
+
+  test("same-call re-latch: a recovery under the re-arm mark closes the latch in the same pick", () => {
+    installMonotonicClock();
+    seedState({ schema_version: 2, reserve_open: true, picks: {} });
+    writeConfig(["recovered", "hot"]);
+    writeEnvelope("recovered", {
+      subscription_active: true,
+      session_percent: 30,
+    });
+    writeEnvelope("hot", { subscription_active: true, session_percent: 85 });
+
+    const chosen = pickProfile();
+
+    expect(readState().reserve_open).toBe(false);
+    expect(readState().last_pick.tier).toBe("healthy");
+    // Re-latched to healthy-only → the recovered account is the only viable pick.
+    expect(chosen).toBe("recovered");
+  });
+
+  test("hold-open: accounts between the re-arm mark and the threshold keep the reserve open", () => {
+    installMonotonicClock();
+    seedState({ schema_version: 2, reserve_open: true, picks: {} });
+    writeConfig(["mid1", "mid2"]);
+    // Both under the threshold (so both are healthy) but neither under the
+    // re-arm mark → the hysteresis band holds the reserve open.
+    writeEnvelope("mid1", { subscription_active: true, session_percent: 60 });
+    writeEnvelope("mid2", { subscription_active: true, session_percent: 70 });
+
+    pickProfile();
+
+    expect(readState().reserve_open).toBe(true);
+    expect(readState().last_pick.tier).toBe("reserve");
+  });
+
+  test("boundary: session exactly at the threshold is not healthy", () => {
+    installMonotonicClock();
+    writeConfig(["edge", "under"]);
+    // 80 is not < 80 → edge is never viable while `under` is healthy.
+    writeEnvelope("edge", { subscription_active: true, session_percent: 80 });
+    writeEnvelope("under", { subscription_active: true, session_percent: 0 });
+
+    const picks = Array.from({ length: 4 }, () => pickProfile());
+
+    expect(picks.every((p) => p === "under")).toBe(true);
+    expect(readState().reserve_open).toBe(false);
+  });
+
+  test("boundary: session exactly at the re-arm mark does not re-latch", () => {
+    installMonotonicClock();
+    seedState({ schema_version: 2, reserve_open: true, picks: {} });
+    writeConfig(["a", "b"]);
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 50,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+    writeEnvelope("b", {
+      subscription_active: true,
+      session_percent: 90,
+      last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+    });
+
+    pickProfile();
+    // 50 is not < 50 → not re-armed → latch stays open.
+    expect(readState().reserve_open).toBe(true);
+
+    // Drop just under the mark → re-latch.
+    writeEnvelope("a", {
+      subscription_active: true,
+      session_percent: 49,
+      last_successful_fetch_at: "2026-01-01T01:00:00+00:00",
+    });
+    pickProfile();
+    expect(readState().reserve_open).toBe(false);
+  });
+
+  test("boundary: week exactly at the threshold is not healthy", () => {
+    installMonotonicClock();
+    writeConfig(["weekedge", "fine"]);
+    // 95 is not < 95 → weekedge is never in the healthy set.
+    writeEnvelope("weekedge", { subscription_active: true, week_percent: 95 });
+    writeEnvelope("fine", { subscription_active: true, session_percent: 0 });
+
+    const picks = Array.from({ length: 4 }, () => pickProfile());
+
+    expect(picks.every((p) => p === "fine")).toBe(true);
+    expect(readState().reserve_open).toBe(false);
+  });
+
+  test("an absent reserve_open flag is read as latched on the first pick", () => {
+    installMonotonicClock();
+    // A pre-existing v2 ledger with accumulated pending/LRU state but NO
+    // reserve_open field — read as latched (healthy-only), state preserved.
+    seedState({
+      schema_version: 2,
+      picks: {
+        healthy: {
+          last_picked_at: "2025-01-01T00:00:00+00:00",
+          pending: 0,
+          seen_fetch_at: null,
+        },
+        hot: {
+          last_picked_at: "2025-01-01T00:00:01+00:00",
+          pending: 0,
+          seen_fetch_at: null,
+        },
+      },
+    });
+    writeConfig(["healthy", "hot"]);
+    writeEnvelope("healthy", {
+      subscription_active: true,
+      session_percent: 10,
+    });
+    writeEnvelope("hot", { subscription_active: true, session_percent: 85 });
+
+    const chosen = pickProfile();
+
+    // Latched → only the healthy account is viable.
+    expect(chosen).toBe("healthy");
+    expect(readState().last_pick.tier).toBe("healthy");
+    expect(readState().reserve_open).toBe(false);
+    // Prior LRU state survived (no wipe of the untouched account).
+    expect(readState().picks.hot.last_picked_at).toBe(
+      "2025-01-01T00:00:01+00:00",
+    );
+  });
+
+  test("a stalled scraper opens the reserve and keeps the fleet rotating", () => {
+    installMonotonicClock();
+    writeConfig(["a", "b"]);
+    // Frozen fetch stamp: pending never resets, so effective usage climbs
+    // without bound and eventually pushes every account past the threshold —
+    // the reserve opens and stays open, but the fleet keeps rotating.
+    for (const name of ["a", "b"]) {
+      writeEnvelope(name, {
+        subscription_active: true,
+        session_percent: 0,
+        last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
+      });
+    }
+
+    const picks = Array.from({ length: 50 }, () => pickProfile());
+
+    expect(picks.filter((p) => p === "a").length).toBeGreaterThan(0);
+    expect(picks.filter((p) => p === "b").length).toBeGreaterThan(0);
+    expect(readState().reserve_open).toBe(true);
+    expect(readState().last_pick.tier).toBe("reserve");
+  });
+
+  test("all-parked backstop: no throw, tier=backstop, reserve_open persisted", () => {
+    installMonotonicClock();
+    seedState({ schema_version: 2, reserve_open: true, picks: {} });
+    writeConfig(["p1", "p2"]);
+    writeEnvelope("p1", {
+      subscription_active: true,
+      lift_at: isoOffset(3600),
+    });
+    writeEnvelope("p2", {
+      subscription_active: true,
+      lift_at: isoOffset(7200),
+    });
+
+    const picks = Array.from({ length: 4 }, () => pickProfile());
+
+    expect(picks.every((p) => ["p1", "p2"].includes(p))).toBe(true);
+    expect(readState().last_pick.tier).toBe("backstop");
+    expect(readState().reserve_open).toBe(true);
   });
 });
 
@@ -518,7 +688,7 @@ describe("burst reservation", () => {
     installMonotonicClock();
     writeConfig(["m5"]);
     // multiplier 5, STEP_SESSION 5 → each pick adds 5*1/5 = 1 to effective
-    // session. Starting at 78, admission (< 80) survives one pick then gates.
+    // session. Starting at 78, healthy (< 80) survives one pick then gates out.
     writeEnvelope("m5", {
       subscription_active: true,
       multiplier: 5,
@@ -526,15 +696,18 @@ describe("burst reservation", () => {
       last_successful_fetch_at: "2026-01-01T00:00:00+00:00",
     });
 
-    // Pick 1: effective 78 < 80 → rung 1.
+    // Pick 1: effective 78 < 80 → healthy.
     expect(pickProfile()).toBe("m5");
-    expect(readState().last_pick.rung).toBe(1);
-    // Pick 2: pending 1 → effective 78 + 1 = 79 < 80 → still rung 1.
+    expect(readState().last_pick.tier).toBe("healthy");
+    expect(readState().reserve_open).toBe(false);
+    // Pick 2: pending 1 → effective 78 + 1 = 79 < 80 → still healthy.
     pickProfile();
-    expect(readState().last_pick.rung).toBe(1);
-    // Pick 3: pending 2 → effective 78 + 2 = 80 → out of rung 1, into overflow.
+    expect(readState().last_pick.tier).toBe("healthy");
+    // Pick 3: pending 2 → effective 78 + 2 = 80 → no healthy account → reserve
+    // opens in this pick and serves it.
     pickProfile();
-    expect(readState().last_pick.rung).toBe(2);
+    expect(readState().last_pick.tier).toBe("reserve");
+    expect(readState().reserve_open).toBe(true);
   });
 });
 
@@ -545,7 +718,7 @@ describe("rollover grace", () => {
     installMonotonicClock();
     writeConfig(["expired", "other"]);
     // expired reads 99% but its window reset in the past (tz-aware) → grace
-    // treats it as 0 → admitted to rung 1 alongside other.
+    // treats it as 0 → healthy alongside other.
     writeEnvelope("expired", {
       subscription_active: true,
       usage: {
@@ -557,7 +730,7 @@ describe("rollover grace", () => {
     const picks = new Set(Array.from({ length: 4 }, () => pickProfile()));
 
     expect(picks).toEqual(new Set(["expired", "other"]));
-    expect(readState().last_pick.rung).toBe(1);
+    expect(readState().last_pick.tier).toBe("healthy");
   });
 
   test("a naive past resets_at gets no grace", () => {
@@ -615,8 +788,14 @@ describe("ledger v2", () => {
     expect(entry.seen_fetch_at).toBe("2026-01-01T00:00:00+00:00");
     // No stride-era `count` field survives.
     expect(entry.count).toBeUndefined();
-    expect(state.last_pick).toMatchObject({ profile: chosen, rung: 1 });
+    expect(state.last_pick).toMatchObject({
+      profile: chosen,
+      tier: "healthy",
+      reserve_open: false,
+    });
     expect(typeof state.last_pick.at).toBe("string");
+    // The authoritative top-level latch is persisted for the next pick to read.
+    expect(state.reserve_open).toBe(false);
   });
 
   test("a v1 picker.json is treated as absent (discarded on first pick)", () => {
@@ -695,7 +874,7 @@ describe("fail-open", () => {
 // ---------- rate-limit cooldown (lift_at) -----------------------------------
 
 describe("rate-limit cooldown", () => {
-  test("future lift_at parks a profile out of the primary rungs", () => {
+  test("future lift_at parks a profile out of the healthy and reserve tiers", () => {
     installMonotonicClock();
     writeConfig(["cool", "hot"]);
     writeEnvelope("cool", { subscription_active: true, session_percent: 0 });
@@ -724,7 +903,7 @@ describe("rate-limit cooldown", () => {
     expect(picks).toEqual(new Set(["p1", "p2"]));
   });
 
-  test("all parked falls through to the rung-4 all-subscribed backstop", () => {
+  test("all parked falls through to the all-included backstop", () => {
     installMonotonicClock();
     writeConfig(["p1", "p2"]);
     writeEnvelope("p1", {
@@ -739,7 +918,7 @@ describe("rate-limit cooldown", () => {
     const picks = Array.from({ length: 4 }, () => pickProfile());
 
     expect(picks.every((p) => ["p1", "p2"].includes(p))).toBe(true);
-    expect(readState().last_pick.rung).toBe(4);
+    expect(readState().last_pick.tier).toBe("backstop");
   });
 
   test("malformed lift_at is ignored (non-string / unparseable / naive)", () => {
