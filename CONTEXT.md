@@ -80,6 +80,13 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Adopted job**: A tracked session a non-launcher path minted — a hand-started hermes self-seed or a claimed codex rollout — rather than the keeper agent launcher, marked so the board pills it distinctly and restore surfaces it. Avoid: orphan, imported session, unmanaged job.
 - **Originator**: The ownership signal on a codex rollout marking it keeper-launched; strictly absent or empty means keeper never owned it, so a sole unambiguous rollout becomes adoptable. Avoid: owner tag, launch marker, origin flag.
 
+## Crash restore
+
+- **Generation**: One tmux server boot — every window and agent observed between a server start and its death, the cohort crash-restore scopes to. One boot carries exactly one keeper-stamped identity, so a probe-format change can never split it in two. Avoid: server epoch, boot id, killed cohort (that is the fallback derivation model, not the concept).
+- **Restore**: Relaunching a dead generation's agent tabs so each re-attaches to its exact prior conversation, proven per tab from attach evidence — window creation alone never counts as restored. Avoid: revive (that is the runnable dump-script artifact), resurrect, respawn.
+- **Harness resume**: One harness re-attaching to its own persisted session by native id — the per-tab primitive a restore drives. Distinct from the Resume cursor (a fold checkpoint) and from unblocking a task. Avoid: reconnect, reload, restore (that is the whole-generation flow).
+- **Resume target**: The harness-native id a harness resume needs — the claude session id, or the stored native id for pi/codex/hermes; empty means not-resumable, and a display title is never a resume key. Avoid: session name, label, job id (identity, not the resume key).
+
 ## Frame stream and supervision
 
 - **Frame**: One rendered snapshot of a viewer's body text, minted only when the rendered content actually changes; the unit the frame stream emits and a sidecar triple records. Avoid: screen, repaint, delta (that is the coarse tail's unit).
