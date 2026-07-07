@@ -462,6 +462,18 @@ export interface ReconcileSnapshot {
    */
   sharedDirtyDistressDirs?: Set<string>;
   /**
+   * The `repoDir`s that currently have an OPEN per-repo shared-checkout-DESYNC distress
+   * row (synthetic `daemon::shared-checkout-desync:<repoHash>`, collected off the row's
+   * `dir`). PRODUCER-ONLY: the per-cycle desync content probe re-seeds its in-memory
+   * latch from THIS durable set (so a restarted worker still probes + clears a distress
+   * it minted before the restart) and level-clears any row whose checkout has since
+   * caught up to the default tip. A LIVE-producer sibling — never drained like {@link
+   * sharedWedgeDistressDirs} / {@link sharedDirtyDistressDirs} — on its own id prefix so
+   * the surfaces never cross-clear. Optional for call-site back-compat; an absent field
+   * is an empty set (no open desync distress).
+   */
+  sharedDesyncDistressDirs?: Set<string>;
+  /**
    * The `(verb, id, dir)` of every OPEN fan-in LANE pre-merge `dispatch_failures`
    * row (its `reason` carries {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX}; minted by
    * `provision()` on the NATURAL `work::<taskId>` key with the lane worktree path as

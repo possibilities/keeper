@@ -45,6 +45,7 @@ import {
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   buildWorktreeStatusEntries,
+  type CheckoutDesyncProbe,
   type ConfirmRunningDeps,
   classifyResolverOutcome,
   classifyWorktreeRepos,
@@ -56,6 +57,7 @@ import {
   confirmRunning,
   createDispatchFailedGate,
   createLaneWedgeTracker,
+  createSharedCheckoutDesyncTracker,
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
   createStaleBaseLaneTracker,
@@ -98,6 +100,7 @@ import {
   loadReconcileSnapshot,
   mergeLaneBaseIntoDefault,
   prepareWorktreeGeometry,
+  probeSharedCheckoutDesync,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
@@ -109,8 +112,11 @@ import {
   reposForRecovery,
   resolveWorkerLaunchConfig,
   runReconcileCycle,
+  SHARED_CHECKOUT_DESYNC_GRACE_SEC,
   SHARED_CHECKOUT_DIRTY_GRACE_SEC,
   SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
@@ -121,6 +127,7 @@ import {
   STALE_BASE_LANE_GRACE_SEC,
   type StaleBaseLaneObservation,
   sharedCheckoutDistressObservations,
+  sharedDesyncDistressId,
   sharedDirtyDistressId,
   sharedWedgeDistressId,
   staleBaseLaneDistressId,
@@ -238,6 +245,7 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     question: null,
+    selection_review: null,
     ...overrides,
   };
 }
@@ -7799,6 +7807,86 @@ test("fn-1140 mergeLaneBaseIntoDefault: an IDLE-CLEAN-on-default shared checkout
   expect(cmds.some((c) => c === `reset --hard ${MG_MERGE_COMMIT}`)).toBe(true);
 });
 
+test("fn-1169 mergeLaneBaseIntoDefault: an idle-clean checkout whose resync APPLIES does NOT fire the desync seed", async () => {
+  // The happy path: on default, clean, reset --hard succeeds → the checkout carries the
+  // merged tip, so there is no desync to seed. The `merged` result shape is UNCHANGED.
+  const { run } = makeMergeGit();
+  let seeded = 0;
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+    () => {
+      seeded++;
+    },
+  );
+  expect(res).toEqual({ kind: "merged" });
+  expect(seeded).toBe(0);
+});
+
+test("fn-1169 mergeLaneBaseIntoDefault: a dirty-on-default checkout whose resync is SKIPPED fires the desync seed (still merged)", async () => {
+  // The incident shape: the ref advances but the dirty checkout's resync is skipped, so
+  // the tree trails the merged tip → the seed fires, while the merge still returns merged.
+  const { run, cmds } = makeMergeGit({ dirty: true });
+  let seeded = 0;
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+    () => {
+      seeded++;
+    },
+  );
+  expect(res).toEqual({ kind: "merged" });
+  // The ref advanced but no reset --hard ran (WIP never clobbered) → exactly one seed.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
+  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
+  expect(seeded).toBe(1);
+});
+
+test("fn-1169 mergeLaneBaseIntoDefault: an off-default checkout fires the desync seed (ref advanced, resync skipped) even as the push defers off-branch", async () => {
+  // The ref advances locally but the resync is skipped (HEAD is off default), so the
+  // checkout trails → the seed fires BEFORE the push defers off-branch (the seed is about
+  // the local ref advance, independent of the push verdict).
+  const { run } = makeMergeGit({ head: "feature" });
+  let seeded = 0;
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+    () => {
+      seeded++;
+    },
+  );
+  expect(res).toEqual({ kind: "off-branch", head: "feature" });
+  expect(seeded).toBe(1);
+});
+
+test("fn-1169 mergeLaneBaseIntoDefault: a CAS-stale ref (no advance) does NOT fire the desync seed", async () => {
+  // The compare-and-swap failed, so the ref never advanced and the checkout is not
+  // desynced — the seed must stay silent on every not-advanced early return.
+  const { run } = makeMergeGit({ updateRefExit: 1 });
+  let seeded = 0;
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+    () => {
+      seeded++;
+    },
+  );
+  expect(res).toEqual({ kind: "cas-stale" });
+  expect(seeded).toBe(0);
+});
+
 test("fn-1140 mergeLaneBaseIntoDefault: a CONCURRENT default advance (update-ref CAS mismatch) → { kind: 'cas-stale' }, a transient retry-skip, never a strand", async () => {
   // The compare-and-swap `<old>` is stale — an agent commit advanced default out
   // from under the merge. A DISTINCT transient retry-skip (modeled like lock-timeout),
@@ -14068,6 +14156,389 @@ test("post base-merge decouple: the recover cycle derives NO shared-checkout wed
   expect(dirtyDecision.clear.map((c) => c.id)).toEqual([
     sharedDirtyDistressId(REPO_A),
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1169 — the shared-checkout DESYNC distress escalation. A LIVE-producer sibling of
+// the (neutered) wedge/dirty trackers: a per-repo distress row when a base→default merge
+// advanced the ref but the checkout's resync was skipped/aborted, so the working tree
+// trails the default tip. Mint is EVENT-SEEDED + graced; clear is a per-cycle CONTENT
+// probe. All expected values are hand-computed constants, never re-derived from the
+// tracker/probe.
+// ---------------------------------------------------------------------------
+
+const DESYNC_BLOCKER =
+  "content-trailing (index/worktree differ from the default tip)";
+
+test("sharedDesyncDistressId is stable per repo, distinct across repos, prefix-tagged + distinct from the wedge/dirty ids", () => {
+  const a = sharedDesyncDistressId(REPO_A);
+  const b = sharedDesyncDistressId(REPO_B);
+  expect(a).toBe(sharedDesyncDistressId(REPO_A)); // deterministic
+  expect(a).not.toBe(b); // per-repo distinct
+  expect(a.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX)).toBe(true);
+  // A desync row, a wedge row, and a dirt row for the SAME repo are three DISTINCT ids —
+  // never cross-clear.
+  expect(sharedDesyncDistressId(REPO_A)).not.toBe(
+    sharedWedgeDistressId(REPO_A),
+  );
+  expect(sharedDesyncDistressId(REPO_A)).not.toBe(
+    sharedDirtyDistressId(REPO_A),
+  );
+});
+
+test("SHARED_CHECKOUT_DESYNC_GRACE_SEC is the ~5min grace watermark", () => {
+  expect(SHARED_CHECKOUT_DESYNC_GRACE_SEC).toBe(5 * 60);
+});
+
+test("desync tracker: a repo desynced past the grace watermark mints EXACTLY once, blocker named", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDesyncTracker(grace);
+  const desynced = new Map([[REPO_A, DESYNC_BLOCKER]]);
+  const empty = new Set<string>();
+  // t=1000 first observed desynced → no mint (grace clock starts here).
+  expect(
+    tracker.step({ desynced, openDistressDirs: empty, nowSec: 1000 }).mint,
+  ).toEqual([]);
+  // Just short of grace → still no mint (the index.lock-blip mitigation window).
+  expect(
+    tracker.step({ desynced, openDistressDirs: empty, nowSec: 1299 }).mint,
+  ).toEqual([]);
+  // Exactly grace elapsed → mint once, keyed per-repo, reason display-mapped + blocker.
+  const crossed = tracker.step({
+    desynced,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(crossed.mint.length).toBe(1);
+  expect(crossed.mint[0]?.id).toBe(sharedDesyncDistressId(REPO_A));
+  expect(crossed.mint[0]?.dir).toBe(REPO_A);
+  expect(
+    crossed.mint[0]?.reason?.startsWith(SHARED_DESYNC_DISTRESS_REASON),
+  ).toBe(true);
+  expect(crossed.mint[0]?.reason).toContain(REPO_A);
+  expect(crossed.mint[0]?.reason).toContain(DESYNC_BLOCKER);
+  // Subsequent cycles while still desynced → NEVER re-mint (O(1) per episode).
+  for (const ts of [1301, 1600, 5000]) {
+    expect(
+      tracker.step({ desynced, openDistressDirs: empty, nowSec: ts }).mint,
+    ).toEqual([]);
+  }
+});
+
+test("desync tracker: the storm shape — one persistent desync over many cycles yields exactly ONE mint", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDesyncTracker(grace);
+  const desynced = new Map([[REPO_A, DESYNC_BLOCKER]]);
+  const empty = new Set<string>();
+  let mints = 0;
+  for (let ts = 1000; ts < 5000; ts++) {
+    mints += tracker.step({ desynced, openDistressDirs: empty, nowSec: ts })
+      .mint.length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("desync tracker: a checkout that catches up level-clears the open row EXACTLY once (carries-HEAD evidence)", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDesyncTracker(grace);
+  const desynced = new Map([[REPO_A, DESYNC_BLOCKER]]);
+  const open = new Set([REPO_A]); // the durable open desync row for REPO_A
+  // Still desynced → no clear (the row belongs; the checkout does not carry HEAD).
+  expect(
+    tracker.step({ desynced, openDistressDirs: open, nowSec: 2000 }).clear,
+  ).toEqual([]);
+  // The checkout content-carries the default tip (no longer in `desynced`) but the row is
+  // still open → level-clear it once, keyed on the same per-repo id.
+  const caughtUp = tracker.step({
+    desynced: new Map(),
+    openDistressDirs: open,
+    nowSec: 2001,
+  });
+  expect(caughtUp.clear.length).toBe(1);
+  expect(caughtUp.clear[0]?.id).toBe(sharedDesyncDistressId(REPO_A));
+  // Once main folds the clear the row is gone from openDistressDirs → no re-clear.
+  expect(
+    tracker.step({
+      desynced: new Map(),
+      openDistressDirs: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("desync tracker: an off-default / mid-merge checkout keeps the row open (still in `desynced`), never clears or re-mints", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDesyncTracker(grace);
+  const empty = new Set<string>();
+  // Mint the row at t=1300 (content-trailing).
+  tracker.step({
+    desynced: new Map([[REPO_A, DESYNC_BLOCKER]]),
+    openDistressDirs: empty,
+    nowSec: 1000,
+  });
+  expect(
+    tracker.step({
+      desynced: new Map([[REPO_A, DESYNC_BLOCKER]]),
+      openDistressDirs: empty,
+      nowSec: 1300,
+    }).mint.length,
+  ).toBe(1);
+  const open = new Set([REPO_A]);
+  // Now the checkout is off-default (a DIFFERENT blocker, but still desynced) → the row
+  // is RETAINED (no clear) and NOT re-minted (already minted this episode).
+  const offDefault = tracker.step({
+    desynced: new Map([[REPO_A, "off-default (on feature/x, expected main)"]]),
+    openDistressDirs: open,
+    nowSec: 1600,
+  });
+  expect(offDefault.clear).toEqual([]);
+  expect(offDefault.mint).toEqual([]);
+});
+
+test("desync tracker: two repos on a multi-repo board desync independently — distinct rows, no collision", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDesyncTracker(grace);
+  const empty = new Set<string>();
+  // A desyncs at t=1000; B desyncs later at t=1200.
+  tracker.step({
+    desynced: new Map([[REPO_A, DESYNC_BLOCKER]]),
+    openDistressDirs: empty,
+    nowSec: 1000,
+  });
+  const both = new Map([
+    [REPO_A, DESYNC_BLOCKER],
+    [REPO_B, DESYNC_BLOCKER],
+  ]);
+  tracker.step({ desynced: both, openDistressDirs: empty, nowSec: 1200 });
+  // At t=1300, A has crossed its grace (started 1000) but B has not (started 1200).
+  const atA = tracker.step({
+    desynced: both,
+    openDistressDirs: empty,
+    nowSec: 1300,
+  });
+  expect(atA.mint.map((m) => m.dir)).toEqual([REPO_A]);
+  // At t=1500, B crosses its own grace — its own distinct row, A does not re-mint.
+  const atB = tracker.step({
+    desynced: both,
+    openDistressDirs: empty,
+    nowSec: 1500,
+  });
+  expect(atB.mint.map((m) => m.dir)).toEqual([REPO_B]);
+  expect(sharedDesyncDistressId(REPO_A)).not.toBe(
+    sharedDesyncDistressId(REPO_B),
+  );
+});
+
+test("desync tracker: a repo that catches up then re-desyncs waits the FULL grace again", () => {
+  const grace = 300;
+  const tracker = createSharedCheckoutDesyncTracker(grace);
+  const desynced = new Map([[REPO_A, DESYNC_BLOCKER]]);
+  const empty = new Set<string>();
+  // First episode: mint at 1300.
+  tracker.step({ desynced, openDistressDirs: empty, nowSec: 1000 });
+  expect(
+    tracker.step({ desynced, openDistressDirs: empty, nowSec: 1300 }).mint
+      .length,
+  ).toBe(1);
+  // Catches up at 1400 (re-arms the in-memory grace clock).
+  tracker.step({ desynced: new Map(), openDistressDirs: empty, nowSec: 1400 });
+  // Re-desyncs at 1500 — a NEW episode: no mint until a fresh full grace elapses.
+  expect(
+    tracker.step({ desynced, openDistressDirs: empty, nowSec: 1500 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ desynced, openDistressDirs: empty, nowSec: 1799 }).mint,
+  ).toEqual([]);
+  expect(
+    tracker.step({ desynced, openDistressDirs: empty, nowSec: 1800 }).mint
+      .length,
+  ).toBe(1);
+});
+
+test("desync tracker: a restart (fresh tracker) still level-clears a row minted before it, and re-mints at most once", () => {
+  const grace = 300;
+  // Simulate a daemon restart: a brand-new tracker with an empty in-memory latch, but the
+  // durable desync row for REPO_A is still open in the projection (which re-seeds the
+  // probe's watched set → the open-row dir set drives the clear).
+  const fresh = createSharedCheckoutDesyncTracker(grace);
+  const open = new Set([REPO_A]);
+  // The checkout caught up during downtime: not desynced now, row still open → the
+  // projection-driven clear fires even though this instance never minted it.
+  const cleared = fresh.step({
+    desynced: new Map(),
+    openDistressDirs: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([
+    sharedDesyncDistressId(REPO_A),
+  ]);
+
+  // Alternatively, still desynced after the restart: the fresh clock re-arms and re-mints
+  // ONCE after a full grace (the accepted bounded per-restart burst).
+  const fresh2 = createSharedCheckoutDesyncTracker(grace);
+  const desynced = new Map([[REPO_A, DESYNC_BLOCKER]]);
+  let mints = 0;
+  for (let ts = 9000; ts < 9000 + 2 * grace; ts++) {
+    mints += fresh2.step({ desynced, openDistressDirs: open, nowSec: ts }).mint
+      .length;
+  }
+  expect(mints).toBe(1);
+});
+
+test("desync + wedge + dirty distress rows for the SAME repo never cross-clear (distinct ids, independent open sets)", () => {
+  const grace = 300;
+  const desyncTracker = createSharedCheckoutDesyncTracker(grace);
+  const wedgeTracker = createSharedCheckoutWedgeTracker(grace);
+  const dirtyTracker = createSharedCheckoutDirtyTracker(grace);
+  const open = new Set([REPO_A]);
+  // Each tracker fed NOTHING active but its own open row → each clears ONLY its own id.
+  const desyncClear = desyncTracker.step({
+    desynced: new Map(),
+    openDistressDirs: open,
+    nowSec: 5000,
+  });
+  const wedgeClear = wedgeTracker.step({
+    wedged: new Map(),
+    openDistressDirs: open,
+    nowSec: 5000,
+  });
+  const dirtyClear = dirtyTracker.step({
+    dirty: new Map(),
+    openDistressDirs: open,
+    nowSec: 5000,
+  });
+  expect(desyncClear.clear.map((c) => c.id)).toEqual([
+    sharedDesyncDistressId(REPO_A),
+  ]);
+  expect(wedgeClear.clear.map((c) => c.id)).toEqual([
+    sharedWedgeDistressId(REPO_A),
+  ]);
+  expect(dirtyClear.clear.map((c) => c.id)).toEqual([
+    sharedDirtyDistressId(REPO_A),
+  ]);
+  // The three ids are pairwise distinct — no clear could ever target another's row.
+  expect(sharedDesyncDistressId(REPO_A)).not.toBe(
+    sharedWedgeDistressId(REPO_A),
+  );
+  expect(sharedDesyncDistressId(REPO_A)).not.toBe(
+    sharedDirtyDistressId(REPO_A),
+  );
+  expect(sharedWedgeDistressId(REPO_A)).not.toBe(sharedDirtyDistressId(REPO_A));
+});
+
+// The desync content probe (probeSharedCheckoutDesync) — every git decision through a
+// scripted GitRunner fake, no real git. `desynced:false` is the SOLE clear evidence
+// (on-default + no MERGE_HEAD + empty `status --porcelain -uno`); every other state (and
+// every inconclusive probe) reports `desynced:true` so a real signal is never
+// false-cleared.
+
+/** A scripted GitRunner modeling one checkout's state for the desync probe. */
+function makeDesyncProbeGit(opts: {
+  branch?: string; // current branch (default "main")
+  defaultBranch?: string; // resolved default (default "main")
+  mergeHead?: boolean; // MERGE_HEAD present
+  statusExit?: number; // `git status` exit code (default 0)
+  porcelain?: string; // `status --porcelain -uno` stdout (default clean "")
+}): GitRunner {
+  const def = opts.defaultBranch ?? "main";
+  const branch = opts.branch ?? "main";
+  return async (args, _o) => {
+    const joined = args.join(" ");
+    // resolveDefaultBranch: symbolic-ref (origin/HEAD) → `origin/<def>`.
+    if (joined === "symbolic-ref --short refs/remotes/origin/HEAD") {
+      return { code: 0, stdout: `origin/${def}\n`, stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref")) {
+      return { code: 0, stdout: `${def}\n`, stderr: "" };
+    }
+    // currentBranch.
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${branch}\n`, stderr: "" };
+    }
+    if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+      return opts.mergeHead
+        ? { code: 0, stdout: "deadbeef\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined === "status --porcelain --untracked-files=no") {
+      return {
+        code: opts.statusExit ?? 0,
+        stdout: opts.porcelain ?? "",
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+}
+
+test("desync probe: on-default + no MERGE_HEAD + clean porcelain → SYNCED (the clear evidence)", async () => {
+  const verdict: CheckoutDesyncProbe = await probeSharedCheckoutDesync(
+    REPO_A,
+    makeDesyncProbeGit({ branch: "main", defaultBranch: "main" }),
+  );
+  expect(verdict).toEqual({ desynced: false });
+});
+
+test("desync probe: off the default branch → desynced, off-default blocker named", async () => {
+  const verdict = await probeSharedCheckoutDesync(
+    REPO_A,
+    makeDesyncProbeGit({ branch: "feature/x", defaultBranch: "main" }),
+  );
+  expect(verdict.desynced).toBe(true);
+  if (verdict.desynced) {
+    expect(verdict.blocker).toContain("off-default");
+    expect(verdict.blocker).toContain("feature/x");
+  }
+});
+
+test("desync probe: mid-merge (MERGE_HEAD present) → desynced, mid-merge blocker named", async () => {
+  const verdict = await probeSharedCheckoutDesync(
+    REPO_A,
+    makeDesyncProbeGit({
+      branch: "main",
+      defaultBranch: "main",
+      mergeHead: true,
+    }),
+  );
+  expect(verdict.desynced).toBe(true);
+  if (verdict.desynced) {
+    expect(verdict.blocker).toContain("mid-merge");
+  }
+});
+
+test("desync probe: on-default but dirty porcelain (index/worktree ≠ HEAD) → desynced, content-trailing", async () => {
+  // Both observed states satisfy the contract: a STAGED delta (index behind HEAD) and an
+  // UNSTAGED delta (index==HEAD, worktree stale) each leave porcelain non-empty.
+  for (const porcelain of ["M  src/x.ts\n", " M src/x.ts\n"]) {
+    const verdict = await probeSharedCheckoutDesync(
+      REPO_A,
+      makeDesyncProbeGit({ branch: "main", defaultBranch: "main", porcelain }),
+    );
+    expect(verdict.desynced).toBe(true);
+    if (verdict.desynced) {
+      expect(verdict.blocker).toContain("content-trailing");
+    }
+  }
+});
+
+test("desync probe: an inconclusive git result (status probe failed) → desynced (never a false clear)", async () => {
+  const verdict = await probeSharedCheckoutDesync(
+    REPO_A,
+    makeDesyncProbeGit({
+      branch: "main",
+      defaultBranch: "main",
+      statusExit: 128,
+    }),
+  );
+  expect(verdict.desynced).toBe(true);
+});
+
+test("desync probe: a THROWING runner degrades to desynced, never propagates the throw", async () => {
+  const throwing: GitRunner = async () => {
+    throw new Error("git spawn boom");
+  };
+  const verdict = await probeSharedCheckoutDesync(REPO_A, throwing);
+  expect(verdict.desynced).toBe(true);
 });
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import {
   type DispatchFailureIdentity,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
+  isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
@@ -29,6 +30,9 @@ import {
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
   routeDispatchFailure,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_REASON,
+  SHARED_DESYNC_DISTRESS_VERB,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_VERB,
@@ -600,6 +604,7 @@ describe("single vocabulary source", () => {
       ["daemon-crash-loop", "crash-loop"],
       ["shared-checkout-wedge", "shared-wedge"],
       ["shared-checkout-dirty", "shared-dirty"],
+      ["shared-checkout-desync", "shared-desync"],
       ["worktree-lane-wedge", "lane-wedge"],
       ["worktree-lane-premerge", "lane-premerge"],
       ["stale-base-lane", "stale-base"],
@@ -802,6 +807,134 @@ describe("fn-1127 stale-base-lane distress vocabulary", () => {
     // The id prefix is itself a well-formed `stale-base-lane` display match.
     expect(
       STALE_BASE_DISTRESS_ID_PREFIX.startsWith(STALE_BASE_DISTRESS_REASON),
+    ).toBe(true);
+  });
+});
+
+// ── fn-1169 — the shared-checkout-desync distress family ────────────────────
+
+describe("fn-1169 shared-checkout-desync distress vocabulary", () => {
+  test("shared-checkout-desync distress key → unknown (never enters failedKeys)", () => {
+    // Same synthetic-verb discipline as the wedge/dirty/lane distress rows, per-repo:
+    // the id carries `<repoHash>`. It must route as `unknown` for EVERY shape so no
+    // desync row ever suppresses a real dispatch key.
+    for (const suffix of ["abc123", "0", "zzz999"]) {
+      const id = `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${suffix}`;
+      expect(
+        routeDispatchFailure(
+          row(
+            SHARED_DESYNC_DISTRESS_VERB,
+            id,
+            `${SHARED_DESYNC_DISTRESS_REASON}: /repo has stayed DESYNCED`,
+          ),
+        ).kind,
+      ).toBe("unknown");
+      expect(isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, id)).toBe(
+        true,
+      );
+    }
+  });
+
+  test("isSharedDesyncDistressKey is the synthetic daemon-verb per-repo surface only", () => {
+    const id = `${SHARED_DESYNC_DISTRESS_ID_PREFIX}abc123`;
+    expect(isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, id)).toBe(
+      true,
+    );
+    // Wrong verb, wrong id prefix, and a real close/work row all miss.
+    expect(isSharedDesyncDistressKey("close", id)).toBe(false);
+    expect(isSharedDesyncDistressKey("work", id)).toBe(false);
+    expect(
+      isSharedDesyncDistressKey(
+        "close",
+        `${WORKTREE_RECOVER_KEY_PREFIX}fn-1-x`,
+      ),
+    ).toBe(false);
+    expect(isSharedDesyncDistressKey("work", "fn-1-x.2")).toBe(false);
+    // The crash-loop id shares the verb but lacks the prefix.
+    expect(
+      isSharedDesyncDistressKey(
+        CRASH_LOOP_DISTRESS_VERB,
+        CRASH_LOOP_DISTRESS_ID,
+      ),
+    ).toBe(false);
+    // Shares the un-retryable synthetic `daemon` verb with the sibling distress rows.
+    expect(SHARED_DESYNC_DISTRESS_VERB).toBe(CRASH_LOOP_DISTRESS_VERB);
+    expect(SHARED_DESYNC_DISTRESS_VERB).not.toBe("work");
+    expect(SHARED_DESYNC_DISTRESS_VERB).not.toBe("close");
+  });
+
+  test("shared-checkout-desync distress key is DISJOINT from the wedge / dirty / lane-wedge / stale keys", () => {
+    // The five distress prefixes never mutually match, so their rows never
+    // cross-classify or cross-clear. A shared `<hash>` tail is deliberate.
+    const tail = "abc123";
+    const desyncId = `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${tail}`;
+    const wedgeId = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${tail}`;
+    const dirtyId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}${tail}`;
+    const laneId = `${LANE_WEDGE_DISTRESS_ID_PREFIX}${tail}`;
+    const staleId = `${STALE_BASE_DISTRESS_ID_PREFIX}${tail}`;
+    // A desync id is a desync key but NONE of the others, and vice versa.
+    expect(
+      isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, desyncId),
+    ).toBe(true);
+    expect(isSharedWedgeDistressKey(SHARED_WEDGE_DISTRESS_VERB, desyncId)).toBe(
+      false,
+    );
+    expect(isSharedDirtyDistressKey(SHARED_DIRTY_DISTRESS_VERB, desyncId)).toBe(
+      false,
+    );
+    expect(isLaneWedgeDistressKey(LANE_WEDGE_DISTRESS_VERB, desyncId)).toBe(
+      false,
+    );
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, desyncId)).toBe(
+      false,
+    );
+    expect(
+      isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, wedgeId),
+    ).toBe(false);
+    expect(
+      isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, dirtyId),
+    ).toBe(false);
+    expect(isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, laneId)).toBe(
+      false,
+    );
+    expect(
+      isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, staleId),
+    ).toBe(false);
+  });
+
+  test("shared-checkout-desync distress reason is collision-free + display-mapped", () => {
+    expect(SHARED_DESYNC_DISTRESS_REASON).toBe("shared-checkout-desync");
+    expect(SHARED_DESYNC_DISTRESS_ID_PREFIX).toBe("shared-checkout-desync:");
+    // No OTHER display-rule prefix is a prefix of the desync reason, nor it of them, so
+    // the pill classifies a desync row to its OWN kind (never shadowed by the sibling
+    // shared-checkout-wedge / -dirty rules, which share the `shared-checkout-` stem but
+    // are not a prefix of it).
+    for (const { prefix } of DISPATCH_FAILURE_DISPLAY_RULES) {
+      if (prefix === SHARED_DESYNC_DISTRESS_REASON) continue;
+      expect(SHARED_DESYNC_DISTRESS_REASON.startsWith(prefix)).toBe(false);
+      expect(prefix.startsWith(SHARED_DESYNC_DISTRESS_REASON)).toBe(false);
+    }
+    // A desync row's reason must NOT route as a recover reason (it lives OUTSIDE the
+    // `worktree-recover*` auto-clear prefix — its only clear is the level-trigger)…
+    expect(isWorktreeRecoverReason(`${SHARED_DESYNC_DISTRESS_REASON}: x`)).toBe(
+      false,
+    );
+    // …nor as a lane pre-merge reason (a distinct prefix).
+    expect(
+      isWorktreeLanePremergeReason(`${SHARED_DESYNC_DISTRESS_REASON}: x`),
+    ).toBe(false);
+    // The two shared-checkout sibling reasons are each disjoint from the desync reason.
+    expect(
+      SHARED_DESYNC_DISTRESS_REASON.startsWith(SHARED_WEDGE_DISTRESS_REASON),
+    ).toBe(false);
+    expect(
+      SHARED_DESYNC_DISTRESS_REASON.startsWith(SHARED_DIRTY_DISTRESS_REASON),
+    ).toBe(false);
+    // The id prefix is itself a well-formed `shared-checkout-desync` display match.
+    expect(
+      SHARED_DESYNC_DISTRESS_ID_PREFIX.startsWith(
+        SHARED_DESYNC_DISTRESS_REASON,
+      ),
     ).toBe(true);
   });
 });
