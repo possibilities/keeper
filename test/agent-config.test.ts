@@ -32,13 +32,23 @@ import {
   presetsCatalogPath,
   resolvePreset,
 } from "../src/agent/config";
+import { loadMatrix, type Matrix } from "../src/agent/matrix";
 
 let tmpDir: string;
+let savedConfigDir: string | undefined;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-config-"));
+  // Pin the config dir at the (matrix-less) tmpDir so the default `loadMatrix()`
+  // inside `loadPresetCatalog` never reaches the real ~/.config/keeper — test
+  // isolation, and it keeps the un-augmented corpora byte-identical. Tests that
+  // exercise augmentation pass a matrix explicitly.
+  savedConfigDir = process.env.KEEPER_CONFIG_DIR;
+  process.env.KEEPER_CONFIG_DIR = tmpDir;
 });
 afterEach(() => {
+  if (savedConfigDir === undefined) delete process.env.KEEPER_CONFIG_DIR;
+  else process.env.KEEPER_CONFIG_DIR = savedConfigDir;
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -204,7 +214,25 @@ describe("loadPresetCatalog", () => {
       "presets.yaml",
       "presets:\n  Opus:\n    harness: claude\n",
     );
-    expect(() => loadPresetCatalog(p)).toThrow(/\[a-z0-9_-\]/);
+    expect(() => loadPresetCatalog(p)).toThrow(/\[a-z0-9\._-\]/);
+  });
+
+  test("a dotted preset name validates (widened charset)", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  gpt-5.5:\n    harness: codex\n",
+    );
+    expect(loadPresetCatalog(p, null).presets["gpt-5.5"]?.harness).toBe(
+      "codex",
+    );
+  });
+
+  test("a leading-dot preset name is rejected (never a hidden file)", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  .hidden:\n    harness: claude\n",
+    );
+    expect(() => loadPresetCatalog(p, null)).toThrow(/no leading dot/);
   });
 
   test("a missing-file error names the absent path", () => {
@@ -295,6 +323,113 @@ describe("loadPresetCatalog", () => {
     const cat = loadPresetCatalog(p);
     expect(cat.presets.worker?.model).toBe("sonnet");
     expect(cat.claude_default).toBe("claude-opus");
+  });
+});
+
+describe("loadPresetCatalog host-matrix augmentation", () => {
+  /**
+   * A roster with a native claude pair, a wrapped codex model carrying a
+   * native-id alias, and a wrapped pi model with no alias — every axis the
+   * augmentation reads. Written under tmpDir and loaded so the test drives the
+   * real matrix → catalog path.
+   */
+  function rosterMatrix(): Matrix {
+    const body = [
+      "efforts: [high]",
+      "providers:",
+      "  - name: claude",
+      "    models: [opus]",
+      "  - name: codex",
+      "    models:",
+      "      - gpt-5.5: gpt-5.5-codex",
+      "  - name: pi",
+      "    models: [gpt-5.5]",
+      "subagents: [worker]",
+      "wrapper_driver:",
+      "  model: opus",
+      "  effort: high",
+      "",
+    ].join("\n");
+    const path = join(tmpDir, "matrix.yaml");
+    writeFileSync(path, body);
+    const matrix = loadMatrix(path);
+    if (matrix === null) throw new Error("fixture matrix failed to load");
+    return matrix;
+  }
+
+  test("exposes a resolvable preset for every roster pair", () => {
+    const p = writeYaml("presets.yaml", "presets: {}\n");
+    const cat = loadPresetCatalog(p, rosterMatrix());
+    // Native claude pair.
+    expect(resolvePreset(cat, "claude-opus")).toEqual({
+      harness: "claude",
+      model: "opus",
+      effort: null,
+      thinking: null,
+      role: null,
+    });
+    // Wrapped codex model: the preset model is the provider-native alias target.
+    expect(resolvePreset(cat, "codex-gpt-5.5").model).toBe("gpt-5.5-codex");
+    expect(resolvePreset(cat, "codex-gpt-5.5").harness).toBe("codex");
+    // Wrapped pi model, no alias: native id is the capability token itself.
+    expect(resolvePreset(cat, "pi-gpt-5.5").model).toBe("gpt-5.5");
+    expect(resolvePreset(cat, "pi-gpt-5.5").harness).toBe("pi");
+  });
+
+  test("auto-presets carry no second reasoning axis (effort/thinking null)", () => {
+    const p = writeYaml("presets.yaml", "presets: {}\n");
+    const cat = loadPresetCatalog(p, rosterMatrix());
+    expect(cat.presets["codex-gpt-5.5"]?.effort).toBeNull();
+    expect(cat.presets["pi-gpt-5.5"]?.thinking).toBeNull();
+  });
+
+  test("auto-presets are visible to panel validation", () => {
+    const p = writeYaml("presets.yaml", "presets: {}\n");
+    const cat = loadPresetCatalog(p, rosterMatrix());
+    const panelPath = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude-opus\n    - codex-gpt-5.5\n",
+    );
+    expect(loadPanelSelections(cat, panelPath).panels.duo).toEqual([
+      "claude-opus",
+      "codex-gpt-5.5",
+    ]);
+  });
+
+  test("a `<harness>_default` may point at an auto-generated preset", () => {
+    const p = writeYaml("presets.yaml", "codex_default: codex-gpt-5.5\n");
+    const cat = loadPresetCatalog(p, rosterMatrix());
+    expect(cat.codex_default).toBe("codex-gpt-5.5");
+  });
+
+  test("a hand-authored preset colliding with an auto name fails loud", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  codex-gpt-5.5:\n    harness: codex\n",
+    );
+    expect(() => loadPresetCatalog(p, rosterMatrix())).toThrow(
+      /collides with a hand-authored preset/,
+    );
+  });
+
+  test("an absent matrix leaves the catalog byte-identical", () => {
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  worker:\n    harness: claude\n    model: sonnet\n",
+    );
+    expect(loadPresetCatalog(p, null)).toEqual(loadPresetCatalog(p, null));
+    const cat = loadPresetCatalog(p, null);
+    expect(Object.keys(cat.presets)).toEqual(["worker"]);
+  });
+
+  test("the default matrix arg augments from ~/.config/keeper (matrix-less tmpDir → no-op)", () => {
+    // KEEPER_CONFIG_DIR is pinned at the matrix-less tmpDir, so the default
+    // `loadMatrix()` finds nothing and the catalog stays hand-authored-only.
+    const p = writeYaml(
+      "presets.yaml",
+      "presets:\n  worker:\n    harness: claude\n",
+    );
+    expect(Object.keys(loadPresetCatalog(p).presets)).toEqual(["worker"]);
   });
 });
 

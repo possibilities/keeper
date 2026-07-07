@@ -33,6 +33,7 @@ import {
   type HarnessName,
   isCapturableHarness,
 } from "./harness";
+import { loadMatrix, type Matrix, presetNameFor } from "./matrix";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
 export class ConfigError extends Error {}
@@ -344,7 +345,10 @@ const RESERVED_PRESET_NAMES: ReadonlySet<string> = new Set([
   "~",
 ]);
 
-const PRESET_NAME_PATTERN = /^[a-z0-9_-]+$/;
+// Lowercase alnum, hyphen, underscore, dot — with no LEADING dot (so a name
+// never reads as a hidden file). The dot admits a dotted capability token like
+// `gpt-5.5` inside an auto-generated `<provider>-<model>` preset name.
+const PRESET_NAME_PATTERN = /^[a-z0-9_-][a-z0-9._-]*$/;
 
 function presetStringField(
   raw: Record<string, unknown>,
@@ -367,7 +371,7 @@ function presetStringField(
 function validatePresetName(name: string, configPath: string): void {
   if (!PRESET_NAME_PATTERN.test(name)) {
     throw new ConfigError(
-      `Preset name '${name}' must match [a-z0-9_-]+ in ${configPath}`,
+      `Preset name '${name}' must match [a-z0-9._-] with no leading dot in ${configPath}`,
     );
   }
   if (RESERVED_PRESET_NAMES.has(name)) {
@@ -452,9 +456,17 @@ function rejectUnknownKeys(
  * invalid entry (a bad harness, cross-harness effort+thinking, a reserved /
  * non-matching name), or a `<harness>_default` pointer that names no defined
  * preset or one whose harness does not match the key prefix.
+ *
+ * The parsed catalog is then augmented IN MEMORY with one auto-generated
+ * `<provider>-<model>` preset per host-matrix roster pair (ADR 0010) — nothing is
+ * ever written back to presets.yaml. `matrix` defaults to the host
+ * `matrix.yaml`; an absent matrix (null) leaves the catalog byte-identical to the
+ * hand-authored file. Pass `matrix` explicitly (including `null`) to load the raw
+ * hand-authored catalog without the roster augmentation.
  */
 export function loadPresetCatalog(
   configPath: string = presetsCatalogPath(),
+  matrix: Matrix | null = loadMatrix(),
 ): PresetCatalog {
   if (!isFile(configPath)) {
     throw new ConfigError(`Preset catalog missing at ${configPath}.`);
@@ -471,6 +483,9 @@ export function loadPresetCatalog(
     validatePresetName(name, configPath);
     presets[name] = parsePreset(name, value, configPath);
   }
+  // Merge the host-matrix roster cells BEFORE the `<harness>_default` pointers
+  // resolve, so a pointer may name an auto-generated preset.
+  augmentCatalogWithMatrix(presets, matrix, configPath);
   return {
     presets,
     claude_default: parseHarnessDefault(raw, "claude", presets, configPath),
@@ -478,6 +493,50 @@ export function loadPresetCatalog(
     pi_default: parseHarnessDefault(raw, "pi", presets, configPath),
     hermes_default: parseHarnessDefault(raw, "hermes", presets, configPath),
   };
+}
+
+/**
+ * Augment the parsed catalog in memory with one `<provider>-<model>` preset per
+ * host-matrix roster pair (ADR 0010). Each auto-preset pins the roster provider's
+ * harness and the model's provider-native id, carrying NO effort/thinking — the
+ * second reasoning axis arrives per-run through the descriptor map, never baked
+ * here. Absent matrix (null) → no-op, the catalog stays byte-identical. An
+ * auto-generated name colliding with a hand-authored preset OR a reserved name is
+ * fail-loud, so the operator renames rather than silently shadowing a roster
+ * cell. Auto-names are globally unique (a distinct provider × model pair each), so
+ * no auto-vs-auto collision is possible — those two guarded cases are the only
+ * ones.
+ */
+function augmentCatalogWithMatrix(
+  presets: Record<string, Preset>,
+  matrix: Matrix | null,
+  configPath: string,
+): void {
+  if (matrix === null) {
+    return;
+  }
+  for (const provider of matrix.providers) {
+    for (const [capability, nativeId] of provider.models) {
+      const name = presetNameFor(provider.name, capability);
+      if (RESERVED_PRESET_NAMES.has(name)) {
+        throw new ConfigError(
+          `Auto-generated preset '${name}' (matrix provider ${provider.name}, model ${capability}) is a reserved name in ${configPath}.`,
+        );
+      }
+      if (name in presets) {
+        throw new ConfigError(
+          `Auto-generated preset '${name}' (matrix provider ${provider.name}, model ${capability}) collides with a hand-authored preset in ${configPath} — rename the hand-authored preset.`,
+        );
+      }
+      presets[name] = {
+        harness: provider.name,
+        model: nativeId,
+        effort: null,
+        thinking: null,
+        role: null,
+      };
+    }
+  }
 }
 
 /**
