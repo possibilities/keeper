@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant in the human-paging escalation lifecycle where a wrong NULL-inclusion predicate either re-leaks a stale prior-instance row or orphans a legitimate corroboration-miss and silently suppresses a genuine page, across two call sites.",
+      "task_id": "fn-1179-harden-escalation-instance-isolation.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T23:46:36.951000Z",
+  "epic_id": "fn-1179-harden-escalation-instance-isolation",
+  "input_hash": "4ffa2420aa6e160d9345f507b42c87b2d38495cc10e676ce352dca2962bd55ef",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1341793312,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant in the human-paging escalation lifecycle where a wrong NULL-inclusion predicate either re-leaks a stale prior-instance row or orphans a legitimate corroboration-miss and silently suppresses a genuine page, across two call sites.\",\"confidence\":0.78}]}"
+}
