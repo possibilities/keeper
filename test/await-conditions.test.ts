@@ -39,9 +39,24 @@ import {
   isJamReason,
   landedState,
   monitorRunningState,
+  type NeedsHumanSignal,
+  needsHumanSignalNeedsFold,
+  needsHumanState,
   verdictKey,
   workable,
 } from "../src/await-conditions";
+import {
+  INSTANT_DEATH_BREAKER_REASON,
+  MERGE_ESCALATION_REASON_TOKEN,
+  WORKTREE_FINALIZE_NON_FF_REASON,
+  WORKTREE_RECOVER_REASON_PREFIX,
+} from "../src/dispatch-failure-key";
+import {
+  INSTANT_DEATH_WALL_KEYS,
+  type NeedsHumanInputs,
+  type NeedsHumanProjection,
+  projectNeedsHuman,
+} from "../src/needs-human";
 import { computeReadiness, type Verdict } from "../src/readiness";
 import { computeLandedEpicIds } from "../src/readiness-client";
 import type {
@@ -1774,4 +1789,277 @@ test("changedSignature: keys on STORED per-root — a stored change fires even w
     autopilot: { ...base.autopilot, maxConcurrentPerRootStored: 3 },
   };
   expect(changedSignature(storedBumped)).not.toBe(same);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1150 needs-human await predicates: presence per family, jam-class
+// filtering, subset non-double-count, signature anchoring, reconnect baseline
+// retention, and the derived dispatch-failures opt-in (+ its wiring invariant).
+// ---------------------------------------------------------------------------
+
+/** Build a needs-human projection from a partial input set (all families zero
+ *  by default). `dispatchFailures` rows carry only reason (verb/id fill in a
+ *  stable key); target resolution never touches the counts we assert on. */
+function projectFrom(
+  overrides: Partial<NeedsHumanInputs>,
+): NeedsHumanProjection {
+  return projectNeedsHuman({
+    dispatchFailures: [],
+    deadLetters: 0,
+    blockEscalations: 0,
+    parkedQuestionEpicIds: [],
+    epicIds: [],
+    ...overrides,
+  });
+}
+
+/** One sticky `dispatch_failures` row with a given reason. */
+function stickyRow(reason: string, id = "fn-1-a.1") {
+  return { verb: "work", id, reason, dir: "" };
+}
+
+const FOLD_OPEN = { dispatchFoldOpened: true } as const;
+
+test("needsHumanSignalNeedsFold: the dispatch trio + umbrella need the fold; the other three do not", () => {
+  // Dispatch-derived (read the jam class / wall verdict off `dispatch_failures`).
+  expect(needsHumanSignalNeedsFold("stuck-dispatch")).toBe(true);
+  expect(needsHumanSignalNeedsFold("finalize-non-ff")).toBe(true);
+  expect(needsHumanSignalNeedsFold("instant-death-wall")).toBe(true);
+  expect(needsHumanSignalNeedsFold("needs-human")).toBe(true);
+  // Always-folded snapshot members — must NOT open the dispatch-failures fold.
+  expect(needsHumanSignalNeedsFold("dead-letter")).toBe(false);
+  expect(needsHumanSignalNeedsFold("block-escalation")).toBe(false);
+  expect(needsHumanSignalNeedsFold("parked-question")).toBe(false);
+});
+
+test("needs-human presence: dead-letter fires on a parked dead letter, else waits", () => {
+  expect(needsHumanState("dead-letter", projectFrom({}), FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+  const p = projectFrom({ deadLetters: 2 });
+  expect(needsHumanState("dead-letter", p, FOLD_OPEN).kind).toBe("met");
+  // A different family present does NOT satisfy dead-letter.
+  expect(
+    needsHumanState(
+      "dead-letter",
+      projectFrom({ blockEscalations: 1 }),
+      FOLD_OPEN,
+    ).kind,
+  ).toBe("waiting");
+});
+
+test("needs-human presence: block-escalation fires on an escalation latch", () => {
+  expect(
+    needsHumanState("block-escalation", projectFrom({}), FOLD_OPEN).kind,
+  ).toBe("waiting");
+  expect(
+    needsHumanState(
+      "block-escalation",
+      projectFrom({ blockEscalations: 1 }),
+      FOLD_OPEN,
+    ).kind,
+  ).toBe("met");
+});
+
+test("needs-human presence: parked-question fires on an epic carrying a question", () => {
+  expect(
+    needsHumanState("parked-question", projectFrom({}), FOLD_OPEN).kind,
+  ).toBe("waiting");
+  expect(
+    needsHumanState(
+      "parked-question",
+      projectFrom({ parkedQuestionEpicIds: ["fn-1-a"] }),
+      FOLD_OPEN,
+    ).kind,
+  ).toBe("met");
+});
+
+test("needs-human jam filtering: an occupancy / self-clearing sticky never satisfies stuck-dispatch", () => {
+  // A `worktree-recover*` row self-clears (isJamReason false) — broad
+  // stuckDispatches counts it, but the alarm predicate reads the jam class only.
+  const recover = projectFrom({
+    dispatchFailures: [stickyRow(`${WORKTREE_RECOVER_REASON_PREFIX}-conflict`)],
+  });
+  expect(recover.counts.stuckDispatches).toBe(1);
+  expect(recover.jamCount).toBe(0);
+  expect(needsHumanState("stuck-dispatch", recover, FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+  // A genuine jam (merge-conflict close-sink) trips it.
+  const jam = projectFrom({
+    dispatchFailures: [stickyRow(`${MERGE_ESCALATION_REASON_TOKEN}: x into y`)],
+  });
+  expect(jam.jamCount).toBe(1);
+  expect(needsHumanState("stuck-dispatch", jam, FOLD_OPEN).kind).toBe("met");
+});
+
+test("needs-human presence: finalize-non-ff fires on the origin-ahead non-ff jam", () => {
+  const p = projectFrom({
+    dispatchFailures: [stickyRow(WORKTREE_FINALIZE_NON_FF_REASON)],
+  });
+  expect(needsHumanState("finalize-non-ff", p, FOLD_OPEN).kind).toBe("met");
+  // A non-finalize jam does NOT satisfy the finalize-non-ff subset token.
+  const otherJam = projectFrom({
+    dispatchFailures: [stickyRow(`${MERGE_ESCALATION_REASON_TOKEN}: x`)],
+  });
+  expect(needsHumanState("finalize-non-ff", otherJam, FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+});
+
+test("needs-human presence: instant-death-wall fires only at/above the wall threshold", () => {
+  // One breaker sticky is below the wall — a single breaker doing its job.
+  const one = projectFrom({
+    dispatchFailures: [stickyRow(INSTANT_DEATH_BREAKER_REASON, "fn-1-a.1")],
+  });
+  expect(one.counts.instantDeathWall).toBe(1);
+  expect(one.instantDeathWallTripped).toBe(false);
+  expect(needsHumanState("instant-death-wall", one, FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+  // Enough distinct keys to read as an account/quota wall.
+  const rows = [];
+  for (let i = 0; i < INSTANT_DEATH_WALL_KEYS; i++) {
+    rows.push(stickyRow(INSTANT_DEATH_BREAKER_REASON, `fn-1-a.${i + 1}`));
+  }
+  const wall = projectFrom({ dispatchFailures: rows });
+  expect(wall.instantDeathWallTripped).toBe(true);
+  expect(needsHumanState("instant-death-wall", wall, FOLD_OPEN).kind).toBe(
+    "met",
+  );
+  // A breaker sticky is NOT a jam, so it never satisfies stuck-dispatch.
+  expect(needsHumanState("stuck-dispatch", wall, FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+});
+
+test("needs-human umbrella: fires on ANY family (dispatch part = the jam class)", () => {
+  expect(needsHumanState("needs-human", projectFrom({}), FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+  for (const p of [
+    projectFrom({ deadLetters: 1 }),
+    projectFrom({ blockEscalations: 1 }),
+    projectFrom({ parkedQuestionEpicIds: ["fn-1-a"] }),
+    projectFrom({
+      dispatchFailures: [stickyRow(WORKTREE_FINALIZE_NON_FF_REASON)],
+    }),
+  ]) {
+    expect(needsHumanState("needs-human", p, FOLD_OPEN).kind).toBe("met");
+  }
+  // An occupancy sticky alone (non-jam) does NOT trip the umbrella — the
+  // dispatch contribution is the operator-jam class, not the broad count.
+  const occupancy = projectFrom({
+    dispatchFailures: [
+      stickyRow(`${WORKTREE_RECOVER_REASON_PREFIX}-push-failed`),
+    ],
+  });
+  expect(occupancy.counts.stuckDispatches).toBe(1);
+  expect(needsHumanState("needs-human", occupancy, FOLD_OPEN).kind).toBe(
+    "waiting",
+  );
+});
+
+test("needs-human umbrella: a lone finalize-non-ff row is ONE signal, never double-counted", () => {
+  // stuckDispatches counts it once (via the broad member); finalizeNonFf is a
+  // SUBSET surfaced separately and never re-added into the total.
+  const p = projectFrom({
+    dispatchFailures: [stickyRow(WORKTREE_FINALIZE_NON_FF_REASON)],
+  });
+  expect(p.counts.stuckDispatches).toBe(1);
+  expect(p.counts.finalizeNonFf).toBe(1);
+  expect(p.counts.total).toBe(1);
+  expect(needsHumanState("needs-human", p, FOLD_OPEN).kind).toBe("met");
+});
+
+test("needs-human every state carries the current signature", () => {
+  const p = projectFrom({ deadLetters: 1 });
+  const met = needsHumanState("dead-letter", p, FOLD_OPEN);
+  expect(met.kind).toBe("met");
+  expect(met.signature).toBe(p.signature);
+  const waiting = needsHumanState("stuck-dispatch", p, FOLD_OPEN);
+  expect(waiting.kind).toBe("waiting");
+  expect(waiting.signature).toBe(p.signature);
+});
+
+test("needs-human anchor: a present-at-arm signal whose signature MATCHES the anchor holds (anti-spin)", () => {
+  const p = projectFrom({
+    dispatchFailures: [stickyRow(WORKTREE_FINALIZE_NON_FF_REASON)],
+  });
+  // No anchor → fires immediately (level-triggered presence).
+  expect(needsHumanState("stuck-dispatch", p, FOLD_OPEN).kind).toBe("met");
+  // Anchored on the SAME signature → still-present, already-triaged → waiting.
+  const held = needsHumanState("stuck-dispatch", p, {
+    dispatchFoldOpened: true,
+    since: p.signature,
+  });
+  expect(held.kind).toBe("waiting");
+  expect(held.signature).toBe(p.signature);
+});
+
+test("needs-human anchor: a NEW signal landing beside a persisting one fires", () => {
+  const before = projectFrom({
+    dispatchFailures: [stickyRow(WORKTREE_FINALIZE_NON_FF_REASON)],
+  });
+  // A dead letter lands beside the persisting jam — signature moves.
+  const after = projectFrom({
+    dispatchFailures: [stickyRow(WORKTREE_FINALIZE_NON_FF_REASON)],
+    deadLetters: 1,
+  });
+  expect(after.signature).not.toBe(before.signature);
+  const fired = needsHumanState("stuck-dispatch", after, {
+    dispatchFoldOpened: true,
+    since: before.signature,
+  });
+  expect(fired.kind).toBe("met");
+  expect(fired.signature).toBe(after.signature);
+});
+
+test("needs-human anchor: a reconnect re-paint of the UNCHANGED board keeps the anchor held", () => {
+  // Baseline retention: the signature is a pure function of the signal set, so a
+  // re-paint of the same board recomputes the SAME signature — an anchor captured
+  // once still holds across the re-paint (never re-anchors, never spuriously fires).
+  const inputs: NeedsHumanInputs = {
+    dispatchFailures: [stickyRow(`${MERGE_ESCALATION_REASON_TOKEN}: x`)],
+    deadLetters: 0,
+    blockEscalations: 0,
+    parkedQuestionEpicIds: [],
+    epicIds: [],
+  };
+  const first = projectNeedsHuman(inputs);
+  // Re-paint: same signal set, rows rebuilt fresh (a new array, same content).
+  const repaint = projectNeedsHuman({
+    ...inputs,
+    dispatchFailures: [...inputs.dispatchFailures],
+  });
+  expect(repaint.signature).toBe(first.signature);
+  const held = needsHumanState("stuck-dispatch", repaint, {
+    dispatchFoldOpened: true,
+    since: first.signature,
+  });
+  expect(held.kind).toBe("waiting");
+});
+
+test("needs-human invariant: a dispatch-derived signal with the fold CLOSED throws (wiring bug, never a silent wait)", () => {
+  const p = projectFrom({});
+  for (const signal of [
+    "stuck-dispatch",
+    "finalize-non-ff",
+    "instant-death-wall",
+    "needs-human",
+  ] satisfies NeedsHumanSignal[]) {
+    expect(() =>
+      needsHumanState(signal, p, { dispatchFoldOpened: false }),
+    ).toThrow();
+  }
+  // The always-folded signals never require the fold — evaluate cleanly.
+  for (const signal of [
+    "dead-letter",
+    "block-escalation",
+    "parked-question",
+  ] satisfies NeedsHumanSignal[]) {
+    expect(needsHumanState(signal, p, { dispatchFoldOpened: false }).kind).toBe(
+      "waiting",
+    );
+  }
 });

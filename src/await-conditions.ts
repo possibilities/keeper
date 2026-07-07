@@ -87,6 +87,13 @@ import {
   WORKTREE_FINALIZE_NON_FF_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
+// Type-only import — the shared needs-human projector ({@link projectNeedsHuman})
+// already imports `isJamReason` from THIS module for its jam classification, so a
+// value import here would close a runtime cycle. The `keeper await` command owns
+// the value call to `projectNeedsHuman`; this module only consumes the resulting
+// {@link NeedsHumanProjection} shape, so a type-only import (erased at runtime)
+// keeps the dependency one-directional.
+import type { NeedsHumanProjection } from "./needs-human";
 import type { BlockReason, ReadinessSnapshot, Verdict } from "./readiness";
 import type { Epic, GitStatus, Job, Task } from "./types";
 
@@ -288,13 +295,18 @@ function escalationSoftensStuck(
  * is blocked:dep-on-task"` for a `waiting` result, or
  * `detail="stuck:job-rejected"` for a `stuck` result. The command writes
  * its own line; this module just supplies the supporting prose.
+ *
+ * `signature` is the current needs-human signature every {@link needsHumanState}
+ * result carries (met and waiting alike) so the command prints it on the met
+ * envelope — the anchor a supervisor captures to re-arm with `since:<signature>`.
+ * Absent (undefined) on every other predicate.
  */
 export type AwaitState =
-  | { kind: "met"; detail?: string }
-  | { kind: "waiting"; detail?: string }
-  | { kind: "not-found"; detail?: string }
-  | { kind: "deleted"; detail?: string }
-  | { kind: "stuck"; detail?: string };
+  | { kind: "met"; detail?: string; signature?: string }
+  | { kind: "waiting"; detail?: string; signature?: string }
+  | { kind: "not-found"; detail?: string; signature?: string }
+  | { kind: "deleted"; detail?: string; signature?: string }
+  | { kind: "stuck"; detail?: string; signature?: string };
 
 // ---------------------------------------------------------------------------
 // Index lookups
@@ -1272,4 +1284,163 @@ export function changedSignature(input: BoardSignatureInput): string {
     perEpic: mapSig(input.perEpic),
     autopilot: input.autopilot,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Needs-human await predicates (fn-1150): the six per-signal tokens plus the
+// umbrella. Level-triggered PRESENCE predicates over the shared needs-human
+// projector's classification (ADR 0011) — so `keeper status`, `keeper watch`,
+// and `keeper await` can never drift on what "stuck" or "jammed" means. Pure:
+// no I/O, no `Date.now()`; the command computes the projection off its snapshot
+// and threads it in.
+// ---------------------------------------------------------------------------
+
+/**
+ * The six per-signal needs-human await tokens plus the umbrella. Each maps to a
+ * needs-human family the shared projector classifies:
+ *   - `dead-letter` / `block-escalation` / `parked-question` ride the
+ *     ALWAYS-folded snapshot members (dead-letter backlog, escalation latches,
+ *     epics carrying a parked closer question) and never open the fold.
+ *   - `stuck-dispatch` / `finalize-non-ff` / `instant-death-wall` read the
+ *     `dispatch_failures` classification and REQUIRE the ADR-0011
+ *     `includeDispatchFailures` fold.
+ *   - `needs-human` is the umbrella: any family present, its dispatch
+ *     contribution the operator-jam class (never the broad sticky count).
+ */
+export type NeedsHumanSignal =
+  | "dead-letter"
+  | "block-escalation"
+  | "parked-question"
+  | "stuck-dispatch"
+  | "finalize-non-ff"
+  | "instant-death-wall"
+  | "needs-human";
+
+/**
+ * The signals whose PRESENCE is read off the `dispatch_failures` classification
+ * (the operator-jam class / the wall verdict), so they REQUIRE the ADR-0011
+ * `includeDispatchFailures` fold to be open. The other three ride always-folded
+ * snapshot members and must never open the fold. `keeper await` UNIONS
+ * {@link needsHumanSignalNeedsFold} over its parsed condition set to DERIVE the
+ * opt-in, so the gate can never be mis-wired narrow.
+ */
+const DISPATCH_DERIVED_SIGNALS: ReadonlySet<NeedsHumanSignal> = new Set([
+  "stuck-dispatch",
+  "finalize-non-ff",
+  "instant-death-wall",
+  "needs-human",
+]);
+
+/**
+ * Does awaiting `signal` require the `dispatch_failures` fold? True for the
+ * dispatch trio and the umbrella (they read the jam class / wall verdict), false
+ * for dead-letter / block-escalation / parked-question (always-folded members).
+ * The await command derives its `includeDispatchFailures` opt-in from the union
+ * of this over its condition set.
+ */
+export function needsHumanSignalNeedsFold(signal: NeedsHumanSignal): boolean {
+  return DISPATCH_DERIVED_SIGNALS.has(signal);
+}
+
+/**
+ * Is `signal` present in the projection? The dispatch trio and the umbrella fire
+ * on the OPERATOR-JAM class only (`jamCount` / the wall verdict), NEVER the broad
+ * `stuckDispatches` count — an occupancy / self-clearing sticky inflates the
+ * status display but is not an alarm, so it never satisfies `stuck-dispatch`.
+ * `finalize-non-ff` is a jam subset; `instant-death-wall` is the tripped wall
+ * verdict (a distinct needs-human signal, not itself a jam). The umbrella ORs the
+ * six families, so its dispatch contribution stays the jam class + wall verdict
+ * and honors the subset non-double-count rule (a lone finalize-non-ff row is one
+ * signal via the jam class, never two).
+ */
+function needsHumanSignalPresent(
+  signal: NeedsHumanSignal,
+  p: NeedsHumanProjection,
+): boolean {
+  switch (signal) {
+    case "dead-letter":
+      return p.counts.deadLetters > 0;
+    case "block-escalation":
+      return p.counts.blockEscalations > 0;
+    case "parked-question":
+      return p.counts.parkedQuestions > 0;
+    case "stuck-dispatch":
+      return p.jamCount > 0;
+    case "finalize-non-ff":
+      return p.counts.finalizeNonFf > 0;
+    case "instant-death-wall":
+      return p.instantDeathWallTripped;
+    case "needs-human":
+      return (
+        p.counts.deadLetters > 0 ||
+        p.counts.blockEscalations > 0 ||
+        p.counts.parkedQuestions > 0 ||
+        p.jamCount > 0 ||
+        p.instantDeathWallTripped
+      );
+  }
+}
+
+/** Options for {@link needsHumanState}. */
+export interface NeedsHumanAwaitOptions {
+  /**
+   * Was the ADR-0011 `dispatch_failures` fold opened for this subscription? The
+   * command sets it from `snapshot.dispatchFailures !== undefined`. A
+   * dispatch-derived signal ({@link needsHumanSignalNeedsFold}) evaluated with
+   * the fold CLOSED is a wiring bug — the projection would read a silent zero and
+   * wait forever — so the predicate throws instead. Always-folded signals ignore
+   * it.
+   */
+  dispatchFoldOpened: boolean;
+  /**
+   * The `since:<signature>` anti-spin anchor, if the caller supplied one. Omitted
+   * for a plain level-triggered arm (fires the instant the signal is present).
+   */
+  since?: string;
+}
+
+/**
+ * Level-triggered presence predicate for one needs-human `signal`, consuming the
+ * shared projector's classification ({@link NeedsHumanProjection}, task 1) so
+ * status / watch / await never drift on "stuck" or "jammed" (ADR 0011). MET the
+ * instant the signal is present — reconnect-safe, since presence is re-observable
+ * on any re-paint — `waiting` otherwise. EVERY returned state carries the current
+ * needs-human `signature`, so the command prints it on the met envelope (the
+ * anchor a supervisor captures to re-arm).
+ *
+ * `since:<signature>` anti-spin: with an anchor, a present signal whose current
+ * signature EQUALS the anchor holds `waiting` (already-triaged, no re-fire),
+ * while a genuinely different signal set (the signature moved — a new signal
+ * landed or one cleared beside it) fires `met`. The signature is the WHOLE
+ * board's needs-human hash, so a new signal landing beside a persisting one moves
+ * it. This is the supervisor's re-arm idiom, preferred over `--require-transition`
+ * for these conditions.
+ *
+ * Invariant: a dispatch-derived signal with `dispatchFoldOpened === false` throws
+ * a programming error rather than waiting forever on an unopened fold.
+ */
+export function needsHumanState(
+  signal: NeedsHumanSignal,
+  projection: NeedsHumanProjection,
+  opts: NeedsHumanAwaitOptions,
+): AwaitState {
+  if (needsHumanSignalNeedsFold(signal) && !opts.dispatchFoldOpened) {
+    throw new Error(
+      `await '${signal}': dispatch_failures fold not opened — the ` +
+        `includeDispatchFailures opt-in must be derived from the condition ` +
+        `set (programming error)`,
+    );
+  }
+  const signature = projection.signature;
+  if (!needsHumanSignalPresent(signal, projection)) {
+    return { kind: "waiting", detail: `${signal} not present`, signature };
+  }
+  if (opts.since !== undefined && opts.since === signature) {
+    return {
+      kind: "waiting",
+      detail: `${signal} present but unchanged since anchor`,
+      signature,
+    };
+  }
+  return { kind: "met", detail: `${signal} present`, signature };
 }
