@@ -923,8 +923,9 @@ export async function runAwait(
   const hasServerUp = args.segments.some((s) => s.condition === "server-up");
   // fn-1015 board conditions all read off the readiness snapshot. `drained`
   // additionally needs the boot-status `catching_up` flag (latched via
-  // `onBootStatus`) and, under `--fail-on-stuck`, the live `dispatch_failures`
-  // rows (a dedicated collection subscribe — there's no readiness equivalent).
+  // `onBootStatus`) and, under `--fail-on-stuck`, the sticky `dispatch_failures`
+  // rows — which ride the SAME readiness snapshot via the `includeDispatchFailures`
+  // opt-in (ADR 0011), no bespoke collection subscribe.
   const hasDrained = args.segments.some((s) => s.condition === "drained");
   // fn-1016: `landed` reads the whole-board `landedEpicIds` set, so it rides
   // the readiness stream like the other board conditions — BUT that set is only
@@ -940,6 +941,11 @@ export async function runAwait(
       s.condition === "epic-removed" ||
       s.condition === "landed",
   );
+  // ADR 0011: `drained --fail-on-stuck` reads the sticky `dispatch_failures`
+  // rows for its jam check. This gates the readiness `includeDispatchFailures`
+  // opt-in (the rows ride the shared snapshot), not a separate subscribe. Since
+  // `hasDrained ⇒ hasBoard ⇒ openReadiness`, the readiness stream is always open
+  // when this is set.
   const openDispatchFailures = hasDrained && args.failOnStuck;
   // `monitor-running` reads jobs rows but is own-session-scoped — it needs
   // NO git root (unlike `agents-idle`, which scopes by cwd containment).
@@ -1030,9 +1036,10 @@ export async function runAwait(
   // draining toward head. Defaults `false` (steady state / a server stamping no
   // header → treat as caught up).
   let latestCatchingUp = false;
-  // fn-1015: latest `dispatch_failures.reason` strings, latched off the
-  // dedicated collection stream opened only for `drained --fail-on-stuck`. Null
-  // until first-painted; the drained jam check reads it.
+  // fn-1015 / ADR 0011: latest `dispatch_failures.reason` strings, latched off
+  // the readiness snapshot's `dispatchFailures` member (the stream opts into
+  // `includeDispatchFailures` only for `drained --fail-on-stuck`). Null until
+  // first-painted; the drained jam check reads it.
   let latestDispatchFailureReasons: readonly string[] | null = null;
   // Latest readiness snapshot (null until first paint); plan + (when
   // riding readiness) git/jobs read off it.
@@ -1050,17 +1057,12 @@ export async function runAwait(
     // `allPainted()` AND so `server-up`'s single slot only `met`s once the
     // daemon is actually serving.
     serverUp: !openServerUp,
-    // fn-1015: the dedicated `dispatch_failures` stream for `drained
-    // --fail-on-stuck`. Folded into the gate so a board condition doesn't
-    // glitch-evaluate before the jam rows have first-painted.
-    dispatchFailures: !openDispatchFailures,
   };
   const allPainted = (): boolean =>
     paintGate.readiness &&
     paintGate.git &&
     paintGate.jobs &&
-    paintGate.serverUp &&
-    paintGate.dispatchFailures;
+    paintGate.serverUp;
 
   const state: RunnerState = {
     terminating: false,
@@ -1078,13 +1080,11 @@ export async function runAwait(
     git: true,
     jobs: true,
     serverUp: true,
-    dispatchFailures: true,
   };
 
   let readinessHandle: ReadinessClientHandle | null = null;
   let gitHandle: ReadinessClientHandle | null = null;
   let jobsHandle: ReadinessClientHandle | null = null;
-  let dispatchFailuresHandle: ReadinessClientHandle | null = null;
   let deadlineHandle: unknown = null;
   let unregisterSignals: (() => void) | null = null;
 
@@ -1093,12 +1093,7 @@ export async function runAwait(
       deps.clearTimer(deadlineHandle);
       deadlineHandle = null;
     }
-    for (const h of [
-      readinessHandle,
-      gitHandle,
-      jobsHandle,
-      dispatchFailuresHandle,
-    ]) {
+    for (const h of [readinessHandle, gitHandle, jobsHandle]) {
       if (h !== null) {
         try {
           h.dispose();
@@ -1110,7 +1105,6 @@ export async function runAwait(
     readinessHandle = null;
     gitHandle = null;
     jobsHandle = null;
-    dispatchFailuresHandle = null;
     if (unregisterSignals !== null) {
       try {
         unregisterSignals();
@@ -1950,6 +1944,16 @@ export async function runAwait(
     if (needsJobs) {
       latestJobRows = Array.from(snap.jobs.values());
     }
+    // ADR 0011: the `drained --fail-on-stuck` jam check reads the sticky
+    // `dispatch_failures` reasons off the SAME snapshot — the readiness stream
+    // opts into `includeDispatchFailures` (below), so the rows ride first-paint
+    // (the readiness gate holds until they paint) instead of a bespoke collection
+    // stream. `reason` rides through the fold intact.
+    if (openDispatchFailures) {
+      latestDispatchFailureReasons = (snap.dispatchFailures ?? []).map((r) =>
+        typeof r.reason === "string" ? r.reason : "",
+      );
+    }
     void evaluate();
   };
 
@@ -1979,15 +1983,6 @@ export async function runAwait(
     void evaluate();
   };
 
-  // fn-1015: dedicated `dispatch_failures` rows for `drained --fail-on-stuck`.
-  const onDispatchFailureRows = (rows: Record<string, unknown>[]): void => {
-    latestDispatchFailureReasons = rows.map((r) =>
-      typeof r.reason === "string" ? r.reason : "",
-    );
-    paintGate.dispatchFailures = true;
-    void evaluate();
-  };
-
   // `server-up` (fn-750.2): first-paint IS the signal. We deliberately read
   // NO rows off the snapshot — the daemon serving its first composed
   // readiness frame is the whole condition. Flip the paint flag and let
@@ -1998,7 +1993,7 @@ export async function runAwait(
   };
 
   const onLifecycle =
-    (stream: "readiness" | "git" | "jobs" | "serverUp" | "dispatchFailures") =>
+    (stream: "readiness" | "git" | "jobs" | "serverUp") =>
     (event: string): void => {
       if (event === "disconnected") {
         reconnectStable[stream] = false;
@@ -2124,6 +2119,11 @@ export async function runAwait(
       // shares the opt-in — the `landedEpicIds` set is only populated under it (its
       // worktree-OFF degradation reads done epics, which ride this same merge).
       ...(hasComplete || hasLanded ? { includeRecentDoneEpics: true } : {}),
+      // ADR 0011: `drained --fail-on-stuck` reads the sticky `dispatch_failures`
+      // rows for its jam check off this SAME snapshot — opt in so they ride
+      // first-paint instead of a bespoke collection stream. `drained` without
+      // `--fail-on-stuck` keeps the byte-identical board scope (flag off).
+      ...(openDispatchFailures ? { includeDispatchFailures: true } : {}),
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
@@ -2149,21 +2149,6 @@ export async function runAwait(
       collection: "jobs",
       onRows: onJobRows,
       onLifecycle: onLifecycle("jobs"),
-      onFatal,
-      ...(giveUpExtras ?? {}),
-      ...(deps.connect === undefined ? {} : { connect: deps.connect }),
-    });
-  }
-  // fn-1015: the `dispatch_failures` stream for `drained --fail-on-stuck`'s jam
-  // check — there's no readiness equivalent, so it rides its own dedicated
-  // collection subscribe regardless of whether readiness is open.
-  if (openDispatchFailures) {
-    dispatchFailuresHandle = subscribeCollection({
-      sockPath: args.sock,
-      idPrefix: `await-${process.pid}`,
-      collection: "dispatch_failures",
-      onRows: onDispatchFailureRows,
-      onLifecycle: onLifecycle("dispatchFailures"),
       onFatal,
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),

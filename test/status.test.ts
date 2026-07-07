@@ -19,14 +19,27 @@ import {
   buildStatusEnvelope,
   buildStatusErrorEnvelope,
   DEFAULT_CONNECT_DEADLINE_MS,
+  type ParsedStatusArgs,
   parseStatusArgs,
+  type RunStatusDeps,
+  runStatus,
   STATUS_SCHEMA_VERSION,
   type StatusBootInfo,
 } from "../cli/status";
 import { QUERY_READ_ALLOWLIST, REGISTRY } from "../src/collections";
-import type { FilterValue, Row } from "../src/protocol";
+import {
+  encodeFrame,
+  type FilterValue,
+  type Row,
+  type ServerFrame,
+} from "../src/protocol";
 import type { Verdict } from "../src/readiness";
-import type { ReadinessClientSnapshot } from "../src/readiness-client";
+import type {
+  ConnectFactory,
+  ReadinessClientSnapshot,
+  ReadinessSocket,
+  SocketHandlers,
+} from "../src/readiness-client";
 
 class ExitError extends Error {
   readonly code: number;
@@ -513,6 +526,199 @@ describe("buildStatusEnvelope drained/jammed", () => {
     // in-flight work → not at rest → neither drained nor jammed
     expect(d?.drained).toBe(false);
     expect(d?.jammed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStatus snapshot sourcing (ADR 0011) — the sticky `dispatch_failures` rows
+// ride the readiness snapshot via `includeDispatchFailures`, so `keeper status`
+// reads them in ONE round-trip (no out-of-band `queryCollection`) and the
+// envelope's jammed / needs-human math reflects the snapshot-delivered rows.
+// ---------------------------------------------------------------------------
+
+interface StatusMockSocket extends ReadinessSocket {
+  readonly outbound: string[];
+  handlers: SocketHandlers;
+  deliver(frames: ServerFrame[]): void;
+}
+
+/** Minimal mock connect: `open` fires synchronously so the subscribe's queries
+ *  are on `outbound` before `runStatus` returns; `deliver` feeds inbound frames
+ *  routed by collection (the driver's `byCollection` fallback). */
+function makeStatusMockConnect(): {
+  factory: ConnectFactory;
+  sockets: StatusMockSocket[];
+} {
+  const sockets: StatusMockSocket[] = [];
+  const factory: ConnectFactory = async (_path, handlers) => {
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const sock: StatusMockSocket = {
+      outbound: [],
+      handlers,
+      write(data: string): void {
+        sock.outbound.push(data);
+      },
+      end(): void {
+        resolveDone?.();
+        resolveDone = null;
+      },
+      terminate(): void {
+        resolveDone?.();
+        resolveDone = null;
+      },
+      deliver(frames: ServerFrame[]): void {
+        sock.handlers.data(
+          sock,
+          Buffer.from(frames.map(encodeFrame).join(""), "utf8"),
+        );
+      },
+    };
+    sockets.push(sock);
+    handlers.open(sock);
+    await done;
+    return sock;
+  };
+  return { factory, sockets };
+}
+
+/** The eleven base readiness collections + the `dispatch_failures` opt-in, as a
+ *  single `result` batch. Routed by collection, so no idPrefix bookkeeping. */
+function statusReadinessFrames(
+  dispatchFailures: Record<string, unknown>[],
+  epics: Record<string, unknown>[] = [],
+): ServerFrame[] {
+  const empty = (collection: string): ServerFrame => ({
+    type: "result",
+    id: collection,
+    collection,
+    rev: 1,
+    total: 0,
+    rows: [],
+  });
+  return [
+    {
+      type: "result",
+      id: "epics",
+      collection: "epics",
+      rev: 1,
+      total: epics.length,
+      rows: epics,
+    },
+    empty("jobs"),
+    empty("subagent_invocations"),
+    empty("git"),
+    empty("dead_letters"),
+    empty("pending_dispatches"),
+    empty("autopilot_state"),
+    empty("armed_epics"),
+    empty("scheduled_tasks"),
+    empty("block_escalations"),
+    empty("tmux_client_focus"),
+    {
+      type: "result",
+      id: "dispatch_failures",
+      collection: "dispatch_failures",
+      rev: 1,
+      total: dispatchFailures.length,
+      rows: dispatchFailures,
+    },
+  ];
+}
+
+function statusArgs(): ParsedStatusArgs {
+  return {
+    sock: "/tmp/keeper-mock.sock",
+    connectTimeoutMs: DEFAULT_CONNECT_DEADLINE_MS,
+    format: "json",
+  };
+}
+
+/** Captures stdout + exit code on an object (property access dodges the closure
+ *  narrowing that would pin a `let` to its `null` initializer). */
+function makeStatusDeps(factory: ConnectFactory): {
+  deps: RunStatusDeps;
+  cap: { stdout: string[]; exitCode: number | null };
+} {
+  const cap: { stdout: string[]; exitCode: number | null } = {
+    stdout: [],
+    exitCode: null,
+  };
+  const deps: RunStatusDeps = {
+    writeStdout: (s) => cap.stdout.push(s),
+    writeStderr: () => {},
+    exit: ((code: number) => {
+      cap.exitCode = code;
+      return undefined as never;
+    }) as (code: number) => never,
+    connect: factory,
+  };
+  return { deps, cap };
+}
+
+describe("runStatus dispatch_failures snapshot sourcing (ADR 0011)", () => {
+  test("opts into includeDispatchFailures — dispatch_failures rides the readiness subscribe, no separate round-trip", async () => {
+    const { factory, sockets } = makeStatusMockConnect();
+    const { deps, cap } = makeStatusDeps(factory);
+
+    await runStatus(statusArgs(), deps);
+    // Exactly ONE connection opened (the readiness subscribe) — no bespoke
+    // dispatch_failures socket.
+    expect(sockets).toHaveLength(1);
+    const sock = sockets[0];
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    const collections = sock.outbound.map((line) => {
+      const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+      return (JSON.parse(trimmed) as { collection: string }).collection;
+    });
+    // The one subscribe carries dispatch_failures — the rows arrive on the SAME
+    // snapshot, so there is no out-of-band queryCollection.
+    expect(collections).toContain("dispatch_failures");
+
+    // A jam sticky delivered on the snapshot flows into the envelope's
+    // needs-human / jammed math (board otherwise at rest).
+    sock.deliver(
+      statusReadinessFrames([
+        { verb: "close", id: "fn-1-a", reason: "worktree-merge-conflict" },
+      ]),
+    );
+    expect(cap.exitCode).toBe(0);
+    expect(cap.stdout).toHaveLength(1);
+    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
+      ok: boolean;
+      data: {
+        jammed: boolean;
+        drained: boolean;
+        needs_human: { stuck_dispatches: number; total: number };
+      };
+    };
+    expect(env.ok).toBe(true);
+    expect(env.data.needs_human.stuck_dispatches).toBe(1);
+    expect(env.data.needs_human.total).toBe(1);
+    expect(env.data.jammed).toBe(true);
+    expect(env.data.drained).toBe(false);
+  });
+
+  test("an empty dispatch_failures collection → drained, no jam (rows sourced from the snapshot)", async () => {
+    const { factory, sockets } = makeStatusMockConnect();
+    const { deps, cap } = makeStatusDeps(factory);
+
+    await runStatus(statusArgs(), deps);
+    const sock = sockets[0];
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.deliver(statusReadinessFrames([]));
+    expect(cap.exitCode).toBe(0);
+    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
+      data: { jammed: boolean; drained: boolean };
+    };
+    expect(env.data.jammed).toBe(false);
+    expect(env.data.drained).toBe(true);
   });
 });
 

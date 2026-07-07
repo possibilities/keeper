@@ -73,6 +73,7 @@ import {
   LineBuffer,
   type QueryFrame,
   type QuerySort,
+  type Row,
   type ServerFrame,
 } from "./protocol";
 import {
@@ -121,6 +122,12 @@ const TMUX_CLIENT_FOCUS_PAGE_LIMIT = 0;
 // The `lane_merged` observable — one row per merged-lane epic, bounded
 // by board size, so unbounded (0) like the other epic-keyed collections.
 const LANE_MERGED_PAGE_LIMIT = 0;
+// The `dispatch_failures` collection — subscribed UNBOUNDED (0 = the no-row-cap
+// sentinel) under the `includeDispatchFailures` opt-in: the collection
+// self-prunes as stickies resolve, and exact counts are load-bearing for the
+// instant-death-wall threshold, so a silent page-cap truncation is the worse
+// failure than an unbounded small collection (ADR 0011).
+const DISPATCH_FAILURES_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -237,6 +244,15 @@ export interface ReadinessClientSnapshot {
   // default, or torn-down). Worktree mode OFF: degrades cleanly to DONE epics (no
   // lanes exist; merged ⇔ done) — see {@link computeLandedEpicIds}.
   readonly landedEpicIds?: readonly string[];
+  // ADR 0011 OPT-IN: the sticky `dispatch_failures` rows (verb/id/reason/dir
+  // intact off the fold), backing three of the six needs-human signals (stuck
+  // dispatches, finalize non-ff, the instant-death wall). Present ONLY under the
+  // `includeDispatchFailures` opt-in (status/watch/await's jam path) — ABSENT
+  // (not null, not empty) for board/dash so their first-paint stays
+  // byte-identical (mirrors `landedEpicIds`). The gated fold subscribes unbounded
+  // (limit 0) so the wall-threshold counts are exact; the shared projector owns
+  // the reason classification so status/watch/await never drift on "stuck".
+  readonly dispatchFailures?: readonly Row[];
   // fn-952: the `tmux_client_focus` singleton row (`id = 1`) — the persistent
   // control worker's view of the current real client's focused
   // session/window/pane. `undefined` when the singleton is empty (no-tmux env or
@@ -1487,6 +1503,16 @@ export interface SubscribeOptions {
    * snapshot's `epics` field BYTE-IDENTICAL. Default `false`.
    */
   readonly includeRecentDoneEpics?: boolean;
+  /**
+   * ADR 0011 OPT-IN: also subscribe the `dispatch_failures` collection
+   * (UNBOUNDED — `limit: 0`) and carry its rows on the snapshot's
+   * `dispatchFailures` member (verb/id/reason/dir intact). Set by the surfaces
+   * that read the needs-human jam class (`keeper status`, `keeper watch`, and
+   * `keeper await`'s `drained --fail-on-stuck` jam check). Board/dash leave it
+   * OFF, keeping the `states`/first-paint gate and the snapshot's member set
+   * BYTE-IDENTICAL. Default `false`.
+   */
+  readonly includeDispatchFailures?: boolean;
 }
 
 /**
@@ -1696,6 +1722,23 @@ export function subscribeReadiness(
           limit: LANE_MERGED_PAGE_LIMIT,
         })
       : null;
+  // ADR 0011 OPT-IN: the sticky `dispatch_failures` collection. Created, gated,
+  // and merged ONLY when `includeDispatchFailures` is set (status/watch/await's
+  // jam path). When off it is `null` — never added to `states`, never gated,
+  // never merged — so board/dash first-paint and every non-opt-in consumer's
+  // snapshot member set stay byte-identical. Subscribes UNBOUNDED (limit 0 — the
+  // no-row-cap sentinel). The wire pk is `verb` (a tiny class), but two same-verb
+  // rows would collapse under `byId`, so the snapshot projects off `state.rows`.
+  const dispatchFailuresSubId = `${idPrefix}-dispatch-failures`;
+  const dispatchFailures =
+    opts.includeDispatchFailures === true
+      ? makeState("dispatch_failures", dispatchFailuresSubId, "verb", {
+          type: "query",
+          collection: "dispatch_failures",
+          id: dispatchFailuresSubId,
+          limit: DISPATCH_FAILURES_PAGE_LIMIT,
+        })
+      : null;
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1714,6 +1757,9 @@ export function subscribeReadiness(
   }
   if (laneMerged !== null) {
     states.push(laneMerged);
+  }
+  if (dispatchFailures !== null) {
+    states.push(dispatchFailures);
   }
 
   function emitSnapshotIfReady(): void {
@@ -1749,7 +1795,13 @@ export function subscribeReadiness(
       // OPT-IN: gate on the merge-landed observable ONLY when opted in
       // (`null` otherwise). The table exists from migration, so empty produces a
       // `result` with `rows: []` and still clears the gate.
-      (laneMerged !== null && !laneMerged.gotResult)
+      (laneMerged !== null && !laneMerged.gotResult) ||
+      // ADR 0011 OPT-IN: gate on the `dispatch_failures` collection ONLY when
+      // opted in (`null` otherwise). Holding first paint until it paints means a
+      // painted snapshot always carries the REAL jam rows — a transient fold
+      // failure can never read as "no jam". Empty produces a `result` with
+      // `rows: []`, so it clears.
+      (dispatchFailures !== null && !dispatchFailures.gotResult)
     ) {
       return;
     }
@@ -1924,6 +1976,15 @@ export function subscribeReadiness(
       laneMerged === null
         ? undefined
         : computeLandedEpicIds(worktreeMode, laneMerged.order, epicsTyped);
+    // ADR 0011 OPT-IN: the sticky `dispatch_failures` rows, projected off
+    // `state.rows` (the `verb` wire pk would collapse same-verb rows under
+    // `byId`). Field names (verb/id/reason/dir) ride through intact so the shared
+    // needs-human projector's math is source-agnostic. `undefined` when un-opted
+    // (the state is `null`) so the snapshot member is ABSENT for board/dash.
+    const dispatchFailuresTyped =
+      dispatchFailures === null
+        ? undefined
+        : projectRows<Row>(dispatchFailures);
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -1948,6 +2009,9 @@ export function subscribeReadiness(
       worktreeMode,
       worktreeMultiRepo,
       ...(landedEpicIds === undefined ? {} : { landedEpicIds }),
+      ...(dispatchFailuresTyped === undefined
+        ? {}
+        : { dispatchFailures: dispatchFailuresTyped }),
       ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,
     });

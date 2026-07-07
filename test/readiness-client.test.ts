@@ -471,6 +471,126 @@ test("subscribeReadiness: includeRecentDoneEpics ON subscribes the window, gates
 });
 
 // ---------------------------------------------------------------------------
+// (a.1b) ADR 0011 — the opt-in `dispatch_failures` gated fold. The collection
+//        is subscribed, gated, and carried ONLY when `includeDispatchFailures`
+//        is set; default-off keeps the 11-collection subscribe byte-identical
+//        AND the snapshot member ABSENT (the off-path proof obligation).
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: includeDispatchFailures OFF omits the subscribe and the snapshot member", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const idPrefix = "test-no-df";
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  const collections = (
+    sock.takeOutbound() as Array<{ collection: string }>
+  ).map((f) => f.collection);
+  expect(collections).not.toContain("dispatch_failures");
+  expect(collections).toHaveLength(11);
+
+  // The eleven base collections paint → snapshot fires with the member ABSENT
+  // (not null, not empty) — byte-identical to the pre-ADR-0011 shape.
+  sock.deliver([
+    emptyResult("epics", `${idPrefix}-epics`),
+    emptyResult("jobs", `${idPrefix}-jobs`),
+    emptyResult("subagent_invocations", `${idPrefix}-subagent-invocations`),
+    emptyResult("git", `${idPrefix}-git`),
+    emptyResult("dead_letters", `${idPrefix}-dead-letters`),
+    emptyResult("pending_dispatches", `${idPrefix}-pending-dispatches`),
+    emptyResult("autopilot_state", `${idPrefix}-autopilot-state`),
+    emptyResult("armed_epics", `${idPrefix}-armed-epics`),
+    emptyResult("scheduled_tasks", `${idPrefix}-scheduled-tasks`),
+    emptyResult("block_escalations", `${idPrefix}-block-escalations`),
+    emptyResult("tmux_client_focus", `${idPrefix}-tmux-client-focus`),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  expect("dispatchFailures" in (snapshots[0] ?? {})).toBe(false);
+  expect(snapshots[0]?.dispatchFailures).toBeUndefined();
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: includeDispatchFailures ON subscribes the collection, gates on it, and carries the rows", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const idPrefix = "test-df-on";
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    onSnapshot: (snap) => snapshots.push(snap),
+    includeDispatchFailures: true,
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Twelve queries now — the opt-in adds EXACTLY the one `dispatch_failures`
+  // collection (no recent-done opt-in here, so the base set is eleven).
+  const initial = sock.takeOutbound() as Array<{ collection: string }>;
+  expect(initial).toHaveLength(12);
+  expect(initial.map((f) => f.collection)).toContain("dispatch_failures");
+
+  // The eleven base collections paint but NOT `dispatch_failures` → the gate
+  // HOLDS, proving the opt-in collection is load-bearing when set.
+  sock.deliver([
+    emptyResult("epics", `${idPrefix}-epics`),
+    emptyResult("jobs", `${idPrefix}-jobs`),
+    emptyResult("subagent_invocations", `${idPrefix}-subagent-invocations`),
+    emptyResult("git", `${idPrefix}-git`),
+    emptyResult("dead_letters", `${idPrefix}-dead-letters`),
+    emptyResult("pending_dispatches", `${idPrefix}-pending-dispatches`),
+    emptyResult("autopilot_state", `${idPrefix}-autopilot-state`),
+    emptyResult("armed_epics", `${idPrefix}-armed-epics`),
+    emptyResult("scheduled_tasks", `${idPrefix}-scheduled-tasks`),
+    emptyResult("block_escalations", `${idPrefix}-block-escalations`),
+    emptyResult("tmux_client_focus", `${idPrefix}-tmux-client-focus`),
+  ]);
+  expect(snapshots).toHaveLength(0);
+
+  // `dispatch_failures` paints with two SAME-VERB stickies — proving the `verb`
+  // wire pk does NOT collapse them (the fold projects off `state.rows`). The
+  // gate clears; the member carries both rows with field names intact.
+  sock.deliver([
+    rowsResult("dispatch_failures", `${idPrefix}-dispatch-failures`, [
+      {
+        verb: "close",
+        id: "fn-1-foo",
+        reason: "worktree-finalize-non-fast-forward",
+        dir: "/r",
+      },
+      {
+        verb: "close",
+        id: "fn-2-bar",
+        reason: "worktree-recover-conflict",
+        dir: "/r",
+      },
+    ]),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  const df = snapshots[0]?.dispatchFailures ?? [];
+  expect(df).toHaveLength(2);
+  expect(df.map((r) => r.reason)).toEqual([
+    "worktree-finalize-non-fast-forward",
+    "worktree-recover-conflict",
+  ]);
+  // verb/id/dir ride through the fold intact (source-agnostic projector math).
+  expect(df[0]).toMatchObject({ verb: "close", id: "fn-1-foo", dir: "/r" });
+
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
 // fn-1016 — `computeLandedEpicIds` pure degradation (worktree ON → the
 // `lane_merged` projection; OFF → done epics, merged ⇔ done). Sorted + stable.
 // ---------------------------------------------------------------------------

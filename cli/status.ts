@@ -8,12 +8,13 @@
  *
  * Transport mirrors `keeper await server-up`: a bare `subscribeReadiness`,
  * whose FIRST `onSnapshot` is already a complete composite (the internal
- * all-strict first-paint gate). On that first frame we dispose the handle,
- * pull the sticky `dispatch_failures` rows for the jammed / needs-human
- * signals (a best-effort one-shot `queryCollection` — NEVER `sendControlRpc`),
- * print the envelope, and exit. UNLIKE `server-up`, the subscribe carries a
- * bounded default ~10s `giveUpPolicy`: a one-shot orient must NOT reconnect
- * forever, so a down daemon fires `onFatal({code:"unreachable"})` → exit 1.
+ * all-strict first-paint gate). The subscribe opts into `includeDispatchFailures`
+ * (ADR 0011), so the sticky `dispatch_failures` rows for the jammed /
+ * needs-human signals ride the SAME snapshot in ONE round-trip — no out-of-band
+ * `queryCollection`. On that first frame we dispose the handle, print the
+ * envelope, and exit. UNLIKE `server-up`, the subscribe carries a bounded
+ * default ~10s `giveUpPolicy`: a one-shot orient must NOT reconnect forever, so
+ * a down daemon fires `onFatal({code:"unreachable"})` → exit 1.
  *
  * Exit taxonomy: exit 0 on ANY board state (a bad board is DATA, not an
  * error). Exit 1 ONLY on transport (`unreachable`/`connect`) or usage. On a
@@ -23,8 +24,8 @@
  *
  * `drained`/`jammed`/`needs-human` are computed INLINE here from the readiness
  * snapshot (verdicts + in-flight + each epic's parked-closer `question`) plus
- * the `dispatch_failures` read. The canonical pure predicate is task-4's
- * (`await drained`); when it lands, dedupe this with an import.
+ * the snapshot's `dispatchFailures` member. The canonical pure predicate is
+ * task-4's (`await drained`); when it lands, dedupe this with an import.
  * TODO(fn-1015.4): replace the inline drained/jammed with the shared predicate.
  */
 
@@ -44,7 +45,6 @@ import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
-import { queryCollection } from "./control-rpc";
 import { type FormatMode, parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import {
@@ -470,8 +470,6 @@ export interface RunStatusDeps {
   writeStdout: (s: string) => void;
   writeStderr: (s: string) => void;
   exit: (code: number) => never;
-  /** Best-effort sticky dispatch_failures read (defaults to the real transport). */
-  fetchDispatchFailures: (sock: string) => Promise<Row[]>;
   /** Test-injection connect factory forwarded to `subscribeReadiness`. */
   connect?: ConnectFactory;
   /** Test clock forwarded to the give-up deadline. */
@@ -502,17 +500,12 @@ export async function runStatus(
     }
   };
 
-  const finishSuccess = async (
-    snap: ReadinessClientSnapshot,
-  ): Promise<void> => {
-    let failures: Row[] = [];
-    try {
-      failures = await deps.fetchDispatchFailures(args.sock);
-    } catch {
-      // Best-effort: a vanished daemon between snapshot and read degrades the
-      // jammed/needs-human signal to empty rather than failing the orient.
-      failures = [];
-    }
+  const finishSuccess = (snap: ReadinessClientSnapshot): void => {
+    // ADR 0011: the sticky `dispatch_failures` rows ride the snapshot under the
+    // `includeDispatchFailures` opt-in — ONE round-trip, no out-of-band read.
+    // Absent (never null/empty) only if the flag were off; here it is always on,
+    // so `?? []` is a belt-and-suspenders default the envelope treats as "no jam".
+    const failures = snap.dispatchFailures ?? [];
     const envelope = buildStatusEnvelope(snap, latestBoot, failures);
     emitEnvelopeFormatted(envelope, deps, args.format);
   };
@@ -523,7 +516,7 @@ export async function runStatus(
     }
     done = true;
     disposeHandle();
-    void finishSuccess(snap);
+    finishSuccess(snap);
   };
 
   const onFatal = (err: FatalError): void => {
@@ -549,6 +542,11 @@ export async function runStatus(
     idPrefix: `status-${process.pid}`,
     onSnapshot,
     onFatal,
+    // ADR 0011: carry the sticky `dispatch_failures` rows on the snapshot so the
+    // jammed / needs-human signals read from ONE round-trip, not an out-of-band
+    // query. The gate holds first paint until the collection paints, so a
+    // painted snapshot always carries the real jam rows.
+    includeDispatchFailures: true,
     giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
     onBootStatus: (boot: BootStatus): void => {
       latestBoot = { rev: boot.rev, catching_up: boot.catching_up };
@@ -574,8 +572,6 @@ export async function main(argv: string[]): Promise<void> {
     writeStdout: (s) => process.stdout.write(s),
     writeStderr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
-    fetchDispatchFailures: (sock) =>
-      queryCollection(sock, "dispatch_failures") as Promise<Row[]>,
   });
 }
 
