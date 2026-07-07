@@ -10,6 +10,9 @@ import { describe, expect, test } from "bun:test";
 import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_REASON,
+  SHARED_DESYNC_DISTRESS_VERB,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -145,6 +148,47 @@ describe("classifyDispatchFailure", () => {
         {
           verb: SHARED_WEDGE_DISTRESS_VERB,
           id: `${SHARED_WEDGE_DISTRESS_ID_PREFIX}abc123`,
+          dir: "/repo",
+        },
+        ["fn-1-a"],
+      ),
+    ).toBeNull();
+  });
+
+  test("maps the shared-checkout-desync distress reason to its own display kind", () => {
+    // The full minted reason carries a trailing blocker dump; the prefix rule classifies
+    // it to the shared-desync pill, distinct from every other kind (a different operator
+    // response: return the checkout to default so it carries the landed tip).
+    expect(
+      classifyDispatchFailure(
+        `${SHARED_DESYNC_DISTRESS_REASON}: /repo has stayed DESYNCED past the 5min grace — Blocker: content-trailing (index/worktree differ from the default tip)`,
+      ),
+    ).toBe("shared-desync");
+    expect(classifyDispatchFailure(SHARED_DESYNC_DISTRESS_REASON)).toBe(
+      "shared-desync",
+    );
+    // Distinct from the sibling shared-checkout distress kinds + the recover kinds — the
+    // shared-checkout-* rules share a stem but never shadow one another.
+    for (const other of [
+      SHARED_WEDGE_DISTRESS_REASON,
+      "shared-checkout-dirty",
+      CRASH_LOOP_DISTRESS_REASON,
+      "worktree-recover-dirty-checkout",
+    ]) {
+      expect(classifyDispatchFailure(SHARED_DESYNC_DISTRESS_REASON)).not.toBe(
+        classifyDispatchFailure(other),
+      );
+    }
+  });
+
+  test("a per-repo shared-checkout-desync distress row resolves to no board target", () => {
+    // Per-repo synthetic `daemon`-verb row — surfaces as a needs_human count, never a
+    // mis-attributed per-epic/task pill.
+    expect(
+      resolveFailureTarget(
+        {
+          verb: SHARED_DESYNC_DISTRESS_VERB,
+          id: `${SHARED_DESYNC_DISTRESS_ID_PREFIX}abc123`,
           dir: "/repo",
         },
         ["fn-1-a"],

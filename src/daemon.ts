@@ -132,6 +132,7 @@ import {
   CRASH_LOOP_DISTRESS_VERB,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
+  isSharedDesyncDistressKey,
   isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -355,11 +356,13 @@ export function drainToCompletion(
  *
  * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
- * isStaleBaseDistressKey}) distress key: their synthetic `daemon` verb is un-retryable
+ * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
+ * isSharedDesyncDistressKey}) distress key: their synthetic `daemon` verb is un-retryable
  * by the wire validator BY DESIGN (an operator never clears them), and a level-trigger
  * (main's boot recovery / the recover pass observing the lane clean / the stale-base
- * probe observing the lane re-based or torn down) owns dropping them — so the orphan
- * sweep must never reap a self-managed distress row out from under its signal.
+ * probe observing the lane re-based or torn down / the desync content probe observing the
+ * checkout carry the default tip) owns dropping them — so the orphan sweep must never
+ * reap a self-managed distress row out from under its signal.
  *
  * The per-repo shared-checkout-wedge/-dirty distress family is DELIBERATELY NOT exempt:
  * a dirty or mid-merge shared checkout no longer blocks the working-tree-free base
@@ -396,6 +399,14 @@ export function gcUnretryableDispatchFailures(
     // verb / probe level-clear discipline on its own `stale-base-lane:` id prefix; the
     // operator surface never clears it, so the orphan sweep must not reap it.
     if (isStaleBaseDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the per-repo shared-checkout-DESYNC distress row — a LIVE producer (UNLIKE the
+    // neutered wedge/dirty family drained above): its own `shared-checkout-desync:` id
+    // prefix rides the synthetic `daemon` verb, and the per-cycle content probe's
+    // level-trigger owns dropping it, so the orphan sweep must not reap it out from under
+    // its signal.
+    if (isSharedDesyncDistressKey(row.verb, row.id)) {
       continue;
     }
     mintClear(row.verb, row.id);

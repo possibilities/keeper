@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Accepted. The best-effort-resync consequence (below) is superseded in part by
+[ADR 16](0016-stale-aware-shared-checkout-catchup.md): the resync is now a
+stale-aware two-tree catch-up and its skip is board-visible, not silent + cosmetic.
 
 ## Context
 
@@ -62,6 +64,10 @@ lane), so the base merge no longer inspects the shared checkout's state at all.
 - The ref advance desyncs the shared checkout. A best-effort resync fast-forwards
   an idle-clean-on-default checkout onto the merged commit; a dirty/off-branch
   checkout is the human's to resync, and the resync never blocks the merge.
+  **Superseded in part by [ADR 16](0016-stale-aware-shared-checkout-catchup.md):**
+  the resync is now a stale-aware two-tree catch-up (unrelated edits preserved, a
+  true edit-vs-merge collision aborts atomically), and a skipped or aborted catch-up
+  seeds a board-visible `shared-checkout-desync` row instead of trailing silently.
 - The commit-work merge lock is re-pinned to `--git-common-dir` (the merge now
   advances the shared ref, not one checkout); in the main checkout it coincides with
   `--git-dir`, so a main-checkout `keeper commit-work` still serializes against the

@@ -301,6 +301,51 @@ export function isStaleBaseDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/**
+ * The synthetic PER-REPO distress signal for a shared MAIN checkout left DESYNCED by a
+ * plumbing base→default merge whose post-merge resync was SKIPPED or ABORTED — the ref
+ * advanced (`refs/heads/<default>` moved to the merged commit) but the working tree did
+ * NOT catch up, so everything served off the checkout (selector policy, skills, worker
+ * templates, daemon source at next boot) silently trails landed history. UNLIKE the
+ * neutered shared-checkout-wedge / -dirty family (a dead false positive the boot orphan
+ * sweep DRAINS), this is a LIVE producer, so it mirrors the per-LANE / stale-base
+ * lifecycle instead: the mint is EVENT-SEEDED (the skip/abort happens inside the merge
+ * call, which still returns `merged` — otherwise invisible) and the clear is a per-cycle
+ * CONTENT-LEVEL probe over the OPEN rows' dirs, so the row survives epic teardown +
+ * daemon restarts (the open-row dir set re-seeds the in-memory latch). Mirrors the
+ * shared-checkout-wedge idiom on its OWN id/reason so the surfaces never cross-clear: the
+ * un-retryable synthetic `daemon` verb (routes as {@link routeDispatchFailure}'s
+ * `unknown` arm — never in `failedKeys`, never `retry_dispatch`-clearable) with a
+ * per-repo `id` (`shared-checkout-desync:<repoHash>`) so two checkouts on a multi-repo
+ * board desync independently. Its ONLY clear is the per-cycle probe observing the
+ * on-default checkout content-carry the default tip (index AND worktree both match HEAD —
+ * NEVER a single index-vs-HEAD orientation); the `reason` lives OUTSIDE {@link
+ * WORKTREE_RECOVER_REASON_PREFIX}. UNLIKE the drained wedge/dirty family it IS boot
+ * orphan-GC-EXEMPT (a live level-trigger owns dropping it). Prefix-disjoint from every
+ * existing family (recover/finalize/shared-wedge/shared-dirty/slot/crash-loop/lane-
+ * premerge/lane-wedge/stale-base).
+ */
+export const SHARED_DESYNC_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const SHARED_DESYNC_DISTRESS_ID_PREFIX = "shared-checkout-desync:";
+export const SHARED_DESYNC_DISTRESS_REASON = "shared-checkout-desync";
+
+/**
+ * True iff `(verb, id)` is a shared-checkout-DESYNC distress key — the synthetic `daemon`
+ * verb plus the {@link SHARED_DESYNC_DISTRESS_ID_PREFIX} per-repo id. The boot orphan-GC
+ * EXEMPTS it (like the lane-wedge / stale-base + crash-loop keys, UNLIKE the drained
+ * wedge/dirty rows) since a live level-trigger — not the operator surface — clears it;
+ * pure, dep-free, NEVER throws. Disjoint from {@link isSharedWedgeDistressKey} / {@link
+ * isSharedDirtyDistressKey} / {@link isLaneWedgeDistressKey} / {@link
+ * isStaleBaseDistressKey}: the id prefixes never mutually match, so the five distress
+ * rows never cross-classify or cross-clear.
+ */
+export function isSharedDesyncDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === SHARED_DESYNC_DISTRESS_VERB &&
+    id.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX)
+  );
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -315,6 +360,7 @@ export type DispatchFailureDisplayKind =
   | "crash-loop"
   | "shared-wedge"
   | "shared-dirty"
+  | "shared-desync"
   | "lane-premerge"
   | "lane-wedge"
   | "stale-base";
@@ -343,6 +389,10 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
   { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
   { prefix: SHARED_DIRTY_DISTRESS_REASON, kind: "shared-dirty" },
+  // Prefix-disjoint from the wedge/dirty siblings (`shared-checkout-desync` diverges at
+  // `-de` vs `-di`/`-w`, neither a prefix of the other), so ordering is not load-bearing;
+  // grouped with the shared-checkout family for readability.
+  { prefix: SHARED_DESYNC_DISTRESS_REASON, kind: "shared-desync" },
   // MOST-SPECIFIC-FIRST: the lane WEDGE distress prefix (`worktree-lane-wedge`)
   // must precede the lane PREMERGE prefix (`worktree-lane-premerge`) — neither is a
   // prefix of the other, but ordering keeps the table's stated invariant true even

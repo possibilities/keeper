@@ -1868,11 +1868,19 @@ test("needsHumanLines — folds each row to KIND · locator — trimmed reason, 
       reason:
         "shared-checkout-dirty: /Users/mike/code/keeper has stayed dirty\nsecond line dropped",
     },
+    {
+      // fn-1169 — a shared-checkout-desync row surfaces on the same needs-human board
+      // surface, folded to its own `shared-desync` kind (never shadowed by -dirty/-wedge).
+      locator: "/Users/mike/code/zeta",
+      reason:
+        "shared-checkout-desync: /Users/mike/code/zeta has stayed DESYNCED\nsecond line dropped",
+    },
   ];
   expect(needsHumanLines(rows)).toEqual([
-    "needs human (2)",
+    "needs human (3)",
     "  shared-dirty · /Users/mike/code/keeper — shared-checkout-dirty: /Users/mike/code/keeper has stayed dirty",
     "  lane-wedge · /Users/mike/code/other — worktree-lane-wedge: lane keeper/epic/fn-9 cannot merge its base",
+    "  shared-desync · /Users/mike/code/zeta — shared-checkout-desync: /Users/mike/code/zeta has stayed DESYNCED",
   ]);
 });
 

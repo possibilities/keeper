@@ -74,6 +74,7 @@ import {
 import {
   assertNever,
   isLaneWedgeDistressKey,
+  isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
@@ -82,6 +83,8 @@ import {
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   routeDispatchFailure,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
@@ -186,6 +189,7 @@ import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 // loader routes recover/finalize failure rows through `routeDispatchFailure`.
 export {
   isLaneWedgeDistressKey,
+  isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
@@ -195,6 +199,9 @@ export {
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_DISTRESS_VERB,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_REASON,
+  SHARED_DESYNC_DISTRESS_VERB,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_VERB,
@@ -1103,6 +1110,21 @@ export function staleBaseLaneDistressId(
   return `${STALE_BASE_DISTRESS_ID_PREFIX}${epicId}-${repoDirHash(repoDir)}`;
 }
 
+/**
+ * The `dispatch_failures` id a per-repo shared-checkout-DESYNC distress row keys on —
+ * `shared-checkout-desync:<repoDirHash(repoDir)>`. A SIBLING of {@link
+ * sharedWedgeDistressId} / {@link sharedDirtyDistressId} on a DISTINCT prefix, so a
+ * desync row and a wedge/dirty row for the SAME repo are independent rows that never
+ * cross-clear, yet each is per-repo stable across cycles (the mint and the level-clear
+ * hit the same row) and distinct across repos on a multi-repo board. The composite
+ * `daemon::shared-checkout-desync:<hash>` fails the `retry_dispatch` wire validator
+ * (synthetic `daemon` verb), so only the per-cycle content probe's level-trigger clears
+ * it.
+ */
+export function sharedDesyncDistressId(repoDir: string): string {
+  return `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
+}
+
 /** A shared-checkout-wedge distress row to mint (past grace) or clear (recovered). */
 export interface SharedWedgeDistressAction {
   id: string;
@@ -1631,6 +1653,183 @@ export function createStaleBaseLaneTracker(
       for (const id of openDistressIds) {
         if (!stale.has(id)) {
           decision.clear.push({ id, dir: "" });
+        }
+      }
+      return decision;
+    },
+  };
+}
+
+/**
+ * Grace window (producer-`ts` seconds) a shared MAIN checkout may stay DESYNCED — its
+ * ref advanced past a base→default merge whose resync was skipped/aborted, so the working
+ * tree trails the default tip — before the per-cycle probe escalates it into a visible
+ * per-repo distress row. TUNED SMALL (~5min, minutes not tens): long enough that a
+ * transient in-flight `commit-work` (which re-syncs the tree the next cycle) or an
+ * `index.lock` blip settles inside the window, short enough that a genuine stuck desync
+ * surfaces fast. Injectable so the fast tier drives the grace-crossing without a real
+ * clock. Kept a DISTINCT const from the wedge/dirty/lane/stale grace so the two can
+ * diverge.
+ */
+export const SHARED_CHECKOUT_DESYNC_GRACE_SEC = 5 * 60;
+
+/**
+ * The per-cycle content-level verdict for a watched shared-checkout dir — the SOLE clear
+ * evidence for the desync distress. `desynced:false` iff the checkout is ON the default
+ * branch, has NO merge in flight, and its index AND worktree both match HEAD (tracked
+ * content carries the default tip); otherwise `desynced:true` with a short `blocker`
+ * naming why (off-default / mid-merge / content-trailing / an inconclusive git probe).
+ * NEVER a single index-vs-HEAD orientation: both a fresh desync (index behind HEAD) and
+ * the steady state (index==HEAD, worktree stale) read as `desynced:true`.
+ */
+export type CheckoutDesyncProbe =
+  | { desynced: false }
+  | { desynced: true; blocker: string };
+
+/**
+ * Probe whether a shared MAIN checkout content-carries its default tip (the desync clear
+ * evidence). Pure of keeper.db / the wall clock — reads ONLY live git through the injected
+ * runner, so the fast tier scripts every decision. POSITIVE-EVIDENCE ONLY: any
+ * inconclusive git result (an unresolved branch, a failed status) is reported
+ * `desynced:true` so a probe blip RETAINS an open row rather than false-clearing a real
+ * signal. NEVER throws (a thrown runner degrades to `desynced:true`).
+ *
+ * A checkout is SYNCED iff, in order: it is on the default branch, has no `MERGE_HEAD`,
+ * and `git status --porcelain -uno` is empty — the exact "index AND worktree both match
+ * HEAD" contract (empty porcelain ⟺ no staged AND no unstaged tracked delta ⟺
+ * index==worktree==HEAD). Untracked scratch files are IGNORED (`-uno`): they never mean
+ * the tracked default tip is missing.
+ */
+export async function probeSharedCheckoutDesync(
+  repoDir: string,
+  run: WorktreeGitRunner,
+): Promise<CheckoutDesyncProbe> {
+  try {
+    const defaultBranch = await gitResolveDefaultBranch(repoDir, run);
+    const branch = await gitCurrentBranch(repoDir, run);
+    if (branch.length === 0) {
+      return {
+        desynced: true,
+        blocker: "branch-unresolved (detached or git error)",
+      };
+    }
+    if (branch !== defaultBranch) {
+      return {
+        desynced: true,
+        blocker: `off-default (on ${branch}, expected ${defaultBranch})`,
+      };
+    }
+    const mergeHead = await run(
+      ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+      {
+        cwd: repoDir,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      },
+    );
+    if (mergeHead.code === 0) {
+      return { desynced: true, blocker: "mid-merge (MERGE_HEAD present)" };
+    }
+    const status = await run(
+      ["status", "--porcelain", "--untracked-files=no"],
+      { cwd: repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (status.code !== 0) {
+      return { desynced: true, blocker: "status-probe-failed" };
+    }
+    if (status.stdout.trim().length === 0) {
+      return { desynced: false };
+    }
+    return {
+      desynced: true,
+      blocker: "content-trailing (index/worktree differ from the default tip)",
+    };
+  } catch {
+    return { desynced: true, blocker: "probe-threw" };
+  }
+}
+
+/**
+ * Per-repo grace tracker for the shared-checkout DESYNC distress — a CLONE of {@link
+ * createSharedCheckoutWedgeTracker} on its OWN id/reason/surface, so the wedge/dirty/lane
+ * escalations stay byte-untouched and the surfaces never share a row. Identical contract:
+ * pure of keeper.db / IO / the wall clock (the producer `ts` is the only clock); in-memory
+ * grace + per-repo minted-latch for an exactly-once mint per continuous desync episode;
+ * projection-driven level-clear robust across a restart. Keyed on the checkout DIR (like
+ * the wedge tracker), computing {@link sharedDesyncDistressId} internally. The `desynced`
+ * map's value is the probe blocker detail (mint attribution).
+ *
+ * The one architectural divergence from the wedge tracker: the `desynced` map is NOT
+ * re-derived from a recover observation each cycle — it is the per-cycle {@link
+ * probeSharedCheckoutDesync} verdict over the WATCHED dirs (the event-seeded latch UNION
+ * the open-row set), so a fresh desync mints and a caught-up checkout clears purely off
+ * content evidence.
+ */
+export interface SharedCheckoutDesyncTracker {
+  step(input: {
+    /** This cycle's still-desynced shared checkouts: `repoDir` → the probe blocker. */
+    desynced: ReadonlyMap<string, string>;
+    /** `repoDir`s that currently have an OPEN desync distress row (from the projection). */
+    openDistressDirs: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+/**
+ * Build a {@link SharedCheckoutDesyncTracker}. `graceSec` is injectable for the cadence
+ * test. A near-verbatim sibling of {@link createSharedCheckoutWedgeTracker} keyed on
+ * {@link sharedDesyncDistressId} + the desync reason, so the wedge/dirty paths stay
+ * byte-untouched and the distress surfaces never share a row.
+ */
+export function createSharedCheckoutDesyncTracker(
+  graceSec: number = SHARED_CHECKOUT_DESYNC_GRACE_SEC,
+): SharedCheckoutDesyncTracker {
+  // repoDir → the first cycle-ts it was seen desynced + whether we have minted the
+  // distress for THIS continuous desync episode. In-worker memory only.
+  const firstDesynced = new Map<
+    string,
+    { sinceSec: number; minted: boolean }
+  >();
+  const graceMin = Math.round(graceSec / 60);
+  return {
+    step({ desynced, openDistressDirs, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: track each desynced repo's grace clock; cross the watermark once.
+      for (const [dir, blocker] of desynced) {
+        let entry = firstDesynced.get(dir);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstDesynced.set(dir, entry);
+        }
+        if (!entry.minted && nowSec - entry.sinceSec >= graceSec) {
+          entry.minted = true;
+          decision.mint.push({
+            id: sharedDesyncDistressId(dir),
+            dir,
+            reason:
+              `${SHARED_DESYNC_DISTRESS_REASON}: ${dir} has stayed DESYNCED past the ` +
+              `${graceMin}min grace — a base→default merge advanced refs/heads onto the ` +
+              `merged commit but the shared checkout's post-merge resync was skipped or ` +
+              `aborted, so the working tree (and everything served off it — selector ` +
+              `policy, skills, worker templates, daemon source at next boot) silently ` +
+              `trails landed history. Return the checkout to the default branch and let ` +
+              `it catch up (commit/stash any work first) so it carries the default tip. ` +
+              `Blocker: ${blocker}`,
+          });
+        }
+      }
+      // Re-arm any repo no longer desynced this cycle so a future re-desync waits the
+      // full grace again (the in-memory episode is closed).
+      for (const dir of firstDesynced.keys()) {
+        if (!desynced.has(dir)) {
+          firstDesynced.delete(dir);
+        }
+      }
+      // CLEAR layer: level-trigger off the durable open-distress set — any open row whose
+      // checkout content-carries the default tip this cycle clears (robust across a
+      // restart, since the open set re-seeds the probe's watched dirs).
+      for (const dir of openDistressDirs) {
+        if (!desynced.has(dir)) {
+          decision.clear.push({ id: sharedDesyncDistressId(dir), dir });
         }
       }
       return decision;
@@ -3539,6 +3738,12 @@ export function createWorktreeDriver(
   // production → the default deadline-bounded FFI flock; the fast tier injects a
   // stub so the plumbing merge never touches the real flock.
   acquireLock?: LockAcquirer,
+  // Optional desync seed sink — called with the shared checkout's repo dir whenever a
+  // base→default merge (finalize OR the recover pass's pass-2 backstop) advanced the ref
+  // but the checkout's resync was skipped/aborted, so it trails the default tip. The loop
+  // records the dir into its in-memory latch, which the per-cycle probe then watches +
+  // escalates. Omitted (fake-deps / direct-call tests) → a no-op, byte-identical merge.
+  onResyncSkipped?: (repoDir: string) => void,
 ): WorktreeDriver {
   return {
     async provision(info, liveAttributedDirty) {
@@ -3751,6 +3956,7 @@ export function createWorktreeDriver(
           defaultBranch,
           run,
           acquireLock,
+          () => onResyncSkipped?.(repoDir),
         );
         switch (merge.kind) {
           case "off-branch":
@@ -3981,6 +4187,7 @@ export function createWorktreeDriver(
         undefined,
         epicPresentAndNotDone,
         hasActiveResolver,
+        onResyncSkipped,
       );
     },
   };
@@ -4257,6 +4464,13 @@ export async function mergeLaneBaseIntoDefault(
   defaultBranch: string,
   run: WorktreeGitRunner,
   acquireLock?: LockAcquirer,
+  // Fired (once) when the ref advanced but the post-merge catch-up did NOT bring the
+  // shared checkout current — either SKIPPED (off-default or mid-merge, so ineligible)
+  // or ABORTED (a path both upstream-changed and locally-edited failed the all-or-nothing
+  // read-tree) — so the shared checkout now TRAILS the default tip. This is the event that
+  // seeds the shared-checkout-desync distress latch. A no-op default keeps every existing
+  // caller + direct-call test byte-identical (the `merged` result shape is UNCHANGED).
+  onResyncSkipped: () => void = () => {},
 ): Promise<MergeLaneResult> {
   if (await gitIsAncestorOf(repo, baseBranch, defaultBranch, run)) {
     // The base is already an ancestor of LOCAL default — but a base merged into
@@ -4454,17 +4668,25 @@ export async function mergeLaneBaseIntoDefault(
   if (lock === null) {
     return { kind: "lock-timeout" };
   }
+  // Whether the ref advanced but the checkout did NOT catch up (resync skipped/aborted) —
+  // the desync seed, fired to `onResyncSkipped` AFTER the lock releases (a plain in-memory
+  // record, never held under the flock). Stays `false` on every not-advanced early return.
+  let resyncSkipped = false;
   try {
     // Decision-B eligibility, re-checked UNDER the lock so a concurrent commit-work
-    // cannot dirty the tree between this probe and the resync below.
-    const status = await run(["status", "--porcelain"], {
-      cwd: repo,
-      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-    });
-    const idleCleanOnDefault =
-      (await gitCurrentBranch(repo, run)) === defaultBranch &&
-      status.code === 0 &&
-      status.stdout.trim().length === 0;
+    // cannot flip the checkout's branch / mid-merge state between this probe and the
+    // catch-up below. The catch-up is a STALE-AWARE plumbing merge, NOT a clean-gate:
+    // an on-default checkout with no `MERGE_HEAD` is eligible even when it carries
+    // uncommitted edits — read-tree advances the stale paths and preserves those edits,
+    // aborting all-or-nothing only on a path both upstream-changed AND locally-edited.
+    const onDefault = (await gitCurrentBranch(repo, run)) === defaultBranch;
+    const mergeHeadProbe = await run(
+      ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    const midMerge =
+      mergeHeadProbe.code === 0 && mergeHeadProbe.stdout.trim().length > 0;
+    const catchUpEligible = onDefault && !midMerge;
     // Compare-and-swap the default ref: a stale `<old>` (a concurrent local advance
     // moved default, or the ref lock was contended) is a TRANSIENT cas-stale skip,
     // never a strand — next cycle re-derives off the advanced tip. `--end-of-options`
@@ -4485,21 +4707,44 @@ export async function mergeLaneBaseIntoDefault(
     if (upd.code !== 0) {
       return { kind: "cas-stale" };
     }
-    // Decision-B: best-effort fast-forward the idle-clean shared checkout onto the
-    // merged commit. The ref moved out from under the working tree, so the tree now
-    // shows the merge delta as an inverse diff; a `reset --hard` to the new tip
-    // discards that inverse diff (== applies the merge to the tree). Gated on the
-    // pre-move clean probe so no real WIP is ever clobbered, held under the lock, and
-    // SILENTLY swallowed on any error — cosmetic, and the merge already landed. A
-    // dirty / off-branch checkout is the human's to resync (never blocks the merge).
-    if (idleCleanOnDefault) {
-      await run(["reset", "--hard", newValue], {
+    // Decision-B (stale-aware): the ref just advanced out from under the shared checkout,
+    // so the working tree now TRAILS the new tip. Catch it up with a two-tree plumbing
+    // merge — the plumbing form of `pull --ff-only`'s twoway_merge — passing BOTH trees
+    // EXPLICITLY: `<preMergeTip>` is the CAS `<old>` (`defaultTip`), `<newTip>` the merged
+    // value, since post-CAS HEAD already names the new tip and would be the wrong `$H`.
+    // Stale (unmodified) paths advance to the new tip, locally-edited untouched paths
+    // carry forward byte-identical, and a single path both upstream-changed AND
+    // locally-edited aborts the ENTIRE op with NO writes (two-tree cases 16/17/21) — that
+    // non-zero abort is the normal safe outcome, leaving the checkout trailing so task 1's
+    // desync row stands as the honest signal. `git update-index --really-refresh`
+    // immediately before settles the stat cache, closing the racy-clean window (a full
+    // second on APFS) so a same-second human edit trips the safe abort rather than being
+    // silently clobbered. Gated on on-default + no MERGE_HEAD, held under the common-dir
+    // flock, and SILENTLY swallowed on any non-zero exit — the ref advance already landed
+    // and the catch-up is best-effort, so the `merged` result is UNCONDITIONAL. Never
+    // `checkout <tree> -- <paths>`, `checkout -f`, `--reset`, or hand-written blobs:
+    // read-tree keeps git's symlink / path-traversal protections intact and leaves sparse
+    // skip-worktree paths untouched.
+    if (catchUpEligible) {
+      await run(["update-index", "-q", "--really-refresh"], {
         cwd: repo,
         timeoutMs: GIT_LOCAL_TIMEOUT_MS,
       });
+      const readTree = await run(
+        ["read-tree", "-m", "-u", defaultTip, newValue],
+        { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      resyncSkipped = readTree.code !== 0;
+    } else {
+      resyncSkipped = true;
     }
   } finally {
     lock.release();
+  }
+  // Seed the desync latch (in-memory, lock-free) BEFORE the push: the ref already
+  // advanced, so the checkout trails regardless of the push outcome below.
+  if (resyncSkipped) {
+    onResyncSkipped();
   }
   // Branch-explicit push (pushDefaultToOrigin asserts HEAD==default, uses BatchMode +
   // ConnectTimeout, maps a spawn timeout to the TRANSIENT push-timeout) THEN a
@@ -4724,6 +4969,10 @@ export async function recoverWorktrees(
   // retargeted content conflict now dispatches a resolver for a DONE epic, so pass-2
   // must skip re-attempting the same merge while that resolver is live.
   hasActiveResolver: (epicId: string) => boolean = () => false,
+  // Desync seed sink (see {@link createWorktreeDriver}): called with a repo dir when
+  // pass-2's base→default merge advanced the ref but the shared checkout's resync was
+  // skipped/aborted, so it trails the default tip. Omitted (direct-call tests) → a no-op.
+  onResyncSkipped?: (repoDir: string) => void,
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -4924,6 +5173,7 @@ export async function recoverWorktrees(
           defaultBranch,
           run,
           acquireLock,
+          () => onResyncSkipped?.(repo),
         );
         switch (merge.kind) {
           case "not-ahead":
@@ -5803,6 +6053,12 @@ export async function loadReconcileSnapshot(
   // set (each keys on its own `daemon` id prefix) so a mid-merge wedge clear and a
   // dirt clear never target each other's row.
   const sharedDirtyDistressDirs = new Set<string>();
+  // The `repoDir`s with an OPEN per-repo shared-checkout-DESYNC distress row — a LIVE
+  // producer sibling (never drained like the wedge/dirty sets), on its own
+  // `shared-checkout-desync:` id prefix. Re-seeds the per-cycle content probe's watched
+  // set + the desync grace tracker's clear set, so a restarted worker still probes +
+  // clears a distress it minted before the restart.
+  const sharedDesyncDistressDirs = new Set<string>();
   // The `(verb, id, dir)` of every OPEN fan-in LANE pre-merge row (reason carries
   // WORKTREE_LANE_PREMERGE_REASON_PREFIX), collected VERB-AGNOSTICALLY off the REASON
   // so the recover pass's level-clear reaches a `work::<taskId>` row the typed router
@@ -5834,6 +6090,14 @@ export async function loadReconcileSnapshot(
         const dir = (row as { dir?: unknown }).dir;
         if (typeof dir === "string" && dir.length > 0) {
           sharedDirtyDistressDirs.add(dir);
+        }
+      }
+      if (isSharedDesyncDistressKey(verb, id)) {
+        // Off the row's `dir` (the probe + clear compare dirs); disjoint from the
+        // wedge/dirty sets above by the `shared-checkout-desync:` id prefix.
+        const dir = (row as { dir?: unknown }).dir;
+        if (typeof dir === "string" && dir.length > 0) {
+          sharedDesyncDistressDirs.add(dir);
         }
       }
       if (isLaneWedgeDistressKey(verb, id)) {
@@ -6115,6 +6379,7 @@ export async function loadReconcileSnapshot(
     slotOccupancyFailures,
     sharedWedgeDistressDirs,
     sharedDirtyDistressDirs,
+    sharedDesyncDistressDirs,
     laneFailures,
     laneWedgeDistressDirs,
     staleBaseDistressIds,
@@ -6254,6 +6519,20 @@ function main(): void {
   // recover pass), so it runs independent of `deps.worktree`. In-worker memory only; a
   // restart re-arms it. Distinct surface so the rows never cross-clear.
   const staleBaseLaneTracker = createStaleBaseLaneTracker();
+  // Per-repo grace tracker escalating a shared MAIN checkout left DESYNCED by a base→
+  // default merge whose resync was skipped/aborted (the ref advanced but the working tree
+  // trails the default tip) past the grace into its own per-repo distress row. A LIVE
+  // producer (UNLIKE the neutered wedge/dirty trackers): the mint is EVENT-SEEDED via
+  // `desyncSeedDirs` below and the clear is a per-cycle content probe. In-worker memory
+  // only; a restart re-seeds it from the open-row set. Distinct surface, never
+  // cross-clears the siblings.
+  const sharedDesyncTracker = createSharedCheckoutDesyncTracker();
+  // The EVENT-SEEDED desync latch: repo dirs a base→default merge (finalize / recover
+  // pass-2) advanced-then-left-trailing this run, fed by `createWorktreeDriver`'s
+  // onResyncSkipped sink below. UNIONED each cycle with the OPEN desync row set (which
+  // re-seeds it across a restart), probed for content-carries-HEAD evidence, and pruned
+  // of any dir the probe finds synced. In-worker memory only.
+  const desyncSeedDirs = new Set<string>();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version`, but two edges have no DB write to ride: `play` (set-paused →
   // false) flips an in-memory flag only, and a boot into an already-unpaused
@@ -6533,8 +6812,11 @@ function main(): void {
     // is ON `reconcile` stamps each launch with geometry the driver provisions;
     // when OFF the driver runs only the on-default-branch assertion. The branch-
     // guard hook does NOT fire here — this is the daemon producer shelling git
-    // directly, not a plan-worker subagent's Bash.
-    worktree: createWorktreeDriver(),
+    // directly, not a plan-worker subagent's Bash. The desync seed sink records each
+    // resync-skipped base merge into the in-memory latch the per-cycle probe watches.
+    worktree: createWorktreeDriver(gitExec, undefined, (repoDir) => {
+      desyncSeedDirs.add(repoDir);
+    }),
     // The MAIN-projection done-ness probe finalize gates on (the closer
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
     // same `isEpicDoneById` the recover glue threads into `worktree.recover`.
@@ -6878,6 +7160,62 @@ function main(): void {
           } catch (err) {
             console.error(
               "[autopilot-worker] stale-base lane distress step threw (non-fatal):",
+              err,
+            );
+          }
+        }
+        // Shared-checkout DESYNC distress escalation (fn-1169): a base→default merge
+        // (finalize / recover pass-2) that advanced the ref but left the shared checkout
+        // trailing seeds `desyncSeedDirs` via the driver's onResyncSkipped sink. Each
+        // cycle, UNION the in-memory seeds with the OPEN desync row set (which re-seeds the
+        // latch across a restart) and probe each WATCHED dir for content-carries-HEAD
+        // evidence: a still-desynced dir feeds the grace tracker (mint after grace, blocker
+        // named), a synced dir is pruned from the seed set + level-clears any open row.
+        // EVENT-SEEDED mint + per-cycle content clear — a human's ordinary edit (no skip
+        // event) never enters `watched`, so it never mints. A synthetic write, so gated on
+        // !paused (the level-trigger resumes on unpause); the probe runs only over the
+        // bounded watched set, so a healthy board adds ZERO git spawns. The SAME
+        // verb-neutral distress channel as the shared-checkout / lane / stale rows.
+        if (!state.paused) {
+          try {
+            const openDesyncDirs =
+              snapshot.sharedDesyncDistressDirs ?? new Set<string>();
+            const watched = new Set<string>([
+              ...desyncSeedDirs,
+              ...openDesyncDirs,
+            ]);
+            if (watched.size > 0) {
+              const desynced = new Map<string, string>();
+              for (const dir of watched) {
+                const verdict = await probeSharedCheckoutDesync(dir, gitExec);
+                if (verdict.desynced) {
+                  desynced.set(dir, verdict.blocker);
+                } else {
+                  // Content-carries HEAD → episode closed: drop the seed so a future
+                  // re-skip waits a fresh grace; any open row level-clears below.
+                  desyncSeedDirs.delete(dir);
+                }
+              }
+              const desyncDecision = sharedDesyncTracker.step({
+                desynced,
+                openDistressDirs: openDesyncDirs,
+                nowSec: deps.now(),
+              });
+              for (const m of desyncDecision.mint) {
+                deps.emitSharedWedgeDistress?.({
+                  id: m.id,
+                  dir: m.dir,
+                  reason: m.reason ?? SHARED_DESYNC_DISTRESS_REASON,
+                  ts: deps.now(),
+                });
+              }
+              for (const c of desyncDecision.clear) {
+                deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+              }
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] shared-checkout desync distress step threw (non-fatal):",
               err,
             );
           }
