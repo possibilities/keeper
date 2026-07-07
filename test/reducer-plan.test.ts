@@ -1561,6 +1561,9 @@ function getEpic(epicId: string) {
     // Schema v104 (fn-1083 task .2): nullable TEXT carrying the epic-level
     // parked-closer question.
     question: string | null;
+    // Schema v112 (fn-1151 task .2): nullable TEXT carrying the epic-level
+    // selection-review record.
+    selection_review: string | null;
   } | null;
 }
 
@@ -1669,6 +1672,9 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // Schema v104 (fn-1083 task .2): no `question` in the blob → folds to
     // NULL (no parked closer question, the zero-event reading).
     question: null,
+    // Schema v112 (fn-1151 task .2): no `selection_review` in the blob → folds
+    // to NULL (no review stamped, the zero-event reading).
+    selection_review: null,
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);

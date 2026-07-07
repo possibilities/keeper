@@ -54,6 +54,7 @@ import { runRefineContext } from "./verbs/refine_context.ts";
 import { runResolveTask } from "./verbs/resolve_task.ts";
 import { runScaffold } from "./verbs/scaffold.ts";
 import { runSelectionBrief } from "./verbs/selection_brief.ts";
+import { runSelectionReview } from "./verbs/selection_review.ts";
 import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
@@ -809,6 +810,23 @@ function dispatch(parsed: ParsedArgs): number {
         fromFollowup: readFlag(rest, "--from-followup"),
       });
       break;
+    case "selection-review": {
+      // Positional epic id, then either --set <json> or --clear. --set and
+      // --project are value-taking, so they must be skipped when scanning for
+      // the id positional. Readonly overlay write (mirrors epic-question).
+      const epicId = readPositionalSkipping(
+        rest,
+        new Set(["--set", "--project"]),
+      );
+      runSelectionReview({
+        epicId,
+        payload: readOption(rest, "--set"),
+        clear: readFlag(rest, "--clear"),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    }
     case "show":
       // Read-only: emits one payload envelope via formatOutput.
       runShow(readPositional(rest), readOption(rest, "--project"), format);
