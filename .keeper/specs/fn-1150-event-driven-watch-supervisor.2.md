@@ -38,5 +38,5 @@ Mock-socket subscribe tests (makeMockConnect / takeOutbound / deliver pattern): 
 - [ ] Subscribe-count and gate-hold tests cover both flag states
 
 ## Done summary
-
+Added the ADR-0011 gated includeDispatchFailures fold to subscribeReadiness (null-guarded state, first-paint gate, spread-when-present dispatchFailures member — byte-identical off-path). Flipped keeper status to one-round-trip snapshot sourcing (out-of-band queryCollection deleted) and keeper await drained --fail-on-stuck to the shared snapshot (bespoke dispatch_failures stream deleted).
 ## Evidence
