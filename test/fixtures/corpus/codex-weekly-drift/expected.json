@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "usage": {
+    "session": {
+      "percent_used": 2,
+      "resets_at": "2026-06-29T01:18:00-04:00"
+    },
+    "week": {
+      "percent_used": 0,
+      "resets_at": "2026-07-05T20:18:00-04:00"
+    },
+    "codex_spark_session": {
+      "percent_used": 0,
+      "resets_at": "2026-06-29T01:28:00-04:00"
+    },
+    "codex_spark_week": {
+      "percent_used": 0,
+      "resets_at": "2026-07-05T20:28:00-04:00"
+    }
+  },
+  "subscription_active": null
+}

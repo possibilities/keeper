@@ -5751,16 +5751,10 @@ function spawnedWorkerNames(opts?: {
   // config carrying it so this boot is deterministic regardless of the live
   // `~/.config/keeper/config.yaml` — `builds` is in ALL_WORKERS and must spawn.
   const configPath = join(tmpDir, "keeper-config.yaml");
-  // `builds` is gated on `buildbot_url`; `usageScraper` is gated on BOTH a
-  // resolvable `uv` path + agentusage project dir. Both workers are in
-  // ALL_WORKERS and must spawn, so pin all three keys (the values are never
-  // dereferenced under the Worker spy — the gate only checks they resolve).
-  writeFileSync(
-    configPath,
-    "buildbot_url: http://localhost:8010\n" +
-      `usage_scraper_uv_path: ${join(tmpDir, "uv")}\n` +
-      `usage_scraper_project_dir: ${tmpDir}\n`,
-  );
+  // `builds` is gated on a configured `buildbot_url`; pin it so that worker
+  // spawns deterministically. `usageScraper` spawns unconditionally on the plain
+  // selector (no runtime gate), so it needs no config pinning.
+  writeFileSync(configPath, "buildbot_url: http://localhost:8010\n");
   const sandbox: Record<string, string> = {
     KEEPER_DB: dbPath,
     KEEPER_CONFIG: configPath,
@@ -5803,9 +5797,9 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-two 
   // fn-801 added `renamer` (the tmux window-namer; no watcher, no message minter);
   // fn-875 added `bus` (the Agent Bus UDS relay; no watcher, no message minter —
   // owns its own bus.db + bus.sock, reads keeper.db read-only); fn-930 added
-  // `usageScraper` (the in-process agentusage producer, gated on a resolvable `uv`
-  // runtime — `spawnedWorkerNames` pins the config keys; no watcher, no message
-  // minter — writes only on-disk envelopes the `usage` consumer folds); fn-946
+  // `usageScraper` (the in-process agentusage producer; spawns unconditionally on
+  // the plain selector — no watcher, no message minter — writes only on-disk
+  // envelopes the `usage` consumer folds); fn-946
   // added `handoff` (the `keeper handoff` dispatch worker; no watcher, mints
   // HandoffDispatching/HandoffLaunchFailed, reads keeper.db read-only); fn-952
   // added `tmuxControl` (the persistent `tmux -C` control-focus worker; gated on

@@ -10,10 +10,10 @@
  * — no statistical sampling, no real daemon, per-test tmpdir only.
  *
  * The picker reads two sources redirected into tmp: per-account envelopes under
- * the state dir (via `setStateDir`) and the catalog at
- * `$XDG_CONFIG_HOME/agentusage/config.yaml` (via the env var). The clock is
- * pinned with `setClock` — one `nowFn()` read per pick, so stamps strictly
- * increase and LRU order is exact.
+ * the state dir (via `setStateDir`) and the `usage_models` registry in keeper's
+ * `config.yaml` (via the `KEEPER_CONFIG` env override). The clock is pinned with
+ * `setClock` — one `nowFn()` read per pick, so stamps strictly increase and LRU
+ * order is exact.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -37,35 +37,42 @@ import {
 
 let tmpDir: string;
 let stateDir: string;
-let configHome: string;
-let savedXdg: string | undefined;
+let configPath: string;
+let savedKeeperConfig: string | undefined;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "agentusage-picker-"));
   stateDir = join(tmpDir, "state");
   mkdirSync(stateDir);
-  configHome = join(tmpDir, "config");
-  mkdirSync(join(configHome, "agentusage"), { recursive: true });
   setStateDir(stateDir);
-  savedXdg = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = configHome;
+  configPath = join(tmpDir, "config.yaml");
+  savedKeeperConfig = process.env.KEEPER_CONFIG;
+  // Point at the (not-yet-written) keeper config so a test without writeConfig
+  // fail-opens to an empty registry instead of reading the real user config.
+  process.env.KEEPER_CONFIG = configPath;
 });
 
 afterEach(() => {
   resetClock();
-  if (savedXdg === undefined) {
-    delete process.env.XDG_CONFIG_HOME;
+  if (savedKeeperConfig === undefined) {
+    delete process.env.KEEPER_CONFIG;
   } else {
-    process.env.XDG_CONFIG_HOME = savedXdg;
+    process.env.KEEPER_CONFIG = savedKeeperConfig;
   }
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
 // ---------- helpers ---------------------------------------------------------
 
+// Declare the claude profile ids via keeper's `usage_models` registry (aliases
+// are irrelevant to the picker, so every id is null-aliased). listProfiles reads
+// this through resolveUsageModels.
 function writeConfig(profiles: string[]): void {
-  const yaml = `profiles:\n${profiles.map((p) => `  - ${p}`).join("\n")}\n`;
-  writeFileSync(join(configHome, "agentusage", "config.yaml"), yaml);
+  const yaml =
+    profiles.length > 0
+      ? `usage_models:\n${profiles.map((p) => `  ${p}:`).join("\n")}\n`
+      : "usage_models: {}\n";
+  writeFileSync(configPath, yaml);
 }
 
 interface EnvelopeOpts {
@@ -755,10 +762,10 @@ describe("rate-limit cooldown", () => {
   });
 });
 
-// ---------- list_profiles + YAML adapter ------------------------------------
+// ---------- listProfiles (declared claude ids from usage_models) ------------
 
 describe("listProfiles", () => {
-  test("reads catalog", () => {
+  test("returns the declared claude ids from usage_models", () => {
     writeConfig(["alpha", "beta"]);
     expect(listProfiles()).toEqual(["alpha", "beta"]);
   });
@@ -767,18 +774,13 @@ describe("listProfiles", () => {
     expect(listProfiles()).toEqual([]);
   });
 
-  test("parses the real ~/.config/agentusage/config.yaml shape via Bun.YAML", () => {
-    // Guards the YAML-1.2-only adapter against the real config corpus shape
-    // (a plain string list under `profiles:`; corpus is boolean-free).
+  test("excludes the codex id — only claude profiles balance", () => {
+    // codex is a declared model but not a claude profile, so it never enters the
+    // picker's rotation set.
     writeFileSync(
-      join(configHome, "agentusage", "config.yaml"),
-      "profiles:\n  - default\n  - multi-claude-1\n  - multi-claude-2\n  - multi-claude-3\n",
+      configPath,
+      "usage_models:\n  default: claude-0\n  multi-claude-1:\n  codex: gpt\n",
     );
-    expect(listProfiles()).toEqual([
-      "default",
-      "multi-claude-1",
-      "multi-claude-2",
-      "multi-claude-3",
-    ]);
+    expect(listProfiles()).toEqual(["default", "multi-claude-1"]);
   });
 });

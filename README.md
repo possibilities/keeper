@@ -41,8 +41,9 @@ separate scoped RPC path.
 - **No multi-machine** — single host, single DB file.
 - **No kernel watchers on keeper's own DB** — `data_version` polling is the change-detection
   primitive (FSEvents/kqueue drop same-process and WAL writes on macOS). External trees (transcripts,
-  `.keeper` plan files) use `@parcel/watcher`, keeper's one third-party runtime dep; the git surface
-  is poll-only.
+  `.keeper` plan files) use `@parcel/watcher`; the git surface is poll-only. The usage scraper's
+  Temporal arithmetic pins `@js-temporal/polyfill` (exact version — its serialization format is
+  spec-sensitive). Both are keeper's only third-party runtime deps.
 - **No in-process self-heal** — an unrecoverable error exits non-zero and the LaunchAgent restarts
   the single recovery path.
 
@@ -78,7 +79,9 @@ bash scripts/install.sh          # bun install -> bun link -> keeperd LaunchAgen
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
 path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
 owned by you and mode `644` or macOS silently ignores it. Optional roots and runtimes live in
-`~/.config/keeper/config.yaml`. The autoclose worker force-closes the tmux window of a done-and-idle
+`~/.config/keeper/config.yaml`, including the `usage_models` map that declares which claude profiles
+and codex the usage scraper produces envelopes for and their display aliases (an absent or malformed
+map idles the producer rather than erroring). The autoclose worker force-closes the tmux window of a done-and-idle
 keeper-dispatched agent (an autopilot `work::`/`close::` worker or a finished claude panel leg) after a
 grace: `autoclose_enabled` (default `true`; set `false`/`off`/`no`/`0` to disable — re-read every pulse,
 so a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`) govern it.

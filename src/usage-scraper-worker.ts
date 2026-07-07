@@ -68,6 +68,12 @@ import { MAX_CLAUDE_JSON_BYTES, resolveTierMultiplier } from "./claude-tier";
 import { openDb } from "./db";
 import { FileLock } from "./usage-flock";
 import {
+  claudeProfileIds,
+  hasCodexModel,
+  resolveUsageModels,
+  type UsageModels,
+} from "./usage-models";
+import {
   type AccountState,
   asAccountState,
   asUsageErrorKind,
@@ -185,40 +191,6 @@ function stringifyErr(err: unknown): string {
 
 // ---------- account discovery + tier resolution (TS-side) -------------------
 
-/** Resolve the XDG config base dir, honoring `XDG_CONFIG_HOME`. */
-function xdgConfigHome(): string {
-  const env = process.env.XDG_CONFIG_HOME;
-  return env && env.length > 0 ? env : join(homedir(), ".config");
-}
-
-/**
- * Configured Claude profile names from agentusage's `config.yaml`
- * (`profiles: [name1, ...]`). Fail-open: any missing/malformed config returns
- * `[]` (the worker then runs codex-only). Mirrors the picker's `listProfiles`
- * and the daemon's `_load_profile_names`.
- */
-export function loadProfileNames(): string[] {
-  const path = join(xdgConfigHome(), "agentusage", "config.yaml");
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch {
-    return [];
-  }
-  let data: unknown;
-  try {
-    data = Bun.YAML.parse(text);
-  } catch {
-    return [];
-  }
-  if (!isRecord(data) || !Array.isArray(data.profiles)) {
-    return [];
-  }
-  return data.profiles.filter(
-    (e): e is string => typeof e === "string" && e.length > 0,
-  );
-}
-
 /**
  * Per-path {size, mtimeMs} → resolved-multiplier memo gating the readFileSync +
  * JSON.parse in {@link resolveMultiplierOrNull}. `.claude.json` runs multi-MB and
@@ -322,35 +294,27 @@ export function reResolveMultiplier(
 }
 
 /**
- * Build the runtime account registry: one claude `Account` per configured profile
- * (multiplier derived from its tier) + the always-appended codex account (no tier,
- * 1x). A profile whose name would NOT pass {@link import("./usage-worker").isUsageFilename}
- * — i.e. it would produce an envelope filename the consumer silently ignores — is
- * DROPPED with a warning, so a misnamed profile never produces an invisible file.
- * Mirrors the daemon's `_build_accounts`.
+ * Build the runtime account registry from the declared `usage_models` set: one
+ * claude `Account` per declared claude id (multiplier derived from its own tier)
+ * plus the codex account (no tier, 1x) ONLY when `codex` is declared. An empty
+ * registry yields no accounts — the worker then idles (there is no implicit
+ * codex). The registry keys are already envelope-id-validated at parse time, so
+ * no per-id shape check is needed here. Mirrors the daemon's `_build_accounts`.
  */
-export function buildAccounts(): Account[] {
+export function buildAccounts(
+  models: UsageModels,
+  homeDir: string = homedir(),
+): Account[] {
   const accounts: Account[] = [];
-  const seen = new Set<string>();
-  for (const name of loadProfileNames()) {
-    if (!isUsageId(name)) {
-      console.error(
-        `[usage-scraper] profile ${JSON.stringify(name)} is not a valid envelope id (must match [a-z0-9-]+); skipping`,
-      );
-      continue;
-    }
-    if (seen.has(name)) {
-      continue;
-    }
-    seen.add(name);
+  for (const id of claudeProfileIds(models)) {
     accounts.push({
-      id: name,
+      id,
       target: "claude",
-      profile: name,
-      multiplier: resolveMultiplierOrNull(name),
+      profile: id,
+      multiplier: resolveMultiplierOrNull(id, homeDir),
     });
   }
-  if (!seen.has("codex")) {
+  if (hasCodexModel(models)) {
     accounts.push({ id: "codex", target: "codex", profile: "", multiplier: 1 });
   }
   return accounts;
@@ -1363,7 +1327,7 @@ function main(): void {
   const gate = new ProfileGate(clock);
   const targets = new TargetMutex();
 
-  const accounts = buildAccounts();
+  const accounts = buildAccounts(resolveUsageModels());
   if (accounts.length === 0) {
     console.error("[usage-scraper] no accounts resolved; idling");
   }

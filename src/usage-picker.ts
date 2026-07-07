@@ -21,16 +21,16 @@
  * (see {@link chooseByLadder}). A dead or stalled scraper degrades the fleet to
  * plain LRU rotation and the picker never throws.
  *
- * DB-free leaf: imports only `node:fs`/`node:os`/`node:path` + the vendored
- * `src/usage-flock.ts`, never `src/db.ts`, so the `keeper agent` cold-start stays
- * cheap (the `cli/agent.ts` db-free discipline).
+ * DB-free leaf: imports only `node:fs`/`node:os`/`node:path` + the dep-free
+ * `src/usage-flock.ts` / `src/usage-models.ts`, never `src/db.ts`, so the
+ * `keeper agent` cold-start stays cheap (the `cli/agent.ts` db-free discipline).
  *
  * Two public functions, both fail-open:
  *
  * - `pickProfile() -> string` — the admitted, LRU-oldest subscribed account;
  *   never throws, every failure path returns `DEFAULT_PROFILE`.
- * - `listProfiles() -> string[]` — the configured Claude profile names; `[]`
- *   on missing / malformed config.
+ * - `listProfiles() -> string[]` — the declared claude profile ids from the
+ *   `usage_models` keeper-config registry; `[]` on missing / malformed config.
  *
  * `DEFAULT_PROFILE` ("default") is itself a real account id, so the fallback
  * and a legitimate pick are the same string.
@@ -48,6 +48,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { FileLock } from "./usage-flock";
+import { claudeProfileIds, resolveUsageModels } from "./usage-models";
 
 // Returned when no profile resolves. Also a real account id — the wrapper maps
 // "default" onto the default Claude account.
@@ -108,13 +109,6 @@ function pickerLockPath(): string {
   return join(stateDir, "picker.json.lock");
 }
 
-function configPath(): string {
-  // `~/.config/agentusage/config.yaml` — the same catalog the daemon reads.
-  const env = process.env.XDG_CONFIG_HOME;
-  const base = env ? env : join(homedir(), ".config");
-  return join(base, "agentusage", "config.yaml");
-}
-
 type Envelope = Record<string, unknown>;
 type PickerState = Record<string, unknown>;
 type PicksMap = Record<string, unknown>;
@@ -134,48 +128,17 @@ interface Row {
   effWeek: number;
 }
 
-// ---------- YAML adapter ----------------------------------------------------
-
-/**
- * Parse a YAML document. Bun.YAML targets YAML 1.2 — no `yes/no/on/off`
- * booleans (the agentusage config corpus is boolean-free, so this is safe).
- * Isolated behind one function so js-yaml could swap in if a 1.1-only document
- * ever appears. Returns `null` on any parse failure (fail-open caller turns
- * that into `[]`).
- */
-function parseYaml(text: string): unknown {
-  try {
-    return Bun.YAML.parse(text);
-  } catch {
-    return null;
-  }
-}
-
 // ---------- listProfiles ----------------------------------------------------
 
 /**
- * Configured Claude profile names from agentusage's config.yaml. Reads the same
- * `profiles: [name1, ...]` list the daemon builds its registry from. Fail-open:
- * any missing/malformed config returns `[]` rather than throwing.
+ * The declared claude profile ids from the `usage_models` keeper-config registry
+ * (every declared id except `codex`) — the same set the producer's
+ * `buildAccounts` scrapes. Fail-open: a missing/malformed config folds to an
+ * empty registry, so this returns `[]` rather than throwing. Reads the registry
+ * through the dep-free `src/usage-models.ts` so the picker stays off `src/db.ts`.
  */
 export function listProfiles(): string[] {
-  let text: string;
-  try {
-    text = readFileSync(configPath(), "utf8");
-  } catch {
-    return [];
-  }
-  const data = parseYaml(text);
-  if (!isRecord(data)) {
-    return [];
-  }
-  const raw = data.profiles;
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-  return raw.filter(
-    (entry): entry is string => typeof entry === "string" && entry.length > 0,
-  );
+  return claudeProfileIds(resolveUsageModels());
 }
 
 // ---------- pickProfile -----------------------------------------------------

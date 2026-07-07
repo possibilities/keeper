@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "error",
+  "error_kind": "format_changed",
+  "error_type": "ClaudeUsageParseError",
+  "message": "label 'Current session': percent line did not match: '  usage is unavailable'",
+  "screen_excerpt": [
+    "  Settings  Status   Config   Usage   Stats",
+    "  Current session",
+    "  usage is unavailable",
+    "  Resets 3pm (America/New_York)",
+    "  Current week (all models)",
+    "  [██░░░░░░░░░░░░░░] 17% used",
+    "  Resets May 31 at 9am (America/New_York)"
+  ]
+}

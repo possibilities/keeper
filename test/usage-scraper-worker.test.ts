@@ -25,6 +25,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { UsageModels } from "../src/usage-models";
 import type {
   ScrapeAccount,
   ScrapeResult,
@@ -34,6 +35,7 @@ import {
   type Account,
   AccountLoop,
   type AccountLoopDeps,
+  buildAccounts,
   buildEnvelope,
   deriveLiftAt,
   type Envelope,
@@ -1263,6 +1265,53 @@ describe("resolveMultiplierOrNull (injected home seam)", () => {
       JSON.stringify({ someOtherKey: true }),
     );
     expect(resolveMultiplierOrNull("default", tmpDir)).toBeNull();
+  });
+});
+
+describe("buildAccounts (declared usage_models registry)", () => {
+  test("one claude Account per declared id, multiplier tier-derived, codex appended when declared", () => {
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_20x");
+    writeProfileClaudeJson(tmpDir, "multi-claude-1", "default_claude_max_5x");
+    const models: UsageModels = {
+      default: "claude-0",
+      "multi-claude-1": null,
+      codex: "gpt",
+    };
+    expect(buildAccounts(models, tmpDir)).toEqual([
+      { id: "default", target: "claude", profile: "default", multiplier: 20 },
+      {
+        id: "multi-claude-1",
+        target: "claude",
+        profile: "multi-claude-1",
+        multiplier: 5,
+      },
+      { id: "codex", target: "codex", profile: "", multiplier: 1 },
+    ]);
+  });
+
+  test("an empty registry yields no accounts (the worker idles — no implicit codex)", () => {
+    expect(buildAccounts({}, tmpDir)).toEqual([]);
+  });
+
+  test("codex is NOT appended when it is not declared", () => {
+    writeProfileClaudeJson(tmpDir, "default", "default_claude_max_5x");
+    const models: UsageModels = { default: null };
+    expect(buildAccounts(models, tmpDir)).toEqual([
+      { id: "default", target: "claude", profile: "default", multiplier: 5 },
+    ]);
+  });
+
+  test("a codex-only registry yields only the codex account", () => {
+    expect(buildAccounts({ codex: null }, tmpDir)).toEqual([
+      { id: "codex", target: "codex", profile: "", multiplier: 1 },
+    ]);
+  });
+
+  test("an unresolvable tier carries a null multiplier (renders ?x, no downgrade)", () => {
+    // No .claude.json for `default` → resolveMultiplierOrNull returns null.
+    expect(buildAccounts({ default: null }, tmpDir)).toEqual([
+      { id: "default", target: "claude", profile: "default", multiplier: null },
+    ]);
   });
 });
 

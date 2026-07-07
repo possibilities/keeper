@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!node_modules", "!dist", "!plugins/plan", "!plugins/prompt"]
+    "includes": ["**", "!node_modules", "!dist", "!plugins/plan", "!plugins/prompt", "!test/fixtures/corpus"]
   },
   "formatter": {
     "enabled": true,

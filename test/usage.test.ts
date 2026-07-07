@@ -23,11 +23,13 @@
  * is rendered by the live-shell banner, not the row body.
  */
 
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
   formatShadowAdvisory,
   renderRowLines,
   renderSessionLines,
+  routeUsage,
+  SCRAPE_HELP,
 } from "../cli/usage";
 import type { ShadowProfileFinding } from "../src/agent/shadow-profiles";
 import {
@@ -2022,4 +2024,70 @@ test("advisory lists every qualifying shadow across agents on one line", () => {
   expect(lines[0]).toContain("claude default/");
   expect(lines[0]).toContain("pi auto/");
   expect(lines[0]).not.toContain("real");
+});
+
+// ---------------------------------------------------------------------------
+// `keeper usage scrape` subverb pre-pass. The leading-token router lands ahead
+// of the view's parseArgs: a `scrape` token delegates to the merged scrape CLI
+// with argv forwarded VERBATIM, `scrape --help`/`-h` is the subverb's own pure
+// help, and every other argv (bare, a leading flag, top-level `--help`) is the
+// unchanged view path.
+// ---------------------------------------------------------------------------
+describe("routeUsage — the scrape subverb pre-pass", () => {
+  test("a leading scrape token forwards the remaining argv verbatim", () => {
+    expect(
+      routeUsage([
+        "scrape",
+        "--target",
+        "claude",
+        "--profile",
+        "default",
+        "--rows",
+        "50",
+      ]),
+    ).toEqual({
+      kind: "scrape",
+      argv: ["--target", "claude", "--profile", "default", "--rows", "50"],
+    });
+  });
+
+  test("a bare scrape token delegates an empty argv (entry owns the misuse)", () => {
+    expect(routeUsage(["scrape"])).toEqual({ kind: "scrape", argv: [] });
+  });
+
+  test("scrape --help is the subverb's own pure help", () => {
+    expect(routeUsage(["scrape", "--help"])).toEqual({ kind: "scrape-help" });
+  });
+
+  test("scrape -h is the subverb's own pure help", () => {
+    expect(routeUsage(["scrape", "-h"])).toEqual({ kind: "scrape-help" });
+  });
+
+  test("a --help among scrape flags routes to help, not delegation", () => {
+    expect(routeUsage(["scrape", "--target", "claude", "--help"])).toEqual({
+      kind: "scrape-help",
+    });
+  });
+
+  test("a bare argv is the unchanged view path", () => {
+    expect(routeUsage([])).toEqual({ kind: "view" });
+  });
+
+  test("a leading view flag is the unchanged view path", () => {
+    expect(routeUsage(["--snapshot"])).toEqual({ kind: "view" });
+  });
+
+  test("top-level --help stays the view path (view owns its own help)", () => {
+    expect(routeUsage(["--help"])).toEqual({ kind: "view" });
+  });
+
+  test("a non-scrape leading positional is the view path", () => {
+    expect(routeUsage(["bogus"])).toEqual({ kind: "view" });
+  });
+
+  test("SCRAPE_HELP documents the subverb and its flags", () => {
+    expect(SCRAPE_HELP).toContain("keeper usage scrape");
+    expect(SCRAPE_HELP).toContain("--target");
+    expect(SCRAPE_HELP).toContain("--profile");
+  });
 });
