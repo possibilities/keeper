@@ -154,8 +154,7 @@ describe("subagents matrix loader", () => {
 
 // Cross-island parity: `loadHostMatrix` (plan island, this file) and `loadMatrix`
 // (src/agent/matrix.ts, the launcher island) are two hand-written parsers of the
-// same matrix.yaml shape. They drifted once on the present-but-unreadable path
-// (F1) — this pins them together so the next drift is caught mechanically.
+// same matrix.yaml shape; this pins them so drift is caught mechanically.
 describe("loadHostMatrix / loadMatrix cross-island parity", () => {
   // A minimal roster both islands accept: claude native (opus), codex wrapped
   // (gpt-5.5), a valid harness name recognized by the launcher's registry.
