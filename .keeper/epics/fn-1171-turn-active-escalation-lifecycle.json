@@ -7,7 +7,7 @@
     "fn-1167-variable-depth-automated-review"
   ],
   "id": "fn-1171-turn-active-escalation-lifecycle",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T20:32:43.441000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T20:32:36.233000Z"
+  "updated_at": "2026-07-07T20:32:43.441000Z"
 }
