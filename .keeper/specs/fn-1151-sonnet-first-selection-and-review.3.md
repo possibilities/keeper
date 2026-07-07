@@ -49,5 +49,5 @@ needs-human line.
 - [ ] Clearing the review removes the board line and the count on the next snapshot.
 
 ## Done summary
-
+Surface the close-time selection-review flag as a display-only needs-human class: keeper status gains needs_human.selection_reviews (schema v6, zero into total/jammed) and the board renders a 'selection review' block, both sourced from a new epics_selection_review narrow unfiltered read so a flagged CLOSED epic outlives its epic's close.
 ## Evidence
