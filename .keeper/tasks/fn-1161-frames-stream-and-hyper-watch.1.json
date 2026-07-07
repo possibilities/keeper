@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T13:33:46.397000Z",
+  "depends_on": [],
+  "epic": "fn-1161-frames-stream-and-hyper-watch",
+  "id": "fn-1161-frames-stream-and-hyper-watch.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Shared frames emitter helper",
+  "updated_at": "2026-07-07T13:33:46.397000Z"
+}
