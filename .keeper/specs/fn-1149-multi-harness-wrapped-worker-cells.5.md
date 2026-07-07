@@ -81,5 +81,5 @@ failure when bindings are absent. Runtime behavior is task 8's slow-tier e2e.
       emitting a partial agent.
 
 ## Done summary
-
+Composed worker.md.tmpl into a native/wrapped cell shell: frontmatter branches on the driver (wrapped bakes the wrapper driver at maxTurns 160), the implement/commit middle moves to two template/_partials/ Liquid includes (native byte-faithful, wrapped carries the full delegate-adjudicate-normalize-commit contract), and a missing driver binding fails the render loudly.
 ## Evidence
