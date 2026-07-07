@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical test addition mirroring an explicitly-named sibling pattern with one obvious survives-the-sweep assertion, no design choice.",
+      "task_id": "fn-1170-test-desync-distress-gc-exemption.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T19:45:10.355000Z",
+  "epic_id": "fn-1170-test-desync-distress-gc-exemption",
+  "input_hash": "176b3f650f12f94610da60a88f24760c35b7c5d3a87a95be5b13a75fa160d642",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 392904549,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"sonnet\",\"rationale\":\"Mechanical test addition mirroring an explicitly-named sibling pattern with one obvious survives-the-sweep assertion, no design choice.\",\"confidence\":0.9}]}"
+}
