@@ -34,5 +34,5 @@ Frontmatter greps (user-invoked flag, parseable frontmatter); behavior is prose 
 - [ ] Offline and missing-ledger cases degrade to an honest report, never an error spiral
 
 ## Done summary
-
+Added .claude/skills/matt-upgrade/SKILL.md, a user-invoked native project skill that reads the adoption ledger, diffs the pin against upstream mattpocock/skills HEAD (preferring CHANGELOG/.changeset), triages drift/new/watching buckets anchored to prior verdicts, and proposes one clustered ledger update on confirmation.
 ## Evidence

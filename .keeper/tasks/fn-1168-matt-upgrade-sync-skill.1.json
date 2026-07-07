@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Build matt-upgrade sync skill",
-  "updated_at": "2026-07-07T17:47:22.065000Z"
+  "updated_at": "2026-07-07T20:00:04.750000Z",
+  "worker_done_at": "2026-07-07T20:00:04.750000Z"
 }
