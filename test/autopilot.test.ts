@@ -1108,9 +1108,10 @@ test("autopilotBannerLabel — paused flag drives the pill independent of mode/c
   ).toBe("[playing] · yolo · max ∞ · per-root 1 · worktree:off");
 });
 
-test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` segment for BOTH yolo and armed (fn-959)", () => {
-  // The worktree segment renders for BOTH on and off so the live durable toggle
-  // is always scannable; ON is `worktree:on`.
+test("autopilotBannerLabel — worktree mode ON renders `· worktree:on` and drops the per-root segment for BOTH yolo and armed (fn-959)", () => {
+  // The per-root cap is deliberately ignored under worktree mode (each ready
+  // task gets its own cap-1 lane), so the segment is absent entirely there —
+  // the worktree segment still renders for BOTH on and off.
   expect(
     autopilotBannerLabel({
       paused: false,
@@ -1120,7 +1121,7 @@ test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` seg
       armedCount: 0,
       worktreeMode: true,
     }),
-  ).toBe("[playing] · yolo · max 3 · per-root 2 · worktree:on");
+  ).toBe("[playing] · yolo · max 3 · worktree:on");
   expect(
     autopilotBannerLabel({
       paused: false,
@@ -1130,35 +1131,32 @@ test("autopilotBannerLabel — worktree mode ON renders the `· worktree:on` seg
       armedCount: 2,
       worktreeMode: true,
     }),
-  ).toBe("[playing] · armed · 2 armed · max ∞ · per-root 1 · worktree:on");
+  ).toBe("[playing] · armed · 2 armed · max ∞ · worktree:on");
 });
 
-test("autopilotBannerLabel — annotates the STORED intent only when it differs from effective (worktree-off floor)", () => {
-  // Worktree off ⇒ effective 1 while the stored intent stays 3: the latent cap
-  // is surfaced as `per-root 1 (stored 3)` so it is never invisible.
+test("autopilotBannerLabel — never renders a `(stored …)` annotation in either mode", () => {
+  // The stored intent is dropped from the banner entirely — only the
+  // effective cap (visible only under worktree:off) is shown.
   expect(
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: null,
       maxConcurrentPerRoot: 1,
-      maxConcurrentPerRootStored: 3,
       mode: "yolo",
       armedCount: 0,
       worktreeMode: false,
     }),
-  ).toBe("[playing] · yolo · max ∞ · per-root 1 (stored 3) · worktree:off");
-  // Stored equal to effective (worktree on) → no annotation.
+  ).toBe("[playing] · yolo · max ∞ · per-root 1 · worktree:off");
   expect(
     autopilotBannerLabel({
       paused: false,
       maxConcurrentJobs: null,
-      maxConcurrentPerRoot: 3,
-      maxConcurrentPerRootStored: 3,
+      maxConcurrentPerRoot: 1,
       mode: "yolo",
       armedCount: 0,
       worktreeMode: true,
     }),
-  ).toBe("[playing] · yolo · max ∞ · per-root 3 · worktree:on");
+  ).toBe("[playing] · yolo · max ∞ · worktree:on");
 });
 
 test("autopilotBannerLabel — needs-human count surfaces a pill right after play/pause; 0 or omitted suppresses it", () => {
@@ -1173,11 +1171,9 @@ test("autopilotBannerLabel — needs-human count surfaces a pill right after pla
       worktreeMode: true,
       needsHumanCount: 3,
     }),
-  ).toBe(
-    "[playing] · [needs-human:3] · yolo · max ∞ · per-root 1 · worktree:on",
-  );
+  ).toBe("[playing] · [needs-human:3] · yolo · max ∞ · worktree:on");
   // Explicit 0 and omitted both render the historical banner byte-for-byte.
-  const clean = "[playing] · yolo · max ∞ · per-root 1 · worktree:on";
+  const clean = "[playing] · yolo · max ∞ · worktree:on";
   expect(
     autopilotBannerLabel({
       paused: false,
