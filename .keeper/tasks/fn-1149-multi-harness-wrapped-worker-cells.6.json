@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Selector pipeline for wrapped models",
-  "updated_at": "2026-07-07T00:40:34.519000Z"
+  "updated_at": "2026-07-07T03:05:23.166000Z",
+  "worker_done_at": "2026-07-07T03:05:23.166000Z"
 }

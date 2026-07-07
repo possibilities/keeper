@@ -49,5 +49,5 @@ against embedded defaults.
       language, and the guidance drift gates stay green.
 
 ## Done summary
-
+selection-brief builds candidate cells + brief axes from effectiveMatrix() so host-roster wrapped models are selectable; unguided roster models fail the brief loud; drift gate tolerates host-provisioned model blocks; added gpt-5.5 and gpt-5.3-codex-spark capability-fit guidance.
 ## Evidence
