@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T01:32:48.224000Z",
+  "depends_on": [],
+  "epic": "fn-1152-durable-and-visible-awaits",
+  "id": "fn-1152-durable-and-visible-awaits.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Design durable visible awaits",
+  "updated_at": "2026-07-07T01:32:48.224000Z"
+}
