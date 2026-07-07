@@ -5,6 +5,7 @@
  * fake pane backend (per the test-isolation rules).
  */
 
+import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
   AUTOCLOSE_IDLE_MS,
@@ -41,6 +42,7 @@ const autopilotWork = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_generation_id: "gen-1",
   last_input_request_at: null,
   last_permission_prompt_at: null,
+  escalation_instance: null,
   ...over,
 });
 
@@ -71,8 +73,44 @@ const panelLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_generation_id: "gen-3",
   last_input_request_at: null,
   last_permission_prompt_at: null,
+  escalation_instance: null,
   ...over,
 });
+
+/** A stopped, escalation-dispatched session that passes every rail. Defaults to
+ *  `unblock`; override `plan_verb`/`plan_ref`/`title` for the other two verbs.
+ *  Escalation sessions launch into MANAGED_EXEC_SESSION ("autopilot"), so the
+ *  pane fixture reuses the autopilot session name. Its instance is reaped only
+ *  when its `job_id` is in the `escalationDone` set (the done-signal). */
+const escalationSession = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
+  job_id: "j-escal",
+  state: "stopped",
+  pid: 333,
+  start_time: "300",
+  plan_verb: "unblock",
+  plan_ref: "fn-1-x.2",
+  title: "unblock::fn-1-x.2",
+  dispatch_origin: "escalation",
+  backend_exec_type: "tmux",
+  backend_exec_pane_id: "%4",
+  backend_exec_birth_session_id: "autopilot",
+  backend_exec_generation_id: "gen-4",
+  last_input_request_at: null,
+  last_permission_prompt_at: null,
+  escalation_instance: 500,
+  ...over,
+});
+
+/** A swept pane matching the escalation fixture's pane id + generation, in the
+ *  managed ("autopilot") session. */
+const escalationPane = (over: Partial<PaneInfo> = {}): PaneInfo =>
+  pane({
+    tmuxGenerationId: "gen-4",
+    paneId: "%4",
+    windowId: "@4",
+    windowName: "unblock::fn-1-x.2",
+    ...over,
+  });
 
 /** A swept pane matching a job's pane id and tmux generation. */
 const pane = (over: Partial<PaneInfo> = {}): PaneInfo => ({
@@ -108,6 +146,7 @@ const run = (
   computeAutocloseReaps({
     jobs: [],
     readiness: readiness(),
+    escalationDone: new Set(),
     panes: [],
     graceMap: new Map(),
     config: CONFIG,
@@ -117,7 +156,7 @@ const run = (
   });
 
 // ---------------------------------------------------------------------------
-// IN — the three closeable classes
+// IN — the closeable classes
 // ---------------------------------------------------------------------------
 
 test("IN: autopilot work, completed + stopped, past grace → reaped", () => {
@@ -169,6 +208,64 @@ test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
   expect(reaps[0]).toMatchObject({ bucket: "panel", ref: "panel::claude::q1" });
 });
 
+test("IN: escalation unblock session, resolved instance, past grace → reaped", () => {
+  const { reaps } = run({
+    jobs: [escalationSession()],
+    panes: [escalationPane()],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({
+    jobId: "j-escal",
+    pid: 333,
+    startTime: "300",
+    paneId: "%4",
+    bucket: "escalation",
+    ref: "unblock::fn-1-x.2",
+  });
+});
+
+test("IN: escalation deconflict session, resolved instance, past grace → reaped", () => {
+  const { reaps } = run({
+    jobs: [
+      escalationSession({
+        plan_verb: "deconflict",
+        plan_ref: "fn-1-x",
+        title: "deconflict::fn-1-x",
+      }),
+    ],
+    panes: [escalationPane({ windowName: "deconflict::fn-1-x" })],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({
+    bucket: "escalation",
+    ref: "deconflict::fn-1-x",
+  });
+});
+
+test("IN: escalation resolve session, resolved instance, past grace → reaped (flips the old resolve OUT rail)", () => {
+  const { reaps } = run({
+    jobs: [
+      escalationSession({
+        plan_verb: "resolve",
+        plan_ref: "fn-1-x",
+        title: "resolve::fn-1-x",
+      }),
+    ],
+    panes: [escalationPane({ windowName: "resolve::fn-1-x" })],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({
+    bucket: "escalation",
+    ref: "resolve::fn-1-x",
+  });
+});
+
 // ---------------------------------------------------------------------------
 // OUT — exclusion classes (never keeper-owned or not done)
 // ---------------------------------------------------------------------------
@@ -208,11 +305,67 @@ test("OUT: pair / agentbus sessions → never reaped", () => {
   }
 });
 
-test("OUT: resolve worker (origin autopilot, plan_verb resolve) → never reaped", () => {
+test("OUT: escalation session, instance still OPEN (not in escalationDone) → never reaped (declined-session persistence)", () => {
   const { reaps } = run({
-    jobs: [autopilotWork({ plan_verb: "resolve" })],
-    panes: [pane()],
-    graceMap: elapsed("j-work"),
+    jobs: [escalationSession()],
+    panes: [escalationPane()],
+    graceMap: elapsed("j-escal"),
+    // Empty done set: the block/conflict instance still stands.
+    escalationDone: new Set(),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: escalation session, NULL instance → never reaped (even if job id is in the done set)", () => {
+  const { reaps } = run({
+    jobs: [escalationSession({ escalation_instance: null })],
+    panes: [escalationPane()],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: resolve VERB without the escalation origin stamp → never reaped (provenance, not the verb)", () => {
+  // A resolve verb alone no longer qualifies: without dispatch_origin='escalation'
+  // it is neither the autopilot bucket (wrong verb) nor the escalation bucket
+  // (wrong origin) — the flip of the old blanket "resolve → never reaped" rail.
+  const { reaps } = run({
+    jobs: [
+      escalationSession({
+        plan_verb: "resolve",
+        plan_ref: "fn-1-x",
+        dispatch_origin: null,
+      }),
+    ],
+    panes: [escalationPane({ windowName: "resolve::fn-1-x" })],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
+  });
+  expect(reaps).toHaveLength(0);
+});
+
+test("OUT: escalation session, prompt-parked → never reaped", () => {
+  for (const over of [
+    { last_input_request_at: NOW - 5 },
+    { last_permission_prompt_at: NOW - 5 },
+  ]) {
+    const { reaps } = run({
+      jobs: [escalationSession(over)],
+      panes: [escalationPane()],
+      graceMap: elapsed("j-escal"),
+      escalationDone: new Set(["j-escal"]),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
+
+test("OUT: escalation session, still working (not stopped) → never reaped", () => {
+  const { reaps } = run({
+    jobs: [escalationSession({ state: "working" })],
+    panes: [escalationPane()],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
   });
   expect(reaps).toHaveLength(0);
 });
@@ -366,6 +519,17 @@ test("paused suspends the autopilot bucket but NOT the panel bucket", () => {
   expect(reaps[0]).toMatchObject({ jobId: "j-panel", bucket: "panel" });
 });
 
+test("paused suspends the escalation bucket (like the autopilot bucket)", () => {
+  const { reaps } = run({
+    jobs: [escalationSession()],
+    panes: [escalationPane()],
+    graceMap: elapsed("j-escal"),
+    escalationDone: new Set(["j-escal"]),
+    autopilotPaused: true,
+  });
+  expect(reaps).toHaveLength(0);
+});
+
 // ---------------------------------------------------------------------------
 // Config off-switch
 // ---------------------------------------------------------------------------
@@ -421,6 +585,7 @@ test("grace resets on an intervening ineligible observation", () => {
   const p1 = computeAutocloseReaps({
     jobs: [autopilotWork()],
     readiness: readiness(),
+    escalationDone: new Set(),
     panes: [pane()],
     graceMap: new Map(),
     config: CONFIG,
@@ -433,6 +598,7 @@ test("grace resets on an intervening ineligible observation", () => {
   const p2 = computeAutocloseReaps({
     jobs: [autopilotWork({ state: "working" })],
     readiness: readiness(),
+    escalationDone: new Set(),
     panes: [pane()],
     graceMap: p1.graceMap,
     config: CONFIG,
@@ -445,6 +611,7 @@ test("grace resets on an intervening ineligible observation", () => {
   const p3 = computeAutocloseReaps({
     jobs: [autopilotWork()],
     readiness: readiness(),
+    escalationDone: new Set(),
     panes: [pane()],
     graceMap: p2.graceMap,
     config: CONFIG,
@@ -462,6 +629,7 @@ test("a quiet board (no input change) still reaps a due candidate when now advan
   const p1 = computeAutocloseReaps({
     jobs,
     readiness: readiness(),
+    escalationDone: new Set(),
     panes,
     graceMap: new Map(),
     config: CONFIG,
@@ -473,6 +641,7 @@ test("a quiet board (no input change) still reaps a due candidate when now advan
   const p2 = computeAutocloseReaps({
     jobs,
     readiness: readiness(),
+    escalationDone: new Set(),
     panes,
     graceMap: p1.graceMap,
     config: CONFIG,
@@ -638,5 +807,139 @@ test("autoclosePulse: disabled config kills nothing and clears grace state", asy
   // Disabled short-circuits BEFORE the sweep and clears state.
   expect(listed).toBe(false);
   expect(state.graceMap.size).toBe(0);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// Pulse smoke test — escalation bucket done-signal against the real tables
+// ---------------------------------------------------------------------------
+
+/** Seed an UNPAUSED autopilot + one stopped escalation session (pane %9 / gen-9,
+ *  in the managed "autopilot" session). The escalation bucket is pause-suspended,
+ *  so the state row must exist with paused=0. */
+const seedEscalationPulse = (
+  db: Database,
+  opts: { verb: string; ref: string; instance: number },
+): void => {
+  db.run(
+    `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at)
+       VALUES (1, 0, 0, 0, 0)`,
+  );
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
+        dispatch_origin, backend_exec_type, backend_exec_pane_id,
+        backend_exec_birth_session_id, backend_exec_generation_id,
+        last_input_request_at, last_permission_prompt_at, pid, start_time,
+        escalation_instance)
+     VALUES
+       ('escaljob', 1, 1, 'stopped', ?, ?, ?,
+        'escalation', 'tmux', '%9', 'autopilot', 'gen-9', NULL, NULL, 4242, '55',
+        ?)`,
+    [`${opts.verb}::${opts.ref}`, opts.verb, opts.ref, opts.instance],
+  );
+};
+
+const escalationBackend = (killed: string[], windowName: string) => ({
+  listPanes: async (): Promise<PaneInfo[] | null> => [
+    pane({
+      tmuxGenerationId: "gen-9",
+      paneId: "%9",
+      windowId: "@9",
+      sessionName: "autopilot",
+      windowName,
+    }),
+  ],
+  killWindow: async (paneId: string): Promise<LaunchResult> => {
+    killed.push(paneId);
+    return { ok: true };
+  },
+});
+
+test("autoclosePulse: a due unblock session whose block instance is resolved is reaped", async () => {
+  const { db } = freshMemDb();
+  seedEscalationPulse(db, { verb: "unblock", ref: "fn-x.2", instance: 500 });
+  // No block_escalations row carries blocked_since=500 → the instance is resolved.
+
+  const killed: string[] = [];
+  const intents: AutocloseIntentMessage[] = [];
+  const backend = escalationBackend(killed, "unblock::fn-x.2");
+  let clock = 1000;
+  const state: AutoclosePulseState = { graceMap: new Map() };
+  const deps = {
+    resolveConfig: () => CONFIG,
+    now: () => clock,
+    postIntent: (m: AutocloseIntentMessage) => intents.push(m),
+    noteLine: () => {},
+  };
+
+  // Pulse 1 records the grace clock; nothing due yet.
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toHaveLength(0);
+  expect(state.graceMap.get("escaljob")).toBe(1000);
+
+  // Pulse 2: grace elapsed → one kill, tagged the escalation bucket.
+  clock = 1040;
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toEqual(["%9"]);
+  expect(intents).toHaveLength(1);
+  expect(intents[0]).toMatchObject({
+    kind: "autoclose-intent",
+    jobId: "escaljob",
+    bucket: "escalation",
+    ref: "unblock::fn-x.2",
+  });
+  db.close();
+});
+
+test("autoclosePulse: a deconflict session whose close conflict instance is still OPEN is not reaped", async () => {
+  const { db } = freshMemDb();
+  seedEscalationPulse(db, { verb: "deconflict", ref: "fn-x", instance: 500 });
+  // A close::fn-x sticky STILL carries instance_event_id=500 → conflict open.
+  db.run(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, ts, last_event_id, created_at, updated_at, instance_event_id)
+     VALUES ('close', 'fn-x', 'merge conflict', 0, 500, 0, 0, 500)`,
+  );
+
+  const killed: string[] = [];
+  const backend = escalationBackend(killed, "deconflict::fn-x");
+  // Pre-seed the grace clock already elapsed: an eligible job WOULD reap now, so
+  // the empty kill list proves the still-open instance gated it (not the clock).
+  const state: AutoclosePulseState = { graceMap: new Map([["escaljob", 1]]) };
+  await autoclosePulse(db, backend, state, {
+    resolveConfig: () => CONFIG,
+    now: () => 1000,
+    postIntent: () => {},
+    noteLine: () => {},
+  });
+  expect(killed).toHaveLength(0);
+  db.close();
+});
+
+test("autoclosePulse: a degraded done-signal read skips the pulse and reaps nothing", async () => {
+  const { db } = freshMemDb();
+  seedEscalationPulse(db, { verb: "unblock", ref: "fn-x.2", instance: 500 });
+  // Force the unblock done-signal read to THROW (only readEscalationDoneJobIds
+  // reads this table; readiness does not) — a degraded read must fail closed.
+  db.run("DROP TABLE block_escalations");
+
+  const killed: string[] = [];
+  const notes: string[] = [];
+  // Pre-seed the grace clock already past grace: absent the degradation, this
+  // pulse WOULD reap. The throw is the only thing standing between it and a kill.
+  const state: AutoclosePulseState = { graceMap: new Map([["escaljob", 1]]) };
+  const backend = escalationBackend(killed, "unblock::fn-x.2");
+  await autoclosePulse(db, backend, state, {
+    resolveConfig: () => CONFIG,
+    now: () => 1000,
+    postIntent: () => {},
+    noteLine: (l: string) => notes.push(l),
+  });
+
+  expect(killed).toHaveLength(0);
+  // Grace PRESERVED — the skip is a non-observation, never a reset.
+  expect(state.graceMap.get("escaljob")).toBe(1);
+  expect(notes.some((n) => n.includes("done-signal read failed"))).toBe(true);
   db.close();
 });
