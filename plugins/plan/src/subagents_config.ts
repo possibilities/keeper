@@ -214,19 +214,30 @@ interface HostMatrix {
   driverByModel: Map<string, Driver>;
 }
 
-/** Read + parse the host provider matrix, or null when absent/empty (the caller
- * falls back to the embedded defaults). A present, non-empty file that fails to
- * parse or violates the shape throws — matrix.yaml is fail-loud, never a silent
- * half-built default. */
-function loadHostMatrix(path: string = hostMatrixPath()): HostMatrix | null {
-  let raw: Buffer;
+/** Read + parse the host provider matrix, or null when absent/not-a-file (the
+ * caller falls back to the embedded defaults). A present file that fails to
+ * read (e.g. permission denied) or whose content fails to parse or violates the
+ * shape throws — matrix.yaml is fail-loud, never a silent half-built default;
+ * this matches the launcher island (`src/agent/matrix.ts` `loadMatrix`), whose
+ * `readFileSync` is unguarded. */
+export function loadHostMatrix(
+  path: string = hostMatrixPath(),
+): HostMatrix | null {
   try {
     if (!statSync(path).isFile()) {
       return null;
     }
-    raw = readFileSync(path);
   } catch {
-    return null; // absent / unreadable → fall back to embedded defaults
+    return null; // absent / not a file → fall back to embedded defaults
+  }
+  let raw: Buffer;
+  try {
+    raw = readFileSync(path);
+  } catch (err) {
+    throw new SubagentsConfigError(
+      `host matrix at ${path} could not be read: ${(err as Error).message}`,
+      path,
+    );
   }
   const parsed = parseYamlInput(raw, path);
   if (parsed === null || parsed === undefined) {
