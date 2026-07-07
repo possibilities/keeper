@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Scrub NUL and add byte guard",
-  "updated_at": "2026-07-07T06:28:28.629000Z"
+  "updated_at": "2026-07-07T06:40:16.035000Z",
+  "worker_done_at": "2026-07-07T06:40:16.035000Z"
 }

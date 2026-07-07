@@ -19,5 +19,5 @@ Files:
 - [ ] A new conformance test fails on a raw NUL in a verb source and passes post-scrub.
 
 ## Done summary
-
+Scrubbed the raw NUL byte from selection_audit_brief.ts's changed-paths dedup key (now the \0 escape), restoring the file to text with identical dedup behavior; added a conformance test that fails on a raw control byte in any plan verb source and passes post-scrub.
 ## Evidence
