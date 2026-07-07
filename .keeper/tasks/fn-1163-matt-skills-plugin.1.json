@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T16:51:47.532000Z",
+  "depends_on": [],
+  "epic": "fn-1163-matt-skills-plugin",
+  "id": "fn-1163-matt-skills-plugin.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "xhigh",
+  "title": "Scaffold plugin and vendor three",
+  "updated_at": "2026-07-07T16:51:47.532000Z"
+}
