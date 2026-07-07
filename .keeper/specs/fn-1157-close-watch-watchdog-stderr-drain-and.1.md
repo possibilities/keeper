@@ -37,5 +37,5 @@ watch-watchdog script and its test.
 - [ ] `bun test` stays green (fast pure tier; no real subprocess booted).
 
 ## Done summary
-
+Drained stderr concurrently in keeperJson (F1), factored classifyMonitors as a pure seam with direct unverifiable/dead-sibling coverage (F3), and fixed + directly tested the --no-bus flag-to-filter wiring via deriveChecks (F4).
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix stderr drain, close coverage",
-  "updated_at": "2026-07-07T03:47:52.143000Z"
+  "updated_at": "2026-07-07T03:55:00.902000Z",
+  "worker_done_at": "2026-07-07T03:55:00.902000Z"
 }
