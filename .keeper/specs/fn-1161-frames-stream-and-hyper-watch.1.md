@@ -67,5 +67,5 @@ containing newlines/quotes/ANSI.
 - [ ] All of the above proven in the pure test tier with no subprocess
 
 ## Done summary
-
+Added src/frames-emitter.ts owning the keeper frames NDJSON wire contract (single-line baseline/frame/keepalive/trailer envelopes, contiguous seq, injectable size-bounded diff seam, honest continuous/gap_possible coverage trailer, own-files-only sidecar ring) plus 22 pure-tier tests with no subprocess.
 ## Evidence
