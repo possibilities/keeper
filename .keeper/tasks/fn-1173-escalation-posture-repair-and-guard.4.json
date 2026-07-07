@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Daemon repair routing latch and dispatch",
-  "updated_at": "2026-07-07T20:46:55.209000Z"
+  "updated_at": "2026-07-07T22:36:17.744000Z",
+  "worker_done_at": "2026-07-07T22:36:17.744000Z"
 }

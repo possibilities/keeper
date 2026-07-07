@@ -76,5 +76,5 @@ not. Schema-version pairing test stays green.
 - [ ] Daemon sweep and fingerprint suites green with injectable deps only — no real daemon, git, or socket
 
 ## Done summary
-
+Added the daemon SHARED_BASE_BROKEN repair-escalation producer: a routeBlockedCategory table routes shared-base breakages to a coalesced, write-capable repair::<repo-token> dispatch (sticky dispatch_failures latch keyed per repo+fingerprint via a new pure failure-fingerprint leaf, positive-evidence clear, page-once decline, dirty-checkout defer), schema v113 + python whitelist paired, re-fold-deterministic RepairDispatched/RepairHumanNotified folds.
 ## Evidence
