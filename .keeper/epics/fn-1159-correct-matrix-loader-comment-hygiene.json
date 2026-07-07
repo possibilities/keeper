@@ -7,7 +7,7 @@
     "fn-1158-reconcile-matrixyaml-loader-fault"
   ],
   "id": "fn-1159-correct-matrix-loader-comment-hygiene",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T05:02:35.113000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T05:02:34.564000Z"
+  "updated_at": "2026-07-07T05:02:35.113000Z"
 }
