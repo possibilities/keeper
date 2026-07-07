@@ -34,5 +34,5 @@ Fake-vcs drives numstat cases (normal, error, empty); preflight saga asserts enr
 - [ ] Plan suite green
 
 ## Done summary
-
+close-preflight now enriches the audit brief with per-task tier, per-repo diff stats (from a new commitSetNumstat facade + fake twin), prior per-task finding refs, and a policy-derived depth band (lean/standard/deep); every depth signal degrades independently to lean with the reason recorded, so close-preflight never fails on a depth-signal error and the audit schema version is unchanged.
 ## Evidence
