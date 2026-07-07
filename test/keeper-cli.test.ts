@@ -255,7 +255,12 @@ describe("cli/keeper dispatch", () => {
     await dispatch(["tabs", "restore", "--apply"], h.deps);
     expect(h.calls).toEqual([{ sub: "tabs", argv: ["restore", "--apply"] }]);
     // The verb list is published for the machine-readable command index.
-    expect(SUBCOMMAND_META.tabs.verbs).toEqual(["list", "restore", "dump"]);
+    expect(SUBCOMMAND_META.tabs.verbs).toEqual([
+      "list",
+      "restore",
+      "repair",
+      "dump",
+    ]);
   });
 
   test("session is a registered two-level subcommand routed to its handler", async () => {
@@ -1563,6 +1568,7 @@ describe("keeper --help --json recursive descriptor tree", () => {
     expect(tabs?.verbs?.map((v) => v.name)).toEqual([
       "list",
       "restore",
+      "repair",
       "dump",
     ]);
     const restore = tabs?.verbs?.find((v) => v.name === "restore");

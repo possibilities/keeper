@@ -12,6 +12,10 @@
  *                  generation auto-pick; a contested pick escalates to a numbered
  *                  picker on a TTY and REFUSES (dedicated exit code + ranked
  *                  table) off a TTY. `--generation <id>` targets one generation.
+ *   - `repair`   — READ-ONLY report of non-claude tabs whose recorded resume
+ *                  target rotted (names no on-disk artifact) with the disk-anchored
+ *                  re-pin each would take. Never mutates: the actual re-pin is
+ *                  landed by the daemon's resume-target back-fill producer.
  *   - `dump`     — a runnable revive script for the CURRENT live set on stdout;
  *                  reconciler-managed workers excluded by default
  *                  (`--include-managed` to opt in).
@@ -88,8 +92,10 @@ import {
   type IntentSink,
   loadCurrentSetForDump,
   loadGenerationList,
+  loadRepairProposals,
   loadRestorePlan,
   makeEnsureLaunched,
+  type PiRepairProposal,
   planRestore,
   type RestoreSelection,
   readAutopilotPaused,
@@ -102,6 +108,7 @@ import {
   buildParseOptions,
   TABS_DUMP_FLAGS,
   TABS_LIST_FLAGS,
+  TABS_REPAIR_FLAGS,
   TABS_RESTORE_FLAGS,
 } from "./descriptor";
 import {
@@ -116,6 +123,9 @@ import {
  *  failed / unverified per-tab intents that resurface until they verify. */
 export const TABS_LIST_SCHEMA_VERSION = 2;
 
+/** The `keeper tabs repair` payload schema version. */
+export const TABS_REPAIR_SCHEMA_VERSION = 1;
+
 /** `restore` refused a non-TTY ambiguous selection (policy refusal, distinct from
  *  a runtime failure so an orchestrator can tell the two apart). */
 export const TABS_EXIT_REFUSE_AMBIGUOUS = 6;
@@ -129,6 +139,7 @@ const HELP_OVERVIEW = `keeper tabs — restore keeper-managed Claude Code agents
 Usage:
   keeper tabs list                              Ranked dead-generation summaries + live set (JSON)
   keeper tabs restore [--apply] [options]       Dry-run (default) or relaunch the lost session
+  keeper tabs repair                            Report non-claude tabs with a rotted resume target (read-only)
   keeper tabs dump [--include-managed]          Runnable revive script for the CURRENT live set
 
 Run 'keeper tabs <verb> --help' for a verb's options. All reads open keeper.db
@@ -183,6 +194,30 @@ when the restore plan targets the managed autopilot session, unless --force is p
 proceed); any tab that failed (a died resume) exits ${TABS_EXIT_PARTIAL_FAILURE} with a verified/failed/unverified summary.
 `;
 
+const HELP_REPAIR = `keeper tabs repair — report non-claude tabs with a rotted resume target
+
+Usage:
+  keeper tabs repair [--db <path>]
+
+READ-ONLY. Sweeps non-claude jobs whose recorded resume target names no on-disk
+artifact — the rot a pre-fix resume cycle could leave — and emits a
+{schema_version, ok, error, data} envelope on stdout (exit 0). 'data.proposals'
+lists each rotted job with its harness, cwd, old target, the disk-anchored
+'proposed_target' (null when ambiguous or unmatched), an 'ambiguous' flag, and a
+confidence note. A single plausible same-cwd session resolves; two or more is
+AMBIGUOUS (listed, never resolved).
+
+repair NEVER mutates. The actual re-pin is landed by the daemon's resume-target
+back-fill producer, which applies ONLY the unambiguous single-candidate proposals
+through the same event-sourced path the codex back-fill uses — so a repair takes
+effect on the daemon's next sweep, and 'keeper tabs dump' then emits a target that
+exists on disk.
+
+Flags:
+  --db <path>   keeper.db path override ($KEEPER_DB / default otherwise)
+  --help, -h    Show this help
+`;
+
 const HELP_DUMP = `keeper tabs dump — a runnable revive script for the CURRENT live set
 
 Usage:
@@ -210,6 +245,7 @@ read-only (daemon-down OK); restore is DRY-RUN until --apply.
   keeper tabs restore                     # print the resolved restore plan (touches nothing)
   keeper tabs restore --apply             # relaunch + VERIFY the auto-picked generation
   keeper tabs restore --apply --generation <id>   # disambiguate a contested pick
+  keeper tabs repair                      # report non-claude tabs with a rotted resume target (read-only)
   keeper tabs dump                        # a runnable revive script for the CURRENT live set
 
 --apply is a per-tab VERIFIED transaction: a tab counts restored only on on-disk
@@ -229,7 +265,7 @@ Exit codes: 0 ok · 1 generic · 6 refused a non-TTY ambiguous pick (re-run with
 
 /** A parsed `keeper tabs` invocation, or a usage/help signal. Pure shape. */
 export type TabsCommand =
-  | { kind: "help"; verb: "" | "list" | "restore" | "dump" }
+  | { kind: "help"; verb: "" | "list" | "restore" | "repair" | "dump" }
   | { kind: "agent-help" }
   | { kind: "usage"; error: string }
   | { kind: "list"; db: string | null }
@@ -242,6 +278,7 @@ export type TabsCommand =
       force: boolean;
       db: string | null;
     }
+  | { kind: "repair"; db: string | null }
   | {
       kind: "dump";
       includeManaged: boolean;
@@ -250,7 +287,7 @@ export type TabsCommand =
     };
 
 /** Known `keeper tabs` verbs. */
-const VERBS = new Set(["list", "restore", "dump"]);
+const VERBS = new Set(["list", "restore", "repair", "dump"]);
 
 /**
  * Route a `keeper tabs` argv (already stripped of the `tabs` token) to a command.
@@ -272,7 +309,10 @@ export function parseTabsArgv(argv: string[]): TabsCommand {
     return { kind: "usage", error: `unknown tabs verb '${verb}'` };
   }
   if (wantsHelp) {
-    return { kind: "help", verb: verb as "list" | "restore" | "dump" };
+    return {
+      kind: "help",
+      verb: verb as "list" | "restore" | "repair" | "dump",
+    };
   }
   const rest = argv.slice(1);
   try {
@@ -301,6 +341,14 @@ export function parseTabsArgv(argv: string[]): TabsCommand {
         force: values.force === true,
         db: values.db ?? null,
       };
+    }
+    if (verb === "repair") {
+      const { values } = parseArgs({
+        args: rest,
+        options: buildParseOptions(TABS_REPAIR_FLAGS),
+        allowPositionals: false,
+      });
+      return { kind: "repair", db: values.db ?? null };
     }
     // dump
     const { values } = parseArgs({
@@ -487,9 +535,11 @@ export async function main(argv: string[]): Promise<void> {
         ? HELP_LIST
         : cmd.verb === "restore"
           ? HELP_RESTORE
-          : cmd.verb === "dump"
-            ? HELP_DUMP
-            : HELP_OVERVIEW;
+          : cmd.verb === "repair"
+            ? HELP_REPAIR
+            : cmd.verb === "dump"
+              ? HELP_DUMP
+              : HELP_OVERVIEW;
     process.stdout.write(text);
     return process.exit(0);
   }
@@ -506,10 +556,69 @@ export async function main(argv: string[]): Promise<void> {
   if (cmd.kind === "list") {
     return runList(cmd.db);
   }
+  if (cmd.kind === "repair") {
+    return runRepair(cmd.db);
+  }
   if (cmd.kind === "dump") {
     return runDump(cmd.includeManaged, cmd.session, cmd.db);
   }
   return runRestore(cmd);
+}
+
+/** Serialize one repair proposal for the `keeper tabs repair` envelope. `resolved`
+ *  carries the disk-anchored `proposed_target`; `ambiguous`/`unmatched` carry
+ *  null, with `ambiguous` flagging the never-auto-applied multi-candidate case. */
+function renderRepairProposal(p: PiRepairProposal): {
+  job_id: string;
+  harness: string;
+  cwd: string | null;
+  old_target: string;
+  proposed_target: string | null;
+  ambiguous: boolean;
+  candidates: string[];
+  confidence: string;
+} {
+  return {
+    job_id: p.jobId,
+    harness: p.harness,
+    cwd: p.cwd,
+    old_target: p.oldTarget,
+    proposed_target: p.kind === "resolved" ? p.newTarget : null,
+    ambiguous: p.kind === "ambiguous",
+    candidates:
+      p.kind === "resolved"
+        ? [p.candidate.uuid]
+        : p.kind === "ambiguous"
+          ? p.candidates.map((c) => c.uuid)
+          : [],
+    confidence: p.note,
+  };
+}
+
+/** `keeper tabs repair` — the read-only rotted-resume-target report. Emits a JSON
+ *  envelope of proposals; NEVER mutates (the daemon producer lands the re-pin). */
+function runRepair(dbOverride: string | null): never {
+  const dbPath = dbOverride ?? resolveDbPath();
+  try {
+    const proposals = loadRepairProposals(dbPath);
+    emitEnvelope(
+      successEnvelope(TABS_REPAIR_SCHEMA_VERSION, {
+        proposals: proposals.map(renderRepairProposal),
+      }),
+      processEnvelopeSink,
+    );
+  } catch {
+    emitEnvelope(
+      errorEnvelope(TABS_REPAIR_SCHEMA_VERSION, {
+        code: "read_failed",
+        message: "keeper.db could not be opened for the tabs repair sweep.",
+        recovery: RECOVERY_DB_READ,
+      }),
+      processEnvelopeSink,
+    );
+  }
+  // emitEnvelope always exits; unreachable.
+  return process.exit(0);
 }
 
 /** `keeper tabs list` — the JSON envelope of generation summaries + live set +
