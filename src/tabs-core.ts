@@ -28,6 +28,15 @@
  * `cwd` prefix on every resume command is load-bearing — a session id resolves
  * only within its project dir plus its git worktrees.
  *
+ * DISK-ANCHORED RESUME. The recorded `cwd` is a HINT, not the launch cwd:
+ * `planRestore` / `renderSnapshotScript` route every candidate through a
+ * {@link ResumeResolver} (`src/resume-resolve.ts`, default real fs) that derives
+ * a claude candidate's launch cwd from the transcript on disk (the recorded cwd
+ * drifts) and gates a non-claude target on its on-disk artifact. An unresolvable
+ * claude transcript becomes a typed PREFLIGHT-FAILED entry (a `#` comment naming
+ * the fix, never a doomed `--resume` line); the load-bearing `cd` prefix is
+ * repaired to the disk-anchored cwd, never dropped.
+ *
  * This module imports ONLY `src/` peers (no `cli/`), so both `cli/tabs.ts` and the
  * in-daemon restore-worker consume it. Every renderer is pure; the `load*` readers
  * open `keeper.db` read-only in one span; `applyRestore` routes each candidate
@@ -63,6 +72,7 @@ import {
 } from "./restore-set";
 import { probeServerGeneration } from "./restore-worker";
 import { buildResumeCommand } from "./resume-descriptor";
+import { defaultResumeResolver, type ResumeResolver } from "./resume-resolve";
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
@@ -83,23 +93,45 @@ export type AgentOutcome =
   | { kind: "restored"; candidate: RestoreCandidate }
   | { kind: "failed"; candidate: RestoreCandidate; error: string }
   // A candidate keeper cannot resume — a non-claude harness whose native resume
-  // target was never resolved. Reported (never launched, never counted as a
-  // failure), so the REST of the generation still restores.
-  | { kind: "not-resumable"; candidate: RestoreCandidate; reason: string };
+  // target was never resolved, or whose target names no on-disk artifact.
+  // Reported (never launched, never counted as a failure), so the REST of the
+  // generation still restores.
+  | { kind: "not-resumable"; candidate: RestoreCandidate; reason: string }
+  // A claude candidate whose transcript could not be disk-anchored to a launch
+  // cwd (zero-match, unresolvable multi-match, or a resolved cwd that vanished).
+  // No `--resume` line is ever emitted for it; the failure names the found
+  // candidates and the one fixing command a human runs. Like `not-resumable`, it
+  // is reported (never launched) so the rest of the generation still restores.
+  | {
+      kind: "preflight-failed";
+      candidate: RestoreCandidate;
+      reason: string;
+      found: string[];
+      fixCommand: string;
+    };
 
 /**
- * Pure: turn the candidate set into the per-agent pre-action plan, narrowed by
- * the optional `--session` filter (matched against the candidate's backend
- * session). Candidates arrive already sorted by visual window order, so this
- * preserves that order. A candidate with no resolved resume target
- * ({@link isRestorableCandidate} false — a non-claude harness keeper never
- * back-filled) becomes a `"not-resumable"` entry (reported, never launched) so
- * the rest of the generation still restores. The `--apply` path upgrades each
- * `"would-restore"` to `"restored"` / `"failed"`.
+ * Pure relative to the injected `resolver`: turn the candidate set into the
+ * per-agent pre-action plan, narrowed by the optional `--session` filter (matched
+ * against the candidate's backend session). Candidates arrive already sorted by
+ * visual window order, so this preserves that order.
+ *
+ * Each candidate is DISK-ANCHORED through the {@link ResumeResolver} (default
+ * {@link defaultResumeResolver}, real fs; tests inject a fake):
+ *  - A candidate with no resolved resume target ({@link isRestorableCandidate}
+ *    false — a non-claude harness keeper never back-filled) is short-circuited to
+ *    `"not-resumable"` (reported, never launched).
+ *  - A claude candidate's `cwd` is REPLACED by the resolver's disk-anchored one
+ *    (the recorded cwd demoted to a hint); an unresolvable transcript becomes a
+ *    typed `"preflight-failed"` entry — no doomed `--resume` line.
+ *  - A non-claude candidate whose resume target names no on-disk artifact becomes
+ *    `"not-resumable"` with a reason.
+ * The `--apply` path upgrades each `"would-restore"` to `"restored"` / `"failed"`.
  */
 export function planRestore(
   candidates: RestoreCandidate[],
   sessionFilter: string | null,
+  resolver: ResumeResolver = defaultResumeResolver,
 ): AgentOutcome[] {
   const out: AgentOutcome[] = [];
   for (const candidate of candidates) {
@@ -117,7 +149,25 @@ export function planRestore(
       });
       continue;
     }
-    out.push({ kind: "would-restore", candidate });
+    const res = resolver(candidate);
+    if (res.kind === "resolved") {
+      out.push({
+        kind: "would-restore",
+        candidate: { ...candidate, cwd: res.cwd },
+      });
+    } else if (res.kind === "resumable") {
+      out.push({ kind: "would-restore", candidate });
+    } else if (res.kind === "not-resumable") {
+      out.push({ kind: "not-resumable", candidate, reason: res.reason });
+    } else {
+      out.push({
+        kind: "preflight-failed",
+        candidate,
+        reason: res.reason,
+        found: res.found,
+        fixCommand: res.fixCommand,
+      });
+    }
   }
   return out;
 }
@@ -206,27 +256,31 @@ export async function applyRestore(
   return out;
 }
 
-/** Count restored / failed / would-restore / not-resumable outcomes in one pass.
- *  Exported so the consumer picks the partial-failure exit code without
- *  re-scanning. `notResumable` is NOT a failure — a not-resumable agent is an
- *  expected, reported skip, so it never trips the partial-failure exit. */
+/** Count restored / failed / would-restore / not-resumable / preflight-failed
+ *  outcomes in one pass. Exported so the consumer picks the partial-failure exit
+ *  code without re-scanning. Neither `notResumable` nor `preflightFailed` is a
+ *  launch failure — both are expected, reported skips that never trip the
+ *  partial-failure exit (which keys on `failed` alone). */
 export function countOutcomes(outcomes: AgentOutcome[]): {
   restored: number;
   failed: number;
   wouldRestore: number;
   notResumable: number;
+  preflightFailed: number;
 } {
   let restored = 0;
   let failed = 0;
   let wouldRestore = 0;
   let notResumable = 0;
+  let preflightFailed = 0;
   for (const o of outcomes) {
     if (o.kind === "restored") restored++;
     else if (o.kind === "failed") failed++;
     else if (o.kind === "not-resumable") notResumable++;
+    else if (o.kind === "preflight-failed") preflightFailed++;
     else wouldRestore++;
   }
-  return { restored, failed, wouldRestore, notResumable };
+  return { restored, failed, wouldRestore, notResumable, preflightFailed };
 }
 
 /**
@@ -252,7 +306,7 @@ export function renderOutcomes(
   excludedIdleCount: number,
 ): string {
   const stanzas: string[] = [];
-  const { restored, failed, wouldRestore, notResumable } =
+  const { restored, failed, wouldRestore, notResumable, preflightFailed } =
     countOutcomes(outcomes);
 
   for (const o of outcomes) {
@@ -264,6 +318,20 @@ export function renderOutcomes(
       // No runnable command line — the harness has no resolved resume target.
       stanzas.push(
         `# (${session}) NOT-RESUMABLE ${label}: ${commentSafe(o.reason)}`,
+      );
+      continue;
+    }
+    if (o.kind === "preflight-failed") {
+      // No runnable command line — the claude transcript could not be anchored
+      // to a launch cwd. Surface the reason, the found candidates, and the one
+      // fixing command; never a doomed `--resume` line.
+      const foundNote =
+        o.found.length > 0
+          ? ` [found: ${commentSafe(o.found.join(", "))}]`
+          : "";
+      stanzas.push(
+        `# (${session}) PREFLIGHT-FAILED ${label}: ${commentSafe(o.reason)}${foundNote}\n` +
+          `# fix: ${commentSafe(o.fixCommand)}`,
       );
       continue;
     }
@@ -283,9 +351,11 @@ export function renderOutcomes(
 
   const notResumableNote =
     notResumable > 0 ? ` not-resumable=${notResumable}` : "";
+  const preflightNote =
+    preflightFailed > 0 ? ` preflight-failed=${preflightFailed}` : "";
   const summary = apply
-    ? `# summary: restored=${restored} failed=${failed}${notResumableNote}`
-    : `# summary: would-restore=${wouldRestore}${notResumableNote}`;
+    ? `# summary: restored=${restored} failed=${failed}${notResumableNote}${preflightNote}`
+    : `# summary: would-restore=${wouldRestore}${notResumableNote}${preflightNote}`;
   const idleNote =
     excludedIdleCount > 0
       ? `\n# note: ${excludedIdleCount} crash-like candidate(s) excluded as idle past the cutoff`
@@ -324,6 +394,12 @@ export interface SnapshotScriptOptions {
   /** Count of live panes EXCLUDED from this script (reconciler-managed workers by
    *  default) — surfaced in the header so the human sees what won't be revived. */
   excludedManagedCount?: number;
+  /** Disk-anchored resume resolver (default {@link defaultResumeResolver}, real
+   *  fs). A claude candidate's `cd` prefix is repaired to the resolver's
+   *  disk-anchored cwd; an unresolvable claude transcript or a non-claude target
+   *  with no on-disk artifact emits a `#` comment (naming the fix) instead of a
+   *  doomed launch line. Tests inject a fake so the render stays pure. */
+  resolver?: ResumeResolver;
 }
 
 /**
@@ -349,6 +425,7 @@ export function renderSnapshotScript(
 ): string {
   const sessionFilter = options.sessionFilter ?? null;
   const excludedManagedCount = options.excludedManagedCount ?? 0;
+  const resolver = options.resolver ?? defaultResumeResolver;
   const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
   const included = candidates.filter(
     (c) =>
@@ -411,10 +488,40 @@ export function renderSnapshotScript(
         );
         continue;
       }
-      const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
-      // The BARE keeper agent resume argv — byte-aligned with what --apply spawns.
-      // keeper agent owns the session+window, so NO `tmux new-window` wrapper. The
-      // harness tag routes `keeper agent <harness>` + that harness's resume verb.
+      // Disk-anchor the resume: a claude candidate's `cd` prefix is repaired to
+      // the resolver's on-disk cwd; an unresolvable claude transcript or a
+      // non-claude target with no on-disk artifact emits a `#` comment (naming
+      // the fix) INSTEAD of a doomed launch line — the `cd` is repaired, never
+      // dropped.
+      const res = resolver(candidate);
+      if (res.kind === "not-resumable") {
+        lines.push(
+          `# not-resumable: ${commentSafe(candidate.label)} (${commentSafe(res.reason)})`,
+        );
+        continue;
+      }
+      if (res.kind === "preflight-failed") {
+        const foundNote =
+          res.found.length > 0
+            ? ` [found: ${commentSafe(res.found.join(", "))}]`
+            : "";
+        lines.push(
+          `# preflight-failed: ${commentSafe(candidate.label)} (${commentSafe(res.reason)})${foundNote}`,
+        );
+        lines.push(`# fix: ${commentSafe(res.fixCommand)}`);
+        continue;
+      }
+      // `resolved` (claude, disk-anchored cwd) or `resumable` (non-claude, the
+      // recorded cwd stands). The BARE keeper agent resume argv — byte-aligned
+      // with what --apply spawns. keeper agent owns the session+window, so NO
+      // `tmux new-window` wrapper. The harness tag routes `keeper agent <harness>`
+      // + that harness's resume verb.
+      const cwd =
+        res.kind === "resolved"
+          ? res.cwd
+          : candidate.cwd == null
+            ? ""
+            : seg(candidate.cwd);
       const launchArgv = buildKeeperAgentLaunchArgv({
         launcherArgvPrefix: options.prefix,
         session: sessionName,
@@ -823,7 +930,9 @@ export function restorePlanTouchesManagedSession(
   managedSession = MANAGED_EXEC_SESSION,
 ): boolean {
   return plan.some((entry) => {
-    if (entry.kind === "not-resumable") {
+    // A not-resumable / preflight-failed entry is never launched, so it can't
+    // double-dispatch the managed session.
+    if (entry.kind === "not-resumable" || entry.kind === "preflight-failed") {
       return false;
     }
     return entry.candidate.backend_exec_session_id === managedSession;

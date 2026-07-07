@@ -34,11 +34,13 @@ import {
   TABS_EXIT_PARTIAL_FAILURE,
   TABS_EXIT_ZERO_CANDIDATES,
 } from "../cli/tabs";
+import { harnessOrClaude } from "../src/agent/harness";
 import type {
   EnrichedGeneration,
   GenerationSummary,
   RestoreCandidate,
 } from "../src/restore-set";
+import type { ResumeResolver } from "../src/resume-resolve";
 import {
   type AgentOutcome,
   applyRestore,
@@ -47,15 +49,49 @@ import {
   loadCurrentSetForDump,
   loadGenerationList,
   loadRestorePlan,
-  planRestore,
+  planRestore as planRestoreRaw,
   type RestoreSelection,
   readAutopilotPaused,
   renderOutcomes,
-  renderSnapshotScript,
+  renderSnapshotScript as renderSnapshotScriptRaw,
   restorePlanTouchesManagedSession,
   selectRestoreGeneration,
 } from "../src/tabs-core";
 import { freshDbFile } from "./helpers/template-db";
+
+/**
+ * A passthrough resume resolver for the ported render/plan tests: it keeps the
+ * pre-disk-anchoring behavior (a claude candidate resolves to its recorded cwd,
+ * a non-claude restorable candidate is resumable) so those tests assert the
+ * SCRIPT/PLAN shape without a real `~/.claude` fixture — the disk-anchoring
+ * behavior itself is covered by `test/resume-resolve.test.ts` and the dedicated
+ * cases below. An empty-target candidate never reaches the resolver (it is
+ * short-circuited to not-resumable), so this need not handle it.
+ */
+const passResolver: ResumeResolver = (c) =>
+  harnessOrClaude(c.harness) === "claude"
+    ? { kind: "resolved", cwd: c.cwd ?? "" }
+    : { kind: "resumable" };
+
+/** The ported suites call these two through the passthrough resolver by default;
+ *  the disk-anchoring tests pass an explicit resolver / options. */
+function planRestore(
+  candidates: Parameters<typeof planRestoreRaw>[0],
+  sessionFilter: Parameters<typeof planRestoreRaw>[1],
+  resolver: ResumeResolver = passResolver,
+): ReturnType<typeof planRestoreRaw> {
+  return planRestoreRaw(candidates, sessionFilter, resolver);
+}
+
+function renderSnapshotScript(
+  candidates: Parameters<typeof renderSnapshotScriptRaw>[0],
+  options: Parameters<typeof renderSnapshotScriptRaw>[1],
+): string {
+  return renderSnapshotScriptRaw(candidates, {
+    resolver: passResolver,
+    ...options,
+  });
+}
 
 const RECENT = Math.floor(Date.now() / 1000) - 60;
 
@@ -725,6 +761,7 @@ test("countOutcomes tallies restored / failed / would-restore / not-resumable", 
     failed: 1,
     wouldRestore: 1,
     notResumable: 1,
+    preflightFailed: 0,
   });
 });
 
@@ -837,6 +874,168 @@ test("renderSnapshotScript: a codex candidate emits `agent codex … resume`, a 
   expect(script).toContain(
     "# not-resumable: hermes tab (hermes session has no resolved resume target)",
   );
+});
+
+// ---------------------------------------------------------------------------
+// disk-anchored resume — planRestore / renderSnapshotScript consume the resolver
+// ---------------------------------------------------------------------------
+
+test("renderSnapshotScript emits the RESOLVED cd, never the recorded one", () => {
+  const RECORDED = "/Users/mike/old-worktree";
+  const RESOLVED = "/Users/mike/code/keeper";
+  const resolver: ResumeResolver = () => ({ kind: "resolved", cwd: RESOLVED });
+  const script = renderSnapshotScriptRaw(
+    [
+      fakeCandidate({
+        job_id: "j",
+        resume_target: "j",
+        label: "drifted",
+        cwd: RECORDED,
+      }),
+    ],
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+      resolver,
+    },
+  );
+  expect(script).toContain(`cd '${RESOLVED}' && `);
+  expect(script).not.toContain(`cd '${RECORDED}'`);
+});
+
+test("renderSnapshotScript: an unresolvable claude candidate is a comment + fix, never a --resume line", () => {
+  const resolver: ResumeResolver = () => ({
+    kind: "preflight-failed",
+    reason: "no claude transcript on disk for session j",
+    found: ["/proj/a", "/proj/b"],
+    fixCommand: 'cd /proj/a && claude --resume "j"',
+  });
+  const script = renderSnapshotScriptRaw(
+    [
+      fakeCandidate({
+        job_id: "j",
+        resume_target: "j",
+        label: "gone",
+        cwd: "/stale",
+      }),
+    ],
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+      resolver,
+    },
+  );
+  expect(script).toContain(
+    "# preflight-failed: gone (no claude transcript on disk for session j) [found: /proj/a, /proj/b]",
+  );
+  expect(script).toContain('# fix: cd /proj/a && claude --resume "j"');
+  // No doomed launch: the resume argv never reaches an executable line.
+  for (const line of executableRemainders(script)) {
+    expect(line.includes("--resume")).toBe(false);
+  }
+  expect(script).toContain("windows=0");
+});
+
+test("renderSnapshotScript: a non-claude target with no artifact is a not-resumable comment", () => {
+  const resolver: ResumeResolver = () => ({
+    kind: "not-resumable",
+    reason:
+      "pi session p has no on-disk artifact under /home/.pi/agent/sessions",
+  });
+  const script = renderSnapshotScriptRaw(
+    [
+      fakeCandidate({
+        job_id: "pj",
+        harness: "pi",
+        resume_target: "p",
+        label: "pi tab",
+        cwd: "/repo",
+      }),
+    ],
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+      resolver,
+    },
+  );
+  expect(script).toContain(
+    "# not-resumable: pi tab (pi session p has no on-disk artifact under /home/.pi/agent/sessions)",
+  );
+  for (const line of executableRemainders(script)) {
+    expect(line.includes("'--session'")).toBe(false);
+  }
+});
+
+test("planRestore threads resolver verdicts into typed outcomes (resolved cwd wins)", () => {
+  const RESOLVED = "/Users/mike/code/keeper";
+  const resolver: ResumeResolver = (c) => {
+    if (c.job_id === "ok") return { kind: "resolved", cwd: RESOLVED };
+    if (c.job_id === "pf")
+      return {
+        kind: "preflight-failed",
+        reason: "zero-match",
+        found: [],
+        fixCommand: "# not resumable",
+      };
+    return { kind: "not-resumable", reason: "no artifact" };
+  };
+  const plan = planRestoreRaw(
+    [
+      fakeCandidate({ job_id: "ok", resume_target: "ok", cwd: "/stale" }),
+      fakeCandidate({ job_id: "pf", resume_target: "pf", cwd: "/stale" }),
+      fakeCandidate({
+        job_id: "nr",
+        harness: "codex",
+        resume_target: "cx",
+        cwd: "/repo",
+      }),
+    ],
+    null,
+    resolver,
+  );
+  expect(plan.map((p) => p.kind)).toEqual([
+    "would-restore",
+    "preflight-failed",
+    "not-resumable",
+  ]);
+  // The would-restore candidate carries the RESOLVED cwd (recorded demoted).
+  expect(plan[0].candidate.cwd).toBe(RESOLVED);
+  expect((plan[1] as { fixCommand: string }).fixCommand).toBe(
+    "# not resumable",
+  );
+});
+
+test("renderOutcomes surfaces the preflight-failed stanza + summary note", () => {
+  const plan: AgentOutcome[] = [
+    {
+      kind: "would-restore",
+      candidate: fakeCandidate({
+        job_id: "ok",
+        resume_target: "ok",
+        label: "good",
+        cwd: "/repo",
+      }),
+    },
+    {
+      kind: "preflight-failed",
+      candidate: fakeCandidate({
+        job_id: "pf",
+        resume_target: "pf",
+        label: "bad",
+        cwd: "/stale",
+      }),
+      reason: "zero-match",
+      found: ["/proj/x"],
+      fixCommand: 'cd /proj/x && claude --resume "pf"',
+    },
+  ];
+  const out = renderOutcomes(plan, false, 0);
+  expect(out).toContain("PREFLIGHT-FAILED bad: zero-match [found: /proj/x]");
+  expect(out).toContain('# fix: cd /proj/x && claude --resume "pf"');
+  expect(out).toContain("would-restore=1 preflight-failed=1");
 });
 
 // ---------------------------------------------------------------------------

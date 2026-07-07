@@ -108,6 +108,7 @@ import {
 } from "./exec-backend";
 import { compareCandidates, type RestoreCandidate } from "./restore-set";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
+import type { ResumeResolver } from "./resume-resolve";
 import { runQuery } from "./server-worker";
 import { defaultLauncherPrefix, renderSnapshotScript } from "./tabs-core";
 import type { TmuxTopologyPane } from "./tmux-focus-derive";
@@ -884,9 +885,16 @@ export function restorePulse(
      * INDEPENDENT of the JSON write (own hash gate, own try/catch). Omit on the
      * pure-JSON test path. `path` is the on-disk revive-script path, `sourcePath`
      * the keeper.db provenance printed in the header, `prefix` the absolute
-     * `keeper agent` launcher argv prefix.
+     * `keeper agent` launcher argv prefix. `resolver` disk-anchors each candidate's
+     * resume (default real fs — the daemon reads on-disk transcripts/session
+     * stores); tests inject a fake so the render stays hermetic.
      */
-    script?: { path: string; sourcePath: string; prefix: string[] };
+    script?: {
+      path: string;
+      sourcePath: string;
+      prefix: string[];
+      resolver?: ResumeResolver;
+    };
   },
 ): void {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -981,7 +989,7 @@ export function restorePulse(
   // script header carries no timestamp, so the whole rendered body is the hash
   // input. Disabled when no `script` config is wired (the pure-JSON test path).
   if (snapshot?.script) {
-    const { path: scriptPath, sourcePath, prefix } = snapshot.script;
+    const { path: scriptPath, sourcePath, prefix, resolver } = snapshot.script;
     const { candidates, excludedManagedCount } =
       buildReviveScriptCandidates(jobs);
     const script = renderSnapshotScript(candidates, {
@@ -989,6 +997,7 @@ export function restorePulse(
       tmuxSessionCwd: keeperTmuxSessionCwd(process.env),
       sourcePath,
       excludedManagedCount,
+      resolver,
     });
     const scriptHash = String(Bun.hash(script));
     if (state.lastScriptHash !== scriptHash) {

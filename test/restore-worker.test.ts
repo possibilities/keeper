@@ -42,6 +42,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { harnessOrClaude } from "../src/agent/harness";
 import { resolveRestorePath, resolveRevivePath } from "../src/db";
 import {
   type BackendExecStartMessage,
@@ -58,6 +59,7 @@ import {
   serializeForHash,
   serializeForWrite,
 } from "../src/restore-worker";
+import type { ResumeResolver } from "../src/resume-resolve";
 import type { Epic, Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -1161,12 +1163,27 @@ test("buildReviveScriptCandidates sorts by visual window order (known index firs
 // ---------------------------------------------------------------------------
 
 /** The script config the real worker wires; a fixed prefix + provenance path. */
+/** A passthrough resume resolver: claude resolves to its recorded cwd, a
+ *  non-claude restorable candidate is resumable — the pre-disk-anchoring shape,
+ *  so the revive.sh render stays hermetic (no real `~/.claude` fixture). The
+ *  disk-anchoring behavior itself is covered by `test/resume-resolve.test.ts`. */
+const passResolver: ResumeResolver = (c) =>
+  harnessOrClaude(c.harness) === "claude"
+    ? { kind: "resolved", cwd: c.cwd ?? "" }
+    : { kind: "resumable" };
+
 function scriptCfg(path: string): {
   path: string;
   sourcePath: string;
   prefix: string[];
+  resolver: ResumeResolver;
 } {
-  return { path, sourcePath: "/db/keeper.db", prefix: ["keeper", "agent"] };
+  return {
+    path,
+    sourcePath: "/db/keeper.db",
+    prefix: ["keeper", "agent"],
+    resolver: passResolver,
+  };
 }
 
 test("resolveRevivePath places revive.sh next to restore.json", () => {
