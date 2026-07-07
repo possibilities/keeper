@@ -39,7 +39,7 @@ import {
 } from "node:fs";
 import { join, relative, sep } from "node:path";
 
-import type { GitResult, PlanVcs } from "../src/vcs.ts";
+import type { GitResult, NumstatRow, PlanVcs } from "../src/vcs.ts";
 
 /** One recorded commit — the fake log entry the assertion helpers read. */
 export interface FakeCommit {
@@ -69,6 +69,10 @@ interface FakeSourceCommit {
    * ref `keeper/epic/<epic_id>` and NOT HEAD, so a HEAD scan misses it and only
    * the lane-ref scan finds it — exactly the worktree-epic pre-merge geometry. */
   refs: string[];
+  /** The `git show --numstat` rows the commitNumstat read returns for this sha
+   * (default []). Seeded so the selection-audit brief's diff-stat aggregation is
+   * exercisable without real git. */
+  numstat: NumstatRow[];
 }
 
 /** Per-repo fake state: the auto-commit log + the last committed `.keeper/`
@@ -341,11 +345,12 @@ export function failNextStatus(
  * `opts.refs` overrides which refs reach the commit (default `["HEAD"]` — the
  * ordinary on-main commit a ref-less scan finds). Seed a LANE-ONLY commit with
  * `{ refs: ["keeper/epic/<id>"] }`: it is NOT on HEAD, so only the epic-close
- * lane-ref scan (and `resolveRef`'s lane probe) sees it. */
+ * lane-ref scan (and `resolveRef`'s lane probe) sees it. `opts.numstat` seeds the
+ * per-file diff rows the commitNumstat read returns for the diff-stat brief. */
 export function fakeSourceCommit(
   root: string,
   messageWithTrailers: string,
-  opts?: { refs?: string[] },
+  opts?: { refs?: string[]; numstat?: NumstatRow[] },
 ): string {
   // Ensure a `.git/` exists so the isGitRepo gate passes for a bare seed.
   if (!existsSync(join(root, ".git"))) {
@@ -358,6 +363,7 @@ export function fakeSourceCommit(
     sha,
     message: messageWithTrailers,
     refs: opts?.refs ?? ["HEAD"],
+    numstat: opts?.numstat ?? [],
   });
   return sha;
 }
@@ -499,6 +505,19 @@ export const fakeVcs: PlanVcs = {
 
   sourceCommitShas(taskId, repo): string[] {
     return matchingSourceShas(repoFor(repo), taskId);
+  },
+
+  commitNumstat(sha, repo): NumstatRow[] {
+    const state = repos.get(normRoot(repo));
+    if (!state) {
+      return [];
+    }
+    for (const c of state.sourceCommits) {
+      if (c.sha === sha) {
+        return c.numstat.map((r) => ({ ...r }));
+      }
+    }
+    return [];
   },
 
   committedTaskJson(stateRepo, taskId, dataDirNames) {

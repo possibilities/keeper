@@ -23,6 +23,7 @@
 //     `selections/<id>.json` path classifies as none, so the daemon skips it.
 // A re-select REPLACES the sidecar (idempotent, single JSON object — no append).
 
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { atomicWriteJson } from "./store.ts";
@@ -79,6 +80,26 @@ export interface SelectionSidecar {
 /** Absolute path to the selection sidecar for `epicId` under `dataDir`. */
 export function selectionSidecarPath(dataDir: string, epicId: string): string {
   return join(dataDir, SELECTIONS_DIRNAME, `${epicId}.json`);
+}
+
+/** Read + parse the selection sidecar for `epicId`, or null when it is absent or
+ * unparseable. The close-time selection auditor reads it for each executed cell's
+ * rationale / confidence / label_source plus the run's config + input hashes; a
+ * missing sidecar means the epic never ran through the cell selector, so grading
+ * has no provenance to ground on and the caller fails loud rather than guessing. */
+export function readSelectionSidecar(
+  dataDir: string,
+  epicId: string,
+): SelectionSidecar | null {
+  const path = selectionSidecarPath(dataDir, epicId);
+  if (!existsSync(path)) {
+    return null;
+  }
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as SelectionSidecar;
+  } catch {
+    return null;
+  }
 }
 
 /** Write (REPLACE) the selection sidecar atomically, recording the touched path
