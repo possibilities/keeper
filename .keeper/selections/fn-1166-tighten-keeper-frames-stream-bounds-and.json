@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded two-file contract-honesty bug fix with the root cause and exact fix sites named, low blast radius (wire/exit/schema changes explicitly out of scope), fitting sonnet's named-surface sweet spot at the default high band.",
+      "task_id": "fn-1166-tighten-keeper-frames-stream-bounds-and.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T17:25:45.136000Z",
+  "epic_id": "fn-1166-tighten-keeper-frames-stream-bounds-and",
+  "input_hash": "ec8a3d61e3cef46a4644db065df44270efe7e16185c208c290b14816f5b49640",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 0,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded two-file contract-honesty bug fix with the root cause and exact fix sites named, low blast radius (wire/exit/schema changes explicitly out of scope), fitting sonnet's named-surface sweet spot at the default high band.\",\"confidence\":0.72}]}"
+}
