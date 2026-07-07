@@ -1,0 +1,23 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 1,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T20:04:04.678000Z",
+  "epic_id": "fn-1168-matt-upgrade-sync-skill",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "e3798da6407e3ed8b9beed6a09d80b0d2a9b6487bf26937c8672a1085a9ad587",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "A single-file, 55-insertion/0-deletion skill-authoring commit matches sonnet/high for bounded multi-step prose work, with the selector's 0.8 confidence and no sign of thrash or oversized architectural change.",
+      "input_hash": "e3798da6407e3ed8b9beed6a09d80b0d2a9b6487bf26937c8672a1085a9ad587",
+      "model": "sonnet",
+      "task_id": "fn-1168-matt-upgrade-sync-skill.1",
+      "tier": "high",
+      "verdict": "right_sized"
+    }
+  ]
+}
