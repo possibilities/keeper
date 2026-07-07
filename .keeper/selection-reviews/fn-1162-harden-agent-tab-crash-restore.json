@@ -1,0 +1,50 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 4,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T22:06:18.711000Z",
+  "epic_id": "fn-1162-harden-agent-tab-crash-restore",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "6cc85043462f4687bc7e584f6747e44d57cc2df6abcb4b611bdc26592e1a2396",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "A subtle escalate-or-refuse plus refuse-to-clobber crash-recovery invariant landed in one clean commit (660+/51- across 4 files) matches high/opus.",
+      "input_hash": "6cc85043462f4687bc7e584f6747e44d57cc2df6abcb4b611bdc26592e1a2396",
+      "model": "opus",
+      "task_id": "fn-1162-harden-agent-tab-crash-restore.4",
+      "tier": "high",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "The keystone new-module verified-transaction engine (1800+ insertions, 7 files, never-false-verified state machine) at 0.85 confidence is the epic's largest correctness-critical change and fits xhigh/opus.",
+      "input_hash": "6cc85043462f4687bc7e584f6747e44d57cc2df6abcb4b611bdc26592e1a2396",
+      "model": "opus",
+      "task_id": "fn-1162-harden-agent-tab-crash-restore.5",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Heuristic resume-target re-pin through the event-sourced back-fill is a poisoning-vector correctness surface (904+/17-, 6 files) that justifies high/opus despite reusing a sanctioned seam.",
+      "input_hash": "6cc85043462f4687bc7e584f6747e44d57cc2df6abcb4b611bdc26592e1a2396",
+      "model": "opus",
+      "task_id": "fn-1162-harden-agent-tab-crash-restore.7",
+      "tier": "high",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Pattern-following fast-sim plus copied slow-tier e2e instruments (917+ insertions, mostly test code) is workhorse test work with no misfit signal at high/sonnet.",
+      "input_hash": "6cc85043462f4687bc7e584f6747e44d57cc2df6abcb4b611bdc26592e1a2396",
+      "model": "sonnet",
+      "task_id": "fn-1162-harden-agent-tab-crash-restore.8",
+      "tier": "high",
+      "verdict": "right_sized"
+    }
+  ]
+}
