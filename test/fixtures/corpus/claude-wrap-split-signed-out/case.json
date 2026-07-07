@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "description": "structural: narrow-cols wrap-split OAuth URL sentinel",
+  "target": "claude",
+  "argv": [
+    "--target",
+    "claude",
+    "--profile",
+    "default",
+    "--rows",
+    "24",
+    "--cols",
+    "30"
+  ],
+  "now": "2026-05-29T12:00:00-04:00",
+  "tz": "America/New_York",
+  "cols": 30,
+  "rows": 24,
+  "paint_on_boot": true,
+  "mount_delay_ms": 0,
+  "logged_in": true,
+  "expected_exit_code": 0
+}

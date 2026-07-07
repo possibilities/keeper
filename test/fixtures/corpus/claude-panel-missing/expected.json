@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "error",
+  "error_kind": "panel_missing",
+  "error_type": "ClaudeUsageParseError",
+  "message": "no rate-limit bars and no no-subscription breakdown found — /usage panel did not render or its format changed",
+  "screen_excerpt": [
+    "  Welcome to Claude Code",
+    "  Tips for getting started:",
+    "  1. Run /help for a list of commands",
+    "  2. Ask questions about your code"
+  ]
+}

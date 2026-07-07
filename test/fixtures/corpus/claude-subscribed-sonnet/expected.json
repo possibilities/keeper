@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "usage": {
+    "session": {
+      "percent_used": 42.0,
+      "resets_at": "2026-05-29T15:00:00-04:00"
+    },
+    "week": {
+      "percent_used": 17.0,
+      "resets_at": "2026-05-31T09:00:00-04:00"
+    },
+    "sonnet_week": {
+      "percent_used": 9.0,
+      "resets_at": "2026-05-31T09:00:00-04:00"
+    }
+  },
+  "subscription_active": true
+}

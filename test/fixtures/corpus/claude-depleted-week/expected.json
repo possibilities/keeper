@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "usage": {
+    "session": {
+      "percent_used": 0.0,
+      "resets_at": null
+    },
+    "week": {
+      "percent_used": 100.0,
+      "resets_at": "2026-06-13T03:59:00-04:00"
+    }
+  },
+  "subscription_active": true
+}
