@@ -20,5 +20,5 @@ The composition map's factual enumeration of the arthack scan-dir's manifest-bea
 - [ ] No other section of the map changed
 
 ## Done summary
-
+Added matt to the composition map's scan-dir manifest-bearing children enumeration.
 ## Evidence
