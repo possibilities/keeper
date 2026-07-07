@@ -39,5 +39,5 @@ Fixture tests beside the existing predicate suite: presence per family, jam-clas
 - [ ] Fixture tests cover presence, jam filtering, subset rules, signature anchoring, and reconnect baseline retention
 
 ## Done summary
-
+Added seven keeper await needs-human conditions (six per-signal tokens + umbrella) as level-triggered presence predicates over the shared projector, with since:<signature> anti-spin anchoring, met-envelope signature, and a condition-set-derived includeDispatchFailures opt-in that throws rather than silently waiting on an unopened fold.
 ## Evidence
