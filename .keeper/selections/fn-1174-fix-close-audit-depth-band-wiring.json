@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Root cause fully named and config is source of truth; a bounded multi-file bug fix (consumer + drift gate + regression test) following existing depth_bands assertions, well-specified and not intelligence-bound, so sonnet at high.",
+      "task_id": "fn-1174-fix-close-audit-depth-band-wiring.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T20:44:05.987000Z",
+  "epic_id": "fn-1174-fix-close-audit-depth-band-wiring",
+  "input_hash": "d4f272c6ff6c17f8156a66b4e1c158683a04167c2c5dde0afd57ee7e256a7a54",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3572658886,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Root cause fully named and config is source of truth; a bounded multi-file bug fix (consumer + drift gate + regression test) following existing depth_bands assertions, well-specified and not intelligence-bound, so sonnet at high.\",\"confidence\":0.8}]}"
+}

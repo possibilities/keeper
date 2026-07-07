@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-07T20:44:05.991000Z",
   "created_at": "2026-07-07T17:29:10.898000Z",
   "depends_on_epics": [],
   "id": "fn-1167-variable-depth-automated-review",
   "last_validated_at": "2026-07-07T17:30:15.924000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Variable-depth automated review",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T17:47:51.828000Z"
+  "updated_at": "2026-07-07T20:44:05.991000Z"
 }
