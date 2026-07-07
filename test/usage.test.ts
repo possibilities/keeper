@@ -323,8 +323,8 @@ test("sonnet body line appears only on rows with sonnet_week data", () => {
     NOW_MS,
   );
   // codex block has 3 lines (header + session + week); claude block has
-  // 4 (header + session + week + sonnet). Total = 7.
-  expect(lines).toHaveLength(7);
+  // 5 (header + session + week + sonnet + balance). Total = 8.
+  expect(lines).toHaveLength(8);
   // No sonnet line anywhere in the codex block (the first 3 lines).
   expect(lines.slice(0, 3).join("\n")).not.toContain("sonnet");
   // claude block carries a sonnet body line with the proper format.
@@ -473,6 +473,56 @@ function bodyLineExact(lines: string[], label: string): string | undefined {
   return lines.find((l) => l.trimStart().startsWith(`${label} `));
 }
 
+test("active Claude quota rows render the picker reserve balance line", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 20,
+        week_resets_at: isoOffset(2 * 24 * 60),
+      },
+    ],
+    NOW_MS,
+  );
+  const balance = bodyLineExact(lines, "balance");
+  expect(balance).toBeDefined();
+  expect(balance as string).toMatch(
+    /balance · reserve at session ≥80% \/ week ≥95%$/,
+  );
+  expect(lines.indexOf(balance as string)).toBeGreaterThan(
+    lines.findIndex((l) => l.trimStart().startsWith("week ")),
+  );
+});
+
+test("balance line is omitted for codex and account-state annotation rows", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 20,
+        week_resets_at: isoOffset(2 * 24 * 60),
+      },
+      {
+        id: "signed-out",
+        target: "claude",
+        multiplier: null,
+        subscription_active: null,
+        account_state: "signed_out",
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLineExact(lines, "balance")).toBeUndefined();
+});
+
 test("emits 'limited lifts in <rel>' when rate_limit_lifts_at is known and future (fn-754)", () => {
   // fn-754: the `limited` line is a forward-looking lift countdown. A stack
   // with a known future `rate_limit_lifts_at` renders `limited lifts in
@@ -495,8 +545,8 @@ test("emits 'limited lifts in <rel>' when rate_limit_lifts_at is known and futur
     ],
     NOW_MS,
   );
-  // header + session + week + limited = 4 lines.
-  expect(lines).toHaveLength(4);
+  // header + session + week + balance + limited = 5 lines.
+  expect(lines).toHaveLength(5);
   const row = bodyLineExact(lines, "limited");
   expect(row, "expected a limited line").toBeDefined();
   expect(row as string).toMatch(/ lifts in 1h 2m$/);
@@ -949,8 +999,8 @@ test("a keeper-stale row drops the limited line entirely", () => {
     ],
     NOW_MS,
   );
-  // header + session + week + stale = 4 lines; no limited line.
-  expect(lines).toHaveLength(4);
+  // header + session + week + balance + stale = 5 lines; no limited line.
+  expect(lines).toHaveLength(5);
   expect(bodyLineExact(lines, "limited")).toBeUndefined();
   expect(lines.join("\n")).not.toContain("limited");
   const stale = bodyLineExact(lines, "stale") as string;
@@ -1008,10 +1058,9 @@ test("omits the session line when the weekly window is depleted (>=100%)", () =>
     ],
     NOW_MS,
   );
-  // header + week only — the session line is gone.
-  expect(lines).toHaveLength(2);
+  // header + week + balance — the session body line is gone.
+  expect(lines).toHaveLength(3);
   expect(bodyLineExact(lines, "session")).toBeUndefined();
-  expect(lines.join("\n")).not.toContain("session");
   expect(bodyLine(lines, "week")).toMatch(/ 100%/);
 });
 
@@ -1593,8 +1642,8 @@ test("stale error renders as an indented body line with type:message and ticking
     ],
     NOW_MS,
   );
-  // header + session + week + error = 4 lines.
-  expect(lines).toHaveLength(4);
+  // header + session + week + balance + error = 5 lines.
+  expect(lines).toHaveLength(5);
   const errLine = lines.find((l) => l.trimStart().startsWith("error "));
   expect(errLine).toBeDefined();
   expect(errLine).toContain("ParseError: label not found");
@@ -1648,8 +1697,8 @@ test("error line omitted when error_type is NULL (no stale error to show)", () =
     ],
     NOW_MS,
   );
-  // header + session + week = 3 lines; no error.
-  expect(lines).toHaveLength(3);
+  // header + session + week + balance = 4 lines; no error.
+  expect(lines).toHaveLength(4);
   expect(lines.find((l) => l.trimStart().startsWith("error "))).toBeUndefined();
 });
 

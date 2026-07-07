@@ -73,8 +73,8 @@ export const PICKER_SCHEMA_VERSION = 2;
 // plumbing). `effective_X = scraped_percent_X + pending * STEP_X / multiplier` —
 // the burst reservation, so a hot account climbs toward its limit as it is
 // picked and can open the reserve ahead of the next scrape.
-const SESSION_THRESHOLD = 80;
-const WEEK_THRESHOLD = 95;
+export const SESSION_THRESHOLD = 80;
+export const WEEK_THRESHOLD = 95;
 const SESSION_REARM = 50;
 const STEP_SESSION = 5;
 const STEP_WEEK = 1;
