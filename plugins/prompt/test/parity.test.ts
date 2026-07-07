@@ -35,7 +35,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-
+import {
+  DEFAULT_WRAPPER_EFFORT,
+  DEFAULT_WRAPPER_MODEL,
+  effectiveMatrixFromDisk,
+} from "../../plan/src/subagents_config.ts";
+import { runRenderPluginTemplates } from "../src/render_plugin_templates.ts";
 import type {
   CheckGeneratedFixture,
   OracleManifest,
@@ -71,12 +76,22 @@ const roots: NormalizeRoots = {
   keeperRoot: KEEPER_ROOT,
 };
 
+/** An empty config dir every external `keeper prompt` spawn resolves as its
+ *  `KEEPER_CONFIG_DIR`, so no host `~/.config/keeper/matrix.yaml` leaks into the
+ *  golden compares — with no matrix present the render falls back to the embedded
+ *  claude-only defaults, keeping the suite host-independent. */
+const SANDBOX_CONFIG_DIR = mkdtempSync(join(tmpdir(), "prompt-parity-cfg-"));
+afterAll(() => rmSync(SANDBOX_CONFIG_DIR, { recursive: true, force: true }));
+
 /** Run `keeper prompt <args>` from `cwd`. Returns raw stdout bytes + exit. */
 function runCandidate(
   args: string[],
   cwd: string,
 ): { stdout: Buffer; code: number; stderr: string } {
-  const proc = spawnSync("keeper", ["prompt", ...args], { cwd });
+  const proc = spawnSync("keeper", ["prompt", ...args], {
+    cwd,
+    env: { ...process.env, KEEPER_CONFIG_DIR: SANDBOX_CONFIG_DIR },
+  });
   return {
     stdout: proc.stdout ?? Buffer.alloc(0),
     code: proc.status ?? -1,
@@ -325,6 +340,220 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs golden", ()
         const got = normalize(gotContent, candidateRoots);
         expect(got).toBe(want);
       }
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+// ===========================================================================
+// 3. WRAPPED WORKER CELLS — host provider matrix overlay (ADR 0010)
+//
+// These run the ACTUAL worktree renderer IN-PROCESS (the external-keeper spawns
+// above exercise whatever `keeper` is on PATH). A sandboxed KEEPER_CONFIG_DIR
+// makes each render hermetic: an empty dir → embedded claude-only defaults, a dir
+// carrying a fixture matrix.yaml → the wrapped-cell axes it declares.
+// ===========================================================================
+
+describe("wrapped worker cells: host provider matrix overlay", () => {
+  const LIVE_PLAN_SUBAGENTS = join(
+    KEEPER_ROOT,
+    "plugins",
+    "plan",
+    "subagents.yaml",
+  );
+
+  // claude serves opus (native); codex serves the wrapped capability gpt-5.5 with
+  // a native-id alias; pi also serves gpt-5.5 (pecking-order overlap — allowed).
+  const FIXTURE_MATRIX = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    models:",
+    "      - gpt-5.5: gpt-5.5-codex",
+    "  - name: pi",
+    "    models: [gpt-5.5]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: xhigh",
+    "",
+  ].join("\n");
+
+  const trackedCfgDirs: string[] = [];
+  afterAll(() => {
+    for (const d of trackedCfgDirs) {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  /** A tracked temp config dir, optionally carrying a `matrix.yaml`. */
+  function tmpConfig(matrixYaml?: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "prompt-wrapped-cfg-"));
+    trackedCfgDirs.push(dir);
+    if (matrixYaml !== undefined) {
+      writeFileSync(join(dir, "matrix.yaml"), matrixYaml);
+    }
+    return dir;
+  }
+
+  /** `effectiveMatrixFromDisk` over the live plan subagents.yaml, resolved under
+   *  `configDir` (its matrix.yaml, if any, overlays the embedded defaults). */
+  function effectiveUnder(configDir: string) {
+    const saved = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = configDir;
+    try {
+      return effectiveMatrixFromDisk(LIVE_PLAN_SUBAGENTS);
+    } finally {
+      if (saved === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = saved;
+      }
+    }
+  }
+
+  /** Render the live plan plugin in-process under `configDir`. Returns the temp
+   *  render root + exit code; caller cleans up `work`. */
+  function renderPlanInProcess(configDir: string): {
+    work: string;
+    rc: number;
+  } {
+    const work = mkdtempSync(join(tmpdir(), "prompt-wrapped-plan-"));
+    cpSync(join(KEEPER_ROOT, "plugins", "plan"), work, { recursive: true });
+    writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
+    for (const kind of ["commands", "skills", "agents", "workers"]) {
+      rmSync(join(work, kind), { recursive: true, force: true });
+    }
+    const saved = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = configDir;
+    try {
+      return { work, rc: runRenderPluginTemplates({ projectRoot: work }) };
+    } finally {
+      if (saved === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = saved;
+      }
+    }
+  }
+
+  /** Sorted `workers/<model>-<effort>` cell directory names in a rendered tree. */
+  function workerCellDirs(work: string): string[] {
+    const dir = join(work, "workers");
+    if (!existsSync(dir)) {
+      return [];
+    }
+    return readdirSync(dir)
+      .filter((n) => statSync(join(dir, n)).isDirectory())
+      .sort();
+  }
+
+  test("no host matrix → embedded claude-only axes, all native, default wrapper", () => {
+    const m = effectiveUnder(tmpConfig());
+    expect([...m.models].sort()).toEqual(["opus", "sonnet"]);
+    expect([...m.efforts]).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(m.driverFor("opus")).toBe("native");
+    expect(m.driverFor("sonnet")).toBe("native");
+    expect(m.wrapper_driver).toEqual({
+      model: DEFAULT_WRAPPER_MODEL,
+      effort: DEFAULT_WRAPPER_EFFORT,
+    });
+  });
+
+  test("a fixture matrix overrides the axes: wrapped model + driver + wrapper from the host", () => {
+    const m = effectiveUnder(tmpConfig(FIXTURE_MATRIX));
+    expect([...m.models].sort()).toEqual(["gpt-5.5", "opus"]);
+    expect([...m.efforts]).toEqual(["medium", "high"]);
+    // claude membership → native; a model served only by codex/pi → wrapped.
+    expect(m.driverFor("opus")).toBe("native");
+    expect(m.driverFor("gpt-5.5")).toBe("wrapped");
+    expect(m.wrapper_driver).toEqual({ model: "sonnet", effort: "xhigh" });
+  });
+
+  test("a malformed matrix fails loud, never a silent fall-back to defaults", () => {
+    // providers must be a non-empty list — a mapping is malformed.
+    const cfg = tmpConfig(
+      "efforts: [high]\nproviders: {}\nsubagents: [work]\nwrapper_driver:\n  model: sonnet\n  effort: high\n",
+    );
+    expect(() => effectiveUnder(cfg)).toThrow();
+  });
+
+  test("a model served by claude AND a wrapped provider fails loud (ambiguous driver)", () => {
+    const cfg = tmpConfig(
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: claude",
+        "    models: [gpt-5.5]",
+        "  - name: codex",
+        "    models: [gpt-5.5]",
+        "subagents: [work]",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: high",
+        "",
+      ].join("\n"),
+    );
+    expect(() => effectiveUnder(cfg)).toThrow();
+  });
+
+  test("acceptance 1 — no matrix renders byte-identical to the golden tree (in-process)", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig());
+    try {
+      expect(rc).toBe(0);
+      const gotFiles = collectTree(work);
+      const wantByRel = new Map(
+        pluginTemplates.files.map((f) => [
+          f.relative,
+          Buffer.from(f.content_b64, "base64").toString("utf-8"),
+        ]),
+      );
+      const candidateRoots: NormalizeRoots = {
+        arthackRoot: manifest.arthack_root,
+        keeperRoot: work,
+      };
+      expect(new Set(gotFiles.keys())).toEqual(new Set(wantByRel.keys()));
+      for (const [rel, gotContent] of gotFiles) {
+        const want = normalize(wantByRel.get(rel) as string, roots);
+        expect(normalize(gotContent, candidateRoots)).toBe(want);
+      }
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("acceptance 2 — a fixture matrix fans out one cell per capability model × effort", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig(FIXTURE_MATRIX));
+    try {
+      expect(rc).toBe(0);
+      // model axis {opus, gpt-5.5} × efforts {medium, high} — one cell each.
+      expect(workerCellDirs(work)).toEqual([
+        "gpt-5.5-high",
+        "gpt-5.5-medium",
+        "opus-high",
+        "opus-medium",
+      ]);
+      // the wrapped cell bakes the capability model + effort and emits a manifest.
+      const wrapped = readFileSync(
+        join(work, "workers", "gpt-5.5-high", "agents", "worker.md"),
+        "utf-8",
+      );
+      expect(wrapped).toContain("model: gpt-5.5");
+      expect(wrapped).toContain('effort: "high"');
+      expect(
+        existsSync(
+          join(
+            work,
+            "workers",
+            "gpt-5.5-high",
+            ".claude-plugin",
+            "plugin.json",
+          ),
+        ),
+      ).toBe(true);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
