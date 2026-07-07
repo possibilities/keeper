@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T00:39:12.518000Z",
+  "depends_on": [
+    "fn-1149-multi-harness-wrapped-worker-cells.1"
+  ],
+  "epic": "fn-1149-multi-harness-wrapped-worker-cells",
+  "id": "fn-1149-multi-harness-wrapped-worker-cells.4",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Matrix-aware renderer and plan loader",
+  "updated_at": "2026-07-07T00:39:12.518000Z"
+}
