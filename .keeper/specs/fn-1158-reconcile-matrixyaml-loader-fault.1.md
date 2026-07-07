@@ -31,5 +31,5 @@ Files:
 - [ ] Present-but-unreadable path is covered in both islands.
 
 ## Done summary
-
+Narrowed loadHostMatrix's catch to the statSync/not-a-file case so a present-but-unreadable matrix.yaml throws a typed SubagentsConfigError instead of silently falling back; added a cross-island parity test (loadHostMatrix vs loadMatrix) plus present-but-unreadable coverage in both islands.
 ## Evidence
