@@ -38,5 +38,5 @@ Pair-diff tests per family: appeared, cleared, and no-op-churn (same rows, bumpe
 - [ ] --filter accepts the new types, help text is revised in place, and delta tests cover appear/clear/no-op-churn per family
 
 ## Done summary
-
+Added six additive top-level needs-human watch deltas (dead-letter, block-escalation, parked-question, stuck-dispatch, finalize-non-ff, instant-death-wall) derived through the shared projectNeedsHuman — operator-jam rows only, most-specific class, wall as a crossing bool; WATCH_SCHEMA_VERSION unchanged.
 ## Evidence
