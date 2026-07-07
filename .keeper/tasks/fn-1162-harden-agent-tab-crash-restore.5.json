@@ -1,0 +1,18 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T16:28:51.094000Z",
+  "depends_on": [
+    "fn-1162-harden-agent-tab-crash-restore.1",
+    "fn-1162-harden-agent-tab-crash-restore.2",
+    "fn-1162-harden-agent-tab-crash-restore.3"
+  ],
+  "epic": "fn-1162-harden-agent-tab-crash-restore",
+  "id": "fn-1162-harden-agent-tab-crash-restore.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Verified restore transactions retry",
+  "updated_at": "2026-07-07T16:28:51.094000Z"
+}

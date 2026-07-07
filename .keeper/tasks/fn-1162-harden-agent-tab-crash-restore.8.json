@@ -1,0 +1,19 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T16:28:51.094000Z",
+  "depends_on": [
+    "fn-1162-harden-agent-tab-crash-restore.3",
+    "fn-1162-harden-agent-tab-crash-restore.4",
+    "fn-1162-harden-agent-tab-crash-restore.5",
+    "fn-1162-harden-agent-tab-crash-restore.7"
+  ],
+  "epic": "fn-1162-harden-agent-tab-crash-restore",
+  "id": "fn-1162-harden-agent-tab-crash-restore.8",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "E2E sim and docs sweep",
+  "updated_at": "2026-07-07T16:28:51.094000Z"
+}
