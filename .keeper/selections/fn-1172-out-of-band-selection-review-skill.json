@@ -1,0 +1,48 @@
+{
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract-shaped versioned committed-dataset schema and write-once/--force guard matrix warrant xhigh depth, but the spec templates verbatim on existing committed-artifact invariants so sonnet suffices.",
+      "task_id": "fn-1172-out-of-band-selection-review-skill.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical end-to-end verb deletion, cross-reference scrub, and agent reframe on a clear multi-file path guarded by consistency tests.",
+      "task_id": "fn-1172-out-of-band-selection-review-skill.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Event-sourcing rewinding migration with a subtle re-fold-determinism correctness invariant (wipe exactly the deterministic-replayed projections, historical folds must not throw) cascading across many consumers is a nameable intelligence-bound reason.",
+      "task_id": "fn-1172-out-of-band-selection-review-skill.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Novel design of an honest-statistics grading skill (Wilson CIs, calibration, Simpson's-trap guards), blinded auditor fan-out, set-difference watermark, and corpus-as-injection hardening is design- and correctness-bound work.",
+      "task_id": "fn-1172-out-of-band-selection-review-skill.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T20:40:46.793000Z",
+  "epic_id": "fn-1172-out-of-band-selection-review-skill",
+  "input_hash": "03e00b7571785eff5e2a9f64682eaa03b22bad8c00015b4c85b9863210da1089",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 65014645,
+  "verdict_raw": null
+}
