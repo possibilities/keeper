@@ -5678,7 +5678,9 @@ test("permission-parked pin: a session parked on a mid-turn permission prompt st
 
 test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB → []", () => {
   const { db } = freshMemDb();
-  expect(resolveEscalationJobsFor(db, "deconflict", "fn-1-foo")).toEqual([]);
+  expect(resolveEscalationJobsFor(db, "deconflict", "fn-1-foo", null)).toEqual(
+    [],
+  );
   db.run(
     `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
        VALUES (?, 0, 0, 'working', 'deconflict', 'fn-1-foo')`,
@@ -5689,7 +5691,7 @@ test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB �
        VALUES (?, 0, 0, 'working', 'deconflict', 'fn-2-other')`,
     ["dc-job-2"],
   );
-  const rows = resolveEscalationJobsFor(db, "deconflict", "fn-1-foo");
+  const rows = resolveEscalationJobsFor(db, "deconflict", "fn-1-foo", null);
   expect(rows.map((r) => r.plan_ref)).toEqual(["fn-1-foo"]);
   // The read feeds the classifier — a turn-active row classifies as not-yet-terminal.
   expect(
@@ -5697,6 +5699,81 @@ test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB �
   ).toEqual({
     terminal: false,
   });
+  db.close();
+});
+
+test("resolveEscalationJobsFor: instance-scoped — stale resolved-instance rows excluded, NULL-stamped included, current-instance rows included", () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
+       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', 100)`,
+    ["job-instance-a"],
+  );
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
+       VALUES (?, 0, 0, 'working', 'unblock', 'fn-2-bar.3', 200)`,
+    ["job-instance-b"],
+  );
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
+       VALUES (?, 0, 0, 'working', 'unblock', 'fn-2-bar.3', NULL)`,
+    ["job-instance-null"],
+  );
+  // Scoped to the CURRENT instance (200): the stale instance-100 row (a resolved prior
+  // episode) is excluded, the current-instance row and the NULL-stamped
+  // corroboration-miss row are both included.
+  const scoped = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", 200);
+  expect(scoped.map((r) => r.job_id).sort()).toEqual([
+    "job-instance-b",
+    "job-instance-null",
+  ]);
+  // The stale instance-100 row alone must never suppress or falsely terminate the
+  // classification for instance 200 — it isn't even in the read.
+  expect(scoped.some((r) => r.job_id === "job-instance-a")).toBe(false);
+
+  // A NULL caller-side instance (legacy pre-migration caller context) falls back to the
+  // unscoped verb+ref match — every row, including the stale instance-100 one.
+  const unscoped = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", null);
+  expect(unscoped.map((r) => r.job_id).sort()).toEqual([
+    "job-instance-a",
+    "job-instance-b",
+    "job-instance-null",
+  ]);
+  db.close();
+});
+
+test("resolveEscalationJobsFor: cross-instance classification — a stale stopped row from a resolved instance neither pages nor suppresses a fresh re-block's escalation", () => {
+  const { db } = freshMemDb();
+  // Instance A: an unblock session ran its turn and stopped WITHOUT resolving the block
+  // (would classify declined) — but the task then re-blocked, opening instance B, and A's
+  // window still idles in its pane (killed/reaped later, or simply left behind).
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
+       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', 100)`,
+    ["job-stale-a"],
+  );
+  // Instance B: the fresh dispatch hasn't folded its SessionStart yet (launch window).
+  const rowsForB = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", 200);
+  expect(rowsForB).toEqual([]);
+  // No row for instance B yet → not terminal (launch window), even though instance A's
+  // stale row would have classified as terminal/declined if it leaked in.
+  expect(
+    classifyEscalationOutcome(rowsForB, "unblock", "fn-2-bar.3", true),
+  ).toEqual({ terminal: false });
+
+  // Instance B's own session folds and stops without resolving — NOW instance B
+  // classifies declined, scoped correctly to its own row plus (excluded here) any
+  // NULL-stamped miss.
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
+       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', 200)`,
+    ["job-fresh-b"],
+  );
+  const rowsForB2 = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", 200);
+  expect(rowsForB2.map((r) => r.job_id)).toEqual(["job-fresh-b"]);
+  expect(
+    classifyEscalationOutcome(rowsForB2, "unblock", "fn-2-bar.3", true),
+  ).toEqual({ terminal: true, verdict: "declined" });
   db.close();
 });
 

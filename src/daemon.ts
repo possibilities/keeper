@@ -2172,18 +2172,35 @@ export function classifyEscalationOutcome(
  * liveness arms touch. A jobs read failure degrades to an EMPTY array, which classifies
  * as `{terminal:false}` so the notify conservatively WAITS (never a premature notify on a
  * transient error). Module-level twin of {@link resolveJobsForEpic}.
+ *
+ * `instance` scopes the read to the CURRENT block instance (the caller's `blocked_since`
+ * for unblock, the sticky row's `instance_event_id` for deconflict/resolve) so a stale
+ * row from a RESOLVED instance can neither suppress nor prematurely fire stage-3 for a
+ * re-block. The predicate is `escalation_instance = ?instance OR escalation_instance IS
+ * NULL` — NULL-stamped rows (the corroboration-miss edge; see {@link Job.escalation_instance})
+ * are conservatively INCLUDED so a stamp-missed session can still classify rather than
+ * wait forever. A NULL `instance` (legacy pre-migration caller context) falls back to the
+ * unscoped verb+ref match — the old behavior, untouched.
  */
 export function resolveEscalationJobsFor(
   db: Database,
   verb: EscalationVerb,
   id: string,
+  instance: number | null,
 ): Job[] {
   try {
+    if (instance == null) {
+      return db
+        .query(
+          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = ? AND plan_ref = ?",
+        )
+        .all(verb, id) as unknown as Job[];
+    }
     return db
       .query(
-        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb = ? AND plan_ref = ?",
+        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = ? AND plan_ref = ? AND (escalation_instance = ? OR escalation_instance IS NULL)",
       )
-      .all(verb, id) as unknown as Job[];
+      .all(verb, id, instance) as unknown as Job[];
   } catch {
     return [];
   }
@@ -8659,6 +8676,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // The sticky close row's `instance_event_id` — the block-instance anchor stage-3
+  // scopes {@link resolveEscalationJobsFor} on so a stale row from a resolved incident
+  // never suppresses or prematurely pages a re-escalated deconflict. A read miss or
+  // absent row degrades to NULL (the unscoped verb+ref fallback), never a thrown error.
+  function deconflictInstanceFor(id: string): number | null {
+    try {
+      const row = db
+        .query(
+          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ? LIMIT 1",
+        )
+        .get(id) as { instance_event_id: number | null } | null;
+      return row?.instance_event_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   // Producer-side deconflict human-notify sweep (fn-1129 stage 3). Each heartbeat tick
   // walks the sticky closes whose deconflict session was dispatched but whose human is
   // not yet notified, and sends ONE botctl notification once that session reaches a
@@ -8687,7 +8721,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       },
       deconflictOutcome: (id) =>
         classifyEscalationOutcome(
-          resolveEscalationJobsFor(db, "deconflict", id),
+          resolveEscalationJobsFor(
+            db,
+            "deconflict",
+            id,
+            deconflictInstanceFor(id),
+          ),
           "deconflict",
           id,
           deconflictIncidentOpen(id),
@@ -8886,6 +8925,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // The block latch's `blocked_since` — the block-instance anchor stage-3 scopes
+  // {@link resolveEscalationJobsFor} on so a stale row from a resolved (unblocked) prior
+  // instance never suppresses or prematurely pages a re-blocked task's fresh escalation.
+  // A read miss or absent latch degrades to NULL (the unscoped verb+ref fallback), never
+  // a thrown error. `task_id` is globally unique, keying the latch alone.
+  function unblockInstanceFor(taskId: string): number | null {
+    try {
+      const row = db
+        .query(
+          "SELECT blocked_since FROM block_escalations WHERE task_id = ? AND status = 'attempted' LIMIT 1",
+        )
+        .get(taskId) as { blocked_since: number } | null;
+      return row?.blocked_since ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   // Producer-side unblock human-notify sweep (fn-1129 stage 3). Each heartbeat tick walks
   // the block latches whose `unblock::<task>` session was dispatched but whose human is
   // not yet notified, and sends ONE botctl notification once that session reaches a
@@ -8914,7 +8971,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       },
       unblockOutcome: (taskId) =>
         classifyEscalationOutcome(
-          resolveEscalationJobsFor(db, "unblock", taskId),
+          resolveEscalationJobsFor(
+            db,
+            "unblock",
+            taskId,
+            unblockInstanceFor(taskId),
+          ),
           "unblock",
           taskId,
           unblockIncidentOpen(taskId),
