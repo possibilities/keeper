@@ -11,7 +11,8 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Projection**: A read-optimized view keeper derives purely by folding the event stream; it is disposable and rebuildable, never a source of truth. Avoid: cache, materialized view, table of record.
 - **Fold**: The pure step that applies one event to a projection and advances the cursor in the same transaction. Avoid: ingest, handler, apply-and-save.
 - **Reducer**: The component that folds events into projections and owns the sole write path to them. Avoid: processor, service, controller.
-- **Cursor**: The last event id a reducer has folded, marking how far a projection has caught up. Avoid: pointer, offset, watermark.
+- **Cursor**: The last event id a reducer has folded, marking how far a projection has caught up; a stream position, distinct from the per-row lifecycle stamp. Avoid: pointer, offset, watermark.
+- **Lifecycle stamp**: The per-job event-time high-water mark that lifecycle state transitions may not regress behind, so a stale out-of-order event annotates but never resurrects state. Avoid: watermark, cursor, last-seen.
 - **Re-fold**: Rebuilding a projection by replaying every event, which stays deterministic only because a fold never reads wall-clock, environment, or the filesystem. Avoid: rebuild, replay-repair, reprocess.
 - **Dead letter**: An event the reducer could not fold, parked for inspection and later replay instead of crashing the fold. Avoid: error queue, poison message, reject.
 - **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a rewind. Avoid: snapshot, ephemeral view, scratch state.
@@ -40,6 +41,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Reconciler**: The level-triggered core of autopilot that re-derives what should be running from current state each cycle. Avoid: dispatcher, poller, event loop.
 - **Dispatch**: To fire one worker at a task or a close, whether by autopilot or by hand. Avoid: launch, spawn, enqueue.
 - **Reaper**: A background sweep that reclaims stuck, stale, or dead work so the board keeps moving. Avoid: cleanup job, garbage collector, timeout.
+- **Phantom-working**: A job row stuck reading working after its session has gone permanently idle, so autoclose, readiness, and dependent dispatches all consume the wrong state. Avoid: zombie job, ghost worker, stale running.
 - **Drain**: Folding a backlog of pending events to completion in bounded batches. Avoid: flush, catch-up, backfill.
 - **Sticky**: A dispatch failure that stays parked and visible until an operator retries it, rather than clearing itself. Avoid: transient error, flake, warning.
 - **Needs-human**: The family of board signals requiring operator attention — dead letters, block escalations, parked questions, and stuck dispatches, with finalize-non-ff and the instant-death wall as subsets of stuck dispatches that never double-count into the total, plus display-only members like the selection review that never count toward the jam total at all. Avoid: alert queue, error state, attention list.
