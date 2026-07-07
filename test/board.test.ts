@@ -1802,9 +1802,9 @@ const EPIC_NOT_VALIDATED: Verdict = {
   reason: { kind: "epic-not-validated" },
 };
 
-// Board summary counts visible open/running epics, tasks, and closers from the
-// same readiness verdicts the row renderer consumes.
-test("computeBoardSummary: counts open and running epics/tasks/closers", () => {
+// Board summary counts visible open/running tasks and epics from the same
+// readiness verdicts the row renderer consumes.
+test("computeBoardSummary: counts open/running tasks and epics, including closing epics", () => {
   const taskRunning = makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" });
   const taskCompleted = makeTask({ task_id: "fn-1-a.2", epic_id: "fn-1-a" });
   const epicFromTask = makeEpic({
@@ -1840,16 +1840,14 @@ test("computeBoardSummary: counts open and running epics/tasks/closers", () => {
   expect(counts).toEqual({
     epicsOpen: 2,
     epicsRunning: 2,
+    epicsClosing: 1,
     tasksOpen: 1,
     tasksRunning: 1,
-    closersOpen: 2,
-    closersRunning: 1,
   });
   expect(boardSummaryLines(counts)).toEqual([
     "summary",
-    "  epics: 2 open / 2 running",
     "  tasks: 1 open / 1 running",
-    "  closers: 2 open / 1 running",
+    "  epics: 2 open / 2 running / 1 closing",
   ]);
 });
 
