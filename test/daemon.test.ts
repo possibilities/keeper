@@ -3339,7 +3339,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // This migration REWINDS the cursor and wipes the deterministic projection set
   // so the stamp is back-derived purely by replay and existing phantom-working
   // rows self-heal — `commit_trailer_facts` is spared per the v80/v81/v85 carve-out).
-  expect(SCHEMA_VERSION).toBe(113);
+  // And to 114 via fn-1171 task .2 (appending the nullable `jobs.escalation_instance`
+  // + `dispatch_failures.instance_event_id` INTEGER columns — the escalation-session
+  // block-instance binding; the binding-SessionStart stamp is COALESCE-preserved and
+  // `instance_event_id` copies the event's own id, so a plain additive ALTER with NO
+  // cursor rewind stays re-fold deterministic — a from-scratch re-fold reproduces
+  // every stamp and every corroboration miss byte-identical).
+  expect(SCHEMA_VERSION).toBe(114);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

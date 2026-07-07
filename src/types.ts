@@ -594,6 +594,18 @@ export interface Job {
    */
   dispatch_origin: string | null;
   /**
+   * Block-instance binding (schema v114): the id of the block instance this
+   * session's escalation dispatch was fired for, stamped at the binding
+   * SessionStart ALONGSIDE `dispatch_origin='escalation'` — but ONLY when the
+   * `unblock`/`deconflict`/`resolve` spawn name corroborates against the prior
+   * projection (the unblock latch dispatched, or the merge sticky's
+   * `instance_event_id`). Both-or-neither: a corroboration miss leaves this AND
+   * `dispatch_origin` NULL, never a name-only stamp. The fencing token stage-3
+   * paging scopes on so a superseded incident never re-pages. NULL for every
+   * non-escalation session. Set once on bind, untouched by resume.
+   */
+  escalation_instance: number | null;
+  /**
    * Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`), folded onto
    * `jobs.harness` from the SessionStart tag. NULL on legacy rows and reads as
    * claude at every consumer (the fold never synthesizes a value). The resume/

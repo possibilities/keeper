@@ -2555,6 +2555,304 @@ test("from-scratch re-fold reproduces the dispatch_origin stamps byte-identicall
 });
 
 // ---------------------------------------------------------------------------
+// Schema v114 (fn-1171 task .2) — escalation-session block-instance binding.
+// `dispatch_failures.instance_event_id` stamps the sticky row's FIRST-appearance
+// event id (preserved across UPSERT re-emits, reborn on clear + re-mint). The
+// binding SessionStart seam stamps `jobs.dispatch_origin='escalation'` +
+// `escalation_instance` TOGETHER for an `unblock::`/`deconflict::`/`resolve::`
+// spawn name that CORROBORATES the prior projection (the unblock latch's
+// dispatched outcome → `blocked_since`; the merge sticky's `merge_escalated_at` /
+// `resolver_dispatched_at` → `instance_event_id`); a corroboration miss leaves
+// BOTH NULL. All folds pure over the event log — a from-scratch re-fold
+// reproduces every stamp AND every miss byte-identically.
+// ---------------------------------------------------------------------------
+
+function getInstanceEventId(verb: string, id: string): number | null {
+  const row = db
+    .query(
+      "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { instance_event_id: number | null } | null;
+  return row?.instance_event_id ?? null;
+}
+
+function getEscalationBinding(jobId: string): {
+  dispatch_origin: string | null;
+  escalation_instance: number | null;
+} | null {
+  return db
+    .query(
+      "SELECT dispatch_origin, escalation_instance FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    dispatch_origin: string | null;
+    escalation_instance: number | null;
+  } | null;
+}
+
+test("instance_event_id: first-appearance-stable across a DispatchFailed UPSERT re-emit, reborn on clear + re-mint (fn-1171)", () => {
+  const firstId = dispatchFailedEvent(
+    "close",
+    "fn-inst-1",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(getInstanceEventId("close", "fn-inst-1")).toBe(firstId);
+
+  // A re-emit of the still-open row (different reason/dir/ts) UPSERTs in place —
+  // instance_event_id is PRESERVED (first-appearance, like created_at).
+  const secondId = dispatchFailedEvent(
+    "close",
+    "fn-inst-1",
+    "launch_failed",
+    "/r2",
+    1750,
+  );
+  drainAll();
+  expect(secondId).toBeGreaterThan(firstId);
+  expect(getInstanceEventId("close", "fn-inst-1")).toBe(firstId);
+
+  // A DispatchCleared DELETEs the row; a fresh DispatchFailed re-mints it — a NEW
+  // incident instance, so instance_event_id is reborn at the new event id.
+  dispatchClearedEvent("close", "fn-inst-1");
+  drainAll();
+  expect(getDispatchFailure("close", "fn-inst-1")).toBeNull();
+  const rebornId = dispatchFailedEvent(
+    "close",
+    "fn-inst-1",
+    "worktree-merge-conflict",
+    "/r3",
+    1800,
+  );
+  drainAll();
+  expect(getInstanceEventId("close", "fn-inst-1")).toBe(rebornId);
+  expect(rebornId).toBeGreaterThan(secondId);
+});
+
+test("escalation binding: an unblock session whose latch was dispatched stamps origin='escalation' + instance=blocked_since (fn-1171)", () => {
+  const armId = armBlockLatch("fn-1171-eu", "fn-1171-eu.1");
+  drainAll();
+  expect(getBlockLatch("fn-1171-eu", "fn-1171-eu.1")?.status).toBe("pending");
+  blockAttemptedEvent("fn-1171-eu", "fn-1171-eu.1", "dispatched", 1800);
+  drainAll();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-unblock",
+    spawn_name: "unblock::fn-1171-eu.1",
+  });
+  drainAll();
+  const b = getEscalationBinding("sess-unblock");
+  expect(b?.dispatch_origin).toBe("escalation");
+  // Instance = the latch's blocked_since (the event id that ARMED the block),
+  // which equals the arming TaskSnapshot's event id.
+  expect(b?.escalation_instance).toBe(armId);
+});
+
+test("escalation binding: a deconflict session whose close row was merge-escalated stamps origin='escalation' + instance=instance_event_id (fn-1171)", () => {
+  const dfId = dispatchFailedEvent(
+    "close",
+    "fn-1171-ed",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  mergeEscalationEvent("fn-1171-ed", "sent", 1750);
+  drainAll();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-deconflict",
+    spawn_name: "deconflict::fn-1171-ed",
+  });
+  drainAll();
+  const b = getEscalationBinding("sess-deconflict");
+  expect(b?.dispatch_origin).toBe("escalation");
+  expect(b?.escalation_instance).toBe(dfId);
+});
+
+test("escalation binding: a resolve session whose close row's resolver was dispatched stamps origin='escalation' + instance=instance_event_id (fn-1171)", () => {
+  const dfId = dispatchFailedEvent(
+    "close",
+    "fn-1171-er",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  resolverDispatchEvent("fn-1171-er", "dispatched", 1750);
+  drainAll();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-resolve",
+    spawn_name: "resolve::fn-1171-er",
+  });
+  drainAll();
+  const b = getEscalationBinding("sess-resolve");
+  expect(b?.dispatch_origin).toBe("escalation");
+  expect(b?.escalation_instance).toBe(dfId);
+});
+
+test("escalation binding: a corroboration miss (unblock latch cycled unblocked→re-blocked) leaves BOTH origin and instance NULL (fn-1171)", () => {
+  armBlockLatch("fn-1171-em", "fn-1171-em.1");
+  blockAttemptedEvent("fn-1171-em", "fn-1171-em.1", "dispatched", 1800);
+  drainAll();
+  // Cycle the latch BEFORE the SessionStart folds: unblock (DELETE) then re-block
+  // (re-arm with a NULL outcome). The dispatched outcome is gone, so the name
+  // corroborates against a row that is no longer dispatched — the design forbids
+  // a name-only stamp, so both columns stay NULL.
+  unblockTask("fn-1171-em", "fn-1171-em.1");
+  armBlockLatch("fn-1171-em", "fn-1171-em.1");
+  drainAll();
+  expect(getBlockLatch("fn-1171-em", "fn-1171-em.1")?.outcome).toBeNull();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-miss",
+    spawn_name: "unblock::fn-1171-em.1",
+  });
+  drainAll();
+  const b = getEscalationBinding("sess-miss");
+  expect(b?.dispatch_origin).toBeNull();
+  expect(b?.escalation_instance).toBeNull();
+});
+
+test("escalation binding: a deconflict session with a close row that was never merge-escalated leaves BOTH NULL (fn-1171)", () => {
+  // A sticky close row exists (instance_event_id set) but its merge was never
+  // human-escalated (merge_escalated_at NULL) — the deconflict corroboration
+  // misses, both NULL.
+  dispatchFailedEvent(
+    "close",
+    "fn-1171-edm",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-dmiss",
+    spawn_name: "deconflict::fn-1171-edm",
+  });
+  drainAll();
+  const b = getEscalationBinding("sess-dmiss");
+  expect(b?.dispatch_origin).toBeNull();
+  expect(b?.escalation_instance).toBeNull();
+});
+
+test("escalation binding is set-once: a resume never re-corroborates or clobbers the stamp (fn-1171)", () => {
+  const armId = armBlockLatch("fn-1171-eres", "fn-1171-eres.1");
+  blockAttemptedEvent("fn-1171-eres", "fn-1171-eres.1", "dispatched", 1800);
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-res",
+    spawn_name: "unblock::fn-1171-eres.1",
+  });
+  drainAll();
+  expect(getEscalationBinding("sess-res")?.escalation_instance).toBe(armId);
+
+  // Cycle the latch to a MISS state, then RESUME the same session. The branch is
+  // gated on the spawn-INSERT/heal condition (priorJob.plan_ref is already set on
+  // a resume), so it never re-corroborates — the set-once stamp is preserved.
+  unblockTask("fn-1171-eres", "fn-1171-eres.1");
+  armBlockLatch("fn-1171-eres", "fn-1171-eres.1");
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-res",
+    spawn_name: "unblock::fn-1171-eres.1",
+  });
+  drainAll();
+  const b = getEscalationBinding("sess-res");
+  expect(b?.dispatch_origin).toBe("escalation");
+  expect(b?.escalation_instance).toBe(armId);
+});
+
+test("from-scratch re-fold reproduces the escalation_instance stamps and misses byte-identically (fn-1171)", () => {
+  // A hit (unblock → blocked_since), a hit (deconflict → instance_event_id), and
+  // a miss (cycled unblock latch). Each corroborator precedes its binding
+  // SessionStart in the log, so a cursor-0 re-fold reproduces every stamp AND the
+  // miss byte-identically.
+  const armId = armBlockLatch("fn-1171-ru", "fn-1171-ru.1");
+  blockAttemptedEvent("fn-1171-ru", "fn-1171-ru.1", "dispatched", 1800);
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-refold-u",
+    spawn_name: "unblock::fn-1171-ru.1",
+  });
+
+  const dfId = dispatchFailedEvent(
+    "close",
+    "fn-1171-rd",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  mergeEscalationEvent("fn-1171-rd", "sent", 1750);
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-refold-d",
+    spawn_name: "deconflict::fn-1171-rd",
+  });
+
+  // Miss: latch dispatched, then cycled unblocked→re-blocked before the bind.
+  armBlockLatch("fn-1171-rm", "fn-1171-rm.1");
+  blockAttemptedEvent("fn-1171-rm", "fn-1171-rm.1", "dispatched", 1810);
+  unblockTask("fn-1171-rm", "fn-1171-rm.1");
+  armBlockLatch("fn-1171-rm", "fn-1171-rm.1");
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-refold-m",
+    spawn_name: "unblock::fn-1171-rm.1",
+  });
+  drainAll();
+
+  const before = db
+    .query(
+      "SELECT job_id, dispatch_origin, escalation_instance FROM jobs WHERE job_id LIKE 'sess-refold-%' ORDER BY job_id",
+    )
+    .all();
+  // Sanity: two hits (blocked_since + instance_event_id) and one miss.
+  expect(before).toContainEqual({
+    job_id: "sess-refold-u",
+    dispatch_origin: "escalation",
+    escalation_instance: armId,
+  });
+  expect(before).toContainEqual({
+    job_id: "sess-refold-d",
+    dispatch_origin: "escalation",
+    escalation_instance: dfId,
+  });
+  expect(before).toContainEqual({
+    job_id: "sess-refold-m",
+    dispatch_origin: null,
+    escalation_instance: null,
+  });
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM block_escalations");
+  db.run("DELETE FROM dispatch_failures");
+  db.run("DELETE FROM pending_dispatches");
+  db.run("DELETE FROM dispatch_never_bound");
+  db.run("DELETE FROM dispatch_instant_death");
+  drainAll();
+
+  const after = db
+    .query(
+      "SELECT job_id, dispatch_origin, escalation_instance FROM jobs WHERE job_id LIKE 'sess-refold-%' ORDER BY job_id",
+    )
+    .all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v76 (fn-846) — `dispatch_never_bound` reducer projection + the
 // never-bound circuit breaker. `foldDispatchExpired` increments a per-`(verb,
 // id)` consecutive-`DispatchExpired`-without-bind counter; at K=3 it mints a

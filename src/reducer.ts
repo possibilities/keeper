@@ -4063,8 +4063,9 @@ function foldDispatchFailed(db: Database, event: Event): void {
   db.run(
     `INSERT INTO dispatch_failures (
        verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-       merge_escalated_at, resolver_dispatched_at, human_notified_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+       merge_escalated_at, resolver_dispatched_at, human_notified_at,
+       instance_event_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
@@ -4079,6 +4080,11 @@ function foldDispatchFailed(db: Database, event: Event): void {
        -- deconflict session and the human-notify sweep would re-notify. All three
        -- markers re-arm only on a DispatchCleared (retry_dispatch) DELETE
        -- dropping the row entirely.
+       -- instance_event_id preserved through UPSERT for the SAME reason: it is
+       -- the FIRST-appearance event id of this open incident (the fencing token
+       -- the deconflict/resolve corroboration reads to pin the instance), so a
+       -- re-emit of the still-open row must NOT re-mint it — only a clear + fresh
+       -- INSERT opens a new instance.
        updated_at = excluded.updated_at`,
     [
       payload.verb,
@@ -4089,6 +4095,7 @@ function foldDispatchFailed(db: Database, event: Event): void {
       event.id,
       payload.ts,
       event.ts,
+      event.id,
     ],
   );
   // A `DispatchFailed` also discharges any in-flight `pending_dispatches` row
@@ -4344,11 +4351,13 @@ function foldDispatchExpired(db: Database, event: Event): void {
     // expire time → NULL). `created_at` preserved on conflict so the "sticky
     // since" view is the first never-bound mint. Event-payload-free: `ts` /
     // `created_at` / `updated_at` all come from `event.ts`, keeping the fold
-    // re-fold-deterministic.
+    // re-fold-deterministic. `instance_event_id = event.id` stamps the row's
+    // first-appearance incident id (preserved on conflict, same as `created_at`).
     db.run(
       `INSERT INTO dispatch_failures (
-         verb, id, reason, dir, ts, last_event_id, created_at, updated_at
-       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+         verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+         instance_event_id
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
        ON CONFLICT(verb, id) DO UPDATE SET
          reason = excluded.reason,
          dir = excluded.dir,
@@ -4363,6 +4372,7 @@ function foldDispatchExpired(db: Database, event: Event): void {
         event.id,
         event.ts,
         event.ts,
+        event.id,
       ],
     );
     // Clear the counter: the breaker has tripped and the sticky failure now owns
@@ -4498,10 +4508,13 @@ function foldInstantDeathTerminal(
     // (dir unknown at kill time → NULL; `ts`/`created_at`/`updated_at` all from
     // `event.ts`, keeping the fold re-fold-deterministic). The `failedKeys` arm
     // suppresses re-dispatch of the key until `retry_dispatch` clears it.
+    // `instance_event_id = event.id` stamps the row's first-appearance incident
+    // id (preserved on conflict, same as `created_at`).
     db.run(
       `INSERT INTO dispatch_failures (
-         verb, id, reason, dir, ts, last_event_id, created_at, updated_at
-       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+         verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+         instance_event_id
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
        ON CONFLICT(verb, id) DO UPDATE SET
          reason = excluded.reason,
          dir = excluded.dir,
@@ -4516,6 +4529,7 @@ function foldInstantDeathTerminal(
         event.id,
         event.ts,
         event.ts,
+        event.id,
       ],
     );
     // Clear the counter: the breaker tripped and the sticky now owns suppression;
@@ -8230,6 +8244,79 @@ function projectJobsRow(db: Database, event: Event): void {
             plan_verb,
             plan_ref,
           ]);
+        }
+        // Escalation-instance binding: an `unblock::<task>` / `deconflict::<epic>`
+        // / `resolve::<epic>` session is a first-class dispatch key
+        // (`planVerbRefFromSpawnName` returns its verb), but it is dispatched by a
+        // daemon escalation sweep that mints NO `Dispatched`/`pending_dispatches`
+        // row — so it NEVER trips the discharge gate above and its
+        // `dispatch_origin` would otherwise stay NULL. This branch is STRUCTURALLY
+        // SEPARATE from that gate: gated on the SAME spawn-INSERT-or-heal condition
+        // (never a genuine resume, so the stamp is set-once, COALESCE-preserved),
+        // it CORROBORATES the spawn name against the PRIOR deterministic projection
+        // and — only on a hit — stamps `dispatch_origin='escalation'` + the
+        // `escalation_instance` id TOGETHER. Both-or-neither: a corroboration MISS
+        // (e.g. the task cycled unblocked→re-blocked before this SessionStart
+        // folded, so the latch re-armed with a NULL outcome) leaves BOTH NULL —
+        // stamping origin off the name alone would be the heuristic the design
+        // forbids. The corroborating event (the `BlockEscalationAttempted`
+        // 'dispatched', the merge-escalation stamp, or the resolver-dispatch stamp)
+        // ALWAYS precedes this binding SessionStart in total order, so the fold
+        // reads only prior projections + the event's own spawn name — re-fold-
+        // deterministic including the miss case.
+        if (
+          (isSpawnInsert || priorJob.plan_ref == null) &&
+          plan_verb != null &&
+          plan_ref != null &&
+          (plan_verb === "unblock" ||
+            plan_verb === "deconflict" ||
+            plan_verb === "resolve")
+        ) {
+          let escalationInstance: number | null = null;
+          if (plan_verb === "unblock") {
+            // unblock::<task> — corroborate the block_escalations latch whose
+            // `unblock::<task>` session was dispatched for this task. The latch PK
+            // is (epic_id, task_id) and a task_id is globally unique across epics,
+            // so the task_id-only read resolves the one row. Instance = the latch's
+            // `blocked_since` (the event id that ARMED this blocked episode — a
+            // re-block after an unblock opens a NEW instance with a new id).
+            const latch = db
+              .query(
+                "SELECT blocked_since FROM block_escalations WHERE task_id = ? AND outcome = 'dispatched'",
+              )
+              .get(plan_ref) as { blocked_since: number } | null;
+            escalationInstance = latch?.blocked_since ?? null;
+          } else if (plan_verb === "deconflict") {
+            // deconflict::<epic> — corroborate the sticky close row whose merge was
+            // human-escalated (`merge_escalated_at` set). Instance = the row's
+            // first-appearance `instance_event_id`.
+            const row = db
+              .query(
+                "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NOT NULL",
+              )
+              .get(plan_ref) as { instance_event_id: number | null } | null;
+            escalationInstance = row?.instance_event_id ?? null;
+          } else {
+            // resolve::<epic> — corroborate the sticky close row whose resolver was
+            // dispatched (`resolver_dispatched_at` set). Instance = the SAME
+            // first-appearance `instance_event_id`.
+            const row = db
+              .query(
+                "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NOT NULL",
+              )
+              .get(plan_ref) as { instance_event_id: number | null } | null;
+            escalationInstance = row?.instance_event_id ?? null;
+          }
+          // Both-or-neither: stamp origin + instance TOGETHER, only on a hit. A
+          // miss (NULL instance) leaves both columns NULL — the design forbids a
+          // name-only stamp. The narrow UPDATE need not touch last_event_id /
+          // updated_at (the enclosing UPSERT already wrote them for this event).
+          if (escalationInstance != null) {
+            db.run(
+              "UPDATE jobs SET dispatch_origin = 'escalation', escalation_instance = ? WHERE job_id = ?",
+              [escalationInstance, jobId],
+            );
+          }
         }
         // Handoff bind: a `handoff::<id>` spawn name is a SEPARATE spawn-name
         // class from the `{plan,work,close}::` plan verbs (it carries no plan
