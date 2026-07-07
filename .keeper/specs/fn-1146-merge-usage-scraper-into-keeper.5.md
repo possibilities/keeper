@@ -49,5 +49,5 @@ project directory or the deleted config keys remains.
 - [ ] Doc lints pass
 
 ## Done summary
-
+Truthed up README (Temporal-polyfill dep, usage_models config pointer) and CONTEXT.md (usage-model registry + agentusage-namespace glossary entries), and ported the tmux-owns-the-PTY driver decision into docs/adr/0009.
 ## Evidence

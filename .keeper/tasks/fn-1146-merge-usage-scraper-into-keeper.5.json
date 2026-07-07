@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Update docs and port ADR",
-  "updated_at": "2026-07-06T20:29:24.784000Z"
+  "updated_at": "2026-07-07T01:10:56.102000Z",
+  "worker_done_at": "2026-07-07T01:10:56.102000Z"
 }
