@@ -35,5 +35,5 @@ Cross-instance case: stale stamped rows from resolved instance A (killed or stop
 - [ ] Existing single-instance classifier behavior is unchanged (suites green)
 
 ## Done summary
-
+resolveEscalationJobsFor gained an instance parameter scoping stage-3 escalation classification to the current block instance (escalation_instance = ?instance OR NULL), with both callers (unblock's blocked_since latch, deconflict's instance_event_id sticky) threading their anchor and a NULL fallback to the unscoped match.
 ## Evidence
