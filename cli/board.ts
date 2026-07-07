@@ -694,7 +694,6 @@ export async function main(argv: string[]): Promise<void> {
         apState.maxConcurrentPerRootStored,
         apState.worktreeMode,
       ),
-      maxConcurrentPerRootStored: apState.maxConcurrentPerRootStored,
       mode: apState.mode,
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,

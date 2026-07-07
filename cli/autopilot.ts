@@ -844,16 +844,18 @@ interface ViewerState {
 /**
  * Render the persistent banner pill: the play/pause pill, the mode suffix, the
  * concurrency-cap suffix, (in `armed` mode) the armed-epic count, the per-root
- * count, and the worktree-mode suffix.
- * `[playing] · yolo · max 3 · per-root 2 · worktree:on` in yolo mode;
- * `[playing] · armed · 2 armed · max ∞ · per-root 1 · worktree:on` with two
- * armed epics and worktree mode on. The empty-armed-set-in-armed-mode case
- * renders DISTINCTLY as `[playing] · armed · nothing armed · max ∞ · per-root 1`
- * so idle-by-design is never mistaken for a broken autopilot. The per-root
- * segment renders the EFFECTIVE cap; when the durable STORED intent differs
- * (worktree off floors effective to 1 while a >1 value stays stored) it appends
- * the intent as `per-root 1 (stored 3)`, so a latent cap is never invisible. The
- * per-root and worktree segments render ALWAYS so the live state is scannable.
+ * count (worktree mode off only), and the worktree-mode suffix.
+ * `[playing] · yolo · max 3 · per-root 1 · worktree:off` with worktree mode
+ * off; `[playing] · armed · 2 armed · max ∞ · worktree:on` with two armed
+ * epics and worktree mode on. The empty-armed-set-in-armed-mode case renders
+ * DISTINCTLY as `[playing] · armed · nothing armed · max ∞ · per-root 1 ·
+ * worktree:off` so idle-by-design is never mistaken for a broken autopilot.
+ * The per-root cap governs dispatch ONLY while worktree mode is off (each
+ * ready task gets its own cap-1 lane under worktree mode, so the cap is
+ * deliberately ignored there) — the segment renders ONLY in that mode,
+ * showing the effective cap (always 1). The raw stored intent stays out of
+ * the banner and is still readable via `keeper status` / `keeper watch` JSON.
+ * The worktree segment renders ALWAYS so the live state is scannable.
  *
  * Pure — exported for tests. All values are socket-sourced; the viewer never
  * reads config.
@@ -862,9 +864,6 @@ export function autopilotBannerLabel(state: {
   paused: boolean;
   maxConcurrentJobs: number | null;
   maxConcurrentPerRoot: number;
-  // The durable STORED intent. Omitted (undefined) reads as "equals effective"
-  // and suppresses the annotation; a value differing from effective appends it.
-  maxConcurrentPerRootStored?: number;
   mode: "yolo" | "armed";
   armedCount: number;
   worktreeMode: boolean;
@@ -890,14 +889,11 @@ export function autopilotBannerLabel(state: {
         ? " · nothing armed"
         : ` · ${state.armedCount} armed`
       : "";
-  // Per-root segment renders the EFFECTIVE cap ALWAYS, annotating the stored
-  // intent ONLY when it differs (worktree-off floor), positioned between the
-  // global cap and the worktree toggle.
-  const perRootSeg =
-    state.maxConcurrentPerRootStored === undefined ||
-    state.maxConcurrentPerRootStored === state.maxConcurrentPerRoot
-      ? ` · per-root ${state.maxConcurrentPerRoot}`
-      : ` · per-root ${state.maxConcurrentPerRoot} (stored ${state.maxConcurrentPerRootStored})`;
+  // Per-root segment renders ONLY while worktree mode is off — the only mode
+  // where the cap governs dispatch — showing the effective cap (always 1).
+  const perRootSeg = state.worktreeMode
+    ? ""
+    : ` · per-root ${state.maxConcurrentPerRoot}`;
   // Worktree segment renders for BOTH states (terse `worktree:on`/`worktree:off`)
   // so the live durable toggle is always visible at a glance.
   const worktreeSeg = state.worktreeMode ? " · worktree:on" : " · worktree:off";
@@ -954,7 +950,6 @@ async function runViewer(
           state.maxConcurrentPerRootStored,
           state.worktreeMode,
         ),
-        maxConcurrentPerRootStored: state.maxConcurrentPerRootStored,
         mode: state.mode,
         armedCount: state.armedEpics.length,
         worktreeMode: state.worktreeMode,
@@ -991,7 +986,6 @@ async function runViewer(
     paused: boolean;
     maxConcurrentJobs: number | null;
     maxConcurrentPerRoot: number;
-    maxConcurrentPerRootStored: number;
     mode: "yolo" | "armed";
     armedCount: number;
     worktreeMode: boolean;
@@ -1002,7 +996,6 @@ async function runViewer(
       state.maxConcurrentPerRootStored,
       state.worktreeMode,
     ),
-    maxConcurrentPerRootStored: state.maxConcurrentPerRootStored,
     mode: state.mode,
     armedCount: state.armedEpics.length,
     worktreeMode: state.worktreeMode,
