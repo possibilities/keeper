@@ -54,6 +54,7 @@ the literal `and` token.
 | `epic-added [id]` | "ping me when a new epic shows up" (bare) or "when fn-X appears on the board" (a specific id). **Edge-triggered:** never satisfied on first paint, so it always waits for a real appearance. | `epic-added` / `epic-added fn-…` |
 | `epic-removed <id>` | "when fn-X leaves the board / is done or deleted." **One id, edge-triggered.** | `epic-removed fn-…` |
 | `changed [since:R]` | "ping me when anything on the board moves" — an epic appears/leaves, a verdict flips, or autopilot config changes. **Edge-triggered;** optional `since:<hash>` anchors against a prior `changed` baseline so you can detect movement since a known point. | `changed` / `changed since:<hash>` |
+| `<needs-human> [since:S]` | "ping me when there's a dead letter / block escalation / parked question / stuck dispatch / finalize non-ff jam / instant-death wall" (one signal), or "ping me on any needs-human signal" (the umbrella). **No id.** Six per-signal tokens — `dead-letter`, `block-escalation`, `parked-question`, `stuck-dispatch`, `finalize-non-ff`, `instant-death-wall` — plus the umbrella `needs-human` (any of them). **Level-triggered presence:** `stuck-dispatch`/`finalize-non-ff`/`instant-death-wall` and the umbrella fire on the operator-jam class only — a self-clearing occupancy sticky never trips them. Optional `since:<signature>` anti-spin anchor: a still-present, already-triaged signal whose signature matches the anchor HOLDS, a genuinely new signal (signature moved) FIRES. | `needs-human` / `dead-letter` / `stuck-dispatch since:<sig>` |
 
 | Field | How to derive | Example |
 |---|---|---|
@@ -89,7 +90,8 @@ full orient step run `keeper prompt render engineering/orient`.
 This pre-check applies **only to `complete` / `started` / `unblocked`** (and
 optionally `epic-removed` / `landed`, whose epic id you can verify exists
 today). The other conditions — `git-clean`, `agents-idle`, `server-up`,
-`monitor-running`, `drained`, `epic-added`, `changed` — have **no pre-check**
+`monitor-running`, `drained`, `epic-added`, `changed`, and the six per-signal
+needs-human tokens plus the umbrella `needs-human` — have **no pre-check**
 (they read live projections, or deliberately wait for something not present
 yet); skip straight to step 2.
 
@@ -198,6 +200,13 @@ aggregate:
 # target=<id> rides only the id-bearing forms)
 [keeper-await] armed condition=<drained|changed|epic-added|epic-removed|landed> [target=<id>] state=<…>
 [keeper-await] met condition=<…> [target=<id>] detail=<…>
+
+# single needs-human condition (the six per-signal tokens — dead-letter,
+# block-escalation, parked-question, stuck-dispatch, finalize-non-ff,
+# instant-death-wall — plus the umbrella needs-human; carries the current
+# signature, the since:<signature> re-arm anchor)
+[keeper-await] armed condition=<needs-human|dead-letter|block-escalation|parked-question|stuck-dispatch|finalize-non-ff|instant-death-wall> state=<…> [signature=<…>]
+[keeper-await] met condition=<…> detail=<…> [signature=<…>]
 
 # AND aggregate (two or more conditions)
 [keeper-await] armed conditions=<c1 and c2 …> count=<N>

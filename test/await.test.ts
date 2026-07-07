@@ -224,6 +224,7 @@ function deliverFiveWith(
     epics?: Record<string, unknown>[];
     jobs?: Record<string, unknown>[];
     git?: Record<string, unknown>[];
+    dispatchFailures?: Record<string, unknown>[];
     rev?: number;
   },
 ): void {
@@ -254,6 +255,14 @@ function deliverFiveWith(
     resultFrame("epics_recent_done", `${idPrefix}-epics-recent-done`, [], rev),
     // fn-1016: opt-in merge-landed observable (empty unless a test opts otherwise).
     resultFrame("lane_merged", `${idPrefix}-lane-merged`, [], rev),
+    // ADR 0011: opt-in `dispatch_failures` (empty unless a test opts otherwise).
+    // Delivered uniformly — harmlessly ignored when the stream didn't opt in.
+    resultFrame(
+      "dispatch_failures",
+      `${idPrefix}-dispatch-failures`,
+      opts.dispatchFailures ?? [],
+      rev,
+    ),
   ]);
 }
 
@@ -2814,7 +2823,7 @@ test("await drained: a working job holds waiting, then drains → met", async ()
 });
 
 test("await drained --fail-on-stuck: jam sticky → stuck exit 5", async () => {
-  const { factory, socketsAll } = makeMockConnect();
+  const { factory, socketRef, socketsAll } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
@@ -2822,20 +2831,21 @@ test("await drained --fail-on-stuck: jam sticky → stuck exit 5", async () => {
     argsFor([{ condition: "drained" }], { failOnStuck: true }),
     h.deps,
   );
-  // Two sockets open: readiness + the dedicated dispatch_failures stream.
-  const dfSock = findSockForCollection(socketsAll.sockets, "dispatch_failures");
-  const readinessSock = findSockForCollection(socketsAll.sockets, "epics");
-  if (!dfSock || !readinessSock) {
-    throw new Error("readiness + dispatch_failures sockets not both opened");
+  // ADR 0011: ONE socket now — the readiness stream opts into
+  // `includeDispatchFailures`, so the sticky rows ride the SAME snapshot (no
+  // dedicated `dispatch_failures` subscribe).
+  expect(socketsAll.sockets).toHaveLength(1);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
   }
+  sock.takeOutbound();
 
-  // A jam-reason sticky present, board otherwise at rest → stuck exit 5.
-  dfSock.deliver([
-    resultFrame("dispatch_failures", `${idPrefix}-dispatch_failures`, [
-      { reason: "worktree-finalize-non-fast-forward" },
-    ]),
-  ]);
-  deliverFiveEmpty(readinessSock, idPrefix);
+  // A jam-reason sticky present on the snapshot, board otherwise at rest → the
+  // first-paint gate holds until dispatch_failures paints, then stuck exit 5.
+  deliverFiveWith(sock, idPrefix, {
+    dispatchFailures: [{ reason: "worktree-finalize-non-fast-forward" }],
+  });
 
   const failed = h.stdout.filter((l) => l.includes("[keeper-await] failed"));
   expect(failed.length).toBeGreaterThanOrEqual(1);
@@ -2844,7 +2854,7 @@ test("await drained --fail-on-stuck: jam sticky → stuck exit 5", async () => {
 });
 
 test("await drained --fail-on-stuck: recover* sticky is NOT a jam → met", async () => {
-  const { factory, socketsAll } = makeMockConnect();
+  const { factory, socketRef, socketsAll } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
@@ -2852,18 +2862,16 @@ test("await drained --fail-on-stuck: recover* sticky is NOT a jam → met", asyn
     argsFor([{ condition: "drained" }], { failOnStuck: true }),
     h.deps,
   );
-  const dfSock = findSockForCollection(socketsAll.sockets, "dispatch_failures");
-  const readinessSock = findSockForCollection(socketsAll.sockets, "epics");
-  if (!dfSock || !readinessSock) {
-    throw new Error("readiness + dispatch_failures sockets not both opened");
+  expect(socketsAll.sockets).toHaveLength(1);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
   }
+  sock.takeOutbound();
 
-  dfSock.deliver([
-    resultFrame("dispatch_failures", `${idPrefix}-dispatch_failures`, [
-      { reason: "worktree-recover-conflict" },
-    ]),
-  ]);
-  deliverFiveEmpty(readinessSock, idPrefix);
+  deliverFiveWith(sock, idPrefix, {
+    dispatchFailures: [{ reason: "worktree-recover-conflict" }],
+  });
 
   // recover* is auto-clearing, never an operator jam → drained met, not stuck.
   expect(h.exitCode).toBe(0);

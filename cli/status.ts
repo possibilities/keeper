@@ -8,12 +8,13 @@
  *
  * Transport mirrors `keeper await server-up`: a bare `subscribeReadiness`,
  * whose FIRST `onSnapshot` is already a complete composite (the internal
- * all-strict first-paint gate). On that first frame we dispose the handle,
- * pull the sticky `dispatch_failures` rows for the jammed / needs-human
- * signals (a best-effort one-shot `queryCollection` — NEVER `sendControlRpc`),
- * print the envelope, and exit. UNLIKE `server-up`, the subscribe carries a
- * bounded default ~10s `giveUpPolicy`: a one-shot orient must NOT reconnect
- * forever, so a down daemon fires `onFatal({code:"unreachable"})` → exit 1.
+ * all-strict first-paint gate). The subscribe opts into `includeDispatchFailures`
+ * (ADR 0011), so the sticky `dispatch_failures` rows for the jammed /
+ * needs-human signals ride the SAME snapshot in ONE round-trip — no out-of-band
+ * `queryCollection`. On that first frame we dispose the handle, print the
+ * envelope, and exit. UNLIKE `server-up`, the subscribe carries a bounded
+ * default ~10s `giveUpPolicy`: a one-shot orient must NOT reconnect forever, so
+ * a down daemon fires `onFatal({code:"unreachable"})` → exit 1.
  *
  * Exit taxonomy: exit 0 on ANY board state (a bad board is DATA, not an
  * error). Exit 1 ONLY on transport (`unreachable`/`connect`) or usage. On a
@@ -23,18 +24,18 @@
  *
  * `drained`/`jammed`/`needs-human` are computed INLINE here from the readiness
  * snapshot (verdicts + in-flight + each epic's parked-closer `question`) plus
- * the `dispatch_failures` read. The canonical pure predicate is task-4's
- * (`await drained`); when it lands, dedupe this with an import.
+ * the snapshot's `dispatchFailures` member. The canonical pure predicate is
+ * task-4's (`await drained`); when it lands, dedupe this with an import.
  * TODO(fn-1015.4): replace the inline drained/jammed with the shared predicate.
  */
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
-import { INSTANT_DEATH_BREAKER_REASON } from "../src/dispatch-failure-key";
 import {
   classifyDispatchFailure,
   resolveFailureTarget,
 } from "../src/dispatch-failure-pill";
+import { projectNeedsHuman } from "../src/needs-human";
 import type { BootStatus, Row } from "../src/protocol";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
@@ -44,7 +45,6 @@ import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
-import { queryCollection } from "./control-rpc";
 import { type FormatMode, parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import {
@@ -65,25 +65,11 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
 export const STATUS_SCHEMA_VERSION = 5;
 
 /**
- * Board-wide quota-wall threshold: at or above this many distinct
- * instant-death-breaker stickies (distinct `(verb, id)` keys that each tripped
- * the per-key breaker), the `needs_human.instant_death_wall` count is the likely
- * SESSION/QUOTA-WALL signal — repeated instant worker deaths across MULTIPLE keys
- * in a window, not one flaky task. Signal only (the per-key breakers already stop
- * each key's burn); resume with `keeper autopilot retry <key>` after the limit
- * resets. A single sticky (below this) is the per-key breaker doing its job.
- */
-export const INSTANT_DEATH_WALL_KEYS = 2;
-
-/**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
  * rather than reconnect forever when the daemon is down; `--connect-timeout`
  * overrides it.
  */
 export const DEFAULT_CONNECT_DEADLINE_MS = 10_000;
-
-/** The `dispatch_failures.reason` that needs an operator to reconcile origin. */
-const FINALIZE_NON_FF_REASON = "worktree-finalize-non-fast-forward";
 
 export const HELP = `keeper status — one-shot unified board + autopilot JSON read
 
@@ -331,27 +317,21 @@ export function buildStatusEnvelope(
   const pendingDispatches = snap.pendingDispatches.length;
   const inFlightTotal = pendingDispatches + runningJobs;
 
-  const stuckDispatches = dispatchFailures.length;
-  const finalizeNonFf = dispatchFailures.filter(
-    (r) => r.reason === FINALIZE_NON_FF_REASON,
-  ).length;
-  // Per-key instant-death-breaker stickies (each row is a distinct `(verb, id)`
-  // — the projection PK). A board-wide burst (>= INSTANT_DEATH_WALL_KEYS) is the
-  // likely session/quota wall. Subset of stuck_dispatches, never double-counted.
-  const instantDeathWall = dispatchFailures.filter(
-    (r) => r.reason === INSTANT_DEATH_BREAKER_REASON,
-  ).length;
-  const deadLetters = snap.deadLetters.length;
-  const blockEscalations = snap.blockEscalations.length;
-  // Epics carrying a parked-closer question — a needs-human signal distinct
-  // from the dispatch-failure family (mints no `dispatch_failures` row).
-  const parkedQuestions = snap.epics.filter(
-    (e) => (e.question ?? null) !== null,
-  ).length;
-  // `finalize_non_ff` is a SUBSET of `stuck_dispatches` — surfaced separately,
-  // never double-counted into the total.
-  const needsHumanTotal =
-    deadLetters + blockEscalations + stuckDispatches + parkedQuestions;
+  // The whole needs-human classification derives from the ONE shared projector
+  // (ADR 0011): broad stuck count, the finalize-non-ff / instant-death-wall
+  // subsets (surfaced separately, never double-counted), and the umbrella total.
+  // Parked-closer questions are a needs-human family that mints no
+  // `dispatch_failures` row, so they feed the projector by epic id directly.
+  const needsHuman = projectNeedsHuman({
+    dispatchFailures,
+    deadLetters: snap.deadLetters.length,
+    blockEscalations: snap.blockEscalations.length,
+    parkedQuestionEpicIds: snap.epics
+      .filter((e) => (e.question ?? null) !== null)
+      .map((e) => e.epic_id),
+    epicIds,
+  }).counts;
+  const needsHumanTotal = needsHuman.total;
 
   // At rest: nothing the autopilot could dispatch right now (no ready/running
   // epic header, no in-flight launch). `jammed` vs `drained` splits on whether
@@ -386,13 +366,13 @@ export function buildStatusEnvelope(
       total: inFlightTotal,
     },
     needs_human: {
-      dead_letters: deadLetters,
-      block_escalations: blockEscalations,
-      stuck_dispatches: stuckDispatches,
-      finalize_non_ff: finalizeNonFf,
-      parked_questions: parkedQuestions,
-      instant_death_wall: instantDeathWall,
-      total: needsHumanTotal,
+      dead_letters: needsHuman.deadLetters,
+      block_escalations: needsHuman.blockEscalations,
+      stuck_dispatches: needsHuman.stuckDispatches,
+      finalize_non_ff: needsHuman.finalizeNonFf,
+      parked_questions: needsHuman.parkedQuestions,
+      instant_death_wall: needsHuman.instantDeathWall,
+      total: needsHuman.total,
     },
     rev: boot.rev,
     catching_up: boot.catching_up,
@@ -490,8 +470,6 @@ export interface RunStatusDeps {
   writeStdout: (s: string) => void;
   writeStderr: (s: string) => void;
   exit: (code: number) => never;
-  /** Best-effort sticky dispatch_failures read (defaults to the real transport). */
-  fetchDispatchFailures: (sock: string) => Promise<Row[]>;
   /** Test-injection connect factory forwarded to `subscribeReadiness`. */
   connect?: ConnectFactory;
   /** Test clock forwarded to the give-up deadline. */
@@ -522,17 +500,12 @@ export async function runStatus(
     }
   };
 
-  const finishSuccess = async (
-    snap: ReadinessClientSnapshot,
-  ): Promise<void> => {
-    let failures: Row[] = [];
-    try {
-      failures = await deps.fetchDispatchFailures(args.sock);
-    } catch {
-      // Best-effort: a vanished daemon between snapshot and read degrades the
-      // jammed/needs-human signal to empty rather than failing the orient.
-      failures = [];
-    }
+  const finishSuccess = (snap: ReadinessClientSnapshot): void => {
+    // ADR 0011: the sticky `dispatch_failures` rows ride the snapshot under the
+    // `includeDispatchFailures` opt-in — ONE round-trip, no out-of-band read.
+    // Absent (never null/empty) only if the flag were off; here it is always on,
+    // so `?? []` is a belt-and-suspenders default the envelope treats as "no jam".
+    const failures = snap.dispatchFailures ?? [];
     const envelope = buildStatusEnvelope(snap, latestBoot, failures);
     emitEnvelopeFormatted(envelope, deps, args.format);
   };
@@ -543,7 +516,7 @@ export async function runStatus(
     }
     done = true;
     disposeHandle();
-    void finishSuccess(snap);
+    finishSuccess(snap);
   };
 
   const onFatal = (err: FatalError): void => {
@@ -569,6 +542,11 @@ export async function runStatus(
     idPrefix: `status-${process.pid}`,
     onSnapshot,
     onFatal,
+    // ADR 0011: carry the sticky `dispatch_failures` rows on the snapshot so the
+    // jammed / needs-human signals read from ONE round-trip, not an out-of-band
+    // query. The gate holds first paint until the collection paints, so a
+    // painted snapshot always carries the real jam rows.
+    includeDispatchFailures: true,
     giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
     onBootStatus: (boot: BootStatus): void => {
       latestBoot = { rev: boot.rev, catching_up: boot.catching_up };
@@ -594,8 +572,6 @@ export async function main(argv: string[]): Promise<void> {
     writeStdout: (s) => process.stdout.write(s),
     writeStderr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
-    fetchDispatchFailures: (sock) =>
-      queryCollection(sock, "dispatch_failures") as Promise<Row[]>,
   });
 }
 

@@ -67,10 +67,14 @@ import {
   landedState,
   type MonitorSelector,
   monitorRunningState,
+  type NeedsHumanSignal,
+  needsHumanSignalNeedsFold,
+  needsHumanState,
   type PlanCondition,
 } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
 import type { MonitorEntry } from "../src/derivers";
+import { projectNeedsHuman } from "../src/needs-human";
 import type { GiveUpPolicy } from "../src/readiness-client";
 import {
   type ConnectFactory,
@@ -117,6 +121,16 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      since:<hash> anchors against a prior 'changed' baseline
   landed <epic>      the epic's worktree lane has merged into the LOCAL default
                      branch (the finalize merge landed) — later than 'complete'
+  <needs-human> [since:S]
+                     a needs-human signal is present (level-triggered). Six
+                     per-signal tokens — dead-letter, block-escalation,
+                     parked-question, stuck-dispatch, finalize-non-ff,
+                     instant-death-wall — plus the umbrella needs-human (any of
+                     them). stuck-dispatch/finalize-non-ff/instant-death-wall and
+                     the umbrella fire on the operator-jam class only (an
+                     occupancy sticky never trips them). since:<signature> anchors
+                     against a signature a prior met printed: a still-present,
+                     already-triaged signal holds; a genuinely new one fires
 
 Flags:
   --timeout <dur>        Own deadline (e.g. 30s, 5m) → reason=timeout exit 3
@@ -153,7 +167,22 @@ literal 'and' to wait for ALL. Durations are unit-required (30s, 5m).
   keeper await git-clean and agents-idle  # cwd's git root quiet + no OTHER working session
   keeper await drained --fail-on-stuck    # whole board at rest; exit 5 on an operator jam
   keeper await server-up                  # keeperd is serving (reconnects forever)
+  keeper await needs-human                # ANY needs-human signal present (umbrella)
+  keeper await stuck-dispatch since:S     # re-arm anti-spin: fire only on a NEW signal
   keeper await <cond> --timeout 5m --json # own deadline + JSON envelope lines
+
+Needs-human signals (level-triggered presence; ANDable): the six per-signal tokens
+dead-letter · block-escalation · parked-question · stuck-dispatch · finalize-non-ff ·
+instant-death-wall, plus the umbrella needs-human (any of them). The dispatch trio
+(stuck-dispatch/finalize-non-ff/instant-death-wall) and the umbrella fire on the
+OPERATOR-JAM class only, deriving from the shared status/watch/await projector — an
+occupancy / self-clearing sticky inflates the broad status count but never trips an
+await. Each accepts an optional since:<signature>: a still-present, already-triaged
+signal whose signature matches the anchor HOLDS (anti-spin), while a genuinely new
+signal set (signature moved) FIRES. Every met envelope carries the current signature —
+capture it to re-arm. Arming a per-signal token AND the umbrella wakes twice for one
+event (an intended choice). since: is the preferred re-arm idiom over --require-transition
+(which applies per-slot as always: a condition true at arm time waits for the next edge).
 
 Exit codes: 0 met · 1 not-found/usage/connect/unreachable · 3 timeout · 4 target
 deleted · 5 stuck (only under --fail-on-stuck). Footguns: server-up can't be ANDed
@@ -247,7 +276,11 @@ export type ConditionSegment =
   // board-family condition (reads the whole-board `landedEpicIds` set off the
   // readiness snapshot), but carrying a required epic target like
   // `epic-removed`.
-  | { condition: "landed"; target: string };
+  | { condition: "landed"; target: string }
+  // fn-1150 needs-human conditions — the six per-signal tokens plus the umbrella.
+  // Board-family (read the whole board off the readiness snapshot), no id, each
+  // carrying an OPTIONAL `since:<signature>` anti-spin anchor (mirrors `changed`).
+  | { condition: NeedsHumanSignal; since?: string };
 
 export interface ParsedArgs {
   /** One or more condition segments, ANDed. Always >= 1. */
@@ -304,6 +337,27 @@ const NULLARY_CONDITIONS: ReadonlySet<string> = new Set([
 ]);
 /** Conditions that take EXACTLY ONE selector token (a third arity bucket). */
 const SELECTOR_CONDITIONS: ReadonlySet<string> = new Set(["monitor-running"]);
+/**
+ * fn-1150 needs-human tokens — the six per-signal families plus the umbrella.
+ * Each takes NO id and an OPTIONAL `since:<signature>` anti-spin anchor (same
+ * arity as `changed`). Kept as the {@link NeedsHumanSignal} member set so the
+ * parse branch, the board-slot wiring, and the derived `includeDispatchFailures`
+ * opt-in all key off ONE list.
+ */
+const NEEDS_HUMAN_SIGNALS: ReadonlySet<NeedsHumanSignal> = new Set([
+  "dead-letter",
+  "block-escalation",
+  "parked-question",
+  "stuck-dispatch",
+  "finalize-non-ff",
+  "instant-death-wall",
+  "needs-human",
+]);
+
+/** True iff `c` is one of the seven needs-human condition tokens. */
+function isNeedsHumanCondition(c: string): c is NeedsHumanSignal {
+  return (NEEDS_HUMAN_SIGNALS as ReadonlySet<string>).has(c);
+}
 
 /** The three valid `kind:` provenance values for a monitor selector. */
 const MONITOR_KINDS: ReadonlySet<MonitorEntry["kind"]> = new Set([
@@ -599,10 +653,46 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       }
       seen.add(dupKey);
       segments.push({ condition: "landed", target });
+    } else if (isNeedsHumanCondition(condRaw)) {
+      // fn-1150: the six per-signal needs-human tokens + the umbrella. Each takes
+      // NO id and an OPTIONAL `since:<signature>` anti-spin anchor (mirrors the
+      // `changed since:<hash>` grammar).
+      if (rest.length > 1) {
+        return {
+          ok: false,
+          message: `condition '${condRaw}' takes at most one since:<signature> token (got ${rest.length})`,
+        };
+      }
+      let since: string | undefined;
+      if (rest.length === 1) {
+        const tok = rest[0] ?? "";
+        if (!tok.startsWith("since:")) {
+          return {
+            ok: false,
+            message: `invalid arg '${tok}' for '${condRaw}' (expected since:<signature>)`,
+          };
+        }
+        since = tok.slice("since:".length);
+        if (since.length === 0) {
+          return {
+            ok: false,
+            message: `condition '${condRaw}' since:<signature> requires a non-empty value`,
+          };
+        }
+      }
+      const dupKey = since === undefined ? condRaw : `${condRaw}:${since}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({
+        condition: condRaw,
+        ...(since === undefined ? {} : { since }),
+      });
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed, landed)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed, landed, dead-letter, block-escalation, parked-question, stuck-dispatch, finalize-non-ff, instant-death-wall, needs-human)`,
       };
     }
   }
@@ -842,13 +932,17 @@ interface BoardSlotState {
     | "changed"
     | "epic-added"
     | "epic-removed"
-    | "landed";
+    | "landed"
+    // fn-1150 needs-human conditions — level-triggered presence off the shared
+    // projector; carry `since` (the anti-spin anchor) but no `target` / baseline.
+    | NeedsHumanSignal;
   /**
    * epic id for `epic-added` (optional) / `epic-removed` (required) /
    * `landed` (required, fn-1016).
    */
   readonly target?: string;
-  /** `changed since:<hash>` anchor — overrides the first-paint baseline. */
+  /** `changed since:<hash>` anchor — overrides the first-paint baseline. For a
+   *  needs-human slot, the `since:<signature>` anti-spin anchor. */
   readonly since?: string;
   met: boolean;
   lastEval: AwaitState | null;
@@ -864,6 +958,28 @@ type SlotState =
   | MonitorSlotState
   | ServerUpSlotState
   | BoardSlotState;
+
+/**
+ * Narrow a slot to a {@link BoardSlotState} — the whole-board family (`drained` /
+ * `changed` / `epic-added` / `epic-removed` / `landed`) plus the fn-1150
+ * needs-human conditions. One guard so the emit/eval sites recognize every board
+ * kind without re-enumerating the union at each call.
+ */
+function isBoardSlot(slot: SlotState): slot is BoardSlotState {
+  return (
+    slot.kind === "drained" ||
+    slot.kind === "changed" ||
+    slot.kind === "epic-added" ||
+    slot.kind === "epic-removed" ||
+    slot.kind === "landed" ||
+    isNeedsHumanCondition(slot.kind)
+  );
+}
+
+/** Narrow a board-slot kind to a {@link NeedsHumanSignal}. */
+function isNeedsHumanKind(k: BoardSlotState["kind"]): k is NeedsHumanSignal {
+  return isNeedsHumanCondition(k);
+}
 
 interface RunnerState {
   terminating: boolean;
@@ -923,8 +1039,9 @@ export async function runAwait(
   const hasServerUp = args.segments.some((s) => s.condition === "server-up");
   // fn-1015 board conditions all read off the readiness snapshot. `drained`
   // additionally needs the boot-status `catching_up` flag (latched via
-  // `onBootStatus`) and, under `--fail-on-stuck`, the live `dispatch_failures`
-  // rows (a dedicated collection subscribe — there's no readiness equivalent).
+  // `onBootStatus`) and, under `--fail-on-stuck`, the sticky `dispatch_failures`
+  // rows — which ride the SAME readiness snapshot via the `includeDispatchFailures`
+  // opt-in (ADR 0011), no bespoke collection subscribe.
   const hasDrained = args.segments.some((s) => s.condition === "drained");
   // fn-1016: `landed` reads the whole-board `landedEpicIds` set, so it rides
   // the readiness stream like the other board conditions — BUT that set is only
@@ -932,15 +1049,41 @@ export async function runAwait(
   // `computeLandedEpicIds` gates on it for the OFF degradation), so it shares
   // `complete`'s recent-done opt-in below.
   const hasLanded = args.segments.some((s) => s.condition === "landed");
-  const hasBoard = args.segments.some(
-    (s) =>
-      s.condition === "drained" ||
-      s.condition === "changed" ||
-      s.condition === "epic-added" ||
-      s.condition === "epic-removed" ||
-      s.condition === "landed",
+  // fn-1150: the needs-human conditions read the whole board off the readiness
+  // snapshot (the shared projector's counts + jam classification), so they open
+  // the readiness stream like the other board conditions.
+  const hasNeedsHuman = args.segments.some((s) =>
+    isNeedsHumanCondition(s.condition),
   );
-  const openDispatchFailures = hasDrained && args.failOnStuck;
+  const hasBoard =
+    args.segments.some(
+      (s) =>
+        s.condition === "drained" ||
+        s.condition === "changed" ||
+        s.condition === "epic-added" ||
+        s.condition === "epic-removed" ||
+        s.condition === "landed",
+    ) || hasNeedsHuman;
+  // ADR 0011: `drained --fail-on-stuck` reads the sticky `dispatch_failures`
+  // rows for its jam check. This gates the readiness `includeDispatchFailures`
+  // opt-in (the rows ride the shared snapshot), not a separate subscribe. Since
+  // `hasDrained ⇒ hasBoard ⇒ openReadiness`, the readiness stream is always open
+  // when this is set.
+  //
+  // fn-1150: DERIVE the opt-in from the parsed condition set (ADR 0011) — the
+  // union of `drained --fail-on-stuck` and every dispatch-derived needs-human
+  // signal (the dispatch trio + the umbrella, per `needsHumanSignalNeedsFold`).
+  // dead-letter / block-escalation / parked-question ride always-folded snapshot
+  // members and must NOT open the fold. Deriving it here (never a hand-maintained
+  // flag) makes a narrow mis-wire structurally impossible: a signal that needs the
+  // fold cannot be armed without opening it.
+  const openDispatchFailures =
+    (hasDrained && args.failOnStuck) ||
+    args.segments.some(
+      (s) =>
+        isNeedsHumanCondition(s.condition) &&
+        needsHumanSignalNeedsFold(s.condition),
+    );
   // `monitor-running` reads jobs rows but is own-session-scoped — it needs
   // NO git root (unlike `agents-idle`, which scopes by cwd containment).
   const needsRoot = hasGitClean || hasAgentsIdle;
@@ -982,6 +1125,24 @@ export async function runAwait(
         met: false,
         lastEval: null,
         lastVerdictPhrase: null,
+      };
+    }
+    if (isNeedsHumanCondition(seg.condition)) {
+      // fn-1150 needs-human board slot: level-triggered, so it uses only `since`
+      // (the anti-spin anchor) and leaves the baseline fields unused. A dedicated
+      // branch (not folded into the literal board `||` chain below) so the
+      // discriminated-union narrowing on `seg.condition` stays clean.
+      return {
+        kind: seg.condition,
+        ...("since" in seg && seg.since !== undefined
+          ? { since: seg.since }
+          : {}),
+        met: false,
+        lastEval: null,
+        lastVerdictPhrase: null,
+        baselineCaptured: false,
+        baselineEpicIds: [],
+        baselineSignature: null,
       };
     }
     if (
@@ -1030,9 +1191,10 @@ export async function runAwait(
   // draining toward head. Defaults `false` (steady state / a server stamping no
   // header → treat as caught up).
   let latestCatchingUp = false;
-  // fn-1015: latest `dispatch_failures.reason` strings, latched off the
-  // dedicated collection stream opened only for `drained --fail-on-stuck`. Null
-  // until first-painted; the drained jam check reads it.
+  // fn-1015 / ADR 0011: latest `dispatch_failures.reason` strings, latched off
+  // the readiness snapshot's `dispatchFailures` member (the stream opts into
+  // `includeDispatchFailures` only for `drained --fail-on-stuck`). Null until
+  // first-painted; the drained jam check reads it.
   let latestDispatchFailureReasons: readonly string[] | null = null;
   // Latest readiness snapshot (null until first paint); plan + (when
   // riding readiness) git/jobs read off it.
@@ -1050,17 +1212,12 @@ export async function runAwait(
     // `allPainted()` AND so `server-up`'s single slot only `met`s once the
     // daemon is actually serving.
     serverUp: !openServerUp,
-    // fn-1015: the dedicated `dispatch_failures` stream for `drained
-    // --fail-on-stuck`. Folded into the gate so a board condition doesn't
-    // glitch-evaluate before the jam rows have first-painted.
-    dispatchFailures: !openDispatchFailures,
   };
   const allPainted = (): boolean =>
     paintGate.readiness &&
     paintGate.git &&
     paintGate.jobs &&
-    paintGate.serverUp &&
-    paintGate.dispatchFailures;
+    paintGate.serverUp;
 
   const state: RunnerState = {
     terminating: false,
@@ -1078,13 +1235,11 @@ export async function runAwait(
     git: true,
     jobs: true,
     serverUp: true,
-    dispatchFailures: true,
   };
 
   let readinessHandle: ReadinessClientHandle | null = null;
   let gitHandle: ReadinessClientHandle | null = null;
   let jobsHandle: ReadinessClientHandle | null = null;
-  let dispatchFailuresHandle: ReadinessClientHandle | null = null;
   let deadlineHandle: unknown = null;
   let unregisterSignals: (() => void) | null = null;
 
@@ -1093,12 +1248,7 @@ export async function runAwait(
       deps.clearTimer(deadlineHandle);
       deadlineHandle = null;
     }
-    for (const h of [
-      readinessHandle,
-      gitHandle,
-      jobsHandle,
-      dispatchFailuresHandle,
-    ]) {
+    for (const h of [readinessHandle, gitHandle, jobsHandle]) {
       if (h !== null) {
         try {
           h.dispose();
@@ -1110,7 +1260,6 @@ export async function runAwait(
     readinessHandle = null;
     gitHandle = null;
     jobsHandle = null;
-    dispatchFailuresHandle = null;
     if (unregisterSignals !== null) {
       try {
         unregisterSignals();
@@ -1188,22 +1337,19 @@ export async function runAwait(
         selector: slots[0].raw,
         state: initial.detail ?? initial.kind,
       };
-    } else if (
-      single &&
-      slots[0] !== undefined &&
-      (slots[0].kind === "drained" ||
-        slots[0].kind === "changed" ||
-        slots[0].kind === "epic-added" ||
-        slots[0].kind === "epic-removed" ||
-        slots[0].kind === "landed")
-    ) {
-      // fn-1015/fn-1016 single board condition: bare condition (+ target) + state.
+    } else if (single && slots[0] !== undefined && isBoardSlot(slots[0])) {
+      // fn-1015/fn-1016/fn-1150 single board condition: bare condition (+ target)
+      // + state. A needs-human slot additionally surfaces the current signature so
+      // a supervisor can capture it to re-arm with `since:<signature>`.
       const slot = slots[0];
       const initial = initials[0] ?? { kind: "waiting" as const };
       fields = {
         condition: slot.kind,
         ...(slot.target !== undefined ? { target: slot.target } : {}),
         state: initial.detail ?? initial.kind,
+        ...(initial.signature !== undefined
+          ? { signature: initial.signature }
+          : {}),
       };
     } else if (single) {
       // Single git/jobs condition: bare condition + state.
@@ -1248,20 +1394,17 @@ export async function runAwait(
       });
       return;
     }
-    if (
-      single &&
-      slots[0] !== undefined &&
-      (slots[0].kind === "drained" ||
-        slots[0].kind === "changed" ||
-        slots[0].kind === "epic-added" ||
-        slots[0].kind === "epic-removed" ||
-        slots[0].kind === "landed")
-    ) {
+    if (single && slots[0] !== undefined && isBoardSlot(slots[0])) {
+      // fn-1150: every needs-human met envelope carries the current signature (the
+      // re-arm anchor); the other board conditions leave it undefined.
       const slot = slots[0];
       emitTerminal("met", 0, {
         condition: slot.kind,
         ...(slot.target !== undefined ? { target: slot.target } : {}),
         detail: slot.lastEval?.detail ?? "",
+        ...(slot.lastEval?.signature !== undefined
+          ? { signature: slot.lastEval.signature }
+          : {}),
       });
       return;
     }
@@ -1588,6 +1731,29 @@ export async function runAwait(
       // degradation is already baked into `landedEpicIds` (task-1).
       return landedState(slot.target ?? "", snap.landedEpicIds);
     }
+    if (isNeedsHumanKind(slot.kind)) {
+      // fn-1150: level-triggered presence off the ONE shared needs-human projector
+      // (ADR 0011) — no first-paint baseline (the `since:<signature>` anchor, if
+      // any, is the only anti-spin gate). `dispatchFoldOpened` is derived from the
+      // snapshot member's presence: when the opt-in was armed the gated fold
+      // paints `dispatchFailures` (possibly empty); when a dispatch-derived signal
+      // reaches here with it absent, `needsHumanState` throws (a wiring bug, never
+      // a silent forever-wait). dead-letter / block-escalation / parked-question
+      // ride the always-folded members below.
+      const projection = projectNeedsHuman({
+        dispatchFailures: snap.dispatchFailures ?? [],
+        deadLetters: snap.deadLetters.length,
+        blockEscalations: snap.blockEscalations.length,
+        parkedQuestionEpicIds: snap.epics
+          .filter((e) => (e.question ?? null) !== null)
+          .map((e) => e.epic_id),
+        epicIds: snap.epics.map((e) => e.epic_id),
+      });
+      return needsHumanState(slot.kind, projection, {
+        dispatchFoldOpened: snap.dispatchFailures !== undefined,
+        ...(slot.since !== undefined ? { since: slot.since } : {}),
+      });
+    }
     if (!slot.baselineCaptured) {
       slot.baselineEpicIds = snap.epics.map((e) => e.epic_id);
       slot.baselineSignature =
@@ -1781,15 +1947,9 @@ export async function runAwait(
         logProgress(slot, result);
         slot.met = true;
         evals[i] = result;
-      } else if (
-        slot.kind === "drained" ||
-        slot.kind === "changed" ||
-        slot.kind === "epic-added" ||
-        slot.kind === "epic-removed" ||
-        slot.kind === "landed"
-      ) {
-        // fn-1015/fn-1016 board slots: all read off the readiness snapshot. Hold
-        // `waiting` until it paints.
+      } else if (isBoardSlot(slot)) {
+        // fn-1015/fn-1016/fn-1150 board slots: all read off the readiness snapshot.
+        // Hold `waiting` until it paints.
         if (latestReadiness === null) {
           evals[i] = { kind: "waiting" };
           continue;
@@ -1950,6 +2110,16 @@ export async function runAwait(
     if (needsJobs) {
       latestJobRows = Array.from(snap.jobs.values());
     }
+    // ADR 0011: the `drained --fail-on-stuck` jam check reads the sticky
+    // `dispatch_failures` reasons off the SAME snapshot — the readiness stream
+    // opts into `includeDispatchFailures` (below), so the rows ride first-paint
+    // (the readiness gate holds until they paint) instead of a bespoke collection
+    // stream. `reason` rides through the fold intact.
+    if (openDispatchFailures) {
+      latestDispatchFailureReasons = (snap.dispatchFailures ?? []).map((r) =>
+        typeof r.reason === "string" ? r.reason : "",
+      );
+    }
     void evaluate();
   };
 
@@ -1979,15 +2149,6 @@ export async function runAwait(
     void evaluate();
   };
 
-  // fn-1015: dedicated `dispatch_failures` rows for `drained --fail-on-stuck`.
-  const onDispatchFailureRows = (rows: Record<string, unknown>[]): void => {
-    latestDispatchFailureReasons = rows.map((r) =>
-      typeof r.reason === "string" ? r.reason : "",
-    );
-    paintGate.dispatchFailures = true;
-    void evaluate();
-  };
-
   // `server-up` (fn-750.2): first-paint IS the signal. We deliberately read
   // NO rows off the snapshot — the daemon serving its first composed
   // readiness frame is the whole condition. Flip the paint flag and let
@@ -1998,7 +2159,7 @@ export async function runAwait(
   };
 
   const onLifecycle =
-    (stream: "readiness" | "git" | "jobs" | "serverUp" | "dispatchFailures") =>
+    (stream: "readiness" | "git" | "jobs" | "serverUp") =>
     (event: string): void => {
       if (event === "disconnected") {
         reconnectStable[stream] = false;
@@ -2124,6 +2285,11 @@ export async function runAwait(
       // shares the opt-in — the `landedEpicIds` set is only populated under it (its
       // worktree-OFF degradation reads done epics, which ride this same merge).
       ...(hasComplete || hasLanded ? { includeRecentDoneEpics: true } : {}),
+      // ADR 0011: `drained --fail-on-stuck` reads the sticky `dispatch_failures`
+      // rows for its jam check off this SAME snapshot — opt in so they ride
+      // first-paint instead of a bespoke collection stream. `drained` without
+      // `--fail-on-stuck` keeps the byte-identical board scope (flag off).
+      ...(openDispatchFailures ? { includeDispatchFailures: true } : {}),
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
@@ -2149,21 +2315,6 @@ export async function runAwait(
       collection: "jobs",
       onRows: onJobRows,
       onLifecycle: onLifecycle("jobs"),
-      onFatal,
-      ...(giveUpExtras ?? {}),
-      ...(deps.connect === undefined ? {} : { connect: deps.connect }),
-    });
-  }
-  // fn-1015: the `dispatch_failures` stream for `drained --fail-on-stuck`'s jam
-  // check — there's no readiness equivalent, so it rides its own dedicated
-  // collection subscribe regardless of whether readiness is open.
-  if (openDispatchFailures) {
-    dispatchFailuresHandle = subscribeCollection({
-      sockPath: args.sock,
-      idPrefix: `await-${process.pid}`,
-      collection: "dispatch_failures",
-      onRows: onDispatchFailureRows,
-      onLifecycle: onLifecycle("dispatchFailures"),
       onFatal,
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),

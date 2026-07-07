@@ -12,6 +12,12 @@ import {
   projectCoarseBoard,
   WATCH_DELTA_TYPES,
 } from "../cli/watch";
+import {
+  INSTANT_DEATH_BREAKER_REASON,
+  MERGE_ESCALATION_REASON_TOKEN,
+  SLOT_OCCUPIED_REASON_PREFIX,
+  WORKTREE_FINALIZE_NON_FF_REASON,
+} from "../src/dispatch-failure-key";
 import type { Verdict } from "../src/readiness";
 import { computeReadiness } from "../src/readiness";
 import type { ReadinessClientSnapshot } from "../src/readiness-client";
@@ -22,6 +28,8 @@ interface SnapOverrides {
     epic_id: string;
     status: string | null;
     tasks?: { task_id: string; runtime_status: string }[];
+    /** A parked closer question (a needs-human `parked-question` signal). */
+    question?: string | null;
   }[];
   jobsByState?: Record<string, string>;
   perTask?: Record<string, Verdict>;
@@ -33,6 +41,19 @@ interface SnapOverrides {
   maxConcurrentJobs?: number | null;
   maxConcurrentPerRoot?: number;
   maxConcurrentPerRootStored?: number;
+  /** Parked dead-letter ids (each an `INSERT OR IGNORE` `dl_id`). */
+  deadLetters?: string[];
+  /** Open block-escalation task ids (the `(epic_id, task_id)` latch's task id). */
+  blockEscalations?: string[];
+  /** Sticky `dispatch_failures` rows (the `includeDispatchFailures` fold). A
+   *  `last_event_id` bump with unchanged identity is the no-op-churn probe. */
+  dispatchFailures?: {
+    verb: string;
+    id: string;
+    reason: string;
+    dir?: string;
+    last_event_id?: number;
+  }[];
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
@@ -49,9 +70,17 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
     subagentInvocations: [],
     scheduledTasks: [],
     gitStatus: [],
-    deadLetters: [],
+    deadLetters: (o.deadLetters ?? []).map((dl_id) => ({
+      dl_id,
+    })) as unknown as ReadinessClientSnapshot["deadLetters"],
     pendingDispatches: [],
-    blockEscalations: [],
+    blockEscalations: (o.blockEscalations ?? []).map((task_id) => ({
+      task_id,
+    })) as unknown as ReadinessClientSnapshot["blockEscalations"],
+    dispatchFailures: (o.dispatchFailures ?? []).map((r) => ({
+      dir: "",
+      ...r,
+    })) as unknown as ReadinessClientSnapshot["dispatchFailures"],
     autopilotPaused: o.autopilotPaused ?? false,
     autopilotMode: o.autopilotMode ?? "yolo",
     maxConcurrentJobs:
@@ -357,6 +386,25 @@ test("parseWatchArgs: off-allowlist --filter → usage error (no socket)", () =>
   expect(r.ok).toBe(false);
 });
 
+test("parseWatchArgs: the six needs-human --filter type names are accepted", () => {
+  const names = [
+    "dead-letter",
+    "block-escalation",
+    "parked-question",
+    "stuck-dispatch",
+    "finalize-non-ff",
+    "instant-death-wall",
+  ];
+  const argv = names.flatMap((n) => ["--filter", n]);
+  const r = parseWatchArgs(argv);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  for (const n of names) {
+    expect(r.args.filter.has(n)).toBe(true);
+  }
+});
+
 test("parseWatchArgs: --help → __help__ sentinel", () => {
   const r = parseWatchArgs(["--help"]);
   expect(r.ok).toBe(false);
@@ -373,8 +421,313 @@ test("WATCH_DELTA_TYPES carries the coarse delta vocabulary", () => {
       "verdict-change",
       "job-state-change",
       "autopilot-change",
+      "dead-letter",
+      "block-escalation",
+      "parked-question",
+      "stuck-dispatch",
+      "finalize-non-ff",
+      "instant-death-wall",
     ]),
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-1150.3 — the six needs-human families as additive top-level deltas. Each
+// family emits a crisp appear/clear delta; the stream schema version is
+// unchanged (WATCH_SCHEMA_VERSION stays 1) and unknown-type consumers no-op. The
+// classification comes from the ONE shared projector (src/needs-human.ts) so
+// watch never drifts from status/await on "stuck"/"jammed" (ADR 0011).
+// ---------------------------------------------------------------------------
+
+test("dead-letter: a parked dead letter appears → dead-letter appeared", () => {
+  const a = projectCoarseBoard(makeSnap({ deadLetters: [] }));
+  const b = projectCoarseBoard(makeSnap({ deadLetters: ["dl-1"] }));
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "dead-letter", data: { id: "dl-1", op: "appeared" } },
+  ]);
+});
+
+test("dead-letter: a replayed dead letter clears → dead-letter cleared", () => {
+  const a = projectCoarseBoard(makeSnap({ deadLetters: ["dl-1"] }));
+  const b = projectCoarseBoard(makeSnap({ deadLetters: [] }));
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "dead-letter", data: { id: "dl-1", op: "cleared" } },
+  ]);
+});
+
+test("dead-letter: the same parked set (no-op churn) → zero deltas", () => {
+  const a = projectCoarseBoard(makeSnap({ deadLetters: ["dl-1", "dl-2"] }));
+  const b = projectCoarseBoard(makeSnap({ deadLetters: ["dl-1", "dl-2"] }));
+  expect(diffCoarseBoard(a, b)).toEqual([]);
+});
+
+test("block-escalation: a latched block appears → block-escalation appeared", () => {
+  const a = projectCoarseBoard(makeSnap({ blockEscalations: [] }));
+  const b = projectCoarseBoard(makeSnap({ blockEscalations: ["fn-1-a.2"] }));
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "block-escalation", data: { id: "fn-1-a.2", op: "appeared" } },
+  ]);
+});
+
+test("block-escalation: a resolved block clears → block-escalation cleared", () => {
+  const a = projectCoarseBoard(makeSnap({ blockEscalations: ["fn-1-a.2"] }));
+  const b = projectCoarseBoard(makeSnap({ blockEscalations: [] }));
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "block-escalation", data: { id: "fn-1-a.2", op: "cleared" } },
+  ]);
+});
+
+test("parked-question: an epic parks a closer question → parked-question appeared", () => {
+  const a = projectCoarseBoard(
+    makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", question: null }],
+    }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", question: "which auth?" }],
+    }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "parked-question", data: { epic_id: "fn-1-a", op: "appeared" } },
+  ]);
+});
+
+test("parked-question: an answered question clears → parked-question cleared", () => {
+  const a = projectCoarseBoard(
+    makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", question: "which auth?" }],
+    }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", question: null }],
+    }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "parked-question", data: { epic_id: "fn-1-a", op: "cleared" } },
+  ]);
+});
+
+const MERGE_CONFLICT_REASON = `${MERGE_ESCALATION_REASON_TOKEN}: merging src into base`;
+
+test("stuck-dispatch: an operator-jam merge-conflict row appears → stuck-dispatch appeared", () => {
+  const a = projectCoarseBoard(makeSnap({ dispatchFailures: [] }));
+  const b = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        { verb: "close", id: "fn-1-a", reason: MERGE_CONFLICT_REASON },
+      ],
+    }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([
+    {
+      type: "stuck-dispatch",
+      data: {
+        verb: "close",
+        id: "fn-1-a",
+        op: "appeared",
+        reason: MERGE_CONFLICT_REASON,
+      },
+    },
+  ]);
+});
+
+test("stuck-dispatch: a retried jam row clears → stuck-dispatch cleared", () => {
+  const a = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        { verb: "close", id: "fn-1-a", reason: MERGE_CONFLICT_REASON },
+      ],
+    }),
+  );
+  const b = projectCoarseBoard(makeSnap({ dispatchFailures: [] }));
+  expect(diffCoarseBoard(a, b)).toEqual([
+    {
+      type: "stuck-dispatch",
+      data: {
+        verb: "close",
+        id: "fn-1-a",
+        op: "cleared",
+        reason: MERGE_CONFLICT_REASON,
+      },
+    },
+  ]);
+});
+
+test("stuck-dispatch: a self-clearing occupancy row (not a jam) emits nothing", () => {
+  // A `slot-occupied` sticky is NOT an operator jam — it self-clears once the
+  // occupant is gone, so it must never project and never emit.
+  const a = projectCoarseBoard(makeSnap({ dispatchFailures: [] }));
+  const b = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        {
+          verb: "work",
+          id: "fn-1-a.1",
+          reason: `${SLOT_OCCUPIED_REASON_PREFIX}: pane still claude`,
+        },
+      ],
+    }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([]);
+});
+
+test("finalize-non-ff: a non-ff finalize jam emits ONLY its own most-specific type", () => {
+  // Most-specific classification: a `worktree-finalize-non-fast-forward` jam
+  // routes to `finalize-non-ff`, never the broader `stuck-dispatch`.
+  const a = projectCoarseBoard(makeSnap({ dispatchFailures: [] }));
+  const b = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        {
+          verb: "close",
+          id: "worktree-finalize:fn-1-a-abc123",
+          reason: WORKTREE_FINALIZE_NON_FF_REASON,
+        },
+      ],
+    }),
+  );
+  const deltas = diffCoarseBoard(a, b);
+  expect(deltas).toEqual([
+    {
+      type: "finalize-non-ff",
+      data: {
+        verb: "close",
+        id: "worktree-finalize:fn-1-a-abc123",
+        op: "appeared",
+        reason: WORKTREE_FINALIZE_NON_FF_REASON,
+      },
+    },
+  ]);
+  // Guard the "only its own type" clause: no stuck-dispatch line rides along.
+  expect(deltas.some((d) => d.type === "stuck-dispatch")).toBe(false);
+});
+
+test("dispatch jam: a reducer re-write bumping last_event_id (no net change) → zero deltas", () => {
+  // The churn source the projection drops: two snapshots whose jam row differs
+  // ONLY in `last_event_id` project to the same coarse board → null-diff.
+  const a = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        {
+          verb: "close",
+          id: "fn-1-a",
+          reason: MERGE_CONFLICT_REASON,
+          last_event_id: 41,
+        },
+      ],
+    }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        {
+          verb: "close",
+          id: "fn-1-a",
+          reason: MERGE_CONFLICT_REASON,
+          last_event_id: 42,
+        },
+      ],
+    }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([]);
+});
+
+const breaker = (id: string) => ({
+  verb: "work",
+  id,
+  reason: INSTANT_DEATH_BREAKER_REASON,
+});
+
+test("instant-death-wall: crossing the threshold (1→2 breaker keys) → wall appeared", () => {
+  // Below the threshold a lone breaker is one breaker doing its job — no wall.
+  // A second distinct key crosses INSTANT_DEATH_WALL_KEYS and trips the wall.
+  const a = projectCoarseBoard(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1")] }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1"), breaker("fn-1-b.1")] }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "instant-death-wall", data: { op: "appeared", tripped: true } },
+  ]);
+});
+
+test("instant-death-wall: dropping back under the threshold (2→1) → wall cleared", () => {
+  const a = projectCoarseBoard(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1"), breaker("fn-1-b.1")] }),
+  );
+  const b = projectCoarseBoard(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1")] }),
+  );
+  expect(diffCoarseBoard(a, b)).toEqual([
+    { type: "instant-death-wall", data: { op: "cleared", tripped: false } },
+  ]);
+});
+
+test("instant-death-wall: flips on threshold crossing, not per breaker row", () => {
+  // A breaker row is NOT a jam, so it never projects as a stuck-dispatch — the
+  // wall is the ONLY surface it touches, and only when the threshold flips.
+  const one = projectCoarseBoard(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1")] }),
+  );
+  const two = projectCoarseBoard(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1"), breaker("fn-1-b.1")] }),
+  );
+  const three = projectCoarseBoard(
+    makeSnap({
+      dispatchFailures: [
+        breaker("fn-1-a.1"),
+        breaker("fn-1-b.1"),
+        breaker("fn-1-c.1"),
+      ],
+    }),
+  );
+  // Adding a third breaker while already tripped moves no delta (bool unchanged).
+  expect(diffCoarseBoard(two, three)).toEqual([]);
+  // No breaker ever emits a stuck-dispatch line.
+  expect(
+    diffCoarseBoard(one, three).every((d) => d.type !== "stuck-dispatch"),
+  ).toBe(true);
+});
+
+test("instant-death-wall: a same-cycle 1→2→1 recross nets to zero via the settle", () => {
+  const { clock, lines, emitter } = driveEmitter();
+  emitter.onSnapshot(makeSnap({ dispatchFailures: [breaker("fn-1-a.1")] }));
+  clock.advance(10); // baseline (wall false)
+  // Crosses to tripped, then recrosses back within the settle window.
+  emitter.onSnapshot(
+    makeSnap({ dispatchFailures: [breaker("fn-1-a.1"), breaker("fn-1-b.1")] }),
+  );
+  clock.advance(30);
+  emitter.onSnapshot(makeSnap({ dispatchFailures: [breaker("fn-1-a.1")] }));
+  clock.advance(200); // drain the settle
+  emitter.dispose();
+  // Net wall state over the window is unchanged → only the baseline emitted.
+  expect(lines.map((l) => l.type)).toEqual(["baseline"]);
+});
+
+test("projectCoarseBoard: the baseline carries the needs-human members", () => {
+  const board = projectCoarseBoard(
+    makeSnap({
+      epics: [{ epic_id: "fn-1-a", status: "open", question: "which auth?" }],
+      deadLetters: ["dl-1"],
+      blockEscalations: ["fn-1-a.2"],
+      dispatchFailures: [
+        { verb: "close", id: "fn-1-a", reason: MERGE_CONFLICT_REASON },
+        breaker("fn-1-a.1"),
+        breaker("fn-1-b.1"),
+      ],
+    }),
+  );
+  expect(board.deadLetters).toEqual({ "dl-1": true });
+  expect(board.blockEscalations).toEqual({ "fn-1-a.2": true });
+  expect(board.parkedQuestions).toEqual({ "fn-1-a": true });
+  // Jam rows only: the merge-conflict close jams; the two breakers do NOT (they
+  // ride the wall bool), so exactly one jam key is present.
+  expect(Object.values(board.dispatchJams)).toEqual([MERGE_CONFLICT_REASON]);
+  expect(board.instantDeathWall).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
