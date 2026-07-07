@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Collapse runner to internal entry",
-  "updated_at": "2026-07-06T20:29:24.784000Z"
+  "updated_at": "2026-07-07T00:31:04.621000Z",
+  "worker_done_at": "2026-07-07T00:31:04.621000Z"
 }

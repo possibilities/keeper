@@ -65,5 +65,5 @@ internal entry, including the worker-thread non-empty-stdout proof.
 - [ ] The slow-tier round-trip suite gates on the internal entry (not the external project dir) and the full fast suite is green
 
 ## Done summary
-
+Collapsed the scrape spawn seam to one fixed argv (bun on the internal src/usage-scrape/scrape-cli.ts, no runtime fork/config/db); child cwd derives from the injectable entry path (spawn_failed test seam). Deleted the four usage_scraper_* config keys end-to-end while deployed configs still parse; the usage-scraper worker now spawns on the plain selector with no runtime gate.
 ## Evidence
