@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T17:25:44.782000Z",
+  "created_by_close_of": "fn-1161-frames-stream-and-hyper-watch",
+  "depends_on_epics": [
+    "fn-1161-frames-stream-and-hyper-watch"
+  ],
+  "id": "fn-1166-tighten-keeper-frames-stream-bounds-and",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Tighten keeper frames stream bounds and contract",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-07T17:25:44.782000Z"
+}
