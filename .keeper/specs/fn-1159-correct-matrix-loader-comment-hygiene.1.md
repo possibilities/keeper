@@ -30,5 +30,5 @@ Files:
 - [ ] No behavior change; existing subagents-config tests still pass.
 
 ## Done summary
-
+Fixed comment hygiene: removed past-tense provenance/audit-id from parity-test comment and realigned loadHostMatrix doc-comment with its three-way null/null/throw branch.
 ## Evidence
