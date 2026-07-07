@@ -136,6 +136,15 @@ export interface LaunchSpec {
    * non-worktree / pair launches.
    */
   readonly worktreeBranch?: string;
+  /**
+   * Escalation-session role (`unblock`/`resolve`/`deconflict`/`repair`). Set ONLY
+   * for an escalation dispatch; empty/absent for every other launch. The launch
+   * ALWAYS emits `--x-tmux-env KEEPER_ESCALATION_ROLE=<role-or-empty>` (the
+   * KEEPER_PLAN_WORKTREE_BRANCH always-emit pattern) so a reused tmux session can
+   * never inherit a stale role marker; the escalation-guard hook reads it from
+   * process env to key its command-family allowlist, an empty value being inert.
+   */
+  readonly escalationRole?: string;
 }
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
@@ -922,6 +931,16 @@ export interface KeeperAgentLaunchOpts {
    * empty value resolves identically to unset (the hook collapses it to NULL).
    */
   readonly worktreeBranch?: string;
+  /**
+   * Escalation-session role carrier. ALWAYS emitted as a FOURTH repeated
+   * `--x-tmux-env KEEPER_ESCALATION_ROLE=<role-or-empty>` right after the branch
+   * env (`?? ""`), mirroring the {@link worktreeBranch} always-emit discipline:
+   * a serial / non-escalation launch reusing a tmux session OVERWRITES any stale
+   * role a prior escalation launch left, and an empty value is inert at the
+   * escalation-guard hook. The dispatch path sets the verb for escalation
+   * launches only.
+   */
+  readonly escalationRole?: string;
 }
 
 /**
@@ -1026,6 +1045,14 @@ export function buildKeeperAgentLaunchArgv(
     // hook's SessionStart capture.
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE_BRANCH=${opts.worktreeBranch ?? ""}`,
+    // Escalation-role carrier — ALWAYS a FOURTH repeated `--x-tmux-env` (keeper
+    // agent last-wins per dup key): the escalation verb on an escalation launch,
+    // EMPTY otherwise. Always present so the `-e` OVERWRITES any stale role a prior
+    // escalation launch left in a reused tmux session env (the same reason the
+    // worktree carriers above are unconditional); an empty value is inert at the
+    // escalation-guard hook (no marker → fail open).
+    "--x-tmux-env",
+    `KEEPER_ESCALATION_ROLE=${opts.escalationRole ?? ""}`,
     // Keeper-owned worker permission posture, mirroring the pair-launch precedent
     // (`nativeClaudeArgs`): every claude launch this builder mints is a detached
     // automated worker with NO human to answer a prompt, so it skips permission
@@ -1243,6 +1270,9 @@ export async function keeperAgentLaunch(
       : {}),
     ...(deps.spec.worktreeBranch !== undefined
       ? { worktreeBranch: deps.spec.worktreeBranch }
+      : {}),
+    ...(deps.spec.escalationRole !== undefined
+      ? { escalationRole: deps.spec.escalationRole }
       : {}),
     noConfirm: true,
   });

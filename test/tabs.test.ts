@@ -307,6 +307,7 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper
       "'work' '--x-tmux-env' 'KEEPER_TMUX_SESSION=work' " +
       "'--x-tmux-env' 'KEEPER_PLAN_WORKTREE=' " +
       "'--x-tmux-env' 'KEEPER_PLAN_WORKTREE_BRANCH=' " +
+      "'--x-tmux-env' 'KEEPER_ESCALATION_ROLE=' " +
       "'--permission-mode' 'acceptEdits' '--dangerously-skip-permissions' " +
       "'--x-no-confirm' '--resume' 'name'",
   );
