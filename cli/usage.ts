@@ -52,6 +52,7 @@ import {
   type SnapshotMeta,
   type SnapshotStatus,
 } from "../src/snapshot";
+import { usageModelAliases } from "../src/usage-models";
 import { listProfiles } from "../src/usage-picker";
 import { armViewerExitTriggers } from "../src/view-shell";
 import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
@@ -832,12 +833,12 @@ export async function main(argv: string[]): Promise<void> {
   const isSnapshot = mode === "snapshot";
 
   const sockPath = values.sock ?? resolveSockPath();
-  // Account display aliases (cosmetic) resolved once at startup from
-  // ~/.config/keeper/config.yaml. Best-effort — a missing/bad config yields
-  // `{}` (no aliasing). Read once: the config file is operator-edited, not a
-  // live stream, so a restart picks up edits (consistent with the daemon's
-  // own config read).
-  const accountAliases = resolveConfig().accountAliases;
+  // Account display aliases (cosmetic) derived once at startup from the
+  // `usage_models` registry in ~/.config/keeper/config.yaml — the values carrying
+  // a non-null alias. Best-effort — a missing/bad config yields `{}` (no
+  // aliasing). Read once: the config file is operator-edited, not a live stream,
+  // so a restart picks up edits (consistent with the daemon's own config read).
+  const accountAliases = usageModelAliases(resolveConfig().usageModels);
   // Read-only detection of an auth-bearing reserved profile shadow (a login
   // stranded in `~/.claude-profiles/default` and friends). Computed ONCE here —
   // a live fs read, NEVER a daemon round-trip — and cached for the process'

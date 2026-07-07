@@ -76,60 +76,75 @@ test("KeeperConfig no longer carries maxConcurrentJobs (config-file support remo
 });
 
 // ---------------------------------------------------------------------------
-// account_aliases — cosmetic <profile-id>: <display> map for the usage TUI
+// usage_models — the single <envelope-id>: <alias|null> registry declaring the
+// scraped model set + the usage-TUI aliases. Fail-open + id-validated; the deep
+// parse contract lives in usage-models.test.ts, these pin the resolveConfig
+// integration + the retired-key tolerance.
 // ---------------------------------------------------------------------------
 
-test("accountAliases defaults to {} when the file is absent", () => {
+test("usageModels defaults to {} when the file is absent", () => {
   process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().accountAliases).toEqual({});
+  expect(resolveConfig().usageModels).toEqual({});
 });
 
-test("accountAliases defaults to {} when the key is absent", () => {
+test("usageModels defaults to {} when the key is absent", () => {
   writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().accountAliases).toEqual({});
+  expect(resolveConfig().usageModels).toEqual({});
 });
 
-test("account_aliases parses a <profile-id>: <display> map", () => {
+test("usage_models parses a <envelope-id>: <alias|null> registry", () => {
   writeConfig(
-    "account_aliases:\n" +
+    "usage_models:\n" +
       "  default: claude-0\n" +
-      "  multi-claude-1: claude-1\n" +
-      "  multi-claude-2: claude-2\n",
+      "  multi-claude-1:\n" +
+      "  codex: gpt\n",
   );
-  expect(resolveConfig().accountAliases).toEqual({
+  expect(resolveConfig().usageModels).toEqual({
     default: "claude-0",
-    "multi-claude-1": "claude-1",
-    "multi-claude-2": "claude-2",
+    "multi-claude-1": null,
+    codex: "gpt",
   });
 });
 
-test("account_aliases drops non-string and empty-string entries", () => {
-  // Only string→non-empty-string survives; null / number / "" are dropped.
+test("usage_models drops ids failing the [a-z0-9-]+ shape", () => {
+  writeConfig(
+    "usage_models:\n" +
+      "  default: claude-0\n" +
+      "  Bad_Id: nope\n" +
+      "  UPPER: nope\n",
+  );
+  expect(resolveConfig().usageModels).toEqual({ default: "claude-0" });
+});
+
+test("a non-object usage_models falls back to {}", () => {
+  writeConfig("usage_models: not-a-map\n");
+  expect(resolveConfig().usageModels).toEqual({});
+});
+
+test("an array usage_models falls back to {} (a map is required)", () => {
+  writeConfig("usage_models:\n  - default\n  - codex\n");
+  expect(resolveConfig().usageModels).toEqual({});
+});
+
+test("usage_models resolves independently of a malformed sibling key", () => {
+  writeConfig("roots: not-a-list\nusage_models:\n  default: claude-0\n");
+  const cfg = resolveConfig();
+  expect(cfg.usageModels).toEqual({ default: "claude-0" });
+  expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+test("a lingering account_aliases key is silently ignored (no field, no error)", () => {
+  // The retired alias key is no longer parsed; a deployed config keeping it must
+  // still boot clean, with usage_models resolving from its own key.
   writeConfig(
     "account_aliases:\n" +
       "  default: claude-0\n" +
-      "  multi-claude-1: 7\n" +
-      "  multi-claude-2: null\n" +
-      '  multi-claude-3: ""\n',
+      "usage_models:\n" +
+      "  default: claude-real\n",
   );
-  expect(resolveConfig().accountAliases).toEqual({ default: "claude-0" });
-});
-
-test("a non-object account_aliases falls back to {}", () => {
-  writeConfig("account_aliases: not-a-map\n");
-  expect(resolveConfig().accountAliases).toEqual({});
-});
-
-test("an array account_aliases falls back to {} (a map is required)", () => {
-  writeConfig("account_aliases:\n  - claude-0\n  - claude-1\n");
-  expect(resolveConfig().accountAliases).toEqual({});
-});
-
-test("account_aliases resolves independently of a malformed sibling key", () => {
-  writeConfig("roots: not-a-list\naccount_aliases:\n  default: claude-0\n");
   const cfg = resolveConfig();
-  expect(cfg.accountAliases).toEqual({ default: "claude-0" });
-  expect(cfg.roots.length).toBeGreaterThan(0);
+  expect(cfg).not.toHaveProperty("accountAliases");
+  expect(cfg.usageModels).toEqual({ default: "claude-real" });
 });
 
 // ---------------------------------------------------------------------------

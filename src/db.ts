@@ -41,6 +41,7 @@ import {
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import type { Epic, ResolvedEpicDep } from "./types";
+import { parseUsageModels, type UsageModels } from "./usage-models";
 
 /**
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
@@ -187,9 +188,11 @@ export interface KeeperConfig {
   // (absent / non-number / NaN / <= 0 / Infinity) → 30. Re-read on every
   // `resolveConfig` call.
   autocloseGraceSeconds: number;
-  // Cosmetic, client-side `<profile-id>: <display>` aliases for the usage TUI;
-  // never folded, never changes a row's identity.
-  accountAliases: Record<string, string>;
+  // The `usage_models` registry — the single declaration of which models the
+  // usage scraper produces envelopes for (keys) and their cosmetic TUI aliases
+  // (values). Parsed fail-open + id-validated via {@link parseUsageModels}; never
+  // folded, never changes a row's identity. Empty map ≡ no declared models.
+  usageModels: UsageModels;
 }
 
 /** Default for {@link KeeperConfig.autocloseEnabled} — the feature ships ON. */
@@ -320,7 +323,7 @@ export function resolveConfig(): KeeperConfig {
   // either falls back through the pure resolvers below.
   let autocloseEnabled: boolean = DEFAULT_AUTOCLOSE_ENABLED;
   let autocloseGraceSeconds: number = DEFAULT_AUTOCLOSE_GRACE_SECONDS;
-  let accountAliases: Record<string, string> = {};
+  let usageModels: UsageModels = {};
   try {
     if (!existsSync(path)) {
       return {
@@ -332,7 +335,7 @@ export function resolveConfig(): KeeperConfig {
         agentusageRoot,
         autocloseEnabled,
         autocloseGraceSeconds,
-        accountAliases,
+        usageModels,
       };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
@@ -405,17 +408,12 @@ export function resolveConfig(): KeeperConfig {
       autocloseGraceSeconds = resolveAutocloseGraceSeconds(
         (raw as { autoclose_grace_seconds?: unknown }).autoclose_grace_seconds,
       );
-      // Keep only string→non-empty-string entries; drop the rest.
-      const aliases = (raw as { account_aliases?: unknown }).account_aliases;
-      if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
-        const out: Record<string, string> = {};
-        for (const [k, v] of Object.entries(
-          aliases as Record<string, unknown>,
-        )) {
-          if (typeof v === "string" && v.length > 0) out[k] = v;
-        }
-        accountAliases = out;
-      }
+      // The `usage_models` registry — fail-open + id-validated in one place so
+      // the SQLite-side config and the dep-free picker never diverge. The retired
+      // `account_aliases` key is no longer parsed; a lingering copy is ignored.
+      usageModels = parseUsageModels(
+        (raw as { usage_models?: unknown }).usage_models,
+      );
     }
   } catch (err) {
     console.error(
@@ -431,7 +429,7 @@ export function resolveConfig(): KeeperConfig {
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       autocloseEnabled: DEFAULT_AUTOCLOSE_ENABLED,
       autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
-      accountAliases: {},
+      usageModels: {},
     };
   }
   return {
@@ -447,7 +445,7 @@ export function resolveConfig(): KeeperConfig {
     keeperAgentPath,
     autocloseEnabled,
     autocloseGraceSeconds,
-    accountAliases,
+    usageModels,
   };
 }
 
