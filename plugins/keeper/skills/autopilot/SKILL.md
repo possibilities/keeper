@@ -354,6 +354,7 @@ the breaker.
   reaches a terminal verdict — it DECLINED (stamped BLOCKED) or its job died — never
   concurrently, so the two never race the same base worktree. The close audit still gates
   the merged result whichever path resolves; relay the escalation as usual.
+- **A shared-base breakage routes to `repair::<repo>`, not `unblock::<task>`.** A worker whose baseline confirms the shared default branch is red independent of its own diff blocks `SHARED_BASE_BROKEN` — a repo-scoped class, not a task-scoped one. The daemon dispatches ONE `repair::<repo-token>` session per `(repo, failure-fingerprint)`, converging every task blocked on the same base defect onto one attempt; it runs in the shared checkout, verifies with the full gate, and fans `keeper plan unblock` + a bus resume back out to every affected task on success. It pages you exactly once, only on decline — mechanics live in the plan skill's operator-orchestration reference, not re-taught here.
 - **Pausing does NOT stop an in-flight resolver.** `pause` stops the recover sweep and
   new dispatches, not a resolver already running. On a merge-conflict escalation — or
   before you manually resolve ANY stuck merge-conflict close — check `keeper query jobs`
