@@ -6,7 +6,7 @@
     "fn-1175-pin-needs-human-epics-on-board"
   ],
   "id": "fn-1180-gate-tuis-on-daemon-readiness",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T23:59:57.817000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T23:59:50.010000Z"
+  "updated_at": "2026-07-07T23:59:57.817000Z"
 }
