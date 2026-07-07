@@ -37,5 +37,5 @@ Stopped-idle resolver classifies terminal and deconflict sweep proceeds; working
 - [ ] A duplicate-spawn-name pair (old idle + fresh dispatch, same task) is proven harmless by test, or the defect is documented as a finding with a failing-case description
 
 ## Done summary
-
+Moved classifyResolverOutcome to turn-active occupancy (a stopped-idle resolver reads terminal so the deconflict dispatch sequences instead of starving) and instance-scoped resolveJobsForEpic on the sticky close instance_event_id; left epicHasActiveResolver on pane-liveness for the recover-pass MERGE_HEAD guard. Proved the duplicate-spawn-name pair harmless via turn-active guards (one live occupant) + instance-scoped stage-3 (independent per-instance classification).
 ## Evidence
