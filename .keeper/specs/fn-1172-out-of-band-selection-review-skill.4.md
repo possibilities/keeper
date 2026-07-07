@@ -42,5 +42,5 @@ consistency-skills gains the new static skill (verb refs resolve, no managed sid
 - [ ] The skill's output includes proposed guidance edits with drift-gate re-sync steps and makes no write to model-selector.yaml
 
 ## Done summary
-
+Added /plan:cell-review, the out-of-band worker-cell grading skill: derives its work-list as committed audit briefs minus committed reviews, fans the blinded selection-auditor over each epic, lands version-keyed verdicts via selection-review-submit, computes Wilson-interval cohort stats with a hard minimum-cohort refusal, and proposes (never writes) model-selector.yaml guidance. Landed ADR 0018 (superseding ADR 0011), re-pointed CONTEXT.md, added the plan CLAUDE.md blurb, and pinned the static skill in consistency-skills.
 ## Evidence
