@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Activity-gated transcript path guard",
-  "updated_at": "2026-07-07T16:30:36.607000Z"
+  "updated_at": "2026-07-07T16:47:52.824000Z",
+  "worker_done_at": "2026-07-07T16:47:52.824000Z"
 }

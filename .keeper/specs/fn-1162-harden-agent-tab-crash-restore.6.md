@@ -36,5 +36,5 @@ Sequences: seed → failed-resume (SessionStart+SessionEnd) ⇒ path intact; see
 - [ ] Re-folding the event stream produces projections identical to the incremental fold.
 
 ## Done summary
-
+Activity-gate the transcript_path fold guard in the reducer: seed once at INSERT, then move only on proven-live keep-set activity (UserPromptSubmit/Stop); a bare SessionStart (incl. the failed-resume SessionStart+SessionEnd pair) can no longer clobber the last good path. Pre/PostToolUse excluded for post-shed re-fold determinism.
 ## Evidence
