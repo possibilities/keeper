@@ -270,9 +270,10 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `adopted` (v110) is the current final
-  // appended column, trailing `harness`/`resume_target` (v109), `dispatch_origin`
-  // (v108), `kill_reason` (v103), and the v100 telemetry six.
+  // re-fold determinism charter depends on. `last_lifecycle_ts` (v113) is the
+  // current final appended column, trailing `adopted` (v110),
+  // `harness`/`resume_target` (v109), `dispatch_origin` (v108), `kill_reason`
+  // (v103), and the v100 telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -285,6 +286,7 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
     "harness",
     "resume_target",
     "adopted",
+    "last_lifecycle_ts",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -1114,14 +1116,17 @@ test("autopilot_state has a nullable worktree_mode column (NULL = OFF, the defau
   db.close();
 });
 
-test("v91→v92 migration NULLs backend_exec pane/generation on terminal jobs; live jobs untouched (fn-977 v92)", () => {
-  // Open a fresh DB (migrated to current), rewind the schema stamp to 91, then
-  // hand-seed terminal + live jobs carrying tmux pane/generation coords. The
-  // modern `jobs` table already has both columns (pane id since early, generation
-  // since v83), so no hand-built fixture is needed. Reopen via openDb → the
-  // version-guarded v91→v92 data-fix UPDATE runs once, clearing only the dead
-  // rows. No rewind-and-redrain sits between 91 and 92, so the hand-seeded rows
-  // survive and are observable directly after migrate.
+test("the v113 rewind supersedes the v91→v92 backend_exec terminal-clear data-fix; hand-seeded (event-less) jobs do not survive the rewind (fn-977 v92, fn-1164 v113)", () => {
+  // The v91→v92 migration was a ONE-TIME data-fix UPDATE: NULL backend_exec
+  // pane/generation on EXISTING terminal jobs so a dead job stops holding a
+  // tmux-recyclable pane id. The v113 REWINDING migration (fn-1164) wipes the
+  // whole deterministic `jobs` projection and re-derives it purely by replay, so
+  // the v92 data-fix is SUPERSEDED for any DB migrating through v113: a
+  // directly-seeded job row (no backing events) is DELETEd by the rewind and
+  // never rebuilt. The terminal-clear INVARIANT the v92 fix protected is now
+  // re-derived on every re-fold by the reducer's SessionEnd/Killed arms — proven
+  // directly by the reducer-projections tests "SessionEnd/Killed NULLs the
+  // backend_exec pane + generation coords (recycle guard)".
   const { db: seed } = openDb(dbPath);
   seed.run("UPDATE meta SET value = '91' WHERE key = 'schema_version'");
   const ins = (
@@ -1138,59 +1143,30 @@ test("v91→v92 migration NULLs backend_exec pane/generation on terminal jobs; l
       )
       .run(jobId, state, pane, gen);
   ins("mig-ended", "ended", "%300", "gen-dead-a");
-  ins("mig-killed", "killed", "%301", "gen-dead-b");
-  // A killed row that already lost its pane (idempotency: the WHERE must skip it
-  // without error and it stays NULL).
-  ins("mig-killed-clean", "killed", null, null);
-  // A live worker on a recycled-into pane id — MUST keep its coords.
   ins("mig-live", "working", "%300", "gen-live");
   seed.close();
 
-  // Reopen → migrate() runs the v91→v92 clear.
+  // Reopen → migrate() runs the v92 data-fix, then the v113 rewind DELETEs the
+  // deterministic jobs projection. There are no events to re-fold, so the
+  // directly-seeded rows are gone.
   const { db } = openDb(dbPath);
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
 
-  const read = (jobId: string) =>
+  const jobCount = (
+    db.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }
+  ).n;
+  expect(jobCount).toBe(0);
+  // The cursor was rewound to 0 by the v113 rewinding migration.
+  const cursor = (
     db
-      .prepare(
-        "SELECT state, backend_exec_pane_id, backend_exec_generation_id FROM jobs WHERE job_id = ?",
-      )
-      .get(jobId) as {
-      state: string;
-      backend_exec_pane_id: string | null;
-      backend_exec_generation_id: string | null;
-    };
-
-  const ended = read("mig-ended");
-  expect(ended.state).toBe("ended");
-  expect(ended.backend_exec_pane_id).toBeNull();
-  expect(ended.backend_exec_generation_id).toBeNull();
-
-  const killed = read("mig-killed");
-  expect(killed.backend_exec_pane_id).toBeNull();
-  expect(killed.backend_exec_generation_id).toBeNull();
-
-  const clean = read("mig-killed-clean");
-  expect(clean.backend_exec_pane_id).toBeNull();
-
-  // The LIVE job keeps its coords — only terminal rows are cleared.
-  const live = read("mig-live");
-  expect(live.state).toBe("working");
-  expect(live.backend_exec_pane_id).toBe("%300");
-  expect(live.backend_exec_generation_id).toBe("gen-live");
+      .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
+      .get() as { last_event_id: number }
+  ).last_event_id;
+  expect(cursor).toBe(0);
   db.close();
-
-  // Idempotent re-open — the version guard (preMigrateStoredVersion < 92) is now
-  // false, so the live row is untouched on a second migrate.
-  const { db: db3 } = openDb(dbPath);
-  const liveAgain = db3
-    .prepare("SELECT backend_exec_pane_id FROM jobs WHERE job_id = 'mig-live'")
-    .get() as { backend_exec_pane_id: string | null };
-  expect(liveAgain.backend_exec_pane_id).toBe("%300");
-  db3.close();
 });
 
 test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
@@ -2701,7 +2677,13 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // so column order stays fresh-vs-migrated identical); it widens the epics row
   // shape but does not touch the v62→v63 `default_visible`/`approval` rewrite
   // this test exercises, fn-1151 task .2.
-  expect(SCHEMA_VERSION).toBe(112);
+  // v113 appends the nullable `jobs.last_lifecycle_ts` REAL column (the lifecycle
+  // stamp) via a REWINDING migration (cursor rewind + wipe the deterministic
+  // projection set + re-fold); it widens the jobs row shape and rewinds, but does
+  // not touch the epics table SHAPE — the migrated `epics` table_xinfo this test
+  // pins is unchanged (only epics ROWS are wiped, which this shape test never
+  // seeds), fn-1164 task .1.
+  expect(SCHEMA_VERSION).toBe(113);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

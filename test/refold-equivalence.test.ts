@@ -1155,6 +1155,58 @@ test("jobs bare un-stop: a plain Stop → PostToolUse (stopped → working) fold
 });
 
 // ---------------------------------------------------------------------------
+// fn-1164: the jobs lifecycle stamp (ADR 0013) is a deterministic-replayed
+// `jobs` column (`last_lifecycle_ts`) — the fold reads only event.ts + the
+// pre-update state, so a from-scratch re-fold reproduces it byte-identically,
+// and the REWINDING migration re-derives it purely by replay (never a back-fill).
+// ---------------------------------------------------------------------------
+
+test("jobs lifecycle stamp: a phantom-working straggler folds to stopped and re-folds byte-identically (migrated-in-place == from-scratch)", () => {
+  // The production incident, in ingest order: a turn-final Stop (ts=1003) then a
+  // straggler PostToolUse (ts=1002 < Stop.ts) ingested LAST. The stamp gate folds
+  // the final state to 'stopped' with the stamp at the Stop's ts.
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_A, ts: 1000 });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: SESS_A, ts: 1001 });
+  insertEvent({ hook_event: "Stop", session_id: SESS_A, ts: 1003 });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: SESS_A,
+    ts: 1002, // straggler: earlier ts, ingested last
+  });
+  drainAll();
+
+  const fromScratch = snapshotProjections().jobs as Array<
+    Record<string, unknown>
+  >;
+  const row = fromScratch.find((j) => j.job_id === SESS_A);
+  expect(row?.state).toBe("stopped");
+  expect(row?.last_lifecycle_ts).toBe(1003);
+
+  // Simulate a PRE-migration phantom: the old arrival-order fold resurrected the
+  // row to 'working' and the fresh ADD COLUMN left the stamp NULL. The rewinding
+  // migration shape (cursor->0 + wipe the deterministic projections + re-drain,
+  // which `rewindAndWipeProjections` reproduces) MUST re-derive the correct state
+  // purely by replay — the DELETE discards the corrupted row and the re-fold
+  // rebuilds it, so a phantom self-heals on deploy.
+  db.run(
+    "UPDATE jobs SET state = 'working', last_lifecycle_ts = NULL WHERE job_id = ?",
+    [SESS_A],
+  );
+  rewindAndWipeProjections();
+  drainAll();
+
+  const migratedInPlace = snapshotProjections().jobs;
+  // Byte-identical to the from-scratch fold — including the new stamp column.
+  expect(migratedInPlace).toEqual(fromScratch);
+  const healed = (migratedInPlace as Array<Record<string, unknown>>).find(
+    (j) => j.job_id === SESS_A,
+  );
+  expect(healed?.state).toBe("stopped");
+  expect(healed?.last_lifecycle_ts).toBe(1003);
+});
+
+// ---------------------------------------------------------------------------
 // `block_escalations` latch (fn-941) — the escalate-once gate for the daemon
 // block-escalation producer. A DETERMINISTIC-replayed projection cloned from
 // `dispatch_never_bound`: it MUST re-fold byte-identically from a from-scratch

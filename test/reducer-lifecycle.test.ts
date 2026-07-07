@@ -480,7 +480,9 @@ test("fn-784 re-fold determinism: active_since (stamped + restarted + NULL) re-f
     session_id: "sess-prompted",
     ts: 5000,
   });
-  insertEvent({ hook_event: "Stop", session_id: "sess-prompted" });
+  // Monotonic ts (5500 between the two prompts) so the ADR-0013 stamp gate honors
+  // the Stop; the second prompt at 6000 clears the strict activating gate.
+  insertEvent({ hook_event: "Stop", session_id: "sess-prompted", ts: 5500 });
   insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: "sess-prompted",
@@ -6758,6 +6760,226 @@ test("bounded Stop guard: from-scratch re-fold of a bounded release is byte-dete
 });
 
 // ---------------------------------------------------------------------------
+// fn-1164: the jobs lifecycle stamp (ADR 0013). A per-row event-time high-water
+// mark that a lifecycle transition may not regress behind, so a stale
+// out-of-order event annotates but never resurrects state (phantom-working).
+// ---------------------------------------------------------------------------
+
+/** Read the ADR-0013 lifecycle stamp (`jobs.last_lifecycle_ts`). */
+function getStamp(jobId = "sess-a"): number | null {
+  const r = db
+    .query("SELECT last_lifecycle_ts FROM jobs WHERE job_id = ?")
+    .get(jobId) as { last_lifecycle_ts: number | null } | null;
+  return r?.last_lifecycle_ts ?? null;
+}
+
+/** All permutations of `xs` (Heap-free, small-n recursive). */
+function permutations<T>(xs: T[]): T[][] {
+  if (xs.length <= 1) return [xs];
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i++) {
+    const rest = [...xs.slice(0, i), ...xs.slice(i + 1)];
+    for (const p of permutations(rest)) out.push([xs[i], ...p]);
+  }
+  return out;
+}
+
+/** Reset the projection + cursor + event log so a fresh ordering re-folds clean. */
+function resetForOrdering(): void {
+  db.run("DELETE FROM events");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM subagent_invocations");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+}
+
+test("lifecycle stamp: every ingest ordering of a turn's final event set folds to the SAME state (stale straggler annotates, never resurrects)", () => {
+  // The phantom-working repro: a turn's {UserPromptSubmit, PreToolUse, straggler
+  // PostToolUse, Stop} with the straggler's ts BELOW the turn-final Stop's ts.
+  // The max-ts event is the Stop (a quiescence), so the final state is 'stopped'
+  // in EVERY ingest ordering — a straggler PostToolUse that ingests LAST can no
+  // longer un-stop the correctly-stopped row. The stamp converges to the Stop's
+  // ts (the max), independent of order. Expected values are hand-fixed, not
+  // re-derived from the fold under test.
+  const turn = [
+    { hook_event: "UserPromptSubmit", ts: 100 },
+    { hook_event: "PreToolUse", tool_name: "Bash", ts: 101 },
+    { hook_event: "PostToolUse", tool_name: "Bash", ts: 102 }, // straggler: ts < Stop.ts
+    { hook_event: "Stop", ts: 103 },
+  ];
+  const orderings = permutations(turn);
+  expect(orderings.length).toBe(24);
+  for (const ordering of orderings) {
+    resetForOrdering();
+    insertEvent({ hook_event: "SessionStart", ts: 99 });
+    for (const e of ordering) insertEvent(e);
+    drainAll();
+    expect({
+      order: ordering.map((e) => `${e.hook_event}@${e.ts}`).join(","),
+      state: getJob()?.state,
+      stamp: getStamp(),
+    }).toEqual({
+      order: ordering.map((e) => `${e.hook_event}@${e.ts}`).join(","),
+      state: "stopped",
+      stamp: 103,
+    });
+  }
+});
+
+test("lifecycle stamp: an equal-ts Stop/PostToolUse tie resolves to QUIESCENCE (stopped) in every ordering", () => {
+  // Equal-ts collisions between racing same-host writers are a hot path at ms
+  // granularity. The remove-biased tiebreak: a quiescing '-> stopped' applies at
+  // `ts >= stamp`, an activating '-> working' at strictly `ts > stamp`, so at a
+  // tie the Stop wins. Drive all orderings of a set where the Stop and the
+  // straggler PostToolUse share ts=103 and assert the final state is 'stopped'.
+  const turn = [
+    { hook_event: "UserPromptSubmit", ts: 100 },
+    { hook_event: "PreToolUse", tool_name: "Bash", ts: 101 },
+    { hook_event: "Stop", ts: 103 },
+    { hook_event: "PostToolUse", tool_name: "Bash", ts: 103 }, // equal-ts tie
+  ];
+  for (const ordering of permutations(turn)) {
+    resetForOrdering();
+    insertEvent({ hook_event: "SessionStart", ts: 99 });
+    for (const e of ordering) insertEvent(e);
+    drainAll();
+    expect({
+      order: ordering.map((e) => `${e.hook_event}@${e.ts}`).join(","),
+      state: getJob()?.state,
+    }).toEqual({
+      order: ordering.map((e) => `${e.hook_event}@${e.ts}`).join(","),
+      state: "stopped",
+    });
+  }
+});
+
+test("lifecycle stamp: a genuine resume (fresh-ts tool events, NO prompt) still un-stops a stopped row", () => {
+  // The resume-after-stop flow the bare un-stop arm owns: a Stop idles the row,
+  // then tool events with a NEWER ts (a Stop followed by a flood of
+  // Pre/PostToolUse, no UserPromptSubmit) prove liveness and un-stop it. The gate
+  // must NOT swallow a genuine forward-in-time resume.
+  insertEvent({ hook_event: "SessionStart", ts: 200 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 201 });
+  insertEvent({ hook_event: "Stop", ts: 202 });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(202);
+  // A tool event at a fresh (later) ts un-stops the row.
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 203 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(203);
+});
+
+test("lifecycle stamp: a stale straggler PostToolUse (ts < Stop.ts) ingested AFTER the Stop never resurrects the row", () => {
+  // The exact production incident, in ingest order: the turn-final Stop lands,
+  // THEN a straggler PostToolUse with an EARLIER ts arrives last. Pre-fix this
+  // resurrected the row to 'working' permanently; the stamp gate swallows it.
+  insertEvent({ hook_event: "SessionStart", ts: 300 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 301 });
+  insertEvent({ hook_event: "PreToolUse", tool_name: "Bash", ts: 302 });
+  insertEvent({ hook_event: "Stop", ts: 304 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 303 }); // straggler
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(304);
+});
+
+test("lifecycle stamp: terminal SessionEnd lands on a far-future-stamped row and never regresses the stamp", () => {
+  // A terminal arm is EXEMPT from stamp rejection (a row pinned by a bogus
+  // far-future ts must stay healable) but still advances the stamp via MAX, so
+  // it never regresses. Pin the stamp far in the future via a tool event, then a
+  // much-earlier SessionEnd still lands 'ended' and the stamp stays at the max.
+  insertEvent({ hook_event: "SessionStart", ts: 400 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 401 });
+  insertEvent({ hook_event: "Stop", ts: 402 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 9999 }); // pins stamp far-future
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(9999);
+  insertEvent({ hook_event: "SessionEnd", ts: 500 }); // ts << stamp
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  expect(getStamp()).toBe(9999); // MAX(9999, 500) — never regressed
+});
+
+test("lifecycle stamp: terminal Killed lands regardless of stamp and advances it when newer", () => {
+  insertEvent({ hook_event: "SessionStart", ts: 600 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 601 }); // working, stamp 601
+  drainAll();
+  expect(getStamp()).toBe(601);
+  // Killed carries a proven-dead (pid, start_time). The seed row's start_time is
+  // NULL (UserPromptSubmit set none), so the loose pid-only match applies.
+  insertEvent({
+    hook_event: "Killed",
+    ts: 700,
+    data: JSON.stringify({
+      pid: 4242,
+      start_time: null,
+      close_kind: "killed",
+      reason: "dead-pid",
+    }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getStamp()).toBe(700); // MAX(601, 700) — advanced
+});
+
+test("lifecycle stamp: a UserPromptSubmit revives on a fresh ts but a stale prompt straggler does not", () => {
+  // The prompt-revival is ACTIVATING (strictly ts > stamp). A resume prompt with
+  // a newer ts revives a killed row; a stale prompt straggler (ts <= stamp) is
+  // swallowed, so it can never resurrect a genuinely-dead session.
+  insertEvent({ hook_event: "SessionStart", ts: 800 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 801 });
+  insertEvent({
+    hook_event: "Killed",
+    ts: 810,
+    data: JSON.stringify({
+      pid: 4242,
+      start_time: null,
+      close_kind: "killed",
+      reason: "dead-pid",
+    }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getStamp()).toBe(810);
+  // Stale prompt straggler (ts < stamp) — swallowed, row stays killed.
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 805 });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  // Genuine resume prompt (ts > stamp) — revives to working.
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 820 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(820);
+});
+
+test("lifecycle stamp: a duplicate SessionStart re-opens a terminal row only on a fresh ts (revival is activating)", () => {
+  // The SessionStart ON CONFLICT re-open (terminal -> stopped) is a revival, so
+  // it takes the activating polarity (strictly ts > stamp). A stale/duplicate
+  // SessionStart cannot resurrect a genuinely-dead session; a genuine resume
+  // (newer ts) does re-open it.
+  insertEvent({ hook_event: "SessionStart", ts: 900 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 901 });
+  insertEvent({ hook_event: "SessionEnd", ts: 902 });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  expect(getStamp()).toBe(902); // terminal advanced the stamp
+
+  // A stale duplicate SessionStart (ts <= stamp) — the re-open CASE is gated off,
+  // so the row stays terminal.
+  insertEvent({ hook_event: "SessionStart", ts: 901 });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+
+  // A genuine resume SessionStart (ts > stamp) — re-opens to stopped and advances.
+  insertEvent({ hook_event: "SessionStart", ts: 950 });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(950);
+});
+
+// ---------------------------------------------------------------------------
 // fn-1008: canonical open-turn liveness — the `updated_at` activity re-base,
 // the open-`ok` background-hold, the ApiError guard's new freshness + collapse,
 // and the sweep widening.
@@ -7203,9 +7425,11 @@ test("fn-1056: a plain-stopped row (both annotations NULL) folds back to working
   // The red-first repro: SessionStart → UPS → Stop leaves a 'stopped' row with
   // NO annotation pair set; a following PreToolUse must un-stop it to 'working'
   // and stamp active_since to the tool-event ts (the stopped→working edge).
+  // Event ts are monotonic (prompt 5000 < stop 6000 < tool 8000) so the ADR-0013
+  // stamp gate honors the Stop rather than reading it as a stale straggler.
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
-  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "Stop", ts: 6000 });
   drainAll();
   expect(getJob()?.state).toBe("stopped");
 
@@ -7217,10 +7441,11 @@ test("fn-1056: a plain-stopped row (both annotations NULL) folds back to working
 });
 
 test("fn-1056: a plain-stopped row folds back to working on the next PostToolUse", () => {
-  // Post as well as Pre — both drive the bare un-stop.
+  // Post as well as Pre — both drive the bare un-stop. Monotonic ts so the Stop
+  // is honored (not read as a stale straggler by the ADR-0013 stamp gate).
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
-  insertEvent({ hook_event: "Stop" });
+  insertEvent({ hook_event: "Stop", ts: 6000 });
   drainAll();
   expect(getJob()?.state).toBe("stopped");
 
@@ -7299,6 +7524,7 @@ test("fn-1056: an annotation-carrying stopped row still revives through the EXIS
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
   insertEvent({
     hook_event: "ApiError",
+    ts: 6000, // monotonic: after the prompt, so the quiescing stamp gate honors it
     data: JSON.stringify({ kind: "server_error" }),
   });
   drainAll();
@@ -7370,8 +7596,9 @@ test("active_since: a brand-new SessionStart-only job that never prompted is NUL
 test("active_since: HELD across Stop→stopped and subagent-lifecycle churn (no re-stamp)", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
-  // Stop drops the row to 'stopped' but carries no active_since clause.
-  insertEvent({ hook_event: "Stop" });
+  // Stop drops the row to 'stopped' but carries no active_since clause. Monotonic
+  // ts (6000 > prompt 5000) so the ADR-0013 stamp gate honors the Stop.
+  insertEvent({ hook_event: "Stop", ts: 6000 });
   // Sub-agent lifecycle churn mid-life: SubagentStart/Stop fold
   // subagent_invocations, never jobs.state, so the row stays 'stopped' and
   // active_since is untouched. (A Pre/PostToolUse WOULD un-stop the row and
@@ -7391,7 +7618,10 @@ test("active_since: HELD across Stop→stopped and subagent-lifecycle churn (no 
 test("active_since: re-stamped on a genuine restart (stopped → UserPromptSubmit)", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
-  insertEvent({ hook_event: "Stop" });
+  // Monotonic ts: stop 5500 sits between the two prompts so the stamp gate
+  // honors the quiescence, then the fresh prompt at 6000 clears the strict
+  // activating gate and re-stamps the rising edge.
+  insertEvent({ hook_event: "Stop", ts: 5500 });
   // A fresh prompt after the stop re-promotes: the rising edge fires again.
   insertEvent({ hook_event: "UserPromptSubmit", ts: 6000 });
   drainAll();

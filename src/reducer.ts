@@ -121,6 +121,42 @@ const ENDED = "ended";
 const KILLED = "killed";
 
 /**
+ * The lifecycle-stamp gate (ADR 0013). `jobs.last_lifecycle_ts` is a per-row
+ * event-time high-water mark that a lifecycle transition may not regress behind,
+ * so a stale out-of-order event ANNOTATES but never resurrects state — the fix
+ * for phantom-working (a `stopped` row read as `working` after its session went
+ * permanently idle, because a straggler tool event with an EARLIER ts than the
+ * turn-final `Stop` ingested LAST and un-stopped it).
+ *
+ * Returns a WHERE / CASE predicate FRAGMENT the caller ANDs into its own terminal
+ * and subagent-yield guards — it COMPOSES WITH them, replaces neither. The caller
+ * binds one `?` (the event ts) where the fragment sits, plus (on apply) sets
+ * `last_lifecycle_ts = <event ts>`; the WHERE guarantees `ts >= stamp`
+ * (quiescing) or `ts > stamp` (activating), so the applied value is already
+ * `max(stamp, ts)` and needs no SQL `MAX` — that stays only on the terminal arms.
+ *
+ * Polarity is REMOVE-BIASED last-write-wins (the LWW-Element-Set remove bias):
+ *   - `quiesce` (a `→ stopped` transition) applies at `ts >= stamp`;
+ *   - `activate` (a `→ working` revival — a prompt, a resume, a tool event)
+ *     applies only at strictly `ts > stamp`,
+ * so an equal-ts tie between racing same-host writers resolves to QUIESCENCE.
+ * Equal-ts collisions are a HOT path at ms granularity, not a rare edge. The
+ * tiebreak MUST stay semantic (quiescence wins) and NEVER be "fixed" into an
+ * `event.id` tiebreak: insertion id is arrival order, the exact untrusted input
+ * the phantom-working bug rode in on. A NULL stamp always applies (a fresh row).
+ *
+ * `col` lets a caller qualify the column (`jobs.last_lifecycle_ts`) inside an
+ * UPSERT `ON CONFLICT DO UPDATE` where the bare name is ambiguous. Pure over
+ * event fields + the folded stamp, so the gated fold stays re-fold deterministic.
+ */
+function lifecycleStampGate(
+  polarity: "quiesce" | "activate",
+  col = "last_lifecycle_ts",
+): string {
+  return `(${col} IS NULL OR ? ${polarity === "quiesce" ? ">=" : ">"} ${col})`;
+}
+
+/**
  * Recency bound (unix-SECONDS) for the Stop + ApiError sub-agent guards (both
  * route through {@link findFreshInFlightSubagentAnchor}). Without it, a one-shot
  * orphan sub-agent that never emits `SubagentStop` would pin its parent at
@@ -5685,9 +5721,15 @@ function dropParentJobOnSilentStreamCut(
   ts: number,
 ): boolean {
   const res = db.run(
-    `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
-       WHERE job_id = ? AND state = 'working'`,
-    [eventId, ts, jobId],
+    // Quiescing (working -> stopped): gated at `ts >= stamp` (ADR 0013). A
+    // silent-stream-cut whose ts has regressed behind the lifecycle stamp is a
+    // stale straggler — swallow it (no flip, no stamp advance, no re-fan) rather
+    // than drop a session that a newer event already proved live.
+    `UPDATE jobs SET state = 'stopped', last_lifecycle_ts = ?,
+                     last_event_id = ?, updated_at = ?
+       WHERE job_id = ? AND state = 'working'
+         AND ${lifecycleStampGate("quiesce")}`,
+    [ts, eventId, ts, jobId, ts],
   );
   if (res.changes > 0) {
     syncIfPlanRef(db, jobId, eventId, ts);
@@ -8043,7 +8085,18 @@ function projectJobsRow(db: Database, event: Event): void {
              -- a NULL config_dir derives a NULL excluded.profile_name, so
              -- COALESCE preserves the seeded name (mirrors config_dir above).
              profile_name = COALESCE(excluded.profile_name, jobs.profile_name),
-             state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
+             -- Re-open a TERMINAL row on resume, gated by the ADR-0013 lifecycle
+             -- stamp. This is a revival (terminal -> stopped), so it takes the
+             -- ACTIVATING polarity (strictly ts > stamp) it shares with the
+             -- UserPromptSubmit prompt-revival: a stale/duplicate SessionStart
+             -- whose ts has not advanced past the terminal event's stamp must
+             -- NOT resurrect a genuinely-dead session. A live working/stopped row
+             -- is left untouched (the CASE ELSE), and a fresh INSERT seeds a NULL
+             -- stamp (not in the column list) that the first real lifecycle event
+             -- advances. The stamp CASE mirrors the state CASE so it advances ONLY
+             -- on the re-open, keeping a non-revival resume re-fold-stable.
+             state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') AND ${lifecycleStampGate("activate", "jobs.last_lifecycle_ts")} THEN 'stopped' ELSE jobs.state END,
+             last_lifecycle_ts = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') AND ${lifecycleStampGate("activate", "jobs.last_lifecycle_ts")} THEN ? ELSE jobs.last_lifecycle_ts END,
              -- Heal-on-resume: COALESCE-fill the plan correlator. The existing
              -- jobs column FIRST = fill-only-when-NULL, so a genuine resume's
              -- already-bound pair is preserved (set-once), but a row seeded with
@@ -8103,6 +8156,14 @@ function projectJobsRow(db: Database, event: Event): void {
             event.harness,
             event.resume_target,
             event.adopted,
+            // The three trailing `?` bind the ADR-0013 lifecycle-stamp gate + set
+            // value added to the ON CONFLICT DO UPDATE re-open above (state-CASE
+            // gate, stamp-CASE gate, stamp value) — all the event ts. The DO
+            // UPDATE SET binds no other `?`, so these follow the INSERT VALUES in
+            // positional order.
+            ts,
+            ts,
+            ts,
           ],
         );
         // Seed a visible `profiles` row for this session's `config_dir` bucket.
@@ -8258,7 +8319,18 @@ function projectJobsRow(db: Database, event: Event): void {
       // "why it stopped" annotations no longer apply. Each is unconditional
       // (no-op when already NULL) and paired (both columns of a pair move
       // together).
-      db.run(
+      //
+      // ADR 0013 lifecycle-stamp gate: this revival is ACTIVATING (-> working),
+      // so it requires strictly `ts > stamp` — a stale prompt straggler whose ts
+      // has regressed behind the stamp can NEVER resurrect the row (it shares the
+      // exact stale-arrival race the phantom-working bug rode in on). A genuine
+      // prompt whose ts EXACTLY equals the stamp is swallowed here, which is
+      // acceptable: the turn's following tool events carry newer ts and revive
+      // the row through the bare un-stop arm. On a gated-out (swallowed) prompt
+      // the whole UPDATE no-ops — the annotation clears and pid refresh defer to
+      // the next non-stale event — so `syncIfPlanRef` is gated on `changes > 0`
+      // to keep the swallowed transition re-fold-stable (no stale re-fan).
+      const upsRes = db.run(
         `UPDATE jobs SET state = 'working',
                          last_api_error_at = NULL,
                          last_api_error_kind = NULL,
@@ -8275,11 +8347,14 @@ function projectJobsRow(db: Database, event: Event): void {
                            WHEN state != 'working' THEN ?
                            ELSE active_since
                          END,
+                         last_lifecycle_ts = ?,
                          last_event_id = ?, updated_at = ?
-           WHERE job_id = ?`,
-        [event.pid, event.pid, event.pid, ts, event.id, ts, jobId],
+           WHERE job_id = ? AND ${lifecycleStampGate("activate")}`,
+        [event.pid, event.pid, event.pid, ts, ts, event.id, ts, jobId, ts],
       );
-      syncIfPlanRef(db, jobId, event.id, ts);
+      if (upsRes.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
       break;
     }
 
@@ -8372,10 +8447,17 @@ function projectJobsRow(db: Database, event: Event): void {
       ) {
         break;
       }
+      // ADR 0013 lifecycle-stamp gate: this quiescence (-> stopped) applies at
+      // `ts >= stamp`, so a stale Stop straggler whose ts has regressed behind
+      // the stamp is swallowed (no flip, no stamp advance, no re-fan) — it can
+      // never stop a session a newer event already proved live. Composes AFTER
+      // the terminal + sub-agent-yield guards above (it replaces neither).
       const res = db.run(
-        `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
-           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
-        [event.id, ts, jobId],
+        `UPDATE jobs SET state = 'stopped', last_lifecycle_ts = ?,
+                         last_event_id = ?, updated_at = ?
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')
+             AND ${lifecycleStampGate("quiesce")}`,
+        [ts, event.id, ts, jobId, ts],
       );
       // Sync only when the UPDATE actually wrote — a guarded no-op must NOT
       // re-fan a stale-but-unchanged element with the new event_id.
@@ -8403,15 +8485,23 @@ function projectJobsRow(db: Database, event: Event): void {
       // post-switch COALESCE arm carries a matching terminal guard so a late
       // hook event can't re-stamp the pane). Matches zero rows for a terminal
       // event with no prior SessionStart — a correct no-op.
+      // ADR 0013: a terminal arm keeps its identity/terminal guards and is EXEMPT
+      // from stamp REJECTION (a row pinned by a bogus far-future ts must stay
+      // healable), but STILL advances the stamp via `MAX` so it never regresses —
+      // hence the `MAX(COALESCE(...))`, not the bare `= ?` the rejection-gated
+      // arms use.
       const res = db.run(
         `UPDATE jobs SET state = 'ended', monitors = '[]',
                          backend_exec_pane_id = NULL,
                          backend_exec_generation_id = NULL,
+                         last_lifecycle_ts = MAX(COALESCE(last_lifecycle_ts, ?), ?),
                          last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')
              AND (pid IS NULL OR (? IS NOT NULL AND pid = ?))
              AND (start_time IS NULL OR ? IS NULL OR start_time = ?)`,
         [
+          ts,
+          ts,
           event.id,
           ts,
           jobId,
@@ -8488,14 +8578,19 @@ function projectJobsRow(db: Database, event: Event): void {
         // (same recycle-guard rationale as SessionEnd): a dead job must not keep
         // a tmux pane id `%N` that a fresh window can inherit, or it gets
         // mis-attributed as owning that live window.
+        // ADR 0013: terminal arm — exempt from stamp REJECTION (the JS identity
+        // guards above already gated it; a far-future-pinned row must stay
+        // healable to 'killed'), but still advances the stamp via `MAX` so it
+        // never regresses.
         db.run(
           `UPDATE jobs SET state = 'killed', monitors = '[]', close_kind = ?,
                            kill_reason = ?,
                            backend_exec_pane_id = NULL,
                            backend_exec_generation_id = NULL,
+                           last_lifecycle_ts = MAX(COALESCE(last_lifecycle_ts, ?), ?),
                            last_event_id = ?, updated_at = ?
              WHERE job_id = ?`,
-          [payload.close_kind, payload.reason, event.id, ts, jobId],
+          [payload.close_kind, payload.reason, ts, ts, event.id, ts, jobId],
         );
         // Sweep + sync + clear fire ONLY here, on the proven write path. The
         // earlier `break` arms (malformed / missing / stale) MUST NOT — no
@@ -8563,15 +8658,35 @@ function projectJobsRow(db: Database, event: Event): void {
         MAX_STOP_YIELD_GAP_SEC,
         event.ts,
       );
-      const stateClause = subBlocks ? "state" : "'stopped'";
+      // The `state ->stopped` flip is quiescing (ADR 0013): gate it on the
+      // lifecycle stamp (`ts >= stamp`) so a stale ApiError straggler cannot stop
+      // a session a newer event already proved live — otherwise a permutation of
+      // {ApiError, PostToolUse} would leave a different final state per ingest
+      // order. The gate rides the state CASE (NOT the WHERE) so the (last_api_
+      // error_at, last_api_error_kind) pair still stamps UNCONDITIONALLY, the
+      // honest reading kept from the sub-agent-suppressed path. The stamp advances
+      // ONLY when the flip lands, mirroring the gated CASE. When a fresh in-flight
+      // sub-agent survives, `stateClause`/`stampClause` collapse to no-ops (the
+      // parent stays 'working', the stamp is untouched).
+      const stampGate = lifecycleStampGate("quiesce");
+      const stateClause = subBlocks
+        ? "state"
+        : `CASE WHEN ${stampGate} THEN 'stopped' ELSE state END`;
+      const stampClause = subBlocks
+        ? "last_lifecycle_ts"
+        : `CASE WHEN ${stampGate} THEN ? ELSE last_lifecycle_ts END`;
+      // The gated CASEs bind the event ts three times (state-gate, stamp-gate,
+      // stamp-value); the sub-agent-suppressed branch binds none.
+      const stampParams = subBlocks ? [] : [ts, ts, ts];
       const res = db.run(
         `UPDATE jobs SET state = ${stateClause},
+                         last_lifecycle_ts = ${stampClause},
                          last_api_error_at = ?,
                          last_api_error_kind = ?,
                          last_event_id = ?,
                          updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
-        [ts, kind, event.id, ts, jobId],
+        [...stampParams, ts, kind, event.id, ts, jobId],
       );
       // Sync only when the UPDATE wrote — a guarded no-op must NOT re-fan a
       // stale-but-unchanged element with the new event_id.
@@ -8692,18 +8807,26 @@ function projectJobsRow(db: Database, event: Event): void {
       // `"ask_user_question"` (the single-member union's only value). The clear
       // paths run from the regular hook events.
       const kind = extractInputRequestKind(event);
+      // ADR 0013 lifecycle-stamp gate: this quiescence (-> stopped) applies at
+      // `ts >= stamp`. Unlike the ApiError arm (whose sub-agent guard forces the
+      // annotation stamp to stay UNCONDITIONAL), InputRequest has no sub-agent
+      // guard, so the whole UPDATE — flip AND pair stamp — rides the WHERE gate:
+      // a stale InputRequest straggler is swallowed entirely, which makes both the
+      // final state AND the annotation converge across ingest orderings.
       const res = db.run(
         `UPDATE jobs SET state = 'stopped',
                          last_input_request_at = ?,
                          last_input_request_kind = ?,
+                         last_lifecycle_ts = ?,
                          last_event_id = ?,
                          updated_at = ?
-           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
-        [ts, kind, event.id, ts, jobId],
+           WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')
+             AND ${lifecycleStampGate("quiesce")}`,
+        [ts, kind, ts, event.id, ts, jobId, ts],
       );
       // Sync only when the UPDATE actually wrote — a guarded no-op on a
-      // still-terminal row must NOT re-fan the embedded entry (it would
-      // re-write a stale-but-unchanged element with the new event_id).
+      // still-terminal or stale-straggler row must NOT re-fan the embedded entry
+      // (it would re-write a stale-but-unchanged element with the new event_id).
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
@@ -8728,15 +8851,25 @@ function projectJobsRow(db: Database, event: Event): void {
       // evaluates all SET right-hand sides against the pre-UPDATE row, so both
       // CASEs read the same old state. active_since stamps to `event.ts` only on
       // the genuine stopped→working rising edge (mirrors the UPS arm's mechanics).
+      //
+      // ADR 0013 lifecycle-stamp gate: the un-stop is ACTIVATING (-> working), so
+      // every flip CASE below ANDs `ts > stamp` onto its `state = 'stopped'`
+      // predicate — a stale tool-event straggler whose ts has regressed behind
+      // the stamp clears its annotation pair but does NOT resurrect the row (the
+      // exact phantom-working race). The `last_lifecycle_ts` CASE mirrors the flip
+      // CASE so the stamp advances (and active_since re-stamps) ONLY on a real
+      // rising edge, keeping a swallowed straggler re-fold-stable.
+      const unstopGate = lifecycleStampGate("activate");
       const resApi = db.run(
         `UPDATE jobs SET last_api_error_at = NULL,
                          last_api_error_kind = NULL,
-                         state = CASE WHEN state = 'stopped' THEN 'working' ELSE state END,
-                         active_since = CASE WHEN state = 'stopped' THEN ? ELSE active_since END,
+                         state = CASE WHEN state = 'stopped' AND ${unstopGate} THEN 'working' ELSE state END,
+                         active_since = CASE WHEN state = 'stopped' AND ${unstopGate} THEN ? ELSE active_since END,
+                         last_lifecycle_ts = CASE WHEN state = 'stopped' AND ${unstopGate} THEN ? ELSE last_lifecycle_ts END,
                          last_event_id = ?,
                          updated_at = ?
            WHERE job_id = ? AND last_api_error_at IS NOT NULL`,
-        [ts, event.id, ts, jobId],
+        [ts, ts, ts, ts, ts, event.id, ts, jobId],
       );
       if (resApi.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
@@ -8749,14 +8882,16 @@ function projectJobsRow(db: Database, event: Event): void {
       // gate on both CASEs. Gated on `IS NOT NULL`; paired clear; sync gated on
       // `changes > 0`.
       const res = db.run(
+        // Same ADR-0013 activating gate as the api-error un-stop above (`unstopGate`).
         `UPDATE jobs SET last_input_request_at = NULL,
                          last_input_request_kind = NULL,
-                         state = CASE WHEN state = 'stopped' THEN 'working' ELSE state END,
-                         active_since = CASE WHEN state = 'stopped' THEN ? ELSE active_since END,
+                         state = CASE WHEN state = 'stopped' AND ${unstopGate} THEN 'working' ELSE state END,
+                         active_since = CASE WHEN state = 'stopped' AND ${unstopGate} THEN ? ELSE active_since END,
+                         last_lifecycle_ts = CASE WHEN state = 'stopped' AND ${unstopGate} THEN ? ELSE last_lifecycle_ts END,
                          last_event_id = ?,
                          updated_at = ?
            WHERE job_id = ? AND last_input_request_at IS NOT NULL`,
-        [ts, event.id, ts, jobId],
+        [ts, ts, ts, ts, ts, event.id, ts, jobId],
       );
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
@@ -8808,13 +8943,24 @@ function projectJobsRow(db: Database, event: Event): void {
       // 'working' until the next Stop folds it back — acceptable by design for a
       // 'stopped' (non-terminal) row. Pure over the event log — re-fold
       // deterministic.
+      //
+      // ADR 0013 lifecycle-stamp gate: the un-stop is ACTIVATING (-> working), so
+      // the WHERE ANDs `ts > stamp` onto `state = 'stopped'`. THIS is the
+      // root-cause fix for phantom-working — the turn-final `Stop` advanced the
+      // stamp to its own ts, so a straggler PostToolUse with an EARLIER ts is
+      // swallowed here and can never resurrect the correctly-stopped row. A
+      // genuine resume (tool events with newer ts) still un-stops. The WHERE gate
+      // means a swallowed straggler no-ops entirely (no active_since/stamp churn),
+      // and working rows keep no-op-ing so the 50+/turn hot path stays cold.
       const resUnstop = db.run(
         `UPDATE jobs SET state = 'working',
                          active_since = ?,
+                         last_lifecycle_ts = ?,
                          last_event_id = ?,
                          updated_at = ?
-           WHERE job_id = ? AND state = 'stopped'`,
-        [ts, event.id, ts, jobId],
+           WHERE job_id = ? AND state = 'stopped'
+             AND ${lifecycleStampGate("activate")}`,
+        [ts, ts, event.id, ts, jobId, ts],
       );
       if (resUnstop.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);

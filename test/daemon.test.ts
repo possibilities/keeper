@@ -3317,7 +3317,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // cursor rewind: a pre-v112 EpicSnapshot carries no `selection_review` key, so a
   // from-scratch re-fold folds it NULL byte-identical, and the producer coerces the
   // value before it ever reaches the fold).
-  expect(SCHEMA_VERSION).toBe(112);
+  // And to 113 via fn-1164 task .1 (appending the nullable `jobs.last_lifecycle_ts`
+  // REAL column — the per-row lifecycle stamp; the fold gate is polarity-aware and
+  // pure over event.ts + the pre-update state, so it stays re-fold deterministic.
+  // This migration REWINDS the cursor and wipes the deterministic projection set
+  // so the stamp is back-derived purely by replay and existing phantom-working
+  // rows self-heal — `commit_trailer_facts` is spared per the v80/v81/v85 carve-out).
+  expect(SCHEMA_VERSION).toBe(113);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
