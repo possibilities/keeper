@@ -347,9 +347,11 @@ function extractPrompt(event: Event): string | null {
 }
 
 /**
- * Extract the top-level `transcript_path` from a SessionStart event's `data`
- * blob. Skip-and-log on a malformed blob, never throw. Returns the path only
- * when it is a non-empty absolute string, else `null`.
+ * Extract the top-level `transcript_path` from an event's verbatim hook-payload
+ * `data` blob. A SessionStart seeds the jobs row with it; a proven-live activity
+ * event refreshes it via {@link refreshTranscriptPathFromActivity}. Skip-and-log
+ * on a malformed blob, never throw. Returns the path only when it is a non-empty
+ * absolute string, else `null`.
  */
 function extractTranscriptPath(event: Event): string | null {
   if (event.data && event.data.length > 0) {
@@ -366,6 +368,46 @@ function extractTranscriptPath(event: Event): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Activity-gated `transcript_path` refresh. Only a proven-live activity event
+ * that already carries the live `transcript_path` in its verbatim hook payload
+ * may move the column off the value the row's first-sight INSERT seeded. A bare
+ * SessionStart never reaches here, so the SessionStart(+SessionEnd) pair a
+ * FAILED resume emits (no activity, only a predicted-but-never-created path) can
+ * never clobber the last good `transcript_path`. An activity event LACKING the
+ * field (`extractTranscriptPath` → null) is a no-op — it must never null the
+ * column. The change-gate WHERE keeps the steady state (an unchanged path
+ * repeated across a turn) a cold no-op, so this writes only on a genuine
+ * rehome/resume drift.
+ *
+ * Called ONLY from the UserPromptSubmit and Stop arms — both keep-set
+ * hook_events whose `data` body the retention shed NEVER NULLs, so a from-
+ * scratch re-fold over a shed-shaped corpus reads the same body and reproduces
+ * the same write. Pre/PostToolUse is deliberately NOT a source: its body sheds
+ * for the mutation tools and `transcript_path` has no promoted column, so
+ * reading it there would diverge post-shed (see the Pre/PostToolUse arm note).
+ *
+ * `transcript_path` is display/debug only and is not embedded in the
+ * `epics.jobs` element, so a move needs no `syncIfPlanRef` re-fan. Pure over
+ * `event.data` — re-fold deterministic.
+ */
+function refreshTranscriptPathFromActivity(
+  db: Database,
+  event: Event,
+  jobId: string,
+): void {
+  const transcriptPath = extractTranscriptPath(event);
+  if (transcriptPath == null) {
+    return;
+  }
+  db.run(
+    `UPDATE jobs SET transcript_path = ?, last_event_id = ?, updated_at = ?
+       WHERE job_id = ?
+         AND (transcript_path IS NULL OR transcript_path != ?)`,
+    [transcriptPath, event.id, event.ts, jobId, transcriptPath],
+  );
 }
 
 /**
@@ -7967,7 +8009,13 @@ function projectJobsRow(db: Database, event: Event): void {
       // working/stopped row is left untouched, so a live job is never knocked
       // backwards) and refreshes pid + start_time (a resume is a new OS
       // process). title/title_source/created_at/cwd/transcript_path are NOT
-      // touched — precedence-owned / set-once identity.
+      // touched here — precedence-owned / set-once identity. `cwd` stays
+      // set-once at this insert for the row's life. `transcript_path` is seeded
+      // here on first sight but from then on moves ONLY on proven-live activity
+      // (UserPromptSubmit / Stop via `refreshTranscriptPathFromActivity`): a
+      // bare SessionStart — including the SessionStart(+SessionEnd) pair a
+      // FAILED resume emits — carries no liveness proof, so it can never clobber
+      // the last good path with a predicted-but-never-created one.
       {
         // Derive `plan_verb`/`plan_ref` from the spawn name via the shared pure
         // parser; NULL on any name outside the `{plan|work|close}::<ref>`
@@ -8280,6 +8328,9 @@ function projectJobsRow(db: Database, event: Event): void {
         [event.pid, event.pid, event.pid, ts, event.id, ts, jobId],
       );
       syncIfPlanRef(db, jobId, event.id, ts);
+      // Proven-live activity: refresh transcript_path off this event's live
+      // value when it drifted (rehome/resume). Change-gated no-op otherwise.
+      refreshTranscriptPathFromActivity(db, event, jobId);
       break;
     }
 
@@ -8382,6 +8433,12 @@ function projectJobsRow(db: Database, event: Event): void {
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
+      // Proven-live activity: a Stop is emitted by a live process, so refresh
+      // transcript_path off its live value when it drifted. Change-gated no-op
+      // otherwise. Runs UNGATED by the terminal/sub-agent guards above: a Stop
+      // reaching this arm at all is liveness evidence, and the helper's own
+      // change-gate WHERE never resurrects or re-fans a row.
+      refreshTranscriptPathFromActivity(db, event, jobId);
       break;
     }
 
@@ -8819,6 +8876,15 @@ function projectJobsRow(db: Database, event: Event): void {
       if (resUnstop.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
+      // NOTE: this arm deliberately does NOT refresh transcript_path off the
+      // tool event, even though a tool event is proven-live activity. A
+      // Pre/PostToolUse body for the shed mutation tools (Write/Edit/MultiEdit/
+      // NotebookEdit + non-plan Bash) is NULLed by the retention shed, and
+      // transcript_path lives only in the body (no promoted column), so reading
+      // it here would re-fold differently post-shed — breaking the shed
+      // re-fold-equivalence invariant. The refresh rides UserPromptSubmit +
+      // Stop instead (both keep-set / never shed). This arm reads scalar columns
+      // only — keep it that way.
       break;
     }
 
