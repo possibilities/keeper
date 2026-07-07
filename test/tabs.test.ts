@@ -40,12 +40,18 @@ import type {
   GenerationSummary,
   RestoreCandidate,
 } from "../src/restore-set";
+import {
+  RESTORE_INTENT_SCHEMA_VERSION,
+  type RestoreIntent,
+} from "../src/restore-verify";
 import type { ResumeResolver } from "../src/resume-resolve";
 import {
   type AgentOutcome,
   applyRestore,
+  applyRestoreVerified,
   autopilotGateDecision,
   countOutcomes,
+  type IntentSink,
   loadCurrentSetForDump,
   loadGenerationList,
   loadRestorePlan,
@@ -56,6 +62,8 @@ import {
   renderSnapshotScript as renderSnapshotScriptRaw,
   restorePlanTouchesManagedSession,
   selectRestoreGeneration,
+  VERIFY_FAILED_REASON,
+  VERIFY_UNVERIFIED_REASON,
 } from "../src/tabs-core";
 import { freshDbFile } from "./helpers/template-db";
 
@@ -745,11 +753,17 @@ test("renderOutcomes surfaces / omits the idle-excluded note", () => {
   expect(renderOutcomes(plan, false, 0)).not.toContain("excluded as idle");
 });
 
-test("countOutcomes tallies restored / failed / would-restore / not-resumable", () => {
+test("countOutcomes tallies every kind incl. verified / launched-unverified", () => {
   const outcomes: AgentOutcome[] = [
     { kind: "restored", candidate: fakeCandidate({ job_id: "a" }) },
+    { kind: "verified", candidate: fakeCandidate({ job_id: "v" }) },
     { kind: "failed", candidate: fakeCandidate({ job_id: "b" }), error: "x" },
     { kind: "would-restore", candidate: fakeCandidate({ job_id: "c" }) },
+    {
+      kind: "launched-unverified",
+      candidate: fakeCandidate({ job_id: "u" }),
+      reason: "pane alive, no evidence",
+    },
     {
       kind: "not-resumable",
       candidate: fakeCandidate({ job_id: "d" }),
@@ -758,11 +772,171 @@ test("countOutcomes tallies restored / failed / would-restore / not-resumable", 
   ];
   expect(countOutcomes(outcomes)).toEqual({
     restored: 1,
+    verified: 1,
     failed: 1,
     wouldRestore: 1,
+    unverified: 1,
     notResumable: 1,
     preflightFailed: 0,
   });
+});
+
+// ---------------------------------------------------------------------------
+// applyRestoreVerified — the per-tab durable, evidence-verified transaction
+// ---------------------------------------------------------------------------
+
+/** A recording intent sink + a base-intent builder for the verified-apply tests. */
+function recordingIntent(): { writes: RestoreIntent[]; sink: IntentSink } {
+  const writes: RestoreIntent[] = [];
+  return { writes, sink: { write: (i) => writes.push({ ...i }) } };
+}
+
+function baseIntentFor(candidate: RestoreCandidate): RestoreIntent {
+  return {
+    schema_version: RESTORE_INTENT_SCHEMA_VERSION,
+    generation_id: "gen-1",
+    job_id: candidate.job_id,
+    session_uuid: candidate.resume_target,
+    harness: harnessOrClaude(candidate.harness),
+    resume_target: candidate.resume_target,
+    cwd: candidate.cwd ?? "",
+    backend_exec_session_id: candidate.backend_exec_session_id,
+    argv: ["keeper", "agent", "claude", "--resume", candidate.resume_target],
+    rerun_command: "keeper tabs restore --apply --session work",
+    attempt: 1,
+    state: "planned",
+    reason: "",
+    created_at: "2026-07-07T00:00:00.000Z",
+    updated_at: "2026-07-07T00:00:00.000Z",
+  };
+}
+
+test("applyRestoreVerified: a verified verdict → verified outcome + a verified intent", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: true }),
+    verify: async () => "verified",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out.map((o) => o.kind)).toEqual(["verified"]);
+  // Write-before-launch then a terminal verified write.
+  expect(writes.map((w) => w.state)).toEqual(["launched", "verified"]);
+});
+
+test("applyRestoreVerified: a launch failure → failed outcome, verify never runs", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  let verifyCalled = false;
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: false, error: "exit 3 NOOP" }),
+    verify: async () => {
+      verifyCalled = true;
+      return "verified";
+    },
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out[0].kind).toBe("failed");
+  expect((out[0] as { error: string }).error).toBe("exit 3 NOOP");
+  expect(verifyCalled).toBe(false);
+  expect(writes.at(-1)?.state).toBe("failed");
+  expect(writes.at(-1)?.reason).toBe("exit 3 NOOP");
+});
+
+test("applyRestoreVerified: died resume (verify failed) → failed + resurfacing intent", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: true }),
+    verify: async () => "failed",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out[0].kind).toBe("failed");
+  expect((out[0] as { error: string }).error).toBe(VERIFY_FAILED_REASON);
+  expect(writes.at(-1)?.state).toBe("failed");
+});
+
+test("applyRestoreVerified: no evidence + live pane → launched-unverified warn", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => ({ ok: true }),
+    verify: async () => "launched-unverified",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+  expect(out[0].kind).toBe("launched-unverified");
+  expect((out[0] as { reason: string }).reason).toBe(VERIFY_UNVERIFIED_REASON);
+  expect(writes.at(-1)?.state).toBe("launched-unverified");
+});
+
+test("applyRestoreVerified: an already-live session no-ops (never launches)", async () => {
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  let launched = false;
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => {
+      launched = true;
+      return { ok: true };
+    },
+    verify: async () => "failed",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    isLive: () => true,
+    sleep: async () => {},
+  });
+  expect(out.map((o) => o.kind)).toEqual(["verified"]);
+  // No launch, no intent churn — the existing verified marker is left untouched.
+  expect(launched).toBe(false);
+  expect(writes).toEqual([]);
+});
+
+test("applyRestoreVerified: hands verify the pre-launch floor + carries the launch id", async () => {
+  const plan = planRestore(
+    [fakeCandidate({ job_id: "a", resume_target: "sess-a", cwd: "/repo/a" })],
+    null,
+  );
+  const { sink } = recordingIntent();
+  const launchCalls: { resumeTarget: string; jobId: string }[] = [];
+  const floors: number[] = [];
+  await applyRestoreVerified(plan, {
+    ensureLaunched: async (_s, resumeTarget, _c, _h, jobId) => {
+      launchCalls.push({ resumeTarget, jobId });
+      return { ok: true };
+    },
+    verify: async (_candidate, launchStartMs) => {
+      floors.push(launchStartMs);
+      return "verified";
+    },
+    intent: sink,
+    makeIntent: baseIntentFor,
+    now: () => 4242,
+    sleep: async () => {},
+  });
+  expect(launchCalls).toEqual([{ resumeTarget: "sess-a", jobId: "a" }]);
+  expect(floors).toEqual([4242]);
+});
+
+test("renderOutcomes apply summary counts verified as restored, notes unverified", () => {
+  const outcomes: AgentOutcome[] = [
+    { kind: "verified", candidate: fakeCandidate({ job_id: "v" }) },
+    {
+      kind: "launched-unverified",
+      candidate: fakeCandidate({ job_id: "u" }),
+      reason: "pane alive",
+    },
+  ];
+  const rendered = renderOutcomes(outcomes, true, 0);
+  expect(rendered).toContain("VERIFIED");
+  expect(rendered).toContain("UNVERIFIED");
+  expect(rendered).toContain("# summary: restored=1 failed=0 unverified=1");
 });
 
 // ---------------------------------------------------------------------------

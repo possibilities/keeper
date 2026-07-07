@@ -18,12 +18,22 @@
  *
  * Exit codes (slotted into the published `keeper --help --json` table, distinct
  * from the usage code and the await-owned range):
- *   0 — printed the plan / list / dump, or completed the `--apply` restore.
+ *   0 — printed the plan / list / dump, or completed the `--apply` restore (every
+ *       launched tab verified or is an accepted `launched-unverified` warn).
  *   1 — usage/read failure, the autopilot fail-closed gate refusal, or a declined
  *       confirmation (launched nothing).
  *   6 — `restore` refused a non-TTY AMBIGUOUS selection (ranked table on stderr).
  *   7 — `restore --apply` found ZERO candidates without `--allow-empty`.
- *   8 — `restore --apply` had a PARTIAL launch failure (restored/failed summary).
+ *   8 — `restore --apply` had a PARTIAL FAILURE: at least one tab `failed` — a
+ *       launch that never returned OK, or a resume that died with no attach
+ *       evidence. Each such tab leaves a durable intent that resurfaces in `keeper
+ *       tabs list` until it verifies. A `launched-unverified` warn is NOT a failure.
+ *
+ * `--apply` is a per-tab VERIFIED transaction: the intent is written before the
+ * launch, then settled against on-disk attach evidence (`src/restore-verify.ts`).
+ * Retries are idempotent — an already-live session no-ops, a per-apply advisory
+ * flock stops concurrent double-spawns, and a tab past the crash-loop bound (two
+ * auto-attempts per generation) is refused with an on-demand `--force` hint.
  *
  * The autopilot fail-closed gate is scoped to the managed backend session:
  * `--apply` refuses while autopilot is UNPAUSED only when the restore plan targets
@@ -39,14 +49,43 @@
 
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
-import { resolveDbPath } from "../src/db";
-import type { GenerationSummary } from "../src/restore-set";
+import { harnessOrClaude } from "../src/agent/harness";
+import { resolveBirthDir } from "../src/birth-record";
+import { resolveDbPath, resolveEventsLogDir } from "../src/db";
+import {
+  buildKeeperAgentLaunchArgv,
+  localeDefaultedEnv,
+} from "../src/exec-backend";
+import type { GenerationSummary, RestoreCandidate } from "../src/restore-set";
 import { RECENT_GENERATION_BOUND } from "../src/restore-set";
 import {
-  applyRestore,
+  type AttachVerdict,
+  classifyPaneLiveness,
+  claudeAttachEvidence,
+  crashLoopHint,
+  gcRestoreIntents,
+  listOpenRestoreIntents,
+  mayAttemptRestore,
+  nonClaudeAttachEvidence,
+  type PaneLiveness,
+  RESTORE_INTENT_SCHEMA_VERSION,
+  RESTORE_VERIFY_POLL_MS,
+  RESTORE_VERIFY_TIMEOUT_MS,
+  type RestoreIntent,
+  readRestoreIntent,
+  resolveRestoreApplyLockPath,
+  resolveRestoreIntentDir,
+  tryAcquireApplyLock,
+  verifyAttach,
+  writeRestoreIntent,
+} from "../src/restore-verify";
+import {
+  type AttachVerifyFn,
+  applyRestoreVerified,
   autopilotGateDecision,
   countOutcomes,
   defaultLauncherPrefix,
+  type IntentSink,
   loadCurrentSetForDump,
   loadGenerationList,
   loadRestorePlan,
@@ -73,8 +112,9 @@ import {
   successEnvelope,
 } from "./envelope";
 
-/** The `keeper tabs list` payload schema version. */
-export const TABS_LIST_SCHEMA_VERSION = 1;
+/** The `keeper tabs list` payload schema version. v2 adds `open_restores` — the
+ *  failed / unverified per-tab intents that resurface until they verify. */
+export const TABS_LIST_SCHEMA_VERSION = 2;
 
 /** `restore` refused a non-TTY ambiguous selection (policy refusal, distinct from
  *  a runtime failure so an orchestrator can tell the two apart). */
@@ -130,13 +170,17 @@ off a TTY (exit ${TABS_EXIT_REFUSE_AMBIGUOUS}, ranked table on stderr).
                       an older generation is past the bound and unreachable)
   --session <name>    Restore only agents from this backend session
   --allow-empty       Suppress the zero-candidate failure under --apply (exit ${TABS_EXIT_ZERO_CANDIDATES})
-  --force             Override the --apply autopilot fail-closed gate (still warns)
+  --force             Override the --apply autopilot fail-closed gate AND the
+                      crash-loop bound (an on-demand rerun past the auto cap); still warns
   --db <path>         keeper.db path override ($KEEPER_DB / default otherwise)
   --help, -h          Show this help
 
+--apply is a per-tab VERIFIED transaction: each tab re-attaches only on on-disk
+attach evidence, otherwise resurfaces in 'keeper tabs list' until it verifies.
+Retries are idempotent (already-live no-op, per-apply flock, crash-loop bound).
 --apply FAILS CLOSED (exit 1, launches nothing) while autopilot is UNPAUSED only
 when the restore plan targets the managed autopilot session, unless --force is passed. Zero candidates under --apply exits ${TABS_EXIT_ZERO_CANDIDATES} (pass --allow-empty to
-proceed); any partial launch failure exits ${TABS_EXIT_PARTIAL_FAILURE} with a restored/failed summary.
+proceed); any tab that failed (a died resume) exits ${TABS_EXIT_PARTIAL_FAILURE} with a verified/failed/unverified summary.
 `;
 
 const HELP_DUMP = `keeper tabs dump — a runnable revive script for the CURRENT live set
@@ -162,16 +206,21 @@ export const AGENT_HELP = `keeper tabs — operator runbook (agent-facing)
 Restore keeper-managed Claude Code agents after a crash. Every read opens keeper.db
 read-only (daemon-down OK); restore is DRY-RUN until --apply.
 
-  keeper tabs list                        # ranked dead-generation summaries + live set (JSON)
+  keeper tabs list                        # generations + live set + open_restores (unverified tabs)
   keeper tabs restore                     # print the resolved restore plan (touches nothing)
-  keeper tabs restore --apply             # relaunch the auto-picked generation
+  keeper tabs restore --apply             # relaunch + VERIFY the auto-picked generation
   keeper tabs restore --apply --generation <id>   # disambiguate a contested pick
   keeper tabs dump                        # a runnable revive script for the CURRENT live set
 
+--apply is a per-tab VERIFIED transaction: a tab counts restored only on on-disk
+attach evidence, else it resurfaces in 'list' (open_restores) with its rerun
+command until it verifies. Retries are idempotent (already-live no-op, per-apply
+flock, crash-loop bound of 2 auto-attempts — past it, rerun with --force).
+
 Exit codes: 0 ok · 1 generic · 6 refused a non-TTY ambiguous pick (re-run with
 --generation <id> or on a TTY) · 7 --apply found ZERO candidates (pass --allow-empty)
-· 8 --apply PARTIAL launch failure. Footgun: --apply fails CLOSED (exit 1, launches
-nothing) while autopilot is UNPAUSED unless you pass --force.
+· 8 --apply had a tab that FAILED (a died resume). Footgun: --apply fails CLOSED
+(exit 1, launches nothing) while autopilot is UNPAUSED unless you pass --force.
 `;
 
 // ---------------------------------------------------------------------------
@@ -463,13 +512,28 @@ export async function main(argv: string[]): Promise<void> {
   return runRestore(cmd);
 }
 
-/** `keeper tabs list` — the JSON envelope of generation summaries + live set. */
+/** `keeper tabs list` — the JSON envelope of generation summaries + live set +
+ *  the open (failed / unverified) restore intents that resurface until verified. */
 function runList(dbOverride: string | null): never {
   const dbPath = dbOverride ?? resolveDbPath();
   try {
     const payload = loadGenerationList(dbPath);
+    // The retry surface: per-tab intents whose restore has not verified. Read from
+    // the durable intent tree (daemon-down OK); a read failure degrades to []
+    // rather than failing the whole list.
+    let openRestores: RestoreIntent[] = [];
+    try {
+      openRestores = listOpenRestoreIntents(
+        resolveRestoreIntentDir(process.env),
+      );
+    } catch {
+      openRestores = [];
+    }
     emitEnvelope(
-      successEnvelope(TABS_LIST_SCHEMA_VERSION, payload),
+      successEnvelope(TABS_LIST_SCHEMA_VERSION, {
+        ...payload,
+        open_restores: openRestores,
+      }),
       processEnvelopeSink,
     );
   } catch {
@@ -657,10 +721,20 @@ async function runRestore(cmd: {
       if (answer.trim().toLowerCase() !== "y") {
         return fail("aborted, restored nothing", 1);
       }
-      return runApply(plan, gate, dbPath);
+      return runApply(
+        plan,
+        gate,
+        selection.pickedGeneration?.generation_id ?? "",
+        cmd.force,
+      );
     }
     case "apply": {
-      return runApply(plan, gate, dbPath);
+      return runApply(
+        plan,
+        gate,
+        selection.pickedGeneration?.generation_id ?? "",
+        cmd.force,
+      );
     }
     default: {
       // The `picker` kind is resolved above into an explicit selection; a residual
@@ -670,13 +744,151 @@ async function runRestore(cmd: {
   }
 }
 
-/** The `--apply` launch loop: warn on a forced gate, relaunch every candidate via
- *  keeper's sole transport, render the outcome summary, and exit 0 (all restored)
- *  or {@link TABS_EXIT_PARTIAL_FAILURE} (any launch failed). */
+/** The exact one-command idempotent rerun for a tab's backend session. */
+function buildRerunCommand(generationId: string, session: string): string {
+  const genArg = generationId !== "" ? ` --generation ${generationId}` : "";
+  return `keeper tabs restore --apply${genArg} --session ${session}`;
+}
+
+/** The intent-artifact key for a candidate — its resume target (claude session id
+ *  / harness-native id) falls back to the keeper job id when empty. */
+function intentKey(candidate: RestoreCandidate, generationId: string) {
+  return {
+    generation_id: generationId,
+    session_uuid: candidate.resume_target,
+    job_id: candidate.job_id,
+  };
+}
+
+/** Build the base (planned) intent for a candidate, stamping its attempt count off
+ *  any prior intent (crash-loop bound) and recording the real keeper-agent launch
+ *  argv + the idempotent rerun command. */
+function buildRestoreIntent(
+  candidate: RestoreCandidate,
+  generationId: string,
+  intentDir: string,
+  launcherPrefix: string[],
+): RestoreIntent {
+  const harness = harnessOrClaude(candidate.harness);
+  const cwd = candidate.cwd ?? "";
+  const prior = readRestoreIntent(
+    intentDir,
+    intentKey(candidate, generationId),
+  );
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: launcherPrefix,
+    session: candidate.backend_exec_session_id,
+    prompt: "",
+    resumeTarget: candidate.resume_target,
+    jobId: candidate.job_id,
+    harness,
+    noConfirm: true,
+  });
+  const nowIso = new Date().toISOString();
+  return {
+    schema_version: RESTORE_INTENT_SCHEMA_VERSION,
+    generation_id: generationId,
+    job_id: candidate.job_id,
+    session_uuid: candidate.resume_target,
+    harness,
+    resume_target: candidate.resume_target,
+    cwd,
+    backend_exec_session_id: candidate.backend_exec_session_id,
+    argv,
+    rerun_command: buildRerunCommand(
+      generationId,
+      candidate.backend_exec_session_id,
+    ),
+    // A never-attempted tab is attempt 1; each apply increments off its prior.
+    attempt: (prior?.attempt ?? 0) + 1,
+    state: "planned",
+    reason: "",
+    created_at: prior?.created_at ?? nowIso,
+    updated_at: nowIso,
+  };
+}
+
+/** Best-effort probe of a tmux session's active pane harness liveness — the verify
+ *  timeout disambiguator. Any failure (no tmux, no session, probe error) is
+ *  `unknown` (→ launched-unverified, never a false `failed`). */
+function probeSessionPaneLiveness(session: string): PaneLiveness {
+  try {
+    const res = Bun.spawnSync(
+      [
+        "tmux",
+        "display-message",
+        "-p",
+        "-t",
+        `=${session}`,
+        "-F",
+        "#{pane_dead}\t#{pane_current_command}",
+      ],
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        env: localeDefaultedEnv(
+          process.env as Record<string, string | undefined>,
+        ),
+      },
+    );
+    if (res.exitCode !== 0) {
+      return "unknown";
+    }
+    const line = res.stdout.toString("utf8").split("\n")[0] ?? "";
+    const tab = line.indexOf("\t");
+    if (tab < 0) {
+      return "unknown";
+    }
+    return classifyPaneLiveness(line.slice(0, tab), line.slice(tab + 1));
+  } catch {
+    return "unknown";
+  }
+}
+
+/** The production attach verifier: read on-disk evidence (claude NDJSON / non-claude
+ *  birth record) gated on the pre-launch floor, bounded-poll, then disambiguate a
+ *  no-evidence timeout by pane liveness. */
+function makeAttachVerify(): AttachVerifyFn {
+  const eventsDir = resolveEventsLogDir();
+  const birthDir = resolveBirthDir(process.env);
+  return (candidate, launchStartMs): Promise<AttachVerdict> => {
+    const harness = harnessOrClaude(candidate.harness);
+    const hasEvidence =
+      harness === "claude"
+        ? () =>
+            claudeAttachEvidence(
+              eventsDir,
+              candidate.resume_target,
+              launchStartMs,
+            )
+        : () =>
+            nonClaudeAttachEvidence(birthDir, candidate.job_id, launchStartMs);
+    return verifyAttach({
+      hasEvidence,
+      paneLiveness: () =>
+        probeSessionPaneLiveness(candidate.backend_exec_session_id),
+      now: () => Date.now(),
+      sleep: (ms) => Bun.sleep(ms),
+      timeoutMs: RESTORE_VERIFY_TIMEOUT_MS,
+      pollMs: RESTORE_VERIFY_POLL_MS,
+    });
+  };
+}
+
+/**
+ * The `--apply` VERIFIED launch loop. Takes the per-apply advisory flock (a live
+ * concurrent holder is an idempotent success — no double-spawn), refuses any tab
+ * past the crash-loop bound (auto only; `--force` is on-demand), then drives the
+ * per-tab verified transaction: durable intent written before each launch,
+ * attach-verified against on-disk evidence, cleared on verified / resurfaced
+ * otherwise. Exit 8 on any `failed` tab (a launch or a died resume); a
+ * `launched-unverified` warn does not fail the apply.
+ */
 async function runApply(
   plan: ReturnType<typeof planRestore>,
   gate: "proceed" | "blocked" | "forced",
-  _dbPath: string,
+  generationId: string,
+  force: boolean,
 ): Promise<never> {
   if (gate === "forced") {
     process.stderr.write(
@@ -684,11 +896,76 @@ async function runApply(
         "aren't 'verb::id'-named; autopilot may double-dispatch this work.\n",
     );
   }
-  const ensureLaunched = makeEnsureLaunched(defaultLauncherPrefix(), (l) =>
-    process.stderr.write(`${l}\n`),
-  );
-  const outcomes = await applyRestore(plan, ensureLaunched);
-  process.stdout.write(renderOutcomes(outcomes, true, 0));
-  const { failed } = countOutcomes(outcomes);
-  return process.exit(failed > 0 ? TABS_EXIT_PARTIAL_FAILURE : 0);
+  const env = process.env;
+  const intentDir = resolveRestoreIntentDir(env);
+  // Sweep stale intents from prior generations past the idle cutoff so they never
+  // resurface forever.
+  gcRestoreIntents(intentDir, Date.now());
+
+  // The per-apply advisory flock: a concurrent live holder is an idempotent
+  // success (launch nothing, exit 0) — never a double-spawn.
+  const lock = tryAcquireApplyLock(resolveRestoreApplyLockPath(env), {
+    pid: process.pid,
+    startTs: new Date().toISOString(),
+    uuid: crypto.randomUUID(),
+  });
+  if (lock === null) {
+    process.stderr.write(
+      "keeper tabs: another restore --apply is already running (advisory lock " +
+        "held) — no-op, launched nothing.\n",
+    );
+    return process.exit(0);
+  }
+
+  try {
+    // Crash-loop bound: refuse any tab at/over the auto cap (unless --force marks
+    // this an on-demand rerun), surfacing the on-demand hint. Launch only the rest.
+    const attemptable: typeof plan = [];
+    for (const entry of plan) {
+      if (entry.kind !== "would-restore") {
+        attemptable.push(entry);
+        continue;
+      }
+      const prior = readRestoreIntent(
+        intentDir,
+        intentKey(entry.candidate, generationId),
+      );
+      if (!mayAttemptRestore(prior, !force)) {
+        process.stderr.write(
+          `keeper tabs: [bound] ${entry.candidate.label}: ${crashLoopHint({
+            generation_id: generationId,
+            backend_exec_session_id: entry.candidate.backend_exec_session_id,
+          })}\n`,
+        );
+        continue;
+      }
+      attemptable.push(entry);
+    }
+
+    const ensureLaunched = makeEnsureLaunched(defaultLauncherPrefix(), (l) =>
+      process.stderr.write(`${l}\n`),
+    );
+    const launcherPrefix = defaultLauncherPrefix();
+    const intent: IntentSink = {
+      write: (i) => writeRestoreIntent(intentDir, i),
+    };
+    const outcomes = await applyRestoreVerified(attemptable, {
+      ensureLaunched,
+      verify: makeAttachVerify(),
+      intent,
+      makeIntent: (candidate) =>
+        buildRestoreIntent(candidate, generationId, intentDir, launcherPrefix),
+      // A prior VERIFIED intent for this exact tab+generation means an earlier
+      // apply already re-attached it — no-op (never double-spawn). A crashed tab
+      // has no verified intent this generation, so it is never false-skipped.
+      isLive: (candidate) =>
+        readRestoreIntent(intentDir, intentKey(candidate, generationId))
+          ?.state === "verified",
+    });
+    process.stdout.write(renderOutcomes(outcomes, true, 0));
+    const { failed } = countOutcomes(outcomes);
+    return process.exit(failed > 0 ? TABS_EXIT_PARTIAL_FAILURE : 0);
+  } finally {
+    lock.release();
+  }
 }

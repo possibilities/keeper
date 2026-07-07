@@ -39,6 +39,14 @@
  * the fix, never a doomed `--resume` line); the load-bearing `cd` prefix is
  * repaired to the disk-anchored cwd, never dropped.
  *
+ * VERIFIED APPLY. `applyRestore` trusts window creation (the legacy `restored`
+ * outcome); `applyRestoreVerified` upgrades each tab to a durable, evidence-proven
+ * transaction (`src/restore-verify.ts`): it writes the intent BEFORE the launch,
+ * then settles it against on-disk attach evidence — `verified` (cleared),
+ * `launched-unverified` (a live pane with no evidence, a warn), or `failed` (a
+ * launch or a died resume, resurfaced in `keeper tabs list` until it verifies). An
+ * already-live session is an idempotent no-op (never a double-spawn).
+ *
  * This module imports ONLY `src/` peers (no `cli/`), so both `cli/tabs.ts` and the
  * in-daemon restore-worker consume it. Every renderer is pure; the `load*` readers
  * open `keeper.db` read-only in one span; `applyRestore` routes each candidate
@@ -71,6 +79,7 @@ import {
   type RestoreCandidate,
   selectGenerationFromEnriched,
 } from "./restore-set";
+import type { AttachVerdict, RestoreIntent } from "./restore-verify";
 import { probeServerGeneration } from "./restore-worker";
 import { buildResumeCommand } from "./resume-descriptor";
 import { defaultResumeResolver, type ResumeResolver } from "./resume-resolve";
@@ -92,6 +101,17 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
 export type AgentOutcome =
   | { kind: "would-restore"; candidate: RestoreCandidate }
   | { kind: "restored"; candidate: RestoreCandidate }
+  // A launch that verified against on-disk ATTACH EVIDENCE (a claude SessionStart
+  // for the requested session id, or a non-claude birth record on the carried job
+  // id) — the only outcome that grants "the tab re-attached". `restored` is the
+  // unverified legacy peer (window created, evidence not consulted); `verified` is
+  // the {@link applyRestoreVerified} upgrade.
+  | { kind: "verified"; candidate: RestoreCandidate }
+  // Launched, but no attach evidence appeared inside the verify bound and the pane
+  // is still alive — unconfirmed, surfaced as a WARN (never a false verified or a
+  // false failed). The tab's intent artifact survives so it resurfaces until it
+  // verifies.
+  | { kind: "launched-unverified"; candidate: RestoreCandidate; reason: string }
   | { kind: "failed"; candidate: RestoreCandidate; error: string }
   // A candidate keeper cannot resume — a non-claude harness whose native resume
   // target was never resolved, or whose target names no on-disk artifact.
@@ -257,31 +277,191 @@ export async function applyRestore(
   return out;
 }
 
-/** Count restored / failed / would-restore / not-resumable / preflight-failed
- *  outcomes in one pass. Exported so the consumer picks the partial-failure exit
- *  code without re-scanning. Neither `notResumable` nor `preflightFailed` is a
- *  launch failure — both are expected, reported skips that never trip the
- *  partial-failure exit (which keys on `failed` alone). */
+// ---------------------------------------------------------------------------
+// Verified apply — the per-tab durable, evidence-verified transaction
+// ---------------------------------------------------------------------------
+
+/** Verify one launched candidate against on-disk attach evidence — the injected
+ *  seam production wires to {@link import("./restore-verify").verifyAttach} and
+ *  tests fake with a fixed verdict. `launchStartMs` is the wall-clock captured
+ *  BEFORE the launch, so the real verify gates evidence on records at/after it
+ *  (rejecting a stale pre-crash SessionStart for the same session id). */
+export type AttachVerifyFn = (
+  candidate: RestoreCandidate,
+  launchStartMs: number,
+) => Promise<AttachVerdict>;
+
+/** The durable intent side of the transaction: persist the intent (write-before-
+ *  launch, overwrite on each state transition). A `verified` write drops the tab
+ *  off the resurface list (verified ∉ the OPEN states) — the "clear" the artifact
+ *  contract calls for — while leaving the marker on disk for the live-UUID no-op
+ *  (GC reaps it past the idle cutoff). */
+export interface IntentSink {
+  write(intent: RestoreIntent): void;
+}
+
+/** Injected deps for {@link applyRestoreVerified} — every non-pure seam, so the
+ *  transaction's state matrix is unit-tested with zero fs / tmux. `makeIntent`
+ *  builds the base (attempt-stamped) intent for a candidate; the loop drives its
+ *  `state`/`reason` transitions and hands it to `intent`. */
+export interface VerifiedApplyDeps {
+  ensureLaunched: EnsureLaunchedFn;
+  verify: AttachVerifyFn;
+  intent: IntentSink;
+  makeIntent: (candidate: RestoreCandidate) => RestoreIntent;
+  /** Idempotency gate: `true` when the candidate's session is ALREADY LIVE (a
+   *  recent attach for its id). A live session is a no-op — the tab is reported
+   *  `verified` WITHOUT a relaunch (never a double-spawn) and its intent cleared.
+   *  Absent ⇒ always attempt. */
+  isLive?: (candidate: RestoreCandidate) => boolean;
+  /** Wall-clock (ms) captured before each launch and handed to `verify` as the
+   *  evidence recency floor. Default `Date.now`. */
+  now?: () => number;
+  sleep?: SleepFn;
+}
+
+/** The reason strings the verified transaction stamps into a non-verified intent
+ *  + its outcome — exported so the CLI + tests key on ONE source of truth. */
+export const VERIFY_FAILED_REASON =
+  "resume attach failed — pane died with no attach evidence";
+export const VERIFY_UNVERIFIED_REASON =
+  "launched but attach unconfirmed within the verify bound (pane still alive)";
+
+/**
+ * The per-tab VERIFIED restore transaction: for each would-restore candidate,
+ * write the durable intent BEFORE the launch (`launched`), drive keeper's launch
+ * transport, then VERIFY the attach against on-disk evidence and settle the
+ * intent — cleared on `verified`, rewritten `failed` / `launched-unverified`
+ * otherwise so the tab resurfaces in `keeper tabs list` until it verifies. A
+ * transport failure (or a thrown launch) is `failed` with no verify. Continues
+ * past a single tab's failure, and paces {@link INTER_WINDOW_PAUSE_MS} between
+ * consecutive launches (outside the per-tab try, like {@link applyRestore}).
+ */
+export async function applyRestoreVerified(
+  plan: AgentOutcome[],
+  deps: VerifiedApplyDeps,
+): Promise<AgentOutcome[]> {
+  const sleep = deps.sleep ?? defaultSleep;
+  const now = deps.now ?? Date.now;
+  const out: AgentOutcome[] = [];
+  let launched = 0;
+  for (const entry of plan) {
+    if (entry.kind !== "would-restore") {
+      out.push(entry);
+      continue;
+    }
+    const candidate = entry.candidate;
+    const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
+    const session = candidate.backend_exec_session_id;
+    const base = deps.makeIntent(candidate);
+    // Idempotent no-op: an already-live session is reported verified WITHOUT a
+    // relaunch, so a repeated apply never double-spawns it. Checked BEFORE the
+    // inter-window pause + launch counter so a no-op costs no pacing; the existing
+    // verified marker is left untouched.
+    if (deps.isLive?.(candidate) === true) {
+      out.push({ kind: "verified", candidate });
+      continue;
+    }
+    if (launched > 0) {
+      await sleep(INTER_WINDOW_PAUSE_MS);
+    }
+    launched++;
+    // Write-before-launch: the fsynced intent is the crash-safe record of what we
+    // are about to do, so a death mid-launch leaves a resumable artifact.
+    const launchedIntent = touchIntent(base, "launched", "");
+    deps.intent.write(launchedIntent);
+    // Capture the evidence floor BEFORE the launch so a SessionStart that fires
+    // during the launch still counts (and a stale pre-crash one never does).
+    const launchStartMs = now();
+    try {
+      const res = await deps.ensureLaunched(
+        session,
+        candidate.resume_target,
+        cwd,
+        harnessOrClaude(candidate.harness),
+        candidate.job_id,
+      );
+      if (!res.ok) {
+        deps.intent.write(touchIntent(base, "failed", res.error));
+        out.push({ kind: "failed", candidate, error: res.error });
+        continue;
+      }
+      const verdict = await deps.verify(candidate, launchStartMs);
+      if (verdict === "verified") {
+        deps.intent.write(touchIntent(base, "verified", ""));
+        out.push({ kind: "verified", candidate });
+      } else if (verdict === "failed") {
+        deps.intent.write(touchIntent(base, "failed", VERIFY_FAILED_REASON));
+        out.push({ kind: "failed", candidate, error: VERIFY_FAILED_REASON });
+      } else {
+        deps.intent.write(
+          touchIntent(base, "launched-unverified", VERIFY_UNVERIFIED_REASON),
+        );
+        out.push({
+          kind: "launched-unverified",
+          candidate,
+          reason: VERIFY_UNVERIFIED_REASON,
+        });
+      }
+    } catch (err) {
+      const reason = (err as Error).message;
+      deps.intent.write(touchIntent(base, "failed", reason));
+      out.push({ kind: "failed", candidate, error: reason });
+    }
+  }
+  return out;
+}
+
+/** Transition an intent to a new state/reason, stamping `updated_at` (a side-file
+ *  wall-clock, never a fold input). Pure over its inputs. */
+function touchIntent(
+  base: RestoreIntent,
+  state: RestoreIntent["state"],
+  reason: string,
+): RestoreIntent {
+  return { ...base, state, reason, updated_at: new Date().toISOString() };
+}
+
+/** Count each outcome kind in one pass. Exported so the consumer picks the
+ *  partial-failure exit code without re-scanning. `verified` is the evidence-proven
+ *  peer of the unverified `restored`; `unverified` (launched-unverified) is a WARN,
+ *  not a failure. Only `failed` trips the partial-failure exit — neither
+ *  `notResumable`, `preflightFailed`, nor `unverified` does (all are expected,
+ *  reported non-launch-failures). */
 export function countOutcomes(outcomes: AgentOutcome[]): {
   restored: number;
+  verified: number;
   failed: number;
   wouldRestore: number;
+  unverified: number;
   notResumable: number;
   preflightFailed: number;
 } {
   let restored = 0;
+  let verified = 0;
   let failed = 0;
   let wouldRestore = 0;
+  let unverified = 0;
   let notResumable = 0;
   let preflightFailed = 0;
   for (const o of outcomes) {
     if (o.kind === "restored") restored++;
+    else if (o.kind === "verified") verified++;
     else if (o.kind === "failed") failed++;
+    else if (o.kind === "launched-unverified") unverified++;
     else if (o.kind === "not-resumable") notResumable++;
     else if (o.kind === "preflight-failed") preflightFailed++;
     else wouldRestore++;
   }
-  return { restored, failed, wouldRestore, notResumable, preflightFailed };
+  return {
+    restored,
+    verified,
+    failed,
+    wouldRestore,
+    unverified,
+    notResumable,
+    preflightFailed,
+  };
 }
 
 /**
@@ -307,8 +487,15 @@ export function renderOutcomes(
   excludedIdleCount: number,
 ): string {
   const stanzas: string[] = [];
-  const { restored, failed, wouldRestore, notResumable, preflightFailed } =
-    countOutcomes(outcomes);
+  const {
+    restored,
+    verified,
+    failed,
+    wouldRestore,
+    unverified,
+    notResumable,
+    preflightFailed,
+  } = countOutcomes(outcomes);
 
   for (const o of outcomes) {
     const c = o.candidate;
@@ -343,6 +530,12 @@ export function renderOutcomes(
       stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);
     } else if (o.kind === "restored") {
       stanzas.push(`# (${session}) restored ${label}\n${cmd}`);
+    } else if (o.kind === "verified") {
+      stanzas.push(`# (${session}) VERIFIED ${label}\n${cmd}`);
+    } else if (o.kind === "launched-unverified") {
+      stanzas.push(
+        `# (${session}) UNVERIFIED ${label}: ${commentSafe(o.reason)}\n${cmd}`,
+      );
     } else {
       stanzas.push(
         `# (${session}) FAILED ${label}: ${commentSafe(o.error)}\n${cmd}`,
@@ -354,8 +547,12 @@ export function renderOutcomes(
     notResumable > 0 ? ` not-resumable=${notResumable}` : "";
   const preflightNote =
     preflightFailed > 0 ? ` preflight-failed=${preflightFailed}` : "";
+  const unverifiedNote = unverified > 0 ? ` unverified=${unverified}` : "";
+  // On the verified apply path `verified` supersedes `restored`; sum them so the
+  // summary's restored count stays meaningful whichever apply path produced it.
+  const applyRestored = restored + verified;
   const summary = apply
-    ? `# summary: restored=${restored} failed=${failed}${notResumableNote}${preflightNote}`
+    ? `# summary: restored=${applyRestored} failed=${failed}${unverifiedNote}${notResumableNote}${preflightNote}`
     : `# summary: would-restore=${wouldRestore}${notResumableNote}${preflightNote}`;
   const idleNote =
     excludedIdleCount > 0

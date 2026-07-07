@@ -171,7 +171,7 @@ describe("--x-tmux", () => {
       'KEEPER_AGENT_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     );
     expect(script).toContain(
-      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--x-profile' 'work' 'hello'`,
+      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--x-profile' 'work' 'hello'`,
     );
     expect(script).not.toContain("--x-tmux");
     // Non-wait launch: one JSON line, transcriptPath null, exits before the poll.
@@ -425,7 +425,7 @@ describe("--x-tmux", () => {
     );
     const script = readFileSync(launchScript, "utf8");
     expect(script).toContain(
-      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'pi' 'hello'`,
+      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'pi' 'hello'`,
     );
     expect(script).not.toContain("--x-tmux-L");
   });
