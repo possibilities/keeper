@@ -1,0 +1,32 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 2,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T21:16:49.870000Z",
+  "epic_id": "fn-1164-phantom-working-lifecycle-fix",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "f5f535ce30fc461afebfb3fd4883bfd07cc6d653d1bdfa1de0828dff9b64c8a3",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Small 264-insertion/3-file diff landed in one clean commit but the work is a subtle re-fold-deterministic stamp-gate + subagent-yield correctness invariant, so the xhigh cell fits with no misfit signal.",
+      "input_hash": "f5f535ce30fc461afebfb3fd4883bfd07cc6d653d1bdfa1de0828dff9b64c8a3",
+      "model": "opus",
+      "task_id": "fn-1164-phantom-working-lifecycle-fix.2",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "A substantial 1277-insertion/8-file novel synthetic-event producer with sticky-distress semantics and live-session false-positive risk, delivered in one clean commit, matches the xhigh cell.",
+      "input_hash": "f5f535ce30fc461afebfb3fd4883bfd07cc6d653d1bdfa1de0828dff9b64c8a3",
+      "model": "opus",
+      "task_id": "fn-1164-phantom-working-lifecycle-fix.3",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    }
+  ]
+}
