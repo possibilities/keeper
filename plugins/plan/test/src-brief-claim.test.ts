@@ -65,6 +65,7 @@ describe("brief assemble + write", () => {
         primaryRepo: "/repo",
         stateRepo: "/repo",
         tier: "high",
+        auditRequired: false,
         dataDir,
       });
       expect(brief.schema_version).toBe(BRIEF_SCHEMA_VERSION);
@@ -72,12 +73,34 @@ describe("brief assemble + write", () => {
       expect(brief.epic_id).toBe("fn-1-x");
       expect(brief.tier).toBe("high");
       expect(brief.snippet_context).toBe(""); // present, not omitted
+      // audit_required is a stable key, present even when unflagged.
+      expect("audit_required" in brief).toBe(true);
+      expect(brief.audit_required).toBe(false);
       // Missing specs -> empty markdown, never a throw.
       expect(brief.task_spec_md).toBe("");
       expect(brief.epic_spec_md).toBe("");
       // Absent CONTEXT.md -> present-but-empty glossary (stable key set).
       expect("glossary_md" in brief).toBe(true);
       expect(brief.glossary_md).toBe("");
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("assembleBrief carries audit_required=true when the task is flagged", () => {
+    const dataDir = tmp("planctl-brief-flag-");
+    try {
+      const brief = assembleBrief({
+        taskId: "fn-1-x.1",
+        epicId: "fn-1-x",
+        targetRepo: "/repo",
+        primaryRepo: "/repo",
+        stateRepo: "/repo",
+        tier: "max",
+        auditRequired: true,
+        dataDir,
+      });
+      expect(brief.audit_required).toBe(true);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -96,6 +119,7 @@ describe("brief assemble + write", () => {
         primaryRepo: repo,
         stateRepo: repo,
         tier: "high",
+        auditRequired: false,
         dataDir,
       });
       expect(brief.glossary_md).toBe(glossary);
@@ -119,6 +143,7 @@ describe("brief assemble + write", () => {
         primaryRepo: primary,
         stateRepo: primary,
         tier: null,
+        auditRequired: false,
         dataDir: primary,
       });
       expect(brief.glossary_md).toBe("target glossary\n");
@@ -145,6 +170,7 @@ describe("brief assemble + write", () => {
         primaryRepo: repo,
         stateRepo: repo,
         tier: "high",
+        auditRequired: false,
         dataDir: repo,
       });
       const g = brief.glossary_md as string;
@@ -176,6 +202,7 @@ describe("brief assemble + write", () => {
         primaryRepo: "/r",
         stateRepo: "/r",
         tier: null,
+        auditRequired: false,
         dataDir,
       });
       expect(brief.task_spec_md).toBe("## Task\nbody\n");
@@ -195,6 +222,7 @@ describe("brief assemble + write", () => {
         primaryRepo: "/r",
         stateRepo: "/r",
         tier: "max",
+        auditRequired: true,
         dataDir: briefsDir,
       });
       const ref = writeBrief(briefsDir, "fn-1-x.1", brief);

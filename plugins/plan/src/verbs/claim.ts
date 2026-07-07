@@ -235,6 +235,7 @@ export function runClaim(args: ClaimArgs): void {
   // Assemble the brief out-of-band (BEFORE the single mutation).
   const tier = (taskDef.tier as string | null | undefined) ?? null;
   const model = (taskDef.model as string | null | undefined) ?? null;
+  const auditRequired = taskDef.audit_required === true;
   const stateRepo = primaryRepo;
   const briefDict = assembleBrief({
     taskId,
@@ -243,6 +244,7 @@ export function runClaim(args: ClaimArgs): void {
     primaryRepo,
     stateRepo,
     tier,
+    auditRequired,
     dataDir,
   });
 

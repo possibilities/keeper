@@ -72,6 +72,9 @@ export function normalizeTask(
   if (!("model" in data)) {
     data.model = null;
   }
+  if (!("audit_required" in data)) {
+    data.audit_required = false;
+  }
   if (!("snippets" in data)) {
     data.snippets = [];
   }

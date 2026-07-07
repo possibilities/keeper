@@ -1,0 +1,43 @@
+# Post-selection audit policy — the plan-time sizing seam for variable-depth
+# automated review. Two sections, both drift-gated against the subagents.yaml
+# axes and the fixed depth vocabulary:
+#   bun plugins/plan/scripts/audit-policy-check.ts --check
+# (test/consistency-audit-policy.test.ts asserts the same in the fast suite).
+#
+# Read off disk at assign-cells time, never compile-embedded — removing this file
+# is a clean rollback: an absent OR malformed policy degrades to no task flagged
+# and (later, at close) a lean depth band, by construction. The
+# KEEPER_PLAN_AUDIT_POLICY env var overrides the path (test seam + operator lever).
+
+# Per-tier audit-flag decision. Every configured effort tier (the subagents.yaml
+# `efforts` axis) MUST map to an explicit true/false — the gate fails on an
+# unmapped tier or a mapping for a non-axis tier. A flagged tier's selected tasks
+# park for a per-task audit before their done-latch releases; ship conservative
+# so the false-positive cost stays measurable before the flags widen. Only the
+# `max` ceiling flags today; `xhigh` is staged (flip to true as rates prove out).
+tier_audit:
+  low: false
+  medium: false
+  high: false
+  xhigh: false
+  max: true
+
+# Close-depth bands. The close audit sizes itself lean/standard/deep from epic
+# signals; the consumer picks the FIRST band (top-to-bottom) whose every
+# threshold is met, so order richest-first with an all-zero lean floor. Each band
+# names a valid depth (lean/standard/deep) — the gate fails on an unknown name.
+# Thresholds are inclusive minimums over signals carried at close: task_count,
+# diff_loc (numstat added+deleted), and touched_repos.
+depth_bands:
+  - depth: deep
+    min_task_count: 8
+    min_diff_loc: 2000
+    min_touched_repos: 2
+  - depth: standard
+    min_task_count: 3
+    min_diff_loc: 400
+    min_touched_repos: 1
+  - depth: lean
+    min_task_count: 0
+    min_diff_loc: 0
+    min_touched_repos: 0

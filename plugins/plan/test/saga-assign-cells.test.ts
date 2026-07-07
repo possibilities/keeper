@@ -543,6 +543,68 @@ describe("assign-cells degrade + re-select", () => {
 });
 
 // ---------------------------------------------------------------------------
+// audit_required stamping (audit-policy.yaml) + degrade provenance
+// ---------------------------------------------------------------------------
+
+describe("assign-cells audit_required stamping", () => {
+  test("a policy-flagged tier stamps audit_required=true; an unflagged tier stays false", () => {
+    // The committed audit-policy.yaml flags `max` only (conservative rollout),
+    // so a max cell parks for a per-task audit and a high cell does not. The
+    // flag values are the config's contract, not re-derived here.
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 2 });
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "max", model: "opus" },
+      { taskId: taskIds[1] as string, tier: "high", model: "opus" },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)]);
+    expect(r.code).toBe(0);
+    expect(readTask(taskIds[0] as string).audit_required).toBe(true);
+    expect(readTask(taskIds[1] as string).audit_required).toBe(false);
+
+    // The sidecar records applied provenance naming the flagged task.
+    const ap = readSidecar(epicId).audit_policy as Record<string, unknown>;
+    expect(ap.status).toBe("applied");
+    expect(ap.reason).toBeNull();
+    expect(ap.flagged_task_ids).toEqual([taskIds[0]]);
+  });
+
+  test("an absent policy degrades to no flag, recorded in the sidecar", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "max", model: "opus" },
+    ]);
+    // Point the policy path at a file that does not exist -> degrade.
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)], {
+      env: { KEEPER_PLAN_AUDIT_POLICY: join(project.root, "no-policy.yaml") },
+    });
+    expect(r.code).toBe(0);
+    // Even a would-be-flagged max tier is unflagged under a degrade.
+    expect(readTask(taskIds[0] as string).audit_required).toBe(false);
+    const ap = readSidecar(epicId).audit_policy as Record<string, unknown>;
+    expect(ap.status).toBe("degraded");
+    expect(ap.reason).toBe("absent");
+    expect(ap.flagged_task_ids).toEqual([]);
+  });
+
+  test("a malformed policy degrades (never an error)", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "max", model: "opus" },
+    ]);
+    // tier_audit as a scalar (not a mapping) is malformed for the runtime read.
+    const badPolicy = writeInput("tier_audit: nope\n", "bad-policy.yaml");
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)], {
+      env: { KEEPER_PLAN_AUDIT_POLICY: badPolicy },
+    });
+    expect(r.code).toBe(0);
+    expect(readTask(taskIds[0] as string).audit_required).toBe(false);
+    const ap = readSidecar(epicId).audit_policy as Record<string, unknown>;
+    expect(ap.status).toBe("degraded");
+    expect(ap.reason).toBe("malformed");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Failure shapes + registry membership
 // ---------------------------------------------------------------------------
 

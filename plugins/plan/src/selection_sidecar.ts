@@ -57,6 +57,18 @@ export interface SidecarSelector {
   model: string;
 }
 
+/** Audit-policy provenance for the run: whether the tier-audit policy applied or
+ * degraded (absent/malformed file), and which tasks it flagged audit_required. */
+export interface SidecarAuditPolicy {
+  /** `applied` when the policy loaded and flags were resolved; `degraded` when
+   * the policy file was absent or malformed (no task flagged). */
+  status: "applied" | "degraded";
+  /** The degrade reason (e.g. `absent` / `malformed`), null when applied. */
+  reason: string | null;
+  /** Task ids this run stamped audit_required=true (empty on degrade). */
+  flagged_task_ids: string[];
+}
+
 /** The full selection sidecar written to `<data-dir>/selections/<epic_id>.json`. */
 export interface SelectionSidecar {
   schema_version: number;
@@ -75,6 +87,10 @@ export interface SelectionSidecar {
   /** The selector's raw verdict text, or null on a degrade with no verdict. */
   verdict_raw: string | null;
   cells: SidecarCell[];
+  /** Provenance of the audit-policy pass that stamped audit_required on cells.
+   * Written by assign-cells (always, applied or degraded); omitted by the
+   * close-mint path, which does not run the tier-audit pass. */
+  audit_policy?: SidecarAuditPolicy;
 }
 
 /** Absolute path to the selection sidecar for `epicId` under `dataDir`. */

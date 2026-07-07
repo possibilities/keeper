@@ -25,9 +25,16 @@
 // embedded subagents matrix only (configuredEfforts/configuredModels), keeping
 // the guidance config off the verb/embed path. The `selection:` block is captured
 // verbatim into the sidecar; the verb does not police its values beyond shape.
+//
+// It DOES read audit-policy.yaml (the plan-time sizing seam), degrade-SOFT: a cell
+// whose selected tier is policy-flagged gets `audit_required: true` stamped on its
+// task JSON, else false. An absent or malformed policy degrades to no task flagged
+// and is recorded in the sidecar's `audit_policy` provenance block — never an
+// error. KEEPER_PLAN_AUDIT_POLICY overrides the policy path (test seam + lever).
 
 import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
@@ -42,6 +49,7 @@ import { resolveProject } from "../project.ts";
 import {
   SELECTION_SCHEMA_VERSION,
   type SelectionSidecar,
+  type SidecarAuditPolicy,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
 import {
@@ -280,6 +288,11 @@ export function runAssignCells(args: AssignCellsArgs): number {
   const efforts = configuredEfforts();
   const models = configuredModels();
 
+  // Load the audit policy degrade-SOFT (outside the lock — a pure disk read). A
+  // flagged tier stamps audit_required on its task; absent/malformed degrades to
+  // no flag, captured in the sidecar's audit_policy provenance.
+  const auditLoad = loadAuditFlags();
+
   type FlockOutcome =
     | { kind: "failure"; code: string; message: string; details: string[] }
     | { kind: "success"; taskIds: string[] };
@@ -348,16 +361,29 @@ export function runAssignCells(args: AssignCellsArgs): number {
       };
     }
 
-    // --- mutate: overwrite tier/model on every cell's task JSON ------
+    // --- mutate: overwrite tier/model + stamp audit_required per cell ------
+    // audit_required is written explicitly (true or false) on every cell so a
+    // re-run after a policy change correctly flips a stale flag; a degrade loads
+    // no flags, so every cell resolves false.
     const now = nowIso();
+    const flaggedTaskIds: string[] = [];
     for (const c of parsedCells) {
       const tp = join(dataDir, "tasks", `${c.taskId}.json`);
       const tdef = loadJson(tp);
       tdef.tier = c.tier;
       tdef.model = c.model;
+      const flagged = auditLoad.ok && auditLoad.flags[c.tier] === true;
+      tdef.audit_required = flagged;
+      if (flagged) {
+        flaggedTaskIds.push(c.taskId);
+      }
       tdef.updated_at = now;
       atomicWriteJson(tp, tdef, dataDir);
     }
+
+    const auditPolicy: SidecarAuditPolicy = auditLoad.ok
+      ? { status: "applied", reason: null, flagged_task_ids: flaggedTaskIds }
+      : { status: "degraded", reason: auditLoad.reason, flagged_task_ids: [] };
 
     // --- sidecar: schema-versioned provenance, REPLACE (no append) --
     const sidecar: SelectionSidecar = {
@@ -378,6 +404,7 @@ export function runAssignCells(args: AssignCellsArgs): number {
         confidence: c.confidence,
         label_source: c.labelSource,
       })),
+      audit_policy: auditPolicy,
     };
     writeSelectionSidecar(dataDir, sidecar);
 
@@ -470,6 +497,50 @@ function typeName(v: unknown): string {
 /** Python `!r` for a string scalar — single-quoted, for the out-of-axis message. */
 function pyReprStr(v: string): string {
   return `'${v}'`;
+}
+
+/** The audit-policy path: KEEPER_PLAN_AUDIT_POLICY override, else the committed
+ * plugin-root audit-policy.yaml. Resolved off import.meta.url so it works from
+ * the interpreted plan CLI at an arbitrary cwd (mirrors selection-brief). */
+function auditPolicyPath(): string {
+  const override = process.env.KEEPER_PLAN_AUDIT_POLICY;
+  if (override !== undefined && override !== "") {
+    return override;
+  }
+  const planRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  return join(planRoot, "audit-policy.yaml");
+}
+
+/** Degrade-SOFT read of the tier→audit-flag map. An absent file, unparseable
+ * YAML, or a missing / non-mapping `tier_audit` all degrade (no flags); a present
+ * mapping yields its boolean entries (a non-boolean or unmapped tier reads
+ * unflagged). Fail-loud validation is the drift gate's job (audit-policy-check),
+ * never the runtime stamp. */
+type AuditFlagLoad =
+  | { ok: true; flags: Record<string, boolean> }
+  | { ok: false; reason: string };
+
+function loadAuditFlags(): AuditFlagLoad {
+  const path = auditPolicyPath();
+  if (!existsSync(path)) {
+    return { ok: false, reason: "absent" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYamlInput(readYamlBytes(path), path);
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.tier_audit)) {
+    return { ok: false, reason: "malformed" };
+  }
+  const flags: Record<string, boolean> = {};
+  for (const [tier, value] of Object.entries(parsed.tier_audit)) {
+    if (typeof value === "boolean") {
+      flags[tier] = value;
+    }
+  }
+  return { ok: true, flags };
 }
 
 /** Stems of direct-child `tasks/<epicId>.<m>.json` files (one directory glob),

@@ -73,6 +73,7 @@ export function runWorkerResume(opts: {
   let status = "unknown";
   let tier: string | null = null;
   let model: string | null = null;
+  let auditRequired = false;
   let epicId = taskId.includes(".")
     ? taskId.slice(0, taskId.lastIndexOf("."))
     : taskId;
@@ -88,6 +89,7 @@ export function runWorkerResume(opts: {
       epicId = (merged.epic as string | undefined) ?? epicId;
       tier = (merged.tier as string | null | undefined) ?? null;
       model = (merged.model as string | null | undefined) ?? null;
+      auditRequired = merged.audit_required === true;
     }
   }
 
@@ -119,6 +121,7 @@ export function runWorkerResume(opts: {
     primaryRepo,
     stateRepo,
     tier,
+    auditRequired,
     dataDir,
   });
 

@@ -29,6 +29,7 @@ describe("normalizeTask", () => {
     expect(t.depends_on).toEqual([]);
     expect(t.tier).toBeNull();
     expect(t.model).toBeNull();
+    expect(t.audit_required).toBe(false);
     expect(t.snippets).toEqual([]);
     expect(t.bundles).toEqual([]);
   });
