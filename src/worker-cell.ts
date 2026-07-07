@@ -13,7 +13,7 @@
  * imports it one-directionally, never the reverse.
  *
  * The seam returns MACHINE KINDS ONLY — a closed discriminated union of
- * `{ok:true, pluginDir}` and three typed rejects, carrying minimal machine
+ * `{ok:true, pluginDir}` and four typed rejects, carrying minimal machine
  * fields and NO prose. Each caller composes its own operator text from the
  * kind, which is exactly what keeps the producer's byte-pinned sticky-reason
  * strings (including the `KEEPER_ROOT`-baked remediation) untouched while a
@@ -26,6 +26,12 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { WORKERS_BASE } from "../plugins/plan/src/subagents_config.ts";
 import { ConfigError, loadPluginSources } from "./agent/config";
+import {
+  driverFor,
+  loadMatrix,
+  type Matrix,
+  providerOrderFor,
+} from "./agent/matrix";
 import { KEEPER_ROOT, workerCellPluginDir } from "./reconcile-core";
 
 /**
@@ -152,15 +158,70 @@ export function composeWorkerCellDir(
 }
 
 /**
+ * The host-matrix route verdict for a WRAPPED-candidate cell — a `{model, tier}`
+ * the compiled (claude-only) subagents matrix rejected, so it may be a capability
+ * model claude does not serve. `no-route` carries the capability model: a wrapped
+ * model no configured provider serves, OR a malformed matrix at probe time (the
+ * daemon degrades a parse failure to the SAME visible no-route rather than
+ * faulting). `routed` covers every non-no-route verdict — a native model, an
+ * absent matrix (the claude-only world), or a wrapped model with ≥1 serving
+ * provider — and leaves the generic out-of-matrix reject standing.
+ */
+export type WorkerCellRoute =
+  | { kind: "routed" }
+  | { kind: "no-route"; model: string };
+
+/**
+ * Default {@link WorkerCellProbeDeps.probeRoute} impl: classify a capability
+ * model against the host matrix (ADR 0010). Called ONLY for a wrapped-candidate
+ * cell (a compose that fell outside the compiled subagents matrix), so a native
+ * (claude) cell never reaches it and never reads `matrix.yaml`.
+ *
+ * PRODUCER-ONLY, filesystem-probing by contract (mirrors {@link
+ * defaultShadowingWorkProbe}). Degrade-not-throw: a malformed matrix
+ * (`ConfigError`) becomes a `no-route` verdict so the daemon mints a visible
+ * sticky naming the file instead of a `fatalExit` — fail-loud parsing stays a
+ * CLI-only posture. An ABSENT matrix (`null`) is the claude-only world → `routed`
+ * (a non-claude token there is a plain out-of-matrix, never a no-route). The
+ * matrix loader is injected so tests drive every branch without touching disk.
+ */
+export function defaultRouteProbe(
+  model: string,
+  load: () => Matrix | null = () => loadMatrix(),
+): WorkerCellRoute {
+  let matrix: Matrix | null;
+  try {
+    matrix = load();
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      return { kind: "no-route", model };
+    }
+    throw err;
+  }
+  if (matrix === null || driverFor(matrix, model) === "native") {
+    return { kind: "routed" };
+  }
+  return providerOrderFor(matrix, model).length > 0
+    ? { kind: "routed" }
+    : { kind: "no-route", model };
+}
+
+/**
  * The closed result union {@link resolveWorkerCell} returns. `ok:true` carries
  * the resolved `pluginDir` (`null` = cell-less, launch with no `--plugin-dir`).
- * The three rejects carry minimal machine fields and NO prose — each caller
+ * The four rejects carry minimal machine fields and NO prose — each caller
  * composes its own operator text. Adding a reject kind here breaks compilation
  * at every caller's `assertNever`-closed switch (the parity net).
+ *
+ * `no-route` carries the capability `model`: a WRAPPED cell (a model claude does
+ * not serve) that the host matrix routes to zero providers — the caller composes
+ * the sticky naming `matrix.yaml`, cleared by `retry_dispatch` after the config
+ * is fixed.
  */
 export type WorkerCellResult =
   | { ok: true; pluginDir: string | null }
   | { ok: false; kind: "out-of-matrix"; message: string }
+  | { ok: false; kind: "no-route"; model: string }
   | { ok: false; kind: "missing"; pluginDir: string }
   | { ok: false; kind: "shadowed"; pluginDir: string; shadowManifest: string };
 
@@ -175,6 +236,14 @@ export type WorkerCellResult =
 export interface WorkerCellProbeDeps {
   dirExists: (path: string) => boolean;
   probeShadow: () => string | null;
+  /**
+   * Host-matrix route probe, bound to the cell's capability model at the call
+   * site (the producer / dispatch CLI pass {@link defaultRouteProbe}). Consulted
+   * ONLY when the compose fell outside the compiled subagents matrix (a wrapped
+   * candidate); a native cell never reaches it, so the matrix file stays unread
+   * for claude cells and dispatch is byte-identical with or without a matrix.
+   */
+  probeRoute: () => WorkerCellRoute;
 }
 
 /**
@@ -185,12 +254,24 @@ export interface WorkerCellProbeDeps {
  * probes fire lazily in precedence order — the shadow probe is reached ONLY for
  * a present cell whose manifest exists, so a reject or cell-less launch never
  * touches the scan dirs.
+ *
+ * The host-matrix route probe fires ONLY down the compose-reject arm — a wrapped
+ * capability model claude does not serve lands here as an out-of-matrix compose,
+ * and the probe re-classifies it: no serving provider (or a malformed matrix) is
+ * a `no-route` reject naming the model, ranked AHEAD of the generic
+ * out-of-matrix; any other verdict leaves out-of-matrix standing. A native cell
+ * (a real cell dir composed) skips this arm entirely and never touches the route
+ * probe.
  */
 export function resolveWorkerCell(
   compose: WorkerCellCompose,
   deps: WorkerCellProbeDeps,
 ): WorkerCellResult {
   if (compose.reject !== undefined) {
+    const route = deps.probeRoute();
+    if (route.kind === "no-route") {
+      return { ok: false, kind: "no-route", model: route.model };
+    }
     return { ok: false, kind: "out-of-matrix", message: compose.reject };
   }
   if (compose.pluginDir == null) {
