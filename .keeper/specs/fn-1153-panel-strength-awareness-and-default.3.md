@@ -42,5 +42,5 @@ Land the vendored snippet, both BAKE sites, the extended drift gate, and the sta
 - [ ] `bun run test:full` is green
 
 ## Done summary
-
+Vendored engineering/panel-strength (scoped add preserving orient drift), baked the rubric byte-verbatim into hack + panel SKILL.md with the drift gate extended to both, and swept stale panel docs (references/panel.md loadable config + default alias note, README /plan:panel row config-agnostic).
 ## Evidence
