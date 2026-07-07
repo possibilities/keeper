@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "New mint-event-plus-per-cycle-clear distress family spanning dispatch-failure keys, reconcile snapshot threading, and restart-survivable latching demands subtle correctness invariants and a cross-file contract cascade, a nameable opus reason.",
+      "task_id": "fn-1169-surface-and-heal-checkout-desync.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Rewriting the resync to git read-tree/update-index plumbing with all-or-nothing abort carries data-loss and path-traversal safety invariants where a wrong abstraction clobbers human edits, a hard opus correctness gate.",
+      "task_id": "fn-1169-surface-and-heal-checkout-desync.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T18:19:02.512000Z",
+  "epic_id": "fn-1169-surface-and-heal-checkout-desync",
+  "input_hash": "d18566e84c6129ad06829e00aeab3bfb162d8ded3a098683d2d7c7a8e67aa69d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3515180776,
+  "verdict_raw": null
+}
