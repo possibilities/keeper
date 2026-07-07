@@ -34,6 +34,7 @@ import {
   colorizePillsInLine,
   computeBoardSummary,
   epicNumFromIdOrBare,
+  homedBlockedWorkRows,
   needsHumanLines,
   orphanedFailureRows,
   renderDeadLetterPill,
@@ -1998,6 +1999,38 @@ test("orphanedFailureRows — an off-board work failure surfaces; an on-board ta
       locator: "fn-999-gone.2",
       reason: "instant-death-breaker: worker keeps dying",
     },
+  ]);
+});
+
+test("homedBlockedWorkRows — a homed blocked:-prefix work row is promoted; a non-blocked homed row is not", () => {
+  const rows = homedBlockedWorkRows({
+    openTaskIds: new Set(["fn-1171-a.1", "fn-1171-a.2"]),
+    workFailures: new Map([
+      ["fn-1171-a.1", "blocked: TOOLING_FAILURE"],
+      ["fn-1171-a.2", "worktree-multi-repo"],
+    ]),
+  });
+  expect(rows).toEqual([
+    { locator: "fn-1171-a.1", reason: "blocked: TOOLING_FAILURE" },
+  ]);
+});
+
+test("homedBlockedWorkRows — an off-board blocked:-prefix row is NOT homed (orphanedFailureRows covers it instead)", () => {
+  const rows = homedBlockedWorkRows({
+    openTaskIds: new Set<string>(),
+    workFailures: new Map([["fn-999-gone.1", "blocked: unparseable"]]),
+  });
+  expect(rows).toEqual([]);
+});
+
+test("needsHumanLines — a promoted homed blocked:-prefix work row classifies as `blocked`, not `unknown` (task-id locator, category visible)", () => {
+  const rows = homedBlockedWorkRows({
+    openTaskIds: new Set(["fn-1171-a.1"]),
+    workFailures: new Map([["fn-1171-a.1", "blocked: TOOLING_FAILURE"]]),
+  });
+  expect(needsHumanLines(rows)).toEqual([
+    "needs human (1)",
+    "  blocked · fn-1171-a.1 — blocked: TOOLING_FAILURE",
   ]);
 });
 

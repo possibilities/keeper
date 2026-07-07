@@ -36,6 +36,17 @@ import {
 export const INSTANT_DEATH_WALL_KEYS = 2;
 
 /**
+ * The `dispatch_failures.reason` prefix a surface-and-stop `work::` block mints
+ * (`daemon.ts`'s `suppressRedispatch` on a non-escalatable blocked category —
+ * TOOLING_FAILURE / absent / unparseable — that never dispatches an unblock
+ * session and never pages). Distinct from the board's `[blocked:*]` TASK PILL
+ * vocabulary (a verdict rendering, not a dispatch-failure reason). Shared with
+ * `cli/board.ts` so the top-of-board promotion and this projector's subset
+ * count never drift on what counts as a blocked-work row.
+ */
+export const BLOCKED_WORK_REASON_PREFIX = "blocked:";
+
+/**
  * The most-specific class of ONE sticky `dispatch_failures` row, each row landing
  * in exactly one bucket:
  *   - `finalize-non-ff`         — the origin-ahead non-fast-forward finalize jam.
@@ -121,6 +132,11 @@ export interface NeedsHumanCounts {
   finalizeNonFf: number;
   /** Subset of `stuckDispatches`: per-key instant-death-breaker stickies. */
   instantDeathWall: number;
+  /** Subset of `stuckDispatches`: homed `work::` surface-and-stop rows whose
+   *  reason carries the {@link BLOCKED_WORK_REASON_PREFIX} prefix — mirrors the
+   *  `finalizeNonFf` never-double-count pattern, not `deadLetters`'s
+   *  independent adder. */
+  blockedWork: number;
   parkedQuestions: number;
   /** Umbrella total honoring the subset non-double-count rule. */
   total: number;
@@ -175,11 +191,17 @@ export function projectNeedsHuman(
   const instantDeathWall = rows.filter(
     (r) => r.cls === "instant-death-breaker",
   ).length;
+  // Homed `work::` surface-and-stop rows — verb-scoped (never a `close` row) so
+  // this never collides with a coincidentally `blocked:`-prefixed close reason.
+  const blockedWork = rows.filter(
+    (r) => r.verb === "work" && r.reason.startsWith(BLOCKED_WORK_REASON_PREFIX),
+  ).length;
   const jamCount = rows.filter((r) => r.isJam).length;
   const parkedQuestions = inputs.parkedQuestionEpicIds.length;
 
-  // `finalizeNonFf` and `instantDeathWall` are SUBSETS of `stuckDispatches` —
-  // surfaced separately, never double-counted into the umbrella total.
+  // `finalizeNonFf`, `instantDeathWall`, and `blockedWork` are SUBSETS of
+  // `stuckDispatches` — surfaced separately, never double-counted into the
+  // umbrella total.
   const total =
     inputs.deadLetters +
     inputs.blockEscalations +
@@ -192,6 +214,7 @@ export function projectNeedsHuman(
     stuckDispatches,
     finalizeNonFf,
     instantDeathWall,
+    blockedWork,
     parkedQuestions,
     total,
   };

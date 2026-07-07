@@ -476,6 +476,32 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.needs_human.instant_death_wall).toBe(0);
   });
 
+  test("blocked_work counts blocked:-prefix work rows as a subset of stuck_dispatches, not double-added", () => {
+    const failures: Row[] = [
+      { verb: "work", id: "fn-1-a.1", reason: "blocked: TOOLING_FAILURE" },
+      { verb: "close", id: "fn-2-b", reason: "worktree-merge-conflict" },
+    ];
+    const d = buildStatusEnvelope(makeSnap(), BOOT, failures).data;
+    expect(d?.needs_human.stuck_dispatches).toBe(2);
+    expect(d?.needs_human.blocked_work).toBe(1);
+    expect(d?.needs_human.total).toBe(2);
+  });
+
+  test("blocked_work is verb-scoped to work rows; a non-blocked work reason (e.g. worktree-multi-repo) does not count — total unchanged versus the pre-existing fixture", () => {
+    const failures: Row[] = [
+      { verb: "work", id: "fn-9-x.1", reason: "worktree-multi-repo" },
+    ];
+    const d = buildStatusEnvelope(makeSnap(), BOOT, failures).data;
+    expect(d?.needs_human.blocked_work).toBe(0);
+    expect(d?.needs_human.stuck_dispatches).toBe(1);
+    expect(d?.needs_human.total).toBe(1);
+  });
+
+  test("no blocked:-prefix work stickies → blocked_work:0", () => {
+    const d = buildStatusEnvelope(makeSnap(), BOOT, []).data;
+    expect(d?.needs_human.blocked_work).toBe(0);
+  });
+
   test("selection_reviews counts flagged epics of ANY status off the narrow read; a flagged CLOSED epic still counts (ADR 0011)", () => {
     // The narrow read carries an OPEN flagged epic and a CLOSED flagged epic —
     // the closed one is absent from `board.epics` (open-filtered) but must still
@@ -587,6 +613,7 @@ describe("buildStatusEnvelope drained/jammed", () => {
       "finalize_non_ff",
       "parked_questions",
       "instant_death_wall",
+      "blocked_work",
       "selection_reviews",
       "total",
     ]);
@@ -597,6 +624,7 @@ describe("buildStatusEnvelope drained/jammed", () => {
       finalize_non_ff: 1,
       parked_questions: 1,
       instant_death_wall: 2,
+      blocked_work: 0,
       selection_reviews: 0,
       total: 8,
     });
