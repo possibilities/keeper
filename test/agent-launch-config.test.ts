@@ -5,6 +5,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { mapKeeperEffortToAxis } from "../src/agent/harness";
 import {
   AGENT_ROLES,
   buildAgentLaunchArgv,
@@ -135,6 +136,28 @@ test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () 
   expect(args[idx + 1]).toBe('model_reasoning_effort="high"');
 });
 
+test("nativeCodexArgs: keeper effort max caps at codex band xhigh", () => {
+  const args = nativeCodexArgs({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "p",
+    effort: "max",
+  });
+  const idx = args.indexOf("-c");
+  expect(args[idx + 1]).toBe('model_reasoning_effort="xhigh"');
+});
+
+test("nativeCodexArgs: an already-native band (minimal) passes through unmapped", () => {
+  const args = nativeCodexArgs({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "p",
+    effort: "minimal",
+  });
+  const idx = args.indexOf("-c");
+  expect(args[idx + 1]).toBe('model_reasoning_effort="minimal"');
+});
+
 // ---------------------------------------------------------------------------
 // native flag sets — pi (posture-independent: read-only is prompting-only)
 // ---------------------------------------------------------------------------
@@ -153,8 +176,9 @@ test("nativePiArgs: only -na, no tool strip, no codex/claude/effort flags", () =
   expect(args).not.toContain("--dangerously-skip-permissions");
   expect(args).not.toContain("--permission-mode");
   expect(args).not.toContain("--disallowed-tools");
-  // pi uses thinking, never effort — pairing routes neither through here.
+  // No effort supplied → no `--thinking`; pi never gets codex's `-c` either.
   expect(args).not.toContain("-c");
+  expect(args).not.toContain("--thinking");
 });
 
 test("nativePiArgs: --model appended when supplied", () => {
@@ -177,16 +201,63 @@ test("nativePiArgs: --name appended (pi has a native name flag)", () => {
   expect(args.slice(-2)).toEqual(["--name", "panel::smoke::pi-fast"]);
 });
 
-test("nativePiArgs: --effort is never emitted even when supplied (pi uses thinking)", () => {
+test("nativePiArgs: a keeper effort maps onto pi's --thinking band (never codex -c)", () => {
   const args = nativePiArgs({
     launcherArgvPrefix: LAP,
     cli: "pi",
     prompt: "p",
     effort: "high",
   });
-  expect(args).toEqual(["-na"]);
+  const idx = args.indexOf("--thinking");
+  expect(idx).toBeGreaterThanOrEqual(0);
+  expect(args[idx + 1]).toBe("high");
+  // pi's second axis is `--thinking`, never codex's `-c model_reasoning_effort`.
   expect(args).not.toContain("-c");
-  expect(args).not.toContain("high");
+});
+
+test("nativePiArgs: keeper effort max caps at pi band xhigh, before --name", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "p",
+    effort: "max",
+    name: "panel::smoke::pi",
+  });
+  const idx = args.indexOf("--thinking");
+  expect(args[idx + 1]).toBe("xhigh");
+  // --name stays the final pair so the launcher's native name lands last.
+  expect(args.slice(-2)).toEqual(["--name", "panel::smoke::pi"]);
+});
+
+// ---------------------------------------------------------------------------
+// effort → second-axis band mapping (descriptor-driven, no harness-name switch)
+// ---------------------------------------------------------------------------
+
+test("mapKeeperEffortToAxis: claude/hermes null map passes every token through", () => {
+  for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+    expect(mapKeeperEffortToAxis("claude", effort)).toBe(effort);
+    expect(mapKeeperEffortToAxis("hermes", effort)).toBe(effort);
+  }
+});
+
+test("mapKeeperEffortToAxis: codex/pi are identity for the four shared rungs", () => {
+  for (const effort of ["low", "medium", "high", "xhigh"]) {
+    expect(mapKeeperEffortToAxis("codex", effort)).toBe(effort);
+    expect(mapKeeperEffortToAxis("pi", effort)).toBe(effort);
+  }
+});
+
+test("mapKeeperEffortToAxis: keeper max caps at codex/pi band xhigh", () => {
+  expect(mapKeeperEffortToAxis("codex", "max")).toBe("xhigh");
+  expect(mapKeeperEffortToAxis("pi", "max")).toBe("xhigh");
+});
+
+test("mapKeeperEffortToAxis: already-native bands pass through unmapped (precedence)", () => {
+  // Tokens outside keeper's five efforts are left as-is — the map rewrites only
+  // genuine keeper efforts, never an already-native band the caller supplied.
+  expect(mapKeeperEffortToAxis("codex", "minimal")).toBe("minimal");
+  expect(mapKeeperEffortToAxis("pi", "off")).toBe("off");
+  expect(mapKeeperEffortToAxis("pi", "minimal")).toBe("minimal");
 });
 
 // ---------------------------------------------------------------------------

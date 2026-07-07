@@ -27,6 +27,19 @@ export type HarnessName = (typeof HARNESS_NAMES)[number];
  *  harness is model-only (hermes) — a preset for it may set neither axis. */
 export type SecondAxis = "effort" | "thinking" | "none";
 
+/** keeper's own five-rung reasoning-effort vocabulary — the effort axis of the
+ *  plan worker `{model × effort}` matrix and the `--effort` flag, ordered
+ *  ascending. A harness's {@link HarnessDescriptor.effortAxisMap} translates
+ *  these onto its native second-axis bands. */
+export const KEEPER_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export type KeeperEffort = (typeof KEEPER_EFFORTS)[number];
+
 /** How a harness's live working/stopped churn reaches keeper's jobs projection.
  *  `claude-hooks`: keeper's native hook set feeds the events-log channel.
  *  `pi-extension`: an ephemeral in-process pi extension (armed per-launch via
@@ -70,6 +83,12 @@ export interface HarnessDescriptor {
   profileEnvVar: string;
   /** The second reasoning axis this harness accepts (effort|thinking|none). */
   secondAxis: SecondAxis;
+  /** Translation of keeper's five efforts onto this harness's native second-axis
+   *  bands, or `null` when they pass through unmapped (claude's `--effort` is
+   *  native; hermes has no second axis). Total over {@link KEEPER_EFFORTS}; a
+   *  token that is not a keeper effort (an already-native band) is left as-is by
+   *  {@link mapKeeperEffortToAxis}. */
+  effortAxisMap: Record<KeeperEffort, string> | null;
   /** M2 capability: `keeper agent run` / a panel leg can capture this harness's
    *  final message (transcript discovery + stop parser exist). GATES panel
    *  eligibility — a non-capturable harness is a launchable partner but not a
@@ -88,6 +107,18 @@ export interface HarnessDescriptor {
   resumeArgv: ResumeArgvForm;
 }
 
+/** codex and pi expose the same reasoning-band vocabulary
+ *  (minimal/low/medium/high/xhigh), so keeper's efforts map onto it identically:
+ *  identity for the four shared rungs, with keeper's top `max` capped at the
+ *  shared `xhigh` band. */
+const KEEPER_EFFORT_TO_REASONING_BAND: Record<KeeperEffort, string> = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "xhigh",
+};
+
 /** The registry — one {@link HarnessDescriptor} per {@link HarnessName}. The
  *  single home for per-harness facts; add a harness by adding a row here (plus
  *  its native builders / parsers in the consuming modules), never by threading a
@@ -99,6 +130,8 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     binaryName: "claude",
     profileEnvVar: "KEEPER_AGENT_CLAUDE_PROFILE",
     secondAxis: "effort",
+    // Claude's native `--effort` speaks keeper's efforts directly — no translation.
+    effortAxisMap: null,
     capturable: true,
     mintsOwnSessionId: false,
     hookMechanism: "claude-hooks",
@@ -110,6 +143,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     binaryName: "codex",
     profileEnvVar: "KEEPER_AGENT_CODEX_PROFILE",
     secondAxis: "effort",
+    effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
     capturable: true,
     mintsOwnSessionId: true,
     // M3b: live stop-churn via the daemon-side rollout tailer. Stop-only — codex's
@@ -126,6 +160,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     binaryName: "pi",
     profileEnvVar: "KEEPER_AGENT_PI_PROFILE",
     secondAxis: "thinking",
+    effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
     capturable: true,
     mintsOwnSessionId: false,
     // M3b: an ephemeral in-process extension (plugins/keeper/pi-extension,
@@ -143,6 +178,8 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // Hermes is model-only: it exposes neither an effort nor a thinking axis, so
     // a preset for it may set neither (config.ts fails a preset that does).
     secondAxis: "none",
+    // Model-only: no second axis, so keeper efforts never reach a hermes argv.
+    effortAxisMap: null,
     // M2: captured by bounded polling of `hermes sessions export`, positively
     // attributed by cwd + created-at (refuse-to-guess on collision). Capturable
     // ⇒ panel-eligible with no extra panel wiring.
@@ -171,6 +208,25 @@ export function isHarnessName(name: string): name is HarnessName {
 /** The descriptor for a known harness, or undefined for an unknown name. */
 export function harnessDescriptor(name: string): HarnessDescriptor | undefined {
   return isHarnessName(name) ? HARNESS_DESCRIPTORS[name] : undefined;
+}
+
+/**
+ * Translate a keeper effort onto `harness`'s native second-axis band via its
+ * descriptor {@link HarnessDescriptor.effortAxisMap}. A null map (claude effort
+ * is native, hermes has none) returns the token unchanged, so those argvs stay
+ * byte-identical. A token outside {@link KEEPER_EFFORTS} — an already-native band
+ * such as codex/pi `minimal` — also passes through untouched, so the map rewrites
+ * only genuine keeper efforts (in practice just `max` → `xhigh` for codex/pi).
+ */
+export function mapKeeperEffortToAxis(
+  harness: HarnessName,
+  effort: string,
+): string {
+  const map = HARNESS_DESCRIPTORS[harness].effortAxisMap;
+  if (map === null) {
+    return effort;
+  }
+  return map[effort as KeeperEffort] ?? effort;
 }
 
 /** True when a harness's final message is capturable (M2) — the panel-eligibility

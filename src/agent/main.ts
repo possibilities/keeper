@@ -63,7 +63,11 @@ import {
   USAGE,
   VERSION,
 } from "./dispatch";
-import { HARNESS_DESCRIPTORS, type HarnessName } from "./harness";
+import {
+  HARNESS_DESCRIPTORS,
+  type HarnessName,
+  mapKeeperEffortToAxis,
+} from "./harness";
 import { piExtensionArgs, READ_ONLY_DIRECTIVE } from "./launch-config";
 import {
   type LaunchHandleDeps,
@@ -2327,10 +2331,13 @@ export async function main(deps: MainDeps): Promise<never> {
       note(`model: ${startupModel}`);
     }
     if (startupEffort !== null) {
-      const effortConfig = codexEffortConfigArg(startupEffort);
+      // A keeper effort maps onto codex's reasoning band via the descriptor
+      // (keeper `max` → codex `xhigh`); an already-native band passes through.
+      const band = mapKeeperEffortToAxis("codex", startupEffort);
+      const effortConfig = codexEffortConfigArg(band);
       runCmd.push("-c", effortConfig);
       actionLog.push(`Added Codex effort override: -c ${effortConfig}`);
-      note(`effort: ${startupEffort}`);
+      note(`effort: ${band}`);
     }
 
     runCmd.push(...remainingArgs);
@@ -2597,11 +2604,12 @@ export async function main(deps: MainDeps): Promise<never> {
       defaultModel,
     );
     if (startupThinking !== null) {
-      runCmd.push("--thinking", startupThinking);
-      actionLog.push(
-        `Added Pi thinking override: --thinking ${startupThinking}`,
-      );
-      note(`thinking: ${startupThinking}`);
+      // A keeper effort maps onto pi's band via the descriptor (keeper `max` → pi
+      // `xhigh`); an already-native band (e.g. `off`) passes through unchanged.
+      const band = mapKeeperEffortToAxis("pi", startupThinking);
+      runCmd.push("--thinking", band);
+      actionLog.push(`Added Pi thinking override: --thinking ${band}`);
+      note(`thinking: ${band}`);
     }
     if (startupModel !== null) {
       runCmd.push("--model", startupModel);
