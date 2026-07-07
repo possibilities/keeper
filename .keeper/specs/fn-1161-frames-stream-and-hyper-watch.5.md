@@ -42,5 +42,5 @@ so the recipe cannot be integration-driven — acceptance is documentary.
 - [ ] No mechanics already documented elsewhere in the skill are restated
 
 ## Done summary
-
+Added the narrow-to-armed-then-restore-yolo recipe to the autopilot skill, between the take-over window and await integration sections, citing existing mechanics with one worked example.
 ## Evidence
