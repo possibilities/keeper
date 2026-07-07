@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted.
+Superseded by [ADR 18](0018-out-of-band-selection-review-skill.md): selection
+grading moved off the close path into a human-invoked, out-of-band skill, and the
+board-visible record (verb, projection column, display surfaces) was removed. The
+committed per-epic review dataset survives — now version-keyed and produced
+out-of-band. The rest of this record stands as the original decision.
 
 ## Context
 

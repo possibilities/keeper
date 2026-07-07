@@ -233,6 +233,58 @@ describe("model-guidance skill frontmatter", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// cell-review — the out-of-band selection-grading skill. Static (no .tmpl, no
+// managed sidecar), slash-only, and every keeper plan verb it drives resolves
+// against the live CLI.
+// ---------------------------------------------------------------------------
+
+const CELL_REVIEW_SKILL = join(REPO, "skills", "cell-review", "SKILL.md");
+
+describe("cell-review skill consistency", () => {
+  test("exists as tracked source at the documented path", () => {
+    expect(existsSync(CELL_REVIEW_SKILL)).toBe(true);
+  });
+
+  test("name: is the bare verb cell-review", () => {
+    const fm = parseFrontmatter(frontmatterBlock(CELL_REVIEW_SKILL));
+    expect(fm.name).toBe("cell-review");
+  });
+
+  test("stays slash-only", () => {
+    const fm = parseFrontmatter(frontmatterBlock(CELL_REVIEW_SKILL));
+    expect(fm["disable-model-invocation"]).toBe("true");
+  });
+
+  test("is static — the skill dir carries no .tmpl or managed-file sidecar", () => {
+    const entries = readdirSync(join(REPO, "skills", "cell-review"));
+    expect(entries).toContain("SKILL.md");
+    for (const e of entries) {
+      expect(e.endsWith(".tmpl")).toBe(false);
+      expect(e.includes("managed-file")).toBe(false);
+    }
+  });
+
+  test("references both mutating verbs it drives", () => {
+    const text = readFileSync(CELL_REVIEW_SKILL, "utf-8");
+    expect(text).toContain("keeper plan selection-audit-brief");
+    expect(text).toContain("keeper plan selection-review-submit");
+  });
+
+  test("extracts at least one keeper plan verb from a fenced bash block", () => {
+    const verbs = extractPlanctlVerbs(readFileSync(CELL_REVIEW_SKILL, "utf-8"));
+    expect(verbs.length).toBeGreaterThan(0);
+  });
+
+  test("every extracted keeper plan verb responds to --help (exit 0)", () => {
+    const verbs = extractPlanctlVerbs(readFileSync(CELL_REVIEW_SKILL, "utf-8"));
+    for (const parts of verbs) {
+      const r = runCli([...parts, "--help"], { cwd: CWD });
+      expect(r.code).toBe(0);
+    }
+  });
+});
+
 describe("model-selector agent frontmatter", () => {
   test("exists as a tracked agent named model-selector", () => {
     expect(existsSync(MODEL_SELECTOR_AGENT)).toBe(true);
