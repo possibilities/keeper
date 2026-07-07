@@ -39,5 +39,5 @@ The snippet body must be static: no `{{` / `{%` template metacharacters (the byt
 - [ ] Snippet front-matter carries domain `engineering` and follows the house comment-block format
 
 ## Done summary
-
+Authored the canonical engineering/panel-strength snippet (config contract, member-count/harness-diversity strength signal, four-branch selection procedure, discovery-failure branch; config-agnostic — no concrete panel/count/model) and rebuilt the index, preserving the pending dev-servers-table token drift. render succeeds and build-snippets --check is clean.
 ## Evidence
