@@ -40,6 +40,7 @@ import {
   DEFAULT_WRAPPER_MODEL,
   effectiveMatrixFromDisk,
 } from "../../plan/src/subagents_config.ts";
+import { renderTemplate } from "../src/render_engine.ts";
 import { runRenderPluginTemplates } from "../src/render_plugin_templates.ts";
 import type {
   CheckGeneratedFixture,
@@ -536,13 +537,18 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
         "opus-high",
         "opus-medium",
       ]);
-      // the wrapped cell bakes the capability model + effort and emits a manifest.
+      // the wrapped cell's frontmatter bakes the WRAPPER driver (claude sonnet at
+      // xhigh, maxTurns 160) — the capability model runs via its provider, not here.
       const wrapped = readFileSync(
         join(work, "workers", "gpt-5.5-high", "agents", "worker.md"),
         "utf-8",
       );
-      expect(wrapped).toContain("model: gpt-5.5");
-      expect(wrapped).toContain('effort: "high"');
+      expect(wrapped).toContain("model: sonnet");
+      expect(wrapped).toContain('effort: "xhigh"');
+      expect(wrapped).toContain("maxTurns: 160");
+      // the body bakes the capability model + keeper effort it delegates for.
+      expect(wrapped).toContain("model `gpt-5.5`, keeper effort `high`");
+      expect(wrapped).toContain("keeper agent providers resolve gpt-5.5 high");
       expect(
         existsSync(
           join(
@@ -557,6 +563,127 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
+  });
+
+  test("the composed shell branches the frontmatter on the driver — native keeps the model/effort/maxTurns, wrapped bakes the wrapper driver", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig(FIXTURE_MATRIX));
+    try {
+      expect(rc).toBe(0);
+      // A native cell (claude serves opus) keeps its own model + effort at the
+      // full task-worker maxTurns budget.
+      const native = readFileSync(
+        join(work, "workers", "opus-high", "agents", "worker.md"),
+        "utf-8",
+      );
+      expect(native).toContain("model: opus");
+      expect(native).toContain('effort: "high"');
+      expect(native).toContain("maxTurns: 300");
+      expect(native).not.toContain("model: sonnet");
+      // A wrapped cell (gpt-5.5 served by codex/pi) runs as the wrapper driver at
+      // the shorter wrapper budget, never the capability model in the frontmatter.
+      const wrapped = readFileSync(
+        join(work, "workers", "gpt-5.5-high", "agents", "worker.md"),
+        "utf-8",
+      );
+      expect(wrapped).toContain("model: sonnet");
+      expect(wrapped).toContain('effort: "xhigh"');
+      expect(wrapped).toContain("maxTurns: 160");
+      // The shared spine (Phase 5/6, escalation taxonomy) is single-sourced, so
+      // both kinds carry it byte-for-byte; only the implement/commit middle differs.
+      for (const body of [native, wrapped]) {
+        expect(body).toContain("## Phase 5 — Mark done");
+        expect(body).toContain("## Phase 6 — Verify completion criteria");
+        expect(body).toContain("BLOCKED: <CATEGORY>");
+      }
+      // The divergent middle: native carries today's implement phase verbatim; the
+      // wrapped body carries the delegate phase instead, never the native one.
+      expect(native).toContain("## Phase 2 — Implement");
+      expect(native).not.toContain("## Phase 2 — Delegate implementation");
+      expect(wrapped).toContain(
+        "## Phase 2 — Delegate implementation to the provider",
+      );
+      expect(wrapped).not.toContain("## Phase 2 — Implement");
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("a wrapped cell body carries the full delegate → adjudicate → normalize → commit contract", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig(FIXTURE_MATRIX));
+    try {
+      expect(rc).toBe(0);
+      const wrapped = readFileSync(
+        join(work, "workers", "gpt-5.5-medium", "agents", "worker.md"),
+        "utf-8",
+      );
+      // Delegate: resolve providers for the BAKED capability + effort, then launch
+      // the first candidate DETACHED (never one blocking call) with chunked waits.
+      expect(wrapped).toContain(
+        "keeper agent providers resolve gpt-5.5 medium",
+      );
+      expect(wrapped).toContain("wrapped::<task-id>");
+      expect(wrapped).toContain("nohup");
+      expect(wrapped).toContain("keeper agent wait");
+      // Failure map: launch-fail falls through the pecking order, timeout retries
+      // to max_attempts then blocks, no_route / bad args are typed blocks.
+      expect(wrapped).toContain("Failure map");
+      expect(wrapped).toContain("no_route");
+      expect(wrapped).toContain("max_attempts");
+      expect(wrapped).toContain("BLOCKED: EXTERNAL_BLOCKED");
+      // Adjudicate: the return is attacker-influenced, re-run the authoritative pass.
+      expect(wrapped).toContain("attacker-influenced");
+      expect(wrapped).toContain("re-run the authoritative test pass");
+      // Normalize + commit: soft-reset a foreign commit, stage the git-derived set,
+      // land ONE commit with the wrapper's own Task line + Job-Id via commit-work.
+      expect(wrapped).toContain("git reset --soft");
+      expect(wrapped).toContain("forbidden-trailer gate");
+      expect(wrapped).toContain("Task: $TASK_ID");
+      expect(wrapped).toContain("Job-Id:");
+      expect(wrapped).toContain("keeper commit-work");
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("a cell rendered without driver bindings fails the render loudly (strictVariables), never a partial agent", () => {
+    const workerTmpl = join(
+      KEEPER_ROOT,
+      "plugins",
+      "plan",
+      "template",
+      "agents",
+      "worker.md.tmpl",
+    );
+    // No driver binding at all → the frontmatter branch raises rather than
+    // silently emitting a partial (unbranched) agent.
+    expect(() =>
+      renderTemplate(workerTmpl, {
+        current_model: "opus",
+        current_effort: "high",
+        wrapper_model: "sonnet",
+        wrapper_effort: "xhigh",
+      }),
+    ).toThrow(/current_driver/);
+    // A wrapped driver missing its wrapper bindings also raises loudly.
+    expect(() =>
+      renderTemplate(workerTmpl, {
+        current_model: "gpt-5.5",
+        current_effort: "high",
+        current_driver: "wrapped",
+        wrapper_effort: "xhigh",
+      }),
+    ).toThrow(/wrapper_model/);
+    // The full native binding set renders cleanly (no throw, real body).
+    const ok = renderTemplate(workerTmpl, {
+      current_model: "opus",
+      current_effort: "high",
+      current_driver: "native",
+      wrapper_model: "sonnet",
+      wrapper_effort: "xhigh",
+    });
+    expect(ok.text).toContain("model: opus");
+    expect(ok.text).toContain("maxTurns: 300");
+    expect(ok.text).toContain("## Phase 2 — Implement");
   });
 });
 

@@ -66,22 +66,38 @@ describe("render engine — byte-identical vs the promptctl oracle goldens", () 
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_model: "opus", current_effort: "medium" },
+      vars: {
+        current_model: "opus",
+        current_effort: "medium",
+        current_driver: "native",
+      },
       golden: "workers/opus-medium/agents/worker.md",
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_model: "opus", current_effort: "high" },
+      vars: {
+        current_model: "opus",
+        current_effort: "high",
+        current_driver: "native",
+      },
       golden: "workers/opus-high/agents/worker.md",
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_model: "opus", current_effort: "xhigh" },
+      vars: {
+        current_model: "opus",
+        current_effort: "xhigh",
+        current_driver: "native",
+      },
       golden: "workers/opus-xhigh/agents/worker.md",
     },
     {
       template: join(PLAN_TEMPLATES, "agents", "worker.md.tmpl"),
-      vars: { current_model: "opus", current_effort: "max" },
+      vars: {
+        current_model: "opus",
+        current_effort: "max",
+        current_driver: "native",
+      },
       golden: "workers/opus-max/agents/worker.md",
     },
     {
