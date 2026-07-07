@@ -44,5 +44,5 @@ Fast tier: extend makeMergeGit with update-index/read-tree matches + per-path kn
 - [ ] A new ADR records the stale-aware, board-visible resync decision and ADR 0008 carries a supersession-in-part pointer to it
 
 ## Done summary
-
+Rewrote decision-B post-ref-advance resync to a stale-aware two-tree read-tree -m -u catch-up (refresh + gate on on-default/no-MERGE_HEAD): stale paths advance, unrelated local edits preserved, a colliding edit aborts atomically leaving the shared-checkout-desync row standing; best-effort/swallowed so the merge stays merged. Added ADR 0016 (supersedes ADR 0008 decision-B in part) and a real-git slow proof.
 ## Evidence
