@@ -40,5 +40,5 @@ Pure-function tests in the existing style (panelStart with injected makeDeps({ca
 - [ ] Unknown panel/preset names still exit 2; bare-preset panel-of-one resolution is unchanged; root `bun test` suite is green
 
 ## Done summary
-
+Aliased the reserved name 'default' to the configured default panel at both resolution entry points (resolvePanelMembers and runPresetsResolve), so '--panel default' and 'presets resolve default' resolve the default panel; null-default fails loud naming what was typed, and the resolve envelope reports the resolved panel's real name.
 ## Evidence
