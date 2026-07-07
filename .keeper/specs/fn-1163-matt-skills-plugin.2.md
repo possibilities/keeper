@@ -32,5 +32,5 @@ grep the forked files for /grilling, /domain-modeling, /codebase-design — zero
 - [ ] The README sync log records the fork
 
 ## Done summary
-
+Forked the improve-codebase-architecture skill from mattpocock/skills@1445797d, resolving its three dangling refs (/grilling -> /matt:grill-me, /domain-modeling -> the domain-docs reflex, /codebase-design -> a new compact references/design-vocabulary.md pointed at with read-when wording). The survey now ends by offering /plan:defer to queue the picked opportunity; README sync log records the fork.
 ## Evidence
