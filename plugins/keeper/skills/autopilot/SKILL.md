@@ -192,6 +192,45 @@ you the wheel:
 - **`pause`** stops all dispatching — deliberate and total; remember to `play`
   (or restore) when done.
 
+## Narrow to armed to solve a problem, then restore yolo
+
+A named composition for "something's wrong on the board, work just this
+problem in isolation, then hand control back to yolo" — it reuses mechanics
+this skill already documents rather than restating them:
+
+1. **Capture** the current `{paused, mode, armed}` (plus any other field
+   you're about to touch) using the take-over window's capture step above.
+2. **Narrow.** `keeper autopilot mode armed`, then `arm` the problem epic(s).
+   The armed set works with its transitive upstream dep-closure (see the mode
+   table above), so arming the problem epic pulls in exactly what it depends
+   on and nothing else.
+3. **Drive the fix**, or simply let the narrowed reconciler drain it —
+   `armed` mode still dispatches, just over the smaller set (risk gradient
+   above: narrowing is walk-away-adjacent).
+4. **Gate the restore on completion.** Arm a `keeper:await` for the problem
+   epic reaching complete/landed rather than polling by hand; let it fire the
+   restore.
+5. **Restore yolo and disarm** on the await's `met`, following the take-over
+   window's re-read-then-restore step — re-read current state, then restore
+   only the fields you changed (`mode yolo`; `disarm` the problem epic(s) if
+   you want a clean armed set for next time).
+
+### Narrow, fix, and hand back (worked example)
+
+> User: "fn-871-…-skills is stuck on a bad task — only work that while I sort
+> it out, then put it back to normal."
+
+1. **Capture:** `keeper status --json | jq .data.autopilot` → pin
+   `{paused:false, mode:"yolo", armed:[]}`.
+2. **Narrow:** `keeper autopilot mode armed`; `keeper autopilot arm
+   fn-871-…-skills` → arms it plus its transitive dep closure.
+3. Fix the bad task by hand, or leave the narrowed reconciler to drain it.
+4. Arm `keeper:await` for `fn-871-…-skills` landed; the window stays open
+   across turns until it fires.
+5. **On `met` — re-read, then restore:** `keeper status --json | jq
+   .data.autopilot`; `keeper autopilot mode yolo`; `keeper autopilot disarm
+   fn-871-…-skills`. Surface "back to yolo, fn-871-…-skills disarmed."
+
 ## await integration
 
 For "pause and do something manually at a point WHILE work runs," combine a
