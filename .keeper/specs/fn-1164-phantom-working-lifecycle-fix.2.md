@@ -51,5 +51,5 @@ previous task with idle_prompt as a member.
 - [ ] The fold state-machine suite including the extended permutation set is green
 
 ## Done summary
-
+Notification arm now folds event_type=idle_prompt (working -> stopped) as a quiescing transition through the shared lifecycle-stamp gate, behind the same terminal + sub-agent-yield guards as Stop; a stale replayed idle_prompt is swallowed and the two stamp-only kinds stay byte-identical. Covered by new reducer-lifecycle permutation + guard cases.
 ## Evidence
