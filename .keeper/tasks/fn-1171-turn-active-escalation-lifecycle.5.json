@@ -4,11 +4,11 @@
   "depends_on": [],
   "epic": "fn-1171-turn-active-escalation-lifecycle",
   "id": "fn-1171-turn-active-escalation-lifecycle.5",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Needs-human blocked-task surfacing",
-  "updated_at": "2026-07-07T20:30:24.998000Z"
+  "updated_at": "2026-07-07T20:32:36.111000Z"
 }

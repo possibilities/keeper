@@ -1,0 +1,72 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Load-bearing subtle-correctness invariant across four guard consumers plus the conditional permission-parked fallback arm gating the epic",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped schema migration with SCHEMA_VERSION bump and a sacred re-fold-determinism invariant",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-function SELECT widening with the exact predicate and fallback already spelled out",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Fail-closed destroy-only actuator with a TOCTOU fencing-token invariant; a wrong kill is destructive",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Rendering plus a subset counter mirroring the existing never-double-count template, no novel design",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Deconflict sequencing correctness plus an open-ended duplicate-name collision audit needing judgment",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.6",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical revise-in-place doc reconciliation gated by lint and grep",
+      "task_id": "fn-1171-turn-active-escalation-lifecycle.7",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T20:32:36.111000Z",
+  "epic_id": "fn-1171-turn-active-escalation-lifecycle",
+  "input_hash": "5834f621d2fdd9ceb89f3c41dd9058a2b36571d0bd2cfa4d343970d6cb615523",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1479865889,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Load-bearing subtle-correctness invariant (the {terminal:false} occupancy/verdict semantics across four guard consumers) plus a conditional investigate-and-extend permission-parked fallback arm that gates the whole epic.\",\"confidence\":0.72},{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped schema migration with SCHEMA_VERSION bump and a sacred re-fold-determinism invariant (byte-identical stamps/misses via a load-bearing event-order cross-projection read).\",\"confidence\":0.78},{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-function SELECT widening with the exact NULL-inclusive predicate and fallback branch already spelled out in the spec, favoring sonnet's literal precise execution.\",\"confidence\":0.66},{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Fail-closed destroy-only actuator with a TOCTOU/CWE-367 fencing-token invariant where killing a superseded window is destructive and a wrong abstraction propagates.\",\"confidence\":0.7},{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Multi-file rendering plus a subset counter that mirrors the existing finalize_non_ff never-double-count pattern, a known template with no novel design.\",\"confidence\":0.68},{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.6\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Correctness of deconflict sequencing plus an open-ended duplicate-spawn-name collision audit requiring judgment to surface a defect finding, mirroring the task-1 template.\",\"confidence\":0.62},{\"task_id\":\"fn-1171-turn-active-escalation-lifecycle.7\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Mechanical revise-in-place documentation reconciliation gated by a lint check and grep, no design choice beyond updating all duplicated copies.\",\"confidence\":0.8}]}\n"
+}
