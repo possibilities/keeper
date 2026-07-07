@@ -7356,6 +7356,7 @@ const MG_DEFAULT_TIP = "1111111111111111111111111111111111111111";
 const MG_BASE_TIP = "2222222222222222222222222222222222222222";
 const MG_TREE_OID = "3333333333333333333333333333333333333333";
 const MG_MERGE_COMMIT = "4444444444444444444444444444444444444444";
+const MG_MERGE_HEAD = "5555555555555555555555555555555555555555";
 const MG_BASE_TIP_DATE = "2026-01-02T03:04:05+00:00";
 
 interface MergeGitOpts {
@@ -7378,7 +7379,8 @@ interface MergeGitOpts {
   updateRefExit?: number; // non-zero → cas-stale
   updateRefTimeout?: boolean;
   head?: string; // rev-parse --abbrev-ref HEAD (default = defaultBranch)
-  dirty?: boolean; // status --porcelain non-empty → decision-B resync skipped
+  mergeHead?: boolean; // MERGE_HEAD present → catch-up ineligible (mid-merge)
+  readTreeAbort?: boolean; // read-tree -m -u aborts (a colliding edit) → resync skipped
   pushExit?: number;
   pushTimeout?: boolean;
   pushStdout?: string;
@@ -7513,12 +7515,15 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
       }
       return { code: 0, stdout: `${MG_MERGE_COMMIT}\n`, stderr: "" };
     }
+    if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
+      // The catch-up gate: a present MERGE_HEAD makes the checkout mid-merge → ineligible.
+      return opts.mergeHead
+        ? { code: 0, stdout: `${MG_MERGE_HEAD}\n`, stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
     if (joined.startsWith("status --porcelain")) {
-      return {
-        code: 0,
-        stdout: opts.dirty ? " M src/file.ts\n" : "",
-        stderr: "",
-      };
+      // Inert for the catch-up gate (no longer clean-gated); kept for finalize teardown.
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (joined === "rev-parse --abbrev-ref HEAD") {
       return { code: 0, stdout: `${opts.head ?? def}\n`, stderr: "" };
@@ -7538,8 +7543,19 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
       refAdvanced = true; // local default now contains the base
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined.startsWith("reset --hard")) {
+    if (joined === "update-index -q --really-refresh") {
+      // The stat-cache settle immediately before read-tree — always exits 0 in the fake.
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "read-tree") {
+      // Two-tree catch-up merge; a colliding local edit aborts all-or-nothing (case 16/17/21).
+      return opts.readTreeAbort
+        ? {
+            code: 128,
+            stdout: "",
+            stderr: "error: Entry 'foo.ts' not uptodate. Cannot merge.",
+          }
+        : { code: 0, stdout: "", stderr: "" };
     }
     if (joined === `push origin ${def}`) {
       pushed = true;
@@ -7746,12 +7762,12 @@ test("fn-1140 mergeLaneBaseIntoDefault: a PURE fast-forward advances default str
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
 });
 
-test("fn-1140 mergeLaneBaseIntoDefault: the merge LANDS while the shared checkout is DIRTY on default — the regression this decouples — pushes, resync skipped", async () => {
+test("fn-1140 mergeLaneBaseIntoDefault: the merge LANDS while a colliding local edit ABORTS the catch-up — the regression this decouples — pushes, checkout left trailing", async () => {
   // The incident: a dirty shared checkout silently retry-skipped the base merge,
-  // stranding a done epic unmerged. The plumbing merge never touches the working
-  // tree, so it lands + pushes regardless; only decision-B's cosmetic resync is
-  // skipped (the tree is dirty).
-  const { run, cmds } = makeMergeGit({ dirty: true });
+  // stranding a done epic unmerged. The plumbing merge never touches the working tree,
+  // so it lands + pushes regardless; a path both upstream-changed AND locally-edited
+  // aborts the stale-aware catch-up all-or-nothing, leaving the checkout trailing.
+  const { run, cmds } = makeMergeGit({ readTreeAbort: true });
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
     "keeper/epic/fn-1-foo",
@@ -7762,8 +7778,15 @@ test("fn-1140 mergeLaneBaseIntoDefault: the merge LANDS while the shared checkou
   expect(res).toEqual({ kind: "merged" });
   expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
-  // Decision-B resync is SKIPPED on a dirty tree — never a `reset --hard` that would
-  // clobber the human's WIP — and NEVER a working-tree merge.
+  // The catch-up IS attempted (refresh + read-tree) and aborts all-or-nothing on the
+  // colliding edit — never a `reset --hard` / working-tree `git merge` that would
+  // clobber the human's WIP.
+  expect(cmds.some((c) => c === "update-index -q --really-refresh")).toBe(true);
+  expect(
+    cmds.some(
+      (c) => c === `read-tree -m -u ${MG_DEFAULT_TIP} ${MG_MERGE_COMMIT}`,
+    ),
+  ).toBe(true);
   expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
@@ -7785,16 +7808,21 @@ test("fn-1140 mergeLaneBaseIntoDefault: the merge advances LOCAL default while t
   expect(res).toEqual({ kind: "off-branch", head: "feature" });
   // The LOCAL ref DID advance (the merge landed) even though HEAD is off-default.
   expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
-  // No wrong-ref push, no resync onto a checkout that isn't on default, no `git merge`.
+  // No wrong-ref push, no catch-up onto a checkout that isn't on default, no `git merge`.
   expect(cmds.some((c) => c === "push origin main")).toBe(false);
+  expect(cmds.some((c) => c.startsWith("read-tree"))).toBe(false);
+  expect(cmds.some((c) => c === "update-index -q --really-refresh")).toBe(
+    false,
+  );
   expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 
-test("fn-1140 mergeLaneBaseIntoDefault: an IDLE-CLEAN-on-default shared checkout is best-effort fast-forwarded onto the merged commit (decision B)", async () => {
-  // The shared checkout is on default and clean → decision-B resyncs its working
-  // tree to carry the merged commit via a `reset --hard` to the new tip (under the
-  // lock, after the ref advance).
+test("fn-1140 mergeLaneBaseIntoDefault: an on-default shared checkout is caught up onto the merged commit via refresh + two-tree read-tree (decision B)", async () => {
+  // On default with no MERGE_HEAD → the stale-aware catch-up settles the stat cache
+  // (`update-index --really-refresh`) then advances the tree with an explicit two-tree
+  // `read-tree -m -u <preMergeTip> <newTip>` (under the lock, after the ref advance) —
+  // never a `reset --hard` that would clobber a concurrent local edit.
   const { run, cmds } = makeMergeGit();
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
@@ -7804,12 +7832,18 @@ test("fn-1140 mergeLaneBaseIntoDefault: an IDLE-CLEAN-on-default shared checkout
     () => ({ release() {} }),
   );
   expect(res).toEqual({ kind: "merged" });
-  expect(cmds.some((c) => c === `reset --hard ${MG_MERGE_COMMIT}`)).toBe(true);
+  const readTreeArgv = `read-tree -m -u ${MG_DEFAULT_TIP} ${MG_MERGE_COMMIT}`;
+  expect(cmds).toContain("update-index -q --really-refresh");
+  expect(cmds).toContain(readTreeArgv);
+  // The refresh runs IMMEDIATELY before read-tree — the racy-clean window is closed.
+  const refreshIdx = cmds.indexOf("update-index -q --really-refresh");
+  expect(cmds.indexOf(readTreeArgv)).toBe(refreshIdx + 1);
+  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
 });
 
-test("fn-1169 mergeLaneBaseIntoDefault: an idle-clean checkout whose resync APPLIES does NOT fire the desync seed", async () => {
-  // The happy path: on default, clean, reset --hard succeeds → the checkout carries the
-  // merged tip, so there is no desync to seed. The `merged` result shape is UNCHANGED.
+test("fn-1169 mergeLaneBaseIntoDefault: an on-default checkout whose catch-up APPLIES does NOT fire the desync seed", async () => {
+  // The happy path: on default, no MERGE_HEAD, read-tree succeeds → the checkout carries
+  // the merged tip, so there is no desync to seed. The `merged` result shape is UNCHANGED.
   const { run } = makeMergeGit();
   let seeded = 0;
   const res = await mergeLaneBaseIntoDefault(
@@ -7826,10 +7860,11 @@ test("fn-1169 mergeLaneBaseIntoDefault: an idle-clean checkout whose resync APPL
   expect(seeded).toBe(0);
 });
 
-test("fn-1169 mergeLaneBaseIntoDefault: a dirty-on-default checkout whose resync is SKIPPED fires the desync seed (still merged)", async () => {
-  // The incident shape: the ref advances but the dirty checkout's resync is skipped, so
-  // the tree trails the merged tip → the seed fires, while the merge still returns merged.
-  const { run, cmds } = makeMergeGit({ dirty: true });
+test("fn-1169 mergeLaneBaseIntoDefault: a colliding local edit that ABORTS the catch-up fires the desync seed (still merged)", async () => {
+  // The incident shape: the ref advances but a path both upstream-changed and locally-
+  // edited aborts the catch-up all-or-nothing, so the tree trails the merged tip → the
+  // seed fires, while the merge still returns merged (best-effort, swallowed-on-error).
+  const { run, cmds } = makeMergeGit({ readTreeAbort: true });
   let seeded = 0;
   const res = await mergeLaneBaseIntoDefault(
     "/repo",
@@ -7842,9 +7877,37 @@ test("fn-1169 mergeLaneBaseIntoDefault: a dirty-on-default checkout whose resync
     },
   );
   expect(res).toEqual({ kind: "merged" });
-  // The ref advanced but no reset --hard ran (WIP never clobbered) → exactly one seed.
+  // The ref advanced and the catch-up was ATTEMPTED (refresh + read-tree) but aborted —
+  // no reset --hard ever runs (WIP never clobbered) → exactly one seed.
   expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
+  expect(cmds.some((c) => c === "update-index -q --really-refresh")).toBe(true);
+  expect(cmds.some((c) => c.startsWith("read-tree"))).toBe(true);
   expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
+  expect(seeded).toBe(1);
+});
+
+test("fn-1169 mergeLaneBaseIntoDefault: a mid-merge checkout (MERGE_HEAD present) SKIPS the catch-up and fires the desync seed (still merged)", async () => {
+  // On default but mid-merge → the catch-up is ineligible (never read-tree over a
+  // half-merged tree), so the ref advances, the checkout trails, and the seed fires.
+  const { run, cmds } = makeMergeGit({ mergeHead: true });
+  let seeded = 0;
+  const res = await mergeLaneBaseIntoDefault(
+    "/repo",
+    "keeper/epic/fn-1-foo",
+    "main",
+    run,
+    () => ({ release() {} }),
+    () => {
+      seeded++;
+    },
+  );
+  expect(res).toEqual({ kind: "merged" });
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(true);
+  // The catch-up never touched the tree while mid-merge.
+  expect(cmds.some((c) => c.startsWith("read-tree"))).toBe(false);
+  expect(cmds.some((c) => c === "update-index -q --really-refresh")).toBe(
+    false,
+  );
   expect(seeded).toBe(1);
 });
 
@@ -7901,9 +7964,12 @@ test("fn-1140 mergeLaneBaseIntoDefault: a CONCURRENT default advance (update-ref
   );
   expect(res).toEqual({ kind: "cas-stale" });
   expect(isWorktreeRecoverReason((res as { kind: string }).kind)).toBe(false);
-  // The CAS failed, so nothing was pushed and nothing resynced.
+  // The CAS failed, so nothing was pushed and the catch-up never ran.
   expect(cmds.some((c) => c === "push origin main")).toBe(false);
-  expect(cmds.some((c) => c.startsWith("reset --hard"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("read-tree"))).toBe(false);
+  expect(cmds.some((c) => c === "update-index -q --really-refresh")).toBe(
+    false,
+  );
 });
 
 test("fn-1140 mergeLaneBaseIntoDefault: git < 2.38 (no `merge-tree --write-tree`) → { kind: 'merge-tree-unsupported' }, a transient skip, never a merge/push", async () => {
@@ -8742,6 +8808,7 @@ function makeRecoveryGit(state: {
   originUnresolved?: boolean; // the cached origin/<default> ref does not resolve (never-pushed default) → FF precheck "unknown"
   repoHead?: string; // main worktree current branch
   headAt?: Map<string, string>; // cwd → that worktree's abbrev-ref HEAD (falls back to repoHead/defaultBranch)
+  readTreeAbortAt?: Set<string>; // cwds whose two-tree catch-up read-tree aborts (a colliding edit)
   dirtyStatus?: string; // git status --porcelain stdout on the main checkout
   remoteAhead?: boolean; // cached origin ref NOT an ancestor of local → non-ff
   noRemote?: boolean; // `remote get-url origin` fails → not turn-key
@@ -9033,10 +9100,20 @@ function makeRecoveryGit(state: {
       }
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (joined.startsWith("reset --hard")) {
-      // Decision-B best-effort resync of an idle-clean shared checkout. Cosmetic —
-      // its result never changes the merge outcome.
+    if (joined === "update-index -q --really-refresh") {
+      // The stat-cache settle immediately before the two-tree catch-up read-tree.
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "read-tree") {
+      // Decision-B stale-aware catch-up of the on-default shared checkout. Best-effort —
+      // a colliding-edit abort (non-zero) never changes the merge outcome.
+      return (state.readTreeAbortAt?.has(cwd) ?? false)
+        ? {
+            code: 128,
+            stdout: "",
+            stderr: "error: Entry 'foo.ts' not uptodate. Cannot merge.",
+          }
+        : { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "push") {
       // (`push --dry-run` is matched earlier.) Covers BOTH the bare merge-path
@@ -10499,10 +10576,11 @@ test("fn-1140 recoverWorktrees: an OFF-DEFAULT main checkout still advances the 
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
 });
 
-test("fn-1140 recoverWorktrees: a DIRTY main checkout NO LONGER blocks the base merge — it lands via plumbing (the regression), resync skipped", async () => {
+test("fn-1140 recoverWorktrees: a DIRTY main checkout NO LONGER blocks the base merge — it lands via plumbing (the regression), catch-up aborts on the colliding edit", async () => {
   // The incident: a dirty shared checkout silently retry-skipped the base merge,
   // stranding a done epic unmerged. The working-tree-free plumbing merge lands
-  // regardless of the dirty tree; only decision-B's cosmetic resync is skipped.
+  // regardless of the checkout state; a colliding local edit aborts the stale-aware
+  // catch-up all-or-nothing, leaving the checkout trailing but never blocking the merge.
   const { run, calls, lock } = makeRecoveryGit({
     worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
     mergeHeadAt: new Set(),
@@ -10510,7 +10588,7 @@ test("fn-1140 recoverWorktrees: a DIRTY main checkout NO LONGER blocks the base 
     defaultBranch: "main",
     ancestors: new Set(),
     repoHead: "main", // on default…
-    dirtyStatus: " M src/foo.ts\n", // …but the human has uncommitted work
+    readTreeAbortAt: new Set(["/repo"]), // …with a colliding local edit → catch-up aborts
   });
   const { failures } = await recoverWorktrees(
     ["/repo"],
@@ -10522,8 +10600,12 @@ test("fn-1140 recoverWorktrees: a DIRTY main checkout NO LONGER blocks the base 
   expect(
     calls.some((c) => c.args.startsWith("update-ref --end-of-options")),
   ).toBe(true);
-  // Decision-B resync is SKIPPED on a dirty tree (never a `reset --hard` clobbering
-  // WIP), and NEVER a working-tree `git merge`.
+  // The catch-up IS attempted (refresh + read-tree) and aborts all-or-nothing — never a
+  // `reset --hard` clobbering WIP, and NEVER a working-tree `git merge`.
+  expect(calls.some((c) => c.args === "update-index -q --really-refresh")).toBe(
+    true,
+  );
+  expect(calls.some((c) => c.args.startsWith("read-tree -m -u"))).toBe(true);
   expect(calls.some((c) => c.args.startsWith("reset --hard"))).toBe(false);
   expect(calls.some((c) => c.args.startsWith("merge --no-edit"))).toBe(false);
 });
@@ -11401,12 +11483,13 @@ function makeFinalizeReadinessRun(opts: {
   return { run, cmds };
 }
 
-test("fn-1140 finalizeEpic: a DIRTY main checkout NO LONGER blocks finalize — the base merge lands via plumbing and teardown proceeds (the regression), resync skipped", async () => {
+test("fn-1140 finalizeEpic: a DIRTY main checkout NO LONGER blocks finalize — the base merge lands via plumbing and teardown proceeds (the regression), catch-up aborts", async () => {
   // The incident: a dirty shared checkout silently retry-skipped the base merge,
   // stranding a done epic unmerged. The working-tree-free plumbing merge lands
-  // regardless of the dirty tree, so finalize succeeds and tears the lanes down;
-  // only decision-B's cosmetic resync is skipped (never a `reset --hard` over WIP).
-  const { run, cmds } = makeMergeGit({ dirty: true });
+  // regardless of the checkout state, so finalize succeeds and tears the lanes down;
+  // even a colliding local edit that aborts the stale-aware catch-up never runs a
+  // `reset --hard` over WIP and never blocks the merge.
+  const { run, cmds } = makeMergeGit({ readTreeAbort: true });
   const res = await createWorktreeDriver(run, () => ({
     release() {},
   })).finalizeEpic(makeFinalizeInfo(), async () => true);

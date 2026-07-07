@@ -4464,11 +4464,12 @@ export async function mergeLaneBaseIntoDefault(
   defaultBranch: string,
   run: WorktreeGitRunner,
   acquireLock?: LockAcquirer,
-  // Fired (once) when the ref advanced but the post-merge resync was SKIPPED (the
-  // checkout was not idle-clean-on-default) or ABORTED (the `reset --hard` errored), so
-  // the shared checkout now TRAILS the default tip — the event that seeds the
-  // shared-checkout-desync distress latch. A no-op default so every existing caller +
-  // direct-call test is byte-identical (the `merged` result shape is UNCHANGED).
+  // Fired (once) when the ref advanced but the post-merge catch-up did NOT bring the
+  // shared checkout current — either SKIPPED (off-default or mid-merge, so ineligible)
+  // or ABORTED (a path both upstream-changed and locally-edited failed the all-or-nothing
+  // read-tree) — so the shared checkout now TRAILS the default tip. This is the event that
+  // seeds the shared-checkout-desync distress latch. A no-op default keeps every existing
+  // caller + direct-call test byte-identical (the `merged` result shape is UNCHANGED).
   onResyncSkipped: () => void = () => {},
 ): Promise<MergeLaneResult> {
   if (await gitIsAncestorOf(repo, baseBranch, defaultBranch, run)) {
@@ -4673,15 +4674,19 @@ export async function mergeLaneBaseIntoDefault(
   let resyncSkipped = false;
   try {
     // Decision-B eligibility, re-checked UNDER the lock so a concurrent commit-work
-    // cannot dirty the tree between this probe and the resync below.
-    const status = await run(["status", "--porcelain"], {
-      cwd: repo,
-      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-    });
-    const idleCleanOnDefault =
-      (await gitCurrentBranch(repo, run)) === defaultBranch &&
-      status.code === 0 &&
-      status.stdout.trim().length === 0;
+    // cannot flip the checkout's branch / mid-merge state between this probe and the
+    // catch-up below. The catch-up is a STALE-AWARE plumbing merge, NOT a clean-gate:
+    // an on-default checkout with no `MERGE_HEAD` is eligible even when it carries
+    // uncommitted edits — read-tree advances the stale paths and preserves those edits,
+    // aborting all-or-nothing only on a path both upstream-changed AND locally-edited.
+    const onDefault = (await gitCurrentBranch(repo, run)) === defaultBranch;
+    const mergeHeadProbe = await run(
+      ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    const midMerge =
+      mergeHeadProbe.code === 0 && mergeHeadProbe.stdout.trim().length > 0;
+    const catchUpEligible = onDefault && !midMerge;
     // Compare-and-swap the default ref: a stale `<old>` (a concurrent local advance
     // moved default, or the ref lock was contended) is a TRANSIENT cas-stale skip,
     // never a strand — next cycle re-derives off the advanced tip. `--end-of-options`
@@ -4702,21 +4707,34 @@ export async function mergeLaneBaseIntoDefault(
     if (upd.code !== 0) {
       return { kind: "cas-stale" };
     }
-    // Decision-B: best-effort fast-forward the idle-clean shared checkout onto the
-    // merged commit. The ref moved out from under the working tree, so the tree now
-    // shows the merge delta as an inverse diff; a `reset --hard` to the new tip
-    // discards that inverse diff (== applies the merge to the tree). Gated on the
-    // pre-move clean probe so no real WIP is ever clobbered, held under the lock, and
-    // SILENTLY swallowed on any error — cosmetic, and the merge already landed. A
-    // dirty / off-branch checkout is the human's to resync (never blocks the merge).
-    // Either way, a SKIP (not idle-clean) or a FAILED reset leaves the checkout trailing
-    // the just-advanced tip — the desync the caller must surface.
-    if (idleCleanOnDefault) {
-      const reset = await run(["reset", "--hard", newValue], {
+    // Decision-B (stale-aware): the ref just advanced out from under the shared checkout,
+    // so the working tree now TRAILS the new tip. Catch it up with a two-tree plumbing
+    // merge — the plumbing form of `pull --ff-only`'s twoway_merge — passing BOTH trees
+    // EXPLICITLY: `<preMergeTip>` is the CAS `<old>` (`defaultTip`), `<newTip>` the merged
+    // value, since post-CAS HEAD already names the new tip and would be the wrong `$H`.
+    // Stale (unmodified) paths advance to the new tip, locally-edited untouched paths
+    // carry forward byte-identical, and a single path both upstream-changed AND
+    // locally-edited aborts the ENTIRE op with NO writes (two-tree cases 16/17/21) — that
+    // non-zero abort is the normal safe outcome, leaving the checkout trailing so task 1's
+    // desync row stands as the honest signal. `git update-index --really-refresh`
+    // immediately before settles the stat cache, closing the racy-clean window (a full
+    // second on APFS) so a same-second human edit trips the safe abort rather than being
+    // silently clobbered. Gated on on-default + no MERGE_HEAD, held under the common-dir
+    // flock, and SILENTLY swallowed on any non-zero exit — the ref advance already landed
+    // and the catch-up is best-effort, so the `merged` result is UNCONDITIONAL. Never
+    // `checkout <tree> -- <paths>`, `checkout -f`, `--reset`, or hand-written blobs:
+    // read-tree keeps git's symlink / path-traversal protections intact and leaves sparse
+    // skip-worktree paths untouched.
+    if (catchUpEligible) {
+      await run(["update-index", "-q", "--really-refresh"], {
         cwd: repo,
         timeoutMs: GIT_LOCAL_TIMEOUT_MS,
       });
-      resyncSkipped = reset.code !== 0;
+      const readTree = await run(
+        ["read-tree", "-m", "-u", defaultTip, newValue],
+        { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      resyncSkipped = readTree.code !== 0;
     } else {
       resyncSkipped = true;
     }
