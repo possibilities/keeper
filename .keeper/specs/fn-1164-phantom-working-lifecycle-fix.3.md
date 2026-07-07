@@ -79,5 +79,5 @@ retry_dispatch clear. No real daemon/worker/socket in tests.
 - [ ] The README system map names the sentinel among the producers; the full fast suite is green
 
 ## Done summary
-
+Add the two-tier producer-side stuck-state sentinel (self-heal worker-done-but-working via a StopReconciled corrective quiescence; detect-only for very-stale live-pid rows) with a sticky retry_dispatch-cleared anomaly distress row; StopReconciled folds stamp-rejection-exempt like terminal arms.
 ## Evidence

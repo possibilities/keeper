@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Two-tier stuck-state sentinel producer",
-  "updated_at": "2026-07-07T17:44:25.983000Z"
+  "updated_at": "2026-07-07T21:06:26.465000Z",
+  "worker_done_at": "2026-07-07T21:06:26.465000Z"
 }
