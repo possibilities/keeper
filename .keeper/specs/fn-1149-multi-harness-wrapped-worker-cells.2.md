@@ -47,5 +47,5 @@ pi --effort high → --thinking high; claude passthrough unchanged; hermes ignor
 - [ ] The map lives on the descriptor and no consumer adds a harness-name switch.
 
 ## Done summary
-
+Added effortAxisMap to HarnessDescriptor so codex/pi translate keeper efforts onto their native reasoning bands (identity except max→xhigh) at every argv-build site — native builders and the run handler — via a descriptor read, no harness-name switch. pi now emits the mapped --thinking instead of silently dropping the effort; claude/hermes carry a null map and stay byte-identical.
 ## Evidence
