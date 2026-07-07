@@ -2,25 +2,35 @@
  * Unit contract for the shared launcher-owned worker-cell resolution seam
  * (`src/worker-cell.ts`) — the ONE decision both the autopilot producer and the
  * manual dispatch CLI route through. Covers every union variant, the injected
- * filesystem-probe CADENCE (a lazy shadow probe reached only for a present cell),
- * the precedence (out-of-matrix → missing → shadowed), and the no-prose contract
- * (the helper returns machine kinds only; each caller owns its operator text).
+ * filesystem- and host-matrix probe CADENCE (a lazy shadow probe reached only for
+ * a present cell; a route probe reached only down the compose-reject arm), the
+ * precedence (no-route → out-of-matrix → missing → shadowed), and the no-prose
+ * contract (the helper returns machine kinds only; each caller owns its operator
+ * text).
  *
- * Pure in-process — no daemon, no real plugin config. `composeWorkerCellDir`
- * reaches the compiled-in subagents matrix (a memoized embed parse, no I/O);
- * `resolveWorkerCell` takes injected probes so no test touches the disk.
+ * Pure in-process — no daemon, no real plugin config, no real matrix.yaml.
+ * `composeWorkerCellDir` reaches the compiled-in subagents matrix (a memoized
+ * embed parse, no I/O); `resolveWorkerCell` and `defaultRouteProbe` take injected
+ * probes / a hand-built matrix so no test touches the disk.
  */
 
 import { expect, test } from "bun:test";
+import { ConfigError } from "../src/agent/config";
+import type { HarnessName } from "../src/agent/harness";
+import type { Matrix } from "../src/agent/matrix";
 import {
   composeWorkerCellDir,
+  defaultRouteProbe,
   resolveWorkerCell,
   type WorkerCellCompose,
   type WorkerCellResult,
+  type WorkerCellRoute,
 } from "../src/worker-cell";
 
 // A probe pair that FAILS the test if invoked — proves a code path never reaches
-// the filesystem. `dirExists`/`probeShadow` throw so an accidental call surfaces.
+// the filesystem OR the host matrix. `dirExists`/`probeShadow` are the fs probes;
+// `probeRoute` is the host-matrix probe (reached ONLY down the compose-reject
+// arm). Each throws so an accidental call surfaces.
 const neverProbe = {
   dirExists: (_p: string): boolean => {
     throw new Error("dirExists must not be called on this path");
@@ -28,7 +38,29 @@ const neverProbe = {
   probeShadow: (): string | null => {
     throw new Error("probeShadow must not be called on this path");
   },
+  probeRoute: (): WorkerCellRoute => {
+    throw new Error("probeRoute must not be called on this path");
+  },
 };
+
+// A route probe that reports every wrapped-candidate as routable — leaves the
+// generic out-of-matrix reject standing (the pre-no-route behavior).
+const routed = (): WorkerCellRoute => ({ kind: "routed" });
+
+// Build a host matrix from a `[harness, [models...]]` roster (native id ===
+// capability). Enough to exercise `driverFor` / `providerOrderFor` purely.
+function mkMatrix(roster: Array<[HarnessName, string[]]>): Matrix {
+  return {
+    efforts: ["high"],
+    providers: roster.map(([name, models]) => ({
+      name,
+      models: new Map(models.map((m) => [m, m])),
+    })),
+    subagents: ["template/agents/worker.md.tmpl"],
+    wrapper_driver: { model: "sonnet", effort: "high" },
+    defaults: { stop_timeout_ms: 1, max_attempts: 1 },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // composeWorkerCellDir — the pure try/catch wrapper around workerCellPluginDir
@@ -57,13 +89,72 @@ test("composeWorkerCellDir: an out-of-matrix pair is carried as a reject (never 
 });
 
 // ---------------------------------------------------------------------------
-// resolveWorkerCell — the shared filesystem-probe precedence over a compose
+// defaultRouteProbe — the host-matrix classification for a wrapped candidate
 // ---------------------------------------------------------------------------
 
-test("resolveWorkerCell: a present cell with no shadow → ok, pluginDir threaded", () => {
+test("defaultRouteProbe: an ABSENT matrix → routed (the claude-only world; out-of-matrix stands)", () => {
+  expect(defaultRouteProbe("gpt-5.5", () => null)).toEqual({ kind: "routed" });
+});
+
+test("defaultRouteProbe: a native (claude-served) model → routed", () => {
+  const matrix = mkMatrix([
+    ["claude", ["opus", "sonnet"]],
+    ["codex", ["gpt-5.5"]],
+  ]);
+  expect(defaultRouteProbe("opus", () => matrix)).toEqual({ kind: "routed" });
+});
+
+test("defaultRouteProbe: a wrapped model with ≥1 serving provider → routed", () => {
+  const matrix = mkMatrix([
+    ["claude", ["opus"]],
+    ["codex", ["gpt-5.5"]],
+  ]);
+  expect(defaultRouteProbe("gpt-5.5", () => matrix)).toEqual({
+    kind: "routed",
+  });
+});
+
+test("defaultRouteProbe: a wrapped model NO provider serves → no-route carrying the model", () => {
+  const matrix = mkMatrix([
+    ["claude", ["opus"]],
+    ["codex", ["gpt-5.5"]],
+  ]);
+  expect(defaultRouteProbe("grok-9", () => matrix)).toEqual({
+    kind: "no-route",
+    model: "grok-9",
+  });
+});
+
+test("defaultRouteProbe: a malformed matrix (ConfigError) → no-route DEGRADE, never throws", () => {
+  // Producer/daemon posture: a parse fault at probe time degrades to the visible
+  // no-route sticky rather than a fatalExit. `defaultRouteProbe` swallows the
+  // ConfigError; a NON-config error still propagates (a real bug, not degradable).
+  expect(
+    defaultRouteProbe("gpt-5.5", () => {
+      throw new ConfigError("bad matrix.yaml");
+    }),
+  ).toEqual({ kind: "no-route", model: "gpt-5.5" });
+
+  expect(() =>
+    defaultRouteProbe("gpt-5.5", () => {
+      throw new TypeError("not a config error");
+    }),
+  ).toThrow(TypeError);
+});
+
+// ---------------------------------------------------------------------------
+// resolveWorkerCell — the shared probe precedence over a compose
+// ---------------------------------------------------------------------------
+
+test("resolveWorkerCell: a present cell with no shadow → ok, pluginDir threaded (native never routes)", () => {
   const cell = resolveWorkerCell(
     { pluginDir: "/abs/keeper/plugins/plan/workers/opus-max" },
-    { dirExists: () => true, probeShadow: () => null },
+    // A native (composed) cell must NEVER touch the route probe.
+    {
+      dirExists: () => true,
+      probeShadow: () => null,
+      probeRoute: neverProbe.probeRoute,
+    },
   );
   expect(cell).toEqual({
     ok: true,
@@ -76,10 +167,17 @@ test("resolveWorkerCell: a cell-less compose → ok with null pluginDir, probes 
   expect(cell).toEqual({ ok: true, pluginDir: null });
 });
 
-test("resolveWorkerCell: a reject compose → out-of-matrix, probes never touched (invalid wins first)", () => {
+test("resolveWorkerCell: a reject compose + routed probe → out-of-matrix, fs probes never touched", () => {
+  // The route probe IS consulted down the reject arm (that is the wrapped-cell
+  // check); a `routed` verdict leaves the generic out-of-matrix reject standing,
+  // and the filesystem probes stay untouched.
   const cell = resolveWorkerCell(
     { pluginDir: null, reject: "no worker agent for (opus, ludicrous)" },
-    neverProbe,
+    {
+      dirExists: neverProbe.dirExists,
+      probeShadow: neverProbe.probeShadow,
+      probeRoute: routed,
+    },
   );
   expect(cell).toEqual({
     ok: false,
@@ -88,7 +186,22 @@ test("resolveWorkerCell: a reject compose → out-of-matrix, probes never touche
   });
 });
 
-test("resolveWorkerCell: an absent cell manifest → missing, BEFORE the shadow probe", () => {
+test("resolveWorkerCell: a reject compose + no-route probe → no-route carrying the model (ranks ahead)", () => {
+  // A wrapped model claude does not serve lands as an out-of-matrix compose; the
+  // route probe re-classifies it to the more actionable no-route reject, ranked
+  // AHEAD of the generic out-of-matrix. fs probes stay untouched.
+  const cell = resolveWorkerCell(
+    { pluginDir: null, reject: "no worker agent for (gpt-5.5, high)" },
+    {
+      dirExists: neverProbe.dirExists,
+      probeShadow: neverProbe.probeShadow,
+      probeRoute: () => ({ kind: "no-route", model: "gpt-5.5" }),
+    },
+  );
+  expect(cell).toEqual({ ok: false, kind: "no-route", model: "gpt-5.5" });
+});
+
+test("resolveWorkerCell: an absent cell manifest → missing, BEFORE the shadow probe, never routes", () => {
   const cell = resolveWorkerCell(
     { pluginDir: "/abs/cell" },
     {
@@ -96,17 +209,19 @@ test("resolveWorkerCell: an absent cell manifest → missing, BEFORE the shadow 
       probeShadow: () => {
         throw new Error("shadow probe reached after a missing manifest");
       },
+      probeRoute: neverProbe.probeRoute,
     },
   );
   expect(cell).toEqual({ ok: false, kind: "missing", pluginDir: "/abs/cell" });
 });
 
-test("resolveWorkerCell: a shadowing work plugin → shadowed, carrying both paths", () => {
+test("resolveWorkerCell: a shadowing work plugin → shadowed, carrying both paths, never routes", () => {
   const cell = resolveWorkerCell(
     { pluginDir: "/abs/cell" },
     {
       dirExists: () => true,
       probeShadow: () => "/scan/arthack-work/plugin.json",
+      probeRoute: neverProbe.probeRoute,
     },
   );
   expect(cell).toEqual({
@@ -117,18 +232,17 @@ test("resolveWorkerCell: a shadowing work plugin → shadowed, carrying both pat
   });
 });
 
-test("resolveWorkerCell: precedence — a reject outranks a missing manifest AND a shadow", () => {
-  // reject + manifest-absent + shadow-present all true at once → out-of-matrix
-  // (the probes are never consulted).
+test("resolveWorkerCell: precedence — a no-route probe outranks the out-of-matrix message", () => {
+  // reject present + no-route probe → no-route wins; fs probes never consulted.
   const cell = resolveWorkerCell(
     { pluginDir: null, reject: "bad pair" },
     {
       dirExists: () => false,
       probeShadow: () => "/scan/shadow/plugin.json",
+      probeRoute: () => ({ kind: "no-route", model: "gpt-5.5" }),
     },
   );
-  expect(cell.ok).toBe(false);
-  expect(cell).toMatchObject({ kind: "out-of-matrix", message: "bad pair" });
+  expect(cell).toMatchObject({ kind: "no-route", model: "gpt-5.5" });
 });
 
 test("resolveWorkerCell: precedence — a missing manifest outranks a present shadow (shadow unreached)", () => {
@@ -141,6 +255,7 @@ test("resolveWorkerCell: precedence — a missing manifest outranks a present sh
         shadowCalls++;
         return "/scan/shadow/plugin.json";
       },
+      probeRoute: neverProbe.probeRoute,
     },
   );
   expect(cell).toMatchObject({ kind: "missing" });
@@ -148,8 +263,33 @@ test("resolveWorkerCell: precedence — a missing manifest outranks a present sh
 });
 
 // ---------------------------------------------------------------------------
-// Probe cadence — the shadow probe fires lazily; a memoized closure serves once
+// Probe cadence — the route probe fires ONLY down the reject arm; the shadow
+// probe fires lazily; a memoized closure serves once
 // ---------------------------------------------------------------------------
+
+test("resolveWorkerCell: the route probe is reached ONLY down the compose-reject arm (native bypass)", () => {
+  let routeCalls = 0;
+  const probeRoute = (): WorkerCellRoute => {
+    routeCalls++;
+    return { kind: "routed" };
+  };
+  // A present (native) cell and a cell-less compose never route.
+  resolveWorkerCell(
+    { pluginDir: "/abs/cell" },
+    { dirExists: () => true, probeShadow: () => null, probeRoute },
+  );
+  resolveWorkerCell(
+    { pluginDir: null },
+    { dirExists: () => true, probeShadow: () => null, probeRoute },
+  );
+  expect(routeCalls).toBe(0);
+  // A reject compose (a wrapped candidate) reaches it exactly once.
+  resolveWorkerCell(
+    { pluginDir: null, reject: "x" },
+    { dirExists: () => true, probeShadow: () => null, probeRoute },
+  );
+  expect(routeCalls).toBe(1);
+});
 
 test("resolveWorkerCell: the shadow probe is reached ONLY for a present cell with a live manifest", () => {
   let shadowCalls = 0;
@@ -157,20 +297,20 @@ test("resolveWorkerCell: the shadow probe is reached ONLY for a present cell wit
     shadowCalls++;
     return null;
   };
-  // Cell-less and reject compose never reach the probe.
+  // Cell-less and reject compose never reach the shadow probe.
   resolveWorkerCell(
     { pluginDir: null },
-    { dirExists: () => true, probeShadow },
+    { dirExists: () => true, probeShadow, probeRoute: routed },
   );
   resolveWorkerCell(
     { pluginDir: null, reject: "x" },
-    { dirExists: () => true, probeShadow },
+    { dirExists: () => true, probeShadow, probeRoute: routed },
   );
   expect(shadowCalls).toBe(0);
   // A present cell with a live manifest reaches it exactly once.
   resolveWorkerCell(
     { pluginDir: "/abs/cell" },
-    { dirExists: () => true, probeShadow },
+    { dirExists: () => true, probeShadow, probeRoute: neverProbe.probeRoute },
   );
   expect(shadowCalls).toBe(1);
 });
@@ -188,7 +328,11 @@ test("resolveWorkerCell: a memoized shadow closure (producer cadence) scans at m
     }
     return memo;
   };
-  const deps = { dirExists: () => true, probeShadow: memoized };
+  const deps = {
+    dirExists: () => true,
+    probeShadow: memoized,
+    probeRoute: neverProbe.probeRoute,
+  };
   for (let i = 0; i < 5; i++) {
     resolveWorkerCell({ pluginDir: `/abs/cell-${i}` }, deps);
   }
@@ -203,7 +347,11 @@ test("resolveWorkerCell: a fresh probe (dispatch cadence) scans on each call", (
     scanCount++;
     return null;
   };
-  const deps = { dirExists: () => true, probeShadow: fresh };
+  const deps = {
+    dirExists: () => true,
+    probeShadow: fresh,
+    probeRoute: neverProbe.probeRoute,
+  };
   resolveWorkerCell({ pluginDir: "/abs/cell-a" }, deps);
   resolveWorkerCell({ pluginDir: "/abs/cell-b" }, deps);
   expect(scanCount).toBe(2);
@@ -216,7 +364,11 @@ test("resolveWorkerCell: a fresh probe (dispatch cadence) scans on each call", (
 test("resolveWorkerCell: reject results carry machine fields ONLY, no operator prose", () => {
   const missing = resolveWorkerCell(
     { pluginDir: "/abs/cell" },
-    { dirExists: () => false, probeShadow: () => null },
+    {
+      dirExists: () => false,
+      probeShadow: () => null,
+      probeRoute: neverProbe.probeRoute,
+    },
   );
   // The missing reject exposes the raw cell path — NEVER the caller-composed
   // 'regenerate via render-plugin-templates' remediation prose (that stays in
@@ -227,7 +379,11 @@ test("resolveWorkerCell: reject results carry machine fields ONLY, no operator p
 
   const shadowed = resolveWorkerCell(
     { pluginDir: "/abs/cell" },
-    { dirExists: () => true, probeShadow: () => "/scan/w/plugin.json" },
+    {
+      dirExists: () => true,
+      probeShadow: () => "/scan/w/plugin.json",
+      probeRoute: neverProbe.probeRoute,
+    },
   );
   expect(Object.keys(shadowed).sort()).toEqual([
     "kind",
@@ -238,6 +394,20 @@ test("resolveWorkerCell: reject results carry machine fields ONLY, no operator p
   // No 'steal' / 'remove or rename' shadow prose leaks into the machine result.
   expect(JSON.stringify(shadowed)).not.toContain("steal");
   expect(JSON.stringify(shadowed)).not.toContain("rename");
+
+  // The no-route reject carries the capability model ONLY — never the caller's
+  // 'add a provider to matrix.yaml' remediation prose or the file path.
+  const noRoute = resolveWorkerCell(
+    { pluginDir: null, reject: "x" },
+    {
+      dirExists: neverProbe.dirExists,
+      probeShadow: neverProbe.probeShadow,
+      probeRoute: () => ({ kind: "no-route", model: "gpt-5.5" }),
+    },
+  );
+  expect(Object.keys(noRoute).sort()).toEqual(["kind", "model", "ok"]);
+  expect(JSON.stringify(noRoute)).not.toContain("matrix.yaml");
+  expect(JSON.stringify(noRoute)).not.toContain("provider");
 });
 
 test("resolveWorkerCell result is a closed union an assertNever switch can exhaust", () => {
@@ -250,6 +420,8 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     switch (r.kind) {
       case "out-of-matrix":
         return "out-of-matrix";
+      case "no-route":
+        return "no-route";
       case "missing":
         return "missing";
       case "shadowed":
@@ -258,17 +430,22 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
         return ((x: never) => `unreachable:${String(x)}`)(r);
     }
   };
-  const cases: WorkerCellCompose[] = [
-    { pluginDir: "/c" }, // → ok
-    { pluginDir: null }, // → ok (cell-less)
-    { pluginDir: null, reject: "x" }, // → out-of-matrix
+  const okCases: Array<[WorkerCellCompose, WorkerCellRoute]> = [
+    [{ pluginDir: "/c" }, { kind: "routed" }], // → ok
+    [{ pluginDir: null }, { kind: "routed" }], // → ok (cell-less)
+    [{ pluginDir: null, reject: "x" }, { kind: "routed" }], // → out-of-matrix
+    [
+      { pluginDir: null, reject: "x" },
+      { kind: "no-route", model: "m" },
+    ], // → no-route
   ];
-  for (const c of cases) {
+  for (const [c, route] of okCases) {
     kinds.add(
       classify(
         resolveWorkerCell(c, {
           dirExists: () => true,
           probeShadow: () => null,
+          probeRoute: () => route,
         }),
       ),
     );
@@ -277,7 +454,11 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     classify(
       resolveWorkerCell(
         { pluginDir: "/c" },
-        { dirExists: () => false, probeShadow: () => null },
+        {
+          dirExists: () => false,
+          probeShadow: () => null,
+          probeRoute: neverProbe.probeRoute,
+        },
       ),
     ),
   );
@@ -285,11 +466,15 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     classify(
       resolveWorkerCell(
         { pluginDir: "/c" },
-        { dirExists: () => true, probeShadow: () => "/s" },
+        {
+          dirExists: () => true,
+          probeShadow: () => "/s",
+          probeRoute: neverProbe.probeRoute,
+        },
       ),
     ),
   );
   expect(kinds).toEqual(
-    new Set(["ok", "out-of-matrix", "missing", "shadowed"]),
+    new Set(["ok", "out-of-matrix", "no-route", "missing", "shadowed"]),
   );
 });

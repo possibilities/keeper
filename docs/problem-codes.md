@@ -111,6 +111,22 @@ Exit codes (distinct from the shared 0/1/2 core, published in `keeper --help --j
 | 1    | `agent providers check`   | Tool error — the matrix is malformed (ConfigError naming the offense on stderr).                     |
 | 9    | `agent providers check`   | One or more roster/preset/reachability drift findings (an unreachable provider binary, or an auto-generated `<provider>-<model>` preset colliding with a hand-authored one); each finding prints one line. |
 
+## Worker-cell launch rejects (`keeper dispatch`, autopilot)
+
+The launcher-owned worker-cell seam (`src/worker-cell.ts`) rejects a doomed
+`work` launch BEFORE spawning: the autopilot producer mints a sticky
+`DispatchFailed` (cleared by `retry_dispatch`), and manual `keeper dispatch` dies
+non-zero (exit 1) with the same reason. These are launch-time reason tokens
+(carried in the sticky reason / stderr message), NOT shared-envelope codes.
+
+| code                   | emitted by                    | meaning                                                                                                                | recovery                                                                                                              | retry-safe |
+| ---------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `worker-cell-no-route` | autopilot producer, `dispatch` | A WRAPPED cell (a capability model claude does not serve) that the host matrix routes to zero providers, or a malformed `matrix.yaml` at probe time (degraded, never a daemon exit). | Add a provider serving the model to `~/.config/keeper/matrix.yaml` (or fix the matrix), then `keeper retry-dispatch` (autopilot) / re-run (manual). | yes (fix config first) |
+
+Distinct from the run-time `no_route` the `agent providers resolve` verb emits
+(above): that is a read-time doctor verdict, this is a launch-time dispatch
+reject that parks the task.
+
 ## Plan family (`keeper plan` accumulate-all failures)
 
 `plugins/plan/src/emit.ts::emitFailureEnvelope` prints
