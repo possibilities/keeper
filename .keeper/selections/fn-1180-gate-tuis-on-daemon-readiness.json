@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant in the shared subscribe client every viewer rides \u2014 the headerless-result latch clear couples to the server's memo-bypass invariant and a timer-lifecycle backstop where a wrong abstraction propagates past the task.",
+      "task_id": "fn-1180-gate-tuis-on-daemon-readiness.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical, fully-specified envelope addition (tri-state field with null default, two distinct version-constant bumps) with no design choice left open, so the default workhorse at a bounded single-surface band suffices.",
+      "task_id": "fn-1180-gate-tuis-on-daemon-readiness.2",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.75,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting cascade across the shared view-shell plus five TUIs with subtle interacting-timer and monotonic-clamp correctness (disconnect grace vs banner-flash, hold-without-paint) where a wrong abstraction propagates widely.",
+      "task_id": "fn-1180-gate-tuis-on-daemon-readiness.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Multi-file work mirroring task 3's now-established gate pattern onto two isolated surfaces with a prescribed two-stream latch and pure-view-model seam, well-specified with no named intelligence-bound reason to escalate.",
+      "task_id": "fn-1180-gate-tuis-on-daemon-readiness.4",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T23:59:49.878000Z",
+  "epic_id": "fn-1180-gate-tuis-on-daemon-readiness",
+  "input_hash": "7c3691284e10f1adffd8541e3eaeb5b5a68bfba21bf40c81a5ad506d14c1ef06",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2083950888,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1180-gate-tuis-on-daemon-readiness.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1180-gate-tuis-on-daemon-readiness.2\",\"tier\":\"medium\",\"model\":\"sonnet\"},{\"task_id\":\"fn-1180-gate-tuis-on-daemon-readiness.3\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1180-gate-tuis-on-daemon-readiness.4\",\"tier\":\"high\",\"model\":\"sonnet\"}]}"
+}
