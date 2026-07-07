@@ -452,6 +452,55 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.needs_human.instant_death_wall).toBe(0);
   });
 
+  test("the whole needs_human block is byte-identical off the shared projector (fields + order)", () => {
+    // A mixed board: 2 dead letters, 1 block escalation, 1 parked question, and
+    // 4 sticky rows — one finalize-non-ff subset + two breaker subsets + one
+    // plain merge-conflict. Hand-computed: stuck=4, finalize_non_ff=1,
+    // instant_death_wall=2, parked=1, total = 2+1+4+1 = 8 (subsets never added).
+    const snap = makeSnap({
+      epics: [
+        {
+          epic_id: "fn-9-x",
+          status: "open",
+          tasks: [],
+          question: "does the evidence check out?",
+        },
+      ],
+      perEpic: { "fn-9-x": { tag: "blocked", reason: { kind: "unknown" } } },
+      deadLetters: 2,
+      blockEscalations: 1,
+    });
+    const failures: Row[] = [
+      {
+        verb: "close",
+        id: "worktree-finalize:fn-9-x-h1",
+        reason: "worktree-finalize-non-fast-forward",
+      },
+      { verb: "work", id: "fn-9-x.1", reason: "instant-death-breaker" },
+      { verb: "work", id: "fn-9-x.2", reason: "instant-death-breaker" },
+      { verb: "close", id: "fn-9-x", reason: "worktree-merge-conflict" },
+    ];
+    const d = buildStatusEnvelope(snap, BOOT, failures).data;
+    expect(Object.keys(d?.needs_human ?? {})).toEqual([
+      "dead_letters",
+      "block_escalations",
+      "stuck_dispatches",
+      "finalize_non_ff",
+      "parked_questions",
+      "instant_death_wall",
+      "total",
+    ]);
+    expect(d?.needs_human).toEqual({
+      dead_letters: 2,
+      block_escalations: 1,
+      stuck_dispatches: 4,
+      finalize_non_ff: 1,
+      parked_questions: 1,
+      instant_death_wall: 2,
+      total: 8,
+    });
+  });
+
   test("in-flight counts pending dispatches + working jobs", () => {
     const snap = makeSnap({
       pendingDispatches: 2,

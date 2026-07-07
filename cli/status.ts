@@ -30,11 +30,11 @@
 
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
-import { INSTANT_DEATH_BREAKER_REASON } from "../src/dispatch-failure-key";
 import {
   classifyDispatchFailure,
   resolveFailureTarget,
 } from "../src/dispatch-failure-pill";
+import { projectNeedsHuman } from "../src/needs-human";
 import type { BootStatus, Row } from "../src/protocol";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
@@ -65,25 +65,11 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
 export const STATUS_SCHEMA_VERSION = 5;
 
 /**
- * Board-wide quota-wall threshold: at or above this many distinct
- * instant-death-breaker stickies (distinct `(verb, id)` keys that each tripped
- * the per-key breaker), the `needs_human.instant_death_wall` count is the likely
- * SESSION/QUOTA-WALL signal — repeated instant worker deaths across MULTIPLE keys
- * in a window, not one flaky task. Signal only (the per-key breakers already stop
- * each key's burn); resume with `keeper autopilot retry <key>` after the limit
- * resets. A single sticky (below this) is the per-key breaker doing its job.
- */
-export const INSTANT_DEATH_WALL_KEYS = 2;
-
-/**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
  * rather than reconnect forever when the daemon is down; `--connect-timeout`
  * overrides it.
  */
 export const DEFAULT_CONNECT_DEADLINE_MS = 10_000;
-
-/** The `dispatch_failures.reason` that needs an operator to reconcile origin. */
-const FINALIZE_NON_FF_REASON = "worktree-finalize-non-fast-forward";
 
 export const HELP = `keeper status — one-shot unified board + autopilot JSON read
 
@@ -331,27 +317,21 @@ export function buildStatusEnvelope(
   const pendingDispatches = snap.pendingDispatches.length;
   const inFlightTotal = pendingDispatches + runningJobs;
 
-  const stuckDispatches = dispatchFailures.length;
-  const finalizeNonFf = dispatchFailures.filter(
-    (r) => r.reason === FINALIZE_NON_FF_REASON,
-  ).length;
-  // Per-key instant-death-breaker stickies (each row is a distinct `(verb, id)`
-  // — the projection PK). A board-wide burst (>= INSTANT_DEATH_WALL_KEYS) is the
-  // likely session/quota wall. Subset of stuck_dispatches, never double-counted.
-  const instantDeathWall = dispatchFailures.filter(
-    (r) => r.reason === INSTANT_DEATH_BREAKER_REASON,
-  ).length;
-  const deadLetters = snap.deadLetters.length;
-  const blockEscalations = snap.blockEscalations.length;
-  // Epics carrying a parked-closer question — a needs-human signal distinct
-  // from the dispatch-failure family (mints no `dispatch_failures` row).
-  const parkedQuestions = snap.epics.filter(
-    (e) => (e.question ?? null) !== null,
-  ).length;
-  // `finalize_non_ff` is a SUBSET of `stuck_dispatches` — surfaced separately,
-  // never double-counted into the total.
-  const needsHumanTotal =
-    deadLetters + blockEscalations + stuckDispatches + parkedQuestions;
+  // The whole needs-human classification derives from the ONE shared projector
+  // (ADR 0011): broad stuck count, the finalize-non-ff / instant-death-wall
+  // subsets (surfaced separately, never double-counted), and the umbrella total.
+  // Parked-closer questions are a needs-human family that mints no
+  // `dispatch_failures` row, so they feed the projector by epic id directly.
+  const needsHuman = projectNeedsHuman({
+    dispatchFailures,
+    deadLetters: snap.deadLetters.length,
+    blockEscalations: snap.blockEscalations.length,
+    parkedQuestionEpicIds: snap.epics
+      .filter((e) => (e.question ?? null) !== null)
+      .map((e) => e.epic_id),
+    epicIds,
+  }).counts;
+  const needsHumanTotal = needsHuman.total;
 
   // At rest: nothing the autopilot could dispatch right now (no ready/running
   // epic header, no in-flight launch). `jammed` vs `drained` splits on whether
@@ -386,13 +366,13 @@ export function buildStatusEnvelope(
       total: inFlightTotal,
     },
     needs_human: {
-      dead_letters: deadLetters,
-      block_escalations: blockEscalations,
-      stuck_dispatches: stuckDispatches,
-      finalize_non_ff: finalizeNonFf,
-      parked_questions: parkedQuestions,
-      instant_death_wall: instantDeathWall,
-      total: needsHumanTotal,
+      dead_letters: needsHuman.deadLetters,
+      block_escalations: needsHuman.blockEscalations,
+      stuck_dispatches: needsHuman.stuckDispatches,
+      finalize_non_ff: needsHuman.finalizeNonFf,
+      parked_questions: needsHuman.parkedQuestions,
+      instant_death_wall: needsHuman.instantDeathWall,
+      total: needsHuman.total,
     },
     rev: boot.rev,
     catching_up: boot.catching_up,
