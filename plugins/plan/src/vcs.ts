@@ -40,6 +40,16 @@ export interface GitResult {
   stderr: string;
 }
 
+/** One `git show --numstat` row for a commit: the changed path plus its added /
+ * deleted line counts. A binary file (numstat `-`/`-`) folds to zero lines but
+ * still contributes one changed path. The selection-audit brief aggregates these
+ * across a task's source commits into its diff-stat signal. */
+export interface NumstatRow {
+  path: string;
+  insertions: number;
+  deletions: number;
+}
+
 /** The git operations plan-state persistence performs. A real implementation
  * shells `git`; the test fake records commits + snapshot-diffs the data dir. */
 export interface PlanVcs {
@@ -118,6 +128,13 @@ export interface PlanVcs {
    * THROWS on an unexpected git failure (the caller fails closed to
    * tooling_error). */
   sourceCommitShas(taskId: string, repo: string): string[];
+
+  /** The per-file `git show --numstat` rows for commit `sha` in `repo` — one row
+   * per changed path with its added / deleted line counts (binary `-` folds to
+   * 0). [] on any failure / a missing sha (a clean read of nothing, never a
+   * throw). The selection-audit brief consumes this to derive per-task diff
+   * stats from the Task-trailer source commits. */
+  commitNumstat(sha: string, repo: string): NumstatRow[];
 
   /** The committed `HEAD:<dataDir>/tasks/<taskId>.json` parsed object for the
    * FIRST data dir under which it resolves, or null when the path is absent from
@@ -361,6 +378,37 @@ export const realGitVcs: PlanVcs = {
       }
     }
     return shas;
+  },
+
+  commitNumstat(sha, repo): NumstatRow[] {
+    // `--format=` suppresses the commit header so stdout is numstat rows only;
+    // each row is `<added>\t<deleted>\t<path>` (binary files show `-`/`-`).
+    const proc = runReadGit(["show", "--numstat", "--format=", sha], repo);
+    if (proc.exitCode !== 0) {
+      return [];
+    }
+    const rows: NumstatRow[] = [];
+    for (const line of proc.stdout.split("\n")) {
+      if (line.trim() === "") {
+        continue;
+      }
+      const parts = line.split("\t");
+      if (parts.length < 3) {
+        continue;
+      }
+      const addRaw = parts[0] as string;
+      const delRaw = parts[1] as string;
+      const path = parts.slice(2).join("\t");
+      if (path === "") {
+        continue;
+      }
+      rows.push({
+        path,
+        insertions: addRaw === "-" ? 0 : Number.parseInt(addRaw, 10) || 0,
+        deletions: delRaw === "-" ? 0 : Number.parseInt(delRaw, 10) || 0,
+      });
+    }
+    return rows;
   },
 
   committedTaskJson(stateRepo, taskId, dataDirNames) {

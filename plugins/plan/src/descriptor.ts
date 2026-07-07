@@ -539,6 +539,19 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
     ],
   },
   {
+    name: "selection-audit-brief",
+    summary: "Write the close-time selection-audit brief for an epic.",
+    args: [{ name: "EPIC_ID" }],
+    options: [
+      OPT_PROJECT,
+      {
+        name: "--force",
+        takesValue: false,
+        summary: "Re-assemble despite an existing committed review",
+      },
+    ],
+  },
+  {
     name: "selection-brief",
     summary: "Write the model/effort selector brief for an epic.",
     args: [{ name: "EPIC_ID" }],
@@ -550,6 +563,44 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
         summary:
           "Brief the stored follow-up document instead of live todo tasks",
       },
+    ],
+  },
+  {
+    name: "selection-review",
+    summary:
+      "Set or clear an epic-level selection-review record (board-visible).",
+    args: [{ name: "EPIC_ID" }],
+    options: [
+      {
+        name: "--set",
+        takesValue: true,
+        summary: "Store the review payload (a small JSON verdict summary)",
+      },
+      {
+        name: "--clear",
+        takesValue: false,
+        summary: "Clear the selection-review record",
+      },
+      OPT_PROJECT,
+    ],
+  },
+  {
+    name: "selection-review-submit",
+    summary:
+      "Validate the auditor verdict + land the committed selection-review dataset.",
+    args: [{ name: "EPIC_ID" }],
+    options: [
+      {
+        name: "--file",
+        takesValue: true,
+        summary: "Verdict JSON path (`-` for stdin)",
+      },
+      {
+        name: "--force",
+        takesValue: false,
+        summary: "Overwrite an existing committed review",
+      },
+      OPT_PROJECT,
     ],
   },
   {

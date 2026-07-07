@@ -155,3 +155,27 @@ the input is always safe.
 | `repo_invalid`       | The repo path is not a valid git repo root.                 | Correct the repo path and re-run.                                         |
 | `missing_session_id` | No session id is available for a mutating verb.             | Ensure the invocation carries a session id and re-run.                    |
 | *(unlisted)*         | Any other accumulate-all failure code.                       | Fix the reported problems in the input and re-run; `details` lists them.   |
+
+### Selection-review verbs (`selection-audit-brief`, `selection-review-submit`)
+
+The close-time selection-review pipeline (ADR 0011) rejects with the same
+converged `{code, message, details}` error sub-object, but each verb fails on
+its own first-found fault — never an accumulated bucket — and neither one
+emits a `recovery` key. Both are commit-free preflights until a clean submit;
+a reject leaves no brief, no review file, and no board flag.
+
+| code              | emitted by                                     | meaning                                                                                                                                                    | recovery                                                                                       |
+| ----------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `REVIEW_EXISTS`   | `selection-audit-brief`, `selection-review-submit` | A committed selection-review dataset already exists for the epic — the write-once guard refusing to race a second verdict set onto it.                        | Pass `--force` to re-assemble the brief or re-submit despite the existing review, or leave the epic's dataset as-is. |
+| `VERDICT_INVALID` | `selection-review-submit`                       | The verdict payload is not valid JSON, is not a `{verdicts: [...]}` mapping, or fails shape/coverage validation (missing, extra, or duplicate task id; a non-enum `verdict`; empty `evidence`). | Fix every issue listed in `error.details.errors` and resubmit.                                   |
+| `BRIEF_MISSING`   | `selection-review-submit`                       | No selection-audit brief exists yet for this epic.                                                                                                            | Run `keeper plan selection-audit-brief <epic_id>` first, then resubmit the verdict.               |
+| `BRIEF_CORRUPT`   | `selection-review-submit`                       | The audit brief is unreadable, or its `schema_version` is newer than this `keeper plan` build understands.                                                    | Re-run `selection-audit-brief` to regenerate it, or upgrade `keeper plan`.                        |
+| `SIDECAR_MISSING` | `selection-audit-brief`                         | The epic never ran through the post-scaffold cell selector (`assign-cells`), so there are no graded `{tier, model}` cells to audit.                            | Run cell selection for the epic before auditing; an epic with no selection sidecar has nothing to grade. |
+
+`keeper plan selection-review <epic_id> --set|--clear` (the board-flag
+set/clear verb) rejects a malformed invocation — neither or both of
+`--set`/`--clear`, an empty `--set` payload, invalid JSON, or a payload over
+the length cap — with a plain `{"success": false, "error": "<message>"}`
+string, exit 1. Like the sibling `epic-question` verb, it never emits a coded
+`error.code`; an agent branches on the message text or simply avoids the
+malformed invocation.

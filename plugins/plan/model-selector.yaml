@@ -23,15 +23,30 @@ selector:
 
 # How the selector weighs the two axes, and its default-when-uncertain rule.
 usage: |
-  Choose an {effort, model} cell per task from the two axes below. The effort
-  axis carries most of the signal: match the effort band to the task's true
-  difficulty (its acceptance shape and blast radius), not its line count. The
-  model axis is a capability floor — pick the model whose guidance fits, and
-  route a task DOWN to a cheaper model only when the work is genuinely mechanical
-  and that model exists on the axis. Weigh model first (can this tier do it at
-  all?), then effort (how hard should it think?). When uncertain on either axis,
-  pick UP: the higher-capability model and xhigh effort. A wrong routing-up costs
-  tokens; a wrong routing-down costs a failed task.
+  Choose an {effort, model} cell per task from the two axes below, weighing model
+  first (which tier can do the work at all?) then effort (how hard should it
+  think?) — they are independent axes. The effort axis carries most of the signal:
+  match the band to the task's true difficulty (its acceptance shape and blast
+  radius), never its line count. On the model axis the binding `hand_tuned` policy
+  governs: sonnet is the default implementation workhorse and opus is the
+  exception, chosen only on a concrete, nameable intelligence-bound reason. When
+  uncertain on the model axis, resolve DOWN to sonnet absent such a reason; when
+  uncertain on the effort axis for mechanical work, resolve to the lower band.
+
+# HUMAN-OWNED binding routing policy — the highest-precedence tie-break, carried
+# verbatim in every selector brief. NOT authored or refreshed by the
+# model-guidance research pass; a human hand-tunes it. Capability-shaped only.
+hand_tuned: |
+  The burden of proof is on opus. Choose opus ONLY on a concrete, nameable
+  intelligence-bound reason: a novel algorithm or design, a cross-cutting
+  multi-file architectural cascade, a subtle correctness or security invariant, or
+  long-horizon planning. On a tie, or absent such a reason, choose sonnet — the
+  default implementation workhorse. Security- or correctness-critical work is a
+  hard opus gate that overrides the sonnet-first default regardless of size.
+  Mechanical or templated work takes sonnet at low or medium effort. Anti-anchor
+  clause: spec length and difficulty adjectives are not difficulty — a short spec
+  can be intelligence-bound and a long spec mechanical. Model and effort are
+  independent axes: cranking sonnet's effort is not an opus substitute.
 
 # Provenance for the efforts guidance blocks as a whole — the effort axis has no
 # per-value research cache, so one review stamp covers the set. OPTIONAL and
@@ -49,23 +64,24 @@ efforts:
   low: |
     Tiny, reversible, near-mechanical edits where the acceptance leaves no
     design choice: text/config polish, one obvious assertion, a trivial rename.
-    Cheapest and fastest band; the worker scopes strictly to what was asked, so
-    anything needing investigation or multi-step reasoning under-thinks here.
+    The fastest, most literal band; the worker scopes strictly to what was asked,
+    so anything needing investigation or multi-step reasoning under-thinks here.
   medium: |
     Bounded single-surface work with a "do exactly this" acceptance: one-file
-    edits, mechanical refactors, straight test additions. The cost-saving step
-    down from high. Risk is under-thinking when the task hides cross-module
-    reasoning — route up rather than prompt around it.
+    edits, mechanical refactors, straight test additions. The step down from high
+    in thinking depth. Risk is under-thinking when the task hides cross-module
+    reasoning — prefer a higher band rather than prompt around it.
   high: |
     The model-default band and the usual sweet spot: multi-file features in a
     known pattern, typical bug fixes with the root cause named, obvious in-repo
-    template-following. Balances depth against token spend; pick it when the
+    template-following. Balances depth against over-thinking; pick it when the
     path is clear but execution spans a few files.
   xhigh: |
     The band for hard coding and agentic work: multi-step refactors, new-pattern
     introduction, contract-touching changes (RPC, schema, public API, wire
-    format) — anywhere a wrong abstraction propagates past the task. The default
-    when in doubt: the highest band that is not reserved.
+    format) — anywhere a wrong abstraction propagates past the task. Reserve it
+    for genuinely hard or contract-shaped work, never a generic caution upgrade
+    over high.
   max: |
     Reserved ceiling: gnarly debugging with no clear hypothesis, evals, or
     security-shaped review — where deeper reasoning measurably lifts quality.
@@ -81,25 +97,25 @@ efforts:
 # selector. Raw research stays in references/, never in this prompt-sized block.
 models:
   opus: |
-    The strongest widely released Opus-tier model and keeper's highest-capability
-    worker tier. Strengths: long-horizon autonomous execution, contract-shaped
-    reasoning where a wrong abstraction propagates, and strong bug-finding that
-    tells a flake from a real failure. Weaknesses: under-reaches for subagents /
-    memory / search / custom tools unless the prompt names when to use them, and
-    narrates and deliberates more than the prior generation. When to pick: the
-    default for anything intelligence-sensitive; route away only for genuinely
-    mechanical work when a cheaper tier exists on the axis. When uncertain, keep
-    opus.
+    keeper's highest-capability worker tier — the exception, not the default.
+    Strengths: long-horizon autonomous execution, contract-shaped reasoning where
+    a wrong abstraction propagates, novel algorithm and design work, subtle
+    correctness and security invariants, and strong bug-finding that tells a flake
+    from a real failure. Weaknesses: under-reaches for subagents / memory / search
+    / custom tools unless the prompt names when to use them, and narrates and
+    deliberates more than the prior generation. When to pick: only on a concrete,
+    nameable intelligence-bound reason per the hand_tuned policy — otherwise
+    sonnet.
   sonnet: |
-    Balanced Claude tier: near-opus quality on bounded coding and agentic work
-    at a fraction of the cost and latency, with every effort band available.
-    Strengths: routine implementation, template-following, mechanical refactors,
-    targeted tests, and fixes with a named surface; follows a tightly-scoped
-    spec literally and precisely. Weaknesses: that literalism means an
-    under-specified task fails harder here — less margin than opus on ambiguous
-    design, contract/schema/wire work, cross-repo changes, migrations, and
-    gnarly debugging. When to pick: bounded, well-specified, low-blast-radius
-    work; keep opus for intelligence-sensitive tasks or any uncertainty.
+    The default implementation workhorse: near-top-tier quality on bounded coding
+    and agentic work, with every effort band available. Strengths: routine
+    implementation, template-following, mechanical refactors, targeted tests, and
+    fixes with a named surface; follows a tightly-scoped spec literally and
+    precisely. Weaknesses: that literalism means an under-specified task fails
+    harder here — less margin than opus on ambiguous design, contract/schema/wire
+    work, cross-repo changes, migrations, and gnarly debugging. When to pick: the
+    default for well-specified implementation work; escalate to opus only for a
+    named intelligence-bound reason per the hand_tuned policy.
   gpt-5.5: |
     A high-capability generalist coding model with broad current knowledge and
     strong multi-step reasoning. Strengths: from-scratch implementation against a

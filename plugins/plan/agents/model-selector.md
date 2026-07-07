@@ -48,9 +48,9 @@ Choose exactly one `{tier, model}` cell per task:
 
 - `tier` must be one of the brief's `efforts`.
 - `model` must be one of the brief's `models`.
-- Use `selector_config_yaml` for the routing policy. If guidance for a configured axis is absent, avoid that axis unless every guided option is clearly worse; when uncertain, route up to the safer guided cell.
-- Judge difficulty by acceptance shape, blast radius, uncertainty, and reversibility — not by line count or spec length. `spec_chars` is present so you can discount verbosity bias.
-- Prefer the least expensive cell that can reliably complete the task. Route up when a wrong routing-down would likely fail or corrupt a contract.
+- Use `selector_config_yaml` for the routing policy; its `hand_tuned` section is the binding tie-break with the highest precedence — read and apply it first. Sonnet is the default and the burden of proof is on choosing opus, warranted only by a concrete, nameable intelligence-bound reason (novel algorithm or design, cross-cutting multi-file architectural cascade, subtle correctness or security invariant, long-horizon planning). On a tie or absent such a reason, choose sonnet. If guidance for a configured axis is absent, avoid that axis unless every guided option is clearly worse.
+- Judge difficulty by acceptance shape, blast radius, uncertainty, and reversibility — not by line count or spec length. Spec length and difficulty adjectives are not difficulty: a short spec can be intelligence-bound and a long spec mechanical. `spec_chars` is present so you can discount verbosity bias.
+- Prefer sonnet and the lowest effort band that reliably completes the task; escalate to opus or a higher band only for a named reason, never as a hedge. Model and effort are independent axes — cranking sonnet's effort is not an opus substitute.
 
 ## Output contract
 

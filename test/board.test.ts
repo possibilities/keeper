@@ -51,6 +51,7 @@ import {
   renderDispatchFailurePill,
   renderTaskCellPills,
   renderTaskPills,
+  selectionReviewLines,
   startedPill,
   subagentLinesFor,
   validatedPill,
@@ -137,6 +138,7 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     question: null,
+    selection_review: null,
     ...overrides,
   };
 }
@@ -1814,6 +1816,42 @@ test("needsHumanLines — trims a reason first line past 120 chars with an ellip
   const [, line] = needsHumanLines([{ locator: "/repo", reason: long }]);
   // 119 chars kept + a single ellipsis after the ` — ` separator.
   expect(line).toBe(`  shared-dirty · /repo — ${long.slice(0, 119)}…`);
+});
+
+test("selectionReviewLines — no flagged epics renders no block", () => {
+  expect(selectionReviewLines([])).toEqual([]);
+  // A null-flag entry (cleared) is filtered out — no block.
+  expect(
+    selectionReviewLines([{ epic_id: "fn-1-a", selection_review: null }]),
+  ).toEqual([]);
+});
+
+test("selectionReviewLines — renders a flagged CLOSED epic with verdict counts + clear-verb hint (ADR 0011)", () => {
+  // The narrow read carries this epic regardless of status, so a plan-closed
+  // epic that has left the open board still renders its selection-review line.
+  const lines = selectionReviewLines([
+    {
+      epic_id: "fn-9-closed",
+      selection_review:
+        '{"counts":{"underpowered":1,"right_sized":3,"overpowered":0},"reviewed_at":"2026-07-07T00:00:00Z"}',
+    },
+  ]);
+  expect(lines).toEqual([
+    "selection review (1)",
+    "  fn-9-closed — underpowered:1 right_sized:3 overpowered:0 · keeper plan selection-review fn-9-closed --clear",
+  ]);
+});
+
+test("selectionReviewLines — sorts by epic id and degrades an unparseable blob to ?", () => {
+  const lines = selectionReviewLines([
+    { epic_id: "fn-9-z", selection_review: '{"counts":{"overpowered":2}}' },
+    { epic_id: "fn-1-a", selection_review: "not json" },
+  ]);
+  expect(lines).toEqual([
+    "selection review (2)",
+    "  fn-1-a — ? · keeper plan selection-review fn-1-a --clear",
+    "  fn-9-z — overpowered:2 · keeper plan selection-review fn-9-z --clear",
+  ]);
 });
 
 test("orphanedFailureRows — surfaces a close failure whose plan-closed epic left the board", () => {

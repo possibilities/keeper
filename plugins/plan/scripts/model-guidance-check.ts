@@ -46,6 +46,9 @@ export interface EffortsProvenance {
 export interface ModelSelectorConfig {
   readonly selector: { harness: string; model: string };
   readonly usage: string;
+  /** Human-owned binding routing policy carried verbatim in every selector
+   * brief. Retained through coercion so a silent drop can never pass the gate. */
+  readonly hand_tuned: string;
   readonly efforts: Record<string, string>;
   readonly models: Record<string, string>;
   readonly research: Record<string, ResearchEntry>;
@@ -142,6 +145,7 @@ export function coerceModelSelectorConfig(
       model: asString(selector.model, "selector.model"),
     },
     usage: asString(doc.usage, "usage"),
+    hand_tuned: asString(doc.hand_tuned, "hand_tuned"),
     efforts: asStringRecord(doc.efforts, "efforts"),
     models: asStringRecord(doc.models, "models"),
     research,

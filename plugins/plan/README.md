@@ -49,7 +49,7 @@ Top-level commands:
 - `claim`, `resolve-task`, `reconcile`, `find-task-commit`, `done`, `block`, `unblock`, `epic-question`, `ready`
 - `close-preflight`, `audit submit`, `verdict submit`, `followup submit`, `close-finalize`
 - `show`, `epics`, `tasks`, `list`, `cat`
-- `mv-repo`, `selection-brief`, `assign-cells`
+- `mv-repo`, `selection-brief`, `selection-audit-brief`, `selection-review`, `selection-review-submit`, `assign-cells`
 - `epic`, `task`, `dep`
 
 The board verb `unblock` (flips a task `blocked → todo`, preserving claim history) is distinct from the `/plan:unblock` escalation SKILL: autopilot dispatches the skill as an `unblock::<task>` session to resolve a blocked task autonomously, and that session may CALL the `unblock` board verb as one of its actions. Both escalation skills (`/plan:unblock`, `/plan:deconflict`) load their incident context from the keeper-core `keeper escalation-brief <verb>::<id>` command — NOT a `keeper plan` verb — which resolves the incident details, the transcript pointers, and the creator lineage, walking a closer creator back to the original creator with session ids and transcript paths for both.
@@ -87,10 +87,12 @@ All data lives in `.keeper/` inside the project directory:
   specs/{task-id}.md
   tasks/{task-id}.json
   selections/{epic-id}.json # committed model+effort selection sidecars (assign-cells)
+  selection-reviews/{epic-id}.json # committed close-time selection-review dataset (selection-review-submit)
   state/                    # gitignored -- ephemeral runtime data
     tasks/{task-id}.state.json    # task runtime status
     epics/{epic-id}.state.json    # epic runtime sidecar
     selections/{epic-id}/brief.json # selector brief handoff (selection-brief)
+    selections/{epic-id}/audit-brief.json # close-time selection audit brief (selection-audit-brief)
     locks/{task-id}.lock
 ```
 
@@ -166,6 +168,14 @@ A host matrix is an ordered provider roster (cost-ascending — the pecking orde
 The preset catalog auto-generates one `<provider>-<model>` preset per roster pair (e.g. `codex-gpt-5.5`) in memory at load, colliding fail-loud with a hand-authored preset. Inspect routing with `keeper agent providers check` and `keeper agent providers resolve <model> <effort>` (the latter emits the driver plus the cost-ordered candidate list).
 
 The post-scaffold **model selector** (`plan:model-selector`, fed by `keeper plan selection-brief`) assigns each todo task's `{tier, model}` cell — wrapped capability models included — from the configured axes, batch-written by `assign-cells`. `/plan:model-guidance` authors the per-axis-value guidance the selector reads; every roster model needs a guidance block, enforced fail-loud by the drift gate.
+
+On the model axis the selector's binding tie-break is a human-owned, hand-tuned policy — `model-selector.yaml`'s `hand_tuned` block, carried verbatim in every selector brief and never touched by `/plan:model-guidance`'s research pass (which only refreshes the guidance around it). The burden of proof is on opus: sonnet is the default implementation workhorse, and opus is chosen only on a concrete, nameable intelligence-bound reason (a novel algorithm or design, a cross-cutting multi-file architectural cascade, a subtle correctness or security invariant, long-horizon planning) or a hard security/correctness gate. On a tie, or absent such a reason, the model axis resolves down to sonnet; mechanical or templated work likewise biases the effort axis toward the lower bands. Edit `hand_tuned` directly to retune the policy — it is cheap-to-change config (ADR 0010), not code.
+
+## Close-time selection review
+
+`/plan:close` closes the loop on the selector's picks with a close-time selection review — an audit beat that runs inline, before the irreversible `epic close`, and can never delay or block it (any audit failure mode degrades silently). `keeper plan selection-audit-brief <epic_id>` assembles the graded context for each genuinely selected-and-executed task cell (spec, assigned `{tier, model}`, selection rationale, per-task diff stats, done summary) for the content-blind `plan:selection-auditor` subagent, which grades each cell a coarse `underpowered` / `right_sized` / `overpowered` and hands its raw verdict to `keeper plan selection-review-submit <epic_id> --file <verdict.json>`.
+
+`selection-review-submit` validates the verdict (exact coverage of the auditable task set, a non-empty evidence sentence per verdict) and, on success, writes the committed per-epic dataset at `.keeper/selection-reviews/<epic_id>.json` — write-once per epic, `--force` to re-assemble. Each verdict snapshots the graded `{tier, model}` cell plus the selection run's config/input hashes, so the row still joins to the selection sidecar across a future re-select. A fully right-sized epic writes the dataset silently; any non-right-sized verdict also raises a clearable, **display-only** needs-human flag — surfaced at `keeper status | jq .data.needs_human.selection_reviews`, contributing zero to `total` and `jammed`, and it survives the epic's close. `keeper plan selection-review <epic_id> --clear` is the one way to clear it (the same verb also sets the board overlay; passing neither or both of `--set`/`--clear` is a plain usage rejection, not a coded `error.code`).
 
 ## Planning Skills
 

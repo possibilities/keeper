@@ -25,6 +25,7 @@ import {
   DONE_EPICS_REAP_WINDOW_SEC,
   EPICS_DESCRIPTOR,
   EPICS_RECENT_DONE_DESCRIPTOR,
+  EPICS_SELECTION_REVIEW_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
@@ -84,13 +85,14 @@ function seedEpic(
     depends_on_epics: string;
     jobs: string;
     job_links: string;
+    selection_review: string | null;
   }> = {},
 ): void {
   // The default board order is `epic_number ASC` (tie-break `epic_id`); the
   // seeded `epic_number` is what makes that order deterministic.
   db.query(
-    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, selection_review)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     epic_id,
     opts.epic_number ?? null,
@@ -103,6 +105,7 @@ function seedEpic(
     opts.depends_on_epics ?? "[]",
     opts.jobs ?? "[]",
     opts.job_links ?? "[]",
+    opts.selection_review ?? null,
   );
 }
 
@@ -1013,6 +1016,61 @@ test("runQuery on epics_recent_done: in-window done rows included, stale exclude
     "fn-2-boundary",
   ]);
   expect(res.total).toBe(2);
+  db.close();
+});
+
+test("getCollection resolves the epics_selection_review collection (ADR 0011)", () => {
+  expect(getCollection("epics_selection_review")).toBe(
+    EPICS_SELECTION_REVIEW_DESCRIPTOR,
+  );
+});
+
+test("epics_selection_review mirrors EPICS_DESCRIPTOR's row shape and scopes to non-null selection_review (NOT default_visible)", () => {
+  expect(EPICS_SELECTION_REVIEW_DESCRIPTOR.table).toBe("epics");
+  expect(EPICS_SELECTION_REVIEW_DESCRIPTOR.columns).toEqual(
+    EPICS_DESCRIPTOR.columns,
+  );
+  expect(EPICS_SELECTION_REVIEW_DESCRIPTOR.pk).toBe(EPICS_DESCRIPTOR.pk);
+  expect(EPICS_SELECTION_REVIEW_DESCRIPTOR.jsonColumns).toBe(
+    EPICS_DESCRIPTOR.jsonColumns,
+  );
+  // Scope is the flag predicate, ANY status — NOT the open-only `default_visible
+  // = 1` (which would drop a flagged CLOSED epic) and NO recency window.
+  expect(EPICS_SELECTION_REVIEW_DESCRIPTOR.defaultClause).toEqual({
+    sql: "selection_review IS NOT NULL",
+    params: [],
+  });
+  expect(EPICS_SELECTION_REVIEW_DESCRIPTOR.recencyBound).toBeUndefined();
+});
+
+test("runQuery on epics_selection_review: a flagged epic of ANY status is served, an unflagged one is not (closed-epic visibility)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const flag = '{"counts":{"underpowered":1}}';
+  // An OPEN flagged epic, a CLOSED (done) flagged epic — both must appear
+  // (the review outlives the close) — and two unflagged epics that must not.
+  seedEpic(db, "fn-1-open-flagged", {
+    epic_number: 1,
+    status: "open",
+    selection_review: flag,
+  });
+  seedEpic(db, "fn-2-done-flagged", {
+    epic_number: 2,
+    status: "done",
+    selection_review: flag,
+  });
+  seedEpic(db, "fn-3-open-clean", { epic_number: 3, status: "open" });
+  seedEpic(db, "fn-4-done-clean", { epic_number: 4, status: "done" });
+  const res = asResult(
+    runQuery(db, 0, {
+      type: "query",
+      collection: "epics_selection_review",
+    }),
+  );
+  expect(res.rows.map((r) => String(r.epic_id)).sort()).toEqual([
+    "fn-1-open-flagged",
+    "fn-2-done-flagged",
+  ]);
+  expect(res.rows.map((r) => String(r.selection_review))).toEqual([flag, flag]);
   db.close();
 });
 

@@ -14,6 +14,11 @@ this skill is how it gets authored and kept honest. The `selection-brief` verb a
 *read* the config — nothing regenerates it automatically. That is deliberate: model guidance is
 researched judgment, and a human owns when it is refreshed.
 
+The one section this skill never touches is the top-level `hand_tuned` block. That is human-owned
+routing judgment — the binding sonnet-first burden-of-proof tie-break — hand-tuned directly by a
+human, never authored or refreshed by a research pass. Leave it byte-untouched on every run; the
+`efforts:`/`models:` guidance blocks and the `research:` map are this skill's scope.
+
 The unit of work is one **axis value**. The `efforts:` and `models:` axes live in
 `plugins/plan/subagents.yaml` (the single source of truth); this config must carry exactly one
 guidance block per configured value and no block for a non-axis value. The drift gate enforces both

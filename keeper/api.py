@@ -428,6 +428,10 @@ from pathlib import Path
 # events and jobs surfaces (the harness-session adoption marker) and the
 # ``autopilot_state.codex_adoption`` INTEGER knob; keeper-py reads none of the
 # three, so only the version whitelist gains 111.
+# v112 (fn-1151 task .2) appends the nullable ``epics.selection_review`` TEXT
+# column (the epic-level close-time selection-review record); the fixed epics
+# SELECT names only ``epic_id, project_dir, tasks, jobs``, so only the version
+# whitelist gains 112.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -511,6 +515,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         109,
         110,
         111,
+        112,
     }
 )
 
