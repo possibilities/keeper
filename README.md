@@ -91,6 +91,24 @@ so a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`) 
 third-party sources) and leaves untouched when a file or symlink is already there. Do NOT add a
 `~/.claude/plugins/keeper` symlink — it double-registers the hook (two `events` rows per invocation).
 
+**Host provider matrix (optional).** By default the plan worker matrix is claude-only. A host
+`~/.config/keeper/matrix.yaml` ([ADR 0010](./docs/adr/0010-host-provider-matrix-and-wrapped-worker-cells.md))
+grows the model axis with capability models served by codex or pi: an ordered provider roster
+(cost-ascending — the pecking order), each provider carrying the models it serves (with optional
+native-id aliases), plus the effort axis and the wrapper driver (the fixed claude model/effort that
+runs wrapped cells). A model under the `claude` provider stays **native** (its worker runs that model
+in-session); any other renders as a **wrapped cell** whose claude worker delegates implementation to
+the cost-preferred serving provider at run time. `keeper agent providers check` validates the roster;
+`keeper agent providers resolve <model> <effort>` prints the driver plus the cost-ordered candidate
+harnesses. With no matrix present, rendering, selection, and dispatch stay byte-identical to the
+claude-only default. Standing up the first wrapped task on a host:
+
+1. Author `~/.config/keeper/matrix.yaml` — the provider roster (cost-ascending) and the models each serves.
+2. For a new model, add its selector guidance with `/plan:model-guidance <model>` (the drift gate fails until every roster model has a block).
+3. Re-render the worker cells: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/`).
+4. Verify routing: `keeper agent providers resolve <model> <effort>`.
+5. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
+
 **Shell completions.** The installer writes generated bash/zsh/fish completion files into shell-owned
 user locations (idempotent — a rerun overwrites the same managed files, never appends): fish to
 `~/.config/fish/completions/keeper.fish` (autoloaded), bash to
