@@ -55,6 +55,11 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
 - **Lane pre-merge**: The guard that vets a dependent task's base lane before its fan-in merges the completed siblings in — restoring a provably-redundant leak to the base's HEAD, deferring a base it cannot safely settle to a self-clearing row, and escalating a persistent wedge to a needs-human distress. Avoid: clean, cleanup, premerge fixup.
 
+## Usage scraping
+
+- **Usage-model registry**: The `usage_models` keeper-config map declaring which claude profiles and codex the usage scraper produces envelopes for, keyed by envelope id with an optional display alias per entry; an absent or malformed map idles the producer rather than erroring. Avoid: profile catalog, account list, scrape targets.
+- **agentusage**: The frozen on-disk namespace the usage scraper writes and reads — the envelope root, the tmux socket, and the path-filter token that share this name — pinned as a fixed wire/on-disk contract independent of any project directory. Avoid: the agentusage project, external scraper.
+
 ## Bus, presence, and session surface
 
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
