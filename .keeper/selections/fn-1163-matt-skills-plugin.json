@@ -1,0 +1,48 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-establishing proof-point task introduces the plugin/fork pattern across many files with judgment-heavy vendoring that downstream tasks inherit, warranting the top non-reserved band.",
+      "task_id": "fn-1163-matt-skills-plugin.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Forking with a judgment-call vocabulary compression and three dangling-reference retargets is new-pattern, design-sensitive work where a wrong abstraction propagates into the skill and its report.",
+      "task_id": "fn-1163-matt-skills-plugin.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The init adoption skill is the most intricate spec \u2014 multi-path landing contract, idempotent content-keyed delta, and several explicit edge behaviors \u2014 high uncertainty demanding opus at xhigh.",
+      "task_id": "fn-1163-matt-skills-plugin.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "A single in-place enumeration sentence edit matching existing present-tense style is a tiny, reversible, low-blast-radius doc polish that sonnet handles literally and precisely.",
+      "task_id": "fn-1163-matt-skills-plugin.4",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T16:52:47.862000Z",
+  "epic_id": "fn-1163-matt-skills-plugin",
+  "input_hash": "3cee60463af775314ca45b37327c2689261a5d79fc6b18c3c775ec9be7bd07ef",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1022255174,
+  "verdict_raw": null
+}

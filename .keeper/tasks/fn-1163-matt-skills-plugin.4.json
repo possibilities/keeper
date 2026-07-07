@@ -6,11 +6,11 @@
   ],
   "epic": "fn-1163-matt-skills-plugin",
   "id": "fn-1163-matt-skills-plugin.4",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "medium",
+  "tier": "low",
   "title": "Update composition map enumeration",
-  "updated_at": "2026-07-07T16:51:47.532000Z"
+  "updated_at": "2026-07-07T16:52:47.862000Z"
 }
