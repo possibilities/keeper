@@ -73,6 +73,10 @@ export interface BriefInputs {
   primaryRepo: string;
   stateRepo: string;
   tier: string | null;
+  /** Whether the task's selected tier was audit-flagged at selection time (read
+   * off the task JSON; normalizeTask defaults it false). Carried so the worker
+   * knows its done-latch parks for a per-task audit. */
+  auditRequired: boolean;
   dataDir: string;
 }
 
@@ -90,6 +94,7 @@ export function assembleBrief(inputs: BriefInputs): Record<string, unknown> {
     primary_repo: inputs.primaryRepo,
     state_repo: inputs.stateRepo,
     tier: inputs.tier,
+    audit_required: inputs.auditRequired,
     task_spec_md: readSpecMd(inputs.dataDir, inputs.taskId),
     epic_spec_md: readSpecMd(inputs.dataDir, inputs.epicId),
     glossary_md: readGlossaryMd(inputs.targetRepo),

@@ -108,6 +108,107 @@ export function followupPath(primaryRepo: string, epicId: string): string {
   return join(auditDir(primaryRepo, epicId), FOLLOWUP_BASENAME);
 }
 
+// ---------------------------------------------------------------------------
+// Per-task audit gate — the artifacts the block-machinery audit gate writes for
+// a flagged task between its worker committing and stamping done. One artifact
+// per task lives at `audits/<epic_id>/tasks/<task_id>.json`, task-id-keyed so
+// parallel worktree lanes (each a distinct task) never write the same path.
+// close-preflight references each as the brief's per-task `finding_ref`, and the
+// close quality-auditor reads them for fingerprint dedup.
+// ---------------------------------------------------------------------------
+
+/** `audits/<epic_id>/tasks/` — the per-task artifact dir, created lazily at
+ * 0700 (auditDir already asserts 0700 on the two parent levels; this re-asserts
+ * it on the `tasks/` level regardless of umask). Idempotent. */
+export function taskAuditDir(primaryRepo: string, epicId: string): string {
+  const dir = join(auditDir(primaryRepo, epicId), "tasks");
+  mkdirSync(dir, { recursive: true });
+  chmodSync(dir, 0o700);
+  return dir;
+}
+
+/** `audits/<epic_id>/tasks/<task_id>.json` (a pure path — never created). The
+ * single canonical home for a task's audit result; close-preflight's per-task
+ * `finding_ref` resolves here. */
+export function taskFindingPath(
+  primaryRepo: string,
+  epicId: string,
+  taskId: string,
+): string {
+  return join(auditsRoot(primaryRepo), epicId, "tasks", `${taskId}.json`);
+}
+
+/** Read + schema-gate the per-task finding artifact for (epic, task); null when
+ * absent. Hard-fails ArtifactSchemaTooNewError on a too-new schema_version (the
+ * shared reader gate), never guesses at a future shape. */
+export function readTaskFinding(
+  primaryRepo: string,
+  epicId: string,
+  taskId: string,
+): Record<string, unknown> | null {
+  return readArtifactJson(taskFindingPath(primaryRepo, epicId, taskId));
+}
+
+/** Atomically persist a per-task finding artifact COMMIT-FREE (0600), returning
+ * the resolved path. Stamps `schema_version`, `task_id`, `epic_id`, and a
+ * canonical `commit_set_hash` over the artifact's own `commits` groups — the
+ * staleness key: a later audit against the same commit set short-circuits
+ * (taskFindingCoversCommitSet). Creates the `tasks/` dir. Last-writer-wins, like
+ * every audit artifact. */
+export function writeTaskFinding(
+  primaryRepo: string,
+  epicId: string,
+  taskId: string,
+  finding: Record<string, unknown>,
+): string {
+  taskAuditDir(primaryRepo, epicId);
+  const commits = coerceCommitGroups(finding.commits);
+  const stamped = {
+    ...finding,
+    schema_version: AUDIT_SCHEMA_VERSION,
+    task_id: taskId,
+    epic_id: epicId,
+    commit_set_hash: computeCommitSetHash(commits),
+  };
+  return writeArtifact(
+    taskFindingPath(primaryRepo, epicId, taskId),
+    serializeStateJson(stamped),
+  );
+}
+
+/** True when a persisted per-task finding for (epic, task) already covers
+ * `commitGroups` — its stamped `commit_set_hash` equals the hash of that set.
+ * The crashed-and-resumed orchestrator's short-circuit: a fresh persisted result
+ * means the audit already ran against this exact commit set, so skip the
+ * re-audit. A missing artifact or an absent/mismatched hash reads false
+ * (re-audit); a too-new schema surfaces via readArtifactJson's hard-fail. */
+export function taskFindingCoversCommitSet(
+  primaryRepo: string,
+  epicId: string,
+  taskId: string,
+  commitGroups: CommitGroup[],
+): boolean {
+  const parsed = readTaskFinding(primaryRepo, epicId, taskId);
+  if (parsed === null) {
+    return false;
+  }
+  const stored = parsed.commit_set_hash;
+  return (
+    typeof stored === "string" && stored === computeCommitSetHash(commitGroups)
+  );
+}
+
+/** Coerce an unknown `commits` field to a CommitGroup[] the hash accepts —
+ * drop non-object entries so a malformed artifact never throws into the hash. */
+function coerceCommitGroups(value: unknown): CommitGroup[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (g) => g !== null && typeof g === "object" && !Array.isArray(g),
+  ) as CommitGroup[];
+}
+
 export interface CommitGroup {
   repo: string;
   shas?: string[] | null;

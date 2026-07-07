@@ -56,5 +56,5 @@ repair incident; explicit byte-equality regression on an unblock and a deconflic
 - [ ] Fast suite green including the new parse/brief tables
 
 ## Done summary
-
+Added repair::<repo-token> as a third, repo-scoped escalation verb: verb/set/guard plumbing in dispatch-command.ts, a shared REPO_TOKEN_RE + SPAWN_VERB_REF_RE arm in derivers.ts so its jobs row binds plan_verb/plan_ref, an extracted repoToken() helper in worktree-plan.ts reused by cli/dispatch.ts's cwd resolution (scans all epics, typed error on an unresolved token) and cli/escalation-brief.ts's new repair-kind incident builder (repo + fingerprint + base evidence + affected blocked tasks across every epic on the repo). Unblock/deconflict brief output is unchanged.
 ## Evidence

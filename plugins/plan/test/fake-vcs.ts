@@ -39,7 +39,12 @@ import {
 } from "node:fs";
 import { join, relative, sep } from "node:path";
 
-import type { GitResult, NumstatRow, PlanVcs } from "../src/vcs.ts";
+import type {
+  GitResult,
+  NumstatRow,
+  NumstatTotals,
+  PlanVcs,
+} from "../src/vcs.ts";
 
 /** One recorded commit — the fake log entry the assertion helpers read. */
 export interface FakeCommit {
@@ -102,6 +107,11 @@ const sessionDirtyOverrides = new Map<string, string[] | null>();
 /** Whether the fake reports a present git binary. A test arms absence via
  * setGitBinaryPresent(false) to drive the fail-closed source-scan path. */
 let gitBinaryPresent = true;
+/** Per-repo flag forcing commitSetNumstat to report a `git show` failure
+ * (error:true, zero totals) — the shallow / rewritten-sha numstat degrade a
+ * test drives without real git. Set via setNumstatError, cleared by
+ * resetFakeVcs. */
+const numstatErrorRepos = new Set<string>();
 
 /** Normalize a repo path to its realpath when it exists (the harness tmpdirs are
  * realpath'd; production resolves the project root through realpathSync too), so
@@ -397,6 +407,19 @@ export function resetFakeVcs(): void {
   commitCounter = 0;
   gitBinaryPresent = true;
   sessionDirtyOverrides.clear();
+  numstatErrorRepos.clear();
+}
+
+/** Force `commitSetNumstat(_, root)` to report a `git show` failure (error:true,
+ * zero totals) or restore normal summing — the numstat-degrade arm the close
+ * brief lands at lean. Cleared by resetFakeVcs. */
+export function setNumstatError(root: string, failing: boolean): void {
+  const key = normRoot(root);
+  if (failing) {
+    numstatErrorRepos.add(key);
+  } else {
+    numstatErrorRepos.delete(key);
+  }
 }
 
 /** Arm the fake to report git as absent (false) or present (true). Drives the
@@ -518,6 +541,36 @@ export const fakeVcs: PlanVcs = {
       }
     }
     return [];
+  },
+
+  commitSetNumstat(shas, repo): NumstatTotals {
+    const key = normRoot(repo);
+    const totals: NumstatTotals = {
+      insertions: 0,
+      deletions: 0,
+      files: 0,
+      error: false,
+    };
+    if (numstatErrorRepos.has(key)) {
+      return { ...totals, error: true };
+    }
+    const state = repos.get(key);
+    if (!state) {
+      return totals;
+    }
+    const bySha = new Map(state.sourceCommits.map((c) => [c.sha, c]));
+    for (const sha of shas) {
+      const c = bySha.get(sha);
+      if (c === undefined) {
+        continue;
+      }
+      for (const row of c.numstat) {
+        totals.insertions += row.insertions;
+        totals.deletions += row.deletions;
+        totals.files += 1;
+      }
+    }
+    return totals;
   },
 
   committedTaskJson(stateRepo, taskId, dataDirNames) {

@@ -352,8 +352,15 @@ the breaker.
   security / transaction-boundary shaped it stamps BLOCKED with the unstick sentence and
   leaves for the human. The `planner@<epic>` escalation fires ONLY after that resolver
   reaches a terminal verdict — it DECLINED (stamped BLOCKED) or its job died — never
-  concurrently, so the two never race the same base worktree. The close audit still gates
-  the merged result whichever path resolves; relay the escalation as usual.
+  concurrently, so the two never race the same base worktree. The close audit — sized
+  lean/standard/deep from the epic's signals (task count, tier mix, diff size, touched
+  repos) — still gates the merged result whichever path resolves; relay the escalation as usual.
+- **Per-task audit blocks self-handle or page by category.** A task the selection policy
+  flagged high-risk parks blocked `AUDIT_READY` while its owning orchestrator runs the
+  audit and resumes it — the daemon pages no one while that orchestrator lives, escalating
+  it like any block only if the orchestrator dies with the task still parked past a short
+  grace. A verified-severe finding rewrites the reason to `AUDIT_SEVERE`, which pages
+  immediately like any block; relay either page as a decision-ready brief.
 - **Pausing does NOT stop an in-flight resolver.** `pause` stops the recover sweep and
   new dispatches, not a resolver already running. On a merge-conflict escalation — or
   before you manually resolve ANY stuck merge-conflict close — check `keeper query jobs`

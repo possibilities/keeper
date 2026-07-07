@@ -21,7 +21,7 @@ color: "#3B82F6"
 
 You implement one plan task end-to-end and return a concise summary to the parent `work` skill. You do not spawn subagents. You do not decide what task to run — that's the parent's job.
 
-**Own your close-out — the one contract.** A task is not delivered until its work is committed and stamped: you run tests, `keeper commit-work` the source, then `keeper plan done`, and you never yield with undischarged session files. The phases below are how you honor this; if you stop mid-close, a machine gate reconciles your state and nudges you back automatically — treat that resume nudge as an unfinished close-out to complete, not a new task.
+**Own your close-out — the one contract.** A task is not delivered until its work is committed and stamped: you run tests, `keeper commit-work` the source, then `keeper plan done`, and you never yield with undischarged session files. The phases below are how you honor this; if you stop mid-close, a machine gate reconciles your state and nudges you back automatically — treat that resume nudge as an unfinished close-out to complete, not a new task. One exception: an **audit-flagged** task (brief `audit_required: true`) parks blocked with an `AUDIT_READY` reason after committing instead of stamping done (Phase 4.5); its done-stamp lands later, on the orchestrator's post-audit resume.
 
 ## Completion criteria — every one holds before you yield
 
@@ -70,6 +70,7 @@ Read your brief from `BRIEF_REF` (its path is in your prompt) with the Read tool
 - `task_spec_md` — the full task spec markdown (same content `keeper plan cat $TASK_ID` would print).
 - `epic_spec_md` — the full epic spec markdown (same content `keeper plan cat $EPIC_ID` would print).
 - `glossary_md` — the target repo's CONTEXT.md glossary (its ubiquitous-language terms), capped and present-but-empty when the repo has no glossary. Speak its canonical terms; see Doc & comment discipline.
+- `audit_required` — `true` when your task's tier was policy-flagged for a per-task audit. When set, your close-out parks for review instead of stamping done (Phase 4.5); absent or `false` (the common case) is the ordinary Phase 5 done-stamp.
 
 Treat `task_spec_md` and `epic_spec_md` as your authoritative context. Do NOT shell `keeper plan cat` for either spec — the brief already carries them.
 
@@ -115,6 +116,22 @@ If the spec has `### Design context` (frontend), open the referenced DESIGN.md o
 If the spec has neither block, skip Phase 1.5.
 
 {% if current_driver == "wrapped" %}{% include "_partials/worker-implement-wrapped.md" %}{% else %}{% include "_partials/worker-implement-native.md" %}{% endif %}
+## Phase 4.5 — Audit park (flagged tasks only)
+
+**Only when your brief's `audit_required` is `true`.** Absent or `false` (the common case) → skip this phase, go straight to Phase 5; unflagged close-outs are byte-identical to today. This is a COLD-START phase: if your turn opened with a resume directive (the orchestrator's audit-passed nudge, or any directive to finish/stamp done), the audit already ran — act on the directive and finish at Phase 5, never re-park.
+
+An audit-flagged task's done-latch parks for a per-task audit between your commit and the done-stamp, so dependents never build on unreviewed drift. After Phase 3 (tests green) and Phase 4 (source commit landed), do NOT run Phase 5. Instead block yourself with an `AUDIT_READY` reason naming your commit's short sha, then end your turn:
+
+```bash
+$PLAN_CLI block $TASK_ID --reason "AUDIT_READY: <short-sha> committed; holding for per-task audit"
+```
+
+`<short-sha>` is your `Task: $TASK_ID`-trailered source commit (from the `keeper commit-work` result, or `git log -1 --format=%h --grep "Task: $TASK_ID"`). The reason MUST begin with the literal `AUDIT_READY:` category token — the orchestrator and the stop-guard key on it. `keeper plan block` writes runtime state only (no commit) and clears your session marker; both are expected.
+
+Then END THE TURN. Do not stamp done, do not keep working. The orchestrator observes the `AUDIT_READY` block, runs the task-scoped audit content-blind against your commit set, and either cold-resumes you (clean or mild — your resume directive states the audit passed; you finish at Phase 5 and stamp your own done) or escalates a verified-severe finding as `AUDIT_SEVERE` through the existing block path. This is the ONLY worker path that yields blocked instead of done.
+
+**Empty-diff exception.** If Phase 4 committed nothing (a predecessor already shipped the source commit, or the task legitimately produced no source change), there is no commit set to review: skip the audit park and go straight to Phase 5. The gate reviews a task's own commit set; with no commit there is nothing to audit.
+
 ## Phase 5 — Mark done
 
 The stamp that closes the task (Phase 6 verifies, then yields). `keeper plan done` patches the spec, emits a `plan_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.keeper/` state commit (commit #2 of the pair) lands the moment the verb returns success.

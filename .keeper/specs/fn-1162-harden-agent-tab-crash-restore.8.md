@@ -37,5 +37,5 @@ The sim's assertion set is the epic's acceptance list in miniature — keep one 
 - [ ] Help texts, module headers, and problem-codes rows state the new behavior consistently, and setup-tmux outcome lines carry per-tab verified/failed/unverified counts.
 
 ## Done summary
-
+Added fast-sim (recency-first pick, ambiguous escalation, disk-anchored rehomed-transcript resolve, preflight-failure surfacing, verify-timeout disambiguation) and real-tmux slow-e2e acceptance instruments; fixed setup-tmux's outcome line to surface per-tab verified/failed/unverified counts (docs/help/problem-codes were already consolidated by prior tasks).
 ## Evidence

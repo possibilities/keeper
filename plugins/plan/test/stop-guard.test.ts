@@ -21,9 +21,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  auditReadyBlockReason,
   childInFlight,
   closeBlockReason,
   closeStopAllowed,
+  isAuditReadyReason,
   workBlockReason,
 } from "../plugin/hooks/stop-guard.ts";
 
@@ -81,6 +83,49 @@ describe("workBlockReason", () => {
     expect(reason).toContain("in_progress_uncommitted");
     expect(reason).toContain("keeper plan worker resume fn-1-x.2");
     expect(reason).toContain("never edit or commit");
+  });
+});
+
+describe("isAuditReadyReason", () => {
+  const cases: [string, unknown, boolean][] = [
+    [
+      "AUDIT_READY prefix",
+      "AUDIT_READY: abc123 committed; holding for audit",
+      true,
+    ],
+    ["AUDIT_READY after leading whitespace", "  AUDIT_READY: parked", true],
+    [
+      "AUDIT_SEVERE is not AUDIT_READY",
+      "AUDIT_SEVERE: confirmed data loss",
+      false,
+    ],
+    ["a semantic category", "SPEC_UNCLEAR: the spec is ambiguous", false],
+    [
+      "a bare category-less reason",
+      "holding for audit AUDIT_READY: later",
+      false,
+    ],
+    ["lowercase does not match", "audit_ready: nope", false],
+    ["empty string", "", false],
+    ["non-string", { AUDIT_READY: true }, false],
+    ["null", null, false],
+    ["undefined", undefined, false],
+  ];
+  for (const [label, reason, expected] of cases) {
+    test(`${label} → ${expected}`, () => {
+      expect(isAuditReadyReason(reason)).toBe(expected);
+    });
+  }
+});
+
+describe("auditReadyBlockReason", () => {
+  test("names the task, the audit gate, and the no-done rule", () => {
+    const reason = auditReadyBlockReason("fn-1-x.2");
+    expect(reason).toContain("fn-1-x.2");
+    expect(reason).toContain("AUDIT_READY");
+    expect(reason).toContain("audit gate");
+    expect(reason).toMatch(/quality-auditor/);
+    expect(reason).toContain("stamp done from this context");
   });
 });
 
@@ -398,6 +443,40 @@ describe("stop-guard ladder", () => {
     writePlanCliShim({ verdict: "blocked" });
 
     const { stdout } = await run(stopPayload());
+    expect(stdout).toBe("");
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  test("work marker + blocked AUDIT_READY → block with the audit checklist, marker retained", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "blocked",
+      blocked_reason:
+        "AUDIT_READY: abc123 committed; holding for per-task audit",
+    });
+
+    const { stdout, code } = await run(stopPayload());
+    expect(code).toBe(0);
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("fn-1-x.2");
+    expect(env.reason).toContain("AUDIT_READY");
+    expect(env.reason).toContain("audit gate");
+    // The parked task is NOT terminal — the marker stays so the orchestrator
+    // remains guarded until it runs the audit.
+    expect(existsSync(markerPath())).toBe(true);
+  });
+
+  test("work marker + blocked AUDIT_SEVERE → allow AND unlink (terminal escalation)", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "blocked",
+      blocked_reason:
+        "AUDIT_SEVERE: confirmed correctness bug on the spec'd path",
+    });
+
+    const { stdout } = await run(stopPayload());
+    // An escalated severe finding is a terminal block like any other — allow.
     expect(stdout).toBe("");
     expect(existsSync(markerPath())).toBe(false);
   });
