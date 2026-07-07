@@ -45,5 +45,5 @@ names accepted, leading dot rejected, existing corpora still load, absent matrix
       presets.yaml corpora keep loading unchanged.
 
 ## Done summary
-
+loadPresetCatalog now augments the catalog in memory with one <provider>-<model> preset per host-matrix roster pair (native id, no second axis), failing loud on hand-authored/reserved collisions; widened the preset-name charset to admit interior dots (no leading dot). Absent matrix leaves the catalog byte-identical.
 ## Evidence
