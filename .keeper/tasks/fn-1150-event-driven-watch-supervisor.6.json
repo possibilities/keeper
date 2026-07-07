@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T00:45:44.852000Z",
+  "depends_on": [
+    "fn-1150-event-driven-watch-supervisor.3",
+    "fn-1150-event-driven-watch-supervisor.4"
+  ],
+  "epic": "fn-1150-event-driven-watch-supervisor",
+  "id": "fn-1150-event-driven-watch-supervisor.6",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Align sibling docs and orient snippet",
+  "updated_at": "2026-07-07T00:45:44.852000Z"
+}

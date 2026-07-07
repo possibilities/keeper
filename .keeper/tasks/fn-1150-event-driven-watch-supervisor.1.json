@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T00:45:44.852000Z",
+  "depends_on": [],
+  "epic": "fn-1150-event-driven-watch-supervisor",
+  "id": "fn-1150-event-driven-watch-supervisor.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Shared needs-human projector",
+  "updated_at": "2026-07-07T00:45:44.852000Z"
+}
