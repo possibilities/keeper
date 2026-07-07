@@ -34,5 +34,5 @@ Frontmatter greps as in task 1. Interactive smoke lives at the epic level (run /
 - [ ] Genre rules and commit mechanics are pointed at, not restated
 
 ## Done summary
-
+Added /matt:init: a new-build, user-invoked skill that migrates a repo into the domain-docs convention via a read-only harvest, one clustered proposal, and two landing paths (keeper commit-work greenlight or plan:defer), with content-keyed delta-only re-runs and specified edge behaviors.
 ## Evidence
