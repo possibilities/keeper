@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T20:38:33.846000Z",
+  "depends_on": [
+    "fn-1172-out-of-band-selection-review-skill.1"
+  ],
+  "epic": "fn-1172-out-of-band-selection-review-skill",
+  "id": "fn-1172-out-of-band-selection-review-skill.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Retire close grading and verb",
+  "updated_at": "2026-07-07T20:38:33.846000Z"
+}
