@@ -968,16 +968,6 @@ export interface Epic {
    * board signal.
    */
   question: string | null;
-  /**
-   * The epic-level selection-review record (`keeper plan selection-review`), or
-   * `null` when none is stamped (the zero-event reading). A small JSON payload
-   * (verdict-counts summary + reviewed-at) stored verbatim as TEXT, folded from
-   * the `EpicSnapshot` synthetic event's `selection_review` field, sourced from
-   * the gitignored `<state>/epics/<epic_id>.state.json` runtime overlay —
-   * mirrors {@link Epic.question}. A close-time selection audit stamps it; a
-   * non-null value surfaces as a display-only needs-human board signal.
-   */
-  selection_review: string | null;
 }
 
 /**

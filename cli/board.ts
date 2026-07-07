@@ -50,7 +50,6 @@ import {
   renderDispatchFailurePill,
   renderTaskCellPills,
   renderTaskPills,
-  selectionReviewLines,
   sessionTelemetryPillSeg,
   startedPill,
   subagentLinesFor,
@@ -1068,13 +1067,8 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       }),
     ];
     needsHumanCount = needsHuman.length;
-    // ADR 0011 DISPLAY-ONLY: the close-time selection-review block, sourced from
-    // the narrow unfiltered `selectionReviewEpics` read (any status) so a flagged
-    // CLOSED epic still renders. Deliberately OUTSIDE `needsHumanCount` — it
-    // neither gates nor jams, so it never inflates the `[needs-human:N]` banner.
     const head = [
       ...needsHumanLines(needsHuman),
-      ...selectionReviewLines(snap.selectionReviewEpics ?? []),
       ...boardSummaryLines(computeBoardSummary(snap)),
     ];
     const body = renderEpicsBody(snap, subagentIndex);
@@ -1174,11 +1168,6 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     idPrefix: "board",
     onSnapshot: emitFrame,
     onLifecycle: view.emitLifecycle,
-    // ADR 0011: carry the flagged-epic set (any status) on the readiness
-    // snapshot so the display-only `selection review` needs-human block renders
-    // a flagged CLOSED epic that has dropped off the open board. The first-paint
-    // gate holds until the collection paints (empty clears it).
-    includeSelectionReviewEpics: true,
     // Thread the freshest daemon fold cursor into the frames resume-cursor seam
     // (fn-1161) — every frames envelope + the trailer stamp `String(rev)`. The
     // header rides every `result`, so this tracks catch-up: a frame minted
