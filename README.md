@@ -37,7 +37,8 @@ separate scoped RPC path.
 - **No general write path into the reducer.** `query` is read-only. `rpc` writes only a
   tightly-scoped set of external surfaces, each round-tripping through a synthetic event the reducer
   folds — never the projections directly. Consumers may read any of it straight from SQLite.
-- **No UI** — `sqlite3` and the `keeper` CLI subcommands are the inspection surface.
+- **No UI** — `sqlite3` and the `keeper` CLI subcommands are the inspection surface, including
+  `keeper frames`, an agent-consumable NDJSON stream of every rendered viewer frame.
 - **No multi-machine** — single host, single DB file.
 - **No kernel watchers on keeper's own DB** — `data_version` polling is the change-detection
   primitive (FSEvents/kqueue drop same-process and WAL writes on macOS). External trees (transcripts,
@@ -174,7 +175,8 @@ neither:
   merges each finished lane back to the default branch. The lane/merge-gate invariants live in
   [CLAUDE.md](./CLAUDE.md).
 - **Example clients** ship as one binary — `keeper board`, `keeper jobs`, `keeper autopilot`,
-  `keeper git`, `keeper usage`, `keeper await`, `keeper status`, `keeper query`, `keeper baseline`, `keeper tabs`
+  `keeper git`, `keeper usage`, `keeper frames` (agent NDJSON frame stream), `keeper await`,
+  `keeper status`, `keeper query`, `keeper baseline`, `keeper tabs`
   (crash-restore of keeper-managed agent windows — distinct from the DB "Backup & restore" below).
 
 ## Backup & restore

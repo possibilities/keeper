@@ -25,6 +25,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  createUsageEmitEngine,
   formatShadowAdvisory,
   renderRowLines,
   renderSessionLines,
@@ -32,6 +33,11 @@ import {
   SCRAPE_HELP,
 } from "../cli/usage";
 import type { ShadowProfileFinding } from "../src/agent/shadow-profiles";
+import {
+  createFramesEmitter,
+  type FramesEmitter,
+  type FramesIo,
+} from "../src/frames-emitter";
 import {
   formatMetaLine,
   formatSnapshotOutput,
@@ -2090,4 +2096,220 @@ describe("routeUsage — the scrape subverb pre-pass", () => {
     expect(SCRAPE_HELP).toContain("--target");
     expect(SCRAPE_HELP).toContain("--profile");
   });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1161 frames mode: `keeper frames --view usage`. usage is the open-coded
+// outlier (no `createViewShell`), so it plugs the SHARED `src/frames-emitter.ts`
+// wire contract into its composed-frame emit path via `createUsageEmitEngine`.
+// These PURE tests drive both streams into a real emitter over captured stdout
+// (a fake clock + no-op sidecar IO) and assert: one frame per raw-field hash
+// change, a relative-time tick mints nothing, both streams count once, the
+// bound trips at the emit site, and the envelope is byte-shape-identical to a
+// shared-shell (board) envelope.
+// ---------------------------------------------------------------------------
+
+// A representative `usage`-stream row (mirrors the renderRowLines fixtures).
+const USAGE_ROW: Record<string, unknown> = {
+  id: "primary",
+  target: "opus",
+  multiplier: 2,
+  session_percent: 42,
+  session_resets_at: isoOffset(5),
+  week_percent: 17,
+  week_resets_at: isoOffset(185),
+};
+
+// A representative `jobs`-stream row for the "recent sessions" log
+// (`created_at` is real unix-SECONDS, per renderSessionLines).
+const JOBS_ROW: Record<string, unknown> = {
+  job_id: "abc123def",
+  profile_name: "primary",
+  created_at: Math.floor(NOW_MS / 1000) - 60,
+  state: "running",
+  title: "work fn-1161",
+};
+
+/** A frames emitter over captured stdout with a fake clock + constant diff, so
+ *  the envelope is fully deterministic in the pure tier. */
+function makeFramesCapture(
+  view: string,
+  opts: { maxFrames?: number | null } = {},
+): {
+  emitter: FramesEmitter;
+  records: () => Array<Record<string, unknown>>;
+} {
+  const stdout: string[] = [];
+  const io: FramesIo = {
+    writeFile: () => {},
+    unlink: () => {},
+    nowIso: () => "2026-06-10T00:00:00.000Z",
+    nowMs: () => 0,
+  };
+  const emitter = createFramesEmitter({
+    view,
+    writeStdout: (line) => stdout.push(line),
+    // Constant diff so a usage frame and a board frame carry byte-identical
+    // `diff` — the parity assertion below then needs no diff normalization.
+    diffFn: () => "@@ d @@\n",
+    io,
+    maxFrames: opts.maxFrames ?? null,
+    durationMs: null,
+  });
+  return {
+    emitter,
+    records: () =>
+      stdout.map((l) => JSON.parse(l.trim()) as Record<string, unknown>),
+  };
+}
+
+/** Build a frames-mode usage engine over `emitter` with a fixed cursor + clock
+ *  and no-op live/tick sinks (frames mode never paints). */
+function makeUsageFramesEngine(
+  emitter: FramesEmitter,
+  onMaybeStop: () => void = () => {},
+): ReturnType<typeof createUsageEmitEngine> {
+  return createUsageEmitEngine({
+    mode: "frames",
+    accountAliases: {},
+    shadowAdvisory: [],
+    framesEmitter: emitter,
+    latestCursor: () => "42",
+    onMaybeStop,
+    onLiveFrame: () => {},
+    onTickRefresh: () => {},
+    reportUsageStream: () => {},
+    reportJobsStream: () => {},
+    nowMs: () => NOW_MS,
+  });
+}
+
+test("usage frames: one frame per raw-field hash change; unchanged re-delivery mints nothing", () => {
+  const cap = makeFramesCapture("usage");
+  const engine = makeUsageFramesEngine(cap.emitter);
+
+  engine.emitUsage([USAGE_ROW]); // first accepted frame → baseline
+  engine.emitJobs([JOBS_ROW]); // composed body grew → data frame
+  // Re-delivering byte-equal rows on either stream is a no-op (the raw-field
+  // hash gate suppresses it) — a fetch-only refresh never mints a frame.
+  engine.emitUsage([{ ...USAGE_ROW }]);
+  engine.emitJobs([{ ...JOBS_ROW }]);
+
+  const recs = cap.records();
+  expect(recs.map((r) => r.type)).toEqual(["baseline", "frame"]);
+  expect(recs.map((r) => r.seq)).toEqual([0, 1]);
+  expect(recs.every((r) => r.view === "usage")).toBe(true);
+  expect(recs.every((r) => r.cursor === "42")).toBe(true);
+  expect(recs.every((r) => r.schema_version === 1)).toBe(true);
+});
+
+test("usage frames: a relative-time tick with no data change never mints a frame", () => {
+  const cap = makeFramesCapture("usage");
+  const engine = makeUsageFramesEngine(cap.emitter);
+  engine.emitUsage([USAGE_ROW]); // baseline
+  engine.emitJobs([JOBS_ROW]); // frame
+  const before = cap.records().length;
+
+  // The 30s tick re-renders relative-time cells but the raw fields are
+  // unchanged — the emitter is hooked at the hash-gated emit site, never the
+  // tick, so a countdown repaint is exactly the no-op churn a consumer must not
+  // drown in. It must produce ZERO new envelopes.
+  engine.tick();
+  engine.tick();
+
+  expect(cap.records().length).toBe(before);
+});
+
+test("usage frames: both streams count once toward coverage accounting", () => {
+  const cap = makeFramesCapture("usage");
+  const engine = makeUsageFramesEngine(cap.emitter);
+
+  engine.emitUsage([USAGE_ROW]); // baseline (usage's one contribution)
+  engine.emitJobs([JOBS_ROW]); // one data frame (jobs' one contribution)
+  engine.emitUsage([USAGE_ROW]); // unchanged → no double-count
+  engine.emitJobs([JOBS_ROW]); // unchanged → no double-count
+
+  expect(engine.usageStreamReported()).toBe(true);
+  expect(engine.jobsStreamReported()).toBe(true);
+  expect(engine.framesBaselineEmitted()).toBe(true);
+  // Exactly one baseline + one data frame across the four deliveries — each
+  // stream's real change landed once, neither re-delivery inflated the count.
+  const recs = cap.records();
+  expect(recs.filter((r) => r.type === "baseline")).toHaveLength(1);
+  expect(recs.filter((r) => r.type === "frame")).toHaveLength(1);
+});
+
+test("usage frames: a data frame trips the max-frames bound at the emit site; the baseline does not", () => {
+  const cap = makeFramesCapture("usage", { maxFrames: 1 });
+  const stops: Array<string | null> = [];
+  // `onMaybeStop` is the shell's `maybeStopFrames`: it re-checks the emitter's
+  // bound after every emit and (in prod) flushes the trailer + exits.
+  const engine = makeUsageFramesEngine(cap.emitter, () =>
+    stops.push(cap.emitter.shouldStop()),
+  );
+
+  engine.emitUsage([USAGE_ROW]); // baseline — excluded from the data-frame bound
+  engine.emitJobs([JOBS_ROW]); // data frame 1 — trips maxFrames: 1
+
+  expect(stops).toEqual([null, "max_frames"]);
+});
+
+test("usage frames: a disconnect clears the change-gate and downgrades coverage to gap_possible", () => {
+  const cap = makeFramesCapture("usage");
+  const engine = makeUsageFramesEngine(cap.emitter);
+  engine.emitUsage([USAGE_ROW]); // baseline
+
+  // A disconnect is the sole gap source the emitter's contiguous seq can't see.
+  // It must (a) clear the gate so the post-reconnect first paint re-emits even
+  // on identical rows, and (b) downgrade the trailer coverage verdict.
+  engine.noteDisconnect();
+  engine.emitUsage([USAGE_ROW]); // same rows, but the gate was cleared → frame
+  cap.emitter.emitTrailer({ reason: "interrupt" });
+
+  const recs = cap.records();
+  expect(recs.map((r) => r.type)).toEqual(["baseline", "frame", "trailer"]);
+  const trailer = recs.at(-1);
+  expect(trailer?.coverage).toBe("gap_possible");
+});
+
+test("usage frames: envelope is byte-shape-identical to a shared-shell (board) frames envelope", () => {
+  // Drive the REAL usage engine to produce a usage baseline + frame.
+  const u = makeFramesCapture("usage");
+  const engine = makeUsageFramesEngine(u.emitter);
+  engine.emitUsage([USAGE_ROW]); // baseline
+  engine.emitJobs([JOBS_ROW]); // frame
+  const [uBaseline, uFrame] = u.records();
+
+  // Build a board frames envelope directly through the shared emitter — the
+  // shared shell's exact path. Same cursor + constant diff, so only the
+  // view-derived fields differ.
+  const b = makeFramesCapture("board");
+  b.emitter.emitBaseline({ cursor: "42", frameText: "x", stateJson: {} });
+  b.emitter.emitFrame({ cursor: "42", frameText: "x\ny", stateJson: {} });
+  const [bBaseline, bFrame] = b.records();
+
+  // Normalize the view-derived fields: `view` itself and the sidecar paths that
+  // embed it. Everything else must match — same key set, same per-key typeof,
+  // and normalized deep-equality — proving usage routes through the shared wire
+  // contract with no hand-rolled envelope (mirrors the snapshot trailer-drift
+  // guard above).
+  const norm = (r: Record<string, unknown>): Record<string, unknown> => ({
+    ...r,
+    view: "X",
+    frame_path: r.frame_path === null ? null : "X",
+    state_path: r.state_path === null ? null : "X",
+    diff_path: r.diff_path === null ? null : "X",
+  });
+  for (const [uRec, bRec] of [
+    [uBaseline, bBaseline],
+    [uFrame, bFrame],
+  ] as const) {
+    expect(Object.keys(uRec)).toEqual(Object.keys(bRec));
+    for (const k of Object.keys(uRec)) {
+      expect(typeof uRec[k]).toBe(typeof bRec[k]);
+    }
+    expect(uRec.view).toBe("usage");
+    expect(bRec.view).toBe("board");
+    expect(norm(uRec)).toEqual(norm(bRec));
+  }
 });

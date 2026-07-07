@@ -29,6 +29,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  boardFrameStateJson,
   boardSummaryLines,
   colorizePillsInLine,
   computeBoardSummary,
@@ -39,6 +40,7 @@ import {
   renderEpicDepPills,
   renderHandoffLinkLines,
   renderJobLinkLines,
+  serializeSubagentIndex,
   taskVerdictPill,
 } from "../cli/board";
 import {
@@ -164,6 +166,68 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     ...overrides,
   };
 }
+
+// ---------------------------------------------------------------------------
+// fn-1161: frames state-sidecar enrichment — the subagent index serialized in
+// stable (job_id-sorted) order alongside epics, so a frames consumer has
+// ground truth for stale-pill truthfulness checks by pointer.
+// ---------------------------------------------------------------------------
+
+test("serializeSubagentIndex sorts entries by job_id, preserves per-job order", () => {
+  // Insert in job_id order c, a, b (mirrors arbitrary wire arrival) — the
+  // serialized order must be a, b, c regardless of the Map's insertion order.
+  const index = new Map<string, SubagentInvocation[]>();
+  index.set("job-c", [
+    makeSub({ job_id: "job-c", subagent_type: "z", turn_seq: 0, status: "ok" }),
+  ]);
+  index.set("job-a", [
+    makeSub({ job_id: "job-a", subagent_type: "x", turn_seq: 0, status: "ok" }),
+    makeSub({
+      job_id: "job-a",
+      subagent_type: "y",
+      turn_seq: 1,
+      status: "running",
+    }),
+  ]);
+  index.set("job-b", [
+    makeSub({ job_id: "job-b", subagent_type: "w", turn_seq: 0, status: "ok" }),
+  ]);
+
+  const out = serializeSubagentIndex(index);
+  expect(out.map((e) => e.job_id)).toEqual(["job-a", "job-b", "job-c"]);
+  // Per-job invocation order is preserved (the board feeds it turn_seq asc).
+  expect(out[0]?.invocations.map((i) => i.subagent_type)).toEqual(["x", "y"]);
+});
+
+test("serializeSubagentIndex on an empty index yields []", () => {
+  expect(serializeSubagentIndex(new Map())).toEqual([]);
+});
+
+test("boardFrameStateJson carries epics AND the stable-ordered subagent index", () => {
+  const epics = [makeEpic({ epic_id: "fn-2-bar", epic_number: 2 })];
+  const index = new Map<string, SubagentInvocation[]>();
+  index.set("session-2", [
+    makeSub({ job_id: "session-2", turn_seq: 0, status: "ok" }),
+  ]);
+  index.set("session-1", [
+    makeSub({ job_id: "session-1", turn_seq: 0, status: "running" }),
+  ]);
+
+  const state = boardFrameStateJson(epics, index);
+  // The epics ride through by reference (no copy) alongside the subagents.
+  expect(state.epics).toBe(epics);
+  expect(state.subagents.map((e) => e.job_id)).toEqual([
+    "session-1",
+    "session-2",
+  ]);
+  // The state JSON round-trips through the sidecar serializer with its stable
+  // ordering intact (JSON has no Map — the array shape is what survives).
+  const round = JSON.parse(JSON.stringify(state)) as typeof state;
+  expect(round.subagents.map((e) => e.job_id)).toEqual([
+    "session-1",
+    "session-2",
+  ]);
+});
 
 // ---------------------------------------------------------------------------
 // projectRows — pure helper assertions

@@ -94,6 +94,11 @@ import {
 import { resolveSockPath } from "../src/db";
 import { createTmuxPaneOps } from "../src/exec-backend";
 import {
+  createFramesEmitter,
+  defaultDiffFn,
+  defaultFramesIo,
+} from "../src/frames-emitter";
+import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
@@ -612,6 +617,75 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+
+  await runJobs({
+    mode: mode === "snapshot" ? "snapshot" : "live",
+    sockPath,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
+}
+
+/** Data-frame bound + `--prev-frame` seed for `keeper frames --view jobs`. */
+export interface JobsFramesConfig {
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}
+
+export interface RunJobsConfig {
+  mode: "live" | "snapshot" | "frames";
+  sockPath: string;
+  timeoutMs?: number;
+  frames?: JobsFramesConfig;
+}
+
+/**
+ * Drive the jobs viewer in `frames` mode — the entry `keeper frames --view jobs`
+ * dispatch calls. Mirrors `runBoardFrames` on the frames flag grammar
+ * (`maxFrames` / `durationMs` / `prevFrameText`), never `resolveSnapshotMode`.
+ */
+export async function runJobsFrames(config: {
+  sockPath?: string;
+  maxFrames?: number | null;
+  durationMs?: number | null;
+  prevFrameText?: string | null;
+}): Promise<void> {
+  await runJobs({
+    mode: "frames",
+    sockPath: config.sockPath ?? resolveSockPath(),
+    frames: {
+      maxFrames: config.maxFrames ?? null,
+      durationMs: config.durationMs ?? null,
+      prevFrameText: config.prevFrameText ?? null,
+    },
+  });
+}
+
+/**
+ * Shared jobs-viewer runner. `main` drives it in `live` / `snapshot`;
+ * `runJobsFrames` drives it in `frames`. All modes share ONE
+ * `subscribeReadiness` wiring, so the dead-letter banner, insert mode, and
+ * diagnostics drain cannot drift between them. The interactive `r` / insert-mode
+ * / focus key handlers are defined here but inert outside live mode — the
+ * `runSnapshot` / `runFrames` paths never wire the key layer.
+ */
+export async function runJobs(config: RunJobsConfig): Promise<void> {
+  const { mode, sockPath, timeoutMs } = config;
+  // Frames mode: build the prod emitter (view `jobs`, `diff -u` seam, real
+  // sidecar IO, the caller's chunk bounds + `--prev-frame` seed). Inert
+  // otherwise.
+  const framesEmitter =
+    mode === "frames"
+      ? createFramesEmitter({
+          view: "jobs",
+          writeStdout: (line) => void process.stdout.write(line),
+          diffFn: defaultDiffFn,
+          io: defaultFramesIo(),
+          maxFrames: config.frames?.maxFrames ?? null,
+          durationMs: config.frames?.durationMs ?? null,
+          prevFrameText: config.frames?.prevFrameText ?? null,
+        })
+      : null;
   // Readiness diagnostics JSONL log — same sibling location as board.ts /
   // autopilot.ts (POSIX O_APPEND under PIPE_BUF gives atomicity, no flock).
   const diagnosticsLogPath = join(
@@ -878,9 +952,17 @@ export async function main(argv: string[]): Promise<void> {
     // (`subscribeReadiness` → `emitFrame` → `view.emit`), so `streamCount:
     // 1`. The modal insert-mode `captureKeys` is irrelevant in snapshot
     // mode — `runSnapshot` never wires the key layer (no live shell).
-    mode: mode === "snapshot" ? "snapshot" : "live",
+    mode,
     streamCount: 1,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(framesEmitter !== null
+      ? {
+          frames: {
+            emitter: framesEmitter,
+            durationMs: config.frames?.durationMs ?? null,
+          },
+        }
+      : {}),
     // Insert mode captures the whole keyboard so navigation is local to
     // the job list (frame-scrub / copy / replay suppressed).
     captureKeys: () => insertMode,
@@ -973,10 +1055,15 @@ export async function main(argv: string[]): Promise<void> {
     idPrefix: "jobs",
     onSnapshot: emitFrame,
     onLifecycle: view.emitLifecycle,
+    // Thread the daemon fold cursor into the frames resume-cursor seam
+    // (fn-1161). Inert in live/snapshot.
+    onBootStatus: (boot) => view.noteCursor(String(boot.rev)),
   });
 
   if (mode === "snapshot") {
     view.runSnapshot(() => handle.dispose());
+  } else if (mode === "frames") {
+    view.runFrames(() => handle.dispose());
   } else {
     view.installSigintHandler(() => handle.dispose());
   }

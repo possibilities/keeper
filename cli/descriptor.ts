@@ -278,6 +278,55 @@ export const DASH_FLAGS = [
   FLAG_HELP_DEFAULTED,
 ] as const satisfies readonly FlagDescriptor[];
 
+/**
+ * `keeper frames` — the agent frame stream (ADR 0012). Its own flag grammar,
+ * deliberately NOT the viewer snapshot trio (`--snapshot`/`--watch`/`--timeout`):
+ * one invocation streams ONE `--view`, bounded by `--for` / `--max-frames` (or
+ * `--follow` for the reconnect-forever alternate — mutually exclusive with the
+ * two bounds). `--prev-frame` seeds the baseline diff against a prior chunk's
+ * last frame; `--project-dir` scopes the git view.
+ */
+export const FRAMES_FLAGS = [
+  {
+    name: "view",
+    type: "string",
+    default: "board",
+    summary:
+      "Viewer to stream: board|jobs|git|autopilot|builds|usage (default board)",
+  },
+  {
+    name: "for",
+    type: "string",
+    summary: "Bounded-chunk duration, then a trailer + exit (e.g. 10s, 2m)",
+  },
+  {
+    name: "max-frames",
+    type: "string",
+    summary: "Bounded-chunk data-frame count, then a trailer + exit",
+  },
+  {
+    name: "follow",
+    type: "boolean",
+    default: false,
+    summary:
+      "Reconnect-forever stream (mutually exclusive with --for / --max-frames)",
+  },
+  {
+    name: "prev-frame",
+    type: "string",
+    summary:
+      "Prior chunk's last-frame file — render the baseline as a net diff against it",
+  },
+  {
+    name: "project-dir",
+    type: "string",
+    summary: "--view git only: repo whose git status to frame",
+  },
+  FLAG_SOCK,
+  FLAG_HELP_DEFAULTED,
+  FLAG_AGENT_HELP_DEFAULTED,
+] as const satisfies readonly FlagDescriptor[];
+
 /** `keeper dispatch` flag surface. */
 export const DISPATCH_FLAGS = [
   { name: "prompt", type: "string", summary: "Free-form prompt to launch" },
@@ -575,6 +624,21 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: true,
     requires_tty: false,
     flags: VIEWER_FLAGS,
+  },
+  {
+    name: "frames",
+    summary:
+      "Agent frame stream: bounded NDJSON envelopes per rendered viewer frame (one process per --view)",
+    visibility: "public",
+    mutates: false,
+    requires_daemon: true,
+    requires_tty: false,
+    agent_help: true,
+    exit_codes: {
+      "0": "a trailer was emitted (idle zero-frame chunks included)",
+      "1": "the daemon was never reachable (no frame ever rendered)",
+    },
+    flags: FRAMES_FLAGS,
   },
   {
     name: "dash",
