@@ -61,5 +61,5 @@ state-sidecar enrichment asserted with stable ordering over makeSub fixtures.
 - [ ] A multi-stream view reports each stream at most once toward readiness/coverage accounting
 
 ## Done summary
-
+Added a third createViewShell 'frames' mode emitting one NDJSON envelope per accepted frame through the task-1 emitter (baseline/frame + trailer flushed on max-frames/duration/SIGINT), a noteCursor seam threading BootStatus.rev, and wired board's frames entry (runBoardFrames) plus per-frame stateJson enrichment with the stable-ordered subagent index.
 ## Evidence
