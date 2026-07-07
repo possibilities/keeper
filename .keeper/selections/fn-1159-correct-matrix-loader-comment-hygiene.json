@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Tiny, reversible comment-only edits to two named files with an exact acceptance and no behavior change fit low effort and sonnet's literal, well-specified-work strength.",
+      "task_id": "fn-1159-correct-matrix-loader-comment-hygiene.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T05:02:34.844000Z",
+  "epic_id": "fn-1159-correct-matrix-loader-comment-hygiene",
+  "input_hash": "a42bff9d4a37af1a5010ab2746b8feb205d9c6c56e105cd6521f01b2b1664025",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2754346909,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"sonnet\",\"rationale\":\"Tiny, reversible comment-only edits to two named files with an exact acceptance and no behavior change fit low effort and sonnet's literal, well-specified-work strength.\",\"confidence\":0.9}]}"
+}
