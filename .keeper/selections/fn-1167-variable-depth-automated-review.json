@@ -1,0 +1,56 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Early proof point introducing a new policy config, drift gate, task-JSON schema field, and byte-parity brief contract on a mid-refactor surface \u2014 a misread abstraction propagates to every downstream task.",
+      "task_id": "fn-1167-variable-depth-automated-review.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-sensitive VCS facade plus commit_set_hash-stability and audit-schema-version constraints with many degrade arms, where a wrong hash-input change trips in-flight audits.",
+      "task_id": "fn-1167-variable-depth-automated-review.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Prose-only but intelligence-sensitive prompt engineering of autonomous review depth, refute logic, and fingerprint dedup with strict report/verdict contract preservation and no unit-test safety net.",
+      "task_id": "fn-1167-variable-depth-automated-review.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The crux gate riding block machinery \u2014 highest blast radius with idempotent per-task hashing, parallel-lane clobber safety, refute loop, resume-budget accounting, and reap-window interactions where a wrong contract wedges the board.",
+      "task_id": "fn-1167-variable-depth-automated-review.4",
+      "tier": "max"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded single-surface daemon escalation change with a named root cause and precedents, but invariant-sensitive (producer-side liveness, change-gate discipline) so it stays on the high-capability tier.",
+      "task_id": "fn-1167-variable-depth-automated-review.5",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T17:30:15.189000Z",
+  "epic_id": "fn-1167-variable-depth-automated-review",
+  "input_hash": "909d8ac593e57477268fa5c2854aa7ba6655d1ccf18bae4c57c1677cf520a9af",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2426243781,
+  "verdict_raw": null
+}
