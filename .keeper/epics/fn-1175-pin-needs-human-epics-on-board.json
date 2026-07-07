@@ -7,7 +7,7 @@
     "fn-1172-out-of-band-selection-review-skill"
   ],
   "id": "fn-1175-pin-needs-human-epics-on-board",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T22:51:11.258000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T22:51:05.543000Z"
+  "updated_at": "2026-07-07T22:51:11.258000Z"
 }
