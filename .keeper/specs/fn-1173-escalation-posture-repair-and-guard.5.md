@@ -68,5 +68,5 @@ against the skill frontmatter.
 - [ ] Fast suites and lint/drift gates green
 
 ## Done summary
-
+Authored /plan:repair (deconflict-derived, write-capable, green-at-HEAD success path, non-overlap bound, full-gate verify, structured commit + audit ping, unblock+bus fan-out, bounded attempts); hardened unblock/deconflict with anti-heredoc + never-write-in-another-lane guardrails and a SHARED_BASE_BROKEN decline-toward-repair row; updated the operator-orchestration reference and autopilot skill's escalation narrative to describe the repair route.
 ## Evidence
