@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Sole proof-point task authoring a judgment-laden analyzes-only skill body with multi-reference investigation, degradation logic, idempotence, and strict scope discipline that a wrong behavioral contract would undermine.",
+      "task_id": "fn-1168-matt-upgrade-sync-skill.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T17:34:36.692000Z",
+  "epic_id": "fn-1168-matt-upgrade-sync-skill",
+  "input_hash": "f1dcff4f60b815dbf0d71be0b309a9bbabe5bd2939fdc02a777c1b29437d7e9b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4057792335,
+  "verdict_raw": null
+}
