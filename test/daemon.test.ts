@@ -25,8 +25,11 @@ import {
 } from "../src/backstop-telemetry";
 import {
   ALL_WORKERS,
+  AUDIT_READY_ORCHESTRATOR_GRACE_MS,
   AUTOCLOSE_HINT_TTL_MS,
+  type AuditOrchestratorLiveness,
   AutocloseHintSet,
+  auditReadyEscalationDecision,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
   type BlockEscalationOutcome,
@@ -77,6 +80,7 @@ import {
   parseBlockedCategory,
   parseRestartLedger,
   prewarmWatcherAddon,
+  probeAuditOrchestrator,
   pruneRecoveredDeadLetters,
   RESTART_LEDGER_CAP,
   type ResolverDispatchOutcome,
@@ -3933,6 +3937,11 @@ function fakeSweepDeps(opts: {
   /** Epic ids for which an `unblock::<task>` session is already LIVE — drives the
    *  per-epic serialization (across-sweep) guard. */
   epicLive?: Set<string>;
+  /** Owning-orchestrator liveness keyed by task id — drives the AUDIT_READY gate.
+   *  A task with no entry reads `absent`. */
+  orchestrator?: Record<string, AuditOrchestratorLiveness>;
+  /** Fixed wall-clock (ms) for the AUDIT_READY grace comparison. */
+  nowMs?: number;
   dispatch?: (
     row: PendingBlockEscalation,
   ) => Promise<EscalationDispatchOutcome>;
@@ -3958,6 +3967,9 @@ function fakeSweepDeps(opts: {
       return (await opts.dispatch?.(row)) ?? "dispatched";
     },
     isEpicUnblockLive: (epicId) => opts.epicLive?.has(epicId) ?? false,
+    auditOrchestratorLiveness: (row) =>
+      opts.orchestrator?.[row.task_id] ?? { state: "absent" },
+    now: () => opts.nowMs ?? Date.now(),
     hasOpenWorkFailure: (taskId) => opts.alreadyFailed?.has(taskId) ?? false,
     suppressRedispatch: (args) => suppressions.push(args),
   };
@@ -4250,6 +4262,214 @@ test("runBlockEscalationSweep: an empty pending set is a no-op (no mints, no dis
   await runBlockEscalationSweep(deps);
   expect(mints).toEqual([]);
   expect(dispatches).toEqual([]);
+});
+
+// ---- AUDIT_READY / AUDIT_SEVERE gate (the variable-depth per-task audit) -----
+
+const AUDIT_READY_REASON = "AUDIT_READY: per-task audit parked this task";
+const AUDIT_SEVERE_REASON =
+  "AUDIT_SEVERE: verified-severe finding survived refute";
+
+test("runBlockEscalationSweep: AUDIT_READY with a LIVE orchestrator defers — no dispatch, no mint (self-handled)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
+    orchestrator: { "fn-1-foo.1": { state: "live" } },
+    nowMs: 1_000_000,
+  });
+  await runBlockEscalationSweep(deps);
+
+  // A live orchestrator owns the audit — the producer pages no one and mints
+  // nothing, so the latch stays pending and re-sweeps.
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace escalates like any block (one unblock dispatch)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
+    // Died 200s ago, grace is 120s — past grace → escalate.
+    orchestrator: { "fn-1-foo.1": { state: "dead", diedAtMs: 800_000 } },
+    nowMs: 1_000_000,
+  });
+  // Guard: the fixture's elapsed exceeds the grace we test against.
+  expect(1_000_000 - 800_000).toBeGreaterThanOrEqual(
+    AUDIT_READY_ORCHESTRATOR_GRACE_MS,
+  );
+  await runBlockEscalationSweep(deps);
+
+  // A witnessed death past grace hands the park to the ordinary block path —
+  // exactly one unblock dispatch, latch advanced pending→requested→attempted once.
+  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+    {
+      kind: "attempted",
+      epicId: "fn-1-foo",
+      taskId: "fn-1-foo.1",
+      outcome: "dispatched",
+    },
+  ]);
+});
+
+test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator WITHIN grace defers (no page yet)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
+    // Died 50s ago, grace is 120s — inside the window → defer.
+    orchestrator: { "fn-1-foo.1": { state: "dead", diedAtMs: 950_000 } },
+    nowMs: 1_000_000,
+  });
+  expect(1_000_000 - 950_000).toBeLessThan(AUDIT_READY_ORCHESTRATOR_GRACE_MS);
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: AUDIT_READY with an ABSENT orchestrator defers (never pages a park it cannot attribute)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
+    // No orchestrator entry → the gate reads `absent` → defer (no death witnessed).
+    nowMs: 1_000_000,
+  });
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: a deferred AUDIT_READY mints nothing across repeated sweeps (no per-cycle re-emit)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
+    orchestrator: { "fn-1-foo.1": { state: "live" } },
+    nowMs: 1_000_000,
+  });
+  await runBlockEscalationSweep(deps);
+  await runBlockEscalationSweep(deps);
+
+  // Two sweeps, still no marker — the defer path is a pure continue (change-gated
+  // by minting nothing at all, so the latch never re-emits per cycle).
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: AUDIT_SEVERE escalates immediately like any block (orchestrator liveness ignored)", async () => {
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_SEVERE_REASON },
+    // A live orchestrator MUST NOT suppress a severe finding — the deny gate
+    // never consults liveness for AUDIT_SEVERE.
+    orchestrator: { "fn-1-foo.1": { state: "live" } },
+    nowMs: 1_000_000,
+  });
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+    {
+      kind: "attempted",
+      epicId: "fn-1-foo",
+      taskId: "fn-1-foo.1",
+      outcome: "dispatched",
+    },
+  ]);
+});
+
+// ---- probeAuditOrchestrator / auditReadyEscalationDecision (pure) ------------
+
+/** A synthetic owning-orchestrator jobs row: the liveness columns plus the
+ *  `updated_at` death anchor `probeAuditOrchestrator` reads. */
+function orchJob(
+  planVerb: string,
+  planRef: string,
+  state: string,
+  updatedAt: number,
+): Job {
+  return {
+    plan_verb: planVerb,
+    plan_ref: planRef,
+    state,
+    backend_exec_pane_id: null,
+    updated_at: updatedAt,
+  } as unknown as Job;
+}
+
+test("probeAuditOrchestrator: a working work::<task> session reads live", () => {
+  const jobs: Job[] = [orchJob("work", "fn-1-foo.1", "working", 100)];
+  expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "live",
+  });
+});
+
+test("probeAuditOrchestrator: a working close::<epic> session (covering the task's audit) reads live", () => {
+  const jobs: Job[] = [orchJob("close", "fn-1-foo", "working", 100)];
+  expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "live",
+  });
+});
+
+test("probeAuditOrchestrator: a stopped owner with a live backend reads live (shared isStoppedJobLive rule)", () => {
+  const jobs: Job[] = [orchJob("work", "fn-1-foo.1", "stopped", 100)];
+  expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "live",
+  });
+});
+
+test("probeAuditOrchestrator: only-dead owners read dead at the MOST-RECENT death (updated_at → ms)", () => {
+  const jobs: Job[] = [
+    orchJob("work", "fn-1-foo.1", "ended", 500),
+    orchJob("close", "fn-1-foo", "killed", 700), // more recent death
+  ];
+  expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "dead",
+    diedAtMs: 700_000,
+  });
+});
+
+test("probeAuditOrchestrator: a live owner wins over a dead sibling row", () => {
+  const jobs: Job[] = [
+    orchJob("work", "fn-1-foo.1", "ended", 500),
+    orchJob("work", "fn-1-foo.1", "working", 900),
+  ];
+  expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "live",
+  });
+});
+
+test("probeAuditOrchestrator: no matching owner (wrong verb, wrong ref, sibling task) reads absent", () => {
+  const jobs: Job[] = [
+    orchJob("plan", "fn-1-foo", "working", 100), // wrong verb
+    orchJob("work", "fn-9-other.1", "working", 100), // different epic
+    orchJob("work", "fn-1-foo.2", "working", 100), // sibling task, not this task or its epic
+  ];
+  expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "absent",
+  });
+});
+
+test("auditReadyEscalationDecision: escalate only on a dead orchestrator past grace; defer otherwise", () => {
+  const grace = 120_000;
+  // Dead, elapsed exactly at grace → escalate (>=).
+  expect(
+    auditReadyEscalationDecision({ state: "dead", diedAtMs: 0 }, grace, grace),
+  ).toBe("escalate");
+  // Dead, elapsed just under grace → defer.
+  expect(
+    auditReadyEscalationDecision({ state: "dead", diedAtMs: 1 }, grace, grace),
+  ).toBe("defer");
+  // Live → defer regardless of clock.
+  expect(
+    auditReadyEscalationDecision({ state: "live" }, 10 * grace, grace),
+  ).toBe("defer");
+  // Absent → defer (no witnessed death).
+  expect(
+    auditReadyEscalationDecision({ state: "absent" }, 10 * grace, grace),
+  ).toBe("defer");
 });
 
 // ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------
