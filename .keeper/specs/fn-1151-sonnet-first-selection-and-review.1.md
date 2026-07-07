@@ -65,5 +65,5 @@ drift gate green both directions.
       documents the hand_tuned section as human-owned.
 
 ## Done summary
-
+Added a human-owned hand_tuned burden-of-proof section to model-selector.yaml and inverted both up-bias copies (config usage/effort/model blocks and the selector agent prompt) to a sonnet-first default; taught the guidance-check coercion to retain hand_tuned so a silent drop fails loud.
 ## Evidence
