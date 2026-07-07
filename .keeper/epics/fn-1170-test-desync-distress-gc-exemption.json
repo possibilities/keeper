@@ -7,7 +7,7 @@
     "fn-1169-surface-and-heal-checkout-desync"
   ],
   "id": "fn-1170-test-desync-distress-gc-exemption",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T19:45:10.545000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T19:45:10.094000Z"
+  "updated_at": "2026-07-07T19:45:10.545000Z"
 }
