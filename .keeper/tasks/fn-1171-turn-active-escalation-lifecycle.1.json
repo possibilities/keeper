@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Turn-active escalation occupancy",
-  "updated_at": "2026-07-07T20:32:36.111000Z"
+  "updated_at": "2026-07-07T22:42:02.861000Z",
+  "worker_done_at": "2026-07-07T22:42:02.861000Z"
 }

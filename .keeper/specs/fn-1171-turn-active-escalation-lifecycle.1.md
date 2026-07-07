@@ -45,5 +45,5 @@ Extend the hand-built Job[] suites: stopped-idle session frees cap/occupancy/per
 - [ ] isStoppedJobLive behavior for non-escalation verbs is unchanged (existing suites green)
 
 ## Done summary
-
+Moved escalation guards (cap, per-key occupancy, per-epic serialization, stage-3 classifier) to turn-active occupancy: escalationJobLive now keys on state==='working', so a finished-but-idling unblock/deconflict session frees its slot instead of starving it. classifyEscalationOutcome takes a caller-computed incidentOpen board-state (stopped+open->declined, killed/ended+open->died, closed->non-terminal), fixing the unreachable ended->declined verdict. Permission-parked pin passes (reducer's Notification arm never flips state off working), so no parked-marker arm needed.
 ## Evidence
