@@ -124,6 +124,8 @@ import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DESYNC_DISTRESS_VERB,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_VERB,
@@ -294,6 +296,7 @@ test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout wedge/d
   const wedgeId = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}abc123`;
   const dirtyId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`;
   const laneId = `${LANE_WEDGE_DISTRESS_ID_PREFIX}def456`;
+  const desyncId = `${SHARED_DESYNC_DISTRESS_ID_PREFIX}abc123`;
   insert.run(
     SHARED_WEDGE_DISTRESS_VERB,
     wedgeId,
@@ -322,20 +325,28 @@ test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout wedge/d
     null,
     33,
   );
+  insert.run(
+    SHARED_DESYNC_DISTRESS_VERB,
+    desyncId,
+    "shared-checkout-desync: …",
+    "/repo",
+    34,
+  );
 
   const cleared: { verb: string; id: string }[] = [];
   const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
     cleared.push({ verb, id }),
   );
 
-  // Exactly the two shared-checkout rows are drained; the lane-wedge + crash-loop rows
-  // are left untouched (assert the drained set, order-independent).
+  // Exactly the two shared-checkout rows are drained; the lane-wedge + crash-loop +
+  // desync rows are left untouched (assert the drained set, order-independent).
   expect(swept).toBe(2);
   const clearedIds = cleared.map((c) => c.id).sort();
   expect(clearedIds).toEqual([dirtyId, wedgeId].sort());
   expect(cleared.every((c) => c.verb === SHARED_WEDGE_DISTRESS_VERB)).toBe(
     true,
   );
+  expect(cleared.some((c) => c.id === desyncId)).toBe(false);
   db.close();
 });
 
