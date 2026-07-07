@@ -37,5 +37,5 @@ Corpus/bake check green after the index regeneration; skill lints green; a grep 
 - [ ] All prose is forward-facing and the corpus and skill lint gates pass
 
 ## Done summary
-
+Aligned await/autopilot SKILL.md prose and the orient snippet template to the full six needs-human tokens (dead-letter, block-escalation, parked-question, stuck-dispatch, finalize-non-ff, instant-death-wall) plus the umbrella needs-human and since:<signature> idiom; query SKILL.md verified no-change; regenerated the snippet index and bumped vendor.lock.
 ## Evidence
