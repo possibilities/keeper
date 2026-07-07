@@ -42,5 +42,5 @@ Docs lint gates; grep for stale route-up phrasing.
       family table and the docs lint gates pass.
 
 ## Done summary
-
+Consolidated the plan README's selector narrative (sonnet-first hand_tuned policy, burden-of-proof rule, close-time selection-review lifecycle) and added problem-codes rows for the review verbs' new codes (REVIEW_EXISTS, VERDICT_INVALID, BRIEF_MISSING, BRIEF_CORRUPT, SIDECAR_MISSING) plus the uncoded set/clear usage-error note.
 ## Evidence
