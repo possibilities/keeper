@@ -352,6 +352,38 @@ export const EPICS_RECENT_DONE_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `epics_selection_review` descriptor — the NARROW unfiltered read of every
+ * epic carrying a non-null `selection_review` flag, REGARDLESS of open/closed
+ * status. The close-time selection-review flag (ADR 0011) is a display-only
+ * needs-human signal that must outlive its epic's close, so this read must NOT
+ * inherit the open-only `default_visible = 1` scope (which would drop a flagged
+ * CLOSED epic) NOR the recency window `epics_recent_done` applies (a review
+ * nags until an operator clears it, not for a fixed window). Mirrors
+ * {@link EPICS_DESCRIPTOR}'s full column/jsonColumn surface so rows project as
+ * full `Epic` objects. The `selection_review IS NOT NULL` `defaultClause` is
+ * the membership predicate AND the natural bound — the flagged set is tiny and
+ * an operator clear removes a row — so no LIMIT is imposed (unbounded page,
+ * mirroring `dispatch_failures`).
+ */
+export const EPICS_SELECTION_REVIEW_DESCRIPTOR: CollectionDescriptor = {
+  name: "epics_selection_review",
+  table: "epics",
+  columns: EPICS_DESCRIPTOR.columns,
+  pk: EPICS_DESCRIPTOR.pk,
+  version: EPICS_DESCRIPTOR.version,
+  sortable: EPICS_DESCRIPTOR.sortable,
+  defaultSort: { column: "epic_number", dir: "asc" },
+  filters: EPICS_DESCRIPTOR.filters,
+  // Membership: a non-null selection-review flag, ANY status. NOT the inherited
+  // `default_visible = 1` (open-only) — a flagged CLOSED epic must still render.
+  defaultClause: {
+    sql: "selection_review IS NOT NULL",
+    params: [],
+  },
+  jsonColumns: EPICS_DESCRIPTOR.jsonColumns,
+};
+
+/**
  * The `git` descriptor — one row per watched git worktree (membership gate:
  * `.keeper present || dirty || ahead of upstream > 0`, recomputed each
  * reconcile). A current-status snapshot plus derived per-live-job dirty/orphan
@@ -954,6 +986,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
   [EPICS_RECENT_DONE_DESCRIPTOR.name, EPICS_RECENT_DONE_DESCRIPTOR],
+  [EPICS_SELECTION_REVIEW_DESCRIPTOR.name, EPICS_SELECTION_REVIEW_DESCRIPTOR],
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [SCHEDULED_TASKS_DESCRIPTOR.name, SCHEDULED_TASKS_DESCRIPTOR],
