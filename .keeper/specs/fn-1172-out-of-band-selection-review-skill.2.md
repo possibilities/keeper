@@ -37,5 +37,5 @@ Remove the close-time grading beat and the board-flag verb. /plan:close keeps Ph
 - [ ] The Phase 3.5 follow-up cell-selection beat is byte-untouched
 
 ## Done summary
-
+Removed the selection-review board-flag verb and close-time auditor spawn/submit beat; close now only commits the mechanical brief. Reframed selection-auditor.md venue-neutral (committed brief path, no rationale/confidence, pointer-bounded evidence). Updated plan README, plugin CLAUDE.md, and problem-codes.md to the surviving surfaces.
 ## Evidence
