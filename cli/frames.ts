@@ -94,7 +94,10 @@ Options:
   --for <dur>          Stream a bounded chunk for this long, then a trailer +
                        exit (unit required, e.g. 10s, 2m). Default ~30s when
                        neither --for/--max-frames nor --follow is given.
-  --max-frames <n>     Stream until N data frames, then a trailer + exit.
+  --max-frames <n>     Stream until N data frames, then a trailer + exit. Also
+                       floored by the default ~30s duration unless --for is
+                       given, so an idle board that never reaches N still
+                       terminates.
   --follow             Reconnect-forever stream; ends only on Ctrl-C / EOF
                        (mutually exclusive with --for / --max-frames).
   --prev-frame <path>  A prior chunk's last-frame file — the baseline is rendered
@@ -120,12 +123,12 @@ WHAT IT IS
 THE ENVELOPE (one single-line JSON object per record; NDJSON)
   { schema_version, type, seq, ts, view, cursor,
     diff, diff_truncated, frame_path, state_path, diff_path }
-  - type      : baseline | frame | keepalive | trailer
+  - type      : baseline | frame | trailer
   - seq       : per-process contiguous counter across ALL record types
   - cursor    : the daemon's opaque, NON-UNIQUE fold checkpoint (never a
                 wall-clock timestamp; repaints at one rev legally share it)
   - diff      : a size-bounded unified diff for a 'frame' (null for baseline
-                unless --prev-frame seeds a net diff; null for keepalive)
+                unless --prev-frame seeds a net diff)
   - *_path    : sidecar pointers to the FULL frame text / state JSON / full diff
                 (the inline diff is a bounded convenience; dereference for truth)
   Single-line JSON is the injection guard — frame text embeds untrusted slugs,
@@ -137,7 +140,7 @@ THE TRAILER (always the final line, on --max-frames / --for / Ctrl-C alike)
   - coverage      : "continuous" (one uninterrupted run, provably lost nothing)
                     | "gap_possible" (a reconnect happened, or you resumed across
                     chunks — a fresh baseline mid-stream is itself the gap signal)
-  - frames_emitted: data frames this chunk (baseline + keepalives excluded)
+  - frames_emitted: data frames this chunk (baseline excluded)
 
 CHUNKED-CONSUMPTION LOOP (bounded foreground commands or a polled background)
   1. keeper frames --view board --max-frames 20 --for 30s > chunk.ndjson
@@ -266,9 +269,12 @@ export async function runFramesCli(
     maxFrames = n;
   }
 
-  // Bounded-chunked by default: with neither bound nor --follow, apply the
-  // default duration so a bare invocation never streams forever.
-  if (!follow && durationMs === null && maxFrames === null) {
+  // Bounded-chunked by default: whenever --follow is absent and --for was not
+  // given, apply the default duration as a wall-clock FLOOR — even when
+  // --max-frames is set. --max-frames alone arms no teardown of its own (an
+  // idle board that never reaches N data frames would otherwise hang until
+  // SIGINT), so the two bounds race and whichever trips first ends the chunk.
+  if (!follow && durationMs === null) {
     durationMs = DEFAULT_FRAMES_DURATION_MS;
   }
 

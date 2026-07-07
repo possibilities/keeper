@@ -6,10 +6,10 @@
  *
  * Proven here: baseline-vs-frame typing, contiguous seq across every record
  * type, the truncation marker with byte/line counts, a trailer on every
- * termination cause with an honest coverage verdict, keepalive seq, max-frames
- * counting data frames only, the sidecar ring pruning ONLY its own files, and
- * single-line framing safety against frame/diff text carrying newlines, quotes,
- * and ANSI escapes.
+ * termination cause with an honest coverage verdict, max-frames counting data
+ * frames only, the sidecar ring pruning ONLY its own files, and single-line
+ * framing safety against frame/diff text carrying newlines, quotes, and ANSI
+ * escapes.
  */
 
 import { expect, test } from "bun:test";
@@ -204,43 +204,26 @@ test("a truncated frame diff sets diff_truncated and still writes the full diff 
 });
 
 // ---------------------------------------------------------------------------
-// seq contiguity + keepalives
+// seq contiguity
 // ---------------------------------------------------------------------------
 
-test("seq is contiguous across baseline, frames, keepalives, and the trailer", () => {
+test("seq is contiguous across baseline, frames, and the trailer", () => {
   const h = makeHarness();
   h.emitter.emitBaseline(frameInput());
   h.emitter.emitFrame(frameInput({ frameText: "f1" }));
-  h.emitter.emitKeepalive("rev-k");
   h.emitter.emitFrame(frameInput({ frameText: "f2" }));
   h.emitter.emitTrailer({ reason: "interrupt" });
   const seqs = h.records().map((r) => r.seq);
-  expect(seqs).toEqual([0, 1, 2, 3, 4]);
-});
-
-test("a keepalive carries the current seq + cursor and never counts as a data frame", () => {
-  const h = makeHarness();
-  h.emitter.emitBaseline(frameInput({ cursor: "rev-1" }));
-  h.emitter.emitKeepalive(null); // null → falls back to the last cursor
-  const [, ka] = h.records();
-  expect(ka.type).toBe("keepalive");
-  expect(ka.seq).toBe(1);
-  expect(ka.cursor).toBe("rev-1");
-  expect(ka.frame_path).toBeNull();
-  expect(ka.state_path).toBeNull();
-  expect(ka.diff_path).toBeNull();
-  expect(h.emitter.framesEmitted()).toBe(0);
+  expect(seqs).toEqual([0, 1, 2, 3]);
 });
 
 // ---------------------------------------------------------------------------
 // Bounds: max-frames counts data frames only; duration via the fake clock
 // ---------------------------------------------------------------------------
 
-test("max-frames counts data frames only — baseline and keepalives are excluded", () => {
+test("max-frames counts data frames only — baseline is excluded", () => {
   const h = makeHarness({ maxFrames: 2 });
   h.emitter.emitBaseline(frameInput());
-  expect(h.emitter.shouldStop()).toBeNull();
-  h.emitter.emitKeepalive("k");
   expect(h.emitter.shouldStop()).toBeNull();
   h.emitter.emitFrame(frameInput({ frameText: "f1" }));
   expect(h.emitter.shouldStop()).toBeNull();
@@ -354,7 +337,6 @@ test("every record is exactly one physical line terminated by a single newline",
   const h = makeHarness();
   h.emitter.emitBaseline(frameInput());
   h.emitter.emitFrame(frameInput({ frameText: "f1" }));
-  h.emitter.emitKeepalive("k");
   h.emitter.emitTrailer({ reason: "eof" });
   for (const raw of h.rawWrites) {
     expect(raw.endsWith("\n")).toBe(true);
