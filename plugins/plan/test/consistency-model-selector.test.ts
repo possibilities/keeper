@@ -53,6 +53,34 @@ describe("on-disk selector config", () => {
     }
   });
 
+  test("the launch-model guidance blocks exist and carry no cost or provider language", () => {
+    const config = loadModelSelectorConfig(
+      join(PLAN_ROOT, "model-selector.yaml"),
+    );
+    // Content-blind selector guidance must stay capability-shaped: cost and
+    // provider ordering live in the host matrix, never in a guidance block.
+    const forbidden = [
+      "cost",
+      "cheap",
+      "expensive",
+      "price",
+      "provider",
+      "codex",
+      "claude",
+      "harness",
+      "subscription",
+      "pecking",
+    ];
+    for (const model of ["gpt-5.5", "gpt-5.3-codex-spark"]) {
+      const block = config.models[model] ?? "";
+      expect(block.length).toBeGreaterThan(0);
+      const lower = block.toLowerCase();
+      for (const word of forbidden) {
+        expect(lower).not.toContain(word);
+      }
+    }
+  });
+
   test("subagents.yaml header cross-references model-selector.yaml", () => {
     const text = readFileSync(join(PLAN_ROOT, "subagents.yaml"), "utf-8");
     expect(text).toContain("model-selector.yaml");
@@ -138,6 +166,36 @@ describe("model-guidance check core", () => {
     expect(result.ok).toBe(false);
     expect(
       result.errors.some((e) => e.includes("models") && e.includes("sonnet")),
+    ).toBe(true);
+  });
+
+  test("an extra model guidance block beyond the axis is tolerated", () => {
+    // A host-provisioned block for a capability model absent from the embedded
+    // axis (and without a research entry) must NOT fail the host-blind gate — the
+    // runtime selection-brief seam owns effective-matrix coverage.
+    const input = baseInput();
+    const result = checkModelGuidance({
+      ...input,
+      config: {
+        ...input.config,
+        models: { ...input.config.models, "gpt-5.5": "wrapped block" },
+      },
+    });
+    expect(result).toEqual({ ok: true, errors: [] });
+  });
+
+  test("an extra effort guidance block still fails coverage (efforts stay strict)", () => {
+    const input = baseInput();
+    const result = checkModelGuidance({
+      ...input,
+      config: {
+        ...input.config,
+        efforts: { ...input.config.efforts, ultra: "?" },
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(
+      result.errors.some((e) => e.includes("efforts") && e.includes("ultra")),
     ).toBe(true);
   });
 

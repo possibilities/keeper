@@ -84,6 +84,49 @@ the await-owned range):
 | 7    | `keeper tabs restore --apply` | ZERO candidates without `--allow-empty`. Pass `--allow-empty` to proceed with an empty set, or drop `--apply` to inspect the plan. |
 | 8    | `keeper tabs restore --apply` | PARTIAL launch failure — some candidates relaunched, some failed; the restored/failed summary prints on stdout. Re-run to retry the failures (already-live sessions are deduped). |
 
+## Agent provider matrix (`keeper agent providers resolve|check`)
+
+The host-matrix doctor verbs read `~/.config/keeper/matrix.yaml` (ADR 0010) — the
+ordered provider roster that grows the worker model axis beyond claude. They emit
+a structured JSON line on stdout (`resolve`'s candidate envelope, `check`'s
+findings) and human diagnostics on stderr; neither rides the shared `cli/envelope.ts`
+shape. An ABSENT matrix is the claude-only world and never faults — every existing
+`keeper agent` behavior stays byte-identical. Reads only; nothing is mutated.
+
+`resolve <model> <effort>` emits `{schema_version, model, effort, driver,
+candidates:[{harness, model_id, preset_name}], defaults}` at exit 0. On the
+unroutable path it emits `{schema_version, error:"no_route", model, effort,
+driver, candidates:[]}`.
+
+| code       | verb                        | meaning                                                                                          | recovery                                                                                 | retry-safe |
+| ---------- | --------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- | ---------- |
+| `no_route` | `agent providers resolve`   | A wrapped (non-claude) model has no configured provider in the roster (empty candidate list).     | Add a provider serving the model to `~/.config/keeper/matrix.yaml`, or correct the token. | yes (read-only) |
+
+Exit codes (distinct from the shared 0/1/2 core, published in `keeper --help --json`):
+
+| exit | verb                      | meaning                                                                                              |
+| ---- | ------------------------- | ---------------------------------------------------------------------------------------------------- |
+| 2    | `agent providers resolve` | A model/effort token violates the name charset (lowercase alnum, hyphen, underscore, dot; no leading dot), or the matrix is malformed. |
+| 3    | `agent providers resolve` | `no_route` — a wrapped model has no configured provider in the roster. Add a serving provider or correct the model token. |
+| 1    | `agent providers check`   | Tool error — the matrix is malformed (ConfigError naming the offense on stderr).                     |
+| 9    | `agent providers check`   | One or more roster/preset/reachability drift findings (an unreachable provider binary, or an auto-generated `<provider>-<model>` preset colliding with a hand-authored one); each finding prints one line. |
+
+## Worker-cell launch rejects (`keeper dispatch`, autopilot)
+
+The launcher-owned worker-cell seam (`src/worker-cell.ts`) rejects a doomed
+`work` launch BEFORE spawning: the autopilot producer mints a sticky
+`DispatchFailed` (cleared by `retry_dispatch`), and manual `keeper dispatch` dies
+non-zero (exit 1) with the same reason. These are launch-time reason tokens
+(carried in the sticky reason / stderr message), NOT shared-envelope codes.
+
+| code                   | emitted by                    | meaning                                                                                                                | recovery                                                                                                              | retry-safe |
+| ---------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `worker-cell-no-route` | autopilot producer, `dispatch` | A WRAPPED cell (a capability model claude does not serve) that the host matrix routes to zero providers, or a malformed `matrix.yaml` at probe time (degraded, never a daemon exit). | Add a provider serving the model to `~/.config/keeper/matrix.yaml` (or fix the matrix), then `keeper retry-dispatch` (autopilot) / re-run (manual). | yes (fix config first) |
+
+Distinct from the run-time `no_route` the `agent providers resolve` verb emits
+(above): that is a read-time doctor verdict, this is a launch-time dispatch
+reject that parks the task.
+
 ## Plan family (`keeper plan` accumulate-all failures)
 
 `plugins/plan/src/emit.ts::emitFailureEnvelope` prints

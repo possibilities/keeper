@@ -15,7 +15,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HARNESS_NAME_SET, type HarnessName } from "./harness";
+import {
+  HARNESS_NAME_SET,
+  type HarnessName,
+  mapKeeperEffortToAxis,
+} from "./harness";
 
 // ---------------------------------------------------------------------------
 // CLIs, roles, read-only directive
@@ -118,8 +122,10 @@ export interface AgentLaunchOpts {
   prompt: string;
   /** `--model <m>` (claude/pi `--model`, codex `-m`). Omitted when absent. */
   model?: string;
-  /** Reasoning effort (codex only — maps to `-c model_reasoning_effort=`).
-   *  Ignored for claude (no effort flag fits the headless surface). */
+  /** Keeper reasoning effort, mapped per-harness onto the native second axis at
+   *  argv-build time: codex `-c model_reasoning_effort=`, pi `--thinking`. Claude
+   *  and hermes ignore it here (claude effort rides the run-handler `--effort`;
+   *  hermes has no second axis). Omitted when absent. */
   effort?: string;
   /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
   session?: string;
@@ -259,8 +265,10 @@ export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
     args.push("-m", opts.model);
   }
   if (opts.effort !== undefined && opts.effort !== "") {
-    // codex `-c` parses TOML, so the value is quoted.
-    args.push("-c", `model_reasoning_effort="${opts.effort}"`);
+    // codex `-c` parses TOML, so the value is quoted. The keeper effort maps onto
+    // codex's reasoning band via the descriptor (keeper `max` → codex `xhigh`).
+    const band = mapKeeperEffortToAxis("codex", opts.effort);
+    args.push("-c", `model_reasoning_effort="${band}"`);
   }
   return args;
 }
@@ -276,14 +284,20 @@ export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
  * way codex does (its `trust.json` is a shared profile path a seeder would
  * collide with). Posture-independent: pi read-only is carried by the prompt
  * directive alone (no `--exclude-tools` strip — bash stays leaky, so a strip was
- * never a sandbox), so the flags are the same either way. pi uses `thinking`,
- * never `effort`; pairing routes neither here. Pure — exported for tests.
+ * never a sandbox), so the flags are the same either way. pi's second axis is
+ * `--thinking`; a keeper effort maps onto it via the descriptor (keeper `max` →
+ * pi `xhigh`). Pure — exported for tests.
  */
 export function nativePiArgs(opts: AgentLaunchOpts): string[] {
   // `-na` (--no-approve): ignore project-local `.pi/` resources for this run.
   const args = ["-na"];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("--model", opts.model);
+  }
+  // pi's second axis is `--thinking`; the keeper effort maps onto pi's band
+  // vocabulary via the descriptor (keeper `max` → pi `xhigh`).
+  if (opts.effort !== undefined && opts.effort !== "") {
+    args.push("--thinking", mapKeeperEffortToAxis("pi", opts.effort));
   }
   // The harness-native session name; an explicit `--name` suppresses the
   // interactive auto-mint on the detached re-exec.

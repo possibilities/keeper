@@ -50,8 +50,8 @@ import {
 import { dirname, join, relative, resolve, sep } from "node:path";
 import yaml from "js-yaml";
 import {
-  loadSubagentsMatrixFromDisk,
-  type SubagentsMatrix,
+  type EffectiveMatrix,
+  effectiveMatrixFromDisk,
 } from "../../plan/src/subagents_config.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { renderTemplate, sourceRelpath } from "./render_engine.ts";
@@ -124,16 +124,19 @@ function sourceVariants(templatePath: string): string[] {
   return variants.map((v) => String(v));
 }
 
-/** The plugin's committed {model × effort} matrix config, or null when the
- * plugin ships no `subagents.yaml`. Read once per renderAgents pass; a listed
- * agent template fans out over the sorted cartesian product instead of the 1-D
- * `variants:` path. A malformed config throws (fail-loud build). */
-function pluginSubagentsMatrix(pluginDir: string): SubagentsMatrix | null {
+/** The plugin's EFFECTIVE {model × effort} matrix, or null when the plugin ships
+ * no `subagents.yaml`. The plugin's committed config is the claude-native base;
+ * a host `~/.config/keeper/matrix.yaml`, when present, overrides the model axis
+ * (adding wrapped capability cells) and the wrapper driver. Read once per
+ * renderAgents pass; a listed agent template fans out over the sorted cartesian
+ * product instead of the 1-D `variants:` path. A malformed config throws
+ * (fail-loud build). */
+function pluginEffectiveMatrix(pluginDir: string): EffectiveMatrix | null {
   const configPath = join(pluginDir, "subagents.yaml");
   if (!isFile(configPath)) {
     return null;
   }
-  return loadSubagentsMatrixFromDisk(configPath);
+  return effectiveMatrixFromDisk(configPath);
 }
 
 /** The sidecar companion path for a rendered output. */
@@ -514,7 +517,7 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
   const agentsDir = join(pluginDir, "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  const matrix = pluginSubagentsMatrix(pluginDir);
+  const matrix = pluginEffectiveMatrix(pluginDir);
 
   let hadFailures = false;
   for (const tmpl of sortedTemplates(templatesDir)) {
@@ -565,15 +568,23 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
 
     if (matrixCell !== null) {
       // 2-D {model × effort} fan-out: one generated agent per cell, both axes
-      // sorted before the cartesian product for stable output ordering.
+      // sorted before the cartesian product for stable output ordering. Each cell
+      // also carries its driver (native/wrapped) and the wrapper driver, so the
+      // composed template can branch a wrapped cell onto its foreign harness
+      // while a native cell stays byte-identical.
       const models = [...matrixCell.models].sort();
       const efforts = [...matrixCell.efforts].sort();
+      const wrapperModel = matrixCell.wrapper_driver.model;
+      const wrapperEffort = matrixCell.wrapper_driver.effort;
       for (const model of models) {
         for (const effort of efforts) {
           const defaultOut = join(agentsDir, `${stem}-${model}-${effort}.md`);
           const [rendered, failed] = renderOne(tmpl, {
             current_model: model,
             current_effort: effort,
+            current_driver: matrixCell.driverFor(model),
+            wrapper_model: wrapperModel,
+            wrapper_effort: wrapperEffort,
           });
           if (failed) {
             hadFailures = true;

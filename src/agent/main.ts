@@ -63,13 +63,29 @@ import {
   USAGE,
   VERSION,
 } from "./dispatch";
-import { HARNESS_DESCRIPTORS } from "./harness";
+import {
+  HARNESS_DESCRIPTORS,
+  type HarnessName,
+  mapKeeperEffortToAxis,
+} from "./harness";
 import { piExtensionArgs, READ_ONLY_DIRECTIVE } from "./launch-config";
 import {
   type LaunchHandleDeps,
   launchToResolvedHandle,
   tmuxTranscriptSessionId,
 } from "./launch-handle";
+import {
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_STOP_TIMEOUT_MS,
+  isValidMatrixToken,
+  loadMatrix,
+  type Matrix,
+  matrixConfigPath,
+  presetNameFor,
+  providerCheckFindings,
+  type ResolveResult,
+  resolveModel,
+} from "./matrix";
 import {
   resolveHandle,
   runShowLastMessage,
@@ -196,6 +212,19 @@ export interface MainDeps {
    * binds the real `findShadowProfileDirs` against `homedir()`.
    */
   findShadowProfileDirsFn: () => ShadowProfileFinding[];
+  /**
+   * Read the host provider matrix from `matrix.yaml`; null when absent (the
+   * caller falls back to claude-only embedded defaults). Producer-side launch
+   * config, re-parsed per call, never a fold input. Injected so the `providers`
+   * verbs are testable against fixture matrices without a real `~/.config`.
+   */
+  loadMatrixFn: () => Matrix | null;
+  /**
+   * True when a roster provider's harness binary is reachable on PATH — the
+   * `providers check` reachability probe. HOME/PATH-coupled, so a seam;
+   * `realDeps()` binds it against the resolved per-harness bins.
+   */
+  providerReachableFn: (harness: HarnessName) => boolean;
   startCodexSessionNameIndexerFn: (
     opts: CodexSessionNameIndexerOptions,
   ) => () => void;
@@ -244,6 +273,12 @@ export function realDeps(): MainDeps {
   // mkdir reads launcherStateDir (a launch with an explicit --name never hits
   // the cwd-ordinal chokepoint, so this surface must migrate too).
   migrateLegacyAgentStateDir();
+  const bins: Record<HarnessName, string> = {
+    claude: join(homedir(), ".local", "bin", "claude"),
+    codex: resolveCodexBin(process.env),
+    pi: "pi",
+    hermes: resolveHermesBin(),
+  };
   return {
     argv: process.argv.slice(2),
     env: process.env,
@@ -258,10 +293,10 @@ export function realDeps(): MainDeps {
     write: (s) => process.stdout.write(s),
     writeErr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
-    claudeBin: join(homedir(), ".local", "bin", "claude"),
-    codexBin: resolveCodexBin(process.env),
-    piBin: "pi",
-    hermesBin: resolveHermesBin(),
+    claudeBin: bins.claude,
+    codexBin: bins.codex,
+    piBin: bins.pi,
+    hermesBin: bins.hermes,
     pluginConfigPath: pluginConfigPath(),
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
@@ -280,6 +315,8 @@ export function realDeps(): MainDeps {
       ensureKeeperAgentPiProfileDir(profileName, actionLog, homedir()),
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
+    loadMatrixFn: loadMatrix,
+    providerReachableFn: (harness) => isBinaryReachable(bins[harness]),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
     emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
     tmuxBin: resolveTmuxBin(process.env),
@@ -354,6 +391,31 @@ function resolveHermesBin(): string {
   } catch {
     return "hermes";
   }
+}
+
+/**
+ * True when a resolved harness binary is reachable + executable — the
+ * `providers check` reachability probe. An absolute path is X_OK-tested directly;
+ * a bare name is searched across PATH. Any access failure reads as unreachable.
+ */
+function isBinaryReachable(bin: string): boolean {
+  try {
+    if (isAbsolute(bin)) {
+      accessSync(bin, constants.X_OK);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  for (const pathEntry of (process.env.PATH ?? "").split(delimiter)) {
+    try {
+      accessSync(join(pathEntry || ".", bin), constants.X_OK);
+      return true;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return false;
 }
 
 /**
@@ -1599,6 +1661,184 @@ function runProfilesCheck(deps: MainDeps, json: boolean): never {
   return deps.exit(PROFILES_CHECK_FOUND_EXIT);
 }
 
+/** `providers` (host-matrix doctor) JSON contract version. */
+const PROVIDERS_SCHEMA_VERSION = 1;
+/** `providers resolve`: a wrapped model has no configured provider (no_route). */
+const PROVIDERS_NO_ROUTE_EXIT = 3;
+/** `providers check`: one or more roster/preset/reachability drift findings. */
+const PROVIDERS_CHECK_DRIFT_EXIT = 9;
+
+/**
+ * `providers resolve <model> <effort>`: emit the cost-ordered serving candidates
+ * for a model from the host matrix, plus the defaults block. A native (claude)
+ * model resolves to the single claude candidate; a wrapped model resolves to its
+ * pecking-ordered foreign candidates. An UNROUTABLE wrapped model (no configured
+ * provider) exits with the distinct `no_route` code; a bad model/effort token
+ * exits 2; a malformed matrix exits 2. An ABSENT matrix is the claude-only world:
+ * every model resolves native (byte-identical to today, where no non-claude
+ * provider exists), so no_route can only arise once a matrix configures wrapped
+ * models.
+ */
+function runProvidersResolve(
+  deps: MainDeps,
+  model: string,
+  effort: string,
+): never {
+  for (const [label, token] of [
+    ["model", model],
+    ["effort", effort],
+  ] as const) {
+    if (!isValidMatrixToken(token)) {
+      deps.writeErr(
+        `agent providers resolve: ${label} '${token}' is not a valid token ` +
+          "(lowercase alnum, hyphen, underscore, dot; no leading dot).\n",
+      );
+      return deps.exit(2);
+    }
+  }
+  let matrix: Matrix | null;
+  try {
+    matrix = deps.loadMatrixFn();
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(2);
+    }
+    throw exc;
+  }
+  const result: ResolveResult =
+    matrix === null
+      ? {
+          driver: "native",
+          candidates: [
+            {
+              harness: "claude",
+              model_id: model,
+              preset_name: presetNameFor("claude", model),
+            },
+          ],
+        }
+      : resolveModel(matrix, model);
+  if (result.driver === "wrapped" && result.candidates.length === 0) {
+    deps.writeErr(
+      `agent providers resolve: no configured provider serves the wrapped ` +
+        `model '${model}' in ${matrixConfigPath()} (no_route). Add a provider ` +
+        "serving it to the matrix roster, or correct the model token.\n",
+    );
+    deps.write(
+      `${JSON.stringify({
+        schema_version: PROVIDERS_SCHEMA_VERSION,
+        error: "no_route",
+        model,
+        effort,
+        driver: result.driver,
+        candidates: [],
+      })}\n`,
+    );
+    return deps.exit(PROVIDERS_NO_ROUTE_EXIT);
+  }
+  const defaults = matrix?.defaults ?? {
+    stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+    max_attempts: DEFAULT_MAX_ATTEMPTS,
+  };
+  deps.write(
+    `${JSON.stringify({
+      schema_version: PROVIDERS_SCHEMA_VERSION,
+      model,
+      effort,
+      driver: result.driver,
+      candidates: result.candidates,
+      defaults,
+    })}\n`,
+  );
+  return deps.exit(0);
+}
+
+/**
+ * `providers check`: the host-matrix doctor. Reports roster-vs-preset-catalog and
+ * roster-vs-binary-reachability drift — one line per finding on stderr, the
+ * structured findings as a JSON line on stdout. An ABSENT matrix is clean (exit
+ * 0, claude-only defaults, nothing to drift); a malformed matrix is a tool error
+ * (exit 1); drift findings exit 9. Read-only — never mutates config.
+ */
+function runProvidersCheck(deps: MainDeps): never {
+  let matrix: Matrix | null;
+  try {
+    matrix = deps.loadMatrixFn();
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(1);
+    }
+    throw exc;
+  }
+  if (matrix === null) {
+    deps.write(
+      `${JSON.stringify({
+        schema_version: PROVIDERS_SCHEMA_VERSION,
+        matrix_present: false,
+        findings: [],
+      })}\n`,
+    );
+    deps.writeErr(
+      `providers check: no matrix.yaml at ${matrixConfigPath()} — claude-only ` +
+        "embedded defaults, nothing to drift.\n",
+    );
+    return deps.exit(0);
+  }
+  // The hand-authored preset names the auto-generated `<provider>-<model>` set
+  // must not collide with. A missing/invalid catalog is not fatal to the doctor —
+  // treat it as no hand-authored presets (the collision axis is simply empty).
+  let handAuthored: ReadonlySet<string>;
+  try {
+    handAuthored = new Set(Object.keys(deps.loadPresetCatalogFn().presets));
+  } catch (exc) {
+    if (exc instanceof ConfigError) {
+      handAuthored = new Set();
+    } else {
+      throw exc;
+    }
+  }
+  const rendered = providerCheckFindings(
+    matrix,
+    handAuthored,
+    deps.providerReachableFn,
+  ).map((f) =>
+    f.kind === "binary-unreachable"
+      ? {
+          kind: f.kind,
+          provider: f.provider,
+          binary: f.binary,
+          line: `provider '${f.provider}' binary '${f.binary}' is not reachable on PATH`,
+        }
+      : {
+          kind: f.kind,
+          preset: f.preset,
+          provider: f.provider,
+          model: f.model,
+          line: `auto-generated preset '${f.preset}' collides with a hand-authored preset`,
+        },
+  );
+  deps.write(
+    `${JSON.stringify({
+      schema_version: PROVIDERS_SCHEMA_VERSION,
+      matrix_present: true,
+      findings: rendered,
+    })}\n`,
+  );
+  for (const f of rendered) {
+    deps.writeErr(`${f.line}\n`);
+  }
+  if (rendered.length === 0) {
+    deps.writeErr(
+      "providers check: roster, preset catalog, and binaries all consistent.\n",
+    );
+    return deps.exit(0);
+  }
+  deps.writeErr(`providers check: ${rendered.length} finding(s).\n`);
+  return deps.exit(PROVIDERS_CHECK_DRIFT_EXIT);
+}
+
 export async function main(deps: MainDeps): Promise<never> {
   const actionLog: string[] = [];
 
@@ -1662,6 +1902,12 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "profiles-check") {
     return runProfilesCheck(deps, dispatch.json);
+  }
+  if (dispatch.kind === "providers-resolve") {
+    return runProvidersResolve(deps, dispatch.model, dispatch.effort);
+  }
+  if (dispatch.kind === "providers-check") {
+    return runProvidersCheck(deps);
   }
 
   // Resolve the leading-token harness. `run` carries it directly; the
@@ -2085,10 +2331,13 @@ export async function main(deps: MainDeps): Promise<never> {
       note(`model: ${startupModel}`);
     }
     if (startupEffort !== null) {
-      const effortConfig = codexEffortConfigArg(startupEffort);
+      // A keeper effort maps onto codex's reasoning band via the descriptor
+      // (keeper `max` → codex `xhigh`); an already-native band passes through.
+      const band = mapKeeperEffortToAxis("codex", startupEffort);
+      const effortConfig = codexEffortConfigArg(band);
       runCmd.push("-c", effortConfig);
       actionLog.push(`Added Codex effort override: -c ${effortConfig}`);
-      note(`effort: ${startupEffort}`);
+      note(`effort: ${band}`);
     }
 
     runCmd.push(...remainingArgs);
@@ -2355,11 +2604,12 @@ export async function main(deps: MainDeps): Promise<never> {
       defaultModel,
     );
     if (startupThinking !== null) {
-      runCmd.push("--thinking", startupThinking);
-      actionLog.push(
-        `Added Pi thinking override: --thinking ${startupThinking}`,
-      );
-      note(`thinking: ${startupThinking}`);
+      // A keeper effort maps onto pi's band via the descriptor (keeper `max` → pi
+      // `xhigh`); an already-native band (e.g. `off`) passes through unchanged.
+      const band = mapKeeperEffortToAxis("pi", startupThinking);
+      runCmd.push("--thinking", band);
+      actionLog.push(`Added Pi thinking override: --thinking ${band}`);
+      note(`thinking: ${band}`);
     }
     if (startupModel !== null) {
       runCmd.push("--model", startupModel);

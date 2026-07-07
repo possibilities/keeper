@@ -29,7 +29,11 @@ import {
   tryResolveOwningProjectForId,
 } from "../project.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
-import { loadSubagentsMatrixFromDisk } from "../subagents_config.ts";
+import {
+  type EffectiveMatrix,
+  effectiveMatrix,
+  loadSubagentsMatrixFromDisk,
+} from "../subagents_config.ts";
 import { loadYamlInput, parseYamlInput } from "../yaml_input.ts";
 
 export const SELECTION_BRIEF_SCHEMA_VERSION = 1;
@@ -186,6 +190,33 @@ function shuffledCellsForTask(
   });
 }
 
+/** The set of models carrying a non-empty guidance block in the selector policy
+ * config (`model-selector.yaml`). The content-blind selector can only rank a
+ * model it has a capability-fit block for, so this drives the roster-coverage
+ * enforcement. Best-effort parse: a malformed config is caught by the caller's
+ * prior `validateYamlFile`, so an unparseable body here yields the empty set. */
+function guidanceModelBlocks(configYaml: string): Set<string> {
+  const out = new Set<string>();
+  let parsed: unknown;
+  try {
+    parsed = parseYamlInput(
+      Buffer.from(configYaml, "utf-8"),
+      "model-selector.yaml",
+    );
+  } catch {
+    return out;
+  }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.models)) {
+    return out;
+  }
+  for (const [key, value] of Object.entries(parsed.models)) {
+    if (typeof value === "string" && value.trim() !== "") {
+      out.add(key);
+    }
+  }
+  return out;
+}
+
 export function runSelectionBrief(args: SelectionBriefArgs): void {
   const { epicId, project, format } = args;
   if (!isEpicId(epicId)) {
@@ -205,9 +236,10 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
   validateYamlFile(configPath, "CONFIG_MISSING", format);
   const subagentsYaml = readUtf8(subagentsPath, "MATRIX_MISSING", format);
   validateYamlFile(subagentsPath, "MATRIX_MISSING", format);
-  let matrix: ReturnType<typeof loadSubagentsMatrixFromDisk>;
+  // Structurally validate the raw subagents.yaml the brief embeds — the selector
+  // reads it as the axis source, so a malformed embed fails loud here.
   try {
-    matrix = loadSubagentsMatrixFromDisk(subagentsPath);
+    loadSubagentsMatrixFromDisk(subagentsPath);
   } catch (exc) {
     emitSelectionBriefError(
       "MATRIX_MISSING",
@@ -220,14 +252,49 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
     );
   }
 
+  // The effective axes = embedded claude defaults overlaid by the host provider
+  // matrix (matrix.yaml) when present, so wrapped capability models the host
+  // roster lists become selectable with no rebuild. A malformed host matrix is
+  // fail-loud (never a silent fall-back to defaults).
+  let effective: EffectiveMatrix;
+  try {
+    effective = effectiveMatrix();
+  } catch (exc) {
+    emitSelectionBriefError(
+      "MATRIX_MISSING",
+      `host provider matrix (matrix.yaml) is invalid: ${exc instanceof Error ? exc.message : String(exc)}`,
+      format,
+      { error: exc instanceof Error ? exc.message : String(exc) },
+    );
+  }
+
+  // Every roster model must carry a model-selector.yaml guidance block. This
+  // enforcement lives at the runtime seam — not repo CI's drift gate — because a
+  // host-added model is invisible to the committed axes: without guidance the
+  // content-blind selector would rank a model it knows nothing about. Fail loud,
+  // naming the model and the file to edit.
+  const guided = guidanceModelBlocks(selectorConfigYaml);
+  for (const model of effective.models) {
+    if (!guided.has(model)) {
+      emitSelectionBriefError(
+        "MODEL_GUIDANCE_MISSING",
+        `roster model "${model}" has no guidance block in ${configPath}; ` +
+          `add a \`models: ${model}\` capability-fit block (strengths, ` +
+          "when-to-pick, when-to-avoid) before selecting cells",
+        format,
+        { model, config_path: configPath },
+      );
+    }
+  }
+
   const epicDef = loadEpic(ctx, epicId);
   const primaryRepo =
     typeof epicDef.primary_repo === "string" && epicDef.primary_repo !== ""
       ? epicDef.primary_repo
       : ctx.projectPath;
 
-  const candidateCells = matrix.models.flatMap((model) =>
-    matrix.efforts.map((effort) => ({ model, tier: effort })),
+  const candidateCells = effective.models.flatMap((model) =>
+    effective.efforts.map((effort) => ({ model, tier: effort })),
   );
 
   const source = args.fromFollowup
@@ -252,8 +319,8 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
     selector_config_yaml: selectorConfigYaml,
     subagents_path: subagentsPath,
     subagents_yaml: subagentsYaml,
-    efforts: matrix.efforts,
-    models: matrix.models,
+    efforts: effective.efforts,
+    models: effective.models,
     input_hash: inputHash,
     shuffle_seed: shuffleSeed,
     epic: {

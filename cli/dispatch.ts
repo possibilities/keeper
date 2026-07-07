@@ -48,6 +48,7 @@ import {
   type Preset,
   resolvePreset,
 } from "../src/agent/config";
+import { matrixConfigPath } from "../src/agent/matrix";
 import {
   KEEPER_ROOT,
   resolveWorkerLaunchConfig,
@@ -74,6 +75,7 @@ import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
 import {
   composeWorkerCellDir,
+  defaultRouteProbe,
   defaultShadowingWorkProbe,
   resolveWorkerCell,
 } from "../src/worker-cell";
@@ -718,6 +720,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
           dirExists: deps.dirExists ?? existsSync,
           probeShadow:
             deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
+          probeRoute: () => defaultRouteProbe(cwdResult.model ?? ""),
         },
       );
       if (!cell.ok) {
@@ -727,6 +730,14 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
               `refusing to launch ${claudeName}: its {model, tier} resolves no valid ` +
                 `worker cell — ${cell.message}; fix the task's model/tier in the plan ` +
                 "or regenerate the worker matrix",
+            );
+            break;
+          case "no-route":
+            die(
+              `refusing to launch ${claudeName}: '${cell.model}' is a wrapped model ` +
+                `with no configured provider in ${matrixConfigPath()} — add a ` +
+                "provider serving it to the roster (or correct the task's model), " +
+                "then retry (worker-cell-no-route)",
             );
             break;
           case "missing":
