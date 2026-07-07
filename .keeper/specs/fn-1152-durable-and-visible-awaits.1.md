@@ -48,5 +48,5 @@ ready to hand to a planner, and commits to one recommended direction.
 - [ ] The doc closes with a follow-up epic decomposition a planner can scaffold from directly
 
 ## Done summary
-
+Wrote the design proposal at ~/docs/keeper-durable-awaits.md: recommends one visibility surface (a display-only needs_human.finalize_pending count for done-but-unmerged epics on a paused worktree board) and one durable-await mechanism (an event-sourced awaits projection + level-triggered await-worker, patterned on the request_handoff durable-intent template), each with verified integration points, a write-rules compliance table, worktree-OFF degrade handling, and a planner-ready follow-up epic decomposition.
 ## Evidence
