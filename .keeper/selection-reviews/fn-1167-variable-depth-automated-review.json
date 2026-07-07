@@ -1,0 +1,32 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 2,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T20:43:59.607000Z",
+  "epic_id": "fn-1167-variable-depth-automated-review",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "ddc5cf277a7526226a34d845d05b35777a7c838c8ad14be8eb10783599cfe767",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "Prose-only 3-file, 55-insertion change with dedup-fingerprint and refute semantics carrying real reasoning load; sonnet at high tier matches, no concrete misfit signal (confidence 0.68).",
+      "input_hash": "ddc5cf277a7526226a34d845d05b35777a7c838c8ad14be8eb10783599cfe767",
+      "model": "sonnet",
+      "task_id": "fn-1167-variable-depth-automated-review.3",
+      "tier": "high",
+      "verdict": "right_sized"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "The epic's core gate \u2014 9 files, 463 insertions, tests included \u2014 with contract-shaped orchestration invariants (idempotent re-audit, lane isolation, refute-then-escalate) justifies opus at xhigh (confidence 0.8).",
+      "input_hash": "ddc5cf277a7526226a34d845d05b35777a7c838c8ad14be8eb10783599cfe767",
+      "model": "opus",
+      "task_id": "fn-1167-variable-depth-automated-review.4",
+      "tier": "xhigh",
+      "verdict": "right_sized"
+    }
+  ]
+}
