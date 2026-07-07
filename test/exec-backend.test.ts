@@ -633,6 +633,11 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     // ...and an empty branch entry (the durable-marker sibling), same reason.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    // A prompt launch ALWAYS carries the EMPTY identity carrier (the 4th env
+    // entry) — a fresh launch never inherits a stale KEEPER_JOB_ID from a reused
+    // session env and folds onto someone else's row.
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     // Keeper-owned worker permission posture (mirrors the pair path); rides every
     // launch, right after the worktree env block and before model/effort/name.
     "--permission-mode",
@@ -674,6 +679,8 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -724,6 +731,8 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     // Permission posture rides even the minimal launch (no model/effort/name).
     "--permission-mode",
     "acceptEdits",
@@ -754,6 +763,10 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    // Resume mode with NO jobId still carries the identity slot, EMPTY — the value
+    // is present only when the caller threads the original job id (pinned below).
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     // Resume is just as human-less as a fresh launch — the posture rides it too.
     "--permission-mode",
     "acceptEdits",
@@ -788,6 +801,8 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -820,6 +835,8 @@ test("buildKeeperAgentLaunchArgv: codex resume emits `keeper agent codex … res
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     "--x-no-confirm",
     "resume",
     "rollout-uuid",
@@ -866,6 +883,46 @@ test("buildKeeperAgentLaunchArgv: an explicit claude harness is byte-identical t
   );
 });
 
+test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JOB_ID=<id> as the 4th env carrier", () => {
+  // The identity carrier the revived non-claude harness folds onto its existing
+  // row from — distinct from the harness-native resume target in the tail.
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "s",
+    prompt: "",
+    resumeTarget: "d98a2d54-native",
+    jobId: "45f94c4d-orig",
+    harness: "pi",
+    noConfirm: true,
+  });
+  // Exactly one identity carrier, valued with the ORIGINAL job id.
+  const idEntries = argv.filter((a) => a.startsWith("KEEPER_JOB_ID="));
+  expect(idEntries).toEqual(["KEEPER_JOB_ID=45f94c4d-orig"]);
+  // It is the FOURTH repeated env entry (after session/lane/branch), each preceded
+  // by its own `--x-tmux-env`.
+  const idx = argv.indexOf("KEEPER_JOB_ID=45f94c4d-orig");
+  expect(argv[idx - 1]).toBe("--x-tmux-env");
+  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(4);
+  // Identity (job id) and the resume key (native target) stay DISTINCT.
+  expect(argv.slice(-2)).toEqual(["--session", "d98a2d54-native"]);
+  expect(idEntries[0]).not.toContain("d98a2d54-native");
+});
+
+test("buildKeeperAgentLaunchArgv: a PROMPT launch emits the EMPTY overwrite even when a jobId is passed (stale-identity guard)", () => {
+  // A fresh prompted launch must NEVER carry an identity — the empty overwrite
+  // clears any stale KEEPER_JOB_ID a prior resume left in a reused session env.
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "autopilot",
+    prompt: "/plan:work fn-1-x.1",
+    jobId: "should-not-leak",
+    noConfirm: true,
+  });
+  const idEntries = argv.filter((a) => a.startsWith("KEEPER_JOB_ID="));
+  expect(idEntries).toEqual(["KEEPER_JOB_ID="]);
+  expect(argv.join(" ")).not.toContain("should-not-leak");
+});
+
 test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-env KEEPER_PLAN_WORKTREE (byte-pinned)", () => {
   expect(
     buildKeeperAgentLaunchArgv({
@@ -895,6 +952,8 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     // The 3rd repeated env entry — the durable lane-branch marker.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x",
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -935,6 +994,8 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x--fn-1-x.2",
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",

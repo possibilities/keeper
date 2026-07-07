@@ -259,8 +259,13 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE keeper agent
   expect(script).toContain("cd '/repo/a' && '/abs/bun' '/abs/cli/keeper.ts'");
   expect(script).toContain("'--resume' 'first-name'");
   expect(script).toContain("'--resume' 'second-name'");
-  expect(script).not.toContain("j1");
-  expect(script).not.toContain("j2");
+  // The revive script carries the ORIGINAL job identity per line so a revived
+  // non-claude harness folds onto its existing row — the job id rides as the
+  // KEEPER_JOB_ID env carrier, never as the (name-based) resume target.
+  expect(script).toContain("'KEEPER_JOB_ID=j1'");
+  expect(script).toContain("'KEEPER_JOB_ID=j2'");
+  expect(script).not.toContain("'--resume' 'j1'");
+  expect(script).not.toContain("'--resume' 'j2'");
   // Exactly one inter-launch pause (between the two; none leading/trailing).
   expect(script.match(/^sleep 0\.5$/gm) ?? []).toHaveLength(1);
   expect(script).toContain(
@@ -307,6 +312,9 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper
       "'work' '--x-tmux-env' 'KEEPER_TMUX_SESSION=work' " +
       "'--x-tmux-env' 'KEEPER_PLAN_WORKTREE=' " +
       "'--x-tmux-env' 'KEEPER_PLAN_WORKTREE_BRANCH=' " +
+      // The dumped resume line carries the identity env (candidate.job_id),
+      // byte-aligned with what --apply spawns for the same candidate.
+      "'--x-tmux-env' 'KEEPER_JOB_ID=j' " +
       "'--permission-mode' 'acceptEdits' '--dangerously-skip-permissions' " +
       "'--x-no-confirm' '--resume' 'name'",
   );
@@ -532,11 +540,16 @@ test("applyRestore launches each would-restore via ensureLaunched, carrying the 
     ],
     null,
   );
-  const calls: { session: string; resumeTarget: string; cwd: string }[] = [];
+  const calls: {
+    session: string;
+    resumeTarget: string;
+    cwd: string;
+    jobId: string;
+  }[] = [];
   const out = await applyRestore(
     plan,
-    async (session, resumeTarget, cwd) => {
-      calls.push({ session, resumeTarget, cwd });
+    async (session, resumeTarget, cwd, _harness, jobId) => {
+      calls.push({ session, resumeTarget, cwd, jobId });
       return { ok: true };
     },
     async () => {},
@@ -546,8 +559,12 @@ test("applyRestore launches each would-restore via ensureLaunched, carrying the 
     session: "work",
     resumeTarget: "a-name",
     cwd: "/repo/a",
+    // The candidate's ORIGINAL job id is threaded through so the launch carries
+    // the identity env (distinct from the resume target).
+    jobId: "a",
   });
   expect(calls[1].resumeTarget).toBe("b-name");
+  expect(calls[1].jobId).toBe("b");
 });
 
 test("applyRestore continues past a single agent's launch failure", async () => {

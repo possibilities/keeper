@@ -127,13 +127,17 @@ export function planRestore(
  * `keeperAgentLaunch` in resume mode (keeper's sole launch transport); tests
  * inject a capturing fake so `--apply` can be asserted without spawning a real
  * multiplexer. Carries the RESUME TARGET (not a pre-wrapped argv) — keeper agent
- * builds the `--resume <target>` invocation and owns the tmux window.
+ * builds the `--resume <target>` invocation and owns the tmux window. `jobId` is
+ * the candidate's ORIGINAL keeper job id, carried into the resume launch as the
+ * identity env so the revived non-claude harness folds onto its existing row
+ * (distinct from `resumeTarget`, the harness-native resume key).
  */
 export type EnsureLaunchedFn = (
   session: string,
   resumeTarget: string,
   cwd: string,
   harness: string,
+  jobId: string,
 ) => Promise<{ ok: true } | { ok: false; error: string }>;
 
 /** Sleep injection for {@link applyRestore} — production passes the real
@@ -180,6 +184,7 @@ export async function applyRestore(
         entry.candidate.resume_target,
         cwd,
         harnessOrClaude(entry.candidate.harness),
+        entry.candidate.job_id,
       );
       if (res.ok) {
         out.push({ kind: "restored", candidate: entry.candidate });
@@ -415,6 +420,7 @@ export function renderSnapshotScript(
         session: sessionName,
         prompt: "",
         resumeTarget: candidate.resume_target,
+        jobId: candidate.job_id,
         harness: harnessOrClaude(candidate.harness),
         noConfirm: true,
       });
@@ -861,20 +867,22 @@ export function defaultLauncherPrefix(): string[] {
  * Build the real {@link EnsureLaunchedFn}: route every candidate through keeper's
  * sole launch transport — `keeperAgentLaunch` in resume mode (the same seam
  * `keeper bus wake` uses). keeper agent mints/owns the recorded session and
- * re-attaches via `--resume <target>`; cwd is set on the spawn. Per-candidate
+ * re-attaches via `--resume <target>`; cwd is set on the spawn. The candidate's
+ * ORIGINAL job id rides the spec so the launch carries the identity env — the
+ * revived harness folds onto its existing row, not an orphan. Per-candidate
  * failure isolation rides on the returned LaunchResult verdict.
  */
 export function makeEnsureLaunched(
   launcherArgvPrefix: string[],
   noteLine: (line: string) => void,
 ): EnsureLaunchedFn {
-  return (session, resumeTarget, cwd, harness) =>
+  return (session, resumeTarget, cwd, harness, jobId) =>
     keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix,
       session,
       cwd,
       label: `restore resume ${harness} ${resumeTarget}`,
-      spec: { prompt: "", resumeTarget, harness },
+      spec: { prompt: "", resumeTarget, jobId, harness },
     });
 }
