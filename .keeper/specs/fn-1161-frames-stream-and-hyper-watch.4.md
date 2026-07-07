@@ -48,5 +48,5 @@ shared-shell envelope after normalization.
 - [ ] Both usage streams count once toward coverage accounting
 
 ## Done summary
-
+Wired the open-coded usage viewer into the shared frames emitter via a new createUsageEmitEngine, so 'keeper frames --view usage' streams baseline/frame/trailer envelopes byte-shape-identical to the shell viewers with the raw-field hash gate as the sole emit trigger (a relative-time tick never mints a frame). Completed the cli/frames.ts usage dispatch arm; added pure parity/tick/coverage/bound tests.
 ## Evidence
