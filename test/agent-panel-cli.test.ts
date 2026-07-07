@@ -34,6 +34,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseDuration } from "../cli/duration";
 import type {
   PanelSelections,
   Preset,
@@ -277,6 +278,20 @@ test("agent panel wait: --chunk above the ceiling → exit 2", async () => {
   expect(r.stderr).toContain("ceiling");
 });
 
+test("agent panel wait: a unitless --chunk exits 2 with the self-healing unit hint", async () => {
+  const pdir = seedTerminalPanel();
+  const r = await runAgent([
+    "panel",
+    "wait",
+    "--run-dir",
+    pdir,
+    "--chunk",
+    "540",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("needs a unit");
+});
+
 test("agent panel start: a missing/empty config is fail-loud exit 2 (no leg spawns)", async () => {
   const promptFile = join(dir, "ask.md");
   writeFileSync(promptFile, "what is the best answer?");
@@ -331,6 +346,16 @@ test("agent panel start: a --slug that slugifies to nothing → exit 2", async (
   ]);
   expect(r.code).toBe(2);
   expect(r.stderr).toContain("slugifies to nothing");
+});
+
+test("agent panel start: a unitless --timeout exits 2 with the self-healing unit hint", async () => {
+  const promptFile = join(dir, "ask.md");
+  writeFileSync(promptFile, "what is the best answer?");
+  // --timeout is parsed before the slug gate + config load, so a bare promptFile
+  // is enough to reach the rejection without a working config.
+  const r = await runAgent(["panel", "start", promptFile, "--timeout", "30"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("needs a unit");
 });
 
 test("agent panel: bare sub-verb → exit 2", async () => {
@@ -708,6 +733,32 @@ describe("panelStart (ad-hoc member fan-out)", () => {
       readFileSync(join(pdir, "manifest.json"), "utf8"),
     );
     expect(manifest.slug).toBe("duo-run");
+  });
+
+  test("--timeout <dur> maps the accepted unit to the leg's --stop-timeout ms", async () => {
+    const promptFile = join(dir, "ask.md");
+    writeFileSync(promptFile, "what is the best answer?");
+    const pdir = join(dir, "adhoc-timeout");
+    const { deps, spawns } = makeAdHocDeps();
+    // Mirrors runPanel's own `dur.ms / 1000` → `timeoutSeconds * 1000` mapping
+    // for a `--timeout 5m` flag.
+    const dur = parseDuration("5m");
+    expect(dur.ok).toBe(true);
+    if (!dur.ok) return;
+    const code = await panelStart(
+      {
+        promptFile,
+        slug: "adhoc-run",
+        panel: undefined,
+        adHoc: { preset: "codex-review", readOnly: true },
+        dir: pdir,
+        timeoutSeconds: dur.ms / 1000,
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    const leg = legOf(spawns[0] as AdHocSpawn);
+    expect(leg[leg.indexOf("--stop-timeout") + 1]).toBe("300000ms");
   });
 });
 
