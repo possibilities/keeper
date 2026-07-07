@@ -7,7 +7,7 @@
     "fn-1173-escalation-posture-repair-and-guard"
   ],
   "id": "fn-1176-harden-diagnosis-role-git-command",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T23:37:43.265000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T23:37:42.826000Z"
+  "updated_at": "2026-07-07T23:37:43.265000Z"
 }
