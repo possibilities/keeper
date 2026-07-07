@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Verified restore transactions retry",
-  "updated_at": "2026-07-07T17:48:07.074000Z"
+  "updated_at": "2026-07-07T20:29:49.290000Z",
+  "worker_done_at": "2026-07-07T20:29:49.290000Z"
 }

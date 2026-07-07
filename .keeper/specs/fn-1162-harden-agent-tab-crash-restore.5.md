@@ -40,5 +40,5 @@ Fake evidence dirs: NDJSON with the right/wrong session id, torn tail; birth-rec
 - [ ] Retries are idempotent: an already-live session UUID no-ops, concurrent applies cannot double-spawn, and the third auto-attempt in one generation is refused with an on-demand hint.
 
 ## Done summary
-
+Restore is now a per-tab verified transaction: a durable schema-versioned intent artifact is written before each launch and settled against on-disk attach evidence (claude SessionStart / non-claude birth record), never window creation. Failed/unverified tabs resurface in keeper tabs list with their rerun command until verified; retries are idempotent via an already-live no-op, a per-apply advisory flock, and a 2-attempt crash-loop bound. New src/restore-verify.ts owns the intent + evidence + bounded verify state matrix + pane-liveness classifier.
 ## Evidence
