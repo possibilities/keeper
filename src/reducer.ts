@@ -8606,6 +8606,40 @@ function projectJobsRow(db: Database, event: Event): void {
       }
       break;
 
+    case "StopReconciled":
+      // ADR 0013 layer 3: the corrective quiescence the stuck-state sentinel
+      // producer mints when a `working` row is a proven logical contradiction —
+      // a worker-done task (or a very-stale live-pid session) whose row never
+      // folded back to `stopped` because its stamp was pinned by an out-of-order
+      // straggler. Deliberately NOT `Killed`: the exit-watcher is the sole Killed
+      // producer, `killed` fails the `stopped`-only autoclose gate, and killing
+      // mislabels completed work — this only quiesces so autoclose can reap it.
+      //
+      // A quiescing (-> stopped) transition that, like the terminal arms, is
+      // EXEMPT from stamp REJECTION (a phantom row pinned by a bogus far-future ts
+      // must stay healable) but still ADVANCES the stamp via MAX so it never
+      // regresses, and respects the terminal WHERE guard (never resurrects an
+      // ended/killed row). Reads ONLY session_id + ts, so a from-scratch re-fold
+      // reproduces it byte-identically. A genuine resume AFTER the heal simply
+      // re-activates under the stamp gate — a later event with a newer ts wins the
+      // strictly-`ts > stamp` activation.
+      {
+        const res = db.run(
+          `UPDATE jobs SET state = 'stopped',
+                           last_lifecycle_ts = MAX(COALESCE(last_lifecycle_ts, ?), ?),
+                           last_event_id = ?, updated_at = ?
+             WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
+          [ts, ts, event.id, ts, jobId],
+        );
+        // Fan the healed state into the embedded epics.jobs / task.jobs arrays —
+        // ONLY on the proven write path (a guarded terminal-row no-op must NOT
+        // re-fan a stale-but-unchanged element with the new event_id).
+        if (res.changes > 0) {
+          syncIfPlanRef(db, jobId, event.id, ts);
+        }
+      }
+      break;
+
     case "ResumeTargetResolved":
       // Synthetic event (fn-1103) minted daemon-side when a harness's native
       // resume target is resolved AFTER launch — the codex rollout-poll match or

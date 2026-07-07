@@ -6980,6 +6980,210 @@ test("lifecycle stamp: a duplicate SessionStart re-opens a terminal row only on 
 });
 
 // ---------------------------------------------------------------------------
+// fn-1164 (task .3): the StopReconciled corrective quiescence (ADR 0013 layer 3).
+// The stuck-state sentinel's synthetic heal — a quiescing (-> stopped) transition
+// that, like the terminal arms, is EXEMPT from stamp rejection (a far-future-pinned
+// phantom row stays healable) but still advances the stamp via MAX and respects the
+// terminal WHERE guard. Deliberately NOT Killed (killed fails the autoclose gate).
+// ---------------------------------------------------------------------------
+
+test("StopReconciled: heals a working row to stopped and advances the stamp via MAX", () => {
+  insertEvent({ hook_event: "SessionStart", ts: 1000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 1001 }); // working, stamp 1001
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(1001);
+  // The corrective quiescence at a newer ts heals to stopped and advances.
+  insertEvent({
+    hook_event: "StopReconciled",
+    ts: 1100,
+    data: JSON.stringify({
+      reason: "stuck-sentinel: worker-done-while-working",
+    }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(1100); // MAX(1001, 1100) — advanced
+});
+
+test("StopReconciled: is EXEMPT from stamp rejection — heals a far-future-stamped row without regressing the stamp", () => {
+  // The whole point of the exemption: a phantom row pinned by a bogus far-future ts
+  // must STILL heal. A rejection-gated quiescence (ts >= stamp) would be swallowed
+  // here (500 < 9999); the corrective arm heals anyway and the stamp stays at MAX.
+  insertEvent({ hook_event: "SessionStart", ts: 400 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 401 });
+  insertEvent({ hook_event: "Stop", ts: 402 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 9999 }); // pins stamp far-future
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(9999);
+  insertEvent({
+    hook_event: "StopReconciled",
+    ts: 500, // ts << stamp — a rejection-gated quiesce would be swallowed
+    data: JSON.stringify({
+      reason: "stuck-sentinel: worker-done-while-working (clock-skew)",
+    }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(9999); // MAX(9999, 500) — never regressed
+});
+
+test("StopReconciled: respects the terminal WHERE guard — never resurrects an ended or killed row", () => {
+  insertEvent({ hook_event: "SessionStart", ts: 1200 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 1201 });
+  insertEvent({ hook_event: "SessionEnd", ts: 1202 });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  // A stray corrective on a terminal row is a no-op — the row stays ended.
+  insertEvent({
+    hook_event: "StopReconciled",
+    ts: 1300,
+    data: JSON.stringify({ reason: "stuck-sentinel: stale-working" }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("ended");
+  expect(getStamp()).toBe(1202); // untouched — the guard blocked the write
+});
+
+test("StopReconciled: the healed row satisfies the autoclose candidate condition (state='stopped')", () => {
+  // Seed a genuinely wedged working row, heal it, and prove it now falls into the
+  // autoclose candidate set — the `readAutocloseJobs` WHERE is exactly `state =
+  // 'stopped'`, so we assert the healed row matches that filter (autoclose stays a
+  // pure consumer — no gate is widened).
+  insertEvent({ hook_event: "SessionStart", ts: 1400 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 1401 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 1402 }); // working
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  // Before the heal the row is NOT an autoclose candidate.
+  const before = db
+    .query(
+      "SELECT COUNT(*) AS n FROM jobs WHERE state = 'stopped' AND job_id = 'sess-a'",
+    )
+    .get() as { n: number };
+  expect(before.n).toBe(0);
+  insertEvent({
+    hook_event: "StopReconciled",
+    ts: 1500,
+    data: JSON.stringify({
+      reason: "stuck-sentinel: worker-done-while-working",
+    }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  const after = db
+    .query(
+      "SELECT COUNT(*) AS n FROM jobs WHERE state = 'stopped' AND job_id = 'sess-a'",
+    )
+    .get() as { n: number };
+  expect(after.n).toBe(1); // now a candidate — flows to autoclose eligibility
+});
+
+test("StopReconciled: a genuine resume AFTER the heal re-activates under the stamp gate (a newer ts wins)", () => {
+  // The risk-note guarantee: a real session that resumes after being healed simply
+  // re-activates — a later event with a strictly-newer ts clears the activation gate.
+  insertEvent({ hook_event: "SessionStart", ts: 1600 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 1601 });
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 1602 });
+  drainAll();
+  insertEvent({ hook_event: "StopReconciled", ts: 1700, data: "{}" });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getStamp()).toBe(1700);
+  // A fresh tool event (ts > stamp) proves liveness and un-stops the row.
+  insertEvent({ hook_event: "PostToolUse", tool_name: "Bash", ts: 1701 });
+  drainAll();
+  expect(getJob()?.state).toBe("working");
+  expect(getStamp()).toBe(1701);
+});
+
+test("StopReconciled: re-folds byte-identically (reads only session_id + ts)", () => {
+  // Re-fold determinism gate: the corrective event is pure over event fields, so a
+  // rewind + re-drain on the same connection reproduces the identical row.
+  insertEvent({ hook_event: "SessionStart", ts: 1800 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 1801 });
+  insertEvent({ hook_event: "StopReconciled", ts: 1900, data: "{}" });
+  drainAll();
+  const first = getJob();
+  expect(first?.state).toBe("stopped");
+  // Rewind the cursor + wipe the projection, then re-drain from scratch.
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM subagent_invocations");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  drainAll();
+  const second = getJob();
+  expect(second?.state).toBe("stopped");
+  expect(second?.last_event_id).toBe(first?.last_event_id ?? -1);
+  expect(getStamp()).toBe(1900);
+});
+
+test("stuck-sentinel anomaly: the sticky row SURVIVES the heal and clears ONLY on retry_dispatch (DispatchCleared)", () => {
+  // The end-to-end sticky-until-ack contract: the tier-one mint pairs a
+  // StopReconciled (heals the row) with a `close::stuck-sentinel:<jobId>` distress
+  // row. The heal must NOT clear the anomaly; a re-emit UPSERTs (preserving the
+  // sticky-since created_at); and only a DispatchCleared (the retry_dispatch ack)
+  // deletes it — never a level-trigger.
+  const distressKey = "close::stuck-sentinel:sess-a";
+  insertEvent({ hook_event: "SessionStart", ts: 2000 });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 2001 }); // working
+  // The tier-one pair: the heal on the session + the distress on the synthetic key.
+  insertEvent({ hook_event: "StopReconciled", ts: 2100, data: "{}" });
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: distressKey,
+    ts: 2100,
+    data: JSON.stringify({
+      verb: "close",
+      id: "stuck-sentinel:sess-a",
+      reason: "stuck-sentinel: worker-done-while-working",
+      dir: null,
+      ts: 2100,
+    }),
+  });
+  drainAll();
+  // The row healed to stopped AND the anomaly row is present (survives the heal).
+  expect(getJob()?.state).toBe("stopped");
+  const readRow = () =>
+    db
+      .query(
+        "SELECT reason, created_at FROM dispatch_failures WHERE verb = 'close' AND id = 'stuck-sentinel:sess-a'",
+      )
+      .get() as { reason: string; created_at: number } | null;
+  const afterHeal = readRow();
+  expect(afterHeal?.reason).toBe("stuck-sentinel: worker-done-while-working");
+
+  // A re-emit (bounded still-stuck) UPSERTs — the row persists, created_at (the
+  // sticky-since anchor) is preserved through the recovery of the condition.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: distressKey,
+    ts: 2200,
+    data: JSON.stringify({
+      verb: "close",
+      id: "stuck-sentinel:sess-a",
+      reason: "stuck-sentinel: worker-done-while-working",
+      dir: null,
+      ts: 2200,
+    }),
+  });
+  drainAll();
+  const afterReemit = readRow();
+  expect(afterReemit).not.toBeNull();
+  expect(afterReemit?.created_at).toBe(afterHeal?.created_at ?? -1); // sticky-since preserved
+
+  // Only the operator ack (retry_dispatch → DispatchCleared) removes it.
+  insertEvent({
+    hook_event: "DispatchCleared",
+    session_id: distressKey,
+    ts: 2300,
+    data: JSON.stringify({ verb: "close", id: "stuck-sentinel:sess-a" }),
+  });
+  drainAll();
+  expect(readRow()).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // fn-1164 (task .2): `idle_prompt` as positive idle evidence (ADR 0013 layer 2).
 // The Notification arm folds `event_type='idle_prompt'` from working -> stopped
 // behind the SAME terminal, sub-agent-yield, and lifecycle-stamp guards as the

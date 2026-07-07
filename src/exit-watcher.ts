@@ -59,10 +59,12 @@ import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import { openDb } from "./db";
+import { parsePlanRef } from "./derivers";
 import { createExitWatcher, type ExitWatcher } from "./exit-watcher-ffi";
 import { NotadbTolerance } from "./notadb-tolerance";
 import { readOsStartTime } from "./seed-sweep";
 import { isPidAlive } from "./server-worker";
+import { findFreshInFlightSubagentAnchor } from "./subagent-invocations";
 
 /** workerData payload — only the DB path and the optional poll cadence. */
 export interface ExitWatcherWorkerData {
@@ -99,13 +101,39 @@ export interface ExitMessage {
 }
 
 /**
- * Every shape the exit-watcher posts to main: the exit reap message, plus
- * the backstop-telemetry channel (fn-1096.3 — a `notadb-skip` record when
- * `diffLoop`'s `PRAGMA data_version` poll tolerates a transient
- * `SQLITE_NOTADB`). `main` routes `{kind:"backstop"}` to the sole sidecar
- * writer and everything else to the exit-reap verifier.
+ * Worker → main stuck-state-sentinel message (ADR 0013 layer 3). Posted by the
+ * {@link sentinelLoop} when a `working` row is a proven idle contradiction. Main
+ * mints the corrective `StopReconciled` quiescence event (when `heal`) AND the
+ * sticky `stuck-sentinel` anomaly `dispatch_failures` row — both are producer
+ * decisions the worker already change-gated, so main just executes the mint. The
+ * `reason` is CLASS-stable (never a live age) so the change-gate does not re-fire
+ * every tick; `tsSec` is the producer-stamped wall clock for re-fold determinism.
  */
-export type ExitWatcherOutbound = ExitMessage | BackstopMessage;
+export interface StuckSentinelMessage {
+  kind: "stuck-sentinel";
+  /** The stuck session id (== `jobs.job_id` / `events.session_id`). */
+  jobId: string;
+  /** The class-stable anomaly reason (starts with `stuck-sentinel`). */
+  reason: string;
+  /** Producer-stamped wall-clock seconds — the corrective event + row ts. */
+  tsSec: number;
+  /** True for a TIER-ONE self-heal (mint `StopReconciled`); false for a TIER-TWO
+   *  detect-only anomaly (visibility row ONLY, state untouched). */
+  heal: boolean;
+}
+
+/**
+ * Every shape the exit-watcher posts to main: the exit reap message, the
+ * stuck-state-sentinel anomaly/heal message, plus the backstop-telemetry channel
+ * (a `notadb-skip` record when `diffLoop`'s `PRAGMA data_version` poll tolerates a
+ * transient `SQLITE_NOTADB`). `main` routes `{kind:"backstop"}` to the
+ * sole sidecar writer, `{kind:"stuck-sentinel"}` to the sentinel mint, and
+ * everything else to the exit-reap verifier.
+ */
+export type ExitWatcherOutbound =
+  | ExitMessage
+  | BackstopMessage
+  | StuckSentinelMessage;
 
 /** Main → worker shutdown command (same shape as the other workers). */
 export interface ShutdownMessage {
@@ -440,6 +468,400 @@ export async function reprobeLoop(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Stuck-state sentinel (ADR 0013 layer 3) — the producer-side sweep that makes
+// the "board says working, session is demonstrably idle" contradiction LOUD.
+// ---------------------------------------------------------------------------
+
+/**
+ * Sweep cadence (ms). Coarse like the re-probe backstop — the contradiction it
+ * catches is a permanent stuck state, not a live race, so a 60s tick catches a
+ * row within a minute of crossing its staleness threshold while keeping the
+ * per-tick DB + `ps` cost negligible.
+ */
+export const STUCK_SENTINEL_MS = 60_000;
+
+/**
+ * TIER ONE (self-heal) minimum event staleness (seconds). A plan job whose task
+ * is worker-done while the row still reads `working`, with events at least this
+ * stale, a live pid, and no fresh in-flight subagent, is a logical contradiction
+ * healed to `stopped`. Conservative by design (the risk note): a real resume
+ * within the window keeps events fresh and never trips this.
+ */
+export const STUCK_TIER1_MIN_AGE_SECS = 10 * 60;
+
+/**
+ * TIER TWO (detect-only) minimum event staleness (seconds). ANY `working` row
+ * with a live pid this stale mints visibility only — never a correction — so a
+ * non-plan free-form job with no worker-done signal is still surfaced.
+ */
+export const STUCK_TIER2_MIN_AGE_SECS = 60 * 60;
+
+/**
+ * Bounded still-stuck re-emit interval (ms). After a first-detect (or a
+ * reason-change), the change-gate suppresses re-emits for this long so a
+ * persistent condition mints O(1) events, not one per poll tick — then re-emits
+ * once so a long-lived stuck state stays fresh. Mirrors the DispatchFailed
+ * producer's change-gate precedent.
+ */
+export const STUCK_SENTINEL_REEMIT_MS = 30 * 60_000;
+
+/**
+ * Implausible-skew epsilon (seconds). Legitimate host clock drift is seconds; an
+ * event whose `ts` — or the row's lifecycle stamp — sits more than this far in
+ * the FUTURE of the sweep's wall clock is implausible event-clock skew, noted on
+ * the anomaly reason (the ADR's "flag skew instead of clamping ingest ts").
+ */
+export const STUCK_SENTINEL_SKEW_EPSILON_SECS = 5 * 60;
+
+/**
+ * Fresh-subagent freshness bound (seconds). Mirrors the reducer's
+ * `MAX_STOP_YIELD_GAP_SEC`: a parent that dispatched a Task tool yields to a
+ * sub-agent sharing its session id, so a fresh in-flight sub means the session is
+ * conceptually still working — tier one excludes it. Consulted producer-side via
+ * {@link findFreshInFlightSubagentAnchor} against the sweep's wall clock.
+ */
+export const STUCK_SENTINEL_SUBAGENT_GAP_SEC = 120;
+
+/**
+ * One `working` candidate row with every signal the pure predicate needs already
+ * RESOLVED off the DB (worker-done, subagent freshness, staleness) — so the
+ * predicate stays pure and tests drive it clause-by-clause with plain values.
+ */
+export interface SentinelRow {
+  jobId: string;
+  /** NULL rows are out of scope — the sweep query filters `pid IS NOT NULL`; the
+   *  predicate skips NULL defensively (a NULL-pid working row is the exit-watcher
+   *  diff loop's pidless-reap job, never this sweep's). */
+  pid: number | null;
+  /** Freshest `events.ts` for the session (`MAX(ts)`), NULL when it has none. The
+   *  staleness anchor: wall clock minus this. */
+  lastEventTs: number | null;
+  /** The row's lifecycle stamp (`jobs.last_lifecycle_ts`) — the skew probe (a
+   *  far-future stamp is the phantom-pinning signature), NULL on a fresh row. */
+  lastLifecycleTs: number | null;
+  /** Task marked worker-done in the plan projection (NOT a jobs column). Resolved
+   *  via the job's `plan_ref` → epic → embedded task `worker_phase === "done"`. */
+  workerDone: boolean;
+  /** A fresh in-flight subagent survives (tier-one exclusion). */
+  hasFreshSubagent: boolean;
+}
+
+/** One sentinel verdict — the stuck row plus what to do about it. */
+export interface StuckSentinelVerdict {
+  jobId: string;
+  /** 1 = self-heal contradiction; 2 = detect-only. */
+  tier: 1 | 2;
+  /** True ONLY for tier one — mint the corrective `StopReconciled`. */
+  heal: boolean;
+  /** Class-stable anomaly reason (starts with `stuck-sentinel`). */
+  reason: string;
+}
+
+/**
+ * Build the class-stable anomaly reason. NEVER embeds a live age (which would
+ * defeat the reason-change change-gate); a newly-observed clock skew flips the
+ * class so it re-surfaces exactly once. Pure.
+ */
+export function sentinelReason(
+  cls: "worker-done-while-working" | "stale-working" | "clock-skew",
+  clockSkew: boolean,
+): string {
+  const base = `stuck-sentinel: ${cls}`;
+  return clockSkew && cls !== "clock-skew" ? `${base} (clock-skew)` : base;
+}
+
+/**
+ * Pure two-tier predicate: from the resolved candidate rows, the wall-clock
+ * `nowSecs`, and the injected liveness probe, return one verdict per stuck row.
+ * Pure (no I/O — every DB read is resolved into the row upstream) so tests drive
+ * it clause-by-clause. Wall-clock never enters the fold: this is producer-side.
+ *
+ *   - NULL pid → skip (the diff loop's pidless-reap job).
+ *   - pid DEAD (`isAlive` false) → skip: a dead pid is the exit-watcher's reap,
+ *     keeping the two producers DISJOINT (tier one requires a LIVE pid).
+ *   - NULL `lastEventTs` → skip (staleness uncomputable).
+ *   - TIER ONE (heal): `workerDone` AND NOT `hasFreshSubagent` AND event age
+ *     `>= STUCK_TIER1_MIN_AGE_SECS`. The worker-done contradiction + the
+ *     fresh-subagent exclusion + the conservative min-age keep a live session
+ *     safe (a real resume re-activates under the stamp gate).
+ *   - TIER TWO (detect-only): event age `>= STUCK_TIER2_MIN_AGE_SECS`, regardless
+ *     of `workerDone` — the universal net for free-form jobs.
+ *   - CLOCK SKEW with no staleness trip → a detect-only skew anomaly, so an
+ *     implausibly-future event/stamp is never silently swallowed.
+ *
+ * Skew is computed from BOTH the last event ts and the lifecycle stamp being
+ * implausibly ahead of `nowSecs`; it ANNOTATES a firing tier's reason and stands
+ * alone as its own detect when nothing else trips.
+ */
+export function selectStuckSentinelVerdicts(
+  rows: SentinelRow[],
+  nowSecs: number,
+  isAlive: (pid: number) => boolean,
+): StuckSentinelVerdict[] {
+  const out: StuckSentinelVerdict[] = [];
+  for (const row of rows) {
+    if (row.pid == null) {
+      continue; // pidless rows are the diff loop's job, not ours.
+    }
+    if (!isAlive(row.pid)) {
+      continue; // dead pid → exit-watcher's reap; keep the producers disjoint.
+    }
+    if (row.lastEventTs == null) {
+      continue; // no events → staleness uncomputable.
+    }
+    const ageSecs = nowSecs - row.lastEventTs;
+    const clockSkew =
+      row.lastEventTs > nowSecs + STUCK_SENTINEL_SKEW_EPSILON_SECS ||
+      (row.lastLifecycleTs != null &&
+        row.lastLifecycleTs > nowSecs + STUCK_SENTINEL_SKEW_EPSILON_SECS);
+    if (
+      row.workerDone &&
+      !row.hasFreshSubagent &&
+      ageSecs >= STUCK_TIER1_MIN_AGE_SECS
+    ) {
+      out.push({
+        jobId: row.jobId,
+        tier: 1,
+        heal: true,
+        reason: sentinelReason("worker-done-while-working", clockSkew),
+      });
+      continue;
+    }
+    if (ageSecs >= STUCK_TIER2_MIN_AGE_SECS) {
+      out.push({
+        jobId: row.jobId,
+        tier: 2,
+        heal: false,
+        reason: sentinelReason("stale-working", clockSkew),
+      });
+      continue;
+    }
+    if (clockSkew) {
+      out.push({
+        jobId: row.jobId,
+        tier: 2,
+        heal: false,
+        reason: sentinelReason("clock-skew", true),
+      });
+    }
+  }
+  return out;
+}
+
+/** Prior emit state for one session's change-gate memo. */
+export interface SentinelMemoEntry {
+  reason: string;
+  lastEmitMs: number;
+}
+
+/**
+ * The change-gate decision: emit iff first appearance, reason-change, or the
+ * bounded still-stuck re-emit interval elapsed. Pure over the passed prior state;
+ * the loop owns the memo map. Mirrors the DispatchFailed producer's O(1)-per-
+ * condition change-gate so a persistent stuck state never emits every poll tick.
+ */
+export function shouldEmitSentinel(
+  prev: SentinelMemoEntry | undefined,
+  reason: string,
+  nowMs: number,
+  reemitMs: number,
+): boolean {
+  if (prev === undefined) {
+    return true; // first appearance.
+  }
+  if (prev.reason !== reason) {
+    return true; // reason-change (e.g. skew newly observed).
+  }
+  return nowMs - prev.lastEmitMs >= reemitMs; // bounded still-stuck re-emit.
+}
+
+/**
+ * Resolve the freshest `events.ts` for a session (`MAX(ts)`) — the staleness
+ * anchor, NULL when the session has no events. Indexed by `idx_events_session`.
+ */
+function resolveLastEventTs(db: Database, jobId: string): number | null {
+  const row = db
+    .query("SELECT MAX(ts) AS ts FROM events WHERE session_id = ?")
+    .get(jobId) as { ts: number | null } | null;
+  return row?.ts ?? null;
+}
+
+/**
+ * Resolve worker-done-ness for a plan `work` job by reading the plan projection
+ * (worker-done is NOT a jobs column): the job's `plan_ref` → its epic's embedded
+ * `tasks` JSON → the matching task's `worker_phase === "done"`. A non-plan /
+ * non-task ref, a missing epic, a malformed blob, or an absent task all fold to
+ * `false` (never worker-done, so tier one never fires on them). NEVER throws.
+ */
+function resolveWorkerDone(
+  db: Database,
+  planVerb: string | null,
+  planRef: string | null,
+): boolean {
+  if (planVerb == null || planRef == null) {
+    return false;
+  }
+  const parsed = parsePlanRef(planRef);
+  if (parsed == null || parsed.kind !== "task") {
+    return false;
+  }
+  try {
+    const epicRow = db
+      .query("SELECT tasks FROM epics WHERE epic_id = ?")
+      .get(parsed.epic_id) as { tasks: string | null } | null;
+    if (epicRow?.tasks == null) {
+      return false;
+    }
+    const tasks = JSON.parse(epicRow.tasks) as Array<{
+      task_id?: unknown;
+      worker_phase?: unknown;
+    }>;
+    if (!Array.isArray(tasks)) {
+      return false;
+    }
+    for (const t of tasks) {
+      if (t.task_id === parsed.task_id) {
+        return t.worker_phase === "done";
+      }
+    }
+    return false;
+  } catch {
+    return false; // malformed embedded tasks JSON → conservatively not-done.
+  }
+}
+
+/** One candidate row from the sentinel sweep query (`working`, pid-bearing). */
+interface SentinelCandidateRow {
+  job_id: string;
+  pid: number | null;
+  plan_verb: string | null;
+  plan_ref: string | null;
+  last_lifecycle_ts: number | null;
+}
+
+/**
+ * Run the periodic stuck-state-sentinel sweep against an already-open RO
+ * connection. On each slow (`STUCK_SENTINEL_MS`) tick: query the `working`
+ * pid-bearing candidate set, RESOLVE each row's staleness + worker-done +
+ * subagent-freshness off the same connection, run the pure predicate, apply the
+ * in-memory change-gate, and post one {@link StuckSentinelMessage} per newly
+ * emittable verdict. We never write the DB, never signal, never mint events here
+ * — message-to-main keeps every write on main's sole writer.
+ *
+ * The change-gate memo is per-worker in-memory, so a daemon restart re-emits at
+ * most once per still-present condition (the fold UPSERTs on the row key, so a
+ * re-mint is idempotent). Exported for tests. Resolves once `isShutdown()` is
+ * true. NEVER throws — a per-row probe failure logs and the sweep continues.
+ */
+export async function sentinelLoop(
+  db: Database,
+  post: (msg: StuckSentinelMessage) => void,
+  isShutdown: () => boolean,
+  opts: {
+    intervalMs?: number;
+    reemitMs?: number;
+    nowSecs?: () => number;
+    isAlive?: (pid: number) => boolean;
+  } = {},
+): Promise<void> {
+  const interval = opts.intervalMs ?? STUCK_SENTINEL_MS;
+  const reemitMs = opts.reemitMs ?? STUCK_SENTINEL_REEMIT_MS;
+  const nowSecs = opts.nowSecs ?? (() => Date.now() / 1000);
+  const isAlive = opts.isAlive ?? isPidAlive;
+  const candidatesQuery = db.query(
+    `SELECT job_id, pid, plan_verb, plan_ref, last_lifecycle_ts FROM jobs
+       WHERE state = 'working' AND pid IS NOT NULL`,
+  );
+  // Per-session change-gate memo: jobId → last emitted {reason, lastEmitMs}.
+  const memo = new Map<string, SentinelMemoEntry>();
+
+  while (!isShutdown()) {
+    // Sleep FIRST (like the re-probe loop): the contradiction is a permanent
+    // stuck state, so nothing an immediate sweep catches would be missed one
+    // interval later. Wake in slices so a shutdown mid-interval unblocks within
+    // one slice, not a full interval.
+    const slice = Math.min(interval, WAIT_TIMEOUT_MS);
+    let waited = 0;
+    while (waited < interval && !isShutdown()) {
+      await Bun.sleep(slice);
+      waited += slice;
+    }
+    if (isShutdown()) {
+      break;
+    }
+    let candidates: SentinelCandidateRow[];
+    try {
+      candidates = candidatesQuery.all() as SentinelCandidateRow[];
+    } catch (err) {
+      console.error("[exit-watcher] sentinel query failed:", err);
+      continue;
+    }
+    const now = nowSecs();
+    const rows: SentinelRow[] = [];
+    for (const c of candidates) {
+      // Per-row try/catch so one bad resolve (read race) never wedges the sweep.
+      try {
+        rows.push({
+          jobId: c.job_id,
+          pid: c.pid,
+          lastEventTs: resolveLastEventTs(db, c.job_id),
+          lastLifecycleTs: c.last_lifecycle_ts,
+          workerDone: resolveWorkerDone(db, c.plan_verb, c.plan_ref),
+          hasFreshSubagent: findFreshInFlightSubagentAnchor(
+            db,
+            c.job_id,
+            STUCK_SENTINEL_SUBAGENT_GAP_SEC,
+            now,
+          ),
+        });
+      } catch (err) {
+        console.error(
+          `[exit-watcher] sentinel resolve failed for job_id=${c.job_id}:`,
+          err,
+        );
+      }
+    }
+    let verdicts: StuckSentinelVerdict[];
+    try {
+      verdicts = selectStuckSentinelVerdicts(rows, now, isAlive);
+    } catch (err) {
+      console.error("[exit-watcher] sentinel predicate failed:", err);
+      continue;
+    }
+    const nowMs = Date.now();
+    const seen = new Set<string>();
+    for (const v of verdicts) {
+      seen.add(v.jobId);
+      if (!shouldEmitSentinel(memo.get(v.jobId), v.reason, nowMs, reemitMs)) {
+        continue; // change-gated — no re-emit this tick.
+      }
+      memo.set(v.jobId, { reason: v.reason, lastEmitMs: nowMs });
+      console.error(
+        `[exit-watcher] stuck-sentinel job_id=${v.jobId} tier=${v.tier} heal=${v.heal} reason="${v.reason}"`,
+      );
+      post({
+        kind: "stuck-sentinel",
+        jobId: v.jobId,
+        reason: v.reason,
+        tsSec: now,
+        heal: v.heal,
+      });
+    }
+    // Drop memo entries whose condition cleared (healed to stopped, resumed, or
+    // recovered) so a future re-stuck is a fresh first-detect. The sticky
+    // `dispatch_failures` row SURVIVES — only `retry_dispatch` clears it — so
+    // dropping the memo resets only the emission gate, never the anomaly row.
+    if (memo.size > seen.size) {
+      for (const jobId of memo.keys()) {
+        if (!seen.has(jobId)) {
+          memo.delete(jobId);
+        }
+      }
+    }
+  }
+}
+
 /**
  * Worker entrypoint. Opens its own read-only connection, constructs the FFI
  * ExitWatcher, and runs the diff and wait loops in parallel until told to
@@ -701,11 +1123,25 @@ function main(): void {
     console.error("[exit-watcher] re-probe loop crashed:", err);
     throw err;
   });
+  // Stuck-state sentinel (ADR 0013 layer 3) — the SIBLING producer to the dead-pid
+  // reap. It watches the SAME `working` candidate set but the LIVE-pid half: a row
+  // whose session is demonstrably idle (worker-done contradiction / very-stale)
+  // heals to `stopped` and/or mints a sticky anomaly. Posts `{kind:"stuck-sentinel"}`
+  // to main's onmessage handler, which mints the corrective event + distress row on
+  // its sole writable connection. A throw here is fatal like the other loops.
+  const sentinel = sentinelLoop(
+    db,
+    (msg) => parentPort?.postMessage(msg),
+    () => shutdown,
+  ).catch((err) => {
+    console.error("[exit-watcher] sentinel loop crashed:", err);
+    throw err;
+  });
 
-  // All three loops must complete before we close the DB + FFI handle. If any
+  // All four loops must complete before we close the DB + FFI handle. If any
   // throws, we treat the whole worker as fatal: close everything and exit
   // non-zero so the daemon escalates.
-  Promise.all([diff, wait, reprobe])
+  Promise.all([diff, wait, reprobe, sentinel])
     .then(() => {
       closeAll();
       process.exit(0);

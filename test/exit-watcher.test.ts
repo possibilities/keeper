@@ -24,7 +24,18 @@ import {
   diffLoop,
   type ReprobeRow,
   reprobeLoop,
+  type SentinelMemoEntry,
+  type SentinelRow,
+  STUCK_SENTINEL_REEMIT_MS,
+  STUCK_SENTINEL_SKEW_EPSILON_SECS,
+  STUCK_TIER1_MIN_AGE_SECS,
+  STUCK_TIER2_MIN_AGE_SECS,
+  type StuckSentinelMessage,
   selectDeadReprobeCandidates,
+  selectStuckSentinelVerdicts,
+  sentinelLoop,
+  sentinelReason,
+  shouldEmitSentinel,
 } from "../src/exit-watcher";
 import type {
   AddResult,
@@ -499,6 +510,366 @@ test("reprobeLoop: a re-sweep of a row that left the candidate set is a no-op", 
   await loop;
 
   expect(posted).toEqual([]);
+
+  writer.close();
+  reader.close();
+});
+
+// ---------------------------------------------------------------------------
+// selectStuckSentinelVerdicts (ADR 0013 layer 3) — pure predicate, clause by
+// clause. Every DB read is resolved into the row upstream, so the predicate is
+// driven with plain values + injected liveness.
+// ---------------------------------------------------------------------------
+
+const SNOW = 1_000_000; // arbitrary wall-clock seconds for the sentinel tests.
+const STALE_T1 = SNOW - STUCK_TIER1_MIN_AGE_SECS; // age EXACTLY at the tier-1 gate.
+const STALE_T2 = SNOW - STUCK_TIER2_MIN_AGE_SECS; // age EXACTLY at the tier-2 gate.
+const FRESH_EVT = SNOW - 60; // 1 min old — not stale.
+const MID_STALE = SNOW - 30 * 60; // 30 min — past tier-1, under tier-2.
+const FUTURE_SKEW = SNOW + STUCK_SENTINEL_SKEW_EPSILON_SECS + 100; // implausible.
+
+/** Build a SentinelRow with sane (not-stuck) defaults; override per clause. */
+function srow(over: Partial<SentinelRow> = {}): SentinelRow {
+  return {
+    jobId: "sess",
+    pid: 4242,
+    lastEventTs: FRESH_EVT,
+    lastLifecycleTs: FRESH_EVT,
+    workerDone: false,
+    hasFreshSubagent: false,
+    ...over,
+  };
+}
+
+const sAlive = () => true;
+const sDead = () => false;
+
+test("sentinel predicate: worker-done + stale + live pid + no subagent → TIER ONE heal", () => {
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        workerDone: true,
+        lastEventTs: STALE_T1,
+        lastLifecycleTs: STALE_T1,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 1,
+      heal: true,
+      reason: "stuck-sentinel: worker-done-while-working",
+    },
+  ]);
+});
+
+test("sentinel predicate: tier-one age gate is inclusive (age == threshold heals) and exclusive one second under", () => {
+  // Exactly at the gate → heal.
+  expect(
+    selectStuckSentinelVerdicts(
+      [srow({ workerDone: true, lastEventTs: STALE_T1 })],
+      SNOW,
+      sAlive,
+    ).map((v) => v.tier),
+  ).toEqual([1]);
+  // One second fresher than the gate → not tier one, and under tier two → skip.
+  expect(
+    selectStuckSentinelVerdicts(
+      [
+        srow({
+          workerDone: true,
+          lastEventTs: SNOW - (STUCK_TIER1_MIN_AGE_SECS - 1),
+        }),
+      ],
+      SNOW,
+      sAlive,
+    ),
+  ).toEqual([]);
+});
+
+test("sentinel predicate: a fresh in-flight subagent is NEVER healed (tier-one exclusion)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: true, lastEventTs: STALE_T1, hasFreshSubagent: true })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: worker-done but recent events is never corrected", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: true, lastEventTs: FRESH_EVT })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: a DEAD pid is skipped (the exit-watcher's reap — producers stay disjoint)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: true, lastEventTs: STALE_T1 })],
+    SNOW,
+    sDead, // pid dead → out of scope for the sentinel
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: no worker-done + VERY stale → TIER TWO detect-only (heal false)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: false, lastEventTs: STALE_T2 })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: stale-working",
+    },
+  ]);
+});
+
+test("sentinel predicate: no worker-done + only MID-stale (past tier-1, under tier-2) → skip", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: false, lastEventTs: MID_STALE })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: tier-two age gate is inclusive", () => {
+  expect(
+    selectStuckSentinelVerdicts(
+      [srow({ lastEventTs: STALE_T2 })],
+      SNOW,
+      sAlive,
+    ).map((v) => v.tier),
+  ).toEqual([2]);
+  expect(
+    selectStuckSentinelVerdicts(
+      [srow({ lastEventTs: SNOW - (STUCK_TIER2_MIN_AGE_SECS - 1) })],
+      SNOW,
+      sAlive,
+    ),
+  ).toEqual([]);
+});
+
+test("sentinel predicate: NULL lastEventTs (no events) → skip (staleness uncomputable)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: true, lastEventTs: null })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: NULL pid → skip (the diff loop's pidless arm owns it)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: true, lastEventTs: STALE_T1, pid: null })],
+    SNOW,
+    sDead, // never consulted for a null pid
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: an implausibly-future event clock with no staleness trip → clock-skew detect", () => {
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        workerDone: false,
+        lastEventTs: FUTURE_SKEW, // ahead of wall clock → age negative, not stale
+        lastLifecycleTs: FUTURE_SKEW,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: clock-skew",
+    },
+  ]);
+});
+
+test("sentinel predicate: a far-future STAMP annotates a firing tier's reason with clock-skew", () => {
+  // A tier-two stale row (its last event is genuinely old) whose lifecycle stamp
+  // is pinned implausibly far in the future — the phantom far-future signature.
+  const out = selectStuckSentinelVerdicts(
+    [srow({ lastEventTs: STALE_T2, lastLifecycleTs: FUTURE_SKEW })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: stale-working (clock-skew)",
+    },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// sentinelReason — the class-stable reason builder
+// ---------------------------------------------------------------------------
+
+test("sentinelReason: class-stable, with a clock-skew suffix only when observed", () => {
+  expect(sentinelReason("worker-done-while-working", false)).toBe(
+    "stuck-sentinel: worker-done-while-working",
+  );
+  expect(sentinelReason("worker-done-while-working", true)).toBe(
+    "stuck-sentinel: worker-done-while-working (clock-skew)",
+  );
+  expect(sentinelReason("stale-working", false)).toBe(
+    "stuck-sentinel: stale-working",
+  );
+  // The clock-skew CLASS never double-appends its own suffix.
+  expect(sentinelReason("clock-skew", true)).toBe("stuck-sentinel: clock-skew");
+});
+
+// ---------------------------------------------------------------------------
+// shouldEmitSentinel — the change-gate (first-detect + reason-change + bounded
+// still-stuck re-emit), so a persistent condition emits O(1), not per tick.
+// ---------------------------------------------------------------------------
+
+test("shouldEmitSentinel: first appearance emits", () => {
+  expect(shouldEmitSentinel(undefined, "stuck-sentinel: x", 1000, 10_000)).toBe(
+    true,
+  );
+});
+
+test("shouldEmitSentinel: same reason inside the re-emit window is suppressed", () => {
+  const prev: SentinelMemoEntry = {
+    reason: "stuck-sentinel: x",
+    lastEmitMs: 1000,
+  };
+  expect(
+    shouldEmitSentinel(prev, "stuck-sentinel: x", 1000 + 9_999, 10_000),
+  ).toBe(false);
+});
+
+test("shouldEmitSentinel: a reason-change re-emits immediately (e.g. skew newly observed)", () => {
+  const prev: SentinelMemoEntry = {
+    reason: "stuck-sentinel: stale-working",
+    lastEmitMs: 1000,
+  };
+  expect(
+    shouldEmitSentinel(
+      prev,
+      "stuck-sentinel: stale-working (clock-skew)",
+      1000 + 5,
+      10_000,
+    ),
+  ).toBe(true);
+});
+
+test("shouldEmitSentinel: same reason re-emits once the bounded interval elapses", () => {
+  const prev: SentinelMemoEntry = {
+    reason: "stuck-sentinel: x",
+    lastEmitMs: 1000,
+  };
+  expect(
+    shouldEmitSentinel(prev, "stuck-sentinel: x", 1000 + 10_000, 10_000),
+  ).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// sentinelLoop — live-DB integration: a worker-done working row with stale
+// events + a live pid heals ONCE (change-gated across ticks).
+// ---------------------------------------------------------------------------
+
+/** Seed a `working` plan `work` job the sentinel sweep will pick up. */
+function seedWorkingPlanJob(
+  db: ReturnType<typeof openDb>["db"],
+  jobId: string,
+  pid: number,
+  planRef: string,
+  lastLifecycleTs: number,
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                       updated_at, plan_verb, plan_ref, last_lifecycle_ts)
+       VALUES (?, ?, NULL, ?, 'working', 0, ?, 'work', ?, ?)`,
+    [jobId, lastLifecycleTs, pid, lastLifecycleTs, planRef, lastLifecycleTs],
+  );
+}
+
+/** Seed the epic whose embedded tasks carry the worker-done signal. */
+function seedEpicWithTask(
+  db: ReturnType<typeof openDb>["db"],
+  epicId: string,
+  taskId: string,
+  workerPhase: string,
+): void {
+  const tasks = JSON.stringify([
+    { task_id: taskId, worker_phase: workerPhase },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, status, updated_at, tasks) VALUES (?, 'open', 0, ?)`,
+    [epicId, tasks],
+  );
+}
+
+/** Seed one raw event so `MAX(ts)` gives the session its staleness anchor. */
+function seedEvent(
+  db: ReturnType<typeof openDb>["db"],
+  jobId: string,
+  ts: number,
+): void {
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type)
+       VALUES (?, ?, 'PostToolUse', 'PostToolUse')`,
+    [ts, jobId],
+  );
+}
+
+test("sentinelLoop: a worker-done working row with stale events heals ONCE (change-gated)", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+
+  const nowSecs = 2_000_000;
+  seedEpicWithTask(writer, "fn-9-x", "fn-9-x.1", "done");
+  seedWorkingPlanJob(writer, "sess-stuck", 6001, "fn-9-x.1", nowSecs - 3600);
+  seedEvent(writer, "sess-stuck", nowSecs - 3600); // ~1h stale
+
+  const posted: StuckSentinelMessage[] = [];
+  let shutdown = false;
+  const loop = sentinelLoop(
+    reader,
+    (msg) => posted.push(msg),
+    () => shutdown,
+    {
+      intervalMs: 25,
+      // Large re-emit window so a persistent condition never re-emits within the
+      // test — proves the change-gate suppresses per-tick spam.
+      reemitMs: 10 * 60_000,
+      nowSecs: () => nowSecs,
+      isAlive: (pid) => pid === 6001, // the stuck pid is alive
+    },
+  );
+
+  const got = await retryUntil(
+    () => (posted.length > 0 ? posted : null),
+    5_000,
+  );
+  // Give the loop several MORE ticks to prove the change-gate holds it at one.
+  await Bun.sleep(150);
+  shutdown = true;
+  await loop;
+
+  expect(got).not.toBeNull();
+  expect(posted.length).toBe(1); // change-gated — exactly one emission.
+  expect(posted[0]?.jobId).toBe("sess-stuck");
+  expect(posted[0]?.heal).toBe(true);
+  expect(posted[0]?.reason).toBe("stuck-sentinel: worker-done-while-working");
 
   writer.close();
   reader.close();
