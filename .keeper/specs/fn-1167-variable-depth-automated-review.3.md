@@ -33,5 +33,5 @@ Prose surfaces — no unit tests; the contract greps (headings intact, report li
 - [ ] Report and verdict contracts (headings, envelope fields, one-line auditor return) are unchanged
 
 ## Done summary
-
+Close skill mechanically pins DEPTH_BAND off the brief and hands it to the quality-auditor, which branches lean/standard/deep (deep adds a cross-file interaction sweep + contract-surface focus, tags kept Critical findings [REFUTE], echoes the band in its report), and dedups against prior per-task finding_ref artifacts (fixed findings suppress with a note, accumulated-open ones surface still-open). close-planner's vet gains a refute step for [REFUTE]-tagged deep findings, recorded in the existing rationale field. Report/verdict contracts and one-line returns are unchanged.
 ## Evidence
