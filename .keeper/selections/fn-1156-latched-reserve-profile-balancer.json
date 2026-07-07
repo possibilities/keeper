@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Persisted on-disk contract change + correctness-sensitive latch/hysteresis state machine (off-by-one and flap risk), comprehensive test redesign, and ADR/glossary \u2014 contract-touching and intelligence-sensitive.",
+      "task_id": "fn-1156-latched-reserve-profile-balancer.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T03:42:29.525000Z",
+  "epic_id": "fn-1156-latched-reserve-profile-balancer",
+  "input_hash": "d6ff5067610f7d243214b66a6b1fd44d2b1cf4f83704bc38dfe5e243867836e4",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "opus"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": "{\"fn-1156-latched-reserve-profile-balancer.1\": {\"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Persisted on-disk contract change + correctness-sensitive latch/hysteresis state machine with off-by-one and flap risk, plus comprehensive test redesign and ADR/glossary \u2014 contract-touching, intelligence-sensitive, not gnarly-debug/eval territory.\", \"confidence\": 0.83}}"
+}
