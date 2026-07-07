@@ -768,6 +768,84 @@ export function effectiveBlockEscalationRepo(
   return "";
 }
 
+/**
+ * The two audit categories the block-escalation producer treats specially. An
+ * `AUDIT_READY` block is self-handled by the owning orchestrator (no page while it
+ * lives); an `AUDIT_SEVERE` block escalates immediately like any block. Both are
+ * plain `<CATEGORY>:` reason prefixes ({@link parseBlockedCategory}), so an epic
+ * that emits neither leaves the gate inert.
+ */
+export const AUDIT_READY_CATEGORY = "AUDIT_READY";
+export const AUDIT_SEVERE_CATEGORY = "AUDIT_SEVERE";
+
+/**
+ * Grace (ms) after the owning orchestrator job dies before a still-parked
+ * `AUDIT_READY` task escalates like any block. A live orchestrator defers
+ * indefinitely; only a witnessed death past this window pages. Tunable.
+ */
+export const AUDIT_READY_ORCHESTRATOR_GRACE_MS = 120_000;
+
+/**
+ * The owning orchestrator's liveness as the AUDIT_READY gate reads it off the jobs
+ * projection: `live` (a `work`/`close` session for the task or its epic is
+ * running), `dead` with the last-activity wall-clock (ms) of the most-recent dead
+ * owner, or `absent` (no owner row at all).
+ */
+export type AuditOrchestratorLiveness =
+  | { readonly state: "live" }
+  | { readonly state: "dead"; readonly diedAtMs: number }
+  | { readonly state: "absent" };
+
+/**
+ * Classify the owning orchestrator of a parked AUDIT_READY task off `jobs` — the
+ * `work::<task>` session or the `close::<epic>` session that runs (or re-dispatches)
+ * the audit and resumes the worker. Liveness rides the shared {@link isStoppedJobLive}
+ * rule (`working`, or `stopped` with a live backend — never forked); a dead owner's
+ * `updated_at` (an event ts, seconds) is its death anchor, so the ONLY wall-clock is
+ * the caller's `now` comparison, never this read. Any live owner wins. Pure over the
+ * passed rows; exported for tests.
+ */
+export function probeAuditOrchestrator(
+  jobs: readonly Job[],
+  epicId: string,
+  taskId: string,
+): AuditOrchestratorLiveness {
+  let latestDeadMs: number | null = null;
+  for (const job of jobs) {
+    if (job.plan_verb !== "work" && job.plan_verb !== "close") continue;
+    if (job.plan_ref !== taskId && job.plan_ref !== epicId) continue;
+    if (
+      job.state === "working" ||
+      (job.state === "stopped" && isStoppedJobLive(job, null))
+    ) {
+      return { state: "live" };
+    }
+    const ms = (job.updated_at ?? 0) * 1000;
+    if (latestDeadMs == null || ms > latestDeadMs) latestDeadMs = ms;
+  }
+  if (latestDeadMs != null) return { state: "dead", diedAtMs: latestDeadMs };
+  return { state: "absent" };
+}
+
+/**
+ * The AUDIT_READY escalation gate. `defer` while the owning orchestrator is live,
+ * or dead within the grace window, or absent (no witnessed death — never page a
+ * park we cannot even attribute; the safe under-page direction the epic's
+ * noise-is-the-dominant-failure stance demands). `escalate` once a dead
+ * orchestrator's grace has elapsed, handing the park to the ordinary
+ * block-escalation path. Pure.
+ */
+export function auditReadyEscalationDecision(
+  liveness: AuditOrchestratorLiveness,
+  nowMs: number,
+  graceMs: number,
+): "defer" | "escalate" {
+  if (liveness.state === "dead" && nowMs - liveness.diedAtMs >= graceMs) {
+    return "escalate";
+  }
+  return "defer";
+}
+
 /** The outcome the producer records on the `block_escalations` latch (the
  *  `BlockEscalationAttempted.outcome` column). The TERMINAL `dispatched` (the
  *  `unblock::<task>` session launched) and the two skip terminals advance the latch
@@ -822,6 +900,17 @@ export interface BlockEscalationSweepDeps {
    *  Production reads the live jobs (via {@link epicHasLiveUnblock}) PLUS the
    *  producer's not-yet-folded in-flight memo. */
   readonly isEpicUnblockLive: (epicId: string) => boolean;
+  /** Classify the owning orchestrator's liveness for an AUDIT_READY park
+   *  (DELEGATES to {@link probeAuditOrchestrator} over the live jobs in
+   *  production). Read ONLY for the `AUDIT_READY` category — every other category
+   *  ignores it. Optional: absent → the gate reads `absent` and defers, so a
+   *  test with no AUDIT_READY row need not supply it. */
+  readonly auditOrchestratorLiveness?: (
+    row: PendingBlockEscalation,
+  ) => AuditOrchestratorLiveness;
+  /** Wall-clock now in ms — the AUDIT_READY grace clock (producer-side).
+   *  Optional; defaults to {@link Date.now}. */
+  readonly now?: () => number;
   /** True IFF an OPEN sticky `dispatch_failures` row already exists for
    *  `work::<taskId>` — the once-only guard for {@link suppressRedispatch}. Reads
    *  the live projection on the writable connection in production; the sweep skips
@@ -906,6 +995,33 @@ export async function runBlockEscalationSweep(
 
     const reason = deps.readBlockedReason(row.project_dir, row.task_id);
     const category = parseBlockedCategory(reason);
+
+    // AUDIT_READY: a per-task audit deliberately parked this task; the owning
+    // orchestrator runs the audit and resumes the worker. Self-handled — mint
+    // NOTHING while that orchestrator is live (or within the post-death grace),
+    // so the latch stays `pending` and re-sweeps without ever paging. Only a
+    // witnessed orchestrator death past the grace falls through to escalate like
+    // any block (the recovery path — a planner runs or re-dispatches the audit).
+    // AUDIT_SEVERE carries no such prefix match and rides the ordinary
+    // escalatable path below, paging immediately like any block.
+    if (category === AUDIT_READY_CATEGORY) {
+      const liveness = deps.auditOrchestratorLiveness?.(row) ?? {
+        state: "absent",
+      };
+      const nowMs = (deps.now ?? Date.now)();
+      if (
+        auditReadyEscalationDecision(
+          liveness,
+          nowMs,
+          AUDIT_READY_ORCHESTRATOR_GRACE_MS,
+        ) === "defer"
+      ) {
+        continue;
+      }
+      // Past grace with a dead orchestrator: fall through to the ordinary
+      // escalatable dispatch path (AUDIT_READY is not on the skip denylist).
+    }
+
     if (!shouldEscalateBlockedCategory(category)) {
       // TOOLING_FAILURE / absent / unparseable: surface-and-stop, NEVER dispatch an
       // agent. Record a terminal outcome so it never re-evaluates.
@@ -8180,6 +8296,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     return jobs;
   }
+  // The owning-orchestrator jobs for an AUDIT_READY park — the `work::<task>` and
+  // `close::<epic>` sessions that run (or re-dispatch) the audit and resume the
+  // worker. Selects `updated_at` (the dead-owner death anchor) on top of the
+  // liveness columns. A read failure degrades to `[]` → `probeAuditOrchestrator`
+  // reads `absent` → the gate DEFERS, never a premature page on a transient error.
+  function readAuditOrchestratorJobs(epicId: string, taskId: string): Job[] {
+    try {
+      return db
+        .query(
+          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, updated_at FROM jobs WHERE plan_verb IN ('work', 'close') AND plan_ref IN (?, ?)",
+        )
+        .all(taskId, epicId) as unknown as Job[];
+    } catch {
+      return [];
+    }
+  }
   const liveEscalationDispatchDeps: EscalationDispatchDeps = {
     countLiveEscalations: () =>
       // GC-then-count: `readLiveEscalationJobs` prunes folded keys from the memo first,
@@ -8483,6 +8615,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         ),
       dispatchUnblock: (row) => dispatchUnblock(row),
       isEpicUnblockLive: (epicId) => epicUnblockLive(epicId),
+      auditOrchestratorLiveness: (row) =>
+        probeAuditOrchestrator(
+          readAuditOrchestratorJobs(row.epic_id, row.task_id),
+          row.epic_id,
+          row.task_id,
+        ),
+      now: () => Date.now(),
       hasOpenWorkFailure: (taskId) => {
         try {
           return (
