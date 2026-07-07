@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped change adding a SubscribeOptions flag plus a strict-superset SQL membership invariant and an open-wins readiness merge over closed epics where a wrong abstraction or under-selection propagates to consumers.",
+      "task_id": "fn-1175-pin-needs-human-epics-on-board.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified consumption of the dep task's member across two CLI surfaces following existing block/pill patterns, with a concrete directly-assertable no-double-count invariant rather than a novel or deep one.",
+      "task_id": "fn-1175-pin-needs-human-epics-on-board.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T22:51:05.513000Z",
+  "epic_id": "fn-1175-pin-needs-human-epics-on-board",
+  "input_hash": "83eba9f27c30e70b7d729c5d6b39401d222fa5e27a9fe8b7e2c4fa64918734e4",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2213259762,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1175-pin-needs-human-epics-on-board.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped change adding a SubscribeOptions flag plus a strict-superset SQL membership invariant and an open-wins readiness merge over closed epics where a wrong abstraction or under-selection propagates to consumers.\",\"confidence\":0.8},{\"task_id\":\"fn-1175-pin-needs-human-epics-on-board.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Well-specified consumption of the dep task's member across two CLI surfaces following existing block/pill patterns, with a concrete directly-assertable no-double-count invariant rather than a novel or deep one.\",\"confidence\":0.7}]}"
+}
