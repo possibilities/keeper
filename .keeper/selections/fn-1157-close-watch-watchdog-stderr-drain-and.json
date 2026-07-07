@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single file-pair change with a named surface and explicit fix options (drain stderr, factor a pure seam, add parseArgv assertions), low blast radius and no contract touch, well suited to sonnet at medium.",
+      "task_id": "fn-1157-close-watch-watchdog-stderr-drain-and.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T03:47:52.367000Z",
+  "epic_id": "fn-1157-close-watch-watchdog-stderr-drain-and",
+  "input_hash": "addf9d65210c8b3da34f727af78d9545fb7625fc11a36f3fe105b529c773c96e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2917113189,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded single file-pair change with a named surface and explicit fix options (drain stderr, factor a pure seam, add parseArgv assertions), low blast radius and no contract touch, well suited to sonnet at medium.\",\"confidence\":0.8}]}"
+}
