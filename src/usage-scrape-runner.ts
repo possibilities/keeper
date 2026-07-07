@@ -1,10 +1,10 @@
 /**
- * The keeper→`uv`→agentusage-util→JSON scrape seam (fn-930 `.3`).
+ * The keeper→bun→internal-scrape-cli→JSON scrape seam.
  *
- * This is the thin boundary the usage-scraper worker (`.4`) stands on: it shells
- * the stateless one-shot agentusage scrape util through an absolute `uv`,
+ * This is the thin boundary the usage-scraper worker stands on: it spawns the
+ * daemon's own bun binary on the internal `src/usage-scrape/scrape-cli.ts` entry,
  * captures stdout, and parses + validates the discriminated `{ok|error}` JSON
- * contract the util prints. The ENVELOPE assembly (multiplier, next_fetch_at,
+ * contract the entry prints. The ENVELOPE assembly (multiplier, next_fetch_at,
  * last_*_fetch_at, lift_at carry — all producer-side wall-clock) is the worker's
  * job, NOT this seam's; this layer owns only the scrape round-trip.
  *
@@ -12,30 +12,36 @@
  * and the `SessionStateDeps`/`buildSessionState` seam): production threads the
  * real {@link spawnScrape}; unit tests pass a synthetic {@link ScrapeRunner}
  * returning canned JSON so the worker's branch logic (ok / no_subscription /
- * error / schema mismatch) is exercised in-process with NO real `uv`/PTY. A plain
- * function param — no DI framework.
+ * error / schema mismatch) is exercised in-process with NO real subprocess/PTY.
+ * A plain function param — no DI framework.
  *
- * Spawn discipline (the keystone risks this task de-risks):
+ * Spawn discipline (the keystone risks this seam de-risks):
+ *  - the argv is ONE fixed shape — `[process.execPath, <internal scrape-cli>,
+ *    --target …, --profile …]` — with no runtime fork and no config lookup.
+ *  - the child `cwd` is set EXPLICITLY to the keeper repo root (derived from the
+ *    entry path, never inherited): keeperd runs under launchd where the daemon
+ *    cwd may be `/`, so an explicit root makes bunfig/tsconfig discovery
+ *    deterministic. The entry path is injectable
+ *    ({@link SpawnScrapeOptions.entryPath}) and the cwd derives from it, so an
+ *    off-tree override also relocates cwd — how the `spawn_failed` arm is reached
+ *    in a unit test (Bun.spawn throws synchronously on a missing cwd, starting no
+ *    child).
  *  - stdout is DRAINED CONCURRENTLY with `proc.exited` via `Promise.all` — never
- *    await-then-read, which deadlocks once the util's stdout exceeds the ~64KB
+ *    await-then-read, which deadlocks once the entry's stdout exceeds the ~64KB
  *    pipe buffer (a big `screen_excerpt` on a parse-drift error can approach it).
  *  - bounded by a manual `setTimeout` → `proc.kill("SIGKILL")` deadline
  *    (`AbortSignal.timeout()` mis-fires on Bun/macOS, bun#7512), so a hung PTY
  *    scrape can never wedge a worker loop.
- *  - stderr is drained separately (the util sends ALL diagnostics/tracebacks
+ *  - stderr is drained separately (the entry sends ALL diagnostics/tracebacks
  *    there) and surfaced on the failure arms for diagnosis.
- *  - the `cwd` is set to the agentusage project dir so `python -m
- *    agentusage.scrape_cli` resolves the package; `uv run --directory <dir>`
- *    additionally pins the project env under keeperd's stripped LaunchAgent PATH.
- *    Plain `run` — NEVER `--python <path>`, which recreates the venv every call
- *    (uv#11288).
  *
- * No `bun:sqlite` import — this is a db-free leaf shelled from the worker.
+ * No `bun:sqlite`/`./db` import — this is a db-free leaf shelled from the worker.
  */
 
-import { dirname, isAbsolute, join } from "node:path";
+import { realpathSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveTmuxBin } from "./agent/tmux-launch";
-import { resolveUsageScraperRuntime, type UsageScraperRuntime } from "./db";
 
 /** Schema version the util stamps on every JSON object; the worker gates on it. */
 export const SCRAPE_CONTRACT_SCHEMA_VERSION = 1;
@@ -214,19 +220,44 @@ export type ScrapeResult =
 export type ScrapeRunner = (account: ScrapeAccount) => Promise<ScrapeResult>;
 
 /**
- * Build the FULL argv (binary + args) for one scrape, per the resolved runtime.
- *  - `uv`: `<uv> run --directory <dir> python -m agentusage.scrape_cli …` — plain
- *    `run` sets the child cwd + pins the project env; NEVER `--python` (uv#11288
- *    recreates the venv per call).
- *  - `bun`: `<bun> <dir>/src/scrape-cli.ts …` — the agentusage bun entry under the
- *    same project dir.
- * Both thread an identical `--target`/`--profile` (+ optional
- * `--command`/`--rows`/`--cols`) tail, so a flip changes only the launcher, not
- * the request shape.
+ * The internal scrape-cli entry: this module's sibling `usage-scrape/scrape-cli.ts`,
+ * symlink-resolved. Mirrors `defaultKeeperAgentPath`'s import.meta pattern
+ * (fileURLToPath → dirname → resolve → realpathSync with fallback-on-throw), so
+ * the path is absolute and survives keeperd's stripped LaunchAgent PATH. Falls
+ * back to the unresolved abs path when a symlink-resolve throws (partial install).
+ */
+export function defaultScrapeCliPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const entry = resolve(here, "usage-scrape", "scrape-cli.ts");
+  try {
+    return realpathSync(entry);
+  } catch {
+    return entry;
+  }
+}
+
+/**
+ * The keeper repo root a scrape child runs in, derived as the entry path's
+ * grandparent (`<root>/src/usage-scrape/scrape-cli.ts` → `<root>`). Anchoring cwd
+ * to the ENTRY (not this module) means an off-tree entry override relocates cwd
+ * too — a missing cwd makes Bun.spawn throw synchronously, the seam the
+ * `spawn_failed` unit test rides without ever starting a child.
+ */
+function scrapeChildCwd(entryPath: string): string {
+  return resolve(dirname(entryPath), "..", "..");
+}
+
+/**
+ * Build the FULL argv for one scrape: the daemon's own bun binary
+ * (`process.execPath`, absolute under launchd's stripped PATH) on the internal
+ * scrape-cli entry, then an identical `--target`/`--profile` (+ optional
+ * `--command`/`--rows`/`--cols`) tail. ONE fixed shape — no runtime fork, no
+ * config lookup. `entryPath` defaults to the internal entry; a test overrides it
+ * to point at a fixture or an off-tree path.
  */
 export function buildScrapeArgs(
-  runtime: UsageScraperRuntime,
   account: ScrapeAccount,
+  entryPath: string = defaultScrapeCliPath(),
 ): string[] {
   const tail = ["--target", account.target, "--profile", account.profile];
   if (account.command !== undefined) {
@@ -238,23 +269,7 @@ export function buildScrapeArgs(
   if (account.cols !== undefined) {
     tail.push("--cols", String(account.cols));
   }
-  if (runtime.runtime === "bun") {
-    return [
-      runtime.bunPath,
-      join(runtime.projectDir, "src", "scrape-cli.ts"),
-      ...tail,
-    ];
-  }
-  return [
-    runtime.uvPath,
-    "run",
-    "--directory",
-    runtime.projectDir,
-    "python",
-    "-m",
-    "agentusage.scrape_cli",
-    ...tail,
-  ];
+  return [process.execPath, entryPath, ...tail];
 }
 
 /**
@@ -376,17 +391,20 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** Options for {@link spawnScrape} — the resolved runtime + the per-call budget. */
+/** Options for {@link spawnScrape} — the injectable entry path (test seam), the
+ *  per-call budget, and extra child env. */
 export interface SpawnScrapeOptions {
-  /** The resolved runtime (uv|bun): binary + project dir + which argv shape. */
-  runtime: UsageScraperRuntime;
+  /** Override the internal scrape-cli entry (argv[1]). The child cwd derives from
+   *  it, so an off-tree override relocates cwd — how the `spawn_failed` arm is
+   *  exercised in tests. Defaults to {@link defaultScrapeCliPath}. */
+  entryPath?: string;
   timeoutMs?: number;
   /** Extra env merged over `process.env` for the child (e.g. `PATH`, `CLAUDE_CONFIG_DIR`). */
   env?: Record<string, string>;
 }
 
 /**
- * Run ONE scrape as a real `uv` subprocess and return the parsed contract. Drains
+ * Run ONE scrape as a real bun subprocess and return the parsed contract. Drains
  * stdout + stderr CONCURRENTLY with `proc.exited`, bounds the run with a manual
  * SIGKILL deadline, and parses the result. NEVER throws — a spawn failure /
  * timeout / non-contract output folds to a `runner_failure` arm so the worker
@@ -394,20 +412,24 @@ export interface SpawnScrapeOptions {
  */
 export async function spawnScrape(
   account: ScrapeAccount,
-  opts: SpawnScrapeOptions,
+  opts: SpawnScrapeOptions = {},
 ): Promise<ScrapeResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SCRAPE_TIMEOUT_MS;
-  const argv = buildScrapeArgs(opts.runtime, account);
+  const entryPath = opts.entryPath ?? defaultScrapeCliPath();
+  const argv = buildScrapeArgs(account, entryPath);
   // `const proc` (spawned INSIDE the try) keeps Bun.spawn's NARROWED stream
   // types — a pre-declared widened annotation erases them to the
   // `number | ReadableStream` union and breaks `new Response`. Bun.spawn throws
-  // SYNCHRONOUSLY on a bad binary, so a spawn failure lands in the same catch.
+  // SYNCHRONOUSLY on a missing cwd/binary, so a spawn failure lands in the same
+  // catch.
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const proc = Bun.spawn(argv, {
-      // cwd at the project dir keeps module resolution correct (redundant with
-      // uv's `--directory`, load-bearing for the bun entry's relative imports).
-      cwd: opts.runtime.projectDir,
+      // Explicit cwd at the keeper repo root keeps bunfig/tsconfig discovery
+      // deterministic under launchd (where the daemon cwd may be `/`). Derived
+      // from the entry, so an off-tree entry override relocates it — a missing
+      // cwd throws synchronously here and folds to `spawn_failed`.
+      cwd: scrapeChildCwd(entryPath),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -458,28 +480,16 @@ export async function spawnScrape(
 }
 
 /**
- * The default production {@link ScrapeRunner}. Gates on
- * {@link resolveUsageScraperRuntime}: if the absolute `uv` path + agentusage
- * project dir do not BOTH resolve, returns a `spawn_failed` runner_failure rather
- * than spawning — the worker (`.4`) checks the runtime resolves BEFORE arming its
- * loop, so this guard is the belt-and-suspenders second line, never the gate.
+ * The default production {@link ScrapeRunner}. Spawns the internal scrape-cli
+ * entry unconditionally — the entry is first-class keeper source (always present),
+ * so there is no runtime gate; the scraped model SET is governed by config
+ * declaring models (resolved by the worker), not here.
  */
 export const runScrape: ScrapeRunner = async (account) => {
-  const runtime = resolveUsageScraperRuntime();
-  if (runtime === null) {
-    return {
-      kind: "runner_failure",
-      reason: "spawn_failed",
-      message: "usage-scraper runtime unresolved (project dir / uv path unset)",
-      stderr: "",
-      exitCode: null,
-    };
-  }
-  // Both legs spawn `tmux` to drive the target TUI; launchd strips PATH, so the
+  // The scrape spawns `tmux` to drive the target TUI; launchd strips PATH, so the
   // child needs tmux's directory injected or the scrape ENOENTs. Append (never
   // prepend) so an operator PATH still wins.
   return spawnScrape(account, {
-    runtime,
     env: { PATH: scrapeChildPath(process.env.PATH) },
   });
 };

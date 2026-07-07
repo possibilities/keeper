@@ -112,7 +112,6 @@ import {
   resolveSockPath,
   resolveStatuslineRoot,
   resolveUsageRoot,
-  resolveUsageScraperRuntime,
   runDispatchMintGate,
   truncateEphemeralProjections,
 } from "./db";
@@ -6661,28 +6660,26 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (buildsWorker)`
 
-  // Spawn the usage-scraper PRODUCER worker (fn-930) — the in-process port of
-  // agentusage's retired daemon.py. It runs N per-account scrape loops and writes
-  // ONLY the on-disk `<id>.json` / `.error.json` / `events.jsonl` envelopes under
-  // the agentusage state root; the existing `usage` CONSUMER worker watches that
-  // same dir and mints the events, so the scraper posts NO messages to main and
-  // needs no `onmessage` minting. NOT a file-watcher (not in WATCHER_WORKERS).
-  // Gated like `builds`: the selector AND a resolvable runtime (absolute `uv` path
-  // + agentusage project dir). An unresolved runtime leaves the worker un-spawned
-  // and the daemon boots normally (rollback = unset the config key) — never a
-  // `fatalExit`. The state dir is resolved on main via `resolveUsageRoot()` so the
+  // Spawn the usage-scraper PRODUCER worker — the in-process port of the retired
+  // agentusage daemon. It runs N per-account scrape loops and writes ONLY the
+  // on-disk `<id>.json` / `.error.json` / `events.jsonl` envelopes under the
+  // agentusage state root; the existing `usage` CONSUMER worker watches that same
+  // dir and mints the events, so the scraper posts NO messages to main and needs
+  // no `onmessage` minting. NOT a file-watcher (not in WATCHER_WORKERS). Gated on
+  // the plain worker selector — the scrape entry is first-class keeper source
+  // (always present), and the scraped model SET is governed by config declaring
+  // models (resolved inside the worker), so there is no runtime-resolution gate.
+  // The state dir is resolved on main via `resolveUsageRoot()` so the
   // `KEEPER_AGENTUSAGE_ROOT` sandbox seam moves the producer + the consumer
   // together.
-  const usageScraperRuntime = resolveUsageScraperRuntime();
-  const usageScraperWorker =
-    want("usageScraper") && usageScraperRuntime !== null
-      ? new Worker(new URL("./usage-scraper-worker.ts", import.meta.url).href, {
-          workerData: {
-            dbPath,
-            stateDir: resolveUsageRoot(),
-          } satisfies UsageScraperWorkerData,
-        } as WorkerOptions & { workerData: unknown })
-      : null;
+  const usageScraperWorker = want("usageScraper")
+    ? new Worker(new URL("./usage-scraper-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          stateDir: resolveUsageRoot(),
+        } satisfies UsageScraperWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
   if (usageScraperWorker) {
     const usw = usageScraperWorker;

@@ -151,32 +151,6 @@ export interface KeeperConfig {
   repoForkRoot: string;
   claudeProjectsRoot?: string;
   agentusageRoot?: string;
-  // Absolute path to the `uv` binary the usage-scraper-worker shells the
-  // stateless agentusage scrape util through. Independent best-effort key with
-  // NO default — absent/empty/garbage → undefined → the scraper worker is not
-  // spawned. MUST be absolute (keeperd's LaunchAgent PATH is stripped, so a bare
-  // `uv` would not resolve). Resolved by {@link resolveUsageScraperRuntime}.
-  usageScraperUvPath?: string;
-  // Absolute path to the agentusage project directory (the repo holding
-  // `pyproject.toml` + `agentusage/scrape_cli.py`). Independent best-effort key
-  // with NO default — absent/empty/garbage → undefined → the scraper worker is
-  // not spawned. The worker runs `<uv> run --directory <this> python -m
-  // agentusage.scrape_cli …`. Resolved by {@link resolveUsageScraperRuntime}.
-  usageScraperProjectDir?: string;
-  // Which runtime the usage-scraper shells each scrape through: `"uv"` (the
-  // python util via `uv run`) or `"bun"` (the agentusage bun entry). Parsed from
-  // `usage_scraper_runtime`; ANY value but an exact `"bun"` — absent, empty,
-  // garbage — fails closed to `"uv"`, matching the unrecognized-schema-version
-  // house rule so a mistyped toggle never silently spawns the bun leg. The env
-  // `KEEPER_USAGE_SCRAPER_RUNTIME` overrides at resolve time
-  // ({@link resolveUsageScraperRuntimeKind}), re-read per scrape so a flip or
-  // rollback lands without a daemon restart.
-  usageScraperRuntime: "uv" | "bun";
-  // Absolute path to the `bun` binary the runtime=bun leg spawns. Independent
-  // best-effort key with NO parse default — {@link resolveUsageScraperRuntime}
-  // falls back to the daemon's own `process.execPath` (absolute under launchd's
-  // stripped PATH) and honors a `KEEPER_USAGE_SCRAPER_BUN_PATH` env override.
-  usageScraperBunPath?: string;
   // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
@@ -333,16 +307,6 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
   // never spawns.
   let buildbotUrl: string | undefined;
-  // No default — absent leaves these undefined so the usage-scraper worker
-  // never spawns. Both must be absolute (stripped LaunchAgent PATH).
-  let usageScraperUvPath: string | undefined;
-  let usageScraperProjectDir: string | undefined;
-  // Defaults to "uv" — the shipped runtime. A malformed/absent value fails closed
-  // to "uv" via `normalizeUsageScraperRuntime`.
-  let usageScraperRuntime: "uv" | "bun" = "uv";
-  // No default — absent leaves `usageScraperBunPath` undefined so the bun leg
-  // falls back to `process.execPath`.
-  let usageScraperBunPath: string | undefined;
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
@@ -366,7 +330,6 @@ export function resolveConfig(): KeeperConfig {
         repoForkRoot,
         claudeProjectsRoot,
         agentusageRoot,
-        usageScraperRuntime,
         autocloseEnabled,
         autocloseGraceSeconds,
         accountAliases,
@@ -408,32 +371,6 @@ export function resolveConfig(): KeeperConfig {
       const bbu = (raw as { buildbot_url?: unknown }).buildbot_url;
       if (typeof bbu === "string" && bbu.length > 0) {
         buildbotUrl = bbu;
-      }
-      // Independent best-effort keys — non-empty string only; garbage/absent
-      // leaves them undefined and the usage-scraper worker un-spawned. NOT
-      // tilde-expanded here — resolution happens in
-      // `resolveUsageScraperRuntime()`.
-      const usuv = (raw as { usage_scraper_uv_path?: unknown })
-        .usage_scraper_uv_path;
-      if (typeof usuv === "string" && usuv.length > 0) {
-        usageScraperUvPath = usuv;
-      }
-      const uspd = (raw as { usage_scraper_project_dir?: unknown })
-        .usage_scraper_project_dir;
-      if (typeof uspd === "string" && uspd.length > 0) {
-        usageScraperProjectDir = uspd;
-      }
-      // Runtime toggle — fails closed to "uv" via the pure normalizer so a
-      // mistyped value never silently flips to the bun leg.
-      usageScraperRuntime = normalizeUsageScraperRuntime(
-        (raw as { usage_scraper_runtime?: unknown }).usage_scraper_runtime,
-      );
-      // Independent best-effort key — non-empty string only; absent leaves the
-      // bun leg on the `process.execPath` default.
-      const usbp = (raw as { usage_scraper_bun_path?: unknown })
-        .usage_scraper_bun_path;
-      if (typeof usbp === "string" && usbp.length > 0) {
-        usageScraperBunPath = usbp;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `dispatchPromptPrefix` undefined and no free-form prompt prefix
@@ -492,7 +429,6 @@ export function resolveConfig(): KeeperConfig {
       repoForkRoot: DEFAULT_REPO_FORK_ROOT,
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
-      usageScraperRuntime: "uv",
       autocloseEnabled: DEFAULT_AUTOCLOSE_ENABLED,
       autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
       accountAliases: {},
@@ -506,10 +442,6 @@ export function resolveConfig(): KeeperConfig {
     claudeProjectsRoot,
     agentusageRoot,
     buildbotUrl,
-    usageScraperUvPath,
-    usageScraperProjectDir,
-    usageScraperRuntime,
-    usageScraperBunPath,
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
@@ -582,91 +514,6 @@ function expandTilde(entry: string): string {
     return join(home, entry.slice(2));
   }
   return entry;
-}
-
-/**
- * Resolved usage-scraper runtime — a discriminated union over the two legs. Both
- * carry the absolute agentusage `projectDir` (the scrape entry lives under it);
- * the `runtime` discriminant selects the binary field and the argv shape the
- * runner's `buildScrapeArgs` emits.
- */
-export type UsageScraperRuntime =
-  | { runtime: "uv"; uvPath: string; projectDir: string }
-  | { runtime: "bun"; bunPath: string; projectDir: string };
-
-/**
- * Normalize a raw `usage_scraper_runtime` value to a runtime kind, FAILING
- * CLOSED to `"uv"` on anything but an exact `"bun"` — absent, empty, wrong type,
- * or garbage all resolve `"uv"` (mirrors the unrecognized-schema-version house
- * rule so a mistyped toggle never silently spawns the bun leg).
- */
-function normalizeUsageScraperRuntime(v: unknown): "uv" | "bun" {
-  return v === "bun" ? "bun" : "uv";
-}
-
-/**
- * Resolve which runtime the usage-scraper shells each scrape through:
- * `KEEPER_USAGE_SCRAPER_RUNTIME` env > `usage_scraper_runtime` config > `"uv"`.
- * A present env value is AUTHORITATIVE and shadows config (a valid `uv`/`bun`
- * wins; any other value fails closed to `"uv"`), so a stray LaunchAgent override
- * is never silently undone by a config flip. Re-read per scrape.
- */
-export function resolveUsageScraperRuntimeKind(): "uv" | "bun" {
-  return normalizeUsageScraperRuntime(
-    firstNonEmpty(
-      process.env.KEEPER_USAGE_SCRAPER_RUNTIME,
-      resolveConfig().usageScraperRuntime,
-    ),
-  );
-}
-
-/**
- * Resolve the usage-scraper worker's runtime, or null when unconfigured. The
- * worker spawn is GATED on a non-null return here (resolves → spawn; unresolved
- * → un-spawn + warn, never `fatalExit`); the boot gate reads only null-ness, so
- * this stays a drop-in for both legs.
- *
- * The agentusage `projectDir` is required for BOTH legs (the entry lives under
- * it). The binary depends on {@link resolveUsageScraperRuntimeKind}:
- *  - `uv`: an absolute `uv` binary (`KEEPER_USAGE_SCRAPER_UV_PATH` env > config),
- *    with NO default — an unresolved uv path closes the gate exactly as before.
- *  - `bun`: the `bun` binary (`KEEPER_USAGE_SCRAPER_BUN_PATH` env > config >
- *    `process.execPath`), which always resolves, so runtime=bun needs only the
- *    project dir — a flip to bun with the uv keys absent still spawns.
- *
- * A leading `~` is expanded AT RESOLVE TIME (`execvp` does not expand `~`). No
- * existence check — a bad path fails the scrape loudly at spawn, never here.
- */
-export function resolveUsageScraperRuntime(): UsageScraperRuntime | null {
-  const cfg = resolveConfig();
-  const dirEntry = firstNonEmpty(
-    process.env.KEEPER_USAGE_SCRAPER_PROJECT_DIR,
-    cfg.usageScraperProjectDir,
-  );
-  if (dirEntry === undefined) {
-    return null;
-  }
-  const projectDir = expandTilde(dirEntry);
-  if (resolveUsageScraperRuntimeKind() === "bun") {
-    const bunEntry = firstNonEmpty(
-      process.env.KEEPER_USAGE_SCRAPER_BUN_PATH,
-      cfg.usageScraperBunPath,
-    );
-    return {
-      runtime: "bun",
-      bunPath:
-        bunEntry !== undefined ? expandTilde(bunEntry) : process.execPath,
-      projectDir,
-    };
-  }
-  const uvEntry = firstNonEmpty(
-    process.env.KEEPER_USAGE_SCRAPER_UV_PATH,
-    cfg.usageScraperUvPath,
-  );
-  if (uvEntry === undefined) {
-    return null;
-  }
-  return { runtime: "uv", uvPath: expandTilde(uvEntry), projectDir };
 }
 
 /**
