@@ -61,5 +61,5 @@ key; picker tests re-source their profile fixtures.
 - [ ] Full fast suite green
 
 ## Done summary
-
+Introduced the db-free src/usage-models.ts registry parsing one usage_models: { <envelope-id>: <alias|null> } keeper-config map (fail-open, id-validated), and routed buildAccounts (codex only when declared, idle on empty), the picker's listProfiles (declared claude ids, still db-free), and the usage TUI aliases through it. Retired the external agentusage config.yaml reads and the account_aliases key.
 ## Evidence
