@@ -4,11 +4,11 @@
   "depends_on": [],
   "epic": "fn-1161-frames-stream-and-hyper-watch",
   "id": "fn-1161-frames-stream-and-hyper-watch.5",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Autopilot skill armed recipe",
-  "updated_at": "2026-07-07T13:33:46.397000Z"
+  "updated_at": "2026-07-07T13:35:08.037000Z"
 }

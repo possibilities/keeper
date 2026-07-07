@@ -1,0 +1,64 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Foundational wire-contract module consumed by two structurally different shells and the epic's proof point, so a wrong abstraction propagates.",
+      "task_id": "fn-1161-frames-stream-and-hyper-watch.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Net-new rev-into-emit seam plus a third view-shell mode and multi-stream coverage gating that must not disturb byte-identical live/snapshot behavior.",
+      "task_id": "fn-1161-frames-stream-and-hyper-watch.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multi-file top-level subcommand following the known three-touch add pattern, but with contract-shaped exit-code taxonomy and trailer discipline that warrant the opus floor.",
+      "task_id": "fn-1161-frames-stream-and-hyper-watch.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Small surface but subtle dual-consumer invariant and a hash-gated emit site that must not mint per-tick frames, proven by a normalized parity test.",
+      "task_id": "fn-1161-frames-stream-and-hyper-watch.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.75,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Tightly-scoped prose recipe composed by citation of existing skill sections with low blast radius, well suited to sonnet's literal spec-following.",
+      "task_id": "fn-1161-frames-stream-and-hyper-watch.5",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.77,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Complex new three-mode taxonomy, rubric, ratchet, and injection discipline for a high-blast-radius operator skill where design judgment matters.",
+      "task_id": "fn-1161-frames-stream-and-hyper-watch.6",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T13:35:08.037000Z",
+  "epic_id": "fn-1161-frames-stream-and-hyper-watch",
+  "input_hash": "ddb8bd7a97e3bae98720de6f1e8f0c73ba4cbcd9b1094bd645766c1da9ba362c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3719871866,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1161-frames-stream-and-hyper-watch.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1161-frames-stream-and-hyper-watch.2\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1161-frames-stream-and-hyper-watch.3\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1161-frames-stream-and-hyper-watch.4\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1161-frames-stream-and-hyper-watch.5\",\"tier\":\"medium\",\"model\":\"sonnet\"},{\"task_id\":\"fn-1161-frames-stream-and-hyper-watch.6\",\"tier\":\"xhigh\",\"model\":\"opus\"}]}"
+}
