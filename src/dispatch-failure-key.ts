@@ -346,6 +346,44 @@ export function isSharedDesyncDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/**
+ * The stuck-state-sentinel anomaly distress signal (ADR 0013 layer 3) — the
+ * PER-SESSION sticky the producer mints when the board says `working` but the
+ * session is demonstrably idle (a worker-done-but-working contradiction, or a
+ * very-stale live-pid session). UNLIKE the `daemon`-verb distress family above,
+ * this diverges from the glossary's LEVEL-cleared distress row: it mirrors the
+ * `worktree-merge-conflict` sticky's `retry_dispatch`-ONLY clear — every firing
+ * is evidence of a layer-1 fold gap, and a silently self-tidying corrector is how
+ * this class stayed invisible for weeks, so the OPERATOR acks it, never a
+ * level-trigger. To be `retry_dispatch`-clearable the verb MUST be a retryable one
+ * ({@link import("./dispatch-command").RetryDispatchVerb} = work|close|approve);
+ * `close` mirrors the merge-conflict precedent. The `id` is a DEDICATED synthetic
+ * namespace (`stuck-sentinel:<jobId>`) that never collides with a real epic
+ * (`fn-…`), so it routes as a `close-plain` dead-end (no escalation sweep fires on
+ * it), the reconciler's post-clear re-attempt finds no such epic and no-ops, and
+ * — being retryable — the boot orphan-GC leaves it alone by construction (that
+ * sweep only reaps UN-retryable keys). The `reason` is CLASS-stable (never carries
+ * a live age) so the producer's change-gate does not re-fire every poll tick; a
+ * newly-observed clock skew flips the reason and re-surfaces once.
+ */
+export const STUCK_SENTINEL_DISTRESS_VERB = "close";
+export const STUCK_SENTINEL_DISTRESS_ID_PREFIX = "stuck-sentinel:";
+export const STUCK_SENTINEL_DISTRESS_REASON = "stuck-sentinel";
+
+/**
+ * True iff `(verb, id)` is a stuck-state-sentinel anomaly distress key — the
+ * retryable `close` verb plus the {@link STUCK_SENTINEL_DISTRESS_ID_PREFIX}
+ * per-session id. Pure, dep-free, NEVER throws. Disjoint from every `daemon`-verb
+ * distress predicate (different verb) and from a real `close::<epic>` row (the
+ * `stuck-sentinel:` id prefix never matches an `fn-…` epic).
+ */
+export function isStuckSentinelDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === STUCK_SENTINEL_DISTRESS_VERB &&
+    id.startsWith(STUCK_SENTINEL_DISTRESS_ID_PREFIX)
+  );
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */
@@ -363,7 +401,8 @@ export type DispatchFailureDisplayKind =
   | "shared-desync"
   | "lane-premerge"
   | "lane-wedge"
-  | "stale-base";
+  | "stale-base"
+  | "stuck-sentinel";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -402,6 +441,9 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // Prefix-disjoint from every rule above (`stale-base-lane` shares no stem), so
   // ordering is not load-bearing here — appended last, its own kind.
   { prefix: STALE_BASE_DISTRESS_REASON, kind: "stale-base" },
+  // The stuck-state-sentinel anomaly (`stuck-sentinel`) — prefix-disjoint from
+  // every rule above, so ordering is not load-bearing; appended last, own kind.
+  { prefix: STUCK_SENTINEL_DISTRESS_REASON, kind: "stuck-sentinel" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

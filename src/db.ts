@@ -48,7 +48,7 @@ import { parseUsageModels, type UsageModels } from "./usage-models";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 112;
+export const SCHEMA_VERSION = 113;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -6125,6 +6125,95 @@ function migrate(db: Database): void {
       // jobs`, so this bump MUST add 112 to `SUPPORTED_SCHEMA_VERSIONS` there in
       // the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "epics", "selection_review", "TEXT");
+
+      // v112→v113 (fn-1164 task .1): the jobs lifecycle stamp. Add the nullable
+      // `jobs.last_lifecycle_ts` REAL column — the per-row event-time high-water
+      // mark a lifecycle transition may not regress behind (ADR 0013), so a stale
+      // out-of-order event annotates but never resurrects state (the
+      // phantom-working root cause). Nullable, NO default: a `DEFAULT` would
+      // poison the "NULL always applies" fresh-row invariant AND break re-fold
+      // byte-identity. Migration-ONLY (kept OUT of the CREATE_JOBS literal, NOT in
+      // LIVE_ONLY_JOBS_COLUMNS — it is deterministic-replayed), appended after
+      // every prior jobs ALTER so fresh-vs-migrated `PRAGMA table_info(jobs)` stays
+      // byte-identical.
+      addColumnIfMissing(db, "jobs", "last_lifecycle_ts", "REAL");
+
+      // REWINDING migration: the stamp is back-derived PURELY BY REPLAY (never a
+      // SQL back-fill — an UPDATE cannot reconstruct the per-transition high-water
+      // mark), so rewind the cursor to 0 and wipe the FULL current
+      // deterministic-replayed projection set; the post-migrate boot drain
+      // re-folds them under the v113 gated reducer, self-healing every existing
+      // phantom-working row on deploy (a Stop that lost to a later-ingested
+      // straggler now wins by ts). Version-guarded — the rewind is non-idempotent.
+      //
+      // The DELETE list is enumerated FRESH from the current schema, NOT copied
+      // from the v80/v81/v85 blocks (those PREDATE `dispatch_instant_death`,
+      // `epic_dep_edges`, `epic_tombstones`, `scheduled_tasks`, so they are
+      // provably incomplete for v113 — the risk the census surfaced). Every
+      // reducer-folded projection is wiped EXCEPT `commit_trailer_facts` (below);
+      // the NON-projections stay: `events` / `event_ingest_offsets` (the log + its
+      // ingest cursor), `dead_letters` + `dispatch_mint_gate` (durable PRODUCER
+      // state, never folded), and the control singletons `meta` / `reducer_state`
+      // / `git_projection_state` / `tmux_projection_state`.
+      //
+      // `commit_trailer_facts` is DELIBERATELY NOT wiped, matching v80/v81/v85: it
+      // is a DERIVE INPUT keyed by the `event_id` PK with an `INSERT OR IGNORE`
+      // fold (`foldCommit`) reading `Commit` events alone, and the `syncPlanLinks`
+      // commit-trailer channel reads it clamped `event_id <= maxEventId`, so a
+      // cursor-0 re-fold rebuilds it byte-identically WITHOUT a wipe (a bare
+      // DELETE would only drop the commit-channel edges the merge reads). Its
+      // survival across a rewind is a fixed contract (test/db.test.ts v77).
+      //
+      // The LIVE-ONLY git surface is wiped + its floor RAISED to `max(events.id)`
+      // (NOT reset to 0 — that would re-arm the O(history) `computeRepoBashWindows`
+      // re-fold time-bomb v79 fixed; this deliberately does NOT call
+      // `rewindLiveProjection`, whose floor-0 reset is only safe on a small/early
+      // DB), `seed_required = 1` so the boot-seed re-derives it above the floor.
+      // The ephemeral `pending_dispatches` is wiped so the cursor-0 re-fold cannot
+      // resurrect a phantom dispatch jam (the boot-truncate also clears it).
+      //
+      // Whitelist-only Python read (keeper-py reads none of these projection
+      // internals) — this bump MUST add 113 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
+      if (preMigrateStoredVersion < 113) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM usage");
+        db.run("DELETE FROM profiles");
+        db.run("DELETE FROM dispatch_failures");
+        db.run("DELETE FROM dispatch_instant_death");
+        db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM autopilot_state");
+        db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM armed_epics");
+        db.run("DELETE FROM builds");
+        db.run("DELETE FROM epic_dep_edges");
+        db.run("DELETE FROM epic_tombstones");
+        db.run("DELETE FROM scheduled_tasks");
+        // Ephemeral (boot-truncated) — wiped so the cursor-0 re-fold cannot
+        // resurrect a phantom `pending_dispatches` row before serving.
+        db.run("DELETE FROM pending_dispatches");
+        // LIVE-ONLY git surface: wipe the tables + zero the embedded jobs
+        // git-counters, then RAISE the floor to `max(events.id)` (never a floor-0
+        // reset) so the cursor-0 re-fold drain skips the historical git folds and
+        // the boot-seed re-derives the surface above the floor.
+        for (const table of LIVE_ONLY_PROJECTIONS) {
+          db.run(`DELETE FROM ${table}`);
+        }
+        db.run(
+          `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
+        );
+        db.run(
+          `UPDATE git_projection_state
+              SET floor = max(floor, (SELECT COALESCE(MAX(id), 0) FROM events)),
+                  seed_required = 1,
+                  updated_at = unixepoch('now', 'subsec')
+            WHERE id = 1`,
+        );
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { isRetryableDispatchKey } from "../src/dispatch-command";
 import {
   assertNever,
   CRASH_LOOP_DISTRESS_ID,
@@ -22,6 +23,7 @@ import {
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isStaleBaseDistressKey,
+  isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
@@ -44,6 +46,9 @@ import {
   STALE_BASE_DISTRESS_ID_PREFIX,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_DISTRESS_VERB,
+  STUCK_SENTINEL_DISTRESS_ID_PREFIX,
+  STUCK_SENTINEL_DISTRESS_REASON,
+  STUCK_SENTINEL_DISTRESS_VERB,
   WORKTREE_CLOSE_KEY_PREFIXES,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_NON_FF_REASON,
@@ -51,6 +56,7 @@ import {
   WORKTREE_RECOVER_KEY_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "../src/dispatch-failure-key";
+import { classifyDispatchFailure } from "../src/dispatch-failure-pill";
 
 // ── Pre-refactor predicates, replicated with HARDCODED literals ─────────────
 // Independent of production so `old === new` proves the router preserved behavior
@@ -608,6 +614,7 @@ describe("single vocabulary source", () => {
       ["worktree-lane-wedge", "lane-wedge"],
       ["worktree-lane-premerge", "lane-premerge"],
       ["stale-base-lane", "stale-base"],
+      ["stuck-sentinel", "stuck-sentinel"],
     ]);
   });
 });
@@ -954,5 +961,60 @@ describe("assertNever exhaustiveness tripwire", () => {
     expect(() => assertNever(bogus)).toThrow(
       /unhandled dispatch-failure variant/,
     );
+  });
+});
+
+// ── fn-1164.3 — stuck-state-sentinel anomaly vocabulary (ADR 0013 layer 3) ──
+
+describe("fn-1164.3 stuck-state-sentinel distress vocabulary", () => {
+  const jobId = "01234567-89ab-cdef-0123-456789abcdef";
+  const distressId = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}${jobId}`;
+
+  test("the vocabulary constants are the retryable close-keyed synthetic namespace", () => {
+    // UNLIKE the daemon-verb distress family, the sentinel uses a RETRYABLE verb so
+    // `retry_dispatch` (operator ack) is its only clear — mirroring the
+    // worktree-merge-conflict sticky rather than the level-cleared crash-loop row.
+    expect(STUCK_SENTINEL_DISTRESS_VERB).toBe("close");
+    expect(STUCK_SENTINEL_DISTRESS_ID_PREFIX).toBe("stuck-sentinel:");
+    expect(STUCK_SENTINEL_DISTRESS_REASON).toBe("stuck-sentinel");
+    // Distinct from the un-retryable synthetic `daemon` verb the other distress
+    // rows share — that difference is exactly what makes this one operator-clearable.
+    expect(STUCK_SENTINEL_DISTRESS_VERB).not.toBe(CRASH_LOOP_DISTRESS_VERB);
+  });
+
+  test("isStuckSentinelDistressKey matches the close::stuck-sentinel: namespace only", () => {
+    expect(
+      isStuckSentinelDistressKey(STUCK_SENTINEL_DISTRESS_VERB, distressId),
+    ).toBe(true);
+    // Wrong verb and a real close/work row all miss.
+    expect(isStuckSentinelDistressKey("work", distressId)).toBe(false);
+    expect(isStuckSentinelDistressKey("daemon", distressId)).toBe(false);
+    expect(isStuckSentinelDistressKey("close", "fn-1-x")).toBe(false);
+    // Disjoint from the daemon-verb distress surfaces (different verb).
+    expect(
+      isStuckSentinelDistressKey(CRASH_LOOP_DISTRESS_VERB, distressId),
+    ).toBe(false);
+  });
+
+  test("the key is retryable — so retry_dispatch clears it AND the orphan-GC leaves it alone", () => {
+    // Retryable ⇒ the boot orphan-GC (which only reaps UN-retryable keys) never
+    // sweeps it, so nothing tidies it silently; the operator ack is the sole clear.
+    expect(
+      isRetryableDispatchKey(STUCK_SENTINEL_DISTRESS_VERB, distressId),
+    ).toBe(true);
+    // The synthetic id never collides with a real epic id (`fn-…`), so no real close
+    // is suppressed and the reconciler's post-clear re-attempt finds nothing to do.
+    expect(distressId.startsWith("fn-")).toBe(false);
+  });
+
+  test("the reason collapses to its own board pill kind", () => {
+    expect(
+      classifyDispatchFailure("stuck-sentinel: worker-done-while-working"),
+    ).toBe("stuck-sentinel");
+    expect(
+      classifyDispatchFailure("stuck-sentinel: stale-working (clock-skew)"),
+    ).toBe("stuck-sentinel");
+    // Prefix-disjoint from every other display rule — no sibling shadows it.
+    expect(classifyDispatchFailure("stale-base-lane: x")).toBe("stale-base");
   });
 });

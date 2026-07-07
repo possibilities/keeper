@@ -58,7 +58,7 @@ reducer (main)  --fold, one BEGIN IMMEDIATE per event-->  projections (jobs, epi
 consumers poll `PRAGMA data_version` on their own read-only connections:
     UDS subscribe + RPC server | autopilot reconciler | plan / exit-watcher / git workers | tmux control/renamer/autoclose workers
 producers feed the log via main only (never write the DB):
-    transcript-title | plan | usage-scraper | builds | dead-letter | statusline watchers | birth-ingest | codex-state (rollout tail)
+    transcript-title | plan | usage-scraper | builds | dead-letter | statusline watchers | birth-ingest | codex-state (rollout tail) | stuck-state sentinel
 ```
 
 Main is the sole writer of the log's synthetic events and of every projection; the per-pid NDJSON

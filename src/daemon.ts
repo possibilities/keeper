@@ -136,6 +136,8 @@ import {
   isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_WEDGE_DISTRESS_VERB,
+  STUCK_SENTINEL_DISTRESS_ID_PREFIX,
+  STUCK_SENTINEL_DISTRESS_VERB,
 } from "./dispatch-failure-key";
 import { resolveEscalationLaunchConfig } from "./escalation-config";
 import type {
@@ -152,6 +154,7 @@ import {
 import type {
   ExitWatcherOutbound,
   ExitWatcherWorkerData,
+  StuckSentinelMessage,
 } from "./exit-watcher";
 import { REPROBE_MIN_AGE_SECS, REPROBE_MS } from "./exit-watcher";
 import { seedGitProjection } from "./git-boot-seed";
@@ -6267,6 +6270,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         handleBackstopMessage(msg);
         return;
       }
+      // ADR 0013 layer 3: the stuck-state sentinel's heal + anomaly mint. Main is
+      // the sole writer — the worker already ran the pure predicate + change-gate,
+      // so main just executes the corrective `StopReconciled` (when `heal`) and the
+      // sticky `stuck-sentinel` anomaly row. NON-FATAL on mint failure.
+      if (msg.kind === "stuck-sentinel") {
+        handleStuckSentinelMint(msg);
+        return;
+      }
       if (msg.kind !== "exit") {
         return;
       }
@@ -7545,6 +7556,113 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch (err) {
       console.error(
         `[keeperd] shared-checkout-wedge distress mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Execute a stuck-state-sentinel mint (ADR 0013 layer 3) — the corrective
+   * quiescence (TIER ONE only, `heal`) PLUS the sticky `stuck-sentinel` anomaly
+   * `dispatch_failures` row, on main's sole writable connection. The worker's pure
+   * predicate + change-gate already decided WHETHER to mint; main just executes.
+   *
+   * The corrective event is deliberately `StopReconciled`, NOT `Killed`: the
+   * exit-watcher is the sole `Killed` producer, `killed` fails the `stopped`-only
+   * autoclose gate, and killing mislabels completed work — this only quiesces so
+   * autoclose can reap the healed row. `$ts` is the producer-stamped `tsSec` so the
+   * fold's stamp advance is re-fold deterministic.
+   *
+   * The anomaly row keys on the RETRYABLE `close::stuck-sentinel:<jobId>` synthetic
+   * key so `retry_dispatch` (operator ack) is its ONLY clear — never a level-trigger
+   * — and, being retryable, the boot orphan-GC leaves it alone. The producer-stamped
+   * `ts` rides the payload for re-fold determinism; the UPSERT on `(verb, id)`
+   * preserves the sticky-since `created_at`, so a bounded still-stuck re-emit
+   * refreshes without resetting. Idempotent + NON-FATAL on insert failure.
+   */
+  function handleStuckSentinelMint(msg: StuckSentinelMessage): void {
+    try {
+      if (msg.heal) {
+        stmts.insertEvent.run({
+          $ts: msg.tsSec,
+          $session_id: msg.jobId,
+          $pid: null,
+          $hook_event: "StopReconciled",
+          $event_type: "stop_reconciled",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({ reason: msg.reason }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $plan_op: null,
+          $plan_target: null,
+          $plan_epic_id: null,
+          $plan_task_id: null,
+          $plan_subject_present: null,
+          $config_dir: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $plan_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+          $worktree: null,
+        });
+      }
+      const distressId = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}${msg.jobId}`;
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${STUCK_SENTINEL_DISTRESS_VERB}::${distressId}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: STUCK_SENTINEL_DISTRESS_VERB,
+          id: distressId,
+          reason: msg.reason,
+          dir: null,
+          ts: msg.tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] stuck-sentinel mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
