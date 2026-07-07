@@ -1370,20 +1370,41 @@ export function selectPendingMergeEscalations(
 
 /**
  * Load the `resolve::<epic>` job rows for `epicId` into the map shape {@link
- * classifyResolverOutcome} reads — the merge-escalation sweep's terminal-resolver
+ * classifyResolverOutcome} reads — the deconflict-dispatch sweep's terminal-resolver
  * probe. Bounded (a handful of rows per epic on the `plan_verb='resolve'` partial
- * index), selecting only the columns the liveness arms touch. A jobs read failure
+ * index), selecting only the columns the turn-active arm touches. A jobs read failure
  * degrades to an EMPTY map, which classifies as `{terminal:false}` so the escalation
- * conservatively WAITS (never a premature notify on a transient error).
+ * conservatively WAITS (never a premature dispatch on a transient error).
+ *
+ * `instance` scopes the read to the CURRENT block instance (the sticky close row's
+ * `instance_event_id`, which task .2 stamps onto the resolve session's
+ * `escalation_instance`) so a stale resolve row from a RESOLVED instance can neither
+ * suppress nor prematurely mark terminal a re-block's sequencing. The predicate is
+ * `escalation_instance = ?instance OR escalation_instance IS NULL` — NULL-stamped rows
+ * (the corroboration-miss edge) are conservatively INCLUDED so a stamp-missed resolver
+ * can still classify rather than wait forever. A NULL `instance` (absent sticky /
+ * legacy caller) falls back to the unscoped verb+ref match. Module-level twin of
+ * {@link resolveEscalationJobsFor}.
  */
-function resolveJobsForEpic(db: Database, epicId: string): Map<string, Job> {
+function resolveJobsForEpic(
+  db: Database,
+  epicId: string,
+  instance: number | null,
+): Map<string, Job> {
   const jobs = new Map<string, Job>();
   try {
-    const rows = db
-      .query(
-        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ?",
-      )
-      .all(epicId) as unknown as Job[];
+    const rows =
+      instance == null
+        ? (db
+            .query(
+              "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ?",
+            )
+            .all(epicId) as unknown as Job[])
+        : (db
+            .query(
+              "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ? AND (escalation_instance = ? OR escalation_instance IS NULL)",
+            )
+            .all(epicId, instance) as unknown as Job[]);
     for (const row of rows) {
       jobs.set(row.job_id, row);
     }
@@ -8634,7 +8655,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }
       },
       resolverOutcome: (id) =>
-        classifyResolverOutcome(resolveJobsForEpic(db, id), id, null),
+        classifyResolverOutcome(
+          resolveJobsForEpic(db, id, stickyCloseInstanceFor(id)),
+          id,
+        ),
       dispatchDeconflict: (row) => dispatchDeconflict(row),
       mintAttempted: (id, outcome) => mintMergeEscalationEvent(id, outcome),
       noteLine: (line) => console.error(`[keeperd] ${line}`),
@@ -8676,11 +8700,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // The sticky close row's `instance_event_id` — the block-instance anchor stage-3
-  // scopes {@link resolveEscalationJobsFor} on so a stale row from a resolved incident
-  // never suppresses or prematurely pages a re-escalated deconflict. A read miss or
-  // absent row degrades to NULL (the unscoped verb+ref fallback), never a thrown error.
-  function deconflictInstanceFor(id: string): number | null {
+  // The sticky close row's `instance_event_id` — the block-instance anchor the
+  // resolver-outcome probe (stage 2) and the deconflict human-notify (stage 3) both
+  // scope their jobs reads on, so a stale resolve/deconflict row from a resolved
+  // incident never suppresses or prematurely fires a re-escalated close. The column is
+  // marker-agnostic (the first-appearance incident id, preserved through UPSERT), so
+  // one read serves both stages. A read miss or absent row degrades to NULL (the
+  // unscoped verb+ref fallback), never a thrown error.
+  function stickyCloseInstanceFor(id: string): number | null {
     try {
       const row = db
         .query(
@@ -8725,7 +8752,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             db,
             "deconflict",
             id,
-            deconflictInstanceFor(id),
+            stickyCloseInstanceFor(id),
           ),
           "deconflict",
           id,

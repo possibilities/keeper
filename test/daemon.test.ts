@@ -136,6 +136,7 @@ import {
   SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
 import type { ResolverOutcome } from "../src/reconcile-core";
+import { classifyResolverOutcome } from "../src/reconcile-core";
 import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
@@ -5139,6 +5140,190 @@ test("runMergeEscalationSweep: a resolver that DIED is terminal — the deconfli
   await runMergeEscalationSweep(deps);
   expect(dispatches.length).toBe(1);
   expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
+});
+
+// ---- turn-active resolver classifier × deconflict sequencing (end-to-end) -----
+// fn-1171.6 — wire the REAL classifyResolverOutcome into runMergeEscalationSweep, not
+// a mocked outcome, to prove the epic's fix unstarves the deconflict dispatch: a
+// stopped-idle resolver (turn ended) must read terminal so the deconflict follows,
+// while a working (turn-active) resolver must still defer it.
+
+/** Minimal `Job` builder for the classifier tests — mirrors autopilot-worker.test's
+ *  `makeJob`, defaulting a resolve session row. */
+function mkResolveJob(overrides: Partial<Job>): Job {
+  return {
+    job_id: "j-res",
+    created_at: 0,
+    cwd: null,
+    pid: null,
+    state: "stopped",
+    last_event_id: 0,
+    updated_at: 0,
+    title: null,
+    title_source: null,
+    transcript_path: null,
+    start_time: null,
+    plan_verb: "resolve",
+    plan_ref: "fn-1-foo",
+    epic_links: [],
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    config_dir: null,
+    git_dirty_count: 0,
+    git_unattributed_to_live_count: 0,
+    git_orphan_count: 0,
+    ...overrides,
+  } as Job;
+}
+
+test("runMergeEscalationSweep + REAL classifyResolverOutcome: a stopped-idle resolver reads terminal and the deconflict dispatches (the epic bug fix, end-to-end)", async () => {
+  // A finished `/plan:resolve` session idling `stopped` in its pane. Under the OLD
+  // pane-liveness rule it counted LIVE and the deconflict NEVER dispatched; turn-active
+  // occupancy reads its yielded turn as terminal so the sequencing proceeds.
+  const jobs = new Map<string, Job>([
+    ["j-res", mkResolveJob({ state: "stopped", backend_exec_pane_id: "%7" })],
+  ]);
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    resolverOutcome: (id) => classifyResolverOutcome(jobs, id),
+  });
+  await runMergeEscalationSweep(deps);
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
+});
+
+test("runMergeEscalationSweep + REAL classifyResolverOutcome: a working (turn-active) resolver still defers the deconflict (sequencing unchanged)", async () => {
+  const jobs = new Map<string, Job>([
+    ["j-res", mkResolveJob({ state: "working", backend_exec_pane_id: "%1" })],
+  ]);
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    resolverOutcome: (id) => classifyResolverOutcome(jobs, id),
+  });
+  await runMergeEscalationSweep(deps);
+  // The resolver still owns the conflict (its turn is live) → nothing dispatched.
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+// ---- duplicate-spawn-name pair coexistence (autoclose off) -------------------
+// fn-1171.6 second audit strand — a re-block while an old idle `unblock::<task>`
+// session still lingers (autoclose off) launches a SECOND session with the SAME spawn
+// name. Task .2 already proves the jobs fold stamps two rows with distinct job_ids +
+// escalation_instances (test/reducer-projections.test.ts). This proves the CONSUMERS
+// this task touches — turn-active occupancy guards + instance-scoped stage-3 — stay
+// correct with the pair coexisting: no starvation, no double-count, no cross-adoption.
+
+/** Minimal `Job` builder defaulting an `unblock::<task>` escalation session row. */
+function mkUnblockJob(overrides: Partial<Job>): Job {
+  return mkResolveJob({
+    plan_verb: "unblock",
+    plan_ref: "fn-1-foo.2",
+    ...overrides,
+  });
+}
+
+test("duplicate unblock pair (old idle + fresh dispatch, same task, distinct instances): turn-active guards see exactly ONE live occupant — no starvation, no double-count", () => {
+  // Old instance A finished and idles `stopped`; fresh instance B is turn-active
+  // (`working`). Same spawn name, distinct job_ids + escalation_instances.
+  const oldIdle = mkUnblockJob({
+    job_id: "j-old",
+    state: "stopped",
+    backend_exec_pane_id: "%7",
+    escalation_instance: 100,
+  });
+  const freshLive = mkUnblockJob({
+    job_id: "j-new",
+    state: "working",
+    backend_exec_pane_id: "%8",
+    escalation_instance: 200,
+  });
+  const pair = [oldIdle, freshLive];
+
+  // Global cap denominator: the idle old session freed its slot; only the live one
+  // counts. Pane-liveness would have counted BOTH, double-charging the cap.
+  expect(countLiveEscalationSessions(pair)).toBe(1);
+  // Per-key occupancy guard: exactly one live occupant for the key, so a third
+  // dispatch is correctly suppressed while B runs (never starved by the idle A).
+  expect(escalationSessionLiveFor(pair, "unblock", "fn-1-foo.2")).toBe(true);
+  // Per-epic serialization: one live unblock in the epic.
+  expect(epicHasLiveUnblock(pair, "fn-1-foo")).toBe(true);
+});
+
+test("duplicate unblock pair both finished-idle (autoclose off): every turn-active guard frees the slot so a re-block gets a fresh dispatch", () => {
+  // Both the old and the once-fresh session have ended their turns and idle `stopped`
+  // (autoclose left the panes open). Turn-active occupancy frees the slot entirely.
+  const first = mkUnblockJob({
+    job_id: "j-old",
+    state: "stopped",
+    backend_exec_pane_id: "%7",
+    escalation_instance: 100,
+  });
+  const second = mkUnblockJob({
+    job_id: "j-new",
+    state: "stopped",
+    backend_exec_pane_id: "%8",
+    escalation_instance: 200,
+  });
+  const pair = [first, second];
+  expect(countLiveEscalationSessions(pair)).toBe(0);
+  expect(escalationSessionLiveFor(pair, "unblock", "fn-1-foo.2")).toBe(false);
+  expect(epicHasLiveUnblock(pair, "fn-1-foo")).toBe(false);
+});
+
+test("duplicate unblock pair: instance-scoped stage-3 read classifies each instance INDEPENDENTLY — the stale idle row never speaks for the live one, nor vice versa", () => {
+  const { db } = openDb(dbPath);
+  // Two coexisting `unblock::fn-1-foo.2` rows: old instance A idle+stopped, fresh
+  // instance B turn-active+working. Same plan_verb/plan_ref, distinct job_ids +
+  // escalation_instances — the fold-tolerated pair.
+  const seed = (
+    jobId: string,
+    state: string,
+    instance: number,
+    pane: string,
+  ): void => {
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                         updated_at, title, title_source, transcript_path, start_time,
+                         plan_verb, plan_ref, backend_exec_pane_id, escalation_instance)
+         VALUES (?, 0, NULL, NULL, ?, 0, 0, NULL, NULL, NULL, NULL,
+                 'unblock', 'fn-1-foo.2', ?, ?)`,
+      [jobId, state, pane, instance],
+    );
+  };
+  seed("j-old", "stopped", 100, "%7");
+  seed("j-new", "working", 200, "%8");
+
+  // Scoped to instance B (the live re-block): only the working row is in scope, so the
+  // stage-3 classifier WAITS (never pages a live session), unpolluted by the stale A.
+  const bRows = resolveEscalationJobsFor(db, "unblock", "fn-1-foo.2", 200);
+  expect(bRows.map((j) => j.job_id).sort()).toEqual(["j-new"]);
+  expect(
+    classifyEscalationOutcome(bRows, "unblock", "fn-1-foo.2", true),
+  ).toEqual({ terminal: false });
+
+  // Scoped to instance A (the resolved prior episode): only the stopped row is in
+  // scope. Were its incident still open it would classify declined — proving the two
+  // instances are read independently, no cross-adoption of B's live turn into A.
+  const aRows = resolveEscalationJobsFor(db, "unblock", "fn-1-foo.2", 100);
+  expect(aRows.map((j) => j.job_id).sort()).toEqual(["j-old"]);
+  expect(
+    classifyEscalationOutcome(aRows, "unblock", "fn-1-foo.2", true),
+  ).toEqual({ terminal: true, verdict: "declined" });
 });
 
 // ---- selectPendingResolverDispatches (the resolver working-set read) ---------

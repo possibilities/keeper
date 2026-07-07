@@ -775,12 +775,12 @@ test("classifyResolverOutcome: no resolve job row is not terminal (launch window
       state: "ended",
     }),
   );
-  expect(classifyResolverOutcome(jobs, "fn-1-foo", null)).toEqual({
+  expect(classifyResolverOutcome(jobs, "fn-1-foo")).toEqual({
     terminal: false,
   });
 });
 
-test("classifyResolverOutcome: a live resolver is not terminal (working, or stopped under a degraded probe)", () => {
+test("classifyResolverOutcome: a working (turn-active) resolver is not terminal — the deconflict defers", () => {
   const working = new Map<string, Job>();
   working.set(
     "j-1",
@@ -792,11 +792,16 @@ test("classifyResolverOutcome: a live resolver is not terminal (working, or stop
       backend_exec_pane_id: "%1",
     }),
   );
-  expect(classifyResolverOutcome(working, "fn-1-foo", null)).toEqual({
+  expect(classifyResolverOutcome(working, "fn-1-foo")).toEqual({
     terminal: false,
   });
-  // A stopped resolver under a null (degraded) probe stays LIVE — conservative, so the
-  // escalation waits for a definitive ended/killed rather than firing prematurely.
+});
+
+test("classifyResolverOutcome: a stopped-idle resolver reads terminal/declined — turn-active occupancy, not pane-liveness (the epic bug fix)", () => {
+  // A one-shot `/plan:resolve` session idles `stopped` after its turn. Under the OLD
+  // pane-liveness rule a stopped resolver with a live/unprobeable pane counted as LIVE
+  // and never read terminal, STARVING the deconflict dispatch forever. Turn-active
+  // occupancy reads the yielded turn as terminal so the deconflict can follow.
   const stopped = new Map<string, Job>();
   stopped.set(
     "j-1",
@@ -808,27 +813,13 @@ test("classifyResolverOutcome: a live resolver is not terminal (working, or stop
       backend_exec_pane_id: "%7",
     }),
   );
-  expect(classifyResolverOutcome(stopped, "fn-1-foo", null)).toEqual({
-    terminal: false,
-  });
-});
-
-test("classifyResolverOutcome: an ended resolver is terminal/declined; a killed or dead-pane resolver is terminal/died", () => {
-  const ended = new Map<string, Job>();
-  ended.set(
-    "j-1",
-    makeJob({
-      job_id: "j-1",
-      plan_verb: "resolve",
-      plan_ref: "fn-1-foo",
-      state: "ended",
-    }),
-  );
-  // A clean exit (SessionEnd) — it stamped BLOCKED / gave up → declined.
-  expect(classifyResolverOutcome(ended, "fn-1-foo", null)).toEqual({
+  expect(classifyResolverOutcome(stopped, "fn-1-foo")).toEqual({
     terminal: true,
     verdict: "declined",
   });
+});
+
+test("classifyResolverOutcome: a killed or ended resolver is terminal/died (abnormal CLI exit — a one-shot session should idle stopped)", () => {
   const killed = new Map<string, Job>();
   killed.set(
     "j-1",
@@ -839,26 +830,54 @@ test("classifyResolverOutcome: an ended resolver is terminal/declined; a killed 
       state: "killed",
     }),
   );
-  // Proven-gone → died.
-  expect(classifyResolverOutcome(killed, "fn-1-foo", null)).toEqual({
+  expect(classifyResolverOutcome(killed, "fn-1-foo")).toEqual({
     terminal: true,
     verdict: "died",
   });
-  // A stopped resolver whose pane is DEAD under a real probe — crashed → died.
-  const deadPane = new Map<string, Job>();
-  deadPane.set(
+  const ended = new Map<string, Job>();
+  ended.set(
     "j-1",
     makeJob({
       job_id: "j-1",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "ended",
+    }),
+  );
+  expect(classifyResolverOutcome(ended, "fn-1-foo")).toEqual({
+    terminal: true,
+    verdict: "died",
+  });
+});
+
+test("classifyResolverOutcome: a working resolver defers even beside a stopped sibling (live wins)", () => {
+  // A stale stopped resolver row from a prior turn plus a fresh working one → the live
+  // turn wins, so the deconflict still defers. Instance scoping (daemon side) narrows
+  // the row set per incident; here the classifier's live-wins invariant is proven.
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-old",
+    makeJob({
+      job_id: "j-old",
       plan_verb: "resolve",
       plan_ref: "fn-1-foo",
       state: "stopped",
       backend_exec_pane_id: "%7",
     }),
   );
-  expect(
-    classifyResolverOutcome(deadPane, "fn-1-foo", new Set(["%99"])),
-  ).toEqual({ terminal: true, verdict: "died" });
+  jobs.set(
+    "j-new",
+    makeJob({
+      job_id: "j-new",
+      plan_verb: "resolve",
+      plan_ref: "fn-1-foo",
+      state: "working",
+      backend_exec_pane_id: "%8",
+    }),
+  );
+  expect(classifyResolverOutcome(jobs, "fn-1-foo")).toEqual({
+    terminal: false,
+  });
 });
 
 test("classifyResolverOutcome: keyed per-epic — a terminal resolver for another epic never speaks for this one", () => {
@@ -873,7 +892,7 @@ test("classifyResolverOutcome: keyed per-epic — a terminal resolver for anothe
     }),
   );
   // No resolve row for fn-1-foo → not terminal (its escalation still waits).
-  expect(classifyResolverOutcome(jobs, "fn-1-foo", null)).toEqual({
+  expect(classifyResolverOutcome(jobs, "fn-1-foo")).toEqual({
     terminal: false,
   });
 });
