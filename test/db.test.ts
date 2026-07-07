@@ -265,15 +265,15 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1)", () => {
+test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted + v113 last_lifecycle_ts + v114 escalation_instance are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1, fn-1164 task .1, fn-1171 task .2)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `last_lifecycle_ts` (v113) is the
-  // current final appended column, trailing `adopted` (v110),
-  // `harness`/`resume_target` (v109), `dispatch_origin` (v108), `kill_reason`
-  // (v103), and the v100 telemetry six.
+  // re-fold determinism charter depends on. `escalation_instance` (v114) is the
+  // current final appended column, trailing `last_lifecycle_ts` (v113), `adopted`
+  // (v110), `harness`/`resume_target` (v109), `dispatch_origin` (v108),
+  // `kill_reason` (v103), and the v100 telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -287,6 +287,7 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
     "resume_target",
     "adopted",
     "last_lifecycle_ts",
+    "escalation_instance",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -329,6 +330,65 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
   ).toBe(String(SCHEMA_VERSION));
   expect(tailOf(migrated)).toEqual(expectedTail);
   migrated.close();
+});
+
+test("openDb adds nullable escalation_instance to jobs + instance_event_id to dispatch_failures, no DEFAULT (fn-1171 task .2)", () => {
+  // The v113→v114 step binds an escalation session to its block instance:
+  // `jobs.escalation_instance` (the bound instance id) and
+  // `dispatch_failures.instance_event_id` (the sticky row's first-appearance
+  // incident id). Both nullable INTEGER, NO default — a DEFAULT would poison the
+  // NULL=absent invariant and break re-fold byte-identity. A bare-inserted row
+  // reads NULL on both (the zero-event shape).
+  const { db } = openDb(":memory:");
+  const jobsCol = (
+    db.prepare("PRAGMA table_info(jobs)").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[]
+  ).find((c) => c.name === "escalation_instance");
+  expect(jobsCol).toBeDefined();
+  expect(jobsCol?.type).toBe("INTEGER");
+  expect(jobsCol?.notnull).toBe(0);
+  expect(jobsCol?.dflt_value).toBeNull();
+
+  const dfCol = (
+    db.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[]
+  ).find((c) => c.name === "instance_event_id");
+  expect(dfCol).toBeDefined();
+  expect(dfCol?.type).toBe("INTEGER");
+  expect(dfCol?.notnull).toBe(0);
+  expect(dfCol?.dflt_value).toBeNull();
+
+  db.prepare(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('je', 1, 0, 1)",
+  ).run();
+  expect(
+    (
+      db
+        .prepare("SELECT escalation_instance FROM jobs WHERE job_id = 'je'")
+        .get() as { escalation_instance: number | null }
+    ).escalation_instance,
+  ).toBeNull();
+  db.prepare(
+    "INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at) VALUES ('close', 'fn-df-i', 'r', 1, 0, 1, 1)",
+  ).run();
+  expect(
+    (
+      db
+        .prepare(
+          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = 'fn-df-i'",
+        )
+        .get() as { instance_event_id: number | null }
+    ).instance_event_id,
+  ).toBeNull();
+  db.close();
 });
 
 test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1103 task .3)", () => {
@@ -2683,7 +2743,12 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // not touch the epics table SHAPE — the migrated `epics` table_xinfo this test
   // pins is unchanged (only epics ROWS are wiped, which this shape test never
   // seeds), fn-1164 task .1.
-  expect(SCHEMA_VERSION).toBe(113);
+  // v114 appends the nullable `jobs.escalation_instance` +
+  // `dispatch_failures.instance_event_id` INTEGER columns (the escalation-session
+  // block-instance binding) via a plain additive ALTER; it widens the jobs and
+  // dispatch_failures row shapes but does not touch the epics table SHAPE this
+  // test pins, fn-1171 task .2.
+  expect(SCHEMA_VERSION).toBe(114);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

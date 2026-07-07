@@ -435,6 +435,10 @@ from pathlib import Path
 # v113 (fn-1164 task .1) appends the nullable ``jobs.last_lifecycle_ts`` REAL
 # column (the per-row lifecycle stamp) via a REWINDING migration; keeper-py reads
 # no jobs projection internals, so only the version whitelist gains 113.
+# v114 (fn-1171 task .2) appends the nullable ``jobs.escalation_instance`` and
+# ``dispatch_failures.instance_event_id`` INTEGER columns (the escalation-session
+# block-instance binding) via a plain additive ALTER; keeper-py reads neither, so
+# only the version whitelist gains 114.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -520,6 +524,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         111,
         112,
         113,
+        114,
     }
 )
 
