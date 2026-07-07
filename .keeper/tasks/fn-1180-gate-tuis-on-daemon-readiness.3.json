@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-07T23:58:16.149000Z",
+  "depends_on": [
+    "fn-1180-gate-tuis-on-daemon-readiness.1",
+    "fn-1180-gate-tuis-on-daemon-readiness.2"
+  ],
+  "epic": "fn-1180-gate-tuis-on-daemon-readiness",
+  "id": "fn-1180-gate-tuis-on-daemon-readiness.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Readiness gate in view-shell",
+  "updated_at": "2026-07-07T23:58:16.149000Z"
+}

@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T23:58:16.149000Z",
+  "depends_on_epics": [],
+  "id": "fn-1180-gate-tuis-on-daemon-readiness",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Gate TUIs on daemon readiness",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-07T23:58:16.149000Z"
+}
