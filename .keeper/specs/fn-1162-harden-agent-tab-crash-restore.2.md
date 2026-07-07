@@ -38,5 +38,5 @@ Fixture a fake projects tree: rehomed transcript (recorded cwd A, transcript und
 - [ ] Non-claude candidates whose resume target names no on-disk artifact surface as not-resumable with a reason, never a broken launch.
 
 ## Done summary
-
+Added src/resume-resolve.ts: disk-anchored claude resume cwd resolution (transcript glob + torn-tail-safe cwd + slug match, typed preflight failures) and non-claude artifact-existence gates. Wired planRestore/renderSnapshotScript (tabs-core) + restore-worker revive.sh to consume the resolver via an injectable fs seam.
 ## Evidence
