@@ -41,5 +41,5 @@ Update the three saga tests: brief lands a commit (mirror saga-selection-review-
 - [ ] `bun test` green in the plan plugin
 
 ## Done summary
-
+Made the selection-audit brief a committed top-level data-dir artifact, write-once on its own existence with an idempotent re-close skip; dropped selector rationale/confidence/label_source from the blinded brief; selection-review-submit now stamps rubric_version/judge_model_version/prompt_hash and writes no board/overlay state.
 ## Evidence
