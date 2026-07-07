@@ -346,6 +346,43 @@ describe("presets resolve JSON contract", () => {
     });
   });
 
+  test("the reserved name 'default' resolves the configured default panel by its real name", async () => {
+    // The default pointer names `reviewers`; the envelope must report that real
+    // name (pointer dereference), never the literal `default`.
+    const h = makeHarness({
+      argv: ["presets", "resolve", "default"],
+      rawArgv: true,
+      presetCatalog: catalog({
+        a: preset({ harness: "claude", model: "opus" }),
+        b: preset({ harness: "codex", model: "gpt-5.5" }),
+      }),
+      panelSelections: selections({ reviewers: ["a", "b"] }, "reviewers"),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    expect(JSON.parse(h.out.join(""))).toEqual({
+      kind: "panel",
+      name: "reviewers",
+      members: [
+        { name: "a", harness: "claude" },
+        { name: "b", harness: "codex" },
+      ],
+    });
+  });
+
+  test("'default' with no configured default fails loud naming 'default'", async () => {
+    const h = makeHarness({
+      argv: ["presets", "resolve", "default"],
+      rawArgv: true,
+      presetCatalog: catalog({ a: preset({ harness: "claude" }) }),
+      panelSelections: selections({ reviewers: ["a"] }, null),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("default");
+    expect(h.err.join("")).toContain("panel.yaml");
+  });
+
   test("a catalog preset resolves without consulting panel.yaml", async () => {
     // A catalog-preset name wins before panel resolution — the empty default
     // panel selections (which would fail-loud a panel lookup) is never reached.
