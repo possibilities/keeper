@@ -86,6 +86,35 @@ export function workBlockReason(taskId: string, verdict: string): string {
   );
 }
 
+/** True when a blocked task's reason carries the `AUDIT_READY` category prefix
+ * (`AUDIT_READY: …`) — the audit-gate park a flagged worker leaves after
+ * committing, distinct from a terminal semantic block and from an escalated
+ * `AUDIT_SEVERE`. The token is the leading `[A-Z_]+:` category, matching the
+ * daemon's block-category convention, so a free-text reason with a later `:`
+ * never false-matches. Pure; a non-string reason reads false. */
+export function isAuditReadyReason(reason: unknown): boolean {
+  if (typeof reason !== "string") return false;
+  const m = reason.match(/^\s*([A-Z_]+):/);
+  return m?.[1] === "AUDIT_READY";
+}
+
+/** The audit-gate resume checklist — delivered to the blocked orchestrator when
+ * its task parked AUDIT_READY (a flagged worker committed and is holding for a
+ * per-task audit instead of stamping done). Names the audit branch so the
+ * orchestrator runs the task-scoped audit rather than treating the block as a
+ * terminal stop; a deliberate human interrupt reads why it was caught and simply
+ * stops again (stop_hook_active passes the second stop). */
+export function auditReadyBlockReason(taskId: string): string {
+  return (
+    `Task ${taskId} parked AUDIT_READY: its worker committed and is holding for ` +
+    "a per-task audit, not stopping. Before stopping: run the audit gate " +
+    "(Phase 2b audit branch) — spawn the quality-auditor content-blind against " +
+    "the task's commit set, then route clean/mild to unblock + cold-resume the " +
+    "worker (it stamps its own done), or verified-severe to AUDIT_SEVERE. Never " +
+    "edit, commit, or stamp done from this context."
+  );
+}
+
 /** The close-branch block reason — reached only when neither allow gate fired:
  * close-finalize never returned success (the marker would be gone otherwise), the
  * last message carried no sanctioned typed stop, and no spawned subagent is
@@ -133,6 +162,16 @@ async function main(): Promise<void> {
     // stale marker is unlinked.
     const env = await runPlanCli(["reconcile", marker.task_id]);
     const verdict = env?.verdict;
+    // AUDIT_READY splits the blocked arm: the worker parked for its task-scoped
+    // audit — a routine gate, not a terminal stop. The orchestrator must still
+    // run the audit and unblock+resume, so BLOCK the stop with the audit
+    // checklist rather than allowing it and stranding the parked task. Every
+    // other blocked reason (a semantic block, an escalated AUDIT_SEVERE) stays
+    // terminal — allow and unlink.
+    if (verdict === "blocked" && isAuditReadyReason(env?.blocked_reason)) {
+      emitBlock(auditReadyBlockReason(marker.task_id));
+      return;
+    }
     if (verdict === "done" || verdict === "blocked") {
       await unlinkMarker(sessionId);
       return;

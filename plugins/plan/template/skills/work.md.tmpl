@@ -7,7 +7,7 @@ description: >-
   says "work", "/work", or invokes the plan work workflow on an existing
   `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(keeper plan:*), Read, Glob, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Read, Write, Glob, Task, SendMessage
 disable-model-invocation: true
 ---
 
@@ -124,7 +124,7 @@ keeper plan reconcile <task_id>
 - **`in_progress_committed`** → the worker's source commit landed but `keeper plan done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `keeper plan done <task_id> --summary "..."` now."*
 - **`in_progress_uncommitted`** → the worker dropped before committing. Resume with the nudge *"Finish implementation, run tests within your two-full-pass budget, `keeper commit-work`, `keeper plan done`."*
 - **`state_uncommitted`** → the worker stamped `done` but the `.keeper/` state commit never landed. Resume with the nudge *"Re-run `keeper plan done <task_id> --summary "..."` to land the state commit."*
-- **`blocked`** → the worker escalated a semantic block; the task already carries the block on the board → **Phase 2c** (stamp-if-needed, then surface-and-stop). Carry the `blocked_reason` plus any `BLOCKED: <category>` breadcrumb from the worker return into Phase 2c.
+- **`blocked`** → split on the `blocked_reason` category. A reason beginning with the `AUDIT_READY:` token is an **audit-flagged worker holding for review** (it committed but parked instead of stamping done) → **Phase 2d** (the audit gate). Every other blocked reason is a **semantic block** the worker escalated → **Phase 2c** (stamp-if-needed, then surface-and-stop); carry the `blocked_reason` plus any `BLOCKED: <category>` breadcrumb from the worker return into Phase 2c.
 - **`not_started`** → unexpected post-worker (the task is still `todo`); surface the verdict verbatim and stop.
 - **`tooling_error`** → a git subprocess failed and the verdict is unreliable; surface the envelope verbatim and stop. **Do NOT act on a `tooling_error`** — fail closed, never resume against an unreliable verdict.
 
@@ -182,6 +182,35 @@ keeper plan block <task_id> --reason "<CATEGORY>: <one-line text>"
 Format the reason with the worker's `BLOCKED: <category>` category as the prefix (`SPEC_UNCLEAR: …`, `DEPENDENCY_BLOCKED: …`, etc.) — the daemon's escalation producer parses this category prefix and skips `TOOLING_FAILURE`. If the task is ALREADY `blocked` (the `blocked` reconcile verdict — the board already carries the reason), do not re-stamp.
 
 **Step 2 — surface and stop.** Surface the `BLOCKED: <category>` breadcrumb plus the `blocked_reason` verbatim, then STOP. The daemon detects the blocked task on the board and escalates to the epic's `planner@<epic>` over the Agent Bus exactly once per block. This orchestrator session ends its turn but stays REACHABLE — its `keeper bus watch` inbox Monitor is armed. The planner resolves the blocker, runs `keeper plan unblock <task>`, and then bus-messages THIS session at its `work::<task>` name to resume (the PRIMARY path). On that resume directive, confirm the task is unblocked with `keeper plan reconcile <task>`, then re-enter the **Phase 2b** warm-resume: `SendMessage` the original worker subagent, cold-spawning a fresh subagent in-session only if that misses. The wielder still NEVER sends on the bus and never resumes on its own — it only RECEIVES the planner's resume and acts. Autopilot cold-re-dispatch is the fallback for when THIS orchestrator session is gone.
+
+### 2d. Audit gate (AUDIT_READY blocks only)
+
+An audit-flagged worker commits its source, then parks itself `blocked` with an `AUDIT_READY: <sha> …` reason instead of stamping done (its worker spec's Phase 4.5). The gate holds the done-latch through the existing block machinery, so dependents never dispatch against unreviewed drift. You run the audit CONTENT-BLIND: you pass commit shas and relay a returned envelope by path — you never open the diff, the report, or the findings prose. You NEVER edit code, run `keeper plan done`, or resume on your own outside this gate.
+
+**Step 1 — idempotency short-circuit.** Read the per-task finding artifact at `<primary_repo>/.keeper/state/audits/<epic_id>/tasks/<task_id>.json` (its layout + schema are owned by the audit-artifacts helpers). If it exists AND its recorded `commits` match reconcile's `source_commits` for this task, a prior run already audited this exact commit set (a crashed-and-resumed orchestrator) — skip Steps 2–3 and route on the persisted top-level `status` (Step 4). Absent, or a commit-set mismatch (a new commit landed since) → run the audit.
+
+**Step 2 — spawn the quality-auditor, task-scoped + content-blind.** Spawn `plan:quality-auditor` against ONLY this task's commit set — reconcile's `source_commits` (a list of `{repo, sha}`) — with a config-only prompt: `TASK_ID`, `EPIC_ID`, `PRIMARY_REPO`, the commit shas, and the per-task finding path. Direct it to review just those commits and RETURN a compact findings envelope — its top-level `status` (`clean` / `mild` / `severe`) plus fingerprinted findings (each a `category:file` fingerprint with a one-line summary) — and NOT to run the epic-scoped `audit submit` (that would clobber a sibling lane's report). No `model=` kwarg — the agent file owns the model + effort.
+
+**Step 3 — persist findings.** Write the auditor's returned envelope to the per-task finding artifact (Write tool, the path from Step 1), carrying the audited `commits`, the top-level `status`, and each finding stamped `status: accumulated-open`. This is a mechanical relay of a returned envelope to a gitignored file — the same content-blind write `/plan:close` does — never a read-and-reason over findings prose. The artifact is the durable record the close audit later fingerprint-links against.
+
+**Step 4 — route on the verdict.**
+
+- **`clean` / `mild`** → the drift is acceptable to ship. Unblock, then cold-resume the worker so it stamps its OWN done (you NEVER run `keeper plan done`):
+
+  ```bash
+  keeper plan unblock <task_id>
+  keeper plan worker resume <task_id>
+  ```
+
+  Spawn the resumed worker per **Phase 2b's cold path**, with a resume nudge that states *the audit PASSED — finish commit-then-done, do not re-park*. Re-run `keeper plan reconcile <task_id>` after it returns and re-switch: `done` → **Phase 3**; a non-`done` `in_progress_*` / `state_uncommitted` arm → the ordinary resume machinery.
+
+- **`severe`** → do NOT unblock. Run ONE refute pass: re-spawn `plan:quality-auditor` on the same commit set with a refute directive (argue the finding is NOT real / not gating). A refute that **overturns** it → treat as `mild` (downgrade the persisted finding to `accumulated-open`, then the clean/mild path above). A refute that **confirms** it → rewrite the block reason to `AUDIT_SEVERE` and hand off to the existing escalation:
+
+  ```bash
+  keeper plan block <task_id> --reason "AUDIT_SEVERE: <one-line finding summary>"
+  ```
+
+  Re-blocking an already-blocked task just rewrites its reason. Surface the finding summary and STOP — the daemon's block-escalation path pages from there, exactly like any semantic block. The refute pass runs at most ONCE; the gate never loops.
 
 ---
 

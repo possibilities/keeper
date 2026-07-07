@@ -9,6 +9,13 @@
 // present in src-audit-spine, so a future rename can't silently orphan these
 // citations.
 //
+// Below the citation guard, this file ALSO owns the direct tests for the
+// per-task audit gate helpers (taskAuditDir / taskFindingPath / writeTaskFinding
+// / readTaskFinding / taskFindingCoversCommitSet). Those are keeper-native
+// additions with no Python ancestor, so they live here rather than in the frozen
+// src-audit-spine port — covering the task-scoped layout (task-id-keyed, so
+// parallel lanes never clobber) and the commit-set-hash staleness key.
+//
 // Node -> citation map (every node accounted for):
 //
 // TestCommitSetHash (compute_commit_set_hash determinism + canonicalization):
@@ -79,8 +86,30 @@
 //     group/other bits.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import {
+  ArtifactSchemaTooNewError,
+  AUDIT_SCHEMA_VERSION,
+  auditsRoot,
+  type CommitGroup,
+  computeCommitSetHash,
+  readTaskFinding,
+  taskAuditDir,
+  taskFindingCoversCommitSet,
+  taskFindingPath,
+  writeTaskFinding,
+} from "../src/audit_artifacts.ts";
 
 const SPINE = join(import.meta.dir, "src-audit-spine.test.ts");
 
@@ -94,6 +123,146 @@ describe("audit-artifacts citation guard", () => {
       "readArtifactJson schema gate",
     ]) {
       expect(body).toContain(block);
+    }
+  });
+});
+
+describe("per-task audit gate helpers", () => {
+  let primary: string;
+
+  function setup(): string {
+    primary = realpathSync(mkdtempSync(join(tmpdir(), "planctl-task-audit-")));
+    return primary;
+  }
+  function teardown(): void {
+    rmSync(primary, { recursive: true, force: true });
+  }
+
+  const EPIC = "fn-9-x";
+  const COMMITS: CommitGroup[] = [{ repo: "/r/a", shas: ["abc123", "def456"] }];
+
+  test("taskFindingPath lands under audits/<epic>/tasks/<task>.json (pure path, not created)", () => {
+    setup();
+    try {
+      const p = taskFindingPath(primary, EPIC, `${EPIC}.3`);
+      expect(p).toBe(
+        join(auditsRoot(primary), EPIC, "tasks", `${EPIC}.3.json`),
+      );
+      expect(existsSync(p)).toBe(false);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("distinct tasks resolve to distinct paths — parallel lanes cannot clobber", () => {
+    setup();
+    try {
+      const a = taskFindingPath(primary, EPIC, `${EPIC}.3`);
+      const b = taskFindingPath(primary, EPIC, `${EPIC}.4`);
+      expect(a).not.toBe(b);
+      // Two concurrent lanes each writing their own task never touch one file.
+      writeTaskFinding(primary, EPIC, `${EPIC}.3`, {
+        status: "clean",
+        commits: COMMITS,
+      });
+      writeTaskFinding(primary, EPIC, `${EPIC}.4`, {
+        status: "mild",
+        commits: [{ repo: "/r/a", shas: ["999999"] }],
+      });
+      expect(readTaskFinding(primary, EPIC, `${EPIC}.3`)?.status).toBe("clean");
+      expect(readTaskFinding(primary, EPIC, `${EPIC}.4`)?.status).toBe("mild");
+    } finally {
+      teardown();
+    }
+  });
+
+  test("taskAuditDir creates tasks/ at 0700, idempotently", () => {
+    setup();
+    try {
+      const dir = taskAuditDir(primary, EPIC);
+      expect(dir).toBe(join(auditsRoot(primary), EPIC, "tasks"));
+      expect(existsSync(dir)).toBe(true);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(taskAuditDir(primary, EPIC)).toBe(dir);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("writeTaskFinding persists commit-free at 0600, stamping ids + schema + hash", () => {
+    setup();
+    try {
+      const dest = writeTaskFinding(primary, EPIC, `${EPIC}.3`, {
+        status: "mild",
+        commits: COMMITS,
+        findings: [
+          { fingerprint: "correctness:a.ts", status: "accumulated-open" },
+        ],
+      });
+      expect(statSync(dest).mode & 0o777).toBe(0o600);
+      const parsed = readTaskFinding(primary, EPIC, `${EPIC}.3`);
+      expect(parsed?.schema_version).toBe(AUDIT_SCHEMA_VERSION);
+      expect(parsed?.task_id).toBe(`${EPIC}.3`);
+      expect(parsed?.epic_id).toBe(EPIC);
+      expect(parsed?.status).toBe("mild");
+      // Hash is the independent computeCommitSetHash over the artifact's commits.
+      expect(parsed?.commit_set_hash).toBe(computeCommitSetHash(COMMITS));
+      // No touched-log entry — the write is commit-free (audit artifacts never
+      // draw a .keeper/ commit).
+      expect(existsSync(join(primary, ".keeper", "state", "sessions"))).toBe(
+        false,
+      );
+    } finally {
+      teardown();
+    }
+  });
+
+  test("readTaskFinding returns null when absent and hard-fails a too-new schema", () => {
+    setup();
+    try {
+      expect(readTaskFinding(primary, EPIC, `${EPIC}.7`)).toBeNull();
+      // A future-version artifact must surface the reader's hard-fail, never a
+      // guess at a newer shape.
+      const bump = AUDIT_SCHEMA_VERSION + 5;
+      taskAuditDir(primary, EPIC);
+      // Write a raw too-new artifact by hand (bypassing writeTaskFinding's stamp).
+      writeFileSync(
+        taskFindingPath(primary, EPIC, `${EPIC}.8`),
+        JSON.stringify({ schema_version: bump }),
+      );
+      expect(() => readTaskFinding(primary, EPIC, `${EPIC}.8`)).toThrow(
+        ArtifactSchemaTooNewError,
+      );
+    } finally {
+      teardown();
+    }
+  });
+
+  test("taskFindingCoversCommitSet: true only when the stored hash matches the current commit set", () => {
+    setup();
+    try {
+      const task = `${EPIC}.3`;
+      // No artifact yet → not covered (re-audit).
+      expect(taskFindingCoversCommitSet(primary, EPIC, task, COMMITS)).toBe(
+        false,
+      );
+      writeTaskFinding(primary, EPIC, task, {
+        status: "clean",
+        commits: COMMITS,
+      });
+      // Same commit set → fresh, short-circuit the re-audit.
+      expect(taskFindingCoversCommitSet(primary, EPIC, task, COMMITS)).toBe(
+        true,
+      );
+      // A moved commit set (a new commit landed) → stale, re-audit.
+      const moved: CommitGroup[] = [
+        { repo: "/r/a", shas: ["abc123", "def456", "0000ff"] },
+      ];
+      expect(taskFindingCoversCommitSet(primary, EPIC, task, moved)).toBe(
+        false,
+      );
+    } finally {
+      teardown();
     }
   });
 });

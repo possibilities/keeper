@@ -20,8 +20,8 @@ import { fileURLToPath } from "node:url";
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
   AUDIT_SCHEMA_VERSION,
-  auditsRoot,
   computeCommitSetHash,
+  taskFindingPath,
   writeBriefArtifact,
 } from "../audit_artifacts.ts";
 import {
@@ -208,7 +208,7 @@ function findingRefFor(
   epicId: string,
   taskId: string,
 ): { ref: FindingRef | null; unreadable: boolean } {
-  const path = join(auditsRoot(primaryRepo), epicId, "tasks", `${taskId}.json`);
+  const path = taskFindingPath(primaryRepo, epicId, taskId);
   if (!existsSync(path)) {
     return { ref: null, unreadable: false };
   }
