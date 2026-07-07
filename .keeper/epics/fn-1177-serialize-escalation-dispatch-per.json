@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T23:40:26.584000Z",
+  "depends_on_epics": [],
+  "id": "fn-1177-serialize-escalation-dispatch-per",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Serialize escalation dispatch per checkout",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-07T23:40:26.584000Z"
+}
