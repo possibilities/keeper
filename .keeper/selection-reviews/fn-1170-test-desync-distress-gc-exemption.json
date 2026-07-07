@@ -1,0 +1,23 @@
+{
+  "counts": {
+    "overpowered": 0,
+    "right_sized": 1,
+    "underpowered": 0
+  },
+  "created_at": "2026-07-07T19:50:23.822000Z",
+  "epic_id": "fn-1170-test-desync-distress-gc-exemption",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "176b3f650f12f94610da60a88f24760c35b7c5d3a87a95be5b13a75fa160d642",
+  "verdicts": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "evidence": "A 1-commit, 1-file, +13/-2 mechanical test extension mirroring an explicitly-named sibling exemption pattern (selector confidence 0.9) fits the low/sonnet cell without thrash or oversized scope.",
+      "input_hash": "176b3f650f12f94610da60a88f24760c35b7c5d3a87a95be5b13a75fa160d642",
+      "model": "sonnet",
+      "task_id": "fn-1170-test-desync-distress-gc-exemption.1",
+      "tier": "low",
+      "verdict": "right_sized"
+    }
+  ]
+}
