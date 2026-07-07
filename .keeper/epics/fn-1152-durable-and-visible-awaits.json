@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-07T02:45:53.766000Z",
   "created_at": "2026-07-07T01:32:48.224000Z",
   "depends_on_epics": [],
   "id": "fn-1152-durable-and-visible-awaits",
   "last_validated_at": "2026-07-07T01:33:21.742000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Durable and visible awaits",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T01:33:21.742000Z"
+  "updated_at": "2026-07-07T02:45:53.766000Z"
 }
