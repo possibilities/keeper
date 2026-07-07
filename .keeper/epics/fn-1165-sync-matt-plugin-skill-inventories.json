@@ -7,7 +7,7 @@
     "fn-1163-matt-skills-plugin"
   ],
   "id": "fn-1165-sync-matt-plugin-skill-inventories",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-07T17:22:30.503000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/arthack"
   ],
-  "updated_at": "2026-07-07T17:22:29.591000Z"
+  "updated_at": "2026-07-07T17:22:30.503000Z"
 }
