@@ -24,5 +24,5 @@ it tracks forks only and correctly omits the original `init` skill.
 - [ ] No change to the README `## Sync log`.
 
 ## Done summary
-
+Extended matt plugin inventories in claude/CLAUDE.md and claude/matt/README.md to list all five shipped skills (added improve-codebase-architecture and init).
 ## Evidence
