@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-07T23:37:42.826000Z",
+  "created_by_close_of": "fn-1173-escalation-posture-repair-and-guard",
+  "depends_on_epics": [
+    "fn-1173-escalation-posture-repair-and-guard"
+  ],
+  "id": "fn-1176-harden-diagnosis-role-git-command",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden diagnosis-role git command allowlist",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-07T23:37:42.826000Z"
+}
