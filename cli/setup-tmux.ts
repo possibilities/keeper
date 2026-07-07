@@ -26,9 +26,10 @@
  * first `setup-tmux` offers — one combined y/N TTY prompt carrying the picked
  * generation's age + agent count — to relaunch them by spawning
  * `keeper tabs restore --apply` SYNCHRONOUSLY per session and printing one
- * authoritative outcome line each. An accepted batch is marked for retry before
- * apply and cleared only after a successful restore; the reconciler-managed
- * `autopilot` session is never offered.
+ * authoritative outcome line each, carrying the per-tab verified/failed/
+ * unverified counts the transaction engine reports. An accepted batch is
+ * marked for retry before apply and cleared only after a successful restore;
+ * the reconciler-managed `autopilot` session is never offered.
  *
  *   keeper setup-tmux [--kill-sessions]
  *   keeper setup-tmux --help
@@ -44,7 +45,12 @@ import type { GenerationSummary } from "../src/restore-set";
 import { loadRestorePlan, type RestoreSelection } from "../src/tabs-core";
 import { keeperTmuxSessionCwd } from "../src/tmux-session-cwd";
 import { parseOptions } from "./descriptor";
-import { formatAge, formatGenerationMenu, parsePickerChoice } from "./tabs";
+import {
+  formatAge,
+  formatGenerationMenu,
+  parsePickerChoice,
+  TABS_EXIT_PARTIAL_FAILURE,
+} from "./tabs";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash server + work session)
 
@@ -72,13 +78,15 @@ after a crash) and the last tmux-server generation left crashed agents for it,
 it offers — ONE combined y/N prompt on a TTY only, never auto — to relaunch them.
 The prompt carries the picked generation's age + agent count (a skeleton is
 recognizable at the prompt); on confirm it spawns 'keeper tabs restore --apply'
-SYNCHRONOUSLY per session and prints one authoritative outcome line each (the
-restored count with generation context, or the verbatim failure incl. the
-autopilot-gate refusal). An accepted batch is marked for retry before apply and
-cleared only after a successful restore; a marked retry is offered even when the
-session now exists. The managed 'autopilot' session is never offered. A present
-session without a retry marker, zero candidates, or a non-TTY skips that
-session's offer.
+SYNCHRONOUSLY per session and prints one authoritative outcome line each: the
+restored count with generation context (an 'unverified=' note when a tab
+launched without attach evidence), a PARTIAL line with the restored/failed/
+unverified breakdown when some tabs failed, or the verbatim failure incl. the
+autopilot-gate refusal for any other non-zero exit. An accepted batch is marked
+for retry before apply and cleared only after a successful restore; a marked
+retry is offered even when the session now exists. The managed 'autopilot'
+session is never offered. A present session without a retry marker, zero
+candidates, or a non-TTY skips that session's offer.
 
 A CONTESTED auto-pick — the richest generation isn't the freshest, or the
 derived cohort disagrees with the last non-empty disaster mirror — never silently
@@ -1001,21 +1009,29 @@ export function buildTabsRestoreArgv(
   return argv;
 }
 
-/** Parse the `restored=<n>` field off a `keeper tabs restore` summary line; null
- *  when absent (degraded/older child output — the offer count is the fallback). */
-function parseRestoredCount(stdout: string): number | null {
-  const m = stdout.match(/restored=(\d+)/);
+/** Parse a `<field>=<n>` token off a `keeper tabs restore` summary line; null
+ *  when absent (degraded/older child output, or the field wasn't emitted
+ *  because the transaction engine had nothing to report for it). */
+function parseSummaryField(stdout: string, field: string): number | null {
+  const m = stdout.match(new RegExp(`${field}=(\\d+)`));
   return m != null ? Number.parseInt(m[1] as string, 10) : null;
 }
 
 /**
  * Render the ONE authoritative outcome line for a session's synchronous
- * `keeper tabs restore --apply` spawn. Exit 0 ⇒ a success line: the restored
- * count (parsed from the child summary, offer count as fallback) plus the
- * picked-generation context — a candidate going live between offer and apply
- * reads here as a benign `restored 0`, never a failure. Any non-zero exit ⇒ a
- * FAILED line carrying the verbatim child stderr (the autopilot-gate refusal
- * included). Pure.
+ * `keeper tabs restore --apply` spawn, surfacing the per-tab verified/failed/
+ * unverified counts the transaction engine (`src/tabs-core.ts` `countOutcomes`)
+ * emits on its `# summary:` stdout line — never just an opaque exit code.
+ *
+ * Exit 0 ⇒ a success line: the restored count (parsed from the child summary,
+ * offer count as fallback) plus the picked-generation context — a candidate
+ * going live between offer and apply reads here as a benign `restored 0`,
+ * never a failure. A `launched-unverified` warn can coexist with exit 0 (it
+ * doesn't trip the partial-failure exit), so an `unverified=` note is appended
+ * whenever the count is nonzero. Exit `TABS_EXIT_PARTIAL_FAILURE` ⇒ a PARTIAL
+ * line carrying the restored/failed/unverified breakdown parsed off the same
+ * summary. Any other non-zero exit ⇒ a FAILED line carrying the verbatim child
+ * stderr (the autopilot-gate refusal included). Pure.
  */
 export function renderRestoreOutcome(
   session: string,
@@ -1023,19 +1039,28 @@ export function renderRestoreOutcome(
   result: SyncSpawnResult,
   nowSecs: number = Date.now() / 1000,
 ): string {
+  const stdout = result.stdout.toString();
+  const genId = offer?.generationId ?? null;
+  const ctx =
+    genId !== null && offer?.generationLastTs != null
+      ? ` from generation ${genId} (${formatAge(nowSecs - offer.generationLastTs)} ago)`
+      : "";
   if (result.exitCode === 0) {
-    const restored =
-      parseRestoredCount(result.stdout.toString()) ?? offer?.count ?? 0;
-    const genId = offer?.generationId ?? null;
-    const ctx =
-      genId !== null && offer?.generationLastTs != null
-        ? ` from generation ${genId} (${formatAge(nowSecs - offer.generationLastTs)} ago)`
-        : "";
-    return `keeper setup-tmux: '${session}' restored ${restored} agent(s)${ctx}`;
+    const restored = parseSummaryField(stdout, "restored") ?? offer?.count ?? 0;
+    const unverified = parseSummaryField(stdout, "unverified") ?? 0;
+    const unverifiedNote = unverified > 0 ? ` (unverified=${unverified})` : "";
+    return `keeper setup-tmux: '${session}' restored ${restored} agent(s)${unverifiedNote}${ctx}`;
+  }
+  if (result.exitCode === TABS_EXIT_PARTIAL_FAILURE) {
+    const restored = parseSummaryField(stdout, "restored") ?? 0;
+    const failed = parseSummaryField(stdout, "failed") ?? 0;
+    const unverified = parseSummaryField(stdout, "unverified") ?? 0;
+    const unverifiedNote = unverified > 0 ? ` unverified=${unverified}` : "";
+    return `keeper setup-tmux: '${session}' restore PARTIAL (exit ${TABS_EXIT_PARTIAL_FAILURE}): restored=${restored} failed=${failed}${unverifiedNote}${ctx}`;
   }
   const code = result.exitCode === null ? "signal" : String(result.exitCode);
   const stderr = result.stderr.toString().trim();
-  const detail = stderr !== "" ? stderr : result.stdout.toString().trim();
+  const detail = stderr !== "" ? stderr : stdout.trim();
   return `keeper setup-tmux: '${session}' restore FAILED (exit ${code}): ${detail}`;
 }
 
