@@ -337,6 +337,37 @@ test("an unblock brief lifts the blocked reason, CATEGORY, and blocked siblings"
   db.close();
 });
 
+test("an unblock brief parses a SHARED_BASE_BROKEN blocked reason to its category", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-201-solo",
+    project_dir: tmp,
+    job_links: [{ kind: "creator", job_id: "solo-sess-2" }],
+  });
+  seedJob(db, {
+    job_id: "solo-sess-2",
+    plan_verb: null,
+    transcript_path: "/t/solo2.jsonl",
+  });
+  writeEpicFile(tmp, "fn-201-solo", { primary_repo: "/repo" });
+  writeTaskState(tmp, "fn-201-solo.1", {
+    status: "blocked",
+    blocked_reason:
+      "BLOCKED: SHARED_BASE_BROKEN\nSummary: base sha abc123 fails `bun test` independent of this diff",
+  });
+
+  const r = buildEscalationBrief(db, "unblock::fn-201-solo.1", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const inc = r.brief.incident as { category: string | null };
+  expect(inc.category).toBe("SHARED_BASE_BROKEN");
+  expect(r.brief.degraded).toEqual([]);
+  db.close();
+});
+
 // ── Degrade paths (exit 0 with flags) ──────────────────────────────────────
 
 test("a missing creator edge degrades lineage but still emits", () => {

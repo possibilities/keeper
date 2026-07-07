@@ -97,7 +97,7 @@ Parse the task spec for what matters: **Acceptance** (the bar you must clear), *
 
 **Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `keeper plan find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
 
-- **Source commit already shipped** → skip Phases 2–4. Verify cheaply: read the predecessor commit's diff (`git show <sha>`) and run the task-targeted tests only (scope from the task `Files:` list — see Phase 3). The predecessor's commit is your confidence anchor; do not re-read every file and do not open with a fresh full-suite pass (one full pass stays available under the Phase 3 cap if the targeted run raises doubt). If the diff and targeted tests cover the acceptance, jump to Phase 5. Partial coverage → continue from Phase 3 against the existing tree for the uncovered acceptance items. If the targeted tests fail in code you did not write, treat it as your task's code and fix it within budget only when the failure sits on this task's acceptance surface; otherwise consult `keeper baseline <base sha> --wait` before you classify it — the baseline answers "red at this sha in a healthy environment", so a failure green there but red in your worktree is your environment, not the base, while a baseline-confirmed pre-existing red is `BLOCKED: DEPENDENCY_BLOCKED` naming the commit.
+- **Source commit already shipped** → skip Phases 2–4. Verify cheaply: read the predecessor commit's diff (`git show <sha>`) and run the task-targeted tests only (scope from the task `Files:` list — see Phase 3). The predecessor's commit is your confidence anchor; do not re-read every file and do not open with a fresh full-suite pass (one full pass stays available under the Phase 3 cap if the targeted run raises doubt). If the diff and targeted tests cover the acceptance, jump to Phase 5. Partial coverage → continue from Phase 3 against the existing tree for the uncovered acceptance items. If the targeted tests fail in code you did not write, treat it as your task's code and fix it within budget only when the failure sits on this task's acceptance surface; otherwise consult `keeper baseline <base sha> --wait` before you classify it — the baseline answers "red at this sha in a healthy environment", so a failure green there but red in your worktree is your environment, not the base, while a baseline-confirmed pre-existing red is `BLOCKED: SHARED_BASE_BROKEN` naming the repo, base sha, failing command/test, and suspected commit when known (genuine upstream-task dependencies still emit `BLOCKED: DEPENDENCY_BLOCKED`).
 - **Uncommitted work in `status_porcelain`** → continue from Phase 3 against the existing tree. When BOTH a predecessor commit and uncommitted work exist, this branch wins — work against the tree.
 
 If neither condition holds, this is a normal cold start — continue to Phase 1.5.
@@ -171,7 +171,7 @@ Impact: <what downstream tasks this blocks>
 Suggested resolution: <one line, actionable>
 ```
 
-Categories: `SPEC_UNCLEAR` | `DEPENDENCY_BLOCKED` | `DESIGN_CONFLICT` | `SCOPE_EXCEEDED` | `TOOLING_FAILURE` | `EXTERNAL_BLOCKED`.
+Categories: `SPEC_UNCLEAR` | `DEPENDENCY_BLOCKED` | `DESIGN_CONFLICT` | `SCOPE_EXCEEDED` | `TOOLING_FAILURE` | `EXTERNAL_BLOCKED` | `RESUME_EXHAUSTED` | `SHARED_BASE_BROKEN`.
 
 The parent stops the loop and surfaces this verbatim.
 
