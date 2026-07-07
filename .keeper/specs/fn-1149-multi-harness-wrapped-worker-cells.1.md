@@ -67,5 +67,5 @@ Verify resolve ordering, alias resolution, and the no_route exit path.
 - [ ] The fast suite passes with the new sandboxed matrix tests.
 
 ## Done summary
-
+Added dep-free src/agent/matrix.ts (matrix.yaml loader with fail-loud validation, absent->null fallback, and driverFor/providerOrderFor/nativeIdFor/cellSet/resolveModel derivations) plus the keeper agent providers resolve/check verbs, registered in the CLI descriptor tree with documented no_route/exit codes.
 ## Evidence
