@@ -1,0 +1,64 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical bypass-resistant Bash allowlist guard with fail-closed envelope semantics and adversarial command tokenization \u2014 a subtle security invariant where any parsing gap is a live bypass.",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical two-surface category addition plus a template re-point and re-render against existing drift gates, with named patterns to mirror.",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.2",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract-touching ref/parse/brief plumbing across leaf modules with byte-identical preservation, but it mirrors existing incident-builder and verb-union shapes so no intelligence-bound reason clears the opus bar.",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Re-fold-deterministic fingerprint fold, synthetic-event sticky latch, schema bump, and positive-evidence/page-once semantics wired into the daemon sweep \u2014 subtle event-sourcing correctness invariants with replay-bomb risk.",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Prose-only skill authoring cloned from the deconflict precedent plus sibling hardening lines, requiring cross-check against the guard allowlist but no novel design.",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Prune-first documentation and glossary edits in existing styles, with care needed for a dense revise-in-place paragraph and a lint gate.",
+      "task_id": "fn-1173-escalation-posture-repair-and-guard.6",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-07T20:46:55.209000Z",
+  "epic_id": "fn-1173-escalation-posture-repair-and-guard",
+  "input_hash": "69117f682131d3e2257ba822773fa9488b85b0c817797fe55bf504a316e6bde3",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1762754408,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1173-escalation-posture-repair-and-guard.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.8},{\"task_id\":\"fn-1173-escalation-posture-repair-and-guard.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"confidence\":0.82},{\"task_id\":\"fn-1173-escalation-posture-repair-and-guard.3\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"confidence\":0.68},{\"task_id\":\"fn-1173-escalation-posture-repair-and-guard.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.79},{\"task_id\":\"fn-1173-escalation-posture-repair-and-guard.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"confidence\":0.72},{\"task_id\":\"fn-1173-escalation-posture-repair-and-guard.6\",\"tier\":\"medium\",\"model\":\"sonnet\",\"confidence\":0.8}]}\n"
+}

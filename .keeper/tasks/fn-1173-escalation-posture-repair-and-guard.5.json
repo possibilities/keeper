@@ -7,11 +7,11 @@
   ],
   "epic": "fn-1173-escalation-posture-repair-and-guard",
   "id": "fn-1173-escalation-posture-repair-and-guard.5",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Repair skill and escalation prose hardening",
-  "updated_at": "2026-07-07T20:43:49.673000Z"
+  "updated_at": "2026-07-07T20:46:55.209000Z"
 }
