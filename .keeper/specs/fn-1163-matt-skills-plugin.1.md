@@ -35,5 +35,5 @@ python3 -m json.tool over the manifest; grep every SKILL.md for disable-model-in
 - [ ] Vendored prose says "the human" throughout; claude/CLAUDE.md inventories the plugin
 
 ## Done summary
-
+Scaffolded the matt plugin (manifest, MIT LICENSE, README fork contract, NOTICES + claude/CLAUDE.md inventory) and vendored three user-invoked skills — teach (+4 FORMAT siblings), grill-me (grilling primitive inlined), prototype (+LOGIC/UI) — forked at mattpocock/skills@1445797d with provenance frontmatter, re-tuned trigger descriptions, and the-user→the-human address swap.
 ## Evidence
