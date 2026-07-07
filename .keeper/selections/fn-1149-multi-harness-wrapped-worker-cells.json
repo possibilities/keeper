@@ -1,0 +1,80 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Foundational fail-loud config schema and new CLI verbs with descriptor-tree registration and byte-identical absent-file fallback \u2014 a contract whose wrong abstraction propagates to every downstream task.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded single-surface descriptor field applied at argv-build time, but the native-vs-keeper-effort precedence risk warrants opus over sonnet's literalism.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded in-memory catalog augmentation with a named merge point, though the fail-loud collision semantics and widened name regex touching every validation site keep it on opus.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-island loader plus new render bindings under strictVariables with a byte-identical-fallback contract \u2014 a wrong abstraction breaks the compiled binary and every render gate.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The hardest task: a novel delegate-adjudicate-commit contract with detached launch, attacker-influenced foreign JSON, failure maps, and byte-faithful native extraction \u2014 high blast radius and security-shaped.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded selection-brief extension with fail-loud guidance enforcement, but authoring capability-only guidance that must not leak cost/provider ordering into a content-blind selector needs opus judgment.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.6",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Closed-union extension threading through reconcile-core, the autopilot producer, and dispatch with delicate degrade-not-fatalExit and sticky/retry semantics \u2014 contract-touching daemon work.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.7",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Slow-tier e2e proving the full novel pipe plus consolidating docs \u2014 bounded and convention-following, but the worktree-anchored orchestration and loud-skip discipline are intelligence-sensitive.",
+      "task_id": "fn-1149-multi-harness-wrapped-worker-cells.8",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T00:40:34.519000Z",
+  "epic_id": "fn-1149-multi-harness-wrapped-worker-cells",
+  "input_hash": "781916b0c9c2a7067b4ac82c42d7c1dfdd51cf449a09d298117c70a32d8c9ea2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2014910128,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.2\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.3\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.4\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.5\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.6\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.7\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1149-multi-harness-wrapped-worker-cells.8\",\"tier\":\"high\",\"model\":\"opus\"}]}\n"
+}
