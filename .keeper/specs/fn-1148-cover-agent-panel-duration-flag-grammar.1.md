@@ -29,5 +29,5 @@ test-budget ratio lean (no over-testing).
 - [ ] `bun test test/agent-panel-cli.test.ts` is green
 
 ## Done summary
-
+Added CLI-level tests for agent panel duration flags: unitless --chunk and --timeout both exit 2 with the self-healing unit hint, and a --timeout <dur> happy path asserts the accepted unit maps to the correct leg --stop-timeout ms.
 ## Evidence
