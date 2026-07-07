@@ -25,6 +25,7 @@
 import { expect, test } from "bun:test";
 import {
   AGENTBUS_EXEC_SESSION,
+  buildGenerationId,
   buildKeeperAgentLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxKillWindowArgs,
@@ -45,6 +46,7 @@ import {
   localeDefaultedEnv,
   MANAGED_EXEC_SESSION,
   mapKeeperAgentExit,
+  parseGenerationId,
   parseKeeperAgentStdout,
   type SpawnFn,
   type SyncProbeFn,
@@ -179,6 +181,58 @@ test("buildTmuxServerGenerationArgs: display-message -p of the server generation
     "-p",
     "#{pid}:#{start_time}",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// Generation identity — the SOLE builder + parser. buildGenerationId mints only
+// the CURRENT pid:start_time form; parseGenerationId ALSO reads the legacy
+// bare-pid form so the read-time canonicalizer can alias it.
+// ---------------------------------------------------------------------------
+
+test("buildGenerationId mints the canonical pid:start_time and trims whitespace", () => {
+  expect(buildGenerationId("4242:777")).toBe("4242:777");
+  expect(buildGenerationId("  777:888\n")).toBe("777:888");
+});
+
+test("buildGenerationId NEVER mints a bare pid (a bare form is legacy-read only)", () => {
+  // The current probe always carries start_time; a bare pid means a degraded
+  // probe, so the builder emits nothing rather than fork a new format.
+  expect(buildGenerationId("123")).toBeNull();
+});
+
+test("buildGenerationId rejects every degraded / malformed probe line", () => {
+  for (const raw of [
+    "",
+    "  ",
+    "0:1",
+    "1:0",
+    "-1:1",
+    "12.5:1",
+    "0x1f:1",
+    "abc",
+    "12 34",
+    "1:2:3",
+    "123:",
+    ":456",
+  ]) {
+    expect(buildGenerationId(raw)).toBeNull();
+  }
+});
+
+test("parseGenerationId splits the full form and the legacy bare-pid form", () => {
+  expect(parseGenerationId("4242:777")).toEqual({
+    pid: "4242",
+    startTime: "777",
+  });
+  // Bare pid is accepted as a legacy read (startTime null) — the alias source.
+  expect(parseGenerationId("21705")).toEqual({ pid: "21705", startTime: null });
+  expect(parseGenerationId("  9:9 ")).toEqual({ pid: "9", startTime: "9" });
+});
+
+test("parseGenerationId rejects non-positive-integer fields and >2 segments", () => {
+  for (const raw of ["", "0", "1:0", "a:1", "1:b", "1:2:3", "1.5"]) {
+    expect(parseGenerationId(raw)).toBeNull();
+  }
 });
 
 test("buildTmuxRenameWindowArgs: targets @N window id and carries `--` before the name", () => {

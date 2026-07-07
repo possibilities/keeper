@@ -8,9 +8,9 @@
  *  - engine: renderSnapshotScript, planRestore, applyRestore, renderOutcomes,
  *    countOutcomes, the autopilot gate, and the read-only load* readers over a
  *    seeded keeper.db (daemon-down, no socket).
- *  - selection: selectRestoreGeneration — the richness-ranked auto-pick that
- *    restores the 9-pane generation over the 1-pane skeleton, the ambiguity flag,
- *    and explicit --generation targeting.
+ *  - selection: selectRestoreGeneration — the recency-first auto-pick that
+ *    restores the just-lost generation (skipping the 1-pane skeleton), the
+ *    older-substantially-richer ambiguity flag, and explicit --generation targeting.
  *  - CLI: parseTabsArgv routing, classifyRestore (refuse/zero/gate/partial/
  *    allow-empty), parsePickerChoice, and the table/summary renderers.
  *
@@ -1039,7 +1039,7 @@ test("renderOutcomes surfaces the preflight-failed stanza + summary note", () =>
 });
 
 // ---------------------------------------------------------------------------
-// selectRestoreGeneration — the richness-ranked auto-pick (the epic keystone)
+// selectRestoreGeneration — the recency-first auto-pick (the epic keystone)
 // ---------------------------------------------------------------------------
 
 test("selectRestoreGeneration restores the 9-pane generation, NEVER the 1-pane skeleton", () => {
@@ -1073,7 +1073,7 @@ test("selectRestoreGeneration restores the 9-pane generation, NEVER the 1-pane s
   expect(sel.ambiguous).toBe(false);
 });
 
-test("selectRestoreGeneration flags ambiguous when the richest is not the freshest", () => {
+test("selectRestoreGeneration picks the freshest but flags ambiguous when an older generation is substantially richer", () => {
   const eNriched: EnrichedGeneration[] = [
     enriched(gen({ generation_id: "gen-fresh", last_event_id: 200 }), [
       fakeCandidate({ job_id: "f1" }),
@@ -1088,13 +1088,35 @@ test("selectRestoreGeneration flags ambiguous when the richest is not the freshe
     ]),
   ];
   const sel = selectRestoreGeneration(eNriched);
-  expect(sel.pickedGeneration?.generation_id).toBe("gen-rich");
+  // Recency-first: the freshest (2 restorable) is picked, NOT the richer older one.
+  expect(sel.pickedGeneration?.generation_id).toBe("gen-fresh");
+  expect(sel.candidates.map((c) => c.job_id)).toEqual(["f1", "f2"]);
+  // ...but the substantially-richer older cohort (5 vs 2) contests the pick.
   expect(sel.ambiguous).toBe(true);
   // Both eligible generations are offered in the picker menu.
   expect(sel.eligible.map((g) => g.generation_id).sort()).toEqual([
     "gen-fresh",
     "gen-rich",
   ]);
+});
+
+test("selectRestoreGeneration does NOT flag ambiguous for a marginally-richer older generation", () => {
+  // gen-fresh (newest) has 2 restorable; gen-close has 3 — richer, but below the
+  // factor+gap threshold. Recency-first takes the freshest silently.
+  const eNriched: EnrichedGeneration[] = [
+    enriched(gen({ generation_id: "gen-fresh", last_event_id: 200 }), [
+      fakeCandidate({ job_id: "f1" }),
+      fakeCandidate({ job_id: "f2" }),
+    ]),
+    enriched(gen({ generation_id: "gen-close", last_event_id: 100 }), [
+      fakeCandidate({ job_id: "c1" }),
+      fakeCandidate({ job_id: "c2" }),
+      fakeCandidate({ job_id: "c3" }),
+    ]),
+  ];
+  const sel = selectRestoreGeneration(eNriched);
+  expect(sel.pickedGeneration?.generation_id).toBe("gen-fresh");
+  expect(sel.ambiguous).toBe(false);
 });
 
 test("selectRestoreGeneration --generation targets a specific generation, no ambiguity", () => {

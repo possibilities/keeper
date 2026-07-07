@@ -22,6 +22,7 @@ import { extractTmuxTopologySnapshot } from "../src/reducer";
 import {
   BURST_MIN_SIZE,
   burstEventIds,
+  canonicalizeGenerationSummaries,
   DEFAULT_IDLE_CUTOFF_SECS,
   DEGENERATE_MAX_SPAN_SECS,
   deriveCurrentSet,
@@ -31,6 +32,7 @@ import {
   GENERATION_SUMMARY_SQL,
   isCrashLike,
   isRestorableCandidate,
+  type RawGenerationSummary,
   RECENT_GENERATION_BOUND,
   type RestoreCandidate,
   summarizeTopologyGenerations,
@@ -1436,8 +1438,8 @@ test("deriveLastGenerationSetFromTopology (bound): a richer generation beyond th
     ]);
   }
   const res = deriveTopo("gen-now");
-  // Pick = the newest in-bound generation (recency tiebreak among equal
-  // restorable=1); the rich-but-old generation is beyond K and excluded.
+  // Pick = the newest in-bound generation (recency-first); the rich-but-old
+  // generation is beyond K and excluded.
   expect(res.candidates.map((c) => c.job_id)).toEqual([
     `near-${RECENT_GENERATION_BOUND - 1}`,
   ]);
@@ -1730,10 +1732,10 @@ test("deriveLastGenerationSetFromTopology: works against a read-only connection 
 });
 
 // ---------------------------------------------------------------------------
-// Bounded richness-ranked selection (epic fn-1102 T1) — the new selection that
-// ranks dead generations by restorable richness instead of "single newest",
-// bounds to the newest K inside the idle cutoff, excludes short-lived single-
-// pane skeletons, steps back to the newest attributed snapshot, flags ambiguity.
+// Bounded recency-first selection — the auto-pick is the NEWEST eligible dead
+// generation (the one just lost), bounded to the newest K inside the idle cutoff,
+// excluding short-lived single-pane skeletons and stepping back to the newest
+// attributed snapshot; an older substantially-richer generation flags ambiguity.
 // ---------------------------------------------------------------------------
 
 /** Seed N killed jobs + N owned panes (window_index 0..N-1) for a generation. */
@@ -1824,11 +1826,11 @@ test("deriveLastGenerationSetFromTopology (pairing race): the newest ATTRIBUTED 
   expect(res.fallbackNote).toBeUndefined();
 });
 
-test("deriveLastGenerationSetFromTopology (ambiguity): auto-pick differing from the newest non-degenerate flags ambiguous", () => {
+test("deriveLastGenerationSetFromTopology (ambiguity): an older substantially-richer generation contests the recency-first pick", () => {
   // Two non-degenerate dead generations. The NEWER (gen-new, id 600) has 1
-  // restorable; the OLDER (gen-old, id 500) has 3 — so the max-restorable auto-
-  // pick (gen-old) is NOT the newest non-degenerate (gen-new). The result must
-  // carry the ambiguity flag AND still return the auto-pick's richer set.
+  // restorable; the OLDER (gen-old, id 500) has 3. Recency-first PICKS the newer
+  // (the one just lost) and returns ITS set, but flags ambiguous because the
+  // older cohort is substantially richer — the consumer escalates or refuses.
   seedTmuxTopologySnapshot(
     kdb.db,
     500,
@@ -1848,14 +1850,39 @@ test("deriveLastGenerationSetFromTopology (ambiguity): auto-pick differing from 
     NOW - 50,
   );
   const res = deriveTopo("gen-now");
-  expect(res.candidates.map((c) => c.job_id)).toEqual(["o0", "o1", "o2"]);
+  // The just-killed (newer) set is restored — NOT the older richer one.
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["n0"]);
   expect(res.ambiguous).toBe(true);
   expect(res.fallbackNote).toBeUndefined();
 });
 
-test("deriveLastGenerationSetFromTopology (ambiguity): newest non-degenerate IS the richest ⇒ NOT ambiguous", () => {
-  // Mirror of the ambiguity case: here the NEWER generation is also the richest,
-  // so the auto-pick equals the newest non-degenerate — no ambiguity.
+test("deriveLastGenerationSetFromTopology (ambiguity): a marginally-richer older generation does NOT contest — just-killed wins silently", () => {
+  // The common case: the newer pick has 2 restorable, the older has 3 — richer,
+  // but not SUBSTANTIALLY (below the factor+gap threshold). Recency-first takes
+  // the just-killed one with no escalation.
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    500,
+    "gen-old",
+    ownedPanes(["o0", "o1", "o2"]),
+    NOW - 200,
+  );
+  seedTmuxTopologySnapshot(
+    kdb.db,
+    600,
+    "gen-new",
+    ownedPanes(["n0", "n1"]),
+    NOW - 50,
+  );
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["n0", "n1"]);
+  expect(res.ambiguous).toBeUndefined();
+  expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology (ambiguity): newest IS the richest ⇒ NOT ambiguous", () => {
+  // The NEWER generation is also the richest, so no older cohort out-riches the
+  // recency-first pick — no ambiguity.
   seedJob(kdb.db, { job_id: "lean", state: "killed", title: "lean" });
   seedTmuxTopologySnapshot(
     kdb.db,
@@ -1883,6 +1910,117 @@ test("deriveLastGenerationSetFromTopology (ambiguity): newest non-degenerate IS 
   expect(res.candidates.map((c) => c.job_id)).toEqual(["f0", "f1"]);
   expect(res.ambiguous).toBeUndefined();
   expect(res.fallbackNote).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// Read-time generation canonicalizer — a boot observed under a bare-pid and a
+// full-form probe reads as ONE generation, so a probe-format change can never
+// fork one server boot into two competing generations.
+// ---------------------------------------------------------------------------
+
+test("summarizeTopologyGenerations: a bare-pid id and its full-form sibling fold into ONE generation", () => {
+  // The v107 column groups on the STORED id, so these are two rows out of the
+  // index walk; the canonicalizer folds them into one canonical (full-form) boot.
+  seedJob(kdb.db, { job_id: "j-full", state: "killed", title: "full" });
+  seedJob(kdb.db, { job_id: "j-bare", state: "killed", title: "bare" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "21705:1783191303", [
+    { pane_id: "%f", session_name: "work", window_index: 0, job_id: "j-full" },
+    PAD_PANE,
+  ]);
+  seedTmuxTopologySnapshot(kdb.db, 600, "21705", [
+    { pane_id: "%b", session_name: "work", window_index: 0, job_id: "j-bare" },
+    PAD_PANE,
+  ]);
+  const summaries = summarizeTopologyGenerations(kdb.db, {
+    currentGenerationId: "gen-now",
+  });
+  expect(summaries).toHaveLength(1);
+  // Canonical id is the full form; the merged range spans BOTH stored rowids.
+  expect(summaries[0]?.generation_id).toBe("21705:1783191303");
+  expect(summaries[0]?.first_event_id).toBe(500);
+  expect(summaries[0]?.last_event_id).toBe(600);
+  expect(summaries[0]?.snapshot_count).toBe(2);
+});
+
+test("deriveLastGenerationSetFromTopology: the canonicalized boot restores from its newest snapshot across BOTH source ids", () => {
+  // The newest snapshot (id 600) was stored under the BARE id; the union decode
+  // must still reach it (reading only the canonical full-form id would return the
+  // OLDER j-full set). Proves the decode reads every folded source id.
+  seedJob(kdb.db, { job_id: "j-full", state: "killed", title: "full" });
+  seedJob(kdb.db, { job_id: "j-bare", state: "killed", title: "bare" });
+  seedTmuxTopologySnapshot(kdb.db, 500, "21705:1783191303", [
+    { pane_id: "%f", session_name: "work", window_index: 0, job_id: "j-full" },
+    PAD_PANE,
+  ]);
+  seedTmuxTopologySnapshot(kdb.db, 600, "21705", [
+    { pane_id: "%b", session_name: "work", window_index: 0, job_id: "j-bare" },
+    PAD_PANE,
+  ]);
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["j-bare"]);
+  expect(res.ambiguous).toBeUndefined();
+});
+
+test("canonicalizeGenerationSummaries: a bare-pid alias folds into its full-form sibling", () => {
+  const raw = (
+    id: string,
+    first: number,
+    last: number,
+  ): RawGenerationSummary => ({
+    generation_id: id,
+    first_event_id: first,
+    last_event_id: last,
+    snapshot_count: 1,
+    first_ts: 0,
+    last_ts: 0,
+    source_ids: [id],
+  });
+  // Newest-first input: bare 21705 (last 600) + its full-form sibling (last 500).
+  const out = canonicalizeGenerationSummaries([
+    raw("21705", 600, 600),
+    raw("21705:99", 500, 500),
+  ]);
+  expect(out).toHaveLength(1);
+  expect(out[0]?.generation_id).toBe("21705:99");
+  expect(out[0]?.first_event_id).toBe(500);
+  expect(out[0]?.last_event_id).toBe(600);
+  expect(out[0]?.snapshot_count).toBe(2);
+  expect([...(out[0]?.source_ids ?? [])].sort()).toEqual(["21705", "21705:99"]);
+});
+
+test("canonicalizeGenerationSummaries: two full forms with DIFFERENT start_time stay two boots (pid recycle guard)", () => {
+  const raw = (id: string, last: number): RawGenerationSummary => ({
+    generation_id: id,
+    first_event_id: last,
+    last_event_id: last,
+    snapshot_count: 1,
+    first_ts: 0,
+    last_ts: 0,
+    source_ids: [id],
+  });
+  const out = canonicalizeGenerationSummaries([
+    raw("21705:200", 600),
+    raw("21705:100", 500),
+  ]);
+  expect(out.map((g) => g.generation_id)).toEqual(["21705:200", "21705:100"]);
+});
+
+test("canonicalizeGenerationSummaries: a bare pid with no full-form sibling stays its own generation (ages out)", () => {
+  const raw = (id: string, last: number): RawGenerationSummary => ({
+    generation_id: id,
+    first_event_id: last,
+    last_event_id: last,
+    snapshot_count: 1,
+    first_ts: 0,
+    last_ts: 0,
+    source_ids: [id],
+  });
+  const out = canonicalizeGenerationSummaries([
+    raw("999", 600),
+    raw("21705:100", 500),
+  ]);
+  // 999 has no full-form sibling → not aliased; stays separate, newest-first.
+  expect(out.map((g) => g.generation_id)).toEqual(["999", "21705:100"]);
 });
 
 test("deriveLastGenerationSetFromTopology (fallback): an all-degenerate board degrades to the labeled killed-cohort fallback", () => {

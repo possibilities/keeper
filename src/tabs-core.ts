@@ -7,16 +7,18 @@
  * connection (`src/restore-set.ts`) — no frozen snapshot, no socket round-trip,
  * so the disaster-recovery path is first-class with the daemon DOWN.
  *
- * SELECTION. The default restore set is recency-bounded and richness-ranked over
+ * SELECTION. The default restore set is recency-bounded and RECENCY-FIRST over
  * per-generation `TmuxTopologySnapshot` evidence
- * ({@link enrichedTopologyGenerations}): the auto-pick is the newest DEAD
- * generation with the MOST restorable agents (recency as tiebreak), rejecting the
- * short-lived single-pane skeleton the naive "newest dead generation" model
- * restored over a rich session. A contested pick (the richest set is not the
- * freshest) surfaces {@link RestoreSelection.ambiguous} so the consumer escalates
- * (a TTY picker) or refuses (a non-TTY offer). No restorable dying-generation
- * topology degrades to the retrospective killed-cohort model with a VISIBLE
- * `fallbackNote` banner (never a silent downgrade).
+ * ({@link enrichedTopologyGenerations}): the auto-pick is the NEWEST eligible DEAD
+ * generation — the one you just lost — still rejecting the short-lived single-pane
+ * skeleton (degenerate) the naive "newest dead generation" model restored over a
+ * rich session. A contested pick (an OLDER in-window generation is substantially
+ * richer than the newest pick) surfaces {@link RestoreSelection.ambiguous} so the
+ * consumer escalates (a TTY picker) or refuses (a non-TTY offer). Generation
+ * identity is keeper-owned — one builder mints every id and a read-time
+ * canonicalizer folds a boot observed under two probe formats into one. No
+ * restorable dying-generation topology degrades to the retrospective killed-cohort
+ * model with a VISIBLE `fallbackNote` banner (never a silent downgrade).
  *
  * RESULT. Each candidate carries a `harness` tag and a harness-native
  * `resume_target`: a claude candidate re-attaches by session UUID
@@ -60,15 +62,14 @@ import {
   resolveKeeperAgentPathDepFree,
 } from "./keeper-agent-path";
 import {
-  DEFAULT_IDLE_CUTOFF_SECS,
   deriveCurrentSet,
   deriveLastGenerationSet,
   type EnrichedGeneration,
   enrichedTopologyGenerations,
   type GenerationSummary,
   isRestorableCandidate,
-  RECENT_GENERATION_BOUND,
   type RestoreCandidate,
+  selectGenerationFromEnriched,
 } from "./restore-set";
 import { probeServerGeneration } from "./restore-worker";
 import { buildResumeCommand } from "./resume-descriptor";
@@ -604,24 +605,22 @@ export interface SelectRestoreOptions {
 }
 
 /**
- * Pure: the recency-bounded, richness-ranked generation selection over the
- * enriched topology generations (mirrors
- * {@link deriveLastGenerationSetFromTopology}'s auto-pick so the list a human sees
- * and the set restore offers are computed identically). An explicit
- * `generationId` resolves THAT generation's candidates (no auto-pick); an unknown
- * id sets `unknownGeneration`. Otherwise the auto-pick is the DEAD generation
- * (inside the idle cutoff, bounded to the newest {@link RECENT_GENERATION_BOUND})
- * with the MOST restorable agents, recency as tiebreak; a pick that is not the
- * newest eligible generation is flagged `ambiguous`. No eligible generation
- * returns an empty pick (the caller degrades to the killed-cohort fallback).
+ * Pure: the recency-first generation selection over the enriched topology
+ * generations, delegating the auto-pick to the SHARED
+ * {@link selectGenerationFromEnriched} so the list a human sees and the set
+ * restore offers are ONE computation (structurally incapable of drifting). An
+ * explicit `generationId` resolves THAT generation's candidates (no auto-pick);
+ * an unknown id sets `unknownGeneration`. Otherwise the auto-pick is the NEWEST
+ * eligible DEAD generation (inside the idle cutoff, bounded to the newest
+ * {@link RECENT_GENERATION_BOUND}) — the one you just lost; a pick an older
+ * in-window generation is substantially richer than is flagged `ambiguous`. No
+ * eligible generation returns an empty pick (the caller degrades to the
+ * killed-cohort fallback).
  */
 export function selectRestoreGeneration(
   enriched: EnrichedGeneration[],
   options: SelectRestoreOptions = {},
 ): RestoreSelection {
-  const now = options.now ?? Date.now() / 1000;
-  const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
-  const idleBefore = now - idleCutoffSecs;
   const generationId = options.generationId ?? null;
 
   // Explicit --generation <id>: resolve THAT generation's candidates verbatim.
@@ -644,16 +643,13 @@ export function selectRestoreGeneration(
     };
   }
 
-  // Auto-pick: DEAD (not the current server), newest snapshot inside the idle
-  // cutoff, bounded to the newest K (already ranked newest-first).
-  const candidateGens = enriched
-    .filter((e) => !e.summary.is_current)
-    .filter((e) => e.summary.last_ts >= idleBefore)
-    .slice(0, RECENT_GENERATION_BOUND);
-  const eligible = candidateGens.filter(
-    (e) => !e.summary.degenerate && e.summary.restorable > 0,
-  );
-  if (eligible.length === 0) {
+  // Auto-pick: the shared recency-first selection — the SAME function the restore
+  // deriver runs, so the offer and the list can never disagree.
+  const sel = selectGenerationFromEnriched(enriched, {
+    now: options.now,
+    idleCutoffSecs: options.idleCutoffSecs,
+  });
+  if (sel.pick === null) {
     return {
       candidates: [],
       pickedGeneration: null,
@@ -661,27 +657,11 @@ export function selectRestoreGeneration(
       ambiguous: false,
     };
   }
-
-  // MAX restorable, recency (highest last_event_id) as the tiebreak.
-  const pick = eligible.reduce((best, e) =>
-    e.summary.restorable > best.summary.restorable ||
-    (e.summary.restorable === best.summary.restorable &&
-      e.summary.last_event_id > best.summary.last_event_id)
-      ? e
-      : best,
-  );
-  const newestEligible = eligible.reduce((a, b) =>
-    b.summary.last_event_id > a.summary.last_event_id ? b : a,
-  );
-  const ambiguous =
-    pick.summary.generation_id !== newestEligible.summary.generation_id ||
-    pick.summary.first_event_id !== newestEligible.summary.first_event_id;
-
   return {
-    candidates: pick.candidates,
-    pickedGeneration: pick.summary,
-    eligible: eligible.map((e) => e.summary),
-    ambiguous,
+    candidates: sel.pick.candidates,
+    pickedGeneration: sel.pick.summary,
+    eligible: sel.eligible.map((e) => e.summary),
+    ambiguous: sel.ambiguous,
   };
 }
 

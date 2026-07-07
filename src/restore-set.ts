@@ -64,7 +64,7 @@
 
 import type { Database } from "bun:sqlite";
 import { harnessOrClaude } from "./agent/harness";
-import type { CloseKind } from "./exec-backend";
+import { type CloseKind, parseGenerationId } from "./exec-backend";
 import { extractTmuxTopologySnapshot } from "./reducer";
 import { resumeTarget } from "./resume-descriptor";
 
@@ -210,13 +210,13 @@ export interface RestoreSetResult {
    */
   fallbackNote?: string;
   /**
-   * Set by {@link deriveLastGenerationSetFromTopology} when the auto-picked
-   * generation (max restorable) is NOT the newest non-degenerate candidate — the
-   * bounded selection could not confidently pick one generation over another, so
-   * the consumer must escalate (a TTY picker) or refuse (a non-TTY offer). Absent
-   * on an unambiguous pick and on every non-topology deriver. Advisory: the
-   * candidates ARE the auto-pick's set; the flag only tells the consumer the pick
-   * was contested.
+   * Set by {@link deriveLastGenerationSetFromTopology} when an OLDER in-window
+   * generation is substantially richer than the recency-first pick (the newest
+   * eligible generation) — the just-killed cohort is not unambiguously the one to
+   * restore, so the consumer must escalate (a TTY picker) or refuse (a non-TTY
+   * offer). Absent on an unambiguous pick and on every non-topology deriver.
+   * Advisory: the candidates ARE the recency-first pick's set; the flag only
+   * tells the consumer the pick was contested.
    */
   ambiguous?: boolean;
 }
@@ -742,26 +742,109 @@ interface PostTerminalBackendRow {
 }
 
 /**
+ * How much richer an OLDER in-window generation must be than the recency-first
+ * pick before that pick is contested. "Substantially richer" is BOTH a fold
+ * factor ({@link AMBIGUOUS_RICHER_FACTOR}× the pick's restorable count) AND an
+ * absolute floor ({@link AMBIGUOUS_RICHER_MIN_GAP} more), so a marginal +1 or a
+ * tiny-count ratio never contests the just-killed generation — only a genuinely
+ * heavier lost cohort escalates. Recency-first means the freshest restorable
+ * generation wins silently; this threshold is the SOLE escape to the picker.
+ */
+export const AMBIGUOUS_RICHER_FACTOR = 2;
+export const AMBIGUOUS_RICHER_MIN_GAP = 2;
+
+/** Is `other` SUBSTANTIALLY richer than the recency-first `picked` count — both a
+ *  {@link AMBIGUOUS_RICHER_FACTOR}× ratio AND a {@link AMBIGUOUS_RICHER_MIN_GAP}
+ *  absolute gap (so 2-vs-1 stays silent, 3-vs-1 and 31-vs-5 contest)? */
+function isSubstantiallyRicher(other: number, picked: number): boolean {
+  return (
+    other >= picked * AMBIGUOUS_RICHER_FACTOR &&
+    other - picked >= AMBIGUOUS_RICHER_MIN_GAP
+  );
+}
+
+/** The recency-first generation pick plus the picker menu + contested flag — the
+ *  ONE selection {@link deriveLastGenerationSetFromTopology} and the list view's
+ *  `selectRestoreGeneration` both consume, so the two can never drift. */
+export interface EnrichedGenerationSelection {
+  /** The auto-picked generation (newest eligible), or `null` when none is
+   *  eligible — the caller degrades to the killed-cohort fallback. */
+  pick: EnrichedGeneration | null;
+  /** The eligible generations newest-first — the numbered picker's menu on an
+   *  ambiguous pick; empty when nothing is eligible. */
+  eligible: EnrichedGeneration[];
+  /** The pick is contested — an older in-window generation is substantially
+   *  richer than it — so the consumer escalates (picker) or refuses (non-TTY). */
+  ambiguous: boolean;
+}
+
+/**
+ * The SOLE recency-first generation selection over enriched topology generations,
+ * consumed by BOTH the restore deriver and the list view so the two are
+ * structurally incapable of drifting. Candidates are DEAD (not `G_now`), inside
+ * the idle cutoff, and bounded to the newest {@link RECENT_GENERATION_BOUND};
+ * eligibility adds non-degenerate AND `restorable > 0`. The AUTO-PICK is the
+ * NEWEST eligible generation (recency-first — the one you just lost); restorable
+ * count is now mere display metadata. The pick is `ambiguous` when an OLDER
+ * in-window eligible generation is {@link isSubstantiallyRicher} than it — the
+ * escalate-or-refuse contract for a genuinely contested lost cohort. Pure;
+ * `enriched` is assumed newest-first (the summary walk's order).
+ */
+export function selectGenerationFromEnriched(
+  enriched: EnrichedGeneration[],
+  options: DeriveRestoreSetOptions = {},
+): EnrichedGenerationSelection {
+  const now = options.now ?? Date.now() / 1000;
+  const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
+  const idleBefore = now - idleCutoffSecs;
+
+  const candidateGens = enriched
+    .filter((e) => !e.summary.is_current)
+    .filter((e) => e.summary.last_ts >= idleBefore)
+    .slice(0, RECENT_GENERATION_BOUND);
+  const eligible = candidateGens.filter(
+    (e) => !e.summary.degenerate && e.summary.restorable > 0,
+  );
+  if (eligible.length === 0) {
+    return { pick: null, eligible: [], ambiguous: false };
+  }
+  // Recency-first: the NEWEST eligible generation (highest last_event_id) is the
+  // one that just died — the auto-pick. Event ids are unique, so this is total.
+  const pick = eligible.reduce((a, b) =>
+    b.summary.last_event_id > a.summary.last_event_id ? b : a,
+  );
+  // Contested only when an OLDER in-window eligible generation is substantially
+  // richer than the newest pick — otherwise the just-killed one wins silently.
+  const ambiguous = eligible.some(
+    (e) =>
+      e.summary.generation_id !== pick.summary.generation_id &&
+      isSubstantiallyRicher(e.summary.restorable, pick.summary.restorable),
+  );
+  return { pick, eligible, ambiguous };
+}
+
+/**
  * PRIMARY last-generation crash-restore deriver — derives the restore set from
  * POSITIVE pre-crash evidence: a DYING generation's `TmuxTopologySnapshot`
  * events, written BEFORE the crash and so immune to the server-restart race that
  * defeats the retrospective `close_kind`/killed-cohort model (epic fn-955). The
- * selection is RECENCY-BOUNDED and RICHNESS-RANKED over per-generation topology
+ * selection is RECENCY-BOUNDED and RECENCY-FIRST over per-generation topology
  * summaries — NOT "single newest non-current generation" (the defect that
  * restored a 1-pane skeleton over a 9-pane session).
  *
  * SELECTION. Probe `G_now` (the current server generation) in the CONSUMER and
- * pass it as `currentGenerationId`. {@link summarizeTopologyGenerations} ranks every
- * generation by recency (event rowid). Candidates are the newest
+ * pass it as `currentGenerationId`. The shared {@link selectGenerationFromEnriched}
+ * ranks every generation by recency (event rowid). Candidates are the newest
  * {@link RECENT_GENERATION_BOUND} DEAD (`generation_id != G_now`) generations
  * whose newest snapshot ts is inside the idle cutoff. A DEGENERATE generation (a
  * short-lived single-pane skeleton — see {@link DEGENERATE_MAX_PANES}) is
- * excluded from candidacy but stays listable. The AUTO-PICK is the candidate
- * with the most restorable agents, recency as tiebreak; when that pick is NOT
- * also the newest non-degenerate candidate the result is flagged
- * {@link RestoreSetResult.ambiguous} so the consumer escalates (a TTY picker) or
- * refuses (a non-TTY offer). `G_now == null` (no server up) ⇒ every generation
- * is dead and the richest recent one wins.
+ * excluded from candidacy but stays listable. The AUTO-PICK is the NEWEST
+ * eligible (non-degenerate, restorable > 0) generation — the one you just lost;
+ * restorable count is display metadata. When an OLDER in-window generation is
+ * substantially richer than that pick ({@link isSubstantiallyRicher}) the result
+ * is flagged {@link RestoreSetResult.ambiguous} so the consumer escalates (a TTY
+ * picker) or refuses (a non-TTY offer). `G_now == null` (no server up) ⇒ every
+ * generation is dead and the newest recent one wins.
  *
  * CANDIDATES. Within the picked generation the restore set is built from its
  * newest ATTRIBUTED snapshot — the newest snapshot that yields at least one
@@ -792,25 +875,9 @@ export function deriveLastGenerationSetFromTopology(
   db: Database,
   options: DeriveFromTopologyOptions,
 ): RestoreSetResult {
-  const now = options.now ?? Date.now() / 1000;
-  const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
-  const idleBefore = now - idleCutoffSecs;
-
   const enriched = loadEnrichedGenerations(db, options.currentGenerationId);
-
-  // Candidate generations: DEAD (not the current server), newest snapshot inside
-  // the idle cutoff, bounded to the newest K (the summaries are already ranked
-  // newest-first, so `slice` takes the K most recent).
-  const candidateGens = enriched
-    .filter((e) => !e.summary.is_current)
-    .filter((e) => e.summary.last_ts >= idleBefore)
-    .slice(0, RECENT_GENERATION_BOUND);
-
-  // Eligible for auto-pick: non-degenerate AND at least one restorable agent.
-  const eligible = candidateGens.filter(
-    (e) => !e.summary.degenerate && e.summary.restorable > 0,
-  );
-  if (eligible.length === 0) {
+  const sel = selectGenerationFromEnriched(enriched, options);
+  if (sel.pick === null) {
     // No candidate generation at all, all-degenerate, or zero restorable
     // everywhere — degrade to the retrospective model and LABEL it (visible).
     const fallback = deriveLastGenerationSet(db, options);
@@ -820,35 +887,16 @@ export function deriveLastGenerationSetFromTopology(
         "no restorable dying-generation topology — using the retrospective killed-cohort fallback (restore set may be approximate)",
     };
   }
-
-  // Auto-pick: MAX restorable, recency (highest last_event_id) as the tiebreak.
-  const pick = eligible.reduce((best, e) =>
-    e.summary.restorable > best.summary.restorable ||
-    (e.summary.restorable === best.summary.restorable &&
-      e.summary.last_event_id > best.summary.last_event_id)
-      ? e
-      : best,
-  );
-  // The newest eligible generation by recency. When the auto-pick is a DIFFERENT
-  // generation than this, the richest set was not the freshest — an ambiguous
-  // choice the consumer must resolve (picker) or refuse (non-TTY).
-  const newestEligible = eligible.reduce((a, b) =>
-    b.summary.last_event_id > a.summary.last_event_id ? b : a,
-  );
-  const ambiguous =
-    pick.summary.generation_id !== newestEligible.summary.generation_id ||
-    pick.summary.first_event_id !== newestEligible.summary.first_event_id;
-
   // The topology path is pane-based positive evidence: the panes were all live at
   // crash time, so it surfaces neither idle-cutoff nor coordless-cohort counts
   // (excludedIdleCount / adoptedCoordlessSkipCount are 0 here — a coordless adopted
   // job has no pane, so it is surfaced only by the retrospective fallback above,
   // whose `...fallback` carries its count).
   return {
-    candidates: pick.candidates,
+    candidates: sel.pick.candidates,
     excludedIdleCount: 0,
     adoptedCoordlessSkipCount: 0,
-    ...(ambiguous ? { ambiguous: true } : {}),
+    ...(sel.ambiguous ? { ambiguous: true } : {}),
   };
 }
 
@@ -919,7 +967,9 @@ function loadEnrichedGenerations(
   db: Database,
   currentGenerationId: string | null,
 ): EnrichedGeneration[] {
-  const raws = summarizeGenerationsIndexOnly(db);
+  const raws = canonicalizeGenerationSummaries(
+    summarizeGenerationsIndexOnly(db),
+  );
   if (raws.length === 0) {
     return [];
   }
@@ -946,14 +996,21 @@ function loadEnrichedGenerations(
   );
 }
 
-/** Raw (pre-enrichment) generation summary straight off {@link GENERATION_SUMMARY_SQL}. */
-interface RawGenerationSummary {
+/** Raw (pre-enrichment) generation summary straight off {@link GENERATION_SUMMARY_SQL},
+ *  then folded by {@link canonicalizeGenerationSummaries}. `generation_id` is the
+ *  CANONICAL id; `source_ids` are the stored `tmux_generation_id`s that fold into
+ *  it (one, in the common single-format case), so the decode reads every one. */
+export interface RawGenerationSummary {
   generation_id: string;
   first_event_id: number;
   last_event_id: number;
   snapshot_count: number;
   first_ts: number;
   last_ts: number;
+  /** The stored `tmux_generation_id`(s) this canonical generation folds — the
+   *  decode reads snapshots across all of them. A bare-pid alias contributes its
+   *  own stored id here so its snapshots still decode under the canonical boot. */
+  source_ids: string[];
 }
 
 /**
@@ -991,8 +1048,83 @@ function summarizeGenerationsIndexOnly(db: Database): RawGenerationSummary[] {
       snapshot_count: num(r.snapshot_count),
       first_ts: num(r.first_ts),
       last_ts: num(r.last_ts),
+      source_ids: [generationId],
     });
   }
+  return out;
+}
+
+/**
+ * Read-time canonicalizer: fold generation summaries that name ONE server boot
+ * under more than one stored id into a single generation, so a probe-format
+ * change can never fork one boot into two competing generations. A LEGACY
+ * bare-pid id ({@link parseGenerationId} `startTime: null`) aliases onto the
+ * newest full-form `pid:start_time` sibling sharing its pid when one is in the
+ * window; a bare id with no derivable sibling stays its own generation and ages
+ * out of the decode bound. A full-form id is its own canonical id — a reused OS
+ * pid with a DIFFERENT start_time stays two distinct boots (start_time is the
+ * recycle guard). Merges the folded rows' event-id + ts ranges and snapshot
+ * count, unions their `source_ids`, and re-sorts newest-first by `last_event_id`
+ * (a fold can reorder). Grouping stays on the stored column upstream
+ * ({@link GENERATION_SUMMARY_SQL}, index-served) — this folds the RESULT. Pure.
+ */
+export function canonicalizeGenerationSummaries(
+  raws: RawGenerationSummary[],
+): RawGenerationSummary[] {
+  // pid → the newest full-form id observed for it. `raws` is newest-first, so the
+  // first full form seen per pid is its newest — the canonical alias target.
+  const fullByPid = new Map<string, string>();
+  for (const raw of raws) {
+    const parsed = parseGenerationId(raw.generation_id);
+    if (
+      parsed !== null &&
+      parsed.startTime !== null &&
+      !fullByPid.has(parsed.pid)
+    ) {
+      fullByPid.set(parsed.pid, raw.generation_id);
+    }
+  }
+  const merged = new Map<string, RawGenerationSummary>();
+  const order: string[] = [];
+  for (const raw of raws) {
+    const parsed = parseGenerationId(raw.generation_id);
+    const canonicalId =
+      parsed !== null && parsed.startTime === null
+        ? (fullByPid.get(parsed.pid) ?? raw.generation_id)
+        : raw.generation_id;
+    const existing = merged.get(canonicalId);
+    if (existing === undefined) {
+      merged.set(canonicalId, {
+        generation_id: canonicalId,
+        first_event_id: raw.first_event_id,
+        last_event_id: raw.last_event_id,
+        snapshot_count: raw.snapshot_count,
+        first_ts: raw.first_ts,
+        last_ts: raw.last_ts,
+        source_ids: [...raw.source_ids],
+      });
+      order.push(canonicalId);
+    } else {
+      existing.first_event_id = Math.min(
+        existing.first_event_id,
+        raw.first_event_id,
+      );
+      existing.last_event_id = Math.max(
+        existing.last_event_id,
+        raw.last_event_id,
+      );
+      existing.snapshot_count += raw.snapshot_count;
+      existing.first_ts = Math.min(existing.first_ts, raw.first_ts);
+      existing.last_ts = Math.max(existing.last_ts, raw.last_ts);
+      for (const s of raw.source_ids) {
+        if (!existing.source_ids.includes(s)) {
+          existing.source_ids.push(s);
+        }
+      }
+    }
+  }
+  const out = order.map((id) => merged.get(id) as RawGenerationSummary);
+  out.sort((a, b) => b.last_event_id - a.last_event_id);
   return out;
 }
 
@@ -1011,7 +1143,22 @@ function enrichGeneration(
   currentGenerationId: string | null,
   liveJobIds: Set<string>,
 ): EnrichedGeneration {
-  const snapshots = readGenerationSnapshotsDesc(db, raw.generation_id);
+  // A canonicalized generation may fold snapshots stored under more than one id
+  // (a bare-pid legacy alias + its full-form sibling); read each source id's
+  // snapshots, tagged with that id for the per-pane projection-join fallback.
+  const snapshots: {
+    id: number;
+    panes: TmuxTopologyPaneLike[];
+    sourceId: string;
+  }[] = [];
+  for (const sourceId of raw.source_ids) {
+    for (const snap of readGenerationSnapshotsDesc(db, sourceId)) {
+      snapshots.push({ id: snap.id, panes: snap.panes, sourceId });
+    }
+  }
+  // Newest-first across every source id (rowid order). A single-source
+  // generation is already DESC, so the sort is a no-op in the common case.
+  snapshots.sort((a, b) => b.id - a.id);
   let maxPaneCount = 0;
   let candidates: RestoreCandidate[] = [];
   for (const snap of snapshots) {
@@ -1023,7 +1170,7 @@ function enrichGeneration(
     if (candidates.length === 0) {
       const built = buildCandidatesFromSnapshot(
         db,
-        raw.generation_id,
+        snap.sourceId,
         snap.panes,
         liveJobIds,
       );

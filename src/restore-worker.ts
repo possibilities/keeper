@@ -102,6 +102,7 @@ import {
   sortObjectKeys,
 } from "./db";
 import {
+  buildGenerationId,
   buildTmuxServerGenerationArgs,
   DEFAULT_EXEC_BACKEND,
   localeDefaultedEnv,
@@ -718,11 +719,12 @@ export function probeTmuxTopology(spawnSync: SpawnSyncFn): TmuxTopologyProbe {
 }
 
 /**
- * Probe the backend's current generation handle via the injected `spawnSync`.
- * Returns the generation STRING when the probe yields `pid:start_time` with both
- * sides positive integers; `null` for every degraded case — ENOENT (no tmux
- * binary), a non-zero exit (no running server), or output that does not parse to
- * the expected shape (garbage / empty). NEVER throws. A `null` means "no
+ * Probe the backend's current generation handle via the injected `spawnSync`,
+ * minting the id through the sole {@link buildGenerationId} builder so this
+ * boundary pulse and every topology emitter share ONE format. Returns the
+ * canonical `pid:start_time` STRING; `null` for every degraded case — ENOENT (no
+ * tmux binary), a non-zero exit (no running server), or output the builder
+ * rejects (garbage / empty / bare-pid). NEVER throws. A `null` means "no
  * generation observed this pulse" and the caller emits nothing — a degraded
  * probe must NOT fire a spurious boundary. Pure relative to the injected
  * `spawnSync`.
@@ -737,25 +739,7 @@ export function probeServerGeneration(spawnSync: SpawnSyncFn): string | null {
   if (!res.success || res.exitCode !== 0) {
     return null;
   }
-  const raw = res.stdout.toString().trim();
-  if (raw === "") {
-    return null;
-  }
-  const parts = raw.split(":");
-  if (parts.length !== 2) {
-    return null;
-  }
-  const [pid, startTime] = parts;
-  for (const part of [pid, startTime]) {
-    if (part == null || !/^\d+$/.test(part)) {
-      return null;
-    }
-    const n = Number(part);
-    if (!Number.isInteger(n) || n <= 0) {
-      return null;
-    }
-  }
-  return raw;
+  return buildGenerationId(res.stdout.toString());
 }
 
 /**

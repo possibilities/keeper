@@ -430,6 +430,73 @@ export function buildTmuxServerGenerationArgs(): string[] {
 }
 
 /**
+ * The parsed shape of a generation id. The CURRENT format carries the tmux
+ * server `pid` PLUS its `startTime` (`pid:start_time`); a LEGACY bare-pid id
+ * carries only `pid` with `startTime: null` — a read-only artifact the
+ * canonicalizer aliases onto its full-form sibling, never a freshly minted id.
+ */
+export interface ParsedGenerationId {
+  pid: string;
+  startTime: string | null;
+}
+
+/** A tmux `#{pid}` / `#{start_time}` field is a positive integer; anything else
+ *  (empty, non-digit, non-positive, float, hex) is a degraded probe field. */
+function isPositiveIntField(s: string | undefined): boolean {
+  if (s == null || !/^\d+$/.test(s)) {
+    return false;
+  }
+  const n = Number(s);
+  return Number.isInteger(n) && n > 0;
+}
+
+/**
+ * Parse a generation id into `{pid, startTime}`. Accepts the CURRENT
+ * `pid:start_time` form (both positive integers) and the LEGACY bare-pid form
+ * (`pid` alone → `startTime: null`), so the read-time canonicalizer can alias a
+ * bare id onto its full-form sibling. Returns `null` for any other shape (empty,
+ * >2 segments, a non-positive-integer field). Pure — the sole parser of a
+ * generation-id string.
+ */
+export function parseGenerationId(id: string): ParsedGenerationId | null {
+  const raw = id.trim();
+  if (raw === "") {
+    return null;
+  }
+  const parts = raw.split(":");
+  if (parts.length === 1) {
+    return isPositiveIntField(parts[0])
+      ? { pid: parts[0], startTime: null }
+      : null;
+  }
+  if (parts.length === 2) {
+    const [pid, startTime] = parts;
+    return isPositiveIntField(pid) && isPositiveIntField(startTime)
+      ? { pid, startTime }
+      : null;
+  }
+  return null;
+}
+
+/**
+ * The SOLE producer of a generation-id string from a raw `#{pid}:#{start_time}`
+ * probe. Every emitter mints through this one builder — the restore-worker
+ * boundary pulse, the boot seed, and the tmux-control-worker topology stream —
+ * so a probe-format change can never fork one server boot into two competing
+ * generations. Returns the canonical `pid:start_time` form; `null` for a
+ * degraded probe (empty / non-zero-exit output / a bare-pid or garbage line),
+ * meaning "no generation observed" so the caller emits nothing. A bare-pid parse
+ * is never minted — it is a read-time legacy artifact only. Pure.
+ */
+export function buildGenerationId(rawProbeOutput: string): string | null {
+  const parsed = parseGenerationId(rawProbeOutput);
+  if (parsed === null || parsed.startTime === null) {
+    return null;
+  }
+  return `${parsed.pid}:${parsed.startTime}`;
+}
+
+/**
  * Build the tmux `list-panes -a -F '#{pid}:#{start_time}\t#{pane_id}\t
  * #{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t
  * #{window_name}'` sweep argv. Pure — exported for tests. `-a` spans every
