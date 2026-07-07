@@ -1,0 +1,64 @@
+{
+  "cells": [
+    {
+      "confidence": 0.75,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Rewrites the binding selector policy contract plus guidance-check coercion with a silent-drop failure that still passes gates, so a wrong abstraction propagates to every future selection.",
+      "task_id": "fn-1151-sonnet-first-selection-and-review.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Schema migration with SCHEMA_VERSION/Python-whitelist pairing plus a must-never-throw deterministic reducer fold is squarely the schema/wire work the policy reserves for opus at xhigh.",
+      "task_id": "fn-1151-sonnet-first-selection-and-review.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.65,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded Size-S surface in a known pattern, but the status/needs_human envelope is a wire contract with a subtle closed-epic visibility requirement warranting opus.",
+      "task_id": "fn-1151-sonnet-first-selection-and-review.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Largest surface: a hash-snapshotted dataset schema that must survive future re-selects, a new auditor subagent, and a validating submit verb \u2014 contract-shaped and high blast radius.",
+      "task_id": "fn-1151-sonnet-first-selection-and-review.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Single-file skill prose but the degrade-never-block posture and pre-finalize phase ordering are correctness-sensitive orchestration where a copy-paste of the blocking posture would violate the directive.",
+      "task_id": "fn-1151-sonnet-first-selection-and-review.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Forward-facing docs consolidation of README plus problem-code rows gated by lint \u2014 bounded, well-specified, low blast radius, a clean sonnet fit.",
+      "task_id": "fn-1151-sonnet-first-selection-and-review.6",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "d6d6f6d4f0cd9cc9af9427f44b646ba5cded7b96d96a020ba611a566eff6c3fa",
+  "created_at": "2026-07-07T01:02:40.795000Z",
+  "epic_id": "fn-1151-sonnet-first-selection-and-review",
+  "input_hash": "01044d8472c0f3a2b3e8864749b5dcbc487255a06ccc1547aa7b8b2bdde7a713",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 17059204,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1151-sonnet-first-selection-and-review.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1151-sonnet-first-selection-and-review.2\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1151-sonnet-first-selection-and-review.3\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1151-sonnet-first-selection-and-review.4\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1151-sonnet-first-selection-and-review.5\",\"tier\":\"high\",\"model\":\"opus\"},{\"task_id\":\"fn-1151-sonnet-first-selection-and-review.6\",\"tier\":\"high\",\"model\":\"sonnet\"}]}\n"
+}
