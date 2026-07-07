@@ -40,5 +40,5 @@ Byte-pin the new resume argv (with carrier) and the prompt argv (empty carrier).
 - [ ] All byte-pin suites updated in the same change and green.
 
 ## Done summary
-
+Resume transport now carries the original keeper job id (KEEPER_JOB_ID env carrier on resume launches, empty overwrite on prompt launches) through buildKeeperAgentLaunchArgv/LaunchSpec/EnsureLaunchedFn/renderSnapshotScript, and armBirthRecord stamps resume_target from the harness-native argv token so a resumed non-claude tab folds onto its original job row and re-emits its native resume key.
 ## Evidence
