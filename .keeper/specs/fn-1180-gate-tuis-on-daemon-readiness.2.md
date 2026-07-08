@@ -52,5 +52,5 @@ during catch-up terminates normally.
 - [ ] Envelope suites cover the new field on every record kind and the null default
 
 ## Done summary
-
+Added tri-state catching_up to SnapshotMeta/FrameRecord/TrailerRecord defaulting to null, bumped SNAPSHOT_SCHEMA_VERSION and FRAMES_SCHEMA_VERSION (1->2), threaded via injectable seams; extended snapshot/frames test coverage for presence + defaulting on every record kind.
 ## Evidence
