@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 2,
+        "insertions": 35
+      },
+      "done_summary": "Hardened gitReadSubcommandExecFlag: deny git grep's -O exec alias buried in a short-flag cluster (regex on capital-O anywhere in a single-dash cluster) and deny --output=<file> on read subcommands as a file-write vector. Added deny-case tests for bundled -O and --output= forms plus benign diff/log -O order-file allow rows.",
+      "input_hash": "6e6abb8a376e18d5b4d886b67c4ed67eee2ea02e17145703f0a9d23cfcaac452",
+      "model": "opus",
+      "spec_chars": 2352,
+      "spec_md": "## Description\n\nHarden `gitReadSubcommandExecFlag` in\n`plugins/keeper/plugin/hooks/escalation-guard.ts` (audited version around\nlines 496-513) to close two read-subcommand escapes for diagnosis roles.\n\nF1 (kept): the short-alias deny `sub === \"grep\" && arg.startsWith(\"-O\")`\n(line 508) only matches a token that *begins* with `-O`. Git honors\nshort-option bundling, so `git grep -nO<pager>`/`-iO<pager>`/any\n`-<flags>O<pager>` reaches `--open-files-in-pager` while the token starts\nwith `-n`/`-i`, sailing past the check \u2014 reproduced live firing the pager\nprogram (`PAGER-EXEC-FIRED`). Detect the exec alias anywhere in a\nsingle-dash, non-`--` short-flag cluster (e.g. `/^-[A-Za-z]*O/` for\n`sub === \"grep\"`; git's optional-arg `-O` consumes the token remainder as\nthe pager). The un-bundled and long forms already deny; only the bundled\nshort form leaks.\n\nF2 (merged into F1): the added deny-case tests only exercise leading `-O`\nand the long `--open-files-in-pager=` form, so the truth table gives false\nconfidence. Add deny rows for the bundled forms.\n\nF3 (kept): `git log --output=<file>` / `git diff --output=<file>` write an\narbitrary file for a read-only diagnosis role (reproduced live) \u2014 a flag,\nnot a shell redirect, so the lexer's redirect deny does not catch it, and\n`gitReadSubcommandExecFlag` screens only the pager aliases. Deny\n`--output` / `--output=<file>` (and the space-separated value form) on the\nallowlisted read subcommands as an arbitrary file-write vector.\n\nFiles: plugins/keeper/plugin/hooks/escalation-guard.ts,\ntest/escalation-guard.test.ts.\n\n## Acceptance\n\n- [ ] `git grep -nO<pager>`, `-iO<pager>`, and `-<flags>O<pager>` deny for diagnosis roles.\n- [ ] `git log --output=<file>` and `git diff --output=<file>` (glued and space forms) deny for diagnosis roles.\n- [ ] Legitimate un-bundled reads and diff/log benign `-O` order-file usage stay allowed.\n- [ ] New deny-case tests cover the bundled `-O` form and the `--output=` form; existing allow/deny rows stay green.\n\n## Done summary\nHardened gitReadSubcommandExecFlag: deny git grep's -O exec alias buried in a short-flag cluster (regex on capital-O anywhere in a single-dash cluster) and deny --output=<file> on read subcommands as a file-write vector. Added deny-case tests for bundled -O and --output= forms plus benign diff/log -O order-file allow rows.\n## Evidence\n",
+      "task_id": "fn-1188-harden-diagnosis-read-subcommand-flag.1",
+      "tier": "high",
+      "title": "Close grep exec and output write"
+    }
+  ],
+  "created_at": "2026-07-08T03:12:49.878000Z",
+  "epic_id": "fn-1188-harden-diagnosis-read-subcommand-flag",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "6e6abb8a376e18d5b4d886b67c4ed67eee2ea02e17145703f0a9d23cfcaac452",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
