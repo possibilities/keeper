@@ -3244,44 +3244,99 @@ export const CRASH_LOOP_WINDOW_MS = 30 * 60_000;
  * loop still records enough boots to trip.
  */
 export const RESTART_LEDGER_CAP = 64;
+/**
+ * Length cap on a persisted `reason` string. A reason is built from error
+ * messages / worker names — attacker-influenced in the sense that upstream
+ * input can shape it — so it is bounded (silently truncated) before it lands
+ * in the ledger, keeping one pathological message from bloating the sidecar.
+ * The reason is forensic best-effort, never load-bearing for the count.
+ */
+export const RESTART_LEDGER_REASON_MAX_LEN = 300;
+
+/** One restart-ledger entry: the boot timestamp plus an optional named fatal reason. */
+export interface RestartLedgerEntry {
+  ts: number;
+  reason?: string;
+}
+
+function boundRestartReason(reason: string): string {
+  return reason.length > RESTART_LEDGER_REASON_MAX_LEN
+    ? reason.slice(0, RESTART_LEDGER_REASON_MAX_LEN)
+    : reason;
+}
 
 /**
- * Parse a restart-ledger file body into a boot-timestamp array. FAIL-OPEN: any
- * malformed body (not JSON, not an array, non-finite entries) yields `[]` so a
- * corrupt ledger becomes an empty one — never new `fatalExit` fuel, and never a
- * false crash-loop trip. The next write overwrites it clean. Pure; NEVER throws.
+ * Parse a restart-ledger file body into ledger entries. FAIL-OPEN: any
+ * malformed body (not JSON, not an array, non-finite/non-object entries)
+ * yields `[]` so a corrupt ledger becomes an empty one — never new `fatalExit`
+ * fuel, and never a false crash-loop trip. DUAL-READS the on-disk shape: a
+ * bare `number` (the legacy shape) coerces to `{ ts }`; an object entry with a
+ * finite `ts` (+ optional string `reason`) passes through — so a legacy or
+ * mixed ledger parses cleanly and counts identically for the crash-loop
+ * decision. The next write overwrites it clean. Pure; NEVER throws.
  */
-export function parseRestartLedger(raw: string): number[] {
+export function parseRestartLedger(raw: string): RestartLedgerEntry[] {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (t): t is number => typeof t === "number" && Number.isFinite(t),
-    );
+    const entries: RestartLedgerEntry[] = [];
+    for (const item of parsed) {
+      if (typeof item === "number" && Number.isFinite(item)) {
+        entries.push({ ts: item });
+        continue;
+      }
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        continue;
+      }
+      const ts = (item as { ts?: unknown }).ts;
+      if (typeof ts !== "number" || !Number.isFinite(ts)) {
+        continue;
+      }
+      const reason = (item as { reason?: unknown }).reason;
+      entries.push(
+        typeof reason === "string"
+          ? { ts, reason: boundRestartReason(reason) }
+          : { ts },
+      );
+    }
+    return entries;
   } catch {
     return [];
   }
 }
 
 /**
- * Fold this boot into the ledger: drop timestamps outside the window (and any
- * future-dated garbage), append `nowMs`, sort ascending, and keep only the most
- * recent `cap`. Window-aging makes the ledger self-heal after a loop stops;
- * the cap bounds the file under a same-window burst. Pure; NEVER throws.
+ * Fold this boot into the ledger: drop entries outside the window (and any
+ * future-dated garbage), then append-or-replace the entry for `nowMs` — a
+ * second call with the SAME `nowMs` (the {@link fatalExit} seam enriching the
+ * entry this same boot already wrote, rather than minting a second one, which
+ * would double-count a single boot toward the crash-loop threshold) replaces
+ * in place instead of duplicating. Sort ascending, keep only the most recent
+ * `cap`. Window-aging makes the ledger self-heal after a loop stops; the cap
+ * bounds the file under a same-window burst. Pure; NEVER throws.
  */
 export function updateRestartLedger(inputs: {
-  existing: number[];
+  existing: RestartLedgerEntry[];
   nowMs: number;
   windowMs: number;
   cap: number;
-}): number[] {
-  const { existing, nowMs, windowMs, cap } = inputs;
+  reason?: string;
+}): RestartLedgerEntry[] {
+  const { existing, nowMs, windowMs, cap, reason } = inputs;
   const cutoff = nowMs - windowMs;
   const kept = existing.filter(
-    (t) => Number.isFinite(t) && t >= cutoff && t <= nowMs,
+    (e) =>
+      Number.isFinite(e.ts) &&
+      e.ts >= cutoff &&
+      e.ts <= nowMs &&
+      e.ts !== nowMs,
   );
-  kept.push(nowMs);
-  kept.sort((a, b) => a - b);
+  kept.push(
+    reason !== undefined
+      ? { ts: nowMs, reason: boundRestartReason(reason) }
+      : { ts: nowMs },
+  );
+  kept.sort((a, b) => a.ts - b.ts);
   return kept.length > cap ? kept.slice(kept.length - cap) : kept;
 }
 
@@ -3289,7 +3344,9 @@ export function updateRestartLedger(inputs: {
  * Pure crash-loop verdict: how many of `bootTimestamps` fall inside the window
  * ending at `nowMs`, and whether that count reached `threshold`. Windowing here
  * (not just trusting a pre-aged caller) keeps the decision self-contained and
- * unit-testable across the threshold/window/aging axes. NEVER throws.
+ * unit-testable across the threshold/window/aging axes. Takes bare
+ * timestamps, not ledger entries — the decision reads `ts` only; `reason` is
+ * forensics, never an input to the counter. NEVER throws.
  */
 export function decideCrashLoop(inputs: {
   nowMs: number;
@@ -3310,7 +3367,7 @@ export function decideCrashLoop(inputs: {
  * boot) or any read/parse error yields `[]` — the crash-loop detector must never
  * be the thing that crashes boot. Mirrors {@link parseRestartLedger}'s contract.
  */
-export function readRestartLedger(path: string): number[] {
+export function readRestartLedger(path: string): RestartLedgerEntry[] {
   try {
     return parseRestartLedger(readFileSync(path, "utf8"));
   } catch {
@@ -3319,13 +3376,19 @@ export function readRestartLedger(path: string): number[] {
 }
 
 /**
- * Persist the ledger (best-effort, atomic). A write failure (full disk, ENOENT
- * dir) is swallowed: a lost boot record only undercounts a future loop — strictly
- * safer than crashing boot on the write. NEVER throws.
+ * Persist the ledger (best-effort, SYNCHRONOUS + ATOMIC via
+ * {@link atomicWriteFile}'s temp-file-then-`renameSync`). A write failure
+ * (full disk, ENOENT dir) is swallowed: a lost boot record only undercounts a
+ * future loop — strictly safer than crashing boot on the write. Both the write
+ * and the rename are synchronous, so calling this from the `fatalExit` seam
+ * lands durably before `process.exit`. NEVER throws.
  */
-export function writeRestartLedger(path: string, timestamps: number[]): void {
+export function writeRestartLedger(
+  path: string,
+  entries: RestartLedgerEntry[],
+): void {
   try {
-    atomicWriteFile(path, JSON.stringify(timestamps));
+    atomicWriteFile(path, JSON.stringify(entries));
   } catch (err) {
     console.error(
       `[keeperd] restart-ledger write threw (non-fatal): ${
@@ -5414,6 +5477,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let draining = false;
   let shuttingDown = false;
 
+  // The restart-ledger timestamp boot-fold wrote for THIS process (set below,
+  // once boot-fold runs). `fatalExit` re-uses it so a named reason enriches
+  // the SAME entry rather than minting a second one for one boot. `null`
+  // until boot-fold runs; a crash before then falls back to `Date.now()`.
+  let restartLedgerBootTsMs: number | null = null;
+
   // fn-921 git seed-liveness watchdog state. `lastGitLivenessAtMs` is stamped on
   // every worker poll-tick pulse (and on every GitSnapshot) — the MUTE-check
   // anchor. `lastGitProgressAtMs` is the STABLE staleness anchor: stamped at
@@ -6390,16 +6459,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   {
     const nowMs = Date.now();
     const ledgerPath = resolveRestartLedgerPath();
-    const bootTimestamps = updateRestartLedger({
+    const ledgerEntries = updateRestartLedger({
       existing: readRestartLedger(ledgerPath),
       nowMs,
       windowMs: CRASH_LOOP_WINDOW_MS,
       cap: RESTART_LEDGER_CAP,
     });
-    writeRestartLedger(ledgerPath, bootTimestamps);
+    writeRestartLedger(ledgerPath, ledgerEntries);
+    // Remember this boot's own entry ts so a later `fatalExit` enriches it
+    // with a reason instead of minting a second entry for the same boot.
+    restartLedgerBootTsMs = nowMs;
     const verdict = decideCrashLoop({
       nowMs,
-      bootTimestamps,
+      bootTimestamps: ledgerEntries.map((e) => e.ts),
       threshold: CRASH_LOOP_THRESHOLD,
       windowMs: CRASH_LOOP_WINDOW_MS,
     });
@@ -11038,8 +11110,34 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
-  function fatalExit(): void {
+  /**
+   * Crash exit. Reserved for unrecoverable errors so launchd restarts us.
+   * `reason` is optional and backward-compatible — every existing bare
+   * `fatalExit()` call site stays valid and records no reason. When given,
+   * the reason is written into the SAME restart-ledger entry boot-fold
+   * already minted for this process ({@link restartLedgerBootTsMs}), via a
+   * synchronous + atomic {@link writeRestartLedger}, so it lands durably
+   * BEFORE `process.exit`. A crash before boot-fold has run (no entry yet to
+   * enrich) falls back to `Date.now()`, minting a fresh entry rather than
+   * dropping the reason. Ledger trouble never blocks the crash exit.
+   */
+  function fatalExit(reason?: string): void {
+    if (reason !== undefined) {
+      try {
+        const ledgerPath = resolveRestartLedgerPath();
+        const nowMs = restartLedgerBootTsMs ?? Date.now();
+        const entries = updateRestartLedger({
+          existing: readRestartLedger(ledgerPath),
+          nowMs,
+          windowMs: CRASH_LOOP_WINDOW_MS,
+          cap: RESTART_LEDGER_CAP,
+          reason,
+        });
+        writeRestartLedger(ledgerPath, entries);
+      } catch {
+        // best-effort; never block the crash exit on ledger trouble
+      }
+    }
     try {
       db.close();
     } catch {
@@ -11109,7 +11207,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         "[keeperd] git seed-liveness watchdog: surface stuck after " +
           `${gitSeedReseedAttempts} re-seed attempt(s) (or worker mute) — exiting for LaunchAgent restart`,
       );
-      if (!shuttingDown) fatalExit();
+      if (!shuttingDown)
+        fatalExit(
+          `git-seed-watchdog: surface stuck after ${gitSeedReseedAttempts} re-seed attempt(s) (or worker mute)`,
+        );
     }, GIT_SEED_WATCHDOG_INTERVAL_MS);
   }
 
@@ -11132,7 +11233,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           "[keeperd] tmux-control liveness watchdog: control client mute — " +
             "exiting for LaunchAgent restart",
         );
-        if (!shuttingDown) fatalExit();
+        if (!shuttingDown)
+          fatalExit("tmux-control-watchdog: control client mute");
       }
     }, TMUX_CONTROL_WATCHDOG_INTERVAL_MS);
   }
@@ -11222,7 +11324,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             serverAgeMs ?? "n/a"
           }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES} — exiting for LaunchAgent restart`,
         );
-        if (!shuttingDown) fatalExit();
+        if (!shuttingDown)
+          fatalExit(
+            `serve-liveness-watchdog: ${verdict.trigger} server-probe-age=${
+              serverAgeMs ?? "n/a"
+            }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES}`,
+          );
       }
     }, SERVE_WATCHDOG_INTERVAL_MS);
   }
@@ -11262,12 +11369,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.on("unhandledRejection", (reason) => {
     if (shuttingDown) return;
     console.error("[keeperd] unhandled rejection:", reason);
-    fatalExit();
+    fatalExit(
+      `unhandledRejection: ${
+        reason instanceof Error ? reason.message : String(reason)
+      }`,
+    );
   });
   process.on("uncaughtException", (err) => {
     if (shuttingDown) return;
     console.error("[keeperd] uncaught exception:", err);
-    fatalExit();
+    fatalExit(
+      `uncaughtException: ${err instanceof Error ? err.message : String(err)}`,
+    );
   });
 
   // Step 5 — clean teardown. TEARDOWN LOGIC ONLY: set the shutdown flag FIRST (so
