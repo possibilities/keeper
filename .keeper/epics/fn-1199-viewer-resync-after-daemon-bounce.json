@@ -6,7 +6,7 @@
     "fn-1197-unify-per-root-cap-derivation"
   ],
   "id": "fn-1199-viewer-resync-after-daemon-bounce",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T20:58:08.217000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T20:57:58.294000Z"
+  "updated_at": "2026-07-08T20:58:08.217000Z"
 }
