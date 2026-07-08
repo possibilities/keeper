@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Schema/migration refactor turning on a subtle correctness invariant the fingerprint cannot catch (guard-flavor preservation, verbatim byte-equivalent execution order).",
+      "task_id": "fn-1181-extract-schema-step-ladder.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded, well-specified test additions over SCHEMA_STEPS reusing the existing parser with a do-exactly-this acceptance.",
+      "task_id": "fn-1181-extract-schema-step-ladder.2",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Documentation work (new ADR, status amendment, byte-capped CLAUDE.md rewrite, glossary entries) with clear acceptance.",
+      "task_id": "fn-1181-extract-schema-step-ladder.3",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T01:52:46.908000Z",
+  "epic_id": "fn-1181-extract-schema-step-ladder",
+  "input_hash": "3096b0ed36ab86fd44a54e8ecb48f37280cb2106b8f547f5c170097d702e4e6e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 815182061,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1181-extract-schema-step-ladder.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.8},{\"task_id\":\"fn-1181-extract-schema-step-ladder.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"confidence\":0.82},{\"task_id\":\"fn-1181-extract-schema-step-ladder.3\",\"tier\":\"medium\",\"model\":\"sonnet\",\"confidence\":0.78}]}"
+}
