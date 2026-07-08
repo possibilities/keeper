@@ -21,6 +21,7 @@
 import { existsSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join, resolve as resolveAbs } from "node:path";
 
+import { acquirePlanCommitGuard } from "../commit.ts";
 import { detectCycles } from "../deps.ts";
 import {
   checkGlobalNameUnique,
@@ -1001,330 +1002,344 @@ export function runScaffold(args: ScaffoldArgs): number {
   );
   const touchedRepos = [...new Set(resolvedTaskTargetRepos)].sort();
 
-  // The flock spans dup-guard through ALL atomic writes. A failure inside
-  // returns a sentinel so the verb can emit + return outside the lock; the
-  // success path carries the fields emit() needs back out. NEVER emit() inside.
-  type FlockOutcome =
-    | { kind: "failure"; code: string; message: string; details: string[] }
-    | { kind: "success"; epicId: string };
+  // Merge-window guard + commit-work serialization (commit-work OUTER, epic-id
+  // flock INNER): refuse a mid-operation write before touching state, else hold
+  // the shared lock across the write -> auto-commit window, released via finally.
+  const commitGuard = acquirePlanCommitGuard(primaryRepo);
+  if (commitGuard.kind === "refused") {
+    emitFailureEnvelope("merge_in_progress", commitGuard.message, [
+      commitGuard.detail,
+    ]);
+    return 1;
+  }
+  try {
+    // The flock spans dup-guard through ALL atomic writes. A failure inside
+    // returns a sentinel so the verb can emit + return outside the lock; the
+    // success path carries the fields emit() needs back out. NEVER emit() inside.
+    type FlockOutcome =
+      | { kind: "failure"; code: string; message: string; details: string[] }
+      | { kind: "success"; epicId: string };
 
-  const outcome = withEpicIdLock<FlockOutcome>(() => {
-    // Dup guard: reject a same-slug sibling epic up front. Runs BEFORE id
-    // allocation / any write so a rejected dup leaves scanMaxEpicId unchanged.
-    const slug = slugify(epicTitleStr);
-    if (slug && !allowDuplicate) {
-      const epicsDir = join(dataDir, "epics");
-      if (existsSync(epicsDir)) {
-        // The glob fn-*-{slug}.json false-matches any epic whose slug ENDS with
-        // -{slug}; pin exact-slug equivalence with a fullmatch on the stem.
-        const exactStemRe = new RegExp(`^fn-\\d+-${escapeRegex(slug)}$`);
-        const dupMatches = readdirSync(epicsDir)
-          .filter((entry) => {
-            if (!entry.endsWith(".json")) {
-              return false;
+    const outcome = withEpicIdLock<FlockOutcome>(() => {
+      // Dup guard: reject a same-slug sibling epic up front. Runs BEFORE id
+      // allocation / any write so a rejected dup leaves scanMaxEpicId unchanged.
+      const slug = slugify(epicTitleStr);
+      if (slug && !allowDuplicate) {
+        const epicsDir = join(dataDir, "epics");
+        if (existsSync(epicsDir)) {
+          // The glob fn-*-{slug}.json false-matches any epic whose slug ENDS with
+          // -{slug}; pin exact-slug equivalence with a fullmatch on the stem.
+          const exactStemRe = new RegExp(`^fn-\\d+-${escapeRegex(slug)}$`);
+          const dupMatches = readdirSync(epicsDir)
+            .filter((entry) => {
+              if (!entry.endsWith(".json")) {
+                return false;
+              }
+              const stem = entry.slice(0, -".json".length);
+              return exactStemRe.test(stem) && matchesSlugGlob(stem, slug);
+            })
+            .sort();
+          if (dupMatches.length > 0) {
+            const details: string[] = [];
+            for (const match of dupMatches) {
+              const existingId = match.slice(0, -".json".length);
+              let existingStatus: string;
+              const existing = loadJsonSafe(join(epicsDir, match));
+              if (existing === null) {
+                existingStatus = "<unreadable>";
+              } else {
+                existingStatus = (existing.status as string) ?? "<unknown>";
+              }
+              details.push(`${existingId} (status: ${existingStatus})`);
             }
-            const stem = entry.slice(0, -".json".length);
-            return exactStemRe.test(stem) && matchesSlugGlob(stem, slug);
-          })
-          .sort();
-        if (dupMatches.length > 0) {
-          const details: string[] = [];
-          for (const match of dupMatches) {
-            const existingId = match.slice(0, -".json".length);
-            let existingStatus: string;
-            const existing = loadJsonSafe(join(epicsDir, match));
-            if (existing === null) {
-              existingStatus = "<unreadable>";
-            } else {
-              existingStatus = (existing.status as string) ?? "<unknown>";
-            }
-            details.push(`${existingId} (status: ${existingStatus})`);
+            return {
+              kind: "failure",
+              code: "duplicate_epic",
+              message:
+                `An epic with slug ${pyReprStr(slug)} already exists in this ` +
+                "project; pass --allow-duplicate to mint a distinct fn-N anyway",
+              details,
+            };
           }
-          return {
-            kind: "failure",
-            code: "duplicate_epic",
-            message:
-              `An epic with slug ${pyReprStr(slug)} already exists in this ` +
-              "project; pass --allow-duplicate to mint a distinct fn-N anyway",
-            details,
-          };
         }
       }
-    }
 
-    // max(scan, ledger)+1, never bare scan: the durable id ledger keeps a
-    // number burned even after its epic's working-tree files are destroyed, so
-    // the destroy-then-re-mint sequence cannot reuse it on this host.
-    const epicNum =
-      Math.max(scanMaxEpicId(dataDir), ledgerMaxEpicNum(primaryRepo)) + 1;
-    const epicId = slug
-      ? `fn-${epicNum}-${slug}`
-      : `fn-${epicNum}-${generateSuffix()}`;
-    const branchName = (isStr(epicBranch) ? epicBranch : "") || "main";
+      // max(scan, ledger)+1, never bare scan: the durable id ledger keeps a
+      // number burned even after its epic's working-tree files are destroyed, so
+      // the destroy-then-re-mint sequence cannot reuse it on this host.
+      const epicNum =
+        Math.max(scanMaxEpicId(dataDir), ledgerMaxEpicNum(primaryRepo)) + 1;
+      const epicId = slug
+        ? `fn-${epicNum}-${slug}`
+        : `fn-${epicNum}-${generateSuffix()}`;
+      const branchName = (isStr(epicBranch) ? epicBranch : "") || "main";
 
-    // Same-project bare-number guard: refuse if any existing epic already
-    // carries this number under a different slug (an unlocked-degrade race that
-    // wrote a sibling after our scan). Reuses id_collision, naming both ids.
-    const bareCollisions = epicIdsWithNumber(dataDir, epicNum).filter(
-      (id) => id !== epicId,
-    );
-    if (bareCollisions.length > 0) {
-      return {
-        kind: "failure",
-        code: "id_collision",
-        message: `Allocated epic id ${epicId} collides on number with an existing same-project epic`,
-        details: bareCollisions.map((id) => `existing: ${id}`),
-      };
-    }
-
-    // Global-name uniqueness check across all discovered projects.
-    const foreignOwner = checkGlobalNameUnique(epicId, primaryRepo);
-    if (foreignOwner !== null) {
-      return {
-        kind: "failure",
-        code: "id_collision",
-        message: `Allocated epic id ${epicId} already exists in another project`,
-        details: [`existing owner: ${foreignOwner}`],
-      };
-    }
-
-    // Backstop collision check before any write.
-    const epicPath = join(dataDir, "epics", `${epicId}.json`);
-    const epicSpecPath = join(dataDir, "specs", `${epicId}.md`);
-    const collisions: string[] = [];
-    if (existsSync(epicPath)) {
-      collisions.push(`epic JSON exists: ${epicPath}`);
-    }
-    if (existsSync(epicSpecPath)) {
-      collisions.push(`epic spec exists: ${epicSpecPath}`);
-    }
-    const taskPaths: [string, string][] = [];
-    for (let i = 1; i <= nTasks; i += 1) {
-      const taskId = `${epicId}.${i}`;
-      const tp = join(dataDir, "tasks", `${taskId}.json`);
-      const sp = join(dataDir, "specs", `${taskId}.md`);
-      if (existsSync(tp)) {
-        collisions.push(`task JSON exists: ${tp}`);
+      // Same-project bare-number guard: refuse if any existing epic already
+      // carries this number under a different slug (an unlocked-degrade race that
+      // wrote a sibling after our scan). Reuses id_collision, naming both ids.
+      const bareCollisions = epicIdsWithNumber(dataDir, epicNum).filter(
+        (id) => id !== epicId,
+      );
+      if (bareCollisions.length > 0) {
+        return {
+          kind: "failure",
+          code: "id_collision",
+          message: `Allocated epic id ${epicId} collides on number with an existing same-project epic`,
+          details: bareCollisions.map((id) => `existing: ${id}`),
+        };
       }
-      if (existsSync(sp)) {
-        collisions.push(`task spec exists: ${sp}`);
+
+      // Global-name uniqueness check across all discovered projects.
+      const foreignOwner = checkGlobalNameUnique(epicId, primaryRepo);
+      if (foreignOwner !== null) {
+        return {
+          kind: "failure",
+          code: "id_collision",
+          message: `Allocated epic id ${epicId} already exists in another project`,
+          details: [`existing owner: ${foreignOwner}`],
+        };
       }
-      taskPaths.push([tp, sp]);
-    }
-    if (collisions.length > 0) {
-      return {
-        kind: "failure",
-        code: "id_collision",
-        message: `Allocated epic id ${epicId} would overwrite existing files`,
-        details: collisions,
-      };
-    }
 
-    // ----- Assemble the in-memory tree -> integrity gate -> write -----
-    const now = nowIso();
-    const epicDef: Record<string, unknown> = {
-      id: epicId,
-      title: epicTitleStr,
-      status: "open",
-      branch_name: branchName,
-      depends_on_epics: [...dependsOnEpics],
-      primary_repo: primaryRepo,
-      touched_repos: touchedRepos,
-      snippets: toArray(epicSnippets),
-      bundles: toArray(epicBundles),
-      last_validated_at: null,
-      created_at: now,
-      updated_at: now,
-    };
-    if (createdByCloseOf !== null) {
-      epicDef.created_by_close_of = createdByCloseOf;
-    }
+      // Backstop collision check before any write.
+      const epicPath = join(dataDir, "epics", `${epicId}.json`);
+      const epicSpecPath = join(dataDir, "specs", `${epicId}.md`);
+      const collisions: string[] = [];
+      if (existsSync(epicPath)) {
+        collisions.push(`epic JSON exists: ${epicPath}`);
+      }
+      if (existsSync(epicSpecPath)) {
+        collisions.push(`epic spec exists: ${epicSpecPath}`);
+      }
+      const taskPaths: [string, string][] = [];
+      for (let i = 1; i <= nTasks; i += 1) {
+        const taskId = `${epicId}.${i}`;
+        const tp = join(dataDir, "tasks", `${taskId}.json`);
+        const sp = join(dataDir, "specs", `${taskId}.md`);
+        if (existsSync(tp)) {
+          collisions.push(`task JSON exists: ${tp}`);
+        }
+        if (existsSync(sp)) {
+          collisions.push(`task spec exists: ${sp}`);
+        }
+        taskPaths.push([tp, sp]);
+      }
+      if (collisions.length > 0) {
+        return {
+          kind: "failure",
+          code: "id_collision",
+          message: `Allocated epic id ${epicId} would overwrite existing files`,
+          details: collisions,
+        };
+      }
 
-    const inMemTaskDefs: Record<string, Record<string, unknown>> = {};
-    const inMemTaskSpecs: Record<string, string> = {};
-    for (let i = 1; i <= nTasks; i += 1) {
-      const taskId = `${epicId}.${i}`;
-      const depOrdinals = taskDepsList[i - 1] as number[];
-      const dependsOn = depOrdinals.map((d) => `${epicId}.${d}`);
-      inMemTaskDefs[taskId] = {
-        id: taskId,
-        epic: epicId,
-        title: taskTitles[i - 1],
-        priority: null,
-        depends_on: dependsOn,
-        target_repo: resolvedTaskTargetRepos[i - 1],
-        tier: taskTiers[i - 1],
-        model: taskModels[i - 1],
-        snippets: toArray(taskSnippetsList[i - 1]),
-        bundles: toArray(taskBundlesList[i - 1]),
+      // ----- Assemble the in-memory tree -> integrity gate -> write -----
+      const now = nowIso();
+      const epicDef: Record<string, unknown> = {
+        id: epicId,
+        title: epicTitleStr,
+        status: "open",
+        branch_name: branchName,
+        depends_on_epics: [...dependsOnEpics],
+        primary_repo: primaryRepo,
+        touched_repos: touchedRepos,
+        snippets: toArray(epicSnippets),
+        bundles: toArray(epicBundles),
+        last_validated_at: null,
         created_at: now,
         updated_at: now,
       };
-      inMemTaskSpecs[taskId] = taskSpecs[i - 1] as string;
-    }
-
-    // All-epic-ids set + {epic_id: depends_on_epics} map for the integrity
-    // helper's existence + cycle check, with the newly-minted epic overlaid.
-    const existingEpicIds = new Set<string>();
-    const existingEpicDeps: Record<string, string[]> = {};
-    const epicsGlobDir = join(dataDir, "epics");
-    if (existsSync(epicsGlobDir)) {
-      for (const f of readdirSync(epicsGlobDir)) {
-        if (!f.endsWith(".json")) {
-          continue;
-        }
-        const stem = f.slice(0, -".json".length);
-        existingEpicIds.add(stem);
-        const ep = loadJson(join(epicsGlobDir, f));
-        existingEpicDeps[stem] = [
-          ...((ep.depends_on_epics as string[] | undefined) ?? []),
-        ];
+      if (createdByCloseOf !== null) {
+        epicDef.created_by_close_of = createdByCloseOf;
       }
-    }
-    existingEpicIds.add(epicId);
-    existingEpicDeps[epicId] = [
-      ...((epicDef.depends_on_epics as string[] | undefined) ?? []),
-    ];
 
-    // Extend the existence + cycle universe across every discovered project.
-    let discovered: string[];
-    try {
-      discovered = discoverProjects();
-    } catch {
-      discovered = [];
-    }
-    const globalEpicIds =
-      discovered.length > 0 ? scanEpicIdsGlobal(discovered) : {};
-    if (discovered.length > 0) {
-      for (const project of discovered) {
-        const otherDataDir = resolveDataDir(project);
-        if (otherDataDir === null) {
-          continue;
-        }
-        const otherEpics = join(otherDataDir, "epics");
-        if (!existsSync(otherEpics)) {
-          continue;
-        }
-        for (const f of readdirSync(otherEpics)) {
+      const inMemTaskDefs: Record<string, Record<string, unknown>> = {};
+      const inMemTaskSpecs: Record<string, string> = {};
+      for (let i = 1; i <= nTasks; i += 1) {
+        const taskId = `${epicId}.${i}`;
+        const depOrdinals = taskDepsList[i - 1] as number[];
+        const dependsOn = depOrdinals.map((d) => `${epicId}.${d}`);
+        inMemTaskDefs[taskId] = {
+          id: taskId,
+          epic: epicId,
+          title: taskTitles[i - 1],
+          priority: null,
+          depends_on: dependsOn,
+          target_repo: resolvedTaskTargetRepos[i - 1],
+          tier: taskTiers[i - 1],
+          model: taskModels[i - 1],
+          snippets: toArray(taskSnippetsList[i - 1]),
+          bundles: toArray(taskBundlesList[i - 1]),
+          created_at: now,
+          updated_at: now,
+        };
+        inMemTaskSpecs[taskId] = taskSpecs[i - 1] as string;
+      }
+
+      // All-epic-ids set + {epic_id: depends_on_epics} map for the integrity
+      // helper's existence + cycle check, with the newly-minted epic overlaid.
+      const existingEpicIds = new Set<string>();
+      const existingEpicDeps: Record<string, string[]> = {};
+      const epicsGlobDir = join(dataDir, "epics");
+      if (existsSync(epicsGlobDir)) {
+        for (const f of readdirSync(epicsGlobDir)) {
           if (!f.endsWith(".json")) {
             continue;
           }
           const stem = f.slice(0, -".json".length);
-          if (stem in existingEpicDeps) {
-            continue;
-          }
-          const ep = loadJson(join(otherEpics, f));
+          existingEpicIds.add(stem);
+          const ep = loadJson(join(epicsGlobDir, f));
           existingEpicDeps[stem] = [
             ...((ep.depends_on_epics as string[] | undefined) ?? []),
           ];
         }
       }
+      existingEpicIds.add(epicId);
+      existingEpicDeps[epicId] = [
+        ...((epicDef.depends_on_epics as string[] | undefined) ?? []),
+      ];
+
+      // Extend the existence + cycle universe across every discovered project.
+      let discovered: string[];
+      try {
+        discovered = discoverProjects();
+      } catch {
+        discovered = [];
+      }
+      const globalEpicIds =
+        discovered.length > 0 ? scanEpicIdsGlobal(discovered) : {};
+      if (discovered.length > 0) {
+        for (const project of discovered) {
+          const otherDataDir = resolveDataDir(project);
+          if (otherDataDir === null) {
+            continue;
+          }
+          const otherEpics = join(otherDataDir, "epics");
+          if (!existsSync(otherEpics)) {
+            continue;
+          }
+          for (const f of readdirSync(otherEpics)) {
+            if (!f.endsWith(".json")) {
+              continue;
+            }
+            const stem = f.slice(0, -".json".length);
+            if (stem in existingEpicDeps) {
+              continue;
+            }
+            const ep = loadJson(join(otherEpics, f));
+            existingEpicDeps[stem] = [
+              ...((ep.depends_on_epics as string[] | undefined) ?? []),
+            ];
+          }
+        }
+      }
+
+      // The inline integrity gate asserts filesystem-repo validity in-process, so
+      // the trailing `validate --epic` arm never re-checks integrity — it only
+      // flips the ghost marker to ready. epicSpecContent lets the helper assert
+      // epic-spec presence from RAM — NO spec file is written before this passes.
+      const [integErrors] = checkEpicTreeInMemory(
+        epicId,
+        epicDef,
+        inMemTaskDefs,
+        inMemTaskSpecs,
+        {
+          dataDir,
+          allEpicIds: existingEpicIds,
+          allEpicDeps: existingEpicDeps,
+          allGlobalEpicIds: globalEpicIds,
+          checkFilesystemRepos: true,
+          epicSpecContent: epicSpecStr,
+        },
+      );
+      if (integErrors.length > 0) {
+        // Nothing written before the gate — pure no-op on disk.
+        return {
+          kind: "failure",
+          code: "integrity_failed",
+          message: "Scaffold integrity check failed against the in-memory tree",
+          details: integErrors,
+        };
+      }
+
+      // Integrity passed — write the whole tree. The epic mints as a not-ready
+      // ghost (last_validated_at stays null from assembly: blocked by autopilot
+      // readiness predicate 2, rendered dashed) so no dep-free task folds to
+      // [ready] before the create/defer/close flow's trailing `validate --epic`
+      // arms it once deps are wired.
+      // Burn the number in the durable ledger BEFORE any file write, still inside
+      // the flock: a subsequent destroy of these files leaves the ledger holding
+      // the number, so re-minting allocates strictly higher. Fail-soft.
+      appendEpicRecord(primaryRepo, epicNum, epicId);
+
+      // The mid-write unwind unlinks SPECS BEFORE JSONs (orphan-spec invariant).
+      const writtenPaths: string[] = [];
+      try {
+        atomicWriteJson(epicPath, epicDef, dataDir);
+        writtenPaths.push(epicPath);
+        atomicWrite(epicSpecPath, epicSpecStr, dataDir);
+        writtenPaths.push(epicSpecPath);
+        for (let i = 1; i <= nTasks; i += 1) {
+          const taskId = `${epicId}.${i}`;
+          const [tp, sp] = taskPaths[i - 1] as [string, string];
+          atomicWrite(sp, taskSpecs[i - 1] as string, dataDir);
+          writtenPaths.push(sp);
+          atomicWriteJson(
+            tp,
+            inMemTaskDefs[taskId] as Record<string, unknown>,
+            dataDir,
+          );
+          writtenPaths.push(tp);
+        }
+      } catch (exc) {
+        for (const p of writtenPaths) {
+          unlinkQuiet(p);
+        }
+        throw exc;
+      }
+
+      return { kind: "success", epicId };
+    });
+
+    if (outcome.kind === "failure") {
+      emitFailureEnvelope(outcome.code, outcome.message, outcome.details);
+      return 1;
     }
 
-    // The inline integrity gate asserts filesystem-repo validity in-process, so
-    // the trailing `validate --epic` arm never re-checks integrity — it only
-    // flips the ghost marker to ready. epicSpecContent lets the helper assert
-    // epic-spec presence from RAM — NO spec file is written before this passes.
-    const [integErrors] = checkEpicTreeInMemory(
-      epicId,
-      epicDef,
-      inMemTaskDefs,
-      inMemTaskSpecs,
+    // ------------------------------------------------------------------
+    // Phase 5: emit ONE envelope covering the whole tree (OUTSIDE the lock).
+    // ------------------------------------------------------------------
+    const epicId = outcome.epicId;
+    const taskIds: string[] = [];
+    for (let i = 1; i <= nTasks; i += 1) {
+      taskIds.push(`${epicId}.${i}`);
+    }
+    // repo_distribution = sorted {repo_path: count} counter object.
+    const counts: Record<string, number> = {};
+    for (const repo of resolvedTaskTargetRepos) {
+      counts[repo] = (counts[repo] ?? 0) + 1;
+    }
+    const repoDistribution: Record<string, number> = {};
+    for (const key of Object.keys(counts).sort()) {
+      repoDistribution[key] = counts[key] as number;
+    }
+
+    emitMutating(
       {
-        dataDir,
-        allEpicIds: existingEpicIds,
-        allEpicDeps: existingEpicDeps,
-        allGlobalEpicIds: globalEpicIds,
-        checkFilesystemRepos: true,
-        epicSpecContent: epicSpecStr,
+        epic_id: epicId,
+        task_ids: taskIds,
+        repo_distribution: repoDistribution,
+      },
+      {
+        verb: "scaffold",
+        target: epicId,
+        repoRoot: ctx.projectPath,
+        primaryRepo,
       },
     );
-    if (integErrors.length > 0) {
-      // Nothing written before the gate — pure no-op on disk.
-      return {
-        kind: "failure",
-        code: "integrity_failed",
-        message: "Scaffold integrity check failed against the in-memory tree",
-        details: integErrors,
-      };
-    }
-
-    // Integrity passed — write the whole tree. The epic mints as a not-ready
-    // ghost (last_validated_at stays null from assembly: blocked by autopilot
-    // readiness predicate 2, rendered dashed) so no dep-free task folds to
-    // [ready] before the create/defer/close flow's trailing `validate --epic`
-    // arms it once deps are wired.
-    // Burn the number in the durable ledger BEFORE any file write, still inside
-    // the flock: a subsequent destroy of these files leaves the ledger holding
-    // the number, so re-minting allocates strictly higher. Fail-soft.
-    appendEpicRecord(primaryRepo, epicNum, epicId);
-
-    // The mid-write unwind unlinks SPECS BEFORE JSONs (orphan-spec invariant).
-    const writtenPaths: string[] = [];
-    try {
-      atomicWriteJson(epicPath, epicDef, dataDir);
-      writtenPaths.push(epicPath);
-      atomicWrite(epicSpecPath, epicSpecStr, dataDir);
-      writtenPaths.push(epicSpecPath);
-      for (let i = 1; i <= nTasks; i += 1) {
-        const taskId = `${epicId}.${i}`;
-        const [tp, sp] = taskPaths[i - 1] as [string, string];
-        atomicWrite(sp, taskSpecs[i - 1] as string, dataDir);
-        writtenPaths.push(sp);
-        atomicWriteJson(
-          tp,
-          inMemTaskDefs[taskId] as Record<string, unknown>,
-          dataDir,
-        );
-        writtenPaths.push(tp);
-      }
-    } catch (exc) {
-      for (const p of writtenPaths) {
-        unlinkQuiet(p);
-      }
-      throw exc;
-    }
-
-    return { kind: "success", epicId };
-  });
-
-  if (outcome.kind === "failure") {
-    emitFailureEnvelope(outcome.code, outcome.message, outcome.details);
-    return 1;
+    return 0;
+  } finally {
+    commitGuard.release();
   }
-
-  // ------------------------------------------------------------------
-  // Phase 5: emit ONE envelope covering the whole tree (OUTSIDE the lock).
-  // ------------------------------------------------------------------
-  const epicId = outcome.epicId;
-  const taskIds: string[] = [];
-  for (let i = 1; i <= nTasks; i += 1) {
-    taskIds.push(`${epicId}.${i}`);
-  }
-  // repo_distribution = sorted {repo_path: count} counter object.
-  const counts: Record<string, number> = {};
-  for (const repo of resolvedTaskTargetRepos) {
-    counts[repo] = (counts[repo] ?? 0) + 1;
-  }
-  const repoDistribution: Record<string, number> = {};
-  for (const key of Object.keys(counts).sort()) {
-    repoDistribution[key] = counts[key] as number;
-  }
-
-  emitMutating(
-    {
-      epic_id: epicId,
-      task_ids: taskIds,
-      repo_distribution: repoDistribution,
-    },
-    {
-      verb: "scaffold",
-      target: epicId,
-      repoRoot: ctx.projectPath,
-      primaryRepo,
-    },
-  );
-  return 0;
 }
 
 // --- Local helpers ---------------------------------------------------------

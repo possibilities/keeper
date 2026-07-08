@@ -24,7 +24,8 @@
 // records commits + snapshot-diffs the data dir, so the default test tier spawns
 // zero real git.
 
-import { getVcs } from "./vcs.ts";
+import { acquireCommitWorkLock } from "./flock.ts";
+import { getVcs, type InProgressOp } from "./vcs.ts";
 
 // Bounded retry over git's own lock domains (index.lock + ref-lock). Sized so
 // the worst case (8 x 2s cap ~= 16s) fits the test timeout with margin.
@@ -150,6 +151,19 @@ function isStageContention(message: string): boolean {
  * re-parents off the winner's tip — pathspec-scoping makes that merge-free. */
 function isCommitContention(message: string): boolean {
   return message.includes("cannot lock ref");
+}
+
+/** The in-progress operation named in git's "cannot do a partial commit during a
+ * <op>." fatal, or null when `message` is not that refusal. git emits it when a
+ * pathspec commit is attempted while a merge / cherry-pick / revert holds the
+ * index — the fn-1183 destruction window. This is the EAFP safety net: a commit
+ * that slips past a STALE pre-write probe (the merge began in the probe->commit
+ * TOCTOU window) still classifies as the retryable merge_in_progress class, never
+ * the contention-retry arm (retrying would spin the whole budget against a wedge
+ * that only clears when the operation finishes). */
+function partialCommitOp(message: string): string | null {
+  const m = message.match(/cannot do a partial commit during a ([a-z-]+)/);
+  return m?.[1] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +303,18 @@ export function autoCommitFromInvocation(
       if (!(exc instanceof CommitFailed)) {
         throw exc;
       }
+      // EAFP: the commit is the authority. A pathspec commit git refuses because
+      // the checkout went mid-operation in the probe->commit TOCTOU window is the
+      // retryable merge_in_progress class — surface it immediately, never the
+      // contention-retry arm below.
+      if (exc.error === "git_commit") {
+        const midOp = partialCommitOp(exc.detail);
+        if (midOp !== null) {
+          throw new CommitFailed("merge_in_progress", exc.detail, {
+            operation: midOp,
+          });
+        }
+      }
       const stageContended =
         exc.error === "git_add" && isStageContention(exc.detail);
       const commitContended =
@@ -320,4 +346,89 @@ export function autoCommitFromInvocation(
     "commit_contended",
     `git lock contention persisted across ${RETRY_MAX_ATTEMPTS} attempts`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Pre-write merge-window guard + commit-work serialization.
+// ---------------------------------------------------------------------------
+//
+// A plan auto-commit that lands mid-operation is the fn-1183 destruction window:
+// its pathspec-staged files are committed into a checkout a later `git merge
+// --abort` discards, freeing the number for a concurrent re-mint. Two layers
+// close the window on the minting host — a mutating verb calls acquirePlanCommitGuard
+// at its entry, BEFORE any plan-state write:
+//   1. a lock-free probe of the STATE repo's in-progress op (merge / cherry-pick
+//      / revert / rebase / sequencer) that refuses before writing — a verb invoked
+//      FROM a deconflict session holds MERGE_HEAD itself, so the refusal must be
+//      immediate and never block on the lock that session's own commit may hold;
+//   2. the shared commit-work flock, held across the write -> auto-commit window so
+//      a plan verb and the daemon's base-merge / commit-work never race one
+//      checkout's index. The lock path is byte-identical to the daemon's
+//      (vcs.commitWorkLockPath).
+// The probe is best-effort UX (TOCTOU is inherent); autoCommitFromInvocation's
+// partialCommitOp classifier is the EAFP backstop for a commit that slips past a
+// stale probe.
+
+/** Plan-side commit-work lock deadline (ms). Deliberately shorter than the
+ * daemon's 45s: a plan verb parked that long behind a lint-matrix commit-work
+ * run is retryable-correct but slow, and the caller retries anyway, so a few
+ * seconds bounds the wait while still absorbing a brief in-flight commit. */
+export const PLAN_COMMIT_WORK_DEADLINE_MS = 5_000;
+
+/** The outcome of {@link acquirePlanCommitGuard}. `refused` means the verb must
+ * write nothing and emit the retryable `merge_in_progress` envelope — a probed
+ * in-progress op OR the commit-work lock held past the deadline, both carrying
+ * the same poll-then-rerun contract. `locked` means the verb may proceed;
+ * `release()` MUST run on every exit path via try/finally (never on process exit
+ * — close-finalize and the bun test harness run verbs in-process) and is a no-op
+ * when the lock degraded fail-soft to unlocked. */
+export type PlanCommitGuard =
+  | { kind: "refused"; detail: string; message: string }
+  | { kind: "locked"; release: () => void };
+
+/** Probe `stateRepo` for an in-progress git operation and, when clean, acquire
+ * the shared commit-work lock within `deadlineMs`. The probe fires FIRST and
+ * lock-free so a mid-operation refusal is immediate. A timeout is retryable
+ * (refused); an environmental acquire failure (unwritable lock dir, IO error)
+ * degrades fail-soft to an unlocked proceed with a stderr note, matching
+ * withEpicIdLock — the probe still guards the destruction window, only the
+ * concurrency serialization is lost. Lock order is fixed: this commit-work lock
+ * is the OUTER lock; a verb's epic-id / task lock nests INSIDE it. */
+export function acquirePlanCommitGuard(
+  stateRepo: string,
+  deadlineMs: number = PLAN_COMMIT_WORK_DEADLINE_MS,
+): PlanCommitGuard {
+  const op: InProgressOp = getVcs().inProgressOp(stateRepo);
+  if (op !== "none") {
+    return {
+      kind: "refused",
+      detail: `operation: ${op}`,
+      message:
+        `the plan state repo has a ${op} in progress — no plan state was ` +
+        "written; wait for the operation to finish, then re-run",
+    };
+  }
+  const lockPath = getVcs().commitWorkLockPath(stateRepo);
+  const acquired = acquireCommitWorkLock(lockPath, deadlineMs);
+  switch (acquired.kind) {
+    case "acquired":
+      return { kind: "locked", release: () => acquired.lock.release() };
+    case "timeout":
+      return {
+        kind: "refused",
+        detail: "operation: commit-work-lock",
+        message:
+          "the plan state repo's commit-work lock is held by a concurrent " +
+          `commit or base-merge past the ${deadlineMs}ms deadline — no plan ` +
+          "state was written; re-run once it clears",
+      };
+    case "environmental":
+      // Fail-soft to unlocked (the probe above still guards the destruction
+      // window); surface the degrade on stderr without flipping the success path.
+      process.stderr.write(
+        `planctl.commit: commit-work lock unavailable at ${lockPath} ` +
+          `(${acquired.message}); proceeding unlocked\n`,
+      );
+      return { kind: "locked", release: () => {} };
+  }
 }

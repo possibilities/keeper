@@ -299,6 +299,20 @@ function scaffoldFollowup(
   );
 
   if (rc) {
+    // A follow-up scaffold that REFUSED because the state repo is mid-operation
+    // (merge/cherry-pick/revert/rebase) wrote nothing and is retryable — surface
+    // it as a distinct re-runnable outcome, not terminal SCAFFOLD_FAILED (which
+    // reads as a broken plan). A re-close once the window closes completes.
+    if (scaffoldRefusedMidOperation(output)) {
+      emitFinalizeError(
+        "MERGE_IN_PROGRESS",
+        "the follow-up scaffold hit an in-progress operation in the state " +
+          "repo; nothing was written and the source epic is still open — " +
+          "re-run the close once the operation finishes",
+        format,
+        { scaffold_output: output.trim() },
+      );
+    }
     emitFinalizeError(
       "SCAFFOLD_FAILED",
       "scaffold of the follow-up plan failed; the source epic is still " +
@@ -319,6 +333,40 @@ function scaffoldFollowup(
     );
   }
   return newEpicId;
+}
+
+/** True when scaffold's captured output carries the retryable merge_in_progress
+ * failure envelope ({success:false, error:{code:"merge_in_progress", ...}}). The
+ * follow-up scaffold refuses (writing nothing) when the state repo is
+ * mid-operation; scaffoldFollowup passes that class through as a re-runnable
+ * outcome rather than mapping it to terminal SCAFFOLD_FAILED. Scans every JSON
+ * object on the captured stream, matching parseScaffoldEpicId's decode dance. */
+function scaffoldRefusedMidOperation(output: string): boolean {
+  let idx = 0;
+  while (idx < output.length) {
+    const brace = output.indexOf("{", idx);
+    if (brace === -1) {
+      break;
+    }
+    const decoded = rawDecode(output, brace);
+    if (decoded === null) {
+      idx = brace + 1;
+      continue;
+    }
+    const [obj, end] = decoded;
+    if (obj !== null && typeof obj === "object") {
+      const err = (obj as Record<string, unknown>).error;
+      if (
+        err !== null &&
+        typeof err === "object" &&
+        (err as Record<string, unknown>).code === "merge_in_progress"
+      ) {
+        return true;
+      }
+    }
+    idx = end;
+  }
+  return false;
 }
 
 /** Pull epic_id from scaffold's success envelope on stdout, skipping the

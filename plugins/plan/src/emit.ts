@@ -230,6 +230,10 @@ const PLAN_ERROR_RECOVERY: Record<string, string> = {
   integrity_failed:
     "The post-write integrity check failed and the write was not committed. " +
     "Re-run the verb; if it persists, inspect the reported artifacts.",
+  merge_in_progress:
+    "The plan state repo is mid-operation (a merge/cherry-pick/revert/rebase, " +
+    "or the shared commit-work lock is held by a concurrent commit/base-merge). " +
+    "Nothing was written — wait for it to finish, then re-run the verb.",
   target_invalid:
     "The target id is not well-formed or does not exist. Correct the target " +
     "and re-run.",
