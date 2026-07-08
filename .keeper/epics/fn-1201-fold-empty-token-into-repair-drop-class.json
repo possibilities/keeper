@@ -7,7 +7,7 @@
     "fn-1198-fix-repair-escalation-dispatch"
   ],
   "id": "fn-1201-fold-empty-token-into-repair-drop-class",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T23:25:45.549000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T23:25:44.775000Z"
+  "updated_at": "2026-07-08T23:25:45.549000Z"
 }
