@@ -5903,6 +5903,15 @@ test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on
   expect(brief).toContain("to proceed, tell me exactly:");
   // The NOT-clear path aborts to a clean lane (never a half-merge).
   expect(brief).toContain("git merge --abort");
+  // The foreign-staged guard: before BOTH the concluding commit and the decline abort,
+  // unstage (leave-in-tree) any path staged OUTSIDE this merge's own set — a concurrent
+  // commit's staged work a whole-index commit / abort would otherwise sweep or destroy.
+  // Keyed on the merge's OWN set (`git diff HEAD MERGE_HEAD`) so a resolved-then-staged
+  // conflict file is never mistaken for foreign work.
+  expect(brief).toContain("FOREIGN staged path");
+  expect(brief).toContain("git restore --staged");
+  expect(brief).toContain("git diff --cached --name-only");
+  expect(brief).toContain("git diff --name-only HEAD MERGE_HEAD");
   // The free-text reason rides as a body line.
   expect(brief).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
 });
@@ -5925,6 +5934,11 @@ test("buildResolverBrief: a parse-miss degrades to a still-actionable brief (nev
   expect(brief).toContain("keeper find-file-history");
   expect(brief).toContain("Do NOT invent new behaviour");
   expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
+  // The foreign-staged guard rides the shared blockedPath (abort) + clear-path commit
+  // into the parse-miss branch too.
+  expect(brief).toContain("FOREIGN staged path");
+  expect(brief).toContain("git restore --staged");
+  expect(brief).toContain("git diff --name-only HEAD MERGE_HEAD");
 });
 
 test("buildResolverBrief: a null/empty repoDir degrades to the manual body (never throws)", () => {

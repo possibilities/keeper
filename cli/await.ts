@@ -1426,7 +1426,7 @@ export async function runAwait(
   // for an aggregate it names which condition failed.
   const emitPlanFailure = (
     slot: PlanSlotState,
-    reason: "not-found" | "deleted" | "stuck",
+    reason: "not-found" | "deleted" | "stuck" | "ambiguous",
     code: number,
     detail: string | undefined,
   ): void => {
@@ -1975,6 +1975,12 @@ export async function runAwait(
           emitPlanFailure(slot, "not-found", 1, undefined);
           return;
         }
+        // A bare `fn-N` target resolving to 2+ live epics is a terminal usage
+        // refusal known at arm time (fn-1193) — exit 6 naming the candidates.
+        if (slot?.kind === "plan" && ev?.kind === "ambiguous") {
+          emitPlanFailure(slot, "ambiguous", 6, ev.detail);
+          return;
+        }
         // Refuse-upfront: a `monitor-running` slot that's already `met` at
         // arm time matched no running monitor in this session — refuse
         // loudly instead of an instant `met` (premature-unblock guard).
@@ -2063,6 +2069,12 @@ export async function runAwait(
       }
       if (ev.kind === "stuck" && args.failOnStuck) {
         emitPlanFailure(slot, "stuck", 5, ev.detail);
+        return;
+      }
+      // A bare-id ambiguity that first arises mid-stream (a second same-number
+      // epic appears) is terminal too — exit 6 naming the candidates (fn-1193).
+      if (ev.kind === "ambiguous") {
+        emitPlanFailure(slot, "ambiguous", 6, ev.detail);
         return;
       }
     }

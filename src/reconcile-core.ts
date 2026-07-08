@@ -681,6 +681,17 @@ export interface ReconcileSnapshot {
    */
   staleBaseDistressIds?: Set<string>;
   /**
+   * The `dispatch_failures.id`s that currently have an OPEN per-(project,number)
+   * duplicate-epic-number distress row (synthetic `daemon::dup-epic-number:<projectHash>-
+   * <number>`, collected off the row's `id`). PRODUCER-ONLY: read by the duplicate-number
+   * probe to level-clear a distress row whose duplicate no longer holds (a conflicting
+   * epic renumbered, deleted, or gone done) — NOT by the pure `reconcile`. Off the durable
+   * projection (not in-memory) so a restarted worker still clears a distress it minted
+   * before the restart. Keyed on the ID directly (the per-(project,number) hash is
+   * one-way). Optional for call-site back-compat; an absent field is an empty set.
+   */
+  dupEpicNumberDistressIds?: Set<string>;
+  /**
    * Producer-side LIVE-JOB dirty attribution for the worktree pre-merge clean —
    * keyed by lane worktree path (== `file_attributions.project_dir`, realpath +
    * trailing-slash normalized), each value the repo-relative paths a currently-LIVE

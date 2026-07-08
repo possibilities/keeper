@@ -51,11 +51,13 @@ import {
   classifyWorktreeRepos,
   closerJobFinished,
   computeDeferredEpicIds,
+  computeDuplicateEpicNumberGroups,
   computeMergedLaneEntries,
   computeSlotOccupancy,
   computeStaleBaseLaneEntries,
   confirmRunning,
   createDispatchFailedGate,
+  createDupEpicNumberTracker,
   createLaneWedgeTracker,
   createSharedCheckoutDesyncTracker,
   createSharedCheckoutDirtyTracker,
@@ -69,6 +71,9 @@ import {
   type DispatchedPayload,
   type DispatchFailedPayload,
   type DispatchKey,
+  DUP_EPIC_NUMBER_DISTRESS_REASON,
+  type DupEpicNumberObservation,
+  dupEpicNumberDistressId,
   epicFrameVerdict,
   epicHasActiveResolver,
   epicPresentAndNotDone,
@@ -8843,6 +8848,9 @@ function makeRecoveryGit(state: {
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
   linkedWorktreeAt?: Set<string>; // cwds whose git-dir ≠ common-dir → a linked lane (skipped by the sweep filter)
   probeErrorAt?: Set<string>; // cwds whose git-dir/common-dir probe exits nonzero → defer the repo this cycle
+  stagedPaths?: Map<string, string[]>; // cwd → `git diff --cached --name-only -z` paths (mid-merge staged set the abort would touch)
+  mergeTouchedPaths?: Map<string, string[]>; // cwd → `git diff --name-only -z HEAD MERGE_HEAD` paths (the merge's OWN set — auto-merged + resolved conflicts)
+  stagedProbeFailAt?: Map<string, number>; // cwd → non-zero exit for the `git diff --cached` staged-set probe (an inconclusive foreign-staged probe)
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
   calls: { cwd: string; args: string; env?: Record<string, string> }[];
@@ -8888,6 +8896,28 @@ function makeRecoveryGit(state: {
       }
       state.mergeHeadAt?.delete(cwd);
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "diff --cached --name-only -z") {
+      // The foreign-staged probe's staged-set read (held under the abort flock). A
+      // pinned non-zero exit models an inconclusive probe → the abort defers fail-safe.
+      const fail = state.stagedProbeFailAt?.get(cwd);
+      if (fail !== undefined && fail !== 0) {
+        return { code: fail, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: (state.stagedPaths?.get(cwd) ?? []).join("\0"),
+        stderr: "",
+      };
+    }
+    if (joined === "diff --name-only -z HEAD MERGE_HEAD") {
+      // The merge's OWN set (auto-merged + resolved conflicts): any staged path outside
+      // it is FOREIGN. Only read when the staged set is non-empty.
+      return {
+        code: 0,
+        stdout: (state.mergeTouchedPaths?.get(cwd) ?? []).join("\0"),
+        stderr: "",
+      };
     }
     if (joined === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
       const present = state.autostashAt?.has(cwd) ?? false;
@@ -9619,6 +9649,168 @@ test("fn-1114 recoverWorktrees: a lock-timeout acquiring the flock for the main-
   expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
   expect(failures).toHaveLength(1);
   expect(failures[0]?.reason).toContain("worktree-recover-lock-timeout");
+});
+
+test("fn-1193 recoverWorktrees: a keeper-owned main mid-merge with ONLY the merge's OWN paths staged (auto-merged / resolved-then-staged) still aborts — no foreign work to preserve", async () => {
+  // Under the abort flock the pass probes the staged set vs the merge's own set
+  // (`git diff HEAD MERGE_HEAD`). Every staged path here IS the merge's own — a
+  // resolved-then-staged conflict file and an auto-merged file — so there is no
+  // concurrent commit's work to lose: the abort proceeds exactly as before.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    stagedPaths: new Map([["/repo", ["src/resolved.ts", "src/auto.ts"]]]),
+    mergeTouchedPaths: new Map([["/repo", ["src/resolved.ts", "src/auto.ts"]]]),
+    epicBases: [], // keep pass-2 a no-op; this case is only about the abort gate
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(failures).toEqual([]);
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(1);
+});
+
+test("fn-1193 recoverWorktrees: a keeper-owned main mid-merge with a FOREIGN staged path DEFERS the abort with a distinct worktree-recover-staged-foreign reason (the id-reservation incident: never destroy a concurrent commit's staged work)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    // A concurrent `keeper plan` mint staged its pathspec file; the merge itself never
+    // touched it, so it is FOREIGN — a git merge --abort would wipe it.
+    stagedPaths: new Map([
+      ["/repo", ["src/resolved.ts", ".keeper/epics/fn-42-x.json"]],
+    ]),
+    mergeTouchedPaths: new Map([["/repo", ["src/resolved.ts"]]]),
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  // The abort was DEFERRED — never run — so the foreign staged file survives.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBeNull();
+  expect(failures[0]?.dir).toBe("/repo");
+  expect(failures[0]?.reason).toContain("worktree-recover-staged-foreign");
+  expect(failures[0]?.reason).toContain(".keeper/epics/fn-42-x.json");
+  // Distinct from the existing mid-merge / lock-timeout / abort-failed defer reasons.
+  expect(failures[0]?.reason).not.toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).not.toContain("worktree-recover-lock-timeout");
+  // Inside the recover prefix so the level-clear releases it once the staged work goes.
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1193 recoverWorktrees: once the FOREIGN staged path is unstaged, the next cycle aborts and the recover row level-clears (positive-evidence, never a stuck wedge)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  // ONE mutable state so cycle 1 (foreign present, defer — no abort, MERGE_HEAD stays)
+  // and cycle 2 (foreign unstaged, abort proceeds) share the same checkout.
+  const state = {
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    stagedPaths: new Map([
+      ["/repo", ["src/resolved.ts", ".keeper/epics/fn-42-x.json"]],
+    ]),
+    mergeTouchedPaths: new Map([["/repo", ["src/resolved.ts"]]]),
+    epicBases: [] as string[],
+    defaultBranch: "main",
+    repoHead: "main",
+  };
+  const { run, calls, lock } = makeRecoveryGit(state);
+  // Cycle 1: foreign staged → defer, no abort.
+  const c1 = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(0);
+  const stagedForeign = c1.failures.find((f) =>
+    f.reason.includes("worktree-recover-staged-foreign"),
+  );
+  expect(stagedForeign).toBeDefined();
+  const openId = recoverFailureDispatchId(
+    stagedForeign as WorktreeRecoveryFailure,
+  );
+  // The open row does NOT clear while the defer still fires (never-clear-what-fails).
+  expect(
+    recoverFailuresToClear(new Set([openId]), c1.failures, c1.resolved),
+  ).toEqual([]);
+
+  // Cycle 2: the concurrent commit landed / unstaged its file → abort proceeds.
+  state.stagedPaths = new Map([["/repo", ["src/resolved.ts"]]]);
+  const c2 = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(1);
+  expect(
+    c2.failures.some((f) =>
+      f.reason.includes("worktree-recover-staged-foreign"),
+    ),
+  ).toBe(false);
+  // Positive evidence emitted for the dir + no fresh failure → the row level-clears.
+  expect(
+    recoverFailuresToClear(new Set([openId]), c2.failures, c2.resolved),
+  ).toEqual([openId]);
+});
+
+test("fn-1193 recoverWorktrees: an INCONCLUSIVE foreign-staged probe (git diff --cached fails) DEFERS the abort fail-safe — an unknown staged state is never a licence to destroy", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    stagedProbeFailAt: new Map([["/repo", 1]]), // the staged-set read fails
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-staged-probe");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
 });
 
 test("fn-1140 recoverWorktrees pass-2: a foreign main-checkout wedge NO LONGER blocks the DONE base merge — pass-2 advances it via plumbing (the decoupling), and the foreign wedge is never aborted", async () => {
@@ -13520,6 +13712,147 @@ test("stale tracker: a restart (fresh tracker) still level-clears a row minted b
       .length;
   }
   expect(mints).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1193 — the duplicate-epic-number producer probe + distress tracker. The
+// probe is a PURE O(open epics) read over the epics projection; the tracker is a
+// CLONE of the stale-base tracker (grace 0 → mint on first observation), keyed on
+// the per-(project,number) distress ID. All expected values are hand-computed
+// constants, never re-derived from the probe/tracker.
+// ---------------------------------------------------------------------------
+
+test("fn-1193 computeDuplicateEpicNumberGroups: two non-done same-project epics sharing a number → one group naming both (sorted)", () => {
+  const groups = computeDuplicateEpicNumberGroups([
+    makeEpic({ epic_id: "fn-7-zeta", epic_number: 7, project_dir: "/repo" }),
+    makeEpic({ epic_id: "fn-7-alpha", epic_number: 7, project_dir: "/repo" }),
+    makeEpic({ epic_id: "fn-8-solo", epic_number: 8, project_dir: "/repo" }),
+  ]);
+  expect(groups).toEqual([
+    {
+      epicNumber: 7,
+      projectDir: "/repo",
+      epicIds: ["fn-7-alpha", "fn-7-zeta"],
+    },
+  ]);
+});
+
+test("fn-1193 computeDuplicateEpicNumberGroups: a DONE epic in the pair is history, not a jam — no group", () => {
+  // A duplicate involving a done epic is closed history; scoping to non-done pairs
+  // keeps closed history from minting eternal distress.
+  expect(
+    computeDuplicateEpicNumberGroups([
+      makeEpic({ epic_id: "fn-7-live", epic_number: 7, project_dir: "/repo" }),
+      makeEpic({
+        epic_id: "fn-7-done",
+        epic_number: 7,
+        project_dir: "/repo",
+        status: "done",
+      }),
+    ]),
+  ).toEqual([]);
+});
+
+test("fn-1193 computeDuplicateEpicNumberGroups: same number in DIFFERENT projects is NOT a duplicate", () => {
+  expect(
+    computeDuplicateEpicNumberGroups([
+      makeEpic({ epic_id: "fn-7-a", epic_number: 7, project_dir: "/repo-a" }),
+      makeEpic({ epic_id: "fn-7-b", epic_number: 7, project_dir: "/repo-b" }),
+    ]),
+  ).toEqual([]);
+});
+
+test("fn-1193 computeDuplicateEpicNumberGroups: null number / null project are un-keyable and skipped", () => {
+  expect(
+    computeDuplicateEpicNumberGroups([
+      makeEpic({ epic_id: "fn-x-1", epic_number: null, project_dir: "/repo" }),
+      makeEpic({ epic_id: "fn-x-2", epic_number: null, project_dir: "/repo" }),
+      makeEpic({ epic_id: "fn-7-a", epic_number: 7, project_dir: null }),
+      makeEpic({ epic_id: "fn-7-b", epic_number: 7, project_dir: null }),
+    ]),
+  ).toEqual([]);
+});
+
+const DUP_ID_7 = dupEpicNumberDistressId("/repo", 7);
+const DUP_OBS_7: DupEpicNumberObservation = {
+  projectDir: "/repo",
+  epicNumber: 7,
+  epicIds: ["fn-7-alpha", "fn-7-zeta"],
+};
+
+test("fn-1193 dup tracker: a duplicate mints EXACTLY once on first observation (grace 0), keyed per-(project,number)", () => {
+  const tracker = createDupEpicNumberTracker(); // grace 0
+  const dup = new Map([[DUP_ID_7, DUP_OBS_7]]);
+  const empty = new Set<string>();
+  const first = tracker.step({
+    duplicates: dup,
+    openDistressIds: empty,
+    nowSec: 1000,
+  });
+  expect(first.mint.length).toBe(1);
+  expect(first.mint[0]?.id).toBe(DUP_ID_7);
+  expect(first.mint[0]?.dir).toBe("/repo");
+  expect(
+    first.mint[0]?.reason?.startsWith(DUP_EPIC_NUMBER_DISTRESS_REASON),
+  ).toBe(true);
+  expect(first.mint[0]?.reason).toContain("fn-7-alpha");
+  expect(first.mint[0]?.reason).toContain("fn-7-zeta");
+  // Subsequent cycles while still duplicated → NEVER re-mint (O(1) per episode).
+  for (const ts of [1001, 1600, 5000]) {
+    expect(
+      tracker.step({ duplicates: dup, openDistressIds: empty, nowSec: ts })
+        .mint,
+    ).toEqual([]);
+  }
+});
+
+test("fn-1193 dup tracker: the duplicate resolving level-clears the open distress row EXACTLY once", () => {
+  const tracker = createDupEpicNumberTracker();
+  const dup = new Map([[DUP_ID_7, DUP_OBS_7]]);
+  const open = new Set([DUP_ID_7]); // durable open distress row
+  // Still duplicated → no clear.
+  expect(
+    tracker.step({ duplicates: dup, openDistressIds: open, nowSec: 2000 })
+      .clear,
+  ).toEqual([]);
+  // The probe stops reporting the duplicate (renumbered / removed / gone done) but the
+  // row is still open → level-clear it once, keyed on the same per-(project,number) id.
+  const cleared = tracker.step({
+    duplicates: new Map(),
+    openDistressIds: open,
+    nowSec: 2001,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([DUP_ID_7]);
+  // Once main folds the clear the row is gone → no re-clear.
+  expect(
+    tracker.step({
+      duplicates: new Map(),
+      openDistressIds: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("fn-1193 dup tracker: key is STABLE across cycles and DISTINCT per (project, number)", () => {
+  // Same (project, number) → same id across cycles (mint + clear hit one row).
+  expect(dupEpicNumberDistressId("/repo", 7)).toBe(DUP_ID_7);
+  // Distinct number, or distinct project → distinct rows.
+  expect(dupEpicNumberDistressId("/repo", 8)).not.toBe(DUP_ID_7);
+  expect(dupEpicNumberDistressId("/repo-b", 7)).not.toBe(DUP_ID_7);
+});
+
+test("fn-1193 dup tracker: a restart (fresh tracker) still level-clears a row minted before it", () => {
+  // Simulate a daemon restart: brand-new tracker, empty in-memory latch, but the
+  // durable distress row is still open in the projection. The duplicate resolved during
+  // downtime → the projection-driven clear fires even though this instance never minted.
+  const fresh = createDupEpicNumberTracker();
+  const open = new Set([DUP_ID_7]);
+  const cleared = fresh.step({
+    duplicates: new Map(),
+    openDistressIds: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([DUP_ID_7]);
 });
 
 test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH suppressed; a non-deferred sibling still launches (no sticky / dispatch_failures minted)", () => {

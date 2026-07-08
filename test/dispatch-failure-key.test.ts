@@ -16,6 +16,10 @@ import {
   CRASH_LOOP_DISTRESS_VERB,
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
+  DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
+  DUP_EPIC_NUMBER_DISTRESS_REASON,
+  DUP_EPIC_NUMBER_DISTRESS_VERB,
+  isDupEpicNumberDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isSharedDesyncDistressKey,
@@ -614,6 +618,7 @@ describe("single vocabulary source", () => {
       ["worktree-lane-wedge", "lane-wedge"],
       ["worktree-lane-premerge", "lane-premerge"],
       ["stale-base-lane", "stale-base"],
+      ["dup-epic-number", "dup-epic-number"],
       ["stuck-sentinel", "stuck-sentinel"],
     ]);
   });
@@ -815,6 +820,112 @@ describe("fn-1127 stale-base-lane distress vocabulary", () => {
     expect(
       STALE_BASE_DISTRESS_ID_PREFIX.startsWith(STALE_BASE_DISTRESS_REASON),
     ).toBe(true);
+  });
+});
+
+// ── fn-1193 — the duplicate-epic-number distress family ─────────────────────
+
+describe("fn-1193 duplicate-epic-number distress vocabulary", () => {
+  test("dup-epic-number distress key → unknown (never enters failedKeys)", () => {
+    // Same synthetic-verb discipline as the shared-checkout / lane / stale distress rows,
+    // per-(project,number): the id carries `<projectHash>-<number>`. It must route as
+    // `unknown` for EVERY shape so no dup row ever suppresses a real dispatch key.
+    for (const suffix of ["abc123-7", "0-1", "zz9-1193"]) {
+      const id = `${DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX}${suffix}`;
+      expect(
+        routeDispatchFailure(
+          row(
+            DUP_EPIC_NUMBER_DISTRESS_VERB,
+            id,
+            `${DUP_EPIC_NUMBER_DISTRESS_REASON}: plan number 7 is held by 2 live epics`,
+          ),
+        ).kind,
+      ).toBe("unknown");
+      expect(
+        isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, id),
+      ).toBe(true);
+    }
+  });
+
+  test("isDupEpicNumberDistressKey is the synthetic daemon-verb per-(project,number) surface only", () => {
+    const id = `${DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX}abc123-7`;
+    expect(isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, id)).toBe(
+      true,
+    );
+    // Wrong verb, wrong id prefix, and a real close/work row all miss.
+    expect(isDupEpicNumberDistressKey("close", id)).toBe(false);
+    expect(isDupEpicNumberDistressKey("work", id)).toBe(false);
+    expect(isDupEpicNumberDistressKey("work", "fn-1-x.2")).toBe(false);
+    // The crash-loop id shares the verb but lacks the prefix.
+    expect(
+      isDupEpicNumberDistressKey(
+        CRASH_LOOP_DISTRESS_VERB,
+        CRASH_LOOP_DISTRESS_ID,
+      ),
+    ).toBe(false);
+    // Shares the un-retryable synthetic `daemon` verb with the sibling distress rows.
+    expect(DUP_EPIC_NUMBER_DISTRESS_VERB).toBe(CRASH_LOOP_DISTRESS_VERB);
+    expect(DUP_EPIC_NUMBER_DISTRESS_VERB).not.toBe("work");
+    expect(DUP_EPIC_NUMBER_DISTRESS_VERB).not.toBe("close");
+  });
+
+  test("dup-epic-number distress key is DISJOINT from every sibling distress key", () => {
+    // The prefixes never mutually match, so their rows never cross-classify/cross-clear.
+    const tail = "abc123-7";
+    const dupId = `${DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX}${tail}`;
+    const staleId = `${STALE_BASE_DISTRESS_ID_PREFIX}${tail}`;
+    const wedgeId = `${SHARED_WEDGE_DISTRESS_ID_PREFIX}${tail}`;
+    const desyncId = `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${tail}`;
+    const laneId = `${LANE_WEDGE_DISTRESS_ID_PREFIX}${tail}`;
+    // The dup id is a dup key but NONE of the others.
+    expect(
+      isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, dupId),
+    ).toBe(true);
+    expect(isStaleBaseDistressKey(STALE_BASE_DISTRESS_VERB, dupId)).toBe(false);
+    expect(isSharedWedgeDistressKey(SHARED_WEDGE_DISTRESS_VERB, dupId)).toBe(
+      false,
+    );
+    expect(isSharedDesyncDistressKey(SHARED_DESYNC_DISTRESS_VERB, dupId)).toBe(
+      false,
+    );
+    expect(isLaneWedgeDistressKey(LANE_WEDGE_DISTRESS_VERB, dupId)).toBe(false);
+    // …and a sibling id is never a dup key.
+    expect(
+      isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, staleId),
+    ).toBe(false);
+    expect(
+      isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, wedgeId),
+    ).toBe(false);
+    expect(
+      isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, desyncId),
+    ).toBe(false);
+    expect(
+      isDupEpicNumberDistressKey(DUP_EPIC_NUMBER_DISTRESS_VERB, laneId),
+    ).toBe(false);
+  });
+
+  test("dup-epic-number distress reason is collision-free + display-mapped", () => {
+    expect(DUP_EPIC_NUMBER_DISTRESS_REASON).toBe("dup-epic-number");
+    expect(DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX).toBe("dup-epic-number:");
+    // A dup row's reason classifies to its OWN display kind (never shadowed by a sibling).
+    expect(
+      classifyDispatchFailure(
+        `${DUP_EPIC_NUMBER_DISTRESS_REASON}: plan number 7 is held by 2 live epics`,
+      ),
+    ).toBe("dup-epic-number");
+    // No OTHER display-rule prefix is a prefix of the dup reason, nor it of them.
+    for (const { prefix } of DISPATCH_FAILURE_DISPLAY_RULES) {
+      if (prefix === DUP_EPIC_NUMBER_DISTRESS_REASON) continue;
+      expect(DUP_EPIC_NUMBER_DISTRESS_REASON.startsWith(prefix)).toBe(false);
+      expect(prefix.startsWith(DUP_EPIC_NUMBER_DISTRESS_REASON)).toBe(false);
+    }
+    // The dup row lives OUTSIDE the `worktree-recover*` auto-clear + lane pre-merge scopes.
+    expect(
+      isWorktreeRecoverReason(`${DUP_EPIC_NUMBER_DISTRESS_REASON}: x`),
+    ).toBe(false);
+    expect(
+      isWorktreeLanePremergeReason(`${DUP_EPIC_NUMBER_DISTRESS_REASON}: x`),
+    ).toBe(false);
   });
 });
 

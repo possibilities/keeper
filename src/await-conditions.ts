@@ -306,7 +306,13 @@ export type AwaitState =
   | { kind: "waiting"; detail?: string; signature?: string }
   | { kind: "not-found"; detail?: string; signature?: string }
   | { kind: "deleted"; detail?: string; signature?: string }
-  | { kind: "stuck"; detail?: string; signature?: string };
+  | { kind: "stuck"; detail?: string; signature?: string }
+  // A bare `fn-N` target that resolves to 2+ live epics — a terminal usage
+  // refusal, never a wait: the command cannot know which epic the caller meant,
+  // so it exits naming every candidate (fn-1193). `detail` carries the
+  // comma-joined candidate ids. Distinct from `not-found` (no match) — this is
+  // TOO-MANY matches.
+  | { kind: "ambiguous"; detail?: string; signature?: string };
 
 // ---------------------------------------------------------------------------
 // Index lookups
@@ -332,39 +338,59 @@ function findTaskById(
 }
 
 /**
- * Find an epic by full id (`fn-N-slug`) or bare id (`fn-N`). The bare
- * form matches by `epic_number`; the full form matches by `epic_id`
- * exactly. Mirrors the bare-vs-full split in `cli/board.ts:439`
- * (`epicNumFromIdOrBare`) without re-using its full resolver shape —
- * here we only need a presence check, not the cross-project tie-break.
+ * Discriminated outcome of {@link findEpicByIdOrBare}. A bare `fn-N` that
+ * matches 2+ epics is a REFUSAL (`ambiguous`), never a silent first-match —
+ * the resolver cannot know which epic the caller meant, so it names every
+ * candidate and lets the caller surface the refusal (fn-1193). This mirrors
+ * the board-side `resolveEpicDep`, which already refuses a bare-id ambiguity
+ * (dangling + a diagnostic naming every match) rather than coin-flipping — the
+ * two resolvers now AGREE on refuse-don't-guess.
+ */
+export type EpicIdResolution =
+  | { kind: "found"; epic: Epic }
+  | { kind: "none" }
+  | { kind: "ambiguous"; matches: string[] };
+
+/**
+ * Resolve an epic by full id (`fn-N-slug`) or bare id (`fn-N`). The bare form
+ * matches by `epic_number`; the full form matches by `epic_id` exactly.
  *
- * Returns `null` when no epic in the input scope matches. Ambiguity
- * (two epics in scope with the same `epic_number`) returns the first
- * match by iteration order; the command's scope-exempt re-query path is
- * what disambiguates a truly absent epic from a renamed one.
+ * Full-id resolution is unchanged: exact `epic_id` match → `found`, else
+ * `none` (an `epic_id` is unique, so it can never be ambiguous). Bare-id
+ * resolution refuses ambiguity: zero matches → `none`; exactly one → `found`;
+ * 2+ → `ambiguous` naming every matching full id (SORTED, so the refusal is
+ * deterministic). The command's scope-exempt re-query path still disambiguates
+ * a truly absent epic from a renamed one on the `none` branch.
  */
 export function findEpicByIdOrBare(
   epics: readonly Epic[],
   id: string,
-): Epic | null {
+): EpicIdResolution {
   const bareMatch = /^fn-(\d+)$/.exec(id);
   if (bareMatch !== null) {
     const num = Number.parseInt(bareMatch[1] ?? "", 10);
-    if (Number.isFinite(num)) {
-      for (const e of epics) {
-        if (e.epic_number === num) {
-          return e;
-        }
-      }
+    if (!Number.isFinite(num)) {
+      return { kind: "none" };
     }
-    return null;
+    const matches = epics.filter((e) => e.epic_number === num);
+    if (matches.length === 0) {
+      return { kind: "none" };
+    }
+    if (matches.length === 1) {
+      // Non-null: length===1 guarantees the element exists.
+      return { kind: "found", epic: matches[0] as Epic };
+    }
+    return {
+      kind: "ambiguous",
+      matches: matches.map((e) => e.epic_id).sort(),
+    };
   }
   for (const e of epics) {
     if (e.epic_id === id) {
-      return e;
+      return { kind: "found", epic: e };
     }
   }
-  return null;
+  return { kind: "none" };
 }
 
 // ---------------------------------------------------------------------------
@@ -679,10 +705,21 @@ function evaluateEpicAwait(
   inputs: AwaitInputs,
   target: AwaitTarget,
 ): AwaitState {
-  const epic = findEpicByIdOrBare(inputs.epics, target.id);
-  if (epic === null) {
+  const resolved = findEpicByIdOrBare(inputs.epics, target.id);
+  if (resolved.kind === "ambiguous") {
+    // A bare `fn-N` matching 2+ live epics is a terminal usage refusal, not a
+    // wait — the command exits naming every candidate (fn-1193).
+    return {
+      kind: "ambiguous",
+      detail: `bare id ${target.id} is ambiguous — matches ${resolved.matches.join(
+        ", ",
+      )}`,
+    };
+  }
+  if (resolved.kind === "none") {
     return absentBranch(inputs, target);
   }
+  const epic = resolved.epic;
   if (target.condition === "complete") {
     // fn-1015: with the await-complete opt-in recent-done merge feeding this
     // input set, a done epic stays observable through its close-row wind-down,

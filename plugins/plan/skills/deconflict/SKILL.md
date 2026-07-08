@@ -75,7 +75,7 @@ Resolve every conflict by **merging BOTH intents** — read both branches' epic 
 
 ## Phase 4 — Verify, commit, retry the close
 
-Run the epic's tests and build; a failure here is an attempt spent, not a commit. Then commit the merge in the worktree and verify `source_branch` is now an ancestor:
+Run the epic's tests and build; a failure here is an attempt spent, not a commit. Before committing, unstage any FOREIGN staged path — one in `git diff --cached --name-only` but NOT in `git diff --name-only HEAD MERGE_HEAD` (this merge's own set) — with `git restore --staged`, leaving it in the tree, so the merge commit carries only this merge's content and never a concurrent commit's staged files. Then commit the merge in the worktree and verify `source_branch` is now an ancestor:
 
 ```bash
 git branch --contains <source_branch>   # lists base_branch
@@ -91,7 +91,7 @@ Confirm the retry envelope reports success. Do not run `keeper autopilot play` �
 
 ## Decline
 
-When the conflict is not mechanically clear, hits a decline condition, or resists ~3 passes, abort the merge (`git merge --abort`) so the base worktree is left clean, then page the human once and stop:
+When the conflict is not mechanically clear, hits a decline condition, or resists ~3 passes, first preserve any foreign staged work — `git restore --staged` every staged path (`git diff --cached --name-only`) NOT in `git diff --name-only HEAD MERGE_HEAD`, leaving it in the tree so the abort cannot destroy a concurrent commit's files — then abort the merge (`git merge --abort`) so the base worktree is left clean, then page the human once and stop:
 
 ```bash
 botctl send-message --topic Keeper "deconflict::<epic_id> declined — FOUND: <the conflict, which paths>. TRIED: <the reconciliation you attempted>. STOPPED: <why merging both sides is unsafe here>."
