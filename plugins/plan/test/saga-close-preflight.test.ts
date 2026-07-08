@@ -788,13 +788,13 @@ describe("deriveDepthBand (pure policy derivation)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// deriveDepthBand over the REAL committed audit-policy.yaml — the coverage
-// hole that let F1 ship: every fixture above is hand-built, so a consumer/
-// config shape mismatch (the actual bug) would never surface. This threads
-// the real on-disk depth_bands list the same way close-preflight does.
+// deriveDepthBand over the REAL committed audit-policy.yaml: every fixture
+// above is hand-built, so a consumer/config shape mismatch would never
+// surface there. This threads the real on-disk depth_bands list the same
+// way close-preflight does.
 // ---------------------------------------------------------------------------
 
-describe("deriveDepthBand over the real committed audit-policy.yaml (F2 regression)", () => {
+describe("deriveDepthBand over the real committed audit-policy.yaml", () => {
   const PLAN_ROOT = resolve(import.meta.dir, "..");
   const { doc: realPolicy, reason: realPolicyReason } = readAuditPolicyDoc(
     join(PLAN_ROOT, "audit-policy.yaml"),
@@ -1027,7 +1027,7 @@ describe("close-preflight depth enrichment", () => {
     expect(typeof ref.path).toBe("string");
   });
 
-  test("a deep-sized epic (>=8 done tasks, >=2 touched repos, >=2000 diff loc) stamps a non-degraded deep band (F1 regression)", () => {
+  test("a deep-sized epic (>=8 done tasks, >=2 touched repos, >=2000 diff loc) stamps a non-degraded deep band", () => {
     const proj = getProj();
     const primary = realpathSync(proj.root);
     const secondary = realpathSync(

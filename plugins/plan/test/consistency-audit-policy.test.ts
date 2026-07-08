@@ -207,15 +207,13 @@ describe("audit-policy coercion", () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3 — runtime consumer / config key parity. Proves the coercion schema is
+// Runtime consumer / config key parity. Proves the coercion schema is
 // DERIVED from close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS rather than
 // an independently hand-maintained copy, so the two cannot silently diverge
-// again — this exact silent divergence (the runtime reading min_tasks/
-// min_diff_lines while the file provided min_task_count/min_diff_loc) is how
-// F1 shipped undetected.
+// again.
 // ---------------------------------------------------------------------------
 
-describe("audit-policy ↔ runtime consumer key parity (F3)", () => {
+describe("audit-policy ↔ runtime consumer key parity", () => {
   test("a coerced depth_bands entry supplies exactly the runtime consumer's keys", () => {
     const policy = coerceAuditPolicy(baseDoc());
     const band = policy.depth_bands[0] as unknown as Record<string, unknown>;
