@@ -1013,6 +1013,22 @@ export interface BlockEscalationSweepDeps {
 }
 
 /**
+ * The class-stable reason a pending block-escalation latch is dropped from the
+ * unblock-dispatch path — the {@link runBlockEscalationSweep} sibling of {@link
+ * RepairCandidateDropClass}. `repair` / `surface_and_stop` name the {@link
+ * BlockRoute} the row took instead of `unblock`; `empty_repo` is the same
+ * defensive guard as its repair-sweep sibling — unreachable while
+ * `readBlockedReason` ties reason-readability to a non-empty `project_dir`, but
+ * kept as part of the greppable contract in case that read seam ever changes.
+ */
+export type BlockCandidateDropClass =
+  | "not_blocked"
+  | "reason_unreadable"
+  | "repair"
+  | "surface_and_stop"
+  | "empty_repo";
+
+/**
  * Run one daemon block-escalation sweep (stage 2) — the producer half of the
  * dispatch-once loop for a blocked task with an escalatable category. Walk the
  * pending `block_escalations` latch rows, gate each by the cancellation guard + the
@@ -1034,6 +1050,14 @@ export interface BlockEscalationSweepDeps {
  *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal, re-sweeps) — the
  *    launch outcome. A cap/occupancy SKIP (`at_cap` / `already_live`) mints NOTHING.
  *
+ * Every disqualifying drop emits a class-stable diagnostic through `note` ({@link
+ * BlockCandidateDropClass}); a re-sweepable cap/occupancy park (per-epic
+ * serialization, or the dispatch-time `at_cap`/`already_live`/`checkout_busy` skip)
+ * emits its own `block-escalation-skip` line — mirrors {@link
+ * runRepairEscalationSweep}'s instrumentation so a starving unblock route is
+ * greppable within one sweep instead of invisible. A row is dropped by exactly one
+ * class-carrying gate per cycle — never double-logged.
+ *
  * NEVER throws — every helper edge degrades to a recorded outcome (mirrors {@link
  * runMergeEscalationSweep}). The spawn lives ONLY here in the producer, never
  * reachable from `applyEvent`, so a re-fold never re-fires a launch.
@@ -1042,6 +1066,8 @@ export async function runBlockEscalationSweep(
   deps: BlockEscalationSweepDeps,
 ): Promise<void> {
   const note = deps.noteLine ?? (() => {});
+  const drop = (taskId: string, cls: BlockCandidateDropClass, detail: string) =>
+    note(`# block-escalation-drop task=${taskId} class=${cls} ${detail}`);
   let pending: PendingBlockEscalation[];
   try {
     pending = deps.selectPending();
@@ -1067,12 +1093,24 @@ export async function runBlockEscalationSweep(
     // Requested→Attempted{skipped_unblocked} is a belt-and-braces terminal — if
     // the DELETE already ran, both folds no-op on the missing row.
     if (row.runtime_status !== "blocked") {
+      drop(
+        row.task_id,
+        "not_blocked",
+        `runtime_status=${row.runtime_status ?? "null"}`,
+      );
       deps.mintRequested(row.epic_id, row.task_id);
       deps.mintAttempted(row.epic_id, row.task_id, "skipped_unblocked");
       continue;
     }
 
     const reason = deps.readBlockedReason(row.project_dir, row.task_id);
+    if (reason == null) {
+      drop(
+        row.task_id,
+        "reason_unreadable",
+        `project_dir=${row.project_dir ?? "null"}`,
+      );
+    }
     const category = parseBlockedCategory(reason);
 
     // AUDIT_READY: a per-task audit deliberately parked this task; the owning
@@ -1111,11 +1149,16 @@ export async function runBlockEscalationSweep(
       // diagnosis-only unblock for a shared-base breakage (that is the whole point of
       // the repair route), and never surface-and-stop it (it IS escalatable, just to a
       // different owner).
+      drop(row.task_id, "repair", `category=${category ?? "null"}`);
       continue;
     }
     if (route === "surface_and_stop") {
       // TOOLING_FAILURE / absent / unparseable: surface-and-stop, NEVER dispatch an
-      // agent. Record a terminal outcome so it never re-evaluates.
+      // agent. Record a terminal outcome so it never re-evaluates. A null reason
+      // already left its own `reason_unreadable` trace above — never double-log.
+      if (reason != null) {
+        drop(row.task_id, "surface_and_stop", `category=${category ?? "null"}`);
+      }
       deps.mintRequested(row.epic_id, row.task_id);
       deps.mintAttempted(row.epic_id, row.task_id, "skipped_category");
       // Durable re-dispatch guard: a surface-and-stop block must NOT auto-requeue.
@@ -1139,12 +1182,33 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
+    // Defensive guard, mirrors {@link selectRepairCandidates}'s `empty_repo`: since
+    // `readBlockedReason` (production: {@link readTaskBlockedReason}) ties
+    // reason-readability to a non-empty `project_dir`, reaching here already implies
+    // a non-empty effective repo — but the injected seam doesn't structurally
+    // guarantee that, so the gate stays part of the greppable contract.
+    const repoDir = effectiveBlockEscalationRepo(
+      row.target_repo,
+      row.project_dir,
+    );
+    if (repoDir === "") {
+      drop(
+        row.task_id,
+        "empty_repo",
+        `target_repo=${row.target_repo ?? "null"} project_dir=${row.project_dir ?? "null"}`,
+      );
+      continue;
+    }
+
     // Per-epic serialization: an unblock is already in play for this epic — either a
     // sibling won the claim THIS sweep, or a session dispatched a prior cycle is
     // still live. Skip WITHOUT minting so the latch stays `pending` and re-sweeps
     // once that session terminates (a shared root cause the unblock clears takes the
     // sibling out of `blocked`, deleting its latch before it ever dispatches).
     if (claimedEpics.has(row.epic_id) || deps.isEpicUnblockLive(row.epic_id)) {
+      note(
+        `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=epic_serialized`,
+      );
       continue;
     }
     claimedEpics.add(row.epic_id);
@@ -1173,6 +1237,9 @@ export async function runBlockEscalationSweep(
       outcome === "already_live" ||
       outcome === "checkout_busy"
     ) {
+      note(
+        `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=${outcome}`,
+      );
       continue;
     }
     deps.mintRequested(row.epic_id, row.task_id);
