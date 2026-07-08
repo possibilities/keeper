@@ -1,0 +1,66 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 2,
+        "insertions": 868
+      },
+      "done_summary": "Added scripts/rebase-schema-migration.ts: pure core apply(main, lane) renumbers a lane's branch-local additive-idempotent SCHEMA_STEPS onto main-tip+1..+k (updating the api.py whitelist and pinned version assertions) and refuses with a machine-readable envelope on any rewind/drop/backfill/CREATE-literal/unknown/identical-content collision; token-based (comment-stripped) denylist; in-process openDb(:memory:) SCHEMA_FINGERPRINT re-pin; idempotent. 15 fast-tier tests, full suite + typecheck + lint green.",
+      "input_hash": "2feafe6dc328998e5dbbbb4cd8bf2be0d21f7e94d191f918f719a3491ac80c40",
+      "model": "opus",
+      "spec_chars": 4545,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** scripts/rebase-schema-migration.ts, test/rebase-schema-migration.test.ts\n\n### Approach\n\nA two-layer tool following the repo's scripts convention (pure functions exported at top,\nside-effecting entrypoint behind `if (import.meta.main)`). The PURE core takes file\nCONTENTS (main-side and lane-side src/db.ts, keeper/api.py, and the pinned-assertion test\nregions) \u2014 never paths, never git \u2014 and returns either a rewritten file set or a refusal.\nDetection: parse `SCHEMA_STEPS` entries from both sides (the ladder's structured\nentry shape \u2014 version, kind, body span); branch-local steps are entries present on the\nlane side whose versions collide with or trail main's tail. Proof gate: every branch-local\ncolliding step must be `kind: \"additive\"` AND its body must pass a conservative denylist\nscan (no dropColumnIfPresent / DELETE / UPDATE / cursor rewind / table rebuild / CREATE-\nliteral delta outside the entry) \u2014 any miss returns a refusal envelope naming the step and\nreason. Rewrite: shift the lane's branch-local steps to main-tip+1..+k preserving relative\norder, update the api.py whitelist expectation (the derivability test's derived set moves\nwith the ladder; the tool rewrites the lane's hand-added frozenset lines), and rewrite\nversion-string assertions (toBe(N), vN: regexes) that reference the shifted numbers.\n\nThe IMPURE entrypoint (import.meta.main only) reads the real files, runs the pure core,\nwrites results, then re-pins SCHEMA_FINGERPRINT by opening `openDb(\":memory:\")` in-process\nand calling `computeSchemaFingerprint` \u2014 in-process bun:sqlite, never a subprocess, never\ngit. Exit 0 with a summary JSON on success; exit non-zero with the refusal envelope\n(`{refused: true, step, reason}`) on any proof-gate miss. The tool NEVER touches table-tail\nidentity assertions (those belong to the merge content, not the numbering) and NEVER\nrewrites main-side (landed) entries.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/db.ts \u2014 SCHEMA_STEPS shape + kind discriminant as landed by fn-1181 (the parse target)\n- src/db.ts computeSchemaFingerprint + SCHEMA_FINGERPRINT \u2014 the re-pin pair\n- test/schema-version.test.ts \u2014 readSupportedVersions() parser (reuse for the whitelist region)\n- scripts/assert-comment-only.ts + its test \u2014 the pure-core/impure-entry + direct-import test pattern to mirror\n\n**Optional** (reference as needed):\n- docs/adr/0020-schema-version-renumber-at-merge-time.md \u2014 the rule being mechanized\n- scripts/emit-schema-fixture.ts \u2014 sibling script convention\n\n### Risks\n\n- Multi-step lanes: a lane carrying two new versions must shift both, preserving relative order \u2014 test explicitly.\n- Identical-content collision (both sides added the same column at the same N): REFUSE, do not dedupe \u2014 dedup is a human judgment about intent.\n- The pinned-assertion rewrite is bounded to version references; over-eager regex across test files is the failure mode \u2014 anchor rewrites to the specific assertion shapes the predecessor epic's tests establish.\n\n### Test notes\n\nPure fast-tier tests over the core seam: happy-path single-step shift, multi-step lane,\neach refusal kind (rewind / drop / backfill / CREATE-literal / unknown), identical-content\nrefusal, and the idempotency round-trip (apply twice, second run returns \"no branch-local\nsteps\"). The impure re-pin phase gets one test via openDb(\":memory:\") \u2014 in-process is\nfast-tier legal.\n\n## Acceptance\n\n- [ ] Pure core exposes apply(mainContents, laneContents) \u2192 {rewritten files} | {refusal envelope}; no filesystem or git reads in the core\n- [ ] Every refusal case above fails closed with a named machine-readable reason\n- [ ] Idempotency round-trip test passes; multi-step lanes shift with relative order preserved\n- [ ] Entrypoint re-pins SCHEMA_FINGERPRINT via in-process recompute and exits non-zero on refusal\n- [ ] Full fast suite + typecheck + lint green\n\n## Done summary\nAdded scripts/rebase-schema-migration.ts: pure core apply(main, lane) renumbers a lane's branch-local additive-idempotent SCHEMA_STEPS onto main-tip+1..+k (updating the api.py whitelist and pinned version assertions) and refuses with a machine-readable envelope on any rewind/drop/backfill/CREATE-literal/unknown/identical-content collision; token-based (comment-stripped) denylist; in-process openDb(:memory:) SCHEMA_FINGERPRINT re-pin; idempotent. 15 fast-tier tests, full suite + typecheck + lint green.\n## Evidence\n",
+      "task_id": "fn-1182-schema-renumber-tool-and-guards.1",
+      "tier": "xhigh",
+      "title": "Build schema renumber tool"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 4,
+        "insertions": 22
+      },
+      "done_summary": "All three resolver-authority surfaces (buildResolverBrief guardrail, autopilot skill, deconflict skill) now carry the same schema-version-collision carve-out: tool exit 0 = mechanically clear, refusal or a schema SHAPE decision stays BLOCKED. buildResolverBrief tests updated and green.",
+      "input_hash": "2feafe6dc328998e5dbbbb4cd8bf2be0d21f7e94d191f918f719a3491ac80c40",
+      "model": "sonnet",
+      "spec_chars": 2694,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/daemon.ts, test/daemon.test.ts, plugins/keeper/skills/autopilot/SKILL.md, plugins/plan/skills/deconflict/SKILL.md\n\n### Approach\n\nLand the SAME carve-out on all three resolver-authority surfaces, in the same vocabulary:\na schema-version COLLISION is mechanically clear IFF scripts/rebase-schema-migration.ts\nexits 0 on it \u2014 the resolver invokes the tool and composes its output; a tool REFUSAL, or\nany schema SHAPE decision (what a column means, whether a rewind is right, a CREATE-literal\nconflict), stays BLOCKED-for-human exactly as today. Surfaces: (1) buildResolverBrief's\nguardrail array in src/daemon.ts \u2014 the \"schema\" bullet gains the collision-vs-shape\ndistinction and names the tool; (2) the autopilot skill's resolver bullet\n(\"mechanically-clear conflicts only, else BLOCKED\") gains the same clause; (3) the\ndeconflict skill's \"no schema or migration edits\" line is reconciled so tier-2 wording does\nnot contradict the tier-1 tool path. Update the buildResolverBrief unit tests for the new\nbrief text.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts buildResolverBrief + its guardrail array (~2225-2339 pre-refactor) and its tests in test/daemon.test.ts\n- plugins/keeper/skills/autopilot/SKILL.md \u2014 the merge-conflict resolver bullet\n- plugins/plan/skills/deconflict/SKILL.md \u2014 the schema-edits prohibition line\n- scripts/rebase-schema-migration.ts \u2014 the exit contract the wording references\n\n### Risks\n\n- Charter drift: if the three surfaces phrase the carve-out differently, a resolver either over-refuses (tool never fires) or over-reaches (edits a rewinding step). Write once, paste thrice, adapt only surrounding grammar.\n\n### Test notes\n\nbuildResolverBrief tests assert the brief carries the tool invocation and the\ncollision-vs-shape boundary; skill prose has no tests \u2014 read both files end-to-end after\nediting for internal consistency.\n\n## Acceptance\n\n- [ ] All three surfaces name the tool, the exit-0-clear / refusal-BLOCKED boundary, and the shape-decision exclusion in consistent vocabulary\n- [ ] buildResolverBrief tests updated and green; full fast suite green\n- [ ] No surface still asserts an unconditional \"schema = BLOCKED\" or \"no schema edits\" without the carve-out\n\n## Done summary\nAll three resolver-authority surfaces (buildResolverBrief guardrail, autopilot skill, deconflict skill) now carry the same schema-version-collision carve-out: tool exit 0 = mechanically clear, refusal or a schema SHAPE decision stays BLOCKED. buildResolverBrief tests updated and green.\n## Evidence\n",
+      "task_id": "fn-1182-schema-renumber-tool-and-guards.2",
+      "tier": "medium",
+      "title": "Resolver charter schema carve-out"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 5
+      },
+      "done_summary": "Taught planning layer the schema ladder is a singleton resource: epic-scout gains a schema-bump overlap signal in both its guidance and Overlaps output bucket; the plan skill's same-session paragraph and spec-authoring guidance now name the ladder explicitly and require version-at-merge wording instead of hardcoded next-version numbers.",
+      "input_hash": "2feafe6dc328998e5dbbbb4cd8bf2be0d21f7e94d191f918f719a3491ac80c40",
+      "model": "sonnet",
+      "spec_chars": 2279,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/agents/epic-scout.md, plugins/plan/skills/plan/SKILL.md\n\n### Approach\n\nTeach the planning layer that the schema ladder is a singleton resource. epic-scout.md:\nadd a schema-singleton signal to the overlap detection guidance (an epic whose specs imply\na SCHEMA_STEPS/ladder bump) and to the Overlaps output bucket, so two open migration-\nbearing epics surface as an overlap the planner wires a dep edge for. The plan skill:\nextend the same-session multi-epic overlap note (the epic-scout blind-spot paragraph in\nPhase 6) to name the schema ladder explicitly, and add one line to the spec-authoring\nguidance: a migration task's spec says the version is assigned at merge time \u2014 specs never\nhardcode \"the next\" number. Keep both edits tight and in each file's existing voice; the\nplan skill file is long and load-bearing, so additions are surgical, not structural.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/agents/epic-scout.md \u2014 overlap signals + four-bucket output contract\n- plugins/plan/skills/plan/SKILL.md \u2014 Phase 6 same-session sibling paragraph + Phase 5e spec guidance\n\n**Optional** (reference as needed):\n- src/db.ts SCHEMA_FINGERPRINT doc comment \u2014 the singleton rationale to cite in one clause\n\n### Risks\n\n- epic-scout is blind to same-session siblings by design \u2014 the SKILL.md paragraph is where that gap is covered; do not pretend the scout can see them.\n\n## Acceptance\n\n- [ ] epic-scout's charter names a ladder bump as an overlap signal and shows it in the Overlaps bucket contract\n- [ ] The plan skill's same-session paragraph and spec-authoring guidance carry the singleton + version-at-merge conventions\n- [ ] Both files read coherently end-to-end; no contradiction with the resolver-charter wording\n\n## Done summary\nTaught planning layer the schema ladder is a singleton resource: epic-scout gains a schema-bump overlap signal in both its guidance and Overlaps output bucket; the plan skill's same-session paragraph and spec-authoring guidance now name the ladder explicitly and require version-at-merge wording instead of hardcoded next-version numbers.\n## Evidence\n",
+      "task_id": "fn-1182-schema-renumber-tool-and-guards.3",
+      "tier": "medium",
+      "title": "Epic-scout schema singleton check"
+    }
+  ],
+  "created_at": "2026-07-08T12:26:02.889000Z",
+  "epic_id": "fn-1182-schema-renumber-tool-and-guards",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "2feafe6dc328998e5dbbbb4cd8bf2be0d21f7e94d191f918f719a3491ac80c40",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
