@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T23:58:27.872000Z",
+  "depends_on": [],
+  "epic": "fn-1205-guard-lane-workers-from-wrong-tree",
+  "id": "fn-1205-guard-lane-workers-from-wrong-tree.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Add wrong-tree write guard hook",
+  "updated_at": "2026-07-08T23:58:27.872000Z"
+}
