@@ -2,7 +2,11 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-08T06:23:34.212000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1182-schema-renumber-tool-and-guards",
+    "fn-1180-gate-tuis-on-daemon-readiness",
+    "fn-1190-complete-plan-done-durable-or-nothing"
+  ],
   "id": "fn-1193-durable-plan-id-reservation",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T06:23:34.212000Z"
+  "updated_at": "2026-07-08T06:23:52.323000Z"
 }
