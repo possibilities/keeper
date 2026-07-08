@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Investigation-first distress-lifecycle work; one-incident-one-row invariant",
+      "task_id": "fn-1202-age-deferred-sweeps-into-visibility.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-file producer predicate carve-out",
+      "task_id": "fn-1202-age-deferred-sweeps-into-visibility.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:59:50.838000Z",
+  "epic_id": "fn-1202-age-deferred-sweeps-into-visibility",
+  "input_hash": "e0cb7d7a345d097f0e7b1eebe8ec26d97cf4d03000eb221c9068a54a51c1c370",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3771432314,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\".1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\".2\",\"tier\":\"medium\",\"model\":\"sonnet\"}]} (outer brace truncated in return; cells parsed unambiguously)"
+}
