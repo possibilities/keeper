@@ -7,7 +7,7 @@
     "fn-1189-close-grep-exec-alias-abbreviation"
   ],
   "id": "fn-1192-lower-grep-exec-alias-abbreviation-floor",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T06:16:20.154000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T06:16:17.995000Z"
+  "updated_at": "2026-07-08T06:16:20.154000Z"
 }
