@@ -486,16 +486,19 @@ function gitConfigInjection(tokens: string[], boundary: number): string | null {
 }
 
 /** True when `arg` is git's `--open-files-in-pager` exec alias in long form,
- *  including any unambiguous abbreviation git parse-options accepts (`--open`,
- *  `--open-f`, `--open-files`, … up to the full literal), in both bare and
- *  glued-`=<cmd>` forms. Git accepts any unambiguous prefix down to `--open`, so
- *  matching only the exact literal misses the abbreviations — every prefix of the
- *  literal at least as long as `--open` opens matches in a caller-named program. */
+ *  including any unambiguous abbreviation git parse-options accepts (`--op`,
+ *  `--ope`, `--open-files`, … up to the full literal), in both bare and
+ *  glued-`=<cmd>` forms. Git's minimum unambiguous prefix is `--op` (4 chars):
+ *  among grep's `--o*` options (`--only-matching`, `--open-files-in-pager`,
+ *  `--or`) only `--op` resolves to the exec alias, while `--o` is ambiguous and
+ *  git rejects it outright. So the deny floors at `--op`; a longer `--open` floor
+ *  lets the live 4- and 5-char prefixes (`--op`/`--ope`) through to the exec alias
+ *  and open a match in a caller-named program. */
 function isOpenFilesInPagerAbbrev(arg: string): boolean {
   const eq = arg.indexOf("=");
   const flag = eq === -1 ? arg : arg.slice(0, eq);
   return (
-    flag.length >= "--open".length && "--open-files-in-pager".startsWith(flag)
+    flag.length >= "--op".length && "--open-files-in-pager".startsWith(flag)
   );
 }
 
@@ -508,7 +511,7 @@ function isOpenFilesInPagerAbbrev(arg: string): boolean {
  *  a `--` (after which tokens are patterns/pathspecs, never flags).
  *
  *  The long-form exec alias is matched by unambiguous-prefix (`isOpenFilesInPagerAbbrev`),
- *  since git parse-options accepts any prefix down to `--open`. `-O` is grep's exec
+ *  since git parse-options accepts any prefix down to `--op`. `-O` is grep's exec
  *  alias only — for diff/log it is a benign order file — so the short form is scoped
  *  to grep. Git honors short-option bundling and `-O` takes an optional glued
  *  argument, so the alias reaches the exec option buried in a cluster
