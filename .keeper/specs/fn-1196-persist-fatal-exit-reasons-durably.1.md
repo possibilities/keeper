@@ -38,5 +38,5 @@ Extend the existing ledger pure-fn units in test/daemon.test.ts: object entries 
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Threaded an optional named reason through fatalExit, enriching the SAME restart-ledger entry boot-fold already wrote for this process (never a second entry — crash-loop boot count untouched) via a synchronous, atomic tmp+rename write landing before process.exit. Ledger entries grow from bare number[] to RestartLedgerEntry[] ({ts, reason?}), dual-reading legacy bare-number and mixed-shape ledgers; decideCrashLoop is unchanged (bare timestamps only), so the verdict is byte-identical with or without reason fields. Wired named reasons into the three watchdog escalations (git-seed, tmux-control, serve-liveness) and the uncaughtException/unhandledRejection handlers; all other bare fatalExit() call sites are untouched per the backward-compat contract. Side-investigation: log rotation already truncates server.stderr in-place weekly (plist/arthack.keeperd.logrotate.plist truncates then kickstarts, never renames), so the StandardErrorPath fd is never orphaned by rotation — no new rotation work needed. The real log-loss mechanism is unflushed stdout/stderr at the crash instant, which is exactly why the ledger write is its own synchronous file I/O rather than relying on console output surviving process.exit.
 ## Evidence

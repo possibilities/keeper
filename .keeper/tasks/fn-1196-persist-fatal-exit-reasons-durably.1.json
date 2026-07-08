@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Persist fatal exit reasons in restart ledger",
-  "updated_at": "2026-07-08T20:57:57.632000Z"
+  "updated_at": "2026-07-08T21:14:45.872000Z",
+  "worker_done_at": "2026-07-08T21:14:45.872000Z"
 }
