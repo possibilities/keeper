@@ -81,5 +81,5 @@ carried, open-wins dedup — an epic both open and pinned appears once).
 - [ ] Full fast suite green (bun test)
 
 ## Done summary
-
+Add the epics_pinned collection (correlated EXISTS over close/work dispatch_failures, daemon-verb excluded) and the includePinnedEpics subscribeReadiness opt-in that carries a distinct pinnedEpics member and merges pins open-wins into the computeReadiness epic set. Un-opted subscriptions stay byte-identical.
 ## Evidence
