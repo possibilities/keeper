@@ -6,7 +6,7 @@
     "fn-1203-continuous-trunk-baseline-detection"
   ],
   "id": "fn-1204-gate-finalize-on-merge-suite",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T23:59:52.432000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T23:59:51.312000Z"
+  "updated_at": "2026-07-08T23:59:52.432000Z"
 }
