@@ -526,6 +526,21 @@ export function computeReadiness(
   // which builds the SAME map off the SAME `deriveWorktreePlan`. Appended LAST so
   // default-reliant call sites stay valid.
   laneKeyById: ReadonlyMap<string, string> = new Map(),
+  // Job ids whose owning session the daemon has PROVEN dead — the recorded
+  // claude pid re-proved gone by a producer-side probe at snapshot load,
+  // mirroring the exit-watcher's own pid-death verdict. Consumed ONLY by the
+  // terminal-completed gate (predicate 1): a done task whose OWNING worker is in
+  // this set no longer has its `completed` verdict un-set by that job's lingering
+  // subagent / monitor rows, which are GHOSTS once the session is dead (a
+  // `stopped` row's open-turn subs are never swept the way a `killed`/`ended`
+  // fold sweeps them, so a dead worker's orphan `running` sub would otherwise
+  // oscillate the verdict completed↔running against unrelated sibling churn).
+  // ABSENT/EMPTY (the board, autoclose, tests, the simulator) is byte-identical
+  // to the plain gate — a mere `stopped` owning job still holds the verdict off
+  // `completed` (conservative; never earlier-firing). NEVER a fold input
+  // (producer-side liveness only, so re-fold stays deterministic). Appended LAST
+  // so default-reliant call sites stay valid.
+  provenDeadJobIds: ReadonlySet<string> = new Set<string>(),
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the
@@ -619,6 +634,7 @@ export function computeReadiness(
         now,
         pendingKeys,
         matchedPendingKeys,
+        provenDeadJobIds,
       );
       perTask.set(task.task_id, verdict);
     }
@@ -741,16 +757,34 @@ function isTaskTerminalCompleted(
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   epicsById: Map<string, Epic>,
   now: number,
+  provenDeadJobIds: ReadonlySet<string>,
 ): boolean {
   const ownEpic =
     task.epic_id == null ? undefined : epicsById.get(task.epic_id);
   const terminalAdminSignal =
     task.worker_phase === "done" || ownEpic?.status === "done";
+  // A still-`working` owning job always holds the verdict off `completed` (the
+  // live-worker mutex hold), read over the FULL job set — a proven-dead set is
+  // `stopped`-only, so a working job is never in it and this bar is never
+  // relaxed.
+  if (!terminalAdminSignal || anyEmbeddedJobWorking(task.jobs)) {
+    return false;
+  }
+  // The `completed` verdict is a one-way latch per the OWNING job's terminality.
+  // Once that worker session is PROVEN dead (its recorded pid re-proved gone —
+  // `provenDeadJobIds`), its lingering subagent / monitor rows are GHOSTS: a
+  // `stopped` row's open-turn subs are never swept the way a `killed`/`ended`
+  // fold sweeps them, so a dead worker's orphan `running` sub would otherwise
+  // oscillate this verdict completed↔running against unrelated sibling churn.
+  // Read the subagent + monitor liveness off ONLY the jobs that are NOT proven
+  // dead, so a ghost can't un-complete the task. A job still merely `stopped`
+  // (NOT proven dead) stays in the set and keeps holding — conservative, never
+  // earlier-firing — and a genuinely re-activated owning job re-enters via
+  // `anyEmbeddedJobWorking` above (no permanent latch on the task id).
+  const liveOwningJobs = excludeProvenDeadJobs(task.jobs, provenDeadJobIds);
   return (
-    terminalAdminSignal &&
-    !anyEmbeddedJobWorking(task.jobs) &&
-    !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) &&
-    !embeddedMonitorOccupies(task.jobs, now)
+    !anyEmbeddedJobHasRunningSubagent(liveOwningJobs, subRunningByJobId) &&
+    !embeddedMonitorOccupies(liveOwningJobs, now)
   );
 }
 
@@ -792,6 +826,12 @@ function evaluateTask(
   // `dispatch-pending` verdict below.
   pendingKeys: Set<string>,
   matchedPendingKeys: Set<string>,
+  // Job ids the daemon has PROVEN dead — threaded into the terminal-completed
+  // gate (predicate 1) so a done task's ghost subagent / monitor liveness on a
+  // dead owning worker can't un-complete it. Also consulted for predicate 8's
+  // upstream terminal check so a proven-dead upstream reads done
+  // order-independently. EMPTY on the board / autoclose / test paths.
+  provenDeadJobIds: ReadonlySet<string>,
 ): Verdict {
   // Record a pending dispatch keyed on THIS task's `work::`/`approve::` verb
   // so the root-fallback doesn't ALSO synthesize a root occupant (the per-row
@@ -823,7 +863,15 @@ function evaluateTask(
   // no such backstop, so the `sub-agent-stale` verdict keeps occupying the
   // mutex by design — correctness over throughput, cleared by autopilot pause
   // + manual replay.
-  if (isTaskTerminalCompleted(task, subRunningByJobId, epicsById, now)) {
+  if (
+    isTaskTerminalCompleted(
+      task,
+      subRunningByJobId,
+      epicsById,
+      now,
+      provenDeadJobIds,
+    )
+  ) {
     return { tag: "completed" };
   }
 
@@ -905,7 +953,13 @@ function evaluateTask(
     const upstreamTask = taskById.get(upstream);
     if (
       upstreamTask === undefined ||
-      !isTaskTerminalCompleted(upstreamTask, subRunningByJobId, epicsById, now)
+      !isTaskTerminalCompleted(
+        upstreamTask,
+        subRunningByJobId,
+        epicsById,
+        now,
+        provenDeadJobIds,
+      )
     ) {
       return {
         tag: "blocked",
@@ -2017,6 +2071,24 @@ function rollupEpicHeader(
 // ---------------------------------------------------------------------------
 // Predicate helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Drop the embedded jobs whose owning session the daemon has PROVEN dead
+ * (recorded pid re-proved gone — `provenDeadJobIds`) so the terminal-completed
+ * gate reads subagent / monitor liveness off ONLY the jobs that are NOT proven
+ * dead. An EMPTY set (the board / autoclose / test / simulator default) returns
+ * the input reference unchanged — byte-identical to the plain gate, and the
+ * downstream predicates already null-tolerate. Pure; never mutates the input.
+ */
+function excludeProvenDeadJobs<T extends { job_id: string }>(
+  embedded: T[] | undefined,
+  provenDeadJobIds: ReadonlySet<string>,
+): T[] | undefined {
+  if (embedded === undefined || provenDeadJobIds.size === 0) {
+    return embedded;
+  }
+  return embedded.filter((job) => !provenDeadJobIds.has(job.job_id));
+}
 
 function anyEmbeddedJobWorking(
   embedded: { state: string }[] | undefined,

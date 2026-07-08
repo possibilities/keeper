@@ -82,6 +82,7 @@ import {
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isStaleBaseDistressKey,
+  isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
@@ -94,6 +95,8 @@ import {
   SHARED_WEDGE_DISTRESS_REASON,
   STALE_BASE_DISTRESS_ID_PREFIX,
   STALE_BASE_DISTRESS_REASON,
+  STUCK_SENTINEL_DISTRESS_VERB,
+  stuckSentinelJobId,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_LANE_PREMERGE_REASON_PREFIX,
 } from "./dispatch-failure-key";
@@ -140,7 +143,7 @@ import {
   type WorktreeRepoStatusEntry,
   worktreeRecoverDispatchId,
 } from "./reconcile-core";
-import { runQuery } from "./server-worker";
+import { isPidAlive, runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
@@ -201,6 +204,7 @@ export {
   isSharedWedgeDistressKey,
   isSlotOccupancyReason,
   isStaleBaseDistressKey,
+  isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
@@ -218,6 +222,9 @@ export {
   STALE_BASE_DISTRESS_ID_PREFIX,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_DISTRESS_VERB,
+  STUCK_SENTINEL_DISTRESS_ID_PREFIX,
+  STUCK_SENTINEL_DISTRESS_VERB,
+  stuckSentinelJobId,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
@@ -502,6 +509,35 @@ export function laneFailuresToClear(
     const key = normalizeLanePath(row.dir);
     if (resolvedLanePaths.has(key) && !wedgedLanePaths.has(key)) {
       cleared.push({ verb: row.verb, id: row.id });
+    }
+  }
+  return cleared;
+}
+
+/**
+ * ADR-0013 amendment (fn-1200.2) — the stuck-sentinel ORPHAN reconciliation.
+ * Given the OPEN `stuck-sentinel:<jobId>` distress ids (`snapshot`-independent —
+ * callers scope the input set via {@link isStuckSentinelDistressKey}) and the
+ * set of job ids the LIVE `jobs` table actually carries (every state — a
+ * terminal `ended`/`killed` row still COUNTS as live here; only a genuinely
+ * ABSENT row is an orphan), return the ids whose evidentiary value is gone: the
+ * referenced job no longer exists at all, so there is nothing left an operator
+ * could inspect by acking it. A row whose job id still resolves — in ANY state —
+ * is untouched: it stays under the unchanged operator-ack-only discipline
+ * (`retry_dispatch` is its only other clear), preserving the ADR's "never
+ * silently self-tidy a live signal" rule. Pure — a function of the two input
+ * sets, no git, no clock; the caller logs a trace line per cleared id BEFORE
+ * emitting `DispatchCleared` so the evidence trail survives the GC.
+ */
+export function stuckSentinelOrphansToClear(
+  openSentinelIds: ReadonlySet<string>,
+  liveJobIds: ReadonlySet<string>,
+): string[] {
+  const cleared: string[] = [];
+  for (const id of openSentinelIds) {
+    const jobId = stuckSentinelJobId(id);
+    if (jobId !== null && !liveJobIds.has(jobId)) {
+      cleared.push(id);
     }
   }
   return cleared;
@@ -6279,6 +6315,13 @@ export async function loadReconcileSnapshot(
   // (the conservative fallback: every stopped row occupies). NEVER read in a
   // fold — liveness lives only on this read-time path.
   listPanes?: () => Promise<PaneInfo[] | null>,
+  // Producer-side process-liveness probe (`process.kill(pid, 0)` — a cheap
+  // syscall, NEVER a per-job spawn) mirroring the exit-watcher's own pid-death
+  // reprobe. Re-proves a stopped-but-live-pane occupant's recorded claude pid so
+  // the slot reaper can reclaim a session the daemon has PROVEN dead even when its
+  // pane shows a lingering wrapper/launcher command. Injectable so tests drive the
+  // dead/live matrix without a real process; defaults to {@link isPidAlive}.
+  pidAlive: (pid: number) => boolean = isPidAlive,
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -6544,6 +6587,35 @@ export async function loadReconcileSnapshot(
     }
   }
 
+  // Slot authority from the job LIFECYCLE, not pane cosmetics: re-prove dead the
+  // recorded claude pid of every STOPPED job still holding a LIVE pane, mirroring
+  // the exit-watcher's own pid-death reprobe. A dead pid is the same kernel-truth
+  // verdict the exit-watcher folds `Killed` on — but claude's exit leaves the tmux
+  // pane held alive by the launch wrapper's trailing shell or a lingering launcher
+  // process, and the `Killed` fold NULLS the pane, so `kill_reason` alone leaves no
+  // pane for the reaper to reap. Probing here catches the session while the stopped
+  // row still carries its pane, so the reaper can reclaim that residual pane
+  // regardless of the (wrapper) foreground command. Scoped to the narrow
+  // stopped-AND-live-pane candidate set (never every job) so the syscall cost stays
+  // bounded; producer-side only (NEVER a fold input — re-fold stays deterministic).
+  // Empty whenever the pane probe is degraded (`livePaneIds === null`): with no
+  // live-pane set there is nothing to reclaim, so the slot pass stays inert.
+  const provenDeadJobIds = new Set<string>();
+  if (livePaneIds !== null) {
+    for (const job of jobs.values()) {
+      if (job.state !== "stopped" || job.pid == null) {
+        continue;
+      }
+      const paneId = job.backend_exec_pane_id;
+      if (paneId == null || paneId === "" || !livePaneIds.has(paneId)) {
+        continue;
+      }
+      if (!pidAlive(job.pid)) {
+        provenDeadJobIds.add(job.job_id);
+      }
+    }
+  }
+
   // The PER-ROOT unseeded set (`reconcile` forces UNKNOWN only for rows whose
   // `effectiveRoot` is unseeded, so a stale/failed root never darks the whole
   // board) is resolved by `loadReadinessInputs` above off the autopilot's own read
@@ -6665,6 +6737,7 @@ export async function loadReconcileSnapshot(
     liveTabKeys,
     livePaneIds,
     paneCommandById,
+    provenDeadJobIds,
     pendingDispatches,
     mode,
     armedIds,
@@ -7546,6 +7619,59 @@ function main(): void {
           } catch (err) {
             console.error(
               "[autopilot-worker] shared-checkout desync distress step threw (non-fatal):",
+              err,
+            );
+          }
+        }
+        // Stuck-sentinel ORPHAN reconciliation (fn-1200.2, ADR-0013 amendment): an
+        // ack-only sentinel row (layer 3) whose referenced job is genuinely ABSENT
+        // from the `jobs` table has lost its evidentiary value — the fn-1200
+        // incident found five of seven open sentinel rows pointing at exactly this.
+        // Read RAW off the writable connection's own tables (never the default-
+        // filtered `jobs` collection `snapshot.jobs` draws from, which hides
+        // terminal rows and would misclassify a job that finished NORMALLY as
+        // "absent" — a live-job row in ANY state, including `ended`/`killed`, stays
+        // untouched under the unchanged operator-ack-only discipline). A synthetic
+        // write (`DispatchCleared`), so gated on !paused like the sibling distress
+        // sweeps; a trace line precedes every clear so the evidence trail the
+        // ack-only discipline exists to preserve survives the GC.
+        if (!state.paused) {
+          try {
+            const openSentinelIds = new Set<string>();
+            for (const row of db
+              .query("SELECT id FROM dispatch_failures WHERE verb = ?")
+              .all(STUCK_SENTINEL_DISTRESS_VERB) as { id: string }[]) {
+              if (
+                isStuckSentinelDistressKey(STUCK_SENTINEL_DISTRESS_VERB, row.id)
+              ) {
+                openSentinelIds.add(row.id);
+              }
+            }
+            if (openSentinelIds.size > 0) {
+              const liveJobIds = new Set<string>();
+              for (const row of db.query("SELECT job_id FROM jobs").all() as {
+                job_id: string;
+              }[]) {
+                liveJobIds.add(row.job_id);
+              }
+              for (const id of stuckSentinelOrphansToClear(
+                openSentinelIds,
+                liveJobIds,
+              )) {
+                console.error(
+                  `[autopilot-worker] stuck-sentinel orphan GC: ${STUCK_SENTINEL_DISTRESS_VERB}::${id} — job_id=${
+                    stuckSentinelJobId(id) ?? id
+                  } absent from the jobs table (evidence preserved in this trace line)`,
+                );
+                deps.emitDispatchCleared({
+                  verb: STUCK_SENTINEL_DISTRESS_VERB,
+                  id,
+                });
+              }
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] stuck-sentinel orphan reconciliation threw (non-fatal):",
               err,
             );
           }

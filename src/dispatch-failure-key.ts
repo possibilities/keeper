@@ -424,6 +424,21 @@ export function isStuckSentinelDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/**
+ * Extract the job id a stuck-sentinel distress `id` carries — the substring
+ * after {@link STUCK_SENTINEL_DISTRESS_ID_PREFIX} — or `null` when `id` does not
+ * carry the prefix. Pure string slice, verb-agnostic (a caller needing the full
+ * key predicate combines it with {@link isStuckSentinelDistressKey}). This is the
+ * correlation key the ADR-0013 orphan reconciliation joins against the LIVE
+ * `jobs` table: a sentinel row whose extracted job id no longer resolves there
+ * has lost its evidentiary value (nothing left to inspect).
+ */
+export function stuckSentinelJobId(id: string): string | null {
+  return id.startsWith(STUCK_SENTINEL_DISTRESS_ID_PREFIX)
+    ? id.slice(STUCK_SENTINEL_DISTRESS_ID_PREFIX.length)
+    : null;
+}
+
 // ── Display collapse — the board pill KIND ─────────────────────────────────
 
 /** The short scannable KIND a raw reason collapses to for the board pill. */

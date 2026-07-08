@@ -284,6 +284,20 @@ test("buildTmuxKillWindowArgs: targets the %N pane id, exact argv", () => {
   ]);
 });
 
+test("fn-1200 buildTmuxKillWindowArgs: pane metadata is never shell-interpolated — it rides as ONE argv element verbatim", () => {
+  // The slot reaper kills a provably-dead occupant's pane by its server-global
+  // `%N` id, which tmux mints and is metachar-free by construction. This pins the
+  // safety contract regardless: even an adversarial id carrying shell
+  // metacharacters survives as a SINGLE argv element (no `sh -c`, no interpolation,
+  // no split), so pane metadata can never escape into a shell.
+  const hostile = "%7; rm -rf / #$(touch pwned) `id` &";
+  const argv = buildTmuxKillWindowArgs(hostile);
+  expect(argv).toEqual(["tmux", "kill-window", "-t", hostile]);
+  // The whole payload is exactly one argv element — no shell ever sees it.
+  expect(argv[3]).toBe(hostile);
+  expect(argv).toHaveLength(4);
+});
+
 // ---------------------------------------------------------------------------
 // AGENTBUS_EXEC_SESSION — the wake managed session
 // ---------------------------------------------------------------------------
