@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 17,
+        "files_changed": 3,
+        "insertions": 89
+      },
+      "done_summary": "Bounded the escalation-guard git config-injection scan to the pre-subcommand region (combined-diff 'git log/show -c --format' reads now allow while reordered '-c' globals stay fail-closed via valued-global-aware gitSubcommandInfo), denied the 'git grep --open-files-in-pager'/'-O' exec vector for diagnosis roles, and locked the ref-classifier deny/allow table tests.",
+      "input_hash": "380ea03977e32808d7bca20fbf8a2b00378861837c1047390cd847896129cacc",
+      "model": "opus",
+      "spec_chars": 2571,
+      "spec_md": "## Description\n\nAll changes land in `plugins/keeper/plugin/hooks/escalation-guard.ts` and\n`test/escalation-guard.test.ts` (audit evidence read against commit 2d5aa9d6).\n\n1. F1 \u2014 fix the config-injection over-block. `gitConfigInjection` currently loops the\n   whole segment (`for i=1..tokens.length`), so `git log -c --format=%H` and `git show\n   -c --format=...` (combined-diff `-c` immediately followed by an `=`-bearing token)\n   are denied as injection even though a post-subcommand `-c` is the subcommand's own\n   flag, not a git global. Compute `gitSubcommandInfo` first and scan only\n   `tokens[1 .. sub.index)` for injection. Git honors `-c` solely as a global (which\n   must precede the subcommand), so this still catches the reorder case\n   (`git --git-dir d -c x=y status`) while leaving a post-subcommand `-c` alone. Fix\n   the stale function comment (\"no read subcommand legitimately pairs a `-c` with an\n   `=`-bearing value\") \u2014 `git log -c --format=` does exactly that.\n2. F6 \u2014 close the exec vector: `grep` is in `READONLY_GIT_SUBCOMMANDS`, so\n   `git grep --open-files-in-pager=<cmd>` runs an arbitrary program for a diagnosis\n   role. Deny the exec-bearing flag(s) on allowlisted read subcommands (at minimum\n   `--open-files-in-pager`), fail-closed and consistent with the config-injection deny.\n3. F3/F4/F5 \u2014 lock the table tests. Add two DENY cases to the ref-classifier tests:\n   a delete flag (`-D`) sitting in a filter-flag value slot after a `--list` filter,\n   and the `--unset-upstream` mutating flag (the one mutating flag with no deny-table\n   case). Add (after the F1 fix) `git log -c --format=%H` and `git show -c --format=%H`\n   to the diagnosis ALLOW table.\n\n## Acceptance\n\n- [ ] `git log -c --format=%H` / `git show -c --format=%H` allow for a diagnosis role; `git -c core.pager=x log` and `git --git-dir d -c x=y status` still deny.\n- [ ] `git grep --open-files-in-pager=<cmd>` denies for a diagnosis role.\n- [ ] The delete-flag-in-value-slot form (a `--list` filter then a `-D` flag) and the `--unset-upstream` form deny; the new allow/deny rows are in the table tests and green.\n- [ ] Write-capable roles retain full git (no regression).\n\n## Done summary\nBounded the escalation-guard git config-injection scan to the pre-subcommand region (combined-diff 'git log/show -c --format' reads now allow while reordered '-c' globals stay fail-closed via valued-global-aware gitSubcommandInfo), denied the 'git grep --open-files-in-pager'/'-O' exec vector for diagnosis roles, and locked the ref-classifier deny/allow table tests.\n## Evidence\n",
+      "task_id": "fn-1183-refine-diagnosis-role-git-command.1",
+      "tier": "xhigh",
+      "title": "Refine diagnosis git classifier"
+    }
+  ],
+  "created_at": "2026-07-08T02:51:29.200000Z",
+  "epic_id": "fn-1183-refine-diagnosis-role-git-command",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "380ea03977e32808d7bca20fbf8a2b00378861837c1047390cd847896129cacc",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
