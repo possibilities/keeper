@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 7,
+        "files_changed": 2,
+        "insertions": 19
+      },
+      "done_summary": "Lowered the escalation-guard isOpenFilesInPagerAbbrev floor from --open (6) to git's true minimum --op (4), closing the arbitrary-exec bypass where git grep --op=<cmd>/--ope=<cmd> reached the exec alias for the diagnosis role; corrected both doc-comments and added --op/--ope deny-case tests (glued and space-separated).",
+      "input_hash": "d33fc0feff56974a3fc8f25234c5b017015118e2918220827710f2d6ed0711b2",
+      "model": "opus",
+      "spec_chars": 2426,
+      "spec_md": "## Description\n\nFixes finding F1 (with its merged test-gap finding F2). At the source epic's\ncommit aa2d1a3f, `isOpenFilesInPagerAbbrev` in\n`plugins/keeper/plugin/hooks/escalation-guard.ts` (lines 490-496) gates on\n`flag.length >= \"--open\".length` \u2014 a 6-char floor. Git's minimum unambiguous\nprefix for `--open-files-in-pager` is `--op` (4 chars): among git grep's\n`--o*` options (`--only-matching`, `--open-files-in-pager`, `--or`), `--op`\nuniquely resolves to the exec alias. Verified empirically (git 2.50.1):\n`git grep --op=/tmp/x TODO` and `--ope=/tmp/x TODO` both hit\n`fatal: cannot exec '/tmp/x'` (exec attempted), while `--o=` is rejected as\n`ambiguous option`. The 6-char floor lets the 4- and 5-char prefixes through:\nthe abbreviation branch fails the length check, `--output` doesn't match, and\nthe `-O` regex requires a capital `O`. So the command is ALLOWED for the\ndiagnosis role and git execs the caller-named program.\n\nLower the floor to git's true minimum. The fail-closed choice is to match any\nprefix down to `--o` (over-blocking benign `--or`/`--only-matching` is a\nharmless false-positive for a security deny); at minimum set the floor to\n`\"--op\".length`. Correct the predicate's doc-comment in the same edit \u2014 its\nclaim that every prefix \"at least as long as `--open`\" is the exec alias is\nthe factual source of the off-by-two.\n\nFiles:\n- `plugins/keeper/plugin/hooks/escalation-guard.ts` \u2014 the\n  `isOpenFilesInPagerAbbrev` floor and its doc-comment.\n- `test/escalation-guard.test.ts` \u2014 add the deny-case tests below to the\n  existing diagnosis-role deny table (append-only; do not weaken existing\n  assertions).\n\n## Acceptance\n\n- [ ] Floor lowered so `git grep --op=<cmd>` and `--ope=<cmd>` are denied.\n- [ ] Deny-case tests added for `--op=/tmp/evil` and `--ope=/tmp/evil` in\n      both glued-`=` and space-separated forms.\n- [ ] Doc-comment corrected to state git's real `--op` minimum, not `--open`.\n- [ ] Optional: an allow/boundary note or test for `--o` (git rejects it as\n      ambiguous) documenting where the deny stops.\n- [ ] `bun test` green.\n\n## Done summary\nLowered the escalation-guard isOpenFilesInPagerAbbrev floor from --open (6) to git's true minimum --op (4), closing the arbitrary-exec bypass where git grep --op=<cmd>/--ope=<cmd> reached the exec alias for the diagnosis role; corrected both doc-comments and added --op/--ope deny-case tests (glued and space-separated).\n## Evidence\n",
+      "task_id": "fn-1192-lower-grep-exec-alias-abbreviation-floor.1",
+      "tier": "high",
+      "title": "Lower exec-alias abbreviation floor"
+    }
+  ],
+  "created_at": "2026-07-08T12:08:45.370000Z",
+  "epic_id": "fn-1192-lower-grep-exec-alias-abbreviation-floor",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "d33fc0feff56974a3fc8f25234c5b017015118e2918220827710f2d6ed0711b2",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
