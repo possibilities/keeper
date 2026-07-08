@@ -38,5 +38,7 @@ Regression: a pure test driving both the boot-emission path and the steady-state
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Routed the client-side effective per-root cap through the one seam. The readiness snapshot now derives the effective cap from the folded autopilot_state via effectivePerRootCap — the same source as the reported stored intent + worktree mode, mirroring the server's loadReadinessInputs — instead of latching it off the boot-status header (a skew-prone second source that lagged the fold by a frame and minted the post-boot autopilot-change per_root 1<->2 flip). Boot and steady-state now report byte-identical effective values for identical {stored, worktree_mode}; stored intent stays distinctly readable. The boot-header field is still floored server-side and forwarded verbatim (no protocol change).
 ## Evidence
+- Commits: f0d14836
+- Tests: test/readiness-client.test.ts: new fn-1197 boot-vs-steady regression (both worktree modes, boot-header-ignored, stored-stays-distinct) + fn-1015 tests updated to fold-derived semantics; keeper fast suite green (bun run test: 0 fail, 7693 + 80 opentui); biome lint clean (419 files)
