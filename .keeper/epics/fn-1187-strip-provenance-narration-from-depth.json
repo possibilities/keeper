@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-08T02:39:44.356000Z",
+  "created_by_close_of": "fn-1174-fix-close-audit-depth-band-wiring",
+  "depends_on_epics": [
+    "fn-1174-fix-close-audit-depth-band-wiring"
+  ],
+  "id": "fn-1187-strip-provenance-narration-from-depth",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Strip provenance narration from depth-band comments",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-08T02:39:44.356000Z"
+}
