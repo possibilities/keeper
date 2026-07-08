@@ -39,5 +39,5 @@ Files:
 - [ ] `bun test` green.
 
 ## Done summary
-
+Lowered the escalation-guard isOpenFilesInPagerAbbrev floor from --open (6) to git's true minimum --op (4), closing the arbitrary-exec bypass where git grep --op=<cmd>/--ope=<cmd> reached the exec alias for the diagnosis role; corrected both doc-comments and added --op/--ope deny-case tests (glued and space-separated).
 ## Evidence
