@@ -11,6 +11,9 @@
  * the tool's own path.
  */
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   apply,
   applyFingerprintRepin,
@@ -18,7 +21,9 @@ import {
   type FileSet,
   parseLadder,
 } from "../scripts/rebase-schema-migration";
-import { SCHEMA_FINGERPRINT } from "../src/db";
+import { openDb, SCHEMA_FINGERPRINT } from "../src/db";
+
+const REAL_DB_TS = join(import.meta.dir, "..", "src", "db.ts");
 
 // --- fixture builders --------------------------------------------------------
 
@@ -231,7 +236,9 @@ test("applying twice is a no-op — the second run finds no branch-local steps",
 // --- fingerprint re-pin (impure helper, in-process) --------------------------
 
 test("computeRepinnedFingerprint recomputes the live schema fingerprint in-process", () => {
-  const fp = computeRepinnedFingerprint();
+  // no renumber in play: feed the real, already-consistent committed db.ts.
+  const realDb = readFileSync(REAL_DB_TS, "utf8");
+  const fp = computeRepinnedFingerprint(realDb);
   expect(fp).toMatch(/^v\d+:[0-9a-f]{64}$/);
   // independent truth: the hand-pinned constant committed in src/db.ts.
   expect(fp).toBe(SCHEMA_FINGERPRINT);
@@ -248,4 +255,74 @@ test("applyFingerprintRepin replaces the SCHEMA_FINGERPRINT literal", () => {
   const multiOut = applyFingerprintRepin(multi, "v4:new");
   expect(multiOut).toContain('"v4:new"');
   expect(multiOut).not.toContain("v3:old");
+});
+
+// --- composed: renumber -> re-pin (F1 regression) ----------------------------
+
+/** Directly reproduces `computeSchemaFingerprint`'s dump+hash algorithm
+ * (src/db.ts) against a caller-supplied version, so the expected value below
+ * is computed independently of `computeRepinnedFingerprint`'s own code path —
+ * only the SQL dump query is shared (by necessity: it's the real live schema
+ * shape), never the tail-version derivation under test. */
+function hashSchemaAt(version: number): string {
+  const { db } = openDb(":memory:");
+  try {
+    const rows = db
+      .query(
+        `SELECT type, name, sql FROM sqlite_master
+          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+          ORDER BY type, name`,
+      )
+      .all() as { type: string; name: string; sql: string }[];
+    const dump = rows.map((r) => `${r.type}\t${r.name}\t${r.sql}`).join("\n");
+    const hash = createHash("sha256")
+      .update(`v${version}\n${dump}`)
+      .digest("hex");
+    return `v${version}:${hash}`;
+  } finally {
+    db.close();
+  }
+}
+
+test("composed: renumbering a synthetic colliding lane re-pins a fingerprint consistent with the renumbered tail", () => {
+  const realDb = readFileSync(REAL_DB_TS, "utf8");
+  const realSteps = parseLadder(realDb);
+  const lastStep = realSteps[realSteps.length - 1];
+  const mainTail = lastStep.version;
+
+  // Craft a lane that collides at the TIP: the real committed ladder as
+  // "main", and a "lane" that independently added its own step reusing
+  // main's tip version — the classic two-branches-both-picked-"next" merge
+  // collision. Appended right after the real tail entry (not replacing it,
+  // so the shared v2..mainTail prefix stays byte-identical and this is the
+  // ONLY divergence) via `parseLadder`'s own `versionEnd` offset for the
+  // real tail step, scanning forward to the array's closing `];` — the
+  // first one after the last step's own body (verified fixture-side: the
+  // real ladder's tail body contains no nested array literal to false-hit).
+  const collideAt = mainTail;
+  const extraStep = `  { version: ${collideAt}, kind: "additive", apply: (ctx) => { addColumnIfMissing(ctx.db, "jobs", "rebase_repin_regression_col", "TEXT"); } },`;
+  const closeIdx = realDb.indexOf("\n];", lastStep.versionEnd);
+  if (closeIdx < 0)
+    throw new Error("could not locate SCHEMA_STEPS closing bracket");
+  const laneDb = `${realDb.slice(0, closeIdx)}\n${extraStep}${realDb.slice(closeIdx)}`;
+
+  const main: FileSet = { db: realDb, apiPy: "", tests: {} };
+  const lane: FileSet = { db: laneDb, apiPy: "", tests: {} };
+
+  const r = apply(main, lane);
+  expect(r.refused).toBe(false);
+  if (r.refused) return;
+  expect(r.shifts).toEqual([{ from: collideAt, to: mainTail + 1 }]);
+
+  const renumberedTail = parseLadder(r.files.db).reduce(
+    (mx, s) => Math.max(mx, s.version),
+    0,
+  );
+  expect(renumberedTail).toBe(mainTail + 1);
+
+  const fp = computeRepinnedFingerprint(r.files.db);
+  // from-scratch: independent recompute over the RENUMBERED tail. Before the
+  // fix, computeRepinnedFingerprint pinned against the process-start
+  // module's stale (pre-renumber) SCHEMA_VERSION — this fails against that.
+  expect(fp).toBe(hashSchemaAt(renumberedTail));
 });

@@ -40,10 +40,11 @@
  *   bun scripts/rebase-schema-migration.ts [--base <ref>]   # default base: main
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
-import { computeSchemaFingerprint, openDb } from "../src/db";
+import { openDb } from "../src/db";
 
 // ---------------------------------------------------------------------------
 // Types — the pure core's input/output contract.
@@ -471,13 +472,37 @@ export function apply(main: FileSet, lane: FileSet): ApplyResult {
 
 const FINGERPRINT_RE = /(SCHEMA_FINGERPRINT\s*=\s*\n?\s*")([^"]*)(")/;
 
-/** Recompute the schema fingerprint from a fresh in-memory migrate of the live
- * (in-process) ladder. Run against the merged working tree, this observes the
- * merged schema. */
-export function computeRepinnedFingerprint(): string {
+/** Recompute the schema fingerprint's `v<N>:<digest>` from a fresh in-memory
+ * migrate, version-prefixed with the RENUMBERED ladder's tail rather than the
+ * process-start-imported `../src/db` module's `SCHEMA_VERSION`.
+ *
+ * `openDb(":memory:")` still runs the imported module's own `SCHEMA_STEPS` —
+ * that's fine because a renumber (proof-gated pure core `apply()`, above)
+ * shifts version NUMBERS only and never touches an `apply` body or step
+ * order, so the migrated DDL shape is byte-identical whether it's produced by
+ * the pre-renumber (colliding) ladder or the post-renumber one; only the
+ * `v<N>` label the shape gets hashed under is allowed to move. Passing the
+ * REWRITTEN `db.ts` source (`renumberedDbSource`, i.e. `result.files.db`) and
+ * parsing its tail via {@link parseLadder} is what makes that label track the
+ * renumber instead of going stale — the bug this fixes is entirely that the
+ * import-time module's `SCHEMA_VERSION` still reflects the pre-renumber tail
+ * at the point this runs.
+ */
+export function computeRepinnedFingerprint(renumberedDbSource: string): string {
+  const steps = parseLadder(renumberedDbSource);
+  const tail = steps.reduce((mx, s) => Math.max(mx, s.version), 0);
   const { db } = openDb(":memory:");
   try {
-    return computeSchemaFingerprint(db);
+    const rows = db
+      .query(
+        `SELECT type, name, sql FROM sqlite_master
+          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+          ORDER BY type, name`,
+      )
+      .all() as { type: string; name: string; sql: string }[];
+    const dump = rows.map((r) => `${r.type}\t${r.name}\t${r.sql}`).join("\n");
+    const hash = createHash("sha256").update(`v${tail}\n${dump}`).digest("hex");
+    return `v${tail}:${hash}`;
   } finally {
     db.close();
   }
@@ -588,9 +613,10 @@ function main(argv: string[]): number {
     return 0;
   }
 
-  // Write the renumbered surfaces, then re-pin the fingerprint from the live
-  // (merged) in-process schema.
-  const fingerprint = computeRepinnedFingerprint();
+  // Write the renumbered surfaces, then re-pin the fingerprint against the
+  // RENUMBERED ladder's tail (result.files.db) — not the process-start
+  // import, which still reflects the pre-renumber (colliding) tree.
+  const fingerprint = computeRepinnedFingerprint(result.files.db);
   writeFileSync(
     join(root, DB_PATH),
     applyFingerprintRepin(result.files.db, fingerprint),
