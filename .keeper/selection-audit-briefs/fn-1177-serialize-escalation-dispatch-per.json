@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 24,
+        "files_changed": 2,
+        "insertions": 396
+      },
+      "done_summary": "Added a per-checkout occupancy guard to the resolver- and deconflict-dispatch sweeps: a second same-repo escalation whose resolved base checkout is already held by a live resolve::/deconflict:: session defers as a non-terminal checkout_busy skip (no marker, no dispatch_failures row) and re-sweeps once the checkout frees, while different repos dispatch concurrently.",
+      "input_hash": "b384a0bce9cc09332d51bf26c075873243e0d237e8d8524696ffbc5731d1b2a2",
+      "model": "opus",
+      "spec_chars": 2859,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/daemon.ts, test/daemon.test.ts\n\n### Approach\n\nThe resolver- and deconflict-dispatch sweeps must not launch an escalation session\nwhose resolved cwd (the merge-conflict base checkout) is already occupied by a\nlive escalation session: the launch is SKIPPED \u2014 non-terminal and re-sweepable,\nexactly like the existing at_cap/already_live skip outcomes \u2014 so no once-marker is\nstamped, no dispatch_failures row is minted, and the level-triggered re-sweep\ndispatches it once the occupying session reaches a terminal state. The occupancy\nprobe rides the machinery the cap already uses (live escalation jobs off the jobs\nprojection plus the in-flight launch memo), keyed by the resolved checkout dir.\nThe escalation-role posture is role-keyed (diagnosis-only vs write-capable\nclasses); verify which session classes actually occupy a checkout today and gate\nevery class that recreates a merge in it.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but this\nfile moves frequently.*\n\n**Required** (read before coding):\n- src/daemon.ts:1675-1685 \u2014 EscalationDispatchOutcome skip vocabulary\n  (at_cap/already_live) + MAX_LIVE_ESCALATION_SESSIONS: the guard is a sibling\n  skip outcome\n- src/daemon.ts:2351 \u2014 runResolverDispatchSweep; src/daemon.ts:1868 \u2014\n  runMergeEscalationSweep: the two sweeps to gate\n- src/daemon.ts:2565 \u2014 dispatchEscalationSession: the shared cap+occupancy\n  dispatch path the guard extends\n- src/daemon.ts:9064 \u2014 inFlightEscalations memo (launched-but-not-yet-folded\n  keys); src/daemon.ts:9704 dispatchResolver + :9140 dispatchDeconflict \u2014 cwd\n  resolution via mergeConflictBaseCheckout (the key the guard groups on)\n- test/daemon.test.ts \u2014 the escalation sweep test cluster (injectable-deps\n  pattern; add same-checkout serialization + cross-repo concurrency cases)\n\n## Acceptance\n\n- [ ] With two sticky merge conflicts in the same repo, only one escalation\n      session whose cwd is that repo's shared checkout is live at a time; the\n      second dispatches only after the first reaches a terminal state\n- [ ] The deferred dispatch is a pure skip: no once-marker stamped, no\n      dispatch_failures row minted, and the row re-sweeps to a successful\n      dispatch once the checkout frees\n- [ ] Sticky conflicts in different repos dispatch their sessions concurrently\n      (the guard is per checkout, never global)\n- [ ] Full fast suite green (bun test)\n\n## Done summary\nAdded a per-checkout occupancy guard to the resolver- and deconflict-dispatch sweeps: a second same-repo escalation whose resolved base checkout is already held by a live resolve::/deconflict:: session defers as a non-terminal checkout_busy skip (no marker, no dispatch_failures row) and re-sweeps once the checkout frees, while different repos dispatch concurrently.\n## Evidence\n",
+      "task_id": "fn-1177-serialize-escalation-dispatch-per.1",
+      "tier": "high",
+      "title": "Per-checkout escalation dispatch guard"
+    }
+  ],
+  "created_at": "2026-07-08T01:17:23.953000Z",
+  "epic_id": "fn-1177-serialize-escalation-dispatch-per",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "b384a0bce9cc09332d51bf26c075873243e0d237e8d8524696ffbc5731d1b2a2",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
