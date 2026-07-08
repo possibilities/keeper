@@ -692,6 +692,10 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     // session env and folds onto someone else's row.
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
+    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     // Keeper-owned worker permission posture (mirrors the pair path); rides every
     // launch, right after the worktree env block and before model/effort/name.
     "--permission-mode",
@@ -735,6 +739,10 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
+    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -787,6 +795,10 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
+    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     // Permission posture rides even the minimal launch (no model/effort/name).
     "--permission-mode",
     "acceptEdits",
@@ -821,6 +833,10 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     // is present only when the caller threads the original job id (pinned below).
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
+    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     // Resume is just as human-less as a fresh launch — the posture rides it too.
     "--permission-mode",
     "acceptEdits",
@@ -857,6 +873,10 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
+    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -891,6 +911,10 @@ test("buildKeeperAgentLaunchArgv: codex resume emits `keeper agent codex … res
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
+    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     "--x-no-confirm",
     "resume",
     "rollout-uuid",
@@ -956,7 +980,7 @@ test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JO
   // by its own `--x-tmux-env`.
   const idx = argv.indexOf("KEEPER_JOB_ID=45f94c4d-orig");
   expect(argv[idx - 1]).toBe("--x-tmux-env");
-  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(4);
+  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(5);
   // Identity (job id) and the resume key (native target) stay DISTINCT.
   expect(argv.slice(-2)).toEqual(["--session", "d98a2d54-native"]);
   expect(idEntries[0]).not.toContain("d98a2d54-native");
@@ -1008,6 +1032,9 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // The 5th carrier — empty here (a work launch, not an escalation).
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -1050,6 +1077,9 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x--fn-1-x.2",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
+    // The 5th carrier — empty here (a worktree resume, not an escalation).
+    "--x-tmux-env",
+    "KEEPER_ESCALATION_ROLE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -1090,6 +1120,35 @@ test("buildKeeperAgentLaunchArgv: serial (empty/absent worktreePath) ALWAYS emit
     a.startsWith("KEEPER_PLAN_WORKTREE_BRANCH="),
   );
   expect(branchEntries).toEqual(["KEEPER_PLAN_WORKTREE_BRANCH="]);
+  // ...and the escalation-role carrier is the 5th always-emitted-empty sibling,
+  // so a non-escalation launch reusing a tmux session cannot inherit a stale role.
+  const roleEntries = absent.filter((a) =>
+    a.startsWith("KEEPER_ESCALATION_ROLE="),
+  );
+  expect(roleEntries).toEqual(["KEEPER_ESCALATION_ROLE="]);
+});
+
+test("buildKeeperAgentLaunchArgv: an escalation launch carries the verb in KEEPER_ESCALATION_ROLE, still one entry (byte-pinned)", () => {
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "autopilot",
+    prompt: "/plan:unblock fn-1-x.3",
+    claudeName: "unblock::fn-1-x.3",
+    escalationRole: "unblock",
+    noConfirm: true,
+  });
+  // Exactly one role entry, carrying the escalation verb — emitted right after the
+  // job-identity carrier and before the permission posture.
+  const roleEntries = argv.filter((a) =>
+    a.startsWith("KEEPER_ESCALATION_ROLE="),
+  );
+  expect(roleEntries).toEqual(["KEEPER_ESCALATION_ROLE=unblock"]);
+  const branchIdx = argv.indexOf("KEEPER_PLAN_WORKTREE_BRANCH=");
+  expect(argv[branchIdx + 1]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 2]).toBe("KEEPER_JOB_ID=");
+  expect(argv[branchIdx + 3]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 4]).toBe("KEEPER_ESCALATION_ROLE=unblock");
+  expect(argv[branchIdx + 5]).toBe("--permission-mode");
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {

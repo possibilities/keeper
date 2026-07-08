@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Per-checkout escalation dispatch guard",
-  "updated_at": "2026-07-07T23:46:52.208000Z"
+  "updated_at": "2026-07-08T00:09:22.305000Z",
+  "worker_done_at": "2026-07-08T00:09:22.305000Z"
 }

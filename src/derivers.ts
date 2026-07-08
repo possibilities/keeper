@@ -22,22 +22,47 @@
 const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
 
 /**
- * Anchored spawn-name → `{verb, ref}` match:
- * `{plan|work|close|resolve|unblock|deconflict}::fn-\d+-[a-z0-9-]+(.\d+)?`. The
- * verb whitelist is locked — any other verb returns `(null, null)`; adding one is
- * a deliberate edit here. `resolve` is the daemon merge-resolver dispatch
- * (`resolve::<epic>`); `unblock` (`unblock::<task>`) and `deconflict`
- * (`deconflict::<epic>`) are the two autonomous ESCALATION dispatches. Folding
- * each one's `plan_verb`/`plan_ref` makes it a first-class dispatch key, so the
- * jobs-keyed reaps + instant-death breaker apply to it like any work/close worker.
- * The `$` anchor rejects extra `::` segments so a typo never partial-matches and
- * lands wrong data in the projection. The ref matches both epic and task refs (the
- * optional dot-suffix is the task-number tail); its slug class is narrower than the
- * slash-command class (kebab-only, no `_`/`:`) so a malformed ref rejects rather than
- * masking the error.
+ * The repo-token shape a `repair::<token>` key's id half must match — the
+ * `<basename-slug>-<hash>` convention worktree provisioning already names its
+ * lane directories with (see `repoToken` in `src/worktree-plan.ts`, the
+ * canonical producer). A permissive basename-charset slug (letters/digits/
+ * `.`/`_`/`-`) ending in a `-<hash>` suffix, where `<hash>` is the base36
+ * FNV-1a digest {@link repoToken} produces (1-7 lowercase alnum chars, the
+ * range `(2**32-1).toString(36)` spans). STRUCTURAL only — it cannot prove the
+ * token names a real repo (that requires a DB-backed reverse lookup), so it
+ * exists to reject an obviously malformed or path-shaped token, not to
+ * validate the hash itself. Exported (as the anchored {@link REPO_TOKEN_RE}
+ * and this un-anchored source) so {@link SPAWN_VERB_REF_RE}'s repair arm and
+ * `dispatch-command.ts`'s `parseDispatchableKey` share ONE definition — both
+ * dep-free leaf modules, so a hand-duplicated copy could silently drift.
  */
-const SPAWN_VERB_REF_RE =
-  /^(plan|work|close|resolve|unblock|deconflict)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
+const REPO_TOKEN_SRC =
+  "[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?-[0-9a-z]{1,7}";
+
+/** Anchored {@link REPO_TOKEN_SRC} — the standalone repo-token validator. */
+export const REPO_TOKEN_RE = new RegExp(`^${REPO_TOKEN_SRC}$`);
+
+/**
+ * Anchored spawn-name → `{verb, ref}` match, as TWO alternatives:
+ *  - `{plan|work|close|resolve|unblock|deconflict}::fn-\d+-[a-z0-9-]+(.\d+)?`
+ *    (captures 1-2) — the verb whitelist is locked; adding one is a deliberate
+ *    edit here. `resolve` is the daemon merge-resolver dispatch
+ *    (`resolve::<epic>`); `unblock` (`unblock::<task>`) and `deconflict`
+ *    (`deconflict::<epic>`) are two of the three autonomous ESCALATION
+ *    dispatches.
+ *  - `repair::<repo-token>` (captures 3-4) — the THIRD escalation dispatch,
+ *    repo-scoped rather than epic/task-scoped, so its ref is a {@link
+ *    REPO_TOKEN_SRC} token, never an `fn-`-shaped ref.
+ * Folding each one's `plan_verb`/`plan_ref` makes it a first-class dispatch
+ * key, so the jobs-keyed reaps + instant-death breaker apply to it like any
+ * work/close worker. The `$` anchor rejects extra `::` segments so a typo
+ * never partial-matches and lands wrong data in the projection. The fn-shaped
+ * ref's slug class is narrower than the slash-command class (kebab-only, no
+ * `_`/`:`) so a malformed ref rejects rather than masking the error.
+ */
+const SPAWN_VERB_REF_RE = new RegExp(
+  `^(?:(plan|work|close|resolve|unblock|deconflict)::(fn-\\d+-[a-z0-9-]+(?:\\.\\d+)?)|(repair)::(${REPO_TOKEN_SRC}))$`,
+);
 
 /**
  * Anchored `handoff::<slug>` spawn-name match — the SEPARATE spawn-name class for
@@ -123,8 +148,14 @@ export function planVerbRefFromSpawnName(
   if (m == null) {
     return { plan_verb: null, plan_ref: null };
   }
-  // biome-ignore lint/style/noNonNullAssertion: regex match guarantees both capture groups
-  return { plan_verb: m[1]!, plan_ref: m[2]! };
+  // Exactly one alternative matched — captures 1-2 (fn-shaped ref) or 3-4
+  // (repair's repo-token ref); the other pair is `undefined`.
+  const verb = m[1] ?? m[3];
+  const ref = m[2] ?? m[4];
+  if (verb === undefined || ref === undefined) {
+    return { plan_verb: null, plan_ref: null };
+  }
+  return { plan_verb: verb, plan_ref: ref };
 }
 
 /**

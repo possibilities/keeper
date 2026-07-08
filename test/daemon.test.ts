@@ -77,6 +77,7 @@ import {
   type PendingBlockEscalation,
   type PendingBlockHumanNotify,
   type PendingMergeEscalation,
+  type PendingRepairRow,
   type PendingResolverDispatch,
   parseBlockedCategory,
   parseRestartLedger,
@@ -84,18 +85,26 @@ import {
   probeAuditOrchestrator,
   pruneRecoveredDeadLetters,
   RESTART_LEDGER_CAP,
+  type RepairCandidate,
+  type RepairEscalationSweepDeps,
+  type RepairGroup,
+  type RepairHumanNotifiedOutcome,
   type ResolverDispatchOutcome,
   type ResolverDispatchSweepDeps,
   recoverOneDeadLetter,
+  repairReasonFor,
   resolveEscalationJobsFor,
+  routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
   runMergeEscalationSweep,
+  runRepairEscalationSweep,
   runResolverDispatchSweep,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
   SERVE_PROBE_STUCK_THRESHOLD_MS,
   SERVE_WATCHDOG_BOOT_GRACE_MS,
+  SHARED_BASE_BROKEN_CATEGORY,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
@@ -3346,7 +3355,14 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `instance_event_id` copies the event's own id, so a plain additive ALTER with NO
   // cursor rewind stays re-fold deterministic — a from-scratch re-fold reproduces
   // every stamp and every corroboration miss byte-identical).
-  expect(SCHEMA_VERSION).toBe(114);
+  // And to 115 via fn-1173 task .4 (appending the nullable
+  // `dispatch_failures.repair_dispatched_at` once-marker — the shared-base repair
+  // dispatch latch on the `repair::<repo-token>` sticky row, sibling of
+  // `merge_escalated_at` / `resolver_dispatched_at`; an additive ALTER, NO cursor
+  // rewind: a pre-v115 stream carries no `RepairDispatched` event, so a from-scratch
+  // re-fold leaves it NULL byte-identical, and `foldDispatchFailed` preserves it across
+  // the UPSERT).
+  expect(SCHEMA_VERSION).toBe(115);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -4495,6 +4511,334 @@ test("auditReadyEscalationDecision: escalate only on a dead orchestrator past gr
   expect(
     auditReadyEscalationDecision({ state: "absent" }, 10 * grace, grace),
   ).toBe("defer");
+});
+
+test("runBlockEscalationSweep: a SHARED_BASE_BROKEN block routes to REPAIR — never dispatches an unblock, never surface-and-stops", async () => {
+  // The repair route is owned by the sibling repair sweep, so the block sweep skips the
+  // row WITHOUT minting: no unblock dispatch, no Requested/Attempted, no work:: suppression.
+  const { deps, mints, dispatches, suppressions } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: {
+      "fn-1-foo.1": "SHARED_BASE_BROKEN: `bun test` red at base sha abc1234",
+    },
+  });
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+  expect(suppressions).toEqual([]);
+});
+
+// ---- routeBlockedCategory (the category→handler dispatch table / shared seam) --
+
+test("routeBlockedCategory: the three routes are keyed by category", () => {
+  // SHARED_BASE_BROKEN → repair; TOOLING_FAILURE / null / unparseable → surface_and_stop;
+  // every other escalatable category → unblock.
+  expect(routeBlockedCategory(SHARED_BASE_BROKEN_CATEGORY)).toBe("repair");
+  expect(routeBlockedCategory(BLOCK_ESCALATION_SKIP_CATEGORY)).toBe(
+    "surface_and_stop",
+  );
+  expect(routeBlockedCategory(null)).toBe("surface_and_stop");
+  for (const c of [
+    "SPEC_UNCLEAR",
+    "DEPENDENCY_BLOCKED",
+    "DESIGN_CONFLICT",
+    "SCOPE_EXCEEDED",
+    "EXTERNAL_BLOCKED",
+    "RESUME_EXHAUSTED",
+  ]) {
+    expect(routeBlockedCategory(c)).toBe("unblock");
+  }
+});
+
+// ---- runRepairEscalationSweep (SHARED_BASE_BROKEN repair core, injected deps) --
+
+interface RepairMint {
+  kind: "row" | "dispatched" | "notified" | "clear";
+  token: string;
+  reason?: string;
+  dir?: string | null;
+  outcome?: string;
+}
+
+function repairCandidate(
+  epicId: string,
+  taskId: string,
+  overrides: Partial<RepairCandidate> = {},
+): RepairCandidate {
+  return {
+    epic_id: epicId,
+    task_id: taskId,
+    repo_dir: "/repo",
+    repo_token: "repo-abc",
+    fingerprint: "fp1",
+    ...overrides,
+  };
+}
+
+function repairRow(
+  overrides: Partial<PendingRepairRow> = {},
+): PendingRepairRow {
+  return {
+    id: "repo-abc",
+    reason: "shared-base-broken:fp1",
+    dir: "/repo",
+    repair_dispatched_at: null,
+    human_notified_at: null,
+    ...overrides,
+  };
+}
+
+function fakeRepairSweepDeps(opts: {
+  candidates?: RepairCandidate[];
+  rows?: PendingRepairRow[];
+  /** repo_dirs whose shared checkout is DIRTY (DEFER). */
+  dirty?: Set<string>;
+  /** repo_dirs whose base reads GREEN (positive-evidence clear gate). */
+  green?: Set<string>;
+  dispatch?: (group: RepairGroup) => Promise<EscalationDispatchOutcome>;
+  repairOutcome?: (token: string) => ResolverOutcome;
+  notify?: (
+    row: PendingRepairRow,
+    verdict: "declined" | "died",
+  ) => Promise<RepairHumanNotifiedOutcome>;
+  candidatesThrow?: boolean;
+  rowsThrow?: boolean;
+}): {
+  deps: RepairEscalationSweepDeps;
+  mints: RepairMint[];
+  dispatches: RepairGroup[];
+  notifies: { token: string; verdict: "declined" | "died" }[];
+} {
+  const mints: RepairMint[] = [];
+  const dispatches: RepairGroup[] = [];
+  const notifies: { token: string; verdict: "declined" | "died" }[] = [];
+  const deps: RepairEscalationSweepDeps = {
+    selectCandidates: () => {
+      if (opts.candidatesThrow) throw new Error("candidate read boom");
+      return opts.candidates ?? [];
+    },
+    selectRepairRows: () => {
+      if (opts.rowsThrow) throw new Error("row read boom");
+      return opts.rows ?? [];
+    },
+    isDirtyCheckout: (dir) => opts.dirty?.has(dir) ?? false,
+    isBaseGreen: (dir) => opts.green?.has(dir) ?? false,
+    dispatchRepair: async (group) => {
+      dispatches.push(group);
+      return (await opts.dispatch?.(group)) ?? "dispatched";
+    },
+    repairOutcome:
+      opts.repairOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
+    notifyHuman: async (row, verdict) => {
+      notifies.push({ token: row.id, verdict });
+      return (await opts.notify?.(row, verdict)) ?? "notified";
+    },
+    mintRow: (group) =>
+      mints.push({
+        kind: "row",
+        token: group.repo_token,
+        reason: repairReasonFor(group.fingerprint),
+        dir: group.repo_dir,
+      }),
+    mintDispatched: (token, outcome) =>
+      mints.push({ kind: "dispatched", token, outcome }),
+    mintNotified: (token, outcome) =>
+      mints.push({ kind: "notified", token, outcome }),
+    clearRow: (token) => mints.push({ kind: "clear", token }),
+  };
+  return { deps, mints, dispatches, notifies };
+}
+
+test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE repo+fingerprint → exactly one dispatch + one sticky row", async () => {
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-1-foo", "fn-1-foo.3"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
+  });
+  await runRepairEscalationSweep(deps);
+  // Coalesced to ONE repair for the repo token.
+  expect(dispatches).toEqual([
+    { repo_token: "repo-abc", repo_dir: "/repo", fingerprint: "fp1" },
+  ]);
+  expect(mints).toEqual([
+    {
+      kind: "row",
+      token: "repo-abc",
+      reason: "shared-base-broken:fp1",
+      dir: "/repo",
+    },
+    { kind: "dispatched", token: "repo-abc", outcome: "dispatched" },
+  ]);
+});
+
+test("runRepairEscalationSweep: two distinct repos each dispatch under the cap (independent tokens)", async () => {
+  const { deps, dispatches } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2", {
+        repo_dir: "/a",
+        repo_token: "a-111",
+        fingerprint: "fpa",
+      }),
+      repairCandidate("fn-2-bar", "fn-2-bar.1", {
+        repo_dir: "/b",
+        repo_token: "b-222",
+        fingerprint: "fpb",
+      }),
+    ],
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches.map((g) => g.repo_token).sort()).toEqual([
+    "a-111",
+    "b-222",
+  ]);
+});
+
+test("runRepairEscalationSweep: a dirty shared checkout DEFERS — no dispatch, no row minted, no attempt", async () => {
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    dirty: new Set(["/repo"]),
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO RepairDispatched (re-sweeps)", async () => {
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    dispatch: async () => "at_cap",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches.length).toBe(1);
+  // The latch is minted (durable), but repair_dispatched_at stays NULL (no RepairDispatched).
+  expect(mints).toEqual([
+    {
+      kind: "row",
+      token: "repo-abc",
+      reason: "shared-base-broken:fp1",
+      dir: "/repo",
+    },
+  ]);
+});
+
+test("runRepairEscalationSweep: a dispatch_failed mints RepairDispatched{dispatch_failed} (non-terminal, re-sweeps)", async () => {
+  const { deps, mints } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    dispatch: async () => "dispatch_failed",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(mints).toContainEqual({
+    kind: "dispatched",
+    token: "repo-abc",
+    outcome: "dispatch_failed",
+  });
+});
+
+test("runRepairEscalationSweep: a LIVE repair (row dispatched, session not terminal) → no re-dispatch, no page", async () => {
+  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    repairOutcome: () => ({ terminal: false }),
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a DECLINED repair (dispatched, terminal, candidates remain) pages the human ONCE", async () => {
+  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    repairOutcome: () => ({ terminal: true, verdict: "declined" }),
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "declined" }]);
+  expect(mints).toEqual([
+    { kind: "notified", token: "repo-abc", outcome: "notified" },
+  ]);
+});
+
+test("runRepairEscalationSweep: an already-paged repair does NOT re-page and does NOT re-dispatch (sticky until retry)", async () => {
+  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 100, human_notified_at: 200 })],
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a notify_failed leaves the page marker unset (re-sweepable, never silent)", async () => {
+  const { deps, mints } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    notify: async () => "notify_failed",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(mints).toEqual([
+    { kind: "notified", token: "repo-abc", outcome: "notify_failed" },
+  ]);
+});
+
+test("runRepairEscalationSweep: positive-evidence CLEAR — a row with zero candidates + green base clears", async () => {
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidates: [],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    green: new Set(["/repo"]),
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([{ kind: "clear", token: "repo-abc" }]);
+});
+
+test("runRepairEscalationSweep: a row with zero candidates but a NON-green base is RETAINED (no report)", async () => {
+  const { deps, mints } = fakeRepairSweepDeps({
+    candidates: [],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    green: new Set(), // base not green / unknown → retain
+  });
+  await runRepairEscalationSweep(deps);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a row whose token STILL has candidates is never cleared (owned by dispatch/notify)", async () => {
+  const { deps, mints } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    green: new Set(["/repo"]), // green, but candidates remain → NOT cleared
+    repairOutcome: () => ({ terminal: false }),
+  });
+  await runRepairEscalationSweep(deps);
+  expect(mints.find((m) => m.kind === "clear")).toBeUndefined();
+});
+
+test("runRepairEscalationSweep: empty candidates + empty rows is a no-op", async () => {
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({});
+  await runRepairEscalationSweep(deps);
+  expect(mints).toEqual([]);
+  expect(dispatches).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidatesThrow: true,
+    rows: [repairRow()],
+  });
+  await runRepairEscalationSweep(deps);
+  expect(mints).toEqual([]);
+  expect(dispatches).toEqual([]);
+});
+
+test("repairReasonFor: the mint-side reason matches escalation-brief's REPAIR_REASON_RE", () => {
+  const reason = repairReasonFor("abc123");
+  expect(reason).toBe("shared-base-broken:abc123");
+  // The exact contract cli/escalation-brief.ts parses.
+  expect(reason).toMatch(/^shared-base-broken:\s*(\S+)/);
 });
 
 // ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------

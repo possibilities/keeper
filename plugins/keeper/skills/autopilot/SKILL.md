@@ -362,6 +362,7 @@ the breaker.
   it like any block only if the orchestrator dies with the task still parked past a short
   grace. A verified-severe finding rewrites the reason to `AUDIT_SEVERE`, which pages
   immediately like any block; relay either page as a decision-ready brief.
+- **A shared-base breakage routes to `repair::<repo>`, not `unblock::<task>`.** A worker whose baseline confirms the shared default branch is red independent of its own diff blocks `SHARED_BASE_BROKEN` — a repo-scoped class, not a task-scoped one. The daemon dispatches ONE `repair::<repo-token>` session per `(repo, failure-fingerprint)`, converging every task blocked on the same base defect onto one attempt; it runs in the shared checkout, verifies with the full gate, and fans `keeper plan unblock` + a bus resume back out to every affected task on success. It pages you exactly once, only on decline — mechanics live in the plan skill's operator-orchestration reference, not re-taught here.
 - **Pausing does NOT stop an in-flight resolver.** `pause` stops the recover sweep and
   new dispatches, not a resolver already running. On a merge-conflict escalation — or
   before you manually resolve ANY stuck merge-conflict close — check `keeper query jobs`

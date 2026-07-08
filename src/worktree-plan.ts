@@ -145,13 +145,29 @@ export function ribBranchFor(epicId: string, taskId: string): string {
 }
 
 /**
+ * The `<repoName>-<hash>` half of a lane path — a repo identifier built from
+ * its basename plus a short stable digest, so two SAME-BASENAME repos (e.g.
+ * `~/a/foo` and `~/b/foo`) never collide onto one token. Extracted as its own
+ * function so a repo-scoped identifier OUTSIDE the worktree-path context (the
+ * `repair::<repo-token>` escalation key — see `src/dispatch-command.ts` /
+ * `cli/escalation-brief.ts`) can name a repo the identical way {@link
+ * worktreePathFor} already does, without a second hand-rolled derivation that
+ * could drift from it. PURE: no wall-clock/random/syscall, just the
+ * (already realpath'd by the caller) repo dir; the trailing slash is
+ * stripped first so `<dir>` and `<dir>/` map to the same token.
+ */
+export function repoToken(repoDir: string): string {
+  const stripped = stripTrailingSlash(repoDir);
+  const repoName = baseName(stripped) || "repo";
+  return `${repoName}-${shortHash(stripped)}`;
+}
+
+/**
  * Resolve a branch to its worktree path: a dir under `~/worktrees/`, OUTSIDE the
- * repo tree, named `<repoName>-<hash>--<branch-slug>` where `slug` is the branch
- * with `/` → `-` (filesystem-safe; branch names are unique per lane, so the slug
- * is collision-free) and `<hash>` is a short stable digest of the repo dir. The
- * hash disambiguates two SAME-BASENAME repos (e.g. `~/a/foo` and `~/b/foo`) that
- * each host a same-id epic: the basename alone would collide their lanes onto one
- * worktree dir; the dir-hash keeps them distinct. A rib slug carries `--` twice
+ * repo tree, named `<repoToken>--<branch-slug>` ({@link repoToken} is
+ * `<repoName>-<hash>`) where `slug` is the branch with `/` → `-`
+ * (filesystem-safe; branch names are unique per lane, so the slug is
+ * collision-free). A rib slug carries `--` twice
  * (`<repoName>-<hash>--keeper-epic-<id>--<task>`): the prefix separator and the
  * rib's own — still unambiguous + collision-free, since the slug is an injective
  * image of the unique branch name.
@@ -159,10 +175,8 @@ export function ribBranchFor(epicId: string, taskId: string): string {
  * PURE function of (repoDir, branch, worktreesRoot): the hash folds only the
  * (already realpath'd by the producer) repo dir, no wall-clock / random / syscall,
  * so the producer (provision) and teardown (removeWorktree) derive a byte-identical
- * path and the path-equality comparisons on both sides still hold. The trailing
- * slash is stripped before hashing so `<dir>` and `<dir>/` map to the same lane.
- * Kept outside the repo tree so a worktree is never nested inside the repo it
- * forks from.
+ * path and the path-equality comparisons on both sides still hold. Kept outside
+ * the repo tree so a worktree is never nested inside the repo it forks from.
  *
  * `worktreesRoot` is the parent dir every lane hangs under. When passed (the
  * autopilot reconciler injects `${homedir()}/worktrees` from the producer-side
@@ -176,12 +190,9 @@ export function worktreePathFor(
   branch: string,
   worktreesRoot?: string,
 ): string {
-  const stripped = stripTrailingSlash(repoDir);
-  const repoName = baseName(stripped) || "repo";
-  const hash = shortHash(stripped);
   const slug = branch.replace(/\//g, "-");
   const root = worktreesRoot ?? `${homedir()}/worktrees`;
-  return `${root}/${repoName}-${hash}--${slug}`;
+  return `${root}/${repoToken(repoDir)}--${slug}`;
 }
 
 /**

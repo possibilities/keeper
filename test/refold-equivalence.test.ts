@@ -1691,6 +1691,98 @@ test("dispatch_failures.resolver_dispatched_at: a {DispatchFailed(close), MergeE
 });
 
 // ---------------------------------------------------------------------------
+// `dispatch_failures.repair_dispatched_at` once-marker (fn-1173) — the daemon
+// SHARED_BASE_BROKEN repair sweep's dispatch-once latch folded by `RepairDispatched`
+// onto the sticky `repair::<repo-token>` row, plus the reused `human_notified_at`
+// page-once marker folded by `RepairHumanNotified`. A DETERMINISTIC-replayed marker on
+// a deterministic-replayed table: a from-scratch re-fold MUST reproduce the stamp (and
+// the NULL non-terminal arm, and the two markers' independent coexistence) byte-
+// identically, or the dispatch-once / page-once guarantees are unsound.
+// ---------------------------------------------------------------------------
+
+test("dispatch_failures.repair_dispatched_at: a {DispatchFailed(repair), RepairDispatched, RepairHumanNotified} stream re-folds byte-identically (fn-1173)", () => {
+  // A repair row that is BOTH dispatched AND (later, on decline) paged, and a second
+  // repair row whose dispatch FAILED (stays NULL, re-sweepable). Both arms — and the two
+  // independent markers' coexistence — must reproduce byte-identically from a replay.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "repair::repo-abc",
+    data: JSON.stringify({
+      verb: "repair",
+      id: "repo-abc",
+      reason: "shared-base-broken:fp1",
+      dir: "/repo",
+      ts: 1700,
+    }),
+  });
+  insertEvent({
+    hook_event: "RepairDispatched",
+    session_id: "repair::repo-abc",
+    ts: 1755,
+    data: JSON.stringify({ id: "repo-abc", outcome: "dispatched" }),
+  });
+  insertEvent({
+    hook_event: "RepairHumanNotified",
+    session_id: "repair::repo-abc",
+    ts: 1758,
+    data: JSON.stringify({ id: "repo-abc", outcome: "notified" }),
+  });
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "repair::repo-xyz",
+    data: JSON.stringify({
+      verb: "repair",
+      id: "repo-xyz",
+      reason: "shared-base-broken:fp2",
+      dir: "/other",
+      ts: 1760,
+    }),
+  });
+  insertEvent({
+    hook_event: "RepairDispatched",
+    session_id: "repair::repo-xyz",
+    ts: 1770,
+    data: JSON.stringify({ id: "repo-xyz", outcome: "dispatch_failed" }),
+  });
+  // A re-failure of the dispatched row AFTER it stamped must preserve BOTH markers
+  // through the UPSERT — fold it into the re-folded stream.
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "repair::repo-abc",
+    data: JSON.stringify({
+      verb: "repair",
+      id: "repo-abc",
+      reason: "shared-base-broken:fp1",
+      dir: "/repo2",
+      ts: 1800,
+    }),
+  });
+  drainAll();
+
+  const live = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all() as Array<Record<string, unknown>>;
+  const dispatched = live.find((r) => r.id === "repo-abc");
+  const failed = live.find((r) => r.id === "repo-xyz");
+  // Terminal dispatch stamp survives the later re-failure UPSERT; the page marker
+  // coexists independently; the failed dispatch stays NULL.
+  expect(dispatched?.repair_dispatched_at).toBe(1755);
+  expect(dispatched?.human_notified_at).toBe(1758);
+  expect(failed?.repair_dispatched_at).toBeNull();
+
+  // Full from-scratch re-fold: rewind + wipe, then re-drain from id 0.
+  rewindAndWipeProjections();
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+
+  const refolded = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all() as Array<Record<string, unknown>>;
+  // Byte-identical — the repair dispatch-once + page-once markers are re-fold-deterministic.
+  expect(refolded).toEqual(live);
+});
+
+// ---------------------------------------------------------------------------
 // Layer 1 — aggregate counts over the live-shaped corpus
 // ---------------------------------------------------------------------------
 

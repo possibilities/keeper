@@ -23,6 +23,7 @@ import {
   main,
   parseEscalationKey,
 } from "../cli/escalation-brief";
+import { repoToken as deriveRepoToken } from "../src/worktree-plan";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
 // ── Seed helpers ───────────────────────────────────────────────────────────
@@ -32,17 +33,29 @@ interface JobLink {
   job_id: string;
 }
 
+interface SeedTask {
+  task_id: string;
+  target_repo?: string | null;
+  runtime_status?: string;
+}
+
 function seedEpic(
   db: Database,
-  opts: { epic_id: string; project_dir?: string | null; job_links?: JobLink[] },
+  opts: {
+    epic_id: string;
+    project_dir?: string | null;
+    job_links?: JobLink[];
+    tasks?: SeedTask[];
+  },
 ): void {
   db.query(
-    "INSERT INTO epics (epic_id, updated_at, project_dir, job_links) VALUES (?, ?, ?, ?)",
+    "INSERT INTO epics (epic_id, updated_at, project_dir, job_links, tasks) VALUES (?, ?, ?, ?, ?)",
   ).run(
     opts.epic_id,
     1,
     opts.project_dir ?? null,
     JSON.stringify(opts.job_links ?? []),
+    JSON.stringify(opts.tasks ?? []),
   );
 }
 
@@ -128,7 +141,7 @@ afterEach(() => {
 
 // ── Key parsing ────────────────────────────────────────────────────────────
 
-test("parseEscalationKey accepts both key shapes", () => {
+test("parseEscalationKey accepts all three key shapes", () => {
   expect(parseEscalationKey("deconflict::fn-12-add-oauth")).toEqual({
     kind: "deconflict",
     epic_id: "fn-12-add-oauth",
@@ -137,6 +150,10 @@ test("parseEscalationKey accepts both key shapes", () => {
     kind: "unblock",
     epic_id: "fn-12-add-oauth",
     task_id: "fn-12-add-oauth.3",
+  });
+  expect(parseEscalationKey("repair::keeper-qzvs8i")).toEqual({
+    kind: "repair",
+    repo_token: "keeper-qzvs8i",
   });
 });
 
@@ -148,6 +165,15 @@ test("parseEscalationKey rejects shape mismatches and garbage", () => {
   expect(parseEscalationKey("resolve::fn-12-add-oauth")).toBeNull();
   expect(parseEscalationKey("garbage")).toBeNull();
   expect(parseEscalationKey("deconflict::")).toBeNull();
+});
+
+test("parseEscalationKey rejects a malformed or path-shaped repair token", () => {
+  // repair:: does NOT route through parsePlanRef — an fn-shaped ref is not
+  // rejected on THAT basis, but a genuinely malformed / path-shaped token
+  // still fails the REPO_TOKEN_RE structural check.
+  expect(parseEscalationKey("repair::nohyphenatall")).toBeNull();
+  expect(parseEscalationKey("repair::../etc/passwd")).toBeNull();
+  expect(parseEscalationKey("repair::")).toBeNull();
 });
 
 // ── Error paths (exit non-zero) ────────────────────────────────────────────
@@ -337,6 +363,37 @@ test("an unblock brief lifts the blocked reason, CATEGORY, and blocked siblings"
   db.close();
 });
 
+test("an unblock brief parses a SHARED_BASE_BROKEN blocked reason to its category", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-201-solo",
+    project_dir: tmp,
+    job_links: [{ kind: "creator", job_id: "solo-sess-2" }],
+  });
+  seedJob(db, {
+    job_id: "solo-sess-2",
+    plan_verb: null,
+    transcript_path: "/t/solo2.jsonl",
+  });
+  writeEpicFile(tmp, "fn-201-solo", { primary_repo: "/repo" });
+  writeTaskState(tmp, "fn-201-solo.1", {
+    status: "blocked",
+    blocked_reason:
+      "BLOCKED: SHARED_BASE_BROKEN\nSummary: base sha abc123 fails `bun test` independent of this diff",
+  });
+
+  const r = buildEscalationBrief(db, "unblock::fn-201-solo.1", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const inc = r.brief.incident as { category: string | null };
+  expect(inc.category).toBe("SHARED_BASE_BROKEN");
+  expect(r.brief.degraded).toEqual([]);
+  db.close();
+});
+
 // ── Degrade paths (exit 0 with flags) ──────────────────────────────────────
 
 test("a missing creator edge degrades lineage but still emits", () => {
@@ -419,6 +476,343 @@ test("an epic found only in the .keeper tree (no db row) still emits, using cwd"
   }
   expect(r.brief.primary_repo).toBe("/repo");
   expect(r.brief.degraded).toContain("lineage_creator_missing:fn-600-fileonly");
+  db.close();
+});
+
+// ── Repair (repo-scoped) ────────────────────────────────────────────────────
+
+function seedRepairFailure(
+  db: Database,
+  opts: { repo_token: string; reason: string },
+): void {
+  db.query(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+     VALUES ('repair', ?, ?, NULL, 1, 1, 1, 1)`,
+  ).run(opts.repo_token, opts.reason);
+}
+
+test("a repair token unresolvable against any epic returns unknown_incident", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-800-elsewhere",
+    project_dir: join(tmp, "somewhere-else"),
+  });
+  const r = buildEscalationBrief(db, "repair::keeper-qzvs8i", tmp);
+  expect(r.kind).toBe("error");
+  if (r.kind === "error") {
+    expect(r.code).toBe("unknown_incident");
+  }
+  db.close();
+});
+
+test("a repair brief resolves the repo, fingerprint, base evidence, and affected tasks across every epic on that repo", () => {
+  const { db } = freshMemDb();
+  const repoDir = join(tmp, "repaired-repo");
+  const otherDir = join(tmp, "unrelated");
+  const token = deriveRepoToken(repoDir);
+  // Two DIFFERENT epics share the repo — one via project_dir, one via a
+  // task's own target_repo — so "every epic on that repo" is exercised.
+  seedEpic(db, {
+    epic_id: "fn-801-alpha",
+    project_dir: repoDir,
+    tasks: [
+      { task_id: "fn-801-alpha.1", runtime_status: "blocked" },
+      { task_id: "fn-801-alpha.2", runtime_status: "todo" },
+    ],
+  });
+  seedEpic(db, {
+    epic_id: "fn-802-beta",
+    project_dir: otherDir,
+    tasks: [
+      {
+        task_id: "fn-802-beta.1",
+        target_repo: repoDir,
+        runtime_status: "blocked",
+      },
+    ],
+  });
+  writeTaskState(repoDir, "fn-801-alpha.1", {
+    status: "blocked",
+    blocked_reason:
+      "BLOCKED: SHARED_BASE_BROKEN\nSummary: base sha deadbeef fails `bun test` independent of this diff",
+  });
+  writeTaskState(repoDir, "fn-801-alpha.2", { status: "todo" });
+  // fn-802-beta's OWN .keeper tree lives under its own project_dir, not repoDir.
+  writeTaskState(otherDir, "fn-802-beta.1", {
+    status: "blocked",
+    blocked_reason:
+      "BLOCKED: SHARED_BASE_BROKEN\nSummary: base sha deadbeef fails `bun test` independent of this diff",
+  });
+  seedRepairFailure(db, {
+    repo_token: token,
+    reason: "shared-base-broken:fp-deadbeef",
+  });
+
+  const r = buildEscalationBrief(db, `repair::${token}`, tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const b = r.brief;
+  expect(b.kind).toBe("repair");
+  expect(b.epic_id).toBeNull();
+  expect(b.task_id).toBeNull();
+  expect(b.primary_repo).toBe(repoDir);
+  expect(b.lineage).toEqual({
+    creator: null,
+    original_creator: null,
+    chain: [],
+  });
+
+  const inc = b.incident as {
+    repo_token: string;
+    repo: string | null;
+    fingerprint: string | null;
+    base_evidence: {
+      base_sha: string | null;
+      failing_command: string | null;
+    } | null;
+    affected_tasks: Array<{
+      epic_id: string;
+      task_id: string;
+      blocked_reason: string | null;
+    }>;
+  };
+  expect(inc.repo_token).toBe(token);
+  expect(inc.repo).toBe(repoDir);
+  expect(inc.fingerprint).toBe("fp-deadbeef");
+  expect(inc.base_evidence).toEqual({
+    base_sha: "deadbeef",
+    failing_command: "bun test",
+  });
+  expect(inc.affected_tasks).toEqual([
+    {
+      epic_id: "fn-801-alpha",
+      task_id: "fn-801-alpha.1",
+      blocked_reason:
+        "BLOCKED: SHARED_BASE_BROKEN\nSummary: base sha deadbeef fails `bun test` independent of this diff",
+    },
+    {
+      epic_id: "fn-802-beta",
+      task_id: "fn-802-beta.1",
+      blocked_reason:
+        "BLOCKED: SHARED_BASE_BROKEN\nSummary: base sha deadbeef fails `bun test` independent of this diff",
+    },
+  ]);
+  expect(b.degraded).toEqual([]);
+  db.close();
+});
+
+test("a repair brief with no dispatch_failures row and no matching blocked task degrades but still emits", () => {
+  const { db } = freshMemDb();
+  const repoDir = join(tmp, "quiet-repo");
+  const token = deriveRepoToken(repoDir);
+  seedEpic(db, { epic_id: "fn-810-quiet", project_dir: repoDir, tasks: [] });
+
+  const r = buildEscalationBrief(db, `repair::${token}`, tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const b = r.brief;
+  expect(b.kind).toBe("repair");
+  expect(b.primary_repo).toBe(repoDir);
+  const inc = b.incident as {
+    fingerprint: string | null;
+    base_evidence: unknown;
+    affected_tasks: unknown[];
+  };
+  expect(inc.fingerprint).toBeNull();
+  expect(inc.base_evidence).toBeNull();
+  expect(inc.affected_tasks).toEqual([]);
+  expect(b.degraded).toEqual([
+    "incident_repair_row_missing",
+    "incident_no_affected_tasks",
+  ]);
+  db.close();
+});
+
+test("a repair dispatch_failures row under an unrecognized reason shape degrades incident_reason_unparsed", () => {
+  const { db } = freshMemDb();
+  const repoDir = join(tmp, "odd-reason-repo");
+  const token = deriveRepoToken(repoDir);
+  seedEpic(db, { epic_id: "fn-811-odd", project_dir: repoDir, tasks: [] });
+  seedRepairFailure(db, {
+    repo_token: token,
+    reason: "not-the-expected-shape",
+  });
+
+  const r = buildEscalationBrief(db, `repair::${token}`, tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const inc = r.brief.incident as { fingerprint: string | null };
+  expect(inc.fingerprint).toBeNull();
+  expect(r.brief.degraded).toContain("incident_reason_unparsed");
+  db.close();
+});
+
+// ── Byte-equality regression: unblock/deconflict unaffected by repair ──────
+
+test("byte-equality regression: an unblock brief's full shape is unchanged", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-820-byte",
+    project_dir: tmp,
+    job_links: [{ kind: "creator", job_id: "byte-sess" }],
+  });
+  seedJob(db, {
+    job_id: "byte-sess",
+    plan_verb: null,
+    transcript_path: "/t/byte.jsonl",
+  });
+  writeEpicFile(tmp, "fn-820-byte", { primary_repo: "/repo" });
+  writeTaskState(tmp, "fn-820-byte.1", {
+    status: "blocked",
+    blocked_reason: "BLOCKED: SPEC_UNCLEAR\nSummary: unclear",
+  });
+
+  const r = buildEscalationBrief(db, "unblock::fn-820-byte.1", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  expect(r.brief).toEqual({
+    kind: "unblock",
+    epic_id: "fn-820-byte",
+    task_id: "fn-820-byte.1",
+    primary_repo: "/repo",
+    incident: {
+      task_id: "fn-820-byte.1",
+      status: "blocked",
+      blocked_reason: "BLOCKED: SPEC_UNCLEAR\nSummary: unclear",
+      category: "SPEC_UNCLEAR",
+      blocked_siblings: [],
+    },
+    lineage: {
+      creator: {
+        session_id: "byte-sess",
+        transcript_path: "/t/byte.jsonl",
+        is_closer: false,
+        plan_verb: null,
+        plan_ref: null,
+        state: "stopped",
+        job_row_present: true,
+      },
+      original_creator: {
+        session_id: "byte-sess",
+        transcript_path: "/t/byte.jsonl",
+        is_closer: false,
+        plan_verb: null,
+        plan_ref: null,
+        state: "stopped",
+        job_row_present: true,
+      },
+      chain: [
+        {
+          epic_id: "fn-820-byte",
+          creator: {
+            session_id: "byte-sess",
+            transcript_path: "/t/byte.jsonl",
+            is_closer: false,
+            plan_verb: null,
+            plan_ref: null,
+            state: "stopped",
+            job_row_present: true,
+          },
+        },
+      ],
+    },
+    degraded: [],
+  });
+  db.close();
+});
+
+test("byte-equality regression: a deconflict brief's full shape is unchanged", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-821-byte",
+    project_dir: tmp,
+    job_links: [{ kind: "creator", job_id: "byte-sess-2" }],
+  });
+  seedJob(db, {
+    job_id: "byte-sess-2",
+    plan_verb: null,
+    transcript_path: "/t/byte2.jsonl",
+  });
+  writeEpicFile(tmp, "fn-821-byte", { primary_repo: "/repo" });
+  seedMergeConflict(db, {
+    epic_id: "fn-821-byte",
+    reason:
+      "worktree-merge-conflict: merging keeper/epic/fn-821-byte into main — CONFLICT (content): foo.ts",
+    dir: "/repo",
+  });
+
+  const r = buildEscalationBrief(db, "deconflict::fn-821-byte", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  expect(r.brief).toEqual({
+    kind: "deconflict",
+    epic_id: "fn-821-byte",
+    task_id: null,
+    primary_repo: "/repo",
+    incident: {
+      conflict: {
+        reason:
+          "worktree-merge-conflict: merging keeper/epic/fn-821-byte into main — CONFLICT (content): foo.ts",
+        source_branch: "keeper/epic/fn-821-byte",
+        base_branch: "main",
+        stderr: "CONFLICT (content): foo.ts",
+        repo_dir: "/repo",
+        merge_escalated_at: null,
+        resolver_dispatched_at: null,
+      },
+      resolver_jobs: [],
+    },
+    lineage: {
+      creator: {
+        session_id: "byte-sess-2",
+        transcript_path: "/t/byte2.jsonl",
+        is_closer: false,
+        plan_verb: null,
+        plan_ref: null,
+        state: "stopped",
+        job_row_present: true,
+      },
+      original_creator: {
+        session_id: "byte-sess-2",
+        transcript_path: "/t/byte2.jsonl",
+        is_closer: false,
+        plan_verb: null,
+        plan_ref: null,
+        state: "stopped",
+        job_row_present: true,
+      },
+      chain: [
+        {
+          epic_id: "fn-821-byte",
+          creator: {
+            session_id: "byte-sess-2",
+            transcript_path: "/t/byte2.jsonl",
+            is_closer: false,
+            plan_verb: null,
+            plan_ref: null,
+            state: "stopped",
+            job_row_present: true,
+          },
+        },
+      ],
+    },
+    degraded: ["incident_resolver_job_missing"],
+  });
   db.close();
 });
 

@@ -2748,7 +2748,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // block-instance binding) via a plain additive ALTER; it widens the jobs and
   // dispatch_failures row shapes but does not touch the epics table SHAPE this
   // test pins, fn-1171 task .2.
-  expect(SCHEMA_VERSION).toBe(114);
+  // v115 appends the nullable `dispatch_failures.repair_dispatched_at`
+  // once-marker for the daemon SHARED_BASE_BROKEN repair sweep (an additive
+  // ALTER, not an epics-shape change), fn-1173 task .4.
+  expect(SCHEMA_VERSION).toBe(115);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

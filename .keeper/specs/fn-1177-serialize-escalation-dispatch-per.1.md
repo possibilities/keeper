@@ -49,5 +49,5 @@ file moves frequently.*
 - [ ] Full fast suite green (bun test)
 
 ## Done summary
-
+Added a per-checkout occupancy guard to the resolver- and deconflict-dispatch sweeps: a second same-repo escalation whose resolved base checkout is already held by a live resolve::/deconflict:: session defers as a non-terminal checkout_busy skip (no marker, no dispatch_failures row) and re-sweeps once the checkout frees, while different repos dispatch concurrently.
 ## Evidence

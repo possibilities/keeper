@@ -157,6 +157,7 @@ import type {
   StuckSentinelMessage,
 } from "./exit-watcher";
 import { REPROBE_MIN_AGE_SECS, REPROBE_MS } from "./exit-watcher";
+import { fingerprintFailure } from "./failure-fingerprint";
 import { seedGitProjection } from "./git-boot-seed";
 import type {
   AddDiscoveryRootMessage,
@@ -248,7 +249,7 @@ import type {
   WakeWorkerData,
   WakeWorkerOutbound,
 } from "./wake-worker";
-import { worktreePathFor } from "./worktree-plan";
+import { repoToken, worktreePathFor } from "./worktree-plan";
 
 /** Grace period for the worker to exit on shutdown before we close the db anyway. */
 const WORKER_SHUTDOWN_DEADLINE_MS = 2000;
@@ -362,12 +363,13 @@ export function drainToCompletion(
  * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
  * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
- * isSharedDesyncDistressKey}) distress key: their synthetic `daemon` verb is un-retryable
- * by the wire validator BY DESIGN (an operator never clears them), and a level-trigger
- * (main's boot recovery / the recover pass observing the lane clean / the stale-base
- * probe observing the lane re-based or torn down / the desync content probe observing the
- * checkout carry the default tip) owns dropping them — so the orphan sweep must never
- * reap a self-managed distress row out from under its signal.
+ * isSharedDesyncDistressKey}) distress key, AND the per-repo shared-base repair latch
+ * (`repair::<repo-token>`): each is un-retryable by the wire validator BY DESIGN (an
+ * operator never clears them through the retry wire), and a level-trigger (main's boot
+ * recovery / the recover pass observing the lane clean / the stale-base probe observing
+ * the lane re-based or torn down / the desync content probe observing the checkout carry
+ * the default tip / the repair sweep observing the base green) owns dropping them — so
+ * the orphan sweep must never reap a self-managed row out from under its signal.
  *
  * The per-repo shared-checkout-wedge/-dirty distress family is DELIBERATELY NOT exempt:
  * a dirty or mid-merge shared checkout no longer blocks the working-tree-free base
@@ -412,6 +414,16 @@ export function gcUnretryableDispatchFailures(
     // level-trigger owns dropping it, so the orphan sweep must not reap it out from under
     // its signal.
     if (isSharedDesyncDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the per-repo shared-base repair latch (`repair::<repo-token>`) — a LIVE
+    // producer owns it (the SHARED_BASE_BROKEN sweep re-mints it while the base is broken
+    // and CLEARS it on positive evidence — base green + zero remaining candidates). Its
+    // `repair` verb is un-retryable by the wire validator BY DESIGN (the retry-wire stays
+    // narrow, per `parseDispatchKey`), so the orphan sweep must not reap it — reaping
+    // would drop its once-page / once-dispatch markers and re-page + re-dispatch a
+    // declined repair after every daemon restart.
+    if (row.verb === "repair") {
       continue;
     }
     mintClear(row.verb, row.id);
@@ -663,6 +675,17 @@ export const CODEX_ADOPTION_MINT_CAP_PER_TICK = 8;
 export const BLOCK_ESCALATION_SKIP_CATEGORY = "TOOLING_FAILURE";
 
 /**
+ * The blocked category whose authority follows the SHARED (base) surface rather than
+ * one task: a worker-confirmed "the shared base is broken" report. It routes NOT to a
+ * diagnosis-only `unblock::<task>` session but to a write-capable, trunk-committing
+ * `repair::<repo-token>` escalation, keyed per (repo, fingerprint) and fanning its
+ * fix out to every affected task across every epic on that repo. Named as its own
+ * constant (not folded into the denylist) so the {@link routeBlockedCategory} table
+ * can key on it explicitly.
+ */
+export const SHARED_BASE_BROKEN_CATEGORY = "SHARED_BASE_BROKEN";
+
+/**
  * A pending `block_escalations` latch row joined to its epic's `project_dir` and
  * the embedded task's live `runtime_status` / `target_repo`. The producer sweep's
  * current-state working set — bounded by the number of concurrently-blocked
@@ -766,6 +789,37 @@ export function shouldEscalateBlockedCategory(
   category: string | null,
 ): boolean {
   return category != null && category !== BLOCK_ESCALATION_SKIP_CATEGORY;
+}
+
+/**
+ * The route a blocked category takes out of the block-escalation sweep:
+ *  - `surface_and_stop` — a `TOOLING_FAILURE` / absent-or-unparseable category:
+ *    NEVER dispatch an agent; suppress `work::<task>` re-dispatch (see
+ *    {@link runBlockEscalationSweep}).
+ *  - `repair` — a `SHARED_BASE_BROKEN` category: the shared base is broken, so
+ *    authority follows the repo surface. The sweep does NOT dispatch a
+ *    diagnosis-only `unblock::<task>` here; the sibling repair sweep
+ *    ({@link runRepairEscalationSweep}) owns the (repo, fingerprint)-keyed,
+ *    write-capable `repair::<repo-token>` dispatch, so the block sweep skips the row
+ *    (latch left `pending`, re-sweeps; a successful repair unblocks the task,
+ *    deleting the latch).
+ *  - `unblock` — every other escalatable category: today's per-epic-serialized
+ *    `unblock::<task>` dispatch, byte-equivalent.
+ */
+export type BlockRoute = "surface_and_stop" | "repair" | "unblock";
+
+/**
+ * The category→route dispatch TABLE — the shared SEAM the block-escalation sweep
+ * routes each blocked row through. Extracted as ONE pure exported function (rather
+ * than an inline if/else chain in the sweep body) so a new category route is a
+ * one-line edit HERE, never a rewrite of the sweep loop — the seam an in-flight epic
+ * adding audit-category routes (AUDIT_READY / AUDIT_SEVERE) extends without a
+ * merge-conflict. Pure; total; never throws.
+ */
+export function routeBlockedCategory(category: string | null): BlockRoute {
+  if (category === SHARED_BASE_BROKEN_CATEGORY) return "repair";
+  if (!shouldEscalateBlockedCategory(category)) return "surface_and_stop";
+  return "unblock";
 }
 
 /**
@@ -1035,10 +1089,22 @@ export async function runBlockEscalationSweep(
         continue;
       }
       // Past grace with a dead orchestrator: fall through to the ordinary
-      // escalatable dispatch path (AUDIT_READY is not on the skip denylist).
+      // escalatable dispatch path (AUDIT_READY routes "unblock" below).
     }
 
-    if (!shouldEscalateBlockedCategory(category)) {
+    const route = routeBlockedCategory(category);
+    if (route === "repair") {
+      // SHARED_BASE_BROKEN: authority follows the repo surface, not this one task.
+      // The sibling repair sweep owns the (repo, fingerprint)-keyed
+      // `repair::<repo-token>` dispatch, so skip WITHOUT minting — the latch stays
+      // `pending` and re-sweeps; a successful repair unblocks the task, deleting the
+      // latch via the leave-blocked `TaskSnapshot` fold. NEVER dispatch a
+      // diagnosis-only unblock for a shared-base breakage (that is the whole point of
+      // the repair route), and never surface-and-stop it (it IS escalatable, just to a
+      // different owner).
+      continue;
+    }
+    if (route === "surface_and_stop") {
       // TOOLING_FAILURE / absent / unparseable: surface-and-stop, NEVER dispatch an
       // agent. Record a terminal outcome so it never re-evaluates.
       deps.mintRequested(row.epic_id, row.task_id);
@@ -1173,6 +1239,32 @@ export function buildBlockHumanNotifyBody(args: {
   ].join("\n");
 }
 
+/**
+ * Build the ONE structured operator page the repair human-notify sweep sends over
+ * botctl when a `repair::<repo-token>` session DECLINES or DIES. Short by design — the
+ * sticky repair row + every affected task carry the full context on the board; this is
+ * the courtesy page that names the repo, the verdict, and the re-arm command. Pure.
+ */
+export function buildRepairHumanNotifyBody(args: {
+  repoToken: string;
+  repoDir: string | null;
+  verdict: "declined" | "died";
+}): string {
+  const verdictLine =
+    args.verdict === "died"
+      ? `its job DIED before landing a fix`
+      : `it DECLINED (could not repair the shared base — stamped BLOCKED)`;
+  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
+  return [
+    `🔴 keeper: repair::${args.repoToken} needs you — the autonomous shared-base`,
+    `repair session gave up on the broken base (${verdictLine}); repo ${repo}`,
+    `stays broken and every SHARED_BASE_BROKEN task on it stays BLOCKED.`,
+    ``,
+    `Fix the shared base by hand, then re-arm the repair:`,
+    `  keeper autopilot retry repair::${args.repoToken}`,
+  ].join("\n");
+}
+
 /** Injectable dependency surface for {@link runBlockHumanNotifySweep} — the stage-3
  *  unblock human-notify sweep. Same fail-open injectable-deps discipline as
  *  {@link DeconflictHumanNotifySweepDeps}. */
@@ -1270,6 +1362,265 @@ export async function runBlockHumanNotifySweep(
     // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
     // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
     deps.mintAttempted(row.epic_id, row.task_id, result);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// fn-1173 — daemon SHARED_BASE_BROKEN repair-escalation producer
+// ---------------------------------------------------------------------------
+//
+// The write-capable sibling of the unblock/deconflict escalation dispatches. Where a
+// `unblock::<task>` session is diagnosis-only and task-scoped, a `repair::<repo-token>`
+// session is REPO-scoped and trunk-committing: it fixes the broken shared base ONCE and
+// its fix fans out to every affected task across every epic on that repo. The sweep
+// coalesces every `SHARED_BASE_BROKEN` blocked task to at most one repair per repo
+// (biasing conservative — one repair per shared checkout never races two commits at one
+// tree), keying the fingerprint on the reason so escalation-brief can name the defect.
+
+/** The fixed leading token a repair session's sticky `dispatch_failures` row carries in
+ *  its `reason` — `shared-base-broken:<fingerprint>`. The SAME contract
+ *  `cli/escalation-brief.ts`'s `REPAIR_REASON_RE` parses, established there ahead of this
+ *  producer; the fingerprint half is a `\S+` token (see {@link fingerprintFailure}). */
+export const REPAIR_REASON_PREFIX = "shared-base-broken";
+
+/** Build the sticky repair row's `reason` for a fingerprint — the mint-side twin of
+ *  `cli/escalation-brief.ts`'s `REPAIR_REASON_RE`. Pure. */
+export function repairReasonFor(fingerprint: string): string {
+  return `${REPAIR_REASON_PREFIX}:${fingerprint}`;
+}
+
+/** One `SHARED_BASE_BROKEN` blocked task resolved to the shared repo it hashes to — the
+ *  repair sweep's per-row working set, bounded by the number of concurrently
+ *  shared-base-broken tasks (never a history scan). Coalesced by {@link repo_token}. */
+export interface RepairCandidate {
+  epic_id: string;
+  task_id: string;
+  /** The resolved shared-checkout dir (non-empty) — the repair session's cwd. */
+  repo_dir: string;
+  /** {@link repoToken}(repo_dir) — the `repair::<token>` key half + row id. */
+  repo_token: string;
+  /** {@link fingerprintFailure}(blocked reason) — the defect identity in the row reason. */
+  fingerprint: string;
+}
+
+/** The coalesced representative of a repo token's candidate group — the (repo_dir,
+ *  fingerprint) one repair dispatch + one sticky row are keyed on. */
+export interface RepairGroup {
+  repo_token: string;
+  repo_dir: string;
+  fingerprint: string;
+}
+
+/** An existing sticky `dispatch_failures` repair row (verb `repair`, id the repo
+ *  token) — the repair sweep's clear/notify working set. */
+export interface PendingRepairRow {
+  /** The repo token (`dispatch_failures.id`; verb is `repair`). */
+  id: string;
+  reason: string;
+  dir: string | null;
+  /** The dispatch-once marker (stamped by `RepairDispatched`). */
+  repair_dispatched_at: number | null;
+  /** The page-once marker (stamped by `RepairHumanNotified`). */
+  human_notified_at: number | null;
+}
+
+/** The outcome the repair sweep records on `RepairDispatched`. The TERMINAL
+ *  `dispatched` stamps `repair_dispatched_at`; `dispatch_failed` is NON-terminal. */
+export type RepairDispatchOutcome = "dispatched" | "dispatch_failed";
+
+/** The outcome the repair sweep records on `RepairHumanNotified`. The TERMINAL
+ *  `notified` stamps `human_notified_at`; `notify_failed` is NON-terminal. */
+export type RepairHumanNotifiedOutcome = "notified" | "notify_failed";
+
+/** Injectable dependency surface for {@link runRepairEscalationSweep}. Same fail-open
+ *  injectable-deps discipline as the sibling escalation sweeps — the producer is
+ *  testable with synthetic candidates + rows and an injected dispatcher, never touching
+ *  a real daemon / git / socket, and never throws into the daemon loop. */
+export interface RepairEscalationSweepDeps {
+  /** The current `SHARED_BASE_BROKEN` blocked candidates, resolved to (repo, fingerprint)
+   *  (production builds them from {@link selectPendingBlockEscalations} + the fs reason
+   *  read + {@link repoToken} + {@link fingerprintFailure}). */
+  readonly selectCandidates: () => RepairCandidate[];
+  /** The existing sticky repair rows (production: `dispatch_failures WHERE verb='repair'`). */
+  readonly selectRepairRows: () => PendingRepairRow[];
+  /** True iff the repo's shared checkout is DIRTY / mid-merge — a DEFER at dispatch time
+   *  (no attempt consumed, and no row minted when none exists yet), per the finalize
+   *  dirty-degrade precedent. Production reads the `git_status` projection. */
+  readonly isDirtyCheckout: (repoDir: string) => boolean;
+  /** True iff the repo's shared base reads GREEN — the positive-evidence gate the clear
+   *  requires (combined with zero remaining candidates). Anything else (red / unknown /
+   *  unseeded) RETAINS the sticky row ("retained on no report"). */
+  readonly isBaseGreen: (repoDir: string) => boolean;
+  /** Launch ONE `repair::<token>` escalation session for the group (DELEGATES to the
+   *  shared {@link dispatchEscalationSession} in production, so the global cap + per-key
+   *  occupancy guard apply). Async + fail-open — a SKIP (`at_cap` / `already_live`) mints
+   *  nothing so the row re-sweeps. */
+  readonly dispatchRepair: (
+    group: RepairGroup,
+  ) => Promise<EscalationDispatchOutcome>;
+  /** Classify the dispatched `repair::<token>` session's outcome (DELEGATES to
+   *  {@link classifyEscalationOutcome} over the live `jobs` in production). The human is
+   *  paged only on a terminal decline/death; while it is live or unfolded it returns
+   *  `{terminal:false}` and the sweep skips (a successful repair unblocks the tasks,
+   *  emptying the candidate set so this row reaches the CLEAR pass, not the notify). */
+  readonly repairOutcome: (repoToken: string) => ResolverOutcome;
+  /** Send the ONE botctl page about a declined/dead `repair::<token>` session. Async +
+   *  fail-open — every error degrades to `notify_failed` so the row re-sweeps. */
+  readonly notifyHuman: (
+    row: PendingRepairRow,
+    verdict: "declined" | "died",
+  ) => Promise<RepairHumanNotifiedOutcome>;
+  /** Mint the sticky repair row (a `DispatchFailed{verb:'repair', id:token,
+   *  reason:'shared-base-broken:<fp>', dir:repoDir}`) — the durable latch escalation-brief
+   *  reads and the once-page anchor. Idempotent UPSERT (preserves `created_at`). */
+  readonly mintRow: (group: RepairGroup) => void;
+  /** Mint a `RepairDispatched{outcome}` synthetic event — the fold stamps
+   *  `repair_dispatched_at` ONLY on the terminal `dispatched`. */
+  readonly mintDispatched: (
+    repoToken: string,
+    outcome: RepairDispatchOutcome,
+  ) => void;
+  /** Mint a `RepairHumanNotified{outcome}` synthetic event — the fold stamps
+   *  `human_notified_at` ONLY on the terminal `notified`. */
+  readonly mintNotified: (
+    repoToken: string,
+    outcome: RepairHumanNotifiedOutcome,
+  ) => void;
+  /** Mint a `DispatchCleared{verb:'repair', id:token}` — the positive-evidence clear.
+   *  Drops the row + every marker so a fresh breakage re-arms at NULL. */
+  readonly clearRow: (repoToken: string) => void;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/** Deterministic `(epic_id, task_id)` order — the stable total sort the coalesced
+ *  representative fingerprint is picked from, so a re-key never flaps. */
+function compareRepairCandidate(
+  a: RepairCandidate,
+  b: RepairCandidate,
+): number {
+  return (
+    a.epic_id.localeCompare(b.epic_id) || a.task_id.localeCompare(b.task_id)
+  );
+}
+
+/**
+ * Run one daemon repair-escalation sweep — the producer for the `SHARED_BASE_BROKEN`
+ * incident class. Coalesce every shared-base-broken blocked candidate to one group per
+ * repo token (representative = the (repo_dir, fingerprint) of the lexicographically-first
+ * candidate), then per token:
+ *
+ *  - A row with `repair_dispatched_at` set and candidates STILL remaining means the
+ *    dispatched repair DECLINED / DIED (a success would have unblocked the tasks, emptying
+ *    the group): page the human ONCE via the `human_notified_at` gate, then leave the row
+ *    sticky until `retry_dispatch` re-arms it.
+ *  - A token with no dispatched repair yet DISPATCHES one `repair::<token>` session (the
+ *    global cap + per-key occupancy guard apply via `dispatchRepair`), minting the sticky
+ *    latch first when none exists. A DIRTY shared checkout DEFERS — no attempt consumed,
+ *    and no row minted when none exists yet.
+ *  - A sticky row whose repo token has ZERO remaining candidates AND whose base reads
+ *    GREEN is CLEARED on positive evidence (an unknown/red base RETAINS it).
+ *
+ * NEVER throws — every helper edge degrades to a recorded outcome (mirrors the sibling
+ * escalation sweeps). The spawn lives ONLY here in the producer, never reachable from
+ * `applyEvent`, so a re-fold never re-fires a launch.
+ */
+export async function runRepairEscalationSweep(
+  deps: RepairEscalationSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let candidates: RepairCandidate[];
+  let rows: PendingRepairRow[];
+  try {
+    candidates = deps.selectCandidates();
+  } catch (err) {
+    note(
+      `# warn: repair-escalation sweep candidate read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  try {
+    rows = deps.selectRepairRows();
+  } catch (err) {
+    note(
+      `# warn: repair-escalation sweep row read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  if (candidates.length === 0 && rows.length === 0) return;
+
+  // Coalesce to one group per repo token. The candidates are walked in a stable total
+  // order so the representative (repo_dir, fingerprint) is deterministic — a re-key of a
+  // token that gains/loses siblings never flaps.
+  const groups = new Map<string, RepairGroup>();
+  for (const c of [...candidates].sort(compareRepairCandidate)) {
+    if (c.repo_token === "" || c.repo_dir === "") continue;
+    if (!groups.has(c.repo_token)) {
+      groups.set(c.repo_token, {
+        repo_token: c.repo_token,
+        repo_dir: c.repo_dir,
+        fingerprint: c.fingerprint,
+      });
+    }
+  }
+  const rowByToken = new Map(rows.map((r) => [r.id, r]));
+
+  // DISPATCH / NOTIFY — one pass over the tokens that still carry a breakage.
+  for (const [token, group] of groups) {
+    const existing = rowByToken.get(token);
+    if (existing != null && existing.repair_dispatched_at != null) {
+      // A repair already ran, yet the breakage persists (candidates remain) — it
+      // DECLINED / DIED. Page the human ONCE, sequenced behind the session's TERMINAL
+      // verdict; the row then stays sticky until `retry_dispatch`.
+      if (existing.human_notified_at != null) continue; // already paged
+      const outcome = deps.repairOutcome(token);
+      if (!outcome.terminal) continue; // still live / job not folded yet
+      let result: RepairHumanNotifiedOutcome;
+      try {
+        result = await deps.notifyHuman(existing, outcome.verdict);
+      } catch (err) {
+        note(
+          `# warn: repair human-notify threw for ${token} (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        result = "notify_failed";
+      }
+      deps.mintNotified(token, result);
+      continue;
+    }
+    // Not yet dispatched (no row, or a minted-but-undispatched row waiting on a cap slot).
+    // A DIRTY shared checkout DEFERS — never launch a write-capable session into a
+    // mid-merge/dirty tree, consume no attempt, and mint no row when none exists yet.
+    if (deps.isDirtyCheckout(group.repo_dir)) continue;
+    if (existing == null) deps.mintRow(group); // the durable latch, minted once
+    let outcome: EscalationDispatchOutcome;
+    try {
+      outcome = await deps.dispatchRepair(group);
+    } catch (err) {
+      note(
+        `# warn: repair dispatch threw for ${token} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      outcome = "dispatch_failed";
+    }
+    // A SKIP (`at_cap` / `already_live`) mints nothing — the row persists and re-sweeps.
+    if (outcome === "at_cap" || outcome === "already_live") continue;
+    deps.mintDispatched(token, outcome);
+  }
+
+  // CLEAR — positive-evidence level-clear. A sticky repair row whose repo token no longer
+  // carries ANY shared-base-broken candidate (the breakage is gone) clears IFF the base
+  // reads green; an unknown/red base RETAINS the row (never a false clear on no report).
+  for (const row of rows) {
+    if (groups.has(row.id)) continue; // still broken → owned by the dispatch/notify pass
+    if (!deps.isBaseGreen(row.dir ?? "")) continue; // retained on no report / red base
+    deps.clearRow(row.id);
   }
 }
 
@@ -8456,6 +8807,187 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
+   * Mint the sticky repair-latch `DispatchFailed` on the `repair::<repo-token>` key —
+   * the durable `dispatch_failures` row (verb `repair`, id the token) escalation-brief
+   * reads and the once-page / once-dispatch markers hang on. Rides its OWN thin closure
+   * (like the distress mints) because the `repair` verb is NOT part of the strict
+   * `DispatchFailedMessage["payload"]` union {@link handleDispatchFailedMint} takes. The
+   * fold UPSERTs on `(verb, id)` preserving `created_at` + every marker, so a re-mint
+   * while the base stays broken is idempotent; `ts` is producer-stamped for re-fold
+   * determinism. NON-FATAL on insert failure — the next heartbeat sweep re-attempts.
+   */
+  function mintRepairRowEvent(
+    token: string,
+    reason: string,
+    dir: string | null,
+    tsSec: number,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `repair::${token}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: dir,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: "repair",
+          id: token,
+          reason,
+          dir,
+          ts: tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] repair-latch DispatchFailed mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint one synthetic `RepairDispatched` event onto the writable connection — the
+   * repair sweep's only write path into the `dispatch_failures.repair_dispatched_at`
+   * once-marker (the reducer fold owns the UPDATE, stamping ONLY on a terminal
+   * `dispatched` and NEVER clearing the sticky row). Sibling of
+   * {@link mintResolverDispatchEvent}; the repo-token `id` rides the entity-key overload
+   * on `session_id`. NON-FATAL on insert failure — the next heartbeat sweep re-attempts.
+   */
+  function mintRepairDispatchedEvent(
+    id: string,
+    outcome: RepairDispatchOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: id,
+        $pid: null,
+        $hook_event: "RepairDispatched",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ id, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] RepairDispatched mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Mint one synthetic `RepairHumanNotified` event onto the writable connection — the
+   * repair sweep's only write path into the `dispatch_failures.human_notified_at`
+   * once-marker on the repair row (the reducer fold owns the UPDATE, stamping ONLY on a
+   * terminal `notified` and NEVER clearing the sticky row). Sibling of
+   * {@link mintMergeHumanNotifiedEvent}. NON-FATAL on insert failure — the next
+   * heartbeat sweep re-attempts (the marker stays NULL on a `notify_failed`).
+   */
+  function mintRepairHumanNotifiedEvent(
+    id: string,
+    outcome: RepairHumanNotifiedOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: id,
+        $pid: null,
+        $hook_event: "RepairHumanNotified",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ id, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] RepairHumanNotified mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
    * Read the task's `blocked_reason` from its plan state file
    * (`<project_dir>/.keeper/state/tasks/<task_id>.state.json`). Producer-side fs
    * read — legal OUTSIDE any fold. Returns null on every miss (no `project_dir`,
@@ -8589,7 +9121,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     try {
       jobs = db
         .query(
-          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb IN ('unblock', 'deconflict')",
+          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb IN ('unblock', 'deconflict', 'repair')",
         )
         .all() as unknown as Job[];
     } catch {
@@ -9117,6 +9649,228 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         void runBlockHumanNotifySweepTick().catch((err) => {
           console.error(
             `[keeperd] unblock human-notify sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
+    : null;
+
+  // Producer-side SHARED_BASE_BROKEN repair-escalation sweep (fn-1173). Each heartbeat
+  // tick coalesces every shared-base-broken blocked task to one `repair::<repo-token>`
+  // dispatch per repo (write-capable, trunk-committing), pages a declined repair ONCE via
+  // the `human_notified_at` gate, and clears the sticky row on positive evidence (base
+  // green + zero remaining candidates). All wall-clock + fs + spawn lives HERE in the
+  // producer; the spawn lives only here, so a re-fold never re-fires a launch.
+
+  // Read the `git_status` projection dirty-count for a repo dir. Returns the count, or
+  // `null` when no row exists (an unseeded / unknown surface — never treated as clean).
+  function repoDirtyCount(repoDir: string): number | null {
+    try {
+      const row = db
+        .query("SELECT dirty_count FROM git_status WHERE project_dir = ?")
+        .get(repoDir) as { dirty_count: number } | null | undefined;
+      return row == null ? null : row.dirty_count;
+    } catch {
+      return null;
+    }
+  }
+  // DEFER gate: a repo whose shared checkout is dirty (>0) OR unknown (no seeded row) is
+  // NOT safe for a write-capable repair launch, so DEFER conservatively on both.
+  function isRepairCheckoutDirty(repoDir: string): boolean {
+    const n = repoDirtyCount(repoDir);
+    return n == null || n > 0;
+  }
+  // Positive-evidence gate: the base reads green only when the shared checkout is seeded
+  // AND clean (dirty_count === 0). Unknown / dirty RETAINS the sticky row (no false clear).
+  function isRepairBaseGreen(repoDir: string): boolean {
+    return repoDirtyCount(repoDir) === 0;
+  }
+
+  // Build the repair candidate set from the SHARED_BASE_BROKEN blocked tasks: reuse the
+  // block-escalation pending selector + the fs reason read, keep only the shared-base
+  // route, and resolve each to (repo_dir, repo_token, fingerprint). Producer-side fs reads
+  // are legal outside any fold. A row with no effective repo is skipped (unrepairable).
+  function selectRepairCandidates(): RepairCandidate[] {
+    const out: RepairCandidate[] = [];
+    for (const row of selectPendingBlockEscalations(db)) {
+      if (row.runtime_status !== "blocked") continue;
+      const reason = readTaskBlockedReason(row.project_dir, row.task_id);
+      if (routeBlockedCategory(parseBlockedCategory(reason)) !== "repair") {
+        continue;
+      }
+      const repoDir = effectiveBlockEscalationRepo(
+        row.target_repo,
+        row.project_dir,
+      );
+      if (repoDir === "") continue;
+      out.push({
+        epic_id: row.epic_id,
+        task_id: row.task_id,
+        repo_dir: repoDir,
+        repo_token: repoToken(repoDir),
+        // `reason` is non-null here (route === "repair" required a parseable category).
+        fingerprint: fingerprintFailure(reason ?? ""),
+      });
+    }
+    return out;
+  }
+
+  // Read the existing sticky repair rows off the writable connection (sequenced inside
+  // the same writer that mints). A read failure degrades to an empty set (the sweep
+  // re-sweeps next tick).
+  function selectRepairRows(): PendingRepairRow[] {
+    try {
+      return db
+        .query(
+          "SELECT id, reason, dir, repair_dispatched_at, human_notified_at FROM dispatch_failures WHERE verb = 'repair'",
+        )
+        .all() as PendingRepairRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
+  // checkout (the repo dir itself — NOT the lane-or-project resolution unblock uses),
+  // where the base branch lives and `keeper commit-work` lands a trunk commit; the prompt
+  // is `/plan:repair <token>`, run at the escalation model/effort via the shared
+  // `dispatchEscalationSession` (so the global cap + per-key occupancy guard apply).
+  async function dispatchRepair(
+    group: RepairGroup,
+  ): Promise<EscalationDispatchOutcome> {
+    return dispatchEscalationSession(liveEscalationDispatchDeps, {
+      verb: "repair",
+      id: group.repo_token,
+      prompt: defaultPlanPrompt("repair", group.repo_token),
+      cwd: group.repo_dir,
+    });
+  }
+
+  // Send the ONE botctl page about a declined/dead `repair::<token>` session. Sibling of
+  // `notifyHumanOfBlock`: ASYNC spawn, array form so the body rides as a literal argv
+  // element. A non-zero exit OR a missing botctl maps to `notify_failed` — NON-terminal,
+  // so the marker stays NULL and the row re-sweeps: the page is never lost, and the sticky
+  // repair row stays operator-visible on the board throughout.
+  async function notifyHumanOfRepair(
+    row: PendingRepairRow,
+    verdict: "declined" | "died",
+  ): Promise<RepairHumanNotifiedOutcome> {
+    const body = buildRepairHumanNotifyBody({
+      repoToken: row.id,
+      repoDir: row.dir,
+      verdict,
+    });
+    try {
+      const proc = Bun.spawn(
+        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0 ? "notified" : "notify_failed";
+    } catch (err) {
+      console.error(
+        `[keeperd] repair human-notify spawn threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return "notify_failed";
+    }
+  }
+
+  // The stage-3 board-state gate for the repair notify: is the sticky
+  // `repair::<token>` row still present? A successful repair clears it (the sweep's
+  // positive-evidence `DispatchCleared`) before the notify fires, so a surviving row
+  // means the breakage is unresolved — the incident {@link classifyEscalationOutcome}
+  // may page on. A read miss degrades to `false` (incident treated closed → the
+  // notify WAITS, never a premature page on a transient error), mirroring
+  // {@link deconflictIncidentOpen}.
+  function repairIncidentOpen(token: string): boolean {
+    try {
+      return (
+        db
+          .query(
+            "SELECT 1 FROM dispatch_failures WHERE verb = 'repair' AND id = ? LIMIT 1",
+          )
+          .get(token) != null
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  // The sticky repair row's `instance_event_id` — the incident anchor the repair
+  // human-notify probe scopes its jobs read on, so a stale `repair::<token>` session
+  // row from a resolved (cleared) prior breakage never suppresses or prematurely
+  // fires the notify for a re-minted one. A read miss or absent row degrades to NULL
+  // (the unscoped verb+ref fallback), never a thrown error — mirrors
+  // {@link stickyCloseInstanceFor}.
+  function stickyRepairInstanceFor(token: string): number | null {
+    try {
+      const row = db
+        .query(
+          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'repair' AND id = ? LIMIT 1",
+        )
+        .get(token) as { instance_event_id: number | null } | null;
+      return row?.instance_event_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function runRepairEscalationSweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    // Paused = the human is in control; a paused board never auto-dispatches a NEW
+    // escalation session (mirrors the block/deconflict/resolver pause gate). So a fresh
+    // shared-base breakage on a paused board defers BOTH the repair dispatch and the page
+    // until play.
+    if (autopilotPaused) return;
+    await runRepairEscalationSweep({
+      selectCandidates: () => selectRepairCandidates(),
+      selectRepairRows: () => selectRepairRows(),
+      isDirtyCheckout: (repoDir) => isRepairCheckoutDirty(repoDir),
+      isBaseGreen: (repoDir) => isRepairBaseGreen(repoDir),
+      dispatchRepair: (group) => dispatchRepair(group),
+      repairOutcome: (token) =>
+        classifyEscalationOutcome(
+          resolveEscalationJobsFor(
+            db,
+            "repair",
+            token,
+            stickyRepairInstanceFor(token),
+          ),
+          "repair",
+          token,
+          repairIncidentOpen(token),
+        ),
+      notifyHuman: (row, verdict) => notifyHumanOfRepair(row, verdict),
+      mintRow: (group) =>
+        mintRepairRowEvent(
+          group.repo_token,
+          repairReasonFor(group.fingerprint),
+          group.repo_dir,
+          Date.now() / 1000,
+        ),
+      mintDispatched: (token, outcome) =>
+        mintRepairDispatchedEvent(token, outcome),
+      mintNotified: (token, outcome) =>
+        mintRepairHumanNotifiedEvent(token, outcome),
+      clearRow: (token) => mintDispatchClearedEvent("repair", token),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
+  // launcher is reachable. Rides the same 60s heartbeat as the block-escalation sweep.
+  const repairEscalationSweepTimer = want("autopilot")
+    ? setInterval(() => {
+        void runRepairEscalationSweepTick().catch((err) => {
+          console.error(
+            `[keeperd] repair-escalation sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -10357,6 +11111,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     if (blockHumanNotifySweepTimer !== null) {
       clearInterval(blockHumanNotifySweepTimer);
+    }
+    if (repairEscalationSweepTimer !== null) {
+      clearInterval(repairEscalationSweepTimer);
     }
     if (mergeEscalationSweepTimer !== null) {
       clearInterval(mergeEscalationSweepTimer);

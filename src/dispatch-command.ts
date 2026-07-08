@@ -10,8 +10,12 @@
  * `BadParamsError` (which lives in the heavy `./server-worker`), so importing
  * this module never drags the server-worker graph into a leaf. The RPC handler
  * re-wraps an `{ ok: false }` into `BadParamsError` to keep the `bad_params`
- * wire contract byte-identical.
+ * wire contract byte-identical. The ONE import here — {@link REPO_TOKEN_RE}
+ * from `./derivers` — is itself a dep-free leaf (zero imports of its own), so
+ * it stays within this discipline; it exists so this module and `./derivers`
+ * share ONE repo-token shape definition rather than two that could drift.
  */
+import { REPO_TOKEN_RE } from "./derivers";
 
 // ---------------------------------------------------------------------------
 // `${verb}::${id}` composite-key validator
@@ -31,15 +35,19 @@ const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
 ]);
 
 /**
- * The escalation spawn verbs — the two autonomous escalation dispatches
- * (`unblock::<task>`, `deconflict::<epic>`). DELIBERATELY separate from {@link
- * RetryDispatchVerb}: an escalation key is NEVER a sticky `dispatch_failures` row
- * (those stay `work::`/`close::`), so the `retry_dispatch` wire validator ({@link
- * parseDispatchKey}) must NOT accept them — widening it would let `retry_dispatch`
- * accept keys that never exist as rows. The MANUAL `keeper dispatch` surface
- * parses the wider {@link DispatchableVerb} set via {@link parseDispatchableKey}.
+ * The escalation spawn verbs — the three autonomous escalation dispatches
+ * (`unblock::<task>`, `deconflict::<epic>`, `repair::<repo-token>`).
+ * DELIBERATELY separate from {@link RetryDispatchVerb}: an escalation session
+ * is launched directly (`dispatchEscalationSession` / this manual CLI), never
+ * through the `retry_dispatch` RPC, so the `retry_dispatch` wire validator
+ * ({@link parseDispatchKey}) must NOT accept these verbs — widening it would
+ * let an operator "retry" a key that RPC path never dispatches. `repair` is
+ * repo-scoped rather than epic/task-scoped: its id half is a {@link
+ * REPO_TOKEN_RE} repo token, never an `fn-`-shaped ref. The MANUAL `keeper
+ * dispatch` surface parses the wider {@link DispatchableVerb} set via {@link
+ * parseDispatchableKey}.
  */
-export type EscalationVerb = "unblock" | "deconflict";
+export type EscalationVerb = "unblock" | "deconflict" | "repair";
 
 /**
  * Every verb the manual `keeper dispatch` plan-form positional accepts — the
@@ -55,16 +63,17 @@ const DISPATCHABLE_VERBS = new Set<DispatchableVerb>([
   "approve",
   "unblock",
   "deconflict",
+  "repair",
 ]);
 
 /**
- * True iff `verb` is an escalation verb (`unblock` / `deconflict`). The launch
- * surface uses this to select the escalation launch config (sonnet/high +
- * `escalation` preset) over the worker one — the escalation dispatches boot a
- * purpose-built plan skill, never a worker cell.
+ * True iff `verb` is an escalation verb (`unblock` / `deconflict` / `repair`).
+ * The launch surface uses this to select the escalation launch config
+ * (sonnet/high + `escalation` preset) over the worker one — the escalation
+ * dispatches boot a purpose-built plan skill, never a worker cell.
  */
 export function isEscalationVerb(verb: string): verb is EscalationVerb {
-  return verb === "unblock" || verb === "deconflict";
+  return verb === "unblock" || verb === "deconflict" || verb === "repair";
 }
 
 /** Discriminated result of {@link parseDispatchKey}. */
@@ -144,13 +153,18 @@ export type ParseDispatchableKeyResult =
 /**
  * Split + validate a `${verb}::${id}` composite key for the MANUAL `keeper
  * dispatch` surface, accepting the wider {@link DispatchableVerb} set (the
- * retry-wire verbs PLUS the escalation verbs `unblock` / `deconflict`). The
- * id-shape rules are identical to {@link parseDispatchKey} — same separator +
- * {@link isSafeDispatchIdToken} filename-safety checks — the ONLY difference is
- * the accepted verb set. Kept as a SEPARATE function (not a widening of
- * {@link parseDispatchKey}) so the `retry_dispatch` wire validator stays
- * byte-identical: it never accepts an escalation key, which is never a sticky
- * `dispatch_failures` row. Returns a DISCRIMINATED result; dep-free.
+ * retry-wire verbs PLUS the escalation verbs `unblock` / `deconflict` /
+ * `repair`). The id-shape rules are identical to {@link parseDispatchKey} —
+ * same separator + {@link isSafeDispatchIdToken} filename-safety checks —
+ * with ONE addition: a `repair` id must ALSO match {@link REPO_TOKEN_RE} (a
+ * repo token, never an `fn-`-shaped ref) — this is a STRUCTURAL check only
+ * (rejects an obviously malformed or path-shaped token); it cannot prove the
+ * token names a real repo, which the CLI's DB-backed cwd resolution does
+ * separately. Kept as a SEPARATE function (not a widening of {@link
+ * parseDispatchKey}) so the `retry_dispatch` wire validator stays
+ * byte-identical: it never accepts an escalation key (see {@link
+ * EscalationVerb}). Returns a DISCRIMINATED result; dep-free (see the module
+ * docstring for the one `./derivers` import).
  */
 export function parseDispatchableKey(
   value: unknown,
@@ -181,7 +195,7 @@ export function parseDispatchableKey(
   if (!DISPATCHABLE_VERBS.has(verbRaw as DispatchableVerb)) {
     return {
       ok: false,
-      error: `dispatch: \`verb\` must be one of work|close|approve|unblock|deconflict (got ${JSON.stringify(verbRaw)})`,
+      error: `dispatch: \`verb\` must be one of work|close|approve|unblock|deconflict|repair (got ${JSON.stringify(verbRaw)})`,
     };
   }
   if (!isSafeDispatchIdToken(idRaw)) {
@@ -189,6 +203,12 @@ export function parseDispatchableKey(
       ok: false,
       error:
         "dispatch: `id` half is empty or weaponizable (path-traversal token rejected)",
+    };
+  }
+  if (verbRaw === "repair" && !REPO_TOKEN_RE.test(idRaw)) {
+    return {
+      ok: false,
+      error: `dispatch: 'repair' id must be a '<slug>-<hash>' repo token (got ${JSON.stringify(idRaw)})`,
     };
   }
   return { ok: true, verb: verbRaw as DispatchableVerb, id: idRaw };
@@ -228,9 +248,9 @@ function isSafeDispatchIdToken(value: string): boolean {
 
 /** The canonical `/plan:<verb> <id>` slash-command prompt for a plan-form
  *  dispatch. Accepts the full {@link DispatchableVerb} set so an escalation
- *  dispatch boots `/plan:unblock` / `/plan:deconflict`; the reconciler's
- *  `work`/`close` launches (a {@link RetryDispatchVerb} subset) pass through
- *  unchanged. */
+ *  dispatch boots `/plan:unblock` / `/plan:deconflict` / `/plan:repair`; the
+ *  reconciler's `work`/`close` launches (a {@link RetryDispatchVerb} subset)
+ *  pass through unchanged. */
 export function defaultPlanPrompt(verb: DispatchableVerb, id: string): string {
   return `/plan:${verb} ${id}`;
 }

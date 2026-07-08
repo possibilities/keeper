@@ -366,6 +366,7 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper
       // The dumped resume line carries the identity env (candidate.job_id),
       // byte-aligned with what --apply spawns for the same candidate.
       "'--x-tmux-env' 'KEEPER_JOB_ID=j' " +
+      "'--x-tmux-env' 'KEEPER_ESCALATION_ROLE=' " +
       "'--permission-mode' 'acceptEdits' '--dangerously-skip-permissions' " +
       "'--x-no-confirm' '--resume' 'name'",
   );

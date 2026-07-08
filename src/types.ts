@@ -1269,3 +1269,49 @@ export interface MergeHumanNotifiedPayload {
   /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
 }
+
+/**
+ * Pre-flattened `RepairDispatched` synthetic event payload — the daemon
+ * SHARED_BASE_BROKEN sweep mints it after it attempts to launch ONE
+ * `repair::<repo-token>` escalation session against a broken shared base, stamping
+ * the `dispatch_failures.repair_dispatched_at` once-marker so the repair fires
+ * exactly once per condition instance (never a per-cycle re-dispatch loop). Keyed by
+ * the sticky repair-row `id` (the repo token; verb is always `repair`). The TERMINAL
+ * `dispatched` outcome (the launch succeeded) stamps `repair_dispatched_at =
+ * event.ts`; the non-terminal `dispatch_failed` outcome folds to a no-op, leaving the
+ * marker NULL so the row stays re-sweepable (mirrors `ResolverDispatchAttempted`'s
+ * `dispatch_failed`-is-non-terminal rule). The fold reads ONLY the payload +
+ * `event.ts`, so re-fold stays byte-deterministic. The marker NEVER clears the sticky
+ * row — only `DispatchCleared` does (retry_dispatch OR the sweep's positive-evidence
+ * clear), which re-arms the marker at NULL. Sibling of `MergeEscalationAttempted` /
+ * `ResolverDispatchAttempted` on the same table (different verb). KEEP-SET inline
+ * forever (never added to the retention shed predicate).
+ */
+export interface RepairDispatchedPayload {
+  /** The sticky repair-row `dispatch_failures.id` (the repo token; verb is `repair`). */
+  id: string;
+  /** Producer-recorded launch outcome; only the terminal `dispatched` stamps the marker. */
+  outcome: string;
+}
+
+/**
+ * Pre-flattened `RepairHumanNotified` synthetic event payload — the terminal "human
+ * notified" stage of the REPAIR escalation path, sibling to `MergeHumanNotified` but
+ * on the `repair::<repo-token>` sticky row. The daemon sweep mints it after it
+ * observes the `repair::<token>` session reach a terminal decline/death and sends the
+ * one structured botctl notification, stamping the `dispatch_failures.human_notified_at`
+ * once-marker so the human is paged exactly once. Keyed by the repair-row `id` (the
+ * repo token; verb is always `repair`). The TERMINAL `notified` outcome stamps
+ * `human_notified_at = event.ts` (gated `IS NULL`); any other outcome (`notify_failed`
+ * / unknown) is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts. The fold reads ONLY the payload + `event.ts`, so re-fold stays
+ * byte-deterministic. The marker NEVER clears the sticky row — only `DispatchCleared`
+ * does, which re-arms it at NULL. KEEP-SET inline forever (never added to the retention
+ * shed predicate).
+ */
+export interface RepairHumanNotifiedPayload {
+  /** The sticky repair-row `dispatch_failures.id` (the repo token; verb is `repair`). */
+  id: string;
+  /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
+  outcome: string;
+}

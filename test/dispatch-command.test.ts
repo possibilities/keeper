@@ -107,6 +107,39 @@ test("parseDispatchableKey: accepts the escalation verbs unblock/deconflict", ()
   });
 });
 
+// ---------------------------------------------------------------------------
+// parseDispatchableKey — repair::<repo-token> (repo-scoped escalation verb)
+// ---------------------------------------------------------------------------
+
+test("parseDispatchableKey: accepts repair::<repo-token> for a valid '<slug>-<hash>' token", () => {
+  for (const token of [
+    "keeper-qzvs8i",
+    "my-repo-ab12",
+    "Repo.name_v2-z",
+    "a-1",
+  ]) {
+    expect(parseDispatchableKey(`repair::${token}`)).toEqual({
+      ok: true,
+      verb: "repair",
+      id: token,
+    });
+  }
+});
+
+test("parseDispatchableKey: rejects a malformed (non-slug-hash-shaped) repair token", () => {
+  for (const bad of ["noHash", "-leadinghyphen", "repo-AB12", "repo-"]) {
+    const r = parseDispatchableKey(`repair::${bad}`);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/repo token/);
+  }
+});
+
+test("parseDispatchableKey: rejects a path-shaped repair token (never a raw path)", () => {
+  for (const bad of ["../etc/passwd", "/abs/path", "a/b", ".hidden"]) {
+    expect(parseDispatchableKey(`repair::${bad}`).ok).toBe(false);
+  }
+});
+
 test("parseDispatchableKey: still accepts the retry-wire verbs (superset)", () => {
   for (const [key, verb, id] of [
     ["work::fn-1-foo.3", "work", "fn-1-foo.3"],
@@ -142,23 +175,26 @@ test("retry wire byte-identical: parseDispatchKey REJECTS the escalation verbs",
   // widening it would accept keys that never exist as rows.
   expect(parseDispatchKey("unblock::fn-1-foo.3").ok).toBe(false);
   expect(parseDispatchKey("deconflict::fn-1-foo").ok).toBe(false);
+  expect(parseDispatchKey("repair::keeper-qzvs8i").ok).toBe(false);
 });
 
-test("isEscalationVerb: true only for unblock/deconflict", () => {
+test("isEscalationVerb: true only for unblock/deconflict/repair", () => {
   expect(isEscalationVerb("unblock")).toBe(true);
   expect(isEscalationVerb("deconflict")).toBe(true);
+  expect(isEscalationVerb("repair")).toBe(true);
   for (const v of ["work", "close", "approve", "resolve", "plan", ""]) {
     expect(isEscalationVerb(v)).toBe(false);
   }
 });
 
 test("isRetryableDispatchKey: an escalation key is NOT retry-wire (first-class job, not an orphan row)", () => {
-  // A live unblock::/deconflict:: job is a first-class `jobs` row (folded via the
-  // spawn-name deriver), never a `dispatch_failures` row — so it must never be a
-  // retry-wire key, and the boot orphan-GC (which only sweeps `dispatch_failures`)
-  // never sees it.
+  // A live unblock::/deconflict::/repair:: job is a first-class `jobs` row
+  // (folded via the spawn-name deriver), never a `dispatch_failures` row — so
+  // it must never be a retry-wire key, and the boot orphan-GC (which only
+  // sweeps `dispatch_failures`) never sees it.
   expect(isRetryableDispatchKey("unblock", "fn-1-foo.3")).toBe(false);
   expect(isRetryableDispatchKey("deconflict", "fn-1-foo")).toBe(false);
+  expect(isRetryableDispatchKey("repair", "keeper-qzvs8i")).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
@@ -176,6 +212,9 @@ test("defaultPlanPrompt: composes the escalation slash-commands", () => {
   );
   expect(defaultPlanPrompt("deconflict", "fn-1-foo")).toBe(
     "/plan:deconflict fn-1-foo",
+  );
+  expect(defaultPlanPrompt("repair", "keeper-qzvs8i")).toBe(
+    "/plan:repair keeper-qzvs8i",
   );
 });
 
