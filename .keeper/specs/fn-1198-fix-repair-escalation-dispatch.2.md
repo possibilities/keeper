@@ -30,5 +30,5 @@ Unit at the sweep seam: injected deps capture the diagnostic sink; assert one li
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Instrumented runBlockEscalationSweep's candidate-drop/skip gates (not_blocked, reason_unreadable, repair, surface_and_stop, empty_repo, epic_serialized, at_cap/already_live/checkout_busy) with class-stable note() diagnostics, mirroring the repair sweep's fn-1198.1 instrumentation; added a new empty-repo defensive guard and extended/added daemon.test.ts coverage for all classes plus repeat-sweep determinism.
 ## Evidence
