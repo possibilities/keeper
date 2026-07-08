@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T06:08:03.105000Z",
+  "depends_on": [],
+  "epic": "fn-1191-fix-stop-exemption-in-retention-data",
+  "id": "fn-1191-fix-stop-exemption-in-retention-data.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Fix Stop retention sentinel exemption",
+  "updated_at": "2026-07-08T06:08:03.105000Z"
+}
