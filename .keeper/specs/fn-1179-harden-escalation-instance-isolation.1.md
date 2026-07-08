@@ -38,4 +38,14 @@ escalation instance-scope test file.
 
 ## Done summary
 
+Scoped NULL-stamped escalation rows per the spec: the escalation-instance isolation fix is
+complete and tested (244 tests pass, including a new cross-instance NULL-contamination
+regression test), committed on the epic branch as b37b04d3. Board state reconciled by the
+operator: the worker's `keeper plan done` git commit was lost to a concurrent merge in the
+shared checkout while the daemon projection recorded done; this commit restores the durable
+backing.
+
 ## Evidence
+
+- Epic-branch commit b37b04d3 (keeper/epic/fn-1179-harden-escalation-instance-isolation)
+- Worker transcript: full suite green incl. the new regression test
