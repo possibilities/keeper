@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 11,
+        "files_changed": 2,
+        "insertions": 114
+      },
+      "done_summary": "Fixed computeRepinnedFingerprint to derive the schema fingerprint's v<N> prefix and digest from the renumbered ladder's tail (parsed from the rewritten db.ts) rather than the process-start-imported module's stale SCHEMA_VERSION; added a composed renumber -> re-pin regression test over a synthetic colliding lane, verified red against the old re-pin and green after the fix.",
+      "input_hash": "d7f32726817dd0b3251b4e6751d0892e4800c087a60410da42b4448df262bcd7",
+      "model": "sonnet",
+      "spec_chars": 2213,
+      "spec_md": "## Description\n\nFixes F1 (evidence: scripts/rebase-schema-migration.ts:477-484 and :593;\nsrc/db.ts:4282-4295). computeRepinnedFingerprint() opens openDb(\":memory:\")\nagainst the ../src/db module imported at process start, whose module-level\nSCHEMA_VERSION reflects the pre-renumber (colliding) working tree. main()\ncalls it at :593 AFTER apply() produced the renumbered result.files.db, but\nthe module is never reloaded, so computeSchemaFingerprint (src/db.ts:4292)\nprefixes and hashes with the stale tail (e.g. v116) while the written db.ts\nre-imports to v117 \u2014 the schema-version/db.test.ts gate then recomputes\nv117:<digest-over-v117> and mismatches the pinned v116:..., failing the\nresolver's exit-0 commit on every real renumber.\n\nRecompute the fingerprint from the rewritten ladder (result.files.db) rather\nthan the imported module snapshot: parse the post-renumber tail out of the\nrenumbered db.ts and prefix with it, or migrate a :memory: DB seeded from the\nrewritten SCHEMA_STEPS, so both the vN prefix and the hashed input observe\nthe renumbered schema.\n\nAlso folds in F4: add the composed renumber -> re-pin regression test that is\ncurrently missing \u2014 apply() tests never touch the fingerprint and\ncomputeRepinnedFingerprint is only tested against the already-consistent\ncommitted db.ts (no renumber in play), which is exactly how F1 escaped.\n\nFiles: scripts/rebase-schema-migration.ts (re-pin path),\ntest/rebase-schema-migration.test.ts (new composed test).\n\n## Acceptance\n\n- [ ] After a synthetic lane renumber, the pinned fingerprint equals a\n      from-scratch recompute over the renumbered ladder's tail (prefix + digest).\n- [ ] New test renumbers a synthetic colliding lane and asserts re-pin\n      consistency; red before the fix, green after.\n- [ ] Full fast suite + typecheck + lint green.\n\n## Done summary\nFixed computeRepinnedFingerprint to derive the schema fingerprint's v<N> prefix and digest from the renumbered ladder's tail (parsed from the rewritten db.ts) rather than the process-start-imported module's stale SCHEMA_VERSION; added a composed renumber -> re-pin regression test over a synthetic colliding lane, verified red against the old re-pin and green after the fix.\n## Evidence\n",
+      "task_id": "fn-1195-fix-schema-renumber-fingerprint-re-pin.1",
+      "tier": "xhigh",
+      "title": "Re-pin fingerprint from renumbered ladder"
+    }
+  ],
+  "created_at": "2026-07-08T12:49:18.258000Z",
+  "epic_id": "fn-1195-fix-schema-renumber-fingerprint-re-pin",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "d7f32726817dd0b3251b4e6751d0892e4800c087a60410da42b4448df262bcd7",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
