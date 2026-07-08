@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-08T12:26:06.659000Z",
+  "created_by_close_of": "fn-1182-schema-renumber-tool-and-guards",
+  "depends_on_epics": [
+    "fn-1182-schema-renumber-tool-and-guards"
+  ],
+  "id": "fn-1195-fix-schema-renumber-fingerprint-re-pin",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix schema-renumber fingerprint re-pin",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-08T12:26:06.659000Z"
+}

@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T12:26:06.659000Z",
+  "depends_on": [],
+  "epic": "fn-1195-fix-schema-renumber-fingerprint-re-pin",
+  "id": "fn-1195-fix-schema-renumber-fingerprint-re-pin.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Re-pin fingerprint from renumbered ladder",
+  "updated_at": "2026-07-08T12:26:06.659000Z"
+}
