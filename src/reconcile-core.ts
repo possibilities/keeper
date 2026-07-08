@@ -1680,6 +1680,14 @@ export function reconcile(
     // onto lane paths (cap-1 per lane) without diverging from the dispatch-side
     // worktree geometry, which derives the SAME plan in `attachWorktreeGeometry`.
     laneKeyById,
+    // The proven-dead owning-worker set (recorded pid re-proved gone at snapshot
+    // load — the SAME lifecycle verdict `computeSlotOccupancy` reclaims a slot
+    // on). Stabilizes a done task's `completed` verdict: once its worker is proven
+    // dead, that job's lingering ghost subagent / monitor rows no longer oscillate
+    // the verdict back to `running` against unrelated sibling churn. Empty on a
+    // degraded pane probe, so the terminal gate then falls back to the
+    // conservative liveness hold.
+    snapshot.provenDeadJobIds,
   );
 
   // Harvest the completion set from the ONE readiness pass above (never a second
