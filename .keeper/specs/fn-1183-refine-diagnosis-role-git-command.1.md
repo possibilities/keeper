@@ -31,5 +31,5 @@ All changes land in `plugins/keeper/plugin/hooks/escalation-guard.ts` and
 - [ ] Write-capable roles retain full git (no regression).
 
 ## Done summary
-
+Bounded the escalation-guard git config-injection scan to the pre-subcommand region (combined-diff 'git log/show -c --format' reads now allow while reordered '-c' globals stay fail-closed via valued-global-aware gitSubcommandInfo), denied the 'git grep --open-files-in-pager'/'-O' exec vector for diagnosis roles, and locked the ref-classifier deny/allow table tests.
 ## Evidence
