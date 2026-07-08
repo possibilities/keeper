@@ -90,6 +90,7 @@ import {
   isInCooldown,
   isLaneWedgeDistressKey,
   isOccupyingJob,
+  isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   LANE_OWNER_STALL_GRACE_SEC,
@@ -130,12 +131,16 @@ import {
   type SlotOccupancySignal,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
+  STUCK_SENTINEL_DISTRESS_ID_PREFIX,
+  STUCK_SENTINEL_DISTRESS_VERB,
   type StaleBaseLaneObservation,
   sharedCheckoutDistressObservations,
   sharedDesyncDistressId,
   sharedDirtyDistressId,
   sharedWedgeDistressId,
   staleBaseLaneDistressId,
+  stuckSentinelJobId,
+  stuckSentinelOrphansToClear,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
@@ -11361,6 +11366,42 @@ test("fn-1119 recoverFailuresToClear: a path-tied recover id clears on the per-d
   // But WITHOUT the observation (the repo was never swept — paused / not in the set)
   // → retained. A skipped cycle no longer clears a path-tied row either.
   expect(recoverFailuresToClear(open, [], [])).toEqual([]);
+});
+
+test("fn-1200.2 stuckSentinelJobId: extracts the job id after the prefix; null on a non-sentinel id", () => {
+  const id = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}job-abc-123`;
+  expect(stuckSentinelJobId(id)).toBe("job-abc-123");
+  expect(isStuckSentinelDistressKey(STUCK_SENTINEL_DISTRESS_VERB, id)).toBe(
+    true,
+  );
+  // A bare epic id (a real `close::<epic>` row sharing the verb) never parses.
+  expect(stuckSentinelJobId("fn-1-foo")).toBe(null);
+});
+
+test("fn-1200.2 stuckSentinelOrphansToClear: a sentinel row whose job id resolves in the jobs table stays under ack-only (never auto-cleared)", () => {
+  const liveId = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}live-job`;
+  const open = new Set([liveId]);
+  // The referenced job is present — ANY state counts as live, including a
+  // terminal one (ADR-0013's operator-ack-only discipline is unchanged for it).
+  const liveJobIds = new Set(["live-job"]);
+  expect(stuckSentinelOrphansToClear(open, liveJobIds)).toEqual([]);
+});
+
+test("fn-1200.2 stuckSentinelOrphansToClear: a sentinel row whose job id is ABSENT from the jobs table is the orphan reconciliation's GC candidate", () => {
+  const orphanId = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}pruned-job`;
+  const open = new Set([orphanId]);
+  // No job row at all for "pruned-job" — the incident shape (five of seven open
+  // sentinel rows pointing at already-pruned jobs).
+  const liveJobIds = new Set<string>();
+  expect(stuckSentinelOrphansToClear(open, liveJobIds)).toEqual([orphanId]);
+});
+
+test("fn-1200.2 stuckSentinelOrphansToClear: mixed set — only the orphan clears, the live-job row is retained", () => {
+  const liveId = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}still-here`;
+  const orphanId = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}long-gone`;
+  const open = new Set([liveId, orphanId]);
+  const liveJobIds = new Set(["still-here"]);
+  expect(stuckSentinelOrphansToClear(open, liveJobIds)).toEqual([orphanId]);
 });
 
 test("fn-1050 recoverFailureDispatchId: epic-tied → per-(epic,repo); null-epic → dir slug; the two never collide", () => {
