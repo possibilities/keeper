@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A subtle correctness invariant \u2014 id-keyed quiescence detection over a line-order stateful scan with fail-open parsing and a byte-identical regression floor \u2014 contract-touching, new-pattern shape fits xhigh.",
+      "task_id": "fn-1184-background-aware-agent-run-capture.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical, tightly-specified work \u2014 sibling string const in an existing pattern, prepend it, re-derive byte-pins, prune-edit prose \u2014 named surface, no design ambiguity.",
+      "task_id": "fn-1184-background-aware-agent-run-capture.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T02:04:49.414000Z",
+  "epic_id": "fn-1184-background-aware-agent-run-capture",
+  "input_hash": "e06f7ad89a891c05ff325ceed692b375f2c5eac281a0b9e5ed89295ca39d5194",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3765402328,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1184-background-aware-agent-run-capture.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"A subtle correctness invariant \u2014 id-keyed quiescence detection over a line-order stateful scan with fail-open parsing and a byte-identical regression floor \u2014 is a nameable intelligence-bound reason, and its contract-touching, new-pattern shape fits xhigh.\", \"confidence\": 0.8}, {\"task_id\": \"fn-1184-background-aware-agent-run-capture.2\", \"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"Mechanical, tightly-specified work \u2014 add a sibling string const in an existing pattern, prepend it, re-derive byte-pins, and prune-edit prose \u2014 with a named surface and no design ambiguity, so sonnet at medium.\", \"confidence\": 0.78}]}\n"
+}
