@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-surface observability fix with a named file/test surface and an explicit pick-one acceptance\u2014mechanical enough for sonnet at medium, no intelligence-bound reason for opus.",
+      "task_id": "fn-1201-fold-empty-token-into-repair-drop-class.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:25:45.185000Z",
+  "epic_id": "fn-1201-fold-empty-token-into-repair-drop-class",
+  "input_hash": "29b5b9f083e3c93f8990143feb103cee5526e88fc65534cb573b5ec77e042142",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 699775472,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-surface observability fix with a named file/test surface and an explicit pick-one acceptance\u2014mechanical enough for sonnet at medium, no intelligence-bound reason for opus.\",\"confidence\":0.86}]}"
+}
