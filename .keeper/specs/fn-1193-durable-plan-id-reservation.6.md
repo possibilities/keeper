@@ -57,5 +57,5 @@ test beside the existing brief-content tests in test/daemon.test.ts).
 - [ ] Root fast suite passes with the new recover-pass cases
 
 ## Done summary
-
+The recover pass defers its keeper-owned mid-merge abort (distinct worktree-recover-staged-foreign reason) when a concurrent commit's files are staged outside the merge's own set, and the deconflict skill + resolver brief now unstage-preserve foreign staged paths before any abort or concluding commit.
 ## Evidence
