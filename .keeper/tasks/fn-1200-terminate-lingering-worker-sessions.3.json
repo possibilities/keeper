@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Stabilize done-and-idle verdicts",
-  "updated_at": "2026-07-08T20:57:58.467000Z"
+  "updated_at": "2026-07-08T22:00:07.497000Z",
+  "worker_done_at": "2026-07-08T22:00:07.497000Z"
 }

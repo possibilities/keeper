@@ -36,5 +36,5 @@ Pure verdict tests replaying the incident shape and a control (owning job genuin
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Stabilized a done task's terminal-completed verdict against sibling-session liveness churn: computeReadiness now takes a proven-dead owning-worker set and reads the subagent/monitor liveness clauses off only non-proven-dead jobs, so a dead worker's lingering ghost subagent no longer oscillates the verdict completed<->running. Threaded the reconciler's provenDeadJobIds in; empty-set board/autoclose/test paths are byte-identical.
 ## Evidence
