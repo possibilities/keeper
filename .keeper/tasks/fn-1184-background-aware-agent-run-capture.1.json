@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T02:01:53.022000Z",
+  "depends_on": [],
+  "epic": "fn-1184-background-aware-agent-run-capture",
+  "id": "fn-1184-background-aware-agent-run-capture.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Gate claude stops on background quiescence",
+  "updated_at": "2026-07-08T02:01:53.022000Z"
+}
