@@ -41,6 +41,7 @@ import { join, relative, sep } from "node:path";
 
 import type {
   GitResult,
+  InProgressOp,
   NumstatRow,
   NumstatTotals,
   PlanVcs,
@@ -96,6 +97,10 @@ interface RepoState {
    * stateHeadVisible read consults — the fake analogue of HEAD:<path>. Seeded by
    * fakeCommitTaskJson; the auto-commit path also writes it on commit(). */
   committedBlobs: Map<string, string>;
+  /** The in-progress operation inProgressOp(cwd) reports, armed by
+   * armInProgressOp. Default "none" — the fake models no real git dir, so the
+   * merge-window guard's refusal is driven from this armed state. */
+  inProgressOp: InProgressOp;
 }
 
 const repos = new Map<string, RepoState>();
@@ -139,6 +144,7 @@ function repoFor(root: string): RepoState {
       statusFailures: [],
       sourceCommits: [],
       committedBlobs: new Map(),
+      inProgressOp: "none",
     };
     repos.set(key, state);
   }
@@ -293,6 +299,7 @@ export function initRepo(root: string): void {
   state.statusFailures = [];
   state.sourceCommits = [];
   state.committedBlobs = new Map();
+  state.inProgressOp = "none";
 }
 
 /** Adopt the current `.keeper/` tree as the committed baseline WITHOUT recording
@@ -398,6 +405,14 @@ export function fakeCommitTaskJson(root: string, taskId: string): void {
  * close-out gate surfaces as a visible marker. Cleared by resetFakeVcs. */
 export function setSessionDirty(root: string, value: string[] | null): void {
   sessionDirtyOverrides.set(normRoot(root), value);
+}
+
+/** Arm `root`'s fake in-progress-operation probe to report `op` — the state the
+ * merge-window guard reads via inProgressOp(cwd) before writing. A test arms an
+ * op here to prove a mutating verb refuses to write mid-operation. Reset to
+ * "none" by initRepo / resetFakeVcs. */
+export function armInProgressOp(root: string, op: InProgressOp): void {
+  repoFor(root).inProgressOp = op;
 }
 
 /** Clear all fake-repo state — call in a global beforeEach so per-test repos
@@ -628,5 +643,18 @@ export const fakeVcs: PlanVcs = {
       return [];
     }
     return [...diffAgainstSnapshot(key, state.snapshot)].sort();
+  },
+
+  inProgressOp(cwd): InProgressOp {
+    const state = repos.get(normRoot(cwd));
+    return state?.inProgressOp ?? "none";
+  },
+
+  commitWorkLockPath(cwd): string {
+    // The fake models `.git` as a directory under the repo root, so the lock
+    // path is `<root>/.git/keeper-commit-work.lock` — the same file both a plan
+    // committer and the daemon key on for a main checkout (byte-parity with
+    // realGitVcs is asserted against real git in the slow tier).
+    return join(normRoot(cwd), ".git", "keeper-commit-work.lock");
   },
 };
