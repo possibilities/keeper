@@ -2548,13 +2548,19 @@ export function classifyEscalationOutcome(
  * transient error). Module-level twin of {@link resolveJobsForEpic}.
  *
  * `instance` scopes the read to the CURRENT block instance (the caller's `blocked_since`
- * for unblock, the sticky row's `instance_event_id` for deconflict/resolve) so a stale
- * row from a RESOLVED instance can neither suppress nor prematurely fire stage-3 for a
- * re-block. The predicate is `escalation_instance = ?instance OR escalation_instance IS
- * NULL` — NULL-stamped rows (the corroboration-miss edge; see {@link Job.escalation_instance})
- * are conservatively INCLUDED so a stamp-missed session can still classify rather than
- * wait forever. A NULL `instance` (legacy pre-migration caller context) falls back to the
- * unscoped verb+ref match — the old behavior, untouched.
+ * for unblock, the sticky row's `instance_event_id` for deconflict/resolve/repair) so a
+ * stale row from a RESOLVED instance can neither suppress nor prematurely fire stage-3 for
+ * a re-block. The predicate is `escalation_instance = ?instance OR (escalation_instance IS
+ * NULL AND last_event_id >= ?instance)`: a stamp-missed session (the corroboration-miss
+ * edge; see {@link Job.escalation_instance}) is still INCLUDED so it can classify rather
+ * than wait forever, but ONLY when its own `last_event_id` clears the instance anchor. A
+ * genuine miss row folds every event AFTER the anchor that armed its own escalation, so it
+ * always clears it; a resolved PRIOR instance's miss row — whose events all predate this
+ * anchor — is excluded, closing the cross-instance leak where an unreaped prior-instance
+ * NULL row would page the human for a newer re-block before its own session ran (and latch
+ * `human_notified_at`, suppressing the genuine verdict). A NULL `instance` (legacy
+ * pre-migration caller context) falls back to the unscoped verb+ref match — the old
+ * behavior, untouched.
  */
 export function resolveEscalationJobsFor(
   db: Database,
@@ -2572,9 +2578,9 @@ export function resolveEscalationJobsFor(
     }
     return db
       .query(
-        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = ? AND plan_ref = ? AND (escalation_instance = ? OR escalation_instance IS NULL)",
+        "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = ? AND plan_ref = ? AND (escalation_instance = ? OR (escalation_instance IS NULL AND last_event_id >= ?))",
       )
-      .all(verb, id, instance) as unknown as Job[];
+      .all(verb, id, instance, instance) as unknown as Job[];
   } catch {
     return [];
   }

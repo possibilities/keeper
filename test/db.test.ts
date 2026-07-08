@@ -22,7 +22,6 @@ import {
   isTransientBootOpenError,
   MAX_IN_PARAMS,
   openDb,
-  SCHEMA_FINGERPRINT,
   resolveClaudeProjectsRoot,
   resolveConfig,
   resolveDbPath,
@@ -31,6 +30,7 @@ import {
   resolveRepoCreateRoot,
   resolveRepoForkRoot,
   resolveSockPath,
+  SCHEMA_FINGERPRINT,
   SCHEMA_VERSION,
   selectWorldRev,
 } from "../src/db";

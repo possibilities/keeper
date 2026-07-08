@@ -6239,18 +6239,20 @@ test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB �
 test("resolveEscalationJobsFor: instance-scoped — stale resolved-instance rows excluded, NULL-stamped included, current-instance rows included", () => {
   const { db } = freshMemDb();
   db.run(
-    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
-       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', 100)`,
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance, last_event_id)
+       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', 100, 150)`,
     ["job-instance-a"],
   );
   db.run(
-    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
-       VALUES (?, 0, 0, 'working', 'unblock', 'fn-2-bar.3', 200)`,
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance, last_event_id)
+       VALUES (?, 0, 0, 'working', 'unblock', 'fn-2-bar.3', 200, 250)`,
     ["job-instance-b"],
   );
+  // A genuine corroboration-miss for the CURRENT instance: NULL-stamped, but its own
+  // events (last_event_id 260) fold AFTER the instance-200 anchor, so it clears it.
   db.run(
-    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance)
-       VALUES (?, 0, 0, 'working', 'unblock', 'fn-2-bar.3', NULL)`,
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance, last_event_id)
+       VALUES (?, 0, 0, 'working', 'unblock', 'fn-2-bar.3', NULL, 260)`,
     ["job-instance-null"],
   );
   // Scoped to the CURRENT instance (200): the stale instance-100 row (a resolved prior
@@ -6305,6 +6307,46 @@ test("resolveEscalationJobsFor: cross-instance classification — a stale stoppe
   );
   const rowsForB2 = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", 200);
   expect(rowsForB2.map((r) => r.job_id)).toEqual(["job-fresh-b"]);
+  expect(
+    classifyEscalationOutcome(rowsForB2, "unblock", "fn-2-bar.3", true),
+  ).toEqual({ terminal: true, verdict: "declined" });
+  db.close();
+});
+
+test("resolveEscalationJobsFor: cross-instance NULL contamination — a resolved prior instance's NULL-stamped miss row never pages a launch-window re-block, yet the re-block's OWN NULL miss still classifies", () => {
+  const { db } = freshMemDb();
+  // Instance A (blocked_since 100): an `unblock::fn-2-bar.3` session was dispatched but
+  // corroboration-MISSED (escalation_instance stayed NULL — the task cycled
+  // unblocked→re-blocked before its SessionStart folded), ran its turn, and stopped
+  // WITHOUT resolving. A NULL-stamped row is never reaped (isEscalationCandidate requires
+  // a non-null instance), so it lingers — all its events (last_event_id 150) predating the
+  // re-block anchor.
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance, last_event_id)
+       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', NULL, 150)`,
+    ["job-null-stale-a"],
+  );
+  // Instance B's launch window (blocked_since 200): B's latch is marked dispatched but its
+  // own SessionStart has not folded yet. Scoped to 200, A's stale NULL row (last_event_id
+  // 150 < 200) is EXCLUDED — the classifier WAITS instead of reading it as a declined
+  // verdict and paging the human for B before B ever ran (which would latch
+  // human_notified_at and suppress B's genuine page).
+  const rowsForB = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", 200);
+  expect(rowsForB).toEqual([]);
+  expect(
+    classifyEscalationOutcome(rowsForB, "unblock", "fn-2-bar.3", true),
+  ).toEqual({ terminal: false });
+
+  // NULL-fallback intent preserved: B's OWN corroboration-miss session — dispatched for
+  // instance B, so its events fold AFTER the anchor (last_event_id 260 >= 200) — stops
+  // without resolving and DOES classify declined for B, while A's stale NULL row stays out.
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref, escalation_instance, last_event_id)
+       VALUES (?, 0, 0, 'stopped', 'unblock', 'fn-2-bar.3', NULL, 260)`,
+    ["job-null-miss-b"],
+  );
+  const rowsForB2 = resolveEscalationJobsFor(db, "unblock", "fn-2-bar.3", 200);
+  expect(rowsForB2.map((r) => r.job_id)).toEqual(["job-null-miss-b"]);
   expect(
     classifyEscalationOutcome(rowsForB2, "unblock", "fn-2-bar.3", true),
   ).toEqual({ terminal: true, verdict: "declined" });
