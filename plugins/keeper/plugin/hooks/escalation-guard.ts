@@ -485,14 +485,21 @@ function gitConfigInjection(tokens: string[], boundary: number): string | null {
   return null;
 }
 
-/** Deny an exec-bearing flag on an allowlisted READ subcommand — the vector that
- *  turns a whitelisted read into arbitrary program execution by naming a
- *  pager/command to spawn. `git grep --open-files-in-pager[=<cmd>]` (short alias
- *  `-O[<cmd>]`) opens each match in a caller-named program. Scans the
- *  post-subcommand args, stopping at a `--` (after which tokens are
- *  patterns/pathspecs, never flags). `-O` is grep's exec alias only — for diff/log
- *  it is a benign order file — so the short form is scoped to grep. Returns a deny
- *  reason or null. */
+/** Deny an exec-bearing or file-writing flag on an allowlisted READ subcommand —
+ *  the vectors that turn a whitelisted read into arbitrary program execution or an
+ *  arbitrary file write. `git grep --open-files-in-pager[=<cmd>]` (short alias
+ *  `-O[<cmd>]`) opens each match in a caller-named program; `--output[=<file>]`
+ *  (log/diff/…) writes a caller-named file — a flag, not a shell redirect, so the
+ *  lexer's redirect deny never sees it. Scans the post-subcommand args, stopping at
+ *  a `--` (after which tokens are patterns/pathspecs, never flags).
+ *
+ *  `-O` is grep's exec alias only — for diff/log it is a benign order file — so the
+ *  short form is scoped to grep. Git honors short-option bundling and `-O` takes an
+ *  optional glued argument, so the alias reaches `--open-files-in-pager` buried in a
+ *  cluster (`-nO<cmd>`/`-iO<cmd>`) whose token starts with a benign flag; the regex
+ *  fires on a capital `O` ANYWHERE in a single-dash short-flag cluster — git grep's
+ *  only capital-`O` short option is the exec alias, so this over-blocks nothing.
+ *  Returns a deny reason or null. */
 function gitReadSubcommandExecFlag(
   subArgs: string[],
   sub: string,
@@ -505,7 +512,10 @@ function gitReadSubcommandExecFlag(
     ) {
       return "git `--open-files-in-pager` opens matches in a caller-named program (arbitrary program execution from an allowlisted read subcommand)";
     }
-    if (sub === "grep" && arg.startsWith("-O")) {
+    if (arg === "--output" || arg.startsWith("--output=")) {
+      return "git `--output=<file>` writes to a caller-named file (an arbitrary file-write vector from an allowlisted read subcommand)";
+    }
+    if (sub === "grep" && /^-[A-Za-z]*O/.test(arg)) {
       return "git grep `-O`/`--open-files-in-pager` opens matches in a caller-named program (arbitrary program execution from an allowlisted read subcommand)";
     }
   }
