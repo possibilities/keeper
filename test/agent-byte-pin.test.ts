@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildAgentLaunchArgv,
+  FINAL_MESSAGE_DIRECTIVE,
   READ_ONLY_DIRECTIVE,
 } from "../src/agent/launch-config";
 import { launchEnvForAgent } from "../src/agent/launch-handle";
@@ -292,44 +293,51 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
 }
 
 describe("keeper agent byte-pin — agent run posture", () => {
-  test("run --read-only claude: directive prepended, NO tool strip (prompting-only)", async () => {
+  test("run --read-only claude: read-only then final-message directive, NO tool strip (prompting-only)", async () => {
     const cmd = await runCommand({ readOnly: true });
     // Read-only is prompting-only — the native command carries NO tool strip.
     expect(cmd).not.toContain("--disallowed-tools");
     expect(cmd).not.toContain("--exclude-tools");
-    // The directive is prepended CALLER-SIDE with a raw `\n\n` join — no `User:`
-    // scaffold (agent run has no role framing), and NOT double-prepended.
-    expect(cmd.at(-1)).toBe(`${READ_ONLY_DIRECTIVE}\n\nsay hi`);
+    // Both directives are prepended CALLER-SIDE with a raw `\n\n` join — no
+    // `User:` scaffold (agent run has no role framing); read-only leads, the
+    // always-on final-message directive follows it, and neither is
+    // double-prepended.
+    expect(cmd.at(-1)).toBe(
+      `${READ_ONLY_DIRECTIVE}\n\n${FINAL_MESSAGE_DIRECTIVE}\n\nsay hi`,
+    );
     expect(cmd.filter((t) => t === READ_ONLY_DIRECTIVE).length).toBe(0);
   });
 
-  test("run claude (no --read-only): bare prompt, no strip, no directive", async () => {
+  test("run claude (no --read-only): bare prompt carries the final-message directive only", async () => {
     const cmd = await runCommand();
     expect(cmd).not.toContain("--disallowed-tools");
-    expect(cmd.at(-1)).toBe("say hi");
+    expect(cmd.at(-1)).toBe(`${FINAL_MESSAGE_DIRECTIVE}\n\nsay hi`);
     expect(cmd.join("\n")).not.toContain(READ_ONLY_DIRECTIVE);
   });
 
-  test("run --system claude: `System:` block prepended, no --append-system-prompt", async () => {
+  test("run --system claude: final-message directive then `System:` block, no --append-system-prompt", async () => {
     const cmd = await runCommand({ system: "be terse" });
-    // Uniform caller-side compose: `System: <text>\n\n<prompt>` at the positional.
-    expect(cmd.at(-1)).toBe("System: be terse\n\nsay hi");
+    // Uniform caller-side compose: the always-on final-message directive leads,
+    // then `System: <text>\n\n<prompt>` at the positional.
+    expect(cmd.at(-1)).toBe(
+      `${FINAL_MESSAGE_DIRECTIVE}\n\nSystem: be terse\n\nsay hi`,
+    );
     // The uniform prepend is user-turn text — the native path is a future upgrade.
     expect(cmd).not.toContain("--append-system-prompt");
     expect(cmd).not.toContain("--append-system-prompt-file");
   });
 
-  test("run --read-only --system claude: directive → System → prompt block order", async () => {
+  test("run --read-only --system claude: read-only → final-message → System → prompt block order", async () => {
     const cmd = await runCommand({ readOnly: true, system: "be terse" });
     expect(cmd.at(-1)).toBe(
-      `${READ_ONLY_DIRECTIVE}\n\nSystem: be terse\n\nsay hi`,
+      `${READ_ONLY_DIRECTIVE}\n\n${FINAL_MESSAGE_DIRECTIVE}\n\nSystem: be terse\n\nsay hi`,
     );
     expect(cmd).not.toContain("--append-system-prompt");
   });
 
   test("run --system '' claude: empty-after-trim is a no-op (no System: block)", async () => {
     const cmd = await runCommand({ system: "   " });
-    expect(cmd.at(-1)).toBe("say hi");
+    expect(cmd.at(-1)).toBe(`${FINAL_MESSAGE_DIRECTIVE}\n\nsay hi`);
     expect(cmd.join("\n")).not.toContain("System:");
   });
 
@@ -338,7 +346,9 @@ describe("keeper agent byte-pin — agent run posture", () => {
     const path = join(dir, "sys.txt");
     writeFileSync(path, "  from file  \n");
     const cmd = await runCommand({ systemFile: path });
-    expect(cmd.at(-1)).toBe("System: from file\n\nsay hi");
+    expect(cmd.at(-1)).toBe(
+      `${FINAL_MESSAGE_DIRECTIVE}\n\nSystem: from file\n\nsay hi`,
+    );
     expect(cmd).not.toContain("--append-system-prompt");
   });
 
