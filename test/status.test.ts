@@ -612,11 +612,14 @@ function makeStatusMockConnect(): {
   return { factory, sockets };
 }
 
-/** The eleven base readiness collections + the `dispatch_failures` opt-in, as a
- *  single `result` batch. Routed by collection, so no idPrefix bookkeeping. */
+/** The eleven base readiness collections + the `dispatch_failures` opt-in +
+ *  the `epics_pinned` opt-in (ADR 0018), as a single `result` batch. Routed by
+ *  collection, so no idPrefix bookkeeping. `pinnedEpics` defaults empty — most
+ *  callers don't care about the pin window, only that its gate clears. */
 function statusReadinessFrames(
   dispatchFailures: Record<string, unknown>[],
   epics: Record<string, unknown>[] = [],
+  pinnedEpics: Record<string, unknown>[] = [],
 ): ServerFrame[] {
   const empty = (collection: string): ServerFrame => ({
     type: "result",
@@ -652,6 +655,14 @@ function statusReadinessFrames(
       rev: 1,
       total: dispatchFailures.length,
       rows: dispatchFailures,
+    },
+    {
+      type: "result",
+      id: "epics_pinned",
+      collection: "epics_pinned",
+      rev: 1,
+      total: pinnedEpics.length,
+      rows: pinnedEpics,
     },
   ];
 }
@@ -747,6 +758,85 @@ describe("runStatus dispatch_failures snapshot sourcing (ADR 0011)", () => {
     };
     expect(env.data.jammed).toBe(false);
     expect(env.data.drained).toBe(true);
+  });
+});
+
+describe("runStatus pinned-epics snapshot sourcing (ADR 0018, fn-1175.2)", () => {
+  test("opts into includePinnedEpics — a plan-closed epic with a live close failure lands in board.epics with its dispatch_failure kinds, needs_human total unaffected by the pin", async () => {
+    const { factory, sockets } = makeStatusMockConnect();
+    const { deps, cap } = makeStatusDeps(factory);
+
+    await runStatus(statusArgs(), deps);
+    // Still exactly ONE connection — the pin window rides the same readiness
+    // subscribe, no bespoke round-trip.
+    expect(sockets).toHaveLength(1);
+    const sock = sockets[0];
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    const collections = sock.outbound.map((line) => {
+      const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+      return (JSON.parse(trimmed) as { collection: string }).collection;
+    });
+    expect(collections).toContain("epics_pinned");
+
+    // fn-9-x is plan-closed (status: "done") and off the OPEN `epics` result
+    // ([]), but carries a live close dispatch failure and rides the
+    // `epics_pinned` window — the merge (ADR 0018, task .1) folds it into
+    // `epics` open-wins so it gets a real `completeReadiness` verdict.
+    sock.deliver(
+      statusReadinessFrames(
+        [{ verb: "close", id: "fn-9-x", reason: "worktree-merge-conflict" }],
+        [],
+        [{ epic_id: "fn-9-x", epic_number: 9, status: "done", tasks: [] }],
+      ),
+    );
+    expect(cap.exitCode).toBe(0);
+    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
+      data: {
+        board: {
+          epics: Array<{
+            epic_id: string;
+            status: string | null;
+            question: string | null;
+            verdict: string;
+            pill: string;
+            dispatch_failure: string[];
+            tasks: unknown[];
+            close: {
+              verdict: string;
+              pill: string;
+              dispatch_failure: string[];
+            } | null;
+          }>;
+        };
+        needs_human: { stuck_dispatches: number; total: number };
+      };
+    };
+    // Hand-computed: one pinned epic, real "completed" verdicts (status
+    // "done", zero tasks, no embedded jobs), its close row carries the
+    // classified "merge-conflict" kind.
+    expect(env.data.board.epics).toEqual([
+      {
+        epic_id: "fn-9-x",
+        status: "done",
+        question: null,
+        verdict: "completed",
+        pill: "[completed]",
+        dispatch_failure: [],
+        tasks: [],
+        close: {
+          verdict: "completed",
+          pill: "[completed]",
+          dispatch_failure: ["merge-conflict"],
+        },
+      },
+    ]);
+    // The umbrella count is a straight tally of every sticky row regardless of
+    // homing (`stuckDispatches = rows.length`) — pinning changes WHICH board
+    // row the kinds attach to, never the total.
+    expect(env.data.needs_human.stuck_dispatches).toBe(1);
+    expect(env.data.needs_human.total).toBe(1);
   });
 });
 
