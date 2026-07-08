@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped schema-migration tool whose refusal denylist and idempotent re-pin are subtle correctness invariants where a wrong abstraction propagates.",
+      "task_id": "fn-1182-schema-renumber-tool-and-guards.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded write-once-paste-thrice carve-out wording across three surfaces plus a brief-text test update.",
+      "task_id": "fn-1182-schema-renumber-tool-and-guards.2",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Surgical doc additions to two planning files requiring only cross-file consistency in an existing voice.",
+      "task_id": "fn-1182-schema-renumber-tool-and-guards.3",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T01:52:53.610000Z",
+  "epic_id": "fn-1182-schema-renumber-tool-and-guards",
+  "input_hash": "2feafe6dc328998e5dbbbb4cd8bf2be0d21f7e94d191f918f719a3491ac80c40",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 803929709,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1182-schema-renumber-tool-and-guards.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.85},{\"task_id\":\"fn-1182-schema-renumber-tool-and-guards.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"confidence\":0.78},{\"task_id\":\"fn-1182-schema-renumber-tool-and-guards.3\",\"tier\":\"medium\",\"model\":\"sonnet\",\"confidence\":0.76}]}"
+}
