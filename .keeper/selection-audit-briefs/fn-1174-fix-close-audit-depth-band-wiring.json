@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 52,
+        "files_changed": 4,
+        "insertions": 228
+      },
+      "done_summary": "Fixed deriveDepthBand/bandMatches to read the committed depth_bands list shape (min_task_count/min_diff_loc/min_touched_repos) instead of a nonexistent close_depth mapping; extended the audit-policy drift gate to coerce depth_bands off close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS so consumer and config can't silently diverge again; added regression tests threading the real committed audit-policy.yaml through deriveDepthBand and the close-preflight verb.",
+      "input_hash": "d4f272c6ff6c17f8156a66b4e1c158683a04167c2c5dde0afd57ee7e256a7a54",
+      "model": "sonnet",
+      "spec_chars": 2837,
+      "spec_md": "## Description\n\nOriginating finding F1 (with merged F2, F3). Evidence path:\n`plugins/plan/src/verbs/close_preflight.ts:183` reads\n`policyDoc.close_depth` as a band-keyed mapping and `bandMatches`\n(`:148-150`) reads `min_tasks`/`min_diff_lines`/`min_touched_repos`, but\nthe committed `plugins/plan/audit-policy.yaml` provides a `depth_bands`\nLIST of `{depth, min_task_count, min_diff_loc, min_touched_repos}` entries\n(only `min_touched_repos` matches). On the real config\n`policyDoc.close_depth` is `undefined`, so `deriveDepthBand` hits the\n`typeof closeDepth !== \"object\"` guard and returns\n`{ band: \"lean\", reasons: [\"policy_no_depth_bands\"] }` unconditionally \u2014\nthe DEPTH_BAND is always lean+degraded and the variable-depth feature is\ninert.\n\nPoint the consumer at the real config shape: read `depth_bands` as a\nrichest-first list, key thresholds on `min_task_count`/`min_diff_loc`/\n`min_touched_repos` (matching `plugins/plan/scripts/audit-policy-check.ts`\nand `consistency-audit-policy.test.ts`, which both already assert the\n`depth_bands` list). The config + drift gate are the source of truth \u2014 the\nconsumer is the side that is wrong.\n\nFiles:\n- `plugins/plan/src/verbs/close_preflight.ts` (`deriveDepthBand`,\n  `bandMatches`, `DEPTH_RANK`, and the doc comments describing the shape).\n- `plugins/plan/scripts/audit-policy-check.ts` (F3: extend the drift gate\n  to cross-check the keys the runtime consumer reads against the file, so\n  consumer and config cannot silently diverge again).\n- The close-preflight / deriveDepthBand test file (F2: add a regression\n  test threading the REAL committed `audit-policy.yaml`).\n\n## Acceptance\n\n- [ ] `deriveDepthBand` over the committed `audit-policy.yaml` with a\n      deep-sized signal set (>= 8 tasks, >= 2000 diff loc, >= 2 repos)\n      returns `band === \"deep\"`; a standard-sized set returns\n      `\"standard\"`; a small set returns `\"lean\"`.\n- [ ] Close-preflight over a deep-sized epic stamps\n      `depth.degraded === false` and no `policy_no_depth_bands` reason.\n- [ ] A regression test feeds the on-disk policy (not a hand-built\n      `close_depth` fixture) and asserts the rising, non-degraded band.\n- [ ] The audit-policy drift gate fails if the consumer's read keys drift\n      from the file; `bun plugins/plan/scripts/audit-policy-check.ts\n      --check` and the fast suite stay green.\n\n## Done summary\nFixed deriveDepthBand/bandMatches to read the committed depth_bands list shape (min_task_count/min_diff_loc/min_touched_repos) instead of a nonexistent close_depth mapping; extended the audit-policy drift gate to coerce depth_bands off close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS so consumer and config can't silently diverge again; added regression tests threading the real committed audit-policy.yaml through deriveDepthBand and the close-preflight verb.\n## Evidence\n",
+      "task_id": "fn-1174-fix-close-audit-depth-band-wiring.1",
+      "tier": "high",
+      "title": "Reconcile depth-band consumer"
+    }
+  ],
+  "created_at": "2026-07-08T02:39:37.657000Z",
+  "epic_id": "fn-1174-fix-close-audit-depth-band-wiring",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "d4f272c6ff6c17f8156a66b4e1c158683a04167c2c5dde0afd57ee7e256a7a54",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
