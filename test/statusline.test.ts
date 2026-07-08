@@ -72,7 +72,7 @@ describe("statusline render", () => {
     );
 
     expect(plain).toBe(
-      `13 ${SEP} main ${SEP} jobsearch ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${NF0_OUTLINE}`,
+      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${NF0_OUTLINE}`,
     );
     expect(plain).not.toContain("❘");
     expect(plain).not.toContain("·");
@@ -99,8 +99,8 @@ describe("statusline render", () => {
       }),
     );
 
-    expect(plain).toContain(`+309−9 ${SEP} ${LANE_GLYPH} fn-1193.5`);
-    expect(plain).toContain(`${LANE_GLYPH} fn-1193.5 ${SEP} keeper`);
+    expect(plain).toContain(`keeper ${SEP} ${LANE_GLYPH} fn-1193.5`);
+    expect(plain).toContain(`${LANE_GLYPH} fn-1193.5 ${SEP} +309−9`);
     expect(plain).toContain(`opus 4.8 ${SEP} xhigh ${SEP} 2.1.204`);
     expect(plain).not.toContain("keeper/epic/");
     expect(plain).not.toContain("keeper-qzvs8i");

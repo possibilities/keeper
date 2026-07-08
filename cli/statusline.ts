@@ -352,13 +352,13 @@ export function renderStatusline(
   const project = resolveGitProjectName(input.projectDir, runGit);
   const { insertions, deletions } = diffStats(input.projectDir, runGit);
 
-  if (insertions !== 0 || deletions !== 0) {
-    parts += `${sep}${theme.ins}+${insertions}${theme.del}−${deletions}`;
-  }
+  parts += `${sep}${theme.project}${project}`;
   if (branchLabel !== "") {
     parts += `${sep}${theme.sep}${theme.branch}${branchLabel}`;
   }
-  parts += `${sep}${theme.project}${project}`;
+  if (insertions !== 0 || deletions !== 0) {
+    parts += `${sep}${theme.ins}+${insertions}${theme.del}−${deletions}`;
+  }
 
   if (input.modelName !== "") {
     parts += `${sep}${theme.model}${input.modelName}`;
