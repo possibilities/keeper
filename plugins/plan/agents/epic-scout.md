@@ -69,6 +69,7 @@ Compare the new REQUEST against each epic's scope. Look for:
 **Overlap signals** (potential conflict, not a dependency):
 - Both write the same files — match on write-target intersections only; a path the new plan or the epic merely mentions in prose, quick-commands, references, or investigation reads is not an overlap
 - Both modify the same data structures
+- Both imply a schema ladder bump (a `SCHEMA_STEPS`/migration ladder entry) — the ladder is a singleton resource, so two epics each adding a step collide regardless of file overlap; flag it as an overlap and let the planner wire a dep edge
 - Risk of merge conflicts
 
 Only report **clear** relationships, not maybes. Speed over completeness — check titles and scope first; only read specs when the title suggests potential relevance.
@@ -96,6 +97,7 @@ Look at `in_progress` and `todo` tasks for specific file-level overlaps. Do **no
 
 ### Overlaps (potential conflicts, not dependencies)
 - **fn-3** (Refactor): Both touch `src/api/handlers.ts`
+- **fn-5** (Schema cleanup): Both add a `SCHEMA_STEPS` entry — the ladder is a singleton resource
 
 ### No Relationship
 - fn-4, fn-6, fn-8: Unrelated scope
