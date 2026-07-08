@@ -23,7 +23,7 @@ const TINTY_SCHEMES_DIR = join(
 );
 const KEEPER_LANE_PREFIX = "keeper/epic/";
 const LANE_GLYPH = "⑂";
-const PROFILE_ICON_BASE_FILLED = 0xf03a1;
+const PROFILE_ICON_BASE_OUTLINE = 0xf03a3;
 const CONTEXT_GLYPH = "\uf295";
 const NETWORK_GLYPH = "\uf0ec";
 
@@ -250,7 +250,7 @@ function accountIcon(account: string): string {
   }
   return Array.from(n, (digit) =>
     String.fromCodePoint(
-      PROFILE_ICON_BASE_FILLED + Number.parseInt(digit, 10) * 3,
+      PROFILE_ICON_BASE_OUTLINE + Number.parseInt(digit, 10) * 3,
     ),
   ).join("");
 }
@@ -345,7 +345,7 @@ export function renderStatusline(
         ? theme.ctx
         : theme.version;
   const sep = `${theme.sep} ∕ `;
-  let parts = `${ctxColor}${input.ctxPct.toFixed(0)}${CONTEXT_GLYPH}`;
+  let parts = `${ctxColor}${input.ctxPct.toFixed(0)} ${CONTEXT_GLYPH}`;
 
   const branch = resolveGitBranch(input.projectDir, env, runGit);
   const branchLabel = compactKeeperLane(branch) || branch;
