@@ -50,8 +50,16 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git rev-parse HEAD",
     "git blame src/x.ts",
     "git ls-files",
-    "git branch",
     "git -C /repo log --oneline",
+    // `git branch` list/inspect forms stay allowed (only mutating forms deny)
+    "git branch",
+    "git branch -a",
+    "git branch -r",
+    "git branch -v",
+    "git branch -vv",
+    "git branch --list 'feat/*'",
+    "git branch --contains HEAD",
+    "git branch --merged main",
     // read utilities
     "rg pattern src/",
     "grep -rn foo .",
@@ -112,6 +120,32 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git push",
     "git add .",
     "git merge feature",
+    // git -c config injection turns an allowlisted read subcommand into arbitrary
+    // program execution (F1) — every exec-bearing key form denies
+    "git -c core.fsmonitor=/tmp/interp status",
+    "git -c core.pager=/tmp/x --paginate log",
+    "git -c diff.external=/tmp/x diff HEAD~1",
+    "git -c core.sshCommand=/tmp/x log",
+    "git -c alias.z=!whoami z",
+    // the reorder evasion (a config flag after another global option) still denies
+    "git -C /repo -c core.pager=/tmp/x log",
+    // --config-env is the same config-injection class (value read from an env var)
+    "git --config-env=core.pager=EVIL --paginate log",
+    // git branch mutating forms mutate refs from a read-only role (F2);
+    // branch-guard cannot cover an escalation session (no agent_id)
+    "git branch -D feature",
+    "git branch -d feature",
+    "git branch --delete feature",
+    "git branch -f main origin/main",
+    "git branch -m old new",
+    "git branch -M old new",
+    "git branch -c src dst",
+    "git branch -u origin/main",
+    "git branch --set-upstream-to=origin/main topic",
+    "git branch --edit-description",
+    // the bare create/reset form (a positional branch name, no list flag)
+    "git branch newbranch",
+    "git branch newbranch origin/main",
     // write-capable-only families are off-list for diagnosis
     "keeper commit-work 'msg'",
     "uv run pytest",
@@ -151,6 +185,12 @@ describe("evaluateEscalationCommand — write-capable role (deconflict/repair)",
     "git add -A",
     "git push",
     "git checkout -- file.ts",
+    // the two diagnosis-role gaps stay OPEN for a write-capable role — they get
+    // all of git by design (config injection + branch mutation both pass)
+    "git -c core.pager=/tmp/x --paginate log",
+    "git branch -D feature",
+    "git branch -m old new",
+    "git branch newbranch",
     "keeper commit-work 'fix(scope): x'",
     "uv run pytest",
     "cargo build",
@@ -211,6 +251,12 @@ test("evaluateEscalationCommand: the deny reason NAMES the offending command / c
   expect(evaluateEscalationCommand("git log $(whoami)", DIAGNOSIS)).toContain(
     "substitution",
   );
+  expect(
+    evaluateEscalationCommand("git -c core.fsmonitor=/tmp/x status", DIAGNOSIS),
+  ).toContain("config injection");
+  expect(
+    evaluateEscalationCommand("git branch -D feature", DIAGNOSIS),
+  ).toContain("mutates refs");
 });
 
 // ---------------------------------------------------------------------------
