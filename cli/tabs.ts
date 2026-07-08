@@ -87,6 +87,7 @@ import {
   type AttachVerifyFn,
   applyRestoreVerified,
   autopilotGateDecision,
+  claudeAttachEvidenceFromDb,
   countOutcomes,
   defaultLauncherPrefix,
   type IntentSink,
@@ -835,6 +836,7 @@ async function runRestore(cmd: {
         gate,
         selection.pickedGeneration?.generation_id ?? "",
         cmd.force,
+        dbPath,
       );
     }
     case "apply": {
@@ -843,6 +845,7 @@ async function runRestore(cmd: {
         gate,
         selection.pickedGeneration?.generation_id ?? "",
         cmd.force,
+        dbPath,
       );
     }
     default: {
@@ -957,7 +960,7 @@ function probeSessionPaneLiveness(session: string): PaneLiveness {
 /** The production attach verifier: read on-disk evidence (claude NDJSON / non-claude
  *  birth record) gated on the pre-launch floor, bounded-poll, then disambiguate a
  *  no-evidence timeout by pane liveness. */
-function makeAttachVerify(): AttachVerifyFn {
+function makeAttachVerify(dbPath: string): AttachVerifyFn {
   const eventsDir = resolveEventsLogDir();
   const birthDir = resolveBirthDir(process.env);
   return (candidate, launchStartMs): Promise<AttachVerdict> => {
@@ -967,6 +970,11 @@ function makeAttachVerify(): AttachVerifyFn {
         ? () =>
             claudeAttachEvidence(
               eventsDir,
+              candidate.resume_target,
+              launchStartMs,
+            ) ||
+            claudeAttachEvidenceFromDb(
+              dbPath,
               candidate.resume_target,
               launchStartMs,
             )
@@ -998,6 +1006,7 @@ async function runApply(
   gate: "proceed" | "blocked" | "forced",
   generationId: string,
   force: boolean,
+  dbPath: string,
 ): Promise<never> {
   if (gate === "forced") {
     process.stderr.write(
@@ -1060,7 +1069,7 @@ async function runApply(
     };
     const outcomes = await applyRestoreVerified(attemptable, {
       ensureLaunched,
-      verify: makeAttachVerify(),
+      verify: makeAttachVerify(dbPath),
       intent,
       makeIntent: (candidate) =>
         buildRestoreIntent(candidate, generationId, intentDir, launcherPrefix),

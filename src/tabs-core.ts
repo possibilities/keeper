@@ -1079,6 +1079,61 @@ export function loadCurrentSetForDump(
 }
 
 // ---------------------------------------------------------------------------
+// Claude attach evidence fallback — raw events-log lines may already be ingested
+// ---------------------------------------------------------------------------
+
+/**
+ * True iff the ingested `events` table carries a `SessionStart` for the exact
+ * Claude session id at or after the launch floor. Restore verification first
+ * reads raw events-log NDJSON; this fallback covers the normal daemon race where
+ * keeperd has already ingested and cleaned up the per-pid hook file. Read-only,
+ * daemon-down-safe, and fail-closed to `false` on any open/read error.
+ */
+export function claudeAttachEvidenceFromDb(
+  dbPath: string,
+  sessionId: string,
+  sinceMs = 0,
+): boolean {
+  if (sessionId === "") {
+    return false;
+  }
+  try {
+    const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
+    try {
+      if (Number.isFinite(sinceMs) && sinceMs > 0) {
+        const row = db
+          .query(
+            `SELECT 1 AS found FROM events
+              WHERE hook_event = 'SessionStart'
+                AND session_id = ?
+                AND ts >= ?
+              LIMIT 1`,
+          )
+          .get(sessionId, sinceMs / 1000) as { found: number } | null;
+        return row !== null;
+      }
+      const row = db
+        .query(
+          `SELECT 1 AS found FROM events
+            WHERE hook_event = 'SessionStart'
+              AND session_id = ?
+            LIMIT 1`,
+        )
+        .get(sessionId) as { found: number } | null;
+      return row !== null;
+    } finally {
+      try {
+        db.close();
+      } catch {
+        // best-effort; the reader is one-shot.
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Autopilot fail-closed gate (the --apply guard) — moved verbatim
 // ---------------------------------------------------------------------------
 

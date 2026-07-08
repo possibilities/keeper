@@ -31,7 +31,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { execBackendEnvMeta } from "./exec-backend";
+import { execBackendEnvMeta, isDefaultTmuxEnvValue } from "./exec-backend";
 
 /** Bumped only on an incompatible birth-record shape change; the ingest worker
  *  rejects an unknown version rather than mis-folding it. */
@@ -217,11 +217,12 @@ export interface BirthBackendCoords {
  * two-arm logic is replicated here (no shared module spans the launcher and the
  * hook — the matching comment on both sides is the drift guard).
  *
- * Native arm: under tmux (`TMUX` set) stamp type + pane id; the session name only
- * when the keeper carrier `KEEPER_TMUX_SESSION` is present. Carrier arm: `TMUX`
- * stripped but `KEEPER_TMUX_PANE` present → stamp from it. No sentinel and no
- * carrier → all-null (never a `type=tmux` row with a null pane — the renamer
- * requires a non-null pane).
+ * Native arm: under the default tmux socket (`TMUX` set) stamp type + pane id;
+ * foreign `tmux -L <name>` sockets are ignored because pane ids are server-local.
+ * The session name stamps only when the keeper carrier `KEEPER_TMUX_SESSION` is
+ * present. Carrier arm: `TMUX` stripped but `KEEPER_TMUX_PANE` present → stamp
+ * from it. No sentinel and no carrier → all-null (never a `type=tmux` row with a
+ * null pane — the renamer requires a non-null pane).
  */
 export function birthBackendCoordsFromEnv(
   env: NodeJS.ProcessEnv,
@@ -232,6 +233,9 @@ export function birthBackendCoordsFromEnv(
 
   const tmuxSentinel = env.TMUX;
   if (tmuxSentinel !== undefined && tmuxSentinel !== "") {
+    if (!isDefaultTmuxEnvValue(tmuxSentinel)) {
+      return { type: null, sessionId: null, paneId: null };
+    }
     return {
       type: meta.backendType,
       sessionId: collapse(env[meta.sessionIdEnvVar]),

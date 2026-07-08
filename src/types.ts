@@ -241,11 +241,12 @@ export interface Event {
   plan_files: string | null;
   /**
    * Terminal-multiplexer backend tag the hook captured via pure `process.env`
-   * reads. `'tmux'` when the `TMUX` sentinel is set; NULL outside tmux. Paired
-   * with {@link Event.backend_exec_session_id} / {@link Event.backend_exec_pane_id} —
-   * type + pane id stamp together; the session may be NULL on its own
-   * (human-created sessions carry no `KEEPER_TMUX_SESSION`). Historical rows
-   * may carry other recorded tags verbatim — the fold copies the string as-is.
+   * reads. `'tmux'` for the default tmux socket keeper observes; NULL outside
+   * tmux and for foreign tmux sockets. Paired with {@link Event.backend_exec_session_id} /
+   * {@link Event.backend_exec_pane_id} — type + pane id stamp together; the
+   * session may be NULL on its own (human-created sessions carry no
+   * `KEEPER_TMUX_SESSION`). Historical rows may carry other recorded tags
+   * verbatim — the fold copies the string as-is.
    */
   backend_exec_type: string | null;
   /**

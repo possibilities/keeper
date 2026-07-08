@@ -222,6 +222,16 @@ describe("env-derived coords / worktree / draft", () => {
     ).toEqual({ type: "tmux", sessionId: "pair", paneId: "%8" });
   });
 
+  test("foreign tmux sockets stamp no coords", () => {
+    expect(
+      birthBackendCoordsFromEnv({
+        TMUX: "/tmp/tmux-x/jobsearch,1,0",
+        TMUX_PANE: "%8",
+        KEEPER_TMUX_SESSION: "work",
+      }),
+    ).toEqual({ type: null, sessionId: null, paneId: null });
+  });
+
   test("stripped tmux but carrier pane present stamps from the carrier", () => {
     expect(birthBackendCoordsFromEnv({ KEEPER_TMUX_PANE: "%9" })).toEqual({
       type: "tmux",
@@ -250,7 +260,11 @@ describe("env-derived coords / worktree / draft", () => {
 
   test("buildBirthDraft assembles coords + worktree + schema", () => {
     const draft = buildBirthDraft(
-      { TMUX: "x", TMUX_PANE: "%1", KEEPER_PLAN_WORKTREE_BRANCH: "wt" },
+      {
+        TMUX: "/tmp/tmux-x/default,1,0",
+        TMUX_PANE: "%1",
+        KEEPER_PLAN_WORKTREE_BRANCH: "wt",
+      },
       {
         session_id: "j",
         harness: "pi",

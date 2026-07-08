@@ -39,6 +39,7 @@ import {
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
+  isDefaultTmuxEnvValue,
   KEEPER_AGENT_SCHEMA_VERSION,
   KEEPER_AGENT_TMUX_EXIT,
   keeperAgentLaunch,
@@ -120,6 +121,17 @@ test("execBackendEnvMeta: unknown backend keeps its label but falls back to tmux
   expect(meta.sessionIdEnvVar).toBe("KEEPER_TMUX_SESSION");
   expect(meta.paneIdEnvVar).toBe("TMUX_PANE");
   expect(meta.paneIdCarrierEnvVar).toBe("KEEPER_TMUX_PANE");
+});
+
+test("isDefaultTmuxEnvValue accepts only the default tmux socket", () => {
+  expect(isDefaultTmuxEnvValue("/private/tmp/tmux-501/default,123,0")).toBe(
+    true,
+  );
+  expect(isDefaultTmuxEnvValue("/private/tmp/tmux-501/jobsearch,123,0")).toBe(
+    false,
+  );
+  expect(isDefaultTmuxEnvValue("")).toBe(false);
+  expect(isDefaultTmuxEnvValue(undefined)).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

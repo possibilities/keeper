@@ -55,6 +55,7 @@ import {
   applyRestore,
   applyRestoreVerified,
   autopilotGateDecision,
+  claudeAttachEvidenceFromDb,
   countOutcomes,
   type IntentSink,
   loadCurrentSetForDump,
@@ -221,6 +222,24 @@ function seedAutopilotPaused(db: Database, paused: number): void {
     [paused, RECENT, RECENT],
   );
 }
+
+test("claudeAttachEvidenceFromDb reads ingested SessionStart evidence with recency gate", () => {
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, 'wanted', 'SessionStart', 'session_start', '{}')`,
+    [RECENT],
+  );
+
+  expect(
+    claudeAttachEvidenceFromDb(dbPath, "wanted", (RECENT - 1) * 1000),
+  ).toBe(true);
+  expect(
+    claudeAttachEvidenceFromDb(dbPath, "wanted", (RECENT + 1) * 1000),
+  ).toBe(false);
+  expect(claudeAttachEvidenceFromDb(dbPath, "other", (RECENT - 1) * 1000)).toBe(
+    false,
+  );
+});
 
 function fakeCandidate(opts: {
   job_id: string;

@@ -320,11 +320,25 @@ export interface ExecBackendEnvMeta {
   readonly paneIdCarrierEnvVar: string;
 }
 
+/** True when a TMUX env value names the default tmux socket keeper observes.
+ *  Pane ids are only unique within one server, so foreign `tmux -L <name>`
+ *  sockets must not enter keeper's default-server pane-coordinate folds. */
+export function isDefaultTmuxEnvValue(value: string | undefined): boolean {
+  if (value === undefined || value === "") {
+    return false;
+  }
+  const comma = value.indexOf(",");
+  const socketPath = comma >= 0 ? value.slice(0, comma) : value;
+  const slash = socketPath.lastIndexOf("/");
+  const leaf = slash >= 0 ? socketPath.slice(slash + 1) : socketPath;
+  return leaf === "default";
+}
+
 export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
   const t = backendType ?? DEFAULT_EXEC_BACKEND;
   // tmux (default) and any unknown backend fall through to the tmux env-var
-  // names. tmux stamps `TMUX`/`TMUX_PANE` into every pane; managed launches add
-  // `KEEPER_TMUX_SESSION` via `-e` so the session name rides a stable column.
+  // names. The default tmux socket stamps `TMUX`/`TMUX_PANE`; managed launches
+  // add `KEEPER_TMUX_SESSION` via `-e` so the session name rides a stable column.
   // Human-created sessions carry no `KEEPER_TMUX_SESSION`, so the hook stamps a
   // NULL session (filled later by the snapshot poller). An unknown name keeps
   // its label for logging, but empty strings would silently null out every hook
@@ -336,9 +350,10 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
     // Drift guard: this literal MUST stay byte-identical to the carrier string
     // the launcher writes in `src/agent/main.ts`. There is no shared module
     // across the launcher and this consumer; matching comments on both sides are
-    // the agreed drift guard. The launcher copies `$TMUX_PANE` here before
-    // deleting `TMUX`/`TMUX_PANE` (so Claude emits truecolor), and the hook's
-    // fallback arm reads it to keep stamping the pane id for window renaming.
+    // the agreed drift guard. The launcher copies a default-socket `$TMUX_PANE`
+    // here before deleting `TMUX`/`TMUX_PANE` (so Claude emits truecolor), and
+    // the hook's fallback arm reads it to keep stamping the pane id for window
+    // renaming.
     paneIdCarrierEnvVar: "KEEPER_TMUX_PANE",
   };
 }

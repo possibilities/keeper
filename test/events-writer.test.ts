@@ -871,6 +871,16 @@ test("backendExecCoordsFromEnv: TMUX sentinel without KEEPER_TMUX_SESSION → ty
   ).toEqual({ type: "tmux", sessionId: null, paneId: "%3" });
 });
 
+test("backendExecCoordsFromEnv: foreign tmux sockets stamp no coords", () => {
+  expect(
+    backendExecCoordsFromEnv({
+      TMUX: "/tmp/tmux-501/jobsearch,12345,0",
+      TMUX_PANE: "%3",
+      KEEPER_TMUX_SESSION: "work",
+    }),
+  ).toEqual({ type: null, sessionId: null, paneId: null });
+});
+
 test("backendExecCoordsFromEnv: empty TMUX sentinel collapses to all-NULL", () => {
   // Empty-string sentinel is the absent shape — no tmux stamp.
   expect(

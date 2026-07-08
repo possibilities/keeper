@@ -23,6 +23,7 @@ import {
   emitBirthRecord,
 } from "../birth-record";
 import { ensureCodexDirTrust } from "../codex-trust";
+import { isDefaultTmuxEnvValue } from "../exec-backend";
 import { ensureHermesShimTrust } from "../hermes-trust";
 import {
   buildLauncherArgvPrefix,
@@ -2685,13 +2686,15 @@ export async function main(deps: MainDeps): Promise<never> {
   if (agent === "claude" && (deps.env.TMUX ?? "") !== "") {
     actionLog.push("Detected tmux environment");
     // Strip tmux env from the child so Claude's ink2 renderer emits truecolor:
-    // it hard-caps itself to 256-color whenever $TMUX is set. Carry the pane id
-    // to keeper's carrier var FIRST so keeper's events-writer hook can still
-    // stamp tmux coords (its native arm keys off $TMUX, which we delete here).
+    // it hard-caps itself to 256-color whenever $TMUX is set. For keeper's
+    // default tmux socket, carry the pane id to keeper's carrier var FIRST so
+    // the events-writer hook can still stamp tmux coords (its native arm keys
+    // off $TMUX, which we delete here). Foreign tmux sockets are deliberately
+    // not carried because pane ids are server-local.
     // KEEPER_TMUX_PANE must match the literal read in ~/code/keeper/src/
     // exec-backend.ts (paneIdCarrierEnvVar) — keep both sides in sync (drift guard).
     const pane = deps.env.TMUX_PANE ?? "";
-    if (pane !== "") {
+    if (pane !== "" && isDefaultTmuxEnvValue(deps.env.TMUX)) {
       deps.env.KEEPER_TMUX_PANE = pane;
       actionLog.push(`Carried tmux pane to KEEPER_TMUX_PANE=${pane}`);
     }

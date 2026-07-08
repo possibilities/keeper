@@ -43,7 +43,10 @@ import {
   extractToolUseId,
   slashCommandFromPrompt,
 } from "../../../../src/derivers";
-import { execBackendEnvMeta } from "../../../../src/exec-backend";
+import {
+  execBackendEnvMeta,
+  isDefaultTmuxEnvValue,
+} from "../../../../src/exec-backend";
 
 /**
  * Hook event names that get renamed when stored as `event_type`. Everything
@@ -254,11 +257,13 @@ export interface BackendExecCoords {
  * fork/fs/PPID-walk), cheap enough for the cold-start budget on every fire.
  *
  * Sentinel gating:
- *  - tmux stamps `TMUX` + `TMUX_PANE` into every pane. Type and pane id always
- *    stamp under tmux; the session name stamps ONLY when `KEEPER_TMUX_SESSION`
- *    is present (keeper-managed launches inject it via `-e`). A human-created
- *    tmux session carries no `KEEPER_TMUX_SESSION`, so the session stays NULL
- *    and the snapshot poller fills it later.
+ *  - tmux stamps `TMUX` + `TMUX_PANE` into every pane. Type and pane id stamp
+ *    only for the default tmux socket keeper observes; foreign `tmux -L <name>`
+ *    sockets are ignored because pane ids are server-local. The session name
+ *    stamps ONLY when `KEEPER_TMUX_SESSION` is present (keeper-managed launches
+ *    inject it via `-e`). A human-created tmux session carries no
+ *    `KEEPER_TMUX_SESSION`, so the session stays NULL and the snapshot poller
+ *    fills it later.
  *  - native `TMUX` absent but the carrier `KEEPER_TMUX_PANE` present → the
  *    fallback arm stamps coord-identical tmux rows from the carrier. keeper agent
  *    strips `TMUX`/`TMUX_PANE` (so Claude emits truecolor) after copying the
@@ -278,11 +283,15 @@ export interface BackendExecCoords {
 export function backendExecCoordsFromEnv(
   env: NodeJS.ProcessEnv,
 ): BackendExecCoords {
-  // tmux sentinel: `TMUX` is set in every tmux pane. Stamp type + pane id; the
-  // session name stamps only when `KEEPER_TMUX_SESSION` is present (managed
-  // launches inject it) — human sessions stay NULL until the poller fills them.
+  // tmux sentinel: `TMUX` is set in every tmux pane. Stamp type + pane id only
+  // for the default socket; the session name stamps only when
+  // `KEEPER_TMUX_SESSION` is present (managed launches inject it) — human
+  // sessions stay NULL until the poller fills them.
   const tmuxSentinel = env.TMUX;
   if (tmuxSentinel !== undefined && tmuxSentinel !== "") {
+    if (!isDefaultTmuxEnvValue(tmuxSentinel)) {
+      return { type: null, sessionId: null, paneId: null };
+    }
     const meta = execBackendEnvMeta("tmux");
     const rawSession = env[meta.sessionIdEnvVar];
     const rawPane = env[meta.paneIdEnvVar];
