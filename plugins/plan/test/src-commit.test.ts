@@ -27,6 +27,7 @@ import {
   buildMessageWithTrailers,
   buildSubject,
   CommitFailed,
+  restoreForRollback,
 } from "../src/commit.ts";
 import { acquireCommitWorkLock } from "../src/flock.ts";
 import {
@@ -36,7 +37,11 @@ import {
   resetVcs,
   setVcs,
 } from "../src/vcs.ts";
-import { armInProgressOp } from "./fake-vcs.ts";
+import {
+  armInProgressOp,
+  armRestoreFailure,
+  failNextCommit,
+} from "./fake-vcs.ts";
 import {
   realCommitCount as commitCount,
   fakeDirtyPaths,
@@ -860,6 +865,169 @@ describe("mutating verbs refuse a mid-operation state repo", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Commit-failure rollback (fast tier, fake VCS): every mutating verb is a
+// working-tree no-op on an auto-commit failure — fresh files unlinked, modified
+// files restored to pre-verb bytes, nothing of the verb's left staged — while a
+// rollback that itself slips stamps rollback_failed without masking commit_failed.
+// The fake models no index, so the staged-residue half is a slow-tier concern
+// (merge-window-rollback.test.ts); here the working-tree diff is the observable.
+// ---------------------------------------------------------------------------
+
+describe("mutating verbs roll back on a commit failure", () => {
+  const getProj = withProject("planctl-rb-");
+  const getTmp = withTmpdir("planctl-rb-done-");
+
+  /** The commit_failed details sub-object — asserts the envelope is the
+   * authoritative commit failure, then returns details for rollback inspection. */
+  function commitFailedDetails(output: string): Record<string, unknown> {
+    const payload = firstJsonPayload(output);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toBe("commit_failed");
+    return payload.details as Record<string, unknown>;
+  }
+
+  const DELTA_YAML =
+    "add_tasks:\n  - title: Added\n    tier: medium\n    model: opus\n" +
+    "    spec: |\n      ## Description\n      x\n\n      ## Acceptance\n" +
+    "      - [ ] x\n\n      ## Done summary\n\n      ## Evidence\n";
+
+  test("scaffold: fresh tree unlinked, no orphan files, no staged residue", () => {
+    const proj = getProj();
+    failNextCommit(proj.root);
+    const planPath = join(proj.root, "_rb_scaffold.yaml");
+    writeFileSync(
+      planPath,
+      scaffoldPlanYaml({ title: "Rollback", nTasks: 2 }),
+      "utf-8",
+    );
+
+    const r = runCli(["scaffold", "--file", planPath], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).not.toBe(0);
+    const details = commitFailedDetails(r.output);
+    expect(details.rollback_failed).toBeUndefined();
+    // The whole minted tree is gone — the working tree equals the pre-verb state.
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+  });
+
+  test("epic create: both fresh files unlinked", () => {
+    const proj = getProj();
+    failNextCommit(proj.root);
+
+    const r = runCli(["epic", "create", "--title", "Rollback epic"], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).not.toBe(0);
+    commitFailedDetails(r.output);
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+  });
+
+  test("refine-apply: fresh tasks unlinked AND existing rewrites restored", () => {
+    const proj = getProj();
+    const { epicId } = scaffoldEpic(proj, { nTasks: 1 });
+    // Clean at the post-scaffold committed snapshot before the failing delta.
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+    failNextCommit(proj.root);
+    const deltaPath = join(proj.root, "_rb_delta.yaml");
+    writeFileSync(deltaPath, DELTA_YAML, "utf-8");
+
+    const r = runCli(["refine-apply", epicId, "--file", deltaPath], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).not.toBe(0);
+    commitFailedDetails(r.output);
+    // The fresh task is unlinked and the epic JSON's updated_at bump is reverted,
+    // so the tree matches the post-scaffold committed snapshot byte-for-byte.
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+  });
+
+  test("assign-cells: task JSON, epic JSON, and fresh sidecar all restored", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(proj, { nTasks: 1 });
+    failNextCommit(proj.root);
+    const cellsPath = join(proj.root, "_rb_cells.yaml");
+    writeFileSync(
+      cellsPath,
+      `cells:\n  - task_id: ${taskIds[0]}\n    tier: medium\n    model: opus\n` +
+        "    label_source: heuristic-default\n" +
+        "selection:\n  harness: none\n  model: none\n  config_hash: h\n" +
+        "  input_hash: i\n  outcome: ok\n",
+      "utf-8",
+    );
+
+    const r = runCli(["assign-cells", epicId, "--file", cellsPath], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).not.toBe(0);
+    commitFailedDetails(r.output);
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+  });
+
+  test("done: the three state files restored to pre-done bytes", () => {
+    const root = getTmp();
+    const [, taskIds] = seedState(root, { epicId: "fn-1-rb", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    seedRuntime(root, taskId, {
+      status: "in_progress",
+      assignee: "test@example.com",
+    });
+    gitBaseline(root);
+    failNextCommit(root);
+
+    const r = runCli(["done", taskId, "--summary", "shipped"], {
+      cwd: root,
+      env: { CLAUDE_CODE_SESSION_ID: "rb-done" },
+    });
+    expect(r.code).not.toBe(0);
+    commitFailedDetails(r.output);
+    expect(fakeDirtyPaths(root)).toEqual([]);
+    // The runtime overlay is back to in_progress — no half-stamped done survives.
+    const overlay = JSON.parse(
+      readFileSync(
+        join(root, ".keeper", "state", "tasks", `${taskId}.state.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect(overlay.status).toBe("in_progress");
+  });
+
+  test("a rollback that itself fails stamps rollback_failed, never masking commit_failed", () => {
+    const proj = getProj();
+    failNextCommit(proj.root);
+    // The index reset fails: the working-tree bytes still restore (real FS) but
+    // the unconfirmed unstage reopens the destruction window — surfaced, not silent.
+    armRestoreFailure(proj.root);
+    const planPath = join(proj.root, "_rb_fail_scaffold.yaml");
+    writeFileSync(
+      planPath,
+      scaffoldPlanYaml({ title: "Rollback fails", nTasks: 1 }),
+      "utf-8",
+    );
+
+    const r = runCli(["scaffold", "--file", planPath], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).not.toBe(0);
+    // commit_failed stays the primary error — rollback_failed only annotates it.
+    const details = commitFailedDetails(r.output);
+    expect(details.rollback_failed).toBe(true);
+    const failedPaths = details.rollback_failed_paths as string[];
+    expect(Array.isArray(failedPaths)).toBe(true);
+    expect(failedPaths.length).toBeGreaterThan(0);
+    // The reopened window is surfaced on stderr, not swallowed.
+    expect(r.stderr).toContain("rollback incomplete");
+    // The working tree still reverted despite the failed index reset.
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // EAFP backstop (real git, slow tier): the probe is best-effort, so a commit that
 // slips past a STALE probe into a real merge window must still classify as the
 // retryable merge_in_progress class — never the contention-retry arm — and the
@@ -906,5 +1074,58 @@ describe.skipIf(!SLOW_ENABLED)("merge-window EAFP (real git)", () => {
     if (guard.kind === "refused") {
       expect(guard.detail).toBe("operation: merge");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Commit-failure rollback (real git, slow tier): a real mid-merge partial-commit
+// refusal leaves the verb's pathspec staged; the rollback must unstage it, unlink
+// the fresh files, and restore the modified files to their pre-verb bytes — while
+// the foreign merge state (MERGE_HEAD) is left entirely untouched. The fake VCS
+// models no index, so this real `git reset HEAD -- <paths>` mid-merge is the only
+// place the staged-residue half of the contract is observable.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!SLOW_ENABLED)("commit-failure rollback (real git)", () => {
+  test("rollback clears the verb's pathspec, leaving foreign merge state", () => {
+    // An existing tracked file (committed) the verb modifies, plus a fresh file
+    // the verb mints — the two rollback classes.
+    const existingRel = ".keeper/tasks/keep.json";
+    const freshRel = ".keeper/tasks/fresh.json";
+    const existingAbs = join(repo, existingRel);
+    const freshAbs = join(repo, freshRel);
+    mkdirSync(dirname(existingAbs), { recursive: true });
+    const originalBytes = '{"id":"keep","v":1}\n';
+    writeFileSync(existingAbs, originalBytes);
+    git(["add", existingRel], repo);
+    git(["commit", "-q", "-m", "seed keep.json"], repo);
+
+    // Pre-verb snapshot, THEN the verb's writes (modify existing + mint fresh),
+    // staged like the auto-commit's `git add` before its refused pathspec commit.
+    const snapshots = [
+      { path: existingAbs, before: originalBytes },
+      { path: freshAbs, before: null },
+    ];
+    writeFileSync(existingAbs, '{"id":"keep","v":2,"dirtied":true}\n');
+    writeFileSync(freshAbs, '{"id":"fresh"}\n');
+    git(["add", existingRel, freshRel], repo);
+
+    // A live MERGE_HEAD is the foreign merge state the rollback must not disturb.
+    const seedSha = git(["rev-parse", "HEAD"], repo).trim();
+    writeFileSync(join(repo, ".git", "MERGE_HEAD"), `${seedSha}\n`, "utf-8");
+
+    const result = restoreForRollback(snapshots, repo);
+    expect(result).toBeNull();
+
+    // Fresh file gone, existing file back to pre-verb bytes.
+    expect(existsSync(freshAbs)).toBe(false);
+    expect(readFileSync(existingAbs, "utf-8")).toBe(originalBytes);
+    // Nothing of the verb's pathspec is staged or dirty any more.
+    expect(
+      git(["status", "--porcelain", "--", existingRel, freshRel], repo).trim(),
+    ).toBe("");
+    // The foreign merge state is untouched — the rollback never aborted it.
+    expect(existsSync(join(repo, ".git", "MERGE_HEAD"))).toBe(true);
+    expect(realGitVcs.inProgressOp(repo)).toBe("merge");
   });
 });

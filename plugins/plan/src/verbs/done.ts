@@ -26,10 +26,10 @@
 // re-run re-commits the missing backing instead of the flat "already done"
 // refusal a durably-committed done still earns.
 
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { acquirePlanCommitGuard } from "../commit.ts";
+import { acquirePlanCommitGuard, restoreForRollback } from "../commit.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
@@ -44,13 +44,11 @@ import {
 import {
   atomicWrite,
   atomicWriteJson,
-  atomicWriteRaw,
   getActor,
   LocalFileStateStore,
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
-import { getVcs } from "../vcs.ts";
 import { GitError, stateHeadVisible } from "./reconcile.ts";
 
 interface DoneArgs {
@@ -321,29 +319,21 @@ export function runDone(args: DoneArgs): void {
         verb: "done",
         target: taskId,
         repoRoot: ctx.projectPath,
-        onCommitFailure: () => {
-          if (taskJsonSnapshot !== null) {
-            atomicWriteRaw(taskPath, taskJsonSnapshot);
-          }
-          if (specSnapshot !== null) {
-            atomicWriteRaw(specPath, specSnapshot);
-          }
-          if (runtimeSnapshot !== null) {
-            atomicWriteRaw(runtimeStatePath, runtimeSnapshot);
-          } else if (existsSync(runtimeStatePath)) {
-            unlinkSync(runtimeStatePath);
-          }
-          // Restoring the working-tree bytes alone leaves the done bytes STAGED:
-          // commit.ts's gitStage (`git add`) ran before the mid-merge-refused
-          // pathspec commit, so a later full-index merge-completion would sweep
-          // the half-stamp into its tree. Return the three state paths' index
-          // entries to HEAD too (a gitignored / never-staged path resets to a
-          // harmless no-op), keeping the index consistent with the restored tree.
-          getVcs().restoreIndexToHead(
-            [taskPath, specPath, runtimeStatePath],
+        // Restore the three state files to their pre-done bytes and unstage them
+        // (a null runtime snapshot means the overlay did not exist and the unwind
+        // deletes the one saveRuntime created). restoreForRollback also resets the
+        // index to HEAD so the `git add` that ran before the mid-merge-refused
+        // pathspec commit leaves no staged half-stamp for a later full-index merge
+        // to sweep in. A gitignored / never-staged path resets to a harmless no-op.
+        onCommitFailure: () =>
+          restoreForRollback(
+            [
+              { path: taskPath, before: taskJsonSnapshot },
+              { path: specPath, before: specSnapshot },
+              { path: runtimeStatePath, before: runtimeSnapshot },
+            ],
             ctx.projectPath,
-          );
-        },
+          ),
       },
     );
   } finally {

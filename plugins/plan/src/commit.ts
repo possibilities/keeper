@@ -24,7 +24,10 @@
 // records commits + snapshot-diffs the data dir, so the default test tier spawns
 // zero real git.
 
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+
 import { acquireCommitWorkLock } from "./flock.ts";
+import { atomicWriteRaw } from "./store.ts";
 import { getVcs, type InProgressOp } from "./vcs.ts";
 
 // Bounded retry over git's own lock domains (index.lock + ref-lock). Sized so
@@ -68,6 +71,96 @@ export class CommitFailed extends Error {
     this.detail = detail;
     this.extra = extra ?? {};
   }
+}
+
+// ---------------------------------------------------------------------------
+// Commit-failure rollback — restore a mutating verb's write set to its pre-verb
+// state so a failed pathspec commit (the mid-merge shared-checkout window) never
+// leaves staged or working-tree residue a later full-index merge-completion can
+// sweep in. Generalizes the done verb's snapshot-then-restore shape across every
+// mutating verb.
+// ---------------------------------------------------------------------------
+
+/** One entry in a verb's rollback set: a path it is about to write plus the
+ * bytes it held BEFORE the write (null when the path did not yet exist, i.e. a
+ * fresh mint the rollback must unlink). */
+export interface RollbackEntry {
+  path: string;
+  before: string | null;
+}
+
+/** The rollback outcome stamped into a commit_failed envelope's details when the
+ * unwind could not fully restore the tree — never replaces the authoritative
+ * commit failure, only annotates that a destruction window may have reopened. */
+export interface RollbackResult {
+  rollback_failed: true;
+  rollback_failed_paths: string[];
+}
+
+/** Snapshot the pre-verb bytes of every path in `paths` (deduplicated, first
+ * occurrence wins so a path written twice keeps its true pre-verb content), so a
+ * later commit-failure rollback can restore each exactly. Snapshotting the bytes
+ * — rather than `git checkout HEAD --` — is safe under contention where HEAD may
+ * have advanced between write and rollback. Call INSIDE the verb's lock, right
+ * before its first write. */
+export function snapshotForRollback(paths: string[]): RollbackEntry[] {
+  const seen = new Set<string>();
+  const out: RollbackEntry[] = [];
+  for (const path of paths) {
+    if (seen.has(path)) {
+      continue;
+    }
+    seen.add(path);
+    out.push({
+      path,
+      before: existsSync(path) ? readFileSync(path, "utf-8") : null,
+    });
+  }
+  return out;
+}
+
+/** Restore a mutating verb's write set to its pre-verb state after its commit
+ * failed: rewrite each previously-existing file's bytes, unlink each fresh file,
+ * then unstage the whole set (`git reset HEAD -- <paths>`, which succeeds
+ * mid-merge) so no half-written, half-staged residue survives. Returns a
+ * RollbackResult naming the paths whose restore could not be confirmed, or null
+ * on a clean rollback. Never throws — the caller's commit_failed envelope stays
+ * authoritative; a per-path filesystem error or a failed index reset is captured
+ * into the result, not raised. Registered as emitMutating's onCommitFailure hook. */
+export function restoreForRollback(
+  entries: RollbackEntry[],
+  cwd: string,
+): RollbackResult | null {
+  const failed: string[] = [];
+  for (const { path, before } of entries) {
+    try {
+      if (before !== null) {
+        atomicWriteRaw(path, before);
+      } else if (existsSync(path)) {
+        unlinkSync(path);
+      }
+    } catch {
+      failed.push(path);
+    }
+  }
+  // Unstage the whole set so a `git add` that ran before the refused pathspec
+  // commit leaves no staged half-write. A non-zero reset means the index state
+  // is unconfirmed for every path — flag them all rather than trust a partial.
+  const reset = getVcs().restoreIndexToHead(
+    entries.map((e) => e.path),
+    cwd,
+  );
+  if (reset.exitCode !== 0) {
+    for (const { path } of entries) {
+      if (!failed.includes(path)) {
+        failed.push(path);
+      }
+    }
+  }
+  if (failed.length === 0) {
+    return null;
+  }
+  return { rollback_failed: true, rollback_failed_paths: failed.sort() };
 }
 
 // ---------------------------------------------------------------------------

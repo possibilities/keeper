@@ -87,9 +87,10 @@ interface FakeSourceCommit {
 interface RepoState {
   log: FakeCommit[];
   snapshot: Map<string, string>;
-  /** Armed one-shot failures for the next commit / status call. */
+  /** Armed one-shot failures for the next commit / status / index-reset call. */
   commitFailures: QueuedFailure[];
   statusFailures: QueuedFailure[];
+  restoreFailures: QueuedFailure[];
   /** Seeded source commits, newest-LAST (a real `git log` reads newest-first, so
    * the read methods reverse this for their result order). */
   sourceCommits: FakeSourceCommit[];
@@ -142,6 +143,7 @@ function repoFor(root: string): RepoState {
       snapshot: new Map(),
       commitFailures: [],
       statusFailures: [],
+      restoreFailures: [],
       sourceCommits: [],
       committedBlobs: new Map(),
       inProgressOp: "none",
@@ -297,6 +299,7 @@ export function initRepo(root: string): void {
   state.snapshot = new Map();
   state.commitFailures = [];
   state.statusFailures = [];
+  state.restoreFailures = [];
   state.sourceCommits = [];
   state.committedBlobs = new Map();
   state.inProgressOp = "none";
@@ -350,6 +353,18 @@ export function failNextStatus(
   stderr = "fake status failure",
 ): void {
   repoFor(root).statusFailures.push({ stderr });
+}
+
+/** Arm the NEXT restoreIndexToHead (`git reset HEAD -- <paths>`) against `root` to
+ * report a non-zero exit (one-shot). Drives the commit-failure rollback's
+ * unstage-failure path: the working-tree bytes still restore (real FS), but the
+ * unconfirmed index reset makes restoreForRollback stamp `rollback_failed`. The
+ * fake models no index, so an index-reset failure is the arm-able rollback slip. */
+export function armRestoreFailure(
+  root: string,
+  stderr = "fake reset failure",
+): void {
+  repoFor(root).restoreFailures.push({ stderr });
 }
 
 /** Seed a worker source commit in `root` carrying `messageWithTrailers` (a raw
@@ -500,10 +515,16 @@ export const fakeVcs: PlanVcs = {
     return { ...ok(), sha };
   },
 
-  restoreIndexToHead(_paths, _cwd): GitResult {
+  restoreIndexToHead(_paths, cwd): GitResult {
     // The fake commits directly from the working-tree diff and models no index,
-    // so an index reset is a no-op — precisely why F1's staged-half-stamp bug is
-    // observable only under real git (the slow tier proves the real unwind).
+    // so an index reset is normally a no-op — precisely why F1's staged-half-stamp
+    // bug is observable only under real git (the slow tier proves the real
+    // unwind). An armed restore failure returns a non-zero exit so a test can
+    // drive restoreForRollback's rollback_failed path.
+    const failure = repoFor(cwd).restoreFailures.shift();
+    if (failure) {
+      return { exitCode: 1, stdout: "", stderr: failure.stderr };
+    }
     return ok();
   },
 

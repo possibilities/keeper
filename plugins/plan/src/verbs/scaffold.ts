@@ -21,7 +21,12 @@
 import { existsSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join, resolve as resolveAbs } from "node:path";
 
-import { acquirePlanCommitGuard } from "../commit.ts";
+import {
+  acquirePlanCommitGuard,
+  type RollbackEntry,
+  restoreForRollback,
+  snapshotForRollback,
+} from "../commit.ts";
 import { detectCycles } from "../deps.ts";
 import {
   checkGlobalNameUnique,
@@ -1018,7 +1023,7 @@ export function runScaffold(args: ScaffoldArgs): number {
     // success path carries the fields emit() needs back out. NEVER emit() inside.
     type FlockOutcome =
       | { kind: "failure"; code: string; message: string; details: string[] }
-      | { kind: "success"; epicId: string };
+      | { kind: "success"; epicId: string; rollback: RollbackEntry[] };
 
     const outcome = withEpicIdLock<FlockOutcome>(() => {
       // Dup guard: reject a same-slug sibling epic up front. Runs BEFORE id
@@ -1271,6 +1276,17 @@ export function runScaffold(args: ScaffoldArgs): number {
       // the number, so re-minting allocates strictly higher. Fail-soft.
       appendEpicRecord(primaryRepo, epicNum, epicId);
 
+      // Snapshot every path the tree write touches (all fresh-mint → null) so a
+      // commit-failure rollback unlinks them, leaving the tree a no-op — the
+      // number stays burned in the ledger, so the next mint allocates strictly
+      // higher, never the rolled-back one.
+      const rollbackPaths: string[] = [epicPath, epicSpecPath];
+      for (let i = 1; i <= nTasks; i += 1) {
+        const [tp, sp] = taskPaths[i - 1] as [string, string];
+        rollbackPaths.push(sp, tp);
+      }
+      const rollback = snapshotForRollback(rollbackPaths);
+
       // The mid-write unwind unlinks SPECS BEFORE JSONs (orphan-spec invariant).
       const writtenPaths: string[] = [];
       try {
@@ -1297,7 +1313,7 @@ export function runScaffold(args: ScaffoldArgs): number {
         throw exc;
       }
 
-      return { kind: "success", epicId };
+      return { kind: "success", epicId, rollback };
     });
 
     if (outcome.kind === "failure") {
@@ -1334,6 +1350,8 @@ export function runScaffold(args: ScaffoldArgs): number {
         target: epicId,
         repoRoot: ctx.projectPath,
         primaryRepo,
+        onCommitFailure: () =>
+          restoreForRollback(outcome.rollback, ctx.projectPath),
       },
     );
     return 0;

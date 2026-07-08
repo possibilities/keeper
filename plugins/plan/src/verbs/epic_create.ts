@@ -15,7 +15,12 @@
 
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { acquirePlanCommitGuard } from "../commit.ts";
+import {
+  acquirePlanCommitGuard,
+  type RollbackEntry,
+  restoreForRollback,
+  snapshotForRollback,
+} from "../commit.ts";
 import { checkGlobalNameUnique } from "../discovery.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
@@ -86,7 +91,12 @@ export function runEpicCreate(args: EpicCreateArgs): void {
     // success path carries epicDef back out for the (post-lock) commit seam.
     type Outcome =
       | { kind: "error"; message: string }
-      | { kind: "success"; epicDef: Record<string, unknown>; epicId: string };
+      | {
+          kind: "success";
+          epicDef: Record<string, unknown>;
+          epicId: string;
+          rollback: RollbackEntry[];
+        };
 
     const outcome = withEpicIdLock<Outcome>(() => {
       // max(scan, ledger)+1, never bare scan: the durable id ledger (keyed on the
@@ -157,6 +167,10 @@ export function runEpicCreate(args: EpicCreateArgs): void {
       // re-minting allocates strictly higher. Fail-soft (keyed on the state repo).
       appendEpicRecord(ctx.projectPath, epicNum, epicId);
 
+      // Snapshot the pre-verb bytes (both fresh-mint → null) so a commit-failure
+      // rollback can unlink them, restoring the tree to a no-op.
+      const rollback = snapshotForRollback([epicPath, specPath]);
+
       // Write epic def + spec inside the lock so the minted N is observable to
       // the next waiter's scan. Mid-write raise unwinds any partial tree (both
       // paths are fresh-mint) so scan_max_epic_id stays unchanged.
@@ -177,7 +191,7 @@ export function runEpicCreate(args: EpicCreateArgs): void {
         throw exc;
       }
 
-      return { kind: "success", epicDef, epicId };
+      return { kind: "success", epicDef, epicId, rollback };
     });
 
     if (outcome.kind === "error") {
@@ -185,8 +199,9 @@ export function runEpicCreate(args: EpicCreateArgs): void {
     }
 
     // Route through the central seam OUTSIDE the (now released) lock. The
-    // write-phase unwind above already handled a MID-WRITE crash; a pre-commit
-    // raise from the seam leaves the written tree on disk (§10 no-rollback).
+    // write-phase unwind above handled a MID-WRITE crash; onCommitFailure handles
+    // a COMMIT failure (the mid-merge window) by unlinking the fresh files +
+    // unstaging, so the tree is left a no-op.
     emitMutating(
       { epic: outcome.epicDef },
       {
@@ -194,6 +209,8 @@ export function runEpicCreate(args: EpicCreateArgs): void {
         target: outcome.epicId,
         repoRoot: ctx.projectPath,
         primaryRepo,
+        onCommitFailure: () =>
+          restoreForRollback(outcome.rollback, primaryRepo),
       },
     );
   } finally {

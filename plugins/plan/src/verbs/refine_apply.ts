@@ -34,7 +34,12 @@
 import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { acquirePlanCommitGuard } from "../commit.ts";
+import {
+  acquirePlanCommitGuard,
+  type RollbackEntry,
+  restoreForRollback,
+  snapshotForRollback,
+} from "../commit.ts";
 import { detectCycles } from "../deps.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
@@ -499,6 +504,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
           kind: "success";
           newTaskIds: string[];
           writtenPaths: string[];
+          rollback: RollbackEntry[];
         };
 
     const outcome = withEpicIdLock<FlockOutcome>(() => {
@@ -707,6 +713,34 @@ export function runRefineApply(args: RefineApplyArgs): number {
         appendTaskRecord(primaryRepo, epicNum, epicId, maxTask + i, tid);
       }
 
+      // Snapshot the pre-verb bytes of EVERY path this delta writes — fresh-mint
+      // new tasks (null → unlinked on rollback) AND existing-file rewrites (epic
+      // JSON, epic spec, rewrite/rewire targets: their bytes → restored on
+      // rollback). A commit failure (the mid-merge window) already committed the
+      // rewrites to the working tree + index, so unlike the mid-write unwind the
+      // rollback MUST restore their prior bytes, not unlink them.
+      const rollbackPaths: string[] = [epicPath];
+      if (epicSpecRewrite !== null) {
+        rollbackPaths.push(epicSpecPath);
+      }
+      for (let i = 1; i <= nNew; i += 1) {
+        const tid = newIdByOrdinal.get(i) as string;
+        rollbackPaths.push(
+          join(dataDir, "tasks", `${tid}.json`),
+          join(dataDir, "specs", `${tid}.md`),
+        );
+      }
+      for (const tid of rewriteTargets) {
+        rollbackPaths.push(
+          join(dataDir, "specs", `${tid}.md`),
+          join(dataDir, "tasks", `${tid}.json`),
+        );
+      }
+      for (const tid of rewireTargets) {
+        rollbackPaths.push(join(dataDir, "tasks", `${tid}.json`));
+      }
+      const rollback = snapshotForRollback(rollbackPaths);
+
       // Track FRESH-MINT writes for the mid-write / Phase-4.5 unwind. CRITICAL:
       // existing-file rewrites (epic JSON, epic spec, rewrite_/rewire_ targets)
       // are OMITTED — atomicWrite is rename-based, so a mid-write failure leaves
@@ -774,7 +808,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
         throw exc;
       }
 
-      return { kind: "success", newTaskIds, writtenPaths };
+      return { kind: "success", newTaskIds, writtenPaths, rollback };
     });
 
     if (outcome.kind === "failure") {
@@ -782,7 +816,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
       return 1;
     }
 
-    const { newTaskIds, writtenPaths } = outcome;
+    const { newTaskIds, writtenPaths, rollback } = outcome;
 
     // ------------------------------------------------------------------
     // Phase 4.5: post-write integrity gate (OUTSIDE the lock).
@@ -823,6 +857,7 @@ export function runRefineApply(args: RefineApplyArgs): number {
         target: epicId,
         repoRoot: ctx.projectPath,
         primaryRepo,
+        onCommitFailure: () => restoreForRollback(rollback, primaryRepo),
       },
     );
     return 0;

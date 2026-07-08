@@ -36,7 +36,12 @@ import { existsSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { acquirePlanCommitGuard } from "../commit.ts";
+import {
+  acquirePlanCommitGuard,
+  type RollbackEntry,
+  restoreForRollback,
+  snapshotForRollback,
+} from "../commit.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
@@ -51,6 +56,7 @@ import {
   SELECTION_SCHEMA_VERSION,
   type SelectionSidecar,
   type SidecarAuditPolicy,
+  selectionSidecarPath,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
 import {
@@ -307,7 +313,7 @@ export function runAssignCells(args: AssignCellsArgs): number {
   try {
     type FlockOutcome =
       | { kind: "failure"; code: string; message: string; details: string[] }
-      | { kind: "success"; taskIds: string[] };
+      | { kind: "success"; taskIds: string[]; rollback: RollbackEntry[] };
 
     const outcomeResult = withEpicIdLock<FlockOutcome>(() => {
       const stateStore = new LocalFileStateStore(ctx.stateDir);
@@ -373,6 +379,21 @@ export function runAssignCells(args: AssignCellsArgs): number {
         };
       }
 
+      // Snapshot every path this verb writes BEFORE mutating — the per-cell task
+      // JSONs + the selection sidecar (both here) and the epic JSON (its
+      // updated_at bump lands in Phase 4.5, OUTSIDE the lock, but the commit
+      // covers it). All are existing files bar a first-time sidecar, so a
+      // commit-failure rollback restores each one's prior bytes (or unlinks a
+      // fresh sidecar) and unstages the set.
+      const rollbackPaths: string[] = [
+        epicPath,
+        selectionSidecarPath(dataDir, epicId),
+      ];
+      for (const c of parsedCells) {
+        rollbackPaths.push(join(dataDir, "tasks", `${c.taskId}.json`));
+      }
+      const rollback = snapshotForRollback(rollbackPaths);
+
       // --- mutate: overwrite tier/model + stamp audit_required per cell ------
       // audit_required is written explicitly (true or false) on every cell so a
       // re-run after a policy change correctly flips a stale flag; a degrade loads
@@ -424,7 +445,11 @@ export function runAssignCells(args: AssignCellsArgs): number {
       };
       writeSelectionSidecar(dataDir, sidecar);
 
-      return { kind: "success", taskIds: parsedCells.map((c) => c.taskId) };
+      return {
+        kind: "success",
+        taskIds: parsedCells.map((c) => c.taskId),
+        rollback,
+      };
     });
 
     if (outcomeResult.kind === "failure") {
@@ -465,6 +490,8 @@ export function runAssignCells(args: AssignCellsArgs): number {
         target: epicId,
         repoRoot: ctx.projectPath,
         primaryRepo,
+        onCommitFailure: () =>
+          restoreForRollback(outcomeResult.rollback, primaryRepo),
       },
     );
     return 0;

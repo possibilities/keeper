@@ -23,7 +23,11 @@
 // INVOCATION_EMITTED_SENTINEL. init is the one verb whose self-emit is
 // conditional (committing path sets it; read-only path leaves it false).
 
-import { autoCommitFromInvocation, CommitFailed } from "./commit.ts";
+import {
+  autoCommitFromInvocation,
+  CommitFailed,
+  type RollbackResult,
+} from "./commit.ts";
 import { compactJson, formatOutput, type OutputFormat } from "./format.ts";
 import {
   buildPlanInvocation,
@@ -94,10 +98,12 @@ export function emitMutating(
     primaryRepo?: string | null;
     // Optional unwind a committing verb registers to restore any state files it
     // wrote when the commit fails, so a failed commit never leaves a durable
-    // half-stamp on disk (the done verb's mid-merge window). Runs BEFORE the
-    // failure envelope prints; its own throw is swallowed so the authoritative
-    // commit_failed envelope always surfaces.
-    onCommitFailure?: () => void;
+    // half-stamp on disk (the mid-merge window). Runs BEFORE the failure envelope
+    // prints; its own throw is swallowed so the authoritative commit_failed
+    // envelope always surfaces. A returned RollbackResult (the unwind could not
+    // fully restore the tree) is stamped into the failure details + a stderr line,
+    // making a reopened destruction window visible without masking commit_failed.
+    onCommitFailure?: () => RollbackResult | null;
   },
 ): void {
   const invocation = buildPlanInvocation(opts.verb, opts.target, opts.detail, {
@@ -111,9 +117,10 @@ export function emitMutating(
     if (!(exc instanceof CommitFailed)) {
       throw exc;
     }
+    let rollback: RollbackResult | undefined;
     if (opts.onCommitFailure) {
       try {
-        opts.onCommitFailure();
+        rollback = opts.onCommitFailure() ?? undefined;
       } catch {
         // Best-effort unwind — never let a restore slip mask the commit failure.
       }
@@ -125,9 +132,22 @@ export function emitMutating(
         error: exc.error,
         message: exc.detail,
         ...exc.extra,
+        ...(rollback ?? {}),
       },
       plan_invocation: invocation,
     };
+    if (rollback) {
+      // The commit failed AND the unwind could not fully restore the tree: a
+      // staged / working-tree half-write may survive into a later full-index
+      // merge-completion. Surface it on stderr so the reopened destruction window
+      // is visible — the stdout envelope stays the authoritative commit_failed.
+      process.stderr.write(
+        `planctl: commit_failed rollback incomplete for ` +
+          `${rollback.rollback_failed_paths.length} path(s): ` +
+          `${rollback.rollback_failed_paths.join(", ")} — inspect for staged ` +
+          `residue before re-running\n`,
+      );
+    }
     process.stdout.write(`${compactJson(failure)}\n`);
     process.exit(1);
   }
