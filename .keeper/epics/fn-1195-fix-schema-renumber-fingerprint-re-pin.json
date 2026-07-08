@@ -7,7 +7,7 @@
     "fn-1182-schema-renumber-tool-and-guards"
   ],
   "id": "fn-1195-fix-schema-renumber-fingerprint-re-pin",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T12:26:07.145000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T12:26:06.659000Z"
+  "updated_at": "2026-07-08T12:26:07.145000Z"
 }
