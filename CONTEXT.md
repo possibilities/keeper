@@ -26,6 +26,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Epic**: A tracked unit of work holding a spec and an ordered set of dependent tasks. Avoid: project, story, milestone.
 - **Task**: One acceptance-bounded slice of an epic that a single worker implements end-to-end. Avoid: subtask, issue, chore.
 - **Plan**: The durable spec-and-dependency graph for an epic, authored interactively and consumed read-only, never mutated by the reducer. Avoid: roadmap, schedule, spec sheet.
+- **Id ledger**: The host-local append-only record of every plan number a project has handed out, consulted at mint alongside the directory scan so destroying a minted file can never free its number. Avoid: high-water mark, watermark, counter.
 - **Brief**: The self-contained context packet a worker receives for its task, carrying the spec and glossary out-of-band instead of inlined prose. Avoid: prompt, ticket body, handoff note.
 - **Readiness**: The gate deciding whether a task may dispatch, recomputed each cycle from its dependencies and validation state. Avoid: status, priority, availability.
 - **Arm**: To flip an epic or task from not-ready to dispatchable by stamping it validated. Avoid: enable, approve, unlock.
