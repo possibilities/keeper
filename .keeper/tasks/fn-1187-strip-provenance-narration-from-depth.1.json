@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "low",
   "title": "Delete provenance from depth-band comments",
-  "updated_at": "2026-07-08T02:39:44.356000Z"
+  "updated_at": "2026-07-08T02:53:54.511000Z",
+  "worker_done_at": "2026-07-08T02:53:54.511000Z"
 }

@@ -19,5 +19,5 @@ Files:
 - [ ] bun run test:full (plan suite) stays green
 
 ## Done summary
-
+Stripped fn-id/provenance narration (F1/F2/F3, past-tense 'how it shipped') from depth-band comments and test banners in close_preflight.ts, audit-policy-check.ts, and two plan test files; forward-facing invariant sentences preserved.
 ## Evidence
