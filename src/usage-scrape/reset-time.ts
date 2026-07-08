@@ -1,3 +1,5 @@
+// @js-temporal/polyfill is pinned EXACT in package.json — its serialization
+// format is spec-sensitive, so a version bump can change `toString` output.
 import { Temporal } from "@js-temporal/polyfill";
 
 /**
