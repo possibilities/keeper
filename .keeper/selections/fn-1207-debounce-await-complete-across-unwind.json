@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Never-fire-early race invariant + await-slot watermark plumbing",
+      "task_id": "fn-1207-debounce-await-complete-across-unwind.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:59:51.916000Z",
+  "epic_id": "fn-1207-debounce-await-complete-across-unwind",
+  "input_hash": "6282b5901a4a427df0b29e8ea359ac941645f411f8599a1fb5f8740553096c2d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1652733328,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\".1\",\"tier\":\"xhigh\",\"model\":\"opus\"}]}"
+}
