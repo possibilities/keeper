@@ -2,7 +2,7 @@
  * Statusline telemetry producer worker. keeperd's SIXTH file-watcher producer
  * (after transcript, plan, git, usage) — watches the keeper-managed statusLine
  * leaf dir (`~/.local/state/keeper/statusline/`, one `<token>.json` per session,
- * written by the `keeper statusline-sink` CLI). It reads each leaf on change,
+ * written by `keeper statusline`). It reads each leaf on change,
  * builds a typed `{kind:"session-telemetry", ...}` message keyed on the RAW
  * `session_id` from the leaf CONTENT, and posts it to the parent. The parent
  * (and only the parent) turns each message into a synthetic `SessionTelemetry`
@@ -73,7 +73,7 @@ export interface StatuslineWorkerData {
   dbPath: string;
   /**
    * The statusLine leaf directory to watch (flat — one `<token>.json` per
-   * session, written by `keeper statusline-sink`). The parent resolves this from
+   * session, written by `keeper statusline`). The parent resolves this from
    * {@link import("./db").resolveStatuslineRoot}. A missing directory is
    * tolerated (subscribe + scan both no-op until the dir appears — no keeper-agent
    * claude session may have rendered yet).

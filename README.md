@@ -91,8 +91,10 @@ conflict instance is resolved.
 
 `keeper agent` loads keeper's own two plugins (`plugins/keeper`, `plugins/plan`) from
 `~/.config/keeper/plugins.yaml`, which `install.sh` writes on a fresh machine (keeper-only, no
-third-party sources) and leaves untouched when a file or symlink is already there. Do NOT add a
-`~/.claude/plugins/keeper` symlink — it double-registers the hook (two `events` rows per invocation).
+third-party sources) and leaves untouched when a file or symlink is already there. The keeper plugin
+ships the statusLine settings file (`keeper statusline`), which `keeper agent` passes when the caller
+has not supplied `--settings`. Do NOT add a `~/.claude/plugins/keeper` symlink — it double-registers
+the hook (two `events` rows per invocation).
 
 **Host provider matrix (optional).** By default the plan worker matrix is claude-only. A host
 `~/.config/keeper/matrix.yaml` ([ADR 0010](./docs/adr/0010-host-provider-matrix-and-wrapped-worker-cells.md))

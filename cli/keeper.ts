@@ -65,6 +65,7 @@ export const SUBCOMMANDS = [
   "agent",
   "reclaim",
   "bus",
+  "statusline",
   "statusline-sink",
   "completions",
 ] as const;
@@ -98,8 +99,8 @@ export const SUBCOMMAND_META: Record<Subcommand, SubcommandMeta> =
   ) as Record<Subcommand, SubcommandMeta>;
 
 /** The public (non-internal) descriptors, in canonical order — the ones the
- *  human `USAGE` block lists. `internal` wiring commands (statusline-sink) are
- *  omitted here yet still carried in `keeper --help --json`. */
+ *  human `USAGE` block lists. `internal` wiring commands are omitted here yet
+ *  still carried in `keeper --help --json`. */
 const PUBLIC_DESCRIPTORS: readonly CommandDescriptor[] = NATIVE_COMMANDS.filter(
   (c) => c.visibility !== "internal",
 );
@@ -596,6 +597,7 @@ export async function main(): Promise<void> {
     agent: async (argv) => (await import("./agent")).main(argv),
     reclaim: async (argv) => (await import("./reclaim")).main(argv),
     bus: async (argv) => (await import("./bus")).main(argv),
+    statusline: async (argv) => (await import("./statusline")).main(argv),
     "statusline-sink": async (argv) =>
       (await import("./statusline-sink")).main(argv),
     completions: (argv) =>

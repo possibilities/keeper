@@ -7276,7 +7276,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Spawn the statusline worker in the SAME post-migration window (fn-1024). It
   // watches the keeper-managed statusLine leaf dir (`~/.local/state/keeper/
   // statusline/`, one `<token>.json` per session written by `keeper
-  // statusline-sink`) and posts `{kind: "session-telemetry", ...}` messages —
+  // statusline`) and posts `{kind: "session-telemetry", ...}` messages —
   // the sixth file-watcher producer-worker instance. Main turns each into a
   // synthetic `SessionTelemetry` events row on its writable connection. The watch
   // root is resolved on main via `resolveStatuslineRoot()` and tolerates absence

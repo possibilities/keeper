@@ -51,7 +51,7 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "--teammate-mode",
       "in-process",
       "--settings",
-      "/fake-home/.config/keeper/agent-statusline-settings.json",
+      "/fake-home/code/keeper/plugins/keeper/settings.json",
       "--session-id",
       UUID,
       "--name",
@@ -73,8 +73,21 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "--teammate-mode",
       "in-process",
       "--settings",
-      "/fake-home/.config/keeper/agent-statusline-settings.json",
+      "/fake-home/code/keeper/plugins/keeper/settings.json",
     ]);
+  });
+
+  test("caller --settings wins over keeper statusline config", async () => {
+    const h = makeHarness({
+      argv: ["claude", "--settings", "/tmp/custom.json", "hello"],
+      rawArgv: true,
+      randomUuid: () => UUID,
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(cmd).toContain("/tmp/custom.json");
+    expect(cmd).not.toContain(
+      "/fake-home/code/keeper/plugins/keeper/settings.json",
+    );
   });
 });
 

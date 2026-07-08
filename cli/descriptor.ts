@@ -1225,6 +1225,16 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     verbs: ["list", "watch", "wake", "chat"].map(nameOnlyVerb),
   },
   {
+    name: "statusline",
+    summary:
+      "Render a Claude Code statusLine payload and coalesce its telemetry leaf",
+    visibility: "internal",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: [FLAG_HELP],
+  },
+  {
     name: "statusline-sink",
     summary:
       "Coalesce a Claude Code statusLine payload (stdin) into a per-session leaf",

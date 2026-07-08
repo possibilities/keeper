@@ -4859,13 +4859,13 @@ export function resolveUsageRoot(): string {
 }
 
 /**
- * Resolve the statusLine leaf directory (fn-1024) — where `keeper statusline-sink`
+ * Resolve the statusLine leaf directory (fn-1024) — where `keeper statusline`
  * writes one `<token>.json` per session and the `statusline-worker` watches for
  * telemetry snapshots. `KEEPER_STATUSLINE_DIR` env wins (hermetic tests point it
  * at a tmpdir; the sink reads the same override); else
  * `~/.local/state/keeper/statusline/`, a sibling of the other keeper state dirs.
  * MUST resolve byte-for-byte to `resolveStatuslineDir` in
- * `cli/statusline-sink.ts` — the sink writes the leaves, the worker reads them;
+ * `cli/statusline.ts` — the command writes the leaves, the worker reads them;
  * the sink keeps its own copy because it cannot import `bun:sqlite`/`src/db.ts`.
  */
 export function resolveStatuslineRoot(): string {

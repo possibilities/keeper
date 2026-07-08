@@ -1,13 +1,9 @@
 /**
- * `keeper statusline-sink` — the statusLine capture leaf-writer (fn-1024 task .2)
- * plus the launcher-side `--settings` injection that wires it onto every
- * keeper-agent claude launch.
+ * `keeper statusline-sink` — the capture-only statusLine leaf-writer.
  *
  * The sink is a pure, dependency-light function set (no DB, no socket, no
  * subprocess), so it is driven directly with captured payload strings + a
- * per-test tmpdir — no stdin plumbing. The injection is exercised through the
- * shared `main()` harness (the recording spawn), asserting the claude-only /
- * caller-wins / fail-open contract.
+ * per-test tmpdir — no stdin plumbing.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -23,17 +19,6 @@ import {
   sanitizeSessionToken,
   main as sinkMain,
 } from "../cli/statusline-sink";
-import {
-  buildStatuslineCommand,
-  buildStatuslineSettingsContent,
-  ensureStatuslineSettingsFile,
-  main,
-} from "../src/agent/main";
-import {
-  flagValues,
-  makeHarness,
-  runAndCapture,
-} from "./helpers/agent-main-harness";
 
 function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), "statusline-sink-"));
@@ -211,98 +196,5 @@ describe("statusline-sink — dir resolution", () => {
     expect(resolveStatuslineDir({})).toMatch(
       /\.local\/state\/keeper\/statusline$/,
     );
-  });
-});
-
-describe("statusline settings — command builder", () => {
-  test("bash -c wrapper tees into the sink then pipes to the chain", () => {
-    expect(buildStatuslineCommand("claudectl show-statusline")).toBe(
-      "bash -c 'tee -i >(keeper statusline-sink) | claudectl show-statusline'",
-    );
-  });
-
-  test("the chain is configurable", () => {
-    expect(buildStatuslineCommand("my-renderer --x")).toContain(
-      "| my-renderer --x'",
-    );
-  });
-
-  test("settings file is a scalar statusLine command override", () => {
-    const parsed = JSON.parse(
-      buildStatuslineSettingsContent("claudectl show-statusline"),
-    ) as { statusLine: { type: string; command: string } };
-    expect(parsed.statusLine.type).toBe("command");
-    expect(parsed.statusLine.command).toContain(
-      "tee -i >(keeper statusline-sink)",
-    );
-  });
-
-  test("ensureStatuslineSettingsFile writes the file, then is idempotent", () => {
-    const dir = tmpDir();
-    const path = ensureStatuslineSettingsFile(dir, {});
-    expect(path).toBe(join(dir, "agent-statusline-settings.json"));
-    const first = readFileSync(path as string, "utf8");
-    expect(first).toContain("keeper statusline-sink");
-    // No leftover temp file; re-running is a no-op that returns the same path.
-    expect(readdirSync(dir)).toEqual(["agent-statusline-settings.json"]);
-    expect(ensureStatuslineSettingsFile(dir, {})).toBe(path);
-    expect(readFileSync(path as string, "utf8")).toBe(first);
-  });
-
-  test("KEEPER_STATUSLINE_CHAIN env overrides the rendered chain", () => {
-    const dir = tmpDir();
-    const path = ensureStatuslineSettingsFile(dir, {
-      KEEPER_STATUSLINE_CHAIN: "custom-render",
-    });
-    expect(readFileSync(path as string, "utf8")).toContain("| custom-render'");
-  });
-});
-
-describe("statusline settings — launch injection", () => {
-  const UUID = "11111111-1111-1111-1111-111111111111";
-
-  test("claude launch injects --settings with the managed path", async () => {
-    const h = makeHarness({
-      argv: ["claude", "hi"],
-      rawArgv: true,
-      randomUuid: () => UUID,
-      resolveStatuslineSettingsPath: () => "/managed/statusline.json",
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(flagValues(cmd, "--settings")).toEqual(["/managed/statusline.json"]);
-  });
-
-  test("a caller-supplied --settings wins (keeper does not clobber it)", async () => {
-    const h = makeHarness({
-      argv: ["claude", "--settings", "/my/own.json", "hi"],
-      rawArgv: true,
-      randomUuid: () => UUID,
-      resolveStatuslineSettingsPath: () => "/managed/statusline.json",
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(flagValues(cmd, "--settings")).toEqual(["/my/own.json"]);
-    expect(cmd).not.toContain("/managed/statusline.json");
-  });
-
-  test("a null resolver skips the injection (fail-open)", async () => {
-    const h = makeHarness({
-      argv: ["claude", "hi"],
-      rawArgv: true,
-      randomUuid: () => UUID,
-      resolveStatuslineSettingsPath: () => null,
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(cmd).not.toContain("--settings");
-  });
-
-  test("codex launch gets no statusline --settings (claude branch only)", async () => {
-    const h = makeHarness({
-      argv: ["codex", "hi"],
-      rawArgv: true,
-      randomUuid: () => UUID,
-      resolveStatuslineSettingsPath: () => "/managed/statusline.json",
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(cmd).not.toContain("--settings");
   });
 });

@@ -1,15 +1,11 @@
 #!/usr/bin/env bun
 /**
- * `keeper statusline-sink` — capture the Claude Code statusLine payload into a
+ * `keeper statusline-sink` — capture a Claude Code statusLine payload into a
  * per-session leaf file so the `statusline-worker` file-watch producer can fold
  * the session's CURRENT model / reasoning effort / context-window usage onto its
- * `jobs` row (schema v100 / fn-1024).
- *
- * Wiring: injected fleet-wide onto every keeper-agent claude launch as
- * `bash -c 'tee -i >(keeper statusline-sink) | <chain>'` (see
- * `src/agent/main.ts` `buildStatuslineCommand`). This process is the tee side
- * branch — it reads a COPY of the statusLine stdin JSON; the visible display is
- * rendered by `<chain>` on the pipe's stdout side, entirely independent of us.
+ * `jobs` row (schema v100 / fn-1024). The full statusline entrypoint is
+ * `keeper statusline`, which calls these capture helpers before rendering the
+ * visible line.
  *
  * CAPTURED CONTRACT (the early-proof-point this task exists to confirm):
  *  - The fold's ONLY match key is `session_id`. The reducer invariant
@@ -31,8 +27,7 @@
  * Discipline (mirrors the events-writer hook): dependency-light (`node:*` only,
  * NEVER `bun:sqlite`/`src/db.ts`), never touches the DB or the socket, and NEVER
  * throws past `main` — a sink crash must never break the human's statusline. It
- * drains stdin to EOF before exiting so the upstream `tee -i` never takes SIGPIPE
- * (which would blank the display). Writes are COALESCED: only a change in
+ * drains stdin to EOF before exiting. Writes are COALESCED: only a change in
  * {model, effort, context-bucket} rewrites the leaf, so the event log the worker
  * mints from does not churn per render. The write is atomic (tmp-in-same-dir +
  * `rename`) with a DETERMINISTIC temp name so render-frequency invocations never
@@ -245,7 +240,7 @@ async function readStdin(): Promise<string> {
  * invoked with the payload on stdin, no arguments).
  */
 export const HELP =
-  "keeper statusline-sink — internal statusLine tee; not for agent use. " +
+  "keeper statusline-sink — internal statusLine capture helper; not for agent use. " +
   "Machine-invoked with the Claude Code statusLine JSON on stdin; coalesces it " +
   "into a per-session leaf the statusline-worker folds. Takes no arguments.\n";
 

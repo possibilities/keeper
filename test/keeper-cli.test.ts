@@ -107,6 +107,7 @@ function makeHarness(): Harness {
       agent: mkHandler("agent"),
       reclaim: mkHandler("reclaim"),
       bus: mkHandler("bus"),
+      statusline: mkHandler("statusline"),
       "statusline-sink": mkHandler("statusline-sink"),
       completions: mkHandler("completions"),
     },
@@ -340,8 +341,8 @@ describe("cli/keeper dispatch", () => {
 describe("cli/keeper command index", () => {
   test("covers every subcommand with a non-empty summary", () => {
     const index = buildHelpIndex();
-    // Catches a future statusline-sink-class gap: a new subcommand cannot land
-    // without a summary (the Record type) and this asserts it is non-empty.
+    // A new subcommand cannot land without a summary (the Record type) and
+    // this asserts it is non-empty.
     for (const name of SUBCOMMANDS) {
       const entry = index.subcommands.find((s) => s.name === name);
       expect(entry).toBeDefined();
@@ -1645,15 +1646,13 @@ describe("keeper --help --json recursive descriptor tree", () => {
 });
 
 describe("USAGE hides internal commands the JSON index still carries", () => {
-  test("statusline-sink is visibility:internal, omitted from USAGE, present in --help --json", () => {
-    // Omitted from the human USAGE block…
-    expect(USAGE).not.toContain("statusline-sink");
-    // …but present in the machine index, tagged internal.
-    const node = buildHelpIndex().subcommands.find(
-      (s) => s.name === "statusline-sink",
-    );
-    expect(node).toBeDefined();
-    expect(node?.visibility).toBe("internal");
+  test("statusline commands are visibility:internal, omitted from USAGE, present in --help --json", () => {
+    for (const name of ["statusline", "statusline-sink"]) {
+      expect(USAGE).not.toContain(name);
+      const node = buildHelpIndex().subcommands.find((s) => s.name === name);
+      expect(node).toBeDefined();
+      expect(node?.visibility).toBe("internal");
+    }
   });
 
   test("every PUBLIC descriptor command appears in USAGE", () => {

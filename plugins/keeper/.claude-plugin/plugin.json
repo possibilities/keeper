@@ -1,6 +1,6 @@
 {
   "name": "keeper",
-  "description": "Write one row per Claude Code hook invocation into keeper.db for the reducer daemon to fold, hard-deny subagents from creating/switching git branches via a PreToolUse(Bash) branch-guard, and auto-arm the Agent Bus inbox watcher (keeper bus watch) as an always-on session Monitor",
+  "description": "Keeper hook/skill plugin: logs Claude Code hook invocations, enforces the branch guard, arms the Agent Bus inbox watcher, and provides statusLine config",
   "author": {"name": "arthack"},
   "experimental": {
     "monitors": "./monitors.json"

@@ -51,6 +51,10 @@ fires two commands — the events-writer (folds the session-start row) and a
 fail-open **context-hint** that emits one `additionalContext` line pointing a
 vanilla session at the repo root's `CONTEXT.md` glossary when present + non-empty
 (nothing when absent/empty/unreadable or the cwd is non-git; always exits 0).
+`plugins/keeper/settings.json` is the sibling statusLine config surface; `keeper
+agent` passes it as `--settings` on Claude launches that do not already supply
+`--settings`, so the visible line and telemetry capture both flow through
+`keeper statusline`.
 
 ## Per launch channel
 
