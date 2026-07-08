@@ -67,8 +67,11 @@ const KEEPER_READ_SUBCOMMANDS = new Set([
 ]);
 
 /** Read-only git subcommands allowed for the diagnosis roles (write-capable
- *  roles get all of git). `branch` is inspection-only in spirit; its create form
- *  is low-harm here and separately governed by branch-guard + skill prose. */
+ *  roles get all of git). `branch` is allowed only in its list/inspect forms —
+ *  `classifyGitBranch` denies the delete/move/copy/force/upstream/create forms
+ *  that mutate refs (branch-guard cannot cover an escalation session — it keys on
+ *  an `agent_id` the session lacks). A `-c`/`--config-env` config-injection global
+ *  option on ANY of these read subcommands is denied by `gitConfigInjection`. */
 const READONLY_GIT_SUBCOMMANDS = new Set([
   "log",
   "show",
@@ -83,6 +86,42 @@ const READONLY_GIT_SUBCOMMANDS = new Set([
   "shortlog",
   "ls-tree",
   "cat-file",
+]);
+
+/** `git branch` flags that mutate refs or tracking config — denied for a
+ *  diagnosis role. The list/inspect forms (bare, `-a`/`-r`/`-v`/`--list`/
+ *  `--contains`/…) carry none of these. */
+const MUTATING_BRANCH_FLAGS = new Set([
+  "-d",
+  "-D",
+  "--delete",
+  "-m",
+  "-M",
+  "--move",
+  "-c",
+  "-C",
+  "--copy",
+  "-f",
+  "--force",
+  "-u",
+  "--set-upstream-to",
+  "--set-upstream",
+  "--unset-upstream",
+  "--edit-description",
+]);
+
+/** `git branch` flags whose FOLLOWING token is a filter value (a ref / pattern),
+ *  so a bare positional after one is a value, not a branch name to create. Glued
+ *  `--flag=value` forms are self-contained and need no lookahead. */
+const BRANCH_FILTER_VALUE_FLAGS = new Set([
+  "--contains",
+  "--no-contains",
+  "--merged",
+  "--no-merged",
+  "--points-at",
+  "--sort",
+  "--format",
+  "--list",
 ]);
 
 /** Read utilities allowed for EVERY role. `find` is further gated (no `-exec`
@@ -376,8 +415,12 @@ function stripWrappers(
   return { deny: "too many stacked command wrappers" };
 }
 
-/** The first non-global-flag token after `git` — the git subcommand. */
-function gitSubcommand(tokens: string[]): string | undefined {
+/** The first non-global-flag token after `git` (the subcommand) and its token
+ *  index, or undefined when there is none. `-C`/`-c` each consume a following
+ *  value so it is not mistaken for the subcommand. */
+function gitSubcommandInfo(
+  tokens: string[],
+): { name: string; index: number } | undefined {
   let i = 1;
   while (i < tokens.length) {
     const t = tokens[i] as string;
@@ -389,9 +432,68 @@ function gitSubcommand(tokens: string[]): string | undefined {
       i += 1;
       continue;
     }
-    return t;
+    return { name: t, index: i };
   }
   return undefined;
+}
+
+/** Deny a git config-injection global option — the vector that turns an
+ *  allowlisted read subcommand into arbitrary program execution: `-c
+ *  <name>=<value>` (an exec-bearing key like core.fsmonitor / core.pager /
+ *  core.sshCommand / diff.external / *.textconv / alias.*) and its
+ *  `--config-env=<name>=<envvar>` sibling. Returns a deny reason or null.
+ *
+ *  Scans the WHOLE segment rather than only the pre-subcommand region: git honors
+ *  `-c` solely as a global option, and no read subcommand legitimately pairs a
+ *  `-c` with an `=`-bearing value, so the segment-wide scan closes the reorder
+ *  evasion (`git --git-dir d -c x=y status`) that a value-skipping global-region
+ *  walk could miss. A missed global option would fail OPEN; the whole-segment scan
+ *  fails CLOSED, the safe direction for this guard. */
+function gitConfigInjection(tokens: string[]): string | null {
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i] as string;
+    if (t === "-c") {
+      const val = tokens[i + 1];
+      if (val?.includes("=")) {
+        return "git `-c <name>=<value>` config injection (an exec-bearing config key turns an allowlisted read subcommand into arbitrary program execution)";
+      }
+      continue;
+    }
+    if (t === "--config-env" || t.startsWith("--config-env=")) {
+      return "git `--config-env` config injection (reads a config value from an env var — the same exec-bearing bypass as `-c`)";
+    }
+  }
+  return null;
+}
+
+/** Classify the args after a `git branch` subcommand for a diagnosis role. The
+ *  list/inspect forms (bare, `-a`/`-r`/`-v`/`--list [<pattern>]`/`--contains
+ *  <ref>`/…) are allowed; the delete/move/copy/force/upstream flags and the bare
+ *  `branch <name>` create/reset form mutate refs and are denied. */
+function classifyGitBranch(branchArgs: string[], role: string): string | null {
+  for (let i = 0; i < branchArgs.length; i++) {
+    const arg = branchArgs[i] as string;
+    if (
+      MUTATING_BRANCH_FLAGS.has(arg) ||
+      arg.startsWith("--set-upstream-to=")
+    ) {
+      return `git 'branch ${arg}' mutates refs, denied for the diagnosis role '${role}' (bare/list/verbose forms allowed)`;
+    }
+    if (arg.startsWith("-")) {
+      // A filter flag consumes its following value (a ref / pattern) — skip it so
+      // it is not misread as a branch name to create. Consume only a real value
+      // token (not another flag), so a mutating flag after it still classifies.
+      if (BRANCH_FILTER_VALUE_FLAGS.has(arg)) {
+        const nextTok = branchArgs[i + 1];
+        if (nextTok !== undefined && !nextTok.startsWith("-")) i += 1;
+      }
+      continue;
+    }
+    // A bare positional with no consuming filter flag is a branch name to
+    // create / rename / reset — a ref mutation.
+    return `git 'branch <name>' (create/reset) mutates refs, denied for the diagnosis role '${role}' (bare/list/verbose forms allowed)`;
+  }
+  return null;
 }
 
 /** Classify one already-wrapper-stripped segment's executable against the role.
@@ -423,10 +525,17 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
 
   if (exe === "git") {
     if (cfg.writeCapable) return null;
-    const sub = gitSubcommand(tokens);
+    const injection = gitConfigInjection(tokens);
+    if (injection !== null) {
+      return `${injection}, denied for the diagnosis role '${cfg.role}'`;
+    }
+    const sub = gitSubcommandInfo(tokens);
     if (sub === undefined) return "bare `git` with no subcommand";
-    if (READONLY_GIT_SUBCOMMANDS.has(sub)) return null;
-    return `git '${sub}' is a mutating/off-list git subcommand, denied for the diagnosis role '${cfg.role}'`;
+    if (sub.name === "branch") {
+      return classifyGitBranch(tokens.slice(sub.index + 1), cfg.role);
+    }
+    if (READONLY_GIT_SUBCOMMANDS.has(sub.name)) return null;
+    return `git '${sub.name}' is a mutating/off-list git subcommand, denied for the diagnosis role '${cfg.role}'`;
   }
 
   if (exe === "botctl") return null;
