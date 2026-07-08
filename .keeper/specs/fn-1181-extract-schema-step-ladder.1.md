@@ -98,5 +98,5 @@ Lands as one commit with zero schema movement; revert-safe.
 - [ ] Every historical version maps to exactly one entry (no-op entries fill bare bumps); the ladder floor and any discovered irregularities are documented in the Done summary
 
 ## Done summary
-
+Extracted migrate()'s interleaved middle section into an exported ordered SCHEMA_STEPS ladder (115 entries, versions 2-116, each {version, kind, apply}); SCHEMA_VERSION now derives from the ladder tail. Bodies moved verbatim inside one transaction; SCHEMA_FINGERPRINT byte-unchanged (recompute + fresh-vs-migrated identity tests green, no re-pin). Ladder floor = 2 (base CREATE = v1). Irregularities: v6/v68/v112 are bare whitelist-only bumps rendered as explicit noop entries; v8/v9 (depends_on_epics, start_time) and pre-v7 v2-v5 carry code but predate per-version comments; historical comment-only bumps become noop entries preserving their comment.
 ## Evidence
