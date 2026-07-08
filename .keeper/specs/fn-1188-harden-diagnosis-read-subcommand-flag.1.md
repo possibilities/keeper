@@ -37,5 +37,5 @@ test/escalation-guard.test.ts.
 - [ ] New deny-case tests cover the bundled `-O` form and the `--output=` form; existing allow/deny rows stay green.
 
 ## Done summary
-
+Hardened gitReadSubcommandExecFlag: deny git grep's -O exec alias buried in a short-flag cluster (regex on capital-O anywhere in a single-dash cluster) and deny --output=<file> on read subcommands as a file-write vector. Added deny-case tests for bundled -O and --output= forms plus benign diff/log -O order-file allow rows.
 ## Evidence

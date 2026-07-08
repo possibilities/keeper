@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Close grep exec and output write",
-  "updated_at": "2026-07-08T02:51:41.111000Z"
+  "updated_at": "2026-07-08T03:03:31.831000Z",
+  "worker_done_at": "2026-07-08T03:03:31.831000Z"
 }
