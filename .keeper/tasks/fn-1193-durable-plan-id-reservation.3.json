@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Rollback plan writes on commit failure",
-  "updated_at": "2026-07-08T06:26:13.259000Z"
+  "updated_at": "2026-07-08T13:59:09.046000Z",
+  "worker_done_at": "2026-07-08T13:59:09.046000Z"
 }

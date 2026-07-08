@@ -58,5 +58,5 @@ for the verb's pathspec while the foreign merge state is untouched.
 - [ ] Fast-tier tests cover every mutating verb's rollback with zero real git; the real-git rollback runs in the slow tier
 
 ## Done summary
-
+Every mutating plan verb (scaffold, epic create, refine-apply, assign-cells, done) now rolls its writes back to a working-tree no-op on an auto-commit failure via shared snapshotForRollback/restoreForRollback helpers registered as onCommitFailure; a rollback that itself fails stamps rollback_failed into the commit_failed envelope + stderr without masking the primary error. Fast-tier tests cover every verb with zero real git; a slow-tier real-git test proves the mid-merge unstage leaves foreign MERGE_HEAD untouched.
 ## Evidence
