@@ -33,6 +33,7 @@ import {
   auditReadyEscalationDecision,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
+  type BlockCandidateDropClass,
   type BlockEscalationOutcome,
   type BlockEscalationSweepDeps,
   type BlockHumanNotifiedOutcome,
@@ -89,6 +90,7 @@ import {
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
   type RepairCandidate,
+  type RepairCandidateDropClass,
   type RepairEscalationSweepDeps,
   type RepairGroup,
   type RepairHumanNotifiedOutcome,
@@ -97,6 +99,7 @@ import {
   type ResolverDispatchSweepDeps,
   type RestartLedgerEntry,
   readRestartLedger,
+  readTaskBlockedReason,
   recoverOneDeadLetter,
   repairReasonFor,
   resolveEscalationJobsFor,
@@ -118,6 +121,7 @@ import {
   selectPendingHumanNotifications,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
+  selectRepairCandidates,
   serializeSessionTelemetry,
   serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
@@ -4163,11 +4167,13 @@ function fakeSweepDeps(opts: {
   mints: MintCall[];
   dispatches: { epicId: string; taskId: string }[];
   suppressions: { taskId: string; reason: string; dir: string | null }[];
+  notes: string[];
 } {
   const mints: MintCall[] = [];
   const dispatches: { epicId: string; taskId: string }[] = [];
   const suppressions: { taskId: string; reason: string; dir: string | null }[] =
     [];
+  const notes: string[] = [];
   const deps: BlockEscalationSweepDeps = {
     selectPending: () => opts.pending,
     readBlockedReason: (_projectDir, taskId) => opts.reasons?.[taskId] ?? null,
@@ -4185,8 +4191,9 @@ function fakeSweepDeps(opts: {
     now: () => opts.nowMs ?? Date.now(),
     hasOpenWorkFailure: (taskId) => opts.alreadyFailed?.has(taskId) ?? false,
     suppressRedispatch: (args) => suppressions.push(args),
+    noteLine: (line) => notes.push(line),
   };
-  return { deps, mints, dispatches, suppressions };
+  return { deps, mints, dispatches, suppressions, notes };
 }
 
 test("runBlockEscalationSweep: an escalatable block DISPATCHES one unblock and mints Requested→Attempted{dispatched} (no planner@ send)", async () => {
@@ -4212,7 +4219,7 @@ test("runBlockEscalationSweep: an escalatable block DISPATCHES one unblock and m
 });
 
 test("runBlockEscalationSweep: TOOLING_FAILURE never dispatches an agent (skipped_category)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "TOOLING_FAILURE: the runner is broken" },
   });
@@ -4228,10 +4235,14 @@ test("runBlockEscalationSweep: TOOLING_FAILURE never dispatches an agent (skippe
       outcome: "skipped_category",
     },
   ]);
+  // A readable-but-non-escalatable category leaves its own class-stable trace.
+  expect(notes).toEqual([
+    "# block-escalation-drop task=fn-1-foo.1 class=surface_and_stop category=TOOLING_FAILURE",
+  ]);
 });
 
 test("runBlockEscalationSweep: an absent/unparseable reason never dispatches (surface-and-stop)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     // No reason entry → readBlockedReason returns null → category null → skip.
     reasons: {},
@@ -4242,6 +4253,12 @@ test("runBlockEscalationSweep: an absent/unparseable reason never dispatches (su
   expect(mints.map((m) => m.kind === "attempted" && m.outcome)).toContain(
     "skipped_category",
   );
+  // The unreadable-reason gate leaves ITS OWN trace — never the sibling
+  // `surface_and_stop` class too (a row drops through exactly one class-carrying
+  // gate per cycle).
+  expect(notes).toEqual([
+    "# block-escalation-drop task=fn-1-foo.1 class=reason_unreadable project_dir=/proj",
+  ]);
 });
 
 test("runBlockEscalationSweep: a TOOLING_FAILURE block mints a durable DispatchFailed on work::<task> (re-dispatch suppression)", async () => {
@@ -4307,7 +4324,7 @@ test("runBlockEscalationSweep: an escalatable block does NOT durably suppress (o
 });
 
 test("runBlockEscalationSweep: cancellation guard — a task that left blocked is skipped_unblocked, no dispatch", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
     // Latch still pending, but the live task already left blocked.
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1", { runtime_status: "todo" })],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: would-escalate-if-still-blocked" },
@@ -4323,6 +4340,9 @@ test("runBlockEscalationSweep: cancellation guard — a task that left blocked i
       taskId: "fn-1-foo.1",
       outcome: "skipped_unblocked",
     },
+  ]);
+  expect(notes).toEqual([
+    "# block-escalation-drop task=fn-1-foo.1 class=not_blocked runtime_status=todo",
   ]);
 });
 
@@ -4355,7 +4375,7 @@ test("runBlockEscalationSweep: per-epic serialization — two blocked tasks in o
 });
 
 test("runBlockEscalationSweep: a sibling is NOT dispatched while the epic's unblock is already live (across-sweep guard)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.2")],
     reasons: { "fn-1-foo.2": "SPEC_UNCLEAR: still blocked" },
     // A prior cycle already dispatched `unblock::fn-1-foo.1`, still live.
@@ -4366,6 +4386,10 @@ test("runBlockEscalationSweep: a sibling is NOT dispatched while the epic's unbl
   // The epic already holds its one live unblock → skip WITHOUT minting (stays latched).
   expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
+  // The occupancy park is a SKIP, not a drop — observable, but re-sweepable.
+  expect(notes).toEqual([
+    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.2 class=epic_serialized",
+  ]);
 });
 
 test("runBlockEscalationSweep: once the epic's unblock terminates, a pending sibling dispatches (none starved)", async () => {
@@ -4409,7 +4433,7 @@ test("runBlockEscalationSweep: two DIFFERENT epics each get their own dispatch (
 });
 
 test("runBlockEscalationSweep: an at_cap skip mints NOTHING (row stays pending, re-sweeps)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
     dispatch: async () => "at_cap",
@@ -4419,16 +4443,22 @@ test("runBlockEscalationSweep: an at_cap skip mints NOTHING (row stays pending, 
   // The dispatcher was consulted, but the cap skip mints no marker — the row re-sweeps.
   expect(dispatches.length).toBe(1);
   expect(mints).toEqual([]);
+  expect(notes).toEqual([
+    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.1 class=at_cap",
+  ]);
 });
 
 test("runBlockEscalationSweep: an already_live skip (occupancy guard) mints NOTHING", async () => {
-  const { deps, mints } = fakeSweepDeps({
+  const { deps, mints, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
     dispatch: async () => "already_live",
   });
   await runBlockEscalationSweep(deps);
   expect(mints).toEqual([]);
+  expect(notes).toEqual([
+    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.1 class=already_live",
+  ]);
 });
 
 test("runBlockEscalationSweep: a dispatch_failed outcome mints Requested→Attempted{dispatch_failed} (re-sweepable)", async () => {
@@ -4688,7 +4718,7 @@ test("auditReadyEscalationDecision: escalate only on a dead orchestrator past gr
 test("runBlockEscalationSweep: a SHARED_BASE_BROKEN block routes to REPAIR — never dispatches an unblock, never surface-and-stops", async () => {
   // The repair route is owned by the sibling repair sweep, so the block sweep skips the
   // row WITHOUT minting: no unblock dispatch, no Requested/Attempted, no work:: suppression.
-  const { deps, mints, dispatches, suppressions } = fakeSweepDeps({
+  const { deps, mints, dispatches, suppressions, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: {
       "fn-1-foo.1": "SHARED_BASE_BROKEN: `bun test` red at base sha abc1234",
@@ -4698,6 +4728,104 @@ test("runBlockEscalationSweep: a SHARED_BASE_BROKEN block routes to REPAIR — n
   expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
   expect(suppressions).toEqual([]);
+  // Silent hand-off to the sibling repair sweep still leaves a class-stable trace —
+  // this is the exact gate that starved the repair route in production.
+  expect(notes).toEqual([
+    "# block-escalation-drop task=fn-1-foo.1 class=repair category=SHARED_BASE_BROKEN",
+  ]);
+});
+
+test("runBlockEscalationSweep: an empty effective repo drops the row (no dispatch attempt) with a class-stable trace", async () => {
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
+    // Both `target_repo` and `project_dir` resolve empty — the injected reader
+    // (unlike the production `readTaskBlockedReason`) doesn't tie reason-readability
+    // to `project_dir`, so this row reaches the dedicated repo guard.
+    pending: [
+      blockedRow("fn-1-foo", "fn-1-foo.1", {
+        project_dir: null,
+        target_repo: null,
+      }),
+    ],
+    reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
+  });
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+  expect(notes).toEqual([
+    "# block-escalation-drop task=fn-1-foo.1 class=empty_repo target_repo=null project_dir=null",
+  ]);
+});
+
+test("runBlockEscalationSweep: every reachable candidate-drop gate emits its class-stable diagnostic", async () => {
+  const { deps, notes } = fakeSweepDeps({
+    pending: [
+      // (1) not_blocked: the latch is pending but the live task left `blocked`.
+      blockedRow("fn-1-nb", "fn-1-nb.1", { runtime_status: "todo" }),
+      // (2) reason_unreadable: blocked, but no reason on file.
+      blockedRow("fn-2-ur", "fn-2-ur.1"),
+      // (3) repair: a SHARED_BASE_BROKEN category hands off to the sibling sweep.
+      blockedRow("fn-3-rp", "fn-3-rp.1"),
+      // (4) surface_and_stop: a readable, non-escalatable category.
+      blockedRow("fn-4-ss", "fn-4-ss.1"),
+      // (5) empty_repo: readable + escalatable, but no resolvable repo.
+      blockedRow("fn-5-er", "fn-5-er.1", {
+        project_dir: null,
+        target_repo: null,
+      }),
+    ],
+    reasons: {
+      "fn-3-rp.1": "SHARED_BASE_BROKEN: base red at HEAD",
+      "fn-4-ss.1": "TOOLING_FAILURE: the runner is broken",
+      "fn-5-er.1": "SPEC_UNCLEAR: a",
+    },
+  });
+  await runBlockEscalationSweep(deps);
+
+  // Each silent-drop gate now leaves a greppable trace, keyed by class — one line
+  // per dropped candidate, never more.
+  const classes = notes.map((n) => n.match(/class=(\w+)/)?.[1]).sort();
+  expect(classes).toEqual([
+    "empty_repo",
+    "not_blocked",
+    "reason_unreadable",
+    "repair",
+    "surface_and_stop",
+  ]);
+  const byTask = (t: string) => notes.find((n) => n.includes(`task=${t}`));
+  expect(byTask("fn-1-nb.1")).toContain("class=not_blocked");
+  expect(byTask("fn-2-ur.1")).toContain("class=reason_unreadable");
+  expect(byTask("fn-3-rp.1")).toContain("class=repair");
+  expect(byTask("fn-4-ss.1")).toContain("class=surface_and_stop");
+  expect(byTask("fn-5-er.1")).toContain("class=empty_repo");
+});
+
+test("runBlockEscalationSweep: candidate-drop diagnostics are class-stable across repeated sweeps on unchanged state (safe to dedupe)", async () => {
+  const { deps, notes } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1", { runtime_status: "todo" })],
+  });
+  await runBlockEscalationSweep(deps);
+  const firstPass = [...notes];
+  await runBlockEscalationSweep(deps);
+  const secondPass = notes.slice(firstPass.length);
+
+  expect(firstPass).toEqual([
+    "# block-escalation-drop task=fn-1-foo.1 class=not_blocked runtime_status=todo",
+  ]);
+  // Unchanged state re-emits the BYTE-IDENTICAL line on the next cycle — no live
+  // age or churn folded in, so a log viewer can dedupe across ticks.
+  expect(secondPass).toEqual(firstPass);
+});
+
+test("BlockCandidateDropClass: the class union is stable (alarm/grep contract)", () => {
+  const classes: BlockCandidateDropClass[] = [
+    "not_blocked",
+    "reason_unreadable",
+    "repair",
+    "surface_and_stop",
+    "empty_repo",
+  ];
+  expect(classes.length).toBe(5);
 });
 
 // ---- routeBlockedCategory (the category→handler dispatch table / shared seam) --
@@ -4780,11 +4908,14 @@ function fakeRepairSweepDeps(opts: {
   mints: RepairMint[];
   dispatches: RepairGroup[];
   notifies: { token: string; verdict: "declined" | "died" }[];
+  notes: string[];
 } {
   const mints: RepairMint[] = [];
   const dispatches: RepairGroup[] = [];
   const notifies: { token: string; verdict: "declined" | "died" }[] = [];
+  const notes: string[] = [];
   const deps: RepairEscalationSweepDeps = {
+    noteLine: (line) => notes.push(line),
     selectCandidates: () => {
       if (opts.candidatesThrow) throw new Error("candidate read boom");
       return opts.candidates ?? [];
@@ -4818,7 +4949,7 @@ function fakeRepairSweepDeps(opts: {
       mints.push({ kind: "notified", token, outcome }),
     clearRow: (token) => mints.push({ kind: "clear", token }),
   };
-  return { deps, mints, dispatches, notifies };
+  return { deps, mints, dispatches, notifies, notes };
 }
 
 test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE repo+fingerprint → exactly one dispatch + one sticky row", async () => {
@@ -4867,18 +4998,24 @@ test("runRepairEscalationSweep: two distinct repos each dispatch under the cap (
   ]);
 });
 
-test("runRepairEscalationSweep: a dirty shared checkout DEFERS — no dispatch, no row minted, no attempt", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a dirty shared checkout DEFERS — no dispatch, no row minted, no attempt, but leaves an observable trace", async () => {
+  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     dirty: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
   expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
+  // Regression guard (fn-1198): the incident dirty-defer was invisible — every defer
+  // MUST now emit a class-stable, token+dir-keyed diagnostic so a starving repair route
+  // is greppable instead of looking like a dead feature.
+  expect(notes).toEqual([
+    "# repair-defer token=repo-abc class=dirty_checkout dir=/repo",
+  ]);
 });
 
-test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO RepairDispatched (re-sweeps)", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO RepairDispatched (re-sweeps), with an observable skip trace", async () => {
+  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     dispatch: async () => "at_cap",
   });
@@ -4893,6 +5030,7 @@ test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO R
       dir: "/repo",
     },
   ]);
+  expect(notes).toEqual(["# repair-skip token=repo-abc class=at_cap"]);
 });
 
 test("runRepairEscalationSweep: a dispatch_failed mints RepairDispatched{dispatch_failed} (non-terminal, re-sweeps)", async () => {
@@ -5011,6 +5149,208 @@ test("repairReasonFor: the mint-side reason matches escalation-brief's REPAIR_RE
   expect(reason).toBe("shared-base-broken:abc123");
   // The exact contract cli/escalation-brief.ts parses.
   expect(reason).toMatch(/^shared-base-broken:\s*(\S+)/);
+});
+
+// ---- selectRepairCandidates round-trip (fn-1198 regression) ------------------
+//
+// The repair route NEVER fired in production: the first four SHARED_BASE_BROKEN
+// blocks all sat pending for hours with zero repair dispatch. Root cause (confirmed
+// via replayable keeper.db GitSnapshot events): the shared checkout `/Users/mike/code/
+// keeper` on `main` held dirty_count >= 3 for the entire incident window, so the
+// repair sweep's `isDirtyCheckout` DEFER `continue`d on every ~60s tick — minting no
+// row, dispatching nothing, and (the actual bug) emitting NO diagnostic, so the
+// non-dispatch was indistinguishable from a dead feature. The candidate gates UPSTREAM
+// of the defer were all healthy — proven here by round-tripping a reason through the
+// EXACT plan-`block`-verb on-disk contract into the sweep's REAL reader (no mocked
+// reason-read: that is the reader/writer-mismatch bug class this guards against).
+
+/** Write a task's runtime state file in the EXACT shape the plan `block` verb lands
+ *  (`LocalFileStateStore.saveRuntime`: top-level `blocked_reason` + `status`), so the
+ *  daemon's real {@link readTaskBlockedReason} round-trips a genuine block write. */
+function writeBlockedStateFile(
+  projectDir: string,
+  taskId: string,
+  blockedReason: string,
+): void {
+  const dir = join(projectDir, ".keeper", "state", "tasks");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${taskId}.state.json`),
+    `${JSON.stringify(
+      {
+        assignee: null,
+        blocked_reason: blockedReason,
+        claim_note: "",
+        claimed_at: null,
+        evidence: null,
+        status: "blocked",
+        updated_at: "2026-07-08T00:00:00.000000Z",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+test("readTaskBlockedReason: round-trips a real block-written state file (reader contract)", () => {
+  const proj = join(tmpDir, "proj");
+  writeBlockedStateFile(
+    proj,
+    "fn-1-foo.1",
+    "SHARED_BASE_BROKEN: origin/main red",
+  );
+  expect(readTaskBlockedReason(proj, "fn-1-foo.1")).toBe(
+    "SHARED_BASE_BROKEN: origin/main red",
+  );
+  // Every miss folds to null (no file, no project dir) — never a throw.
+  expect(readTaskBlockedReason(proj, "fn-1-foo.9")).toBeNull();
+  expect(readTaskBlockedReason(null, "fn-1-foo.1")).toBeNull();
+});
+
+test("selectRepairCandidates: a SHARED_BASE_BROKEN block written by the real writer + read by the real reader yields a repair candidate", () => {
+  const { db } = freshMemDb();
+  const proj = join(tmpDir, "proj");
+  // Real plan-state block write (exact on-disk contract) — NOT a mocked reason.
+  writeBlockedStateFile(
+    proj,
+    "fn-1-foo.1",
+    "SHARED_BASE_BROKEN: main HEAD red on 4 pre-existing tests, baseline-confirmed",
+  );
+  seedEpicWithTasks(db, "fn-1-foo", proj, [
+    { task_id: "fn-1-foo.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
+
+  const notes: string[] = [];
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason, (l) =>
+    notes.push(l),
+  );
+  expect(candidates.length).toBe(1);
+  expect(candidates[0]?.task_id).toBe("fn-1-foo.1");
+  expect(candidates[0]?.repo_dir).toBe(proj);
+  // A produced candidate drops nothing → no diagnostic.
+  expect(notes).toEqual([]);
+  db.close();
+});
+
+test("selectRepairCandidates: the real round-trip drives an actual dispatch decision at the pure sweep seam (clean checkout)", async () => {
+  const { db } = freshMemDb();
+  const proj = join(tmpDir, "proj");
+  writeBlockedStateFile(
+    proj,
+    "fn-1-foo.1",
+    "SHARED_BASE_BROKEN: base red at HEAD",
+  );
+  seedEpicWithTasks(db, "fn-1-foo", proj, [
+    { task_id: "fn-1-foo.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
+
+  // Feed the REAL candidate selector into the sweep; clean checkout (dirty set empty).
+  const dispatches: RepairGroup[] = [];
+  await runRepairEscalationSweep({
+    selectCandidates: () => selectRepairCandidates(db, readTaskBlockedReason),
+    selectRepairRows: () => [],
+    isDirtyCheckout: () => false,
+    isBaseGreen: () => false,
+    dispatchRepair: async (group) => {
+      dispatches.push(group);
+      return "dispatched";
+    },
+    repairOutcome: () => ({ terminal: false }),
+    notifyHuman: async () => "notified",
+    mintRow: () => {},
+    mintDispatched: () => {},
+    mintNotified: () => {},
+    clearRow: () => {},
+  });
+  // One sweep invocation → one repair dispatch decision for the repo.
+  expect(dispatches.length).toBe(1);
+  expect(dispatches[0]?.repo_dir).toBe(proj);
+  db.close();
+});
+
+test("selectRepairCandidates: a non-repair category (SPEC_UNCLEAR) yields NO candidate and a class-stable drop diagnostic (no over-dispatch)", () => {
+  const { db } = freshMemDb();
+  const proj = join(tmpDir, "proj");
+  writeBlockedStateFile(
+    proj,
+    "fn-1-foo.1",
+    "SPEC_UNCLEAR: the acceptance is ambiguous",
+  );
+  seedEpicWithTasks(db, "fn-1-foo", proj, [
+    { task_id: "fn-1-foo.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
+
+  const notes: string[] = [];
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason, (l) =>
+    notes.push(l),
+  );
+  expect(candidates).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-candidate-drop task=fn-1-foo.1 class=non_repair_category category=SPEC_UNCLEAR",
+  ]);
+  db.close();
+});
+
+test("selectRepairCandidates: every reachable candidate-drop gate emits its class-stable diagnostic", () => {
+  const { db } = freshMemDb();
+  const proj = join(tmpDir, "proj");
+  // (1) not_blocked: latch pending but runtime left blocked (belt-and-braces vs the
+  // leave-blocked latch DELETE).
+  seedEpicWithTasks(db, "fn-1-nb", proj, [
+    { task_id: "fn-1-nb.1", runtime_status: "todo", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-1-nb", "fn-1-nb.1");
+  // (2) reason_unreadable: blocked, but no state file on disk — the reader/writer
+  // mismatch bug class the incident feared (here simulated as an absent file).
+  seedEpicWithTasks(db, "fn-2-ur", proj, [
+    { task_id: "fn-2-ur.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-2-ur", "fn-2-ur.1");
+  // (3) non_repair_category: a readable but non-repair category (ordinary block).
+  writeBlockedStateFile(
+    proj,
+    "fn-3-nr.1",
+    "DEPENDENCY_BLOCKED: waiting on fn-9",
+  );
+  seedEpicWithTasks(db, "fn-3-nr", proj, [
+    { task_id: "fn-3-nr.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-3-nr", "fn-3-nr.1");
+
+  const notes: string[] = [];
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason, (l) =>
+    notes.push(l),
+  );
+  expect(candidates).toEqual([]);
+  // Each silent-drop gate now leaves a greppable trace, keyed by class.
+  const classes = notes.map((n) => n.match(/class=(\w+)/)?.[1]).sort();
+  expect(classes).toEqual([
+    "non_repair_category",
+    "not_blocked",
+    "reason_unreadable",
+  ]);
+  const byTask = (t: string) => notes.find((n) => n.includes(`task=${t}`));
+  expect(byTask("fn-1-nb.1")).toContain("class=not_blocked");
+  expect(byTask("fn-2-ur.1")).toContain("class=reason_unreadable");
+  expect(byTask("fn-3-nr.1")).toContain("class=non_repair_category");
+  db.close();
+});
+
+test("RepairCandidateDropClass: the class union is stable (alarm/grep contract)", () => {
+  // `empty_repo` is a defensive guard: since the reason-read keys on `project_dir`, a
+  // readable reason implies a non-empty `project_dir`, which makes the effective repo
+  // non-empty — so the gate cannot fire today, but the class stays part of the
+  // greppable contract in case the read seam ever changes.
+  const classes: RepairCandidateDropClass[] = [
+    "not_blocked",
+    "reason_unreadable",
+    "non_repair_category",
+    "empty_repo",
+  ];
+  expect(classes.length).toBe(4);
 });
 
 // ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------

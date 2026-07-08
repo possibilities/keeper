@@ -1013,6 +1013,22 @@ export interface BlockEscalationSweepDeps {
 }
 
 /**
+ * The class-stable reason a pending block-escalation latch is dropped from the
+ * unblock-dispatch path — the {@link runBlockEscalationSweep} sibling of {@link
+ * RepairCandidateDropClass}. `repair` / `surface_and_stop` name the {@link
+ * BlockRoute} the row took instead of `unblock`; `empty_repo` is the same
+ * defensive guard as its repair-sweep sibling — unreachable while
+ * `readBlockedReason` ties reason-readability to a non-empty `project_dir`, but
+ * kept as part of the greppable contract in case that read seam ever changes.
+ */
+export type BlockCandidateDropClass =
+  | "not_blocked"
+  | "reason_unreadable"
+  | "repair"
+  | "surface_and_stop"
+  | "empty_repo";
+
+/**
  * Run one daemon block-escalation sweep (stage 2) — the producer half of the
  * dispatch-once loop for a blocked task with an escalatable category. Walk the
  * pending `block_escalations` latch rows, gate each by the cancellation guard + the
@@ -1034,6 +1050,14 @@ export interface BlockEscalationSweepDeps {
  *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal, re-sweeps) — the
  *    launch outcome. A cap/occupancy SKIP (`at_cap` / `already_live`) mints NOTHING.
  *
+ * Every disqualifying drop emits a class-stable diagnostic through `note` ({@link
+ * BlockCandidateDropClass}); a re-sweepable cap/occupancy park (per-epic
+ * serialization, or the dispatch-time `at_cap`/`already_live`/`checkout_busy` skip)
+ * emits its own `block-escalation-skip` line — mirrors {@link
+ * runRepairEscalationSweep}'s instrumentation so a starving unblock route is
+ * greppable within one sweep instead of invisible. A row is dropped by exactly one
+ * class-carrying gate per cycle — never double-logged.
+ *
  * NEVER throws — every helper edge degrades to a recorded outcome (mirrors {@link
  * runMergeEscalationSweep}). The spawn lives ONLY here in the producer, never
  * reachable from `applyEvent`, so a re-fold never re-fires a launch.
@@ -1042,6 +1066,8 @@ export async function runBlockEscalationSweep(
   deps: BlockEscalationSweepDeps,
 ): Promise<void> {
   const note = deps.noteLine ?? (() => {});
+  const drop = (taskId: string, cls: BlockCandidateDropClass, detail: string) =>
+    note(`# block-escalation-drop task=${taskId} class=${cls} ${detail}`);
   let pending: PendingBlockEscalation[];
   try {
     pending = deps.selectPending();
@@ -1067,12 +1093,24 @@ export async function runBlockEscalationSweep(
     // Requested→Attempted{skipped_unblocked} is a belt-and-braces terminal — if
     // the DELETE already ran, both folds no-op on the missing row.
     if (row.runtime_status !== "blocked") {
+      drop(
+        row.task_id,
+        "not_blocked",
+        `runtime_status=${row.runtime_status ?? "null"}`,
+      );
       deps.mintRequested(row.epic_id, row.task_id);
       deps.mintAttempted(row.epic_id, row.task_id, "skipped_unblocked");
       continue;
     }
 
     const reason = deps.readBlockedReason(row.project_dir, row.task_id);
+    if (reason == null) {
+      drop(
+        row.task_id,
+        "reason_unreadable",
+        `project_dir=${row.project_dir ?? "null"}`,
+      );
+    }
     const category = parseBlockedCategory(reason);
 
     // AUDIT_READY: a per-task audit deliberately parked this task; the owning
@@ -1111,11 +1149,16 @@ export async function runBlockEscalationSweep(
       // diagnosis-only unblock for a shared-base breakage (that is the whole point of
       // the repair route), and never surface-and-stop it (it IS escalatable, just to a
       // different owner).
+      drop(row.task_id, "repair", `category=${category ?? "null"}`);
       continue;
     }
     if (route === "surface_and_stop") {
       // TOOLING_FAILURE / absent / unparseable: surface-and-stop, NEVER dispatch an
-      // agent. Record a terminal outcome so it never re-evaluates.
+      // agent. Record a terminal outcome so it never re-evaluates. A null reason
+      // already left its own `reason_unreadable` trace above — never double-log.
+      if (reason != null) {
+        drop(row.task_id, "surface_and_stop", `category=${category ?? "null"}`);
+      }
       deps.mintRequested(row.epic_id, row.task_id);
       deps.mintAttempted(row.epic_id, row.task_id, "skipped_category");
       // Durable re-dispatch guard: a surface-and-stop block must NOT auto-requeue.
@@ -1139,12 +1182,33 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
+    // Defensive guard, mirrors {@link selectRepairCandidates}'s `empty_repo`: since
+    // `readBlockedReason` (production: {@link readTaskBlockedReason}) ties
+    // reason-readability to a non-empty `project_dir`, reaching here already implies
+    // a non-empty effective repo — but the injected seam doesn't structurally
+    // guarantee that, so the gate stays part of the greppable contract.
+    const repoDir = effectiveBlockEscalationRepo(
+      row.target_repo,
+      row.project_dir,
+    );
+    if (repoDir === "") {
+      drop(
+        row.task_id,
+        "empty_repo",
+        `target_repo=${row.target_repo ?? "null"} project_dir=${row.project_dir ?? "null"}`,
+      );
+      continue;
+    }
+
     // Per-epic serialization: an unblock is already in play for this epic — either a
     // sibling won the claim THIS sweep, or a session dispatched a prior cycle is
     // still live. Skip WITHOUT minting so the latch stays `pending` and re-sweeps
     // once that session terminates (a shared root cause the unblock clears takes the
     // sibling out of `blocked`, deleting its latch before it ever dispatches).
     if (claimedEpics.has(row.epic_id) || deps.isEpicUnblockLive(row.epic_id)) {
+      note(
+        `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=epic_serialized`,
+      );
       continue;
     }
     claimedEpics.add(row.epic_id);
@@ -1173,6 +1237,9 @@ export async function runBlockEscalationSweep(
       outcome === "already_live" ||
       outcome === "checkout_busy"
     ) {
+      note(
+        `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=${outcome}`,
+      );
       continue;
     }
     deps.mintRequested(row.epic_id, row.task_id);
@@ -1439,6 +1506,128 @@ export interface PendingRepairRow {
   human_notified_at: number | null;
 }
 
+/**
+ * Read the task's `blocked_reason` from its plan state file
+ * (`<project_dir>/.keeper/state/tasks/<task_id>.state.json`) — the exact on-disk
+ * contract the plan `block` verb writes (`LocalFileStateStore.saveRuntime`: a
+ * top-level `blocked_reason` string, sibling of `status:"blocked"`). Producer-side
+ * fs read — legal OUTSIDE any fold. Returns null on every miss (no `project_dir`,
+ * absent / unreadable file, malformed JSON, no `blocked_reason` field) so the
+ * category gate treats an unresolved reason as "skip". NEVER throws. Exported so the
+ * repair-candidate seam is drivable in tests against a real block-written state file
+ * (the reason-read is NOT mocked — the bug class this guards against is a
+ * reader/writer key or path mismatch).
+ */
+export function readTaskBlockedReason(
+  projectDir: string | null,
+  taskId: string,
+): string | null {
+  if (projectDir == null || projectDir === "") return null;
+  const statePath = join(
+    projectDir,
+    ".keeper",
+    "state",
+    "tasks",
+    `${taskId}.state.json`,
+  );
+  try {
+    if (!existsSync(statePath)) return null;
+    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as {
+      blocked_reason?: unknown;
+    };
+    return typeof parsed.blocked_reason === "string"
+      ? parsed.blocked_reason
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The class-stable reason a pending block-escalation latch is dropped from the
+ * repair-candidate set. Every drop leaves a greppable trace on the sweep's note
+ * sink: the incident that motivated this seam was invisible precisely because zero
+ * of the candidate gates recorded WHY they dropped. Distinguishing `reason_unreadable`
+ * (the feared reader/writer mismatch) from the high-volume-but-benign
+ * `non_repair_category` / `not_blocked` is the whole point — an operator must be able
+ * to tell "the repair route is starving" apart from "these are ordinary blocks".
+ */
+export type RepairCandidateDropClass =
+  | "not_blocked"
+  | "reason_unreadable"
+  | "non_repair_category"
+  | "empty_repo";
+
+/**
+ * Build the repair candidate set from the pending `SHARED_BASE_BROKEN` blocked tasks:
+ * reuse {@link selectPendingBlockEscalations} + the injected fs reason read, keep only
+ * the shared-base route, and resolve each to (repo_dir, repo_token, fingerprint).
+ * Producer-side fs reads (via `readReason`) are legal outside any fold.
+ *
+ * `readReason` is injected (production passes {@link readTaskBlockedReason}) so a test
+ * drives the WHOLE pipeline against a real block-written state file with no mocked
+ * reason-read. Every candidate-drop gate emits a class-stable diagnostic through
+ * `note` ({@link RepairCandidateDropClass}); a row with no effective repo is dropped
+ * as unrepairable. Never throws.
+ */
+export function selectRepairCandidates(
+  db: Database,
+  readReason: (projectDir: string | null, taskId: string) => string | null,
+  note: (line: string) => void = () => {},
+): RepairCandidate[] {
+  const drop = (
+    taskId: string,
+    cls: RepairCandidateDropClass,
+    detail: string,
+  ) => note(`# repair-candidate-drop task=${taskId} class=${cls} ${detail}`);
+  const out: RepairCandidate[] = [];
+  for (const row of selectPendingBlockEscalations(db)) {
+    if (row.runtime_status !== "blocked") {
+      drop(
+        row.task_id,
+        "not_blocked",
+        `runtime_status=${row.runtime_status ?? "null"}`,
+      );
+      continue;
+    }
+    const reason = readReason(row.project_dir, row.task_id);
+    if (reason == null) {
+      drop(
+        row.task_id,
+        "reason_unreadable",
+        `project_dir=${row.project_dir ?? "null"}`,
+      );
+      continue;
+    }
+    const category = parseBlockedCategory(reason);
+    if (routeBlockedCategory(category) !== "repair") {
+      drop(
+        row.task_id,
+        "non_repair_category",
+        `category=${category ?? "null"}`,
+      );
+      continue;
+    }
+    const repoDir = effectiveBlockEscalationRepo(
+      row.target_repo,
+      row.project_dir,
+    );
+    if (repoDir === "") {
+      drop(row.task_id, "empty_repo", "target_repo+project_dir both empty");
+      continue;
+    }
+    out.push({
+      epic_id: row.epic_id,
+      task_id: row.task_id,
+      repo_dir: repoDir,
+      repo_token: repoToken(repoDir),
+      // `reason` is non-null here (the reason_unreadable gate above returned early).
+      fingerprint: fingerprintFailure(reason),
+    });
+  }
+  return out;
+}
+
 /** The outcome the repair sweep records on `RepairDispatched`. The TERMINAL
  *  `dispatched` stamps `repair_dispatched_at`; `dispatch_failed` is NON-terminal. */
 export type RepairDispatchOutcome = "dispatched" | "dispatch_failed";
@@ -1573,7 +1762,12 @@ export async function runRepairEscalationSweep(
   // token that gains/loses siblings never flaps.
   const groups = new Map<string, RepairGroup>();
   for (const c of [...candidates].sort(compareRepairCandidate)) {
-    if (c.repo_token === "" || c.repo_dir === "") continue;
+    if (c.repo_token === "" || c.repo_dir === "") {
+      note(
+        `# repair-candidate-drop task=${c.task_id} class=empty_token repo_dir=${c.repo_dir || "null"}`,
+      );
+      continue;
+    }
     if (!groups.has(c.repo_token)) {
       groups.set(c.repo_token, {
         repo_token: c.repo_token,
@@ -1611,7 +1805,17 @@ export async function runRepairEscalationSweep(
     // Not yet dispatched (no row, or a minted-but-undispatched row waiting on a cap slot).
     // A DIRTY shared checkout DEFERS — never launch a write-capable session into a
     // mid-merge/dirty tree, consume no attempt, and mint no row when none exists yet.
-    if (deps.isDirtyCheckout(group.repo_dir)) continue;
+    // This defer is the gate that silently starved the repair route in production: on a
+    // busy worktree-mode board the shared checkout is rarely clean, so a repeated defer
+    // MUST leave a class-stable trace or a live shared-base breakage looks identical to a
+    // broken feature. Emitted every deferring tick (bounded by the concurrently-broken
+    // token count), keyed so an operator can grep "why is repair not dispatching".
+    if (deps.isDirtyCheckout(group.repo_dir)) {
+      note(
+        `# repair-defer token=${token} class=dirty_checkout dir=${group.repo_dir}`,
+      );
+      continue;
+    }
     if (existing == null) deps.mintRow(group); // the durable latch, minted once
     let outcome: EscalationDispatchOutcome;
     try {
@@ -1632,8 +1836,10 @@ export async function runRepairEscalationSweep(
       outcome === "at_cap" ||
       outcome === "already_live" ||
       outcome === "checkout_busy"
-    )
+    ) {
+      note(`# repair-skip token=${token} class=${outcome}`);
       continue;
+    }
     deps.mintDispatched(token, outcome);
   }
 
@@ -9181,38 +9387,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  /**
-   * Read the task's `blocked_reason` from its plan state file
-   * (`<project_dir>/.keeper/state/tasks/<task_id>.state.json`). Producer-side fs
-   * read — legal OUTSIDE any fold. Returns null on every miss (no `project_dir`,
-   * absent / unreadable file, malformed JSON, no `blocked_reason` field) so the
-   * category gate folds an unresolved reason to "skip". NEVER throws.
-   */
-  function readTaskBlockedReason(
-    projectDir: string | null,
-    taskId: string,
-  ): string | null {
-    if (projectDir == null || projectDir === "") return null;
-    const statePath = join(
-      projectDir,
-      ".keeper",
-      "state",
-      "tasks",
-      `${taskId}.state.json`,
-    );
-    try {
-      if (!existsSync(statePath)) return null;
-      const parsed = JSON.parse(readFileSync(statePath, "utf8")) as {
-        blocked_reason?: unknown;
-      };
-      return typeof parsed.blocked_reason === "string"
-        ? parsed.blocked_reason
-        : null;
-    } catch {
-      return null;
-    }
-  }
-
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -9931,35 +10105,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return repoDirtyCount(repoDir) === 0;
   }
 
-  // Build the repair candidate set from the SHARED_BASE_BROKEN blocked tasks: reuse the
-  // block-escalation pending selector + the fs reason read, keep only the shared-base
-  // route, and resolve each to (repo_dir, repo_token, fingerprint). Producer-side fs reads
-  // are legal outside any fold. A row with no effective repo is skipped (unrepairable).
-  function selectRepairCandidates(): RepairCandidate[] {
-    const out: RepairCandidate[] = [];
-    for (const row of selectPendingBlockEscalations(db)) {
-      if (row.runtime_status !== "blocked") continue;
-      const reason = readTaskBlockedReason(row.project_dir, row.task_id);
-      if (routeBlockedCategory(parseBlockedCategory(reason)) !== "repair") {
-        continue;
-      }
-      const repoDir = effectiveBlockEscalationRepo(
-        row.target_repo,
-        row.project_dir,
-      );
-      if (repoDir === "") continue;
-      out.push({
-        epic_id: row.epic_id,
-        task_id: row.task_id,
-        repo_dir: repoDir,
-        repo_token: repoToken(repoDir),
-        // `reason` is non-null here (route === "repair" required a parseable category).
-        fingerprint: fingerprintFailure(reason ?? ""),
-      });
-    }
-    return out;
-  }
-
   // Read the existing sticky repair rows off the writable connection (sequenced inside
   // the same writer that mints). A read failure degrades to an empty set (the sweep
   // re-sweeps next tick).
@@ -10075,7 +10220,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // until play.
     if (autopilotPaused) return;
     await runRepairEscalationSweep({
-      selectCandidates: () => selectRepairCandidates(),
+      selectCandidates: () =>
+        selectRepairCandidates(db, readTaskBlockedReason, (line) =>
+          console.error(`[keeperd] ${line}`),
+        ),
       selectRepairRows: () => selectRepairRows(),
       isDirtyCheckout: (repoDir) => isRepairCheckoutDirty(repoDir),
       isBaseGreen: (repoDir) => isRepairBaseGreen(repoDir),
