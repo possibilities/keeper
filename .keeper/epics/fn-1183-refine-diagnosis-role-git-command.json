@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-08T02:51:42.504000Z",
   "created_at": "2026-07-08T02:00:02.161000Z",
   "created_by_close_of": "fn-1176-harden-diagnosis-role-git-command",
   "depends_on_epics": [
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-08T02:00:03.017000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Refine diagnosis-role git command boundary",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T02:00:03.017000Z"
+  "updated_at": "2026-07-08T02:51:42.504000Z"
 }
