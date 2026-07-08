@@ -28,7 +28,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   auditsRoot,
   briefPath,
@@ -687,11 +687,23 @@ describe("commitSetNumstat fake twin", () => {
 // ---------------------------------------------------------------------------
 
 describe("deriveDepthBand (pure policy derivation)", () => {
+  // Richest-first, mirroring the committed audit-policy.yaml's own
+  // depth_bands list shape and ordering convention.
   const policy = {
-    close_depth: {
-      standard: { min_tasks: 3, min_diff_lines: 400, min_touched_repos: 1 },
-      deep: { min_tasks: 8, min_diff_lines: 2000, min_touched_repos: 2 },
-    },
+    depth_bands: [
+      {
+        depth: "deep",
+        min_task_count: 8,
+        min_diff_loc: 2000,
+        min_touched_repos: 2,
+      },
+      {
+        depth: "standard",
+        min_task_count: 3,
+        min_diff_loc: 400,
+        min_touched_repos: 1,
+      },
+    ],
   };
 
   test("null policy → lean, no reason (the file reason is the caller's)", () => {
@@ -703,7 +715,7 @@ describe("deriveDepthBand (pure policy derivation)", () => {
     ).toEqual({ band: "lean", reasons: [] });
   });
 
-  test("policy without a close_depth section → lean, policy_no_depth_bands", () => {
+  test("policy without a depth_bands list → lean, policy_no_depth_bands", () => {
     expect(
       deriveDepthBand(
         { task_count: 99, diff_lines: 99999, touched_repo_count: 9 },
@@ -750,7 +762,9 @@ describe("deriveDepthBand (pure policy derivation)", () => {
 
   test("a present-but-non-numeric threshold makes its band never match (bias lean)", () => {
     const bad = {
-      close_depth: { standard: { min_tasks: "lots", min_diff_lines: 1 } },
+      depth_bands: [
+        { depth: "standard", min_task_count: "lots", min_diff_loc: 1 },
+      ],
     };
     expect(
       deriveDepthBand(
@@ -761,11 +775,59 @@ describe("deriveDepthBand (pure policy derivation)", () => {
   });
 
   test("an empty band never matches", () => {
-    const empty = { close_depth: { standard: {}, deep: {} } };
+    const empty = {
+      depth_bands: [{ depth: "standard" }, { depth: "deep" }],
+    };
     expect(
       deriveDepthBand(
         { task_count: 100, diff_lines: 100000, touched_repo_count: 50 },
         empty,
+      ),
+    ).toEqual({ band: "lean", reasons: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveDepthBand over the REAL committed audit-policy.yaml — the coverage
+// hole that let F1 ship: every fixture above is hand-built, so a consumer/
+// config shape mismatch (the actual bug) would never surface. This threads
+// the real on-disk depth_bands list the same way close-preflight does.
+// ---------------------------------------------------------------------------
+
+describe("deriveDepthBand over the real committed audit-policy.yaml (F2 regression)", () => {
+  const PLAN_ROOT = resolve(import.meta.dir, "..");
+  const { doc: realPolicy, reason: realPolicyReason } = readAuditPolicyDoc(
+    join(PLAN_ROOT, "audit-policy.yaml"),
+  );
+
+  test("the committed policy loads cleanly (no degrade reason)", () => {
+    expect(realPolicyReason).toBeNull();
+    expect(realPolicy).not.toBeNull();
+  });
+
+  test("a deep-sized signal set (>=8 tasks, >=2000 diff loc, >=2 repos) → deep, non-degraded", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 8, diff_lines: 2000, touched_repo_count: 2 },
+        realPolicy,
+      ),
+    ).toEqual({ band: "deep", reasons: [] });
+  });
+
+  test("a standard-sized signal set → standard, non-degraded", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 3, diff_lines: 400, touched_repo_count: 1 },
+        realPolicy,
+      ),
+    ).toEqual({ band: "standard", reasons: [] });
+  });
+
+  test("a small signal set → lean, non-degraded (legitimate, not a policy failure)", () => {
+    expect(
+      deriveDepthBand(
+        { task_count: 1, diff_lines: 10, touched_repo_count: 1 },
+        realPolicy,
       ),
     ).toEqual({ band: "lean", reasons: [] });
   });
@@ -792,15 +854,21 @@ describe("readAuditPolicyDoc (best-effort policy read)", () => {
 
   test("valid YAML mapping → parsed doc, no reason", () => {
     const p = join(dir, "audit-policy.yaml");
-    writeFileSync(p, "close_depth:\n  deep:\n    min_tasks: 8\n", "utf-8");
+    writeFileSync(
+      p,
+      "depth_bands:\n  - depth: deep\n    min_task_count: 8\n",
+      "utf-8",
+    );
     const res = readAuditPolicyDoc(p);
     expect(res.reason).toBeNull();
-    expect(res.doc).toEqual({ close_depth: { deep: { min_tasks: 8 } } });
+    expect(res.doc).toEqual({
+      depth_bands: [{ depth: "deep", min_task_count: 8 }],
+    });
   });
 
   test("syntactically invalid YAML → policy_malformed", () => {
     const p = join(dir, "audit-policy.yaml");
-    writeFileSync(p, "close_depth: [1, 2\n", "utf-8");
+    writeFileSync(p, "depth_bands: [1, 2\n", "utf-8");
     const res = readAuditPolicyDoc(p);
     expect(res.doc).toBeNull();
     expect(res.reason).toBe("policy_malformed");
@@ -827,6 +895,17 @@ describe("close-preflight depth enrichment", () => {
     const t = JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
     t.tier = tier;
     writeFileSync(p, JSON.stringify(t, null, 2), "utf-8");
+  }
+
+  function setEpicTouchedRepos(
+    root: string,
+    epicId: string,
+    repos: string[],
+  ): void {
+    const p = join(root, ".keeper", "epics", `${epicId}.json`);
+    const e = JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
+    e.touched_repos = repos;
+    writeFileSync(p, JSON.stringify(e, null, 2), "utf-8");
   }
 
   function writeFindingArtifact(
@@ -946,5 +1025,38 @@ describe("close-preflight depth enrichment", () => {
     const ref = briefTasks[0]?.finding_ref as Record<string, unknown>;
     expect(ref.status).toBeNull();
     expect(typeof ref.path).toBe("string");
+  });
+
+  test("a deep-sized epic (>=8 done tasks, >=2 touched repos, >=2000 diff loc) stamps a non-degraded deep band (F1 regression)", () => {
+    const proj = getProj();
+    const primary = realpathSync(proj.root);
+    const secondary = realpathSync(
+      mkdtempSync(join(tmpdir(), "planctl-cpf-depth-secondary-")),
+    );
+    fakeInitRepo(secondary);
+
+    const { epicId, taskIds } = makeEpic(proj, Array(8).fill("done"));
+    setEpicTouchedRepos(proj.root, epicId, [primary, secondary]);
+    fakeSourceCommit(proj.root, `feat: big\n\nTask: ${taskIds[0]}\n`, {
+      numstat: [{ path: "src/big.ts", insertions: 2000, deletions: 0 }],
+    });
+    seedCommit(secondary, taskIds[1] as string);
+
+    try {
+      const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+        cwd: proj.root,
+        home: proj.home,
+      });
+      expect(r.code).toBe(0);
+      const depth = loadBrief(proj.root, epicId).depth as Record<
+        string,
+        unknown
+      >;
+      expect(depth.band).toBe("deep");
+      expect(depth.degraded).toBe(false);
+      expect(depth.degrade_reasons).toEqual([]);
+    } finally {
+      rmSync(secondary, { recursive: true, force: true });
+    }
   });
 });

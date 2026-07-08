@@ -11,6 +11,14 @@
 //   (b) band validity — every `depth_bands` entry names a depth in the fixed
 //       lean/standard/deep vocabulary.
 //
+// A third invariant rides the coercion step rather than `checkAuditPolicy`:
+// `coerceDepthBand` requires each entry to carry exactly the keys in
+// close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS (imported, not
+// re-declared), so a key the runtime close-audit consumer stops reading — or
+// the file stops providing — fails coercion loud instead of silently
+// diverging (this drifting apart, undetected, is exactly how the F1 wiring
+// bug shipped).
+//
 // The check core (`checkAuditPolicy`) is a pure function over already-loaded data
 // so the fast suite drives its failure modes in-process; `--check` wires it to
 // disk. Structural coercion (`coerceAuditPolicy`) is fail-loud so a malformed
@@ -20,6 +28,7 @@
 import { join, resolve } from "node:path";
 
 import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { DEPTH_BAND_THRESHOLD_KEYS } from "../src/verbs/close_preflight.ts";
 import { loadYamlInput } from "../src/yaml_input.ts";
 
 /** Plan plugin root — audit-policy.yaml and subagents.yaml sit here. */
@@ -89,18 +98,22 @@ function asString(raw: unknown, label: string): string {
   return raw;
 }
 
-/** Coerce one `depth_bands` entry, fail-loud on any missing/mistyped field. */
+/** Coerce one `depth_bands` entry, fail-loud on any missing/mistyped field.
+ * Threshold keys come from DEPTH_BAND_THRESHOLD_KEYS — close_preflight.ts's own
+ * runtime read-list, imported rather than re-declared — so a key the consumer
+ * stops reading, or the file stops providing, fails this coercion loud instead
+ * of silently diverging (F1). */
 function coerceDepthBand(raw: unknown, label: string): DepthBand {
   const doc = asMapping(raw, label);
-  return {
-    depth: asString(doc.depth, `${label}.depth`),
-    min_task_count: asNumber(doc.min_task_count, `${label}.min_task_count`),
-    min_diff_loc: asNumber(doc.min_diff_loc, `${label}.min_diff_loc`),
-    min_touched_repos: asNumber(
-      doc.min_touched_repos,
-      `${label}.min_touched_repos`,
-    ),
-  };
+  const depth = asString(doc.depth, `${label}.depth`);
+  const thresholds = {} as Record<
+    (typeof DEPTH_BAND_THRESHOLD_KEYS)[number],
+    number
+  >;
+  for (const key of DEPTH_BAND_THRESHOLD_KEYS) {
+    thresholds[key] = asNumber(doc[key], `${label}.${key}`);
+  }
+  return { depth, ...thresholds };
 }
 
 /** Validate a parsed document into an AuditPolicy. Throws on any structural
