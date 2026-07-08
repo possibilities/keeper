@@ -2261,10 +2261,13 @@ function makeFramesCapture(
 }
 
 /** Build a frames-mode usage engine over `emitter` with a fixed cursor + clock
- *  and no-op live/tick sinks (frames mode never paints). */
+ *  and no-op live/tick sinks (frames mode never paints). `catchingUp` /
+ *  `loadingLine` are the fn-1180 gate deps — omitted (the default) keeps
+ *  every existing caller's pre-gate behavior (`catching_up` always `null`). */
 function makeUsageFramesEngine(
   emitter: FramesEmitter,
   onMaybeStop: () => void = () => {},
+  gate: { catchingUp?: () => boolean | null; loadingLine?: () => string } = {},
 ): ReturnType<typeof createUsageEmitEngine> {
   return createUsageEmitEngine({
     mode: "frames",
@@ -2272,6 +2275,8 @@ function makeUsageFramesEngine(
     shadowAdvisory: [],
     framesEmitter: emitter,
     latestCursor: () => "42",
+    catchingUp: gate.catchingUp,
+    loadingLine: gate.loadingLine,
     onMaybeStop,
     onLiveFrame: () => {},
     onTickRefresh: () => {},
@@ -2410,4 +2415,121 @@ test("usage frames: envelope is byte-shape-identical to a shared-shell (board) f
     expect(bRec.view).toBe("board");
     expect(norm(uRec)).toEqual(norm(bRec));
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-1180: the catching-up gate's frames-mode one-static-loading-record
+// discipline. `deps.catchingUp` omitted keeps every pre-gate caller's
+// behavior byte-identical (asserted above); these tests thread it explicitly.
+// ---------------------------------------------------------------------------
+
+describe("usage frames — the catching-up gate", () => {
+  test("gated (catchingUp true): a real row change never forges a second loading record", () => {
+    const cap = makeFramesCapture("usage");
+    const engine = makeUsageFramesEngine(cap.emitter, () => {}, {
+      catchingUp: () => true,
+      loadingLine: () => "re-folding event log…",
+    });
+
+    engine.emitUsage([USAGE_ROW]); // gated baseline → the one static record
+    engine.emitJobs([JOBS_ROW]); // real data changed underneath — suppressed
+    engine.emitUsage([{ ...USAGE_ROW, session_percent: 99 }]); // still suppressed
+
+    const recs = cap.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0]?.type).toBe("baseline");
+    expect(recs[0]?.catching_up).toBe(true);
+    // The static label, never the real composed usage/jobs body.
+    expect(recs[0]?.diff).toBeNull();
+  });
+
+  test("gated: the static record's frame text is the shell's loading label verbatim, not the composed body", () => {
+    // `makeFramesCapture`'s constant `diffFn` can't surface frame TEXT (only a
+    // fixed diff string), so this test wires its own emitter with a
+    // content-capturing `io.writeFile` to read back the frame sidecar.
+    const stdout: string[] = [];
+    const written = new Map<string, string>();
+    const emitter = createFramesEmitter({
+      view: "usage",
+      writeStdout: (line) => stdout.push(line),
+      diffFn: () => "@@ d @@\n",
+      io: {
+        writeFile: (path, contents) => written.set(path, contents),
+        unlink: () => {},
+        nowIso: () => "2026-06-10T00:00:00.000Z",
+        nowMs: () => 0,
+      },
+      maxFrames: null,
+      durationMs: null,
+    });
+    const engine = makeUsageFramesEngine(emitter, () => {}, {
+      catchingUp: () => true,
+      loadingLine: () => "waiting for git seed…",
+    });
+    engine.emitUsage([USAGE_ROW]);
+
+    const rec = JSON.parse(stdout[0]?.trim() ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    const framePath = rec.frame_path as string;
+    expect(written.get(framePath)).toBe("waiting for git seed…\n");
+  });
+
+  test("ungated (catchingUp false): frames stamp catching_up:false and compose the real body, same as today", () => {
+    const cap = makeFramesCapture("usage");
+    const engine = makeUsageFramesEngine(cap.emitter, () => {}, {
+      catchingUp: () => false,
+    });
+    engine.emitUsage([USAGE_ROW]);
+    engine.emitJobs([JOBS_ROW]);
+    const recs = cap.records();
+    expect(recs.map((r) => r.type)).toEqual(["baseline", "frame"]);
+    expect(recs.every((r) => r.catching_up === false)).toBe(true);
+  });
+
+  test("never observed (catchingUp omitted): every record stamps catching_up:null, matching pre-gate behavior", () => {
+    const cap = makeFramesCapture("usage");
+    const engine = makeUsageFramesEngine(cap.emitter);
+    engine.emitUsage([USAGE_ROW]);
+    engine.emitJobs([JOBS_ROW]);
+    const recs = cap.records();
+    expect(recs.every((r) => r.catching_up === null)).toBe(true);
+  });
+
+  test("a gate clear (catchingUp flips false) resumes real composed frames after the one loading record", () => {
+    const cap = makeFramesCapture("usage");
+    let gated = true;
+    const engine = makeUsageFramesEngine(cap.emitter, () => {}, {
+      catchingUp: () => gated,
+      loadingLine: () => "catching up…",
+    });
+    engine.emitUsage([USAGE_ROW]); // gated → one static baseline record
+    gated = false;
+    engine.emitJobs([JOBS_ROW]); // ungated real data change → a real frame
+
+    const recs = cap.records();
+    expect(recs.map((r) => r.type)).toEqual(["baseline", "frame"]);
+    expect(recs[0]?.catching_up).toBe(true);
+    expect(recs[1]?.catching_up).toBe(false);
+  });
+
+  test("noteDisconnect resets the one-record latch — a reconnect that is still gated earns a fresh record", () => {
+    const cap = makeFramesCapture("usage");
+    const engine = makeUsageFramesEngine(cap.emitter, () => {}, {
+      catchingUp: () => true,
+      loadingLine: () => "catching up…",
+    });
+    engine.emitUsage([USAGE_ROW]); // gated baseline
+    engine.emitUsage([{ ...USAGE_ROW, session_percent: 50 }]); // suppressed
+    expect(cap.records()).toHaveLength(1);
+
+    engine.noteDisconnect(); // a reconnect starts a fresh gated window
+    engine.emitUsage([{ ...USAGE_ROW, session_percent: 50 }]); // earns its own record
+
+    const recs = cap.records();
+    expect(recs).toHaveLength(2);
+    expect(recs.map((r) => r.type)).toEqual(["baseline", "frame"]);
+    expect(recs[1]?.catching_up).toBe(true);
+  });
 });

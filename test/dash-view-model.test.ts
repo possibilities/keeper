@@ -26,6 +26,7 @@ import {
   type BandKey,
   buildDashModel,
   type CardVM,
+  type DashLoadingState,
   type DashModel,
   type RobotRung,
   robotGlyph,
@@ -694,4 +695,41 @@ test("fa-classic: the shared board/jobs glyph map carries no md-robot codepoints
   // A couple of fa-classic anchors still resolve as before (map unchanged).
   expect(glyphForToken("ready", FA_CLASSIC)).toBeTruthy();
   expect(glyphForToken("running:job-running", FA_CLASSIC)).toBeTruthy();
+});
+
+// ---------------------------------------------------------------------------
+// The readiness gate's loading variant (fn-1180)
+// ---------------------------------------------------------------------------
+
+test("loading: a non-null third arg short-circuits to empty bands + the loading state", () => {
+  const loading: DashLoadingState = { line: "re-folding event log  38.0%" };
+  const job = makeJob({ job_id: "j", state: "working" });
+  const model = buildDashModel(jobsMap([job]), false, loading);
+  expect(model.bands).toEqual([]);
+  expect(model.loading).toEqual(loading);
+});
+
+test("loading: an omitted third arg keeps today's ready-state behavior", () => {
+  const job = makeJob({ job_id: "j", state: "working" });
+  const model = buildDashModel(jobsMap([job]), false);
+  expect(model.loading).toBeUndefined();
+  expect(onlyCard(model).key).toBe("job:j");
+});
+
+test("loading: an explicit null third arg is equivalent to omitting it", () => {
+  const job = makeJob({ job_id: "j", state: "working" });
+  const model = buildDashModel(jobsMap([job]), false, null);
+  expect(model.loading).toBeUndefined();
+  expect(onlyCard(model).key).toBe("job:j");
+});
+
+test("loading: the jobs set is never walked while gated — a malformed job set still never throws", () => {
+  const loading: DashLoadingState = { line: "catching up…" };
+  expect(() =>
+    buildDashModel([makeJob({ state: "???" })], true, loading),
+  ).not.toThrow();
+  expect(buildDashModel([makeJob({ state: "???" })], true, loading)).toEqual({
+    bands: [],
+    loading,
+  });
 });
