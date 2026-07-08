@@ -34,5 +34,5 @@ Files: `src/daemon.ts`, `test/daemon.test.ts`.
 - [ ] `bun test` passes.
 
 ## Done summary
-
+Added empty_token to RepairCandidateDropClass, routed both emission sites through a shared typed drop helper, and updated the class-union stability test to length 5.
 ## Evidence
