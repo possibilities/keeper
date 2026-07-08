@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security boundary work on the escalation-guard git classifier \u2014 closing an arbitrary-exec bypass and correcting a deny/allow token-parsing invariant \u2014 is a subtle-security-invariant opus gate, at xhigh for the fail-closed boundary reasoning without being open-ended debugging.",
+      "task_id": "fn-1183-refine-diagnosis-role-git-command.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T02:00:02.555000Z",
+  "epic_id": "fn-1183-refine-diagnosis-role-git-command",
+  "input_hash": "380ea03977e32808d7bca20fbf8a2b00378861837c1047390cd847896129cacc",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 940482617,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security boundary work on the escalation-guard git classifier \u2014 closing an arbitrary-exec bypass and correcting a deny/allow token-parsing invariant \u2014 is a subtle-security-invariant opus gate, at xhigh for the fail-closed boundary reasoning without being open-ended debugging.\",\"confidence\":0.82}]}"
+}
