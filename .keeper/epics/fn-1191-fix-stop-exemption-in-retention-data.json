@@ -7,7 +7,7 @@
     "fn-1186-fix-retention-keep-set-body-loss"
   ],
   "id": "fn-1191-fix-stop-exemption-in-retention-data",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T06:08:04.159000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T06:08:03.105000Z"
+  "updated_at": "2026-07-08T06:08:04.159000Z"
 }
