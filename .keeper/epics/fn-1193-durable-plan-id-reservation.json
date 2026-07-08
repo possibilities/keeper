@@ -8,7 +8,7 @@
     "fn-1190-complete-plan-done-durable-or-nothing"
   ],
   "id": "fn-1193-durable-plan-id-reservation",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T06:26:38.198000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T06:26:13.723000Z"
+  "updated_at": "2026-07-08T06:26:38.198000Z"
 }
