@@ -83,6 +83,10 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "timeout 300 bun test",
     // a `>` INSIDE single quotes is literal — not a redirect
     "git log --grep 'fix > bug'",
+    // `-O` is grep's exec alias ONLY — for diff/log it names a benign order file,
+    // so it must not over-block on those read subcommands
+    "git diff -O.git/order HEAD~1",
+    "git log -O/tmp/orderfile",
   ];
   for (const cmd of allow) {
     test(`allows: ${cmd}`, () => {
@@ -144,6 +148,18 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     // program — `git grep --open-files-in-pager`/`-O` opens matches in a pager
     "git grep --open-files-in-pager=/tmp/evil pattern",
     "git grep -O/tmp/evil pattern",
+    // git's short-option bundling reaches the `-O` exec alias buried in a cluster
+    // whose token STARTS with a benign flag (`-n`/`-i`/…) — the deny must catch a
+    // capital `O` anywhere in a single-dash short-flag cluster (F1/F2)
+    "git grep -nO/tmp/evil pattern",
+    "git grep -iO/tmp/evil pattern",
+    "git grep -inO/tmp/evil pattern",
+    "git grep -O pattern",
+    // `git log/diff --output=<file>` writes an arbitrary file for a read-only role
+    // — a flag, not a shell redirect, so the lexer's redirect deny misses it (F3)
+    "git log --output=/tmp/evil",
+    "git diff --output=/tmp/evil HEAD~1",
+    "git log --output /tmp/evil",
     // git branch mutating forms mutate refs from a read-only role (F2);
     // branch-guard cannot cover an escalation session (no agent_id)
     "git branch -D feature",
