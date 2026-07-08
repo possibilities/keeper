@@ -46,8 +46,13 @@
  */
 
 import { expect, test } from "bun:test";
-import { encodeFrame, type ServerFrame } from "../src/protocol";
 import {
+  type BootStatus,
+  encodeFrame,
+  type ServerFrame,
+} from "../src/protocol";
+import {
+  CATCHUP_BACKSTOP_MS,
   type ConnectFactory,
   computeLandedEpicIds,
   type FatalError,
@@ -3478,6 +3483,474 @@ test("subscribeReadiness: a malformed autopilot_state row falls back to the safe
   expect(snap?.maxConcurrentPerRoot).toBe(1); // no boot header → latch default
   expect(snap?.worktreeMode).toBe(false); // worktree_mode !== 1 → off
   expect(snap?.autopilotEligibleEpicIds).toBeUndefined(); // yolo computes none
+
+  handle.dispose();
+});
+
+// ===========================================================================
+// fn-1180.1 — the catching-up latch + backstop (the TUI readiness gate).
+//
+// The shared subscribe client owns a per-connection catching-up value-latch and
+// surfaces its transitions via `onCatchingUp` so a display harness can gate
+// rendering while headless consumers keep receiving data. Contract: starts
+// READY; a served `result` carrying a boot header sets it to that header's
+// `catching_up` (strict boolean — a malformed value mutates nothing); a
+// headerless `result` observed WHILE latched clears it (catch-up stamps EVERY
+// served frame, so the memo-path headerless result is positive steady-state
+// evidence); `patch`/`meta` never touch it; teardown resets it and the next
+// connection re-derives it. While latched, a slow backstop interval refetches
+// ONE idle collection so the settling flip is always observed.
+// ===========================================================================
+
+/** A minimal catch-up / steady BootStatus header for the latch tests. */
+function bootHeader(catchingUp: boolean, rev = 1, head = 9): BootStatus {
+  return {
+    rev,
+    head_event_id: head,
+    catching_up: catchingUp,
+    git_seed_required: false,
+  };
+}
+
+/** A `result` for `jobs` carrying an explicit boot header (the catch-up stamp). */
+function jobsResultBoot(
+  id: string,
+  rows: Record<string, unknown>[],
+  boot: BootStatus,
+  rev = 1,
+): ServerFrame {
+  return {
+    type: "result",
+    id,
+    collection: "jobs",
+    rev,
+    total: rows.length,
+    rows,
+    boot,
+  };
+}
+
+type CatchLog = { catchingUp: boolean; boot: BootStatus | undefined }[];
+
+/** A single-collection (`jobs`) sidecar wired with an `onCatchingUp` recorder. */
+function makeCatchUpSidecar(idPrefix: string): {
+  sock: MockSocket;
+  rowsLog: Record<string, unknown>[][];
+  catchLog: CatchLog;
+  handle: ReturnType<typeof subscribeCollection>;
+} {
+  const { factory, socketRef } = makeMockConnect();
+  const rowsLog: Record<string, unknown>[][] = [];
+  const catchLog: CatchLog = [];
+  const handle = subscribeCollection({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    collection: "jobs",
+    onRows: (rows) => rowsLog.push(rows),
+    onCatchingUp: (catchingUp, boot) => catchLog.push({ catchingUp, boot }),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  return { sock, rowsLog, catchLog, handle };
+}
+
+/**
+ * A `setInterval` spy keyed by interval duration. The helper installs TWO live
+ * intervals — `pollAll` (`POLL_MS`) and the catching-up backstop
+ * (`CATCHUP_BACKSTOP_MS`) — and the shared `installTimerHarness` only captures
+ * the first. This spy tracks EVERY positive-interval timer by its ms so a test
+ * can `fire()` and `count()` the backstop independently. Non-positive timeouts
+ * (Bun internals) fall through to the real implementation.
+ */
+interface IntervalSpy {
+  fire(intervalMs: number): void;
+  count(intervalMs: number): number;
+  restore(): void;
+}
+
+function installIntervalSpy(): IntervalSpy {
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const live = new Map<number, { handler: () => void; ms: number }>();
+  let nextId = 1;
+  globalThis.setInterval = ((
+    handler: Parameters<typeof realSetInterval>[0],
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    if (typeof timeout === "number" && timeout > 0) {
+      const id = nextId++;
+      live.set(id, { handler: handler as () => void, ms: timeout });
+      return id as unknown as ReturnType<typeof realSetInterval>;
+    }
+    return realSetInterval(handler, timeout, ...args);
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((id?: ReturnType<typeof setInterval>) => {
+    if (typeof id === "number" && live.has(id)) {
+      live.delete(id);
+      return;
+    }
+    realClearInterval(id);
+  }) as typeof clearInterval;
+  return {
+    fire(intervalMs: number): void {
+      // Snapshot before firing — a handler may clear an interval mid-iteration.
+      const handlers = [...live.values()]
+        .filter((e) => e.ms === intervalMs)
+        .map((e) => e.handler);
+      for (const h of handlers) {
+        h();
+      }
+    },
+    count(intervalMs: number): number {
+      let n = 0;
+      for (const e of live.values()) {
+        if (e.ms === intervalMs) {
+          n += 1;
+        }
+      }
+      return n;
+    },
+    restore(): void {
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
+    },
+  };
+}
+
+test("catching-up latch: a catch-up header sets it, a headerless result while latched clears it", () => {
+  const { sock, catchLog, handle } = makeCatchUpSidecar("test-latch");
+  const subId = "test-latch-jobs";
+  sock.takeOutbound();
+
+  // A result carrying `catching_up: true` SETS the latch (first transition).
+  sock.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+  expect(catchLog).toEqual([{ catchingUp: true, boot: bootHeader(true) }]);
+
+  // A second catch-up header is NO transition — the callback fires only on flips.
+  sock.takeOutbound();
+  sock.deliver([jobsResultBoot(subId, [], bootHeader(true, 2))]);
+  expect(catchLog).toHaveLength(1);
+
+  // A headerless result observed WHILE latched is positive steady-state evidence
+  // → clears, delivering the FRESHEST header seen (rev 2, not the rev-1 setter).
+  sock.takeOutbound();
+  sock.deliver([jobsResult(subId, [])]);
+  expect(catchLog).toHaveLength(2);
+  expect(catchLog[1]?.catchingUp).toBe(false);
+  expect(catchLog[1]?.boot).toEqual(bootHeader(true, 2));
+
+  // Now READY: a further headerless result is a no-op (no transition).
+  sock.deliver([jobsResult(subId, [])]);
+  expect(catchLog).toHaveLength(2);
+
+  handle.dispose();
+});
+
+test("catching-up latch: a steady-state header (catching_up=false) clears it", () => {
+  const { sock, catchLog, handle } = makeCatchUpSidecar("test-steady");
+  const subId = "test-steady-jobs";
+  sock.takeOutbound();
+
+  sock.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+  expect(catchLog).toEqual([{ catchingUp: true, boot: bootHeader(true) }]);
+
+  // A header reporting steady state clears the latch, handing back that header.
+  sock.deliver([jobsResultBoot(subId, [], bootHeader(false))]);
+  expect(catchLog).toHaveLength(2);
+  expect(catchLog[1]).toEqual({ catchingUp: false, boot: bootHeader(false) });
+
+  handle.dispose();
+});
+
+test("catching-up latch: a malformed catching_up mutates nothing (not a headerless clear)", () => {
+  const { sock, catchLog, handle } = makeCatchUpSidecar("test-malformed");
+  const subId = "test-malformed-jobs";
+  sock.takeOutbound();
+
+  sock.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+  expect(catchLog).toHaveLength(1);
+
+  // A header whose `catching_up` is non-boolean is present-but-malformed: a
+  // header is NOT a headerless result, so it neither clears nor re-fires.
+  const bad = { ...bootHeader(true), catching_up: "yes" as unknown as boolean };
+  sock.deliver([jobsResultBoot(subId, [], bad)]);
+  expect(catchLog).toHaveLength(1);
+
+  // Prove the latch is STILL set: a headerless result now clears it.
+  sock.deliver([jobsResult(subId, [])]);
+  expect(catchLog).toHaveLength(2);
+  expect(catchLog[1]?.catchingUp).toBe(false);
+
+  handle.dispose();
+});
+
+test("catching-up latch: patch and meta frames never mutate it", () => {
+  const { sock, catchLog, handle } = makeCatchUpSidecar("test-pm");
+  const subId = "test-pm-jobs";
+  sock.takeOutbound();
+
+  // Seed a page and set the latch on one catch-up-stamped result.
+  sock.deliver([
+    jobsResultBoot(
+      subId,
+      [{ job_id: "j1", state: "working", last_event_id: 10 }],
+      bootHeader(true),
+    ),
+  ]);
+  expect(catchLog).toHaveLength(1);
+  sock.takeOutbound();
+
+  // A direct-merge patch and a membership `meta` both leave the latch untouched.
+  sock.deliver([
+    jobsPatch(subId, { job_id: "j1", state: "stopped", last_event_id: 20 }),
+  ]);
+  sock.deliver([
+    { type: "meta", id: subId, collection: "jobs", rev: 3, total: 1 },
+  ]);
+  expect(catchLog).toHaveLength(1);
+
+  // The latch is STILL set — a headerless result clears it, proving neither
+  // patch nor meta cleared it early.
+  sock.takeOutbound();
+  sock.deliver([
+    jobsResult(subId, [{ job_id: "j1", state: "stopped", last_event_id: 30 }]),
+  ]);
+  expect(catchLog).toHaveLength(2);
+  expect(catchLog[1]?.catchingUp).toBe(false);
+
+  handle.dispose();
+});
+
+test("catching-up latch: teardown resets it silently and the reconnect re-derives", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const catchLog: CatchLog = [];
+    const handle = subscribeCollection({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-teardown",
+      collection: "jobs",
+      onRows: () => {},
+      onCatchingUp: (catchingUp, boot) => catchLog.push({ catchingUp, boot }),
+      connect: factory,
+    });
+    const sock1 = socketRef.current;
+    if (!sock1) {
+      throw new Error("mock socket never installed");
+    }
+    const subId = "test-teardown-jobs";
+    sock1.takeOutbound();
+
+    // Latch catching-up → backstop armed.
+    sock1.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+    expect(catchLog).toHaveLength(1);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+
+    // The daemon drops the connection. Teardown resets the latch to READY and
+    // disarms the backstop SILENTLY — a disconnect is a lifecycle signal, not a
+    // latch flip, so `onCatchingUp` does NOT fire.
+    sock1.closeFromServer();
+    expect(catchLog).toHaveLength(1);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+
+    // The mock fires `open` on a FRESH socket synchronously during reconnect.
+    const sock2 = socketRef.current;
+    if (!sock2) {
+      throw new Error("reconnect socket never installed");
+    }
+    expect(sock2).not.toBe(sock1);
+    sock2.takeOutbound();
+
+    // The fresh connection's first result re-derives the latch: still catching up.
+    sock2.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+    expect(catchLog).toHaveLength(2);
+    expect(catchLog[1]?.catchingUp).toBe(true);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+
+    handle.dispose();
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+  } finally {
+    spy.restore();
+  }
+});
+
+test("catching-up backstop: arms while latched, refetches an idle collection, coalesces, disarms on clear", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { sock, catchLog, handle } = makeCatchUpSidecar("test-backstop");
+    const subId = "test-backstop-jobs";
+    sock.takeOutbound();
+
+    // Latch catching-up → backstop armed.
+    sock.deliver([
+      jobsResultBoot(
+        subId,
+        [{ job_id: "j1", state: "working", last_event_id: 10 }],
+        bootHeader(true),
+      ),
+    ]);
+    expect(catchLog).toHaveLength(1);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+    sock.takeOutbound();
+
+    // A tick refetches the ONE idle collection through the shared coalescer.
+    spy.fire(CATCHUP_BACKSTOP_MS);
+    const refetch = sock.takeOutbound();
+    expect(refetch).toHaveLength(1);
+    expect((refetch[0] as { collection: string }).collection).toBe("jobs");
+
+    // That refetch is now in flight; a second tick finds NO idle collection and
+    // coalesces to a no-op — never a duplicate query.
+    spy.fire(CATCHUP_BACKSTOP_MS);
+    expect(sock.takeOutbound()).toHaveLength(0);
+
+    // The refetch response still carries catch-up → latch stays set, still armed.
+    sock.deliver([
+      jobsResultBoot(
+        subId,
+        [{ job_id: "j1", state: "working", last_event_id: 11 }],
+        bootHeader(true),
+      ),
+    ]);
+    expect(catchLog).toHaveLength(1);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+
+    // A steady-state header clears the latch → backstop disarmed the moment it clears.
+    sock.deliver([jobsResultBoot(subId, [], bootHeader(false))]);
+    expect(catchLog).toHaveLength(2);
+    expect(catchLog[1]?.catchingUp).toBe(false);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+
+    // A tick after disarm is inert.
+    spy.fire(CATCHUP_BACKSTOP_MS);
+    expect(sock.takeOutbound()).toHaveLength(0);
+
+    handle.dispose();
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+  } finally {
+    spy.restore();
+  }
+});
+
+test("catching-up backstop: dispose while latched clears the interval (no timer leak)", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { sock, handle } = makeCatchUpSidecar("test-backstop-dispose");
+    const subId = "test-backstop-dispose-jobs";
+    sock.takeOutbound();
+    sock.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+
+    handle.dispose();
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+  } finally {
+    spy.restore();
+  }
+});
+
+test("subscribeReadiness: catching-up backstop refetches exactly ONE idle collection per tick", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const catchLog: boolean[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-rb",
+      onSnapshot: () => {},
+      onCatchingUp: (c) => catchLog.push(c),
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.takeOutbound();
+
+    // During genuine catch-up the server stamps EVERY served frame, so all 11
+    // results carry a catch-up header. The latch flips exactly once.
+    const collections = [
+      "epics",
+      "jobs",
+      "subagent_invocations",
+      "git",
+      "dead_letters",
+      "pending_dispatches",
+      "autopilot_state",
+      "armed_epics",
+      "scheduled_tasks",
+      "block_escalations",
+      "tmux_client_focus",
+    ];
+    for (const c of collections) {
+      sock.deliver([
+        {
+          type: "result",
+          id: `test-rb-${c.replace(/_/g, "-")}`,
+          collection: c,
+          rev: 1,
+          total: 0,
+          rows: [],
+          boot: bootHeader(true),
+        },
+      ]);
+    }
+    expect(catchLog).toEqual([true]);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+    sock.takeOutbound();
+
+    // One tick → exactly ONE refetch (the first idle collection), never 11.
+    spy.fire(CATCHUP_BACKSTOP_MS);
+    const out = sock.takeOutbound();
+    expect(out).toHaveLength(1);
+    expect((out[0] as { collection: string }).collection).toBe("epics");
+
+    handle.dispose();
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+  } finally {
+    spy.restore();
+  }
+});
+
+test("subscribeReadiness: bare frames (no boot header) keep painting and never fire onCatchingUp", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const catchLog: boolean[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-bare",
+    onSnapshot: (s) => snapshots.push(s),
+    onCatchingUp: (c) => catchLog.push(c),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  for (const c of [
+    "epics",
+    "jobs",
+    "subagent_invocations",
+    "git",
+    "dead_letters",
+    "pending_dispatches",
+    "autopilot_state",
+    "armed_epics",
+    "scheduled_tasks",
+    "block_escalations",
+    "tmux_client_focus",
+  ]) {
+    sock.deliver([emptyResult(c, `test-bare-${c.replace(/_/g, "-")}`)]);
+  }
+  // Painted once (first-paint gate cleared) and the latch never left READY, so a
+  // headless consumer's data path is byte-identical to the pre-latch behavior.
+  expect(snapshots).toHaveLength(1);
+  expect(catchLog).toHaveLength(0);
 
   handle.dispose();
 });

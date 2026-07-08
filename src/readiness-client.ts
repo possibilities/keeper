@@ -163,6 +163,16 @@ export const TRANSIENT_SERVER_CODES = new Set<string>(["max_connections"]);
  */
 const SLOW_FLIGHT_MS = 1000;
 const QUERY_TIMEOUT_MS = 5000;
+/**
+ * Catching-up backstop interval. While the per-connection catching-up latch is
+ * set, refetch ONE idle subscribed collection this often so a freshly stamped
+ * `result` always arrives to observe the settling flip: `boot-complete` fans out
+ * to no subscriber and `patch`/`meta` carry no header, so a quiet board would
+ * otherwise wedge the latch. Slow on purpose (an idle-state poll is churn) and
+ * disarmed the moment the latch clears. Deliberately DISTINCT from `POLL_MS`,
+ * which stays 500ms slow-flight detection ONLY and is never widened for this.
+ */
+export const CATCHUP_BACKSTOP_MS = 3000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -363,6 +373,22 @@ export interface ReadinessClientHandle {
 export type LifecycleCallback = (
   event: string,
   detail?: Record<string, unknown>,
+) => void;
+
+/**
+ * Catching-up transition callback (the TUI readiness gate). Fired ONLY when the
+ * per-connection catching-up latch FLIPS — a transition, never per frame.
+ * `catchingUp` is the gate signal: `true` while the daemon is down / draining /
+ * seeding (a display harness paints only its loading indicator), `false` once
+ * the daemon reports ready (resume painting). `boot` is the freshest
+ * {@link BootStatus} header seen on this connection — the re-fold progress a
+ * loading indicator renders — or `undefined` if none has been seen. Headless
+ * consumers (`keeper status` / `await` / autopilot CLI) omit it and keep
+ * receiving rows unchanged; the latch never gates their data path.
+ */
+export type CatchingUpCallback = (
+  catchingUp: boolean,
+  boot: BootStatus | undefined,
 ) => void;
 
 /**
@@ -704,6 +730,12 @@ interface MultiOptions {
    * it never treats an empty projection as "clean". Optional — most callers omit.
    */
   readonly onBootStatus?: (boot: BootStatus) => void;
+  /**
+   * Catching-up transition callback (see {@link CatchingUpCallback}). Fired on
+   * every latch FLIP, delivering the readiness boolean + freshest header. Drives
+   * a display harness's readiness gate; headless callers omit it.
+   */
+  readonly onCatchingUp?: CatchingUpCallback;
   /** Opt-in bounded give-up. Absent → reconnect-forever. */
   readonly giveUpPolicy?: GiveUpPolicy;
   /**
@@ -730,6 +762,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     connect,
     giveUpPolicy,
     onBootStatus,
+    onCatchingUp,
   } = opts;
   const now = opts.now ?? Date.now;
   const byCollection = new Map(states.map((s) => [s.collection, s]));
@@ -764,6 +797,21 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   let reconnecting = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // ---- catching-up latch + backstop (see CatchingUpCallback) ----
+  // Per-connection value-latch. Starts READY (`false`). A served `result`
+  // carrying a boot header sets it to that header's `catching_up` (strict
+  // boolean — a malformed value mutates nothing); a headerless `result` observed
+  // WHILE latched clears it (the server bypasses its pre-serialized memo during
+  // catch-up, so a headerless result is positive steady-state evidence);
+  // `patch`/`meta` never touch it; teardown resets it to ready and the next
+  // connection's first result re-derives it.
+  let catchingUp = false;
+  // The freshest boot header seen on THIS connection — the payload a transition
+  // hands the gate for its loading-indicator progress. Reset on teardown.
+  let freshestBoot: BootStatus | undefined;
+  // The slow refetch interval armed only while `catchingUp`. Bun's `setInterval`
+  // has no `unref`, so it is `clearInterval`d on every disarm/teardown/dispose.
+  let backstopTimer: ReturnType<typeof setInterval> | null = null;
   // Resolves the pending backoff sleep so `dispose()` doesn't leak its timer
   // (a raw `setTimeout`, not `Bun.sleep`, so `dispose()` can `clearTimeout` it).
   let sleepResolve: (() => void) | null = null;
@@ -869,6 +917,74 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     state.queryInFlightSince = Date.now();
     state.lastSlowFlightAt = null;
     currentSock.write(encodeFrame(state.query));
+  }
+
+  /**
+   * One catching-up backstop tick: refetch the FIRST idle subscribed collection
+   * (not in flight) through the shared `scheduleRefetchFor` coalescer, so a
+   * freshly stamped `result` arrives to observe the settling flip. When every
+   * collection is already in flight the tick is a no-op — those in-flight
+   * results will themselves carry the settling header. Guarded so a timer that
+   * fires between a clear and its `disarm` does nothing.
+   */
+  function runBackstopTick(): void {
+    if (shuttingDown || !currentSock || !catchingUp) {
+      return;
+    }
+    for (const s of states) {
+      if (!s.queryInFlight) {
+        scheduleRefetchFor(s);
+        return;
+      }
+    }
+  }
+
+  /** Arm the backstop interval (idempotent; inert while shutting down). */
+  function armBackstop(): void {
+    if (backstopTimer !== null || shuttingDown) {
+      return;
+    }
+    backstopTimer = setInterval(runBackstopTick, CATCHUP_BACKSTOP_MS);
+  }
+
+  /** Disarm + clear the backstop interval (idempotent). */
+  function disarmBackstop(): void {
+    if (backstopTimer !== null) {
+      clearInterval(backstopTimer);
+      backstopTimer = null;
+    }
+  }
+
+  /**
+   * Fold one `result` frame into the catching-up latch, arming/disarming the
+   * backstop and firing `onCatchingUp` on a FLIP only. Called for every `result`
+   * (header-carrying or not); `patch`/`meta` bypass it so they never mutate the
+   * latch.
+   */
+  function updateCatchingUpLatch(frame: ServerFrame): void {
+    let next = catchingUp;
+    if (frame.type === "result" && frame.boot !== undefined) {
+      freshestBoot = frame.boot;
+      // Strict boolean — a malformed `catching_up` mutates nothing.
+      if (typeof frame.boot.catching_up === "boolean") {
+        next = frame.boot.catching_up;
+      }
+    } else if (catchingUp) {
+      // A headerless `result` while latched is positive steady-state evidence
+      // (catch-up stamps every served frame; the memo path — headerless — only
+      // re-engages once `catching_up` is false). Clear.
+      next = false;
+    }
+    if (next === catchingUp) {
+      return;
+    }
+    catchingUp = next;
+    if (catchingUp) {
+      armBackstop();
+    } else {
+      disarmBackstop();
+    }
+    onCatchingUp?.(catchingUp, freshestBoot);
   }
 
   /**
@@ -995,6 +1111,11 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       if (onBootStatus !== undefined && frame.boot !== undefined) {
         onBootStatus(frame.boot);
       }
+      // Fold this result into the catching-up latch BEFORE per-state routing so
+      // a display harness gating on `onCatchingUp` sees the flip alongside the
+      // header. Every `result` participates (a headerless one clears while
+      // latched); `patch`/`meta` deliberately never reach here.
+      updateCatchingUpLatch(frame);
       // Id-first routing: prefer the echoed sub `id`, fall back to `collection`
       // (a legacy server that doesn't echo `id`). Doing this uniformly here
       // keeps result/patch/meta consistent for a future consumer that registers
@@ -1144,6 +1265,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       clearInterval(pollTimer);
       pollTimer = null;
     }
+    // Reset the catching-up latch to READY and disarm the backstop — the next
+    // connection's first `result` re-derives both. Silent (no `onCatchingUp`):
+    // a disconnect surfaces via the `disconnected` lifecycle event, not a latch
+    // flip, and the reconnect re-derives the true state from the wire.
+    disarmBackstop();
+    catchingUp = false;
+    freshestBoot = undefined;
     // Destroy the live socket BEFORE dropping the reference (else the native
     // buffers leak on a flapping daemon). Safe and idempotent on both the
     // peer-closed `close`-handler path and the still-open give-up path.
@@ -1340,6 +1468,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         clearInterval(pollTimer);
         pollTimer = null;
       }
+      // Release the catching-up backstop interval so `dispose()` leaves no live
+      // timer holding the event loop open (Bun's `setInterval` has no `unref`).
+      disarmBackstop();
       // Cancel the give-up backstop timer so `dispose()` leaves no live timer
       // holding the event loop open.
       if (giveUpTimer !== null) {
@@ -1403,6 +1534,8 @@ export interface SubscribeCollectionOptions {
   readonly now?: () => number;
   /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). */
   readonly onBootStatus?: (boot: BootStatus) => void;
+  /** Catching-up transition callback (see {@link CatchingUpCallback}). */
+  readonly onCatchingUp?: CatchingUpCallback;
 }
 
 /**
@@ -1457,6 +1590,9 @@ export function subscribeCollection(
     ...(opts.onBootStatus === undefined
       ? {}
       : { onBootStatus: opts.onBootStatus }),
+    ...(opts.onCatchingUp === undefined
+      ? {}
+      : { onCatchingUp: opts.onCatchingUp }),
   });
 }
 
@@ -1501,6 +1637,12 @@ export interface SubscribeOptions {
   /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). Fires
    *  independently of `onSnapshot` whenever a `result` frame carries a header. */
   readonly onBootStatus?: (boot: BootStatus) => void;
+  /**
+   * Catching-up transition callback (see {@link CatchingUpCallback}). Fires on
+   * the per-connection latch FLIP so a display harness can gate rendering while
+   * the daemon catches up; `onSnapshot`/rows keep flowing unchanged underneath.
+   */
+  readonly onCatchingUp?: CatchingUpCallback;
   /**
    * fn-1015 OPT-IN: also subscribe the `epics_recent_done` window
    * (`status='done'`, time-bounded to the last `DONE_EPICS_REAP_WINDOW_SEC` by
@@ -2116,5 +2258,10 @@ export function subscribeReadiness(
           : DEFAULT_MAX_CONCURRENT_PER_ROOT;
       opts.onBootStatus?.(boot);
     },
+    // The catching-up latch lives in the shared core; readiness forwards the
+    // callback verbatim (no projection to latch, unlike `onBootStatus`).
+    ...(opts.onCatchingUp === undefined
+      ? {}
+      : { onCatchingUp: opts.onCatchingUp }),
   });
 }
