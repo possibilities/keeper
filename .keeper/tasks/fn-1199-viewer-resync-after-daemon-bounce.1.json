@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Repair viewer resync after bounce",
-  "updated_at": "2026-07-08T20:57:58.268000Z"
+  "updated_at": "2026-07-08T22:57:04.158000Z",
+  "worker_done_at": "2026-07-08T22:57:04.158000Z"
 }

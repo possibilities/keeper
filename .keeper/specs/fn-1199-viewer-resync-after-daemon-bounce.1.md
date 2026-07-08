@@ -39,5 +39,5 @@ Pure-seam tests: injected transport driving loss → reconnect → quiet-board a
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Confirmed the failing leg is LOSS DETECTION: a steady-state subscribe client is idle (no in-flight query), so pollAll never probes a silently-dead/half-open socket and the viewer holds stale state forever. Fixed with an app-level liveness heartbeat (idle probe -> existing QUERY_TIMEOUT_MS reconnect) plus a per-daemon-boot generation epoch guard on the boot header that forces re-baseline across a bounce. Pure-seam tests cover the repro, quiet-board and new-generation bounce re-baseline, and the reconnecting-pill repaint.
 ## Evidence
