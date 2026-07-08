@@ -27,5 +27,5 @@ reuse the existing real-git fixture setup).
 - [ ] `bun run test:full:slow` stays green.
 
 ## Done summary
-
+Added a slow-tier case that drives the done verb (runDone) directly through the real-git mid-merge partial-commit refusal, asserting a clean index after the unwind — proving onCommitFailure's restoreIndexToHead wiring end-to-end rather than a hand-reconstructed call.
 ## Evidence

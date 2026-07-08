@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "End-to-end done unwind test",
-  "updated_at": "2026-07-08T06:41:22.159000Z"
+  "updated_at": "2026-07-08T06:50:24.157000Z",
+  "worker_done_at": "2026-07-08T06:50:24.157000Z"
 }
