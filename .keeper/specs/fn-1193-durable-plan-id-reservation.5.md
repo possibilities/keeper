@@ -57,5 +57,5 @@ resolution, and key stability across cycles.
 - [ ] Root fast suite passes with the new tests
 
 ## Done summary
-
+Bare fn-N ambiguity now refuses (findEpicByIdOrBare typed EpicIdResolution + terminal ambiguous await state) instead of first-match, agreeing with the board's resolveEpicDep; full-id resolution unchanged. Added a dup-epic-number distress family + a pure per-cycle producer probe that mints a sticky needs-human row for two non-done same-project epics sharing a number and self-clears on resolution — no fold, no new RPC, no schema change.
 ## Evidence
