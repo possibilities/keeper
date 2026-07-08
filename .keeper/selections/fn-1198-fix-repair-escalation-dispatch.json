@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Hypothesis-driven debugging of a silent dispatch gate in the escalation control path",
+      "task_id": "fn-1198-fix-repair-escalation-dispatch.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-surface instrumentation with named dedup requirement \u2014 mechanical",
+      "task_id": "fn-1198-fix-repair-escalation-dispatch.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T20:57:58.069000Z",
+  "epic_id": "fn-1198-fix-repair-escalation-dispatch",
+  "input_hash": "7f36011be0a941a27798f700f402467ae448a0eb68814b6835411b750f134f7a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2134245659,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1198-fix-repair-escalation-dispatch.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1198-fix-repair-escalation-dispatch.2\",\"tier\":\"medium\",\"model\":\"sonnet\"}]}"
+}

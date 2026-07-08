@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-08T20:54:03.439000Z",
   "depends_on": [],
@@ -10,5 +11,5 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Confirm and fix repair dispatch gate",
-  "updated_at": "2026-07-08T20:54:03.439000Z"
+  "updated_at": "2026-07-08T20:57:58.069000Z"
 }
