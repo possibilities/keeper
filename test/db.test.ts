@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
+  computeSchemaFingerprint,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
   DEFAULT_REPO_CLONE_ROOT,
   DEFAULT_REPO_CREATE_ROOT,
@@ -21,6 +22,7 @@ import {
   isTransientBootOpenError,
   MAX_IN_PARAMS,
   openDb,
+  SCHEMA_FINGERPRINT,
   resolveClaudeProjectsRoot,
   resolveConfig,
   resolveDbPath,
@@ -330,6 +332,19 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
   ).toBe(String(SCHEMA_VERSION));
   expect(tailOf(migrated)).toEqual(expectedTail);
   migrated.close();
+});
+
+test("SCHEMA_FINGERPRINT pins the fully-migrated schema shape — re-pin it with EVERY schema change", () => {
+  // The pinned constant is the schema's lock file: any schema change (new
+  // migration block, CREATE-literal edit, bare version bump) moves the live
+  // fingerprint, so this test forces the one-line re-pin in src/db.ts — and two
+  // lanes re-pinning to DIFFERENT hashes always git-conflict on that line,
+  // where two identical "next SCHEMA_VERSION" integers would merge silently.
+  const { db } = openDb(":memory:");
+  const live = computeSchemaFingerprint(db);
+  db.close();
+  expect(live).toMatch(new RegExp(`^v${SCHEMA_VERSION}:[0-9a-f]{64}$`));
+  expect(live).toBe(SCHEMA_FINGERPRINT);
 });
 
 test("openDb adds nullable escalation_instance to jobs + instance_event_id to dispatch_failures, no DEFAULT (fn-1171 task .2)", () => {

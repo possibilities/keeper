@@ -9,6 +9,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -49,6 +50,43 @@ import { parseUsageModels, type UsageModels } from "./usage-models";
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
 export const SCHEMA_VERSION = 116;
+
+/**
+ * Pinned sha256 of the fully-migrated schema shape (see
+ * {@link computeSchemaFingerprint}), version-prefixed. Every schema change —
+ * a new migration block, a CREATE-literal edit, or a bare SCHEMA_VERSION bump —
+ * must re-pin this constant (test/db.test.ts recomputes and compares).
+ *
+ * The point is the git merge rule: two lanes that each change this ONE line to
+ * DIFFERENT hashes always conflict, so two concurrent schema edits can never
+ * silently fuse the way two identical "next version" integers merge clean.
+ * The schema is a singleton resource; this line is its lock file.
+ */
+export const SCHEMA_FINGERPRINT =
+  "v116:b2caf5d9c6fa05f9f1f85ce6819ac3234205a2dab3c0b131df878f3122b465b9";
+
+/**
+ * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
+ * DDL (tables + indexes, internal `sqlite_*` rows excluded — ALTERed columns
+ * appear in the stored CREATE text, so the dump covers migration-only columns
+ * too), prefixed with the binary's SCHEMA_VERSION so even a shape-preserving
+ * bump (a pure rewind) moves the pinned constant. Pure read; deterministic for
+ * a given migrated database.
+ */
+export function computeSchemaFingerprint(db: Database): string {
+  const rows = db
+    .query(
+      `SELECT type, name, sql FROM sqlite_master
+        WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+        ORDER BY type, name`,
+    )
+    .all() as { type: string; name: string; sql: string }[];
+  const dump = rows.map((r) => `${r.type}\t${r.name}\t${r.sql}`).join("\n");
+  const hash = createHash("sha256")
+    .update(`v${SCHEMA_VERSION}\n${dump}`)
+    .digest("hex");
+  return `v${SCHEMA_VERSION}:${hash}`;
+}
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
