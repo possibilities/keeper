@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 16,
+        "files_changed": 3,
+        "insertions": 64
+      },
+      "done_summary": "Scoped NULL-stamped escalation rows per the spec: the escalation-instance isolation fix is\ncomplete and tested (244 tests pass, including a new cross-instance NULL-contamination\nregression test), committed on the epic branch as b37b04d3. Board state reconciled by the\noperator: the worker's `keeper plan done` git commit was lost to a concurrent merge in the\nshared checkout while the daemon projection recorded done; this commit restores the durable\nbacking.",
+      "input_hash": "4ffa2420aa6e160d9345f507b42c87b2d38495cc10e676ce352dca2962bd55ef",
+      "model": "opus",
+      "spec_chars": 2934,
+      "spec_md": "## Description\n\nFix F1 (folding in F3's test): `resolveEscalationJobsFor` at `src/daemon.ts:2206`\nbuilds its instance-scoped read as\n`WHERE plan_verb = ? AND plan_ref = ? AND (escalation_instance = ? OR escalation_instance IS NULL)`\n(line 2222). The `OR escalation_instance IS NULL` arm matches a NULL-stamped row for\nEVERY non-null instance, so a corroboration-miss `stopped` row from a RESOLVED prior\ninstance A (never reaped, since `isEscalationCandidate` requires a non-null instance)\nleaks into a later re-block instance B's stage-3 read. During B's launch window\n(B's latch marked dispatched, B's own SessionStart not yet folded) the classifier\nreads the stale A row as `{terminal:true, verdict:\"declined\"}` and pages the human for\nB before B ran; `human_notified_at` then latches and suppresses B's genuine verdict.\n\nCareful-fix constraint: the NULL fallback is INTENTIONAL (task .3 threaded it so a\ngenuine corroboration-miss session is still visible to its own instance). Do NOT\nsimply strip the NULL arm \u2014 that would orphan a legitimate miss-stamped session for a\ncurrently-blocked instance and it would never page. Instead, prevent a PRIOR instance's\nNULL row from speaking for a NEWER instance: e.g. only include a NULL-stamped row when\nthe caller's `instance` is itself NULL, or gate NULL-inclusion on the row's own\n`plan_ref`/timing (its `blocked_since`/event anchor) so a resolved-instance miss row\ncannot match a later instance. Both callers (unblock's `blocked_since` latch at\ndaemon.ts:8751, deconflict's `instance_event_id` sticky at daemon.ts:9001) must keep\nworking.\n\nFiles: `src/daemon.ts` (`resolveEscalationJobsFor` + its two call sites), plus the\nescalation instance-scope test file.\n\n## Acceptance\n\n- [ ] A NULL-stamped `stopped` row from a resolved prior instance is excluded from a\n      newer non-null instance's `resolveEscalationJobsFor` read.\n- [ ] A genuine corroboration-miss session is still classified/paged for its own\n      block instance (NULL-fallback intent preserved).\n- [ ] Regression test: seed a NULL-instance stopped `unblock` row + scope to a\n      non-null re-block instance, assert the classifier does NOT fire `declined` for\n      the launch-window re-block; keep the existing non-null-stale-instance (100)\n      exclusion case green.\n\n## Done summary\n\nScoped NULL-stamped escalation rows per the spec: the escalation-instance isolation fix is\ncomplete and tested (244 tests pass, including a new cross-instance NULL-contamination\nregression test), committed on the epic branch as b37b04d3. Board state reconciled by the\noperator: the worker's `keeper plan done` git commit was lost to a concurrent merge in the\nshared checkout while the daemon projection recorded done; this commit restores the durable\nbacking.\n\n## Evidence\n\n- Epic-branch commit b37b04d3 (keeper/epic/fn-1179-harden-escalation-instance-isolation)\n- Worker transcript: full suite green incl. the new regression test\n",
+      "task_id": "fn-1179-harden-escalation-instance-isolation.1",
+      "tier": "xhigh",
+      "title": "Scope NULL-stamped escalation rows"
+    }
+  ],
+  "created_at": "2026-07-08T02:23:03.894000Z",
+  "epic_id": "fn-1179-harden-escalation-instance-isolation",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "4ffa2420aa6e160d9345f507b42c87b2d38495cc10e676ce352dca2962bd55ef",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
