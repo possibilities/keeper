@@ -51,6 +51,10 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git blame src/x.ts",
     "git ls-files",
     "git -C /repo log --oneline",
+    // combined-diff `-c` is the log/show subcommand's OWN flag (not a `-c` config
+    // global), so a post-subcommand `-c` before an `=`-bearing token is a read
+    "git log -c --format=%H",
+    "git show -c --format=%H",
     // `git branch` list/inspect forms stay allowed (only mutating forms deny)
     "git branch",
     "git branch -a",
@@ -131,6 +135,15 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git -C /repo -c core.pager=/tmp/x log",
     // --config-env is the same config-injection class (value read from an env var)
     "git --config-env=core.pager=EVIL --paginate log",
+    // a `-c` global reordered BEHIND another valued global still denies — the scan
+    // spans the true pre-subcommand region because gitSubcommandInfo consumes the
+    // valued global's value rather than misreading it as the subcommand
+    "git --git-dir d -c x=y status",
+    "git --namespace log -c core.pager=/tmp/evil log",
+    // an exec-bearing flag on an allowlisted read subcommand runs an arbitrary
+    // program — `git grep --open-files-in-pager`/`-O` opens matches in a pager
+    "git grep --open-files-in-pager=/tmp/evil pattern",
+    "git grep -O/tmp/evil pattern",
     // git branch mutating forms mutate refs from a read-only role (F2);
     // branch-guard cannot cover an escalation session (no agent_id)
     "git branch -D feature",
@@ -142,7 +155,11 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git branch -c src dst",
     "git branch -u origin/main",
     "git branch --set-upstream-to=origin/main topic",
+    "git branch --unset-upstream",
     "git branch --edit-description",
+    // a mutating flag sitting in a filter-flag's value slot still classifies — the
+    // filter-value lookahead consumes only a REAL value, never a following flag
+    "git branch --list -D victim",
     // the bare create/reset form (a positional branch name, no list flag)
     "git branch newbranch",
     "git branch newbranch origin/main",
