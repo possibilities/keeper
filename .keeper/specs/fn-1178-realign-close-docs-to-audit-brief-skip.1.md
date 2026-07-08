@@ -19,4 +19,11 @@ Files to edit:
 
 ## Done summary
 
+Realigned the close SKILL docs and problem-codes to the audit-brief skip contract; landed on
+main as 58770eed. Board state reconciled by the operator: the done stamp's git commit was
+lost to the same concurrent-merge window while the daemon projection recorded done; this
+commit restores the durable backing.
+
 ## Evidence
+
+- main commit 58770eed (docs(plan): realign close SKILL + problem-codes to audit-brief skip contract)
