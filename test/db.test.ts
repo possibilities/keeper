@@ -31,6 +31,7 @@ import {
   resolveRepoForkRoot,
   resolveSockPath,
   SCHEMA_FINGERPRINT,
+  SCHEMA_STEPS,
   SCHEMA_VERSION,
   selectWorldRev,
 } from "../src/db";
@@ -345,6 +346,48 @@ test("SCHEMA_FINGERPRINT pins the fully-migrated schema shape — re-pin it with
   db.close();
   expect(live).toMatch(new RegExp(`^v${SCHEMA_VERSION}:[0-9a-f]{64}$`));
   expect(live).toBe(SCHEMA_FINGERPRINT);
+});
+
+test("SCHEMA_STEPS versions are unique — a duplicate version is a structural error", () => {
+  const versions = SCHEMA_STEPS.map((s) => s.version);
+  const uniq = new Set(versions);
+  expect(uniq.size).toBe(versions.length);
+});
+
+test("SCHEMA_STEPS versions are strictly increasing in array order — a reorder is a structural error", () => {
+  const versions = SCHEMA_STEPS.map((s) => s.version);
+  for (let i = 1; i < versions.length; i++) {
+    expect(versions[i]).toBeGreaterThan(versions[i - 1]);
+  }
+});
+
+test("SCHEMA_STEPS versions are contiguous from the ladder floor to the tail — a gap is a structural error", () => {
+  const versions = SCHEMA_STEPS.map((s) => s.version);
+  const floor = versions[0];
+  const tail = versions[versions.length - 1];
+  const expected = Array.from(
+    { length: tail - floor + 1 },
+    (_, i) => floor + i,
+  );
+  expect(versions).toEqual(expected);
+});
+
+test("SCHEMA_STEPS tail equals SCHEMA_VERSION — the derived constant must track the ladder", () => {
+  expect(SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version).toBe(SCHEMA_VERSION);
+});
+
+test("every SCHEMA_STEPS entry carries a machine-readable kind discriminant", () => {
+  const validKinds = new Set([
+    "additive",
+    "rewind",
+    "backfill",
+    "drop",
+    "noop",
+  ]);
+  for (const step of SCHEMA_STEPS) {
+    expect(typeof step.kind).toBe("string");
+    expect(validKinds.has(step.kind)).toBe(true);
+  }
 });
 
 test("openDb adds nullable escalation_instance to jobs + instance_event_id to dispatch_failures, no DEFAULT (fn-1171 task .2)", () => {

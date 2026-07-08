@@ -16,6 +16,9 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Re-fold**: Rebuilding a projection by replaying every event, which stays deterministic only because a fold never reads wall-clock, environment, or the filesystem. Avoid: rebuild, replay-repair, reprocess.
 - **Dead letter**: An event the reducer could not fold, parked for inspection and later replay instead of crashing the fold. Avoid: error queue, poison message, reject.
 - **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a rewind. Avoid: snapshot, ephemeral view, scratch state.
+- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed. Avoid: registry (that word belongs to Usage-model registry), migration list, schema chain.
+- **Additive-idempotent step**: A migration ladder step whose `kind` only adds structure and converges safely on repeated application, the one class a merge-time renumber may resolve mechanically without a human. Avoid: safe migration, non-destructive step, idempotent guard.
+- **Schema singleton**: The property that keeper's schema is one lane-at-a-time resource, so two concurrent schema edits are meant to collide at merge rather than compose silently. Avoid: shared resource, lock file, mutex.
 
 ## Plan board
 
