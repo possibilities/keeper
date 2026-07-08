@@ -302,6 +302,46 @@ export function isStaleBaseDistressKey(verb: string, id: string): boolean {
 }
 
 /**
+ * The synthetic PER-(PROJECT,NUMBER) distress signal for a landed DUPLICATE plan number —
+ * two non-done epics in the SAME project sharing one `epic_number`. The mint guard refuses
+ * a same-project duplicate up front, but a number that slips through anyway (a merge-window
+ * race, a hand-authored file) must surface loudly rather than let a bare `fn-N` resolve to
+ * a coin-flip. A once-per-reconcile producer probe (a pure O(open epics) read over the live
+ * `epics` projection — NEVER a fold, NEVER per-event) flags each duplicate pair and mints
+ * this sticky row. Mirrors the shared-checkout-wedge idiom EXACTLY but on its OWN id/reason
+ * so the surfaces never cross-clear: it shares the un-retryable synthetic `daemon` verb
+ * (routes as {@link routeDispatchFailure}'s `unknown` arm — never in `failedKeys`, never
+ * `retry_dispatch`-clearable), the boot orphan-GC exemption, and a probe level-clear — but
+ * the `id` is per-(project,number) (`dup-epic-number:<projectHash>-<number>`), so two
+ * distinct duplicated numbers, or the same number in two projects, surface independently.
+ * Its ONLY clear is the probe's level-trigger observing the duplicate no longer holds (a
+ * conflicting epic renumbered, deleted, or gone done — a duplicate involving a DONE epic is
+ * history, not a jam, so the probe scopes to non-done pairs). The `reason` lives OUTSIDE
+ * {@link WORKTREE_RECOVER_REASON_PREFIX}. In-memory grace tracking, so a daemon restart
+ * re-emits at most once per still-present duplicate. Prefix-disjoint from every existing
+ * family (recover/finalize/shared-wedge/shared-dirty/slot/crash-loop/lane-premerge/lane-
+ * wedge/stale-base/shared-desync).
+ */
+export const DUP_EPIC_NUMBER_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX = "dup-epic-number:";
+export const DUP_EPIC_NUMBER_DISTRESS_REASON = "dup-epic-number";
+
+/**
+ * True iff `(verb, id)` is a duplicate-epic-number distress key — the synthetic `daemon`
+ * verb plus the {@link DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX} per-(project,number) id. The boot
+ * orphan-GC exempts it (like the lane-wedge / stale-base / shared-desync + crash-loop keys)
+ * since a live level-trigger — not the operator surface — clears it; pure, dep-free, NEVER
+ * throws. Disjoint from every other distress predicate: the `dup-epic-number:` id prefix
+ * never matches another family's prefix, so the rows never cross-classify or cross-clear.
+ */
+export function isDupEpicNumberDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === DUP_EPIC_NUMBER_DISTRESS_VERB &&
+    id.startsWith(DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX)
+  );
+}
+
+/**
  * The synthetic PER-REPO distress signal for a shared MAIN checkout left DESYNCED by a
  * plumbing base→default merge whose post-merge resync was SKIPPED or ABORTED — the ref
  * advanced (`refs/heads/<default>` moved to the merged commit) but the working tree did
@@ -402,6 +442,7 @@ export type DispatchFailureDisplayKind =
   | "lane-premerge"
   | "lane-wedge"
   | "stale-base"
+  | "dup-epic-number"
   | "stuck-sentinel";
 
 /**
@@ -441,6 +482,9 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // Prefix-disjoint from every rule above (`stale-base-lane` shares no stem), so
   // ordering is not load-bearing here — appended last, its own kind.
   { prefix: STALE_BASE_DISTRESS_REASON, kind: "stale-base" },
+  // Prefix-disjoint from every rule above (`dup-epic-number` shares no stem), so
+  // ordering is not load-bearing here — its own kind.
+  { prefix: DUP_EPIC_NUMBER_DISTRESS_REASON, kind: "dup-epic-number" },
   // The stuck-state-sentinel anomaly (`stuck-sentinel`) — prefix-disjoint from
   // every rule above, so ordering is not load-bearing; appended last, own kind.
   { prefix: STUCK_SENTINEL_DISTRESS_REASON, kind: "stuck-sentinel" },

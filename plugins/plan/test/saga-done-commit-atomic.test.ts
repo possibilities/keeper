@@ -30,7 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { autoCommitFromInvocation, CommitFailed } from "../src/commit.ts";
-import { realGitVcs, resetVcs } from "../src/vcs.ts";
+import { type PlanVcs, realGitVcs, resetVcs, setVcs } from "../src/vcs.ts";
 import { runDone } from "../src/verbs/done.ts";
 import { failNextCommit } from "./fake-vcs.ts";
 import {
@@ -449,9 +449,12 @@ describe.skipIf(!SLOW_ENABLED)(
     // getVcs().restoreIndexToHead(...) call inside done.ts's onCommitFailure
     // would pass every existing test. This case calls runDone directly (the same
     // exported entry point the CLI dispatches to — `--project` makes locating
-    // explicit so no cwd/roots-config plumbing is needed) against the real-git
-    // mid-merge fixture, so the verb's OWN onCommitFailure closure runs the real
-    // unwind, not a hand-reconstruction.
+    // explicit so no cwd/roots-config plumbing is needed) so the verb's OWN
+    // onCommitFailure closure runs the real unwind, not a hand-reconstruction. The
+    // pre-write merge probe now refuses a real MERGE_HEAD before done writes, so
+    // onCommitFailure is reachable only via the TOCTOU window (the merge begins
+    // AFTER the probe passes) — modeled with a facade reporting a clean probe but a
+    // real partial-commit refusal on the pathspec commit.
     test("runDone itself unwinds the index on a mid-merge partial-commit refusal", () => {
       const taskId = "fn-2-real.1";
       const relTask = `.keeper/tasks/${taskId}.json`;
@@ -470,7 +473,6 @@ describe.skipIf(!SLOW_ENABLED)(
       writeFileSync(absSpec, baseSpec, "utf-8");
       git(["add", "-A"], repo);
       git(["commit", "-q", "-m", "seed baseline"], repo);
-      const headSha = git(["rev-parse", "HEAD"], repo).trim();
 
       // The pre-done runtime overlay `done` reads under its task lock: in_progress
       // with a matching assignee — exactly the shape a non-force `done` requires.
@@ -479,8 +481,21 @@ describe.skipIf(!SLOW_ENABLED)(
         assignee: "test@example.com",
       });
 
-      // Mid-merge, reproduced by writing the ref directly (same fixture as above).
-      writeFileSync(join(repo, ".git", "MERGE_HEAD"), `${headSha}\n`, "utf-8");
+      // A facade reporting a CLEAN probe (the TOCTOU window: the merge began after
+      // the pre-write probe) but failing the pathspec commit with git's real
+      // partial-commit stderr. Real stage + restoreIndexToHead delegate through, so
+      // the index assertions prove done.ts's OWN onCommitFailure wiring end-to-end.
+      const hybrid: PlanVcs = {
+        ...realGitVcs,
+        inProgressOp: () => "none",
+        commit: () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: "error: cannot do a partial commit during a merge.",
+          sha: "",
+        }),
+      };
+      setVcs(hybrid);
 
       // runDone reaches emitMutating's process.exit(1) on the commit failure and
       // getActor()/buildPlanInvocation's session-id resolution off real
@@ -517,15 +532,18 @@ describe.skipIf(!SLOW_ENABLED)(
           throw e;
         }
       } finally {
+        resetVcs();
         process.exit = priorExit;
         process.stdout.write = priorWrite;
         setOrDeleteEnv("CLAUDE_CODE_SESSION_ID", priorSessionId);
         setOrDeleteEnv("KEEPER_PLAN_ACTOR", priorActor);
       }
 
-      // The mid-merge refusal surfaced through runDone's own emitMutating path.
+      // The partial-commit refusal surfaced through runDone's own emitMutating
+      // path (a commit_failed envelope carrying the merge_in_progress class).
       expect(exitCode).toBe(1);
       expect(stdout).toContain("commit_failed");
+      expect(stdout).toContain("merge_in_progress");
       expect(stdout).toContain("partial commit during a merge");
 
       // F1, driven end-to-end: a clean index after runDone's OWN onCommitFailure

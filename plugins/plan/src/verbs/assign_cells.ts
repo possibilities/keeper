@@ -36,6 +36,12 @@ import { existsSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  acquirePlanCommitGuard,
+  type RollbackEntry,
+  restoreForRollback,
+  snapshotForRollback,
+} from "../commit.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
@@ -50,6 +56,7 @@ import {
   SELECTION_SCHEMA_VERSION,
   type SelectionSidecar,
   type SidecarAuditPolicy,
+  selectionSidecarPath,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
 import {
@@ -293,165 +300,204 @@ export function runAssignCells(args: AssignCellsArgs): number {
   // no flag, captured in the sidecar's audit_policy provenance.
   const auditLoad = loadAuditFlags();
 
-  type FlockOutcome =
-    | { kind: "failure"; code: string; message: string; details: string[] }
-    | { kind: "success"; taskIds: string[] };
-
-  const outcomeResult = withEpicIdLock<FlockOutcome>(() => {
-    const stateStore = new LocalFileStateStore(ctx.stateDir);
-
-    // Enumerate the epic's tasks + their live status (re-read INSIDE the lock).
-    const epicTaskIds = new Set(epicTaskStems(dataDir, epicId));
-    const todo = new Set<string>();
-    for (const tid of epicTaskIds) {
-      const def = loadJsonSafe(join(dataDir, "tasks", `${tid}.json`)) ?? {};
-      const status = mergeTaskState(def, stateStore.loadRuntime(tid)).status;
-      if (status === "todo") {
-        todo.add(tid);
-      }
-    }
-
-    const cellErrors: string[] = [];
-    const seen = new Set<string>();
-    for (let idx = 0; idx < parsedCells.length; idx += 1) {
-      const c = parsedCells[idx] as ParsedCell;
-      const prefix = `cells #${idx + 1} (${c.taskId})`;
-      if (!efforts.includes(c.tier)) {
-        cellErrors.push(
-          `${prefix}: tier ${pyReprStr(c.tier)} is not one of ${efforts.join(", ")}`,
-        );
-      }
-      if (!models.includes(c.model)) {
-        cellErrors.push(
-          `${prefix}: model ${pyReprStr(c.model)} is not one of ${models.join(", ")}`,
-        );
-      }
-      if (!epicTaskIds.has(c.taskId)) {
-        cellErrors.push(
-          `${prefix}: unknown task id — not a task of epic ${epicId}`,
-        );
-      } else if (!todo.has(c.taskId)) {
-        cellErrors.push(
-          `${prefix}: task is not in \`todo\` status — assign-cells targets ` +
-            "todo tasks only",
-        );
-      }
-      if (seen.has(c.taskId)) {
-        cellErrors.push(`${prefix}: duplicate cell for task ${c.taskId}`);
-      }
-      seen.add(c.taskId);
-    }
-
-    // Full-set contract: every todo task must be covered by exactly one cell.
-    for (const tid of [...todo].sort()) {
-      if (!seen.has(tid)) {
-        cellErrors.push(
-          `coverage: todo task ${tid} is not covered by any cell ` +
-            "(full-set contract — choosing the default is an explicit cell)",
-        );
-      }
-    }
-
-    if (cellErrors.length > 0) {
-      return {
-        kind: "failure",
-        code: "cell_invalid",
-        message: "One or more selection cells are invalid",
-        details: cellErrors,
-      };
-    }
-
-    // --- mutate: overwrite tier/model + stamp audit_required per cell ------
-    // audit_required is written explicitly (true or false) on every cell so a
-    // re-run after a policy change correctly flips a stale flag; a degrade loads
-    // no flags, so every cell resolves false.
-    const now = nowIso();
-    const flaggedTaskIds: string[] = [];
-    for (const c of parsedCells) {
-      const tp = join(dataDir, "tasks", `${c.taskId}.json`);
-      const tdef = loadJson(tp);
-      tdef.tier = c.tier;
-      tdef.model = c.model;
-      const flagged = auditLoad.ok && auditLoad.flags[c.tier] === true;
-      tdef.audit_required = flagged;
-      if (flagged) {
-        flaggedTaskIds.push(c.taskId);
-      }
-      tdef.updated_at = now;
-      atomicWriteJson(tp, tdef, dataDir);
-    }
-
-    const auditPolicy: SidecarAuditPolicy = auditLoad.ok
-      ? { status: "applied", reason: null, flagged_task_ids: flaggedTaskIds }
-      : { status: "degraded", reason: auditLoad.reason, flagged_task_ids: [] };
-
-    // --- sidecar: schema-versioned provenance, REPLACE (no append) --
-    const sidecar: SelectionSidecar = {
-      schema_version: SELECTION_SCHEMA_VERSION,
-      epic_id: epicId,
-      created_at: now,
-      selector: { harness: selHarness, model: selModel },
-      config_hash: configHash,
-      input_hash: inputHash,
-      shuffle_seed: shuffleSeed,
-      outcome,
-      verdict_raw: verdictRaw,
-      cells: parsedCells.map((c) => ({
-        task_id: c.taskId,
-        tier: c.tier,
-        model: c.model,
-        rationale: c.rationale,
-        confidence: c.confidence,
-        label_source: c.labelSource,
-      })),
-      audit_policy: auditPolicy,
-    };
-    writeSelectionSidecar(dataDir, sidecar);
-
-    return { kind: "success", taskIds: parsedCells.map((c) => c.taskId) };
-  });
-
-  if (outcomeResult.kind === "failure") {
-    emitFailureEnvelope(
-      outcomeResult.code,
-      outcomeResult.message,
-      outcomeResult.details,
-    );
+  // Merge-window guard + commit-work serialization (commit-work OUTER, epic-id
+  // flock INNER): refuse a mid-operation write before touching state, else hold
+  // the shared lock across the write -> auto-commit window, released via finally.
+  const commitGuard = acquirePlanCommitGuard(primaryRepo);
+  if (commitGuard.kind === "refused") {
+    emitFailureEnvelope("merge_in_progress", commitGuard.message, [
+      commitGuard.detail,
+    ]);
     return 1;
   }
+  try {
+    type FlockOutcome =
+      | { kind: "failure"; code: string; message: string; details: string[] }
+      | { kind: "success"; taskIds: string[]; rollback: RollbackEntry[] };
 
-  // ------------------------------------------------------------------
-  // Phase 4.5: post-write integrity gate (OUTSIDE the lock). assign-cells IS an
-  // INTEGRITY_GATE_VERBS member: re-validate the post-mutation tree and bump the
-  // epic's updated_at on a clean result — the marker stays untouched.
-  // checkFilesystemRepos stays false — the verb changes only tier/model, never
-  // repo paths, so re-probing repos on disk would add nothing but a spurious
-  // failure surface.
-  // ------------------------------------------------------------------
-  integrityGateOrFail(epicId, dataDir, { verb: "assign-cells" });
-  const epicDefAfter = loadJson(epicPath);
-  epicDefAfter.updated_at = nowIso();
-  atomicWriteJson(epicPath, epicDefAfter, dataDir);
+    const outcomeResult = withEpicIdLock<FlockOutcome>(() => {
+      const stateStore = new LocalFileStateStore(ctx.stateDir);
 
-  // ------------------------------------------------------------------
-  // Phase 5: emit ONE envelope covering the whole batch (OUTSIDE the lock). The
-  // auto-commit stages the mutated task JSONs, the epic updated_at bump, AND the
-  // sidecar (a non-gitignored `selections/` path) in one commit before this prints.
-  // ------------------------------------------------------------------
-  emitMutating(
-    {
-      epic_id: epicId,
-      assigned_task_ids: outcomeResult.taskIds,
-      outcome,
-    },
-    {
-      verb: "assign-cells",
-      target: epicId,
-      repoRoot: ctx.projectPath,
-      primaryRepo,
-    },
-  );
-  return 0;
+      // Enumerate the epic's tasks + their live status (re-read INSIDE the lock).
+      const epicTaskIds = new Set(epicTaskStems(dataDir, epicId));
+      const todo = new Set<string>();
+      for (const tid of epicTaskIds) {
+        const def = loadJsonSafe(join(dataDir, "tasks", `${tid}.json`)) ?? {};
+        const status = mergeTaskState(def, stateStore.loadRuntime(tid)).status;
+        if (status === "todo") {
+          todo.add(tid);
+        }
+      }
+
+      const cellErrors: string[] = [];
+      const seen = new Set<string>();
+      for (let idx = 0; idx < parsedCells.length; idx += 1) {
+        const c = parsedCells[idx] as ParsedCell;
+        const prefix = `cells #${idx + 1} (${c.taskId})`;
+        if (!efforts.includes(c.tier)) {
+          cellErrors.push(
+            `${prefix}: tier ${pyReprStr(c.tier)} is not one of ${efforts.join(", ")}`,
+          );
+        }
+        if (!models.includes(c.model)) {
+          cellErrors.push(
+            `${prefix}: model ${pyReprStr(c.model)} is not one of ${models.join(", ")}`,
+          );
+        }
+        if (!epicTaskIds.has(c.taskId)) {
+          cellErrors.push(
+            `${prefix}: unknown task id — not a task of epic ${epicId}`,
+          );
+        } else if (!todo.has(c.taskId)) {
+          cellErrors.push(
+            `${prefix}: task is not in \`todo\` status — assign-cells targets ` +
+              "todo tasks only",
+          );
+        }
+        if (seen.has(c.taskId)) {
+          cellErrors.push(`${prefix}: duplicate cell for task ${c.taskId}`);
+        }
+        seen.add(c.taskId);
+      }
+
+      // Full-set contract: every todo task must be covered by exactly one cell.
+      for (const tid of [...todo].sort()) {
+        if (!seen.has(tid)) {
+          cellErrors.push(
+            `coverage: todo task ${tid} is not covered by any cell ` +
+              "(full-set contract — choosing the default is an explicit cell)",
+          );
+        }
+      }
+
+      if (cellErrors.length > 0) {
+        return {
+          kind: "failure",
+          code: "cell_invalid",
+          message: "One or more selection cells are invalid",
+          details: cellErrors,
+        };
+      }
+
+      // Snapshot every path this verb writes BEFORE mutating — the per-cell task
+      // JSONs + the selection sidecar (both here) and the epic JSON (its
+      // updated_at bump lands in Phase 4.5, OUTSIDE the lock, but the commit
+      // covers it). All are existing files bar a first-time sidecar, so a
+      // commit-failure rollback restores each one's prior bytes (or unlinks a
+      // fresh sidecar) and unstages the set.
+      const rollbackPaths: string[] = [
+        epicPath,
+        selectionSidecarPath(dataDir, epicId),
+      ];
+      for (const c of parsedCells) {
+        rollbackPaths.push(join(dataDir, "tasks", `${c.taskId}.json`));
+      }
+      const rollback = snapshotForRollback(rollbackPaths);
+
+      // --- mutate: overwrite tier/model + stamp audit_required per cell ------
+      // audit_required is written explicitly (true or false) on every cell so a
+      // re-run after a policy change correctly flips a stale flag; a degrade loads
+      // no flags, so every cell resolves false.
+      const now = nowIso();
+      const flaggedTaskIds: string[] = [];
+      for (const c of parsedCells) {
+        const tp = join(dataDir, "tasks", `${c.taskId}.json`);
+        const tdef = loadJson(tp);
+        tdef.tier = c.tier;
+        tdef.model = c.model;
+        const flagged = auditLoad.ok && auditLoad.flags[c.tier] === true;
+        tdef.audit_required = flagged;
+        if (flagged) {
+          flaggedTaskIds.push(c.taskId);
+        }
+        tdef.updated_at = now;
+        atomicWriteJson(tp, tdef, dataDir);
+      }
+
+      const auditPolicy: SidecarAuditPolicy = auditLoad.ok
+        ? { status: "applied", reason: null, flagged_task_ids: flaggedTaskIds }
+        : {
+            status: "degraded",
+            reason: auditLoad.reason,
+            flagged_task_ids: [],
+          };
+
+      // --- sidecar: schema-versioned provenance, REPLACE (no append) --
+      const sidecar: SelectionSidecar = {
+        schema_version: SELECTION_SCHEMA_VERSION,
+        epic_id: epicId,
+        created_at: now,
+        selector: { harness: selHarness, model: selModel },
+        config_hash: configHash,
+        input_hash: inputHash,
+        shuffle_seed: shuffleSeed,
+        outcome,
+        verdict_raw: verdictRaw,
+        cells: parsedCells.map((c) => ({
+          task_id: c.taskId,
+          tier: c.tier,
+          model: c.model,
+          rationale: c.rationale,
+          confidence: c.confidence,
+          label_source: c.labelSource,
+        })),
+        audit_policy: auditPolicy,
+      };
+      writeSelectionSidecar(dataDir, sidecar);
+
+      return {
+        kind: "success",
+        taskIds: parsedCells.map((c) => c.taskId),
+        rollback,
+      };
+    });
+
+    if (outcomeResult.kind === "failure") {
+      emitFailureEnvelope(
+        outcomeResult.code,
+        outcomeResult.message,
+        outcomeResult.details,
+      );
+      return 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4.5: post-write integrity gate (OUTSIDE the lock). assign-cells IS an
+    // INTEGRITY_GATE_VERBS member: re-validate the post-mutation tree and bump the
+    // epic's updated_at on a clean result — the marker stays untouched.
+    // checkFilesystemRepos stays false — the verb changes only tier/model, never
+    // repo paths, so re-probing repos on disk would add nothing but a spurious
+    // failure surface.
+    // ------------------------------------------------------------------
+    integrityGateOrFail(epicId, dataDir, { verb: "assign-cells" });
+    const epicDefAfter = loadJson(epicPath);
+    epicDefAfter.updated_at = nowIso();
+    atomicWriteJson(epicPath, epicDefAfter, dataDir);
+
+    // ------------------------------------------------------------------
+    // Phase 5: emit ONE envelope covering the whole batch (OUTSIDE the lock). The
+    // auto-commit stages the mutated task JSONs, the epic updated_at bump, AND the
+    // sidecar (a non-gitignored `selections/` path) in one commit before this prints.
+    // ------------------------------------------------------------------
+    emitMutating(
+      {
+        epic_id: epicId,
+        assigned_task_ids: outcomeResult.taskIds,
+        outcome,
+      },
+      {
+        verb: "assign-cells",
+        target: epicId,
+        repoRoot: ctx.projectPath,
+        primaryRepo,
+        onCommitFailure: () =>
+          restoreForRollback(outcomeResult.rollback, primaryRepo),
+      },
+    );
+    return 0;
+  } finally {
+    commitGuard.release();
+  }
 }
 
 // --- Local helpers ---------------------------------------------------------

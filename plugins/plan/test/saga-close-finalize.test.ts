@@ -29,6 +29,7 @@ import {
   CLOSE_OUTCOMES,
   type CloseOutcome,
 } from "../src/verbs/close_finalize.ts";
+import { armInProgressOp } from "./fake-vcs.ts";
 import {
   fakeDirtyPaths,
   firstJsonPayload,
@@ -296,6 +297,39 @@ describe("close-finalize closed_with_followup", () => {
     // the finalize chokepoint flips last_validated_at null→timestamp so autopilot
     // can dispatch it once the source is closed (never a permanent ghost).
     expect(newDef.last_validated_at).not.toBeNull();
+  });
+
+  test("a follow-up scaffold that hits the merge window is retryable, not terminal", () => {
+    // The follow-up scaffold delegate refuses mid-operation (merge_in_progress);
+    // close-finalize passes that class through as a distinct RE-RUNNABLE outcome
+    // rather than terminal SCAFFOLD_FAILED, and the source epic stays open so a
+    // re-close once the window closes completes.
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, KEPT_ONE, "Merge blocked followup");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    // The state repo (the epic's primary_repo) is mid-merge when the delegated
+    // scaffold fires.
+    armInProgressOp(proj.root, "merge");
+    const { code, env } = finalize(proj, epicId);
+
+    expect(code).not.toBe(0);
+    expect((env.error as Record<string, unknown>).code).toBe(
+      "MERGE_IN_PROGRESS",
+    );
+    // Distinct from terminal SCAFFOLD_FAILED and NOT a terminal close outcome.
+    expect((env.error as Record<string, unknown>).code).not.toBe(
+      "SCAFFOLD_FAILED",
+    );
+    // The source epic is untouched — the irreversible close never ran.
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+
+    // The merge window closes; a re-run completes the close (fresh scaffold + close).
+    armInProgressOp(proj.root, "none");
+    const rerun = finalize(proj, epicId);
+    expect(rerun.code).toBe(0);
+    expect(rerun.env.outcome).toBe("closed_with_followup");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
   });
 
   test("an unrelated open dependent (no stamp) is NOT adopted", () => {

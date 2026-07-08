@@ -34,10 +34,17 @@
 import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import {
+  acquirePlanCommitGuard,
+  type RollbackEntry,
+  restoreForRollback,
+  snapshotForRollback,
+} from "../commit.ts";
 import { detectCycles } from "../deps.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
-import { isEpicId, isTaskId, scanMaxTaskId } from "../ids.ts";
+import { appendTaskRecord, ledgerMaxTaskNum } from "../id_ledger.ts";
+import { isEpicId, isTaskId, parseId, scanMaxTaskId } from "../ids.ts";
 import { integrityGateOrFail } from "../integrity_gate.ts";
 import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
@@ -480,324 +487,383 @@ export function runRefineApply(args: RefineApplyArgs): number {
   // the lock; success carries out the fields Phase 4.5 + emit() need. The
   // integrity gate / emit NEVER run inside the lock.
   // ------------------------------------------------------------------
-  type FlockOutcome =
-    | { kind: "failure"; code: string; message: string; details: string[] }
-    | {
-        kind: "success";
-        newTaskIds: string[];
-        writtenPaths: string[];
-      };
-
-  const outcome = withEpicIdLock<FlockOutcome>(() => {
-    const maxTask = scanMaxTaskId(dataDir, epicId);
-    // Two-pass: ordinal i (1-based into add_tasks) -> id `epic_id.{max+i}`.
-    const newIdByOrdinal = new Map<number, string>();
-    for (let i = 1; i <= nNew; i += 1) {
-      newIdByOrdinal.set(i, `${epicId}.${maxTask + i}`);
-    }
-    const newTaskIds: string[] = [];
-    for (let i = 1; i <= nNew; i += 1) {
-      newTaskIds.push(newIdByOrdinal.get(i) as string);
-    }
-
-    // The full set of task ids that exist AFTER the delta lands.
-    const postDeltaIds = new Set<string>([...existingTaskIds, ...newTaskIds]);
-
-    // --- target existence: rewrites/rewires must hit existing tasks ----
-    const targetErrors: string[] = [];
-    for (const tid of rewriteTargets) {
-      if (!existingTaskIds.has(tid)) {
-        targetErrors.push(
-          `rewrite_specs: task ${tid} does not exist in epic ${epicId}`,
-        );
-      }
-    }
-    for (const tid of rewireTargets) {
-      if (!existingTaskIds.has(tid)) {
-        targetErrors.push(
-          `rewire_deps: task ${tid} does not exist in epic ${epicId}`,
-        );
-      }
-    }
-    if (targetErrors.length > 0) {
-      return {
-        kind: "failure",
-        code: "target_invalid",
-        message: "One or more rewrite/rewire targets are invalid",
-        details: targetErrors,
-      };
-    }
-
-    // --- resolve new-task deps (existing id str OR new-ordinal int) ----
-    const resolvedNewDeps: string[][] = [];
-    for (let i = 1; i <= nNew; i += 1) {
-      const resolved: string[] = [];
-      for (const d of newDepsRaw[i - 1] as (string | number)[]) {
-        if (typeof d === "string") {
-          if (!postDeltaIds.has(d)) {
-            depErrors.push(
-              `add_tasks #${i}: dep ${pyReprStr(d)} references a task absent ` +
-                "after the delta",
-            );
-          } else {
-            resolved.push(d);
-          }
-        } else {
-          // int ordinal into add_tasks
-          if (d < 1 || d > nNew) {
-            depErrors.push(
-              `add_tasks #${i}: dep ordinal ${d} out of range ` +
-                `(must be 1..${nNew})`,
-            );
-          } else if (d === i) {
-            depErrors.push(
-              `add_tasks #${i}: dep ordinal ${d} is self-referential`,
-            );
-          } else {
-            resolved.push(newIdByOrdinal.get(d) as string);
-          }
-        }
-      }
-      resolvedNewDeps.push(resolved);
-    }
-
-    // --- validate rewired dep targets exist post-delta -----------------
-    for (let idx = 0; idx < rewireTargets.length; idx += 1) {
-      const tid = rewireTargets[idx] as string;
-      for (const d of rewireDepsLists[idx] as string[]) {
-        if (!isTaskId(d)) {
-          depErrors.push(
-            `rewire_deps ${tid}: dep ${pyReprStr(d)} is not a valid task id`,
-          );
-        } else if (!postDeltaIds.has(d)) {
-          depErrors.push(
-            `rewire_deps ${tid}: dep ${pyReprStr(d)} references a task absent ` +
-              "after the delta",
-          );
-        } else if (d === tid) {
-          depErrors.push(
-            `rewire_deps ${tid}: dep ${pyReprStr(d)} is self-referential`,
-          );
-        }
-      }
-    }
-
-    if (depErrors.length > 0) {
-      return {
-        kind: "failure",
-        code: "dep_invalid",
-        message: "One or more task dependencies are invalid",
-        details: depErrors,
-      };
-    }
-
-    // --- build the POST-delta graph and detect cycles ------------------
-    // Load existing tasks' current dep lists, then overlay rewires + adds.
-    // Also capture each existing task's target_repo (if any) for the
-    // touched_repos rollup. detectCycles iteration order decides which cycle
-    // surfaces; sort node ids + adjacency lists for cross-engine determinism.
-    const graph: Record<string, { depends_on: string[] }> = {};
-    const existingTargetRepos: string[] = [];
-    for (const tid of [...existingTaskIds].sort()) {
-      const tdef = loadJson(join(dataDir, "tasks", `${tid}.json`));
-      graph[tid] = {
-        depends_on: [...((tdef.depends_on as string[] | undefined) ?? [])],
-      };
-      const etr = tdef.target_repo;
-      if (etr) {
-        existingTargetRepos.push(etr as string);
-      }
-    }
-    for (let idx = 0; idx < rewireTargets.length; idx += 1) {
-      const tid = rewireTargets[idx] as string;
-      graph[tid] = { depends_on: [...(rewireDepsLists[idx] as string[])] };
-    }
-    for (let i = 1; i <= nNew; i += 1) {
-      graph[newIdByOrdinal.get(i) as string] = {
-        depends_on: resolvedNewDeps[i - 1] as string[],
-      };
-    }
-
-    const cycle = detectCycles(graph);
-    if (cycle) {
-      return {
-        kind: "failure",
-        code: "dep_cycle",
-        message: "Post-delta task dependency graph contains a cycle",
-        details: [`cycle: ${cycle.join(" -> ")}`],
-      };
-    }
-
-    // --- backstop collision check on new-task paths --------------------
-    const collisions: string[] = [];
-    for (let i = 1; i <= nNew; i += 1) {
-      const tid = newIdByOrdinal.get(i) as string;
-      const tp = join(dataDir, "tasks", `${tid}.json`);
-      const sp = join(dataDir, "specs", `${tid}.md`);
-      if (existsFile(tp)) {
-        collisions.push(`task JSON exists: ${tp}`);
-      }
-      if (existsFile(sp)) {
-        collisions.push(`task spec exists: ${sp}`);
-      }
-    }
-    if (collisions.length > 0) {
-      return {
-        kind: "failure",
-        code: "id_collision",
-        message: `Allocated new-task ids under ${epicId} would overwrite existing files`,
-        details: collisions,
-      };
-    }
-
-    // --------------------------------------------------------------
-    // Phase 4: mutate — assert-all is done; write the delta.
-    // --------------------------------------------------------------
-    const now = nowIso();
-
-    const epicDef = loadJson(epicPath);
-    epicDef.updated_at = now;
-    const epicTargetRepo = epicDef.primary_repo as string | null | undefined;
-
-    // Resolve per-new-task target_repos: each null defaults to epic.primary_repo.
-    // touched_repos is recomputed on EVERY invocation as the sorted-uniq rollup
-    // of every task's resolved target_repo. Falsy values are filtered so the
-    // sort never compares str <-> null.
-    const resolvedNewTargetRepos: (string | null)[] = newTargetRepos.map(
-      (tr) => (tr !== null ? tr : (epicTargetRepo ?? null)),
-    );
-    const touchedSet = new Set<string>();
-    for (const tr of existingTargetRepos) {
-      if (tr) {
-        touchedSet.add(tr);
-      }
-    }
-    for (const tr of resolvedNewTargetRepos) {
-      if (tr) {
-        touchedSet.add(tr);
-      }
-    }
-    epicDef.touched_repos = [...touchedSet].sort();
-
-    // Track FRESH-MINT writes for the mid-write / Phase-4.5 unwind. CRITICAL:
-    // existing-file rewrites (epic JSON, epic spec, rewrite_/rewire_ targets)
-    // are OMITTED — atomicWrite is rename-based, so a mid-write failure leaves
-    // their previous bytes intact; unlinking them would destroy user data.
-    const writtenPaths: string[] = [];
-    try {
-      // Existing-file rewrite — NOT recorded for unwind.
-      atomicWriteJson(epicPath, epicDef, dataDir);
-      if (epicSpecRewrite !== null) {
-        // Existing-file rewrite — NOT recorded for unwind.
-        atomicWrite(epicSpecPath, epicSpecRewrite, dataDir);
-      }
-
-      // New tasks (two-pass id allocation already resolved deps to ids).
-      // FRESH-MINT paths — recorded for unwind.
-      for (let i = 1; i <= nNew; i += 1) {
-        const tid = newIdByOrdinal.get(i) as string;
-        const taskDef: Record<string, unknown> = {
-          id: tid,
-          epic: epicId,
-          title: newTitles[i - 1],
-          priority: null,
-          depends_on: resolvedNewDeps[i - 1],
-          target_repo: resolvedNewTargetRepos[i - 1],
-          tier: newTiers[i - 1],
-          model: newModels[i - 1],
-          snippets: toArray(newSnippetsList[i - 1]),
-          bundles: toArray(newBundlesList[i - 1]),
-          created_at: now,
-          updated_at: now,
-        };
-        const tp = join(dataDir, "tasks", `${tid}.json`);
-        const sp = join(dataDir, "specs", `${tid}.md`);
-        atomicWriteJson(tp, taskDef, dataDir);
-        writtenPaths.push(tp);
-        atomicWrite(sp, newSpecs[i - 1] as string, dataDir);
-        writtenPaths.push(sp);
-      }
-
-      // Spec rewrites on existing tasks (spec md + bump task updated_at).
-      // Existing files — NOT recorded for unwind (rename-atomic).
-      for (let idx = 0; idx < rewriteTargets.length; idx += 1) {
-        const tid = rewriteTargets[idx] as string;
-        const sp = join(dataDir, "specs", `${tid}.md`);
-        atomicWrite(sp, rewriteSpecMd[idx] as string, dataDir);
-        const tdef = loadJson(join(dataDir, "tasks", `${tid}.json`));
-        tdef.updated_at = now;
-        atomicWriteJson(join(dataDir, "tasks", `${tid}.json`), tdef, dataDir);
-      }
-
-      // Dep rewires on existing tasks (full replacement of depends_on).
-      // Existing files — NOT recorded for unwind (rename-atomic).
-      for (let idx = 0; idx < rewireTargets.length; idx += 1) {
-        const tid = rewireTargets[idx] as string;
-        const tdef = loadJson(join(dataDir, "tasks", `${tid}.json`));
-        tdef.depends_on = [...(rewireDepsLists[idx] as string[])];
-        tdef.updated_at = now;
-        atomicWriteJson(join(dataDir, "tasks", `${tid}.json`), tdef, dataDir);
-      }
-    } catch (exc) {
-      // Mid-write raise inside the lock: unlink the FRESH-MINT files only.
-      for (const p of writtenPaths) {
-        unlinkQuiet(p);
-      }
-      throw exc;
-    }
-
-    return { kind: "success", newTaskIds, writtenPaths };
-  });
-
-  if (outcome.kind === "failure") {
-    emitFailureEnvelope(outcome.code, outcome.message, outcome.details);
+  // Merge-window guard + commit-work serialization (commit-work OUTER, epic-id
+  // flock INNER): refuse a mid-operation write before touching state, else hold
+  // the shared lock across the write -> auto-commit window, released via finally.
+  const commitGuard = acquirePlanCommitGuard(primaryRepo);
+  if (commitGuard.kind === "refused") {
+    emitFailureEnvelope("merge_in_progress", commitGuard.message, [
+      commitGuard.detail,
+    ]);
     return 1;
   }
+  try {
+    type FlockOutcome =
+      | { kind: "failure"; code: string; message: string; details: string[] }
+      | {
+          kind: "success";
+          newTaskIds: string[];
+          writtenPaths: string[];
+          rollback: RollbackEntry[];
+        };
 
-  const { newTaskIds, writtenPaths } = outcome;
-
-  // ------------------------------------------------------------------
-  // Phase 4.5: post-write integrity gate (OUTSIDE the lock).
-  // ------------------------------------------------------------------
-  // refine-apply IS an INTEGRITY_GATE_VERBS member: re-validate the post-mutation
-  // tree (checkFilesystemRepos=true so the repo paths are re-probed). It never
-  // touches last_validated_at — the marker is an arm-exclusive latch, so
-  // refine-apply leaves the (Phase-R1-invalidated) epic a ghost for the trailing
-  // `validate --epic` arm to flip. On integrity FAILURE integrityGateOrFail prints
-  // integrity_failed + process.exit(1); the `onFailure` hook fires BEFORE the exit
-  // and unwinds the FRESH-MINT new-task files (the epic / rewrite / rewire updates
-  // are OMITTED — rewrites of existing user data). This threads the Python
-  // try/except unwind through the hook, since the Bun gate exits rather than
-  // throwing.
-  integrityGateOrFail(epicId, dataDir, {
-    verb: "refine-apply",
-    checkFilesystemRepos: true,
-    onFailure: () => {
-      for (const p of writtenPaths) {
-        unlinkQuiet(p);
+    const outcome = withEpicIdLock<FlockOutcome>(() => {
+      // max(scan, ledger)+1, never bare scan: the durable id ledger (per-epic task
+      // scope) keeps a task number burned after its files are destroyed, so the
+      // destroy-then-re-mint sequence cannot reuse it on this host.
+      const maxTask = Math.max(
+        scanMaxTaskId(dataDir, epicId),
+        ledgerMaxTaskNum(primaryRepo, epicId),
+      );
+      // Two-pass: ordinal i (1-based into add_tasks) -> id `epic_id.{max+i}`.
+      const newIdByOrdinal = new Map<number, string>();
+      for (let i = 1; i <= nNew; i += 1) {
+        newIdByOrdinal.set(i, `${epicId}.${maxTask + i}`);
       }
-    },
-  });
+      const newTaskIds: string[] = [];
+      for (let i = 1; i <= nNew; i += 1) {
+        newTaskIds.push(newIdByOrdinal.get(i) as string);
+      }
 
-  // ------------------------------------------------------------------
-  // Phase 5: emit ONE envelope covering the whole delta (OUTSIDE the lock).
-  // ------------------------------------------------------------------
-  emitMutating(
-    {
-      epic_id: epicId,
-      added_task_ids: newTaskIds,
-      rewritten_specs: [...rewriteTargets],
-      rewired_deps: [...rewireTargets],
-      epic_spec_rewritten: epicSpecRewrite !== null,
-    },
-    {
+      // The full set of task ids that exist AFTER the delta lands.
+      const postDeltaIds = new Set<string>([...existingTaskIds, ...newTaskIds]);
+
+      // --- target existence: rewrites/rewires must hit existing tasks ----
+      const targetErrors: string[] = [];
+      for (const tid of rewriteTargets) {
+        if (!existingTaskIds.has(tid)) {
+          targetErrors.push(
+            `rewrite_specs: task ${tid} does not exist in epic ${epicId}`,
+          );
+        }
+      }
+      for (const tid of rewireTargets) {
+        if (!existingTaskIds.has(tid)) {
+          targetErrors.push(
+            `rewire_deps: task ${tid} does not exist in epic ${epicId}`,
+          );
+        }
+      }
+      if (targetErrors.length > 0) {
+        return {
+          kind: "failure",
+          code: "target_invalid",
+          message: "One or more rewrite/rewire targets are invalid",
+          details: targetErrors,
+        };
+      }
+
+      // --- resolve new-task deps (existing id str OR new-ordinal int) ----
+      const resolvedNewDeps: string[][] = [];
+      for (let i = 1; i <= nNew; i += 1) {
+        const resolved: string[] = [];
+        for (const d of newDepsRaw[i - 1] as (string | number)[]) {
+          if (typeof d === "string") {
+            if (!postDeltaIds.has(d)) {
+              depErrors.push(
+                `add_tasks #${i}: dep ${pyReprStr(d)} references a task absent ` +
+                  "after the delta",
+              );
+            } else {
+              resolved.push(d);
+            }
+          } else {
+            // int ordinal into add_tasks
+            if (d < 1 || d > nNew) {
+              depErrors.push(
+                `add_tasks #${i}: dep ordinal ${d} out of range ` +
+                  `(must be 1..${nNew})`,
+              );
+            } else if (d === i) {
+              depErrors.push(
+                `add_tasks #${i}: dep ordinal ${d} is self-referential`,
+              );
+            } else {
+              resolved.push(newIdByOrdinal.get(d) as string);
+            }
+          }
+        }
+        resolvedNewDeps.push(resolved);
+      }
+
+      // --- validate rewired dep targets exist post-delta -----------------
+      for (let idx = 0; idx < rewireTargets.length; idx += 1) {
+        const tid = rewireTargets[idx] as string;
+        for (const d of rewireDepsLists[idx] as string[]) {
+          if (!isTaskId(d)) {
+            depErrors.push(
+              `rewire_deps ${tid}: dep ${pyReprStr(d)} is not a valid task id`,
+            );
+          } else if (!postDeltaIds.has(d)) {
+            depErrors.push(
+              `rewire_deps ${tid}: dep ${pyReprStr(d)} references a task absent ` +
+                "after the delta",
+            );
+          } else if (d === tid) {
+            depErrors.push(
+              `rewire_deps ${tid}: dep ${pyReprStr(d)} is self-referential`,
+            );
+          }
+        }
+      }
+
+      if (depErrors.length > 0) {
+        return {
+          kind: "failure",
+          code: "dep_invalid",
+          message: "One or more task dependencies are invalid",
+          details: depErrors,
+        };
+      }
+
+      // --- build the POST-delta graph and detect cycles ------------------
+      // Load existing tasks' current dep lists, then overlay rewires + adds.
+      // Also capture each existing task's target_repo (if any) for the
+      // touched_repos rollup. detectCycles iteration order decides which cycle
+      // surfaces; sort node ids + adjacency lists for cross-engine determinism.
+      const graph: Record<string, { depends_on: string[] }> = {};
+      const existingTargetRepos: string[] = [];
+      for (const tid of [...existingTaskIds].sort()) {
+        const tdef = loadJson(join(dataDir, "tasks", `${tid}.json`));
+        graph[tid] = {
+          depends_on: [...((tdef.depends_on as string[] | undefined) ?? [])],
+        };
+        const etr = tdef.target_repo;
+        if (etr) {
+          existingTargetRepos.push(etr as string);
+        }
+      }
+      for (let idx = 0; idx < rewireTargets.length; idx += 1) {
+        const tid = rewireTargets[idx] as string;
+        graph[tid] = { depends_on: [...(rewireDepsLists[idx] as string[])] };
+      }
+      for (let i = 1; i <= nNew; i += 1) {
+        graph[newIdByOrdinal.get(i) as string] = {
+          depends_on: resolvedNewDeps[i - 1] as string[],
+        };
+      }
+
+      const cycle = detectCycles(graph);
+      if (cycle) {
+        return {
+          kind: "failure",
+          code: "dep_cycle",
+          message: "Post-delta task dependency graph contains a cycle",
+          details: [`cycle: ${cycle.join(" -> ")}`],
+        };
+      }
+
+      // --- backstop collision check on new-task paths --------------------
+      const collisions: string[] = [];
+      for (let i = 1; i <= nNew; i += 1) {
+        const tid = newIdByOrdinal.get(i) as string;
+        const tp = join(dataDir, "tasks", `${tid}.json`);
+        const sp = join(dataDir, "specs", `${tid}.md`);
+        if (existsFile(tp)) {
+          collisions.push(`task JSON exists: ${tp}`);
+        }
+        if (existsFile(sp)) {
+          collisions.push(`task spec exists: ${sp}`);
+        }
+      }
+      if (collisions.length > 0) {
+        return {
+          kind: "failure",
+          code: "id_collision",
+          message: `Allocated new-task ids under ${epicId} would overwrite existing files`,
+          details: collisions,
+        };
+      }
+
+      // --------------------------------------------------------------
+      // Phase 4: mutate — assert-all is done; write the delta.
+      // --------------------------------------------------------------
+      const now = nowIso();
+
+      const epicDef = loadJson(epicPath);
+      epicDef.updated_at = now;
+      const epicTargetRepo = epicDef.primary_repo as string | null | undefined;
+
+      // Resolve per-new-task target_repos: each null defaults to epic.primary_repo.
+      // touched_repos is recomputed on EVERY invocation as the sorted-uniq rollup
+      // of every task's resolved target_repo. Falsy values are filtered so the
+      // sort never compares str <-> null.
+      const resolvedNewTargetRepos: (string | null)[] = newTargetRepos.map(
+        (tr) => (tr !== null ? tr : (epicTargetRepo ?? null)),
+      );
+      const touchedSet = new Set<string>();
+      for (const tr of existingTargetRepos) {
+        if (tr) {
+          touchedSet.add(tr);
+        }
+      }
+      for (const tr of resolvedNewTargetRepos) {
+        if (tr) {
+          touchedSet.add(tr);
+        }
+      }
+      epicDef.touched_repos = [...touchedSet].sort();
+
+      // Burn each new task number in the durable ledger BEFORE any file write,
+      // still inside the flock, so a later destroy leaves the numbers claimed and
+      // re-minting allocates strictly higher. Fail-soft (keyed on the state repo).
+      const epicNum = parseId(epicId)[0] ?? 0;
+      for (let i = 1; i <= nNew; i += 1) {
+        const tid = newIdByOrdinal.get(i) as string;
+        appendTaskRecord(primaryRepo, epicNum, epicId, maxTask + i, tid);
+      }
+
+      // Snapshot the pre-verb bytes of EVERY path this delta writes — fresh-mint
+      // new tasks (null → unlinked on rollback) AND existing-file rewrites (epic
+      // JSON, epic spec, rewrite/rewire targets: their bytes → restored on
+      // rollback). A commit failure (the mid-merge window) already committed the
+      // rewrites to the working tree + index, so unlike the mid-write unwind the
+      // rollback MUST restore their prior bytes, not unlink them.
+      const rollbackPaths: string[] = [epicPath];
+      if (epicSpecRewrite !== null) {
+        rollbackPaths.push(epicSpecPath);
+      }
+      for (let i = 1; i <= nNew; i += 1) {
+        const tid = newIdByOrdinal.get(i) as string;
+        rollbackPaths.push(
+          join(dataDir, "tasks", `${tid}.json`),
+          join(dataDir, "specs", `${tid}.md`),
+        );
+      }
+      for (const tid of rewriteTargets) {
+        rollbackPaths.push(
+          join(dataDir, "specs", `${tid}.md`),
+          join(dataDir, "tasks", `${tid}.json`),
+        );
+      }
+      for (const tid of rewireTargets) {
+        rollbackPaths.push(join(dataDir, "tasks", `${tid}.json`));
+      }
+      const rollback = snapshotForRollback(rollbackPaths);
+
+      // Track FRESH-MINT writes for the mid-write / Phase-4.5 unwind. CRITICAL:
+      // existing-file rewrites (epic JSON, epic spec, rewrite_/rewire_ targets)
+      // are OMITTED — atomicWrite is rename-based, so a mid-write failure leaves
+      // their previous bytes intact; unlinking them would destroy user data.
+      const writtenPaths: string[] = [];
+      try {
+        // Existing-file rewrite — NOT recorded for unwind.
+        atomicWriteJson(epicPath, epicDef, dataDir);
+        if (epicSpecRewrite !== null) {
+          // Existing-file rewrite — NOT recorded for unwind.
+          atomicWrite(epicSpecPath, epicSpecRewrite, dataDir);
+        }
+
+        // New tasks (two-pass id allocation already resolved deps to ids).
+        // FRESH-MINT paths — recorded for unwind.
+        for (let i = 1; i <= nNew; i += 1) {
+          const tid = newIdByOrdinal.get(i) as string;
+          const taskDef: Record<string, unknown> = {
+            id: tid,
+            epic: epicId,
+            title: newTitles[i - 1],
+            priority: null,
+            depends_on: resolvedNewDeps[i - 1],
+            target_repo: resolvedNewTargetRepos[i - 1],
+            tier: newTiers[i - 1],
+            model: newModels[i - 1],
+            snippets: toArray(newSnippetsList[i - 1]),
+            bundles: toArray(newBundlesList[i - 1]),
+            created_at: now,
+            updated_at: now,
+          };
+          const tp = join(dataDir, "tasks", `${tid}.json`);
+          const sp = join(dataDir, "specs", `${tid}.md`);
+          atomicWriteJson(tp, taskDef, dataDir);
+          writtenPaths.push(tp);
+          atomicWrite(sp, newSpecs[i - 1] as string, dataDir);
+          writtenPaths.push(sp);
+        }
+
+        // Spec rewrites on existing tasks (spec md + bump task updated_at).
+        // Existing files — NOT recorded for unwind (rename-atomic).
+        for (let idx = 0; idx < rewriteTargets.length; idx += 1) {
+          const tid = rewriteTargets[idx] as string;
+          const sp = join(dataDir, "specs", `${tid}.md`);
+          atomicWrite(sp, rewriteSpecMd[idx] as string, dataDir);
+          const tdef = loadJson(join(dataDir, "tasks", `${tid}.json`));
+          tdef.updated_at = now;
+          atomicWriteJson(join(dataDir, "tasks", `${tid}.json`), tdef, dataDir);
+        }
+
+        // Dep rewires on existing tasks (full replacement of depends_on).
+        // Existing files — NOT recorded for unwind (rename-atomic).
+        for (let idx = 0; idx < rewireTargets.length; idx += 1) {
+          const tid = rewireTargets[idx] as string;
+          const tdef = loadJson(join(dataDir, "tasks", `${tid}.json`));
+          tdef.depends_on = [...(rewireDepsLists[idx] as string[])];
+          tdef.updated_at = now;
+          atomicWriteJson(join(dataDir, "tasks", `${tid}.json`), tdef, dataDir);
+        }
+      } catch (exc) {
+        // Mid-write raise inside the lock: unlink the FRESH-MINT files only.
+        for (const p of writtenPaths) {
+          unlinkQuiet(p);
+        }
+        throw exc;
+      }
+
+      return { kind: "success", newTaskIds, writtenPaths, rollback };
+    });
+
+    if (outcome.kind === "failure") {
+      emitFailureEnvelope(outcome.code, outcome.message, outcome.details);
+      return 1;
+    }
+
+    const { newTaskIds, writtenPaths, rollback } = outcome;
+
+    // ------------------------------------------------------------------
+    // Phase 4.5: post-write integrity gate (OUTSIDE the lock).
+    // ------------------------------------------------------------------
+    // refine-apply IS an INTEGRITY_GATE_VERBS member: re-validate the post-mutation
+    // tree (checkFilesystemRepos=true so the repo paths are re-probed). It never
+    // touches last_validated_at — the marker is an arm-exclusive latch, so
+    // refine-apply leaves the (Phase-R1-invalidated) epic a ghost for the trailing
+    // `validate --epic` arm to flip. On integrity FAILURE integrityGateOrFail prints
+    // integrity_failed + process.exit(1); the `onFailure` hook fires BEFORE the exit
+    // and unwinds the FRESH-MINT new-task files (the epic / rewrite / rewire updates
+    // are OMITTED — rewrites of existing user data). This threads the Python
+    // try/except unwind through the hook, since the Bun gate exits rather than
+    // throwing.
+    integrityGateOrFail(epicId, dataDir, {
       verb: "refine-apply",
-      target: epicId,
-      repoRoot: ctx.projectPath,
-      primaryRepo,
-    },
-  );
-  return 0;
+      checkFilesystemRepos: true,
+      onFailure: () => {
+        for (const p of writtenPaths) {
+          unlinkQuiet(p);
+        }
+      },
+    });
+
+    // ------------------------------------------------------------------
+    // Phase 5: emit ONE envelope covering the whole delta (OUTSIDE the lock).
+    // ------------------------------------------------------------------
+    emitMutating(
+      {
+        epic_id: epicId,
+        added_task_ids: newTaskIds,
+        rewritten_specs: [...rewriteTargets],
+        rewired_deps: [...rewireTargets],
+        epic_spec_rewritten: epicSpecRewrite !== null,
+      },
+      {
+        verb: "refine-apply",
+        target: epicId,
+        repoRoot: ctx.projectPath,
+        primaryRepo,
+        onCommitFailure: () => restoreForRollback(rollback, primaryRepo),
+      },
+    );
+    return 0;
+  } finally {
+    commitGuard.release();
+  }
 }
 
 // --- Local helpers ---------------------------------------------------------

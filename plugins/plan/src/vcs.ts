@@ -29,7 +29,20 @@
 //  - committedTaskJson: reconcile.ts's HEAD:<task.json> cat-file blob,
 //  - shortStatusAndDiff / firstSourceShaShort: worker_resume.ts's nudge probes.
 
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+
+/** Which in-progress git operation a checkout's git dir currently holds, or
+ * "none". An auto-commit that lands mid-operation is the fn-1183 destruction
+ * window (a later `git merge --abort` discards the staged plan files), so the
+ * pre-write guard refuses ANY of these — merge, cherry-pick, revert, rebase, or a
+ * bare sequencer sequence — not just a merge. */
+export type InProgressOp =
+  | "merge"
+  | "cherry-pick"
+  | "revert"
+  | "rebase"
+  | "sequencer"
+  | "none";
 
 /** Result of a git invocation the auto-commit plumbing inspects: exit code plus
  * decoded stdout/stderr. The contention-retry loop matches stderr substrings, so
@@ -196,6 +209,31 @@ export interface PlanVcs {
    * spawn failure): the FAIL-OPEN signal the gate surfaces as a VISIBLE marker
    * rather than a silent false-clean read. Used by reconcile's close-out probe. */
   sessionDirtyPaths(cwd: string): string[] | null;
+
+  // -------------------------------------------------------------------------
+  // Merge-window guard surface — the pre-write in-progress probe + the shared
+  // commit-work lock path the write->commit window serializes on.
+  // -------------------------------------------------------------------------
+
+  /** Which in-progress operation `cwd`'s git dir holds — merge / cherry-pick /
+   * revert / rebase / sequencer, or "none". Probed via `git rev-parse -q --verify`
+   * of MERGE_HEAD / CHERRY_PICK_HEAD / REVERT_HEAD / REBASE_HEAD plus a non-empty
+   * sequencer todo. `cwd` MUST be the STATE repo whose commit is about to run (a
+   * linked worktree carries its OWN MERGE_HEAD / index), NOT the invoking process
+   * cwd. A specific `*_HEAD` classifies the op; the sequencer todo is the fallback
+   * for the between-picks window where no `*_HEAD` is currently set. Any probe
+   * failure (git unreadable) reads "none" — the auto-commit stays the authority. */
+  inProgressOp(cwd: string): InProgressOp;
+
+  /** The commit-work lock path for `cwd`'s checkout —
+   * `<git-dir>/keeper-commit-work.lock`, from `git rev-parse
+   * --path-format=absolute --git-dir` — derived BYTE-IDENTICALLY to the daemon's
+   * `commitWorkLockPath` (src/worktree-git.ts) so a plan verb's committer and the
+   * daemon's base-merge / commit-work contend on the SAME file for one checkout. A
+   * linked worktree keys on its OWN git dir; on a git error / empty stdout it
+   * falls back to `<cwd>/.git/keeper-commit-work.lock` (never a bare relative
+   * `.git`). */
+  commitWorkLockPath(cwd: string): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +556,54 @@ export const realGitVcs: PlanVcs = {
     }
     return parseStatusPaths(result.stdout, true);
   },
+
+  inProgressOp(cwd): InProgressOp {
+    // `-q --verify` exits non-zero silently on an absent ref, so exit 0 == that
+    // pseudo-ref exists == that op is in flight. cwd fixes the STATE repo's git
+    // dir (a linked worktree has its own MERGE_HEAD). Specific op first; the
+    // sequencer todo is the fallback for the between-picks window.
+    const headRef = (ref: string): boolean =>
+      runReadGit(["rev-parse", "-q", "--verify", ref], cwd).exitCode === 0;
+    if (headRef("MERGE_HEAD")) {
+      return "merge";
+    }
+    if (headRef("CHERRY_PICK_HEAD")) {
+      return "cherry-pick";
+    }
+    if (headRef("REVERT_HEAD")) {
+      return "revert";
+    }
+    if (headRef("REBASE_HEAD")) {
+      return "rebase";
+    }
+    // A cherry-pick / revert sequence with remaining picks but no `*_HEAD` set.
+    // `--git-path` resolves sequencer/todo against this checkout's OWN git dir,
+    // so a linked worktree reads its own sequencer, not the common dir's.
+    const todo = runReadGit(
+      ["rev-parse", "--path-format=absolute", "--git-path", "sequencer/todo"],
+      cwd,
+    );
+    if (todo.exitCode === 0) {
+      const path = todo.stdout.trim();
+      if (path.length > 0 && sequencerTodoActive(path)) {
+        return "sequencer";
+      }
+    }
+    return "none";
+  },
+
+  commitWorkLockPath(cwd): string {
+    const res = runReadGit(
+      ["rev-parse", "--path-format=absolute", "--git-dir"],
+      cwd,
+    );
+    const gitDir = res.stdout.trim();
+    const dir =
+      res.exitCode === 0 && gitDir.length > 0
+        ? gitDir
+        : joinGitPath(cwd, ".git");
+    return joinGitPath(dir, "keeper-commit-work.lock");
+  },
 };
 
 // %x1f (ASCII unit separator) field delimiter for sourceCommitShas — cannot
@@ -544,6 +630,34 @@ function runReadGit(args: string[], repo: string, input?: string): GitResult {
   } catch (exc) {
     return { exitCode: 1, stdout: "", stderr: (exc as Error).message };
   }
+}
+
+/** True when the sequencer todo at `path` names at least one remaining pick — a
+ * non-blank, non-comment line. git deletes the whole sequencer dir when a
+ * cherry-pick / revert finishes, so a present, active todo means the sequence is
+ * still in flight. Any read error reads as not-active (classify "none"). */
+function sequencerTodoActive(path: string): boolean {
+  let content: string;
+  try {
+    content = readFileSync(path, "utf-8");
+  } catch {
+    return false;
+  }
+  return content.split("\n").some((line) => {
+    const trimmed = line.trim();
+    return trimmed.length > 0 && !trimmed.startsWith("#");
+  });
+}
+
+/** Join a git dir and a leaf, BYTE-MATCHING src/worktree-git.ts's `joinPath`
+ * (the module boundary forbids importing it): strip a trailing slash on `dir`
+ * (defensive — `--path-format=absolute` never emits one) then append under a
+ * single separator, so {@link realGitVcs.commitWorkLockPath} derives the exact
+ * file the daemon does for a checkout. */
+function joinGitPath(dir: string, name: string): string {
+  const base =
+    dir.length > 1 && dir.endsWith("/") ? dir.replace(/\/+$/, "") : dir;
+  return base.endsWith("/") ? `${base}${name}` : `${base}/${name}`;
 }
 
 /** Run `git show --numstat --format=` for one commit and parse its rows. The

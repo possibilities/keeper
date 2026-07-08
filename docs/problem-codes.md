@@ -134,9 +134,12 @@ reject that parks the task.
 `emit()` family is exempt from the shared envelope for Python byte-parity and the
 one-JSON-root guard — it converges only on this error sub-object). `details` is a
 string list of every issue found; `recovery` is resolved from the code registry
-in `emit.ts` (`recoveryForPlanCode`, fallback for an unlisted code). These are
+in `emit.ts` (`recoveryForPlanCode`, fallback for an unlisted code). Most are
 input-validation failures surfaced BEFORE any commit, so re-running after fixing
-the input is always safe.
+the input is always safe. The family also carries one commit-time RETRYABLE
+class, `merge_in_progress`: a mutating verb refuses when the state repo is
+mid-operation — it wrote nothing and no input is wrong, so re-running unchanged
+once the operation clears is the whole recovery.
 
 | code                 | meaning                                                        | recovery                                                                    |
 | -------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------- |
@@ -148,6 +151,7 @@ the input is always safe.
 | `duplicate_epic`     | An epic with this slug already exists.                        | Choose a distinct slug, or pass `--allow-duplicate` to create a sibling.    |
 | `id_collision`       | A generated id collides with an existing artifact.           | Re-run with a distinct slug or id.                                          |
 | `integrity_failed`   | The post-write integrity check failed; nothing was committed.| Re-run the verb; if it persists, inspect the reported artifacts.           |
+| `merge_in_progress`  | Commit-time RETRYABLE: the state repo is mid-operation — a merge / cherry-pick / revert / rebase / sequencer (the one keeper's own machinery creates is a merge), OR the shared commit-work lock is held by a concurrent commit / base-merge past the deadline. `details` names the operation. The verb wrote nothing. | Wait for the operation to finish, then re-run the verb unchanged — no input fix needed. |
 | `target_invalid`     | The target id is not well-formed or does not exist.          | Correct the target and re-run.                                             |
 | `spec_invalid`       | A task or epic spec field is missing or malformed.          | Fix the reported spec field and re-run.                                    |
 | `model_invalid`      | The declared model is not recognized.                        | Set a supported model value and re-run.                                    |

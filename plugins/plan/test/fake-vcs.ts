@@ -41,6 +41,7 @@ import { join, relative, sep } from "node:path";
 
 import type {
   GitResult,
+  InProgressOp,
   NumstatRow,
   NumstatTotals,
   PlanVcs,
@@ -86,9 +87,10 @@ interface FakeSourceCommit {
 interface RepoState {
   log: FakeCommit[];
   snapshot: Map<string, string>;
-  /** Armed one-shot failures for the next commit / status call. */
+  /** Armed one-shot failures for the next commit / status / index-reset call. */
   commitFailures: QueuedFailure[];
   statusFailures: QueuedFailure[];
+  restoreFailures: QueuedFailure[];
   /** Seeded source commits, newest-LAST (a real `git log` reads newest-first, so
    * the read methods reverse this for their result order). */
   sourceCommits: FakeSourceCommit[];
@@ -96,6 +98,10 @@ interface RepoState {
    * stateHeadVisible read consults — the fake analogue of HEAD:<path>. Seeded by
    * fakeCommitTaskJson; the auto-commit path also writes it on commit(). */
   committedBlobs: Map<string, string>;
+  /** The in-progress operation inProgressOp(cwd) reports, armed by
+   * armInProgressOp. Default "none" — the fake models no real git dir, so the
+   * merge-window guard's refusal is driven from this armed state. */
+  inProgressOp: InProgressOp;
 }
 
 const repos = new Map<string, RepoState>();
@@ -137,8 +143,10 @@ function repoFor(root: string): RepoState {
       snapshot: new Map(),
       commitFailures: [],
       statusFailures: [],
+      restoreFailures: [],
       sourceCommits: [],
       committedBlobs: new Map(),
+      inProgressOp: "none",
     };
     repos.set(key, state);
   }
@@ -291,8 +299,10 @@ export function initRepo(root: string): void {
   state.snapshot = new Map();
   state.commitFailures = [];
   state.statusFailures = [];
+  state.restoreFailures = [];
   state.sourceCommits = [];
   state.committedBlobs = new Map();
+  state.inProgressOp = "none";
 }
 
 /** Adopt the current `.keeper/` tree as the committed baseline WITHOUT recording
@@ -343,6 +353,18 @@ export function failNextStatus(
   stderr = "fake status failure",
 ): void {
   repoFor(root).statusFailures.push({ stderr });
+}
+
+/** Arm the NEXT restoreIndexToHead (`git reset HEAD -- <paths>`) against `root` to
+ * report a non-zero exit (one-shot). Drives the commit-failure rollback's
+ * unstage-failure path: the working-tree bytes still restore (real FS), but the
+ * unconfirmed index reset makes restoreForRollback stamp `rollback_failed`. The
+ * fake models no index, so an index-reset failure is the arm-able rollback slip. */
+export function armRestoreFailure(
+  root: string,
+  stderr = "fake reset failure",
+): void {
+  repoFor(root).restoreFailures.push({ stderr });
 }
 
 /** Seed a worker source commit in `root` carrying `messageWithTrailers` (a raw
@@ -398,6 +420,14 @@ export function fakeCommitTaskJson(root: string, taskId: string): void {
  * close-out gate surfaces as a visible marker. Cleared by resetFakeVcs. */
 export function setSessionDirty(root: string, value: string[] | null): void {
   sessionDirtyOverrides.set(normRoot(root), value);
+}
+
+/** Arm `root`'s fake in-progress-operation probe to report `op` — the state the
+ * merge-window guard reads via inProgressOp(cwd) before writing. A test arms an
+ * op here to prove a mutating verb refuses to write mid-operation. Reset to
+ * "none" by initRepo / resetFakeVcs. */
+export function armInProgressOp(root: string, op: InProgressOp): void {
+  repoFor(root).inProgressOp = op;
 }
 
 /** Clear all fake-repo state — call in a global beforeEach so per-test repos
@@ -485,10 +515,16 @@ export const fakeVcs: PlanVcs = {
     return { ...ok(), sha };
   },
 
-  restoreIndexToHead(_paths, _cwd): GitResult {
+  restoreIndexToHead(_paths, cwd): GitResult {
     // The fake commits directly from the working-tree diff and models no index,
-    // so an index reset is a no-op — precisely why F1's staged-half-stamp bug is
-    // observable only under real git (the slow tier proves the real unwind).
+    // so an index reset is normally a no-op — precisely why F1's staged-half-stamp
+    // bug is observable only under real git (the slow tier proves the real
+    // unwind). An armed restore failure returns a non-zero exit so a test can
+    // drive restoreForRollback's rollback_failed path.
+    const failure = repoFor(cwd).restoreFailures.shift();
+    if (failure) {
+      return { exitCode: 1, stdout: "", stderr: failure.stderr };
+    }
     return ok();
   },
 
@@ -628,5 +664,18 @@ export const fakeVcs: PlanVcs = {
       return [];
     }
     return [...diffAgainstSnapshot(key, state.snapshot)].sort();
+  },
+
+  inProgressOp(cwd): InProgressOp {
+    const state = repos.get(normRoot(cwd));
+    return state?.inProgressOp ?? "none";
+  },
+
+  commitWorkLockPath(cwd): string {
+    // The fake models `.git` as a directory under the repo root, so the lock
+    // path is `<root>/.git/keeper-commit-work.lock` — the same file both a plan
+    // committer and the daemon key on for a main checkout (byte-parity with
+    // realGitVcs is asserted against real git in the slow tier).
+    return join(normRoot(cwd), ".git", "keeper-commit-work.lock");
   },
 };
