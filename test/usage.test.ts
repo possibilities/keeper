@@ -2297,7 +2297,8 @@ test("usage frames: one frame per raw-field hash change; unchanged re-delivery m
   expect(recs.map((r) => r.seq)).toEqual([0, 1]);
   expect(recs.every((r) => r.view === "usage")).toBe(true);
   expect(recs.every((r) => r.cursor === "42")).toBe(true);
-  expect(recs.every((r) => r.schema_version === 1)).toBe(true);
+  // 2: FRAMES_SCHEMA_VERSION as of the catching_up field's addition.
+  expect(recs.every((r) => r.schema_version === 2)).toBe(true);
 });
 
 test("usage frames: a relative-time tick with no data change never mints a frame", () => {
