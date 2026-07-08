@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified single-surface work; persisted-format dual-read contract warrants xhigh, no opus-bound novelty",
+      "task_id": "fn-1196-persist-fatal-exit-reasons-durably.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T20:57:57.632000Z",
+  "epic_id": "fn-1196-persist-fatal-exit-reasons-durably",
+  "input_hash": "d6f23f51b4b94a925ec077d7871832c7d364a666a56e28470744e3792652f391",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3606200145,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1196-persist-fatal-exit-reasons-durably.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"confidence\":0.72}]}"
+}
