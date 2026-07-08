@@ -92,5 +92,5 @@ for transcript-watch (node:* only).
 - [ ] The full fast suite (bun test) is green.
 
 ## Done summary
-
+Gate claude agent-run stop acceptance on background-agent quiescence (id-keyed pending set retired by queue-operation/task-notification lines plus a turn_duration pendingBackgroundAgentCount corroboration), and couple run-capture to prefer the gated stop's message for claude. Fails open; codex/pi/hermes byte-identical.
 ## Evidence

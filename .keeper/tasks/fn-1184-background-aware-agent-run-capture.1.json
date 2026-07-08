@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Gate claude stops on background quiescence",
-  "updated_at": "2026-07-08T02:04:49.414000Z"
+  "updated_at": "2026-07-08T12:16:59.244000Z",
+  "worker_done_at": "2026-07-08T12:16:59.244000Z"
 }
