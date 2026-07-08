@@ -626,3 +626,63 @@ test("destroy is idempotent", async () => {
   // Second destroy is a no-op (must not throw).
   expect(() => app.destroy()).not.toThrow();
 });
+
+// ---------------------------------------------------------------------------
+// The readiness gate's loading variant (fn-1180)
+// ---------------------------------------------------------------------------
+
+test("loading: renders the loading line and no job cards", async () => {
+  const { setup, app } = await bootApp();
+  app.render({ bands: [], loading: { line: "re-folding event log  38.0%" } });
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  expect(frame).toContain("re-folding event log  38.0%");
+  expect(frame).not.toContain("──");
+  expect(frame).not.toContain(SELECT_CARET);
+});
+
+test("loading: engaging the gate clears any already-painted job lines", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([makeJob({ job_id: "a", state: "working", title: "pre-gate-job" })]),
+  );
+  await setup.renderOnce();
+  expect(setup.captureCharFrame()).toContain("pre-gate-job");
+
+  app.render({ bands: [], loading: { line: "waiting for git seed…" } });
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  expect(frame).not.toContain("pre-gate-job");
+  expect(frame).toContain("waiting for git seed…");
+});
+
+test("loading: the gate clearing resumes cards and drops the loading line", async () => {
+  const { setup, app } = await bootApp();
+  app.render({ bands: [], loading: { line: "catching up…" } });
+  await setup.renderOnce();
+  expect(setup.captureCharFrame()).toContain("catching up…");
+
+  app.render(
+    model([makeJob({ job_id: "a", state: "working", title: "resumed-job" })]),
+  );
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  expect(frame).not.toContain("catching up…");
+  expect(frame).toContain("resumed-job");
+});
+
+test("loading: re-rendering the same loading state twice is idempotent (no throw, one line)", async () => {
+  const { setup, app } = await bootApp();
+  const loadingModel: DashModel = {
+    bands: [],
+    loading: { line: "re-folding event log  12.0%" },
+  };
+  app.render(loadingModel);
+  app.render(loadingModel);
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  const occurrences = frame
+    .split("\n")
+    .filter((l) => l.includes("re-folding event log  12.0%")).length;
+  expect(occurrences).toBe(1);
+});
