@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T01:51:32.914000Z",
+  "depends_on": [
+    "fn-1182-schema-renumber-tool-and-guards.1"
+  ],
+  "epic": "fn-1182-schema-renumber-tool-and-guards",
+  "id": "fn-1182-schema-renumber-tool-and-guards.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Resolver charter schema carve-out",
+  "updated_at": "2026-07-08T01:51:32.914000Z"
+}
