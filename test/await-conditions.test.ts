@@ -35,6 +35,7 @@ import {
   epicAddedMet,
   epicRemovedMet,
   evaluateAwaitCondition,
+  findEpicByIdOrBare,
   gitCleanState,
   isJamReason,
   landedState,
@@ -563,6 +564,63 @@ test("epic-complete: bare fn-N form looks up by epic_number", () => {
   // Epic is on the board → waiting (same present-branch rule as the
   // full-id version above).
   expect(state.kind).toBe("waiting");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1193 — bare-id resolution refuses ambiguity (findEpicByIdOrBare + the
+// epic-await surface). A bare `fn-N` matching 2+ live epics names every
+// candidate instead of coin-flipping the first match; full-id resolution is
+// unchanged.
+// ---------------------------------------------------------------------------
+
+test("fn-1193 findEpicByIdOrBare: unique bare fn-N resolves", () => {
+  const a = makeEpic({ epic_id: "fn-7-a", epic_number: 7 });
+  const b = makeEpic({ epic_id: "fn-8-b", epic_number: 8 });
+  const r = findEpicByIdOrBare([a, b], "fn-7");
+  expect(r.kind).toBe("found");
+  expect(r.kind === "found" && r.epic.epic_id).toBe("fn-7-a");
+});
+
+test("fn-1193 findEpicByIdOrBare: no match → none", () => {
+  const a = makeEpic({ epic_id: "fn-7-a", epic_number: 7 });
+  expect(findEpicByIdOrBare([a], "fn-99").kind).toBe("none");
+});
+
+test("fn-1193 findEpicByIdOrBare: duplicate bare fn-N → ambiguous naming BOTH ids (sorted)", () => {
+  // Two live epics share epic_number=7 — the resolver must refuse and name every
+  // candidate rather than return the first by iteration order.
+  const a = makeEpic({ epic_id: "fn-7-zeta", epic_number: 7 });
+  const b = makeEpic({ epic_id: "fn-7-alpha", epic_number: 7 });
+  const r = findEpicByIdOrBare([a, b], "fn-7");
+  expect(r.kind).toBe("ambiguous");
+  // Sorted, so the refusal is deterministic regardless of board order.
+  expect(r.kind === "ambiguous" && r.matches).toEqual([
+    "fn-7-alpha",
+    "fn-7-zeta",
+  ]);
+});
+
+test("fn-1193 findEpicByIdOrBare: full id always resolves, never ambiguous", () => {
+  // Two epics share a number, but a FULL id addresses exactly one — unchanged.
+  const a = makeEpic({ epic_id: "fn-7-zeta", epic_number: 7 });
+  const b = makeEpic({ epic_id: "fn-7-alpha", epic_number: 7 });
+  const r = findEpicByIdOrBare([a, b], "fn-7-alpha");
+  expect(r.kind).toBe("found");
+  expect(r.kind === "found" && r.epic.epic_id).toBe("fn-7-alpha");
+});
+
+test("fn-1193 epic-await: a bare fn-N matching two live epics → ambiguous terminal naming both", () => {
+  const a = makeEpic({ epic_id: "fn-7-zeta", epic_number: 7 });
+  const b = makeEpic({ epic_id: "fn-7-alpha", epic_number: 7 });
+  const snap = run([a, b]);
+  const state = evaluateAwaitCondition(
+    { epics: [a, b], snapshot: snap, priorPresence: true },
+    { id: "fn-7", kind: "epic", condition: "complete" },
+  );
+  expect(state.kind).toBe("ambiguous");
+  // The detail carries every candidate id so the command can print the refusal.
+  expect(state.detail).toContain("fn-7-alpha");
+  expect(state.detail).toContain("fn-7-zeta");
 });
 
 // ---------------------------------------------------------------------------

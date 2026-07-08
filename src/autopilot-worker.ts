@@ -73,6 +73,9 @@ import {
 } from "./db";
 import {
   assertNever,
+  DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
+  DUP_EPIC_NUMBER_DISTRESS_REASON,
+  isDupEpicNumberDistressKey,
   isLaneWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
@@ -188,6 +191,10 @@ import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
 // `from "./autopilot-worker"` import (tests, daemon) keeps resolving. The snapshot
 // loader routes recover/finalize failure rows through `routeDispatchFailure`.
 export {
+  DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
+  DUP_EPIC_NUMBER_DISTRESS_REASON,
+  DUP_EPIC_NUMBER_DISTRESS_VERB,
+  isDupEpicNumberDistressKey,
   isLaneWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
@@ -1111,6 +1118,25 @@ export function staleBaseLaneDistressId(
 }
 
 /**
+ * The `dispatch_failures` id a PER-(PROJECT,NUMBER) duplicate-epic-number distress row keys
+ * on — `dup-epic-number:<repoDirHash(projectDir)>-<number>` (composed
+ * `daemon::dup-epic-number:<hash>-<number>`). Mirrors {@link staleBaseLaneDistressId}'s
+ * composed-key shape so one duplicated number keys ONE stable row (the mint + the
+ * level-clear target the same row across cycles), and two distinct duplicated numbers, or
+ * the same number in two projects, key DISTINCT rows ({@link repoDirHash} is base36, so the
+ * `-<number>` suffix never ambiguates the hash). The synthetic `daemon` verb fails the
+ * `retry_dispatch` wire validator, so only the probe's level-trigger clears it.
+ */
+export function dupEpicNumberDistressId(
+  projectDir: string,
+  epicNumber: number,
+): string {
+  return `${DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX}${repoDirHash(
+    projectDir,
+  )}-${epicNumber}`;
+}
+
+/**
  * The `dispatch_failures` id a per-repo shared-checkout-DESYNC distress row keys on —
  * `shared-checkout-desync:<repoDirHash(repoDir)>`. A SIBLING of {@link
  * sharedWedgeDistressId} / {@link sharedDirtyDistressId} on a DISTINCT prefix, so a
@@ -1652,6 +1678,160 @@ export function createStaleBaseLaneTracker(
       // clears (robust across a restart).
       for (const id of openDistressIds) {
         if (!stale.has(id)) {
+          decision.clear.push({ id, dir: "" });
+        }
+      }
+      return decision;
+    },
+  };
+}
+
+/**
+ * One flagged duplicate-epic-number group — two-or-more NON-DONE epics in the SAME project
+ * sharing one `epic_number`. The producer probe emits one per (project, number) collision;
+ * the tracker keys its distress row on {@link dupEpicNumberDistressId}.
+ */
+export interface DuplicateEpicNumberGroup {
+  /** The colliding `epic_number`. */
+  epicNumber: number;
+  /** The shared project dir (the distress row's `dir` + locator). */
+  projectDir: string;
+  /** Every colliding epic's full id, SORTED for a stable reason string / re-fold. */
+  epicIds: string[];
+}
+
+/**
+ * Detect landed duplicate plan numbers: two-or-more NON-DONE epics in the SAME project
+ * sharing one `epic_number`. A PURE O(open epics) read over the live `epics` projection —
+ * NEVER a fold, NEVER per-event, NEVER a DB scan (the reconciler already holds the epics
+ * snapshot). Scoped to non-done pairs because a duplicate involving a DONE epic is history,
+ * not a jam — closed history must never mint eternal distress. An epic with a null
+ * `epic_number` or a null/empty `project_dir` is un-keyable and skipped (it cannot collide
+ * on a (project, number) pair). Groups are returned SORTED by (projectDir, epicNumber) and
+ * each group's `epicIds` SORTED, so the probe → tracker handoff is deterministic. Pure;
+ * NEVER throws.
+ */
+export function computeDuplicateEpicNumberGroups(
+  epics: readonly Epic[],
+): DuplicateEpicNumberGroup[] {
+  // (projectDir   number) → the colliding epic ids. The NUL joiner never appears in a
+  // path or a number, so the composite key is unambiguous.
+  const byKey = new Map<
+    string,
+    { projectDir: string; epicNumber: number; epicIds: string[] }
+  >();
+  for (const e of epics) {
+    if (e.epic_number === null || e.status === "done") {
+      continue;
+    }
+    const projectDir = e.project_dir ?? "";
+    if (projectDir === "") {
+      continue;
+    }
+    const key = `${projectDir} ${e.epic_number}`;
+    let group = byKey.get(key);
+    if (group === undefined) {
+      group = { projectDir, epicNumber: e.epic_number, epicIds: [] };
+      byKey.set(key, group);
+    }
+    group.epicIds.push(e.epic_id);
+  }
+  const out: DuplicateEpicNumberGroup[] = [];
+  for (const group of byKey.values()) {
+    if (group.epicIds.length < 2) {
+      continue;
+    }
+    out.push({
+      epicNumber: group.epicNumber,
+      projectDir: group.projectDir,
+      epicIds: [...group.epicIds].sort(),
+    });
+  }
+  out.sort(
+    (a, b) =>
+      a.projectDir.localeCompare(b.projectDir) || a.epicNumber - b.epicNumber,
+  );
+  return out;
+}
+
+/** One flagged duplicate-epic-number group the probe hands the tracker (its `id` context). */
+export interface DupEpicNumberObservation {
+  /** The shared project dir — the row's `dir` column + mint attribution. */
+  projectDir: string;
+  /** The colliding `epic_number`. */
+  epicNumber: number;
+  /** Every colliding epic's full id (SORTED) — mint attribution. */
+  epicIds: string[];
+}
+
+/**
+ * Per-(project,number) grace tracker for the duplicate-epic-number distress — a CLONE of
+ * {@link createStaleBaseLaneTracker} on its own id/reason/surface, so the surfaces never
+ * share a row. Identical contract: pure of keeper.db / IO / the wall clock (the producer
+ * `ts` is the only clock); in-memory grace + per-key minted-latch for an exactly-once mint
+ * per continuous duplicate episode; projection-driven level-clear robust across a restart.
+ * KEYED ON THE DISTRESS ID directly (`dup-epic-number:<projectHash>-<number>`): the
+ * per-(project,number) hash is one-way, so the OPEN set carries the ids and the level-clear
+ * compares ids without recomputing a hash.
+ */
+export interface DupEpicNumberTracker {
+  step(input: {
+    /** This cycle's duplicate groups, keyed by distress id → its (project, number) context. */
+    duplicates: ReadonlyMap<string, DupEpicNumberObservation>;
+    /** The distress IDS with an OPEN row (from the projection). */
+    openDistressIds: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+/**
+ * Build a {@link DupEpicNumberTracker}. `graceSec` DEFAULTS to 0 — a duplicate plan number
+ * is a hard data-integrity violation that will not self-resolve transiently, so it mints on
+ * the FIRST observation (the minted-latch still guarantees exactly-once per episode; the
+ * projection-driven clear still fires the cycle the duplicate resolves). Injectable so a
+ * cadence test may drive a non-zero grace. A near-verbatim sibling of {@link
+ * createStaleBaseLaneTracker} keyed on the per-(project,number) distress id.
+ */
+export function createDupEpicNumberTracker(graceSec = 0): DupEpicNumberTracker {
+  // distress id → the first cycle-ts it was seen duplicated + whether we have minted the
+  // distress for THIS continuous duplicate episode. In-worker memory only.
+  const firstSeen = new Map<string, { sinceSec: number; minted: boolean }>();
+  return {
+    step({ duplicates, openDistressIds, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: track each duplicate's grace clock; cross the watermark once.
+      for (const [id, obs] of duplicates) {
+        let entry = firstSeen.get(id);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstSeen.set(id, entry);
+        }
+        if (!entry.minted && nowSec - entry.sinceSec >= graceSec) {
+          entry.minted = true;
+          decision.mint.push({
+            id,
+            dir: obs.projectDir,
+            reason:
+              `${DUP_EPIC_NUMBER_DISTRESS_REASON}: plan number ${obs.epicNumber} in ` +
+              `${obs.projectDir} is held by ${obs.epicIds.length} live epics ` +
+              `(${obs.epicIds.join(", ")}) — a bare fn-${obs.epicNumber} reference now ` +
+              `resolves ambiguously. Renumber or remove all but one (keeper plan renumber) ` +
+              `so the number is unique again.`,
+          });
+        }
+      }
+      // Re-arm any group no longer duplicated this cycle so a future re-duplication waits
+      // the full grace again (the in-memory episode is closed).
+      for (const id of firstSeen.keys()) {
+        if (!duplicates.has(id)) {
+          firstSeen.delete(id);
+        }
+      }
+      // CLEAR layer: level-trigger off the durable open-distress set — any open row no
+      // longer reported duplicated this cycle (renumbered, removed, or gone done) clears
+      // (robust across a restart).
+      for (const id of openDistressIds) {
+        if (!duplicates.has(id)) {
           decision.clear.push({ id, dir: "" });
         }
       }
@@ -6073,6 +6253,11 @@ export async function loadReconcileSnapshot(
   // per-(epic,repo) hash is one-way), so a restarted worker still clears a stale-base
   // distress it minted before the restart.
   const staleBaseDistressIds = new Set<string>();
+  // The distress IDS with an OPEN per-(project,number) duplicate-epic-number distress row —
+  // the level-clear set the duplicate-number grace tracker clears against (a duplicate that
+  // no longer holds this cycle). Collected off the row's ID (the per-(project,number) hash
+  // is one-way), so a restarted worker still clears a distress it minted before the restart.
+  const dupEpicNumberDistressIds = new Set<string>();
   for (const row of read("dispatch_failures")) {
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
@@ -6111,6 +6296,11 @@ export async function loadReconcileSnapshot(
         // disjoint from every dir-keyed distress set above by the `stale-base-lane:`
         // id prefix, so the four distress surfaces never cross-classify.
         staleBaseDistressIds.add(id);
+      }
+      if (isDupEpicNumberDistressKey(verb, id)) {
+        // Collected off the ID (the level-clear compares ids); disjoint from every other
+        // distress set by the `dup-epic-number:` id prefix.
+        dupEpicNumberDistressIds.add(id);
       }
       // A fan-in LANE pre-merge row (its REASON, verb-agnostic — the `daemon`-verb
       // lane WEDGE distress reason is excluded by `isLaneWedgeDistressKey` above and by
@@ -6383,6 +6573,7 @@ export async function loadReconcileSnapshot(
     laneFailures,
     laneWedgeDistressDirs,
     staleBaseDistressIds,
+    dupEpicNumberDistressIds,
     liveTabKeys,
     livePaneIds,
     paneCommandById,
@@ -6527,6 +6718,12 @@ function main(): void {
   // only; a restart re-seeds it from the open-row set. Distinct surface, never
   // cross-clears the siblings.
   const sharedDesyncTracker = createSharedCheckoutDesyncTracker();
+  // Per-(project,number) tracker escalating a landed DUPLICATE plan number (two non-done
+  // epics in one project sharing an `epic_number`) into its own sticky distress row. Fed off
+  // a pure per-cycle probe over the snapshot's epics (NOT git, NOT worktree mode), so it runs
+  // every cycle. In-worker memory only; a restart re-arms it. Distinct surface so the rows
+  // never cross-clear the shared-checkout / lane / stale-base siblings.
+  const dupEpicNumberTracker = createDupEpicNumberTracker();
   // The EVENT-SEEDED desync latch: repo dirs a base→default merge (finalize / recover
   // pass-2) advanced-then-left-trailing this run, fed by `createWorktreeDriver`'s
   // onResyncSkipped sink below. UNIONED each cycle with the OPEN desync row set (which
@@ -7160,6 +7357,51 @@ function main(): void {
           } catch (err) {
             console.error(
               "[autopilot-worker] stale-base lane distress step threw (non-fatal):",
+              err,
+            );
+          }
+        }
+        // Duplicate-epic-number distress escalation (fn-1193): a PURE per-cycle probe over the
+        // snapshot's epics detects two non-done epics in one project sharing an `epic_number`
+        // (a number that slipped past the mint guard). O(open epics), no git, no fold, no new
+        // schema — runs every cycle (NOT gated on worktree mode), gated on !paused (a synthetic
+        // write, mirroring the sibling escalations; the level-trigger resumes on unpause). A
+        // duplicate past the grace mints a per-(project,number) distress row; the level-clear
+        // off the OPEN distress ids fires the cycle the probe stops reporting it (renumbered,
+        // removed, or gone done). The SAME verb-neutral distress channel — the `id` carries the
+        // `dup-epic-number` prefix, so main mints/clears the right synthetic-verb row.
+        if (!state.paused) {
+          try {
+            const dupObs = new Map<string, DupEpicNumberObservation>();
+            for (const g of computeDuplicateEpicNumberGroups(snapshot.epics)) {
+              const id = dupEpicNumberDistressId(g.projectDir, g.epicNumber);
+              if (!dupObs.has(id)) {
+                dupObs.set(id, {
+                  projectDir: g.projectDir,
+                  epicNumber: g.epicNumber,
+                  epicIds: g.epicIds,
+                });
+              }
+            }
+            const dupDecision = dupEpicNumberTracker.step({
+              duplicates: dupObs,
+              openDistressIds: snapshot.dupEpicNumberDistressIds ?? new Set(),
+              nowSec: deps.now(),
+            });
+            for (const m of dupDecision.mint) {
+              deps.emitSharedWedgeDistress?.({
+                id: m.id,
+                dir: m.dir,
+                reason: m.reason ?? DUP_EPIC_NUMBER_DISTRESS_REASON,
+                ts: deps.now(),
+              });
+            }
+            for (const c of dupDecision.clear) {
+              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] duplicate-epic-number distress step threw (non-fatal):",
               err,
             );
           }

@@ -130,6 +130,7 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  isDupEpicNumberDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isSharedDesyncDistressKey,
@@ -414,6 +415,14 @@ export function gcUnretryableDispatchFailures(
     // level-trigger owns dropping it, so the orphan sweep must not reap it out from under
     // its signal.
     if (isSharedDesyncDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the per-(project,number) duplicate-epic-number distress row — a LIVE producer
+    // (the once-per-cycle mint-guard probe) owns it: its own `dup-epic-number:` id prefix
+    // rides the synthetic `daemon` verb, and the probe's level-trigger (the duplicate no
+    // longer holds) owns dropping it, so the orphan sweep must not reap it out from under
+    // its signal.
+    if (isDupEpicNumberDistressKey(row.verb, row.id)) {
       continue;
     }
     // And the per-repo shared-base repair latch (`repair::<repo-token>`) — a LIVE

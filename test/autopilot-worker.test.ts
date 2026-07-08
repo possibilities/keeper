@@ -51,11 +51,13 @@ import {
   classifyWorktreeRepos,
   closerJobFinished,
   computeDeferredEpicIds,
+  computeDuplicateEpicNumberGroups,
   computeMergedLaneEntries,
   computeSlotOccupancy,
   computeStaleBaseLaneEntries,
   confirmRunning,
   createDispatchFailedGate,
+  createDupEpicNumberTracker,
   createLaneWedgeTracker,
   createSharedCheckoutDesyncTracker,
   createSharedCheckoutDirtyTracker,
@@ -69,6 +71,9 @@ import {
   type DispatchedPayload,
   type DispatchFailedPayload,
   type DispatchKey,
+  DUP_EPIC_NUMBER_DISTRESS_REASON,
+  type DupEpicNumberObservation,
+  dupEpicNumberDistressId,
   epicFrameVerdict,
   epicHasActiveResolver,
   epicPresentAndNotDone,
@@ -13520,6 +13525,147 @@ test("stale tracker: a restart (fresh tracker) still level-clears a row minted b
       .length;
   }
   expect(mints).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1193 — the duplicate-epic-number producer probe + distress tracker. The
+// probe is a PURE O(open epics) read over the epics projection; the tracker is a
+// CLONE of the stale-base tracker (grace 0 → mint on first observation), keyed on
+// the per-(project,number) distress ID. All expected values are hand-computed
+// constants, never re-derived from the probe/tracker.
+// ---------------------------------------------------------------------------
+
+test("fn-1193 computeDuplicateEpicNumberGroups: two non-done same-project epics sharing a number → one group naming both (sorted)", () => {
+  const groups = computeDuplicateEpicNumberGroups([
+    makeEpic({ epic_id: "fn-7-zeta", epic_number: 7, project_dir: "/repo" }),
+    makeEpic({ epic_id: "fn-7-alpha", epic_number: 7, project_dir: "/repo" }),
+    makeEpic({ epic_id: "fn-8-solo", epic_number: 8, project_dir: "/repo" }),
+  ]);
+  expect(groups).toEqual([
+    {
+      epicNumber: 7,
+      projectDir: "/repo",
+      epicIds: ["fn-7-alpha", "fn-7-zeta"],
+    },
+  ]);
+});
+
+test("fn-1193 computeDuplicateEpicNumberGroups: a DONE epic in the pair is history, not a jam — no group", () => {
+  // A duplicate involving a done epic is closed history; scoping to non-done pairs
+  // keeps closed history from minting eternal distress.
+  expect(
+    computeDuplicateEpicNumberGroups([
+      makeEpic({ epic_id: "fn-7-live", epic_number: 7, project_dir: "/repo" }),
+      makeEpic({
+        epic_id: "fn-7-done",
+        epic_number: 7,
+        project_dir: "/repo",
+        status: "done",
+      }),
+    ]),
+  ).toEqual([]);
+});
+
+test("fn-1193 computeDuplicateEpicNumberGroups: same number in DIFFERENT projects is NOT a duplicate", () => {
+  expect(
+    computeDuplicateEpicNumberGroups([
+      makeEpic({ epic_id: "fn-7-a", epic_number: 7, project_dir: "/repo-a" }),
+      makeEpic({ epic_id: "fn-7-b", epic_number: 7, project_dir: "/repo-b" }),
+    ]),
+  ).toEqual([]);
+});
+
+test("fn-1193 computeDuplicateEpicNumberGroups: null number / null project are un-keyable and skipped", () => {
+  expect(
+    computeDuplicateEpicNumberGroups([
+      makeEpic({ epic_id: "fn-x-1", epic_number: null, project_dir: "/repo" }),
+      makeEpic({ epic_id: "fn-x-2", epic_number: null, project_dir: "/repo" }),
+      makeEpic({ epic_id: "fn-7-a", epic_number: 7, project_dir: null }),
+      makeEpic({ epic_id: "fn-7-b", epic_number: 7, project_dir: null }),
+    ]),
+  ).toEqual([]);
+});
+
+const DUP_ID_7 = dupEpicNumberDistressId("/repo", 7);
+const DUP_OBS_7: DupEpicNumberObservation = {
+  projectDir: "/repo",
+  epicNumber: 7,
+  epicIds: ["fn-7-alpha", "fn-7-zeta"],
+};
+
+test("fn-1193 dup tracker: a duplicate mints EXACTLY once on first observation (grace 0), keyed per-(project,number)", () => {
+  const tracker = createDupEpicNumberTracker(); // grace 0
+  const dup = new Map([[DUP_ID_7, DUP_OBS_7]]);
+  const empty = new Set<string>();
+  const first = tracker.step({
+    duplicates: dup,
+    openDistressIds: empty,
+    nowSec: 1000,
+  });
+  expect(first.mint.length).toBe(1);
+  expect(first.mint[0]?.id).toBe(DUP_ID_7);
+  expect(first.mint[0]?.dir).toBe("/repo");
+  expect(
+    first.mint[0]?.reason?.startsWith(DUP_EPIC_NUMBER_DISTRESS_REASON),
+  ).toBe(true);
+  expect(first.mint[0]?.reason).toContain("fn-7-alpha");
+  expect(first.mint[0]?.reason).toContain("fn-7-zeta");
+  // Subsequent cycles while still duplicated → NEVER re-mint (O(1) per episode).
+  for (const ts of [1001, 1600, 5000]) {
+    expect(
+      tracker.step({ duplicates: dup, openDistressIds: empty, nowSec: ts })
+        .mint,
+    ).toEqual([]);
+  }
+});
+
+test("fn-1193 dup tracker: the duplicate resolving level-clears the open distress row EXACTLY once", () => {
+  const tracker = createDupEpicNumberTracker();
+  const dup = new Map([[DUP_ID_7, DUP_OBS_7]]);
+  const open = new Set([DUP_ID_7]); // durable open distress row
+  // Still duplicated → no clear.
+  expect(
+    tracker.step({ duplicates: dup, openDistressIds: open, nowSec: 2000 })
+      .clear,
+  ).toEqual([]);
+  // The probe stops reporting the duplicate (renumbered / removed / gone done) but the
+  // row is still open → level-clear it once, keyed on the same per-(project,number) id.
+  const cleared = tracker.step({
+    duplicates: new Map(),
+    openDistressIds: open,
+    nowSec: 2001,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([DUP_ID_7]);
+  // Once main folds the clear the row is gone → no re-clear.
+  expect(
+    tracker.step({
+      duplicates: new Map(),
+      openDistressIds: new Set(),
+      nowSec: 2002,
+    }).clear,
+  ).toEqual([]);
+});
+
+test("fn-1193 dup tracker: key is STABLE across cycles and DISTINCT per (project, number)", () => {
+  // Same (project, number) → same id across cycles (mint + clear hit one row).
+  expect(dupEpicNumberDistressId("/repo", 7)).toBe(DUP_ID_7);
+  // Distinct number, or distinct project → distinct rows.
+  expect(dupEpicNumberDistressId("/repo", 8)).not.toBe(DUP_ID_7);
+  expect(dupEpicNumberDistressId("/repo-b", 7)).not.toBe(DUP_ID_7);
+});
+
+test("fn-1193 dup tracker: a restart (fresh tracker) still level-clears a row minted before it", () => {
+  // Simulate a daemon restart: brand-new tracker, empty in-memory latch, but the
+  // durable distress row is still open in the projection. The duplicate resolved during
+  // downtime → the projection-driven clear fires even though this instance never minted.
+  const fresh = createDupEpicNumberTracker();
+  const open = new Set([DUP_ID_7]);
+  const cleared = fresh.step({
+    duplicates: new Map(),
+    openDistressIds: open,
+    nowSec: 9000,
+  });
+  expect(cleared.clear.map((c) => c.id)).toEqual([DUP_ID_7]);
 });
 
 test("fn-1014 reconcile: a deferred epic's WORK and CLOSE launches are BOTH suppressed; a non-deferred sibling still launches (no sticky / dispatch_failures minted)", () => {
