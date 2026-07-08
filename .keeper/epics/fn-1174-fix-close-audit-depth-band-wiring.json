@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-08T02:39:45.146000Z",
   "created_at": "2026-07-07T20:44:05.623000Z",
   "created_by_close_of": "fn-1167-variable-depth-automated-review",
   "depends_on_epics": [
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-07T20:44:06.246000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix close-audit depth-band wiring",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-07T20:44:06.246000Z"
+  "updated_at": "2026-07-08T02:39:45.146000Z"
 }
