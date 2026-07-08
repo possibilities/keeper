@@ -7,7 +7,7 @@
     "fn-1188-harden-diagnosis-read-subcommand-flag"
   ],
   "id": "fn-1189-close-grep-exec-alias-abbreviation",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T03:12:54.875000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T03:12:54.269000Z"
+  "updated_at": "2026-07-08T03:12:54.875000Z"
 }
