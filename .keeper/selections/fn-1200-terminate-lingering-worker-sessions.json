@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Never-kill-a-live-worker safety invariant across a cross-cutting slot-authority redesign",
+      "task_id": "fn-1200-terminate-lingering-worker-sessions.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.63,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded ack-row reconciliation; GC-vs-prune-block fork is judgment but not opus-bound",
+      "task_id": "fn-1200-terminate-lingering-worker-sessions.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "One-way terminality latch stopping verdict flap without over-latching or earlier await-complete firing",
+      "task_id": "fn-1200-terminate-lingering-worker-sessions.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T20:57:58.467000Z",
+  "epic_id": "fn-1200-terminate-lingering-worker-sessions",
+  "input_hash": "5ae61aadbbb7a8ec390261b3935fadf79e384c063ac92298d1c2511869837957",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1525029549,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1200-terminate-lingering-worker-sessions.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1200-terminate-lingering-worker-sessions.2\",\"tier\":\"high\",\"model\":\"sonnet\"},{\"task_id\":\"fn-1200-terminate-lingering-worker-sessions.3\",\"tier\":\"xhigh\",\"model\":\"opus\"}]}"
+}
