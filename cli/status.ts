@@ -62,9 +62,9 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * additive `board.epics[].question` parked-closer-question field and the
  * `needs_human.parked_questions` count; v5 adds the additive
  * `needs_human.instant_death_wall` count (the instant-death circuit breaker);
- * v6 adds the additive DISPLAY-ONLY `needs_human.selection_reviews` count (the
- * close-time selection-review flag — contributes zero to `total`/`jammed`). */
-export const STATUS_SCHEMA_VERSION = 6;
+ * v7 drops the `needs_human.selection_reviews` count (close-time selection
+ * grading retires — grading moves out-of-band). */
+export const STATUS_SCHEMA_VERSION = 7;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -200,13 +200,6 @@ export interface StatusData {
     // `stuck_dispatches` (never double-counted into `total`, like
     // `finalize_non_ff` / `instant_death_wall`).
     blocked_work: number;
-    // Count of epics carrying a non-null close-time `selection_review` flag,
-    // ANY status (a flagged CLOSED epic still counts — the review outlives its
-    // epic's close). ADR 0011 DISPLAY-ONLY member (v6): contributes ZERO to
-    // `total` and never flips `jammed`; the operator clears it with one verb.
-    // Sourced from the narrow unfiltered `selectionReviewEpics` snapshot read,
-    // NOT the open-filtered `board.epics`.
-    selection_reviews: number;
     total: number;
   };
   rev: number | null;
@@ -348,16 +341,6 @@ export function buildStatusEnvelope(
   }).counts;
   const needsHumanTotal = needsHuman.total;
 
-  // ADR 0011 DISPLAY-ONLY: count epics carrying a non-null `selection_review`
-  // flag REGARDLESS of open/closed status, off the narrow unfiltered
-  // `selectionReviewEpics` read (so a flagged CLOSED epic — absent from the
-  // open-filtered `snap.epics` — still counts). Deliberately NOT folded into
-  // `needsHumanTotal` above, so it contributes zero to `total` and never flips
-  // `jammed`. Filter to non-null for robustness (a cleared epic drops to null).
-  const selectionReviews = (snap.selectionReviewEpics ?? []).filter(
-    (e) => (e.selection_review ?? null) !== null,
-  ).length;
-
   // At rest: nothing the autopilot could dispatch right now (no ready/running
   // epic header, no in-flight launch). `jammed` vs `drained` splits on whether
   // a human-blocking signal remains.
@@ -398,7 +381,6 @@ export function buildStatusEnvelope(
       parked_questions: needsHuman.parkedQuestions,
       instant_death_wall: needsHuman.instantDeathWall,
       blocked_work: needsHuman.blockedWork,
-      selection_reviews: selectionReviews,
       total: needsHuman.total,
     },
     rev: boot.rev,
@@ -574,10 +556,6 @@ export async function runStatus(
     // query. The gate holds first paint until the collection paints, so a
     // painted snapshot always carries the real jam rows.
     includeDispatchFailures: true,
-    // ADR 0011: also carry the flagged-epic set (any status) for the
-    // display-only `needs_human.selection_reviews` count — ONE round-trip, no
-    // out-of-band query, and a flagged CLOSED epic stays visible.
-    includeSelectionReviewEpics: true,
     giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
     onBootStatus: (boot: BootStatus): void => {
       latestBoot = { rev: boot.rev, catching_up: boot.catching_up };

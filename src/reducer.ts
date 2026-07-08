@@ -596,14 +596,6 @@ interface PlanSnapshot {
    * reproduces the same row across re-fold.
    */
   question?: string | null;
-  /**
-   * The epic-level selection-review record (EpicSnapshot blob, epic-level
-   * only) — a small JSON verdict summary, sourced from the same gitignored
-   * `.state.json` runtime overlay as {@link question}. Absent / NULL folds to
-   * `null` (no review stamped) so a pre-this-feature blob reproduces the same
-   * row across re-fold.
-   */
-  selection_review?: string | null;
 }
 
 /**
@@ -686,8 +678,8 @@ function projectPlanRow(db: Database, event: Event): void {
     // EpicSnapshot re-fold would wipe the provenance, job-link, and
     // resolved-deps projections.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, selection_review, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -696,7 +688,6 @@ function projectPlanRow(db: Database, event: Event): void {
          depends_on_epics = excluded.depends_on_epics,
          last_validated_at = excluded.last_validated_at,
          question = excluded.question,
-         selection_review = excluded.selection_review,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at`,
       [
@@ -712,10 +703,6 @@ function projectPlanRow(db: Database, event: Event): void {
         // The parked-closer question — a missing / NULL blob value folds to
         // NULL (no parked question, the zero-event reading).
         snapshot.question ?? null,
-        // The selection-review record — a missing / NULL blob value folds to
-        // NULL (no review stamped, the zero-event reading). The producer already
-        // coerced it to string-or-null, so the fold stays a trivial pass-through.
-        snapshot.selection_review ?? null,
         event.id,
         ts,
       ],
@@ -7840,7 +7827,6 @@ function epicLiteToEpic(row: EpicLite): Epic {
     last_validated_at: null,
     resolved_epic_deps: null,
     question: null,
-    selection_review: null,
   };
 }
 

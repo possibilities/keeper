@@ -1,12 +1,14 @@
 // Conformance spec for `keeper plan selection-review-submit <epic_id> --file -`
-// — validate the auditor verdict + land the committed per-epic review dataset.
+// — validate an out-of-band auditor verdict + land the committed per-epic
+// review dataset.
 //
-// Validates the 3-way enum + exact auditable coverage (no missing / extra /
-// duplicate), writes the committed `.keeper/selection-reviews/<epic>.json` (each
-// verdict snapshotting the graded {tier, model} + selection hashes) riding the
-// verb auto-commit, and sets the task-2 display-only misfit flag ONLY on a
-// non-right-sized verdict. A malformed verdict is rejected with the single
-// distinct VERDICT_INVALID code, leaving no file and no flag. Write-once without
+// Validates the non-empty top-level rubric_version/judge_model_version/
+// prompt_hash, the 3-way enum, + exact auditable coverage (no missing / extra /
+// duplicate), and writes the committed `.keeper/selection-reviews/<epic>.json`
+// stamped with those three provenance keys (each verdict also snapshotting the
+// graded {tier, model} + selection hashes) riding the verb auto-commit. The verb
+// writes no board/overlay state. A malformed verdict is rejected with the
+// single distinct VERDICT_INVALID code, leaving no file. Write-once without
 // --force.
 
 import { describe, expect, test } from "bun:test";
@@ -112,23 +114,21 @@ function loadReview(root: string, epicId: string): Record<string, unknown> {
   >;
 }
 
-/** The `selection_review` overlay field, or undefined when the overlay is absent
- * or carries no review. */
-function overlayReview(root: string, epicId: string): unknown {
-  const p = join(root, ".keeper", "state", "epics", `${epicId}.state.json`);
-  if (!existsSync(p)) {
-    return undefined;
-  }
-  return (JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>)
-    .selection_review;
-}
+/** The grading run's own provenance keys — a fixed default so most tests need
+ * not care about them; a caller testing THEIR validation overrides explicitly. */
+const DEFAULT_PROVENANCE = {
+  rubric_version: "rubric-v1",
+  judge_model_version: "judge-model-v1",
+  prompt_hash: "prompt-hash-abc123",
+};
 
 function submit(
   proj: ProjectHandle,
   epicId: string,
-  verdict: unknown,
+  verdict: Record<string, unknown>,
   extra: string[] = [],
 ) {
+  const payload = { ...DEFAULT_PROVENANCE, ...verdict };
   return runCli(
     [
       "selection-review-submit",
@@ -139,14 +139,14 @@ function submit(
       proj.root,
       ...extra,
     ],
-    { cwd: proj.root, home: proj.home, input: JSON.stringify(verdict) },
+    { cwd: proj.root, home: proj.home, input: JSON.stringify(payload) },
   );
 }
 
 describe("selection-review-submit success", () => {
   const getProj = withProject("planctl-srs-");
 
-  test("misfit verdict writes a snapshotted review file + sets the flag (one commit)", () => {
+  test("misfit verdict writes a snapshotted review file stamped with grading provenance (one commit)", () => {
     const proj = getProj();
     const { epicId, auditableIds } = setupAuditable(proj, 2, [
       { tier: "low", model: "sonnet" },
@@ -171,20 +171,27 @@ describe("selection-review-submit success", () => {
     expect(r.code).toBe(0);
     const env = parseCliOutput(r.output);
     expect(env.success).toBe(true);
-    expect(env.flag_set).toBe(true);
+    expect(env.flag_set).toBeUndefined();
     expect(env.counts).toEqual({
       underpowered: 1,
       right_sized: 1,
       overpowered: 0,
     });
-    // Exactly one commit lands (the committed review file).
+    expect(env.graded_task_ids).toEqual(
+      expect.arrayContaining([auditableIds[0], auditableIds[1]]),
+    );
+    // Exactly one commit lands (the committed review file); no board/overlay
+    // state is written.
     expect(gitLogCount(proj.root)).toBe(before + 1);
 
     const review = loadReview(proj.root, epicId);
-    expect(review.schema_version).toBe(1);
+    expect(review.schema_version).toBe(2);
     expect(review.epic_id).toBe(epicId);
     expect(review.selection_config_hash).toBe("cfg-hash-abc");
     expect(review.selection_input_hash).toBe("in-hash-xyz");
+    expect(review.rubric_version).toBe("rubric-v1");
+    expect(review.judge_model_version).toBe("judge-model-v1");
+    expect(review.prompt_hash).toBe("prompt-hash-abc123");
     expect(review.counts).toEqual({
       underpowered: 1,
       right_sized: 1,
@@ -202,16 +209,9 @@ describe("selection-review-submit success", () => {
     const v1 = byId.get(auditableIds[1] as string) as Record<string, unknown>;
     expect(v1.tier).toBe("xhigh");
     expect(v1.model).toBe("opus");
-
-    // The display-only flag overlay carries the counts payload.
-    const flag = overlayReview(proj.root, epicId);
-    expect(typeof flag).toBe("string");
-    const parsedFlag = JSON.parse(flag as string) as Record<string, unknown>;
-    expect(parsedFlag.underpowered).toBe(1);
-    expect(parsedFlag.overpowered).toBe(0);
   });
 
-  test("fully right-sized epic writes the dataset but raises no flag", () => {
+  test("fully right-sized epic writes the dataset with the same provenance stamp", () => {
     const proj = getProj();
     const { epicId, auditableIds } = setupAuditable(proj, 2);
     const verdict = {
@@ -224,20 +224,20 @@ describe("selection-review-submit success", () => {
     const r = submit(proj, epicId, verdict);
     expect(r.code).toBe(0);
     const env = parseCliOutput(r.output);
-    expect(env.flag_set).toBe(false);
     expect(env.counts).toEqual({
       underpowered: 0,
       right_sized: 2,
       overpowered: 0,
     });
-    // The committed dataset still lands.
     expect(existsSync(reviewPath(proj.root, epicId))).toBe(true);
-    // No misfit flag raised.
-    expect(overlayReview(proj.root, epicId)).toBeUndefined();
+    const review = loadReview(proj.root, epicId);
+    expect(review.rubric_version).toBe("rubric-v1");
+    expect(review.judge_model_version).toBe("judge-model-v1");
+    expect(review.prompt_hash).toBe("prompt-hash-abc123");
   });
 });
 
-describe("selection-review-submit validation (no file, no flag)", () => {
+describe("selection-review-submit validation (no file written)", () => {
   const getProj = withProject("planctl-srs-inv-");
 
   function expectRejected(
@@ -250,7 +250,6 @@ describe("selection-review-submit validation (no file, no flag)", () => {
       (parseCliOutput(r.output).error as Record<string, unknown>).code,
     ).toBe("VERDICT_INVALID");
     expect(existsSync(reviewPath(proj.root, epicId))).toBe(false);
-    expect(overlayReview(proj.root, epicId)).toBeUndefined();
   }
 
   test("bad enum -> VERDICT_INVALID", () => {
@@ -298,7 +297,7 @@ describe("selection-review-submit validation (no file, no flag)", () => {
     expectRejected(proj, epicId, r);
   });
 
-  test("malformed JSON -> VERDICT_INVALID (distinct code, no file, no flag)", () => {
+  test("malformed JSON -> VERDICT_INVALID (distinct code, no file)", () => {
     const proj = getProj();
     const { epicId } = setupAuditable(proj, 1);
     const r = runCli(
@@ -312,6 +311,42 @@ describe("selection-review-submit validation (no file, no flag)", () => {
       ],
       { cwd: proj.root, home: proj.home, input: "{not json" },
     );
+    expectRejected(proj, epicId, r);
+  });
+
+  test("missing rubric_version -> VERDICT_INVALID", () => {
+    const proj = getProj();
+    const { epicId, auditableIds } = setupAuditable(proj, 1);
+    const r = submit(proj, epicId, {
+      rubric_version: "",
+      verdicts: [
+        { task_id: auditableIds[0], verdict: "right_sized", evidence: "x" },
+      ],
+    });
+    expectRejected(proj, epicId, r);
+  });
+
+  test("missing judge_model_version -> VERDICT_INVALID", () => {
+    const proj = getProj();
+    const { epicId, auditableIds } = setupAuditable(proj, 1);
+    const r = submit(proj, epicId, {
+      judge_model_version: "  ",
+      verdicts: [
+        { task_id: auditableIds[0], verdict: "right_sized", evidence: "x" },
+      ],
+    });
+    expectRejected(proj, epicId, r);
+  });
+
+  test("missing prompt_hash -> VERDICT_INVALID", () => {
+    const proj = getProj();
+    const { epicId, auditableIds } = setupAuditable(proj, 1);
+    const r = submit(proj, epicId, {
+      prompt_hash: "",
+      verdicts: [
+        { task_id: auditableIds[0], verdict: "right_sized", evidence: "x" },
+      ],
+    });
     expectRejected(proj, epicId, r);
   });
 });
@@ -349,5 +384,47 @@ describe("selection-review-submit write-once + brief gate", () => {
     expect(
       (parseCliOutput(r.output).error as Record<string, unknown>).code,
     ).toBe("BRIEF_MISSING");
+  });
+});
+
+describe("selection-review-submit schema compatibility", () => {
+  const getProj = withProject("planctl-srs-compat-");
+
+  test("a pre-existing schema_version 1 review file (no provenance keys) still parses and joins by config_hash", () => {
+    const proj = getProj();
+    const { epicId } = scaffoldEpic(proj, { nTasks: 1 });
+    const reviewsDir = join(proj.root, ".keeper", "selection-reviews");
+    mkdirSync(reviewsDir, { recursive: true });
+    const legacy = {
+      schema_version: 1,
+      epic_id: epicId,
+      created_at: "2026-01-01T00:00:00.000000Z",
+      selection_config_hash: "cfg-hash-legacy",
+      selection_input_hash: "in-hash-legacy",
+      counts: { underpowered: 0, right_sized: 1, overpowered: 0 },
+      verdicts: [
+        {
+          task_id: `${epicId}.1`,
+          verdict: "right_sized",
+          evidence: "matched",
+          tier: "medium",
+          model: "opus",
+          config_hash: "cfg-hash-legacy",
+          input_hash: "in-hash-legacy",
+        },
+      ],
+    };
+    writeFileSync(
+      join(reviewsDir, `${epicId}.json`),
+      serializeStateJson(legacy),
+      "utf-8",
+    );
+
+    const loaded = loadReview(proj.root, epicId);
+    expect(loaded.schema_version).toBe(1);
+    expect(loaded.rubric_version).toBeUndefined();
+    expect(loaded.selection_config_hash).toBe("cfg-hash-legacy");
+    const verdicts = loaded.verdicts as Array<Record<string, unknown>>;
+    expect(verdicts[0]?.config_hash).toBe("cfg-hash-legacy");
   });
 });

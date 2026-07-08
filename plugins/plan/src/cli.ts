@@ -55,7 +55,6 @@ import { runResolveTask } from "./verbs/resolve_task.ts";
 import { runScaffold } from "./verbs/scaffold.ts";
 import { runSelectionAuditBrief } from "./verbs/selection_audit_brief.ts";
 import { runSelectionBrief } from "./verbs/selection_brief.ts";
-import { runSelectionReview } from "./verbs/selection_review.ts";
 import { runSelectionReviewSubmit } from "./verbs/selection_review_submit.ts";
 import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
@@ -801,9 +800,10 @@ function dispatch(parsed: ParsedArgs): number {
         createdByCloseOf: null,
       });
     case "selection-audit-brief":
-      // Commit-free audit handoff: writes gitignored state/ and emits one
-      // content-blind envelope; the selection-auditor subagent reads the brief.
-      // --force re-assembles despite an existing committed review.
+      // Committed capture beat: writes a top-level data-dir sibling and rides
+      // the verb's auto-commit; a later out-of-band grading run reads the brief.
+      // Write-once on the brief's own existence — a re-close is idempotent;
+      // --force re-derives despite an existing committed brief.
       runSelectionAuditBrief({
         epicId: readPositionalSkipping(rest, new Set(["--project"])),
         project: readOption(rest, "--project"),
@@ -823,27 +823,10 @@ function dispatch(parsed: ParsedArgs): number {
         fromFollowup: readFlag(rest, "--from-followup"),
       });
       break;
-    case "selection-review": {
-      // Positional epic id, then either --set <json> or --clear. --set and
-      // --project are value-taking, so they must be skipped when scanning for
-      // the id positional. Readonly overlay write (mirrors epic-question).
-      const epicId = readPositionalSkipping(
-        rest,
-        new Set(["--set", "--project"]),
-      );
-      runSelectionReview({
-        epicId,
-        payload: readOption(rest, "--set"),
-        clear: readFlag(rest, "--clear"),
-        project: readOption(rest, "--project"),
-        format,
-      });
-      break;
-    }
     case "selection-review-submit": {
-      // Mutating verb: validates the auditor verdict on stdin (--file -), writes
-      // the committed review file (auto-committed), and sets the display-only
-      // misfit flag only on a non-right-sized verdict. Self-emits its envelope.
+      // Mutating verb: validates the auditor verdict on stdin (--file -) and
+      // writes the committed review file (auto-committed); no board/overlay
+      // state is written. Self-emits its envelope.
       const epicId = readPositionalSkipping(
         rest,
         new Set(["--file", "--project"]),

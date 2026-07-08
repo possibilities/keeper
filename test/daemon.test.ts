@@ -3362,7 +3362,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // rewind: a pre-v115 stream carries no `RepairDispatched` event, so a from-scratch
   // re-fold leaves it NULL byte-identical, and `foldDispatchFailed` preserves it across
   // the UPSERT).
-  expect(SCHEMA_VERSION).toBe(115);
+  // And to 116 via fn-1172 task .3 (DROPPING the `epics.selection_review` TEXT
+  // column via a REWINDING migration — a pre-removal EpicSnapshot's `selection_review`
+  // key folds away unread, so a from-scratch re-fold over any stream produces the
+  // narrower epics shape byte-identically; `commit_trailer_facts` spared per the
+  // same carve-out).
+  expect(SCHEMA_VERSION).toBe(116);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

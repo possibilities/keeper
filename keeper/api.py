@@ -442,6 +442,9 @@ from pathlib import Path
 # v115 (fn-1173 task .4) appends the nullable ``dispatch_failures.repair_dispatched_at``
 # REAL once-marker (the repair-dispatch latch) via a plain additive ALTER; keeper-py
 # never reads ``dispatch_failures``, so only the version whitelist gains 115.
+# v116 (fn-1172 task .3) drops the ``epics.selection_review`` TEXT column (the
+# close-time selection-review record retires) via a REWINDING migration; the fixed
+# epics SELECT never named it, so only the version whitelist gains 116.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -529,6 +532,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         113,
         114,
         115,
+        116,
     }
 )
 

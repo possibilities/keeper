@@ -1,10 +1,11 @@
 // Conformance spec for `keeper plan selection-audit-brief <epic_id>` — the
-// close-time selection-audit handoff. The verb assembles, under gitignored state,
-// the grading record for each AUDITABLE completed task (spec, assigned {tier,
-// model}, sidecar provenance + hashes, per-task diff stats from Task-trailer
-// commits, done summary), excludes degraded-default and never-executed tasks, and
-// refuses when a committed review already exists (unless --force). Commit-free:
-// the brief lands under state/, so no data-dir commit is drawn.
+// committed selection-audit capture beat. The verb assembles the grading record
+// for each AUDITABLE completed task (spec, assigned {tier, model}, selection
+// hashes, per-task diff stats from Task-trailer commits, done summary), excludes
+// degraded-default and never-executed tasks, and lands the brief committed at
+// `.keeper/selection-audit-briefs/<epic>.json` (auto-committed, top-level data-dir
+// sibling). Write-once on its OWN existence: a second invocation without --force
+// skips idempotently (no rewrite, no second commit); --force re-derives it.
 
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -85,16 +86,15 @@ function seedCommit(
   });
 }
 
+function briefPath(root: string, epicId: string): string {
+  return join(root, ".keeper", "selection-audit-briefs", `${epicId}.json`);
+}
+
 function loadBrief(root: string, epicId: string): Record<string, unknown> {
-  const p = join(
-    root,
-    ".keeper",
-    "state",
-    "selections",
-    epicId,
-    "audit-brief.json",
-  );
-  return JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
+  return JSON.parse(readFileSync(briefPath(root, epicId), "utf-8")) as Record<
+    string,
+    unknown
+  >;
 }
 
 describe("selection-audit-brief assembly", () => {
@@ -135,8 +135,9 @@ describe("selection-audit-brief assembly", () => {
     expect(env.selection_config_hash).toBe("cfg-hash-abc");
     expect(env.selection_input_hash).toBe("in-hash-xyz");
 
-    // Commit-free: the brief lands under gitignored state/.
-    expect(gitLogCount(proj.root)).toBe(before);
+    // The committed brief lands (top-level data-dir sibling), riding the verb's
+    // own auto-commit.
+    expect(gitLogCount(proj.root)).toBe(before + 1);
 
     const brief = loadBrief(proj.root, epicId);
     expect(brief.schema_version).toBe(1);
@@ -149,9 +150,11 @@ describe("selection-audit-brief assembly", () => {
     expect(a0.task_id).toBe(t0);
     expect(a0.tier).toBe("high");
     expect(a0.model).toBe("opus");
-    expect(a0.rationale).toBe("architectural work");
-    expect(a0.confidence).toBe(0.9);
-    expect(a0.label_source).toBe("heuristic-guided");
+    // The blinded brief never carries the selector's rationale/confidence/
+    // label_source — those stay in the selection sidecar for calibration only.
+    expect(a0.rationale).toBeUndefined();
+    expect(a0.confidence).toBeUndefined();
+    expect(a0.label_source).toBeUndefined();
     expect(a0.config_hash).toBe("cfg-hash-abc");
     expect(a0.input_hash).toBe("in-hash-xyz");
     expect(a0.done_summary).toBe(`did ${t0}`);
@@ -269,52 +272,47 @@ describe("selection-audit-brief gates", () => {
     expect(r.code).toBe(1);
     const err = parseCliOutput(r.output).error as Record<string, unknown>;
     expect(err.code).toBe("SIDECAR_MISSING");
-    expect(
-      existsSync(
-        join(
-          proj.root,
-          ".keeper",
-          "state",
-          "selections",
-          epicId,
-          "audit-brief.json",
-        ),
-      ),
-    ).toBe(false);
+    expect(existsSync(briefPath(proj.root, epicId))).toBe(false);
   });
 
-  test("an existing committed review blocks re-assembly without --force", () => {
+  test("a second invocation skips idempotently (no rewrite, no commit); --force re-derives", () => {
     const proj = getProj();
     const { epicId, taskIds } = scaffoldEpic(proj, { nTasks: 1 });
     const t0 = taskIds[0] as string;
     writeSidecar(proj.root, epicId, [{ task_id: t0 }]);
     doneTask(proj, t0);
-    // Simulate an already-committed review file.
-    const reviewsDir = join(proj.root, ".keeper", "selection-reviews");
-    mkdirSync(reviewsDir, { recursive: true });
-    writeFileSync(
-      join(reviewsDir, `${epicId}.json`),
-      serializeStateJson({ schema_version: 1, epic_id: epicId }),
-      "utf-8",
-    );
+    seedCommit(proj.root, t0, [{ path: "a.ts", insertions: 1, deletions: 0 }]);
 
-    const blocked = runCli(
+    const first = runCli(
       ["selection-audit-brief", epicId, "--project", proj.root],
       { cwd: proj.root, home: proj.home },
     );
-    expect(blocked.code).toBe(1);
-    expect(
-      (parseCliOutput(blocked.output).error as Record<string, unknown>).code,
-    ).toBe("REVIEW_EXISTS");
+    expect(first.code).toBe(0);
+    const afterFirst = gitLogCount(proj.root);
 
-    // --force re-assembles.
-    seedCommit(proj.root, t0, [{ path: "a.ts", insertions: 1, deletions: 0 }]);
+    // A second invocation without --force is a pure idempotent skip: success,
+    // no rewrite, no second commit — a re-close is not a re-audit.
+    const second = runCli(
+      ["selection-audit-brief", epicId, "--project", proj.root],
+      { cwd: proj.root, home: proj.home },
+    );
+    expect(second.code).toBe(0);
+    const env2 = parseCliOutput(second.output);
+    expect(env2.success).toBe(true);
+    expect(env2.skipped).toBe(true);
+    expect(gitLogCount(proj.root)).toBe(afterFirst);
+
+    // --force re-derives, landing a new write + commit.
+    seedCommit(proj.root, t0, [{ path: "b.ts", insertions: 2, deletions: 0 }]);
     const forced = runCli(
       ["selection-audit-brief", epicId, "--project", proj.root, "--force"],
       { cwd: proj.root, home: proj.home },
     );
     expect(forced.code).toBe(0);
-    expect(parseCliOutput(forced.output).success).toBe(true);
+    const envForced = parseCliOutput(forced.output);
+    expect(envForced.success).toBe(true);
+    expect(envForced.skipped).toBeUndefined();
+    expect(gitLogCount(proj.root)).toBe(afterFirst + 1);
   });
 
   test("malformed id -> BAD_EPIC_ID", () => {

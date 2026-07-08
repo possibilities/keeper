@@ -48,7 +48,7 @@ import { parseUsageModels, type UsageModels } from "./usage-models";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 115;
+export const SCHEMA_VERSION = 116;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1045,13 +1045,7 @@ CREATE TABLE IF NOT EXISTS epics (
     -- Declared AFTER the VIRTUAL default_visible column so a fresh CREATE and
     -- a migrated ALTER TABLE ... ADD COLUMN (which always appends) produce
     -- byte-identical table_info/table_xinfo column order.
-    question TEXT,
-    -- selection_review: nullable TEXT, the epic-level close-time selection-review
-    -- record (the keeper plan selection-review runtime overlay — a small JSON
-    -- verdict-counts summary, stored verbatim). NULL = no review stamped (the
-    -- zero-event reading). Same append-after-default_visible rule as question so
-    -- fresh-vs-migrated column order stays byte-identical.
-    selection_review TEXT
+    question TEXT
 )
 `;
 
@@ -2434,7 +2428,6 @@ function backfillResolvedEpicDeps(db: Database): void {
       last_validated_at: null,
       resolved_epic_deps: null,
       question: null,
-      selection_review: null,
     };
     epicById.set(row.epic_id, epic);
     if (row.epic_number != null) {
@@ -2481,7 +2474,6 @@ function backfillResolvedEpicDeps(db: Database): void {
           last_validated_at: null,
           resolved_epic_deps: null,
           question: null,
-          selection_review: null,
         };
         let depTokens: string[] = [];
         if (row.depends_on_epics != null && row.depends_on_epics.length > 0) {
@@ -6105,27 +6097,6 @@ function migrate(db: Database): void {
       addColumnIfMissing(db, "jobs", "adopted", "INTEGER");
       addColumnIfMissing(db, "autopilot_state", "codex_adoption", "INTEGER");
 
-      // v111→v112 (fn-1151 task .2): add the nullable `epics.selection_review`
-      // TEXT column — the epic-level close-time selection-review record (a small
-      // JSON verdict-counts summary, `keeper plan selection-review`). Folded from
-      // the `EpicSnapshot` synthetic event's `selection_review` field, mirroring
-      // `epics.question`: the plan-worker caches the value observed in the
-      // gitignored `<state>/epics/<epic_id>.state.json` overlay and re-emits a
-      // full EpicSnapshot (def fields + cached question + cached selection_review)
-      // on either a def or overlay change. Nullable, NO default: NULL = no review
-      // stamped (the zero-event reading) and a `DEFAULT` would poison that
-      // invariant. A historical EpicSnapshot payload carries no `selection_review`
-      // key, so a from-scratch re-fold folds the column to NULL byte-identically
-      // (deterministic-replayed, NO cursor rewind needed — migration and re-fold
-      // agree at NULL until a fresh post-upgrade EpicSnapshot lands). Declared in
-      // the `CREATE_EPICS` literal too, placed AFTER `question` so `ALTER TABLE
-      // ADD COLUMN` (which always appends) keeps fresh-vs-migrated
-      // `PRAGMA table_info`/`table_xinfo(epics)` byte-identical. The fixed epics
-      // SELECT list in `keeper/api.py` names only `epic_id, project_dir, tasks,
-      // jobs`, so this bump MUST add 112 to `SUPPORTED_SCHEMA_VERSIONS` there in
-      // the SAME commit; test/schema-version.test.ts enforces it.
-      addColumnIfMissing(db, "epics", "selection_review", "TEXT");
-
       // v112→v113 (fn-1164 task .1): the jobs lifecycle stamp. Add the nullable
       // `jobs.last_lifecycle_ts` REAL column — the per-row event-time high-water
       // mark a lifecycle transition may not regress behind (ADR 0013), so a stale
@@ -6282,6 +6253,71 @@ function migrate(db: Database): void {
         "repair_dispatched_at",
         "REAL",
       );
+
+      // v115→v116 (fn-1172 task .3): retire the epic-level close-time
+      // selection-review record. `epics.selection_review` is a plain leaf TEXT
+      // column (no index, no generated-column reference), so a direct DROP COLUMN
+      // suffices — no table rebuild. The reducer's epics upsert no longer writes
+      // it and a historical EpicSnapshot's `selection_review` key folds away
+      // unread, so a from-scratch re-fold produces the narrower row shape.
+      //
+      // REWINDING migration (the fn-936 v85 `plan_queue_jump` drop is the
+      // precedent): rewind the cursor to 0 and wipe the FULL deterministic-replayed
+      // projection set so the post-migrate boot drain re-folds them under the v116
+      // reducer into the narrower `epics` shape. The DELETE list MIRRORS the v113
+      // block above (enumerated fresh from the current schema, NOT an older block).
+      // `commit_trailer_facts` is DELIBERATELY NOT wiped (a derive input keyed by
+      // the `event_id` PK with an `INSERT OR IGNORE` fold — it re-folds
+      // byte-identically from id 0 without a wipe). The LIVE-ONLY git surface is
+      // wiped + its floor RAISED to `max(events.id)` (never a floor-0 reset — that
+      // re-arms the `computeRepoBashWindows` O(history) re-fold time-bomb v79
+      // fixed), `seed_required = 1` so the boot-seed re-derives it above the floor.
+      // The ephemeral `pending_dispatches` is wiped so the cursor-0 re-fold cannot
+      // resurrect a phantom dispatch jam. Version-guarded — non-idempotent.
+      //
+      // Whitelist-only Python read (keeper-py reads no epics selection-review
+      // surface) — this bump MUST add 116 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
+      if (preMigrateStoredVersion < 116) {
+        dropColumnIfPresent(db, "epics", "selection_review");
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM usage");
+        db.run("DELETE FROM profiles");
+        db.run("DELETE FROM dispatch_failures");
+        db.run("DELETE FROM dispatch_instant_death");
+        db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM autopilot_state");
+        db.run("DELETE FROM block_escalations");
+        db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM armed_epics");
+        db.run("DELETE FROM builds");
+        db.run("DELETE FROM epic_dep_edges");
+        db.run("DELETE FROM epic_tombstones");
+        db.run("DELETE FROM scheduled_tasks");
+        // Ephemeral (boot-truncated) — wiped so the cursor-0 re-fold cannot
+        // resurrect a phantom `pending_dispatches` row before serving.
+        db.run("DELETE FROM pending_dispatches");
+        // LIVE-ONLY git surface: wipe the tables + zero the embedded jobs
+        // git-counters, then RAISE the floor to `max(events.id)` (never a floor-0
+        // reset) so the cursor-0 re-fold drain skips the historical git folds and
+        // the boot-seed re-derives the surface above the floor.
+        for (const table of LIVE_ONLY_PROJECTIONS) {
+          db.run(`DELETE FROM ${table}`);
+        }
+        db.run(
+          `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
+        );
+        db.run(
+          `UPDATE git_projection_state
+              SET floor = max(floor, (SELECT COALESCE(MAX(id), 0) FROM events)),
+                  seed_required = 1,
+                  updated_at = unixepoch('now', 'subsec')
+            WHERE id = 1`,
+        );
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
