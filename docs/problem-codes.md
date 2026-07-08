@@ -165,11 +165,14 @@ committed review dataset. Both reject with the same converged
 `{code, message, details}` error sub-object, but each verb fails on its own
 first-found fault — never an accumulated bucket — and neither one emits a
 `recovery` key. Both are commit-free preflights until a clean write; a reject
-leaves no brief and no review file.
+leaves no brief and no review file. `selection-audit-brief` never emits
+`REVIEW_EXISTS`: on an existing brief its write-once guard instead returns a
+success envelope with `skipped:true`, which `/plan:close` treats as the
+re-close idempotence path.
 
 | code              | emitted by                                     | meaning                                                                                                                                                    | recovery                                                                                       |
 | ----------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `REVIEW_EXISTS`   | `selection-audit-brief`, `selection-review-submit` | A committed selection-review dataset already exists for the epic — the write-once guard refusing to race a second verdict set onto it.                        | Pass `--force` to re-assemble the brief or re-submit despite the existing review, or leave the epic's dataset as-is. |
+| `REVIEW_EXISTS`   | `selection-review-submit`                       | A committed selection-review dataset already exists for the epic — the write-once guard refusing to race a second verdict set onto it.                        | Pass `--force` to re-submit despite the existing review, or leave the epic's dataset as-is. |
 | `VERDICT_INVALID` | `selection-review-submit`                       | The verdict payload is not valid JSON, is not a `{verdicts: [...]}` mapping, or fails shape/coverage validation (missing, extra, or duplicate task id; a non-enum `verdict`; empty `evidence`). | Fix every issue listed in `error.details.errors` and resubmit.                                   |
 | `BRIEF_MISSING`   | `selection-review-submit`                       | No selection-audit brief exists yet for this epic.                                                                                                            | Run `keeper plan selection-audit-brief <epic_id>` first, then resubmit the verdict.               |
 | `BRIEF_CORRUPT`   | `selection-review-submit`                       | The audit brief is unreadable, or its `schema_version` is newer than this `keeper plan` build understands.                                                    | Re-run `selection-audit-brief` to regenerate it, or upgrade `keeper plan`.                        |

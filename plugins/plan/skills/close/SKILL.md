@@ -231,7 +231,7 @@ keeper plan selection-audit-brief <epic_id> --project <primary_repo>
 
 - **Success with a non-empty `auditable_task_ids`** → the brief landed committed. Pin `brief_ref` and the count of `auditable_task_ids` for the report line.
 - **Success with an empty `auditable_task_ids`** → no executed cells to capture (every task was a degraded default or never ran a worker). Log `no auditable cells`. This is the `0 tasks captured` outcome, not a failure.
-- **`REVIEW_EXISTS`** → this epic already has a committed brief. This is the re-close idempotence path: skip, log `already captured (re-close)`. Do **not** pass `--force` — a re-close never re-derives.
+- **Success with `skipped:true`** → this epic already has a committed brief; the write-once guard returns the skip envelope rather than erroring. This is the re-close idempotence path: skip, log `already captured (re-close)`. Do **not** pass `--force` — a re-close never re-derives.
 - **`SIDECAR_MISSING`** → the epic never ran through cell selection, so there are no cells to capture. Skip, log `no selection sidecar`.
 - **Any other error** (`BAD_EPIC_ID` / `EPIC_NOT_FOUND` / `NOT_A_PROJECT` / `AMBIGUOUS_EPIC_ID`, or any non-success envelope) → skip, log `brief error: <error.code>`.
 
