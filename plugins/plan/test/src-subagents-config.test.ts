@@ -16,13 +16,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { loadMatrix } from "../../../src/agent/matrix.ts";
+import { loadHostMatrix } from "../src/host_matrix.ts";
 import {
   configuredEfforts,
   configuredModels,
   workerAgentFor,
 } from "../src/models.ts";
 import {
-  loadHostMatrix,
   loadSubagentsMatrixFromDisk,
   parseSubagentsMatrix,
   SubagentsConfigError,

@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import { followupPath } from "../audit_artifacts.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
+import { type EffectiveMatrix, effectiveMatrix } from "../host_matrix.ts";
 import { isEpicId } from "../ids.ts";
 import {
   type ProjectContext,
@@ -29,11 +30,7 @@ import {
   tryResolveOwningProjectForId,
 } from "../project.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
-import {
-  type EffectiveMatrix,
-  effectiveMatrix,
-  loadSubagentsMatrixFromDisk,
-} from "../subagents_config.ts";
+import { loadSubagentsMatrixFromDisk } from "../subagents_config.ts";
 import { loadYamlInput, parseYamlInput } from "../yaml_input.ts";
 
 export const SELECTION_BRIEF_SCHEMA_VERSION = 1;
