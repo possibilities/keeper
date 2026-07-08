@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T20:54:03.439000Z",
+  "depends_on": [],
+  "epic": "fn-1198-fix-repair-escalation-dispatch",
+  "id": "fn-1198-fix-repair-escalation-dispatch.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Confirm and fix repair dispatch gate",
+  "updated_at": "2026-07-08T20:54:03.439000Z"
+}
