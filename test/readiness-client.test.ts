@@ -58,6 +58,7 @@ import {
   computeLandedEpicIds,
   type FatalError,
   type GiveUpPolicy,
+  HEARTBEAT_IDLE_MS,
   type ReadinessClientSnapshot,
   type ReadinessSocket,
   type SocketHandlers,
@@ -4072,6 +4073,322 @@ test("subscribeReadiness: bare frames (no boot header) keep painting and never f
   // headless consumer's data path is byte-identical to the pre-latch behavior.
   expect(snapshots).toHaveLength(1);
   expect(catchLog).toHaveLength(0);
+
+  handle.dispose();
+});
+
+// ===========================================================================
+// fn-1199 — viewer resync after a daemon bounce.
+//
+// CONFIRMED FAILING LEG: loss detection. After first paint the client is IDLE
+// (no in-flight query, waiting on server-pushed patch/meta), so `pollAll`'s
+// slow-flight/timeout logic — which only inspects an IN-FLIGHT query — never
+// fires. A daemon bounce that leaves the socket half-open (or an app-level
+// subscription eviction) then delivers NEITHER an EOF nor any frame, and the
+// viewer holds its last-painted state forever (the observed "board stuck on a
+// closed epic across bounces until restart"). The pre-fix repro: 200 poll ticks
+// spanning 100s of idle time never tear the connection down.
+//
+// The fix: (1) a steady-state liveness HEARTBEAT probes an idle connection so
+// the existing `QUERY_TIMEOUT_MS` path tears down a dead socket for reconnect;
+// (2) an EPOCH GUARD tracks the per-daemon-boot `generation` across reconnects
+// and forces the re-baseline path (dropping resumable cursors) on a change.
+// Every reconnect fully re-pages (never resumes a dead sequence), and the
+// catching-up backstop clears a quiet-board catch-up latch so the view repaints.
+// ===========================================================================
+
+// Mirrors the private `QUERY_TIMEOUT_MS` in src/readiness-client.ts (the hard
+// in-flight deadline the poll loop tears a connection down at). Hardcoded here
+// as the same fixed spec value the pre-existing slow-flight/timeout tests use.
+const QUERY_TIMEOUT_MS = 5000;
+
+const READINESS_COLLECTIONS = [
+  "epics",
+  "jobs",
+  "subagent_invocations",
+  "git",
+  "dead_letters",
+  "pending_dispatches",
+  "autopilot_state",
+  "armed_epics",
+  "scheduled_tasks",
+  "block_escalations",
+  "tmux_client_focus",
+] as const;
+
+/** Deliver a `result` for every readiness collection to clear the first-paint
+ *  gate. `epics` carries the supplied rows (default empty); every other
+ *  collection is empty. An optional `boot` header rides EVERY frame (mirroring
+ *  the server's catch-up stamp). */
+function deliverReadinessPaint(
+  sock: MockSocket,
+  prefix: string,
+  opts: { epics?: Record<string, unknown>[]; boot?: BootStatus } = {},
+): void {
+  for (const c of READINESS_COLLECTIONS) {
+    const id = `${prefix}-${c.replace(/_/g, "-")}`;
+    const rows = c === "epics" ? (opts.epics ?? []) : [];
+    const frame: ServerFrame = {
+      type: "result",
+      id,
+      collection: c,
+      rev: 1,
+      total: rows.length,
+      rows,
+      ...(opts.boot === undefined ? {} : { boot: opts.boot }),
+    };
+    sock.deliver([frame]);
+  }
+}
+
+test("fn-1199 loss detection: a silently-dead socket (no EOF) is caught by the liveness heartbeat and torn down", () => {
+  // THE REPRODUCING TEST for the confirmed leg. At steady state nothing is in
+  // flight, so without the heartbeat the connection is never probed and the dead
+  // socket is never detected. The heartbeat probes after HEARTBEAT_IDLE_MS, and
+  // the probe drawing no reply times out into the existing reconnect path.
+  const harness = installTimerHarness();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-hb",
+      onSnapshot: () => {},
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        throw new Error("onFatal must not fire — default is reconnect-forever");
+      },
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) throw new Error("mock socket never installed");
+    // Reach steady state: every collection painted, nothing in flight.
+    deliverReadinessPaint(sock, "test-hb");
+    sock.takeOutbound();
+
+    // The daemon silently dies: no more frames, NO close event (half-open).
+    // A poll fired BEFORE the idle threshold sends no probe.
+    harness.advance(HEARTBEAT_IDLE_MS - 1);
+    harness.pollHandler()();
+    expect(sock.takeOutbound()).toHaveLength(0);
+    expect(lifecycle.some((e) => e.event === "heartbeat_probe")).toBe(false);
+
+    // Crossing the idle threshold sends exactly ONE probe refetch.
+    harness.advance(1);
+    harness.pollHandler()();
+    const probe = sock.takeOutbound();
+    expect(probe).toHaveLength(1);
+    expect((probe[0] as { type: string }).type).toBe("query");
+    expect(lifecycle.filter((e) => e.event === "heartbeat_probe")).toHaveLength(
+      1,
+    );
+
+    // A second poll while the probe is still in flight sends NO duplicate.
+    harness.advance(1);
+    harness.pollHandler()();
+    expect(sock.takeOutbound()).toHaveLength(0);
+
+    // The probe draws no reply (dead socket). Past QUERY_TIMEOUT_MS the existing
+    // timeout path fires: query_timeout + HARD-destroy (terminate) → reconnect.
+    harness.advance(QUERY_TIMEOUT_MS);
+    harness.pollHandler()();
+    expect(lifecycle.filter((e) => e.event === "query_timeout")).toHaveLength(
+      1,
+    );
+    expect(sock.terminated ?? 0).toBeGreaterThanOrEqual(1);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
+test("fn-1199 loss detection: a live but quiet board answers the heartbeat — no reconnect", () => {
+  // The heartbeat must not churn a healthy quiet board: the probe draws a reply,
+  // which re-stamps the idle clock and clears the in-flight query, so no timeout
+  // ever fires and the socket is never torn down.
+  const harness = installTimerHarness();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-hb-live",
+      onSnapshot: () => {},
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) throw new Error("mock socket never installed");
+    deliverReadinessPaint(sock, "test-hb-live");
+    sock.takeOutbound();
+
+    // Idle past the threshold → one probe (on `epics`, the first collection).
+    harness.advance(HEARTBEAT_IDLE_MS);
+    harness.pollHandler()();
+    const probe = sock.takeOutbound();
+    expect(probe).toHaveLength(1);
+    expect((probe[0] as { collection: string }).collection).toBe("epics");
+
+    // The daemon answers the probe (alive). The reply re-stamps the idle clock.
+    sock.deliver([emptyResult("epics", "test-hb-live-epics")]);
+
+    // Even well past QUERY_TIMEOUT_MS from the ORIGINAL probe, no timeout fires:
+    // the reply cleared the in-flight query and reset idleness.
+    harness.advance(QUERY_TIMEOUT_MS + 1);
+    harness.pollHandler()();
+    expect(lifecycle.some((e) => e.event === "query_timeout")).toBe(false);
+    expect(sock.terminated ?? 0).toBe(0);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
+test("fn-1199 re-baseline: a bounce → reconnect → quiet catching-up board converges to fresh state (no stale hold)", () => {
+  // The quiet-board variant. A viewer painted a now-closed epic; the daemon
+  // bounces (loss → reconnect), comes back CATCHING UP, and the board is quiet
+  // (no patch/meta post-reconnect). The catching-up backstop must refetch and,
+  // once the daemon settles, deliver the fresh page so the view drops the stale
+  // epic — never the stuck-catching_up-on-a-quiet-board hold (ADR-0019 trap).
+  const spy = installIntervalSpy();
+  try {
+    const { factory, sockets, connectCount } = makeMultiConnect();
+    const snapshots: ReadinessClientSnapshot[] = [];
+    const catchLog: boolean[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-bounce",
+      onSnapshot: (s) => snapshots.push(s),
+      onCatchingUp: (c) => catchLog.push(c),
+      connect: factory,
+    });
+    const sock1 = sockets[0];
+    if (!sock1) throw new Error("mock socket #1 never installed");
+    // First paint: epic fn-9 is OPEN and on screen, daemon steady (headerless).
+    sock1.takeOutbound();
+    deliverReadinessPaint(sock1, "test-bounce", {
+      epics: [epicRow("fn-9", "open")],
+    });
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]?.epics.map((e) => e.epic_id)).toEqual(["fn-9"]);
+    expect(catchLog).toHaveLength(0);
+
+    // The daemon bounces: the socket drops (loss detected → reconnect).
+    sock1.closeFromServer();
+    expect(connectCount()).toBe(2);
+    const sock2 = sockets[1];
+    if (!sock2) throw new Error("reconnect socket never installed");
+    sock2.takeOutbound();
+
+    // Reconnect lands on a CATCHING-UP daemon (still re-folding): every frame
+    // carries a catch-up header, and epic fn-9 is still partially present.
+    deliverReadinessPaint(sock2, "test-bounce", {
+      epics: [epicRow("fn-9", "open")],
+      boot: bootHeader(true),
+    });
+    expect(catchLog).toEqual([true]);
+    // The backstop is armed while catching up.
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+    sock2.takeOutbound();
+
+    // Board is QUIET post-reconnect — no patch/meta. The backstop fires and
+    // refetches the first idle collection (epics).
+    spy.fire(CATCHUP_BACKSTOP_MS);
+    const refetch = sock2.takeOutbound();
+    expect(refetch).toHaveLength(1);
+    expect((refetch[0] as { collection: string }).collection).toBe("epics");
+
+    // The daemon has now settled: the refetch returns a HEADERLESS steady-state
+    // result with epic fn-9 CLOSED-and-gone. The latch clears and the view
+    // re-baselines to the fresh (empty) epic set — the stale epic is dropped.
+    sock2.deliver([emptyResult("epics", "test-bounce-epics")]);
+    expect(catchLog).toEqual([true, false]);
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
+    const last = snapshots.at(-1);
+    expect(last?.epics.map((e) => e.epic_id)).toEqual([]);
+
+    handle.dispose();
+  } finally {
+    spy.restore();
+  }
+});
+
+test("fn-1199 epoch guard: a daemon-generation change across reconnect is detected and forces re-baseline", () => {
+  // The server stamps a per-boot `generation` nonce on the boot header. A
+  // reconnect that lands on a NEW generation (a genuine bounce, vs a transient
+  // blip) is detected via `generation_change` and forces the re-baseline path —
+  // the client never resumes a stored sequence across a daemon generation.
+  const { factory, sockets, connectCount } = makeMultiConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-gen",
+    onSnapshot: (s) => snapshots.push(s),
+    onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+    connect: factory,
+  });
+  const sock1 = sockets[0];
+  if (!sock1) throw new Error("mock socket #1 never installed");
+  sock1.takeOutbound();
+
+  const genA: BootStatus = { ...bootHeader(false), generation: "boot-A" };
+  const genB: BootStatus = { ...bootHeader(false), generation: "boot-B" };
+
+  // First paint under generation boot-A. No change yet (nothing to compare).
+  deliverReadinessPaint(sock1, "test-gen", {
+    epics: [epicRow("fn-1", "open")],
+    boot: genA,
+  });
+  expect(snapshots).toHaveLength(1);
+  expect(lifecycle.some((e) => e.event === "generation_change")).toBe(false);
+
+  // The daemon bounces; the reconnect lands on generation boot-B.
+  sock1.closeFromServer();
+  expect(connectCount()).toBe(2);
+  const sock2 = sockets[1];
+  if (!sock2) throw new Error("reconnect socket never installed");
+  sock2.takeOutbound();
+
+  // The FIRST post-reconnect frame carrying boot-B is detected as a generation
+  // change (boot-A → boot-B), and the fresh page re-baselines to the new state.
+  deliverReadinessPaint(sock2, "test-gen", {
+    epics: [epicRow("fn-2", "open")],
+    boot: genB,
+  });
+  const genChanges = lifecycle.filter((e) => e.event === "generation_change");
+  expect(genChanges).toHaveLength(1);
+  expect(genChanges[0]?.detail).toEqual({ from: "boot-A", to: "boot-B" });
+  expect(snapshots.at(-1)?.epics.map((e) => e.epic_id)).toEqual(["fn-2"]);
+
+  handle.dispose();
+});
+
+test("fn-1199 epoch guard: a stable generation across reconnect fires no generation_change", () => {
+  // A transient blip that reconnects to the SAME daemon generation must NOT be
+  // mistaken for a bounce — the guard fires only on an actual change.
+  const { factory, sockets } = makeMultiConnect();
+  const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-gen-same",
+    onSnapshot: () => {},
+    onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+    connect: factory,
+  });
+  const sock1 = sockets[0];
+  if (!sock1) throw new Error("mock socket #1 never installed");
+  const genA: BootStatus = { ...bootHeader(false), generation: "boot-A" };
+  deliverReadinessPaint(sock1, "test-gen-same", { boot: genA });
+
+  sock1.closeFromServer();
+  const sock2 = sockets[1];
+  if (!sock2) throw new Error("reconnect socket never installed");
+  deliverReadinessPaint(sock2, "test-gen-same", { boot: genA });
+
+  expect(lifecycle.some((e) => e.event === "generation_change")).toBe(false);
 
   handle.dispose();
 });

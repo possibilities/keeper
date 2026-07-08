@@ -1700,6 +1700,49 @@ test("live gate: a reconnect reporting catch-up flips to the indicator immediate
   }
 });
 
+test("fn-1199 live gate: a post-paint bounce resolves the reconnecting pill by repainting FRESH data (never a stale hold)", () => {
+  // The incident scenario at the view seam: a viewer painted a now-doomed epic,
+  // the daemon bounced, and the loss was finally detected (a `disconnected`
+  // lifecycle). The reconnect must resolve the reconnecting pill by REPAINTING
+  // the fresh state — the stale frame is replaced, never held silently. Distinct
+  // from the sub-grace-reconnect test above, which re-delivers a BYTE-IDENTICAL
+  // frame (suppressed); here the data actually CHANGED, so a repaint must occur.
+  const timeouts = patchTimeouts();
+  const poller = makeFakePoller([], null);
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      refoldProgressPoller: poller,
+    });
+    const status = spyStatus(view);
+
+    // Paint a first frame showing the now-doomed epic.
+    view.emit({ body: ["epic fn-9 open"] });
+    expect(stdoutCap.writes.join("")).toContain("epic fn-9 open");
+    expect(view.getFrameCount()).toBe(1);
+
+    // The daemon bounces after the paint → reconnecting pill, last frame held.
+    view.emitLifecycle("disconnected", {});
+    expect(status).toContain("reconnecting…");
+
+    // The reconnect re-baselines to FRESH data (the epic is gone). The changed
+    // body forces a repaint: the pill resolves, the stale frame is replaced.
+    expect(view.emit({ body: ["(idle — nothing to display)"] })).toBe(true);
+    const joined = stdoutCap.writes.join("");
+    expect(joined).toContain("(idle — nothing to display)");
+    // The stale epic is no longer the latest frame text.
+    expect(view.getLastFrameText()).not.toContain("epic fn-9 open");
+    // Pill cleared (banner restored to "" — no persistent pill provider), and
+    // the full loading indicator was never armed (fresh data landed in grace).
+    expect(status.at(-1)).toBe("");
+    expect(joined).not.toContain("connecting to keeperd");
+    expect(view.getFrameCount()).toBe(2);
+  } finally {
+    timeouts.restore();
+  }
+});
+
 test("frames: a catch-up window emits exactly ONE loading record, then resumes data frames on ready", () => {
   const h = makeFramesHarness();
   const emitter = h.makeEmitter();

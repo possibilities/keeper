@@ -119,6 +119,18 @@ export interface BootStatus {
    * falls back to N=1, today's one-task-per-root mutex.
    */
   max_concurrent_per_root?: number;
+  /**
+   * Per-daemon-boot nonce, minted once when the server worker spawns. The fold
+   * cursor (`rev`) and `head_event_id` both PERSIST across a plain daemon
+   * restart (the DB is durable), so neither can tell a client its connection
+   * now rides a NEW daemon generation. This does: a client that observes a
+   * changed generation across a reconnect knows a bounce happened and must
+   * re-baseline rather than resume a stored sequence (the epoch guard). Opaque
+   * to the client — compared for equality only, never parsed. Optional/additive:
+   * an older client ignores it, and a frame omitting it disables the guard
+   * (the client falls back to the always-re-baseline-on-reconnect contract).
+   */
+  generation?: string;
 }
 
 // ---------------------------------------------------------------------------
