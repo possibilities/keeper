@@ -126,6 +126,33 @@ export function scanMaxEpicId(dataDir: string): number {
   return maxN;
 }
 
+/** Full epic ids across BOTH ``epics/*.json`` AND ``specs/fn-*.md`` under
+ * ``dataDir`` whose bare number equals ``num`` — the mint-time same-project
+ * bare-number guard's probe. Deduped, sorted. Under a locked flock this is empty
+ * for a fresh candidate (candidate > scan max); it fires only when a concurrent
+ * unlocked-degrade mint already wrote a sibling carrying the number. */
+export function epicIdsWithNumber(dataDir: string, num: number): string[] {
+  const ids = new Set<string>();
+  for (const sub of ["epics", "specs"]) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(dataDir, sub));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.startsWith("fn-")) {
+        continue;
+      }
+      const match = EPIC_FILE_NUM_REGEX.exec(entry);
+      if (match && Number.parseInt(match[1] as string, 10) === num) {
+        ids.add(entry.slice(0, entry.lastIndexOf(".")));
+      }
+    }
+  }
+  return [...ids].sort();
+}
+
 /** Highest task number for ``epicId`` across ``tasks/<epicId>.<m>.json`` under
  * ``dataDir``. Mirrors ids.scan_max_task_id; 0 when the dir or epic has none. */
 export function scanMaxTaskId(dataDir: string, epicId: string): number {

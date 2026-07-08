@@ -30,7 +30,14 @@ import {
 } from "../discovery.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
-import { generateSuffix, isEpicId, scanMaxEpicId, slugify } from "../ids.ts";
+import { appendEpicRecord, ledgerMaxEpicNum } from "../id_ledger.ts";
+import {
+  epicIdsWithNumber,
+  generateSuffix,
+  isEpicId,
+  scanMaxEpicId,
+  slugify,
+} from "../ids.ts";
 import { checkEpicTreeInMemory } from "../integrity.ts";
 import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
@@ -1045,12 +1052,30 @@ export function runScaffold(args: ScaffoldArgs): number {
       }
     }
 
-    const maxN = scanMaxEpicId(dataDir);
-    const epicNum = maxN + 1;
+    // max(scan, ledger)+1, never bare scan: the durable id ledger keeps a
+    // number burned even after its epic's working-tree files are destroyed, so
+    // the destroy-then-re-mint sequence cannot reuse it on this host.
+    const epicNum =
+      Math.max(scanMaxEpicId(dataDir), ledgerMaxEpicNum(primaryRepo)) + 1;
     const epicId = slug
       ? `fn-${epicNum}-${slug}`
       : `fn-${epicNum}-${generateSuffix()}`;
     const branchName = (isStr(epicBranch) ? epicBranch : "") || "main";
+
+    // Same-project bare-number guard: refuse if any existing epic already
+    // carries this number under a different slug (an unlocked-degrade race that
+    // wrote a sibling after our scan). Reuses id_collision, naming both ids.
+    const bareCollisions = epicIdsWithNumber(dataDir, epicNum).filter(
+      (id) => id !== epicId,
+    );
+    if (bareCollisions.length > 0) {
+      return {
+        kind: "failure",
+        code: "id_collision",
+        message: `Allocated epic id ${epicId} collides on number with an existing same-project epic`,
+        details: bareCollisions.map((id) => `existing: ${id}`),
+      };
+    }
 
     // Global-name uniqueness check across all discovered projects.
     const foreignOwner = checkGlobalNameUnique(epicId, primaryRepo);
@@ -1229,6 +1254,11 @@ export function runScaffold(args: ScaffoldArgs): number {
     // readiness predicate 2, rendered dashed) so no dep-free task folds to
     // [ready] before the create/defer/close flow's trailing `validate --epic`
     // arms it once deps are wired.
+    // Burn the number in the durable ledger BEFORE any file write, still inside
+    // the flock: a subsequent destroy of these files leaves the ledger holding
+    // the number, so re-minting allocates strictly higher. Fail-soft.
+    appendEpicRecord(primaryRepo, epicNum, epicId);
+
     // The mid-write unwind unlinks SPECS BEFORE JSONs (orphan-spec invariant).
     const writtenPaths: string[] = [];
     try {

@@ -37,7 +37,8 @@ import { join } from "node:path";
 import { detectCycles } from "../deps.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
-import { isEpicId, isTaskId, scanMaxTaskId } from "../ids.ts";
+import { appendTaskRecord, ledgerMaxTaskNum } from "../id_ledger.ts";
+import { isEpicId, isTaskId, parseId, scanMaxTaskId } from "../ids.ts";
 import { integrityGateOrFail } from "../integrity_gate.ts";
 import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
@@ -489,7 +490,13 @@ export function runRefineApply(args: RefineApplyArgs): number {
       };
 
   const outcome = withEpicIdLock<FlockOutcome>(() => {
-    const maxTask = scanMaxTaskId(dataDir, epicId);
+    // max(scan, ledger)+1, never bare scan: the durable id ledger (per-epic task
+    // scope) keeps a task number burned after its files are destroyed, so the
+    // destroy-then-re-mint sequence cannot reuse it on this host.
+    const maxTask = Math.max(
+      scanMaxTaskId(dataDir, epicId),
+      ledgerMaxTaskNum(primaryRepo, epicId),
+    );
     // Two-pass: ordinal i (1-based into add_tasks) -> id `epic_id.{max+i}`.
     const newIdByOrdinal = new Map<number, string>();
     for (let i = 1; i <= nNew; i += 1) {
@@ -678,6 +685,15 @@ export function runRefineApply(args: RefineApplyArgs): number {
       }
     }
     epicDef.touched_repos = [...touchedSet].sort();
+
+    // Burn each new task number in the durable ledger BEFORE any file write,
+    // still inside the flock, so a later destroy leaves the numbers claimed and
+    // re-minting allocates strictly higher. Fail-soft (keyed on the state repo).
+    const epicNum = parseId(epicId)[0] ?? 0;
+    for (let i = 1; i <= nNew; i += 1) {
+      const tid = newIdByOrdinal.get(i) as string;
+      appendTaskRecord(primaryRepo, epicNum, epicId, maxTask + i, tid);
+    }
 
     // Track FRESH-MINT writes for the mid-write / Phase-4.5 unwind. CRITICAL:
     // existing-file rewrites (epic JSON, epic spec, rewrite_/rewire_ targets)
