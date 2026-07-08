@@ -157,6 +157,15 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git grep --open-files-in=/tmp/evil pattern",
     "git grep --open /tmp/evil",
     "git grep --open-files /tmp/evil",
+    // git's true minimum unambiguous prefix is `--op` (4 chars) — among grep's
+    // `--o*` options only `--op` resolves to the exec alias — so the 4- and
+    // 5-char prefixes reach `cannot exec` and must deny, glued and space-separated
+    // (a `--open`-length floor let these through; F1) while `--o` is ambiguous and
+    // git rejects it outright, so no correctness need to cover the `--o` boundary
+    "git grep --op=/tmp/evil",
+    "git grep --ope=/tmp/evil",
+    "git grep --op /tmp/evil",
+    "git grep --ope /tmp/evil pattern",
     // git's short-option bundling reaches the `-O` exec alias buried in a cluster
     // whose token STARTS with a benign flag (`-n`/`-i`/…) — the deny must catch a
     // capital `O` anywhere in a single-dash short-flag cluster (F1/F2)
