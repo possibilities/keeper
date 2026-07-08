@@ -65,5 +65,5 @@ fast-tier legal.
 - [ ] Full fast suite + typecheck + lint green
 
 ## Done summary
-
+Added scripts/rebase-schema-migration.ts: pure core apply(main, lane) renumbers a lane's branch-local additive-idempotent SCHEMA_STEPS onto main-tip+1..+k (updating the api.py whitelist and pinned version assertions) and refuses with a machine-readable envelope on any rewind/drop/backfill/CREATE-literal/unknown/identical-content collision; token-based (comment-stripped) denylist; in-process openDb(:memory:) SCHEMA_FINGERPRINT re-pin; idempotent. 15 fast-tier tests, full suite + typecheck + lint green.
 ## Evidence
