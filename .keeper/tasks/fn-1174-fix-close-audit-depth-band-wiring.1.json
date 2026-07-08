@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reconcile depth-band consumer",
-  "updated_at": "2026-07-07T20:44:05.623000Z"
+  "updated_at": "2026-07-08T02:31:08.561000Z",
+  "worker_done_at": "2026-07-08T02:31:08.561000Z"
 }

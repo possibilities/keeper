@@ -44,5 +44,5 @@ Files:
       --check` and the fast suite stay green.
 
 ## Done summary
-
+Fixed deriveDepthBand/bandMatches to read the committed depth_bands list shape (min_task_count/min_diff_loc/min_touched_repos) instead of a nonexistent close_depth mapping; extended the audit-policy drift gate to coerce depth_bands off close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS so consumer and config can't silently diverge again; added regression tests threading the real committed audit-policy.yaml through deriveDepthBand and the close-preflight verb.
 ## Evidence
