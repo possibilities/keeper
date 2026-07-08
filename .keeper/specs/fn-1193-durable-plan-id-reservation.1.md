@@ -62,5 +62,5 @@ one case into the slow tier rather than spawning in the fast tier). Slow tier
 - [ ] `cd plugins/plan && bun test` passes with zero real git spawned in the fast tier
 
 ## Done summary
-
+PlanVcs gains inProgressOp (merge/cherry-pick/revert/rebase/sequencer classification, real+fake) and commitWorkLockPath (byte-identical to the daemon's <git-dir>/keeper-commit-work.lock). The plan flock module gains a synchronous deadline-bounded exclusive acquire returning acquired/timeout/environmental, with close-on-exec set atomically via O_CLOEXEC at open.
 ## Evidence
