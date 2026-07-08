@@ -345,7 +345,7 @@ export function renderStatusline(
         ? theme.ctx
         : theme.version;
   const sep = `${theme.sep} ∕ `;
-  let parts = `${ctxColor}${input.ctxPct.toFixed(0)} ${CONTEXT_GLYPH}`;
+  let parts = `${ctxColor}${input.ctxPct.toFixed(0)}${CONTEXT_GLYPH}`;
 
   const branch = resolveGitBranch(input.projectDir, env, runGit);
   const branchLabel = compactKeeperLane(branch) || branch;

@@ -72,7 +72,7 @@ describe("statusline render", () => {
     );
 
     expect(plain).toBe(
-      `13  ${SEP} main ${SEP} jobsearch ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${NF0_OUTLINE}`,
+      `13 ${SEP} main ${SEP} jobsearch ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${NF0_OUTLINE}`,
     );
     expect(plain).not.toContain("❘");
     expect(plain).not.toContain("·");
