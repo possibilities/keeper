@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Re-fold-safe tip producer, coalesce idempotency, sole-writer re-scope",
+      "task_id": "fn-1203-continuous-trunk-baseline-detection.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Two-greens disentanglement + flake classification + page-once coalescing",
+      "task_id": "fn-1203-continuous-trunk-baseline-detection.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:59:51.062000Z",
+  "epic_id": "fn-1203-continuous-trunk-baseline-detection",
+  "input_hash": "38300e917dc4415d5b288e0bbf453d77339d86c00cfd691f41776cde71fc88ca",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 942673553,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\".1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\".2\",\"tier\":\"xhigh\",\"model\":\"opus\"}]}"
+}
