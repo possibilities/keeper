@@ -11,10 +11,13 @@
  * all-strict first-paint gate). The subscribe opts into `includeDispatchFailures`
  * (ADR 0011), so the sticky `dispatch_failures` rows for the jammed /
  * needs-human signals ride the SAME snapshot in ONE round-trip — no out-of-band
- * `queryCollection`. On that first frame we dispose the handle, print the
- * envelope, and exit. UNLIKE `server-up`, the subscribe carries a bounded
- * default ~10s `giveUpPolicy`: a one-shot orient must NOT reconnect forever, so
- * a down daemon fires `onFatal({code:"unreachable"})` → exit 1.
+ * `queryCollection` — AND into `includePinnedEpics` (ADR 0018), so a plan-closed
+ * epic with a live close/work failure merges into `board.epics` with a real
+ * close verdict instead of dropping off the board. On that first frame we
+ * dispose the handle, print the envelope, and exit. UNLIKE `server-up`, the
+ * subscribe carries a bounded default ~10s `giveUpPolicy`: a one-shot orient
+ * must NOT reconnect forever, so a down daemon fires
+ * `onFatal({code:"unreachable"})` → exit 1.
  *
  * Exit taxonomy: exit 0 on ANY board state (a bad board is DATA, not an
  * error). Exit 1 ONLY on transport (`unreachable`/`connect`) or usage. On a
@@ -556,6 +559,14 @@ export async function runStatus(
     // query. The gate holds first paint until the collection paints, so a
     // painted snapshot always carries the real jam rows.
     includeDispatchFailures: true,
+    // ADR 0018: opt into the pinned-epics window too — a plan-closed epic with
+    // a live close/work dispatch failure merges open-wins into `epics`, so
+    // `board.epics` (built off `snap.epics`) carries its close verdict and
+    // `dispatch_failure` kinds. `needs_human.stuck_dispatches` already tallies
+    // EVERY sticky row regardless of homing (`rows.length`), so pinning an
+    // epic never changes `needs_human.total` — only which board row the row's
+    // kinds attach to.
+    includePinnedEpics: true,
     giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
     onBootStatus: (boot: BootStatus): void => {
       latestBoot = { rev: boot.rev, catching_up: boot.catching_up };

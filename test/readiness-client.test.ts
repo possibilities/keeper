@@ -591,6 +591,128 @@ test("subscribeReadiness: includeDispatchFailures ON subscribes the collection, 
 });
 
 // ---------------------------------------------------------------------------
+// (a.1c) ADR 0018 — the opt-in `epics_pinned` collection. The window is
+//        subscribed, gated, carried as the distinct `pinnedEpics` member, AND
+//        merged open-wins into `epics` ONLY when `includePinnedEpics` is set;
+//        default-off keeps the 11-collection subscribe byte-identical AND the
+//        member ABSENT (the off-path proof obligation).
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: includePinnedEpics OFF omits the subscribe and the snapshot member", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const idPrefix = "test-no-pinned";
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  const collections = (
+    sock.takeOutbound() as Array<{ collection: string }>
+  ).map((f) => f.collection);
+  expect(collections).not.toContain("epics_pinned");
+  expect(collections).toHaveLength(11);
+
+  // The eleven base collections paint → snapshot fires with the member ABSENT
+  // (not null, not empty) — byte-identical to the pre-ADR-0018 shape.
+  sock.deliver([
+    emptyResult("epics", `${idPrefix}-epics`),
+    emptyResult("jobs", `${idPrefix}-jobs`),
+    emptyResult("subagent_invocations", `${idPrefix}-subagent-invocations`),
+    emptyResult("git", `${idPrefix}-git`),
+    emptyResult("dead_letters", `${idPrefix}-dead-letters`),
+    emptyResult("pending_dispatches", `${idPrefix}-pending-dispatches`),
+    emptyResult("autopilot_state", `${idPrefix}-autopilot-state`),
+    emptyResult("armed_epics", `${idPrefix}-armed-epics`),
+    emptyResult("scheduled_tasks", `${idPrefix}-scheduled-tasks`),
+    emptyResult("block_escalations", `${idPrefix}-block-escalations`),
+    emptyResult("tmux_client_focus", `${idPrefix}-tmux-client-focus`),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  expect("pinnedEpics" in (snapshots[0] ?? {})).toBe(false);
+  expect(snapshots[0]?.pinnedEpics).toBeUndefined();
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: includePinnedEpics ON subscribes the window, gates on it, carries the member, and merges open-wins", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const idPrefix = "test-pinned-on";
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    onSnapshot: (snap) => snapshots.push(snap),
+    includePinnedEpics: true,
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Twelve queries — the opt-in adds EXACTLY the one `epics_pinned` collection.
+  const initial = sock.takeOutbound() as Array<{ collection: string }>;
+  expect(initial).toHaveLength(12);
+  expect(initial.map((f) => f.collection)).toContain("epics_pinned");
+
+  // The eleven base collections paint (open `epics` carries an open epic and a
+  // dup that ALSO appears pinned) but NOT `epics_pinned` → the gate HOLDS,
+  // proving the opt-in collection is load-bearing when set.
+  sock.deliver([
+    rowsResult("epics", `${idPrefix}-epics`, [
+      epicRow("fn-1-open", "open"),
+      epicRow("fn-3-dup", "open"),
+    ]),
+    emptyResult("jobs", `${idPrefix}-jobs`),
+    emptyResult("subagent_invocations", `${idPrefix}-subagent-invocations`),
+    emptyResult("git", `${idPrefix}-git`),
+    emptyResult("dead_letters", `${idPrefix}-dead-letters`),
+    emptyResult("pending_dispatches", `${idPrefix}-pending-dispatches`),
+    emptyResult("autopilot_state", `${idPrefix}-autopilot-state`),
+    emptyResult("armed_epics", `${idPrefix}-armed-epics`),
+    emptyResult("scheduled_tasks", `${idPrefix}-scheduled-tasks`),
+    emptyResult("block_escalations", `${idPrefix}-block-escalations`),
+    emptyResult("tmux_client_focus", `${idPrefix}-tmux-client-focus`),
+  ]);
+  expect(snapshots).toHaveLength(0);
+
+  // The pinned window paints: one CLOSED pinned epic + a dup of an open one. Gate
+  // clears; the member carries BOTH pinned rows (the pinned-identity signal is
+  // status-agnostic), and the `epics` merge is open-wins.
+  sock.deliver([
+    rowsResult("epics_pinned", `${idPrefix}-epics-pinned`, [
+      epicRow("fn-2-pinned", "done"),
+      epicRow("fn-3-dup", "done"),
+    ]),
+  ]);
+  expect(snapshots).toHaveLength(1);
+  // Distinct member: every pinned epic, dup included (it IS pinned even while open).
+  expect((snapshots[0]?.pinnedEpics ?? []).map((e) => e.epic_id)).toEqual([
+    "fn-2-pinned",
+    "fn-3-dup",
+  ]);
+  // Merged into `epics` open-wins: the dup keeps its OPEN row and appears once.
+  const epics = snapshots[0]?.epics ?? [];
+  expect(epics.map((e) => e.epic_id)).toEqual([
+    "fn-1-open",
+    "fn-3-dup",
+    "fn-2-pinned",
+  ]);
+  expect(epics.find((e) => e.epic_id === "fn-3-dup")?.status).toBe("open");
+  // A closed pinned epic flows through `computeReadiness` (it is in the typed
+  // set) — a real per-epic verdict exists for it rather than being dropped.
+  expect(snapshots[0]?.readiness.perEpic.has("fn-2-pinned")).toBe(true);
+
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
 // fn-1016 — `computeLandedEpicIds` pure degradation (worktree ON → the
 // `lane_merged` projection; OFF → done epics, merged ⇔ done). Sorted + stable.
 // ---------------------------------------------------------------------------

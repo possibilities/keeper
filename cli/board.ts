@@ -1200,6 +1200,14 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     idPrefix: "board",
     onSnapshot: emitFrame,
     onLifecycle: view.emitLifecycle,
+    // ADR 0018: opt into the pinned-epics window so a plan-closed epic with a
+    // live close/work `dispatch_failures` row merges open-wins into `epics`
+    // (a real `computeReadiness` verdict) instead of dropping off the board.
+    // `renderEpicsBody`'s `epicIds` set (built off `snap.epics`) picks it up
+    // for free, so `orphanedFailureRows`' `openEpicIds` and
+    // `closeFailureReasonFor`'s epic-id join both see it too — the exactly
+    // -one-place invariant needs no extra merge logic here.
+    includePinnedEpics: true,
     // Thread the freshest daemon fold cursor into the frames resume-cursor seam
     // (fn-1161) — every frames envelope + the trailer stamp `String(rev)`. The
     // header rides every `result`, so this tracks catch-up: a frame minted

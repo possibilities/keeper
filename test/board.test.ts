@@ -1850,6 +1850,33 @@ test("computeBoardSummary: counts open/running tasks and epics, including closin
   ]);
 });
 
+// ADR 0018 (fn-1175.2): a pinned epic rides `snap.epics` with a REAL
+// `completeReadiness` verdict (plan-closed → its close row reads `completed`),
+// so `computeBoardSummary` — which derives every count from the readiness
+// verdict maps, never epic membership — must not inflate `epicsOpen` just
+// because the pinned epic is now present in the epics array.
+test("computeBoardSummary: a pinned plan-closed epic (completed close verdict) never inflates epicsOpen", () => {
+  const pinnedEpic = makeEpic({
+    epic_id: "fn-9-x",
+    status: "done",
+    tasks: [],
+  });
+  const counts = computeBoardSummary({
+    epics: [pinnedEpic],
+    readiness: {
+      perTask: new Map<string, Verdict>(),
+      perCloseRow: new Map<string, Verdict>([["fn-9-x", COMPLETED]]),
+    },
+  });
+  expect(counts).toEqual({
+    epicsOpen: 0,
+    epicsRunning: 0,
+    epicsClosing: 0,
+    tasksOpen: 0,
+    tasksRunning: 0,
+  });
+});
+
 test("needsHumanLines — a clean board (no distress) renders no block", () => {
   expect(needsHumanLines([])).toEqual([]);
 });
@@ -1921,6 +1948,40 @@ test("orphanedFailureRows — a close failure homed to an OPEN epic is NOT an or
       [
         "fn-1142-cli-descriptor-and-grammar-convergence",
         "worktree-finalize-conflict: merge conflict",
+      ],
+    ]),
+    workFailures: new Map(),
+  });
+  expect(rows).toEqual([]);
+});
+
+// ADR 0018 (fn-1175.2): a plan-closed epic with a live close/work
+// dispatch_failures row merges into `snap.epics` open-wins (ReadinessClient
+// task .1), so `renderEpicsBody`'s epicIds set — and therefore
+// `orphanedFailureRows`' `openEpicIds` here — carries it for free. The pinned
+// epic's failure must surface in EXACTLY one place: its own block's
+// `[failed:<kind>]` pill, never a duplicate orphan line.
+test("orphanedFailureRows — a close failure homed to a PINNED closed epic (merged into openEpicIds) is NOT an orphan, mirroring an open epic", () => {
+  const rows = orphanedFailureRows({
+    openEpicIds: ["fn-9-x"],
+    openTaskIds: new Set<string>(),
+    closeFailures: new Map([
+      ["fn-9-x", "worktree-merge-conflict: merging fn-9-x hit a conflict"],
+    ]),
+    workFailures: new Map(),
+  });
+  expect(rows).toEqual([]);
+});
+
+test("orphanedFailureRows — TWO dispatch-failure rows homed to the SAME pinned epic are BOTH covered, never a double orphan line", () => {
+  const rows = orphanedFailureRows({
+    openEpicIds: ["fn-9-x"],
+    openTaskIds: new Set<string>(),
+    closeFailures: new Map([
+      ["worktree-finalize:fn-9-x-h1", "worktree-finalize-non-fast-forward"],
+      [
+        "worktree-recover:fn-9-x-h2",
+        "worktree-recover-dirty-checkout: dirty checkout blocks the merge",
       ],
     ]),
     workFailures: new Map(),

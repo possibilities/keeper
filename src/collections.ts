@@ -13,6 +13,10 @@
 
 import type { Database } from "bun:sqlite";
 import { MAX_IN_PARAMS } from "./db";
+import {
+  WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_RECOVER_KEY_PREFIX,
+} from "./dispatch-failure-key";
 import type { FilterValue, Row } from "./protocol";
 
 export type { Row };
@@ -342,6 +346,56 @@ export const EPICS_RECENT_DONE_DESCRIPTOR: CollectionDescriptor = {
   recencyBound: {
     column: "updated_at",
     windowSec: DONE_EPICS_REAP_WINDOW_SEC,
+  },
+  jsonColumns: EPICS_DESCRIPTOR.jsonColumns,
+};
+
+/**
+ * The `epics_pinned` descriptor — the display-only PINNED epic collection
+ * (ADR 0018): every epic a LIVE `close`/`work` `dispatch_failures` row keys to,
+ * REGARDLESS of the epic's status, so a plan-closed epic with a stuck finalize
+ * keeps its full board block until the row clears. Mirrors {@link
+ * EPICS_DESCRIPTOR}'s full column/jsonColumn surface so rows project as full
+ * `Epic` objects (the merge feeds `computeReadiness` for a real verdict; a
+ * trimmed column would degrade it). Default sort `epic_number asc` holds a pinned
+ * epic in its stable board slot, never a status-derived rank that jumps frames.
+ *
+ * Membership is a correlated `EXISTS` over `dispatch_failures` restricted to
+ * `verb IN ('close', 'work')` — the verb gate is exactly what EXCLUDES a
+ * `daemon`-verb stale-base-lane row that embeds an epic id. The four id-forms
+ * mirror the failure-key vocabulary: the bare close key (`df.id = epic_id`), the
+ * {@link WORKTREE_FINALIZE_ID_PREFIX}`<epic>-` / {@link
+ * WORKTREE_RECOVER_KEY_PREFIX}`<epic>-` prefixed close keys, and the `<epic>.<n>`
+ * work-task keys. A STRICT SUPERSET of the true pinned set — the `LIKE` forms may
+ * over-select (their `%`/`_` only widen a match, never narrow it), and the
+ * TypeScript key vocabulary is the true membership arbiter; the client never
+ * needs to ADD an epic the SQL missed. TOTAL: a NULL `epic_id` shell row concats
+ * to NULL and matches nothing without erroring. NO `recencyBound` and NO LIMIT —
+ * a pin nags until its row clears (pin lifetime = row lifetime), and the set is
+ * naturally bounded by the `dispatch_failures` table. The two prefix literals are
+ * trusted module constants (the injection invariant: never wire text).
+ */
+export const EPICS_PINNED_DESCRIPTOR: CollectionDescriptor = {
+  name: "epics_pinned",
+  table: "epics",
+  columns: EPICS_DESCRIPTOR.columns,
+  pk: EPICS_DESCRIPTOR.pk,
+  version: EPICS_DESCRIPTOR.version,
+  sortable: EPICS_DESCRIPTOR.sortable,
+  defaultSort: { column: "epic_number", dir: "asc" },
+  filters: EPICS_DESCRIPTOR.filters,
+  // Correlated EXISTS keyed off the OUTER `epics.epic_id` (the page SELECT's
+  // single-table `FROM epics`), so `df` never collides with the outer scope.
+  defaultClause: {
+    sql:
+      "EXISTS (SELECT 1 FROM dispatch_failures df" +
+      " WHERE df.verb IN ('close', 'work') AND (" +
+      " df.id = epics.epic_id" +
+      ` OR df.id LIKE '${WORKTREE_FINALIZE_ID_PREFIX}' || epics.epic_id || '-%'` +
+      ` OR df.id LIKE '${WORKTREE_RECOVER_KEY_PREFIX}' || epics.epic_id || '-%'` +
+      " OR df.id LIKE epics.epic_id || '.%'" +
+      "))",
+    params: [],
   },
   jsonColumns: EPICS_DESCRIPTOR.jsonColumns,
 };
@@ -949,6 +1003,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
   [EPICS_RECENT_DONE_DESCRIPTOR.name, EPICS_RECENT_DONE_DESCRIPTOR],
+  [EPICS_PINNED_DESCRIPTOR.name, EPICS_PINNED_DESCRIPTOR],
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [SCHEDULED_TASKS_DESCRIPTOR.name, SCHEDULED_TASKS_DESCRIPTOR],
