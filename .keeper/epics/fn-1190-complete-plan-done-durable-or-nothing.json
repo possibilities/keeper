@@ -7,7 +7,7 @@
     "fn-1185-make-plan-done-commit-atomic"
   ],
   "id": "fn-1190-complete-plan-done-durable-or-nothing",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T03:14:27.772000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T03:14:26.879000Z"
+  "updated_at": "2026-07-08T03:14:27.772000Z"
 }
