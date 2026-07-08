@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-08T20:56:06.968000Z",
+  "depends_on_epics": [],
+  "id": "fn-1200-terminate-lingering-worker-sessions",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Terminate lingering worker sessions",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-08T20:56:06.968000Z"
+}
