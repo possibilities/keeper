@@ -34,6 +34,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -2027,6 +2028,14 @@ function readWorldRev(db: Database): number {
  */
 export interface BootGate {
   ready: boolean;
+  /**
+   * Per-daemon-boot nonce (see {@link BootStatus.generation}), minted once when
+   * the server worker spawns so the value is stable for this worker's whole life
+   * and distinct from the prior boot's. Optional so the many `{ ready: … }` test
+   * gates needn't mint one — an absent nonce simply omits the wire field, leaving
+   * a client on its always-re-baseline-on-reconnect fallback.
+   */
+  generation?: string;
 }
 
 /**
@@ -2135,6 +2144,10 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
     // fn-954: the EFFECTIVE per-root dispatch concurrency count so the board
     // demotes the SAME way the reconciler does (stored intent stays server-side).
     max_concurrent_per_root: maxConcurrentPerRoot,
+    // The epoch guard: the per-boot nonce off the gate (omitted when the gate
+    // carries none — e.g. a unit gate — so the client keeps its always-
+    // re-baseline-on-reconnect fallback).
+    ...(gate.generation === undefined ? {} : { generation: gate.generation }),
   };
 }
 
@@ -3576,7 +3589,11 @@ function main(): void {
   // un-`ready` (mutating RPCs rejected `server_booting`, every frame stamped
   // `catching_up`) and flips on main's `{type:"boot-complete"}` message, posted
   // after drain-reaches-head + git-seed + ephemeral-truncate.
-  const bootGate: BootGate = { ready: false };
+  // Mint the per-boot generation nonce ONCE here: this object lives for the whole
+  // worker instance, so every frame it stamps carries the same value, and the
+  // next daemon boot spawns a fresh worker with a fresh nonce — exactly the
+  // "did the daemon bounce under me?" signal the client's epoch guard reads.
+  const bootGate: BootGate = { ready: false, generation: randomUUID() };
 
   let server: RunningServer;
   try {

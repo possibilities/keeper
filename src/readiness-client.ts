@@ -42,7 +42,16 @@
  *     opt-in `giveUpPolicy` bounds the CONTINUOUS-UNPAINTED window: when no
  *     first `result` lands within `deadlineMs` the driver tears down and fires
  *     `onFatal({ code: "unreachable" })` once.
- *   - Steady-poll backstop (500 ms) refetches each collection, coalesced.
+ *   - Poll loop (500 ms): slow-flight/timeout detection on any IN-FLIGHT query,
+ *     plus a steady-state LIVENESS HEARTBEAT — after `HEARTBEAT_IDLE_MS` with no
+ *     inbound frame and nothing in flight it sends ONE probe refetch, so a
+ *     silently-dead socket (a bounce leaving the transport half-open, or an
+ *     app-level eviction) is torn down + reconnected instead of holding stale
+ *     state forever. Real-time `patch`/`meta` frames drive data freshness.
+ *   - Epoch guard: the boot header's per-daemon-boot `generation` nonce is
+ *     tracked across reconnects; a change forces the re-baseline path (drop every
+ *     resumable version cursor) and fires `generation_change` — a bounce never
+ *     resumes a dead sequence even if the transport never signalled the drop.
  *   - On teardown (disconnect or `dispose`): reset every collection's `rows` /
  *     `byId` / `order` / `gotResult`, and HARD-destroy the held socket
  *     (`destroySocket` → `terminate()`, NOT `end()`) so the native buffers +
@@ -173,6 +182,24 @@ const QUERY_TIMEOUT_MS = 5000;
  * which stays 500ms slow-flight detection ONLY and is never widened for this.
  */
 export const CATCHUP_BACKSTOP_MS = 3000;
+/**
+ * Steady-state liveness heartbeat threshold. After first paint the client is
+ * IDLE — it holds no in-flight query and waits on server-pushed `patch`/`meta`
+ * frames — so `pollAll`'s slow-flight/timeout logic (which only inspects an
+ * IN-FLIGHT query) can never fire. A daemon bounce that leaves the socket
+ * half-open (or an app-level subscription eviction) then delivers NEITHER an EOF
+ * NOR any frame, and the viewer holds its last-painted state forever (the
+ * observed "board stuck on a closed epic across bounces until restart"). This is
+ * the app-level loss detector: when the connection has gone this long with no
+ * inbound frame AND nothing is in flight, send ONE probe refetch; a live daemon
+ * answers (resetting the clock, no repaint churn since the body byte-matches),
+ * while a dead one draws no reply and the existing `QUERY_TIMEOUT_MS` path tears
+ * down + reconnects. Deliberately slow — one tiny probe per idle window per
+ * viewer, never the fn-921 unbounded refetch — and distinct from `POLL_MS`
+ * (500ms slow-flight detection) and `CATCHUP_BACKSTOP_MS` (the catch-up-only
+ * settling probe).
+ */
+export const HEARTBEAT_IDLE_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -367,9 +394,11 @@ export interface ReadinessClientHandle {
 /**
  * Lifecycle-event callback shape. The driver emits `connecting` / `connected`
  * / `disconnected` / `waiting` / `error` / `query_slow_flight` /
- * `query_timeout` with a small detail payload (fields per event).
- * `query_slow_flight` fires once per stuck in-flight window; `query_timeout`
- * fires just before the socket teardown + reconnect.
+ * `query_timeout` / `heartbeat_probe` / `generation_change` with a small detail
+ * payload (fields per event). `query_slow_flight` fires once per stuck in-flight
+ * window; `query_timeout` fires just before the socket teardown + reconnect;
+ * `heartbeat_probe` fires when the idle-liveness probe is sent; `generation_change`
+ * fires when a daemon-generation change is detected across a (re)connect.
  */
 export type LifecycleCallback = (
   event: string,
@@ -798,6 +827,20 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   let reconnecting = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // ---- steady-state liveness heartbeat (see HEARTBEAT_IDLE_MS) ----
+  // Wall-clock (`Date.now`, matching the slow-flight machinery) of the last
+  // inbound frame of ANY kind on the CURRENT connection — stamped on `open` and
+  // on every `handleFrame`. `pollAll` reads it to detect a silently-dead socket:
+  // idle past `HEARTBEAT_IDLE_MS` with nothing in flight ⇒ send one probe. Reset
+  // on `open`; irrelevant while torn down (no `currentSock`).
+  let lastInboundAt = 0;
+  // ---- daemon-generation epoch guard (see BootStatus.generation) ----
+  // The last daemon-boot nonce observed on a boot header. DELIBERATELY NOT reset
+  // on teardown: it must survive a reconnect so a bounce that re-serves under a
+  // NEW generation is detectable across the drop. `undefined` until the first
+  // header carrying a generation lands (a server that stamps none leaves the
+  // guard inert — the always-re-baseline-on-reconnect contract still holds).
+  let lastSeenGeneration: string | undefined;
   // ---- catching-up latch + backstop (see CatchingUpCallback) ----
   // Per-connection value-latch. Starts READY (`false`). A served `result`
   // carrying a boot header sets it to that header's `catching_up` (strict
@@ -1017,15 +1060,26 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   function pollAll(): void {
-    // SLOW-FLIGHT DETECTION ONLY: walk every state, compare `Date.now() -
-    // queryInFlightSince` against the thresholds, and emit a one-shot
-    // `query_slow_flight` or trigger a reconnect. No refetch is scheduled here —
-    // real-time `patch`/`meta` frames drive freshness via `scheduleRefetchFor`.
+    // Two jobs on each `POLL_MS` tick, both reading the wall clock (in-process
+    // state cleared on teardown, so `Date.now()` is correct here):
+    //   1. SLOW-FLIGHT DETECTION: walk every state, compare `Date.now() -
+    //      queryInFlightSince` against the thresholds, and emit a one-shot
+    //      `query_slow_flight` or trigger a reconnect. No data refetch is
+    //      scheduled — real-time `patch`/`meta` drive freshness via
+    //      `scheduleRefetchFor`.
+    //   2. LIVENESS HEARTBEAT: when the connection is fully idle (nothing in
+    //      flight) and has drawn no inbound frame for `HEARTBEAT_IDLE_MS`, send
+    //      ONE probe refetch so a silently-dead socket (a bounce that leaves the
+    //      transport half-open with no EOF, or an app-level eviction) surfaces —
+    //      the probe either draws a fresh reply (live) or times out into job 1's
+    //      reconnect (dead). Without it a steady-state viewer never notices loss.
     const now = Date.now();
+    let anyInFlight = false;
     for (const s of states) {
       if (!s.queryInFlight || s.queryInFlightSince === null) {
         continue;
       }
+      anyInFlight = true;
       const age = now - s.queryInFlightSince;
       if (age >= QUERY_TIMEOUT_MS) {
         triggerReconnect(s);
@@ -1040,6 +1094,21 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         });
         s.lastSlowFlightAt = now;
       }
+    }
+    // Heartbeat: fire only when steady (no query in flight — so it never
+    // double-probes an in-flight round and is naturally inert pre-first-paint,
+    // when the opening queries are all in flight) and idle past the threshold.
+    // The probe rides the shared coalescer; its reply re-stamps `lastInboundAt`
+    // and, being byte-identical on a quiet board, repaints nothing.
+    if (
+      !anyInFlight &&
+      currentSock !== null &&
+      !shuttingDown &&
+      states.length > 0 &&
+      now - lastInboundAt >= HEARTBEAT_IDLE_MS
+    ) {
+      emit("heartbeat_probe", { sock: sockPath, idle_ms: now - lastInboundAt });
+      scheduleRefetchFor(states[0]);
     }
   }
 
@@ -1104,7 +1173,36 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     return true;
   }
 
+  /**
+   * Epoch guard (see {@link BootStatus.generation}). Compare a boot header's
+   * per-daemon-boot nonce against the last one seen. A change means the daemon
+   * bounced across this (re)connect — the ONLY wire signal of it, since `rev`
+   * and `head_event_id` both persist a plain restart. Force the re-baseline
+   * path: drop every per-pk version cursor so no PRE-bounce version can bias a
+   * POST-bounce direct-merge `patch` into a stale drop/accept (the fresh full
+   * page reseeds them). Emits `generation_change` so a consumer can observe the
+   * detected bounce. Inert when the header carries no generation (older server)
+   * or on the first-ever observation (nothing to compare).
+   */
+  function checkGeneration(boot: BootStatus | undefined): void {
+    const gen = boot?.generation;
+    if (gen === undefined) {
+      return;
+    }
+    if (lastSeenGeneration !== undefined && gen !== lastSeenGeneration) {
+      emit("generation_change", { from: lastSeenGeneration, to: gen });
+      for (const s of states) {
+        s.lastSeenVersion.clear();
+      }
+    }
+    lastSeenGeneration = gen;
+  }
+
   function handleFrame(frame: ServerFrame): void {
+    // Stamp the liveness clock on EVERY inbound frame (result/patch/meta/error)
+    // so `pollAll`'s heartbeat measures true connection idleness, not just
+    // gaps between full results.
+    lastInboundAt = Date.now();
     if (frame.type === "result") {
       // fn-897 B1: surface the boot-status header (present during catch-up) so a
       // consumer can detect an unseeded git surface / still-draining reducer. Fired
@@ -1112,6 +1210,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       if (onBootStatus !== undefined && frame.boot !== undefined) {
         onBootStatus(frame.boot);
       }
+      // Epoch guard: detect a daemon-generation change across the (re)connect and
+      // force re-baseline BEFORE per-state routing re-pages this collection.
+      checkGeneration(frame.boot);
       // Fold this result into the catching-up latch BEFORE per-state routing so
       // a display harness gating on `onCatchingUp` sees the flip alongside the
       // header. Every `result` participates (a headerless one clears while
@@ -1307,6 +1408,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         // SERVED. The reset is keyed on the first `result` (`servedThisConnection`).
         reconnecting = false;
         currentSock = sock;
+        // Seed the liveness clock at connect so the heartbeat measures idleness
+        // from the fresh connection, not a stale prior-connection stamp.
+        lastInboundAt = Date.now();
         emit("connected", { sock: sockPath });
         // Send every subscribed query up front, stamping `queryInFlightSince`
         // and resetting `lastSlowFlightAt` so the post-reconnect window is clean.
