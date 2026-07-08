@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Trace and fix keep-set body loss",
-  "updated_at": "2026-07-08T02:33:59.687000Z"
+  "updated_at": "2026-07-08T03:09:13.567000Z",
+  "worker_done_at": "2026-07-08T03:09:13.567000Z"
 }

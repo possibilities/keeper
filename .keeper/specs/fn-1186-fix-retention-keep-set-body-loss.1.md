@@ -33,5 +33,5 @@ diverges — state whether that class is affected and, if so, what mitigation ap
 - [ ] The BUG line is absent on a fresh healthy run; full fast suite green
 
 ## Done summary
-
+Root cause: the retention data-loss sentinel (countAbsentBlobs) flagged every non-shed-class NULL body, but the keep-set is not uniformly fold-read — an earlier shed overshoot left SubagentStop/PostToolUse:Agent (offline-analysis, not fold-read) bodies NULL, and synthetic/adopted-harness ResumeTargetResolved/Stop/SessionStart are legitimately minted body-less. Fixed by AND-NOTing a new RETENTION_NULL_TOLERANT_KEEP_PREDICATE so only a mandatory-body keep-set loss fires; validated the sentinel goes 0 on the live DB. Zero re-fold blast radius (none of the absent bodies is a deterministic-replay fold input).
 ## Evidence
