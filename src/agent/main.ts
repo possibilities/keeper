@@ -68,7 +68,11 @@ import {
   type HarnessName,
   mapKeeperEffortToAxis,
 } from "./harness";
-import { piExtensionArgs, READ_ONLY_DIRECTIVE } from "./launch-config";
+import {
+  FINAL_MESSAGE_DIRECTIVE,
+  piExtensionArgs,
+  READ_ONLY_DIRECTIVE,
+} from "./launch-config";
 import {
   type LaunchHandleDeps,
   launchToResolvedHandle,
@@ -1258,17 +1262,21 @@ async function runRunCaptureSubcommand(
   }
   // Compose CALLER-SIDE (raw `\n\n` join, no `User:` scaffold — `agent run` has
   // no role framing):
-  // [read-only directive] → [System: <text>] → [user prompt], UNIFORM across
-  // claude/codex/pi. The shared launch helper stays directive-free so the caller
-  // is the sole prepender. Read-only is prompting-only: the directive is the whole
-  // mechanism (keeper enforces nothing — no tool strip, no changed-files audit).
-  // The `System:` block is user-turn text, NOT a privileged system prompt — the
-  // native `--append-system-prompt` upgrade is a deliberate future step. An
-  // empty-after-trim system value is a no-op skip.
+  // [read-only directive]? → [final-message directive] → [System: <text>]? →
+  // [user prompt], UNIFORM across claude/codex/pi/hermes. The shared launch
+  // helper stays directive-free so the caller is the sole prepender. Read-only
+  // is prompting-only: the directive is the whole mechanism (keeper enforces
+  // nothing — no tool strip, no changed-files audit). The final-message
+  // directive is always-on (no flag gates it, harmless to a harness that has
+  // no background-agent concept of its own). The `System:` block is user-turn
+  // text, NOT a privileged system prompt — the native `--append-system-prompt`
+  // upgrade is a deliberate future step. An empty-after-trim system value is a
+  // no-op skip.
   const promptParts: string[] = [];
   if (parsed.readOnly) {
     promptParts.push(READ_ONLY_DIRECTIVE);
   }
+  promptParts.push(FINAL_MESSAGE_DIRECTIVE);
   if (systemText !== null && systemText !== "") {
     promptParts.push(`System: ${systemText}`);
   }
