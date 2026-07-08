@@ -49,6 +49,7 @@ import {
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
+import { getVcs } from "../vcs.ts";
 import { GitError, stateHeadVisible } from "./reconcile.ts";
 
 interface DoneArgs {
@@ -172,7 +173,10 @@ export function runDone(args: DoneArgs): void {
       }
     }
 
-    // Parse + normalize evidence (default empty object when none given).
+    // Parse + normalize evidence (default empty object when none given). A heal
+    // re-run with no --evidence carries the wedge's recorded evidence forward
+    // from the runtime overlay rather than blanking it to the empty default —
+    // the prior done wrote it there, so a self-heal must not lose it.
     let evidenceData: unknown = {};
     if (evidenceInline) {
       try {
@@ -180,6 +184,13 @@ export function runDone(args: DoneArgs): void {
       } catch (e) {
         emitError(`Invalid evidence JSON: ${(e as Error).message}`, format);
       }
+    } else if (
+      healUncommittedDone &&
+      merged.evidence !== null &&
+      typeof merged.evidence === "object" &&
+      !Array.isArray(merged.evidence)
+    ) {
+      evidenceData = merged.evidence;
     }
     if (
       evidenceData !== null &&
@@ -224,18 +235,25 @@ export function runDone(args: DoneArgs): void {
       );
     }
 
-    const evidenceLines: string[] = [];
-    if (evidence.commits.length > 0) {
-      evidenceLines.push(`- Commits: ${evidence.commits.join(", ")}`);
+    // A heal re-run with no --evidence preserves the existing `## Evidence`
+    // section verbatim rather than blanking the operator's recovered text —
+    // mirrors the `## Done summary` preservation above.
+    let evidenceText: string;
+    if (!evidenceInline && healUncommittedDone) {
+      evidenceText = getTaskSection(specContent, "## Evidence");
+    } else {
+      const evidenceLines: string[] = [];
+      if (evidence.commits.length > 0) {
+        evidenceLines.push(`- Commits: ${evidence.commits.join(", ")}`);
+      }
+      if (evidence.tests.length > 0) {
+        evidenceLines.push(`- Tests: ${evidence.tests.join(", ")}`);
+      }
+      if (evidence.prs.length > 0) {
+        evidenceLines.push(`- PRs: ${evidence.prs.join(", ")}`);
+      }
+      evidenceText = evidenceLines.length > 0 ? evidenceLines.join("\n") : "";
     }
-    if (evidence.tests.length > 0) {
-      evidenceLines.push(`- Tests: ${evidence.tests.join(", ")}`);
-    }
-    if (evidence.prs.length > 0) {
-      evidenceLines.push(`- PRs: ${evidence.prs.join(", ")}`);
-    }
-    const evidenceText =
-      evidenceLines.length > 0 ? evidenceLines.join("\n") : "";
 
     try {
       specContent = patchTaskSection(specContent, "## Evidence", evidenceText);
@@ -298,6 +316,16 @@ export function runDone(args: DoneArgs): void {
         } else if (existsSync(runtimeStatePath)) {
           unlinkSync(runtimeStatePath);
         }
+        // Restoring the working-tree bytes alone leaves the done bytes STAGED:
+        // commit.ts's gitStage (`git add`) ran before the mid-merge-refused
+        // pathspec commit, so a later full-index merge-completion would sweep
+        // the half-stamp into its tree. Return the three state paths' index
+        // entries to HEAD too (a gitignored / never-staged path resets to a
+        // harmless no-op), keeping the index consistent with the restored tree.
+        getVcs().restoreIndexToHead(
+          [taskPath, specPath, runtimeStatePath],
+          ctx.projectPath,
+        );
       },
     },
   );

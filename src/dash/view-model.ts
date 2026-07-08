@@ -232,9 +232,24 @@ export interface Band {
   readonly cards: readonly CardVM[];
 }
 
-/** The complete dash model for one frame. */
+/**
+ * The dash readiness gate's loading state — present while the daemon is down
+ * or catching up, absent once ready. `line` is pre-formatted by the app shell
+ * off the freshest boot-status header (re-fold percentage, a generic
+ * git-seed wait, or a plain catching-up label — no per-root list, mirroring
+ * `keeper usage`'s generic gate); the view-model stays free of any
+ * wire-protocol dependency.
+ */
+export interface DashLoadingState {
+  readonly line: string;
+}
+
+/** The complete dash model for one frame. `loading`, when present, means the
+ *  gate is holding — `bands` is empty and the paint layer renders the
+ *  loading line instead of cards. */
 export interface DashModel {
   readonly bands: readonly Band[];
+  readonly loading?: DashLoadingState;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +344,10 @@ function buildCard(job: Job, rung: RobotRung): CardVM {
  *   `showTerminal` is set.
  * - `showTerminal` — when false (default toggle state) ended/killed lines are
  *   hidden; when true they join their session band.
+ * - `loading` — when non-null, the gate is holding: `jobs` is never walked
+ *   and the model short-circuits to `{ bands: [], loading }`, so a launch or
+ *   reconnect mid-catch-up never renders a partially-folded card. Absent/null
+ *   (default) ⇒ today's ready-state behavior, unchanged.
  *
  * Returns `{ bands }`: one band per active tmux session in render order (priority
  * sessions first, the rest alphabetical, `detached` last), each carrying its job
@@ -338,7 +357,11 @@ function buildCard(job: Job, rung: RobotRung): CardVM {
 export function buildDashModel(
   jobs: Map<string, Job> | Iterable<Job>,
   showTerminal: boolean,
+  loading?: DashLoadingState | null,
 ): DashModel {
+  if (loading != null) {
+    return { bands: [], loading };
+  }
   const jobList =
     jobs instanceof Map ? Array.from(jobs.values()) : Array.from(jobs);
 

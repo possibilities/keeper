@@ -87,5 +87,5 @@ record then resumes; a failed poller open retries on a later poll.
 - [ ] All five harness TUIs wire the new inputs, and CONTEXT.md gains the Catching up entry
 
 ## Done summary
-
+Gate live TUI rendering on daemon readiness: hold data frames behind a re-fold%/git-seed/catching-up loading indicator while catching up, paint the held frame on the flip to ready, reconnecting-pill grace on post-paint disconnect, one frames loading record, snapshot/frames catching_up threading, retryable re-fold poller open, all five TUIs wired, and the Catching up glossary entry.
 ## Evidence

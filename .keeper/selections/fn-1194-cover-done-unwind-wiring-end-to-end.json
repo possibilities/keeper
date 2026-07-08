@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-file test addition with a fully-specified acceptance reusing an existing real-git fixture, no design choice or contract-shaped reasoning.",
+      "task_id": "fn-1194-cover-done-unwind-wiring-end-to-end.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T06:41:22.570000Z",
+  "epic_id": "fn-1194-cover-done-unwind-wiring-end-to-end",
+  "input_hash": "d303ee7b3f1e9ea00d97cd1b785c154a76431e930df0679e63ad4009cc5e23a3",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 0,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-file test addition with a fully-specified acceptance reusing an existing real-git fixture, no design choice or contract-shaped reasoning.\",\"confidence\":0.86}]}"
+}

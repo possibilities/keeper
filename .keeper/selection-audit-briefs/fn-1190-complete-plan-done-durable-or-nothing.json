@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 14,
+        "files_changed": 4,
+        "insertions": 276
+      },
+      "done_summary": "Fixed F1 (onCommitFailure now unstages the three state paths' index to HEAD via a new restoreIndexToHead facade method, so a mid-merge partial-commit refusal leaves no staged half-stamp) and F2 (a --evidence-less self-heal preserves the ## Evidence section and runtime overlay evidence). Added a real-git slow-tier test proving the clean-index unwind plus fast-tier evidence-preservation and heal-recommit-fails coverage.",
+      "input_hash": "9442528c14058a6e40983ac5d4135762423047c46e87763e135ea6025a02f7b0",
+      "model": "opus",
+      "spec_chars": 2526,
+      "spec_md": "## Description\n\nTwo confirmed recovery-edge defects in `plugins/plan/src/verbs/done.ts`\n(audited at commit 3d0e56da), both bundled here because they touch the same\nverb's recovery paths and land as one commit.\n\nFiles: `plugins/plan/src/verbs/done.ts`,\n`plugins/plan/test/saga-done-commit-atomic.test.ts`.\n\nF1 (index not unstaged on unwind): `onCommitFailure` (done.ts:290-299)\nrestores the three state files' working-tree bytes via `atomicWriteRaw` /\n`unlinkSync` but never unstages the git index. `commit.ts` `gitStage`\n(`git add -- <files>`, l.103) runs before the pathspec `gitCommit`\n(`git commit -F - -- <files>`, l.120) that git refuses mid-merge, so the\ndone-version bytes remain staged; a full-index merge-completion\n(`git commit` / `git merge --continue`) then sweeps a durable half-stamp\ninto the commit and leaves HEAD/working-tree inconsistent. Fix: have\n`onCommitFailure` also return the three paths' index entries to HEAD\n(e.g. `git restore --staged --` / `git reset -q HEAD --` on the state repo)\nalongside the working-tree restore.\n\nF2 (heal blanks `## Evidence`): the heal branch preserves `## Done summary`\nvia `getTaskSection` (done.ts:210) but `evidenceText` is unconditionally\nrebuilt from the empty-default `evidence`, so a self-heal without\n`--evidence` blanks the spec's `## Evidence` section and overwrites the\nruntime overlay's evidence \u2014 silent data loss. Fix: mirror the\nsummary-preservation, reading the existing `## Evidence` section on the\n`healUncommittedDone` path when no `--evidence` is supplied.\n\n## Acceptance\n\n- [ ] `onCommitFailure` returns the three state paths' git index to HEAD, not only the working tree.\n- [ ] A `healUncommittedDone` re-run without `--evidence` leaves `## Evidence` and the overlay evidence intact.\n- [ ] Real-git (KEEPER_PLAN_RUN_SLOW) test asserts a clean index after a mid-merge `git commit -- <pathspec>` refusal (F1).\n- [ ] Test asserts a heal re-run preserves the recorded `## Evidence` (F2).\n- [ ] Test covers a heal whose own re-commit also fails mid-merge (the idempotent restore-to-already-done no-op).\n\n## Done summary\nFixed F1 (onCommitFailure now unstages the three state paths' index to HEAD via a new restoreIndexToHead facade method, so a mid-merge partial-commit refusal leaves no staged half-stamp) and F2 (a --evidence-less self-heal preserves the ## Evidence section and runtime overlay evidence). Added a real-git slow-tier test proving the clean-index unwind plus fast-tier evidence-preservation and heal-recommit-fails coverage.\n## Evidence\n",
+      "task_id": "fn-1190-complete-plan-done-durable-or-nothing.1",
+      "tier": "xhigh",
+      "title": "Fix done unwind and heal"
+    }
+  ],
+  "created_at": "2026-07-08T06:41:13.976000Z",
+  "epic_id": "fn-1190-complete-plan-done-durable-or-nothing",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "9442528c14058a6e40983ac5d4135762423047c46e87763e135ea6025a02f7b0",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

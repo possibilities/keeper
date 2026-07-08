@@ -204,6 +204,32 @@ test("a truncated frame diff sets diff_truncated and still writes the full diff 
 });
 
 // ---------------------------------------------------------------------------
+// catching_up — tri-state, defaults to null, threaded per-record
+// ---------------------------------------------------------------------------
+
+test("catching_up defaults to null on every record kind when the caller omits it", () => {
+  const h = makeHarness();
+  h.emitter.emitBaseline(frameInput());
+  h.emitter.emitFrame(frameInput({ frameText: "changed" }));
+  h.emitter.emitTrailer({ reason: "eof" });
+  const [baseline, frame, trailer] = h.records();
+  expect(baseline.catching_up).toBeNull();
+  expect(frame.catching_up).toBeNull();
+  expect(trailer.catching_up).toBeNull();
+});
+
+test("catching_up threads the caller's injected value per record", () => {
+  const h = makeHarness();
+  h.emitter.emitBaseline(frameInput({ catchingUp: true }));
+  h.emitter.emitFrame(frameInput({ frameText: "changed", catchingUp: false }));
+  h.emitter.emitTrailer({ reason: "eof", catchingUp: true });
+  const [baseline, frame, trailer] = h.records();
+  expect(baseline.catching_up).toBe(true);
+  expect(frame.catching_up).toBe(false);
+  expect(trailer.catching_up).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
 // seq contiguity
 // ---------------------------------------------------------------------------
 

@@ -1215,6 +1215,15 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     // suppressed. Inert in live/snapshot (the stored cursor is never read).
     onBootStatus: (boot) => {
       view.noteCursor(String(boot.rev));
+      // Feed the freshest header to the readiness gate so the loading indicator
+      // advances its re-fold % / git-seed branch as catch-up progresses.
+      view.noteCatchingUp(boot.catching_up, boot);
+    },
+    // The latched catch-up transition (holds live rendering while the daemon is
+    // down / draining / seeding; resumes on the flip to ready). Inert in
+    // snapshot/frames beyond stamping the observed state.
+    onCatchingUp: (catchingUp, boot) => {
+      view.noteCatchingUp(catchingUp, boot);
     },
   });
 

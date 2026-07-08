@@ -39,7 +39,7 @@ import {
   DEFAULT_WRAPPER_EFFORT,
   DEFAULT_WRAPPER_MODEL,
   effectiveMatrixFromDisk,
-} from "../../plan/src/subagents_config.ts";
+} from "../../plan/src/host_matrix.ts";
 import { renderTemplate } from "../src/render_engine.ts";
 import { runRenderPluginTemplates } from "../src/render_plugin_templates.ts";
 import type {

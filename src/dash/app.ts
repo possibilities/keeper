@@ -50,6 +50,7 @@ import type {
   StyledText as StyledTextType,
   TextRenderable as TextRenderableType,
 } from "@opentui/core";
+import type { BootStatus } from "../protocol";
 import {
   type ConnectFactory,
   type ReadinessClientSnapshot,
@@ -61,7 +62,12 @@ import {
   colorForIcon,
   STRUCTURE_COLOR_INDEX,
 } from "./theme";
-import { buildDashModel, type CardVM, type DashModel } from "./view-model";
+import {
+  buildDashModel,
+  type CardVM,
+  type DashLoadingState,
+  type DashModel,
+} from "./view-model";
 
 // Bounded first page for the jobs subscription. The feed serializes the
 // snapshot onto one NDJSON line, so an unbounded fetch over a large job history
@@ -234,6 +240,44 @@ export function attachDashApp(
   // re-sort because it's the key, not an index; cleared only when the line
   // leaves the rendered set.
   let selectedKey: string | null = null;
+  // The single readiness-gate loading line, mounted lazily and torn down the
+  // moment the model resumes cards. Kept OUTSIDE `rowNodes` — its lifecycle
+  // (one node, content-only updates, no selection/order participation) is
+  // deliberately simpler than a job/band row's.
+  let loadingNode: TextRenderableType | null = null;
+
+  /** Paint the loading line, pruning every job/band row first so a resumed
+   *  gate never blends stale cards behind it. Idempotent per call. */
+  function renderLoading(line: string): void {
+    for (const [key, handle] of rowNodes) {
+      body.remove(handle.node.id);
+      handle.node.destroy();
+      rowNodes.delete(key);
+    }
+    lastOrder = "";
+    lineOrder = [];
+    selectedKey = null;
+    if (loadingNode === null) {
+      loadingNode = new runtime.TextRenderable(renderer, {
+        id: "dash-loading",
+        width: "100%",
+        height: 1,
+        content: "",
+      });
+      body.add(loadingNode);
+    }
+    loadingNode.content = line;
+    renderer.requestRender();
+  }
+
+  /** Tear down the loading node once the gate clears. No-op if never mounted. */
+  function clearLoading(): void {
+    if (loadingNode !== null) {
+      body.remove(loadingNode.id);
+      loadingNode.destroy();
+      loadingNode = null;
+    }
+  }
 
   function buildLineHandle(key: string, card: CardVM): LineHandle {
     const node = new runtime.BoxRenderable(renderer, {
@@ -367,6 +411,11 @@ export function attachDashApp(
     if (destroyed) {
       return;
     }
+    if (model.loading !== undefined) {
+      renderLoading(model.loading.line);
+      return;
+    }
+    clearLoading();
     const paintRows = flatten(model);
 
     // Ensure every wanted row exists and carries current content. New nodes
@@ -640,7 +689,75 @@ export async function createDashApp(
     },
   });
 
+  // ── catching-up gate (fn-1180) ──────────────────────────────────────────
+  // dash rides ONE `subscribeReadiness` connection (unlike usage's two
+  // streams), so the gate is a direct read of its per-connection latch — no
+  // latest-wins merge needed.
+  let catchingUp = false;
+  let freshestBoot: BootStatus | undefined;
+  // Monotonic floor for the displayed re-fold percentage — never regresses
+  // within a run.
+  let maxRefoldPct = 0;
+  // Grace timer + latch for an unreachable socket: armed on EVERY `connecting`
+  // (cold-start-while-down and every post-disconnect reconnect alike — the
+  // event fires once at the top of each connect attempt), flips the gate to
+  // loading `CATCHUP_GRACE_MS` later if no `connected` has landed by then.
+  const CATCHUP_GRACE_MS = 1500;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let graceExpiredUnreachable = false;
+
+  function isGated(): boolean {
+    return catchingUp || graceExpiredUnreachable;
+  }
+
+  /** The loading line: category text plus, for a real re-fold, a monotonic
+   *  percentage. No per-root git-seed list — that detail is the board's. */
+  function formatLoadingLine(): DashLoadingState {
+    const boot = freshestBoot;
+    if (boot === undefined) {
+      return { line: "catching up…" };
+    }
+    if (boot.git_seed_required) {
+      return { line: "waiting for git seed…" };
+    }
+    if (boot.head_event_id > 0 && boot.rev < boot.head_event_id) {
+      const rawPct = (boot.rev / boot.head_event_id) * 100;
+      if (rawPct > maxRefoldPct) {
+        maxRefoldPct = rawPct;
+      }
+      return {
+        line: `re-folding event log  ${maxRefoldPct.toFixed(1)}%  ${boot.rev.toLocaleString()} / ${boot.head_event_id.toLocaleString()}`,
+      };
+    }
+    return { line: "catching up…" };
+  }
+
+  function armCatchupGrace(): void {
+    if (graceTimer !== undefined) {
+      return;
+    }
+    graceTimer = setTimeout(() => {
+      graceTimer = undefined;
+      graceExpiredUnreachable = true;
+      paint();
+    }, CATCHUP_GRACE_MS);
+  }
+
+  function disarmCatchupGrace(): void {
+    if (graceTimer !== undefined) {
+      clearTimeout(graceTimer);
+      graceTimer = undefined;
+    }
+    graceExpiredUnreachable = false;
+  }
+
   function paint(): void {
+    if (isGated()) {
+      app.render(
+        buildDashModel(new Map(), inputs.showTerminal, formatLoadingLine()),
+      );
+      return;
+    }
     const snap = inputs.snapshot;
     app.render(buildDashModel(snap?.jobs ?? new Map(), inputs.showTerminal));
   }
@@ -664,10 +781,31 @@ export async function createDashApp(
     },
     onLifecycle: (event) => {
       // A snapshot is retained across a drop so the last-good list freezes
-      // until the conn comes back.
+      // until the conn comes back (or, past grace, the gate takes over).
       if (event === "disconnected" || event === "connecting") {
         paint();
       }
+      if (event === "connecting") {
+        armCatchupGrace();
+      }
+      if (event === "connected") {
+        // A fresh connection is no longer "unreachable" — its own
+        // catching-up latch (reset to ready on reconnect) takes the gate
+        // from here.
+        disarmCatchupGrace();
+        paint();
+      }
+    },
+    onBootStatus: (boot) => {
+      freshestBoot = boot;
+      paint();
+    },
+    onCatchingUp: (next, boot) => {
+      catchingUp = next;
+      if (boot !== undefined) {
+        freshestBoot = boot;
+      }
+      paint();
     },
     // Reconnect-forever (settled) — never give up, never tear the TUI down.
     // A fatal pre-paint error (malformed query — should never happen against

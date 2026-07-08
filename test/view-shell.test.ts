@@ -40,6 +40,7 @@ import {
   type FramesEmitter,
   type FramesIo,
 } from "../src/frames-emitter";
+import type { BootStatus } from "../src/protocol";
 import type { RefoldProgressPoller } from "../src/refold-progress";
 import {
   armViewerExitTriggers,
@@ -51,6 +52,100 @@ import {
   type ViewRender,
   type ViewShell,
 } from "../src/view-shell";
+
+// ---------------------------------------------------------------------------
+// Boot-status header factory for the readiness-gate tests. Sensible ready
+// defaults (at head, seeded); overrides drive each branch.
+// ---------------------------------------------------------------------------
+
+function makeBoot(overrides: Partial<BootStatus> = {}): BootStatus {
+  return {
+    rev: 100,
+    head_event_id: 100,
+    catching_up: false,
+    git_seed_required: false,
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// setTimeout monkeypatch — the reconnect grace timer is a bare global
+// `setTimeout` (distinct from the injected snapshot/frames timer seams). Mirror
+// `patchIntervals`: capture callbacks + handles so a test can fire the grace
+// synchronously, and honor `clearTimeout` so a cancelled grace never fires.
+// ---------------------------------------------------------------------------
+
+interface TimeoutCapture {
+  callbacks: Array<() => void>;
+  delays: number[];
+  cleared: Set<number>;
+  restore(): void;
+  /** Fire the most-recently-armed timeout iff it was not cleared. */
+  fireLast(): void;
+}
+
+function patchTimeouts(): TimeoutCapture {
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  const callbacks: Array<() => void> = [];
+  const handles: number[] = [];
+  const delays: number[] = [];
+  const cleared = new Set<number>();
+  let nextHandle = 1;
+
+  globalThis.setTimeout = ((
+    cb: () => void,
+    delay?: number,
+  ): ReturnType<typeof setTimeout> => {
+    const handle = nextHandle++;
+    callbacks.push(cb);
+    handles.push(handle);
+    delays.push(typeof delay === "number" ? delay : 0);
+    return handle as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+
+  globalThis.clearTimeout = ((handle?: unknown): void => {
+    if (typeof handle === "number") {
+      cleared.add(handle);
+    }
+  }) as typeof clearTimeout;
+
+  return {
+    callbacks,
+    delays,
+    cleared,
+    restore(): void {
+      globalThis.setTimeout = realSet;
+      globalThis.clearTimeout = realClear;
+    },
+    fireLast(): void {
+      const i = callbacks.length - 1;
+      if (i < 0) {
+        throw new Error("no timeout armed — fireLast() before setTimeout()");
+      }
+      const handle = handles[i];
+      if (handle !== undefined && !cleared.has(handle)) {
+        callbacks[i]?.();
+      }
+    },
+  };
+}
+
+// Spy on a live view's banner `setStatus` — the reconnecting pill is a banner
+// write (not a body write), so it doesn't surface on the passthrough stdout
+// sink. The shell reads `liveShell.setStatus` by property, so reassigning it
+// intercepts every call.
+function spyStatus(v: ViewShell<{ body: string[] }>): string[] {
+  const captured: string[] = [];
+  const real = v.liveShell.setStatus.bind(v.liveShell);
+  (v.liveShell as unknown as { setStatus: (s: string) => void }).setStatus = (
+    s: string,
+  ): void => {
+    captured.push(s);
+    real(s);
+  };
+  return captured;
+}
 
 // ---------------------------------------------------------------------------
 // Fake poller — records every `poll()` invocation and returns scripted
@@ -364,7 +459,7 @@ test("guards `max<=0` and `cursor>=max` against NaN/>100% paint", () => {
   expect(joined).toContain("connecting to keeperd");
 });
 
-test("first real emit self-stops the interval and closes the poller", () => {
+test("first real emit self-stops the interval but keeps the poller open for a re-gate", () => {
   const poller = makeFakePoller([{ cursor: 50, max: 100 }]);
   view = createViewShell<{ body: string[] }>({
     script: sidecarBase,
@@ -376,18 +471,19 @@ test("first real emit self-stops the interval and closes the poller", () => {
   intervals.tick();
   expect(poller.polls).toBe(1);
 
-  // The first data emit should clear the interval (Bun setInterval
-  // has no .unref()) and close the poller. We assert the captured
-  // clearInterval handle matches the one setInterval returned.
+  // The first data emit (daemon ready, no catch-up) clears the interval (Bun
+  // setInterval has no .unref()) — the captured clearInterval handle matches
+  // the one setInterval returned. The poller is NOT closed: the gate can re-arm
+  // the indicator on a later daemon bounce, and a closed poller is dead for the
+  // process lifetime, so its fd is released only on teardown.
   view.emit({ body: ["data row 1"] });
   expect(intervals.cleared).toHaveLength(1);
-  expect(poller.closes).toBe(1);
+  expect(poller.closes).toBe(0);
 
-  // A SECOND emit must not re-clear / re-close. Both teardown calls
-  // are idempotent.
+  // A SECOND emit must not re-clear. The stop is idempotent.
   view.emit({ body: ["data row 2"] });
   expect(intervals.cleared).toHaveLength(1);
-  expect(poller.closes).toBe(1);
+  expect(poller.closes).toBe(0);
 });
 
 test("tick observed AFTER first frame is a no-op (self-stop on `frameCount>0`)", () => {
@@ -407,8 +503,8 @@ test("tick observed AFTER first frame is a no-op (self-stop on `frameCount>0`)",
   const pollsBefore = poller.polls;
   const closesBefore = poller.closes;
   intervals.tick();
-  // No new poll; the close call is idempotent so the count doesn't
-  // grow either.
+  // No new poll — the tick self-stops on `!shouldShowIndicator()`. The poller
+  // stays open (closed only on teardown), so the close count doesn't move.
   expect(poller.polls).toBe(pollsBefore);
   expect(poller.closes).toBe(closesBefore);
 });
@@ -468,11 +564,11 @@ test("SIGINT teardown clears the interval and closes the poller idempotently", (
   }
 });
 
-test("poller.close() is NOT double-called across self-stop + SIGINT", () => {
-  // Real-world: a first data frame self-stops, then the user hits
-  // Ctrl-C. Both teardown paths fire `stopConnectingSpinner` →
-  // `closeRefoldPoller`. The shell's `refoldPollerClosed` flag guards
-  // against a double close.
+test("poller.close() fires once on teardown (self-stop leaves it open)", () => {
+  // Real-world: a first data frame self-stops the interval (poller stays open
+  // for a possible re-gate), then the user hits Ctrl-C. The self-stop must NOT
+  // close the poller; teardown closes it exactly once (the `refoldPollerClosed`
+  // flag guards against a double close if paths co-fire).
   const poller = makeFakePoller([null]);
   view = createViewShell<{ body: string[] }>({
     script: sidecarBase,
@@ -481,7 +577,8 @@ test("poller.close() is NOT double-called across self-stop + SIGINT", () => {
   });
   view.emitLifecycle("connecting", {});
   view.emit({ body: ["row"] });
-  expect(poller.closes).toBe(1);
+  // Self-stop kept the poller open.
+  expect(poller.closes).toBe(0);
 
   // Swap process.on + exit, drive SIGINT.
   const realOn = process.on.bind(process);
@@ -507,8 +604,7 @@ test("poller.close() is NOT double-called across self-stop + SIGINT", () => {
   try {
     view.installSigintHandler(() => {});
     expect(() => captured?.()).toThrow("__SIGINT_EXIT__");
-    // Close count must still be 1 — the SIGINT path observed
-    // `refoldPollerClosed === true` and short-circuited.
+    // The SIGINT teardown closes the poller exactly once.
     expect(poller.closes).toBe(1);
   } finally {
     (process as unknown as { exit: typeof process.exit }).exit = realExit;
@@ -806,7 +902,8 @@ test("snapshot: first ready composite prints frame + keeper-meta: line, exits 0"
   expect(trailer.status).toBe("ok");
   expect(trailer.frame).toBe(1);
   expect(trailer.truncated).toBe(false);
-  expect(trailer.schema_version).toBe(1);
+  // 2: SNAPSHOT_SCHEMA_VERSION as of the catching_up field's addition.
+  expect(trailer.schema_version).toBe(2);
   expect(typeof trailer.state).toBe("string");
 });
 
@@ -1236,7 +1333,8 @@ test("frames: envelopes carry monotonic contiguous seq + the freshest cursor", (
   expect(recs.map((r) => r.seq)).toEqual([0, 1, 2]);
   expect(recs.map((r) => r.cursor)).toEqual(["42", "42", "43"]);
   expect(recs.every((r) => r.view === "board")).toBe(true);
-  expect(recs.every((r) => r.schema_version === 1)).toBe(true);
+  // 2: FRAMES_SCHEMA_VERSION as of the catching_up field's addition.
+  expect(recs.every((r) => r.schema_version === 2)).toBe(true);
 });
 
 test("frames: max-frames bound terminates with a trailer as the final line", () => {
@@ -1366,4 +1464,317 @@ test("frames: reportSnapshotStream is inert (no coverage accounting to drift)", 
   const recs = h.records();
   expect(recs).toHaveLength(1);
   expect(recs[0]?.type).toBe("baseline");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1180: live-mode daemon-readiness gate. A catch-up-reporting result HOLDS
+// the data frame and paints the loading indicator (re-fold % / git-seed /
+// catching-up branches); the flip to ready paints the held frame at once. A
+// post-paint disconnect keeps the last frame under a "reconnecting…" pill,
+// flipping to the full indicator on grace expiry or immediately on a catch-up
+// report. The re-fold percentage never regresses across the poller→wire switch.
+// ---------------------------------------------------------------------------
+
+test("live gate: a catch-up result holds the frame and paints the re-fold indicator; the flip paints it", () => {
+  const poller = makeFakePoller([]); // wire header drives the branch; poller unused
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: poller,
+  });
+  view.emitLifecycle("connecting", {});
+  // Daemon reports catch-up with the fold cursor well behind head.
+  view.noteCatchingUp(
+    true,
+    makeBoot({ rev: 20, head_event_id: 100, catching_up: true }),
+  );
+
+  // A data emit while gated paints NOTHING — the composite is held.
+  expect(view.emit({ body: ["real data row"] })).toBe(false);
+  expect(stdoutCap.writes.join("")).not.toContain("real data row");
+
+  // The indicator tick renders the re-fold % straight from the wire header —
+  // the sqlite poller is never touched while a header is present.
+  intervals.tick();
+  let joined = stdoutCap.writes.join("");
+  expect(joined).toContain("re-folding event log");
+  expect(joined).toContain("20.0%");
+  expect(poller.polls).toBe(0);
+
+  // Flip to ready → the held frame paints immediately.
+  view.noteCatchingUp(
+    false,
+    makeBoot({ rev: 100, head_event_id: 100, catching_up: false }),
+  );
+  joined = stdoutCap.writes.join("");
+  expect(joined).toContain("real data row");
+  expect(view.getFrameCount()).toBe(1);
+});
+
+test("live gate: the git-seed branch renders the roots, and generic wording when the roots list is empty", () => {
+  const poller = makeFakePoller([]);
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: poller,
+  });
+  view.emitLifecycle("connecting", {});
+  // At head, git seed pending, roots present.
+  view.noteCatchingUp(
+    true,
+    makeBoot({
+      rev: 50,
+      head_event_id: 50,
+      catching_up: true,
+      git_seed_required: true,
+      git_unseeded_roots: ["/repo/a", "/repo/b"],
+    }),
+  );
+  intervals.tick();
+  expect(stdoutCap.writes.at(-1)).toContain(
+    "waiting for git seed: /repo/a, /repo/b",
+  );
+
+  // Empty roots → generic wording (no colon, no roots list).
+  view.noteCatchingUp(
+    true,
+    makeBoot({
+      rev: 50,
+      head_event_id: 50,
+      catching_up: true,
+      git_seed_required: true,
+      git_unseeded_roots: [],
+    }),
+  );
+  intervals.tick();
+  const lastWrite = stdoutCap.writes.at(-1) ?? "";
+  expect(lastWrite).toContain("waiting for git seed");
+  expect(lastWrite).not.toContain(":");
+});
+
+test("live gate: the residual catching-up window renders a plain 'catching up…' line", () => {
+  const poller = makeFakePoller([]);
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: poller,
+  });
+  view.emitLifecycle("connecting", {});
+  // At head, no git seed pending, still catching up (the settling window).
+  view.noteCatchingUp(
+    true,
+    makeBoot({
+      rev: 100,
+      head_event_id: 100,
+      catching_up: true,
+      git_seed_required: false,
+    }),
+  );
+  intervals.tick();
+  expect(stdoutCap.writes.at(-1)).toContain("catching up…");
+});
+
+test("live gate: the re-fold percentage never regresses across the poller→wire source switch", () => {
+  // Cold start: the sqlite poller reports 40% (no wire header yet).
+  const poller = makeFakePoller([{ cursor: 400, max: 1000 }]);
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: poller,
+  });
+  view.emitLifecycle("connecting", {});
+  intervals.tick();
+  expect(stdoutCap.writes.join("")).toContain("40.0%");
+
+  // The wire header now reports a LOWER raw fraction (30%) on the same head —
+  // the display clamps up to the 40% floor instead of regressing.
+  view.noteCatchingUp(
+    true,
+    makeBoot({ rev: 300, head_event_id: 1000, catching_up: true }),
+  );
+  intervals.tick();
+  const joined = stdoutCap.writes.join("");
+  expect(joined).not.toContain("30.0%");
+  expect(joined).toContain("40.0%");
+});
+
+test("live gate: a post-paint disconnect holds the frame under a pill; grace expiry flips to the indicator", () => {
+  const timeouts = patchTimeouts();
+  const poller = makeFakePoller([{ cursor: 5, max: 10 }], {
+    cursor: 5,
+    max: 10,
+  });
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      refoldProgressPoller: poller,
+    });
+    const status = spyStatus(view);
+
+    // Paint a ready first frame.
+    view.emit({ body: ["live data"] });
+    expect(stdoutCap.writes.join("")).toContain("live data");
+
+    // Disconnect AFTER the paint → reconnecting pill, last frame held, grace armed.
+    view.emitLifecycle("disconnected", {});
+    expect(status).toContain("reconnecting…");
+    // No indicator armed during the grace — the last frame stays put.
+    expect(intervals.callbacks).toHaveLength(0);
+    expect(stdoutCap.writes.join("")).not.toContain("re-folding event log");
+
+    // Grace elapses → the full loading indicator arms and paints.
+    timeouts.fireLast();
+    expect(intervals.callbacks).toHaveLength(1);
+    intervals.tick();
+    expect(stdoutCap.writes.join("")).toContain("re-folding event log");
+    expect(stdoutCap.writes.join("")).toContain("50.0%");
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("live gate: a sub-grace reconnect keeps the last frame with no indicator flicker", () => {
+  const timeouts = patchTimeouts();
+  const poller = makeFakePoller([], null);
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      refoldProgressPoller: poller,
+    });
+    const status = spyStatus(view);
+
+    view.emit({ body: ["live data"] });
+    view.emitLifecycle("disconnected", {});
+    expect(status).toContain("reconnecting…");
+    const writesBefore = stdoutCap.writes.length;
+
+    // Reconnect (ready) BEFORE the grace fires — an identical frame is
+    // byte-suppressed (no churn repaint), the grace is cancelled, the pill cleared.
+    expect(view.emit({ body: ["live data"] })).toBe(false);
+    expect(timeouts.cleared.size).toBeGreaterThanOrEqual(1);
+    expect(stdoutCap.writes.length).toBe(writesBefore);
+    expect(stdoutCap.writes.join("")).not.toContain("re-folding event log");
+    expect(stdoutCap.writes.join("")).not.toContain("connecting to keeperd");
+    // The banner was restored (pill cleared) — no persistent pill provider ⇒ "".
+    expect(status.at(-1)).toBe("");
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("live gate: a reconnect reporting catch-up flips to the indicator immediately (before grace)", () => {
+  const timeouts = patchTimeouts();
+  const poller = makeFakePoller([{ cursor: 3, max: 10 }], {
+    cursor: 3,
+    max: 10,
+  });
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      refoldProgressPoller: poller,
+    });
+    const status = spyStatus(view);
+
+    view.emit({ body: ["live data"] });
+    view.emitLifecycle("disconnected", {});
+    expect(status).toContain("reconnecting…");
+    expect(intervals.callbacks).toHaveLength(0);
+
+    // The reconnect's first result reports catch-up → flip immediately, without
+    // waiting out the grace (which is cancelled).
+    view.noteCatchingUp(
+      true,
+      makeBoot({ rev: 30, head_event_id: 100, catching_up: true }),
+    );
+    expect(timeouts.cleared.size).toBeGreaterThanOrEqual(1);
+    expect(intervals.callbacks).toHaveLength(1);
+    intervals.tick();
+    const joined = stdoutCap.writes.join("");
+    expect(joined).toContain("re-folding event log");
+    expect(joined).toContain("30.0%");
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("frames: a catch-up window emits exactly ONE loading record, then resumes data frames on ready", () => {
+  const h = makeFramesHarness();
+  const emitter = h.makeEmitter();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "frames",
+    frames: { emitter, io: h.runIo },
+  });
+  view.noteCursor("5");
+  // Frames mode never arms the connecting spinner overlay.
+  view.noteCatchingUp(
+    true,
+    makeBoot({ rev: 20, head_event_id: 100, catching_up: true }),
+  );
+  expect(intervals.callbacks).toHaveLength(0);
+
+  // The first emit during catch-up mints ONE loading record (the baseline).
+  expect(view.emit({ body: ["provisional a"] })).toBe(true);
+  // Further catch-up emits are suppressed — no per-tick record flood.
+  expect(view.emit({ body: ["provisional a", "provisional b"] })).toBe(false);
+  expect(view.emit({ body: ["provisional c"] })).toBe(false);
+
+  // Flip to ready → data frames resume.
+  view.noteCatchingUp(
+    false,
+    makeBoot({ rev: 100, head_event_id: 100, catching_up: false }),
+  );
+  expect(view.emit({ body: ["real data"] })).toBe(true);
+
+  const recs = h.records();
+  expect(recs.map((r) => r.type)).toEqual(["baseline", "frame"]);
+  // The loading record stamps catching_up:true + the freshest cursor.
+  expect(recs[0]?.catching_up).toBe(true);
+  expect(recs[0]?.cursor).toBe("5");
+  // The resumed data frame stamps catching_up:false.
+  expect(recs[1]?.catching_up).toBe(false);
+});
+
+test("snapshot: the trailer stamps the observed catch-up state (data still flows headless)", () => {
+  const hh = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: hh.io,
+  });
+  view.emitLifecycle("connected", {});
+  view.noteCatchingUp(
+    true,
+    makeBoot({ rev: 20, head_event_id: 100, catching_up: true }),
+  );
+  // Snapshot/headless keeps capturing during catch-up — the emit is NOT gated.
+  view.emit({ body: ["provisional row"] });
+  expect(() => view?.runSnapshot(() => {})).toThrow("__SNAPSHOT_EXIT_0__");
+
+  const trailer = parseSnapshotTrailer(hh.stdout.join(""));
+  expect(trailer.catching_up).toBe(true);
+  expect(trailer.status).toBe("ok");
+  expect(trailer.frame).toBe(1);
+  expect(hh.stdout.join("")).toContain("provisional row");
+});
+
+test("snapshot: no boot header observed → the trailer's catching_up is null", () => {
+  const hh = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: hh.io,
+  });
+  view.emit({ body: ["row"] });
+  expect(() => view?.runSnapshot(() => {})).toThrow("__SNAPSHOT_EXIT_0__");
+  const trailer = parseSnapshotTrailer(hh.stdout.join(""));
+  expect(trailer.catching_up).toBeNull();
 });

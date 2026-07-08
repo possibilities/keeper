@@ -485,6 +485,13 @@ export const fakeVcs: PlanVcs = {
     return { ...ok(), sha };
   },
 
+  restoreIndexToHead(_paths, _cwd): GitResult {
+    // The fake commits directly from the working-tree diff and models no index,
+    // so an index reset is a no-op — precisely why F1's staged-half-stamp bug is
+    // observable only under real git (the slow tier proves the real unwind).
+    return ok();
+  },
+
   gitBinaryPresent(): boolean {
     return gitBinaryPresent;
   },

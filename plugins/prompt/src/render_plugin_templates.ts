@@ -52,7 +52,7 @@ import yaml from "js-yaml";
 import {
   type EffectiveMatrix,
   effectiveMatrixFromDisk,
-} from "../../plan/src/subagents_config.ts";
+} from "../../plan/src/host_matrix.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { renderTemplate, sourceRelpath } from "./render_engine.ts";
 

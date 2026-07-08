@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "New-pattern FFI flock/probe primitives with subtle concurrency correctness (sync deadline acquire that must never block forever, FD_CLOEXEC across git spawns, platform-specific constants) that the whole epic composes on.",
+      "task_id": "fn-1193-durable-plan-id-reservation.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting lock-ordering and release-discipline correctness invariant (deadlock-safe outer/inner order, no leak across in-process runCaptured, EAFP under stale probe) wired through every mutating verb plus a new commit-time envelope class.",
+      "task_id": "fn-1193-durable-plan-id-reservation.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Correctness-critical data-destruction rollback (the incident class itself) generalized across verbs from a named done.ts precedent, where a wrong restore reopens the staged-file destruction window.",
+      "task_id": "fn-1193-durable-plan-id-reservation.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Novel durable-by-construction id-ledger design (append-only JSONL, crash-truncated-tail tolerance, injection safety, max(scan,ledger)+1 across three mint sites) with subtle correctness under unlocked degrade \u2014 the epic's spine.",
+      "task_id": "fn-1193-durable-plan-id-reservation.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.65,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Distress-row/producer-probe invariants (no fold, level-triggered, re-fold determinism sacred) plus a resolver-contract change that ripples through callers, mirroring named templates but correctness-sensitive.",
+      "task_id": "fn-1193-durable-plan-id-reservation.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Additive defer arm inside the invariant-dense recover-pass ladder where a wrong touch collapses distinct deferral reasons or breaks positive-evidence-only level-clear, plus worker-facing skill/brief contract prose.",
+      "task_id": "fn-1193-durable-plan-id-reservation.6",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T06:26:13.259000Z",
+  "epic_id": "fn-1193-durable-plan-id-reservation",
+  "input_hash": "5fff7f540d49c15654c03eb7a3b0bdb423b34b24573d604b14502a894410a37e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1610579796,
+  "verdict_raw": null
+}

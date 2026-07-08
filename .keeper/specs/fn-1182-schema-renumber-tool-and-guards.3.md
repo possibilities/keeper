@@ -37,5 +37,5 @@ plan skill file is long and load-bearing, so additions are surgical, not structu
 - [ ] Both files read coherently end-to-end; no contradiction with the resolver-charter wording
 
 ## Done summary
-
+Taught planning layer the schema ladder is a singleton resource: epic-scout gains a schema-bump overlap signal in both its guidance and Overlaps output bucket; the plan skill's same-session paragraph and spec-authoring guidance now name the ladder explicitly and require version-at-merge wording instead of hardcoded next-version numbers.
 ## Evidence

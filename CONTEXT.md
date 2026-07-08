@@ -26,6 +26,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Epic**: A tracked unit of work holding a spec and an ordered set of dependent tasks. Avoid: project, story, milestone.
 - **Task**: One acceptance-bounded slice of an epic that a single worker implements end-to-end. Avoid: subtask, issue, chore.
 - **Plan**: The durable spec-and-dependency graph for an epic, authored interactively and consumed read-only, never mutated by the reducer. Avoid: roadmap, schedule, spec sheet.
+- **Id ledger**: The host-local append-only record of every plan number a project has handed out, consulted at mint alongside the directory scan so destroying a minted file can never free its number. Avoid: high-water mark, watermark, counter.
 - **Brief**: The self-contained context packet a worker receives for its task, carrying the spec and glossary out-of-band instead of inlined prose. Avoid: prompt, ticket body, handoff note.
 - **Readiness**: The gate deciding whether a task may dispatch, recomputed each cycle from its dependencies and validation state. Avoid: status, priority, availability.
 - **Arm**: To flip an epic or task from not-ready to dispatchable by stamping it validated. Avoid: enable, approve, unlock.
@@ -49,6 +50,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Reaper**: A background sweep that reclaims stuck, stale, or dead work so the board keeps moving. Avoid: cleanup job, garbage collector, timeout.
 - **Phantom-working**: A job row stuck reading working after its session has gone permanently idle, so autoclose, readiness, and dependent dispatches all consume the wrong state. Avoid: zombie job, ghost worker, stale running.
 - **Drain**: Folding a backlog of pending events to completion in bounded batches. Avoid: flush, catch-up, backfill.
+- **Catching up**: The daemon-reported not-ready window — boot gate un-flipped, fold cursor behind the events head, or git surface unseeded — carried on every boot-status header, during which reads are provisional and viewers gate to a loading indicator; distinct from Drain, the folding mechanism that closes it. Avoid: booting, loading, warming up.
 - **Sticky**: A dispatch failure that stays parked and visible until an operator retries it, rather than clearing itself. Avoid: transient error, flake, warning.
 - **Needs-human**: The family of board signals requiring operator attention — dead letters, block escalations, parked questions, and stuck dispatches, with finalize-non-ff, the instant-death wall, and homed blocked-work rows as subsets of stuck dispatches that never double-count into the total, plus display-only members like the pinned epic that never count toward the jam total at all. Avoid: alert queue, error state, attention list.
 - **Operator jam**: A dispatch failure whose reason class cannot self-clear, leaving the board wedged until an operator acts; alarm surfaces fire on the jam class, while the broad sticky count stays a status display. Avoid: stuck row, hard failure, blockage.

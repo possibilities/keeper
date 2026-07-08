@@ -47,6 +47,7 @@ import {
   type TrailerReason,
 } from "../src/frames-emitter";
 import { createLiveShell } from "../src/live-shell";
+import type { BootStatus } from "../src/protocol";
 import { subscribeCollection } from "../src/readiness-client";
 import {
   createSnapshotLatch,
@@ -1020,6 +1021,151 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
   // cursor (the shared shell's `noteCursor` analog). `null` until the first boot
   // header lands; never read outside frames mode.
   let latestCursor: string | null = null;
+
+  // ── catching-up gate (fn-1180) ──────────────────────────────────────────
+  // Latest-wins merge of the two subscription streams' per-connection
+  // catching-up latches (see `CatchingUpCallback`): whichever stream's
+  // transition lands most recently sets the authoritative gate value — both
+  // streams serve the SAME daemon and converge as soon as each has a fresh
+  // result, so no AND/OR reconciliation is needed.
+  let catchingUp = false;
+  // Freshest boot header observed across EITHER stream, refreshed on every
+  // `onBootStatus` call (not just latch flips) so the live re-fold percentage
+  // advances between flips. `undefined` until the first header lands.
+  let freshestGateBoot: BootStatus | undefined;
+  // Tri-state driver for the snapshot/frames envelope stamp: `false` until any
+  // boot header has ever been observed this run (kept distinct from
+  // `catchingUp` itself so a never-connected run stamps `null`, not `false`).
+  let everObservedBoot = false;
+  // Monotonic floor for the displayed re-fold percentage — never regresses
+  // within a run (mirrors `view-shell`'s connecting-spinner clamp).
+  let maxRefoldPct = 0;
+  // Grace timer + latch for an unreachable socket: armed on `disconnected`,
+  // flips the gate to loading `CATCHUP_GRACE_MS` later if no reconnect has
+  // landed by then. Cleared on `connected` — a fresh connection is no longer
+  // "unreachable"; its own catching-up latch takes over from there.
+  const CATCHUP_GRACE_MS = 1500;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let graceExpiredUnreachable = false;
+
+  function isGated(): boolean {
+    return catchingUp || graceExpiredUnreachable;
+  }
+
+  /** The live-TUI loading line: category text plus, for a real re-fold, a
+   *  monotonic percentage. No per-root git-seed list — that detail belongs to
+   *  the board's per-root gate, not this generic two-stream surface. */
+  function formatGateLiveLine(): string {
+    const boot = freshestGateBoot;
+    if (boot === undefined) {
+      return "catching up…";
+    }
+    if (boot.git_seed_required) {
+      return "waiting for git seed…";
+    }
+    if (boot.head_event_id > 0 && boot.rev < boot.head_event_id) {
+      const rawPct = (boot.rev / boot.head_event_id) * 100;
+      if (rawPct > maxRefoldPct) {
+        maxRefoldPct = rawPct;
+      }
+      return `re-folding event log  ${maxRefoldPct.toFixed(1)}%  ${boot.rev.toLocaleString()} / ${boot.head_event_id.toLocaleString()}`;
+    }
+    return "catching up…";
+  }
+
+  /** The frames-mode static loading label: category only, no percentage — a
+   *  ticking number would defeat the one-record-per-gated-window discipline. */
+  function formatGateStaticLabel(): string {
+    const boot = freshestGateBoot;
+    if (boot?.git_seed_required) {
+      return "waiting for git seed…";
+    }
+    if (
+      boot !== undefined &&
+      boot.head_event_id > 0 &&
+      boot.rev < boot.head_event_id
+    ) {
+      return "re-folding event log…";
+    }
+    return "catching up…";
+  }
+
+  function paintLoadingLine(): void {
+    liveShell.refreshLive([formatGateLiveLine()]);
+  }
+
+  /** Paint the real composed frame (history + sidecars). Factored out of
+   *  `onLiveFrame` so a gate-clear can force a repaint even when the
+   *  underlying row hash didn't change while gated — the gated window's rows
+   *  never reached `lastLiveLines`, so nothing would otherwise repaint them. */
+  function paintRealFrame(bodyLines: string[]): void {
+    const frameText = ["---", ...bodyLines].join("\n");
+    frameCount += 1;
+    liveShell.pushFrame(bodyLines);
+    writeSidecars(frameText);
+    lastFrame = frameText;
+  }
+
+  /** Re-evaluate the gate against the live shell: paint loading while gated,
+   *  else force a real repaint of the current composed body (the gate-clears-
+   *  with-no-new-row-event case). No-op outside watch mode — snapshot/frames
+   *  never reach the live shell (it's `enabled: false`, so pushFrame/
+   *  refreshLive are already inert no-ops there). */
+  function refreshGatedPaint(): void {
+    if (mode !== "watch") {
+      return;
+    }
+    if (isGated()) {
+      paintLoadingLine();
+      return;
+    }
+    if (
+      engine.getUsageRows().length === 0 &&
+      engine.getJobsRows().length === 0
+    ) {
+      return;
+    }
+    paintRealFrame(engine.composeBody(Date.now()));
+  }
+
+  function armCatchupGrace(): void {
+    if (graceTimer !== undefined) {
+      return;
+    }
+    graceTimer = setTimeout(() => {
+      graceTimer = undefined;
+      graceExpiredUnreachable = true;
+      refreshGatedPaint();
+    }, CATCHUP_GRACE_MS);
+  }
+
+  function disarmCatchupGrace(): void {
+    if (graceTimer !== undefined) {
+      clearTimeout(graceTimer);
+      graceTimer = undefined;
+    }
+    graceExpiredUnreachable = false;
+  }
+
+  /** Shared `onBootStatus` sink for both streams: threads the resume cursor
+   *  (unchanged), tracks the freshest header for the gate's percentage, and
+   *  repaints so a percentage tick lands even between latch flips. */
+  function onGateBootStatus(boot: BootStatus): void {
+    latestCursor = String(boot.rev);
+    everObservedBoot = true;
+    freshestGateBoot = boot;
+    refreshGatedPaint();
+  }
+
+  /** Shared `onCatchingUp` sink for both streams — latest-wins by arrival. */
+  function onGateCatchingUp(next: boolean, boot: BootStatus | undefined): void {
+    catchingUp = next;
+    if (boot !== undefined) {
+      freshestGateBoot = boot;
+    }
+    refreshGatedPaint();
+  }
+
   // Snapshot-mode wiring. Forward-reference report slots wired by `runSnapshot`
   // to the latch's `reportStream`; no-ops until then, replayed via the engine's
   // once-guards. `sawConnected` lets the no-frame trailer distinguish `timeout`
@@ -1044,23 +1190,34 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
     shadowAdvisory,
     framesEmitter,
     latestCursor: () => latestCursor,
+    catchingUp: () => (everObservedBoot ? catchingUp : null),
+    loadingLine: formatGateStaticLabel,
     onMaybeStop: maybeStopFrames,
     onLiveFrame,
-    onTickRefresh: (bodyLines) => liveShell.refreshLive(bodyLines),
+    onTickRefresh: (bodyLines) => {
+      // Suppressed while gated — the loading line owns `refreshLive` during
+      // this window, so a 30s relative-time tick must not overwrite it with
+      // real (provisional) board content.
+      if (isGated()) return;
+      liveShell.refreshLive(bodyLines);
+    },
     reportUsageStream: () => reportUsageStream(),
     reportJobsStream: () => reportJobsStream(),
     nowMs: () => Date.now(),
   });
 
-  // Live-mode frame sink: append to scroll-back history + write the per-frame
-  // sidecars. `frameCount` names the sidecar files; `lastFrame` seeds the next
-  // diff. Never reached in snapshot/frames (the engine routes those elsewhere).
+  // Live-mode frame sink: while gated, hold real emission and paint the
+  // loading line instead; the flip back to ready is handled by
+  // `refreshGatedPaint` (called from the gate sinks above), which forces a
+  // repaint even with no further row change. `frameCount` names the sidecar
+  // files; `lastFrame` seeds the next diff. Never reached in snapshot/frames
+  // (the engine routes those elsewhere).
   function onLiveFrame(bodyLines: string[]): void {
-    const frameText = ["---", ...bodyLines].join("\n");
-    frameCount += 1;
-    liveShell.pushFrame(bodyLines);
-    writeSidecars(frameText);
-    lastFrame = frameText;
+    if (isGated()) {
+      paintLoadingLine();
+      return;
+    }
+    paintRealFrame(bodyLines);
   }
 
   const prevFrameTmp = `/tmp/keeper-usage.${process.pid}.prev.frame.txt`;
@@ -1159,7 +1316,10 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
       clearTimeout(framesTimer);
       framesTimer = undefined;
     }
-    framesEmitter.emitTrailer({ reason });
+    framesEmitter.emitTrailer({
+      reason,
+      catchingUp: everObservedBoot ? catchingUp : null,
+    });
     liveShell.dispose();
     usageHandle.dispose();
     jobsHandle.dispose();
@@ -1197,10 +1357,25 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
       lastFrame = null;
       engine.noteDisconnect();
     }
+    // `connecting` fires once at the very start of EVERY connect attempt —
+    // the cold-start case (never connected yet) and every post-disconnect
+    // reconnect alike — so arming the grace timer here (idempotent) covers
+    // "unreachable past grace" uniformly for both. Hold the last painted
+    // frame through the short grace before flipping to the loading indicator
+    // — a sub-second bounce stays flicker-free. A catch-up-reporting
+    // reconnect flips immediately via `onGateCatchingUp` instead, well before
+    // this timer would fire.
+    if (event === "connecting") {
+      armCatchupGrace();
+    }
     // Snapshot mode: latch whether we ever reached `connected` so the
     // no-frame trailer reports `timeout` vs `daemon-unreachable` honestly.
     if (event === "connected") {
       sawConnected = true;
+      // A fresh connection is no longer "unreachable" — its own catching-up
+      // latch (reset to ready on reconnect) takes over the gate from here.
+      disarmCatchupGrace();
+      refreshGatedPaint();
     }
   }
 
@@ -1216,11 +1391,12 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
     onRows: engine.emitUsage,
     onLifecycle: emitLifecycle,
     // Thread the freshest daemon fold cursor into the frames resume-cursor seam
-    // — every frames envelope + the trailer stamp `String(rev)`. Inert in
-    // live/snapshot (the stored cursor is never read).
-    onBootStatus: (boot) => {
-      latestCursor = String(boot.rev);
-    },
+    // — every frames envelope + the trailer stamp `String(rev)` — and feed the
+    // catching-up gate's percentage floor. Live-mode-only side effect
+    // (`refreshGatedPaint` no-ops outside `watch`).
+    onBootStatus: onGateBootStatus,
+    // Latest-wins across both streams — see `onGateCatchingUp`.
+    onCatchingUp: onGateCatchingUp,
   });
 
   // Second subscription: the `jobs` collection drives the "recent sessions"
@@ -1238,9 +1414,8 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
     filter: { state: { not_in: [] } },
     onRows: engine.emitJobs,
     onLifecycle: emitLifecycle,
-    onBootStatus: (boot) => {
-      latestCursor = String(boot.rev);
-    },
+    onBootStatus: onGateBootStatus,
+    onCatchingUp: onGateCatchingUp,
   });
 
   // Snapshot mode: one-shot. Wait (via the shared `streamCount: 2` latch) until
@@ -1332,6 +1507,11 @@ async function runUsageView(config: RunUsageConfig): Promise<void> {
         lifecycle: lifecycleSidecar,
         meta: metaSidecar,
         ts: new Date().toISOString(),
+        // Stamp, never block — the snapshot body above is always the real
+        // composed frame (or the honest no-frame case); this field is the
+        // observed catch-up state at capture time, `null` if no boot header
+        // was ever seen this run.
+        catching_up: everObservedBoot ? catchingUp : null,
       };
     }
 
@@ -1471,6 +1651,20 @@ export interface UsageEmitEngineDeps {
   framesEmitter: FramesEmitter | null;
   /** Freshest daemon fold cursor for the frames resume seam, read per emit. */
   latestCursor: () => string | null;
+  /**
+   * Tri-state observed catch-up status, read per emit: `null` ⇒ no boot
+   * header observed this run (every existing caller's default), `true`/
+   * `false` ⇒ the freshest latch value. Omitted ⇒ always `null` (today's
+   * behavior for a caller that hasn't wired the gate).
+   */
+  catchingUp?: () => boolean | null;
+  /**
+   * The frames-mode static loading label — category text only, no
+   * percentage (a ticking number would defeat the one-record-per-gated-
+   * window discipline below). Read once per gated window, on the FIRST emit
+   * while `catchingUp()` is `true`. Omitted ⇒ a generic fallback.
+   */
+  loadingLine?: () => string;
   /** Called after a frames data emit so a tripped bound flushes the trailer. */
   onMaybeStop: () => void;
   /** Live-mode frame sink (history + sidecars). Never called in snapshot/frames. */
@@ -1535,6 +1729,11 @@ export function createUsageEmitEngine(
   let jobsReported = false;
   // Frames mode: the FIRST accepted frame is the `baseline`, the rest `frame`s.
   let baselineEmitted = false;
+  // Frames mode: whether the current gated window has already emitted its
+  // one static loading record. Reset the moment `catchingUp()` reports
+  // `false`/`null` again (a fresh gated window earns a fresh record) and on
+  // `noteDisconnect` (a reconnect starts a new window even if still gated).
+  let loadingRecordEmitted = false;
 
   /**
    * Stringify the projection-meaningful subset of the `usage` row set into a
@@ -1639,12 +1838,40 @@ export function createUsageEmitEngine(
    */
   function emitFrame(): void {
     if (isSnapshot) return;
-    const bodyLines = composeBody(deps.nowMs());
     if (framesEmitter !== null) {
+      const catchingUpNow = deps.catchingUp?.() ?? null;
+      if (catchingUpNow === true) {
+        // Gated: emit AT MOST ONE static loading record per gated window —
+        // real row changes underneath (the server keeps serving during
+        // catch-up) never forge a second one.
+        if (loadingRecordEmitted) {
+          return;
+        }
+        loadingRecordEmitted = true;
+        const input = {
+          cursor: deps.latestCursor(),
+          frameText: deps.loadingLine?.() ?? "catching up…",
+          stateJson: { usage: usageRows, jobs: jobsRows },
+          catchingUp: true,
+        };
+        if (!baselineEmitted) {
+          baselineEmitted = true;
+          framesEmitter.emitBaseline(input);
+        } else {
+          framesEmitter.emitFrame(input);
+        }
+        deps.onMaybeStop();
+        return;
+      }
+      // Ungated (or never-observed): the next gated window earns a fresh
+      // static record.
+      loadingRecordEmitted = false;
+      const bodyLines = composeBody(deps.nowMs());
       const input = {
         cursor: deps.latestCursor(),
         frameText: bodyLines.join("\n"),
         stateJson: { usage: usageRows, jobs: jobsRows },
+        catchingUp: catchingUpNow,
       };
       if (!baselineEmitted) {
         baselineEmitted = true;
@@ -1656,7 +1883,10 @@ export function createUsageEmitEngine(
       return;
     }
     // Live mode: keep `lastLiveLines` in sync so the next tick suppresses an
-    // identical re-render, then hand the body to the history+sidecar sink.
+    // identical re-render, then hand the body to the history+sidecar sink
+    // (which itself gates on the catching-up latch — see the shell's
+    // `onLiveFrame`).
+    const bodyLines = composeBody(deps.nowMs());
     lastLiveLines = bodyLines;
     deps.onLiveFrame(bodyLines);
   }
@@ -1714,6 +1944,9 @@ export function createUsageEmitEngine(
     noteDisconnect: () => {
       usageRowsKey = null;
       jobsRowsKey = null;
+      // A reconnect starts a fresh gated window even if catching-up is still
+      // observed afterward — it earns its own one static loading record.
+      loadingRecordEmitted = false;
       framesEmitter?.noteReconnect();
     },
     composeBody,

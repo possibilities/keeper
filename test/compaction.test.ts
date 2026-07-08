@@ -145,6 +145,15 @@ function projectionSnapshot(): {
   };
 }
 
+/** Parse a job's persisted `jobs.monitors` array (`[]` when null/absent). */
+function monitorsForJob(jobId: string): unknown[] {
+  const row = db
+    .query("SELECT monitors FROM jobs WHERE job_id = ?")
+    .get(jobId) as { monitors: string | null } | null;
+  if (row?.monitors == null) return [];
+  return JSON.parse(row.monitors) as unknown[];
+}
+
 /**
  * Seed a stream with a discharged shed-class mutation, a keep-set
  * UserPromptSubmit, plus filler so the cold ids sit below a tiny recent window.
@@ -595,6 +604,59 @@ test("data-loss sentinel: NULL-tolerant keep-set classes are exempt; a mandatory
   expect(countAbsentBlobs(db)).toBe(1);
   db.run("UPDATE events SET data = NULL WHERE id = ?", [legacyAgentId]);
   expect(countAbsentBlobs(db)).toBe(2);
+});
+
+test("data-loss sentinel: a NULLed final-Stop body stays EXEMPT even though its background_tasks feed jobs.monitors — the monitors->'[]' divergence is benign drop-when-dead", () => {
+  // A Claude Code session whose FINAL Stop carries a live `background_tasks`
+  // snapshot. That body feeds computeMonitors -> jobs.monitors (a byte-identical
+  // re-fold charter projection) plus its derived has_live_worker_monitor readiness
+  // fact and the `keeper await` background-task condition — so the Stop body IS a
+  // charter fold input, NOT "a body no fold reads".
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID, ts: 100 });
+  const finalStopId = insertEvent({
+    hook_event: "Stop",
+    session_id: TEST_UUID,
+    ts: 200,
+    // An ambient shell (no launch event in the stream) — provenance resolves to
+    // `ambient`; hand-derived from the payload shape, not the code under test.
+    data: JSON.stringify({
+      background_tasks: [{ id: "amb-shell", type: "shell" }],
+    }),
+  });
+  drainAll();
+
+  // The final Stop's body populated jobs.monitors with the live shell — proof the
+  // body is a real fold input, not offline-analysis capture.
+  expect(monitorsForJob(TEST_UUID)).toEqual([
+    { id: "amb-shell", kind: "ambient", command: "", description: "" },
+  ]);
+
+  // Inject the data-loss state the sentinel is meant to catch: NULL the final
+  // Stop's body (a stray NULLing write / corrupt restore — retention itself can
+  // NEVER create this, its predicate matches only shed-class rows).
+  db.run("UPDATE events SET data = NULL WHERE id = ?", [finalStopId]);
+
+  // A cursor=0 re-fold over the NULLed log DIVERGES: monitors collapse to '[]'
+  // (drop-when-dead) instead of the live shell — exactly the charter divergence the
+  // old "no fold reads its body" rationale wrongly denied. Snapshot-replace means
+  // there is no later Stop to re-derive the surviving value.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  expect(() => drainAll()).not.toThrow();
+  expect(monitorsForJob(TEST_UUID)).toEqual([]);
+
+  // CHOSEN BEHAVIOR (keep + correct): the Stop class stays EXEMPT — the sentinel
+  // does NOT flag the NULLed final-Stop body. The divergence is benign (monitors
+  // snapshots LIVE OS shells that cannot outlive the re-fold's daemon reboot, so
+  // '[]' is the intended drop-when-dead value; every reader treats absent monitors
+  // as done/not-holding), and cheap-header classification cannot separate this
+  // stray-NULLed body from a legitimately mint-NULL synthetic Stop (mintCodexStop
+  // writes data:null by construction), whose class would drown the sentinel in
+  // false positives. Without the Stop exemption this count would be 1.
+  expect(countAbsentBlobs(db)).toBe(0);
 });
 
 test("paced: a pass never exceeds maxBatches*batchSize sheds; idempotent across passes", () => {

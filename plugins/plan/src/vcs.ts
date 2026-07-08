@@ -101,6 +101,15 @@ export interface PlanVcs {
     cwd: string,
   ): GitResult & { sha: string };
 
+  /** Reset the index entries for `paths` back to HEAD (`git reset -q HEAD --
+   * <paths>`), undoing a `git add` from a pathspec commit git then refused (the
+   * mid-merge partial-commit window). The working tree is left untouched — the
+   * caller restores those bytes separately. Returns the raw GitResult; a path
+   * absent from HEAD is simply unstaged, and a path never staged (a gitignored
+   * overlay) is a clean no-op. done's commit-failure unwind calls this so no
+   * staged half-stamp survives into a later full-index merge-completion. */
+  restoreIndexToHead(paths: string[], cwd: string): GitResult;
+
   // -------------------------------------------------------------------------
   // Read surface — the post-worker verbs' git archaeology.
   // -------------------------------------------------------------------------
@@ -306,6 +315,10 @@ export const realGitVcs: PlanVcs = {
     }
     const shaResult = runGit(["rev-parse", "HEAD"], cwd);
     return { ...commitResult, sha: shaResult.stdout.trim() };
+  },
+
+  restoreIndexToHead(paths, cwd): GitResult {
+    return runGit(["reset", "-q", "HEAD", "--", ...paths], cwd);
   },
 
   gitBinaryPresent(): boolean {

@@ -56,5 +56,5 @@ envelope stamping is threaded.
 - [ ] Both gates are covered by the fast pure-in-process tier
 
 ## Done summary
-
+Gated keeper usage (watch/frames/snapshot) and keeper dash on the daemon's catching-up latch: usage merges the two subscribe streams' transitions latest-wins, holds live emission for a generic loading line, and threads the observed state into frames (one static loading record per gated window) and snapshot envelopes; dash gets a pure buildDashModel loading variant plus app-shell wiring with the same grace/immediate-flip disconnect semantics.
 ## Evidence

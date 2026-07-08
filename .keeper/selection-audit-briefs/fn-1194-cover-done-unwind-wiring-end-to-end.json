@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 1,
+        "insertions": 116
+      },
+      "done_summary": "Added a slow-tier case that drives the done verb (runDone) directly through the real-git mid-merge partial-commit refusal, asserting a clean index after the unwind \u2014 proving onCommitFailure's restoreIndexToHead wiring end-to-end rather than a hand-reconstructed call.",
+      "input_hash": "d303ee7b3f1e9ea00d97cd1b785c154a76431e930df0679e63ad4009cc5e23a3",
+      "model": "sonnet",
+      "spec_chars": 1679,
+      "spec_md": "## Description\n\nClose the F1 coverage gap: the slow-tier `describe.skipIf(!SLOW_ENABLED)`\nblock in `plugins/plan/test/saga-done-commit-atomic.test.ts` proves\n`realGitVcs.restoreIndexToHead(...)` works, but it reconstructs the unwind by\ncalling `autoCommitFromInvocation(...)` and the facade by hand \u2014 it never\ndrives `runDone`. The fast tier's `fakeVcs.restoreIndexToHead`\n(`plugins/plan/test/fake-vcs.ts`) is a no-op, so a dropped or mis-pathed\n`getVcs().restoreIndexToHead([taskPath, specPath, runtimeStatePath], ...)`\ncall in `plugins/plan/src/verbs/done.ts` `onCommitFailure` would pass every\ntest \u2014 the exact staged-half-stamp regression the fast tier cannot catch.\n\nAdd one slow-tier case that seeds a real mid-merge repo (MERGE_HEAD set),\nruns the `done` verb end-to-end through the partial-commit refusal, and\nasserts `git diff --cached` is empty afterward \u2014 proving the verb's own\nwiring, not a hand-reconstruction, restores the index to HEAD.\n\nFiles: `plugins/plan/test/saga-done-commit-atomic.test.ts` (add the case;\nreuse the existing real-git fixture setup).\n\n## Acceptance\n\n- [ ] A slow-tier case drives the `done` verb against a real mid-merge repo\n      and asserts `git diff --cached` is empty after the unwind.\n- [ ] The case fails if `onCommitFailure`'s `restoreIndexToHead` call is\n      dropped or given wrong paths.\n- [ ] `bun run test:full:slow` stays green.\n\n## Done summary\nAdded a slow-tier case that drives the done verb (runDone) directly through the real-git mid-merge partial-commit refusal, asserting a clean index after the unwind \u2014 proving onCommitFailure's restoreIndexToHead wiring end-to-end rather than a hand-reconstructed call.\n## Evidence\n",
+      "task_id": "fn-1194-cover-done-unwind-wiring-end-to-end.1",
+      "tier": "medium",
+      "title": "End-to-end done unwind test"
+    }
+  ],
+  "created_at": "2026-07-08T06:53:31.204000Z",
+  "epic_id": "fn-1194-cover-done-unwind-wiring-end-to-end",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "d303ee7b3f1e9ea00d97cd1b785c154a76431e930df0679e63ad4009cc5e23a3",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
