@@ -41,5 +41,5 @@ Extend the injected-deps sweep suite: a sandboxed board (sandboxEnv all six stat
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Root cause (confirmed via replayable keeper.db GitSnapshot events): the repair-escalation sweep's isDirtyCheckout gate silently deferred on every ~60s tick because the shared checkout /Users/mike/code/keeper on main held dirty_count>=3 (a persistent src/agent/run-capture.ts .M plus lane-merge churn) for the entire incident window; the DEFER continue minted no row, dispatched nothing, and emitted no diagnostic, so the non-dispatch was invisible. All candidate gates UPSTREAM of the defer were healthy (reason-read/runtime/route/repo) — proven by reproduction and by the absence of skipped_category/skipped_unblocked/unblock-dispatch events for the four SHARED_BASE_BROKEN blocks. Fix: extracted readTaskBlockedReason + selectRepairCandidates into pure exported seams (injected reason-read) and added class-stable diagnostics to every drop/defer/skip gate, so a starving repair route is greppable within one sweep. Regression tests round-trip a real block-written state file (exact plan-block on-disk contract) through the real reader into an actual dispatch decision at the pure seam, and confirm non-repair categories still route unchanged.
 ## Evidence
