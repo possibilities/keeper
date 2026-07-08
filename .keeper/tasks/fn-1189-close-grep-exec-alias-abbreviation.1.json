@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T03:12:54.269000Z",
+  "depends_on": [],
+  "epic": "fn-1189-close-grep-exec-alias-abbreviation",
+  "id": "fn-1189-close-grep-exec-alias-abbreviation.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Deny grep exec-alias abbreviations",
+  "updated_at": "2026-07-08T03:12:54.269000Z"
+}
