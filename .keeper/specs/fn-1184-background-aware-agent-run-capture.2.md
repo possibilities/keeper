@@ -66,5 +66,5 @@ the old composed-prompt bytes.
 - [ ] The JSON answer envelope shape is unchanged and the full fast suite (bun test) is green with the argv-golden tests untouched.
 
 ## Done summary
-
+Added an always-on final-message contract directive to the agent run prompt compose site, re-derived the byte-pinned posture compositions, and documented the contract in the pair/panel skill prose.
 ## Evidence
