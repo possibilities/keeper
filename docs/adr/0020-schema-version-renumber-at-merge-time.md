@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted.
+Accepted. Partially superseded by ADR 0022 (explicit-version schema step
+ladder): the hand-renumber mechanism this record describes now operates over
+`SCHEMA_STEPS` instead of an interleaved guard block. This record's
+provisional-numbering and trunk-keeps-its-numbers rule still governs a fan-in
+collision.
 
 ## Context
 

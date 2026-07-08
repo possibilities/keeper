@@ -51,11 +51,11 @@ file is imperative guardrails only.
 
 - **Forward-only** via `meta(schema_version)`; non-idempotent steps are version-guarded. The daemon
   is the SOLE migrator and never downgrades a DB stored above the binary's `SCHEMA_VERSION`.
-- **Every `SCHEMA_VERSION` bump ships THREE same-commit moves**: add it to
-  `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` (hard whitelist, `test/schema-version.test.ts`),
-  re-pin `SCHEMA_FINGERPRINT` (src/db.ts — on EVERY schema change), and treat the number as
-  PROVISIONAL until landed: on a fan-in collision trunk keeps its numbers, the unlanded lane takes
-  main-tip+1 at merge time (docs/adr/0020) — never two schemas under one number.
+- **A schema change appends one `SCHEMA_STEPS` entry** (`{version, kind, apply}`); `SCHEMA_VERSION`
+  derives from the ladder tail, never hand-typed. Re-pin `SCHEMA_FINGERPRINT` on EVERY schema change.
+  A derivability test keeps `keeper/api.py`'s `SUPPORTED_SCHEMA_VERSIONS` whitelist equal to the
+  derived set. The version stays PROVISIONAL until landed — fan-in renumbering rules unchanged
+  (docs/adr/0020, 0022).
 
 ## Writes are tightly scoped — DO NOT widen them
 
