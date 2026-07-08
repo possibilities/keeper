@@ -5894,6 +5894,11 @@ test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on
   expect(brief).toContain("transaction-boundary");
   expect(brief).toContain("BLOCKED");
   expect(brief).toContain("UNSURE");
+  // The schema-version collision carve-out: the tool's exit-0-clear / refusal-BLOCKED
+  // boundary, distinct from a schema SHAPE decision.
+  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
+  expect(brief).toContain("bun scripts/rebase-schema-migration.ts");
+  expect(brief).toContain("schema SHAPE decision");
   // The literal unstick sentence.
   expect(brief).toContain("to proceed, tell me exactly:");
   // The NOT-clear path aborts to a clean lane (never a half-merge).
@@ -5919,6 +5924,7 @@ test("buildResolverBrief: a parse-miss degrades to a still-actionable brief (nev
   expect(brief).toContain("INTENT ARCHAEOLOGY");
   expect(brief).toContain("keeper find-file-history");
   expect(brief).toContain("Do NOT invent new behaviour");
+  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
 });
 
 test("buildResolverBrief: a null/empty repoDir degrades to the manual body (never throws)", () => {
@@ -5936,6 +5942,7 @@ test("buildResolverBrief: a null/empty repoDir degrades to the manual body (neve
   // null-repo manual branch too.
   expect(brief).toContain("INTENT ARCHAEOLOGY");
   expect(brief).toContain("Do NOT invent new behaviour");
+  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
 });
 
 // ---- runResolverDispatchSweep (orchestration core, injected deps) ------------

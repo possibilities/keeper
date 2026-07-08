@@ -351,7 +351,12 @@ the breaker.
   it resolves ONLY mechanically-clear conflicts (both intents preserved, epic tests
   green) then commits and fires `retry close::<epic>`; anything state-machine / schema /
   security / transaction-boundary shaped it stamps BLOCKED with the unstick sentence and
-  leaves for the human. The `planner@<epic>` escalation fires ONLY after that resolver
+  leaves for the human. A schema-version COLLISION (two lanes' `SCHEMA_STEPS` bump the
+  same version) is the one schema-shaped carve-out: the resolver runs
+  `bun scripts/rebase-schema-migration.ts` and composes its output — exit 0 is
+  mechanically clear, a tool REFUSAL or any schema SHAPE decision (what a column means,
+  whether a rewind is right, a CREATE-literal conflict) stays BLOCKED as today. The
+  `planner@<epic>` escalation fires ONLY after that resolver
   reaches a terminal verdict — it DECLINED (stamped BLOCKED) or its job died — never
   concurrently, so the two never race the same base worktree. The close audit — sized
   lean/standard/deep from the epic's signals (task count, tier mix, diff size, touched
