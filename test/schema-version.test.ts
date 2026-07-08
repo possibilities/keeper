@@ -23,9 +23,17 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { SCHEMA_VERSION } from "../src/db";
+import { SCHEMA_STEPS, SCHEMA_VERSION } from "../src/db";
 
 const API_PY = join(import.meta.dir, "..", "keeper", "api.py");
+
+// keeper-py's SUPPORTED_SCHEMA_VERSIONS floor: a contract of keeper-py's
+// reader (it stays free to drop ancient versions it no longer supports), not
+// a property of the ladder itself. Pinned here as a named const so a future
+// floor raise in keeper/api.py is a deliberate two-sided edit — bump this
+// alongside it, don't let the derivability test silently start passing on a
+// stale floor.
+const PYTHON_SUPPORTED_FLOOR = 31;
 
 /** Parse `SUPPORTED_SCHEMA_VERSIONS = frozenset({31, 32, ...})` from api.py.
  *
@@ -65,4 +73,20 @@ test("keeper-py SUPPORTED_SCHEMA_VERSIONS contains the daemon SCHEMA_VERSION", (
   // "Migrations are forward-only". Membership (not max): keeper-py is handed
   // this exact version on the host, and its whitelist is a hard set.
   expect(supported).toContain(SCHEMA_VERSION);
+});
+
+test("keeper-py SUPPORTED_SCHEMA_VERSIONS is exactly the ladder's versions at/above the Python floor", () => {
+  // Sibling to the membership test above: that one pins the CURRENT version
+  // stays listed; this one pins the WHOLE set is derivable from the ladder,
+  // so api.py's frozenset can never silently drift from SCHEMA_STEPS (add a
+  // ladder entry without touching api.py, or vice versa) without failing
+  // here first. api.py itself stays hand-written — this test is what retires
+  // it as a silent second surface.
+  const supported = new Set(readSupportedVersions());
+  const derived = new Set(
+    SCHEMA_STEPS.map((s) => s.version).filter(
+      (v) => v >= PYTHON_SUPPORTED_FLOOR,
+    ),
+  );
+  expect(supported).toEqual(derived);
 });
