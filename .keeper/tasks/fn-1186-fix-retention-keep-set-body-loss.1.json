@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T02:33:59.687000Z",
+  "depends_on": [],
+  "epic": "fn-1186-fix-retention-keep-set-body-loss",
+  "id": "fn-1186-fix-retention-keep-set-body-loss.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Trace and fix keep-set body loss",
+  "updated_at": "2026-07-08T02:33:59.687000Z"
+}
