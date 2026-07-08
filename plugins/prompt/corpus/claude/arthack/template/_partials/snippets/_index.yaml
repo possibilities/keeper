@@ -128,7 +128,7 @@ snippets:
     token-estimate: 628
     used-in: []
   - name: domain-docs
-    summary: The interactive domain-modeling reflex for design work — read CONTEXT.md + ADRs first, challenge and sharpen terms, offer (don't auto-write) a clustered glossary update and write it inline on confirm, gate ADRs on the 3-part test, supersede old records into superseded/.
+    summary: The domain-modeling reflex for design work — read CONTEXT.md + ADRs first, challenge and sharpen terms, offer a clustered glossary update in conversation but commit merited updates autonomously at plan time, gate ADRs on the 3-part test, supersede old records into superseded/.
     domain: engineering
     audience: agent
     severity: guard
@@ -148,7 +148,7 @@ snippets:
       - claude-md-scope
       - future-facing-docs
     path: _partials/snippets/engineering/domain-docs.md.tmpl
-    token-estimate: 403
+    token-estimate: 478
     used-in: []
   - name: escalate-inline-or-plan
     summary: 'Size a work-shaped request to choose where it lands: inline (1-2 files, no new contracts, wanted now), /plan:plan (multi-module or new contract or 3+ moves), or /plan:defer (inline-shaped but not now). Tie-break toward plan over inline, defer over now.'
@@ -210,7 +210,7 @@ snippets:
     related:
       - commit-via-keeper-default
     path: _partials/snippets/engineering/keeper-history-forensics.md.tmpl
-    token-estimate: 525
+    token-estimate: 524
     used-in: []
   - name: landed-vs-complete
     summary: keeper plan `landed <epic>` (lane merged to default) vs `complete <id>` (done AND idle) — under worktree mode complete can fire before files reach the default branch, so daisy-chains gate on landed.
@@ -252,7 +252,7 @@ snippets:
       - executing
       - reviewing
     path: _partials/snippets/engineering/network-service-hardening.md.tmpl
-    token-estimate: 128
+    token-estimate: 138
     used-in: []
   - name: never-assume-tests-pass
     summary: Always run a test you just wrote or modified — never assume it passes.
