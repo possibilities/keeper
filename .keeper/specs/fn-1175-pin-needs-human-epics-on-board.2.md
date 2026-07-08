@@ -73,5 +73,5 @@ dispatch_failure kinds; needs_human total unchanged by pinning.
 - [ ] Full fast suite green (bun test)
 
 ## Done summary
-
+Board and status opt into includePinnedEpics (ADR 0018): a plan-closed epic with a live close/work dispatch failure renders as a full board block and appears in keeper status --json board.epics with its dispatch_failure kinds, in exactly one place, with open/needs-human counts unaffected by the pin.
 ## Evidence
