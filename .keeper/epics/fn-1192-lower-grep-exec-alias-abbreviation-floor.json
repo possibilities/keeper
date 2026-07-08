@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-08T06:16:17.995000Z",
+  "created_by_close_of": "fn-1189-close-grep-exec-alias-abbreviation",
+  "depends_on_epics": [
+    "fn-1189-close-grep-exec-alias-abbreviation"
+  ],
+  "id": "fn-1192-lower-grep-exec-alias-abbreviation-floor",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Lower grep exec-alias abbreviation floor",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-08T06:16:17.995000Z"
+}
