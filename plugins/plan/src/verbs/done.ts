@@ -14,8 +14,19 @@
 // (atomicWriteJson — the gitignored runtime file is NOT where the completion
 // signal lives), clear the work marker, then emit through the mutating seam (one
 // compact NDJSON envelope, commit BEFORE print).
+//
+// The stamp is durable-or-nothing. The runtime overlay, spec patch, and tracked
+// worker_done_at all land BEFORE the commit, and the daemon reads a done overlay
+// the moment it is written (FSEvents, ahead of any commit). So a failed commit —
+// the mid-merge shared-checkout window, where git refuses a partial commit — is
+// unwound: the three files are restored to their pre-done bytes, the daemon
+// re-reads the restored overlay, and no half-stamped "done" the CLI cannot back
+// out of survives. The symmetric recovery for an ALREADY-wedged task (runtime
+// overlay done, HEAD:<task.json> missing worker_done_at) is a self-heal: a `done`
+// re-run re-commits the missing backing instead of the flat "already done"
+// refusal a durably-committed done still earns.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { emitMutating } from "../emit.ts";
@@ -24,15 +35,21 @@ import { isTaskId } from "../ids.ts";
 import { mergeTaskState } from "../models.ts";
 import { resolvePlanStateContext } from "../project.ts";
 import { clearWorkMarker } from "../session_markers.ts";
-import { ensureValidTaskSpec, patchTaskSection } from "../specs.ts";
+import {
+  ensureValidTaskSpec,
+  getTaskSection,
+  patchTaskSection,
+} from "../specs.ts";
 import {
   atomicWrite,
   atomicWriteJson,
+  atomicWriteRaw,
   getActor,
   LocalFileStateStore,
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
+import { GitError, stateHeadVisible } from "./reconcile.ts";
 
 interface DoneArgs {
   taskId: string;
@@ -47,6 +64,24 @@ interface Evidence {
   commits: unknown[];
   tests: unknown[];
   prs: unknown[];
+}
+
+/** True when the task's committed HEAD:<task.json> already carries the durable
+ * done backing (worker_done_at). A wedged done — the runtime overlay reads done
+ * but the state-file commit was lost to the mid-merge window — reads false,
+ * distinguishing a recoverable half-stamp from a genuinely-committed done. Shares
+ * reconcile.stateHeadVisible so the heal decision stays byte-consistent with the
+ * reconcile STATE_UNCOMMITTED verdict. Fail-SAFE: an unreadable git (GitError)
+ * reads true → refuse, never healing on an unverifiable commit state. */
+function doneBackingCommitted(stateRepo: string, taskId: string): boolean {
+  try {
+    return stateHeadVisible(stateRepo, taskId);
+  } catch (exc) {
+    if (exc instanceof GitError) {
+      return true;
+    }
+    throw exc;
+  }
 }
 
 export function runDone(args: DoneArgs): void {
@@ -77,21 +112,51 @@ export function runDone(args: DoneArgs): void {
     emitError(`Task not found: ${taskId}`, format);
   }
 
+  const specPath = join(dataDir, "specs", `${taskId}.md`);
+  const runtimeStatePath = join(ctx.stateDir, "tasks", `${taskId}.state.json`);
+
   const taskDef = loadJsonSafe(taskPath) ?? {};
   const actor = getActor();
 
   let evidence: Evidence = { commits: [], tests: [], prs: [] };
 
+  // Pre-write bytes of the three state files this verb rewrites (spec, runtime
+  // overlay, tracked def). Captured inside the lock before any write so the
+  // commit-failure unwind restores exactly the pre-done state. A null runtime
+  // snapshot means the overlay did not exist and the unwind must DELETE the one
+  // saveRuntime created (never leave a stray done overlay behind).
+  let specSnapshot: string | null = null;
+  let runtimeSnapshot: string | null = null;
+  let taskJsonSnapshot: string | null = null;
+
   stateStore.withTaskLock(taskId, () => {
+    specSnapshot = existsSync(specPath)
+      ? readFileSync(specPath, "utf-8")
+      : null;
+    runtimeSnapshot = existsSync(runtimeStatePath)
+      ? readFileSync(runtimeStatePath, "utf-8")
+      : null;
+    taskJsonSnapshot = readFileSync(taskPath, "utf-8");
+
     const runtime = stateStore.loadRuntime(taskId);
     const merged = mergeTaskState(taskDef, runtime);
     const status = (merged.status as string) ?? "todo";
 
+    // A done overlay with no durable backing is a wedge, not a completed task:
+    // the state-file commit was lost (the mid-merge window) while the daemon's
+    // runtime_status still reads done. Re-commit the backing instead of the flat
+    // "already done" refusal, which is what a genuinely-committed done still
+    // earns. Gates the in_progress/assignee check below off too — the task is
+    // past in_progress, only its commit is missing.
+    let healUncommittedDone = false;
     if (status === "done") {
-      emitError(`Task ${taskId} is already done`, format);
+      if (doneBackingCommitted(ctx.projectPath, taskId)) {
+        emitError(`Task ${taskId} is already done`, format);
+      }
+      healUncommittedDone = true;
     }
 
-    if (!force) {
+    if (!force && !healUncommittedDone) {
       if (status !== "in_progress") {
         emitError(
           `Task ${taskId} is not in_progress (status: ${status})`,
@@ -106,8 +171,6 @@ export function runDone(args: DoneArgs): void {
         );
       }
     }
-
-    const summaryText = summary ? summary : "";
 
     // Parse + normalize evidence (default empty object when none given).
     let evidenceData: unknown = {};
@@ -135,12 +198,18 @@ export function runDone(args: DoneArgs): void {
 
     // Patch the spec — `## Done summary` then `## Evidence`, validating before
     // and after. A malformed spec is a hard error (the four-H2 contract).
-    const specPath = join(dataDir, "specs", `${taskId}.md`);
     if (!existsSync(specPath)) {
       emitError(`Spec file not found: ${specPath}`, format);
     }
 
     let specContent = readFileSync(specPath, "utf-8");
+    // A heal re-run with no --summary preserves the existing Done summary rather
+    // than blanking the operator's recovered text.
+    const summaryText = summary
+      ? summary
+      : healUncommittedDone
+        ? getTaskSection(specContent, "## Done summary")
+        : "";
     try {
       ensureValidTaskSpec(specContent);
       specContent = patchTaskSection(
@@ -207,9 +276,29 @@ export function runDone(args: DoneArgs): void {
   clearWorkMarker(taskId);
 
   // Route through the central seam: rewrite of pre-existing tracked files (rename-
-  // atomic) → one commit, no unwind.
+  // atomic) → one commit. On a commit failure (the mid-merge window), unwind the
+  // three state files to their pre-done bytes so no durable "done" survives the
+  // failed commit — the daemon re-reads the restored overlay and the task stays
+  // recoverable by a plain `done` re-run once the merge completes.
   emitMutating(
     { task_id: taskId, status: "done", evidence },
-    { verb: "done", target: taskId, repoRoot: ctx.projectPath },
+    {
+      verb: "done",
+      target: taskId,
+      repoRoot: ctx.projectPath,
+      onCommitFailure: () => {
+        if (taskJsonSnapshot !== null) {
+          atomicWriteRaw(taskPath, taskJsonSnapshot);
+        }
+        if (specSnapshot !== null) {
+          atomicWriteRaw(specPath, specSnapshot);
+        }
+        if (runtimeSnapshot !== null) {
+          atomicWriteRaw(runtimeStatePath, runtimeSnapshot);
+        } else if (existsSync(runtimeStatePath)) {
+          unlinkSync(runtimeStatePath);
+        }
+      },
+    },
   );
 }

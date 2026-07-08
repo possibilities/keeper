@@ -92,6 +92,12 @@ export function emitMutating(
     detail?: string | null;
     repoRoot: string;
     primaryRepo?: string | null;
+    // Optional unwind a committing verb registers to restore any state files it
+    // wrote when the commit fails, so a failed commit never leaves a durable
+    // half-stamp on disk (the done verb's mid-merge window). Runs BEFORE the
+    // failure envelope prints; its own throw is swallowed so the authoritative
+    // commit_failed envelope always surfaces.
+    onCommitFailure?: () => void;
   },
 ): void {
   const invocation = buildPlanInvocation(opts.verb, opts.target, opts.detail, {
@@ -104,6 +110,13 @@ export function emitMutating(
   } catch (exc) {
     if (!(exc instanceof CommitFailed)) {
       throw exc;
+    }
+    if (opts.onCommitFailure) {
+      try {
+        opts.onCommitFailure();
+      } catch {
+        // Best-effort unwind — never let a restore slip mask the commit failure.
+      }
     }
     const failure = {
       success: false,
