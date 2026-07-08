@@ -24,6 +24,7 @@ import {
   DISPATCH_FAILURES_DESCRIPTOR,
   DONE_EPICS_REAP_WINDOW_SEC,
   EPICS_DESCRIPTOR,
+  EPICS_PINNED_DESCRIPTOR,
   EPICS_RECENT_DONE_DESCRIPTOR,
   GIT_DESCRIPTOR,
   getCollection,
@@ -39,6 +40,10 @@ import {
   USAGE_DESCRIPTOR,
 } from "../src/collections";
 import { MAX_IN_PARAMS, openDb } from "../src/db";
+import {
+  WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_RECOVER_KEY_PREFIX,
+} from "../src/dispatch-failure-key";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import { runQuery } from "../src/server-worker";
 import { freshDbFile } from "./helpers/template-db";
@@ -1013,6 +1018,132 @@ test("runQuery on epics_recent_done: in-window done rows included, stale exclude
     "fn-2-boundary",
   ]);
   expect(res.total).toBe(2);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// epics_pinned — the display-only pinned board collection (ADR 0018)
+// ---------------------------------------------------------------------------
+
+test("epics_pinned resolves by name and mirrors EPICS_DESCRIPTOR's row shape", () => {
+  expect(getCollection("epics_pinned")).toBe(EPICS_PINNED_DESCRIPTOR);
+  // Rows are consumed as full `Epic` objects (merged into computeReadiness), so
+  // the column/jsonColumn surface MUST mirror the open descriptor.
+  expect(EPICS_PINNED_DESCRIPTOR.table).toBe("epics");
+  expect(EPICS_PINNED_DESCRIPTOR.columns).toEqual(EPICS_DESCRIPTOR.columns);
+  expect(EPICS_PINNED_DESCRIPTOR.pk).toBe(EPICS_DESCRIPTOR.pk);
+  expect(EPICS_PINNED_DESCRIPTOR.version).toBe(EPICS_DESCRIPTOR.version);
+  expect(EPICS_PINNED_DESCRIPTOR.sortable).toBe(EPICS_DESCRIPTOR.sortable);
+  expect(EPICS_PINNED_DESCRIPTOR.jsonColumns).toBe(
+    EPICS_DESCRIPTOR.jsonColumns,
+  );
+  // Stable board slot: epic-number order, never a status-derived rank that jumps
+  // rows between frames.
+  expect(EPICS_PINNED_DESCRIPTOR.defaultSort).toEqual({
+    column: "epic_number",
+    dir: "asc",
+  });
+  // A pin nags until its dispatch_failures row clears — NO recency window.
+  expect(EPICS_PINNED_DESCRIPTOR.recencyBound).toBeUndefined();
+});
+
+test("epics_pinned defaultClause is a verb-restricted correlated EXISTS over the failure-key vocabulary", () => {
+  const clause = EPICS_PINNED_DESCRIPTOR.defaultClause;
+  // The epic id comes from the correlated OUTER column, never a bound param.
+  expect(clause?.params).toEqual([]);
+  const sql = clause?.sql ?? "";
+  // A correlated EXISTS restricted to close/work — the verb gate is exactly what
+  // excludes a daemon-verb stale-base-lane row that embeds an epic id.
+  expect(sql).toContain("EXISTS (SELECT 1 FROM dispatch_failures df");
+  expect(sql).toContain("df.verb IN ('close', 'work')");
+  // Each membership form, drawn from the ONE key vocabulary so the SQL literals
+  // can't drift from the router's prefixes.
+  expect(sql).toContain("df.id = epics.epic_id"); // bare close key
+  expect(sql).toContain(
+    `'${WORKTREE_FINALIZE_ID_PREFIX}' || epics.epic_id || '-%'`,
+  );
+  expect(sql).toContain(
+    `'${WORKTREE_RECOVER_KEY_PREFIX}' || epics.epic_id || '-%'`,
+  );
+  expect(sql).toContain("epics.epic_id || '.%'"); // <epic>.<n> work-task key
+});
+
+test("runQuery on epics_pinned: every live close/work failure form pins its epic, in any status", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // One epic per membership form, statuses mixed (open AND done) to prove the pin
+  // is status-agnostic.
+  seedEpic(db, "fn-1-bare", { epic_number: 1, status: "done" });
+  seedEpic(db, "fn-2-finalize", { epic_number: 2, status: "done" });
+  seedEpic(db, "fn-3-recover", { epic_number: 3, status: "open" });
+  seedEpic(db, "fn-4-work", { epic_number: 4, status: "done" });
+  // No failure row → never pinned.
+  seedEpic(db, "fn-5-clean", { epic_number: 5, status: "open" });
+  // Keyed ONLY by a daemon-verb stale-base-lane row → NOT pinned (verb gate).
+  seedEpic(db, "fn-6-daemon", { epic_number: 6, status: "done" });
+
+  seedDispatchFailure(db, "close", "fn-1-bare"); // bare close key
+  seedDispatchFailure(
+    db,
+    "close",
+    `${WORKTREE_FINALIZE_ID_PREFIX}fn-2-finalize-abc123`,
+  );
+  seedDispatchFailure(
+    db,
+    "close",
+    `${WORKTREE_RECOVER_KEY_PREFIX}fn-3-recover-def456`,
+  );
+  seedDispatchFailure(db, "work", "fn-4-work.2"); // <epic>.<n> work-task key
+  seedDispatchFailure(db, "daemon", "stale-base-lane:fn-6-daemon-abc123", {
+    reason: "stale-base-lane",
+  });
+
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "epics_pinned" }),
+  );
+  // epic_number ASC order; fn-5-clean and fn-6-daemon absent.
+  expect(res.rows.map((r) => String(r.epic_id))).toEqual([
+    "fn-1-bare",
+    "fn-2-finalize",
+    "fn-3-recover",
+    "fn-4-work",
+  ]);
+  expect(res.total).toBe(4);
+  db.close();
+});
+
+test("runQuery on epics_pinned: the verb gate excludes a daemon row whose id would otherwise match", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedEpic(db, "fn-1-daemon-bare", { epic_number: 1, status: "done" });
+  // A daemon-verb row whose id is the BARE epic id — it would match `df.id =
+  // epics.epic_id` were the clause not gated on verb. The verb restriction is the
+  // sole guard, so the epic must NOT pin. Proves the gate is load-bearing.
+  seedDispatchFailure(db, "daemon", "fn-1-daemon-bare", {
+    reason: "stale-base-lane",
+  });
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "epics_pinned" }),
+  );
+  expect(res.rows).toHaveLength(0);
+  expect(res.total).toBe(0);
+  db.close();
+});
+
+test("runQuery on epics_pinned: a NULL epic_id row is total (matches nothing, never errors)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // SQLite permits NULL in a TEXT PRIMARY KEY. A shell row (NULL epic_id) must
+  // fold cleanly: the correlated concat is NULL, matching nothing — no blowup and
+  // no spurious match-everything, even with failure rows present.
+  db.query(
+    `INSERT INTO epics (epic_id, epic_number, status, updated_at, tasks, depends_on_epics, jobs, job_links)
+     VALUES (NULL, 1, 'done', 1, '[]', '[]', '[]', '[]')`,
+  ).run();
+  seedEpic(db, "fn-2-pinned", { epic_number: 2, status: "done" });
+  seedDispatchFailure(db, "close", "fn-2-pinned");
+  const res = asResult(
+    runQuery(db, 0, { type: "query", collection: "epics_pinned" }),
+  );
+  expect(res.rows.map((r) => r.epic_id)).toEqual(["fn-2-pinned"]);
+  expect(res.total).toBe(1);
   db.close();
 });
 

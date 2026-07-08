@@ -253,6 +253,16 @@ export interface ReadinessClientSnapshot {
   // (limit 0) so the wall-threshold counts are exact; the shared projector owns
   // the reason classification so status/watch/await never drift on "stuck".
   readonly dispatchFailures?: readonly Row[];
+  // ADR 0018 OPT-IN: the PINNED epics — every epic a live close/work
+  // `dispatch_failures` row keys to, ANY status (the display-only pinned board
+  // collection). Present ONLY under the `includePinnedEpics` opt-in — ABSENT (not
+  // null, not empty) for board/dash so their first-paint stays byte-identical
+  // (mirrors `landedEpicIds` / `dispatchFailures`). The rows also MERGE open-wins
+  // into `epics` (a pinned closed epic gets a real `computeReadiness` verdict);
+  // this member stays the distinct pinned-identity signal so a consumer renders
+  // the pinned block WITHOUT re-scanning `epics`, and the needs-human count never
+  // double-counts a pin as an orphan.
+  readonly pinnedEpics?: readonly Epic[];
   // fn-952: the `tmux_client_focus` singleton row (`id = 1`) — the persistent
   // control worker's view of the current real client's focused
   // session/window/pane. `undefined` when the singleton is empty (no-tmux env or
@@ -1513,6 +1523,19 @@ export interface SubscribeOptions {
    * BYTE-IDENTICAL. Default `false`.
    */
   readonly includeDispatchFailures?: boolean;
+  /**
+   * ADR 0018 OPT-IN: also subscribe the `epics_pinned` collection (UNBOUNDED —
+   * `limit: 0`, a pin nags until its `dispatch_failures` row clears) and (1)
+   * carry its rows on the snapshot's `pinnedEpics` member (the distinct
+   * pinned-identity signal) AND (2) MERGE them open-wins into the epic set fed to
+   * BOTH `computeReadiness` and the snapshot's `epics` field — so a plan-closed
+   * epic with a stuck close/work failure flows through the ordinary verdict path
+   * and keeps its full board block. Same overlay shape as `includeRecentDoneEpics`.
+   * Set by the surfaces that render the needs-human board (`keeper status`,
+   * `keeper watch`). Board/dash leave it OFF, keeping the `states`/first-paint gate
+   * and the snapshot's member set BYTE-IDENTICAL. Default `false`.
+   */
+  readonly includePinnedEpics?: boolean;
 }
 
 /**
@@ -1739,6 +1762,23 @@ export function subscribeReadiness(
           limit: DISPATCH_FAILURES_PAGE_LIMIT,
         })
       : null;
+  // ADR 0018 OPT-IN: the display-only PINNED epics window. Created, gated, and
+  // merged ONLY when `includePinnedEpics` is set (the needs-human render paths).
+  // When off it is `null` — never added to `states`, never gated, never merged —
+  // so board/dash first-paint and every non-opt-in consumer's snapshot member set
+  // stay byte-identical. Reuses `EPICS_PAGE_LIMIT` (0 = unbounded; the pin set is
+  // bounded by the `dispatch_failures` table, so no page cap — a pin nags until
+  // its row clears).
+  const epicsPinnedSubId = `${idPrefix}-epics-pinned`;
+  const epicsPinned =
+    opts.includePinnedEpics === true
+      ? makeState("epics_pinned", epicsPinnedSubId, "epic_id", {
+          type: "query",
+          collection: "epics_pinned",
+          id: epicsPinnedSubId,
+          limit: EPICS_PAGE_LIMIT,
+        })
+      : null;
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1760,6 +1800,9 @@ export function subscribeReadiness(
   }
   if (dispatchFailures !== null) {
     states.push(dispatchFailures);
+  }
+  if (epicsPinned !== null) {
+    states.push(epicsPinned);
   }
 
   function emitSnapshotIfReady(): void {
@@ -1801,7 +1844,11 @@ export function subscribeReadiness(
       // painted snapshot always carries the REAL jam rows — a transient fold
       // failure can never read as "no jam". Empty produces a `result` with
       // `rows: []`, so it clears.
-      (dispatchFailures !== null && !dispatchFailures.gotResult)
+      (dispatchFailures !== null && !dispatchFailures.gotResult) ||
+      // ADR 0018 OPT-IN: gate on the pinned epics ONLY when opted in (`null`
+      // otherwise — board/dash never wait on it). Empty produces a `result` with
+      // `rows: []`, so it clears.
+      (epicsPinned !== null && !epicsPinned.gotResult)
     ) {
       return;
     }
@@ -1810,36 +1857,55 @@ export function subscribeReadiness(
     const openEpicsTyped = epics.order.map(
       (id) => (epics.byId.get(id) ?? { [epics.pk]: id }) as unknown as Epic,
     );
-    // fn-1015 OPT-IN: merge the recently-done epics open-wins (the live open row
-    // wins a collision; a done row only joins for an epic NOT in the open set),
-    // mirroring the reconciler's `loadReconcileSnapshot` dedup. When the window
-    // was not opted in this is exactly `openEpicsTyped` — byte-identical to the
-    // pre-fn-1015 board/dash path. The merged set feeds BOTH `computeReadiness`
-    // (so a done epic's close-row gets a `completed` verdict) AND the snapshot's
-    // `epics` field (so the await presence lookup sees it).
+    // The pinned epics (fn-1015's recent-done sibling), projected off the pinned
+    // window (`null` when un-opted). The `epic_id` wire pk is single-column so
+    // `byId` never collapses.
+    const pinnedEpicsTyped =
+      epicsPinned === null
+        ? null
+        : epicsPinned.order.map(
+            (id) =>
+              (epicsPinned.byId.get(id) ?? {
+                [epicsPinned.pk]: id,
+              }) as unknown as Epic,
+          );
+    // Reduce open + recent-done + pinned into ONE epic_id-keyed set, open-wins
+    // (a live open row wins a collision; a closed done/pinned row only joins for
+    // an epic NOT already present), mirroring the reconciler's
+    // `loadReconcileSnapshot` dedup. Precedence open > recent-done > pinned — the
+    // closed sources carry the SAME epics-table row, so only the identity dedup is
+    // load-bearing. When neither opt-in is set this is exactly `openEpicsTyped` —
+    // byte-identical to the pre-opt-in board/dash path. The merged set feeds BOTH
+    // `computeReadiness` (a closed epic's close-row gets a `completed` verdict) AND
+    // the snapshot's `epics` field (so the await presence lookup sees it).
     let epicsTyped = openEpicsTyped;
-    if (epicsRecentDone !== null) {
-      const doneEpicsTyped = epicsRecentDone.order.map(
-        (id) =>
-          (epicsRecentDone.byId.get(id) ?? {
-            [epicsRecentDone.pk]: id,
-          }) as unknown as Epic,
-      );
+    if (epicsRecentDone !== null || pinnedEpicsTyped !== null) {
+      const doneEpicsTyped =
+        epicsRecentDone === null
+          ? []
+          : epicsRecentDone.order.map(
+              (id) =>
+                (epicsRecentDone.byId.get(id) ?? {
+                  [epicsRecentDone.pk]: id,
+                }) as unknown as Epic,
+            );
       const seenEpicIds = new Set<string>();
       const merged: Epic[] = [];
-      for (const epic of openEpicsTyped) {
+      const pushUnseen = (epic: Epic): void => {
         if (seenEpicIds.has(epic.epic_id)) {
-          continue;
+          return;
         }
         seenEpicIds.add(epic.epic_id);
         merged.push(epic);
+      };
+      for (const epic of openEpicsTyped) {
+        pushUnseen(epic);
       }
       for (const epic of doneEpicsTyped) {
-        if (seenEpicIds.has(epic.epic_id)) {
-          continue;
-        }
-        seenEpicIds.add(epic.epic_id);
-        merged.push(epic);
+        pushUnseen(epic);
+      }
+      for (const epic of pinnedEpicsTyped ?? []) {
+        pushUnseen(epic);
       }
       epicsTyped = merged;
     }
@@ -2012,6 +2078,10 @@ export function subscribeReadiness(
       ...(dispatchFailuresTyped === undefined
         ? {}
         : { dispatchFailures: dispatchFailuresTyped }),
+      // ADR 0018 OPT-IN: the pinned epics as the distinct pinned-identity member
+      // (they ALSO ride merged into `epics` above). `null` when un-opted so the
+      // member is ABSENT for board/dash — byte-identical to the pre-opt-in shape.
+      ...(pinnedEpicsTyped === null ? {} : { pinnedEpics: pinnedEpicsTyped }),
       ...(tmuxFocus === undefined ? {} : { tmuxFocus }),
       readiness,
     });
