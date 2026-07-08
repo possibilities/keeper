@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T06:23:34.212000Z",
+  "depends_on": [
+    "fn-1193-durable-plan-id-reservation.2"
+  ],
+  "epic": "fn-1193-durable-plan-id-reservation",
+  "id": "fn-1193-durable-plan-id-reservation.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Rollback plan writes on commit failure",
+  "updated_at": "2026-07-08T06:23:34.212000Z"
+}
