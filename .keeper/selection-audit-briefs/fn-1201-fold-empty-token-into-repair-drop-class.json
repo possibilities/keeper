@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 6,
+        "files_changed": 2,
+        "insertions": 27
+      },
+      "done_summary": "Added empty_token to RepairCandidateDropClass, routed both emission sites through a shared typed drop helper, and updated the class-union stability test to length 5.",
+      "input_hash": "29b5b9f083e3c93f8990143feb103cee5526e88fc65534cb573b5ec77e042142",
+      "model": "sonnet",
+      "spec_chars": 1853,
+      "spec_md": "## Description\n\nReconciles finding F1 from the fn-1198 close audit. In `src/daemon.ts`,\n`RepairCandidateDropClass` is `not_blocked | reason_unreadable |\nnon_repair_category | empty_repo` (JSDoc-billed as the class-stable\ngrep/alarm contract), and `selectRepairCandidates` routes its four drop\ngates through a typed `drop()` helper constrained to that union. But the\ngrouping loop in `runRepairEscalationSweep` emits a RAW\n`note(\\`# repair-candidate-drop task=... class=empty_token ...\\`)` line\nthat bypasses the typed helper and is NOT a union member \u2014 so an operator\nalarm keyed off the documented union silently misses `empty_token` drops.\n\nEvidence path (audited commit e676639): the union definition, the typed\n`drop()` helper, and the off-union `class=empty_token` emission all live in\n`src/daemon.ts`; the union-length test lives in `test/daemon.test.ts`\n(`RepairCandidateDropClass: the class union is stable`, pins length 4).\n\nPick ONE reconciliation and apply it end to end:\n- add `empty_token` to `RepairCandidateDropClass` and route the sweep's\n  emission through the typed `drop()` helper (it is a defensive,\n  effectively-unreachable guard like `empty_repo`, so the cost is one\n  union member), OR\n- move the `empty_token` emission to a distinct prefix outside the\n  `repair-candidate-drop` grep contract.\n\nFiles: `src/daemon.ts`, `test/daemon.test.ts`.\n\n## Acceptance\n\n- [ ] No `# repair-candidate-drop` line can be emitted with a `class` value\n      outside the documented drop-class contract.\n- [ ] The union-stability test in `test/daemon.test.ts` is updated to match\n      the reconciled membership and stays green.\n- [ ] `bun test` passes.\n\n## Done summary\nAdded empty_token to RepairCandidateDropClass, routed both emission sites through a shared typed drop helper, and updated the class-union stability test to length 5.\n## Evidence\n",
+      "task_id": "fn-1201-fold-empty-token-into-repair-drop-class.1",
+      "tier": "medium",
+      "title": "Add empty_token to drop-class union"
+    }
+  ],
+  "created_at": "2026-07-08T23:47:27.235000Z",
+  "epic_id": "fn-1201-fold-empty-token-into-repair-drop-class",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "29b5b9f083e3c93f8990143feb103cee5526e88fc65534cb573b5ec77e042142",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
