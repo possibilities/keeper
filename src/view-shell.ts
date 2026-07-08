@@ -57,6 +57,7 @@ import { colorizePillsInLine } from "./board-render";
 import { buildDebugSnapshot, copyToClipboard } from "./clipboard-debug";
 import type { FramesEmitter, TrailerReason } from "./frames-emitter";
 import { createLiveShell, type LiveShell } from "./live-shell";
+import type { BootStatus } from "./protocol";
 import {
   createRefoldProgressPoller,
   type RefoldProgressPoller,
@@ -460,6 +461,26 @@ export interface ViewShell<TSnap> {
    */
   noteCursor: (cursor: string | null) => void;
   /**
+   * Daemon-readiness gate seam (mirror of {@link noteCursor}). Each view's
+   * subscription wiring feeds the shell the subscribe client's catching-up
+   * signal — the latched `onCatchingUp` transition AND the freshest boot header
+   * off `onBootStatus` — so live rendering can gate on daemon readiness instead
+   * of stopping the connecting indicator at the first painted frame.
+   *
+   *   - `catchingUp` true (daemon down / draining / seeding): live mode HOLDS
+   *     data frames (retaining only the freshest) and paints the loading
+   *     indicator; frames mode emits exactly one static loading record.
+   *   - `catchingUp` false: live mode paints the held frame immediately and
+   *     resumes normal rendering; frames mode resumes data frames.
+   *
+   * `boot` is the freshest {@link BootStatus} the indicator's branches read
+   * (re-fold %, git-seed wait, catching-up) — `undefined` when none has been
+   * seen (never overwrites a prior header with `undefined`). Inert in snapshot
+   * mode beyond stamping the observed catch-up state into the trailer; the
+   * headless data path (`keeper status`/`await`/autopilot CLI) never gates.
+   */
+  noteCatchingUp: (catchingUp: boolean, boot: BootStatus | undefined) => void;
+  /**
    * Multi-stream snapshot readiness report (fn-772). `view.emit` auto-reports
    * the FIRST stream to the latch (covers single-stream views like git/jobs
    * with zero extra wiring). A multi-stream view (board=2, autopilot=4)
@@ -568,6 +589,11 @@ export function createViewShell<TSnap>(
   // boot header lands. Stored (never read) outside frames mode.
   let latestCursor: string | null = null;
   let framesBaselineEmitted = false;
+  // Frames-mode catch-up latch: during a catch-up window frames mode emits
+  // exactly ONE static loading record (no per-tick data churn) instead of the
+  // provisional data frames; reset on the flip back to ready so a LATER
+  // catch-up window (a mid-run daemon restart) mints its own single record.
+  let framesLoadingEmitted = false;
   // Trailer-flush guard: SIGINT, the duration timer, and a bound tripped
   // mid-emit can all reach the flush — it must emit the trailer + exit exactly
   // once (mirrors the snapshot `settled` / SIGINT `toreDown` idempotency).
@@ -575,19 +601,46 @@ export function createViewShell<TSnap>(
   let framesOnDispose: () => void = () => {};
   let framesTimer: SnapshotTimerHandle | null = null;
 
-  // Connecting-indicator spinner state. A single `setInterval` (~125ms)
-  // animates the braille dots and re-polls the re-fold poller until the
-  // first real frame paints. Each tick repaints via the ephemeral
-  // `refreshLive` overlay (single-slot, no history growth — auto-cleared
-  // by the first real `pushFrame`), so the connect animation never floods
-  // the frame-history ring. Composition lives in `tickConnectingSpinner`
-  // below: when the poller has a `{cursor,max}` sample with `cursor<max`,
-  // the indicator carries the percentage + thousands-grouped counts;
-  // otherwise it falls back to the plain "connecting to keeperd…" line.
-  // Self-stops on `frameCount>0` (NOT on `connected` — that lifecycle
-  // event lands before the first frame paints, per
-  // `readiness-client.ts:800`). Also cleared from the SIGINT teardown
-  // so neither the interval nor the readonly fd leaks on Ctrl-C.
+  // ---- daemon-readiness gate (see `noteCatchingUp`) ----
+  // The latched catching-up signal fed from the subscribe client. While `true`
+  // in live mode the shell HOLDS data frames and paints the loading indicator;
+  // the flip to `false` paints the held frame and resumes. Starts ready.
+  let catchingUp = false;
+  // The freshest boot header the indicator branches read (re-fold %, git-seed
+  // wait, catching-up). Cleared on a live disconnect so a stale header can't
+  // drive the indicator across a socket drop. `undefined` until one is seen.
+  let latestBoot: BootStatus | undefined;
+  // Tri-state catch-up observed this run for the snapshot trailer / frames
+  // records: `null` = no boot header ever seen, else the freshest header's
+  // `catching_up`. Set whenever `noteCatchingUp` carries a defined header.
+  let catchingUpObserved: boolean | null = null;
+  // The freshest rendered composite held while gated (live mode). Retained so
+  // the flip to ready paints it immediately; `null` when nothing is held.
+  let heldRender: { bodyLines: string[]; stateJson: unknown } | null = null;
+  // ---- post-paint disconnect grace ----
+  // `reconnecting`: a socket drop AFTER a paint — the last frame stays on
+  // screen under a "reconnecting…" pill (no indicator, no gate) until a paint
+  // resumes, the reconnect reports catch-up (immediate flip), or the grace
+  // elapses (`graceExpired`). `graceExpired` forces the full loading indicator
+  // even though a frame is already painted and no catch-up header has arrived.
+  let reconnecting = false;
+  let graceExpired = false;
+  // Distinct from the 1500ms banner-restore `flashTimer` (a flash restore must
+  // never clobber the reconnecting pill — see `scheduleFlashRestore`).
+  const RECONNECT_GRACE_MS = 1500;
+  const RECONNECTING_PILL = "reconnecting…";
+  let reconnectGraceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Connecting/loading-indicator spinner state. A single `setInterval` (~125ms)
+  // animates the braille dots and (while unreachable) re-polls the re-fold
+  // poller. Each tick repaints via the ephemeral `refreshLive` overlay
+  // (single-slot, no history growth — auto-cleared by the next real
+  // `pushFrame`), so the animation never floods the frame-history ring.
+  // Composition lives in `formatIndicatorLine`: fold-cursor-behind-head renders
+  // "re-folding X%" with counts, at-head-with-git-seed-pending a non-spinning
+  // "waiting for git seed", the residual window a plain "catching up…". The
+  // spinner is armed/stopped by `syncIndicator` off the gate state; also
+  // stopped from the SIGINT teardown so the interval never leaks on Ctrl-C.
   const CONNECTING_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   const SPINNER_TICK_MS = 125;
   // Drop to the plain spinner after this many consecutive null polls so a
@@ -601,6 +654,14 @@ export function createViewShell<TSnap>(
   let spinnerInterval: ReturnType<typeof setInterval> | undefined;
   let lastRefold: { cursor: number; max: number } | null = null;
   let refoldMisses = 0;
+  // Monotonic re-fold display state shared by BOTH progress sources (wire
+  // header + sqlite poller) so the percentage never regresses across a source
+  // switch. `refoldPctFloor` is the highest percentage shown so far; a raw
+  // sample below it is clamped up. `refoldLastMax` detects an unstable
+  // (shrinking) denominator — a head that goes backwards would make the % jump,
+  // so that tick falls back to raw counts + spinner.
+  let refoldPctFloor = 0;
+  let refoldLastMax: number | null = null;
   // Lazy default — only mint a real poller if the caller didn't inject one.
   // Production callers omit the option; tests inject a fake.
   const refoldPoller: RefoldProgressPoller =
@@ -615,53 +676,124 @@ export function createViewShell<TSnap>(
     refoldPoller.close();
   }
 
+  // Stop the animation interval. The readonly re-fold poller is NOT closed here
+  // — the gate can re-arm the indicator (a daemon restart after a first paint),
+  // and a closed poller is dead for the process lifetime. The poller's fd is
+  // released once, on the SIGINT / frames teardown, via `closeRefoldPoller`.
   function stopConnectingSpinner(): void {
     if (spinnerInterval !== undefined) {
       clearInterval(spinnerInterval);
       spinnerInterval = undefined;
     }
-    closeRefoldPoller();
   }
 
-  function formatRefoldLine(glyph: string): string {
-    // Keep last-good floor across REFOLD_MISS_BUDGET consecutive misses;
-    // beyond that the cursor presentation is too stale to be honest and
-    // we fall back to the plain "connecting" line.
-    if (lastRefold === null || refoldMisses > REFOLD_MISS_BUDGET) {
-      return `${glyph}  connecting to keeperd…`;
+  // Whether the loading indicator should currently occupy the body. Live mode
+  // only: gated by an active catch-up latch, before the first paint (cold
+  // start), or once the post-paint disconnect grace has elapsed. The
+  // reconnecting-pill window itself is NOT indicator-gated — the last frame
+  // stays put until the grace expires.
+  function shouldShowIndicator(): boolean {
+    if (mode !== "live") {
+      return false;
     }
-    const { cursor, max } = lastRefold;
-    // Guard `max` falsy + `cursor>max` (non-monotonic / mid-rewind reset):
-    // never render `NaN%` / `>100%` / a fake 100%. 100% only on confirmed
-    // `connected` (which stops this interval before its next tick paints).
-    if (max <= 0 || cursor >= max) {
-      return `${glyph}  connecting to keeperd…`;
+    return catchingUp || frameCount === 0 || graceExpired;
+  }
+
+  // Arm or stop the animation interval to match the gate. Idempotent both ways.
+  function syncIndicator(): void {
+    if (shouldShowIndicator()) {
+      armConnectingSpinner();
+    } else {
+      stopConnectingSpinner();
     }
-    const pct = ((cursor / max) * 100).toFixed(1);
-    return `${glyph}  re-folding event log  ${pct}%  ${cursor.toLocaleString()} / ${max.toLocaleString()}`;
+  }
+
+  // Render one progress line from a `{cursor, max}` sample (wire header OR
+  // sqlite poller), maintaining the shared monotonic floor so the percentage
+  // never regresses across a source switch. Returns `null` when the sample
+  // isn't a usable re-fold reading (empty / at-or-past head) so the caller
+  // falls back to a plainer line.
+  function refoldLineFromCounts(
+    glyph: string,
+    cursor: number,
+    max: number,
+  ): string | null {
+    if (max <= 0 || cursor < 0 || cursor >= max) {
+      return null;
+    }
+    const denomShrank = refoldLastMax !== null && max < refoldLastMax;
+    refoldLastMax = max;
+    const counts = `${cursor.toLocaleString()} / ${max.toLocaleString()}`;
+    if (denomShrank) {
+      // Unstable denominator — a percentage would jump; show raw counts + spinner.
+      return `${glyph}  re-folding event log  ${counts}`;
+    }
+    const rawPct = (cursor / max) * 100;
+    const shownPct = Math.min(100, Math.max(rawPct, refoldPctFloor));
+    refoldPctFloor = shownPct;
+    return `${glyph}  re-folding event log  ${shownPct.toFixed(1)}%  ${counts}`;
+  }
+
+  // Compose the loading-indicator body for the current tick. Branch precedence:
+  //  1. fold cursor behind head → re-folding % (wire header while connected,
+  //     sqlite poller while unreachable);
+  //  2. at head with git seed pending → non-spinning "waiting for git seed";
+  //  3. residual catching-up window → plain "catching up…".
+  // With no wire header (cold start / unreachable) the sqlite poller drives
+  // branch 1, else the plain "connecting to keeperd…" line.
+  function formatIndicatorLine(glyph: string): string {
+    const boot = latestBoot;
+    if (boot !== undefined) {
+      if (boot.rev < boot.head_event_id) {
+        const line = refoldLineFromCounts(glyph, boot.rev, boot.head_event_id);
+        if (line !== null) {
+          return line;
+        }
+      } else if (boot.git_seed_required) {
+        const roots = boot.git_unseeded_roots ?? [];
+        return roots.length > 0
+          ? `waiting for git seed: ${roots.join(", ")}`
+          : "waiting for git seed";
+      }
+      return `${glyph}  catching up…`;
+    }
+    // No wire header: sqlite poller path (unreachable / cold start).
+    if (lastRefold !== null && refoldMisses <= REFOLD_MISS_BUDGET) {
+      const line = refoldLineFromCounts(
+        glyph,
+        lastRefold.cursor,
+        lastRefold.max,
+      );
+      if (line !== null) {
+        return line;
+      }
+    }
+    return `${glyph}  connecting to keeperd…`;
   }
 
   function tickConnectingSpinner(): void {
-    // Self-stop the moment a real data frame lands. Note: we deliberately
-    // do NOT stop on the `connected` lifecycle event — `connected` fires
-    // before any `result` frame arrives (see `readiness-client.ts:800`),
-    // and the first paint can take additional ms while collections
-    // resolve. `frameCount` is the only honest signal.
-    if (frameCount > 0) {
+    // Self-stop the moment the gate says the body should paint data (a frame
+    // has landed with the daemon ready). Belt-and-suspenders with `syncIndicator`
+    // so a stale tick that fires between a flip and its `clearInterval` no-ops.
+    if (!shouldShowIndicator()) {
       stopConnectingSpinner();
       return;
     }
     connectingSpinnerIdx =
       (connectingSpinnerIdx + 1) % CONNECTING_SPINNER.length;
     const glyph = CONNECTING_SPINNER[connectingSpinnerIdx];
-    const sample = refoldPoller.poll();
-    if (sample !== null) {
-      lastRefold = sample;
-      refoldMisses = 0;
-    } else {
-      refoldMisses += 1;
+    // Poll the sqlite re-fold cursor ONLY while unreachable (no fresh wire
+    // header) — while connected the header carries the authoritative progress.
+    if (latestBoot === undefined) {
+      const sample = refoldPoller.poll();
+      if (sample !== null) {
+        lastRefold = sample;
+        refoldMisses = 0;
+      } else {
+        refoldMisses += 1;
+      }
     }
-    liveShell.refreshLive([formatRefoldLine(glyph)]);
+    liveShell.refreshLive([formatIndicatorLine(glyph)]);
   }
 
   function armConnectingSpinner(): void {
@@ -669,6 +801,36 @@ export function createViewShell<TSnap>(
       return;
     }
     spinnerInterval = setInterval(tickConnectingSpinner, SPINNER_TICK_MS);
+  }
+
+  function clearReconnectGrace(): void {
+    if (reconnectGraceTimer !== undefined) {
+      clearTimeout(reconnectGraceTimer);
+      reconnectGraceTimer = undefined;
+    }
+  }
+
+  // Arm the post-paint disconnect grace: after ~1.5s with no reconnect the body
+  // flips from the held last frame to the full loading indicator.
+  function armReconnectGrace(): void {
+    clearReconnectGrace();
+    reconnectGraceTimer = setTimeout(() => {
+      reconnectGraceTimer = undefined;
+      graceExpired = true;
+      syncIndicator();
+    }, RECONNECT_GRACE_MS);
+  }
+
+  // Leave the reconnecting-pill window: cancel the grace, restore the banner
+  // (clear the pill), and drop the grace-forced gate. Idempotent.
+  function exitReconnecting(): void {
+    if (!reconnecting && !graceExpired) {
+      return;
+    }
+    reconnecting = false;
+    graceExpired = false;
+    clearReconnectGrace();
+    restoreBanner();
   }
 
   // Shared banner-flash timer. Transient `[copied …]` / caller-driven
@@ -852,8 +1014,9 @@ export function createViewShell<TSnap>(
     // (an idle zero-DATA-frame chunk still emits its baseline, so it is a
     // reachable exit 0); a run that ended having never rendered a frame never
     // connected → exit 1.
-    framesEmitter.emitTrailer({ reason });
+    framesEmitter.emitTrailer({ reason, catchingUp: catchingUpObserved });
     stopConnectingSpinner();
+    closeRefoldPoller();
     liveShell.dispose();
     framesOnDispose();
     (framesRunIo.exit ?? ((code: number) => process.exit(code)))(
@@ -889,49 +1052,113 @@ export function createViewShell<TSnap>(
       return true;
     }
     // Frames mode: emit one wire envelope per ACCEPTED frame instead of
-    // painting. The byte-compare gate is the SAME as live (an unchanged body
-    // from any of a multi-stream view's re-emits is suppressed, so per-stream
-    // re-emits can never inflate the frame/coverage accounting). The first
-    // accepted frame is the `baseline`; the rest are `frame`s diffed against
-    // the prior. A tripped bound flushes the trailer through `maybeStopFrames`.
+    // painting. During a catch-up window the provisional data frames are
+    // withheld — a single STATIC loading record stands in (no per-tick churn),
+    // resuming data frames on the flip to ready. The byte-compare gate is the
+    // SAME as live (an unchanged body from any of a multi-stream view's re-emits
+    // is suppressed, so per-stream re-emits can never inflate the frame/coverage
+    // accounting). The first accepted record is the `baseline`; the rest are
+    // `frame`s. A tripped bound flushes the trailer through `maybeStopFrames`.
     if (isFrames) {
       if (framesEmitter === null) {
         return false;
       }
+      if (catchingUp) {
+        // One loading record per catch-up window. Body is STATIC (no ticking
+        // percentage) so a later re-emit while still catching up byte-matches
+        // and is suppressed — a live percentage here would mint a frame per tick.
+        if (framesLoadingEmitted) {
+          return false;
+        }
+        framesLoadingEmitted = true;
+        emitFramesRecord(framesLoadingBody(), { catchingUp: true });
+        return true;
+      }
+      // Ready: resume data frames and re-arm the loading latch for any future
+      // catch-up window (a mid-run daemon restart).
+      framesLoadingEmitted = false;
       const body = bodyLines.join("\n");
       if (body === lastBody) {
         return false;
       }
       lastBody = body;
-      frameCount += 1;
-      const input = {
-        cursor: latestCursor,
-        frameText: plainBodyText(bodyLines),
+      emitFramesRecord(plainBodyText(bodyLines), {
+        catchingUp: catchingUpObserved,
         stateJson,
-      };
-      if (!framesBaselineEmitted) {
-        framesBaselineEmitted = true;
-        framesEmitter.emitBaseline(input);
-      } else {
-        framesEmitter.emitFrame(input);
-      }
-      maybeStopFrames();
+      });
       return true;
     }
-    // The byte-compare body KEEPS the selection prefix so moving the
-    // selection (which only changes which line carries the prefix)
+    // LIVE mode. While the daemon is catching up, HOLD the freshest composite
+    // (retained for an immediate paint on the flip to ready) and mint no history
+    // frame — the loading indicator owns the body via the `refreshLive` overlay.
+    if (catchingUp) {
+      heldRender = { bodyLines, stateJson };
+      return false;
+    }
+    // Ready: paint. The byte-compare body KEEPS the selection prefix so moving
+    // the selection (which only changes which line carries the prefix)
     // invalidates the cache and repaints.
+    return paintLiveFrame(bodyLines, stateJson);
+  }
+
+  // Emit one frames record (baseline on the first, frame thereafter), stamping
+  // the freshest cursor + the tri-state catch-up status, then flush the trailer
+  // if a bound tripped. Sole frames-emit path so cursor / catch-up threading
+  // and the baseline latch never drift between the data and loading records.
+  function emitFramesRecord(
+    frameText: string,
+    opts2: { catchingUp: boolean | null; stateJson?: unknown },
+  ): void {
+    if (framesEmitter === null) {
+      return;
+    }
+    frameCount += 1;
+    const input = {
+      cursor: latestCursor,
+      frameText,
+      stateJson: opts2.stateJson ?? null,
+      catchingUp: opts2.catchingUp,
+    };
+    if (!framesBaselineEmitted) {
+      framesBaselineEmitted = true;
+      framesEmitter.emitBaseline(input);
+    } else {
+      framesEmitter.emitFrame(input);
+    }
+    maybeStopFrames();
+  }
+
+  // The STATIC loading body a frames catch-up record carries — a fixed label
+  // per branch, never a ticking percentage (which would mint a frame per tick).
+  function framesLoadingBody(): string {
+    const boot = latestBoot;
+    if (boot !== undefined) {
+      if (boot.rev < boot.head_event_id) {
+        return "re-folding event log — catching up";
+      }
+      if (boot.git_seed_required) {
+        const roots = boot.git_unseeded_roots ?? [];
+        return roots.length > 0
+          ? `waiting for git seed: ${roots.join(", ")}`
+          : "waiting for git seed";
+      }
+    }
+    return "catching up…";
+  }
+
+  // Paint one ready data frame: leave any reconnecting-pill window, stop the
+  // indicator, byte-compare, and on a change push the frame + write sidecars.
+  // The sole live-paint path — `emit`'s ready branch and the flip-to-ready in
+  // `noteCatchingUp` both route through it.
+  function paintLiveFrame(bodyLines: string[], stateJson: unknown): boolean {
+    exitReconnecting();
+    stopConnectingSpinner();
     const body = bodyLines.join("\n");
     if (body === lastBody) {
       return false;
     }
     lastBody = body;
     frameCount += 1;
-    // The first real frame supersedes the connecting indicator — stop
-    // the spinner interval and release its readonly DB fd before pushing
-    // the data frame, so the next paint isn't fighting a final spinner
-    // tick.
-    stopConnectingSpinner();
     liveShell.pushFrame(toShellLines(bodyLines));
     writeSidecars(stateJson, sidecarFrameText(bodyLines));
     return true;
@@ -966,16 +1193,33 @@ export function createViewShell<TSnap>(
     } catch {
       // best-effort
     }
-    // On disconnect, clear `lastBody` so the next first-paint emits
-    // even if the post-reconnect snapshot happens to match the last
-    // pre-disconnect body byte-for-byte.
     if (event === "disconnected") {
-      lastBody = null;
       // Frames coverage honesty: a reconnect is the sole gap source the
       // emitter cannot see (its own `seq` stays contiguous), so a disconnect
       // downgrades the trailer's coverage verdict to `gap_possible`.
       if (isFrames && framesEmitter !== null) {
         framesEmitter.noteReconnect();
+        lastBody = null;
+      } else if (mode === "live") {
+        // Any header is stale once the socket drops — fall the indicator back to
+        // the sqlite poller until fresh headers resume.
+        latestBoot = undefined;
+        if (frameCount > 0 && !catchingUp && !reconnecting) {
+          // Post-paint disconnect: hold the last frame under a "reconnecting…"
+          // pill and start the grace. Do NOT clear `lastBody` — a byte-identical
+          // frame on reconnect must suppress, not churn-repaint over the held
+          // frame — and do NOT gate to the indicator until the grace elapses.
+          reconnecting = true;
+          liveShell.setStatus(RECONNECTING_PILL);
+          armReconnectGrace();
+        } else {
+          // Never painted (cold start) or already gated: keep showing the
+          // indicator. Clearing `lastBody` here is safe (no painted frame is
+          // held) and forces the first real paint even on identical content.
+          lastBody = null;
+        }
+      } else {
+        lastBody = null;
       }
     }
     // Snapshot mode: latch whether we ever reached `connected` so the
@@ -983,24 +1227,51 @@ export function createViewShell<TSnap>(
     if (event === "connected") {
       sawConnected = true;
     }
-    // Connecting indicator: arm a single ~125ms `setInterval` until the
-    // first real frame paints, so the spinner animates smoothly during a
-    // multi-minute boot re-fold (the subscribe socket isn't bound during
-    // boot drain — the client sits in capped-backoff `connecting` /
-    // `waiting`). The interval re-polls keeper's read-only SQLite each
-    // tick (`reducer_state.last_event_id` vs `MAX(events.id)`) and either
-    // renders the live percentage or the plain "connecting to keeperd…"
-    // line. The `frameCount === 0` gate means a transient disconnect
-    // after data is on screen keeps the last good frame rather than
-    // flicking back to "connecting". Self-stops on first frame; also
-    // cleared from the SIGINT teardown. Armed ONLY in live mode — in snapshot
-    // and frames modes the spinner's `refreshLive` overlay would write
-    // `connecting…` lines to stdout and corrupt the single-frame snapshot
-    // output / the frames NDJSON stream (the open-coded passthrough that
-    // snapshot mode replaces had exactly this spam bug).
-    if (mode === "live" && frameCount === 0 && event !== "connected") {
-      armConnectingSpinner();
+    // Loading indicator: arm/stop the single ~125ms `setInterval` off the gate
+    // state so it animates smoothly during a multi-minute boot re-fold (the
+    // subscribe socket isn't bound during boot drain — the client sits in
+    // capped-backoff `connecting` / `waiting`). Armed ONLY in live mode — in
+    // snapshot / frames modes the `refreshLive` overlay would corrupt the
+    // single-frame snapshot output / the NDJSON stream. `connected` is skipped:
+    // it lands before the first `result`, and arming just to stop it on that
+    // frame is needless churn (a prior `connecting` already armed the spinner).
+    if (mode === "live" && event !== "connected") {
+      syncIndicator();
     }
+  }
+
+  // Daemon-readiness gate seam (see the interface docstring on `noteCatchingUp`).
+  function noteCatchingUp(
+    catchingUpNext: boolean,
+    boot: BootStatus | undefined,
+  ): void {
+    if (boot !== undefined) {
+      latestBoot = boot;
+      // A defined header is the evidence for the tri-state trailer/record value.
+      catchingUpObserved = catchingUpNext;
+    }
+    const was = catchingUp;
+    catchingUp = catchingUpNext;
+    if (mode !== "live") {
+      // Snapshot / frames record the state (above) but never paint or gate here;
+      // frames' loading record is minted from `emit`, snapshot stamps the trailer.
+      return;
+    }
+    if (was && !catchingUp) {
+      // Flip to ready: leave any reconnecting window and paint the held frame
+      // immediately so the daemon's data replaces the loading indicator at once.
+      exitReconnecting();
+      if (heldRender !== null) {
+        const held = heldRender;
+        heldRender = null;
+        paintLiveFrame(held.bodyLines, held.stateJson);
+      }
+    } else if (!was && catchingUp) {
+      // Flip to catch-up (e.g. a reconnect reporting catch-up): the loading
+      // indicator takes over the body, so drop the reconnecting pill.
+      exitReconnecting();
+    }
+    syncIndicator();
   }
 
   function flashStatus(text: string): void {
@@ -1027,11 +1298,14 @@ export function createViewShell<TSnap>(
       // down the connecting-spinner interval + close its readonly DB
       // fd here so neither leaks across an exit. Bun `setInterval` has
       // no `.unref()` — an explicit `clearInterval` on every teardown
-      // path is load-bearing for a clean TUI exit, not cosmetic. Both
-      // `stopConnectingSpinner` and `refoldPoller.close()` are
-      // idempotent so the first-frame self-stop + these teardown paths
-      // are safe to co-fire.
+      // path is load-bearing for a clean TUI exit, not cosmetic. The
+      // interval is stopped without closing the poller as the gate
+      // re-arms it across daemon bounces; teardown is the one place the
+      // readonly fd is released. Both `stopConnectingSpinner` and
+      // `closeRefoldPoller` are idempotent so these paths co-fire safely.
+      clearReconnectGrace();
       stopConnectingSpinner();
+      closeRefoldPoller();
       liveShell.dispose();
       onDispose();
       log("...");
@@ -1081,6 +1355,10 @@ export function createViewShell<TSnap>(
         lifecycle: lifecycleSidecar,
         meta: metaSidecar,
         ts: nowIso(),
+        // The freshest observed catch-up state (tri-state: `null` when no boot
+        // header was ever seen) so a machine consumer knows the frame was read
+        // provisionally during a catch-up window.
+        catching_up: catchingUpObserved,
       };
     }
 
@@ -1241,6 +1519,7 @@ export function createViewShell<TSnap>(
     runSnapshot,
     runFrames,
     noteCursor,
+    noteCatchingUp,
     reportSnapshotStream,
     getLastFrameText: () => lastFrameText,
     getFrameCount: () => frameCount,

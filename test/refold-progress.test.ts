@@ -147,6 +147,30 @@ test("poll returns null on a SELECT-time throw and remains usable", () => {
   poller.close();
 });
 
+test("a failed lazy open is retried on a later poll (never latched for the process lifetime)", () => {
+  // Cold start: the poller is constructed before keeperd's DB exists. The first
+  // poll's open fails → null, but the failure must NOT disable the poller for
+  // good — the readiness gate needs it to pick up the re-fold percentage the
+  // moment the DB appears.
+  const poller = createRefoldProgressPoller(dbPath);
+  expect(poller.poll()).toBeNull();
+
+  // The daemon "boots": the DB file appears, seeded with events + a cursor.
+  const maxId = seedEvents(dbPath, 4);
+  setCursor(dbPath, 2);
+
+  // The poller sits out a modest backoff, then retries and opens successfully.
+  // Loop generously so the assertion doesn't couple to the exact backoff count.
+  let sample: { cursor: number; max: number } | null = null;
+  for (let i = 0; i < 12 && sample === null; i++) {
+    sample = poller.poll();
+  }
+  expect(sample).not.toBeNull();
+  expect(sample?.cursor).toBe(2);
+  expect(sample?.max).toBe(maxId);
+  poller.close();
+});
+
 test("close is idempotent", () => {
   seedEvents(dbPath, 1);
   const poller = createRefoldProgressPoller(dbPath);

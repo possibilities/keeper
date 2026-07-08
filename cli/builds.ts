@@ -367,8 +367,14 @@ export async function runBuilds(config: RunBuildsConfig): Promise<void> {
     onRows: (rows) => view.emit(rows),
     onLifecycle: view.emitLifecycle,
     // Thread the daemon fold cursor into the frames resume-cursor seam
-    // (fn-1161). Inert in live/snapshot.
-    onBootStatus: (boot) => view.noteCursor(String(boot.rev)),
+    // (fn-1161), and the freshest header into the readiness gate so the loading
+    // indicator advances during catch-up.
+    onBootStatus: (boot) => {
+      view.noteCursor(String(boot.rev));
+      view.noteCatchingUp(boot.catching_up, boot);
+    },
+    // Gate live rendering on daemon readiness (the latched catch-up transition).
+    onCatchingUp: (catchingUp, boot) => view.noteCatchingUp(catchingUp, boot),
   });
 
   if (mode === "snapshot") {

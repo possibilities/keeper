@@ -39,7 +39,7 @@
  */
 
 /** Current `keeper-meta:` schema version. Bump on any field shape change. */
-export const SNAPSHOT_SCHEMA_VERSION = 1;
+export const SNAPSHOT_SCHEMA_VERSION = 2;
 
 /** Prefix on the single-line machine-parseable trailer record. */
 export const KEEPER_META_PREFIX = "keeper-meta: ";
@@ -92,6 +92,15 @@ export interface SnapshotMeta {
   meta: string;
   /** ISO timestamp of emission. */
   ts: string;
+  /**
+   * Tri-state catch-up status observed this run: `null` means no boot
+   * header was observed, `false` means the freshest header reported steady
+   * state, `true` means the freshest header reported catch-up. Optional on
+   * the caller's construction so an existing builder that has not yet
+   * threaded a live value keeps compiling; {@link formatMetaLine} normalizes
+   * a missing value to `null` on the wire so the field is always present.
+   */
+  catching_up?: boolean | null;
 }
 
 /**
@@ -275,9 +284,16 @@ export function createSnapshotLatch(deps: SnapshotLatchDeps): SnapshotLatch {
 
 /** Serialize the trailer record as the single-line `keeper-meta:` string. */
 export function formatMetaLine(meta: SnapshotMeta): string {
+  // Normalize the optional `catching_up` to an explicit `null` so every
+  // wire record carries the field, even from a caller that has not yet
+  // threaded a live value through its own construction site.
+  const wire: SnapshotMeta = {
+    ...meta,
+    catching_up: meta.catching_up ?? null,
+  };
   // `JSON.stringify` with no spacer is single-line by construction. The
   // caller appends the newline (the formatters below own line assembly).
-  return `${KEEPER_META_PREFIX}${JSON.stringify(meta)}`;
+  return `${KEEPER_META_PREFIX}${JSON.stringify(wire)}`;
 }
 
 /** The human-readable labeled-path lines that precede the JSON trailer. */

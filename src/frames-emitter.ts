@@ -28,7 +28,7 @@
 import { unlinkSync, writeFileSync } from "node:fs";
 
 /** Current frames-envelope schema version. Bump on any field-shape change. */
-export const FRAMES_SCHEMA_VERSION = 1;
+export const FRAMES_SCHEMA_VERSION = 2;
 
 /** Inline-diff byte budget before it is truncated to a marker. */
 export const DEFAULT_MAX_DIFF_BYTES = 16_384;
@@ -79,6 +79,13 @@ export interface FrameRecord {
   frame_path: string | null;
   state_path: string | null;
   diff_path: string | null;
+  /**
+   * Tri-state catch-up status observed at emit time: `null` means no boot
+   * header was observed this run, `false` means steady state, `true` means
+   * the freshest header reported catch-up. Threaded through {@link
+   * FrameInput.catchingUp} / defaults to `null`.
+   */
+  catching_up: boolean | null;
 }
 
 /**
@@ -98,6 +105,12 @@ export interface TrailerRecord {
   /** Data frames emitted this run (baseline excluded). */
   frames_emitted: number;
   reason: TrailerReason;
+  /**
+   * Tri-state catch-up status at trailer time — same semantics as {@link
+   * FrameRecord.catching_up}. Threaded via {@link
+   * FramesEmitter.emitTrailer}'s `catchingUp` input, defaulting to `null`.
+   */
+  catching_up: boolean | null;
 }
 
 export type FramesEnvelope = FrameRecord | TrailerRecord;
@@ -128,6 +141,12 @@ export interface FrameInput {
   cursor: string | null;
   frameText: string;
   stateJson: unknown;
+  /**
+   * Tri-state catch-up status observed for this frame. `null`/omitted ⇒
+   * no boot header observed (today's behavior for every existing caller);
+   * threading a live value is a dependent caller's job.
+   */
+  catchingUp?: boolean | null;
 }
 
 export interface FramesEmitterDeps {
@@ -168,6 +187,8 @@ export interface FramesEmitter {
   emitTrailer: (input: {
     reason: TrailerReason;
     cursor?: string | null;
+    /** Tri-state catch-up status at trailer time. `null`/omitted ⇒ `null`. */
+    catchingUp?: boolean | null;
   }) => void;
   /** Mark that a reconnect happened → coverage becomes `gap_possible`. */
   noteReconnect: () => void;
@@ -384,6 +405,7 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
       frame_path: framePath,
       state_path: statePath,
       diff_path: diffPath,
+      catching_up: input.catchingUp ?? null,
     });
   }
 
@@ -425,12 +447,14 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
       frame_path: framePath,
       state_path: statePath,
       diff_path: diffPath,
+      catching_up: input.catchingUp ?? null,
     });
   }
 
   function emitTrailer(input: {
     reason: TrailerReason;
     cursor?: string | null;
+    catchingUp?: boolean | null;
   }): void {
     const resumeCursor = input.cursor !== undefined ? input.cursor : lastCursor;
     writeStdout({
@@ -445,6 +469,7 @@ export function createFramesEmitter(deps: FramesEmitterDeps): FramesEmitter {
       coverage: reconnected ? "gap_possible" : "continuous",
       frames_emitted: dataFrames,
       reason: input.reason,
+      catching_up: input.catchingUp ?? null,
     });
   }
 

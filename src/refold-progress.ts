@@ -7,10 +7,15 @@
  * rewinds the reducer cursor to 0 and re-drains the whole log).
  *
  * Design pillars (see fn-691 epic notes for rationale):
- *  - Lazy open. The connection is opened on the FIRST `poll()`, wrapped in
- *    try/catch → null. Importing this module is inert — no fds, no side
- *    effects — so a TUI that never starts the spinner (already-warm
- *    keeperd) never touches sqlite.
+ *  - Lazy, RETRYABLE open. The connection is opened on the FIRST `poll()`,
+ *    wrapped in try/catch → null. Importing this module is inert — no fds, no
+ *    side effects — so a TUI that never starts the spinner (already-warm
+ *    keeperd) never touches sqlite. A failed open does NOT latch dead for the
+ *    process lifetime: the poller sits out a modest backoff of polls, then
+ *    retries. This is load-bearing for the readiness gate — a viewer launched
+ *    while keeperd is still down (no DB file yet) must pick up the re-fold
+ *    percentage the moment the daemon boots and starts folding, not stay stuck
+ *    on the plain spinner because its very first poll lost the open race.
  *  - One read-only connection, naked autocommit SELECTs. Mirrors
  *    `src/wake-worker.ts`'s pattern: an outer `BEGIN` would pin a WAL
  *    snapshot and starve the daemon's checkpoint. We issue two bare
@@ -31,6 +36,14 @@
 
 import type { Database } from "bun:sqlite";
 import { openDb, resolveDbPath } from "./db";
+
+/**
+ * Polls to sit out after a failed lazy open before retrying. Small enough that
+ * a viewer launched before keeperd picks up progress within ~half a second of
+ * the DB appearing (the spinner polls ~every 125ms), large enough not to hammer
+ * a missing/locked file on every animation tick.
+ */
+const OPEN_RETRY_BACKOFF_POLLS = 4;
 
 /** One observation of the reducer-fold position. */
 export interface RefoldProgress {
@@ -68,12 +81,21 @@ export function createRefoldProgressPoller(
   dbPath: string = resolveDbPath(),
 ): RefoldProgressPoller {
   let db: Database | null = null;
-  let openFailed = false;
   let closed = false;
+  // Backoff countdown (in polls) before the next open ATTEMPT after a failure.
+  // `0` = attempt now. A failed open sets it to `OPEN_RETRY_BACKOFF_POLLS` so
+  // the poller sits out a few ticks (never hammers a missing/locked DB every
+  // ~125ms) but always retries — a cold-start viewer must pick up progress the
+  // moment keeperd's DB appears, so the failure is NEVER a process-lifetime latch.
+  let openBackoff = 0;
 
   function ensureOpen(): Database | null {
-    if (db !== null || openFailed || closed) {
+    if (db !== null || closed) {
       return db;
+    }
+    if (openBackoff > 0) {
+      openBackoff -= 1;
+      return null;
     }
     try {
       // Lazy readonly open with a short busy_timeout so a contended SELECT
@@ -90,9 +112,10 @@ export function createRefoldProgressPoller(
       // Missing file, locked DB, schema mismatch — all surface as a null
       // poll. The caller (`view-shell`) drops to the plain spinner after a
       // few consecutive misses, so a transient open failure doesn't crash
-      // the TUI.
-      openFailed = true;
+      // the TUI. Sit out a modest backoff, then retry: the DB file may not
+      // exist yet (keeperd still booting) and must be picked up once it does.
       db = null;
+      openBackoff = OPEN_RETRY_BACKOFF_POLLS;
     }
     return db;
   }
