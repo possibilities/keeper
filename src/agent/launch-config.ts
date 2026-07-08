@@ -64,6 +64,25 @@ export const READ_ONLY_DIRECTIVE =
   "of making it.";
 
 /**
+ * The final-message contract directive, always prepended to the composed
+ * `agent run` prompt (no flag gates it, unlike {@link READ_ONLY_DIRECTIVE}).
+ * It exists because a partner can end its turn while a background agent it
+ * launched is still working, and even a capture stack that waits for that
+ * child to retire is only as good as the eventual final turn — nothing
+ * forces that turn to actually consolidate the background results. This
+ * directive is the answer-shape half of that contract and the SOLE
+ * injection mechanism: skill prose documents it but never re-injects a
+ * second variant.
+ */
+export const FINAL_MESSAGE_DIRECTIVE =
+  "FINAL MESSAGE CONTRACT — Your final message in this turn is the captured " +
+  "deliverable: it must be one complete, self-contained answer, never a " +
+  "summary that refers back to an earlier message or promises a follow-up. " +
+  "Avoid background agents and background tasks; if any are already " +
+  "running, do not end your turn until every one has finished and its " +
+  "results are folded into this one final message.";
+
+/**
  * Resolve the prompts asset dir. The compiled `keeper` binary and the source
  * tree both resolve relative to THIS module's location (`src/agent/launch-config.ts`
  * → `src/agent/prompts/`), so the assets ship alongside the module. Exported for

@@ -79,3 +79,14 @@ and bash, then return a complete, self-contained answer; you are one of several 
 will not see the others' work.* Nothing more — no lens, no framing that nudges the conclusion. Panelists
 have full filesystem access, so the prompt gives directions and the verbatim task, not pre-read
 content.
+
+## Leg output-shape contract
+
+Every leg is a `keeper agent run` launch, so every leg's prompt also carries `agent run`'s final-message
+directive: the leg's final message is the captured deliverable and must be one complete, self-contained
+answer, with any background agent the leg launches folded in before the leg ends its turn — never an
+answer-then-follow-up delta. This is an OUTPUT-SHAPE rule only, never a reasoning lens — it says nothing
+about how a panelist should think about the task, so it does not compromise the independence above. The
+directive is a single always-on prompt block `agent run` injects itself; it is the sole injection
+mechanism for this contract, so this section documents it and nothing in panel-side prompt composition
+re-injects a second copy.

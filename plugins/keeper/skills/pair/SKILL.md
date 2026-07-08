@@ -189,7 +189,12 @@ Each partner's `--output` (or a panel member's `yaml`) is the uniform
 schema-versioned JSON envelope. The fields:
 
 - `message` — the partner's final assistant message. This is the answer (empty
-  string on a tool-only/refusal turn).
+  string on a tool-only/refusal turn). For a claude partner, capture reads this
+  from the **settled stop** — the transcript stop marker capture accepts as
+  terminal because no background agent the partner launched is still live at
+  that point — so a partner that ends a turn early while a background agent is
+  still working never gets captured mid-flight. codex/pi/hermes have no
+  background-agent concept, so their capture is a plain final-message read.
 - `message_found` — whether a final message was present.
 - `transcript_path` — the partner's per-backend transcript JSONL, the drill-down
   for the FULL conversation when `message` alone isn't enough. Read it only if you
@@ -223,6 +228,19 @@ keeper enforces nothing — there is no tool strip and no git audit, so nothing
 stops Bash writes or `git` inside the partner if it ignores the directive. Use
 `--read-only` for any "just look / just review / don't change anything" ask, but
 know the guarantee is best-effort.
+
+## Final-message contract (always on)
+
+Every `agent run` prompt — every partner, every posture, with or without
+`--read-only` — carries a final-message directive ahead of the task text: the
+partner's final message is the captured deliverable, so it must be one
+complete, self-contained answer, never a back-reference to an earlier message
+or an answer-then-follow-up delta. The directive also tells the partner to
+avoid background agents and background tasks, and to fold any already-running
+one's results into that one final message before ending its turn. `agent run`
+injects this directive automatically as a single always-on prompt block — it
+is the sole place this contract is injected, so nothing here or in a prompt
+you write needs to (or should) restate it.
 
 ## What NOT to do
 
