@@ -555,6 +555,48 @@ test("data-loss sentinel: no false alarm on intentional shed NULLs; flags a miss
   expect(readFoldCursor(db)).toBeGreaterThan(0);
 });
 
+test("data-loss sentinel: NULL-tolerant keep-set classes are exempt; a mandatory-body keep-set loss still fires", () => {
+  // MANDATORY-BODY keep-set rows — the body is the SOLE source of a fold-read
+  // value, so a NULL body IS data loss the sentinel must flag.
+  //  - UserPromptSubmit: `$.prompt` (search-history / title folds).
+  const promptId = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: TEST_UUID,
+    data: JSON.stringify({ prompt: "keep me" }),
+  });
+  //  - a LEGACY PostToolUse:Agent (no `subagent_agent_id` column) resolves the
+  //    bridge agent id from the body's `tool_response.agentId` fallback.
+  const legacyAgentId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    subagent_agent_id: null,
+    data: JSON.stringify({ tool_response: { agentId: "sub-legacy" } }),
+  });
+
+  // NULL-TOLERANT keep-set rows minted body-less — a legitimate absence, NEVER
+  // flagged: no fold reads the body, or the fold tolerates a mint-absent one.
+  insertEvent({ hook_event: "SubagentStop", data: null });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    subagent_agent_id: "sub-modern", // the modern bridge reads the cheap column
+    data: null,
+  });
+  insertEvent({ hook_event: "ResumeTargetResolved", data: null });
+  insertEvent({ hook_event: "SessionStart", data: null }); // adopted-harness mint
+  insertEvent({ hook_event: "Stop", data: null }); // synthetic turn-completion
+
+  // Every body-less NULL-tolerant keep-set row above is exempt — sentinel clean.
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // NULLing a mandatory-body keep-set row IS data loss — the sentinel fires, one
+  // per row, and still separates the modern bridge (exempt) from the legacy one.
+  db.run("UPDATE events SET data = NULL WHERE id = ?", [promptId]);
+  expect(countAbsentBlobs(db)).toBe(1);
+  db.run("UPDATE events SET data = NULL WHERE id = ?", [legacyAgentId]);
+  expect(countAbsentBlobs(db)).toBe(2);
+});
+
 test("paced: a pass never exceeds maxBatches*batchSize sheds; idempotent across passes", () => {
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   for (let i = 0; i < 50; i++) {
