@@ -71,7 +71,8 @@ const KEEPER_READ_SUBCOMMANDS = new Set([
  *  `classifyGitBranch` denies the delete/move/copy/force/upstream/create forms
  *  that mutate refs (branch-guard cannot cover an escalation session — it keys on
  *  an `agent_id` the session lacks). A `-c`/`--config-env` config-injection global
- *  option on ANY of these read subcommands is denied by `gitConfigInjection`. */
+ *  option is denied by `gitConfigInjection`, and an exec-bearing subcommand flag
+ *  (`git grep --open-files-in-pager`/`-O`) by `gitReadSubcommandExecFlag`. */
 const READONLY_GIT_SUBCOMMANDS = new Set([
   "log",
   "show",
@@ -415,16 +416,32 @@ function stripWrappers(
   return { deny: "too many stacked command wrappers" };
 }
 
-/** The first non-global-flag token after `git` (the subcommand) and its token
- *  index, or undefined when there is none. `-C`/`-c` each consume a following
- *  value so it is not mistaken for the subcommand. */
+/** Global git options that consume a SEPARATE following token as their value, so
+ *  it is not misread as the subcommand — and so the pre-subcommand injection scan
+ *  (bounded at the subcommand index) spans the true global region even when a `-c`
+ *  is reordered behind one (`git --namespace x -c a=b log`). The glued
+ *  `--opt=value` forms are a single `-`-prefixed token, skipped without lookahead. */
+const GIT_VALUED_GLOBAL_FLAGS = new Set([
+  "-C",
+  "-c",
+  "--git-dir",
+  "--work-tree",
+  "--namespace",
+  "--super-prefix",
+  "--config-env",
+  "--attr-source",
+]);
+
+/** The first non-global token after `git` (the subcommand) and its token index,
+ *  or undefined when there is none. A valued global option consumes its following
+ *  value token so it is not mistaken for the subcommand. */
 function gitSubcommandInfo(
   tokens: string[],
 ): { name: string; index: number } | undefined {
   let i = 1;
   while (i < tokens.length) {
     const t = tokens[i] as string;
-    if (t === "-C" || t === "-c") {
+    if (GIT_VALUED_GLOBAL_FLAGS.has(t)) {
       i += 2;
       continue;
     }
@@ -443,14 +460,16 @@ function gitSubcommandInfo(
  *  core.sshCommand / diff.external / *.textconv / alias.*) and its
  *  `--config-env=<name>=<envvar>` sibling. Returns a deny reason or null.
  *
- *  Scans the WHOLE segment rather than only the pre-subcommand region: git honors
- *  `-c` solely as a global option, and no read subcommand legitimately pairs a
- *  `-c` with an `=`-bearing value, so the segment-wide scan closes the reorder
- *  evasion (`git --git-dir d -c x=y status`) that a value-skipping global-region
- *  walk could miss. A missed global option would fail OPEN; the whole-segment scan
- *  fails CLOSED, the safe direction for this guard. */
-function gitConfigInjection(tokens: string[]): string | null {
-  for (let i = 1; i < tokens.length; i++) {
+ *  Scans only `tokens[1 .. boundary)`, the pre-subcommand global region (boundary
+ *  is the subcommand's token index). Git honors `-c` SOLELY as a global — it must
+ *  precede the subcommand — so a `-c` AFTER the subcommand is that subcommand's own
+ *  flag, not a config global: `git log -c --format=%H` pairs a combined-diff `-c`
+ *  with an `=`-bearing token yet is a legitimate read, never scanned here.
+ *  `gitSubcommandInfo` consumes valued globals, so a `-c` reordered behind another
+ *  global (`git --git-dir d -c x=y status`) still lands inside the scanned region
+ *  and denies. */
+function gitConfigInjection(tokens: string[], boundary: number): string | null {
+  for (let i = 1; i < boundary; i++) {
     const t = tokens[i] as string;
     if (t === "-c") {
       const val = tokens[i + 1];
@@ -461,6 +480,33 @@ function gitConfigInjection(tokens: string[]): string | null {
     }
     if (t === "--config-env" || t.startsWith("--config-env=")) {
       return "git `--config-env` config injection (reads a config value from an env var — the same exec-bearing bypass as `-c`)";
+    }
+  }
+  return null;
+}
+
+/** Deny an exec-bearing flag on an allowlisted READ subcommand — the vector that
+ *  turns a whitelisted read into arbitrary program execution by naming a
+ *  pager/command to spawn. `git grep --open-files-in-pager[=<cmd>]` (short alias
+ *  `-O[<cmd>]`) opens each match in a caller-named program. Scans the
+ *  post-subcommand args, stopping at a `--` (after which tokens are
+ *  patterns/pathspecs, never flags). `-O` is grep's exec alias only — for diff/log
+ *  it is a benign order file — so the short form is scoped to grep. Returns a deny
+ *  reason or null. */
+function gitReadSubcommandExecFlag(
+  subArgs: string[],
+  sub: string,
+): string | null {
+  for (const arg of subArgs) {
+    if (arg === "--") break;
+    if (
+      arg === "--open-files-in-pager" ||
+      arg.startsWith("--open-files-in-pager=")
+    ) {
+      return "git `--open-files-in-pager` opens matches in a caller-named program (arbitrary program execution from an allowlisted read subcommand)";
+    }
+    if (sub === "grep" && arg.startsWith("-O")) {
+      return "git grep `-O`/`--open-files-in-pager` opens matches in a caller-named program (arbitrary program execution from an allowlisted read subcommand)";
     }
   }
   return null;
@@ -525,16 +571,25 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
 
   if (exe === "git") {
     if (cfg.writeCapable) return null;
-    const injection = gitConfigInjection(tokens);
+    const sub = gitSubcommandInfo(tokens);
+    const injection = gitConfigInjection(tokens, sub?.index ?? tokens.length);
     if (injection !== null) {
       return `${injection}, denied for the diagnosis role '${cfg.role}'`;
     }
-    const sub = gitSubcommandInfo(tokens);
     if (sub === undefined) return "bare `git` with no subcommand";
     if (sub.name === "branch") {
       return classifyGitBranch(tokens.slice(sub.index + 1), cfg.role);
     }
-    if (READONLY_GIT_SUBCOMMANDS.has(sub.name)) return null;
+    if (READONLY_GIT_SUBCOMMANDS.has(sub.name)) {
+      const execFlag = gitReadSubcommandExecFlag(
+        tokens.slice(sub.index + 1),
+        sub.name,
+      );
+      if (execFlag !== null) {
+        return `${execFlag}, denied for the diagnosis role '${cfg.role}'`;
+      }
+      return null;
+    }
     return `git '${sub.name}' is a mutating/off-list git subcommand, denied for the diagnosis role '${cfg.role}'`;
   }
 
