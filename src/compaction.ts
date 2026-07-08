@@ -822,53 +822,110 @@ export function reclaimableLogStep(
 }
 
 /**
+ * Keep-set classes whose NULL `data` body is BENIGN — a POSITIVE allow-list of
+ * classes the data-loss sentinel ({@link countAbsentBlobs}) must NOT flag even
+ * though they sit OUTSIDE the shed allow-list ({@link RETENTION_SHED_CLASS_PREDICATE}).
+ *
+ * The keep-set is NOT uniformly "a body a fold reads". It splits in two, and only
+ * the first half is re-fold data loss when its body goes missing:
+ *  - MANDATORY-BODY classes — the body is the SOLE source of a re-fold-critical
+ *    value (UserPromptSubmit `$.prompt`, the PreToolUse:Agent bridge, plan Bash
+ *    `tool_response.stdout`, TmuxTopologySnapshot panes, a legacy Agent row's
+ *    `tool_response.agentId` fallback). A NULL body here IS data loss — deliberately
+ *    NOT listed below, so the sentinel keeps flagging it (the fail-safe default: an
+ *    unlisted keep-set class stays flagged).
+ *  - The classes BELOW — a NULL body is NEVER re-fold data loss, because either no
+ *    fold reads the body OR the fold reads it only as best-effort NULL-tolerant
+ *    enrichment a producer legitimately mints absent.
+ *
+ * Each clause, justified by the fold-read audit and expressed over CHEAP HEADER
+ * COLUMNS ONLY (`hook_event` / `tool_name` / `subagent_agent_id` — the same hard
+ * contract as {@link RETENTION_SHED_CLASS_PREDICATE}, since the sentinel classifies
+ * a row whose body is already NULL and can never re-parse it):
+ *  - `SubagentStop` — its fold reads only `agent_id` + the event `ts`; the body
+ *    (last_assistant_message / effort / transcript_path) is offline-analysis
+ *    capture, never a fold input.
+ *  - `PostToolUse:Agent` WHERE `subagent_agent_id IS NOT NULL` — the modern bridge
+ *    resolves the agent id from the cheap `subagent_agent_id` COLUMN, never the body
+ *    (final answer / model / usage = offline-analysis capture). The LEGACY variant
+ *    (`subagent_agent_id IS NULL`) falls back to the body's `tool_response.agentId`
+ *    — mandatory-body, deliberately EXCLUDED from this clause so it stays flagged.
+ *  - `ResumeTargetResolved` — a synthetic event whose fold reads only the
+ *    `resume_target` COLUMN; it is minted with a NULL body by construction.
+ *  - `SessionStart` / `Stop` — the fold reads the body only for best-effort,
+ *    NULL-tolerant enrichment (transcript_path; the live `background_tasks` monitors
+ *    snapshot), both re-derived from later live activity. An adopted-harness
+ *    SessionStart and a synthetic turn-completion Stop are legitimately minted with
+ *    a NULL body, folding to the same safe value a body-carrying row folds to when
+ *    the field is absent.
+ *
+ * Retention's NULL pass is gated on {@link RETENTION_SHED_PREDICATE} (the shed
+ * allow-list), so it can NEVER strip a keep-set body — every NULL body in the
+ * classes above is a legitimate mint-time absence, not a stripped one.
+ */
+export const RETENTION_NULL_TOLERANT_KEEP_PREDICATE = `(
+        hook_event = 'SubagentStop'
+     OR (hook_event = 'PostToolUse' AND tool_name = 'Agent'
+           AND subagent_agent_id IS NOT NULL)
+     OR hook_event = 'ResumeTargetResolved'
+     OR hook_event IN ('SessionStart','Stop')
+      )`;
+
+/**
  * Count KEEP-SET bodies that went missing — genuine data loss, NOT legitimate
  * retention. Post-shed (fn-836.4) there is no `event_blobs` side table: a body
  * is either inline in `events.data` or intentionally NULLed by retention. NULLing
  * is now an INTENTIONAL outcome for shed-class rows, so the old "absent ⇒ data
  * loss" alarm must NOT fire on a legitimately-shed body.
  *
- * Two intentional outcomes the sentinel must tolerate, both confined to the
- * shed/no-op sets:
+ * Three legitimate NULL/absent outcomes the sentinel must tolerate:
  *  - a NULLed BODY of a shed-class row ({@link RETENTION_SHED_CLASS_PREDICATE}) —
- *    excluded via the `NOT(...)` below;
+ *    the INTENDED retention outcome, excluded via the first `NOT(...)` below;
+ *  - a NULL BODY of a NULL-tolerant keep-set class
+ *    ({@link RETENTION_NULL_TOLERANT_KEEP_PREDICATE}) — a keep-set class whose body
+ *    no fold reads, or reads only as NULL-tolerant enrichment a producer
+ *    legitimately mints absent — excluded via the second `NOT(...)` below;
  *  - a physically ABSENT ROW of a no-op-snapshot class
  *    ({@link NOOP_SNAPSHOT_DELETE_PREDICATE}) — {@link deleteNoopSnapshotRows}
  *    removes these. An absent row carries NO record at all, so it can never
  *    surface as a `data IS NULL` hit — the absent-row case is inherently
  *    invisible to this `COUNT(*)`. (The no-op-snapshot classes are a SUBSET of
  *    the shed class, so a NULLed-but-not-yet-deleted snapshot row is excluded by
- *    the `NOT(...)` anyway.) Either way an absent/NULL no-op-snapshot row is
+ *    the first `NOT(...)` anyway.) Either way an absent/NULL no-op-snapshot row is
  *    never flagged.
  *
- * The sentinel flags only a NULL body that is NOT shed-class — i.e. a keep-set
- * event whose body a fold reads but which is missing. Neither retention pass can
- * create that state (the NULL pass matches only the shed-class allow-list; the
- * DELETE pass removes only no-op-snapshot rows, never a keep-set ROW), so a
- * positive count always indicates a bug elsewhere (a stray NULLing write, a
- * corrupt restore). The daemon logs it distinctly from the (large, legitimate)
- * shed count.
+ * The sentinel flags only a NULL body that is neither shed-class nor NULL-tolerant
+ * keep — i.e. a MANDATORY-BODY keep-set event whose body is the SOLE source of a
+ * value a fold reads. Retention's NULL pass matches only the shed allow-list and
+ * its DELETE pass removes only no-op-snapshot rows, so neither can create that
+ * state — a positive count always indicates a bug elsewhere (a stray NULLing
+ * write, a corrupt restore). The daemon logs it distinctly from the (large,
+ * legitimate) shed count.
  *
  * Header-only `IS NULL` probe: tests nullness via the record header's serial
- * type, never materializing the body (no `COALESCE` — the fn-717.2 overflow-
- * materialization peg). It reuses {@link RETENTION_SHED_CLASS_PREDICATE} — the
- * CHEAP-COLUMNS-ONLY class allow-list, NOT the full {@link RETENTION_SHED_PREDICATE}
- * (whose `json_extract`/`json_valid` would re-parse a body that is already NULL).
- * Only the cheap header columns distinguish shed-class from keep-set, so a
+ * type, never materializing the body (no `COALESCE`, the overflow-materialization
+ * peg). It reuses the CHEAP-COLUMNS-ONLY class allow-lists
+ * ({@link RETENTION_SHED_CLASS_PREDICATE} + {@link RETENTION_NULL_TOLERANT_KEEP_PREDICATE}),
+ * NOT the full {@link RETENTION_SHED_PREDICATE} (whose `json_extract`/`json_valid`
+ * would re-parse a body that is already NULL). Only the cheap header columns
+ * distinguish the exempt classes from a mandatory-body keep-set row, so a
  * NULL-body row is never re-parsed.
  */
 export function countAbsentBlobs(db: Database): number {
   const row = db
     .query(
       // `data IS NULL` reads only the record-header serial type, never any
-      // overflow payload. A shed-class row with a NULL body is the INTENDED
-      // retention outcome and is excluded via the shared cheap-column class
-      // predicate; every other NULL body is a keep-set event whose fold-read
-      // body has gone missing — data loss.
+      // overflow payload. Two NULL-body populations are legitimate and excluded
+      // via cheap-column class predicates: a shed-class row (the INTENDED
+      // retention outcome) and a NULL-tolerant keep-set class (no fold reads its
+      // body, or the fold tolerates a legitimately mint-absent one). Every
+      // REMAINING NULL body is a mandatory-body keep-set event whose sole-source
+      // fold input has gone missing — data loss.
       `SELECT COUNT(*) AS n
          FROM events
         WHERE data IS NULL
-          AND NOT ${RETENTION_SHED_CLASS_PREDICATE}`,
+          AND NOT ${RETENTION_SHED_CLASS_PREDICATE}
+          AND NOT ${RETENTION_NULL_TOLERANT_KEEP_PREDICATE}`,
     )
     .get() as { n: number };
   return row.n;
