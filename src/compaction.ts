@@ -834,9 +834,11 @@ export function reclaimableLogStep(
  *    `tool_response.agentId` fallback). A NULL body here IS data loss — deliberately
  *    NOT listed below, so the sentinel keeps flagging it (the fail-safe default: an
  *    unlisted keep-set class stays flagged).
- *  - The classes BELOW — a NULL body is NEVER re-fold data loss, because either no
- *    fold reads the body OR the fold reads it only as best-effort NULL-tolerant
- *    enrichment a producer legitimately mints absent.
+ *  - The classes BELOW — a NULL body is either NEVER re-fold data loss (no fold
+ *    reads the body, or the fold reads it only as best-effort NULL-tolerant
+ *    enrichment a producer legitimately mints absent) OR — for `Stop` alone — a
+ *    BENIGN drop-when-dead divergence the sentinel cannot separate from a
+ *    legitimate mint-NULL body (spelled out in the `Stop` clause below).
  *
  * Each clause, justified by the fold-read audit and expressed over CHEAP HEADER
  * COLUMNS ONLY (`hook_event` / `tool_name` / `subagent_agent_id` — the same hard
@@ -852,12 +854,32 @@ export function reclaimableLogStep(
  *    — mandatory-body, deliberately EXCLUDED from this clause so it stays flagged.
  *  - `ResumeTargetResolved` — a synthetic event whose fold reads only the
  *    `resume_target` COLUMN; it is minted with a NULL body by construction.
- *  - `SessionStart` / `Stop` — the fold reads the body only for best-effort,
- *    NULL-tolerant enrichment (transcript_path; the live `background_tasks` monitors
- *    snapshot), both re-derived from later live activity. An adopted-harness
- *    SessionStart and a synthetic turn-completion Stop are legitimately minted with
- *    a NULL body, folding to the same safe value a body-carrying row folds to when
- *    the field is absent.
+ *  - `SessionStart` — the fold reads the body only for best-effort, NULL-tolerant
+ *    `transcript_path` enrichment, re-homed from later live activity. An adopted
+ *    -harness SessionStart is legitimately minted with a NULL body, folding to the
+ *    same safe value a body-carrying row folds to when the field is absent.
+ *  - `Stop` — UNLIKE the classes above, a fold DOES read this body: the FINAL
+ *    per-session Stop's `data.background_tasks` feeds `computeMonitors` ->
+ *    `jobs.monitors` (a byte-identical re-fold charter projection, pinned in
+ *    `test/refold-equivalence.test.ts`) plus its derived `has_live_worker_monitor`
+ *    readiness fact and the `keeper await` background-task condition. Snapshot
+ *    -replace means no later Stop re-derives the surviving value, so a stray-NULLed
+ *    body-carrying final Stop IS a genuine re-fold divergence (`monitors` -> `'[]'`).
+ *    The class is exempt anyway, for two reasons the cheap-header sentinel cannot
+ *    act on:
+ *      1. BENIGN divergence — `jobs.monitors` snapshots the session's LIVE OS
+ *         shells, which cannot outlive the daemon a from-scratch re-fold reboots,
+ *         so `'[]'` is the intended drop-when-dead value (the snapshot paradox).
+ *         Every reader (the readiness mutex via `has_live_worker_monitor`, and
+ *         `keeper await`) treats absent monitors as done / not-holding, so the
+ *         divergence only releases a hold that reality already released — it never
+ *         regresses a decision to an unsafe state.
+ *      2. INDISTINGUISHABLE from a legitimate mint — a synthetic turn-completion
+ *         Stop is minted with a NULL body BY CONSTRUCTION (`mintCodexStop`), and
+ *         these vastly outnumber any real loss. Only cheap header columns are
+ *         available here (the body is already NULL), and they cannot separate a
+ *         born-NULL synthetic Stop from a stray-NULLed one — flagging the class
+ *         would be all false positives.
  *
  * Retention's NULL pass is gated on {@link RETENTION_SHED_PREDICATE} (the shed
  * allow-list), so it can NEVER strip a keep-set body — every NULL body in the
@@ -883,8 +905,10 @@ export const RETENTION_NULL_TOLERANT_KEEP_PREDICATE = `(
  *    the INTENDED retention outcome, excluded via the first `NOT(...)` below;
  *  - a NULL BODY of a NULL-tolerant keep-set class
  *    ({@link RETENTION_NULL_TOLERANT_KEEP_PREDICATE}) — a keep-set class whose body
- *    no fold reads, or reads only as NULL-tolerant enrichment a producer
- *    legitimately mints absent — excluded via the second `NOT(...)` below;
+ *    no fold reads, reads only as mint-absent NULL-tolerant enrichment, or (for
+ *    `Stop`) feeds `jobs.monitors` but whose NULLed-body `'[]'` divergence is a
+ *    benign drop-when-dead a cheap-header probe cannot separate from a legitimate
+ *    mint — excluded via the second `NOT(...)` below;
  *  - a physically ABSENT ROW of a no-op-snapshot class
  *    ({@link NOOP_SNAPSHOT_DELETE_PREDICATE}) — {@link deleteNoopSnapshotRows}
  *    removes these. An absent row carries NO record at all, so it can never
@@ -918,9 +942,11 @@ export function countAbsentBlobs(db: Database): number {
       // overflow payload. Two NULL-body populations are legitimate and excluded
       // via cheap-column class predicates: a shed-class row (the INTENDED
       // retention outcome) and a NULL-tolerant keep-set class (no fold reads its
-      // body, or the fold tolerates a legitimately mint-absent one). Every
-      // REMAINING NULL body is a mandatory-body keep-set event whose sole-source
-      // fold input has gone missing — data loss.
+      // body, the fold tolerates a legitimately mint-absent one, or — for `Stop` —
+      // the fold reads it but its NULLed-body `'[]'` divergence is a benign
+      // drop-when-dead indistinguishable from a legitimate mint). Every REMAINING
+      // NULL body is a mandatory-body keep-set event whose sole-source fold input
+      // has gone missing — data loss.
       `SELECT COUNT(*) AS n
          FROM events
         WHERE data IS NULL
