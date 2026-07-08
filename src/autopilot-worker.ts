@@ -140,7 +140,7 @@ import {
   type WorktreeRepoStatusEntry,
   worktreeRecoverDispatchId,
 } from "./reconcile-core";
-import { runQuery } from "./server-worker";
+import { isPidAlive, runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
@@ -6279,6 +6279,13 @@ export async function loadReconcileSnapshot(
   // (the conservative fallback: every stopped row occupies). NEVER read in a
   // fold — liveness lives only on this read-time path.
   listPanes?: () => Promise<PaneInfo[] | null>,
+  // Producer-side process-liveness probe (`process.kill(pid, 0)` — a cheap
+  // syscall, NEVER a per-job spawn) mirroring the exit-watcher's own pid-death
+  // reprobe. Re-proves a stopped-but-live-pane occupant's recorded claude pid so
+  // the slot reaper can reclaim a session the daemon has PROVEN dead even when its
+  // pane shows a lingering wrapper/launcher command. Injectable so tests drive the
+  // dead/live matrix without a real process; defaults to {@link isPidAlive}.
+  pidAlive: (pid: number) => boolean = isPidAlive,
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -6544,6 +6551,35 @@ export async function loadReconcileSnapshot(
     }
   }
 
+  // Slot authority from the job LIFECYCLE, not pane cosmetics: re-prove dead the
+  // recorded claude pid of every STOPPED job still holding a LIVE pane, mirroring
+  // the exit-watcher's own pid-death reprobe. A dead pid is the same kernel-truth
+  // verdict the exit-watcher folds `Killed` on — but claude's exit leaves the tmux
+  // pane held alive by the launch wrapper's trailing shell or a lingering launcher
+  // process, and the `Killed` fold NULLS the pane, so `kill_reason` alone leaves no
+  // pane for the reaper to reap. Probing here catches the session while the stopped
+  // row still carries its pane, so the reaper can reclaim that residual pane
+  // regardless of the (wrapper) foreground command. Scoped to the narrow
+  // stopped-AND-live-pane candidate set (never every job) so the syscall cost stays
+  // bounded; producer-side only (NEVER a fold input — re-fold stays deterministic).
+  // Empty whenever the pane probe is degraded (`livePaneIds === null`): with no
+  // live-pane set there is nothing to reclaim, so the slot pass stays inert.
+  const provenDeadJobIds = new Set<string>();
+  if (livePaneIds !== null) {
+    for (const job of jobs.values()) {
+      if (job.state !== "stopped" || job.pid == null) {
+        continue;
+      }
+      const paneId = job.backend_exec_pane_id;
+      if (paneId == null || paneId === "" || !livePaneIds.has(paneId)) {
+        continue;
+      }
+      if (!pidAlive(job.pid)) {
+        provenDeadJobIds.add(job.job_id);
+      }
+    }
+  }
+
   // The PER-ROOT unseeded set (`reconcile` forces UNKNOWN only for rows whose
   // `effectiveRoot` is unseeded, so a stale/failed root never darks the whole
   // board) is resolved by `loadReadinessInputs` above off the autopilot's own read
@@ -6665,6 +6701,7 @@ export async function loadReconcileSnapshot(
     liveTabKeys,
     livePaneIds,
     paneCommandById,
+    provenDeadJobIds,
     pendingDispatches,
     mode,
     armedIds,

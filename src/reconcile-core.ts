@@ -524,6 +524,18 @@ export interface ReconcileSnapshot {
    */
   paneCommandById: ReadonlyMap<string, string> | null;
   /**
+   * Job ids whose owning session the daemon has PROVEN dead — the recorded claude
+   * pid re-proved gone by a producer-side `isPidAlive` probe at snapshot load,
+   * mirroring the exit-watcher's own pid-death reprobe. The slot-occupancy reaper
+   * ({@link computeSlotOccupancy}) reclaims a proven-dead occupant regardless of
+   * its pane's foreground command, reaping the residual pane a lingering wrapper
+   * shell or launcher process holds alive after claude exits — the gap the
+   * pane-command heuristic and the pane-nulling `Killed` fold both miss. EMPTY on
+   * a degraded probe. Assembled in {@link loadReconcileSnapshot}; NEVER read in a
+   * fold (producer-side liveness only, so re-fold stays deterministic).
+   */
+  provenDeadJobIds: ReadonlySet<string>;
+  /**
    * The open `pending_dispatches` rows projected into the {@link PendingDispatch}[]
    * shape `computeReadiness` consumes for the cross-sibling `dispatch-pending`
    * occupant. Built by the SAME `projectPendingDispatches` helper the board/CLI
@@ -1367,6 +1379,19 @@ export interface SlotOccupancyInput {
   jobs: Map<string, Job>;
   livePaneIds: ReadonlySet<string> | null;
   paneCommandById: ReadonlyMap<string, string> | null;
+  /**
+   * Job ids whose owning session the daemon has PROVEN dead — the exit-watcher's
+   * kernel-truth verdict (its recorded claude pid no longer exists), re-proved
+   * producer-side at snapshot load. A proven-dead occupant is reclaimable
+   * REGARDLESS of its pane's foreground command: after claude exits, a lingering
+   * launch-wrapper shell or launcher process can keep the pane alive showing a
+   * command that is neither `claude` nor the bare `exec $SHELL` tail, which the
+   * pane-command heuristic ({@link isBareShellCommand}) cannot classify dead.
+   * Keying reclaim on the lifecycle verdict — not pane cosmetics — reaps that
+   * residual pane. EMPTY/absent (the degraded-probe default) falls back to the
+   * bare-shell-only proof, never a mere stopped read.
+   */
+  provenDeadJobIds?: ReadonlySet<string>;
   /** OPEN slot-reason `dispatch_failures` keys (reason-scoped at read time). */
   openSlotFailures: readonly { verb: Verb; id: string }[];
   /** True IFF `reconcile` would dispatch `(verb, id)` if the slot were free (the
@@ -1441,8 +1466,17 @@ export function computeSlotOccupancy(
     }
     activeKeys.add(key);
     const command = paneCommandById.get(paneId);
-    const dead =
-      isBareShellCommand(command) && input.now - job.updated_at >= graceSec;
+    // Slot authority is the JOB LIFECYCLE, not pane cosmetics: a session the
+    // daemon has PROVEN dead (its recorded claude pid gone) is reclaimable
+    // whatever its pane's foreground command shows — a lingering launch-wrapper
+    // shell or launcher process holding the pane never masks the verdict. The
+    // bare-shell tail stays a SECONDARY proof for the degraded-probe cycle that
+    // carries no pid verdict. Grace-aged either way (never immediate): the kill
+    // waits `graceSec` past the last fold so a transient teardown frame is never
+    // reaped, and the `wantsDispatch` gate already scopes it to a slot in demand.
+    const provenDead = input.provenDeadJobIds?.has(job.job_id) ?? false;
+    const graceElapsed = input.now - job.updated_at >= graceSec;
+    const dead = graceElapsed && (provenDead || isBareShellCommand(command));
     // Reason text is STABLE across cycles (pane id + command only, never the growing
     // idle age) so the producer change-gate suppresses re-emits — one event per
     // condition, not one per cycle. The row's `ts` carries the age. The
@@ -1937,6 +1971,7 @@ export function reconcile(
     jobs: snapshot.jobs,
     livePaneIds: snapshot.livePaneIds,
     paneCommandById: snapshot.paneCommandById,
+    provenDeadJobIds: snapshot.provenDeadJobIds,
     openSlotFailures: snapshot.slotOccupancyFailures,
     wantsDispatch: (verb, id) =>
       verb === "work"

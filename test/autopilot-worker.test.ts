@@ -169,7 +169,7 @@ import {
   isRetryableDispatchKey,
   parseDispatchKey,
 } from "../src/dispatch-command";
-import type { LaunchSpec } from "../src/exec-backend";
+import type { LaunchSpec, PaneInfo } from "../src/exec-backend";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -304,6 +304,10 @@ function makeSnapshot(
     // Slot-occupancy foreground-command map, null in lockstep with `livePaneIds`
     // (degraded probe) so the slot pass stays inert; the slot tests override both.
     paneCommandById: null,
+    // fn-1200: the producer-proved dead-session set. Default EMPTY so every
+    // pre-fn-1200 test keeps the bare-shell-only reclaim behavior; the
+    // proven-dead slot tests override it.
+    provenDeadJobIds: new Set<string>(),
     // fn-721: the launch-window occupancy set feeding the cross-sibling
     // `dispatch-pending` occupant. Default empty; tests that exercise the
     // occupant override it.
@@ -1224,6 +1228,88 @@ test("computeSlotOccupancy: SLOT_RECLAIM_GRACE_SEC is the default grace, overrid
   const occ = oneOccupant({ command: "zsh", updated_at: 999 }); // idle 1s
   const out = computeSlotOccupancy(slotInput({ ...occ, graceSec: 1 }));
   expect(out.failures[0].reclaimPaneId).toBe("%7");
+});
+
+// ---------------------------------------------------------------------------
+// fn-1200 computeSlotOccupancy — slot authority from the JOB LIFECYCLE
+// (proven-dead verdict), not pane cosmetics
+// ---------------------------------------------------------------------------
+
+test("fn-1200 computeSlotOccupancy: proven-dead job + live WRAPPER pane past grace → reclaim (pane command is NOT a bare shell)", () => {
+  // The wedge fix: claude exited but the launch-wrapper shell / a lingering
+  // launcher process holds the pane, so its foreground command is `bun` — neither
+  // `claude` nor the bare `exec $SHELL` tail. `isBareShellCommand` cannot classify
+  // it dead, so the pre-fn-1200 reaper left the slot wedged forever. With the
+  // exit-watcher's proven-dead verdict in hand (`provenDeadJobIds`), the reaper
+  // reclaims it regardless of the pane command.
+  const occ = oneOccupant({ command: "bun", updated_at: 800 }); // idle 200s ≥ 120
+  expect(isBareShellCommand("bun")).toBe(false); // pin: NOT reclaimable by cosmetics
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, provenDeadJobIds: new Set(["j"]) }),
+  );
+  expect(out.failures).toHaveLength(1);
+  const sig: SlotOccupancySignal = out.failures[0];
+  expect(sig.reclaimPaneId).toBe("%7"); // the reaper targets the residual pane
+  expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("fn-1200 computeSlotOccupancy: a live-session job with the SAME wrapper pane shape → NO reclaim (reaper never targets a job lacking a proven-dead verdict)", () => {
+  // The catastrophic-failure guard: identical pane shape (live pane, `bun`
+  // foreground, past grace) but the job is NOT proven dead — a live worker whose
+  // pane momentarily foregrounds a child process. It must surface only, never be
+  // killed, so a false-dead read can never destroy a live session.
+  const occ = oneOccupant({ command: "bun", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, provenDeadJobIds: new Set<string>() }),
+  );
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("fn-1200 computeSlotOccupancy: proven-dead but WITHIN grace → slot-occupied, NO kill (reclaim is grace-aged, never immediate)", () => {
+  // The kill is grace-aged even for a proven-dead verdict: a pane that JUST went
+  // idle could be a teardown frame, so the reaper waits `graceSec` past the last
+  // fold before issuing the kill.
+  const occ = oneOccupant({ command: "bun", updated_at: 950 }); // idle 50s < 120
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, provenDeadJobIds: new Set(["j"]) }),
+  );
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("fn-1200 computeSlotOccupancy: proven-dead work-task with a launcher pane reclaims on (work, task)", () => {
+  const occ = oneOccupant({
+    verb: "work",
+    id: "fn-1-foo.2",
+    command: "node", // a lingering launcher, not a bare shell
+    pane: "%3",
+    updated_at: 800,
+  });
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, provenDeadJobIds: new Set(["j"]) }),
+  );
+  expect(out.failures[0].verb).toBe("work");
+  expect(out.failures[0].id).toBe("fn-1-foo.2");
+  expect(out.failures[0].reclaimPaneId).toBe("%3");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("fn-1200 computeSlotOccupancy: proven-dead flag on a pane-GONE job → no signal (nothing to reclaim)", () => {
+  // The job's pane left the live sweep — no live-provable occupant, so even a
+  // proven-dead verdict yields no reclaim (the pane is already gone).
+  const occ = oneOccupant({ command: "bun", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      provenDeadJobIds: new Set(["j"]),
+      livePaneIds: new Set(["%99"]), // the job's %7 is gone
+      paneCommandById: new Map([["%99", "bun"]]),
+    }),
+  );
+  expect(out.failures).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
@@ -4098,6 +4184,65 @@ test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcile
     // verdict puts the epic id in completedRowIds — the reap candidate set.
     const decision = reconcile(snap, makeState(), 0);
     expect(decision.completedRowIds.has("fn-9-done")).toBe(true);
+  });
+});
+
+test("fn-1200: loadReconcileSnapshot re-proves the stopped-live-pane occupant's pid, keying provenDeadJobIds on the DEAD-pid verdict", async () => {
+  await withSeededDb(async (db) => {
+    // Two stopped closers, each holding a LIVE pane: one whose recorded claude pid
+    // is proven dead (its pane held by a lingering wrapper), one still alive.
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, updated_at, state, pid, plan_verb, plan_ref, backend_exec_pane_id)
+       VALUES ('j-dead', 0, 0, 'stopped', 4242, 'close', 'fn-1-dead', '%7'),
+              ('j-live', 0, 0, 'stopped', 5252, 'close', 'fn-2-live', '%8')`,
+    );
+    const panes: PaneInfo[] = [
+      {
+        tmuxGenerationId: "1:1",
+        paneId: "%7",
+        windowId: "@1",
+        currentCommand: "bun", // a lingering launcher, NOT a bare shell
+        paneDead: "0",
+        sessionName: "autopilot",
+        windowName: "close::fn-1-dead",
+      },
+      {
+        tmuxGenerationId: "1:1",
+        paneId: "%8",
+        windowId: "@2",
+        currentCommand: "bun",
+        paneDead: "0",
+        sessionName: "autopilot",
+        windowName: "close::fn-2-live",
+      },
+    ];
+    // The injected pid probe: 4242 (j-dead) is gone, 5252 (j-live) still runs.
+    const snap = await loadReconcileSnapshot(
+      db,
+      async () => panes,
+      (pid) => pid !== 4242,
+    );
+    expect(snap.provenDeadJobIds.has("j-dead")).toBe(true);
+    expect(snap.provenDeadJobIds.has("j-live")).toBe(false);
+  });
+});
+
+test("fn-1200: loadReconcileSnapshot leaves provenDeadJobIds empty when the pane probe is degraded (null livePaneIds)", async () => {
+  await withSeededDb(async (db) => {
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, updated_at, state, pid, plan_verb, plan_ref, backend_exec_pane_id)
+       VALUES ('j-dead', 0, 0, 'stopped', 4242, 'close', 'fn-1-dead', '%7')`,
+    );
+    // No listPanes probe → livePaneIds is null → no live-pane candidate set → the
+    // pid probe is never consulted and provenDeadJobIds stays empty (the slot pass
+    // is inert on a degraded cycle, never a double-dispatch).
+    let probed = false;
+    const snap = await loadReconcileSnapshot(db, undefined, () => {
+      probed = true;
+      return false;
+    });
+    expect(snap.provenDeadJobIds.size).toBe(0);
+    expect(probed).toBe(false);
   });
 });
 
