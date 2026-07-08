@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-08T01:50:20.000000Z",
+  "depends_on": [
+    "fn-1181-extract-schema-step-ladder.1"
+  ],
+  "epic": "fn-1181-extract-schema-step-ladder",
+  "id": "fn-1181-extract-schema-step-ladder.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Ladder docs and decision record",
+  "updated_at": "2026-07-08T01:50:20.000000Z"
+}
