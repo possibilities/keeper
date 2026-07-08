@@ -34,5 +34,5 @@ test/rebase-schema-migration.test.ts (new composed test).
 - [ ] Full fast suite + typecheck + lint green.
 
 ## Done summary
-
+Fixed computeRepinnedFingerprint to derive the schema fingerprint's v<N> prefix and digest from the renumbered ladder's tail (parsed from the rewritten db.ts) rather than the process-start-imported module's stale SCHEMA_VERSION; added a composed renumber -> re-pin regression test over a synthetic colliding lane, verified red against the old re-pin and green after the fix.
 ## Evidence
