@@ -19,7 +19,13 @@ import { checkGlobalNameUnique } from "../discovery.ts";
 import { emitMutating } from "../emit.ts";
 import { withEpicIdLock } from "../flock.ts";
 import { emitError, type OutputFormat } from "../format.ts";
-import { generateSuffix, scanMaxEpicId, slugify } from "../ids.ts";
+import { appendEpicRecord, ledgerMaxEpicNum } from "../id_ledger.ts";
+import {
+  epicIdsWithNumber,
+  generateSuffix,
+  scanMaxEpicId,
+  slugify,
+} from "../ids.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { atomicWrite, atomicWriteJson, nowIso } from "../store.ts";
@@ -71,14 +77,30 @@ export function runEpicCreate(args: EpicCreateArgs): void {
     | { kind: "success"; epicDef: Record<string, unknown>; epicId: string };
 
   const outcome = withEpicIdLock<Outcome>(() => {
-    const maxN = scanMaxEpicId(dataDir);
-    const epicNum = maxN + 1;
+    // max(scan, ledger)+1, never bare scan: the durable id ledger (keyed on the
+    // STATE repo) keeps a number burned after its epic's files are destroyed, so
+    // the destroy-then-re-mint sequence cannot reuse it on this host.
+    const epicNum =
+      Math.max(scanMaxEpicId(dataDir), ledgerMaxEpicNum(ctx.projectPath)) + 1;
     const slug = slugify(title);
     const epicId = slug
       ? `fn-${epicNum}-${slug}`
       : `fn-${epicNum}-${generateSuffix()}`;
 
     const branchName = branch || "main";
+
+    // Same-project bare-number guard: refuse if any existing epic already
+    // carries this number under a different slug (an unlocked-degrade race).
+    // Reuses id_collision, naming both ids.
+    const bareCollisions = epicIdsWithNumber(dataDir, epicNum).filter(
+      (id) => id !== epicId,
+    );
+    if (bareCollisions.length > 0) {
+      return {
+        kind: "error",
+        message: `Epic id ${epicId} collides on number with existing same-project epic ${bareCollisions.join(", ")}`,
+      };
+    }
 
     // Global-name uniqueness check across all discovered projects.
     const foreignOwner = checkGlobalNameUnique(epicId, ctx.projectPath);
@@ -117,6 +139,11 @@ export function runEpicCreate(args: EpicCreateArgs): void {
       created_at: now,
       updated_at: now,
     };
+
+    // Burn the number in the durable ledger BEFORE any file write, still inside
+    // the flock, so a later destroy of these files leaves the number claimed and
+    // re-minting allocates strictly higher. Fail-soft (keyed on the state repo).
+    appendEpicRecord(ctx.projectPath, epicNum, epicId);
 
     // Write epic def + spec inside the lock so the minted N is observable to
     // the next waiter's scan. Mid-write raise unwinds any partial tree (both
