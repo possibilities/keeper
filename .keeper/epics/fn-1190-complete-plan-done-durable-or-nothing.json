@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-08T03:14:26.879000Z",
+  "created_by_close_of": "fn-1185-make-plan-done-commit-atomic",
+  "depends_on_epics": [
+    "fn-1185-make-plan-done-commit-atomic"
+  ],
+  "id": "fn-1190-complete-plan-done-durable-or-nothing",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Complete plan-done durable-or-nothing recovery",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-08T03:14:26.879000Z"
+}
