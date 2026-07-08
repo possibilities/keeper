@@ -40,5 +40,5 @@ Pure in-process; no DB open needed except where an existing helper already provi
 - [ ] Full fast suite green
 
 ## Done summary
-
+Added fast-tier tests pinning SCHEMA_STEPS ladder invariants (unique/increasing/contiguous versions, tail==SCHEMA_VERSION, valid kind discriminant) and a sibling whitelist-derivability test asserting keeper/api.py's SUPPORTED_SCHEMA_VERSIONS equals the ladder-derived set at/above the Python floor (31).
 ## Evidence
