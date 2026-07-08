@@ -65,5 +65,5 @@ still routes to merge_in_progress if it slips past a stale probe (EAFP arm).
 - [ ] In-process invocations (close-finalize, bun tests) never leak the lock across calls
 
 ## Done summary
-
+Wired the merge-window guard + commit-work serialization across every mutating plan verb (scaffold, epic create, refine-apply, assign-cells, done): a lock-free in-progress probe refuses mid-operation before writing with a retryable merge_in_progress envelope, the shared commit-work flock is held across the write->commit window via try/finally (commit-work outer, epic-id inner), timeout is retryable and environmental degrades fail-soft. autoCommitFromInvocation classifies a stale-probe partial-commit refusal as merge_in_progress (EAFP), close-finalize passes the class through as re-runnable MERGE_IN_PROGRESS, and problem-codes.md registers the new commit-time retryable class.
 ## Evidence

@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Merge-aware fail-fast plan commits",
-  "updated_at": "2026-07-08T06:26:13.259000Z"
+  "updated_at": "2026-07-08T13:31:11.288000Z",
+  "worker_done_at": "2026-07-08T13:31:11.288000Z"
 }
