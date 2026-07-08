@@ -11,6 +11,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -86,6 +87,7 @@ import {
   probeAuditOrchestrator,
   pruneRecoveredDeadLetters,
   RESTART_LEDGER_CAP,
+  RESTART_LEDGER_REASON_MAX_LEN,
   type RepairCandidate,
   type RepairEscalationSweepDeps,
   type RepairGroup,
@@ -93,6 +95,8 @@ import {
   type ResolverDispatchOutcome,
   type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
+  type RestartLedgerEntry,
+  readRestartLedger,
   recoverOneDeadLetter,
   repairReasonFor,
   resolveEscalationJobsFor,
@@ -123,6 +127,7 @@ import {
   WAL_AUTOCHECKPOINT_PAGES,
   type WorkerName,
   withBootDrainCheckpointTuning,
+  writeRestartLedger,
 } from "../src/daemon";
 import {
   clearDispatchMintGate,
@@ -1210,20 +1215,26 @@ test("decideCrashLoop: future-dated garbage is ignored", () => {
   ).toEqual({ crashLoop: false, recentBoots: 0 });
 });
 
+function entriesAt(timestamps: number[]): RestartLedgerEntry[] {
+  return timestamps.map((ts) => ({ ts }));
+}
+
 test("updateRestartLedger: appends this boot, ages out old, sorts ascending", () => {
   const updated = updateRestartLedger({
-    existing: [CL_NOW - CL_WINDOW - 1, CL_NOW - 1_000, CL_NOW - 500],
+    existing: entriesAt([CL_NOW - CL_WINDOW - 1, CL_NOW - 1_000, CL_NOW - 500]),
     nowMs: CL_NOW,
     windowMs: CL_WINDOW,
     cap: RESTART_LEDGER_CAP,
   });
   // The stale entry is dropped; the current boot is appended; result is sorted.
-  expect(updated).toEqual([CL_NOW - 1_000, CL_NOW - 500, CL_NOW]);
+  expect(updated).toEqual(entriesAt([CL_NOW - 1_000, CL_NOW - 500, CL_NOW]));
 });
 
 test("updateRestartLedger: length cap keeps the most recent entries", () => {
   // More in-window boots than the cap → keep the newest `cap` (including now).
-  const existing = bootsEndingAt(CL_NOW - 1, RESTART_LEDGER_CAP + 20, 100);
+  const existing = entriesAt(
+    bootsEndingAt(CL_NOW - 1, RESTART_LEDGER_CAP + 20, 100),
+  );
   const updated = updateRestartLedger({
     existing,
     nowMs: CL_NOW,
@@ -1231,23 +1242,177 @@ test("updateRestartLedger: length cap keeps the most recent entries", () => {
     cap: RESTART_LEDGER_CAP,
   });
   expect(updated.length).toBe(RESTART_LEDGER_CAP);
-  expect(updated[updated.length - 1]).toBe(CL_NOW);
+  expect(updated[updated.length - 1]).toEqual({ ts: CL_NOW });
   // Sorted ascending, so the retained slice is the newest window of boots.
-  expect(updated[0]).toBeGreaterThan(existing[0]);
+  expect(updated[0].ts).toBeGreaterThan(existing[0].ts);
 });
 
-test("parseRestartLedger: valid array of finite numbers round-trips", () => {
-  expect(parseRestartLedger("[1, 2, 3]")).toEqual([1, 2, 3]);
+test("updateRestartLedger: no reason omits the field (matches today's bare boot fold)", () => {
+  const updated = updateRestartLedger({
+    existing: [],
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(updated).toEqual([{ ts: CL_NOW }]);
+  expect(updated[0]).not.toHaveProperty("reason");
+});
+
+test("updateRestartLedger: a reason lands on the newest entry", () => {
+  const updated = updateRestartLedger({
+    existing: entriesAt([CL_NOW - 1_000]),
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+    reason: "uncaughtException: boom",
+  });
+  expect(updated).toEqual([
+    { ts: CL_NOW - 1_000 },
+    { ts: CL_NOW, reason: "uncaughtException: boom" },
+  ]);
+});
+
+test("updateRestartLedger: a second call at the SAME nowMs enriches the entry boot already wrote, not a duplicate", () => {
+  // Models the fatalExit seam: boot-fold wrote a bare entry for this boot;
+  // fatalExit later calls again with the identical nowMs + a reason. The
+  // entry gains the reason IN PLACE — the boot count must not double.
+  const afterBoot = updateRestartLedger({
+    existing: entriesAt([CL_NOW - 5_000]),
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(afterBoot).toEqual([{ ts: CL_NOW - 5_000 }, { ts: CL_NOW }]);
+
+  const afterFatalExit = updateRestartLedger({
+    existing: afterBoot,
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+    reason: "tmux-control-watchdog: control client mute",
+  });
+  expect(afterFatalExit).toEqual([
+    { ts: CL_NOW - 5_000 },
+    { ts: CL_NOW, reason: "tmux-control-watchdog: control client mute" },
+  ]);
+  expect(afterFatalExit.length).toBe(2); // still one entry for this boot, not two
+});
+
+test("updateRestartLedger: an overlong reason is bounded, never grows the sidecar unbounded", () => {
+  const updated = updateRestartLedger({
+    existing: [],
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+    reason: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN + 500),
+  });
+  expect(updated[0].reason?.length).toBe(RESTART_LEDGER_REASON_MAX_LEN);
+});
+
+test("decideCrashLoop: verdict is byte-identical for identical ts sequences with and without reason fields", () => {
+  const bare = entriesAt(bootsEndingAt(CL_NOW, CRASH_LOOP_THRESHOLD, 90_000));
+  const withReasons: RestartLedgerEntry[] = bare.map((e, i) => ({
+    ts: e.ts,
+    reason: i % 2 === 0 ? `watchdog-fire-${i}` : undefined,
+  }));
+  const verdictBare = decideCrashLoop({
+    nowMs: CL_NOW,
+    bootTimestamps: bare.map((e) => e.ts),
+    threshold: CRASH_LOOP_THRESHOLD,
+    windowMs: CL_WINDOW,
+  });
+  const verdictWithReasons = decideCrashLoop({
+    nowMs: CL_NOW,
+    bootTimestamps: withReasons.map((e) => e.ts),
+    threshold: CRASH_LOOP_THRESHOLD,
+    windowMs: CL_WINDOW,
+  });
+  expect(verdictWithReasons).toEqual(verdictBare);
+  expect(verdictBare).toEqual({
+    crashLoop: true,
+    recentBoots: CRASH_LOOP_THRESHOLD,
+  });
+});
+
+test("parseRestartLedger: valid array of finite numbers (legacy shape) coerces to entries", () => {
+  expect(parseRestartLedger("[1, 2, 3]")).toEqual(entriesAt([1, 2, 3]));
+});
+
+test("parseRestartLedger: object entries with a reason round-trip", () => {
+  const raw = JSON.stringify([
+    { ts: 1 },
+    { ts: 2, reason: "uncaughtException: boom" },
+  ]);
+  expect(parseRestartLedger(raw)).toEqual([
+    { ts: 1 },
+    { ts: 2, reason: "uncaughtException: boom" },
+  ]);
+});
+
+test("parseRestartLedger: a mixed legacy-number + object array coerces uniformly and counts identically", () => {
+  const raw = JSON.stringify([1, { ts: 2 }, { ts: 3, reason: "boom" }, 4]);
+  const parsed = parseRestartLedger(raw);
+  expect(parsed).toEqual([
+    { ts: 1 },
+    { ts: 2 },
+    { ts: 3, reason: "boom" },
+    { ts: 4 },
+  ]);
+  // The crash-loop decision reads ts only, so a mixed-shape ledger counts
+  // exactly like an all-legacy one would.
+  const verdict = decideCrashLoop({
+    nowMs: 4,
+    bootTimestamps: parsed.map((e) => e.ts),
+    threshold: 4,
+    windowMs: CL_WINDOW,
+  });
+  expect(verdict).toEqual({ crashLoop: true, recentBoots: 4 });
+});
+
+test("parseRestartLedger: an object entry with a non-string reason drops the reason but keeps ts", () => {
+  expect(parseRestartLedger('[{"ts": 5, "reason": 12345}]')).toEqual([
+    { ts: 5 },
+  ]);
 });
 
 test("parseRestartLedger: corrupt body fails open to empty (never throws, never trips)", () => {
   // A torn/garbage ledger must become an EMPTY one — never new fatalExit fuel and
-  // never a false crash-loop trip. Non-array, non-JSON, and non-finite entries
-  // all collapse to [].
+  // never a false crash-loop trip. Non-array, non-JSON, and non-finite/malformed
+  // entries all collapse to [].
   expect(parseRestartLedger("not json at all")).toEqual([]);
   expect(parseRestartLedger('{"not":"an array"}')).toEqual([]);
   expect(parseRestartLedger("")).toEqual([]);
-  expect(parseRestartLedger('[1, "two", null, 3, 1e999]')).toEqual([1, 3]);
+  expect(
+    parseRestartLedger(
+      '[1, "two", null, 3, 1e999, {}, {"ts":"nope"}, {"ts":null}]',
+    ),
+  ).toEqual(entriesAt([1, 3]));
+});
+
+test("readRestartLedger / writeRestartLedger: round-trip through a real file, atomically", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-restart-ledger-"));
+  const path = join(dir, "restart-ledger.json");
+  try {
+    const entries: RestartLedgerEntry[] = [
+      { ts: 1 },
+      { ts: 2, reason: "serve-liveness-watchdog: probe-stuck" },
+    ];
+    writeRestartLedger(path, entries);
+    expect(readRestartLedger(path)).toEqual(entries);
+    // atomicWriteFile never leaves a .tmp.* file behind on success.
+    const leftovers = readdirSync(dir).filter(
+      (f) => f !== "restart-ledger.json",
+    );
+    expect(leftovers).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readRestartLedger: a missing file fails open to empty", () => {
+  expect(
+    readRestartLedger(join(tmpdir(), "keeper-nonexistent-ledger.json")),
+  ).toEqual([]);
 });
 
 test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (empties the WAL)", () => {
