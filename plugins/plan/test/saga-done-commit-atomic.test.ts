@@ -31,6 +31,7 @@ import { join } from "node:path";
 
 import { autoCommitFromInvocation, CommitFailed } from "../src/commit.ts";
 import { realGitVcs, resetVcs } from "../src/vcs.ts";
+import { runDone } from "../src/verbs/done.ts";
 import { failNextCommit } from "./fake-vcs.ts";
 import {
   fakeDirtyPaths,
@@ -64,6 +65,24 @@ function taskDef(root: string, taskId: string): Record<string, unknown> {
 
 function specText(root: string, taskId: string): string {
   return readFileSync(join(root, ".keeper", "specs", `${taskId}.md`), "utf-8");
+}
+
+/** Set `process.env[key]` to `value`, or delete it when `value` is undefined —
+ * the save/restore primitive around a direct (non-runCli) verb call, which
+ * touches the REAL process.env rather than runCli's captured/restored copy. */
+function setOrDeleteEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
+/** Thrown by the patched `process.exit` below to unwind out of `runDone`
+ * without killing the test process — the direct-call analogue of runCli's
+ * ExitCode carrier, scoped to this one test. */
+class ExitSignal {
+  constructor(readonly code: number) {}
 }
 
 let root: string;
@@ -416,6 +435,103 @@ describe.skipIf(!SLOW_ENABLED)(
 
       // F1: a clean index — the staged half-stamp is gone, so a merge-completion
       // commits nothing of the backed-out done, and the working tree is restored.
+      expect(git(["diff", "--cached", "--name-only"], repo).trim()).toBe("");
+      expect(readFileSync(absTask, "utf-8")).toBe(baseTask);
+      expect(readFileSync(absSpec, "utf-8")).toBe(baseSpec);
+      expect(
+        git(["status", "--porcelain", "--", relTask, relSpec], repo).trim(),
+      ).toBe("");
+    });
+
+    // F1's own coverage gap: the case above reconstructs the unwind by calling
+    // realGitVcs.restoreIndexToHead by hand after autoCommitFromInvocation — it
+    // never drives `done` itself, so a dropped or mis-pathed
+    // getVcs().restoreIndexToHead(...) call inside done.ts's onCommitFailure
+    // would pass every existing test. This case calls runDone directly (the same
+    // exported entry point the CLI dispatches to — `--project` makes locating
+    // explicit so no cwd/roots-config plumbing is needed) against the real-git
+    // mid-merge fixture, so the verb's OWN onCommitFailure closure runs the real
+    // unwind, not a hand-reconstruction.
+    test("runDone itself unwinds the index on a mid-merge partial-commit refusal", () => {
+      const taskId = "fn-2-real.1";
+      const relTask = `.keeper/tasks/${taskId}.json`;
+      const relSpec = `.keeper/specs/${taskId}.md`;
+      const absTask = join(repo, relTask);
+      const absSpec = join(repo, relSpec);
+
+      mkdirSync(join(repo, ".keeper", "tasks"), { recursive: true });
+      mkdirSync(join(repo, ".keeper", "specs"), { recursive: true });
+      writeFileSync(join(repo, ".keeper", ".gitignore"), "state/\n", "utf-8");
+      const baseTask = `{\n  "id": "${taskId}",\n  "worker_done_at": null\n}\n`;
+      const baseSpec =
+        "## Description\nx\n\n## Acceptance\n- [ ] x\n\n" +
+        "## Done summary\n\n## Evidence\n";
+      writeFileSync(absTask, baseTask, "utf-8");
+      writeFileSync(absSpec, baseSpec, "utf-8");
+      git(["add", "-A"], repo);
+      git(["commit", "-q", "-m", "seed baseline"], repo);
+      const headSha = git(["rev-parse", "HEAD"], repo).trim();
+
+      // The pre-done runtime overlay `done` reads under its task lock: in_progress
+      // with a matching assignee — exactly the shape a non-force `done` requires.
+      seedRuntime(repo, taskId, {
+        status: "in_progress",
+        assignee: "test@example.com",
+      });
+
+      // Mid-merge, reproduced by writing the ref directly (same fixture as above).
+      writeFileSync(join(repo, ".git", "MERGE_HEAD"), `${headSha}\n`, "utf-8");
+
+      // runDone reaches emitMutating's process.exit(1) on the commit failure and
+      // getActor()/buildPlanInvocation's session-id resolution off real
+      // process.env (this call bypasses runCli's captured env + patched exit, so
+      // both are set here directly and restored in `finally`).
+      const priorSessionId = process.env.CLAUDE_CODE_SESSION_ID;
+      const priorActor = process.env.KEEPER_PLAN_ACTOR;
+      const priorExit = process.exit;
+      const priorWrite = process.stdout.write;
+      let stdout = "";
+      let exitCode: number | null = null;
+      process.env.CLAUDE_CODE_SESSION_ID = "test-done-f1-rundone";
+      process.env.KEEPER_PLAN_ACTOR = "test@example.com";
+      process.exit = ((c?: number): never => {
+        exitCode = c ?? 0;
+        throw new ExitSignal(exitCode);
+      }) as typeof process.exit;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        stdout += typeof chunk === "string" ? chunk : String(chunk);
+        return true;
+      }) as typeof process.stdout.write;
+
+      try {
+        runDone({
+          taskId,
+          summary: "shipped it",
+          evidence: null,
+          force: false,
+          project: repo,
+          format: null,
+        });
+      } catch (e) {
+        if (!(e instanceof ExitSignal)) {
+          throw e;
+        }
+      } finally {
+        process.exit = priorExit;
+        process.stdout.write = priorWrite;
+        setOrDeleteEnv("CLAUDE_CODE_SESSION_ID", priorSessionId);
+        setOrDeleteEnv("KEEPER_PLAN_ACTOR", priorActor);
+      }
+
+      // The mid-merge refusal surfaced through runDone's own emitMutating path.
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain("commit_failed");
+      expect(stdout).toContain("partial commit during a merge");
+
+      // F1, driven end-to-end: a clean index after runDone's OWN onCommitFailure
+      // unwind — proof of the verb's wiring (getVcs().restoreIndexToHead with the
+      // right paths inside done.ts), not a reconstruction. A dropped or
+      // mis-pathed call here would leave relTask/relSpec staged.
       expect(git(["diff", "--cached", "--name-only"], repo).trim()).toBe("");
       expect(readFileSync(absTask, "utf-8")).toBe(baseTask);
       expect(readFileSync(absSpec, "utf-8")).toBe(baseSpec);
