@@ -65,7 +65,7 @@ import {
 } from "../cli/autopilot";
 import { computeEligibleEpics } from "./armed-closure";
 import { getCollection } from "./collections";
-import { DEFAULT_MAX_CONCURRENT_PER_ROOT } from "./db";
+import { effectivePerRootCap } from "./db";
 import {
   type BootStatus,
   encodeFrame,
@@ -217,10 +217,11 @@ export interface ReadinessClientSnapshot {
   // dash, await, the new `keeper status`/`watch`) orients off ONE snapshot.
   // `autopilotMode` reuses the local that feeds `computeReadiness`'s armed-mode
   // eligibility (`'yolo'` on a missing/malformed row). `maxConcurrentPerRoot` is
-  // the boot-header-LATCHED value the readiness pass actually used — NOT a re-read
-  // of the `autopilot_state` column — defaulting to the safe
-  // `DEFAULT_MAX_CONCURRENT_PER_ROOT` until the header lands. `maxConcurrentJobs`
-  // (`null` = unlimited) and `worktreeMode` come off the `autopilot_state`
+  // the EFFECTIVE cap the readiness pass used, DERIVED off the folded
+  // `autopilot_state` through `effectivePerRootCap` (the ONE seam) — the SAME
+  // {stored, worktree_mode} the fields below report, so it can never skew against
+  // them; an empty/malformed singleton (worktree off) floors it to 1.
+  // `maxConcurrentJobs` (`null` = unlimited) and `worktreeMode` come off the same
   // singleton via the shared `cli/autopilot.ts` projectors (never re-coerced
   // inline); an empty/malformed singleton defaults to unlimited / off.
   readonly autopilotMode: "yolo" | "armed";
@@ -231,13 +232,13 @@ export interface ReadinessClientSnapshot {
   readonly autopilotEligibleEpicIds?: readonly string[];
   readonly maxConcurrentJobs: number | null;
   readonly maxConcurrentPerRoot: number;
-  // The durable STORED per-root intent — re-projected LOCALLY off the same
-  // `autopilot_state` rows this snapshot already subscribes (never crosses the
-  // boot wire, which carries only the effective cap). `maxConcurrentPerRoot`
-  // above is the EFFECTIVE cap (boot-latched, floored to 1 while worktree off);
-  // this is what the operator SET, honored while worktree mode is on. ABSENT
-  // (undefined) when no autopilot rows have folded — an older server / pre-fold
-  // singleton nulls it rather than FABRICATING a stored value from effective.
+  // The durable STORED per-root intent — projected off the same `autopilot_state`
+  // rows this snapshot subscribes. `maxConcurrentPerRoot` above is the EFFECTIVE
+  // cap derived from THIS value + `worktreeMode` via `effectivePerRootCap` (floored
+  // to 1 while worktree off); this is what the operator SET, honored while worktree
+  // mode is on and surfaced distinctly even when it exceeds the effective cap.
+  // ABSENT (undefined) when no autopilot rows have folded — a pre-fold singleton
+  // nulls it rather than FABRICATING a stored value from the effective default.
   readonly maxConcurrentPerRootStored?: number;
   readonly worktreeMode: boolean;
   // The durable multi-repo worktree rollout flag off the same `autopilot_state`
@@ -1695,11 +1696,6 @@ export function subscribeReadiness(
   // Defaults EMPTY (steady state / a server that stamps no header / an older
   // server omitting the field → assume every root seeded, no per-root gating).
   let unseededRoots: Set<string> = new Set<string>();
-  // fn-954: latch the per-root dispatch concurrency count N off the boot-status
-  // header so the board computes the SAME per-root demotions as the reconciler.
-  // Defaults to 1 (today's one-task-per-root mutex) — a server that stamps no
-  // header, an older server omitting the field, or an absent value all keep N=1.
-  let maxConcurrentPerRoot = DEFAULT_MAX_CONCURRENT_PER_ROOT;
   const onFatal = opts.onFatal ?? defaultOnFatal;
   const connect = opts.connect ?? defaultConnect;
 
@@ -2099,6 +2095,31 @@ export function subscribeReadiness(
     )?.paused;
     const autopilotPaused =
       typeof pausedRaw === "number" ? pausedRaw !== 0 : true;
+    // Derive the autopilot caps / worktree flags off the folded `autopilot_state`
+    // BEFORE the readiness pass. The EFFECTIVE per-root cap is the ONE seam
+    // (`effectivePerRootCap`) applied to the SAME folded {stored intent,
+    // worktree_mode} the snapshot reports — mirroring the server's
+    // `loadReadinessInputs`. Because effective is no longer a SECOND, boot-header
+    // -latched source, it can never skew against the reported stored / worktree on
+    // a snapshot: a boot frame and a steady frame with identical folded inputs
+    // report a byte-identical effective value (no post-boot per_root 1↔2 churn).
+    const autopilotRows = projectRows<Record<string, unknown>>(autopilotState);
+    const maxConcurrentJobs = projectMaxConcurrentJobs(autopilotRows);
+    const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
+    const worktreeMultiRepo = projectWorktreeMultiRepo(autopilotRows) ?? false;
+    // The STORED per-root intent — the raw-column projector. An EMPTY row set omits
+    // the field (undefined) so a snapshot lacking autopilot rows never FABRICATES a
+    // stored value; the EFFECTIVE derivation below still floors to 1 (worktree off).
+    const maxConcurrentPerRootStored =
+      autopilotRows.length === 0
+        ? undefined
+        : projectMaxConcurrentPerRoot(autopilotRows);
+    // The EFFECTIVE cap the pass demotes against AND every surface reports: the ONE
+    // seam over the folded stored intent + worktree mode (worktree off ⇒ 1).
+    const maxConcurrentPerRoot = effectivePerRootCap(
+      projectMaxConcurrentPerRoot(autopilotRows),
+      worktreeMode,
+    );
     // In `armed` mode, compute the eligible set (armed ∪ transitive upstream
     // closure) via the SAME `computeEligibleEpics` the reconciler runs. In
     // `yolo` mode leave it `undefined` so `computeReadiness` takes the legacy
@@ -2131,9 +2152,10 @@ export function subscribeReadiness(
       // fn-905: the per-root unseeded set → only rows whose `effectiveRoot` is
       // unseeded are forced UNKNOWN (a seeded sibling root still renders ready).
       unseededRoots,
-      // fn-954: the per-root dispatch concurrency count N (latched off the
-      // boot-status header) so the board demotes the SAME way the reconciler
-      // does. Default 1 = today's one-task-per-root mutex.
+      // The EFFECTIVE per-root dispatch concurrency count N, derived off the folded
+      // `autopilot_state` through `effectivePerRootCap` — the board demotes the SAME
+      // way the reconciler does because both apply the ONE seam to the same {stored,
+      // worktree_mode}. Default 1 = today's one-task-per-root mutex (worktree off).
       maxConcurrentPerRoot,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
@@ -2153,26 +2175,13 @@ export function subscribeReadiness(
     const tmuxFocus = tmuxClientFocus.byId.get(
       tmuxClientFocus.order[0] ?? "",
     ) as TmuxClientFocus | undefined;
-    // fn-1015: un-drop the autopilot caps/worktree onto the snapshot. `mode` and
-    // the boot-header-latched `maxConcurrentPerRoot` reuse the locals that already
-    // feed `computeReadiness` (so the reported per-root cap matches what the pass
-    // used, never a stale column re-read). `max_concurrent_jobs` / `worktree_mode`
-    // come off the `autopilot_state` singleton via the shared projectors — never
-    // re-coerced inline. The eligibility set is the armed-mode closure, sorted for
-    // a stable render and absent in yolo (no filter).
-    const autopilotRows = projectRows<Record<string, unknown>>(autopilotState);
-    const maxConcurrentJobs = projectMaxConcurrentJobs(autopilotRows);
-    // The STORED per-root intent — the shared raw-column projector IS the stored
-    // read (post-inversion). An EMPTY row set omits the field (undefined) rather
-    // than the projector's floor-to-1 default, so a snapshot lacking autopilot
-    // rows never FABRICATES a stored value; the boot-latched EFFECTIVE
-    // `maxConcurrentPerRoot` that feeds `computeReadiness` stays untouched.
-    const maxConcurrentPerRootStored =
-      autopilotRows.length === 0
-        ? undefined
-        : projectMaxConcurrentPerRoot(autopilotRows);
-    const worktreeMode = projectWorktreeMode(autopilotRows) ?? false;
-    const worktreeMultiRepo = projectWorktreeMultiRepo(autopilotRows) ?? false;
+    // fn-1015: un-drop the autopilot caps/worktree onto the snapshot. `mode`, the
+    // effective + stored per-root caps, `max_concurrent_jobs`, and `worktree_mode`
+    // reuse the locals derived above off the folded `autopilot_state` (so every
+    // reported field matches what the readiness pass used, all through the shared
+    // projectors + the ONE per-root seam — never a boot-latched second source). The
+    // eligibility set is the armed-mode closure, sorted for a stable render and
+    // absent in yolo (no filter).
     const eligibleEpicIdsSorted =
       eligibleEpicIds === undefined ? undefined : [...eligibleEpicIds].sort();
     // The merge-landed set, computed ONLY under the `includeRecentDoneEpics`
@@ -2248,14 +2257,10 @@ export function subscribeReadiness(
     // only in the brief unseeded window, never to a clean-read-as-dirty hazard.
     onBootStatus: (boot: BootStatus): void => {
       unseededRoots = new Set(boot.git_unseeded_roots ?? []);
-      // fn-954: latch N for the readiness pass. An absent/non-positive value (an
-      // older server, or a frame omitting it) defaults to 1 = the one-task-per-root
-      // mutex — never a wrong N. The pass reads this on its NEXT emit.
-      const n = boot.max_concurrent_per_root;
-      maxConcurrentPerRoot =
-        typeof n === "number" && Number.isInteger(n) && n > 0
-          ? n
-          : DEFAULT_MAX_CONCURRENT_PER_ROOT;
+      // The per-root cap is NOT latched off the header: the snapshot derives the
+      // effective cap off the folded `autopilot_state` via `effectivePerRootCap`
+      // (see above), so a boot frame can never skew it against the reported
+      // stored / worktree. The header field is still forwarded verbatim.
       opts.onBootStatus?.(boot);
     },
     // The catching-up latch lives in the shared core; readiness forwards the

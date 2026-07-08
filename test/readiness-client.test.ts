@@ -46,6 +46,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { effectivePerRootCap } from "../src/db";
 import {
   type BootStatus,
   encodeFrame,
@@ -866,10 +867,11 @@ test("subscribeReadiness: boot-status header fires onBootStatus and forces readi
 });
 
 // ---------------------------------------------------------------------------
-// fn-954 — the boot-status header carries `max_concurrent_per_root` (N), which
-//          the client latches for the readiness pass (consumed by task .2's
-//          allocator). A frame stamping N forwards it via `onBootStatus`; a
-//          frame omitting it falls back to N=1 (today's one-task-per-root mutex).
+// fn-954 / fn-1197 — the boot-status header still carries `max_concurrent_per_root`
+//          (the server's effective cap) and `onBootStatus` forwards it verbatim to
+//          callers. The readiness snapshot NO LONGER latches it for the effective
+//          cap — that now derives off the folded autopilot_state through the seam
+//          (see the fn-1197 regression below) — so this test pins only forwarding.
 // ---------------------------------------------------------------------------
 
 test("subscribeReadiness: boot-status header forwards max_concurrent_per_root via onBootStatus", () => {
@@ -3311,9 +3313,10 @@ test("subscribeReadiness: snapshot un-drops autopilot mode/caps/worktree + armed
   }
   sock.takeOutbound();
 
-  // Stamp the boot-status header carrying N=3 on the epics frame; the readiness
-  // pass latches it and the snapshot reports the LATCHED value (NOT the
-  // autopilot_state column re-read) on the same emit.
+  // Stamp the boot-status header carrying a DELIBERATELY-WRONG N=3 on the epics
+  // frame. The snapshot must IGNORE it: the effective per-root cap derives off the
+  // folded autopilot_state (stored 99, worktree on) through effectivePerRootCap, so
+  // the header value can never skew the reported cap against the reported stored.
   sock.deliver([
     {
       type: "result",
@@ -3344,7 +3347,7 @@ test("subscribeReadiness: snapshot un-drops autopilot mode/caps/worktree + armed
     sock.deliver([emptyResult(c, `test-ap-${c.replace(/_/g, "-")}`)]);
   }
   // A populated autopilot_state singleton: playing, armed mode, jobs cap 8,
-  // worktree on; its per-root column (99) is intentionally NOT the latch value.
+  // worktree on, stored per-root 99 — the effective cap derives from THIS row.
   sock.deliver([
     rowsResult("autopilot_state", "test-ap-autopilot-state", [
       {
@@ -3371,12 +3374,12 @@ test("subscribeReadiness: snapshot un-drops autopilot mode/caps/worktree + armed
   expect(snap?.autopilotPaused).toBe(false);
   expect(snap?.autopilotMode).toBe("armed");
   expect(snap?.maxConcurrentJobs).toBe(8);
-  // The boot-header LATCH (3) wins over the autopilot_state column (99) for the
-  // EFFECTIVE per-root value the readiness pass actually used.
-  expect(snap?.maxConcurrentPerRoot).toBe(3);
-  // The STORED intent is re-projected LOCALLY off the same autopilot_state rows
-  // (the raw column, 99) — a distinct source from the boot-latched effective, so
-  // the operator's intent surfaces even when it exceeds the effective cap.
+  // The EFFECTIVE cap derives off the folded stored intent (99) + worktree mode
+  // (on) through effectivePerRootCap — NOT the boot header (3), which is ignored.
+  expect(snap?.maxConcurrentPerRoot).toBe(99);
+  // The STORED intent is the raw column (99), projected off the same rows. With
+  // worktree ON it equals the effective cap; it diverges (and stays distinctly
+  // readable) only while worktree is off, where effective floors to 1.
   expect(snap?.maxConcurrentPerRootStored).toBe(99);
   expect(snap?.worktreeMode).toBe(true);
   expect(snap?.autopilotEligibleEpicIds).toEqual(["fn-1-foo", "fn-2-bar"]);
@@ -3417,9 +3420,9 @@ test("subscribeReadiness: empty autopilot_state defaults the autopilot fields to
   }
   expect(snapshots).toHaveLength(1);
   const snap = snapshots[0];
-  // Safe side: paused, yolo, unlimited jobs (null), per-root default (1, the
-  // latch default with no boot header), worktree off, and no eligibility filter
-  // (undefined — yolo computes none).
+  // Safe side: paused, yolo, unlimited jobs (null), per-root default (1 — no
+  // autopilot rows, so effectivePerRootCap over a worktree-off default floors to
+  // 1), worktree off, and no eligibility filter (undefined — yolo computes none).
   expect(snap?.autopilotPaused).toBe(true);
   expect(snap?.autopilotMode).toBe("yolo");
   expect(snap?.maxConcurrentJobs).toBeNull();
@@ -3480,11 +3483,129 @@ test("subscribeReadiness: a malformed autopilot_state row falls back to the safe
   expect(snap?.autopilotPaused).toBe(true); // non-number paused → paused
   expect(snap?.autopilotMode).toBe("yolo"); // unknown mode → yolo
   expect(snap?.maxConcurrentJobs).toBeNull(); // non-positive → unlimited
-  expect(snap?.maxConcurrentPerRoot).toBe(1); // no boot header → latch default
+  expect(snap?.maxConcurrentPerRoot).toBe(1); // worktree off (7 !== 1) → floors to 1
   expect(snap?.worktreeMode).toBe(false); // worktree_mode !== 1 → off
   expect(snap?.autopilotEligibleEpicIds).toBeUndefined(); // yolo computes none
 
   handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// fn-1197 — the reported EFFECTIVE per-root cap derives off the folded
+//   autopilot_state through the ONE seam (`effectivePerRootCap`), IDENTICALLY at
+//   boot and in steady state. The incident: after every daemon boot an
+//   `autopilot-change` delta flipped per_root 1↔2 while {stored, worktree_mode}
+//   held steady — the snapshot latched the effective cap off the boot header (a
+//   SECOND source) that lagged the folded stored/worktree by a frame. Now a boot
+//   frame (with a deliberately-wrong header value) and a steady frame (no header)
+//   with identical folded inputs report a byte-identical effective value, and the
+//   stored intent stays distinctly readable when worktree mode floors it to 1.
+// ---------------------------------------------------------------------------
+
+// Drive one subscription to first-paint and return its snapshot. `bootHeaderN`,
+// when set, stamps a boot-status header carrying that (wrong) effective value on
+// the epics frame — the boot-emission path; omitted → the steady path (no header).
+function driveFn1197Snapshot(opts: {
+  stored: number;
+  worktreeOn: boolean;
+  bootHeaderN?: number;
+}): ReadinessClientSnapshot {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-1197",
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+  sock.deliver([
+    {
+      type: "result",
+      id: "test-1197-epics",
+      collection: "epics",
+      rev: 1,
+      total: 0,
+      rows: [],
+      ...(opts.bootHeaderN === undefined
+        ? {}
+        : {
+            boot: {
+              rev: 1,
+              head_event_id: 1,
+              catching_up: false,
+              git_seed_required: false,
+              max_concurrent_per_root: opts.bootHeaderN,
+            },
+          }),
+    },
+  ]);
+  for (const c of [
+    "jobs",
+    "subagent_invocations",
+    "git",
+    "dead_letters",
+    "pending_dispatches",
+    "scheduled_tasks",
+    "block_escalations",
+    "tmux_client_focus",
+    "armed_epics",
+  ]) {
+    sock.deliver([emptyResult(c, `test-1197-${c.replace(/_/g, "-")}`)]);
+  }
+  // The folded autopilot_state carrying the {stored, worktree} under test, delivered
+  // last so the first-paint emit fires with it present.
+  sock.deliver([
+    rowsResult("autopilot_state", "test-1197-autopilot-state", [
+      {
+        id: 1,
+        paused: 0,
+        mode: "yolo",
+        max_concurrent_per_root: opts.stored,
+        worktree_mode: opts.worktreeOn ? 1 : 0,
+      },
+    ]),
+  ]);
+  const snap = snapshots.at(-1);
+  handle.dispose();
+  if (!snap) {
+    throw new Error("no snapshot emitted");
+  }
+  return snap;
+}
+
+test("subscribeReadiness: effective per-root cap derives off the folded autopilot_state via the seam — boot == steady, header ignored (fn-1197)", () => {
+  const cases: { stored: number; worktreeOn: boolean; bootHeaderN: number }[] =
+    [
+      // The incident itself: worktree on + stored 2 must report the effective 2 even
+      // when a stale boot header carries 1.
+      { stored: 2, worktreeOn: true, bootHeaderN: 1 },
+      // Worktree off floors the effective cap to 1 though the operator stored 2 — the
+      // stored intent must still surface distinctly.
+      { stored: 2, worktreeOn: false, bootHeaderN: 2 },
+      { stored: 5, worktreeOn: true, bootHeaderN: 99 },
+      { stored: 5, worktreeOn: false, bootHeaderN: 5 },
+      { stored: 1, worktreeOn: true, bootHeaderN: 7 },
+    ];
+  for (const { stored, worktreeOn, bootHeaderN } of cases) {
+    const expected = effectivePerRootCap(stored, worktreeOn);
+    // BOOT-emission path: a (wrong) boot header is stamped. STEADY-state path: none.
+    const bootSnap = driveFn1197Snapshot({ stored, worktreeOn, bootHeaderN });
+    const steadySnap = driveFn1197Snapshot({ stored, worktreeOn });
+    // Both derive the effective cap off the folded {stored, worktree} through the
+    // seam — byte-identical, and neither reflects the wrong boot-header value.
+    expect(bootSnap.maxConcurrentPerRoot).toBe(expected);
+    expect(steadySnap.maxConcurrentPerRoot).toBe(expected);
+    expect(bootSnap.maxConcurrentPerRoot).toBe(steadySnap.maxConcurrentPerRoot);
+    // The stored intent stays distinctly readable (the raw column) on both — even
+    // where worktree mode floors the effective cap below it.
+    expect(bootSnap.maxConcurrentPerRootStored).toBe(stored);
+    expect(steadySnap.maxConcurrentPerRootStored).toBe(stored);
+  }
 });
 
 // ===========================================================================
