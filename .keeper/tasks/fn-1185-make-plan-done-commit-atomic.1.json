@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Sequence done event after commit",
-  "updated_at": "2026-07-08T02:33:35.376000Z"
+  "updated_at": "2026-07-08T03:03:33.748000Z",
+  "worker_done_at": "2026-07-08T03:03:33.748000Z"
 }

@@ -36,5 +36,5 @@ not a new write surface into the reducer.
 - [ ] Full fast suite green
 
 ## Done summary
-
+Made keeper plan done durable-or-nothing: a failed state-file commit (the mid-merge shared-checkout window) unwinds the spec/runtime/worker_done_at writes so no half-stamped done survives, and a done re-run self-heals an already-wedged STATE_UNCOMMITTED task by re-committing the missing backing instead of refusing 'already done'. Added a regression suite proving the unwind, the recovery re-run, and the self-heal.
 ## Evidence
