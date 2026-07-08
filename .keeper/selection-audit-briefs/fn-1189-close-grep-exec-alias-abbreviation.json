@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 2,
+        "insertions": 32
+      },
+      "done_summary": "Match git's --open-files-in-pager exec alias by unambiguous prefix (--open \u2026 full literal) in gitReadSubcommandExecFlag, closing the read-subcommand arbitrary-exec bypass; added deny-case tests for --open=/--open-f=/--open-files= abbreviations in glued and space-separated forms.",
+      "input_hash": "8b67d2e7124668e5795fa5b0ea09468b061eb7fd0fe9fcde9a9bbbf1a4b9cafe",
+      "model": "opus",
+      "spec_chars": 1837,
+      "spec_md": "## Description\n\nFinding F1 (auditor Axis-1 Critical). In\n`plugins/keeper/plugin/hooks/escalation-guard.ts`, `gitReadSubcommandExecFlag`\ndenies the exec alias only via the exact strings `--open-files-in-pager` /\n`--open-files-in-pager=` plus the grep-scoped single-dash regex\n`/^-[A-Za-z]*O/`. Git parse-options accepts any unambiguous prefix\n(`--open`, `--open-f`, `--open-files`, ...) as the same option, and none of\nthose are caught. Live-verified in this repo: `git grep --open='echo X'`\nand `git grep --open-f='echo X'` both executed the caller command (exit 0),\nwhile `--zzzznope=` errors \u2014 confirming `--open` is a genuine accepted\nabbreviation, so arbitrary program execution reaches a read-only diagnosis\nrole. Match the exec alias by unambiguous-prefix (deny any read-subcommand\narg matching `^--open(-files(-in(-pager)?)?)?(=|$)` down to the shortest\nunambiguous prefix `--open`) rather than the exact literal.\n\nFiles:\n- plugins/keeper/plugin/hooks/escalation-guard.ts (`gitReadSubcommandExecFlag`)\n- test/escalation-guard.test.ts\n\n## Acceptance\n\n- [ ] Deny `--open=<cmd>`, `--open-f=<cmd>`, `--open-files=<cmd>` and every\n      unambiguous prefix up to `--open-files-in-pager`, in both glued-`=`\n      and space-separated forms\n- [ ] Guard still fails closed (no under-block) and existing benign allow\n      rows (diff/log `-O` order file, plain grep patterns, `--output` deny)\n      remain unchanged\n- [ ] New deny-case tests assert `git grep --open=/tmp/evil` and\n      `git grep --open-files=/tmp/evil` are denied\n\n## Done summary\nMatch git's --open-files-in-pager exec alias by unambiguous prefix (--open \u2026 full literal) in gitReadSubcommandExecFlag, closing the read-subcommand arbitrary-exec bypass; added deny-case tests for --open=/--open-f=/--open-files= abbreviations in glued and space-separated forms.\n## Evidence\n",
+      "task_id": "fn-1189-close-grep-exec-alias-abbreviation.1",
+      "tier": "high",
+      "title": "Deny grep exec-alias abbreviations"
+    }
+  ],
+  "created_at": "2026-07-08T06:16:11.140000Z",
+  "epic_id": "fn-1189-close-grep-exec-alias-abbreviation",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "8b67d2e7124668e5795fa5b0ea09468b061eb7fd0fe9fcde9a9bbbf1a4b9cafe",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
