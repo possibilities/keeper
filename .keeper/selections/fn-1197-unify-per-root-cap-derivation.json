@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Boot-vs-steady byte-identical floor invariant + wire/boot-header contract with version-skew risk",
+      "task_id": "fn-1197-unify-per-root-cap-derivation.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T20:57:57.858000Z",
+  "epic_id": "fn-1197-unify-per-root-cap-derivation",
+  "input_hash": "3eb21ab5349e1b9f162ea87d94d0220dae9801b35f24d15184d458ed70f19382",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1051859637,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1197-unify-per-root-cap-derivation.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.8}]}"
+}
