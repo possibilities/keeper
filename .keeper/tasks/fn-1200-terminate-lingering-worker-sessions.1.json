@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reclaim slots from dead sessions",
-  "updated_at": "2026-07-08T20:57:58.467000Z"
+  "updated_at": "2026-07-08T21:30:20.926000Z",
+  "worker_done_at": "2026-07-08T21:30:20.926000Z"
 }

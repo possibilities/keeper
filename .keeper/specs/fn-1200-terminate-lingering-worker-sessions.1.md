@@ -38,5 +38,5 @@ Pure-seam tests in the autopilot-worker suite: a reconcile snapshot with a dead-
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Slot reclaim now keys on the job lifecycle: loadReconcileSnapshot re-proves each stopped-live-pane occupant's recorded claude pid (mirroring the exit-watcher's pid-death reprobe) into provenDeadJobIds, and computeSlotOccupancy reaps a proven-dead slot regardless of a lingering wrapper/launcher foreground command. Bare-shell stays a secondary proof; reclaim is grace-aged and never targets a job lacking the proven-dead verdict; the kill rides buildTmuxKillWindowArgs (argv array, no shell interpolation).
 ## Evidence
