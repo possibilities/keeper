@@ -1209,6 +1209,26 @@ describe("main() ambiguous restore escalate-or-refuse", () => {
     expect(spawnedAnyRestore(calls)).toBe(false);
   });
 
+  test("ambiguous + TTY + skip ⇒ clears retry marker and still provisions", async () => {
+    const calls: string[][] = [];
+    const retryStore = memoryRetryStore({ work: offerFor(4) });
+    const spawn = makeOfferStub({ work: 0 }, calls);
+    const writes = await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      ambiguous: true,
+      eligible: [genSummary("111"), genSummary("222")],
+      tty: true,
+      answer: "s",
+      retryStore,
+    });
+
+    expect(spawnedAnyRestore(calls)).toBe(false);
+    expect(retryStore.read().work).toBeUndefined();
+    expect(spawnedDashKillServer(calls)).toBe(true);
+    expect(writes.some((w) => w.includes("work sessions ensured"))).toBe(true);
+  });
+
   test("ambiguous + non-TTY ⇒ visible refusal naming the recovery command, no spawn", async () => {
     const calls: string[][] = [];
     const spawn = makeOfferStub({}, calls);

@@ -90,10 +90,10 @@ candidates, or a non-TTY skips that session's offer.
 
 A CONTESTED auto-pick — the richest generation isn't the freshest, or the
 derived cohort disagrees with the last non-empty disaster mirror — never silently
-restores: on a TTY it presents a numbered generation picker; off a TTY it prints
-a visible refusal naming 'keeper tabs restore' and restores nothing (never
-blocking provisioning). Retry markers (already-disambiguated picks) bypass this
-gate.
+restores: on a TTY it presents a numbered generation picker with an explicit
+skip option; off a TTY it prints a visible refusal naming 'keeper tabs restore'
+and restores nothing (never blocking provisioning). Retry markers
+(already-disambiguated picks) bypass this gate.
 
 Options:
   --kill-sessions  Kill the default-server 'work'/'autopilot' sessions before
@@ -1151,32 +1151,46 @@ export async function main(
     // A successful picker choice IS the confirmation — the picked fresh offers
     // skip the generic y/N confirm below (asking twice would be redundant).
     let pickerConfirmed = false;
+    // Explicit skip bypasses BOTH fresh offers and previously accepted retry
+    // markers, so setup can finish without launching any restore tabs.
+    let skipRestore = false;
     const freshHasOffer = Object.values(freshOffers).some((o) => o.count > 0);
     if (bundle.ambiguous && freshHasOffer) {
       if (tty) {
         process.stdout.write(
           "keeper setup-tmux: ambiguous last-session restore — the newest " +
             "generation isn't unambiguously the one to restore (a richer older " +
-            "cohort, or a disaster-mirror disagreement). Choose one:\n",
+            "cohort, or a disaster-mirror disagreement). Choose one, or skip " +
+            "restore and continue setup:\n",
         );
         process.stdout.write(
           `${formatGenerationMenu(bundle.eligible, nowSecs)}\n`,
         );
         const answer = await promptLine(
-          "Generation to restore (number, or blank to abort): ",
+          "Generation to restore (number), s to skip restore, or blank to abort: ",
         );
-        const idx = parsePickerChoice(answer, bundle.eligible.length);
-        if (idx === null) {
+        const trimmedAnswer = answer.trim().toLowerCase();
+        if (trimmedAnswer === "s" || trimmedAnswer === "skip") {
           freshOffers = {};
+          skipRestore = true;
+          retryStore.clear(RESTORABLE);
           process.stderr.write(
-            "keeper setup-tmux: ambiguous restore aborted — restored nothing " +
-              "(re-run `keeper tabs restore` to choose)\n",
+            "keeper setup-tmux: restore skipped — continuing setup without restoring tabs\n",
           );
         } else {
-          const chosen = bundle.eligible[idx] as GenerationSummary;
-          // Re-resolve THAT generation verbatim (disambiguated, no cross-check).
-          freshOffers = restoreOffer(chosen.generation_id).offers;
-          pickerConfirmed = true;
+          const idx = parsePickerChoice(answer, bundle.eligible.length);
+          if (idx === null) {
+            freshOffers = {};
+            process.stderr.write(
+              "keeper setup-tmux: ambiguous restore aborted — restored nothing " +
+                "(re-run `keeper tabs restore` to choose)\n",
+            );
+          } else {
+            const chosen = bundle.eligible[idx] as GenerationSummary;
+            // Re-resolve THAT generation verbatim (disambiguated, no cross-check).
+            freshOffers = restoreOffer(chosen.generation_id).offers;
+            pickerConfirmed = true;
+          }
         }
       } else {
         process.stderr.write(
@@ -1192,7 +1206,7 @@ export async function main(
       }
     }
 
-    const offers = { ...freshOffers, ...retryOffers };
+    const offers = skipRestore ? {} : { ...freshOffers, ...retryOffers };
     const offered = RESTORABLE.filter((session) => {
       const offer = offers[session];
       if ((offer?.count ?? 0) <= 0) {
