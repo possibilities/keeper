@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-08T23:25:44.775000Z",
+  "created_by_close_of": "fn-1198-fix-repair-escalation-dispatch",
+  "depends_on_epics": [
+    "fn-1198-fix-repair-escalation-dispatch"
+  ],
+  "id": "fn-1201-fold-empty-token-into-repair-drop-class",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fold empty_token into repair-drop class contract",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-08T23:25:44.775000Z"
+}
