@@ -337,6 +337,11 @@ function findTranscriptStop(
   path: string,
   startedAtMs: number,
 ): TranscriptStop | null {
+  // claude gates terminality on background-agent quiescence (a settled stop);
+  // codex/pi keep the plain first-stop scan, byte-identical.
+  if (agent === "claude") {
+    return findClaudeStopGated(path, startedAtMs);
+  }
   for (const line of readLines(path)) {
     const parsed = parseJsonObject(line);
     if (parsed === null) {
@@ -352,6 +357,193 @@ function findTranscriptStop(
     }
   }
   return null;
+}
+
+/**
+ * The claude stop scan, gated on background-agent quiescence. A claude session
+ * can end a turn while background agents it launched (Agent tool /
+ * `run_in_background`) are still working; the harness later injects their
+ * results and the session runs the turns that carry the real answer. A
+ * first-stop-wins scan captures the premature turn, so claude terminality is
+ * gated on a SETTLED stop: a stop marker is accepted only when no launched
+ * background agent is still outstanding at that point AND no governing
+ * turn_duration line reports a nonzero pendingBackgroundAgentCount.
+ *
+ * Line order is authoritative — transcript timestamps are non-monotonic. The
+ * pending set is tracked across the WHOLE file with no started-at filter (a
+ * launch predating the wait but still outstanding must block quiescence), while
+ * stop ACCEPTANCE keeps the started-at window. Everything fails open: a
+ * transcript carrying none of the markers behaves byte-identically to the plain
+ * first-stop parser, malformed lines are skipped, and the stop-timeout ceiling
+ * still bounds the wait. A retired child resumed via SendMessage re-arms work
+ * the pending set no longer sees — the final-message directive carries that.
+ */
+function findClaudeStopGated(
+  path: string,
+  startedAtMs: number,
+): TranscriptStop | null {
+  const pending = new Set<string>();
+  // A stop held pending its governing turn_duration's count. turn_duration
+  // trails the assistant end_turn by a beat in file order, so an accepted
+  // assistant stop is provisional until its turn_duration confirms it (count
+  // absent/zero) or rejects it (count nonzero); a dangling provisional with no
+  // trailing turn_duration is accepted at end-of-scan, since the count rule
+  // only binds when a governing line exists.
+  let provisional: TranscriptStop | null = null;
+
+  for (const line of readLines(path)) {
+    // Hot-path pre-filter: skip JSON.parse for a line carrying no marker
+    // substring — it can be neither a launch/retire nor any stop shape.
+    if (!hasClaudeMarker(line)) {
+      continue;
+    }
+    const parsed = parseJsonObject(line);
+    if (parsed === null) {
+      continue;
+    }
+
+    // Pending-set maintenance runs over the WHOLE file (no started-at filter).
+    const launchId = claudeAsyncLaunchedAgentId(parsed);
+    if (launchId !== null) {
+      pending.add(launchId);
+    }
+    for (const retiredId of claudeRetiredAgentIds(parsed)) {
+      pending.delete(retiredId);
+    }
+
+    if (isClaudeTurnDuration(parsed)) {
+      const count = claudeTurnDurationCount(parsed);
+      // Nonzero count: the turn ended with live background children, so its
+      // stop is premature — reject the provisional and keep scanning.
+      if (count !== null && count > 0) {
+        provisional = null;
+        continue;
+      }
+      // Count absent or zero: the turn is settled. Confirm the turn's
+      // text-bearing assistant stop, else the turn_duration is itself a
+      // structural stop.
+      if (provisional !== null && pending.size === 0) {
+        return provisional;
+      }
+      provisional = null;
+      if (pending.size === 0 && withinStartWindow(parsed, startedAtMs)) {
+        return claudeStopFromObject(parsed);
+      }
+      continue;
+    }
+
+    // A non-turn_duration line: an assistant / stop_hook_summary stop candidate.
+    // Hold the FIRST settled candidate as provisional (freeze-on-first); a
+    // trailing turn_duration may still reject it on a nonzero count.
+    if (
+      provisional === null &&
+      pending.size === 0 &&
+      withinStartWindow(parsed, startedAtMs)
+    ) {
+      const stop = claudeStopFromObject(parsed);
+      if (stop !== null) {
+        provisional = stop;
+      }
+    }
+  }
+
+  return provisional;
+}
+
+/**
+ * The marker substrings a claude stop-scan line must contain to matter — a
+ * background launch, a retire, or any of the three stop shapes. A line with
+ * none affects neither the pending set nor stop detection, so it is skipped
+ * before the JSON parse (a false positive just gets parsed and rejected).
+ */
+const CLAUDE_STOP_SCAN_MARKERS: readonly string[] = [
+  "async_launched",
+  "task-id",
+  "stop_reason",
+  "turn_duration",
+  "stop_hook_summary",
+];
+
+function hasClaudeMarker(line: string): boolean {
+  for (const marker of CLAUDE_STOP_SCAN_MARKERS) {
+    if (line.includes(marker)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function withinStartWindow(
+  obj: Record<string, unknown>,
+  startedAtMs: number,
+): boolean {
+  const eventMs = objectTimestampMs(obj);
+  return eventMs === null || eventMs >= startedAtMs - START_SLOP_MS;
+}
+
+function isClaudeTurnDuration(obj: Record<string, unknown>): boolean {
+  return (
+    stringValue(obj.type) === "system" &&
+    stringValue(obj.subtype) === "turn_duration"
+  );
+}
+
+/**
+ * The `pendingBackgroundAgentCount` a turn_duration line carries, or null when
+ * the field is absent/non-numeric. Null imposes NO count constraint (fail-open);
+ * only a strictly positive value blocks stop acceptance.
+ */
+function claudeTurnDurationCount(obj: Record<string, unknown>): number | null {
+  const count = obj.pendingBackgroundAgentCount;
+  return typeof count === "number" ? count : null;
+}
+
+/**
+ * The `agentId` a claude background-agent LAUNCH line arms, or null. A launch is
+ * a user tool_result whose top-level `toolUseResult` is an OBJECT with
+ * `status:"async_launched"`. A FAILED launch carries a STRING `toolUseResult`
+ * (with an is_error tool_result) — the object check excludes it, so it never
+ * enters the pending set.
+ */
+function claudeAsyncLaunchedAgentId(
+  obj: Record<string, unknown>,
+): string | null {
+  const result = objectValue(obj.toolUseResult);
+  if (result === null || stringValue(result.status) !== "async_launched") {
+    return null;
+  }
+  return stringValue(result.agentId);
+}
+
+const CLAUDE_TERMINAL_STATUS = /<status>(?:completed|failed|killed)<\/status>/;
+const CLAUDE_TASK_ID = /<task-id>([^<]+)<\/task-id>/g;
+
+/**
+ * The background-agent ids a claude line RETIRES. Two carriers, both string
+ * bodies embedding a `<task-id>…</task-id>` alongside a terminal `<status>`:
+ * queue-operation lines (top-level `content`, any operation) and injected
+ * task-notification user lines (`message.content`). A normal assistant/user
+ * turn carries an ARRAY `content`, which yields no string body — so only a
+ * genuine notification retires. Retiring a non-member is a caller-side no-op,
+ * keeping descendant-agent and backgrounded-Bash notifications from gating.
+ */
+function claudeRetiredAgentIds(obj: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  collectRetiredIds(stringValue(obj.content), ids);
+  collectRetiredIds(stringValue(objectValue(obj.message)?.content), ids);
+  return ids;
+}
+
+function collectRetiredIds(body: string | null, into: string[]): void {
+  if (body === null || !CLAUDE_TERMINAL_STATUS.test(body)) {
+    return;
+  }
+  for (const match of body.matchAll(CLAUDE_TASK_ID)) {
+    const id = match[1];
+    if (id !== undefined) {
+      into.push(id);
+    }
+  }
 }
 
 function stopFromObject(

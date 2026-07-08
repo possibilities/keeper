@@ -491,8 +491,23 @@ export async function captureFromHandle(
   // instantly. Should the read still fail (transcript vanished mid-flight), fall
   // back to the text the stop event itself carried rather than losing the run.
   const transcriptPath = show.ok ? show.transcriptPath : wait.transcriptPath;
-  const message = show.ok ? show.text : wait.stop.message;
-  const messageFound = show.ok ? show.found : wait.stop.message !== null;
+  // For claude, the gated wait stop is the BLESSED settled turn: prefer its own
+  // message so a later human-resume turn's whole-file re-scan cannot displace
+  // the answer. Only a structural claude stop (null text) falls back to the
+  // re-scan. codex/pi/hermes keep the re-scan-first preference (their stop text
+  // is a subset of what show-last-message resolves).
+  let message: string | null;
+  let messageFound: boolean;
+  if (agent === "claude" && wait.stop.message !== null) {
+    message = wait.stop.message;
+    messageFound = true;
+  } else if (show.ok) {
+    message = show.text;
+    messageFound = show.found;
+  } else {
+    message = wait.stop.message;
+    messageFound = wait.stop.message !== null;
+  }
   return buildRunCaptureEnvelope({
     outcome: messageFound ? "completed" : "no_message",
     agent,
