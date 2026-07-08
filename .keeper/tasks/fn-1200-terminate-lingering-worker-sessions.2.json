@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reconcile orphaned sentinel ack-rows",
-  "updated_at": "2026-07-08T20:57:58.467000Z"
+  "updated_at": "2026-07-08T21:56:53.083000Z",
+  "worker_done_at": "2026-07-08T21:56:53.083000Z"
 }

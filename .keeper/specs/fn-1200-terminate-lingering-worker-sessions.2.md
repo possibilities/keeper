@@ -32,5 +32,5 @@ Pure tests: a sentinel row whose job id resolves stays under ack-only; one whose
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Reconcile stuck-sentinel ack-rows against the live jobs table: a row whose job is genuinely absent is GC'd with a trace log; a row whose job resolves in any state (including terminal) stays operator-ack-only. Recorded as ADR 24, amending ADR 13.
 ## Evidence
