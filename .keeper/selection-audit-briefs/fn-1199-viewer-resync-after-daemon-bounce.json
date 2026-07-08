@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 5,
+        "insertions": 502
+      },
+      "done_summary": "Confirmed the failing leg is LOSS DETECTION: a steady-state subscribe client is idle (no in-flight query), so pollAll never probes a silently-dead/half-open socket and the viewer holds stale state forever. Fixed with an app-level liveness heartbeat (idle probe -> existing QUERY_TIMEOUT_MS reconnect) plus a per-daemon-boot generation epoch guard on the boot header that forces re-baseline across a bounce. Pure-seam tests cover the repro, quiet-board and new-generation bounce re-baseline, and the reconnecting-pill repaint.",
+      "input_hash": "9683ed2d604b5eabdb49ec638263907f3d497af0bd96662f7e842f53d1c932de",
+      "model": "opus",
+      "spec_chars": 3946,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/readiness-client.ts, src/view-shell.ts, src/server-worker.ts, test/readiness-client.test.ts, test/view-shell.test.ts\n\n### Approach\n\nReproduce first, at the pure seams (no real daemon in tests): drive the client through a simulated daemon bounce \u2014 socket teardown, reconnect, and the quiet-board variant where no new frames arrive post-reconnect \u2014 and identify which leg fails: (1) loss detection (the incident pattern suggests the viewer may never notice a dead subscription when the daemon's restart leaves the socket half-open), (2) resubscription, or (3) the post-reconnect re-baseline, including the ADR-0019 trap where a client whose last result landed pre-boot-complete holds catching_up forever because patch/meta frames carry no boot header. Fix the confirmed leg with the epoch-guard direction: the client tracks a daemon generation (from the boot-status header or a minimal new emission if none exists on the wire), treats any generation change as resume-invalid, and forces resubscribe \u2192 fresh snapshot \u2192 full repaint. The reconnecting pill must resolve \u2014 either to a repaint or to a visible failure state \u2014 never to a silent stale hold. Confirm the board's data path rides the read socket via readiness-client (the bus-worker channel evictions at boot are believed unrelated to this defect; verify rather than assume).\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/readiness-client.ts:1-53, 299-341 \u2014 reconnect machinery (capped backoff, reconnect-forever, first-paint gate, teardown\u2192reconnect deadlines)\n- src/view-shell.ts:402 \u2014 \"so the next post-reconnect snapshot always paints\" (the intent this bug violates); :582 baseline-on-first-accepted-frame; :621-631 reconnecting pill semantics; :148 reparent-after-death baseline\n- docs/adr/0019 \u2014 the catching_up trap mechanics\n\n**Optional** (reference as needed):\n- cli/watch.ts:822-852 \u2014 the CLI tail's reconnect-forever contrast reference\n- src/frames-emitter.ts, cli/frames.ts \u2014 the frames surface for regression coverage\n- src/bus-worker.ts:216-303 \u2014 channel takeover eviction (suspected red herring; rule in/out)\n\n### Risks\n\n- The fix may need a server-side generation signal; keep that emission minimal and backward-compatible (old clients ignore it) \u2014 the client contract is the deliverable.\n- Reconnect-storm flicker during a crash loop: debounce the re-baseline repaint so a bouncing daemon doesn't thrash the terminal.\n\n### Test notes\n\nPure-seam tests: injected transport driving loss \u2192 reconnect \u2192 quiet-board and loss \u2192 reconnect \u2192 new-generation sequences, asserting full-repaint (baseline) frames and cleared catching_up/reconnecting state; frames-surface regression demonstrating a repaint after a simulated bounce. No real daemon/UDS in the fast tier.\n\n## Acceptance\n\n- [ ] The failing leg is named and documented in the Done summary with the reproducing test\n- [ ] Simulated bounce sequences (quiet-board and new-generation variants) converge to a full re-baseline repaint at the client seam, never a stale hold\n- [ ] A generation change across reconnect invalidates any resume and forces the snapshot path\n- [ ] The reconnecting indicator resolves on reconnect (repaint or explicit failure), covered by test\n- [ ] keeper fast suite green\n\n## Done summary\nConfirmed the failing leg is LOSS DETECTION: a steady-state subscribe client is idle (no in-flight query), so pollAll never probes a silently-dead/half-open socket and the viewer holds stale state forever. Fixed with an app-level liveness heartbeat (idle probe -> existing QUERY_TIMEOUT_MS reconnect) plus a per-daemon-boot generation epoch guard on the boot header that forces re-baseline across a bounce. Pure-seam tests cover the repro, quiet-board and new-generation bounce re-baseline, and the reconnecting-pill repaint.\n## Evidence\n",
+      "task_id": "fn-1199-viewer-resync-after-daemon-bounce.1",
+      "tier": "xhigh",
+      "title": "Repair viewer resync after bounce"
+    }
+  ],
+  "created_at": "2026-07-08T23:02:02.142000Z",
+  "epic_id": "fn-1199-viewer-resync-after-daemon-bounce",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "9683ed2d604b5eabdb49ec638263907f3d497af0bd96662f7e842f53d1c932de",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
