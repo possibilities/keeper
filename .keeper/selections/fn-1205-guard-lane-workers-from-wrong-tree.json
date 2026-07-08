@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Guard-class hook; fail-open invariants + realpath edge cases",
+      "task_id": "fn-1205-guard-lane-workers-from-wrong-tree.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:59:51.485000Z",
+  "epic_id": "fn-1205-guard-lane-workers-from-wrong-tree",
+  "input_hash": "f9b22114dbeb7363169f970288e878a73bbb1391e4cf807dbe342d94d72c3e25",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4189200660,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\".1\",\"tier\":\"xhigh\",\"model\":\"opus\"}]}"
+}
