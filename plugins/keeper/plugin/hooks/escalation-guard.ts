@@ -485,6 +485,20 @@ function gitConfigInjection(tokens: string[], boundary: number): string | null {
   return null;
 }
 
+/** True when `arg` is git's `--open-files-in-pager` exec alias in long form,
+ *  including any unambiguous abbreviation git parse-options accepts (`--open`,
+ *  `--open-f`, `--open-files`, … up to the full literal), in both bare and
+ *  glued-`=<cmd>` forms. Git accepts any unambiguous prefix down to `--open`, so
+ *  matching only the exact literal misses the abbreviations — every prefix of the
+ *  literal at least as long as `--open` opens matches in a caller-named program. */
+function isOpenFilesInPagerAbbrev(arg: string): boolean {
+  const eq = arg.indexOf("=");
+  const flag = eq === -1 ? arg : arg.slice(0, eq);
+  return (
+    flag.length >= "--open".length && "--open-files-in-pager".startsWith(flag)
+  );
+}
+
 /** Deny an exec-bearing or file-writing flag on an allowlisted READ subcommand —
  *  the vectors that turn a whitelisted read into arbitrary program execution or an
  *  arbitrary file write. `git grep --open-files-in-pager[=<cmd>]` (short alias
@@ -493,12 +507,14 @@ function gitConfigInjection(tokens: string[], boundary: number): string | null {
  *  lexer's redirect deny never sees it. Scans the post-subcommand args, stopping at
  *  a `--` (after which tokens are patterns/pathspecs, never flags).
  *
- *  `-O` is grep's exec alias only — for diff/log it is a benign order file — so the
- *  short form is scoped to grep. Git honors short-option bundling and `-O` takes an
- *  optional glued argument, so the alias reaches `--open-files-in-pager` buried in a
- *  cluster (`-nO<cmd>`/`-iO<cmd>`) whose token starts with a benign flag; the regex
- *  fires on a capital `O` ANYWHERE in a single-dash short-flag cluster — git grep's
- *  only capital-`O` short option is the exec alias, so this over-blocks nothing.
+ *  The long-form exec alias is matched by unambiguous-prefix (`isOpenFilesInPagerAbbrev`),
+ *  since git parse-options accepts any prefix down to `--open`. `-O` is grep's exec
+ *  alias only — for diff/log it is a benign order file — so the short form is scoped
+ *  to grep. Git honors short-option bundling and `-O` takes an optional glued
+ *  argument, so the alias reaches the exec option buried in a cluster
+ *  (`-nO<cmd>`/`-iO<cmd>`) whose token starts with a benign flag; the regex fires on
+ *  a capital `O` ANYWHERE in a single-dash short-flag cluster — git grep's only
+ *  capital-`O` short option is the exec alias, so this over-blocks nothing.
  *  Returns a deny reason or null. */
 function gitReadSubcommandExecFlag(
   subArgs: string[],
@@ -506,10 +522,7 @@ function gitReadSubcommandExecFlag(
 ): string | null {
   for (const arg of subArgs) {
     if (arg === "--") break;
-    if (
-      arg === "--open-files-in-pager" ||
-      arg.startsWith("--open-files-in-pager=")
-    ) {
+    if (isOpenFilesInPagerAbbrev(arg)) {
       return "git `--open-files-in-pager` opens matches in a caller-named program (arbitrary program execution from an allowlisted read subcommand)";
     }
     if (arg === "--output" || arg.startsWith("--output=")) {

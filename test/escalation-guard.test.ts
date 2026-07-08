@@ -148,6 +148,15 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     // program — `git grep --open-files-in-pager`/`-O` opens matches in a pager
     "git grep --open-files-in-pager=/tmp/evil pattern",
     "git grep -O/tmp/evil pattern",
+    // git parse-options accepts any unambiguous prefix of --open-files-in-pager
+    // (down to --open) as the same exec alias, in both glued-`=` and
+    // space-separated forms — the deny must match by prefix, not exact literal (F1)
+    "git grep --open=/tmp/evil",
+    "git grep --open-f=/tmp/evil",
+    "git grep --open-files=/tmp/evil",
+    "git grep --open-files-in=/tmp/evil pattern",
+    "git grep --open /tmp/evil",
+    "git grep --open-files /tmp/evil",
     // git's short-option bundling reaches the `-O` exec alias buried in a cluster
     // whose token STARTS with a benign flag (`-n`/`-i`/…) — the deny must catch a
     // capital `O` anywhere in a single-dash short-flag cluster (F1/F2)
