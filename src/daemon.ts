@@ -2248,6 +2248,15 @@ export function buildResolverBrief(args: {
   const parsed = parseMergeConflictReason(args.reason);
   const hasRepo = args.repoDir != null && args.repoDir !== "";
   const unstick = `to proceed, tell me exactly: whether to keep both sides, pick one, or how to reconcile them`;
+  // The foreign-staged guard shared by the abort and the concluding commit: a
+  // concurrent `keeper plan` mint can leave pathspec files staged in a shared checkout
+  // that neither a `git merge --abort` nor a whole-index commit may sweep. Identify by
+  // the merge's OWN set (`git diff HEAD MERGE_HEAD`), so a resolved-then-staged conflict
+  // file is never mistaken for foreign work.
+  const foreignStaged =
+    "a staged path in `git diff --cached --name-only` that is NOT in " +
+    "`git diff --name-only HEAD MERGE_HEAD` (this merge's own set — auto-merged plus " +
+    "the conflicts you resolved)";
   const guardrail = [
     `INTENT ARCHAEOLOGY — before you classify, read the PRIMARY SOURCES behind each`,
     `side, not just the conflict-marker diff text. For each conflicting commit, read`,
@@ -2280,6 +2289,8 @@ export function buildResolverBrief(args: {
   ];
   const blockedPath = [
     `IF NOT mechanically clear (or you are unsure):`,
+    `  - FIRST \`git restore --staged\` any FOREIGN staged path (${foreignStaged}),`,
+    `    leaving it in the tree, so the abort cannot destroy a concurrent commit's work.`,
     `  - \`git merge --abort\` to leave the lane CLEAN (the recover pass covers any`,
     `    residue); do NOT commit a half-merge.`,
     `  - Stamp BLOCKED with: the guardrail CATEGORY (state-machine / schema / security /`,
@@ -2311,8 +2322,10 @@ export function buildResolverBrief(args: {
       ``,
       `IF mechanically clear: resolve merging BOTH intents (never pick one side and`,
       `drop the other), run the epic's tests/build within a bounded budget (passing`,
-      `tests are necessary, not sufficient), commit the merge commit, then unstick the`,
-      `board: \`keeper autopilot retry close::${epic}\`, then EXIT (no \`play\` — you never paused).`,
+      `tests are necessary, not sufficient). Before committing, \`git restore --staged\``,
+      `any FOREIGN staged path (${foreignStaged}), leaving it in the tree, so the merge`,
+      `commit carries ONLY this merge's content. Commit the merge commit, then unstick`,
+      `the board: \`keeper autopilot retry close::${epic}\`, then EXIT (no \`play\` — you never paused).`,
       ``,
       ...blockedPath,
       ``,
@@ -2350,8 +2363,11 @@ export function buildResolverBrief(args: {
     ``,
     `  4a. IF mechanically clear: resolve merging BOTH intents — never pick one side`,
     `      and drop the other. Run the epic's tests/build within a bounded budget`,
-    `      (passing tests are necessary, not sufficient). Commit the merge commit, then`,
-    `      verify \`git branch --contains ${parsed.source}\` lists the base branch.`,
+    `      (passing tests are necessary, not sufficient). Before committing,`,
+    `      \`git restore --staged\` any FOREIGN staged path (${foreignStaged}), leaving`,
+    `      it in the tree, so the merge commit carries ONLY this merge's content. Commit`,
+    `      the merge commit, then verify \`git branch --contains ${parsed.source}\` lists`,
+    `      the base branch.`,
     `      Unstick the board and EXIT (no \`play\` — you never paused):`,
     `        keeper autopilot retry close::${epic}`,
     ``,

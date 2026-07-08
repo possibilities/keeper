@@ -8848,6 +8848,9 @@ function makeRecoveryGit(state: {
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
   linkedWorktreeAt?: Set<string>; // cwds whose git-dir ≠ common-dir → a linked lane (skipped by the sweep filter)
   probeErrorAt?: Set<string>; // cwds whose git-dir/common-dir probe exits nonzero → defer the repo this cycle
+  stagedPaths?: Map<string, string[]>; // cwd → `git diff --cached --name-only -z` paths (mid-merge staged set the abort would touch)
+  mergeTouchedPaths?: Map<string, string[]>; // cwd → `git diff --name-only -z HEAD MERGE_HEAD` paths (the merge's OWN set — auto-merged + resolved conflicts)
+  stagedProbeFailAt?: Map<string, number>; // cwd → non-zero exit for the `git diff --cached` staged-set probe (an inconclusive foreign-staged probe)
 }): {
   run: Parameters<typeof recoverWorktrees>[2];
   calls: { cwd: string; args: string; env?: Record<string, string> }[];
@@ -8893,6 +8896,28 @@ function makeRecoveryGit(state: {
       }
       state.mergeHeadAt?.delete(cwd);
       return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === "diff --cached --name-only -z") {
+      // The foreign-staged probe's staged-set read (held under the abort flock). A
+      // pinned non-zero exit models an inconclusive probe → the abort defers fail-safe.
+      const fail = state.stagedProbeFailAt?.get(cwd);
+      if (fail !== undefined && fail !== 0) {
+        return { code: fail, stdout: "", stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: (state.stagedPaths?.get(cwd) ?? []).join("\0"),
+        stderr: "",
+      };
+    }
+    if (joined === "diff --name-only -z HEAD MERGE_HEAD") {
+      // The merge's OWN set (auto-merged + resolved conflicts): any staged path outside
+      // it is FOREIGN. Only read when the staged set is non-empty.
+      return {
+        code: 0,
+        stdout: (state.mergeTouchedPaths?.get(cwd) ?? []).join("\0"),
+        stderr: "",
+      };
     }
     if (joined === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
       const present = state.autostashAt?.has(cwd) ?? false;
@@ -9624,6 +9649,168 @@ test("fn-1114 recoverWorktrees: a lock-timeout acquiring the flock for the main-
   expect(calls.some((c) => c.args === "merge --abort")).toBe(false);
   expect(failures).toHaveLength(1);
   expect(failures[0]?.reason).toContain("worktree-recover-lock-timeout");
+});
+
+test("fn-1193 recoverWorktrees: a keeper-owned main mid-merge with ONLY the merge's OWN paths staged (auto-merged / resolved-then-staged) still aborts — no foreign work to preserve", async () => {
+  // Under the abort flock the pass probes the staged set vs the merge's own set
+  // (`git diff HEAD MERGE_HEAD`). Every staged path here IS the merge's own — a
+  // resolved-then-staged conflict file and an auto-merged file — so there is no
+  // concurrent commit's work to lose: the abort proceeds exactly as before.
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    stagedPaths: new Map([["/repo", ["src/resolved.ts", "src/auto.ts"]]]),
+    mergeTouchedPaths: new Map([["/repo", ["src/resolved.ts", "src/auto.ts"]]]),
+    epicBases: [], // keep pass-2 a no-op; this case is only about the abort gate
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(failures).toEqual([]);
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(1);
+});
+
+test("fn-1193 recoverWorktrees: a keeper-owned main mid-merge with a FOREIGN staged path DEFERS the abort with a distinct worktree-recover-staged-foreign reason (the id-reservation incident: never destroy a concurrent commit's staged work)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    // A concurrent `keeper plan` mint staged its pathspec file; the merge itself never
+    // touched it, so it is FOREIGN — a git merge --abort would wipe it.
+    stagedPaths: new Map([
+      ["/repo", ["src/resolved.ts", ".keeper/epics/fn-42-x.json"]],
+    ]),
+    mergeTouchedPaths: new Map([["/repo", ["src/resolved.ts"]]]),
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  // The abort was DEFERRED — never run — so the foreign staged file survives.
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.epicId).toBeNull();
+  expect(failures[0]?.dir).toBe("/repo");
+  expect(failures[0]?.reason).toContain("worktree-recover-staged-foreign");
+  expect(failures[0]?.reason).toContain(".keeper/epics/fn-42-x.json");
+  // Distinct from the existing mid-merge / lock-timeout / abort-failed defer reasons.
+  expect(failures[0]?.reason).not.toContain("worktree-recover-mid-merge");
+  expect(failures[0]?.reason).not.toContain("worktree-recover-lock-timeout");
+  // Inside the recover prefix so the level-clear releases it once the staged work goes.
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
+});
+
+test("fn-1193 recoverWorktrees: once the FOREIGN staged path is unstaged, the next cycle aborts and the recover row level-clears (positive-evidence, never a stuck wedge)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  // ONE mutable state so cycle 1 (foreign present, defer — no abort, MERGE_HEAD stays)
+  // and cycle 2 (foreign unstaged, abort proceeds) share the same checkout.
+  const state = {
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    stagedPaths: new Map([
+      ["/repo", ["src/resolved.ts", ".keeper/epics/fn-42-x.json"]],
+    ]),
+    mergeTouchedPaths: new Map([["/repo", ["src/resolved.ts"]]]),
+    epicBases: [] as string[],
+    defaultBranch: "main",
+    repoHead: "main",
+  };
+  const { run, calls, lock } = makeRecoveryGit(state);
+  // Cycle 1: foreign staged → defer, no abort.
+  const c1 = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(0);
+  const stagedForeign = c1.failures.find((f) =>
+    f.reason.includes("worktree-recover-staged-foreign"),
+  );
+  expect(stagedForeign).toBeDefined();
+  const openId = recoverFailureDispatchId(
+    stagedForeign as WorktreeRecoveryFailure,
+  );
+  // The open row does NOT clear while the defer still fires (never-clear-what-fails).
+  expect(
+    recoverFailuresToClear(new Set([openId]), c1.failures, c1.resolved),
+  ).toEqual([]);
+
+  // Cycle 2: the concurrent commit landed / unstaged its file → abort proceeds.
+  state.stagedPaths = new Map([["/repo", ["src/resolved.ts"]]]);
+  const c2 = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.filter((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toHaveLength(1);
+  expect(
+    c2.failures.some((f) =>
+      f.reason.includes("worktree-recover-staged-foreign"),
+    ),
+  ).toBe(false);
+  // Positive evidence emitted for the dir + no fresh failure → the row level-clears.
+  expect(
+    recoverFailuresToClear(new Set([openId]), c2.failures, c2.resolved),
+  ).toEqual([openId]);
+});
+
+test("fn-1193 recoverWorktrees: an INCONCLUSIVE foreign-staged probe (git diff --cached fails) DEFERS the abort fail-safe — an unknown staged state is never a licence to destroy", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(["/repo"]),
+    pointsAtBranches: new Map([["/repo", [`refs/heads/${base}`]]]),
+    stagedProbeFailAt: new Map([["/repo", 1]]), // the staged-set read fails
+    epicBases: [],
+    defaultBranch: "main",
+    repoHead: "main",
+  });
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    lock,
+    undefined,
+    () => false,
+  );
+  expect(
+    calls.some((c) => c.cwd === "/repo" && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(failures).toHaveLength(1);
+  expect(failures[0]?.reason).toContain("worktree-recover-staged-probe");
+  expect(isWorktreeRecoverReason(failures[0]?.reason ?? "")).toBe(true);
 });
 
 test("fn-1140 recoverWorktrees pass-2: a foreign main-checkout wedge NO LONGER blocks the DONE base merge — pass-2 advances it via plumbing (the decoupling), and the foreign wedge is never aborted", async () => {

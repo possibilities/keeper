@@ -4961,6 +4961,76 @@ const defaultCommitWorkLockAcquirer: LockAcquirer = (lockPath) =>
   CommitWorkLock.acquireWithDeadline(lockPath);
 
 /**
+ * Probe the shared checkout `repo` (mid-merge, MERGE_HEAD=`mergeHead`) for FOREIGN
+ * staged paths — staged work OUTSIDE the merge's own change set that a
+ * `git merge --abort` would destroy (the id-reservation incident: a concurrent
+ * `keeper plan` mint stages its pathspec files, cannot commit them mid-merge, and the
+ * abort wipes them). The merge's OWN set is `git diff HEAD MERGE_HEAD` (auto-merged
+ * AND conflicted), so a resolved-then-staged conflict file never reads foreign; every
+ * staged path outside it is a concurrent commit's. Returns a `worktree-recover-*` DEFER
+ * failure when foreign paths are present OR either probe is inconclusive (fail-safe —
+ * an unknown staged state is never a licence to abort), else `null` (no foreign work →
+ * the caller aborts). Caller holds the commit-work flock.
+ */
+async function deferOnForeignStaged(
+  repo: string,
+  mergeHead: string,
+  run: WorktreeGitRunner,
+): Promise<WorktreeRecoveryFailure | null> {
+  const staged = await run(["diff", "--cached", "--name-only", "-z"], {
+    cwd: repo,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (staged.code !== 0) {
+    const how =
+      staged.code === GIT_SPAWN_TIMEOUT_CODE
+        ? "timed out"
+        : `failed exit ${staged.code}`;
+    return {
+      epicId: null,
+      reason: `worktree-recover-staged-probe: could not read the staged set for ${repo} (git diff --cached ${how}) mid-merge (MERGE_HEAD=${mergeHead}) — deferring the abort until the staged state is knowable`,
+      dir: repo,
+    };
+  }
+  const stagedPaths = staged.stdout.split("\0").filter((p) => p.length > 0);
+  if (stagedPaths.length === 0) {
+    return null; // nothing staged → the abort destroys no concurrent work
+  }
+  const touched = await run(
+    ["diff", "--name-only", "-z", "HEAD", "MERGE_HEAD"],
+    {
+      cwd: repo,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    },
+  );
+  if (touched.code !== 0) {
+    const how =
+      touched.code === GIT_SPAWN_TIMEOUT_CODE
+        ? "timed out"
+        : `failed exit ${touched.code}`;
+    return {
+      epicId: null,
+      reason: `worktree-recover-staged-probe: could not read the merge-touched set for ${repo} (git diff HEAD MERGE_HEAD ${how}) — cannot tell foreign staged work from the merge's own, deferring the abort`,
+      dir: repo,
+    };
+  }
+  const mergeTouched = new Set(
+    touched.stdout.split("\0").filter((p) => p.length > 0),
+  );
+  const foreign = stagedPaths.filter((p) => !mergeTouched.has(p));
+  if (foreign.length === 0) {
+    return null; // every staged path is the merge's own → safe to abort
+  }
+  const shown = foreign.slice(0, 5).join(", ");
+  const more = foreign.length > 5 ? `, +${foreign.length - 5} more` : "";
+  return {
+    epicId: null,
+    reason: `worktree-recover-staged-foreign: ${repo} is mid-merge with ${foreign.length} path(s) staged OUTSIDE the merge (${shown}${more}) — a concurrent commit's staged work a git merge --abort would destroy; deferring the abort until it is committed or unstaged`,
+    dir: repo,
+  };
+}
+
+/**
  * Recover a mid-merge in the SHARED MAIN checkout (`repo`, a standalone checkout) —
  * the wedge pass-1's lane loop cannot see (that loop filters to `keeper/epic/*`
  * linked lanes, and the main worktree is on the default branch). A keeper-initiated
@@ -4980,9 +5050,12 @@ const defaultCommitWorkLockAcquirer: LockAcquirer = (lockPath) =>
  * releases it once the checkout recovers. Guards, in order: a live `resolve::<epic>`
  * worker for ANY epic owning the MERGE_HEAD base excludes the abort (its in-progress
  * merge must never be raced — the same per-epic exclusion pass-1's lane loop honors);
- * a lock-timeout degrades to a defer, never a blind abort; a failed abort surfaces its
- * own `worktree-recover-abort-failed` reason (the un-cleared wedge). Only ever reached
- * while the board is PLAYING — the caller gates the whole recover sweep on `!paused`.
+ * a lock-timeout degrades to a defer, never a blind abort; foreign staged work OUTSIDE
+ * the merge's own set defers (`worktree-recover-staged-foreign`, via
+ * {@link deferOnForeignStaged}) so the abort never destroys a concurrent commit's
+ * staged files; a failed abort surfaces its own `worktree-recover-abort-failed` reason
+ * (the un-cleared wedge). Only ever reached while the board is PLAYING — the caller
+ * gates the whole recover sweep on `!paused`.
  * Returns a {@link WorktreeRecoveryFailure} to record, or `null` (clean, self-healed,
  * or resolver-excluded — nothing to escalate).
  */
@@ -5075,6 +5148,21 @@ async function recoverSharedCheckoutMidMerge(
     };
   }
   try {
+    // Foreign-staged DEFER — held UNDER the flock so a concurrent commit-work cannot
+    // stage/unstage between this probe and the abort. A concurrent `keeper plan` mint
+    // stages its pathspec files in this shared checkout and, mid-merge, cannot commit
+    // them ("cannot do a partial commit during a merge"), so they sit STAGED; a
+    // `git merge --abort` would DESTROY that staged work (the id-reservation incident).
+    // Before aborting, list the staged paths and subtract the ones the merge itself
+    // owns (`git diff HEAD MERGE_HEAD` — auto-merged AND conflicted, so a
+    // resolved-then-staged conflict file is NEVER counted foreign). Any residue is a
+    // concurrent commit's staged work: DEFER exactly like the inconclusive arms until
+    // it is committed or unstaged — never abort over it. A probe that fails/times out
+    // DEFERS too (an unknown staged state is never a licence to abort).
+    const foreignDefer = await deferOnForeignStaged(repo, mergeHead, run);
+    if (foreignDefer !== null) {
+      return foreignDefer;
+    }
     const abort = await run(["merge", "--abort"], {
       cwd: repo,
       timeoutMs: GIT_LOCAL_TIMEOUT_MS,
