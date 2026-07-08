@@ -99,9 +99,32 @@ interface FindingRef {
   status: string | null;
 }
 
-/** Deepest-first evaluation order; `lean` is the implicit floor needing no
- * thresholds, so it is not a policy-named band. */
-const DEPTH_RANK: readonly Exclude<DepthBand, "lean">[] = ["deep", "standard"];
+/** The `depth_bands` entry threshold keys `bandMatches` reads, in the exact
+ * property names `audit-policy.yaml` uses, paired with the `DepthSignals`
+ * field each measures against. `plugins/plan/scripts/audit-policy-check.ts`
+ * imports this same list to require these exact keys off every band it
+ * coerces, so the runtime consumer and the config's schema cannot silently
+ * diverge again — this pairing drifting apart is exactly how the F1 wiring
+ * bug shipped (the runtime read `min_tasks`/`min_diff_lines` while the file
+ * provided `min_task_count`/`min_diff_loc`). */
+export const DEPTH_BAND_THRESHOLD_KEYS = [
+  "min_task_count",
+  "min_diff_loc",
+  "min_touched_repos",
+] as const;
+
+const SIGNAL_FOR_THRESHOLD_KEY: Record<
+  (typeof DEPTH_BAND_THRESHOLD_KEYS)[number],
+  keyof DepthSignals
+> = {
+  min_task_count: "task_count",
+  min_diff_loc: "diff_lines",
+  min_touched_repos: "touched_repo_count",
+};
+
+function isDepthBand(value: unknown): value is DepthBand {
+  return value === "lean" || value === "standard" || value === "deep";
+}
 
 /** The plan plugin root (`plugins/plan/`), where the drift-gated config files
  * — model-selector.yaml, subagents.yaml, audit-policy.yaml — sit. Mirrors
@@ -135,22 +158,18 @@ export function readAuditPolicyDoc(policyPath: string): {
 }
 
 /** True when the policy band `entry` matches `signals`: a plain-object entry
- * with at least one numeric `min_*` threshold, every present threshold numeric
- * and met by its signal. A missing entry, a non-object, an empty band, or any
- * present-but-non-numeric threshold never matches (conservative bias-lean —
- * a malformed band must not over-claim depth). */
+ * with at least one numeric threshold from DEPTH_BAND_THRESHOLD_KEYS, every
+ * present threshold numeric and met by its paired signal. A missing entry, a
+ * non-object, an empty band, or any present-but-non-numeric threshold never
+ * matches (conservative bias-lean — a malformed band must not over-claim
+ * depth). */
 function bandMatches(entry: unknown, signals: DepthSignals): boolean {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
     return false;
   }
   const thresholds = entry as Record<string, unknown>;
-  const checks: [string, number][] = [
-    ["min_tasks", signals.task_count],
-    ["min_diff_lines", signals.diff_lines],
-    ["min_touched_repos", signals.touched_repo_count],
-  ];
   let constraints = 0;
-  for (const [key, value] of checks) {
+  for (const key of DEPTH_BAND_THRESHOLD_KEYS) {
     if (!(key in thresholds)) {
       continue;
     }
@@ -159,20 +178,21 @@ function bandMatches(entry: unknown, signals: DepthSignals): boolean {
       return false;
     }
     constraints += 1;
-    if (value < threshold) {
+    if (signals[SIGNAL_FOR_THRESHOLD_KEY[key]] < threshold) {
       return false;
     }
   }
   return constraints > 0;
 }
 
-/** Derive the depth band from `signals` and the parsed policy's `close_depth`
- * thresholds (a mapping keyed by band name → `min_tasks` / `min_diff_lines` /
- * `min_touched_repos`). Deepest-first: the first band whose every specified
- * minimum is met wins; none met → lean. Pure over (signals, doc): a null doc is
- * lean with no reason (the caller records the file-level reason), a doc with no
- * usable `close_depth` is lean with `policy_no_depth_bands`. The caller folds in
- * the file + numstat + finding reasons and forces lean on ANY degrade. */
+/** Derive the depth band from `signals` and the parsed policy's `depth_bands`
+ * list — richest-first entries of `{depth, min_task_count, min_diff_loc,
+ * min_touched_repos}` (see audit-policy.yaml). The first entry, in file order,
+ * whose every present threshold is met wins; none met → lean. Pure over
+ * (signals, doc): a null doc is lean with no reason (the caller records the
+ * file-level reason), a doc with no usable `depth_bands` is lean with
+ * `policy_no_depth_bands`. The caller folds in the file + numstat + finding
+ * reasons and forces lean on ANY degrade. */
 export function deriveDepthBand(
   signals: DepthSignals,
   policyDoc: Record<string, unknown> | null,
@@ -180,18 +200,17 @@ export function deriveDepthBand(
   if (policyDoc === null) {
     return { band: "lean", reasons: [] };
   }
-  const closeDepth = policyDoc.close_depth;
-  if (
-    closeDepth === null ||
-    typeof closeDepth !== "object" ||
-    Array.isArray(closeDepth)
-  ) {
+  const bands = policyDoc.depth_bands;
+  if (!Array.isArray(bands) || bands.length === 0) {
     return { band: "lean", reasons: ["policy_no_depth_bands"] };
   }
-  const bands = closeDepth as Record<string, unknown>;
-  for (const band of DEPTH_RANK) {
-    if (bandMatches(bands[band], signals)) {
-      return { band, reasons: [] };
+  for (const entry of bands) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const depth = (entry as Record<string, unknown>).depth;
+    if (isDepthBand(depth) && bandMatches(entry, signals)) {
+      return { band: depth, reasons: [] };
     }
   }
   return { band: "lean", reasons: [] };

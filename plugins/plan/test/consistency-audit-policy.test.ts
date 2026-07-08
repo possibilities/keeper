@@ -18,6 +18,7 @@ import {
   loadAuditPolicy,
 } from "../scripts/audit-policy-check.ts";
 import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { DEPTH_BAND_THRESHOLD_KEYS } from "../src/verbs/close_preflight.ts";
 
 const PLAN_ROOT = resolve(import.meta.dir, "..");
 
@@ -202,5 +203,36 @@ describe("audit-policy coercion", () => {
       ],
     };
     expect(() => coerceAuditPolicy(doc)).toThrow("min_task_count");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — runtime consumer / config key parity. Proves the coercion schema is
+// DERIVED from close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS rather than
+// an independently hand-maintained copy, so the two cannot silently diverge
+// again — this exact silent divergence (the runtime reading min_tasks/
+// min_diff_lines while the file provided min_task_count/min_diff_loc) is how
+// F1 shipped undetected.
+// ---------------------------------------------------------------------------
+
+describe("audit-policy ↔ runtime consumer key parity (F3)", () => {
+  test("a coerced depth_bands entry supplies exactly the runtime consumer's keys", () => {
+    const policy = coerceAuditPolicy(baseDoc());
+    const band = policy.depth_bands[0] as unknown as Record<string, unknown>;
+    expect(new Set(Object.keys(band))).toEqual(
+      new Set(["depth", ...DEPTH_BAND_THRESHOLD_KEYS]),
+    );
+  });
+
+  test("a depth_bands entry missing a key the runtime consumer reads fails loud", () => {
+    // Simulates the file drifting away from the consumer (or vice versa): drop
+    // one of close_preflight.ts's own threshold keys from an otherwise-valid
+    // entry and confirm coercion catches it rather than silently passing.
+    const [firstKey] = DEPTH_BAND_THRESHOLD_KEYS;
+    const doc = baseDoc();
+    const band = { ...(doc.depth_bands as Record<string, unknown>[])[0] };
+    delete band[firstKey];
+    doc.depth_bands = [band];
+    expect(() => coerceAuditPolicy(doc)).toThrow(firstKey);
   });
 });
