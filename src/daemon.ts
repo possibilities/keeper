@@ -1159,7 +1159,13 @@ export async function runBlockEscalationSweep(
       );
       outcome = "dispatch_failed";
     }
-    if (outcome === "at_cap" || outcome === "already_live") continue;
+    if (
+      outcome === "at_cap" ||
+      outcome === "already_live" ||
+      outcome === "checkout_busy"
+    ) {
+      continue;
+    }
     deps.mintRequested(row.epic_id, row.task_id);
     deps.mintAttempted(row.epic_id, row.task_id, outcome);
   }
@@ -1609,8 +1615,16 @@ export async function runRepairEscalationSweep(
       );
       outcome = "dispatch_failed";
     }
-    // A SKIP (`at_cap` / `already_live`) mints nothing — the row persists and re-sweeps.
-    if (outcome === "at_cap" || outcome === "already_live") continue;
+    // A SKIP (`at_cap` / `already_live` / `checkout_busy`) mints nothing — the row
+    // persists and re-sweeps. `checkout_busy` is structurally unreachable here (the
+    // per-checkout guard only gates the `deconflict` verb), but the shared dispatch
+    // outcome type carries it, so this stays exhaustive.
+    if (
+      outcome === "at_cap" ||
+      outcome === "already_live" ||
+      outcome === "checkout_busy"
+    )
+      continue;
     deps.mintDispatched(token, outcome);
   }
 
@@ -1665,13 +1679,16 @@ export type MergeHumanNotifiedOutcome = "notified" | "notify_failed";
 
 /** The result of one shared-helper escalation dispatch. `dispatched` /
  *  `dispatch_failed` are the two MINT outcomes ({@link MergeEscalationOutcome});
- *  `at_cap` (the global concurrency cap is saturated) and `already_live` (a
- *  `<verb>::<id>` session is already running, i.e. the mint fold has not caught up)
- *  are SKIP outcomes — no marker is minted and the row re-sweeps next tick. */
+ *  `at_cap` (the global concurrency cap is saturated), `already_live` (a
+ *  `<verb>::<id>` session is already running, i.e. the mint fold has not caught up),
+ *  and `checkout_busy` (a DIFFERENT merge-recreating escalation session already holds
+ *  the resolved base checkout) are SKIP outcomes — no marker is minted and the row
+ *  re-sweeps next tick. */
 export type EscalationDispatchOutcome =
   | MergeEscalationOutcome
   | "at_cap"
-  | "already_live";
+  | "already_live"
+  | "checkout_busy";
 
 /** Global cap on concurrent escalation sessions (`unblock::` + `deconflict::`
  *  combined). At cap the dispatch is SKIPPED — the row stays pending and re-sweeps —
@@ -1929,12 +1946,19 @@ export async function runMergeEscalationSweep(
       );
       outcome = "dispatch_failed";
     }
-    // A SKIP (`at_cap` / `already_live`) mints nothing: the marker stays NULL and the
-    // row re-sweeps next tick (at cap, or once the in-flight session folds). Only a
-    // real dispatch attempt (`dispatched` / `dispatch_failed`) mints — the fold stamps
-    // the once-marker ONLY on the terminal `dispatched`, so a `dispatch_failed` folds
-    // to a no-op and the row stays re-sweepable.
-    if (outcome === "at_cap" || outcome === "already_live") continue;
+    // A SKIP (`at_cap` / `already_live` / `checkout_busy`) mints nothing: the marker
+    // stays NULL and the row re-sweeps next tick (at cap, once the in-flight session
+    // folds, or once the occupied base checkout frees). Only a real dispatch attempt
+    // (`dispatched` / `dispatch_failed`) mints — the fold stamps the once-marker ONLY
+    // on the terminal `dispatched`, so a `dispatch_failed` folds to a no-op and the row
+    // stays re-sweepable.
+    if (
+      outcome === "at_cap" ||
+      outcome === "already_live" ||
+      outcome === "checkout_busy"
+    ) {
+      continue;
+    }
     deps.mintAttempted(row.id, outcome);
   }
 }
@@ -2130,6 +2154,13 @@ export async function runDeconflictHumanNotifySweep(
  *  `resolver_dispatched_at` once-marker (the reducer fold); `dispatch_failed` is
  *  NON-terminal — the row stays re-sweepable. */
 export type ResolverDispatchOutcome = "dispatched" | "dispatch_failed";
+
+/** What one resolver-dispatch attempt resolves to. `dispatched` / `dispatch_failed` are
+ *  the two MINT outcomes ({@link ResolverDispatchOutcome}); `checkout_busy` is a SKIP —
+ *  a DIFFERENT merge-recreating escalation session already holds the resolved base
+ *  checkout, so no marker is minted and the row re-sweeps once the checkout frees
+ *  (sibling of the shared dispatch path's {@link EscalationDispatchOutcome} skips). */
+export type ResolverDispatchResult = ResolverDispatchOutcome | "checkout_busy";
 
 /**
  * A sticky `worktree-merge-conflict` close failure that has NOT yet had a resolver
@@ -2330,10 +2361,12 @@ export interface ResolverDispatchSweepDeps {
   readonly stillPending: (id: string) => boolean;
   /** Launch ONE `resolve::<epic>` worker for the sticky row (into the epic lane, with
    *  the resolver brief as its prompt). Async + fail-open — every error degrades to
-   *  `dispatch_failed`, never throws into the sweep. */
+   *  `dispatch_failed`, never throws into the sweep. Returns the `checkout_busy` SKIP
+   *  when the resolved base checkout is already held by a live merge-recreating
+   *  escalation session, so the sweep re-sweeps it without minting. */
   readonly dispatchResolver: (
     row: PendingResolverDispatch,
-  ) => Promise<ResolverDispatchOutcome>;
+  ) => Promise<ResolverDispatchResult>;
   /** Mint a `ResolverDispatchAttempted{outcome}` synthetic event. The fold stamps
    *  `resolver_dispatched_at` ONLY on a terminal `dispatched`; it NEVER clears the
    *  sticky row — only `retry_dispatch` (`DispatchCleared`) does. */
@@ -2392,7 +2425,7 @@ export async function runResolverDispatchSweep(
     // nothing left to resolve — skip without minting.
     if (!deps.stillPending(row.id)) continue;
 
-    let outcome: ResolverDispatchOutcome;
+    let outcome: ResolverDispatchResult;
     try {
       outcome = await deps.dispatchResolver(row);
     } catch (err) {
@@ -2405,9 +2438,14 @@ export async function runResolverDispatchSweep(
       );
       outcome = "dispatch_failed";
     }
-    // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
-    // terminal `dispatched`, so a `dispatch_failed` folds to a no-op and the row stays
-    // re-sweepable next tick.
+    // A `checkout_busy` SKIP mints nothing: the resolved base checkout is held by a live
+    // merge-recreating escalation session, so the marker stays NULL and the row
+    // re-sweeps once that session terminates and frees the checkout (per checkout, never
+    // global — a different repo's checkout dispatches concurrently).
+    if (outcome === "checkout_busy") continue;
+    // Mint the attempt regardless of the remaining outcome: the fold stamps the
+    // once-marker ONLY on a terminal `dispatched`, so a `dispatch_failed` folds to a
+    // no-op and the row stays re-sweepable next tick.
     deps.mintAttempted(row.id, outcome);
   }
 }
@@ -2470,6 +2508,34 @@ export function escalationSessionLiveFor(
 ): boolean {
   for (const job of jobs) {
     if (job.plan_verb !== verb || job.plan_ref !== id) continue;
+    if (escalationJobLive(job)) return true;
+  }
+  return false;
+}
+
+/**
+ * Is `checkout` (a merge-conflict BASE checkout dir) currently OCCUPIED by a live
+ * MERGE-RECREATING escalation session — a `resolve::` or `deconflict::` job whose `cwd`
+ * is exactly that checkout? Both classes physically re-run the failing merge in the base
+ * checkout, so two of them sharing one checkout contend for its single working tree; the
+ * `unblock::` class runs in a task checkout and never recreates a merge, so it is neither
+ * an occupant here nor a gated candidate. Excludes the candidate's OWN `<verb>::<id>` key
+ * so a session never self-blocks (the per-key {@link escalationSessionLiveFor} guard owns
+ * that case). Empty `checkout` (an unresolved cwd) is never occupied — a false serialize
+ * that wedged an unresolvable launch would be worse than the contention it prevents. Pure
+ * over the passed rows; exported for tests.
+ */
+export function escalationCheckoutOccupiedBy(
+  jobs: readonly Job[],
+  checkout: string,
+  selfVerb: string,
+  selfId: string,
+): boolean {
+  if (checkout === "") return false;
+  for (const job of jobs) {
+    if (job.plan_verb !== "resolve" && job.plan_verb !== "deconflict") continue;
+    if (job.plan_verb === selfVerb && job.plan_ref === selfId) continue;
+    if (job.cwd !== checkout) continue;
     if (escalationJobLive(job)) return true;
   }
   return false;
@@ -2590,6 +2656,16 @@ export interface EscalationDispatchDeps {
   /** True iff a `<verb>::<id>` session is already live — the per-key occupancy guard.
    *  Production: {@link escalationSessionLiveFor} over the same reads. */
   readonly isEscalationLive: (verb: EscalationVerb, id: string) => boolean;
+  /** True iff `cwd` (the resolved base checkout) is already held by a DIFFERENT live
+   *  merge-recreating escalation session — the per-checkout occupancy guard that
+   *  serializes same-checkout escalations. Production: {@link escalationCheckoutOccupiedBy}
+   *  over the live jobs read PLUS the in-flight launch memo, gated to the merge-recreating
+   *  `deconflict` verb (an `unblock` candidate is never checkout-gated). */
+  readonly isCheckoutOccupied: (
+    verb: EscalationVerb,
+    id: string,
+    cwd: string,
+  ) => boolean;
   /** Resolve the escalation session's `{model, effort}` (DELEGATES to
    *  {@link resolveEscalationLaunchConfig} in production). */
   readonly resolveConfig: () => { model: string; effort: string };
@@ -2627,6 +2703,17 @@ export async function dispatchEscalationSession(
   if (deps.isEscalationLive(args.verb, args.id)) {
     note(`# escalation dispatch skipped — ${label} already live`);
     return "already_live";
+  }
+  // Per-checkout occupancy guard: a DIFFERENT merge-recreating escalation session already
+  // holds the resolved base checkout, so recreating the merge there would contend for the
+  // one working tree. Skip WITHOUT launching — the row re-sweeps and dispatches once the
+  // occupying session reaches a terminal state. Per checkout, never global: a session for
+  // a different repo's checkout dispatches concurrently.
+  if (deps.isCheckoutOccupied(args.verb, args.id, args.cwd)) {
+    note(
+      `# escalation dispatch skipped — checkout ${args.cwd} busy; ${label} stays pending`,
+    );
+    return "checkout_busy";
   }
   // Global cap: bound the total concurrent escalation sessions across BOTH verbs. At
   // cap the row stays pending and re-sweeps once a session frees a slot.
@@ -9112,12 +9199,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // terminal) or ages past its TTL (a never-folded launch), so it stays bounded and is
   // NEVER a fold input.
   const inFlightEscalations = new Map<string, number>();
+  // Producer-side memo of the resolved base CHECKOUT each merge-recreating escalation
+  // (`resolve::` / `deconflict::`) was launched into, keyed by `<verb>::<id>` label — the
+  // per-checkout occupancy guard's not-yet-folded arm (a launch's `jobs.cwd` folds SECONDS
+  // after launch, so a within-tick burst of same-checkout dispatches would otherwise all
+  // slip past the live-jobs probe). GC'd on the SAME rule as `inFlightEscalations` (folded
+  // into the widened jobs read OR aged past its TTL), so it stays bounded and is NEVER a
+  // fold input. `unblock::` launches never land here — they recreate no merge.
+  const inFlightCheckouts = new Map<string, { cwd: string; ts: number }>();
   function readLiveEscalationJobs(): Job[] {
     let jobs: Job[];
     try {
+      // `resolve` rides this read too (beyond the cap's `unblock`/`deconflict`): it is a
+      // merge-recreating occupant of a base checkout, so the per-checkout guard must see
+      // live resolvers. The cap count + per-key liveness filter to their own verbs, so
+      // the extra rows never inflate either.
       jobs = db
         .query(
-          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb IN ('unblock', 'deconflict', 'repair')",
+          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, cwd FROM jobs WHERE plan_verb IN ('resolve', 'unblock', 'deconflict', 'repair')",
         )
         .all() as unknown as Job[];
     } catch {
@@ -9126,14 +9225,39 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // dispatch, never a false over-count that wedges the cap).
       jobs = [];
     }
-    if (inFlightEscalations.size > 0) {
+    if (inFlightEscalations.size > 0 || inFlightCheckouts.size > 0) {
       const cutoff = Date.now() - INFLIGHT_ESCALATION_TTL_MS;
       const folded = new Set(jobs.map((j) => `${j.plan_verb}::${j.plan_ref}`));
       for (const [key, ts] of inFlightEscalations) {
         if (folded.has(key) || ts < cutoff) inFlightEscalations.delete(key);
       }
+      for (const [key, rec] of inFlightCheckouts) {
+        if (folded.has(key) || rec.ts < cutoff) inFlightCheckouts.delete(key);
+      }
     }
     return jobs;
+  }
+  // The per-checkout occupancy probe both merge-recreating dispatch paths consult: a
+  // DIFFERENT live `resolve::`/`deconflict::` session (folded into `jobs`, or still
+  // in-flight in the memo) already holds `checkout`. Excludes the candidate's own
+  // `<verb>::<id>` key so a session never self-blocks. Empty checkout → never occupied.
+  function escalationCheckoutOccupied(
+    selfVerb: string,
+    selfId: string,
+    checkout: string,
+  ): boolean {
+    if (checkout === "") return false;
+    const selfLabel = `${selfVerb}::${selfId}`;
+    // `readLiveEscalationJobs` GCs the in-flight memo first, so the two arms are disjoint
+    // (folded-live jobs + not-yet-folded launches).
+    const jobs = readLiveEscalationJobs();
+    if (escalationCheckoutOccupiedBy(jobs, checkout, selfVerb, selfId))
+      return true;
+    for (const [label, rec] of inFlightCheckouts) {
+      if (label === selfLabel) continue;
+      if (rec.cwd === checkout) return true;
+    }
+    return false;
   }
   // The owning-orchestrator jobs for an AUDIT_READY park — the `work::<task>` and
   // `close::<epic>` sessions that run (or re-dispatch) the audit and resume the
@@ -9164,6 +9288,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         escalationSessionLiveFor(jobs, verb, id)
       );
     },
+    // The per-checkout guard applies ONLY to the merge-recreating `deconflict` verb — an
+    // `unblock` session runs in a task checkout and recreates no merge, so it is never
+    // checkout-gated (the resolver's own path is gated in `dispatchResolver` directly).
+    isCheckoutOccupied: (verb, id, cwd) =>
+      verb === "deconflict" && escalationCheckoutOccupied(verb, id, cwd),
     resolveConfig: () => resolveEscalationLaunchConfig(),
     launch: async ({ spec, cwd, label }) => {
       const result = await keeperAgentLaunch({
@@ -9174,8 +9303,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         label,
         spec,
       });
-      // Record the just-launched key so the cap counts it until its jobs row folds.
-      if (result.ok) inFlightEscalations.set(label, Date.now());
+      // Record the just-launched key so the cap counts it until its jobs row folds. A
+      // `deconflict::` launch also records its base checkout so the per-checkout guard
+      // serializes a within-tick sibling before the jobs row folds; `unblock::` never
+      // recreates a merge, so it stays out of the checkout memo.
+      if (result.ok) {
+        inFlightEscalations.set(label, Date.now());
+        if (label.startsWith("deconflict::")) {
+          inFlightCheckouts.set(label, { cwd, ts: Date.now() });
+        }
+      }
       return { ok: result.ok };
     },
     noteLine: (line) => console.error(`[keeperd] ${line}`),
@@ -9895,7 +10032,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // independent. The launch cwd is the epic's base worktree (where the fan-in lives).
   async function dispatchResolver(
     row: PendingResolverDispatch,
-  ): Promise<ResolverDispatchOutcome> {
+  ): Promise<ResolverDispatchResult> {
     // The checkout where finalize ran the failing merge (the conflict lives there):
     // `mergeConflictBaseCheckout` maps a default-branch base to the repo root (the shared
     // default checkout, never laned) and a `keeper/epic/…` lane base to its worktree. A
@@ -9906,6 +10043,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       parsed != null && hasRepo
         ? mergeConflictBaseCheckout(row.dir as string, parsed.base)
         : (row.dir ?? "");
+    // Per-checkout occupancy guard: a DIFFERENT live merge-recreating escalation session
+    // (`resolve::`/`deconflict::`) already holds this base checkout, so recreating the
+    // merge here would contend for the one working tree. SKIP without launching — the row
+    // re-sweeps and dispatches once the occupying session terminates. Per checkout, never
+    // global: a resolver for a different repo's checkout dispatches concurrently.
+    if (escalationCheckoutOccupied("resolve", row.id, cwd)) {
+      console.error(
+        `[keeperd] # resolver dispatch skipped — checkout ${cwd} busy; resolve::${row.id} stays pending`,
+      );
+      return "checkout_busy";
+    }
     const spec: LaunchSpec = {
       prompt: buildResolverBrief({
         epicId: row.id,
@@ -9927,7 +10075,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // A launch failure (bad launcher / ENOENT cwd / non-zero exit) is NON-terminal:
     // the marker stays NULL and the row re-sweeps next tick, exactly like the
     // merge-escalation `send_failed`. A successful launch stamps the once-marker, so
-    // even a resolver that then declines or dies mints no second dispatch.
+    // even a resolver that then declines or dies mints no second dispatch — and records
+    // its base checkout so the per-checkout guard serializes a within-tick sibling
+    // before the resolver's jobs row folds.
+    if (result.ok) {
+      inFlightCheckouts.set(`resolve::${row.id}`, { cwd, ts: Date.now() });
+    }
     return result.ok ? "dispatched" : "dispatch_failed";
   }
 

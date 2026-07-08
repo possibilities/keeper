@@ -61,6 +61,7 @@ import {
   type EscalationDispatchOutcome,
   effectiveBlockEscalationRepo,
   epicHasLiveUnblock,
+  escalationCheckoutOccupiedBy,
   escalationSessionLiveFor,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
@@ -90,6 +91,7 @@ import {
   type RepairGroup,
   type RepairHumanNotifiedOutcome,
   type ResolverDispatchOutcome,
+  type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
   recoverOneDeadLetter,
   repairReasonFor,
@@ -5406,6 +5408,24 @@ test("runMergeEscalationSweep: an already_live skip (occupancy guard) mints NOTH
   expect(mints).toEqual([]);
 });
 
+test("runMergeEscalationSweep: a checkout_busy skip mints NOTHING (row re-sweeps once the base checkout frees)", async () => {
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    dispatch: async () => "checkout_busy",
+  });
+  await runMergeEscalationSweep(deps);
+  // The dispatch was attempted but skipped on occupancy — no once-marker minted, so the
+  // sticky row stays re-sweepable and dispatches once the occupying session terminates.
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([]);
+});
+
 test("runMergeEscalationSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
   const { deps, mints } = fakeMergeSweepDeps({
     pending: [
@@ -5928,7 +5948,7 @@ interface ResolverMintCall {
 function fakeResolverSweepDeps(opts: {
   pending: PendingResolverDispatch[];
   stillPending?: (id: string) => boolean;
-  dispatch?: (row: PendingResolverDispatch) => Promise<ResolverDispatchOutcome>;
+  dispatch?: (row: PendingResolverDispatch) => Promise<ResolverDispatchResult>;
   selectThrows?: boolean;
 }): {
   deps: ResolverDispatchSweepDeps;
@@ -6035,6 +6055,24 @@ test("runResolverDispatchSweep: a row cleared mid-sweep (stillPending false) is 
   expect(mints).toEqual([]);
 });
 
+test("runResolverDispatchSweep: a checkout_busy skip mints NOTHING (row re-sweeps once the base checkout frees)", async () => {
+  const { deps, mints, dispatches } = fakeResolverSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo",
+        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
+        dir: "/repo/root",
+      },
+    ],
+    dispatch: async () => "checkout_busy",
+  });
+  await runResolverDispatchSweep(deps);
+  // The resolver dispatch was attempted but the base checkout is held by another live
+  // escalation — no `resolver_dispatched_at` once-marker minted, so the row re-sweeps.
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([]);
+});
+
 test("runResolverDispatchSweep: an empty pending set is a no-op", async () => {
   const { deps, mints, dispatches } = fakeResolverSweepDeps({ pending: [] });
   await runResolverDispatchSweep(deps);
@@ -6060,6 +6098,21 @@ function escJob(planVerb: string, planRef: string, state: string): Job {
     plan_ref: planRef,
     state,
     backend_exec_pane_id: null,
+  } as unknown as Job;
+}
+
+function escJobCwd(
+  planVerb: string,
+  planRef: string,
+  state: string,
+  cwd: string | null,
+): Job {
+  return {
+    plan_verb: planVerb,
+    plan_ref: planRef,
+    state,
+    backend_exec_pane_id: null,
+    cwd,
   } as unknown as Job;
 }
 
@@ -6096,6 +6149,104 @@ test("escalationSessionLiveFor: matches a live session for the exact verb+id onl
       [escJob("unblock", "fn-8-idle.2", "stopped")],
       "unblock",
       "fn-8-idle.2",
+    ),
+  ).toBe(false);
+});
+
+test("escalationCheckoutOccupiedBy: a live deconflict in the SAME checkout occupies a different-epic candidate (same-repo serialization)", () => {
+  const jobs: Job[] = [
+    escJobCwd("deconflict", "fn-1-foo", "working", "/repo/root"),
+  ];
+  // A second same-repo escalation (different epic) resolving to the same shared checkout
+  // is blocked while the first is live.
+  expect(
+    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-2-bar"),
+  ).toBe(true);
+  expect(
+    escalationCheckoutOccupiedBy(jobs, "/repo/root", "resolve", "fn-2-bar"),
+  ).toBe(true);
+});
+
+test("escalationCheckoutOccupiedBy: a live resolve occupies the checkout too (both classes recreate the merge)", () => {
+  const jobs: Job[] = [
+    escJobCwd("resolve", "fn-1-foo", "working", "/repo/root"),
+  ];
+  expect(
+    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-2-bar"),
+  ).toBe(true);
+});
+
+test("escalationCheckoutOccupiedBy: a checkout in a DIFFERENT repo is free (per checkout, never global — cross-repo concurrency)", () => {
+  const jobs: Job[] = [
+    escJobCwd("deconflict", "fn-1-foo", "working", "/repo-a/root"),
+  ];
+  // The candidate's checkout is a different repo root → the two dispatch concurrently.
+  expect(
+    escalationCheckoutOccupiedBy(
+      jobs,
+      "/repo-b/root",
+      "deconflict",
+      "fn-2-bar",
+    ),
+  ).toBe(false);
+});
+
+test("escalationCheckoutOccupiedBy: an unblock session never occupies (it recreates no merge)", () => {
+  const jobs: Job[] = [
+    escJobCwd("unblock", "fn-1-foo.3", "working", "/repo/root"),
+  ];
+  expect(
+    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-2-bar"),
+  ).toBe(false);
+});
+
+test("escalationCheckoutOccupiedBy: the candidate's OWN key never self-blocks", () => {
+  const jobs: Job[] = [
+    escJobCwd("deconflict", "fn-1-foo", "working", "/repo/root"),
+  ];
+  expect(
+    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-1-foo"),
+  ).toBe(false);
+});
+
+test("escalationCheckoutOccupiedBy: a TERMINAL occupant frees the checkout (the deferred second re-sweeps and dispatches)", () => {
+  // The first escalation reached a terminal state → its checkout is free again, so the
+  // second (which deferred while it was live) now dispatches.
+  const ended: Job[] = [
+    escJobCwd("deconflict", "fn-1-foo", "ended", "/repo/root"),
+  ];
+  expect(
+    escalationCheckoutOccupiedBy(ended, "/repo/root", "deconflict", "fn-2-bar"),
+  ).toBe(false);
+  const killed: Job[] = [
+    escJobCwd("resolve", "fn-1-foo", "killed", "/repo/root"),
+  ];
+  expect(
+    escalationCheckoutOccupiedBy(
+      killed,
+      "/repo/root",
+      "deconflict",
+      "fn-2-bar",
+    ),
+  ).toBe(false);
+});
+
+test("escalationCheckoutOccupiedBy: an empty checkout (unresolved cwd) is never occupied, and a NULL job cwd never matches", () => {
+  expect(
+    escalationCheckoutOccupiedBy(
+      [escJobCwd("deconflict", "fn-1-foo", "working", "")],
+      "",
+      "deconflict",
+      "fn-2-bar",
+    ),
+  ).toBe(false);
+  // A live occupant with a null cwd cannot collide with a resolved candidate checkout.
+  expect(
+    escalationCheckoutOccupiedBy(
+      [escJobCwd("deconflict", "fn-1-foo", "working", null)],
+      "/repo/root",
+      "deconflict",
+      "fn-2-bar",
     ),
   ).toBe(false);
 });
@@ -6316,6 +6467,7 @@ test("resolveEscalationJobsFor: cross-instance classification — a stale stoppe
 function fakeEscalationDispatchDeps(opts: {
   countLive?: number;
   isLive?: boolean;
+  checkoutBusy?: boolean;
   launchOk?: boolean;
   launchThrows?: boolean;
   config?: { model: string; effort: string };
@@ -6327,6 +6479,7 @@ function fakeEscalationDispatchDeps(opts: {
   const deps: EscalationDispatchDeps = {
     countLiveEscalations: () => opts.countLive ?? 0,
     isEscalationLive: () => opts.isLive ?? false,
+    isCheckoutOccupied: () => opts.checkoutBusy ?? false,
     resolveConfig: () => opts.config ?? { model: "sonnet", effort: "high" },
     launch: async (args) => {
       if (opts.launchThrows) throw new Error("launch boom");
@@ -6398,6 +6551,80 @@ test("dispatchEscalationSession: an already-live session → already_live, launc
   });
   expect(outcome).toBe("already_live");
   expect(launches).toEqual([]);
+});
+
+test("dispatchEscalationSession: an occupied base checkout → checkout_busy, launch NOT called (the per-checkout serialization guard)", async () => {
+  const { deps, launches } = fakeEscalationDispatchDeps({
+    checkoutBusy: true,
+    // Under cap and not the same key live — only the per-checkout guard blocks.
+    countLive: 0,
+    isLive: false,
+  });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-2-bar",
+    prompt: "/plan:deconflict fn-2-bar",
+    cwd: "/repo/root",
+  });
+  expect(outcome).toBe("checkout_busy");
+  expect(launches).toEqual([]);
+});
+
+test("dispatchEscalationSession: the per-key already_live guard wins over a busy checkout", async () => {
+  // Both guards would fire; already_live is checked first (the specific-key short-circuit).
+  const { deps, launches } = fakeEscalationDispatchDeps({
+    isLive: true,
+    checkoutBusy: true,
+  });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-1-foo",
+    prompt: "/plan:deconflict fn-1-foo",
+    cwd: "/repo/root",
+  });
+  expect(outcome).toBe("already_live");
+  expect(launches).toEqual([]);
+});
+
+test("dispatchEscalationSession: the checkout guard wins over the cap (an occupied checkout skips before the cap is consulted)", async () => {
+  let capConsulted = false;
+  const launches: { spec: unknown; cwd: string; label: string }[] = [];
+  const deps: EscalationDispatchDeps = {
+    countLiveEscalations: () => {
+      capConsulted = true;
+      return MAX_LIVE_ESCALATION_SESSIONS;
+    },
+    isEscalationLive: () => false,
+    isCheckoutOccupied: () => true,
+    resolveConfig: () => ({ model: "sonnet", effort: "high" }),
+    launch: async (args) => {
+      launches.push(args);
+      return { ok: true };
+    },
+  };
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-2-bar",
+    prompt: "/plan:deconflict fn-2-bar",
+    cwd: "/repo/root",
+  });
+  expect(outcome).toBe("checkout_busy");
+  expect(launches).toEqual([]);
+  expect(capConsulted).toBe(false);
+});
+
+test("dispatchEscalationSession: a free checkout under cap dispatches normally (the guard is not a blanket block)", async () => {
+  const { deps, launches } = fakeEscalationDispatchDeps({
+    checkoutBusy: false,
+  });
+  const outcome = await dispatchEscalationSession(deps, {
+    verb: "deconflict",
+    id: "fn-1-foo",
+    prompt: "/plan:deconflict fn-1-foo",
+    cwd: "/repo/root",
+  });
+  expect(outcome).toBe("dispatched");
+  expect(launches.length).toBe(1);
 });
 
 test("dispatchEscalationSession: a THROWING launcher degrades to dispatch_failed (never throws)", async () => {
