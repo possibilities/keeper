@@ -1556,7 +1556,22 @@ export type RepairCandidateDropClass =
   | "not_blocked"
   | "reason_unreadable"
   | "non_repair_category"
-  | "empty_repo";
+  | "empty_repo"
+  | "empty_token";
+
+/**
+ * Emit a class-stable `# repair-candidate-drop` diagnostic. The sole emission path for
+ * that grep/alarm contract — every caller routes through here so `class` can never drift
+ * outside {@link RepairCandidateDropClass}.
+ */
+function emitRepairCandidateDrop(
+  note: (line: string) => void,
+  taskId: string,
+  cls: RepairCandidateDropClass,
+  detail: string,
+): void {
+  note(`# repair-candidate-drop task=${taskId} class=${cls} ${detail}`);
+}
 
 /**
  * Build the repair candidate set from the pending `SHARED_BASE_BROKEN` blocked tasks:
@@ -1579,7 +1594,7 @@ export function selectRepairCandidates(
     taskId: string,
     cls: RepairCandidateDropClass,
     detail: string,
-  ) => note(`# repair-candidate-drop task=${taskId} class=${cls} ${detail}`);
+  ) => emitRepairCandidateDrop(note, taskId, cls, detail);
   const out: RepairCandidate[] = [];
   for (const row of selectPendingBlockEscalations(db)) {
     if (row.runtime_status !== "blocked") {
@@ -1763,8 +1778,11 @@ export async function runRepairEscalationSweep(
   const groups = new Map<string, RepairGroup>();
   for (const c of [...candidates].sort(compareRepairCandidate)) {
     if (c.repo_token === "" || c.repo_dir === "") {
-      note(
-        `# repair-candidate-drop task=${c.task_id} class=empty_token repo_dir=${c.repo_dir || "null"}`,
+      emitRepairCandidateDrop(
+        note,
+        c.task_id,
+        "empty_token",
+        `repo_dir=${c.repo_dir || "null"}`,
       );
       continue;
     }

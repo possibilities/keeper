@@ -5343,14 +5343,17 @@ test("RepairCandidateDropClass: the class union is stable (alarm/grep contract)"
   // `empty_repo` is a defensive guard: since the reason-read keys on `project_dir`, a
   // readable reason implies a non-empty `project_dir`, which makes the effective repo
   // non-empty — so the gate cannot fire today, but the class stays part of the
-  // greppable contract in case the read seam ever changes.
+  // greppable contract in case the read seam ever changes. `empty_token` covers the
+  // sibling sweep-side gate: a candidate with an empty repo token or dir is dropped
+  // before it can be coalesced into a repair group.
   const classes: RepairCandidateDropClass[] = [
     "not_blocked",
     "reason_unreadable",
     "non_repair_category",
     "empty_repo",
+    "empty_token",
   ];
-  expect(classes.length).toBe(4);
+  expect(classes.length).toBe(5);
 });
 
 // ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------
