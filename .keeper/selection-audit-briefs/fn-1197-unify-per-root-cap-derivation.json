@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 66,
+        "files_changed": 2,
+        "insertions": 192
+      },
+      "done_summary": "Routed the client-side effective per-root cap through the one seam. The readiness snapshot now derives the effective cap from the folded autopilot_state via effectivePerRootCap \u2014 the same source as the reported stored intent + worktree mode, mirroring the server's loadReadinessInputs \u2014 instead of latching it off the boot-status header (a skew-prone second source that lagged the fold by a frame and minted the post-boot autopilot-change per_root 1<->2 flip). Boot and steady-state now report byte-identical effective values for identical {stored, worktree_mode}; stored intent stays distinctly readable. The boot-header field is still floored server-side and forwarded verbatim (no protocol change).",
+      "input_hash": "3eb21ab5349e1b9f162ea87d94d0220dae9801b35f24d15184d458ed70f19382",
+      "model": "opus",
+      "spec_chars": 4185,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/collections.ts, src/readiness-client.ts, cli/status.ts, cli/watch.ts, src/server-worker.ts, test/db.test.ts, test/status.test.ts, test/watch.test.ts, test/readiness-client.test.ts\n\n### Approach\n\nFind every producer and consumer of `max_concurrent_per_root` that bypasses `effectivePerRootCap`, including whichever boot-time emission produced the observed post-boot effective=stored flip, and route them all through the one seam. The contract: identical {stored, worktree_mode} inputs yield an identical effective value on every surface, at boot and in steady state, with the floor living only inside the seam. Where a surface deliberately exposes the stored intent (e.g. a `_stored` wire field), keep the two clearly distinct \u2014 the bug class is conflating them. For the boot-status client latch: if worktree state is not available at the latch site, prefer flooring server-side before emit over widening the header (older clients then heal without a protocol change). Determine empirically which direction the observed oscillation was wrong in (boot=2 vs steady=1 under worktree-on) and pin the correct semantics with the seam's existing definition as authority.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/db.ts:4521 \u2014 effectivePerRootCap, the seam; :4505 DEFAULT_MAX_CONCURRENT_PER_ROOT\n- src/server-worker.ts:2082-2100 \u2014 the steady-state publisher (already floors; note its warning about omitting worktree_mode from the SELECT)\n- src/readiness-client.ts:2249-2258 \u2014 fn-954 boot-status latch: latches boot.max_concurrent_per_root raw, no worktree consult\n- src/collections.ts:734, cli/status.ts:363, cli/watch.ts:332 \u2014 suspect unfloored seams\n\n**Optional** (reference as needed):\n- src/readiness-inputs.ts:143, cli/board.ts:829 \u2014 examples that floor correctly\n- src/daemon.ts:5990-6008 \u2014 set-autopilot-config mints the patch verbatim (stored intent) BY DESIGN; do not \"fix\" this seam\n\n### Risks\n\n- The boot-vs-steady disagreement direction is unconfirmed (which side is wrong under worktree-on); resolve from the seam definition before changing emission, not from the incident's surface reading.\n- Version skew: a new viewer against a briefly-old daemon mid-upgrade must not mis-latch \u2014 keep the absent-field fallback semantics documented at the latch.\n\n### Test notes\n\nRegression: a pure test driving both the boot-emission path and the steady-state path with the same {stored, worktree_mode} pairs (both modes) asserting byte-identical effective values; extend the existing suites rather than minting a new file.\n\n## Acceptance\n\n- [ ] Boot-time and steady-state emission produce identical effective per-root values for identical {stored, worktree_mode} inputs, proven by a regression test covering both worktree modes\n- [ ] No production code path reads the stored column as an effective value; all effective reads route through the derivation seam\n- [ ] The stored intent stays distinctly readable on surfaces that already expose it\n- [ ] keeper fast suite green\n\n## Done summary\nRouted the client-side effective per-root cap through the one seam. The readiness snapshot now derives the effective cap from the folded autopilot_state via effectivePerRootCap \u2014 the same source as the reported stored intent + worktree mode, mirroring the server's loadReadinessInputs \u2014 instead of latching it off the boot-status header (a skew-prone second source that lagged the fold by a frame and minted the post-boot autopilot-change per_root 1<->2 flip). Boot and steady-state now report byte-identical effective values for identical {stored, worktree_mode}; stored intent stays distinctly readable. The boot-header field is still floored server-side and forwarded verbatim (no protocol change).\n## Evidence\n- Commits: f0d14836\n- Tests: test/readiness-client.test.ts: new fn-1197 boot-vs-steady regression (both worktree modes, boot-header-ignored, stored-stays-distinct) + fn-1015 tests updated to fold-derived semantics; keeper fast suite green (bun run test: 0 fail, 7693 + 80 opentui); biome lint clean (419 files)",
+      "task_id": "fn-1197-unify-per-root-cap-derivation.1",
+      "tier": "xhigh",
+      "title": "Route per-root cap through one seam"
+    }
+  ],
+  "created_at": "2026-07-08T22:19:27.121000Z",
+  "epic_id": "fn-1197-unify-per-root-cap-derivation",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "3eb21ab5349e1b9f162ea87d94d0220dae9801b35f24d15184d458ed70f19382",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
