@@ -62,5 +62,5 @@ bare mock frames without a boot field keep painting.
 - [ ] New unit coverage exercises every latch transition and the backstop lifecycle with mock socket and fake timers
 
 ## Done summary
-
+Added a per-connection catching-up value-latch to the shared subscribe client (subscribeMulti), surfaced via a new onCatchingUp transition callback and threaded through subscribeCollection/subscribeReadiness, plus a slow backstop refetch of one idle collection while latched (disarmed on clear/teardown/dispose, no timer leak). Headless consumers are unaffected.
 ## Evidence
