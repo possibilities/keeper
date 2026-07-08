@@ -224,6 +224,118 @@
     "exit_code": 0
   },
   {
+    "target_relative": "workers/opus-low/.claude-plugin/plugin.json",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/.claude-plugin/plugin.json",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/agents/worker.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/agents/worker.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/agents/worker.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/opus-low/agents/worker.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
     "target_relative": "workers/opus-max/.claude-plugin/plugin.json",
     "on": "read",
     "envelope_raw": {
@@ -547,6 +659,566 @@
   },
   {
     "target_relative": "workers/opus-xhigh/agents/worker.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/.claude-plugin/plugin.json",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/.claude-plugin/plugin.json",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/agents/worker.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/agents/worker.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/agents/worker.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-high/agents/worker.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/.claude-plugin/plugin.json",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/.claude-plugin/plugin.json",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/agents/worker.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/agents/worker.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/agents/worker.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-low/agents/worker.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/.claude-plugin/plugin.json",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/.claude-plugin/plugin.json",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/agents/worker.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/agents/worker.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/agents/worker.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-max/agents/worker.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/.claude-plugin/plugin.json",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/.claude-plugin/plugin.json",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/agents/worker.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/agents/worker.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/agents/worker.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-medium/agents/worker.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/.claude-plugin/plugin.json",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/.claude-plugin/plugin.json",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/.claude-plugin/plugin.json.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. keeper prompt regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/agents/worker.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/agents/worker.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. keeper prompt overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/agents/worker.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: keeper prompt render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "workers/sonnet-xhigh/agents/worker.md.managed-file-dont-edit",
     "on": "write",
     "envelope_raw": {
       "marked": true,
