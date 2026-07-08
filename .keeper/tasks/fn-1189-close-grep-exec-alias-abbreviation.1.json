@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Deny grep exec-alias abbreviations",
-  "updated_at": "2026-07-08T03:12:54.269000Z"
+  "updated_at": "2026-07-08T06:07:25.280000Z",
+  "worker_done_at": "2026-07-08T06:07:25.280000Z"
 }

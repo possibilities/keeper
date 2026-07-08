@@ -30,5 +30,5 @@ Files:
       `git grep --open-files=/tmp/evil` are denied
 
 ## Done summary
-
+Match git's --open-files-in-pager exec alias by unambiguous prefix (--open … full literal) in gitReadSubcommandExecFlag, closing the read-subcommand arbitrary-exec bypass; added deny-case tests for --open=/--open-f=/--open-files= abbreviations in glued and space-separated forms.
 ## Evidence
