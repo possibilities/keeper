@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 14,
+        "files_changed": 2,
+        "insertions": 102
+      },
+      "done_summary": "Corrected the false 'no fold reads its body' rationale for the Stop clause of RETENTION_NULL_TOLERANT_KEEP_PREDICATE (kept the exemption): documented that a final Stop's background_tasks feed jobs.monitors, a byte-identical charter projection, and why the NULLed-body monitors->'[]' divergence is a benign, cheap-header-indistinguishable drop-when-dead. Added a cursor=0 re-fold pinning test proving the divergence and that countAbsentBlobs stays exempt.",
+      "input_hash": "32fc4b3472306caa159e184567aaf3aff97130ad5155b83afa1e8f5248a01281",
+      "model": "opus",
+      "spec_chars": 2702,
+      "spec_md": "## Description\n\nOriginating findings: F1 (kept) and F2 (merged-into-F1) from the\nfn-1186 audit. At commit 033e4bc8 the Stop fold in `src/reducer.ts:8608`\ndoes `JSON.parse(event.data)` -> `computeMonitors(...)` -> `UPDATE jobs SET\nmonitors = ?`. `computeMonitors`'s own doc (`src/reducer.ts` ~line 9678)\ndeclares `jobs.monitors` \"byte-identical across re-folds\", and\n`test/refold-equivalence.test.ts:3552` pins it in the from-scratch re-fold\ncharter (`:3480`: the FINAL per-session Stop is the surviving one, so there\nis no later Stop to re-derive it). Yet `RETENTION_NULL_TOLERANT_KEEP_PREDICATE`\nin `src/compaction.ts` lists `Stop` as a class \"whose body no fold reads\" \u2014\nfalse for a final Stop, blinding `countAbsentBlobs` on a charter fold input\nexactly where a stray NULLing write / corrupt restore would ALSO cause a\ncursor-0 re-fold divergence (`monitors` -> `'[]'`).\n\nPick one remedy and make the code and its justification agree:\n- Narrow: drop `Stop` from `RETENTION_NULL_TOLERANT_KEEP_PREDICATE` so the\n  sentinel keeps flagging a NULL Stop body (its body is a charter input); or\n- Keep + correct: leave the exemption but replace the \"no fold reads its\n  body\" rationale (in the predicate doc-comment in `src/compaction.ts`) with\n  a statement that the Stop body feeds `jobs.monitors` (a byte-identical\n  charter projection) and why a final-Stop `'[]'` divergence is acceptable.\n\nFiles: `src/compaction.ts` (predicate + `countAbsentBlobs` doc),\n`test/compaction.test.ts` (pinning test); consult `src/reducer.ts` (Stop\nfold, `computeMonitors`) and `test/refold-equivalence.test.ts` for the\ncharter shape.\n\n## Acceptance\n\n- [ ] The Stop clause no longer rests on a false re-fold-safety claim \u2014\n      `Stop` is either removed from the exemption or its justification is\n      corrected to name `jobs.monitors` as the charter projection its body\n      feeds and why the divergence is benign.\n- [ ] A pinning test in `test/compaction.test.ts` NULLs a final-Stop body\n      carrying live `background_tasks` monitors and re-folds (cursor=0),\n      asserting the chosen behavior (sentinel flags it, or the\n      `monitors -> '[]'` divergence is proven benign).\n- [ ] `bun test` green (root + plan suites unaffected).\n\n## Done summary\nCorrected the false 'no fold reads its body' rationale for the Stop clause of RETENTION_NULL_TOLERANT_KEEP_PREDICATE (kept the exemption): documented that a final Stop's background_tasks feed jobs.monitors, a byte-identical charter projection, and why the NULLed-body monitors->'[]' divergence is a benign, cheap-header-indistinguishable drop-when-dead. Added a cursor=0 re-fold pinning test proving the divergence and that countAbsentBlobs stays exempt.\n## Evidence\n",
+      "task_id": "fn-1191-fix-stop-exemption-in-retention-data.1",
+      "tier": "high",
+      "title": "Fix Stop retention sentinel exemption"
+    }
+  ],
+  "created_at": "2026-07-08T06:38:54.221000Z",
+  "epic_id": "fn-1191-fix-stop-exemption-in-retention-data",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "32fc4b3472306caa159e184567aaf3aff97130ad5155b83afa1e8f5248a01281",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
