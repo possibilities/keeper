@@ -446,6 +446,202 @@ test("fn-671 regression: T1 done+approved with session-still-working; T2 depends
   );
 });
 
+// ---------------------------------------------------------------------------
+// fn-1200: proven-dead owning-worker latch for the terminal-completed gate.
+//
+// A done task's `completed` verdict must not oscillate with sibling-session
+// liveness churn. In the incident a completed task flapped completed↔running
+// while its OWN worker job sat `stopped` (never terminalized to killed/ended,
+// so its orphaned open-turn subagent rows were never swept), and that lingering
+// GHOST subagent — re-read on every projection tick a sibling worker on the
+// shared lane produced — held the verdict off `completed`. Once the owning
+// worker is PROVEN dead (recorded pid re-proved gone — `provenDeadJobIds`, the
+// SAME lifecycle verdict the slot reaper reclaims on), its ghost subagent /
+// monitor liveness no longer un-completes the task. A mere `stopped` (NOT
+// proven-dead) owning job still holds (conservative, never earlier-firing), and
+// a genuinely re-activated owning job re-surfaces (no permanent task-id latch).
+// ---------------------------------------------------------------------------
+
+// Threads the fn-1200 `provenDeadJobIds` set (computeReadiness's 11th param)
+// with everything between defaulted, so a test asserts the terminal-gate latch
+// in isolation.
+function runProvenDead(
+  epics: Epic[],
+  subs: SubagentInvocation[],
+  provenDeadJobIds: ReadonlySet<string>,
+  now: number = Number.NEGATIVE_INFINITY,
+) {
+  return computeReadiness(
+    epics,
+    new Map(),
+    subs,
+    new Map(),
+    now,
+    [],
+    undefined,
+    new Set<string>(),
+    1,
+    new Map(),
+    provenDeadJobIds,
+  );
+}
+
+test("fn-1200: done task, proven-dead owning worker + ghost running sub-agent → completed (ghost no longer holds)", () => {
+  // The incident shape: worker-1 did the work, is `stopped`, and left an
+  // orphaned `running` sub-agent whose SubagentStop never landed (a stopped
+  // row's open-turn subs are not swept). Pre-fn-1200 this read
+  // `running:sub-agent-running` forever; once worker-1 is proven dead the ghost
+  // is ignored and the task collapses to `completed`.
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const ghostSub = [makeSub({ job_id: "worker-1", status: "running" })];
+  const snap = runProvenDead([epic], ghostSub, new Set(["worker-1"]));
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+});
+
+test("fn-1200: the completed verdict is STABLE across repeated derivations with churning sibling liveness", () => {
+  // The oscillation guard. Same done + proven-dead worker, but each derivation
+  // sees a DIFFERENT sibling-liveness slice (a sibling worker on the shared lane
+  // spawning/finishing sub-agents) AND the owning worker's own ghost sub toggles
+  // running↔unknown. The owning task's verdict must stay `completed` every time —
+  // sibling churn never re-attributes to the proven-dead owner.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const provenDead = new Set(["worker-1"]);
+  // Each element is one projection tick's sub-agent slice: churning sibling
+  // ("sibling-2") activity, plus the owner's own ghost row flipping status.
+  const churn: SubagentInvocation[][] = [
+    [makeSub({ job_id: "worker-1", status: "running" })],
+    [
+      makeSub({ job_id: "worker-1", status: "running" }),
+      makeSub({ job_id: "sibling-2", status: "running" }),
+    ],
+    [makeSub({ job_id: "worker-1", status: "unknown" })],
+    [
+      makeSub({ job_id: "sibling-2", status: "running", turn_seq: 3 }),
+      makeSub({ job_id: "worker-1", status: "running", turn_seq: 4 }),
+    ],
+    [],
+  ];
+  for (const subs of churn) {
+    const snap = runProvenDead([epic], subs, provenDead);
+    expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+  }
+});
+
+test("fn-1200 control: a merely-stopped (NOT proven-dead) owning worker still holds at sub-agent-running", () => {
+  // The done-AND-idle bar is not weakened: absent a proven-dead verdict, a
+  // stopped worker's running sub-agent keeps holding exactly as pre-fn-1200 (the
+  // fn-671 hold), so `completed` never fires EARLIER than today. Asserted with an
+  // EMPTY set AND with a set naming only an UNRELATED sibling job — the latch is
+  // scoped to the OWNING job, never a global toggle.
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const sub = [makeSub({ job_id: "worker-1", status: "running" })];
+  expect(
+    runProvenDead([epic], sub, new Set()).perTask.get(task.task_id),
+  ).toEqual(running({ kind: "sub-agent-running" }));
+  expect(
+    runProvenDead([epic], sub, new Set(["sibling-9"])).perTask.get(
+      task.task_id,
+    ),
+  ).toEqual(running({ kind: "sub-agent-running" }));
+});
+
+test("fn-1200: a genuinely re-activated owning job surfaces running even while listed proven-dead (no permanent latch)", () => {
+  // Terminality is a one-way latch on the OWNING JOB, never on the task id: a
+  // still-`working` owning job holds the verdict off `completed` regardless of a
+  // stale `provenDeadJobIds` membership, because the working clause reads the
+  // FULL job set (a proven-dead set is stopped-only, so this is defence-in-depth).
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = runProvenDead([epic], [], new Set(["worker-1"]));
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+test("fn-1200: proven-dead owning worker's live worker-monitor no longer holds a done task", () => {
+  // The monitor-wake-churn arm of the same fix: a backgrounded worker monitor
+  // fact on a proven-dead owning job is a ghost lease and must not hold the done
+  // task at `running:monitor-running`. Control (empty set) keeps the fn-719 hold.
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        state: "stopped",
+        has_live_worker_monitor: true,
+      }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  expect(
+    runProvenDead([epic], [], new Set()).perTask.get(task.task_id),
+  ).toEqual(running({ kind: "monitor-running" }));
+  expect(
+    runProvenDead([epic], [], new Set(["worker-1"])).perTask.get(task.task_id),
+  ).toEqual({ tag: "completed" });
+});
+
+test("fn-1200: only the proven-dead job's liveness is dropped — a live sibling worker on the SAME task still holds", () => {
+  // Selective exclusion: a re-dispatched task carries two work jobs. The first
+  // (dead-1) is proven dead with a ghost sub; the second (live-2) is stopped but
+  // NOT proven dead and carries a real running sub. The live job's sub-agent
+  // still holds the task, so it stays `running` — the fix drops ONLY the ghost.
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [
+      makeEmbeddedJob({ job_id: "dead-1", state: "stopped" }),
+      makeEmbeddedJob({ job_id: "live-2", state: "stopped" }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [
+    makeSub({ job_id: "dead-1", status: "running" }),
+    makeSub({ job_id: "live-2", status: "running" }),
+  ];
+  const snap = runProvenDead([epic], subs, new Set(["dead-1"]));
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("fn-1200: a proven-dead upstream done task reads terminal, so a dependent unblocks (predicate 8)", () => {
+  // The fix propagates through the dep resolver: predicate 8 asks each upstream's
+  // OWN terminal-completed state, which now honors the proven-dead latch. So a
+  // downstream depending on a done+proven-dead task (ghost sub and all) reads
+  // `ready`, not `blocked:dep-on-task`.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const t2 = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    depends_on: ["fn-1-foo.1"],
+  });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const ghostSub = [makeSub({ job_id: "worker-1", status: "running" })];
+  const snap = runProvenDead([epic], ghostSub, new Set(["worker-1"]));
+  expect(snap.perTask.get(t1.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+});
+
 test("fn-889 regression: forward depends_on (upstream evaluated later) resolves order-independently", () => {
   // The fn-889 incident: a refined epic where tasks 2/3/4 `depends_on` the
   // HIGHER-numbered tasks 6/7/8 (all done). Pre-fix, predicate 8 read the
