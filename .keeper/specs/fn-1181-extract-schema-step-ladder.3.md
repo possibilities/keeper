@@ -43,5 +43,5 @@ structure, no incident narration outside the ADR.
 - [ ] CONTEXT.md defines the three terms with Avoid lines and zero implementation detail
 
 ## Done summary
-
+Added ADR 0022 for the explicit-version schema step ladder, amended ADR 0020's Status with a partial-supersession note, rewrote CLAUDE.md's Migrations bullet net-negative to the ladder reality, and added CONTEXT.md glossary entries for Migration ladder, Additive-idempotent step, and Schema singleton.
 ## Evidence
