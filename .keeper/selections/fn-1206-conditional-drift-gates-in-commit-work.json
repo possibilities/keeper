@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Wiring existing checks via documented staged-path routing precedent",
+      "task_id": "fn-1206-conditional-drift-gates-in-commit-work.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:59:51.692000Z",
+  "epic_id": "fn-1206-conditional-drift-gates-in-commit-work",
+  "input_hash": "05a354084b2e5f0da91e5761972d758c78aff43f59c20a2fc0f4e773c8ba7fb9",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 94589960,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\".1\",\"tier\":\"high\",\"model\":\"sonnet\"}]}"
+}
