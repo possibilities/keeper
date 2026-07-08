@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fix Stop retention sentinel exemption",
-  "updated_at": "2026-07-08T06:08:03.105000Z"
+  "updated_at": "2026-07-08T06:35:48.860000Z",
+  "worker_done_at": "2026-07-08T06:35:48.860000Z"
 }

@@ -39,5 +39,5 @@ charter shape.
 - [ ] `bun test` green (root + plan suites unaffected).
 
 ## Done summary
-
+Corrected the false 'no fold reads its body' rationale for the Stop clause of RETENTION_NULL_TOLERANT_KEEP_PREDICATE (kept the exemption): documented that a final Stop's background_tasks feed jobs.monitors, a byte-identical charter projection, and why the NULLed-body monitors->'[]' divergence is a benign, cheap-header-indistinguishable drop-when-dead. Added a cursor=0 re-fold pinning test proving the divergence and that countAbsentBlobs stays exempt.
 ## Evidence
