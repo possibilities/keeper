@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A fail-closed security guard bypass (arbitrary-exec vector) is a hard opus gate under the hand_tuned policy regardless of size, with high effort matching the fully-specified single-surface fix.",
+      "task_id": "fn-1192-lower-grep-exec-alias-abbreviation-floor.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T06:16:18.972000Z",
+  "epic_id": "fn-1192-lower-grep-exec-alias-abbreviation-floor",
+  "input_hash": "d33fc0feff56974a3fc8f25234c5b017015118e2918220827710f2d6ed0711b2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3544170750,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"A fail-closed security guard bypass (arbitrary-exec vector) is a hard opus gate under the hand_tuned policy regardless of size, with high effort matching the fully-specified single-surface fix.\",\"confidence\":0.8}]}"
+}
