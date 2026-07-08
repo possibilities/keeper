@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Finalize merge-push gating + new family registration + memoization",
+      "task_id": "fn-1204-gate-finalize-on-merge-suite.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T23:59:51.282000Z",
+  "epic_id": "fn-1204-gate-finalize-on-merge-suite",
+  "input_hash": "366fcce51c3cb9a4c8eb500f09e95f1685c9713343bebfba032b5b53c85a2066",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 913296613,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\".1\",\"tier\":\"xhigh\",\"model\":\"opus\"}]}"
+}
