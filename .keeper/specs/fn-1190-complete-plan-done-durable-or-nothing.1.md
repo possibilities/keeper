@@ -36,5 +36,5 @@ summary-preservation, reading the existing `## Evidence` section on the
 - [ ] Test covers a heal whose own re-commit also fails mid-merge (the idempotent restore-to-already-done no-op).
 
 ## Done summary
-
+Fixed F1 (onCommitFailure now unstages the three state paths' index to HEAD via a new restoreIndexToHead facade method, so a mid-merge partial-commit refusal leaves no staged half-stamp) and F2 (a --evidence-less self-heal preserves the ## Evidence section and runtime overlay evidence). Added a real-git slow-tier test proving the clean-index unwind plus fast-tier evidence-preservation and heal-recommit-fails coverage.
 ## Evidence
