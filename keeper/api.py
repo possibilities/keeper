@@ -439,6 +439,9 @@ from pathlib import Path
 # ``dispatch_failures.instance_event_id`` INTEGER columns (the escalation-session
 # block-instance binding) via a plain additive ALTER; keeper-py reads neither, so
 # only the version whitelist gains 114.
+# v115 (fn-1173 task .4) appends the nullable ``dispatch_failures.repair_dispatched_at``
+# REAL once-marker (the repair-dispatch latch) via a plain additive ALTER; keeper-py
+# never reads ``dispatch_failures``, so only the version whitelist gains 115.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
