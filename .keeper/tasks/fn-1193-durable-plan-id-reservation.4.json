@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Durable id ledger allocation",
-  "updated_at": "2026-07-08T06:26:13.259000Z"
+  "updated_at": "2026-07-08T12:52:09.325000Z",
+  "worker_done_at": "2026-07-08T12:52:09.325000Z"
 }

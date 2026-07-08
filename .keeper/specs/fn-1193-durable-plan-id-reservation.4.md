@@ -65,5 +65,5 @@ naming both ids.
 - [ ] CLAUDE.md carries the allocation and sole-writer guardrails within the lint size gate, or the epic's Docs gaps note records why they did not fit
 
 ## Done summary
-
+Added a durable host-local id ledger (id_ledger.ts) consulted at all three mint sites so allocation is max(scan, ledger)+1 — destroying a minted epic's/task's files can no longer free its number. Added a same-project bare-number guard reusing id_collision; every ledger IO failure fails soft to scan-only.
 ## Evidence
