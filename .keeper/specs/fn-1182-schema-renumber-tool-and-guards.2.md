@@ -44,5 +44,5 @@ editing for internal consistency.
 - [ ] No surface still asserts an unconditional "schema = BLOCKED" or "no schema edits" without the carve-out
 
 ## Done summary
-
+All three resolver-authority surfaces (buildResolverBrief guardrail, autopilot skill, deconflict skill) now carry the same schema-version-collision carve-out: tool exit 0 = mechanically clear, refusal or a schema SHAPE decision stays BLOCKED. buildResolverBrief tests updated and green.
 ## Evidence
