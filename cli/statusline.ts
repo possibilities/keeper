@@ -23,7 +23,6 @@ const TINTY_SCHEMES_DIR = join(
 );
 const KEEPER_LANE_PREFIX = "keeper/epic/";
 const LANE_GLYPH = "⑂";
-const PROFILE_ICON_BASE_OUTLINE = 0xf03a3;
 const CONTEXT_GLYPH = "\uf295";
 const NETWORK_GLYPH = "\uf0ec";
 
@@ -239,20 +238,13 @@ export function compactKeeperLane(branch: string): string {
   return `${LANE_GLYPH} ${compactEpic}--${compactPlanId(taskId)}`;
 }
 
-function accountIcon(account: string): string {
+function accountLabel(account: string): string {
   if (account === "") {
     return "";
   }
   const n =
     account === "default" ? "0" : account.match(/^multi-claude-(\d+)$/)?.[1];
-  if (n === undefined) {
-    return account;
-  }
-  return Array.from(n, (digit) =>
-    String.fromCodePoint(
-      PROFILE_ICON_BASE_OUTLINE + Number.parseInt(digit, 10) * 3,
-    ),
-  ).join("");
+  return n === undefined ? account : `c${n}`;
 }
 
 function resolveActiveProfile(env: NodeJS.ProcessEnv): string {
@@ -372,19 +364,23 @@ export function renderStatusline(
   if ((env.ANTHROPIC_BASE_URL ?? "").startsWith("http://127.0.0.1:")) {
     statusChunks.push(`${theme.account}${NETWORK_GLYPH}`);
   }
-  const profile = accountIcon(activeProfile);
-  if (profile !== "") {
-    statusChunks.push(`${theme.account}${profile}`);
-  }
+  const profile = accountLabel(activeProfile);
 
   if (input.version !== "") {
     let versionSeg = `${theme.version}${input.version}`;
     if (statusChunks.length > 0) {
       versionSeg += ` ${statusChunks.join(" ")}`;
     }
+    if (profile !== "") {
+      versionSeg += `${theme.sep} ∕ ${theme.account}${profile}`;
+    }
     parts += `${sep}${versionSeg}`;
-  } else if (statusChunks.length > 0) {
-    parts += `${sep}${statusChunks.join(" ")}`;
+  } else if (statusChunks.length > 0 || profile !== "") {
+    const chunks = [...statusChunks];
+    if (profile !== "") {
+      chunks.push(`${theme.account}${profile}`);
+    }
+    parts += `${sep}${chunks.join(" ")}`;
   }
 
   return `${parts}${theme.reset}`;

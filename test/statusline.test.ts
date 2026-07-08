@@ -12,8 +12,8 @@ import { runSink, type StatuslineLeaf } from "../cli/statusline-sink";
 
 const LANE_GLYPH = "⑂";
 const SEP = "∕";
-const NF0_OUTLINE = "\u{f03a3}";
-const NF1_OUTLINE = "\u{f03a6}";
+const PROFILE_DEFAULT = "c0";
+const PROFILE_ONE = "c1";
 const NETWORK_GLYPH = "";
 
 function stripAnsi(s: string): string {
@@ -72,7 +72,7 @@ describe("statusline render", () => {
     );
 
     expect(plain).toBe(
-      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${NF0_OUTLINE}`,
+      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${SEP} ${PROFILE_DEFAULT}`,
     );
     expect(plain).not.toContain("❘");
     expect(plain).not.toContain("·");
@@ -121,9 +121,9 @@ describe("statusline render", () => {
       }),
     );
 
-    expect(plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${NF1_OUTLINE}`)).toBe(
-      true,
-    );
+    expect(
+      plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} ${PROFILE_ONE}`),
+    ).toBe(true);
   });
 
   test("help is a non-empty machine-command description", () => {
