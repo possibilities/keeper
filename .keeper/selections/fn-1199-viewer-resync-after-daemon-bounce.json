@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Three candidate failing legs + epoch-guard invariant + possible backward-compatible wire emission",
+      "task_id": "fn-1199-viewer-resync-after-daemon-bounce.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-08T20:57:58.268000Z",
+  "epic_id": "fn-1199-viewer-resync-after-daemon-bounce",
+  "input_hash": "9683ed2d604b5eabdb49ec638263907f3d497af0bd96662f7e842f53d1c932de",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2525228333,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1199-viewer-resync-after-daemon-bounce.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"confidence\":0.83}]}"
+}
