@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 3,
+        "files_changed": 2,
+        "insertions": 6
+      },
+      "done_summary": "Realigned the close SKILL docs and problem-codes to the audit-brief skip contract; landed on\nmain as 58770eed. Board state reconciled by the operator: the done stamp's git commit was\nlost to the same concurrent-merge window while the daemon projection recorded done; this\ncommit restores the durable backing.",
+      "input_hash": "687015db58a08d0a89e477c3f494c42e57d1b80a52e6982fca378e9bc832fe1e",
+      "model": "sonnet",
+      "spec_chars": 1774,
+      "spec_md": "## Description\n\nFixes finding F1 (kept) with F2 merged in \u2014 both trace to source task .1\nchanging `selection-audit-brief` to return `{success:true, skipped:true}` on\nan existing brief and stop emitting `REVIEW_EXISTS`. Verified on the epic\nbranch: `git show <epic-tip>:plugins/plan/src/verbs/selection_audit_brief.ts`\nhas zero `REVIEW_EXISTS` and returns the skipped envelope at the write-once\nguard.\n\nFiles to edit:\n- `plugins/plan/skills/close/SKILL.md` (F1) \u2014 Phase 3.6a branch table (~line 234): replace the unreachable `REVIEW_EXISTS` branch with a `skipped:true` (success) branch that logs `already captured (re-close)`, so the re-close idempotence path is no longer mislabeled `no auditable cells` by the empty-`auditable_task_ids` branch.\n- `docs/problem-codes.md` (F2) \u2014 the `REVIEW_EXISTS` row (~line 172): scope \"emitted by\" to `selection-review-submit` only and note the audit-brief's idempotent-skip in the section prose.\n\n## Acceptance\n\n- [ ] The close SKILL documents a `skipped:true` branch (logs `already captured (re-close)`) and no longer lists a `REVIEW_EXISTS` outcome for `selection-audit-brief`.\n- [ ] `docs/problem-codes.md`'s `REVIEW_EXISTS` row lists only `selection-review-submit` as an emitter; the audit-brief's skip behavior is described in prose.\n- [ ] No source (`.ts`) behavior change \u2014 docs only.\n\n## Done summary\n\nRealigned the close SKILL docs and problem-codes to the audit-brief skip contract; landed on\nmain as 58770eed. Board state reconciled by the operator: the done stamp's git commit was\nlost to the same concurrent-merge window while the daemon projection recorded done; this\ncommit restores the durable backing.\n\n## Evidence\n\n- main commit 58770eed (docs(plan): realign close SKILL + problem-codes to audit-brief skip contract)\n",
+      "task_id": "fn-1178-realign-close-docs-to-audit-brief-skip.1",
+      "tier": "low",
+      "title": "Align close docs with skip envelope"
+    }
+  ],
+  "created_at": "2026-07-08T02:20:31.685000Z",
+  "epic_id": "fn-1178-realign-close-docs-to-audit-brief-skip",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "687015db58a08d0a89e477c3f494c42e57d1b80a52e6982fca378e9bc832fe1e",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
