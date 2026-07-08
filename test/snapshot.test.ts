@@ -16,6 +16,7 @@
 import { expect, test } from "bun:test";
 import {
   createSnapshotLatch,
+  formatMetaLine,
   formatNoFrameOutput,
   formatSnapshotOutput,
   KEEPER_META_PREFIX,
@@ -263,6 +264,7 @@ function sampleMeta(overrides: Partial<SnapshotMeta> = {}): SnapshotMeta {
     lifecycle: "/tmp/keeper-git.4242.lifecycle.txt",
     meta: "/tmp/keeper-git.4242.meta.txt",
     ts: "2026-06-10T00:00:00.000Z",
+    catching_up: null,
     ...overrides,
   };
 }
@@ -300,6 +302,37 @@ test("formatSnapshotOutput: frame text, labeled lines, then a parseable keeper-m
   expect(parsed.status).toBe("ok");
   expect(parsed.frame).toBe(1);
   expect(parsed.truncated).toBe(false);
+  expect(parsed.catching_up).toBeNull();
+});
+
+test("formatSnapshotOutput: catching_up round-trips true/false explicitly", () => {
+  expect(
+    parseTrailer(
+      formatSnapshotOutput({
+        frameText: "row",
+        meta: sampleMeta({ catching_up: true }),
+      }),
+    ).catching_up,
+  ).toBe(true);
+  expect(
+    parseTrailer(
+      formatSnapshotOutput({
+        frameText: "row",
+        meta: sampleMeta({ catching_up: false }),
+      }),
+    ).catching_up,
+  ).toBe(false);
+});
+
+test("formatMetaLine: an omitted catching_up defaults to null on the wire", () => {
+  const { catching_up: _omit, ...withoutField } = sampleMeta();
+  const parsed = JSON.parse(
+    formatMetaLine(withoutField as SnapshotMeta).slice(
+      KEEPER_META_PREFIX.length,
+    ),
+  ) as Record<string, unknown>;
+  expect(parsed).toHaveProperty("catching_up");
+  expect(parsed.catching_up).toBeNull();
 });
 
 test("formatSnapshotOutput: truncated:true (timeout-degrade) round-trips", () => {
@@ -330,6 +363,7 @@ test("formatNoFrameOutput: diagnostic on stderr, frame:null keeper-meta: on stdo
   expect(parsed.frame).toBeNull();
   expect(parsed.status).toBe("timeout");
   expect(parsed.state).toBeNull();
+  expect(parsed.catching_up).toBeNull();
 });
 
 test("snapshotExitCode: frame → 0, no frame → 1", () => {

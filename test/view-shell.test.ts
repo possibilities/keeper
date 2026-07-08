@@ -806,7 +806,8 @@ test("snapshot: first ready composite prints frame + keeper-meta: line, exits 0"
   expect(trailer.status).toBe("ok");
   expect(trailer.frame).toBe(1);
   expect(trailer.truncated).toBe(false);
-  expect(trailer.schema_version).toBe(1);
+  // 2: SNAPSHOT_SCHEMA_VERSION as of the catching_up field's addition.
+  expect(trailer.schema_version).toBe(2);
   expect(typeof trailer.state).toBe("string");
 });
 
@@ -1236,7 +1237,8 @@ test("frames: envelopes carry monotonic contiguous seq + the freshest cursor", (
   expect(recs.map((r) => r.seq)).toEqual([0, 1, 2]);
   expect(recs.map((r) => r.cursor)).toEqual(["42", "42", "43"]);
   expect(recs.every((r) => r.view === "board")).toBe(true);
-  expect(recs.every((r) => r.schema_version === 1)).toBe(true);
+  // 2: FRAMES_SCHEMA_VERSION as of the catching_up field's addition.
+  expect(recs.every((r) => r.schema_version === 2)).toBe(true);
 });
 
 test("frames: max-frames bound terminates with a trailer as the final line", () => {
