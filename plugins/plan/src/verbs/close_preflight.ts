@@ -104,9 +104,7 @@ interface FindingRef {
  * field each measures against. `plugins/plan/scripts/audit-policy-check.ts`
  * imports this same list to require these exact keys off every band it
  * coerces, so the runtime consumer and the config's schema cannot silently
- * diverge again — this pairing drifting apart is exactly how the F1 wiring
- * bug shipped (the runtime read `min_tasks`/`min_diff_lines` while the file
- * provided `min_task_count`/`min_diff_loc`). */
+ * diverge again. */
 export const DEPTH_BAND_THRESHOLD_KEYS = [
   "min_task_count",
   "min_diff_loc",

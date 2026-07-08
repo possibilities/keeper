@@ -16,8 +16,7 @@
 // close_preflight.ts's own DEPTH_BAND_THRESHOLD_KEYS (imported, not
 // re-declared), so a key the runtime close-audit consumer stops reading — or
 // the file stops providing — fails coercion loud instead of silently
-// diverging (this drifting apart, undetected, is exactly how the F1 wiring
-// bug shipped).
+// diverging.
 //
 // The check core (`checkAuditPolicy`) is a pure function over already-loaded data
 // so the fast suite drives its failure modes in-process; `--check` wires it to
@@ -102,7 +101,7 @@ function asString(raw: unknown, label: string): string {
  * Threshold keys come from DEPTH_BAND_THRESHOLD_KEYS — close_preflight.ts's own
  * runtime read-list, imported rather than re-declared — so a key the consumer
  * stops reading, or the file stops providing, fails this coercion loud instead
- * of silently diverging (F1). */
+ * of silently diverging. */
 function coerceDepthBand(raw: unknown, label: string): DepthBand {
   const doc = asMapping(raw, label);
   const depth = asString(doc.depth, `${label}.depth`);
