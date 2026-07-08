@@ -7,7 +7,7 @@
     "fn-1174-fix-close-audit-depth-band-wiring"
   ],
   "id": "fn-1187-strip-provenance-narration-from-depth",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-08T02:39:45.693000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T02:39:44.356000Z"
+  "updated_at": "2026-07-08T02:39:45.693000Z"
 }
