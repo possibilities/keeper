@@ -5076,8 +5076,10 @@ export async function runPackageSuiteGate(
  * The production {@link MergeSuiteProbe}: provision a detached scratch worktree at the
  * prospective merged commit, run the root fast suite there (plus the plan suite when
  * the merge touches `plugins/plan`), and classify green / red / cannot-run. Runs
- * INLINE on the reconcile worker (a producer git+suite side effect, never a fold);
- * the scratch worktree is reaped on EVERY path. NEVER throws — any unexpected error
+ * INLINE on the single-flight reconcile drive (a producer git+suite side effect,
+ * never a fold) — an accepted, bounded tradeoff for a default-OFF feature, with the
+ * full rationale at the `runMergeSuite` dep wiring (the `ConfirmRunningDeps` object). The
+ * scratch worktree is reaped on EVERY path. NEVER throws — any unexpected error
  * folds to `cannot-run` (a retry-skip), never a silent push. `run`/`worktreesRoot`/
  * `spawnFn` are injectable seams; production passes `gitExec`, the default root,
  * and the real `spawn`.
@@ -7761,9 +7763,29 @@ function main(): void {
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
     // same `isEpicDoneById` the recover glue threads into `worktree.recover`.
     isEpicDone: (epicId) => isEpicDoneById(db, epicId),
-    // The merge-suite gate probe: finalize runs the fast suite against the prospective
-    // merged commit on a scratch worktree BEFORE local default advances (fn-1204).
-    // Real git + a real inline suite run (a producer side effect, never a fold).
+    // The merge-suite gate probe: before local default advances, finalize runs the
+    // fast suite against the prospective merged commit on a detached scratch worktree.
+    // Real git + a real suite run (a producer side effect, never a fold).
+    //
+    // This runs INLINE on the single-flight reconcile drive: a green worktree-mode
+    // close pauses board-wide dispatch/recover/escalation for the suite's whole
+    // duration (the root suite, plus the plan suite on a plugins/plan merge). That
+    // inline block is an ACCEPTED, bounded tradeoff, not an oversight:
+    //   - worktree mode is default-OFF and opt-in, so only an operator who enabled it
+    //     ever pays this; the default single-checkout autopilot never runs the gate.
+    //   - the cost is paid at most once per successful close — the verdict is memoized
+    //     per prospective-merged OID (`mergeSuiteMemo`), so a parked/retried finalize
+    //     reuses it and never re-runs the suite.
+    //   - it is a board-progress PAUSE, never a liveness/crash risk: the await sits in
+    //     the autopilot WORKER thread over async git subprocesses, stalling neither the
+    //     serve sockets nor the main event loop, so no watchdog fatalExit fires.
+    //   - the correctness isolation is already in place — the suite runs OUTSIDE the
+    //     commit-work flock, on exactly the deterministic OID `mergeLaneBaseIntoDefault`
+    //     advances to; only the drive-occupancy cost is inline.
+    // Revisit if worktree mode goes default-ON or concurrent multi-epic closes become
+    // common: move the run off the drive behind a result-leaf store keyed on the
+    // prospective-merged OID (the baseline runner's idiom, whose scratch worktrees this
+    // gate already shares) and have finalize read the leaf instead of awaiting inline.
     runMergeSuite: (a) => runMergeSuiteGate(a),
   };
 
