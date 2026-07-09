@@ -190,8 +190,12 @@ import { seedKilledSweep } from "../src/seed-sweep";
 import {
   type CensusConnView,
   censusConns,
+  type FanoutCursor,
   isDaemonSelfConn,
   isPidAlive,
+  MAX_SUBS_PER_TICK,
+  newFanoutCursor,
+  sliceFanout,
 } from "../src/server-worker";
 import type { Event, Job } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
@@ -1544,6 +1548,7 @@ function makeCensusConn(o: {
   pending?: boolean;
   everEngaged?: boolean;
   connectedAt?: number;
+  lastActivityAt?: number;
 }): CensusConnView {
   const subs = new Map<string | null, unknown>();
   for (let i = 0; i < (o.subs ?? 0); i++) subs.set(String(i), {});
@@ -1554,6 +1559,9 @@ function makeCensusConn(o: {
       subs: subs as unknown as CensusConnView["data"]["subs"],
       everEngaged: o.everEngaged ?? false,
       connectedAt: o.connectedAt ?? 0,
+      // Default fresh (== NOW at the census call sites below), so a conn is
+      // `subAbandoned` only when a test explicitly ages its inbound activity.
+      lastActivityAt: o.lastActivityAt ?? 1_000_000,
     },
   };
 }
@@ -1582,9 +1590,12 @@ test("censusConns: the daemon's own conns land in a distinct self bucket, apart 
     selfPid: SELF,
     nowMs: NOW,
     unengagedTtlMs: TTL,
+    subscribedSilenceTtlMs: 45_000,
     isPidAlive: (pid) => pid === 5000,
   });
   // Hand-computed from the fixtures above (independent of the implementation).
+  // Every subscribed fixture defaults `lastActivityAt` to NOW (fresh) → none
+  // abandoned; the dedicated aging test below covers `subAbandoned`.
   expect(c).toEqual({
     total: 10,
     self: 3,
@@ -1595,7 +1606,138 @@ test("censusConns: the daemon's own conns land in a distinct self bucket, apart 
     subLive: 2,
     subDead: 1,
     subUnknown: 1,
+    subAbandoned: 0,
   });
+});
+
+test("censusConns: a subscribed conn inbound-silent past the heartbeat ceiling counts as sub_abandoned; a fresh-heartbeat board never does", () => {
+  const SELF = 4242;
+  const NOW = 2_000_000;
+  const SILENCE_TTL = 45_000;
+  const conns: CensusConnView[] = [
+    // Abandoned-but-alive: subscribed, peer alive, inbound-silent 60s > 45s.
+    makeCensusConn({ peerPid: 5000, subs: 1, lastActivityAt: NOW - 60_000 }),
+    // Fresh heartbeat (5s ago < 45s): a legitimately-quiet live board — SAFE,
+    // never reaped, never counted abandoned even though it is silent.
+    makeCensusConn({ peerPid: 5000, subs: 1, lastActivityAt: NOW - 5_000 }),
+    // Exactly at the ceiling counts (>=), independent of peer liveness: a
+    // subscribed conn whose peer probe is unavailable is still abandonable.
+    makeCensusConn({
+      peerPid: null,
+      subs: 2,
+      lastActivityAt: NOW - SILENCE_TTL,
+    }),
+    // Zero-sub silent conn is OUT of scope — the idle/unengaged arms own it, so
+    // an old lastActivityAt here must NOT count as sub_abandoned.
+    makeCensusConn({ peerPid: 5000, subs: 0, lastActivityAt: NOW - 600_000 }),
+    // Self-probe subscribed + silent: exempt (self bucket), never abandoned.
+    makeCensusConn({ peerPid: SELF, subs: 1, lastActivityAt: NOW - 600_000 }),
+  ];
+  const c = censusConns(conns, {
+    selfPid: SELF,
+    nowMs: NOW,
+    unengagedTtlMs: 30_000,
+    subscribedSilenceTtlMs: SILENCE_TTL,
+    isPidAlive: (pid) => pid === 5000,
+  });
+  // Hand-computed: 2 abandoned (the 60s sub_live + the at-ceiling sub_unknown);
+  // the 5s-fresh board, the zero-sub conn, and the self-probe are all excluded.
+  expect(c.subAbandoned).toBe(2);
+  expect(c.subLive).toBe(2); // the 60s + the 5s conns (both peer 5000, subscribed)
+  expect(c.subUnknown).toBe(1); // the null-peer subscribed conn
+  expect(c.zeroSub).toBe(1);
+  expect(c.self).toBe(1);
+  expect(c.total).toBe(5);
+});
+
+// -- sliceFanout: bounded per-tick fan-out + round-robin anti-starvation --------
+
+test("sliceFanout: below-budget set serves every unit and resets the cursor (no-op bound)", () => {
+  const units = [0, 1, 2, 3];
+  const cursor = newFanoutCursor();
+  cursor.value = 3; // even a non-zero cursor is ignored when the budget covers all
+  const slice = sliceFanout(units, cursor, 10);
+  expect(slice.serve).toEqual([0, 1, 2, 3]);
+  expect(slice.deferred).toBe(0);
+  expect(cursor.value).toBe(0);
+});
+
+test("sliceFanout: an empty set serves nothing and resets the cursor", () => {
+  const cursor = newFanoutCursor();
+  cursor.value = 5;
+  const slice = sliceFanout<number>([], cursor, 4);
+  expect(slice.serve).toEqual([]);
+  expect(slice.deferred).toBe(0);
+  expect(cursor.value).toBe(0);
+});
+
+test("sliceFanout: over-budget set serves a bounded window and advances the cursor round-robin", () => {
+  const units = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const cursor = newFanoutCursor();
+  // Tick 1: [0,1,2], cursor → 3.
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([0, 1, 2]);
+  expect(cursor.value).toBe(3);
+  // Tick 2: [3,4,5], cursor → 6.
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([3, 4, 5]);
+  expect(cursor.value).toBe(6);
+  // Tick 3: [6,7,8], cursor → 9.
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([6, 7, 8]);
+  expect(cursor.value).toBe(9);
+  // Tick 4: wraps — [9,0,1], cursor → 2. Every unit served within 4 = ceil(10/3).
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([9, 0, 1]);
+  expect(cursor.value).toBe(2);
+});
+
+test("sliceFanout: every unit is serviced within ceil(N/budget) ticks from ANY starting cursor, and no tick exceeds the budget", () => {
+  // The anti-starvation guarantee, proven over a fake unit set for a spread of
+  // (N, budget) shapes and every starting offset — the property the serve loop
+  // relies on so a deferred subscription can never be starved.
+  for (const n of [7, 10, 16, 33, 64, 100]) {
+    for (const budget of [1, 3, 8, 13, 64]) {
+      if (budget >= n) continue; // the no-op-bound case, covered above
+      const bound = Math.ceil(n / budget);
+      const units = Array.from({ length: n }, (_, i) => i);
+      for (const startOffset of [0, 1, budget, n - 1]) {
+        const cursor = newFanoutCursor();
+        cursor.value = startOffset;
+        // Track, per unit, the last tick it was served; assert no gap exceeds
+        // `bound`. Prime "last served" at -1 so a unit unseen through the first
+        // `bound` ticks trips the gap check.
+        const lastServed = new Array<number>(n).fill(-1);
+        // Run enough ticks to observe steady-state gaps well past one wrap.
+        for (let tick = 0; tick < bound * 3; tick++) {
+          const slice = sliceFanout(units, cursor, budget);
+          expect(slice.serve.length).toBe(budget); // never exceeds the budget
+          expect(slice.deferred).toBe(n - budget);
+          for (const u of slice.serve) lastServed[u] = tick;
+          if (tick >= bound - 1) {
+            // From the first full window onward, every unit must have been seen
+            // within the trailing `bound` ticks.
+            for (let u = 0; u < n; u++) {
+              expect(tick - lastServed[u]).toBeLessThan(bound);
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+test("sliceFanout: a cursor left past a shrunken ring is normalized, not out-of-bounds", () => {
+  // A conn set that shrank between ticks (conns closed) can leave the cursor
+  // pointing past the new length; the slice must wrap it, never index undefined.
+  const units = [0, 1, 2];
+  const cursor: FanoutCursor = { value: 999 };
+  const slice = sliceFanout(units, cursor, 2);
+  expect(slice.serve).toEqual([0, 1]); // 999 % 3 === 0 → start at 0
+  expect(slice.serve.every((u) => u !== undefined)).toBe(true);
+  expect(cursor.value).toBe(2);
+});
+
+test("MAX_SUBS_PER_TICK is a positive bound", () => {
+  // Guards the constant against an accidental 0/negative edit that would make
+  // `sliceFanout` treat the production path as unbounded.
+  expect(MAX_SUBS_PER_TICK).toBeGreaterThan(0);
 });
 
 // -- resolveProbeArming: each socket arms only after its own worker is ready ----

@@ -396,8 +396,10 @@ export const MAX_LIMIT = 500;
 /**
  * Hard upper bound on concurrent connections — the global backstop. Diff fan-out
  * scales with SUBSCRIBED conns only (a zero-sub conn carries no subs and never
- * enters a diff), so the real cost driver is `sub_live`, which the reapers keep
- * low; this ceiling guards against a connection STORM (a reconnect-loop client)
+ * enters a diff), so the real cost driver is `sub_live` — kept low by the reapers
+ * (including {@link SUBSCRIBED_SILENCE_TTL_MS} for abandoned-but-alive subs) AND
+ * bounded per tick by {@link MAX_SUBS_PER_TICK} so no accumulation can starve the
+ * loop. This ceiling guards against a connection STORM (a reconnect-loop client)
  * filling the table. At the cap a NEW connection is REJECTED with a
  * `max_connections` frame then closed — reject-new, NOT LRU-evict: the oldest
  * conn is the legit long-lived board. The {@link PER_PID_MAX_CONNECTIONS}
@@ -460,6 +462,26 @@ export const IDLE_CONN_TTL_MS = 5 * 60_000;
  * because an unengaged conn has, by definition, done nothing worth waiting for.
  */
 export const UNENGAGED_CONN_TTL_MS = 30_000;
+
+/**
+ * Inbound-silence ceiling (ms) for a SUBSCRIBED connection before it is reaped as
+ * abandoned-but-alive: subscribed, peer process still live, `everEngaged` — the
+ * exact conn the dead-peer / unengaged / idle sweeps all miss (live pid, engaged,
+ * subs > 0). A ghost of this shape (a half-open UDS FIN the kernel never surfaces,
+ * a viewer whose event loop wedged, a non-keeper client that abandons its socket
+ * without closing it) generates no backpressure during a DB-quiet window, so it
+ * sits in `conns` forever while every diff tick pays its fan-out.
+ *
+ * Reaped on POSITIVE abandonment evidence, never on push-side silence: a live
+ * `subscribeReadiness` viewer sends a heartbeat probe refetch every
+ * {@link import("./readiness-client").HEARTBEAT_IDLE_MS} (15s) of inbound idleness,
+ * so a healthy subscribed conn refreshes `lastActivityAt` at least that often even
+ * on a silent board. This ceiling sits at 3x the client heartbeat — comfortably
+ * past heartbeat jitter, backpressure, and round-trip slop — so it fires ONLY on a
+ * conn whose engagement has genuinely ceased, never on a legitimately-quiet board.
+ * Keyed on `lastActivityAt` (inbound), NOT the server's push cadence.
+ */
+export const SUBSCRIBED_SILENCE_TTL_MS = 45_000;
 
 // ---------------------------------------------------------------------------
 // DEBUG: timing instrumentation
@@ -2551,6 +2573,41 @@ function reapUnengaged(list: Writable[], conns?: Set<Writable>): void {
 }
 
 /**
+ * Evict a SUBSCRIBED connection whose inbound engagement has ceased past
+ * {@link SUBSCRIBED_SILENCE_TTL_MS} — the abandoned-but-alive ghost the dead-peer,
+ * unengaged, and idle sweeps all miss: it holds live subscriptions (idle sweep
+ * exempts it), its peer process is still alive (dead-peer sweep skips it), and it
+ * long-ago engaged (unengaged sweep skips it). It generates no backpressure in a
+ * DB-quiet window (stuck-pending is inert), so nothing else touches it while every
+ * diff tick pays its fan-out.
+ *
+ * POSITIVE abandonment evidence, never push-side silence: a live `subscribeReadiness`
+ * viewer refreshes `lastActivityAt` via a heartbeat probe at least every 15s (see
+ * {@link SUBSCRIBED_SILENCE_TTL_MS}), so a healthy quiet board is never past this
+ * ceiling. Zero-sub conns are OUT of scope (the idle/unengaged arms own them);
+ * this arm is the subscribed-conn analog keyed on the client's heartbeat contract.
+ * Per-conn try/catch via `evictConn`, exactly as the sibling reapers.
+ */
+function reapAbandonedSubs(list: Writable[], conns?: Set<Writable>): void {
+  const now = Date.now();
+  for (const sock of list) {
+    // Only subscribed conns — zero-sub is the idle/unengaged sweeps' domain.
+    if (sock.data.subs.size === 0) {
+      continue;
+    }
+    if (now - sock.data.lastActivityAt < SUBSCRIBED_SILENCE_TTL_MS) {
+      continue;
+    }
+    console.error(
+      `[server-worker] reaping abandoned-sub conn ${sock.data.id ?? -1} ` +
+        `(subscribed, inbound-silent ${now - sock.data.lastActivityAt}ms > ` +
+        `${SUBSCRIBED_SILENCE_TTL_MS}ms heartbeat ceiling; ${sock.data.subs.size} sub(s))`,
+    );
+    evictConn(sock, conns);
+  }
+}
+
+/**
  * Count live connections sharing a peer pid — the admission-control predicate
  * behind {@link PER_PID_MAX_CONNECTIONS}. Pure read over the conn set.
  */
@@ -2586,7 +2643,12 @@ export function isDaemonSelfConn(
 export type CensusConnView = {
   data: Pick<
     ConnState,
-    "peerPid" | "pending" | "subs" | "everEngaged" | "connectedAt"
+    | "peerPid"
+    | "pending"
+    | "subs"
+    | "everEngaged"
+    | "connectedAt"
+    | "lastActivityAt"
   >;
 };
 
@@ -2606,6 +2668,13 @@ export interface ConnCensus {
   subLive: number;
   subDead: number;
   subUnknown: number;
+  /**
+   * Subscribed conns whose inbound engagement has ceased past the heartbeat
+   * ceiling — the abandoned-but-alive ghosts {@link reapAbandonedSubs} evicts. A
+   * NON-EXCLUSIVE sub-count (mirrors `zeroSubDead`): counted IN ADDITION to the
+   * conn's `subLive`/`subDead`/`subUnknown` classification, never into `total`.
+   */
+  subAbandoned: number;
 }
 
 /**
@@ -2616,7 +2685,9 @@ export interface ConnCensus {
  * candidate), `zero_sub` (idle-sweep candidate), `sub_live` (subscribed, peer
  * alive — the protected board), `sub_dead` (subscribed, peer gone — dead-peer
  * candidate), `sub_unknown` (subscribed, peerPid null — never liveness-reaped),
- * with `self` pulled out ahead of all of them.
+ * `sub_abandoned` (subscribed, inbound-silent past `subscribedSilenceTtlMs` — the
+ * abandoned-but-alive candidate, a non-exclusive sub-count), with `self` pulled
+ * out ahead of all of them.
  */
 export function censusConns(
   conns: Iterable<CensusConnView>,
@@ -2624,6 +2695,7 @@ export function censusConns(
     selfPid: number;
     nowMs: number;
     unengagedTtlMs: number;
+    subscribedSilenceTtlMs: number;
     isPidAlive: (pid: number) => boolean;
   },
 ): ConnCensus {
@@ -2637,6 +2709,7 @@ export function censusConns(
     subLive: 0,
     subDead: 0,
     subUnknown: 0,
+    subAbandoned: 0,
   };
   for (const sock of conns) {
     c.total++;
@@ -2670,6 +2743,12 @@ export function censusConns(
     } else {
       c.subLive++;
     }
+    // Non-exclusive sub-count (mirrors zeroSubDead): a subscribed conn whose
+    // inbound engagement has ceased past the heartbeat ceiling is the
+    // abandoned-but-alive ghost, counted ON TOP of its live/dead/unknown class.
+    if (opts.nowMs - sock.data.lastActivityAt >= opts.subscribedSilenceTtlMs) {
+      c.subAbandoned++;
+    }
   }
   return c;
 }
@@ -2684,13 +2763,15 @@ function logCapCensus(conns: Set<Writable>): void {
     selfPid: process.pid,
     nowMs: Date.now(),
     unengagedTtlMs: UNENGAGED_CONN_TTL_MS,
+    subscribedSilenceTtlMs: SUBSCRIBED_SILENCE_TTL_MS,
     isPidAlive,
   });
   console.error(
     `[server-worker] conn-cap census (${conns.size}/${MAX_CONNECTIONS}): ` +
       `self=${c.self} pending=${c.pending} zero_sub=${c.zeroSub} ` +
       `(dead=${c.zeroSubDead} unengaged=${c.zeroSubUnengaged}) ` +
-      `sub_live=${c.subLive} sub_dead=${c.subDead} sub_unknown=${c.subUnknown}`,
+      `sub_live=${c.subLive} sub_dead=${c.subDead} sub_unknown=${c.subUnknown} ` +
+      `sub_abandoned=${c.subAbandoned}`,
   );
 }
 
@@ -2709,9 +2790,11 @@ function logCapCensus(conns: Set<Writable>): void {
 export function reapConns(list: Writable[], conns?: Set<Writable>): void {
   reapStuckPending(list, conns);
   // Dead-peer + unengaged are the fast storm-clearers (they free a flood of
-  // garbage conns at once); the 5-minute idle sweep is the slow backstop.
+  // garbage conns at once); abandoned-subs clears live-peer ghosts the others
+  // miss; the 5-minute idle sweep is the slow zero-sub backstop.
   reapDeadPeers(list, conns);
   reapUnengaged(list, conns);
+  reapAbandonedSubs(list, conns);
   reapIdleConns(list, conns);
 }
 
@@ -2729,6 +2812,83 @@ function unionWatched(subs: Iterable<SubState>): string[] {
     }
   }
   return [...union];
+}
+
+/**
+ * Per-tick fan-out budget: the maximum number of `(conn, sub)` units one
+ * {@link diffTick} services. The diff's per-tick cost is `subscribed_conns x
+ * watched_ids x collections` — unbounded in board size and conn count, the
+ * re-fold time-bomb discipline transplanted to the serve loop: an accumulation
+ * of subscriptions (ghosts the reapers have not yet cleared, or a genuinely
+ * busy board) would let one tick's synchronous work starve the accept/read
+ * loop. {@link sliceFanout} caps each tick to this many units and round-robins
+ * the remainder across subsequent ticks, so per-tick cost is O(budget), flat in
+ * conn count. At the {@link DEFAULT_POLL_MS} 50ms cadence a deferred sub is
+ * serviced within `ceil(total_subs / MAX_SUBS_PER_TICK)` ticks — generous enough
+ * that a normal board (well under the budget) sees zero added latency, yet a
+ * fully-saturated {@link MAX_CONNECTIONS} table drains within a bounded window.
+ */
+export const MAX_SUBS_PER_TICK = 64;
+
+/**
+ * The round-robin fan-out position, persisted across ticks (owned by the worker
+ * `main` like `conns`, threaded into both {@link pollLoop} and {@link handleKick}
+ * so the SAME rotation advances no matter which path drives the tick). A plain
+ * mutable holder so the pure {@link sliceFanout} can advance it in place.
+ */
+export interface FanoutCursor {
+  value: number;
+}
+
+/** Allocate a fresh fan-out cursor at rotation position 0. */
+export function newFanoutCursor(): FanoutCursor {
+  return { value: 0 };
+}
+
+/** One tick's fan-out slice: the units to service now + how many were deferred. */
+export interface FanoutSlice<T> {
+  serve: T[];
+  deferred: number;
+}
+
+/**
+ * Round-robin scheduler bounding a diff tick's fan-out. Serves at most
+ * `maxPerTick` units starting at `cursor.value`, wrapping the ring, and advances
+ * the cursor to exactly where this slice ended so the NEXT tick continues the
+ * rotation — never a priority-by-recency order (which would starve the ring's
+ * tail; see the task risk). Consecutive slices cover a contiguous arc of length
+ * `k x maxPerTick`, so within `ceil(units.length / maxPerTick)` ticks the arc
+ * wraps the whole ring: EVERY unit is guaranteed serviced within that bound,
+ * regardless of the starting cursor.
+ *
+ * When the budget covers the whole set (`maxPerTick >= units.length`) or is
+ * non-positive (the unbounded caller path), the cursor resets to 0 and every
+ * unit is served — a no-op bound, so a below-budget board behaves exactly as the
+ * un-scheduled fan-out did.
+ */
+export function sliceFanout<T>(
+  units: T[],
+  cursor: FanoutCursor,
+  maxPerTick: number,
+): FanoutSlice<T> {
+  const n = units.length;
+  if (n === 0) {
+    cursor.value = 0;
+    return { serve: [], deferred: 0 };
+  }
+  if (maxPerTick <= 0 || maxPerTick >= n) {
+    cursor.value = 0;
+    return { serve: units, deferred: 0 };
+  }
+  // Normalize the cursor into [0, n) — it may point past the ring after a set
+  // that shrank between ticks (conns closed), so wrap defensively.
+  const start = ((cursor.value % n) + n) % n;
+  const serve: T[] = [];
+  for (let i = 0; i < maxPerTick; i++) {
+    serve.push(units[(start + i) % n]);
+  }
+  cursor.value = (start + maxPerTick) % n;
+  return { serve, deferred: n - maxPerTick };
 }
 
 /**
@@ -2750,31 +2910,50 @@ function unionWatched(subs: Iterable<SubState>): string[] {
  * `events` INSERT but before the fold sees no projection change; the fold is
  * itself a commit that re-bumps `data_version`, so the next poll catches it.
  */
-export function diffTick(db: Database, conns: Iterable<Writable>): void {
+export function diffTick(
+  db: Database,
+  conns: Iterable<Writable>,
+  cursor?: FanoutCursor,
+): void {
   const list = [...conns];
   if (list.length === 0) {
     return;
   }
 
-  // Connection-hygiene reapers run BEFORE the `byCollection.size === 0` early
-  // return so a zero-sub conn is still swept. Also run every poll tick via
-  // `reapConns`; the call here covers the `handleKick` path. Idempotent.
+  // Connection-hygiene reapers run over the FULL conn set (before any fan-out
+  // bound) so every zero-sub AND deferred conn is still swept. Also run every
+  // poll tick via `reapConns`; the call here covers the `handleKick` path.
   reapConns(list);
 
-  // Build the flat list of (sock, subId, sub) triples across all conns and
-  // group by `sub.collection`. A conn with an empty `subs` map (no live
-  // subscription) contributes nothing.
+  // Build the flat list of (sock, subId, sub) triples across ALL conns, then
+  // bound the fan-out to a round-robin slice of {@link MAX_SUBS_PER_TICK} units
+  // so per-tick cost stays flat in conn count (deferred subs ride the cursor to
+  // a later tick — state-based diffing means nothing is lost, only delayed by a
+  // bounded number of ticks). A conn with an empty `subs` map contributes
+  // nothing. When `cursor` is omitted (direct unit callers) the fan-out is
+  // unbounded — every sub served, exactly as before.
   type Triple = { sock: Writable; subId: string | null; sub: SubState };
-  const byCollection = new Map<string, Triple[]>();
+  const units: Triple[] = [];
   for (const sock of list) {
     for (const [subId, sub] of sock.data.subs) {
-      const group = byCollection.get(sub.collection);
-      const triple: Triple = { sock, subId, sub };
-      if (group) {
-        group.push(triple);
-      } else {
-        byCollection.set(sub.collection, [triple]);
-      }
+      units.push({ sock, subId, sub });
+    }
+  }
+  if (units.length === 0) {
+    return;
+  }
+  const served = cursor
+    ? sliceFanout(units, cursor, MAX_SUBS_PER_TICK).serve
+    : units;
+
+  // Group the served slice by `sub.collection` for the patch pass.
+  const byCollection = new Map<string, Triple[]>();
+  for (const triple of served) {
+    const group = byCollection.get(triple.sub.collection);
+    if (group) {
+      group.push(triple);
+    } else {
+      byCollection.set(triple.sub.collection, [triple]);
     }
   }
   if (byCollection.size === 0) {
@@ -2885,10 +3064,13 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   }
   const _tAfterPatch = TRACE ? performance.now() : 0;
 
-  // Second pass: membership-staleness `meta`. Group live `(sock, sub)` pairs by
+  // Second pass: membership-staleness `meta`. Group the SAME served slice by
   // filter signature so pairs sharing a filter share ONE countAndToken; the
   // signature folds in bound params but excludes sort/limit/offset (different
-  // pages of one filter share).
+  // pages of one filter share). Iterating `served` (not `list`) keeps the meta
+  // pass under the same per-tick fan-out bound as the patch pass — a deferred
+  // sub's membership recheck rides the cursor to a later tick, and meta is
+  // throttled to {@link META_MIN_INTERVAL_MS} anyway.
   const byFilter = new Map<
     string,
     {
@@ -2897,24 +3079,22 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       pairs: { sock: Writable; subId: string | null; sub: SubState }[];
     }
   >();
-  for (const sock of list) {
-    for (const [subId, sub] of sock.data.subs) {
-      const descriptor = getCollection(sub.collection);
-      if (!descriptor) {
-        continue;
-      }
-      const sig = JSON.stringify([
-        sub.collection,
-        sub.where.clause,
-        sub.where.params,
-      ]);
-      const group = byFilter.get(sig);
-      const pair = { sock, subId, sub };
-      if (group) {
-        group.pairs.push(pair);
-      } else {
-        byFilter.set(sig, { descriptor, where: sub.where, pairs: [pair] });
-      }
+  for (const { sock, subId, sub } of served) {
+    const descriptor = getCollection(sub.collection);
+    if (!descriptor) {
+      continue;
+    }
+    const sig = JSON.stringify([
+      sub.collection,
+      sub.where.clause,
+      sub.where.params,
+    ]);
+    const group = byFilter.get(sig);
+    const pair = { sock, subId, sub };
+    if (group) {
+      group.pairs.push(pair);
+    } else {
+      byFilter.set(sig, { descriptor, where: sub.where, pairs: [pair] });
     }
   }
 
@@ -3015,7 +3195,10 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
  * `reapConns` still runs every tick regardless, since it has no data_version
  * dependency. `onNotadbSkip` — when given — is invoked with the running
  * consecutive-miss count on every tolerated skip so the caller can post
- * countable backstop telemetry.
+ * countable backstop telemetry. `cursor` — when given — is the persistent
+ * round-robin fan-out position threaded into `diffTick` so a busy board's ticks
+ * stay bounded (shared with `handleKick` by the worker `main`); omit it and the
+ * fan-out is unbounded, the pre-bound behavior direct callers expect.
  */
 export async function pollLoop(
   db: Database,
@@ -3023,6 +3206,7 @@ export async function pollLoop(
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
   onNotadbSkip?: (consecutiveMisses: number) => void,
+  cursor?: FanoutCursor,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
@@ -3070,7 +3254,7 @@ export async function pollLoop(
     if (cur !== null && cur !== last) {
       last = cur;
       const _tickStart = Date.now();
-      diffTick(db, getConns());
+      diffTick(db, getConns(), cursor);
       const _tickDur = Date.now() - _tickStart;
       if (_tickDur >= 20) {
         if (TRACE) srvTs(`poll-loop diffTick duration=${_tickDur}ms`);
@@ -3085,9 +3269,13 @@ export async function pollLoop(
  * The kick does NOT advance `pollLoop`'s `last`, so the next poll re-diffs
  * harmlessly (diffTick is state-based and idempotent).
  */
-export function handleKick(db: Database, conns: Iterable<Writable>): void {
+export function handleKick(
+  db: Database,
+  conns: Iterable<Writable>,
+  cursor?: FanoutCursor,
+): void {
   try {
-    diffTick(db, conns);
+    diffTick(db, conns, cursor);
   } catch (err) {
     // No-self-heal: log + continue. A crashed diffTick must not take down the
     // worker (and with it, the daemon).
@@ -3763,6 +3951,11 @@ function main(): void {
   // "did the daemon bounce under me?" signal the client's epoch guard reads.
   const bootGate: BootGate = { ready: false, generation: randomUUID() };
 
+  // Shared round-robin fan-out position. Threaded into BOTH the poll loop and the
+  // post-fold kick handler so one rotation advances no matter which drives the
+  // tick, bounding every diff tick to {@link MAX_SUBS_PER_TICK} units.
+  const fanoutCursor = newFanoutCursor();
+
   let server: RunningServer;
   try {
     server = startServer(db, sockPath, lockPath, writerDb, bridge, bootGate);
@@ -3876,7 +4069,7 @@ function main(): void {
       if ((msg as KickMessage).type === "kick") {
         // Fast path: main folded + kicked so we diffTick now. The try/catch is in
         // `handleKick` — this handler must never throw (no-self-heal path).
-        handleKick(db, server.conns);
+        handleKick(db, server.conns, fanoutCursor);
         return;
       }
       if ((msg as BootCompleteMessage).type === "boot-complete") {
@@ -3999,6 +4192,7 @@ function main(): void {
         }),
       } satisfies BackstopMessage);
     },
+    fanoutCursor,
   )
     .then(() => {
       // Clean loop exit. Signal `shutdown()` that the poll connection is idle so

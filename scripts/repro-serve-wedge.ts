@@ -72,6 +72,24 @@
  *   --peer-probe            run a per-accept getsockopt(LOCAL_PEERPID) FFI probe
  *                           (the production per-accept peer-pid read, suspect #3).
  *
+ * A SECOND, distinct wedge class (fn-1222.3): ghost-subscription fan-out
+ * saturation. Abandoned-but-alive subscriptions (a subscribed conn with a LIVE
+ * peer + prior engagement — the shape the dead-peer / unengaged / idle reapers
+ * all miss) accumulate and inflate the per-tick diff fan-out until one tick's
+ * synchronous span starves the accept/read loop. Its dimensions:
+ *   --subscribe-churn       N clients that subscribe then hit their first-paint
+ *                           give-up. --giveup-close makes the give-up hard-CLOSE
+ *                           its socket (the well-behaved keeper client); the
+ *                           default ABANDONS it live (the ghost). The toggle is
+ *                           the mechanism characterization — only it flips the
+ *                           verdict.
+ *   --fanout-hz / -cost-us  the diff fan-out cadence + per-served-conn on-loop
+ *                           cost (models pollLoop→diffTick's per-sub work).
+ *   --fanout-bound          the production fix — the round-robin per-tick cap
+ *                           (server-worker MAX_SUBS_PER_TICK / sliceFanout);
+ *                           with it set the fan-out cost is flat in ghost count
+ *                           and the wedge does not reproduce.
+ *
  * BOUNDED / OPT-IN / MANUAL. Never imported by any test tier; spawns no daemon,
  * opens no production DB or socket, writes no events/RPC. The UDS server is a
  * throwaway in THIS process bound to a per-run scratch socket under the OS tmpdir
@@ -120,6 +138,26 @@ Load dimensions (bisect knobs):
   --stampede <n>       Clients that connect + register near-simultaneously at
                        bind — the boot reconnect stampede (default: 0)
   --peer-probe         Per-accept getsockopt(LOCAL_PEERPID) FFI probe (default off)
+  --subscribe-churn <n>
+                       N clients that subscribe then hit their first-paint
+                       give-up — the ghost-subscription accumulation. Each holds
+                       a live pid + an engaged, subscribed conn: the shape the
+                       dead-peer / unengaged / idle reapers all miss (default: 0)
+  --giveup-ms <n>      First-paint give-up window for --subscribe-churn clients
+                       (default: 500; production is ~10000)
+  --giveup-close       On give-up, hard-CLOSE the socket (the well-behaved keeper
+                       client — subscribeReadiness terminate()) instead of the
+                       default ABANDON-live (hold the fd, never close). The
+                       close-vs-abandon toggle is the mechanism characterization:
+                       abandon accumulates ghosts + wedges, close self-evicts
+  --fanout-hz <n>      Server diff fan-out tick rate — models pollLoop→diffTick
+                       (default: 0 = off)
+  --fanout-cost-us <n> Synthetic per-served-conn on-loop cost each fan-out tick
+                       (models diffTick per-sub work parking the loop; default 0)
+  --fanout-bound <n>   Round-robin per-tick fan-out cap — the production fix
+                       (server-worker MAX_SUBS_PER_TICK / sliceFanout). Serve at
+                       most N subscribed conns per tick, defer the rest. With it
+                       set the wedge does not reproduce (default: 0 = unbounded)
 
 Run control:
   --duration-ms <n>    Total run window (default: 20000)
@@ -161,6 +199,28 @@ flag is the only variable that flips the verdict.
 Aggressive search (push the #8044-family dimensions):
   bun scripts/repro-serve-wedge.ts --clients 400 --rate-hz 100 \\
     --payload-bytes 65536 --slow-readers 0.25 --churn 64 --duration-ms 60000
+
+── ghost-subscription / fan-out saturation (fn-1222.3) ──────────────────────────
+The second wedge class: abandoned-but-alive subscriptions accumulate and inflate
+the diff fan-out until one tick starves the loop. The close-vs-abandon toggle IS
+the mechanism characterization — only ONE variable flips the verdict.
+
+Red repro (ghosts ABANDON their sockets live — the leak the reapers miss):
+  bun scripts/repro-serve-wedge.ts --clients 0 --subscribe-churn 100 \\
+    --giveup-ms 400 --fanout-hz 20 --fanout-cost-us 6000 \\
+    --stuck-ms 500 --duration-ms 6000
+
+Green — same load, ghosts CLOSE on give-up (the well-behaved keeper client): the
+subscribed set drains, the fan-out stays cheap, no wedge:
+  bun scripts/repro-serve-wedge.ts --clients 0 --subscribe-churn 100 \\
+    --giveup-ms 400 --fanout-hz 20 --fanout-cost-us 6000 \\
+    --stuck-ms 500 --duration-ms 6000 --giveup-close
+
+Green — ghosts still abandon, but the fan-out BOUND caps per-tick cost (the fix,
+server-worker MAX_SUBS_PER_TICK / sliceFanout): the wedge does not reproduce:
+  bun scripts/repro-serve-wedge.ts --clients 0 --subscribe-churn 100 \\
+    --giveup-ms 400 --fanout-hz 20 --fanout-cost-us 6000 \\
+    --stuck-ms 500 --duration-ms 6000 --fanout-bound 16
 `;
 
 // ── CLI parsing (models scripts/subscribe-bounce-soak.ts) ────────────────────
@@ -177,6 +237,12 @@ interface Args {
   asyncStartTime: boolean;
   stampede: number;
   peerProbe: boolean;
+  subscribeChurn: number;
+  giveupMs: number;
+  giveupClose: boolean;
+  fanoutHz: number;
+  fanoutCostUs: number;
+  fanoutBound: number;
   durationMs: number;
   probeMs: number;
   probeTimeoutMs: number;
@@ -200,6 +266,12 @@ function parse(argv: string[]): Args | "help" {
       "async-start-time": { type: "boolean", default: false },
       stampede: { type: "string" },
       "peer-probe": { type: "boolean", default: false },
+      "subscribe-churn": { type: "string" },
+      "giveup-ms": { type: "string" },
+      "giveup-close": { type: "boolean", default: false },
+      "fanout-hz": { type: "string" },
+      "fanout-cost-us": { type: "string" },
+      "fanout-bound": { type: "string" },
       "duration-ms": { type: "string" },
       "probe-ms": { type: "string" },
       "probe-timeout": { type: "string" },
@@ -231,7 +303,7 @@ function parse(argv: string[]): Args | "help" {
   if (slowReaders > 1) throw new Error("--slow-readers must be in [0, 1]");
 
   return {
-    clients: Math.floor(numOr(values.clients, 200, "clients", 1)),
+    clients: Math.floor(numOr(values.clients, 200, "clients", 0)),
     rateHz: numOr(values["rate-hz"], 50, "rate-hz", 0.1),
     payloadBytes: Math.floor(
       numOr(values["payload-bytes"], 256, "payload-bytes"),
@@ -248,6 +320,16 @@ function parse(argv: string[]): Args | "help" {
     asyncStartTime: values["async-start-time"] ?? false,
     stampede: Math.floor(numOr(values.stampede, 0, "stampede")),
     peerProbe: values["peer-probe"] ?? false,
+    subscribeChurn: Math.floor(
+      numOr(values["subscribe-churn"], 0, "subscribe-churn"),
+    ),
+    giveupMs: Math.floor(numOr(values["giveup-ms"], 500, "giveup-ms", 1)),
+    giveupClose: values["giveup-close"] ?? false,
+    fanoutHz: numOr(values["fanout-hz"], 0, "fanout-hz"),
+    fanoutCostUs: Math.floor(
+      numOr(values["fanout-cost-us"], 0, "fanout-cost-us"),
+    ),
+    fanoutBound: Math.floor(numOr(values["fanout-bound"], 0, "fanout-bound")),
     durationMs: Math.floor(
       numOr(values["duration-ms"], 20_000, "duration-ms", 1),
     ),
@@ -276,6 +358,13 @@ interface ServerConn {
   buffer: LineBuffer;
   /** Backpressured byte tail not yet accepted by the socket; resumed in drain. */
   pending: Uint8Array | null;
+  /**
+   * True once this conn sent a `subscribe` frame — it joins the server's live
+   * subscribed set and every fan-out tick pays its per-sub cost. An abandoned-
+   * but-alive ghost keeps this true (and its fd open) forever; only a `close`
+   * (the well-behaved give-up) clears it.
+   */
+  subscribed: boolean;
 }
 
 type BunSocket = {
@@ -290,6 +379,12 @@ interface ServerMetrics {
   replies: number;
   shortWrites: number;
   registers: number;
+  subscribes: number;
+  /** Live subscribed-conn count at its high-water mark — the ghost census. */
+  subscribedPeak: number;
+  /** Fan-out ticks run + the max conns one tick served (post-bound). */
+  fanoutTicks: number;
+  fanoutMaxServed: number;
 }
 
 // ── per-register ancestry work (the production opRegister → ppidViaPs) ────────
@@ -465,6 +560,43 @@ function peerPidForFd(fd: number): number | null {
   }
 }
 
+// ── subscribe fan-out model (mirrors src/server-worker.ts diffTick cost) ──────
+//
+// The production serve loop runs `diffTick` on every committed change: for every
+// SUBSCRIBED conn it probes versions, fetches changed rows, and writes a patch —
+// synchronous work whose per-tick cost is `subscribed_conns x watched_ids x
+// collections`, unbounded in conn count. An accumulation of abandoned-but-alive
+// ghost subscriptions (live pid, engaged, subscribed — the reapers all miss them)
+// inflates that count without bound; a single fan-out tick's synchronous span
+// then starves the accept/read loop. This harness models that cost as a tight
+// busy-spin per served conn (`--fanout-cost-us`), the faithful in-process proxy
+// for diffTick's per-sub work parking the kqueue loop.
+//
+// `--fanout-bound` applies the production fix — the round-robin per-tick unit cap
+// (server-worker `MAX_SUBS_PER_TICK` / `sliceFanout`): serve at most N conns per
+// tick, deferring the rest to later ticks, so per-tick cost is flat in ghost
+// count. With the bound set, the wedge does not reproduce however many ghosts
+// accumulate — the go/no-go proof that the bound defeats the saturation.
+
+/** Busy-spin the JS loop for ~`us` microseconds (models diffTick per-sub work). */
+function spinFor(us: number): void {
+  if (us <= 0) return;
+  const end = performance.now() + us / 1000;
+  // A tight loop with a cheap side effect the optimizer cannot elide.
+  let acc = 0;
+  while (performance.now() < end) {
+    acc += Math.sqrt(end) % 7;
+  }
+  if (acc === Number.POSITIVE_INFINITY) process.stderr.write("");
+}
+
+/** A synthetic per-tick `patch` frame pushed to a subscribed conn. */
+function patchLine(): Uint8Array {
+  return encoder.encode(
+    `{"type":"patch","collection":"epics","rev":1,"row":{"id":"x","version":1}}\n`,
+  );
+}
+
 /** Build the fixed-size reply line for a query id, padded to `payloadBytes`. */
 function replyLine(id: string | undefined, payloadBytes: number): Uint8Array {
   const idSeg = id !== undefined ? `,"id":${JSON.stringify(id)}` : "";
@@ -485,6 +617,7 @@ function startServer(
   startTimeProbe: number,
   asyncStartTime: boolean,
   peerProbe: boolean,
+  subscribed: Set<BunSocket>,
 ): ReturnType<typeof Bun.listen<ServerConn>> {
   const writeOrQueue = (sock: BunSocket, bytes: Uint8Array): void => {
     // Mirror the server worker's flush: try the socket, stash the unaccepted
@@ -517,7 +650,11 @@ function startServer(
         if (peerProbe) {
           peerPidForFd((socket as unknown as { fd?: number }).fd ?? -1);
         }
-        socket.data = { buffer: new LineBuffer(), pending: null };
+        socket.data = {
+          buffer: new LineBuffer(),
+          pending: null,
+          subscribed: false,
+        };
       },
       data(socket, chunk) {
         const sock = socket as unknown as BunSocket;
@@ -557,6 +694,21 @@ function startServer(
             ).then(() => {
               writeOrQueue(sock, ackLine(id));
             });
+          } else if (frame.type === "subscribe") {
+            // Join the live subscribed set — every fan-out tick now pays this
+            // conn's per-sub cost until it CLOSES. An abandoned-but-alive ghost
+            // never closes, so it stays here forever (the leak). Send one
+            // synthetic first-paint patch so a well-behaved client has something
+            // to give up waiting for.
+            metrics.subscribes += 1;
+            if (!sock.data.subscribed) {
+              sock.data.subscribed = true;
+              subscribed.add(sock);
+              if (subscribed.size > metrics.subscribedPeak) {
+                metrics.subscribedPeak = subscribed.size;
+              }
+            }
+            writeOrQueue(sock, patchLine());
           }
         }
       },
@@ -572,10 +724,50 @@ function startServer(
           sock.data.pending = null;
         }
       },
-      close() {},
-      error() {},
+      close(socket) {
+        // A well-behaved give-up hard-closes; the conn leaves the subscribed set
+        // and stops costing the fan-out. An abandoned ghost never reaches here.
+        subscribed.delete(socket as unknown as BunSocket);
+      },
+      error(socket) {
+        subscribed.delete(socket as unknown as BunSocket);
+      },
     },
   });
+}
+
+// ── subscribe fan-out tick (models the diffTick serve-loop cost) ──────────────
+//
+// One fan-out tick over the live subscribed set: with `--fanout-bound` unset,
+// serve EVERY subscribed conn (the unbounded pre-fix loop — cost grows with ghost
+// count); with it set, serve a round-robin window of at most `bound` conns and
+// defer the rest (the production `sliceFanout` fix). Each served conn costs a
+// `costUs` busy-spin (the per-sub diffTick work parking the loop) then a patch.
+// Returns the number served so the harness records the max per-tick fan-out.
+
+function fanoutTick(
+  subscribed: Set<BunSocket>,
+  cursorRef: { value: number },
+  bound: number,
+  costUs: number,
+): number {
+  const conns = [...subscribed];
+  const n = conns.length;
+  if (n === 0) return 0;
+  const serveCount = bound > 0 && bound < n ? bound : n;
+  const start = bound > 0 && bound < n ? cursorRef.value % n : 0;
+  for (let i = 0; i < serveCount; i++) {
+    const sock = conns[(start + i) % n];
+    spinFor(costUs); // the per-sub serve work — parks the loop on-tick
+    try {
+      const bytes = patchLine();
+      if (sock.data.pending === null) sock.write(bytes, 0, bytes.length);
+    } catch {
+      // a dead conn's write throws — the close/error handler prunes it
+    }
+  }
+  cursorRef.value = serveCount < n ? (start + serveCount) % n : 0;
+  return serveCount;
 }
 
 // ── real-read probe (faithful copy of src/daemon.ts probeSocketRead) ─────────
@@ -839,6 +1031,95 @@ function startStampede(
   }
 }
 
+/**
+ * The subscribe-churn storm: `n` clients connect, each send ONE `subscribe`
+ * frame, then hit their first-paint give-up window (`giveupMs`) and EITHER
+ * hard-close the socket (`giveupClose` — the well-behaved keeper client, which
+ * `subscribeReadiness` implements as a `terminate()` on give-up) or ABANDON it
+ * live (default): stop reading, never close, hold the fd open. The abandon path
+ * is the ghost — a subscribed conn with a live peer (this process) that the
+ * server's dead-peer / unengaged / idle reapers all miss, so it stays in the
+ * subscribed set and every fan-out tick keeps paying for it.
+ *
+ * This is the mechanism the task characterizes. Arrivals are STAGGERED (one every
+ * {@link SUBSCRIBE_CHURN_SPACING_MS}) to model the production shape — reconnect
+ * waves across a crash-loop, not one instantaneous burst. With `--giveup-close`
+ * each client self-evicts `giveupMs` after it arrives, so the live subscribed set
+ * holds only a bounded rolling window (`giveupMs / spacing`) and the fan-out stays
+ * cheap; WITHOUT it the set grows monotonically to `subscribedPeak = n`, inflating
+ * the fan-out until one tick wedges the loop. The ONLY variable that flips the
+ * verdict is close-vs-abandon — the recorded answer.
+ *
+ * (A caveat the harness also surfaces: if `--fanout-cost-us` is set high enough
+ * that even the transient rolling window wedges, close no longer rescues — the
+ * `close` handler runs on the SAME loop and its events queue behind the wedge.
+ * The demo commands tune the cost so the rolling window is safe and only the
+ * unbounded accumulation wedges, isolating the close-vs-abandon variable.)
+ */
+const SUBSCRIBE_CHURN_SPACING_MS = 20;
+
+function startSubscribeChurn(
+  sockPath: string,
+  n: number,
+  giveupMs: number,
+  giveupClose: boolean,
+  state: LoadState,
+): void {
+  const connectOne = (i: number): void => {
+    let reading = true;
+    void Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(s) {
+          try {
+            s.write(
+              `${JSON.stringify({ type: "subscribe", collection: "epics", id: `sub${i}` })}\n`,
+            );
+            state.sent += 1;
+          } catch {
+            return;
+          }
+          // First-paint give-up: after the window, either close (well-behaved)
+          // or abandon live (ghost — stop reading, hold the fd, never close).
+          const t = setTimeout(() => {
+            if (giveupClose) {
+              try {
+                s.end();
+              } catch {
+                // already gone
+              }
+            } else {
+              reading = false; // abandon: stop draining, keep the fd open
+            }
+          }, giveupMs);
+          t.unref?.();
+        },
+        data(_s, chunk) {
+          if (!reading) return; // abandoned — stop draining (build the ghost)
+          const text = chunk.toString("utf8");
+          for (let j = 0; j < text.length; j++) {
+            if (text[j] === "\n") state.received += 1;
+          }
+        },
+        close() {},
+        error() {},
+      },
+    }).catch(() => {
+      /* a failed connect just drops this ghost slot */
+    });
+  };
+  // Stagger the arrivals so accumulation is gradual (the reconnect-wave shape),
+  // not one instantaneous burst — the close path can only hold a bounded rolling
+  // window if arrivals are spread across the give-up interval.
+  for (let i = 0; i < n; i++) {
+    if (state.stop) break;
+    const t = setTimeout(() => {
+      if (!state.stop) connectOne(i);
+    }, i * SUBSCRIBE_CHURN_SPACING_MS);
+    t.unref?.();
+  }
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 interface Report {
@@ -851,6 +1132,10 @@ interface Report {
   serverRegisters: number;
   clientSent: number;
   clientReceived: number;
+  serverSubscribes: number;
+  subscribedPeak: number;
+  fanoutTicks: number;
+  fanoutMaxServed: number;
   probeOk: number;
   probeFail: number;
   maxProbeDarkMs: number;
@@ -872,7 +1157,15 @@ async function run(args: Args): Promise<Report> {
     replies: 0,
     shortWrites: 0,
     registers: 0,
+    subscribes: 0,
+    subscribedPeak: 0,
+    fanoutTicks: 0,
+    fanoutMaxServed: 0,
   };
+  // The live subscribed-conn set the fan-out iterates — the surface the ghost
+  // accumulation fills. Owned here so run() can drive the fan-out tick + tear it
+  // down; startServer adds/removes on subscribe/close.
+  const subscribed = new Set<BunSocket>();
   const server = startServer(
     sockPath,
     args.payloadBytes,
@@ -882,7 +1175,28 @@ async function run(args: Args): Promise<Report> {
     args.startTimeProbe,
     args.asyncStartTime,
     args.peerProbe,
+    subscribed,
   );
+
+  // The diff fan-out timer (models the production pollLoop → diffTick cadence).
+  // Off unless --fanout-hz is set. Each tick serves the subscribed set (bounded
+  // by --fanout-bound), spending --fanout-cost-us per served conn on-loop.
+  const fanoutCursor = { value: 0 };
+  let fanoutTimer: ReturnType<typeof setInterval> | null = null;
+  if (args.fanoutHz > 0) {
+    const periodMs = Math.max(1, Math.floor(1000 / args.fanoutHz));
+    fanoutTimer = setInterval(() => {
+      const served = fanoutTick(
+        subscribed,
+        fanoutCursor,
+        args.fanoutBound,
+        args.fanoutCostUs,
+      );
+      metrics.fanoutTicks += 1;
+      if (served > metrics.fanoutMaxServed) metrics.fanoutMaxServed = served;
+    }, periodMs);
+    fanoutTimer.unref?.();
+  }
 
   // Let the socket bind before dialing.
   await sleep(50);
@@ -893,6 +1207,15 @@ async function run(args: Args): Promise<Report> {
     startClient(sockPath, args.rateHz, i < slowCount, loadState);
   }
   if (args.churn > 0) startChurn(sockPath, args.churn, loadState);
+  if (args.subscribeChurn > 0) {
+    startSubscribeChurn(
+      sockPath,
+      args.subscribeChurn,
+      args.giveupMs,
+      args.giveupClose,
+      loadState,
+    );
+  }
   // The boot reconnect stampede fires AFTER the first green probe (below), so the
   // serve loop is proven live first — the production crash-loop shape is boot →
   // brief serve → stampede → wedge, and the wedge verdict needs a prior success
@@ -972,6 +1295,7 @@ async function run(args: Args): Promise<Report> {
 
   loadState.stop = true;
   clearInterval(lagTimer);
+  if (fanoutTimer !== null) clearInterval(fanoutTimer);
   try {
     server.stop(true);
   } catch {
@@ -989,6 +1313,10 @@ async function run(args: Args): Promise<Report> {
     serverRegisters: metrics.registers,
     clientSent: loadState.sent,
     clientReceived: loadState.received,
+    serverSubscribes: metrics.subscribes,
+    subscribedPeak: metrics.subscribedPeak,
+    fanoutTicks: metrics.fanoutTicks,
+    fanoutMaxServed: metrics.fanoutMaxServed,
     probeOk,
     probeFail,
     maxProbeDarkMs,
@@ -1021,6 +1349,21 @@ function printSummary(r: Report): void {
   out += w("short writes", String(r.serverShortWrites));
   out += w("client sent", String(r.clientSent));
   out += w("client received", String(r.clientReceived));
+  out += w(
+    "subscribe-churn",
+    `n=${r.args.subscribeChurn} giveup=${r.args.giveupMs}ms ` +
+      `${r.args.giveupClose ? "close(well-behaved)" : "abandon(ghost)"}`,
+  );
+  out += w(
+    "fan-out",
+    `${r.args.fanoutHz}Hz cost=${r.args.fanoutCostUs}us ` +
+      `bound=${r.args.fanoutBound > 0 ? r.args.fanoutBound : "unbounded"} ` +
+      `ticks=${r.fanoutTicks} max-served=${r.fanoutMaxServed}`,
+  );
+  out += w(
+    "subscribed peak",
+    `${r.subscribedPeak} (subscribes=${r.serverSubscribes}) — the ghost census`,
+  );
   out += w("probe ok / fail", `${r.probeOk} / ${r.probeFail}`);
   out += w(
     "max probe-dark",
