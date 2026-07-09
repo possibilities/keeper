@@ -38,5 +38,5 @@ One describe extension (or sibling slow file) covering: clean-leg → wrapper co
 - [ ] The suite loud-skips without the slow flag or tmux, and the fast tiers remain green
 
 ## Done summary
-
+Extended the slow-tier wrapped-cell e2e through the wrapper's close-out: retargeted the fixture matrix to a bare-token codex/gpt-5.3-codex-spark provider, and proved wrapper-owned re-test, soft-reset of single/multi contract-violating foreign commits, explicit-path staging, and a sanitized single trailered commit against a real detached leg and real git.
 ## Evidence
