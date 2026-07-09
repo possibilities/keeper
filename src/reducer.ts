@@ -1953,6 +1953,31 @@ function readTmuxFloor(db: Database): number {
  */
 const GIT_FOLD_BREAKDOWN_MS = 1000;
 
+/**
+ * Hard cap on how many per-file entries the `git_status.dirty_files` MATERIALIZED
+ * array carries. `dirty_count` stays EXACT (the full `snapshot.dirty_files.length`);
+ * only the rendered `dirty_files[].attributions[]` mirror is bounded.
+ *
+ * The `git` collection rides the board's subscribe first-frame, and the subscribe
+ * serve path emits each `result` as ONE NDJSON line the client rejects past
+ * `MAX_LINE_LENGTH` (1 MiB, `src/protocol.ts`) — a rejected line reconnect-loops
+ * the viewer and NO first frame ever lands. A single worktree with thousands of
+ * dirty files renders a `dirty_files` array well over 1 MiB on its own (a rendered
+ * entry is ~200-250 B), so the whole-board frame crosses the cap and starves the
+ * snapshot. Capping each worktree's array at this bound keeps its serialized
+ * contribution ≈ 50 KB, so even a board of dozens of simultaneously-dirty
+ * worktrees stays under the line cap.
+ *
+ * Bounding at the FOLD (not the serve path) keeps the wire frame and the
+ * reconciler's direct `git_status` read byte-identical — both fold-consumers see
+ * the same bounded array. The array is a render/consistency mirror only: the
+ * board renders the `dirty_count` scalar, and readiness's per-file consumer
+ * (`projectGitStatusByProjectDir`) is retained-but-unread, so the cap changes no
+ * dispatch decision. The per-job rollups (`jobs.git_*`) fold from the FULL
+ * `snapshot.dirty_files` in pass 4, never this bounded array, so they stay exact.
+ */
+export const GIT_STATUS_DIRTY_FILES_WIRE_CAP = 200;
+
 function projectGitStatus(db: Database, event: Event): void {
   // LIVE-ONLY skip-floor: `git_status` + `file_attributions` are producer-fed,
   // not replayed. A historical GitSnapshot (`id <= floor`) no-ops — the boot-seed
@@ -2168,7 +2193,12 @@ function projectGitStatus(db: Database, event: Event): void {
           ? r.source
           : "inferred",
     }));
-    renderedFiles.push({ ...file, attributions });
+    // Cap only the MATERIALIZED array (the wire/render mirror) — `fileToAttributions`
+    // stays complete so pass 4's per-job rollups fold from every file. See
+    // {@link GIT_STATUS_DIRTY_FILES_WIRE_CAP}.
+    if (renderedFiles.length < GIT_STATUS_DIRTY_FILES_WIRE_CAP) {
+      renderedFiles.push({ ...file, attributions });
+    }
     fileToAttributions.set(file.path, attributions);
   }
 
