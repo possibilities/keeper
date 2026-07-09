@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T21:26:46.900000Z",
+  "depends_on": [],
+  "epic": "fn-1222-harden-serve-liveness-and-restart",
+  "id": "fn-1222-harden-serve-liveness-and-restart.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Fix watchdog probe and arming",
+  "updated_at": "2026-07-09T21:26:46.900000Z"
+}
