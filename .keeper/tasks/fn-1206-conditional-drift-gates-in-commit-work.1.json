@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Wire drift checks into lint matrix",
-  "updated_at": "2026-07-08T23:59:51.692000Z"
+  "updated_at": "2026-07-09T00:31:39.518000Z",
+  "worker_done_at": "2026-07-09T00:31:39.518000Z"
 }

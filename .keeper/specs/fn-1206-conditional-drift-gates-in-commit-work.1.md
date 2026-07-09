@@ -33,5 +33,5 @@ Matrix tests with synthetic staged sets: corpus file staged → vendor stage run
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Wired three staged-path-conditional drift gates (vendor-corpus, model-guidance, import-boundary) into commit-work's lint matrix, each firing only on its own trigger-path set with zero cost otherwise, plus a loud opt-in escape hatch env var; verified end-to-end against a real sandbox commit.
 ## Evidence
