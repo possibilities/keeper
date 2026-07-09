@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 140,
+        "files_changed": 4,
+        "insertions": 380
+      },
+      "done_summary": "Reworked keeper await complete confirmation from counting change-driven subscribe frames to debouncing on elapsed dwell at a stable target-row version. A quiet board now confirms via a bounded re-evaluation timer with no second frame (fixing the F1 indefinite hang), while a done-unwind flap \u2014 including one whose intervening running is coalesced away by diffTick \u2014 bumps the row version and restarts the dwell.",
+      "input_hash": "519e60e38718da9537211224c524694a852bba03d4a5dd5648c0d15b62bf0c3c",
+      "model": "opus",
+      "spec_chars": 3216,
+      "spec_md": "## Description\n\nRework the `complete`-await stability confirmation (fn-1207) so it no longer\ndepends on a second change-driven subscribe frame arriving.\n\nOriginating findings (see the epic's Audit decisions table):\n- F1 (Critical, kept): `advanceCompleteStability` requires `streak >= 2`\n  (src/await-conditions.ts:453, `COMPLETE_CONFIRMATIONS=2` at :418), wired into\n  `evaluate` in cli/await.ts:1681-1707 so a completed-but-unconfirmed observation\n  downgrades to `waiting`. But `diffTick` emits a patch once per advance\n  (src/server-worker.ts:507) and freezes on a DB-quiet board (:2565), and\n  `keeper await complete` is reconnect-forever with no give-up timeout\n  (cli/await.ts:143). So a target that reads `completed` as the FINAL board\n  activity delivers one frame, `streak` stalls at 1, and `met` never fires \u2014 an\n  indefinite hang and a regression from the prior first-frame `met`. Covers both\n  direct/scripted callers and a target that completes-then-settles-quiet after arming.\n- F2 (merged into F1): a `completed -> running -> completed` flap resolving within\n  one poll (`DEFAULT_POLL_MS = 50`) is coalesced by `diffTick` into a single\n  `completed` patch at a higher version, so the intervening `running` never resets\n  the streak and the flap is confirmed anyway. Same root cause: counting coalesced\n  FRAMES is the wrong confirmation basis. The fix must NOT simply raise N \u2014 that\n  worsens F1's quiet-board hang.\n- F3 (merged into F1): no existing test exercises the live-delivery interaction;\n  every stability test drives the pure `advanceCompleteStability` machine or\n  hand-delivers a second frame. Add the missing test as part of this fix.\n\nFiles: cli/await.ts, src/await-conditions.ts, test/await.test.ts,\ntest/await-conditions.test.ts (and the delivery model in src/server-worker.ts as\nread-only context). Prefer driving the confirmation off elapsed dwell / a bounded\nre-evaluation timer (or counting the initial-paint `completed` as confirm-eligible\nafter a short dwell) rather than a second distinct frame delivery, so a quiet board\nconfirms while a genuine reconcile flap still resets.\n\n## Acceptance\n\n- [ ] `keeper await complete <id>` fires `met` on a genuinely quiet board where the target reads `completed` as the final board activity (no further frame delivered), for both direct callers and a target that completes-then-settles-quiet after arming.\n- [ ] The done-unwind flap is still debounced \u2014 including a flap whose intervening `running` is coalesced away by `diffTick` \u2014 without simply raising `COMPLETE_CONFIRMATIONS` in a way that regresses the quiet-board case.\n- [ ] A test arms `complete`, delivers NO further frame after the first `completed`, and asserts `met` fires (the live-delivery interaction current tests assume by hand).\n\n## Done summary\nReworked keeper await complete confirmation from counting change-driven subscribe frames to debouncing on elapsed dwell at a stable target-row version. A quiet board now confirms via a bounded re-evaluation timer with no second frame (fixing the F1 indefinite hang), while a done-unwind flap \u2014 including one whose intervening running is coalesced away by diffTick \u2014 bumps the row version and restarts the dwell.\n## Evidence\n",
+      "task_id": "fn-1210-fix-await-complete-confirmation-on.1",
+      "tier": "high",
+      "title": "Rework await-complete confirmation"
+    }
+  ],
+  "created_at": "2026-07-09T01:29:43.400000Z",
+  "epic_id": "fn-1210-fix-await-complete-confirmation-on",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "519e60e38718da9537211224c524694a852bba03d4a5dd5648c0d15b62bf0c3c",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
