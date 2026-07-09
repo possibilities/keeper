@@ -7,7 +7,7 @@
     "fn-1214-add-apply-selection-verdict-seam"
   ],
   "id": "fn-1217-fix-apply-selection-cross-cwd-state",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T19:56:13.992000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T19:56:12.778000Z"
+  "updated_at": "2026-07-09T19:56:13.992000Z"
 }
