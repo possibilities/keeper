@@ -63,6 +63,20 @@ export const WORKTREE_FINALIZE_NON_FF_REASON =
   "worktree-finalize-non-fast-forward";
 
 /**
+ * The merge-suite-gate finalize reason — an operator jam minted when the fast
+ * suite fails against the PROSPECTIVE lane→default merge result (a semantic merge
+ * conflict git cannot see: two individually-green sides whose merged tree breaks
+ * the suite). Local default never advanced and nothing pushed, so it is NOT a
+ * transient environment skip: it needs an operator to reconcile the conflict, then
+ * `retry_dispatch` to re-arm. Visible non-retry sticky, keyed on {@link
+ * WORKTREE_FINALIZE_ID_PREFIX} exactly like the non-ff arm. Prefix-disjoint from
+ * every existing family: `worktree-finalize-suite-red` shares the `worktree-finalize-`
+ * stem with `-non-fast-forward` / `-conflict` but diverges at `-s`, so it is neither
+ * a prefix of them nor they of it.
+ */
+export const WORKTREE_FINALIZE_SUITE_RED_REASON = "worktree-finalize-suite-red";
+
+/**
  * Worktree-mode close keys prefix the epic (or a path slug) with one of these,
  * stripped by `resolveFailureTarget` before the epic-id join.
  */
@@ -448,6 +462,7 @@ export function stuckSentinelJobId(id: string): string | null {
 export type DispatchFailureDisplayKind =
   | "multi-repo"
   | "non-ff"
+  | "suite-red"
   | "merge-conflict"
   | "dirty-tree"
   | "slot-reclaimed"
@@ -477,6 +492,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
 }> = [
   { prefix: "worktree-multi-repo", kind: "multi-repo" },
   { prefix: WORKTREE_FINALIZE_NON_FF_REASON, kind: "non-ff" },
+  { prefix: WORKTREE_FINALIZE_SUITE_RED_REASON, kind: "suite-red" },
   { prefix: "worktree-finalize-conflict", kind: "merge-conflict" },
   { prefix: "worktree-recover-conflict", kind: "merge-conflict" },
   { prefix: "worktree-recover-dirty-checkout", kind: "dirty-tree" },

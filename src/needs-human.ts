@@ -19,6 +19,7 @@ import { isJamReason } from "./await-conditions";
 import {
   INSTANT_DEATH_BREAKER_REASON,
   WORKTREE_FINALIZE_NON_FF_REASON,
+  WORKTREE_FINALIZE_SUITE_RED_REASON,
 } from "./dispatch-failure-key";
 import {
   type FailureTarget,
@@ -50,29 +51,35 @@ export const BLOCKED_WORK_REASON_PREFIX = "blocked:";
  * The most-specific class of ONE sticky `dispatch_failures` row, each row landing
  * in exactly one bucket:
  *   - `finalize-non-ff`         — the origin-ahead non-fast-forward finalize jam.
+ *   - `finalize-suite-red`      — the merge-suite-gate finalize jam (the prospective
+ *                                 merge result's fast suite failed).
  *   - `instant-death-breaker`   — a per-key instant-death breaker sticky (the
  *                                 wall subset).
  *   - `other`                   — every other sticky (merge-conflict, recover,
  *                                 multi-repo, slot, …).
- * `finalize-non-ff` and `instant-death-breaker` are the two SUBSETS the umbrella
- * total counts once via `stuck_dispatches` and never double-adds; `other` is the
- * remainder. Orthogonal to the jam axis ({@link isJamReason}): a `finalize-non-ff`
- * row is a jam, a `instant-death-breaker` row is not, and an `other` row may be
- * either.
+ * `finalize-non-ff`, `finalize-suite-red`, and `instant-death-breaker` are the
+ * SUBSETS the umbrella total counts once via `stuck_dispatches` and never
+ * double-adds; `other` is the remainder. Orthogonal to the jam axis ({@link
+ * isJamReason}): the two finalize rows are jams, a `instant-death-breaker` row is
+ * not, and an `other` row may be either.
  */
 export type NeedsHumanRowClass =
   | "finalize-non-ff"
+  | "finalize-suite-red"
   | "instant-death-breaker"
   | "other";
 
 /**
  * Classify one row's reason into its most-specific needs-human bucket. Exact
- * equality on the two subset reasons (mirroring the byte-identical status math),
+ * equality on the three subset reasons (mirroring the byte-identical status math),
  * else `other`. Pure; NEVER throws.
  */
 export function classifyNeedsHumanRow(reason: string): NeedsHumanRowClass {
   if (reason === WORKTREE_FINALIZE_NON_FF_REASON) {
     return "finalize-non-ff";
+  }
+  if (reason === WORKTREE_FINALIZE_SUITE_RED_REASON) {
+    return "finalize-suite-red";
   }
   if (reason === INSTANT_DEATH_BREAKER_REASON) {
     return "instant-death-breaker";
@@ -120,9 +127,9 @@ export interface NeedsHumanInputs {
   epicIds: readonly string[];
 }
 
-/** The scalar needs-human counts every surface displays. `finalizeNonFf` and
- *  `instantDeathWall` are SUBSETS of `stuckDispatches`, surfaced separately but
- *  never double-added into `total`. */
+/** The scalar needs-human counts every surface displays. `finalizeNonFf`,
+ *  `finalizeSuiteRed`, and `instantDeathWall` are SUBSETS of `stuckDispatches`,
+ *  surfaced separately but never double-added into `total`. */
 export interface NeedsHumanCounts {
   deadLetters: number;
   blockEscalations: number;
@@ -130,6 +137,10 @@ export interface NeedsHumanCounts {
   stuckDispatches: number;
   /** Subset of `stuckDispatches`: origin-ahead non-ff finalize jams. */
   finalizeNonFf: number;
+  /** Subset of `stuckDispatches`: merge-suite-gate finalize jams (the prospective
+   *  merge result's fast suite failed). Never double-counted into `total`, mirroring
+   *  `finalizeNonFf`. */
+  finalizeSuiteRed: number;
   /** Subset of `stuckDispatches`: per-key instant-death-breaker stickies. */
   instantDeathWall: number;
   /** Subset of `stuckDispatches`: homed `work::` surface-and-stop rows whose
@@ -188,6 +199,9 @@ export function projectNeedsHuman(
 
   const stuckDispatches = rows.length;
   const finalizeNonFf = rows.filter((r) => r.cls === "finalize-non-ff").length;
+  const finalizeSuiteRed = rows.filter(
+    (r) => r.cls === "finalize-suite-red",
+  ).length;
   const instantDeathWall = rows.filter(
     (r) => r.cls === "instant-death-breaker",
   ).length;
@@ -199,9 +213,9 @@ export function projectNeedsHuman(
   const jamCount = rows.filter((r) => r.isJam).length;
   const parkedQuestions = inputs.parkedQuestionEpicIds.length;
 
-  // `finalizeNonFf`, `instantDeathWall`, and `blockedWork` are SUBSETS of
-  // `stuckDispatches` — surfaced separately, never double-counted into the
-  // umbrella total.
+  // `finalizeNonFf`, `finalizeSuiteRed`, `instantDeathWall`, and `blockedWork` are
+  // SUBSETS of `stuckDispatches` — surfaced separately, never double-counted into
+  // the umbrella total.
   const total =
     inputs.deadLetters +
     inputs.blockEscalations +
@@ -213,6 +227,7 @@ export function projectNeedsHuman(
     blockEscalations: inputs.blockEscalations,
     stuckDispatches,
     finalizeNonFf,
+    finalizeSuiteRed,
     instantDeathWall,
     blockedWork,
     parkedQuestions,

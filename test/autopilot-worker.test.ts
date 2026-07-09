@@ -105,6 +105,8 @@ import {
   laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
   loadReconcileSnapshot,
+  type MergeSuiteProbe,
+  type MergeSuiteVerdict,
   mergeLaneBaseIntoDefault,
   planTipBaselineRequests,
   prepareWorktreeGeometry,
@@ -150,6 +152,7 @@ import {
   WORKER_EFFORT,
   WORKER_MODEL,
   WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_FINALIZE_SUITE_RED_REASON,
   type WorktreeDriver,
   type WorktreeLaunchInfo,
   type WorktreeRecoveryEscalation,
@@ -7564,6 +7567,9 @@ interface MergeGitOpts {
   worktreeList?: string; // `worktree list --porcelain` stdout
   epicLaneBranches?: string; // `for-each-ref refs/heads/keeper/epic` stdout
   pruneNotAncestor?: boolean; // keep finalize's prune gate FALSE even post-merge
+  // fn-1204 merge-suite gate: `git diff --name-only <defaultTip> <merged> -- plugins/plan`
+  // stdout — non-empty drives the gate's runsPlanSuite=true. Default "" (root only).
+  planDiff?: string;
 }
 
 function makeMergeGit(opts: MergeGitOpts = {}): {
@@ -7747,6 +7753,10 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
     // --- finalize teardown support (inert for the direct merge tests) ---
     if (joined.startsWith("symbolic-ref")) {
       return { code: 0, stdout: `origin/${def}\n`, stderr: "" };
+    }
+    if (args[0] === "diff") {
+      // fn-1204 merge-suite gate's plan-touch probe (`diff --name-only … -- plugins/plan`).
+      return { code: 0, stdout: opts.planDiff ?? "", stderr: "" };
     }
     if (joined.startsWith("for-each-ref") && joined.includes("keeper/epic")) {
       return { code: 0, stdout: opts.epicLaneBranches ?? "", stderr: "" };
@@ -11924,6 +11934,207 @@ test("fn-1140 finalizeEpic: an OFF-BRANCH main checkout advances the base merge 
   // No wrong-ref push, no teardown behind the deferred push.
   expect(cmds.some((c) => c === "push origin main")).toBe(false);
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+// ── fn-1204 — the finalize merge-suite gate ─────────────────────────────────
+// The prospective lane→default merge result's fast suite runs on a scratch worktree
+// BEFORE local default advances: green proceeds to the existing merge+push; red parks a
+// VISIBLE sticky with local default unmoved and nothing pushed; a gate that cannot run
+// degrades to a non-sticky retry-skip. The suite run is an INJECTED probe so these fast
+// tests drive the three verdicts + the memo purely (the real scratch+suite run is the
+// slow real-git tier's job).
+
+/** A fake merge-suite probe recording its calls and returning a fixed verdict (or a
+ *  per-call verdict picked by 1-based call index). */
+function makeSuiteProbe(
+  verdict: MergeSuiteVerdict | ((call: number) => MergeSuiteVerdict),
+): {
+  probe: MergeSuiteProbe;
+  calls: { repoDir: string; mergedCommit: string; runsPlanSuite: boolean }[];
+} {
+  const calls: {
+    repoDir: string;
+    mergedCommit: string;
+    runsPlanSuite: boolean;
+  }[] = [];
+  const probe: MergeSuiteProbe = async (a) => {
+    calls.push({
+      repoDir: a.repoDir,
+      mergedCommit: a.mergedCommit,
+      runsPlanSuite: a.runsPlanSuite,
+    });
+    return typeof verdict === "function" ? verdict(calls.length) : verdict;
+  };
+  return { probe, calls };
+}
+
+test("fn-1204 finalizeEpic gate: a GREEN merge-suite verdict proceeds through the unchanged merge+push path", async () => {
+  const { run, cmds } = makeMergeGit();
+  const { probe, calls } = makeSuiteProbe({ kind: "green" });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  expect(res).toEqual({ ok: true });
+  // The probe saw the EXACT prospective merged commit the merge advances to.
+  expect(calls).toEqual([
+    { repoDir: "/repo", mergedCommit: MG_MERGE_COMMIT, runsPlanSuite: false },
+  ]);
+  // Green → the real merge+push ran, unchanged.
+  expect(cmds.some((c) => c.startsWith("update-ref --end-of-options"))).toBe(
+    true,
+  );
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+});
+
+test("fn-1204 finalizeEpic gate: a RED merge-suite verdict parks a VISIBLE sticky (no retry) with local default unmoved and nothing pushed", async () => {
+  const { run, cmds } = makeMergeGit();
+  const { probe, calls } = makeSuiteProbe({
+    kind: "red",
+    detail: "3 failing test(s): foo > bar",
+  });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    // A VISIBLE sticky (mirrors the non-ff arm) — never a retry-skip, so the operator
+    // sees it and clears it with retry_dispatch once the semantic conflict is fixed.
+    expect(res.retry).not.toBe(true);
+    expect(
+      res.reason.startsWith(`${WORKTREE_FINALIZE_SUITE_RED_REASON}:`),
+    ).toBe(true);
+    expect(res.reason).toContain(MG_MERGE_COMMIT);
+    expect(res.reason).toContain("3 failing test(s)");
+    // Stays OUTSIDE the recover auto-clear prefix.
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  expect(calls.length).toBe(1);
+  // Local default NEVER advanced and NOTHING was pushed — so the desync producer sees
+  // nothing, and there is no rollback to do.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("fn-1204 finalizeEpic gate: a CANNOT-RUN verdict degrades to a non-sticky retry-skip, never a push, never a permanent silent block", async () => {
+  const { run, cmds } = makeMergeGit();
+  const { probe } = makeSuiteProbe({
+    kind: "cannot-run",
+    detail: "scratch checkout failed",
+  });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).toBe(true); // NON-sticky — retries next cycle
+    expect(res.reason).toContain("worktree-finalize-suite-gate-unavailable");
+    expect(isWorktreeRecoverReason(res.reason)).toBe(false);
+  }
+  // Never a silent push behind an un-run gate.
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-1204 finalizeEpic gate: the verdict is MEMOIZED by merged-commit key — a parked epic's finalize retry reuses the cached red without re-running the suite", async () => {
+  const { run } = makeMergeGit();
+  const { probe, calls } = makeSuiteProbe({ kind: "red", detail: "boom" });
+  // ONE driver (the memo lives on its closure); two finalize retries of the SAME
+  // unchanged merge (the red park never advanced default, so the merged commit is
+  // stable across the retry).
+  const driver = createWorktreeDriver(run, () => ({ release() {} }));
+  const first = await driver.finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    probe,
+  );
+  const second = await driver.finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    probe,
+  );
+  expect(first.ok).toBe(false);
+  expect(second.ok).toBe(false);
+  // The suite probe ran ONCE — the second finalize reused the memoized red verdict.
+  expect(calls.length).toBe(1);
+});
+
+test("fn-1204 finalizeEpic gate: a CANNOT-RUN verdict is NOT memoized — the next finalize retries the suite (a transient scratch hiccup must recompute)", async () => {
+  const { run } = makeMergeGit();
+  // First call cannot-run, second call green — the memo must NOT latch the cannot-run.
+  const { probe, calls } = makeSuiteProbe((call) =>
+    call === 1
+      ? { kind: "cannot-run", detail: "scratch hiccup" }
+      : { kind: "green" },
+  );
+  const driver = createWorktreeDriver(run, () => ({ release() {} }));
+  const first = await driver.finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    probe,
+  );
+  const second = await driver.finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    probe,
+  );
+  expect(first.ok).toBe(false); // retry-skip
+  expect(second).toEqual({ ok: true }); // recomputed → green → merged
+  expect(calls.length).toBe(2); // the probe ran BOTH times — no cannot-run latch
+});
+
+test("fn-1204 finalizeEpic gate: a merge touching plugins/plan drives runsPlanSuite=true (the plan suite is covered)", async () => {
+  const { run } = makeMergeGit({ planDiff: "plugins/plan/src/x.ts\n" });
+  const { probe, calls } = makeSuiteProbe({ kind: "green" });
+  await createWorktreeDriver(run, () => ({ release() {} })).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    probe,
+  );
+  expect(calls).toEqual([
+    { repoDir: "/repo", mergedCommit: MG_MERGE_COMMIT, runsPlanSuite: true },
+  ]);
+});
+
+test("fn-1204 finalizeEpic gate: an ALREADY-MERGED base (ancestor of default) SKIPS the gate — no suite run, idempotent teardown resumes", async () => {
+  // A crash-retry after the merge already landed: the base is an ancestor of default,
+  // so there is no new merged tree to gate — the probe must NOT run, and finalize falls
+  // straight through to the idempotent not-ahead teardown.
+  const { run } = makeMergeGit({ baseAncestorOfDefault: true });
+  const { probe, calls } = makeSuiteProbe({ kind: "red", detail: "unused" });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  expect(res).toEqual({ ok: true });
+  expect(calls.length).toBe(0); // gate skipped — nothing new to test
+});
+
+test("fn-1204 finalizeEpic gate: a merge-tree CONFLICT is NOT gated — it falls through to the shared merge routine's sticky conflict, never a suite-red park", async () => {
+  // The gate only vets a COMPUTABLE merged tree; a content conflict has no merged tree
+  // to test, so the gate falls through and mergeLaneBaseIntoDefault surfaces its own
+  // conflict discriminant unchanged (the probe never runs).
+  const { run } = makeMergeGit({ mergeTreeExit: 1 });
+  const { probe, calls } = makeSuiteProbe({ kind: "green" });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.reason).toContain("worktree-finalize-conflict");
+    expect(
+      res.reason.startsWith(`${WORKTREE_FINALIZE_SUITE_RED_REASON}:`),
+    ).toBe(false);
+  }
+  expect(calls.length).toBe(0); // no computable merged tree → gate skipped
+});
+
+test("fn-1204 finalizeEpic gate: OMITTING the probe skips the gate entirely — finalize merges as before (backward-compatible)", async () => {
+  const { run, cmds } = makeMergeGit();
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true);
+  expect(res).toEqual({ ok: true });
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
 });
 
 test("fn-993 finalizeEpic: a NON-FAST-FORWARD remote (origin ahead) → operator-visible STICKY block (no retry), no merge/push/fetch", async () => {

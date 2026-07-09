@@ -85,6 +85,7 @@ import type { MonitorEntry } from "./derivers";
 import {
   MERGE_ESCALATION_REASON_TOKEN,
   WORKTREE_FINALIZE_NON_FF_REASON,
+  WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
 // Type-only import — the shared needs-human projector ({@link projectNeedsHuman})
@@ -1239,13 +1240,14 @@ export function monitorRunningState(
  * Is this `dispatch_failures.reason` an operator jam (an open-board sticky that
  * will NOT self-resolve)? The jam allowlist for `await drained --fail-on-stuck`:
  * `worktree-finalize-non-fast-forward` (an origin-ahead non-ff needing an operator
- * to reconcile origin) and a `worktree-merge-conflict` close-sink content conflict.
- * The `worktree-recover*` auto-clear prefix is excluded FIRST — a recover row
- * self-clears level-triggered once its git resolves, so a `worktree-recover-conflict`
- * never counts despite sharing the `worktree-` namespace. Tokens come from the
- * dep-free `dispatch-failure-key` leaf (the single dispatch-failure vocabulary), so
- * this leaf module adopts them with no drift risk. Exported for the `drained` jam
- * check + its test.
+ * to reconcile origin), `worktree-finalize-suite-red` (the prospective merge result's
+ * fast suite failed — a semantic merge conflict an operator must reconcile), and a
+ * `worktree-merge-conflict` close-sink content conflict. The `worktree-recover*`
+ * auto-clear prefix is excluded FIRST — a recover row self-clears level-triggered once
+ * its git resolves, so a `worktree-recover-conflict` never counts despite sharing the
+ * `worktree-` namespace. Tokens come from the dep-free `dispatch-failure-key` leaf (the
+ * single dispatch-failure vocabulary), so this leaf module adopts them with no drift
+ * risk. Exported for the `drained` jam check + its test.
  */
 export function isJamReason(reason: string): boolean {
   if (reason.startsWith(WORKTREE_RECOVER_REASON_PREFIX)) {
@@ -1253,6 +1255,7 @@ export function isJamReason(reason: string): boolean {
   }
   return (
     reason === WORKTREE_FINALIZE_NON_FF_REASON ||
+    reason === WORKTREE_FINALIZE_SUITE_RED_REASON ||
     reason.startsWith(MERGE_ESCALATION_REASON_TOKEN)
   );
 }
