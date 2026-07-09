@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T20:17:59.835000Z",
+  "depends_on": [],
+  "epic": "fn-1218-correct-stale-assign-cells-validation",
+  "id": "fn-1218-correct-stale-assign-cells-validation.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "low",
+  "title": "Fix assign-cells seam comment",
+  "updated_at": "2026-07-09T20:17:59.835000Z"
+}
