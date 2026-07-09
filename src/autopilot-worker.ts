@@ -53,6 +53,16 @@ import {
   type BackstopMessage,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
+import {
+  type BaselineRequest,
+  buildRequest,
+  currentToolchain,
+  isValidSha,
+  newRequestId,
+  requestPath,
+  type ToolchainFingerprint,
+  writeRequest,
+} from "./baseline-store";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -6120,6 +6130,168 @@ function stripTrailingSlashPath(p: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Tip-triggered baseline producer (fn-1203)
+// ---------------------------------------------------------------------------
+
+/**
+ * One open-epic repo's current default-branch tip — the producer's unit of
+ * observation: a `git_status.project_dir` carrying an open epic, paired with that
+ * projection row's `head_oid`. The autopilot's primary checkout stays on the
+ * default branch (worktree lanes are separate checkouts; a non-worktree epic
+ * commits directly on default), so this head IS the default-branch tip.
+ */
+export interface TipObservation {
+  /** The repo's `git_status` project dir (== the epic's `project_dir`). */
+  repoDir: string;
+  /** The projection's current `head_oid` for that repo. */
+  tipSha: string;
+}
+
+/**
+ * Gather the tip observations for the baseline producer: each repo carrying an
+ * OPEN epic (`status !== "done"`), paired with its current `git_status` head oid,
+ * deduped per repo (many epics in one repo share the one tip). A done epic, an
+ * epic with no `project_dir`, or a repo with no head-carrying git row (an
+ * initial-commit repo) yields nothing. PURE — reads the passed projections only,
+ * never git or a fold.
+ */
+export function gatherTipObservations(
+  epics: readonly Epic[],
+  gitHeadByProjectDir: ReadonlyMap<string, string>,
+): TipObservation[] {
+  const out: TipObservation[] = [];
+  const seen = new Set<string>();
+  for (const epic of epics) {
+    if (epic.status === "done") continue;
+    const dir = epic.project_dir;
+    if (dir === null || dir.length === 0 || seen.has(dir)) continue;
+    seen.add(dir);
+    const tip = gitHeadByProjectDir.get(dir);
+    if (tip !== undefined && tip.length > 0) {
+      out.push({ repoDir: dir, tipSha: tip });
+    }
+  }
+  return out;
+}
+
+/**
+ * The pure tip-change → baseline-spool plan. Given the current open-epic tip
+ * observations and the last tip this reconciler already spooled per repo, emit
+ * ONE baseline request per repo whose tip CHANGED and return the next per-repo
+ * tip map.
+ *
+ * Coalescing is by SAMPLING: each cycle observes only the repo's CURRENT tip, so
+ * a rapid push train collapses to the latest sha (intermediate tips between
+ * cycles are never observed) and the store's key-dedup makes any duplicate
+ * request idempotent. An unchanged tip emits nothing (the "exactly one request
+ * per change, idempotent across cycles" bar); a fresh boot (`prevTip` empty)
+ * re-spools the current tip once, harmless by compute-once-per-key. `nextTip`
+ * carries every observed repo's current tip (changed or not) so the caller can
+ * adopt it as the new baseline; it is bounded to the current open-epic repo set.
+ * An empty/invalid sha observation is dropped. PURE — the toolchain and clock
+ * ride in as data so key composition never reads the environment.
+ */
+export function planTipBaselineRequests(params: {
+  observations: readonly TipObservation[];
+  prevTip: ReadonlyMap<string, string>;
+  toolchain: ToolchainFingerprint;
+  now: number;
+}): { requests: BaselineRequest[]; nextTip: Map<string, string> } {
+  const { observations, prevTip, toolchain, now } = params;
+  const requests: BaselineRequest[] = [];
+  const nextTip = new Map<string, string>();
+  for (const { repoDir, tipSha } of observations) {
+    if (repoDir.length === 0 || !isValidSha(tipSha) || nextTip.has(repoDir)) {
+      continue;
+    }
+    nextTip.set(repoDir, tipSha);
+    if (prevTip.get(repoDir) === tipSha) continue; // unchanged — no spool
+    requests.push(buildRequest({ repoDir, sha: tipSha, toolchain }, now));
+  }
+  return { requests, nextTip };
+}
+
+/**
+ * Read `project_dir → head_oid` from the `git_status` projection (the git-worker's
+ * feed) via the reconciler's read-only connection — the producer-side tip source
+ * for {@link gatherTipObservations}. A null/absent head (an initial-commit repo)
+ * is dropped. Producer read only, NEVER a fold.
+ */
+export function readGitHeadByProjectDir(
+  db: Parameters<typeof runQuery>[0],
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const res = runQuery(db, 0, {
+    type: "query" as const,
+    collection: "git",
+    id: "autopilot-baseline-git",
+    limit: 0,
+  });
+  if (res.type !== "result") return out;
+  for (const row of res.rows as Record<string, unknown>[]) {
+    const dir = row.project_dir;
+    const head = row.head_oid;
+    if (
+      typeof dir === "string" &&
+      dir.length > 0 &&
+      typeof head === "string" &&
+      head.length > 0
+    ) {
+      out.set(dir, head);
+    }
+  }
+  return out;
+}
+
+/**
+ * The per-cycle tip-triggered baseline producer: observe each open-epic repo's
+ * current default-branch tip off the `git_status` projection, spool ONE baseline
+ * request per repo whose tip changed since this reconciler last spooled it, and
+ * advance the in-memory per-repo tip map. The reconciler is a SANCTIONED second
+ * writer of the request spool (alongside the `keeper baseline` CLI) — a direct
+ * dep-light atomic write, no subprocess. Idempotent across cycles (unchanged tip
+ * → no write) and boots (`baselineTipByRepo` boots empty; the first observation
+ * re-spools the current tip, harmless by compute-once-per-key). A spool-write
+ * failure is logged and its tip is NOT recorded, so the next cycle retries it.
+ * Producer-side only; never a fold. NEVER throws (the caller wraps it too).
+ */
+function runBaselineTipProducer(
+  epics: readonly Epic[],
+  gitHeadByProjectDir: ReadonlyMap<string, string>,
+  baselineTipByRepo: Map<string, string>,
+  deps: {
+    now: () => number;
+    toolchain: ToolchainFingerprint;
+    writeSpoolRequest: (request: BaselineRequest) => void;
+  },
+): void {
+  const observations = gatherTipObservations(epics, gitHeadByProjectDir);
+  const { requests, nextTip } = planTipBaselineRequests({
+    observations,
+    prevTip: baselineTipByRepo,
+    toolchain: deps.toolchain,
+    now: deps.now(),
+  });
+  // Adopt the observed current tips, then revert any repo whose spool write
+  // failed back to its prior tip (or drop it) so the change re-fires next cycle.
+  const nextMap = new Map(nextTip);
+  for (const request of requests) {
+    try {
+      deps.writeSpoolRequest(request);
+    } catch (err) {
+      console.error(
+        `[autopilot-worker] baseline spool write failed for ${request.repoDir}: ${errMsg(err)}`,
+      );
+      const prev = baselineTipByRepo.get(request.repoDir);
+      if (prev === undefined) nextMap.delete(request.repoDir);
+      else nextMap.set(request.repoDir, prev);
+    }
+  }
+  baselineTipByRepo.clear();
+  for (const [dir, tip] of nextMap) baselineTipByRepo.set(dir, tip);
+}
+
+// ---------------------------------------------------------------------------
 // Worker entrypoint
 // ---------------------------------------------------------------------------
 
@@ -6823,6 +6995,15 @@ function main(): void {
   // fresh. Shutdown aborts this one too.
   let cycleController = new AbortController();
   const liveDispatches = new Map<DispatchKey, LiveDispatch>();
+  // fn-1203 tip-triggered baseline producer state: `repoDir → last tip spooled`.
+  // In-memory only, boots EMPTY — the first cycle re-spools each open-epic repo's
+  // current tip (harmless by compute-once-per-key), and thereafter one request is
+  // spooled per repo whose default-branch tip changes. Bounded to the current
+  // open-epic repo set each cycle.
+  const baselineTipByRepo = new Map<string, string>();
+  // The live toolchain fingerprint half of the baseline key — read once here
+  // (env), never per cycle or in a fold; threaded into the producer as data.
+  const baselineToolchain = currentToolchain();
   let shutdown = false;
   // Durable `dispatched-ack` correlation. `emitDispatched` posts a
   // `dispatched-request{id}` and parks a resolver keyed by the monotonic `id`;
@@ -7235,6 +7416,29 @@ function main(): void {
         } catch (err) {
           console.error(
             "[autopilot-worker] lane-merged emit threw (non-fatal):",
+            err,
+          );
+        }
+        // fn-1203 — the tip-triggered baseline producer. Once per cycle,
+        // regardless of paused/playing (detection, not a dispatch action): spool
+        // a fresh trunk baseline for each open-epic repo whose default-branch tip
+        // moved since the last spool. Wrapped — a spool failure must not wedge the
+        // wake loop.
+        try {
+          runBaselineTipProducer(
+            snapshot.epics,
+            readGitHeadByProjectDir(db),
+            baselineTipByRepo,
+            {
+              now: deps.now,
+              toolchain: baselineToolchain,
+              writeSpoolRequest: (request) =>
+                writeRequest(requestPath(newRequestId()), request),
+            },
+          );
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] baseline tip producer threw (non-fatal):",
             err,
           );
         }
