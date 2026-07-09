@@ -122,7 +122,8 @@ export function isVendorCorpusPath(path: string): boolean {
 export function isModelGuidancePath(path: string): boolean {
   return (
     path === "plugins/plan/model-selector.yaml" ||
-    path === "plugins/plan/subagents.yaml"
+    path === "plugins/plan/subagents.yaml" ||
+    path.startsWith("plugins/plan/skills/model-guidance/references/")
   );
 }
 
