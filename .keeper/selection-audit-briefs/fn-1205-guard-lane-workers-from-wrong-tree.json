@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 4,
+        "files_changed": 4,
+        "insertions": 1142
+      },
+      "done_summary": "Added the wrong-tree-guard PreToolUse hook (Write|Edit|MultiEdit|Bash) that denies a worktree-lane worker's write into any non-lane tracked repo tree \u2014 direct file_path plus best-effort Bash redirect/heredoc/tee/sed -i vectors \u2014 while allowing .keeper plan-state, temp/home/state, and own-lane writes, denying .git/config+credentials regardless of lane, and failing open. Registered the dual matcher, bumped CLAUDE.md to seven hooks, and added a 67-case pure+real-fs test suite.",
+      "input_hash": "f9b22114dbeb7363169f970288e878a73bbb1391e4cf807dbe342d94d72c3e25",
+      "model": "opus",
+      "spec_chars": 3817,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** plugins/keeper/plugin/hooks/wrong-tree-guard.ts, plugins/keeper/hooks/hooks.json, plugins/keeper/test (hook suite), CLAUDE.md\n\n### Approach\n\nNew PreToolUse hook, structured like branch-guard (pure payload decision, deny via the JSON envelope, always exit 0) but marker-keyed like escalation-guard: it arms only when KEEPER_PLAN_WORKTREE is present and non-empty (the launch-injected lane path; absent/empty \u2014 including serial launches and the human's own session \u2014 the hook is inert-allow). Decision rule: resolve the write target; deny iff it lands inside a tracked repo working tree whose toplevel is not the lane realpath \u2014 with .keeper/ paths under any repo allowlisted (plan state legitimately writes to primary_repo/.keeper), and a small unconditional denylist (.git/config and credential-shaped paths) regardless of lane. Everything outside tracked repos (temp, scratchpad, home, state dirs) is allowed untouched. Register two matchers (Write|Edit|MultiEdit and Bash), reusing escalation-guard's existing Bash write-vector detection (redirects, heredocs, interpreters, tee/in-place editors) rather than inventing a parser; string parsing is best-effort audit by explicit discipline \u2014 state that in the hook header. Realpath both sides; when the target cannot resolve (create-new paths), resolve the nearest existing ancestor; on any resolution error, allow (fail-open) and log privately. node:* imports only, no bun:sqlite, size-bounded single-line JSON logging, never host stdout.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/keeper/plugin/hooks/branch-guard.ts:250 \u2014 the deny-envelope structure and payload parsing to mirror\n- plugins/keeper/plugin/hooks/escalation-guard.ts:747 \u2014 env-marker read; its write-bypass-class detection to reuse\n- src/exec-backend.ts:1142 \u2014 where KEEPER_PLAN_WORKTREE is injected (realpath-normalized, torn down at finalize)\n- plugins/keeper/hooks/hooks.json \u2014 dual-matcher registration precedent (sidecar-writer)\n\n### Risks\n\n- How the guard learns \"tracked repo toplevels\": prefer deriving from the write target itself (walk up to a .git boundary) over reading keeper config \u2014 hooks must stay dep-free and fast.\n- Env propagation: confirm KEEPER_PLAN_WORKTREE actually reaches the hook subprocess in a lane launch (escalation-guard's marker proves the channel; verify for this variable).\n\n### Test notes\n\nHook-level tests with synthetic payloads: lane-marked + shared-checkout target \u2192 deny; lane-marked + own-lane target \u2192 allow; .keeper under primary repo \u2192 allow; unmarked session \u2192 allow-all; Bash vectors (redirect, heredoc, tee, sed -i) into the shared checkout \u2192 deny; unresolvable path \u2192 allow; .git/config anywhere \u2192 deny.\n\n## Acceptance\n\n- [ ] Lane-marked writes into a non-lane tracked repo tree are denied via the envelope across direct tools and the detected Bash write vectors\n- [ ] .keeper plan-state writes, temp/home/state-dir writes, and all unmarked sessions are unaffected\n- [ ] The hook is fail-open on every internal error path and emits nothing on host stdout\n- [ ] CLAUDE.md's hook bullet reflects seven hooks; the plugin hook suite is green\n- [ ] keeper fast suite green\n\n## Done summary\nAdded the wrong-tree-guard PreToolUse hook (Write|Edit|MultiEdit|Bash) that denies a worktree-lane worker's write into any non-lane tracked repo tree \u2014 direct file_path plus best-effort Bash redirect/heredoc/tee/sed -i vectors \u2014 while allowing .keeper plan-state, temp/home/state, and own-lane writes, denying .git/config+credentials regardless of lane, and failing open. Registered the dual matcher, bumped CLAUDE.md to seven hooks, and added a 67-case pure+real-fs test suite.\n## Evidence\n",
+      "task_id": "fn-1205-guard-lane-workers-from-wrong-tree.1",
+      "tier": "xhigh",
+      "title": "Add wrong-tree write guard hook"
+    }
+  ],
+  "created_at": "2026-07-09T00:43:24.663000Z",
+  "epic_id": "fn-1205-guard-lane-workers-from-wrong-tree",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "f9b22114dbeb7363169f970288e878a73bbb1391e4cf807dbe342d94d72c3e25",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
