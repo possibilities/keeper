@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T21:34:06.025000Z",
+  "depends_on": [],
+  "epic": "fn-1223-restore-hermes-shim-event-set-drift",
+  "id": "fn-1223-restore-hermes-shim-event-set-drift.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "low",
+  "title": "Test hermes event-set drift",
+  "updated_at": "2026-07-09T21:34:06.025000Z"
+}
