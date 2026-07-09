@@ -536,6 +536,8 @@ function srow(over: Partial<SentinelRow> = {}): SentinelRow {
     lastLifecycleTs: FRESH_EVT,
     workerDone: false,
     hasFreshSubagent: false,
+    planRef: "fn-9-x.1",
+    adopted: false,
     ...over,
   };
 }
@@ -716,6 +718,77 @@ test("sentinel predicate: a far-future STAMP annotates a firing tier's reason wi
   ]);
 });
 
+test("sentinel predicate: a stale-working row with NO plan linkage mints no tier-two ack-row (interactive carve-out)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ workerDone: false, lastEventTs: STALE_T2, planRef: null })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: a stale-working ADOPTED row mints no tier-two ack-row even if plan_ref is somehow set", () => {
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        workerDone: false,
+        lastEventTs: STALE_T2,
+        planRef: "fn-9-x.1",
+        adopted: true,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: a stale-working PLAN-LINKED row still mints its tier-two ack-row", () => {
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        workerDone: false,
+        lastEventTs: STALE_T2,
+        planRef: "fn-9-x.1",
+        adopted: false,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: stale-working",
+    },
+  ]);
+});
+
+test("sentinel predicate: tier-one self-heal fires for a plan_ref-null (interactive/adopted) row too — unchanged for all session kinds", () => {
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        workerDone: true,
+        lastEventTs: STALE_T1,
+        planRef: null,
+        adopted: true,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 1,
+      heal: true,
+      reason: "stuck-sentinel: worker-done-while-working",
+    },
+  ]);
+});
+
 // ---------------------------------------------------------------------------
 // sentinelReason — the class-stable reason builder
 // ---------------------------------------------------------------------------
@@ -869,6 +942,55 @@ test("sentinelLoop: a worker-done working row with stale events heals ONCE (chan
   expect(posted[0]?.jobId).toBe("sess-stuck");
   expect(posted[0]?.heal).toBe(true);
   expect(posted[0]?.reason).toBe("stuck-sentinel: worker-done-while-working");
+
+  writer.close();
+  reader.close();
+});
+
+/** Seed a `working` interactive job (no plan linkage) with no live pid tie. */
+function seedWorkingInteractiveJob(
+  db: ReturnType<typeof openDb>["db"],
+  jobId: string,
+  pid: number,
+  lastLifecycleTs: number,
+  adopted: number | null = null,
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                       updated_at, plan_verb, plan_ref, last_lifecycle_ts, adopted)
+       VALUES (?, ?, NULL, ?, 'working', 0, ?, NULL, NULL, ?, ?)`,
+    [jobId, lastLifecycleTs, pid, lastLifecycleTs, lastLifecycleTs, adopted],
+  );
+}
+
+test("sentinelLoop: a parked-idle interactive session (no plan_ref) past the tier-two floor mints NO ack-row", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+
+  const nowSecs = 3_000_000;
+  seedWorkingInteractiveJob(writer, "sess-idle-human", 6002, nowSecs - 3600);
+  seedEvent(writer, "sess-idle-human", nowSecs - 3600); // ~1h stale, past tier-two
+
+  const posted: StuckSentinelMessage[] = [];
+  let shutdown = false;
+  const loop = sentinelLoop(
+    reader,
+    (msg) => posted.push(msg),
+    () => shutdown,
+    {
+      intervalMs: 25,
+      reemitMs: 10 * 60_000,
+      nowSecs: () => nowSecs,
+      isAlive: (pid) => pid === 6002,
+    },
+  );
+
+  // Give the loop several ticks to prove it never emits for this row.
+  await Bun.sleep(150);
+  shutdown = true;
+  await loop;
+
+  expect(posted).toEqual([]);
 
   writer.close();
   reader.close();

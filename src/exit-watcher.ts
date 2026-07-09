@@ -545,6 +545,16 @@ export interface SentinelRow {
   workerDone: boolean;
   /** A fresh in-flight subagent survives (tier-one exclusion). */
   hasFreshSubagent: boolean;
+  /** `jobs.plan_ref` (raw, not the same discriminator as `workerDone`'s parsed
+   *  ref). NULL means the session has no plan linkage — a parked-idle
+   *  interactive session, including every adopted identity (adoption paths
+   *  never spawn under a plan verb). Tier-two ack-row minting excludes these
+   *  (ADR 0013/0024 amendment); tier-one self-heal stays unconditional. */
+  planRef: string | null;
+  /** The harness-agnostic ADOPTED marker (`jobs.adopted`). A defensive second
+   *  signal alongside `planRef == null` — an adopted session is soft
+   *  telemetry even in the (unobserved) case it somehow carries a plan_ref. */
+  adopted: boolean;
 }
 
 /** One sentinel verdict — the stuck row plus what to do about it. */
@@ -586,9 +596,16 @@ export function sentinelReason(
  *     fresh-subagent exclusion + the conservative min-age keep a live session
  *     safe (a real resume re-activates under the stamp gate).
  *   - TIER TWO (detect-only): event age `>= STUCK_TIER2_MIN_AGE_SECS`, regardless
- *     of `workerDone` — the universal net for free-form jobs.
+ *     of `workerDone` — the universal net for free-form jobs. EXCLUDES a session
+ *     with no plan linkage (`planRef == null`, including every adopted
+ *     identity): a parked-idle interactive session is soft telemetry — the
+ *     working/idle contradiction stays observable on jobs/board, but mints no
+ *     needs-human ack-row (ADR 0013/0024 amendment). Plan-linked worker
+ *     sessions keep full tier-two coverage.
  *   - CLOCK SKEW with no staleness trip → a detect-only skew anomaly, so an
- *     implausibly-future event/stamp is never silently swallowed.
+ *     implausibly-future event/stamp is never silently swallowed. NOT carved
+ *     out by the interactive-session exclusion — it flags a different signal
+ *     (implausible event clock), not a stale-working contradiction.
  *
  * Skew is computed from BOTH the last event ts and the lifecycle stamp being
  * implausibly ahead of `nowSecs`; it ANNOTATES a firing tier's reason and stands
@@ -629,12 +646,17 @@ export function selectStuckSentinelVerdicts(
       continue;
     }
     if (ageSecs >= STUCK_TIER2_MIN_AGE_SECS) {
-      out.push({
-        jobId: row.jobId,
-        tier: 2,
-        heal: false,
-        reason: sentinelReason("stale-working", clockSkew),
-      });
+      // Interactive/adopted sessions (no plan linkage) are soft telemetry —
+      // no tier-two ack-row, but they still fall through to the clock-skew
+      // detect below when applicable.
+      if (row.planRef != null && !row.adopted) {
+        out.push({
+          jobId: row.jobId,
+          tier: 2,
+          heal: false,
+          reason: sentinelReason("stale-working", clockSkew),
+        });
+      }
       continue;
     }
     if (clockSkew) {
@@ -738,6 +760,7 @@ interface SentinelCandidateRow {
   plan_verb: string | null;
   plan_ref: string | null;
   last_lifecycle_ts: number | null;
+  adopted: number | null;
 }
 
 /**
@@ -770,7 +793,7 @@ export async function sentinelLoop(
   const nowSecs = opts.nowSecs ?? (() => Date.now() / 1000);
   const isAlive = opts.isAlive ?? isPidAlive;
   const candidatesQuery = db.query(
-    `SELECT job_id, pid, plan_verb, plan_ref, last_lifecycle_ts FROM jobs
+    `SELECT job_id, pid, plan_verb, plan_ref, last_lifecycle_ts, adopted FROM jobs
        WHERE state = 'working' AND pid IS NOT NULL`,
   );
   // Per-session change-gate memo: jobId → last emitted {reason, lastEmitMs}.
@@ -814,6 +837,8 @@ export async function sentinelLoop(
             STUCK_SENTINEL_SUBAGENT_GAP_SEC,
             now,
           ),
+          planRef: c.plan_ref,
+          adopted: c.adopted === 1,
         });
       } catch (err) {
         console.error(
