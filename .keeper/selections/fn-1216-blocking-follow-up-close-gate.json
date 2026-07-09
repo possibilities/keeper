@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "stamped default retained; selector returned no verdict after one retry",
+      "task_id": "fn-1216-blocking-follow-up-close-gate.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "stamped default retained; selector returned no verdict after one retry",
+      "task_id": "fn-1216-blocking-follow-up-close-gate.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "stamped default retained; selector returned no verdict after one retry",
+      "task_id": "fn-1216-blocking-follow-up-close-gate.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T19:17:50.933000Z",
+  "epic_id": "fn-1216-blocking-follow-up-close-gate",
+  "input_hash": "67c31433007bb53608abf4310d754f1a70e9d75770959d2dbcdd0857ddc944c6",
+  "outcome": "degraded:selector-no-verdict",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1740837939,
+  "verdict_raw": null
+}
