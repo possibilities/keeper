@@ -1039,6 +1039,7 @@ export interface GitStatus {
   behind: number | null;
   dirty_count: number;
   orphaned_count: number;
+  unattributed_to_live_count: number;
   dirty_files: unknown[];
   orphaned_files: unknown[];
   jobs: unknown[];

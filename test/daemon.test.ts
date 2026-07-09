@@ -289,12 +289,24 @@ test("git first-frame: a worktree with thousands of dirty files serves a git sna
 
   const row = db
     .query(
-      "SELECT dirty_count, dirty_files FROM git_status WHERE project_dir = ?",
+      "SELECT dirty_count, orphaned_count, unattributed_to_live_count, dirty_files FROM git_status WHERE project_dir = ?",
     )
-    .get(projectDir) as { dirty_count: number; dirty_files: string };
+    .get(projectDir) as {
+    dirty_count: number;
+    orphaned_count: number;
+    unattributed_to_live_count: number;
+    dirty_files: string;
+  };
 
   // The scalar the board actually renders stays EXACT — the full dirty count.
   expect(row.dirty_count).toBe(N);
+  // None of the N fixture files carry a file_attributions row, so all are
+  // orphans — this exercises pass 4's rollup-from-the-FULL-snapshot invariant
+  // (not the capped `dirty_files[]` mirror below).
+  expect(row.orphaned_count).toBe(N);
+  // The unattributed-to-live scalar is exact too — an orphan (zero
+  // attributions) always counts toward it.
+  expect(row.unattributed_to_live_count).toBe(N);
   // The materialized mirror is bounded, so no single row can blow the frame.
   const storedFiles = JSON.parse(row.dirty_files) as unknown[];
   expect(storedFiles.length).toBe(GIT_STATUS_DIRTY_FILES_WIRE_CAP);
@@ -3635,7 +3647,13 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // an additive ALTER declared in the `CREATE_EPICS` literal too, NO cursor rewind:
   // a pre-v117 EpicSnapshot carries no `blocks_closing_of` key, so a from-scratch
   // re-fold leaves it NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(117);
+  // And to 118 via fn-1226 task .1 (appending the nullable
+  // `git_status.unattributed_to_live_count` INTEGER column — the exact
+  // project-wide count the reducer's pass 4 already computed but only ever
+  // stamped onto `jobs.git_unattributed_to_live_count`; an additive ALTER, NO
+  // cursor rewind: `git_status` is LIVE-ONLY, so the boot-seed re-derives the
+  // value rather than replay).
+  expect(SCHEMA_VERSION).toBe(118);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
