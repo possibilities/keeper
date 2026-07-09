@@ -40,5 +40,5 @@ stop-guard: closeStopAllowed is true for the new deferred-report line and existi
 - [ ] The plan-plugin suite is green
 
 ## Done summary
-
+Activated the blocking-follow-up close gate: close-planner emits the consumer-observable blocks_closing decision and authors the blocking follow-up without a source dep; the closer skill switches the five-member outcome enum totally, short-circuits a gated re-entry to finalize, arms the follow-up under armed mode, and escalates a deleted follow-up via the source epic-question; stop-guard sanctions the deferred-close report in lockstep with the SKILL phrasing; README + plan CLAUDE.md track the five-member enum, gate flow, and the status-blind scaffold carve-out.
 ## Evidence
