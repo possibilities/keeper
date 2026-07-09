@@ -46,5 +46,5 @@ Files:
       scalar) equal N, exercising the rollup-from-full-map invariant
 
 ## Done summary
-
+git_status now carries an exact unattributed_to_live_count scalar (SCHEMA_STEPS v118) stamped from the reducer's pass-4 full-snapshot rollup; keeper git renders it directly instead of re-deriving from the wire-capped dirty_files[] mirror, fixing the impossible unattributed < orphan display on >200-dirty worktrees. Hardened the daemon.test.ts git first-frame regression to assert orphaned_count and the new scalar both equal N.
 ## Evidence
