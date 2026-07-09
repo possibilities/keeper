@@ -36,5 +36,5 @@ Anti-rot: copy the example into a fixture config dir, loadMatrix, assert the cod
 - [ ] Docs lint gates stay green
 
 ## Done summary
-
+Committed docs/examples/matrix.example.yaml (real codex/gpt-5.3-codex-spark activation shape, loaded by explicit path in a new anti-rot test in test/agent-matrix.test.ts); docs/install.md links it and notes providers-check fail-loud; docs/plugin-composition-map.md documents wrapped cells riding the additive --plugin-dir channel with matrix.yaml as composition input; CONTEXT.md adds an Alias target entry disambiguated from Preset.
 ## Evidence
