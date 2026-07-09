@@ -1,0 +1,49 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 6,
+        "files_changed": 5,
+        "insertions": 407
+      },
+      "done_summary": "Added a tip-triggered baseline producer to the autopilot reconciler: it spools one trunk baseline request per open-epic repo whose git_status default-branch tip moved, coalesced to the latest tip and idempotent across cycles/boots, joining the keeper baseline CLI as a sanctioned spool writer (re-scoped in CLAUDE.md, baseline-store.ts, cli/baseline.ts).",
+      "input_hash": "38300e917dc4415d5b288e0bbf453d77339d86c00cfd691f41776cde71fc88ca",
+      "model": "opus",
+      "spec_chars": 2630,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/autopilot-worker.ts, src/baseline-store.ts, cli/baseline.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nAdd a tip-change producer to the autopilot reconciler: when the tracked default-branch tip of a repo with plan presence changes (source the tip signal from the projections the git-worker already feeds \u2014 never probe git inside a fold), compose a baseline request through the existing baseline-store API and write it to the spool, coalescing to the latest tip per repo (a rapid push train must not queue every intermediate sha; the store's keying makes duplicate requests idempotent). Scope: repos carrying open epics, not every tracked repo. Persist nothing new: the last-observed tip may be re-derived per cycle; a boot re-spool of the current tip is harmless (compute-once by key). Re-scope the sole-spool-writer rule in CLAUDE.md in the same change \u2014 either the producer writes through baseline-store as a sanctioned second writer, or delegates through the CLI path; state which and why.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/baseline-store.ts:152-168 \u2014 buildRequest/writeRequest/baselineKey (the request path to reuse)\n- src/baseline-worker.ts \u2014 single-slot poll + coalescing semantics (what dedupe already exists)\n- src/git-worker.ts:1021-1065 \u2014 default-branch tip tracking feeding the projections\n- cli/baseline.ts header \u2014 the sole-writer claim being re-scoped\n\n### Risks\n\n- Compute cost: every trunk landing now runs the suite once; coalescing and compute-once keying bound it, but confirm the single-slot worker's backlog behavior under a push train.\n\n### Test notes\n\nPure producer tests: tip-change snapshots yield one spool request for the latest tip only; unchanged tip yields none; repos without open epics yield none.\n\n## Acceptance\n\n- [ ] A default-branch tip change on a repo with open epics produces exactly one baseline request for the newest tip, idempotent across cycles and boots\n- [ ] Rapid successive tips coalesce to the latest\n- [ ] The spool sole-writer rule in CLAUDE.md matches the shipped write path\n- [ ] keeper fast suite green\n\n## Done summary\nAdded a tip-triggered baseline producer to the autopilot reconciler: it spools one trunk baseline request per open-epic repo whose git_status default-branch tip moved, coalesced to the latest tip and idempotent across cycles/boots, joining the keeper baseline CLI as a sanctioned spool writer (re-scoped in CLAUDE.md, baseline-store.ts, cli/baseline.ts).\n## Evidence\n",
+      "task_id": "fn-1203-continuous-trunk-baseline-detection.1",
+      "tier": "xhigh",
+      "title": "Spool baselines on new trunk tips"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 14,
+        "files_changed": 2,
+        "insertions": 509
+      },
+      "done_summary": "Add a baseline-sourced repair candidate: a confirmed-red newest-tip baseline leaf mints a task-less repair candidate coalescing by repo token with worker blocks; single-run/flaky red defers to the store's confirming re-run; infra/timeout never dispatch. Split the conflated 'green' into distinct checkout-clean DEFER and suite-green CLEAR gates.",
+      "input_hash": "38300e917dc4415d5b288e0bbf453d77339d86c00cfd691f41776cde71fc88ca",
+      "model": "opus",
+      "spec_chars": 3203,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/daemon.ts, test/daemon.test.ts\n\n### Approach\n\nGive the repair escalation sweep a second candidate source: a repo whose newest default-tip baseline leaf is confirmed red (red across the confirming re-run, flakySuspect false) mints a repair candidate \u2014 one repair::<repo-token> per (repo, fingerprint), reusing the existing dispatch, latch, and page-once machinery \u2014 even when zero tasks are blocked. An infra-error or timeout leaf is never red for this purpose. Route any new drop/defer diagnostics through the typed drop() helper and the reconciled class union. Resolve the green ambiguity the gap analysis named: the clear gate for a baseline-sourced candidate must consult the baseline leaf (suite green at the current tip), while the checkout-cleanliness gate keeps its distinct dirty-defer role \u2014 name the two checks distinctly so the sweep never conflates them. Flake tolerance: a first red triggers the confirming re-run through the store's existing multi-run classification rather than dispatching immediately.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts:1546-1872 \u2014 the sweep region post fn-1201/fn-1202 (candidate selection, drop classes, defer diagnostics)\n- src/daemon.ts:10116-10124 \u2014 isRepairBaseGreen/isRepairCheckoutDirty (the two \"green\" meanings to disentangle)\n- src/baseline-store.ts deriveResult/classifyFailures \u2014 flakySuspect semantics and multi-run confirmation\n- docs/adr/0017 \u2014 the repair contract (page-once, retry_dispatch re-arm) the new source must honor\n\n### Risks\n\n- A repair session dispatched with no blocked task has no task context \u2014 its brief must carry the failing tests from the leaf; verify the escalation brief composition handles a task-less candidate.\n- Double-dispatch guard: a worker-stamped block and a baseline-sourced candidate for the same (repo, fingerprint) must coalesce to one sticky.\n\n### Test notes\n\nInjected-deps sweep tests: confirmed-red leaf with no blocked tasks yields one dispatch decision; flake-suspect or single-run red yields the re-run request, not a dispatch; infra-error yields nothing; worker-block + baseline-red same fingerprint yields one candidate.\n\n## Acceptance\n\n- [ ] A confirmed-red newest-tip baseline mints exactly one repair candidate per (repo, fingerprint) with zero blocked tasks, honoring the existing page-once and re-arm discipline\n- [ ] Single-run red triggers a confirming re-run instead of dispatch; infra-error/timeout never dispatches\n- [ ] Worker-sourced and baseline-sourced candidates for one fingerprint coalesce to one sticky\n- [ ] The suite-green and checkout-clean gates are named distinctly and tested separately\n- [ ] keeper fast suite green\n\n## Done summary\nAdd a baseline-sourced repair candidate: a confirmed-red newest-tip baseline leaf mints a task-less repair candidate coalescing by repo token with worker blocks; single-run/flaky red defers to the store's confirming re-run; infra/timeout never dispatch. Split the conflated 'green' into distinct checkout-clean DEFER and suite-green CLEAR gates.\n## Evidence\n",
+      "task_id": "fn-1203-continuous-trunk-baseline-detection.2",
+      "tier": "xhigh",
+      "title": "Route confirmed-red baselines to repair"
+    }
+  ],
+  "created_at": "2026-07-09T02:17:02.815000Z",
+  "epic_id": "fn-1203-continuous-trunk-baseline-detection",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "38300e917dc4415d5b288e0bbf453d77339d86c00cfd691f41776cde71fc88ca",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
