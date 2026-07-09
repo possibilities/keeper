@@ -82,6 +82,7 @@ import {
   type FoundJob,
   findShadowingWorkManifest,
   gateWedgedLanesByLiveness,
+  gatherTipObservations,
   isBareShellCommand,
   isEpicDoneById,
   isEpicInFlight,
@@ -105,6 +106,7 @@ import {
   laneWedgeDistressId,
   loadReconcileSnapshot,
   mergeLaneBaseIntoDefault,
+  planTipBaselineRequests,
   prepareWorktreeGeometry,
   probeSharedCheckoutDesync,
   REDISPATCH_COOLDOWN_S,
@@ -143,6 +145,7 @@ import {
   stuckSentinelOrphansToClear,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
+  type TipObservation,
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,
@@ -15623,4 +15626,190 @@ test("gateWedgedLanesByLiveness: dedup preserved — an immediate beats a graced
     LANE_OWNER_GRACE,
   );
   expect(upgraded.get(LANE_A)?.immediate).toBe(true);
+});
+
+// ── fn-1203 tip-triggered baseline producer ──────────────────────────────────
+
+// A fixed toolchain fingerprint (hand-specified) so key composition is
+// deterministic and never reads the environment.
+const TIP_TOOLCHAIN = { bunVersion: "1.2.3", platform: "linux-x64" };
+// Two full-length hand-specified shas standing in for a repo's trunk tips.
+const TIP_SHA_A = "a".repeat(40);
+const TIP_SHA_B = "b".repeat(40);
+
+test("gatherTipObservations: one observation per open-epic repo, keyed to its git head", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo-1", status: "open" }),
+    makeEpic({ epic_id: "fn-2-bar", project_dir: "/repo-2", status: "todo" }),
+  ];
+  const heads = new Map([
+    ["/repo-1", TIP_SHA_A],
+    ["/repo-2", TIP_SHA_B],
+  ]);
+  const obs = gatherTipObservations(epics, heads);
+  expect(obs).toEqual([
+    { repoDir: "/repo-1", tipSha: TIP_SHA_A },
+    { repoDir: "/repo-2", tipSha: TIP_SHA_B },
+  ]);
+});
+
+test("gatherTipObservations: a done epic, a null project_dir, and a repo with no git head all yield nothing", () => {
+  const epics = [
+    makeEpic({
+      epic_id: "fn-1-done",
+      project_dir: "/repo-done",
+      status: "done",
+    }),
+    makeEpic({ epic_id: "fn-2-null", project_dir: null, status: "open" }),
+    makeEpic({
+      epic_id: "fn-3-nohead",
+      project_dir: "/repo-fresh",
+      status: "open",
+    }),
+  ];
+  // Only `/repo-done` has a head — but its epic is done; `/repo-fresh` (open) has
+  // no head (initial-commit repo, dropped by the projection).
+  const heads = new Map([["/repo-done", TIP_SHA_A]]);
+  expect(gatherTipObservations(epics, heads)).toEqual([]);
+});
+
+test("gatherTipObservations: many open epics in one repo collapse to a single observation", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-1-a", project_dir: "/repo", status: "open" }),
+    makeEpic({ epic_id: "fn-2-b", project_dir: "/repo", status: "todo" }),
+    makeEpic({ epic_id: "fn-3-c", project_dir: "/repo", status: "open" }),
+  ];
+  const heads = new Map([["/repo", TIP_SHA_A]]);
+  expect(gatherTipObservations(epics, heads)).toEqual([
+    { repoDir: "/repo", tipSha: TIP_SHA_A },
+  ]);
+});
+
+test("planTipBaselineRequests: a changed tip yields exactly one request for the newest sha", () => {
+  const prevTip = new Map([["/repo", TIP_SHA_A]]);
+  const { requests, nextTip } = planTipBaselineRequests({
+    observations: [{ repoDir: "/repo", tipSha: TIP_SHA_B }],
+    prevTip,
+    toolchain: TIP_TOOLCHAIN,
+    now: 5000,
+  });
+  expect(requests.length).toBe(1);
+  expect(requests[0]?.sha).toBe(TIP_SHA_B);
+  expect(requests[0]?.repoDir).toBe("/repo");
+  expect(requests[0]?.requestedAt).toBe(5000);
+  expect(requests[0]?.toolchain).toEqual(TIP_TOOLCHAIN);
+  // nextTip adopts the new tip so the next cycle sees it as unchanged.
+  expect(nextTip.get("/repo")).toBe(TIP_SHA_B);
+});
+
+test("planTipBaselineRequests: an unchanged tip yields no request but still carries the tip forward", () => {
+  const prevTip = new Map([["/repo", TIP_SHA_A]]);
+  const { requests, nextTip } = planTipBaselineRequests({
+    observations: [{ repoDir: "/repo", tipSha: TIP_SHA_A }],
+    prevTip,
+    toolchain: TIP_TOOLCHAIN,
+    now: 5000,
+  });
+  expect(requests).toEqual([]);
+  expect(nextTip.get("/repo")).toBe(TIP_SHA_A);
+});
+
+test("planTipBaselineRequests: a fresh boot (empty prevTip) spools each observed tip once", () => {
+  const { requests } = planTipBaselineRequests({
+    observations: [
+      { repoDir: "/repo-1", tipSha: TIP_SHA_A },
+      { repoDir: "/repo-2", tipSha: TIP_SHA_B },
+    ],
+    prevTip: new Map(),
+    toolchain: TIP_TOOLCHAIN,
+    now: 1,
+  });
+  expect(requests.map((r) => [r.repoDir, r.sha])).toEqual([
+    ["/repo-1", TIP_SHA_A],
+    ["/repo-2", TIP_SHA_B],
+  ]);
+});
+
+test("planTipBaselineRequests: idempotent across cycles — feeding nextTip back yields no second request", () => {
+  const observations: TipObservation[] = [
+    { repoDir: "/repo", tipSha: TIP_SHA_A },
+  ];
+  const first = planTipBaselineRequests({
+    observations,
+    prevTip: new Map(),
+    toolchain: TIP_TOOLCHAIN,
+    now: 1,
+  });
+  expect(first.requests.length).toBe(1);
+  const second = planTipBaselineRequests({
+    observations,
+    prevTip: first.nextTip,
+    toolchain: TIP_TOOLCHAIN,
+    now: 2,
+  });
+  expect(second.requests).toEqual([]);
+});
+
+test("planTipBaselineRequests: only the changed repo spools; an unchanged sibling stays quiet", () => {
+  const prevTip = new Map([
+    ["/repo-1", TIP_SHA_A],
+    ["/repo-2", TIP_SHA_A],
+  ]);
+  const { requests } = planTipBaselineRequests({
+    observations: [
+      { repoDir: "/repo-1", tipSha: TIP_SHA_A }, // unchanged
+      { repoDir: "/repo-2", tipSha: TIP_SHA_B }, // moved
+    ],
+    prevTip,
+    toolchain: TIP_TOOLCHAIN,
+    now: 9,
+  });
+  expect(requests.length).toBe(1);
+  expect(requests[0]?.repoDir).toBe("/repo-2");
+  expect(requests[0]?.sha).toBe(TIP_SHA_B);
+});
+
+test("planTipBaselineRequests: an empty/invalid sha observation is dropped, not spooled", () => {
+  const { requests, nextTip } = planTipBaselineRequests({
+    observations: [
+      { repoDir: "/repo", tipSha: "" },
+      { repoDir: "/repo-2", tipSha: "not-a-sha" },
+    ],
+    prevTip: new Map(),
+    toolchain: TIP_TOOLCHAIN,
+    now: 1,
+  });
+  expect(requests).toEqual([]);
+  expect(nextTip.size).toBe(0);
+});
+
+test("planTipBaselineRequests: nextTip is bounded to the observed repo set — a repo that dropped out is forgotten", () => {
+  const prevTip = new Map([
+    ["/repo-1", TIP_SHA_A],
+    ["/repo-gone", TIP_SHA_B],
+  ]);
+  const { nextTip } = planTipBaselineRequests({
+    observations: [{ repoDir: "/repo-1", tipSha: TIP_SHA_A }],
+    prevTip,
+    toolchain: TIP_TOOLCHAIN,
+    now: 1,
+  });
+  expect([...nextTip.keys()]).toEqual(["/repo-1"]);
+});
+
+test("gather + plan: a trunk tip advance on an open-epic repo produces exactly one request for the latest tip", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo", status: "open" }),
+  ];
+  // The projection already coalesced a push train to the latest head TIP_SHA_B.
+  const heads = new Map([["/repo", TIP_SHA_B]]);
+  const observations = gatherTipObservations(epics, heads);
+  const { requests } = planTipBaselineRequests({
+    observations,
+    prevTip: new Map([["/repo", TIP_SHA_A]]),
+    toolchain: TIP_TOOLCHAIN,
+    now: 42,
+  });
+  expect(requests.length).toBe(1);
+  expect(requests[0]?.sha).toBe(TIP_SHA_B);
 });

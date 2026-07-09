@@ -9,7 +9,7 @@
  * A Baseline (glossary term — NEVER "cache" / "snapshot" / "golden") is the
  * daemon-computed suite result at a commit sha a worker consults to attribute a
  * test failure as pre-existing or self-inflicted. The persisted result file is a
- * "leaf"; the CLI-written request queue is the "spool".
+ * "leaf"; the request queue is the "spool".
  *
  * DEPENDENCY POSTURE: `node:*` plus the two dep-free leaves `keeper-state-dir`
  * and `worktree-plan` (repoDirHash) — NEVER `bun:sqlite` / `src/db.ts`. Helpers
@@ -41,7 +41,7 @@ import { repoDirHash } from "./worktree-plan";
 
 /** `<state-dir>/baseline/` — the store root. */
 const BASELINE_DIRNAME = "baseline";
-/** `<root>/requests/` — the CLI-written request spool (maildir shape). */
+/** `<root>/requests/` — the request spool (maildir shape). */
 const SPOOL_DIRNAME = "requests";
 /** `<root>/leafs/` — the baseline-worker-written per-key result files. */
 const LEAF_DIRNAME = "leafs";
@@ -247,7 +247,11 @@ export type BaselineReadState = BaselineResult | MissState | ComputingState;
 
 // ── the request spool record ─────────────────────────────────────────────────
 
-/** One spool entry — the CLI is its sole writer; the worker coalesces by `key`. */
+/**
+ * One spool entry. Two sanctioned writers — the `keeper baseline` CLI (a
+ * worker-driven read/await) and the autopilot's tip-triggered producer (a fresh
+ * trunk baseline on each default-branch tip); the worker coalesces both by `key`.
+ */
 export interface BaselineRequest {
   key: string;
   repoDir: string;
@@ -693,7 +697,10 @@ export function readRequest(path: string): BaselineRequest | null {
   return parseRequest(raw);
 }
 
-/** Atomically persist a spool entry. Sole writer: the `keeper baseline` CLI. */
+/**
+ * Atomically persist a spool entry. Sanctioned writers: the `keeper baseline`
+ * CLI and the autopilot tip-triggered baseline producer.
+ */
 export function writeRequest(path: string, request: BaselineRequest): void {
   atomicWrite(path, JSON.stringify(request));
 }

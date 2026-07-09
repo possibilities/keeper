@@ -10,7 +10,8 @@
  * prints the {@link BaselineReadState} union (green / suite-red / infra-error /
  * timeout, plus miss / computing) as one clean JSON value; it NEVER mutates.
  * `--wait` turns the verb into trigger-and-await: it writes exactly one
- * size-bounded request into the spool (the CLI is the spool's SOLE writer),
+ * size-bounded request into the spool (the CLI is one of the spool's two
+ * sanctioned writers — the autopilot's tip-triggered producer is the other),
  * then polls the leaf until a terminal envelope or its own caller-owned
  * deadline. On the deadline it prints the still-non-terminal read state and
  * exits non-zero — a worker can never mistake "gave up waiting" for a result.
