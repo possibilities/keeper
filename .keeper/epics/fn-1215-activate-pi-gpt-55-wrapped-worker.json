@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T18:57:20.519000Z",
+  "depends_on_epics": [],
+  "id": "fn-1215-activate-pi-gpt-55-wrapped-worker",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Activate pi gpt-5.5 wrapped worker",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T18:57:20.519000Z"
+}
