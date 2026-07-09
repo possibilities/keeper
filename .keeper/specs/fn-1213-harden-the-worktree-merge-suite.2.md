@@ -36,5 +36,5 @@ src/baseline-worker.ts (reference isolation pattern), src/daemon.ts (worker spaw
 - [ ] `bun test` stays green
 
 ## Done summary
-
+Documented the inline worktree-mode merge-suite finalize gate as an accepted, bounded opt-in tradeoff (the sanctioned alternative to off-drive isolation): forward-facing rationale added at the runMergeSuite dep wiring and the runMergeSuiteGate doc-comment in src/autopilot-worker.ts. No behavior change — the suite still runs outside the commit-work flock on the identical deterministic merged OID.
 ## Evidence

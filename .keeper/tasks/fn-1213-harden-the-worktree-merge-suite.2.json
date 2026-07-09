@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Isolate the gate off the reconcile drive",
-  "updated_at": "2026-07-09T03:38:57.986000Z"
+  "updated_at": "2026-07-09T18:42:58.303000Z",
+  "worker_done_at": "2026-07-09T18:42:58.303000Z"
 }
