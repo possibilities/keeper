@@ -67,6 +67,15 @@ interface ScaffoldArgs {
   file: string;
   allowDuplicate: boolean;
   createdByCloseOf: string | null;
+  /** Internal-only, symmetric with createdByCloseOf: stamps `blocks_closing_of`
+   * on the minted epic so a blocking close-gate's pointer and epic land
+   * atomically in the one scaffold commit. Null (the CLI default) is a plain
+   * mint. */
+  blocksClosingOf?: string | null;
+  /** Internal-only: when non-null, REPLACES the document's `depends_on_epics`
+   * with this pre-resolved list (the close-gate dep substitution), routed
+   * through the same shape/dup/existence validation the document deps get. */
+  dependsOnEpicsOverride?: string[] | null;
 }
 
 /** YAML implicit-typing guard: an actual string, not a bool/number/Date the
@@ -589,7 +598,13 @@ export function validateScaffoldYaml(
 }
 
 export function runScaffold(args: ScaffoldArgs): number {
-  const { file: fileArg, allowDuplicate, createdByCloseOf } = args;
+  const {
+    file: fileArg,
+    allowDuplicate,
+    createdByCloseOf,
+    blocksClosingOf = null,
+    dependsOnEpicsOverride = null,
+  } = args;
 
   // Fail closed on a missing CLAUDE_CODE_SESSION_ID BEFORE any write — without
   // it scaffold could not build its commit envelope, so it refuses up front
@@ -677,9 +692,13 @@ export function runScaffold(args: ScaffoldArgs): number {
   const epicBundles = "bundles" in epic ? epic.bundles : [];
 
   // --- Epic-dep validation (type / id-shape / dup; existence deferred) ----
+  // A caller-supplied override (the close-gate dep substitution) REPLACES the
+  // document's deps wholesale, then rides the identical validation below.
   const epicDepErrors: string[] = [];
   let dependsOnEpics: string[] = [];
-  const dependsOnRaw = "depends_on_epics" in epic ? epic.depends_on_epics : [];
+  const dependsOnRaw =
+    dependsOnEpicsOverride ??
+    ("depends_on_epics" in epic ? epic.depends_on_epics : []);
   if (!isListOfStr(dependsOnRaw)) {
     epicDepErrors.push("epic: `depends_on_epics` must be a list of strings");
     dependsOnEpics = [];
@@ -1155,6 +1174,9 @@ export function runScaffold(args: ScaffoldArgs): number {
       };
       if (createdByCloseOf !== null) {
         epicDef.created_by_close_of = createdByCloseOf;
+      }
+      if (blocksClosingOf !== null) {
+        epicDef.blocks_closing_of = blocksClosingOf;
       }
 
       const inMemTaskDefs: Record<string, Record<string, unknown>> = {};

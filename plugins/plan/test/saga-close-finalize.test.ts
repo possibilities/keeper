@@ -13,7 +13,15 @@
 // the retired `epic followup-of` node asserts the unknown-subcommand error.
 
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -46,6 +54,7 @@ const CLOSE_SKILL_HANDLERS = new Set([
   "closed_with_followup",
   "fatal_halt",
   "partial_followup",
+  "followup_blocks_close",
 ]);
 
 // The empty-set canonical hash the verb re-derives for an epic with no source
@@ -83,15 +92,22 @@ function seedVerdict(
     fatal?: boolean;
     fatalReason?: string;
     decisions?: Array<Record<string, unknown>>;
+    blocksClosing?: boolean;
+    blocksClosingReason?: string;
   },
 ): void {
-  const record = {
+  const record: Record<string, unknown> = {
     schema_version: 1,
     commit_set_hash: opts.commitSetHash,
     fatal: opts.fatal ?? false,
     fatal_reason: opts.fatalReason ?? "",
     decisions: opts.decisions ?? [],
   };
+  if (opts.blocksClosing !== undefined) {
+    record.blocks_closing = opts.blocksClosing;
+    record.blocks_closing_reason =
+      opts.blocksClosingReason ?? (opts.blocksClosing ? "gate reason" : "");
+  }
   writeArtifact(
     verdictPath(root, epicId),
     `${JSON.stringify(record, null, 2)}\n`,
@@ -149,6 +165,39 @@ function epicStatus(root: string, epicId: string): string {
       readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
     ) as Record<string, unknown>
   ).status as string;
+}
+
+function readEpicDef(root: string, epicId: string): Record<string, unknown> {
+  return JSON.parse(
+    readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
+  ) as Record<string, unknown>;
+}
+
+function patchEpicDef(
+  root: string,
+  epicId: string,
+  patch: Record<string, unknown>,
+): void {
+  const p = join(root, ".keeper", "epics", `${epicId}.json`);
+  const def = { ...readEpicDef(root, epicId), ...patch };
+  writeFileSync(p, `${JSON.stringify(def, null, 2)}\n`, "utf-8");
+}
+
+function countEpicFiles(root: string): number {
+  return readdirSync(join(root, ".keeper", "epics")).filter((n) =>
+    n.endsWith(".json"),
+  ).length;
+}
+
+function blockingMarkerPath(root: string, sourceEpicId: string): string {
+  return join(
+    root,
+    ".keeper",
+    "state",
+    "audits",
+    sourceEpicId,
+    "blocking-followup.json",
+  );
 }
 
 function finalize(
@@ -961,6 +1010,200 @@ describe("close-finalize refusals", () => {
     expect(error.code).toBe("FOLLOWUP_MISSING");
     expect((error.details as Record<string, unknown>).expected_tasks).toBe(1);
     expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outcome: followup_blocks_close (the blocking close-gate truth-table).
+// ---------------------------------------------------------------------------
+
+describe("close-finalize followup_blocks_close (blocking gate)", () => {
+  const getProj = withProject("planctl-cf-block-");
+
+  const BLOCK_KEPT = {
+    commitSetHash: emptySetHash(),
+    decisions: [{ fid: "f1", action: "kept", task: 1, rationale: "real" }],
+    blocksClosing: true,
+    blocksClosingReason:
+      "ships a consumer-observable flaw a follow-up corrects",
+  };
+
+  test("blocking first pass mints an armed, pointer-stamped follow-up with substituted deps and holds the source open", () => {
+    const proj = getProj();
+    // A real upstream the source depends on (must survive into the follow-up),
+    // alongside a dangling id (filtered) and the source itself (never included).
+    const { epicId: depEpicId } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Upstream dep", nTasks: 1 },
+    );
+    const { epicId } = doneEpic(proj, 1, BLOCK_KEPT, "Blocking source");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    // A real upstream (kept) alongside a now-unresolvable id (filtered).
+    patchEpicDef(proj.root, epicId, {
+      depends_on_epics: [depEpicId, "fn-88888-missing"],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("followup_blocks_close");
+    // The source stays OPEN — the gate holds it (and every dependent).
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+
+    const newEpicId = env.new_epic_id as string;
+    expect(newEpicId).toBeTruthy();
+    expect(newEpicId).not.toBe(epicId);
+
+    const followup = readEpicDef(proj.root, newEpicId);
+    // The gate pointer + provenance land atomically in the scaffold commit.
+    expect(followup.blocks_closing_of).toBe(epicId);
+    expect(followup.created_by_close_of).toBe(epicId);
+    // Deps are the still-resolving subset — the real upstream only, never the
+    // source (a cycle) and never the dangling id.
+    expect(followup.depends_on_epics).toEqual([depEpicId]);
+    // Armed so an armed-mode board can dispatch it (the gate cannot wedge).
+    expect(followup.last_validated_at).not.toBeNull();
+    // The durable minted-marker records the mint (adopt-vs-deleted disambiguator).
+    expect(existsSync(blockingMarkerPath(proj.root, epicId))).toBe(true);
+    const marker = JSON.parse(
+      readFileSync(blockingMarkerPath(proj.root, epicId), "utf-8"),
+    ) as Record<string, unknown>;
+    expect(marker.followup_epic_id).toBe(newEpicId);
+  });
+
+  test("an empty substitution set scaffolds the follow-up with no epic-deps", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, BLOCK_KEPT, "No-dep blocking source");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    // Only a now-unresolvable dep -> nothing survives the substitution.
+    patchEpicDef(proj.root, epicId, {
+      depends_on_epics: ["fn-77777-missing"],
+    });
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("followup_blocks_close");
+    const followup = readEpicDef(proj.root, env.new_epic_id as string);
+    expect(followup.depends_on_epics).toEqual([]);
+  });
+
+  test("re-entry with a live follow-up re-emits idempotently and never re-scaffolds", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, BLOCK_KEPT, "Live re-entry source");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const first = finalize(proj, epicId);
+    expect(first.env.outcome).toBe("followup_blocks_close");
+    const newEpicId = first.env.new_epic_id as string;
+    const epicsAfterFirst = countEpicFiles(proj.root);
+
+    const second = finalize(proj, epicId);
+    expect(second.code).toBe(0);
+    expect(second.env.outcome).toBe("followup_blocks_close");
+    expect(second.env.new_epic_id).toBe(newEpicId);
+    // No duplicate follow-up minted; source still open.
+    expect(countEpicFiles(proj.root)).toBe(epicsAfterFirst);
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("re-entry with a done follow-up adopts it into closed_with_followup", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, BLOCK_KEPT, "Adopt re-entry source");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const first = finalize(proj, epicId);
+    const newEpicId = first.env.new_epic_id as string;
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+
+    // The follow-up lands (its own close would set its epic def status done).
+    patchEpicDef(proj.root, newEpicId, { status: "done" });
+
+    const second = finalize(proj, epicId);
+    expect(second.code).toBe(0);
+    expect(second.env.outcome).toBe("closed_with_followup");
+    expect(second.env.new_epic_id).toBe(newEpicId);
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("a deleted-while-gated follow-up is a typed failure, never a close or re-scaffold", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      BLOCK_KEPT,
+      "Deleted follow-up source",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const first = finalize(proj, epicId);
+    const newEpicId = first.env.new_epic_id as string;
+
+    // Delete the follow-up epic def (as `epic rm` would), leaving the source's
+    // durable minted-marker in place.
+    rmSync(join(proj.root, ".keeper", "epics", `${newEpicId}.json`));
+    expect(existsSync(blockingMarkerPath(proj.root, epicId))).toBe(true);
+
+    const second = finalize(proj, epicId);
+    expect(second.code).toBe(1);
+    const error = second.env.error as Record<string, unknown>;
+    expect(error.code).toBe("BLOCKING_FOLLOWUP_DELETED");
+    // The source is NOT closed.
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("the gate outcome releases the close-exclusive claim so a re-dispatch can re-claim", () => {
+    const proj = getProj();
+    const SID = "block-release-session";
+    const { epicId } = doneEpic(proj, 1, BLOCK_KEPT, "Claim release source");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    const markerFor = join(
+      proj.home,
+      ".local",
+      "state",
+      "keeper",
+      "sessions",
+      `${SID}.json`,
+    );
+    const pre = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: SID },
+    });
+    expect(pre.code).toBe(0);
+    // Preflight reports no in-flight gate on the first pass.
+    expect(parseCliOutput(pre.output).blocking_followup).toBeNull();
+    expect(existsSync(markerFor)).toBe(true);
+
+    const fin = runCli(["close-finalize", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: SID },
+    });
+    expect(parseCliOutput(fin.output).outcome).toBe("followup_blocks_close");
+    // The claim is released — a leaked marker would jam the re-dispatched closer.
+    expect(existsSync(markerFor)).toBe(false);
+  });
+
+  test("preflight surfaces the in-flight gate's id and status on re-entry", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      BLOCK_KEPT,
+      "Preflight re-entry source",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const first = finalize(proj, epicId);
+    const newEpicId = first.env.new_epic_id as string;
+
+    const pre = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(pre.code).toBe(0);
+    const bf = parseCliOutput(pre.output).blocking_followup as Record<
+      string,
+      unknown
+    > | null;
+    expect(bf).not.toBeNull();
+    expect((bf as Record<string, unknown>).id).toBe(newEpicId);
+    expect((bf as Record<string, unknown>).status).toBe("open");
   });
 });
 
