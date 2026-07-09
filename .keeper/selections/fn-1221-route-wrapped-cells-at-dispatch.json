@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": "Operator-assigned: contract-touching dispatch-resolution fix across the shared seam and both callers with byte-pinned parity \u2014 the class the guidance reserves opus/xhigh for; also the epic unblocking wrapped routing itself must run native.",
+      "task_id": "fn-1221-route-wrapped-cells-at-dispatch.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T21:08:36.198000Z",
+  "epic_id": "fn-1221-route-wrapped-cells-at-dispatch",
+  "input_hash": "e20ed5cd65f38889a5a0f44597714d738b822ae733d619dd442bcb71a69bedc5",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3792623053,
+  "verdict_raw": "operator hand-assignment; selector beat skipped to keep the wrapped-routing fix itself on a native cell"
+}
