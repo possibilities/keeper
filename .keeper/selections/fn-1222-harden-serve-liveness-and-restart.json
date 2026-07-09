@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle probe-lifecycle race (timeout-before-open leak, id-attribution, precise self-exemption that must not re-open the cap) across three worker files makes this a correctness-invariant early proof point.",
+      "task_id": "fn-1222-harden-serve-liveness-and-restart.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A liveness watchdog whose false-trip fatalExits the daemon demands reasoning over a multi-term starvation conjunction, arrival-clock staleness, and a clock-jump reset \u2014 a subtle correctness invariant on a new worker-main protocol.",
+      "task_id": "fn-1222-harden-serve-liveness-and-restart.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Open-ended characterize-before-fixing plus a re-fold-time-bomb fan-out bound and an abandonment reap predicate that must not half-kill a live viewer is subtle-invariant, investigation-shaped work.",
+      "task_id": "fn-1222-harden-serve-liveness-and-restart.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Kernel-flock single-instance gate with FD_CLOEXEC/inherited-fd hazards that could wedge every future boot, macOS-arm64 silent-failure modes, and ownership-checked unlinks is a subtle concurrency-correctness invariant.",
+      "task_id": "fn-1222-harden-serve-liveness-and-restart.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Append-only NDJSON ledger with boot_id keying, torn-tail tolerance, mid-incident legacy dual-read, exit-path-safe append, and runtime-qualified counting that must avoid per-boot double-count carries several subtle correctness invariants.",
+      "task_id": "fn-1222-harden-serve-liveness-and-restart.5",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T21:28:15.020000Z",
+  "epic_id": "fn-1222-harden-serve-liveness-and-restart",
+  "input_hash": "6e20f953145da4d6284e7e6220e9f76220b7f70d064b21ffd267fae8103cf465",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1847654739,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1222-harden-serve-liveness-and-restart.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle probe-lifecycle race (timeout-before-open leak, id-attribution, precise self-exemption that must not re-open the cap) across three worker files makes this a correctness-invariant early proof point.\",\"confidence\":0.82},{\"task_id\":\"fn-1222-harden-serve-liveness-and-restart.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A liveness watchdog whose false-trip fatalExits the daemon demands intelligence-bound reasoning over a multi-term starvation conjunction, arrival-clock staleness, and a clock-jump reset \u2014 a subtle correctness invariant on a new worker\u2194main protocol.\",\"confidence\":0.83},{\"task_id\":\"fn-1222-harden-serve-liveness-and-restart.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Open-ended characterize-before-fixing plus a re-fold-time-bomb fan-out bound and an abandonment reap predicate that must not half-kill a live viewer is subtle-invariant, investigation-shaped work.\",\"confidence\":0.78},{\"task_id\":\"fn-1222-harden-serve-liveness-and-restart.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Kernel-flock single-instance gate with FD_CLOEXEC/inherited-fd hazards that could wedge every future boot, macOS-arm64 silent-failure modes, and ownership-checked unlinks is a subtle concurrency-correctness invariant.\",\"confidence\":0.78},{\"task_id\":\"fn-1222-harden-serve-liveness-and-restart.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Append-only NDJSON ledger with boot_id keying, torn-tail tolerance, mid-incident legacy dual-read, exit-path-safe append, and runtime-qualified counting that must avoid per-boot double-count carries several subtle correctness invariants.\",\"confidence\":0.72}]}\n"
+}
