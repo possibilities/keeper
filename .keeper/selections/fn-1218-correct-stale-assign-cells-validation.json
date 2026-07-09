@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "sonnet",
+      "rationale": null,
+      "task_id": "fn-1218-correct-stale-assign-cells-validation.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "",
+  "created_at": "2026-07-09T20:18:00.327000Z",
+  "epic_id": "fn-1218-correct-stale-assign-cells-validation",
+  "input_hash": "b41affcf14cab42f5b75a97015ed9c17b476c88a62e59bc64be6e4c9a77c04c6",
+  "outcome": "degraded:no-selection-verdict-supplied",
+  "schema_version": 1,
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}
