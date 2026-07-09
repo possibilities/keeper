@@ -158,6 +158,6 @@ research:
   # research entry is tolerated by the host-blind gate, but the reference must
   # exist and hash-match like any other; the guidance block is a pre-provisioned
   # extra the runtime selection-brief seam gates on the effective matrix.
-  gpt-5.5:
-    reference: skills/model-guidance/references/gpt-5.5.md
-    sha256: b1b1f74fa06fc131d14b533bf7e772eb6b5d6d68cd2b0302c9cf4293ebc5d1fd
+  gpt-5.3-codex-spark:
+    reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
+    sha256: 02243b59cb4220c4b2f860355446b66e97bb5a02f189d9dc7b50117180426f18
