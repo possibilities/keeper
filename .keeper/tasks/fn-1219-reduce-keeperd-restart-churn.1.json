@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T20:25:42.941000Z",
+  "depends_on": [],
+  "epic": "fn-1219-reduce-keeperd-restart-churn",
+  "id": "fn-1219-reduce-keeperd-restart-churn.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Invert cli-to-src import edges",
+  "updated_at": "2026-07-09T20:25:42.941000Z"
+}
