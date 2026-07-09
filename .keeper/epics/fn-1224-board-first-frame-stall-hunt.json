@@ -4,7 +4,7 @@
   "created_at": "2026-07-09T21:43:56.915000Z",
   "depends_on_epics": [],
   "id": "fn-1224-board-first-frame-stall-hunt",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T21:44:16.815000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T21:44:15.131000Z"
+  "updated_at": "2026-07-09T21:44:16.815000Z"
 }
