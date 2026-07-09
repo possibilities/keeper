@@ -359,6 +359,7 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
         summary:
           "Re-assert current cells with a degrade reason (live-only, no stdin)",
       },
+      OPT_PROJECT,
     ],
   },
   {

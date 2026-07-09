@@ -184,7 +184,7 @@ BRIEF_REF: <brief_ref from selection-brief>
 Pipe the Task return VERBATIM — no parsing, no fenced-block extraction, no enum-clamp, no coverage check; the verb does all of that against the on-disk brief — to the trusted apply seam, staging the follow-up verdict document instead of landing live cells:
 
 ```bash
-keeper plan apply-selection <epic_id> --from-followup --file -
+keeper plan apply-selection <epic_id> --from-followup --project <primary_repo> --file -
 ```
 
 A success envelope carries `verdict_path` — the absolute path of the staged, gitignored `followup-verdict.json` sibling of the brief. Pin it as `SELECTION_VERDICT_PATH` for Phase 4. On a failure envelope (`verdict_invalid`, `brief_missing`), relay its `details` array as a `VALIDATION_ERRORS:` block (no spec prose) to **one fresh** `plan:model-selector` spawn (same config-only prompt as 3.5b), then retry `apply-selection` once. If it still fails, **degrade**: stop and hand Phase 4 no verdict — the close flow runs unattended, so degrade is the default posture on ANY ambiguity, never a retry loop.

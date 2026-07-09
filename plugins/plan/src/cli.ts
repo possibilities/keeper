@@ -772,17 +772,19 @@ function dispatch(parsed: ParsedArgs): number {
       return 0;
     case "apply-selection": {
       // Self-emits (emitMutating live/degraded, emitReadonly follow-up, or a
-      // failure envelope) and owns its exit code — return it directly. --file and
-      // --degraded are value-taking, so the positional scan skips their values.
+      // failure envelope) and owns its exit code — return it directly. --file,
+      // --degraded, and --project are value-taking, so the positional scan
+      // skips their values.
       const epicId = readPositionalSkipping(
         rest,
-        new Set(["--file", "--degraded"]),
+        new Set(["--file", "--degraded", "--project"]),
       );
       return runApplySelection({
         epicId,
         fromFollowup: readFlag(rest, "--from-followup"),
         degraded: readOption(rest, "--degraded"),
         file: readOption(rest, "--file") ?? "-",
+        project: readOption(rest, "--project"),
       });
     }
     case "assign-cells": {

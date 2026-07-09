@@ -35,8 +35,11 @@ import {
   writeArtifact,
   writeBriefArtifact,
 } from "../src/audit_artifacts.ts";
+import { selectionBriefPath } from "../src/verbs/selection_brief.ts";
 import {
+  gitFilesInHead,
   gitInit,
+  gitLogCount,
   parseCliOutput,
   runCli,
   seedRuntime,
@@ -156,6 +159,151 @@ describe("close-preflight resolves plan-state to primary from a lane", () => {
     expect(env.all_done).toBe(true);
     expect(env.primary_repo).toBe(primary);
     expect(existsSync(briefPath(primary, epicId))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// apply-selection re-roots plan-state through the epic's primary_repo, same
+// invariant as close-preflight/submit above: a brief written under primary's
+// gitignored state/ must be found (and the verdict landed) from a worktree
+// lane cwd, never degrading to the lane's stale/empty copy.
+// ---------------------------------------------------------------------------
+
+/** Seed a minimal live selection brief directly under PRIMARY's gitignored
+ * state/ (bypassing the selection-brief verb, which needs a real scaffold
+ * tree) — just enough for apply-selection's brief + enum-clamp layers:
+ * exact task_id coverage plus a {model, tier} candidate axis wide enough for
+ * the verdict cells below. */
+function seedLiveSelectionBrief(
+  primary: string,
+  epicId: string,
+  taskIds: string[],
+): void {
+  const briefRef = selectionBriefPath(
+    join(primary, ".keeper", "state"),
+    epicId,
+  );
+  writeArtifact(
+    briefRef,
+    JSON.stringify({
+      schema_version: 1,
+      epic_id: epicId,
+      primary_repo: primary,
+      from_followup: false,
+      selector_config_hash: "cfg-hash",
+      input_hash: "input-hash",
+      shuffle_seed: 1,
+      tasks: taskIds.map((id) => ({ task_id: id })),
+      models: ["opus", "sonnet"],
+      efforts: ["medium", "high", "max"],
+    }),
+  );
+}
+
+function readTaskCell(
+  root: string,
+  taskId: string,
+): { tier: string; model: string } {
+  const def = JSON.parse(
+    readFileSync(join(root, ".keeper", "tasks", `${taskId}.json`), "utf-8"),
+  ) as Record<string, unknown>;
+  return { tier: def.tier as string, model: def.model as string };
+}
+
+describe("apply-selection resolves plan-state to primary from a lane", () => {
+  test("a guided apply from a lane cwd with --project=primary finds the brief and lands researched cells, not defaults", () => {
+    const { primary, lane, home, epicId, taskIds } = makeLaneScenario(
+      "planctl-was-ok-",
+      ["todo", "todo"],
+    );
+    seedLiveSelectionBrief(primary, epicId, taskIds);
+
+    const verdict = JSON.stringify({
+      cells: [
+        { task_id: taskIds[0], tier: "high", model: "sonnet", rationale: "r1" },
+        { task_id: taskIds[1], tier: "max", model: "opus" },
+      ],
+    });
+    const before = gitLogCount(primary);
+    const r = runCli(
+      ["apply-selection", epicId, "--project", primary, "--file", "-"],
+      { cwd: lane, home, input: verdict },
+    );
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.output);
+    expect(env.success).toBe(true);
+    expect(env.assigned_task_ids).toEqual(taskIds);
+
+    // The researched cells landed in PRIMARY — not the scaffold-default
+    // medium/opus the mechanical scaffold stamped every task.
+    expect(readTaskCell(primary, taskIds[0] as string)).toEqual({
+      tier: "high",
+      model: "sonnet",
+    });
+    expect(readTaskCell(primary, taskIds[1] as string)).toEqual({
+      tier: "max",
+      model: "opus",
+    });
+    // The lane's committed def was never touched.
+    expect(readTaskCell(lane, taskIds[0] as string)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+
+    // The auto-commit landed in PRIMARY, never the lane.
+    expect(gitLogCount(primary)).toBe(before + 1);
+    expect(gitLogCount(lane)).toBe(0);
+    expect(gitFilesInHead(primary)).toContain(
+      `.keeper/tasks/${taskIds[0]}.json`,
+    );
+  });
+
+  test("without --project, cwd-first locate still re-roots state through primary_repo", () => {
+    // Same fix, no --project: the lane carries a byte-identical committed def
+    // (epic.primary_repo) so cwd-first locate finds it, then re-roots to
+    // primary regardless — the belt-and-suspenders case close's 3.5c beat
+    // does not rely on, but the seam covers uniformly.
+    const { primary, lane, home, epicId, taskIds } = makeLaneScenario(
+      "planctl-was-noproj-",
+      ["todo"],
+    );
+    seedLiveSelectionBrief(primary, epicId, taskIds);
+
+    const verdict = JSON.stringify({
+      cells: [{ task_id: taskIds[0], tier: "high", model: "sonnet" }],
+    });
+    const r = runCli(["apply-selection", epicId, "--file", "-"], {
+      cwd: lane,
+      home,
+      input: verdict,
+    });
+    expect(r.code).toBe(0);
+    expect(readTaskCell(primary, taskIds[0] as string)).toEqual({
+      tier: "high",
+      model: "sonnet",
+    });
+  });
+
+  test("a lane cwd with no --project and no brief in primary still degrades to brief_missing (never a silent lane read)", () => {
+    const { lane, home, epicId, taskIds } = makeLaneScenario(
+      "planctl-was-missing-",
+      ["todo"],
+    );
+    // No brief seeded anywhere — the pre-fix bug would have silently read the
+    // lane's own (also brief-less) state/ and reported the same error, hiding
+    // the real cross-cwd defect; the assertion here is on the CODE, not the
+    // behavior change itself (a same-shape brief_missing is expected either
+    // way once no brief exists anywhere).
+    const r = runCli(["apply-selection", epicId, "--file", "-"], {
+      cwd: lane,
+      home,
+      input: JSON.stringify({
+        cells: [{ task_id: taskIds[0], tier: "high", model: "sonnet" }],
+      }),
+    });
+    expect(r.code).toBe(1);
+    const error = parseCliOutput(r.output).error as Record<string, unknown>;
+    expect(error.code).toBe("brief_missing");
   });
 });
 
