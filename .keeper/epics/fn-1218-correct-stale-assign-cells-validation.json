@@ -7,7 +7,7 @@
     "fn-1215-activate-pi-gpt-55-wrapped-worker"
   ],
   "id": "fn-1218-correct-stale-assign-cells-validation",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T20:18:00.788000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T20:17:59.835000Z"
+  "updated_at": "2026-07-09T20:18:00.788000Z"
 }
