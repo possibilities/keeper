@@ -24,6 +24,7 @@ import keeperEvents, {
   piEventBindings,
   resolvePiEventsLogDir,
   serializePiLine,
+  transcriptCliArgs,
   translatePiEvent,
 } from "../plugins/keeper/pi-extension/keeper-events";
 import { piExtensionArgs, piExtensionPath } from "../src/agent/launch-config";
@@ -200,14 +201,77 @@ describe("pi extension — NDJSON line contract", () => {
   });
 });
 
+describe("pi extension — transcript tool argv", () => {
+  test("omitted session id lists the current project with bounded filters", () => {
+    expect(
+      transcriptCliArgs({
+        global: true,
+        since: "7d",
+        offset: 20,
+        limit: 10,
+      }),
+    ).toEqual([
+      "transcript",
+      "list",
+      "--harness",
+      "claude",
+      "--offset",
+      "20",
+      "--limit",
+      "10",
+      "--since",
+      "7d",
+      "--global",
+    ]);
+  });
+
+  test("session mode forwards subagent, detail, and content filters as argv", () => {
+    expect(
+      transcriptCliArgs({
+        session_id: "session-1",
+        subagent: "abc123",
+        project: "/work/repo",
+        before: 40,
+        max_chars: 12000,
+        tools: "full",
+        grep: "failure",
+        global: true,
+        include_meta: true,
+        include_thinking: true,
+      }),
+    ).toEqual([
+      "transcript",
+      "session-1",
+      "--harness",
+      "claude",
+      "--project",
+      "/work/repo",
+      "--subagent",
+      "abc123",
+      "--before",
+      "40",
+      "--max-chars",
+      "12000",
+      "--tools",
+      "full",
+      "--grep",
+      "failure",
+      "--meta",
+      "--thinking",
+    ]);
+  });
+});
+
 describe("pi extension — factory arming + fail-open", () => {
   const saved: Record<string, string | undefined> = {};
   let logDir: string;
 
   function fakePi() {
     const handlers = new Map<string, ((e: PiObservedEvent) => void)[]>();
+    const tools = new Map<string, unknown>();
     return {
       handlers,
+      tools,
       on(kind: string, h: (e: PiObservedEvent) => void) {
         const list = handlers.get(kind) ?? [];
         list.push(h);
@@ -217,6 +281,10 @@ describe("pi extension — factory arming + fail-open", () => {
         for (const h of handlers.get(kind) ?? []) {
           h(e);
         }
+      },
+      registerTool(tool: unknown) {
+        const name = (tool as { name?: unknown }).name;
+        if (typeof name === "string") tools.set(name, tool);
       },
     };
   }
@@ -244,6 +312,7 @@ describe("pi extension — factory arming + fail-open", () => {
     const pi = fakePi();
     keeperEvents(pi);
     expect(pi.handlers.size).toBe(0);
+    expect(pi.tools.size).toBe(0);
     pi.fire("agent_start", { type: "agent_start" }); // no handlers — no throw
     expect(existsSync(join(logDir, `${process.pid}.ndjson`))).toBe(false);
   });
@@ -259,6 +328,7 @@ describe("pi extension — factory arming + fail-open", () => {
       "tool_call",
       "tool_result",
     ]);
+    expect([...pi.tools.keys()]).toEqual(["keeper_transcript"]);
   });
 
   test("a fired event appends the translated line to the per-pid file", () => {

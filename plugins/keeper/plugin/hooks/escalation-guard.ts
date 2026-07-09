@@ -55,6 +55,7 @@ function resolveRole(raw: string | undefined): RoleConfig | "unknown" | null {
 const KEEPER_READ_SUBCOMMANDS = new Set([
   "escalation-brief",
   "session",
+  "transcript",
   "plan",
   "query",
   "bus",

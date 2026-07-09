@@ -29,6 +29,7 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     // keeper read/board subset
     "keeper escalation-brief unblock::fn-1-x.3",
     "keeper session state",
+    "keeper transcript session-1 --limit 20",
     "keeper plan unblock fn-1-x.3",
     "keeper query jobs",
     "keeper status",

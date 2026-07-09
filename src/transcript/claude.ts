@@ -1,0 +1,810 @@
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
+import type {
+  SubagentSummary,
+  TranscriptDocument,
+  TranscriptEntry,
+  TranscriptListItem,
+  TranscriptMetadata,
+  TranscriptSession,
+  TranscriptSource,
+  TranscriptTool,
+} from "./model";
+
+const METADATA_SLICE_BYTES = 128 * 1024;
+const SUMMARY_PREVIEW_CHARS = 240;
+
+export interface ClaudeRootOptions {
+  homeDir?: string;
+  env?: NodeJS.ProcessEnv;
+  /** Claude config directories. When present, standard discovery is skipped. */
+  configDirs?: readonly string[];
+}
+
+export interface ClaudeSessionFile {
+  path: string;
+  sessionId: string;
+  bytes: number;
+  modifiedMs: number;
+}
+
+export interface ClaudeListOptions {
+  roots: readonly string[];
+  /** Null scans every project; a path scans only its Claude project bucket. */
+  project: string | null;
+  sinceMs: number | null;
+  untilMs: number | null;
+  offset: number;
+  limit: number;
+}
+
+export interface ClaudeListResult {
+  items: TranscriptListItem[];
+  total: number;
+  offset: number;
+  nextOffset: number | null;
+}
+
+export type ClaudeSessionLookup =
+  | { kind: "found"; file: ClaudeSessionFile }
+  | { kind: "not_found" }
+  | { kind: "ambiguous"; files: ClaudeSessionFile[] };
+
+function safeRealpath(path: string): string | null {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
+
+function safeDirectories(path: string): string[] {
+  try {
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+      .map((entry) => join(path, entry.name))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** Resolve every readable Claude projects tree, deduplicated through symlinks. */
+export function discoverClaudeProjectsRoots(
+  options: ClaudeRootOptions = {},
+): string[] {
+  const home = options.homeDir ?? homedir();
+  const env = options.env ?? process.env;
+  const configDirs = options.configDirs?.length
+    ? [...options.configDirs]
+    : [
+        env.CLAUDE_CONFIG_DIR?.trim() || null,
+        join(home, ".claude"),
+        ...safeDirectories(join(home, ".claude-profiles")),
+      ].filter((path): path is string => path !== null);
+
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const configDir of configDirs) {
+    const projects = join(resolve(configDir), "projects");
+    const real = safeRealpath(projects);
+    if (real === null || seen.has(real)) {
+      continue;
+    }
+    seen.add(real);
+    roots.push(real);
+  }
+  return roots;
+}
+
+export function encodeClaudeProject(project: string): string {
+  return resolve(project).replaceAll(sep, "-");
+}
+
+function isSafeSessionId(sessionId: string): boolean {
+  return (
+    sessionId.length > 0 &&
+    sessionId.length <= 200 &&
+    basename(sessionId) === sessionId &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sessionId)
+  );
+}
+
+function fileInfo(path: string, sessionId: string): ClaudeSessionFile | null {
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) {
+      return null;
+    }
+    return {
+      path,
+      sessionId,
+      bytes: stat.size,
+      modifiedMs: stat.mtimeMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function projectDirs(
+  roots: readonly string[],
+  project: string | null,
+): string[] {
+  if (project !== null) {
+    const bucket = encodeClaudeProject(project);
+    return roots.map((root) => join(root, bucket));
+  }
+  return roots.flatMap(safeDirectories);
+}
+
+/** Locate an exact Claude session id without recursively scanning transcript data. */
+export function findClaudeSession(
+  roots: readonly string[],
+  sessionId: string,
+  project: string | null = null,
+): ClaudeSessionLookup {
+  if (!isSafeSessionId(sessionId)) {
+    return { kind: "not_found" };
+  }
+  const found: ClaudeSessionFile[] = [];
+  const seen = new Set<string>();
+  for (const dir of projectDirs(roots, project)) {
+    const path = join(dir, `${sessionId}.jsonl`);
+    const info = fileInfo(path, sessionId);
+    if (info === null) {
+      continue;
+    }
+    const real = safeRealpath(path) ?? path;
+    if (!seen.has(real)) {
+      seen.add(real);
+      found.push(info);
+    }
+  }
+  if (found.length === 0) {
+    return { kind: "not_found" };
+  }
+  if (found.length > 1) {
+    return {
+      kind: "ambiguous",
+      files: found.sort((a, b) => b.modifiedMs - a.modifiedMs),
+    };
+  }
+  return { kind: "found", file: found[0] as ClaudeSessionFile };
+}
+
+function parseTimestamp(raw: unknown): { text: string; ms: number } | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? { text: raw, ms } : null;
+}
+
+function stringOrNull(raw: unknown): string | null {
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+function recordOf(raw: unknown): Record<string, unknown> | null {
+  return raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : null;
+}
+
+function contentText(raw: unknown): string {
+  if (typeof raw === "string") {
+    return raw;
+  }
+  if (!Array.isArray(raw)) {
+    return raw === null || raw === undefined ? "" : JSON.stringify(raw);
+  }
+  const parts: string[] = [];
+  for (const block of raw) {
+    if (typeof block === "string") {
+      parts.push(block);
+      continue;
+    }
+    const obj = recordOf(block);
+    if (obj === null) {
+      continue;
+    }
+    if (typeof obj.text === "string") {
+      parts.push(obj.text);
+    } else if (typeof obj.content === "string") {
+      parts.push(obj.content);
+    } else {
+      parts.push(JSON.stringify(obj));
+    }
+  }
+  return parts.join("\n");
+}
+
+interface ParseState {
+  source: TranscriptSource;
+  entries: TranscriptEntry[];
+  toolNames: Map<string, string>;
+  metadata: TranscriptMetadata;
+  minTimestamp: { text: string; ms: number } | null;
+  maxTimestamp: { text: string; ms: number } | null;
+}
+
+function pushEntry(
+  state: ParseState,
+  entry: Omit<TranscriptEntry, "sourceOrdinal" | "ordinal" | "source">,
+): void {
+  const sourceOrdinal = state.entries.length;
+  state.entries.push({
+    ...entry,
+    source: state.source,
+    sourceOrdinal,
+    ordinal: sourceOrdinal,
+  });
+}
+
+function updateMetadata(state: ParseState, obj: Record<string, unknown>): void {
+  const timestamp = parseTimestamp(obj.timestamp);
+  if (timestamp !== null) {
+    if (state.minTimestamp === null || timestamp.ms < state.minTimestamp.ms) {
+      state.minTimestamp = timestamp;
+    }
+    if (state.maxTimestamp === null || timestamp.ms > state.maxTimestamp.ms) {
+      state.maxTimestamp = timestamp;
+    }
+  }
+  state.metadata.project = stringOrNull(obj.cwd) ?? state.metadata.project;
+  state.metadata.version = stringOrNull(obj.version) ?? state.metadata.version;
+  state.metadata.gitBranch =
+    stringOrNull(obj.gitBranch) ?? state.metadata.gitBranch;
+  if (obj.type === "custom-title") {
+    state.metadata.title =
+      stringOrNull(obj.customTitle) ?? state.metadata.title;
+  }
+  if (obj.type === "agent-name") {
+    state.metadata.agentName =
+      stringOrNull(obj.agentName) ?? state.metadata.agentName;
+  }
+  const message = recordOf(obj.message);
+  state.metadata.model = stringOrNull(message?.model) ?? state.metadata.model;
+}
+
+function parseToolCall(
+  state: ParseState,
+  obj: Record<string, unknown>,
+  timestamp: { text: string; ms: number } | null,
+  meta: boolean,
+): void {
+  const useId = stringOrNull(obj.id);
+  const name = stringOrNull(obj.name);
+  if (useId !== null && name !== null) {
+    state.toolNames.set(useId, name);
+  }
+  const tool: TranscriptTool = {
+    name,
+    useId,
+    input: obj.input ?? null,
+    result: null,
+    isError: false,
+  };
+  pushEntry(state, {
+    timestamp: timestamp?.text ?? null,
+    timestampMs: timestamp?.ms ?? null,
+    role: "tool",
+    kind: "tool_call",
+    text: null,
+    meta,
+    tool,
+  });
+}
+
+function parseToolResult(
+  state: ParseState,
+  obj: Record<string, unknown>,
+  timestamp: { text: string; ms: number } | null,
+  meta: boolean,
+): void {
+  const useId = stringOrNull(obj.tool_use_id);
+  const tool: TranscriptTool = {
+    name: useId === null ? null : (state.toolNames.get(useId) ?? null),
+    useId,
+    input: null,
+    result: obj.content ?? null,
+    isError: obj.is_error === true,
+  };
+  pushEntry(state, {
+    timestamp: timestamp?.text ?? null,
+    timestampMs: timestamp?.ms ?? null,
+    role: "tool",
+    kind: "tool_result",
+    text: null,
+    meta,
+    tool,
+  });
+}
+
+function parseContentBlock(
+  state: ParseState,
+  block: unknown,
+  recordType: "user" | "assistant",
+  timestamp: { text: string; ms: number } | null,
+  meta: boolean,
+  compactSummary: boolean,
+): void {
+  if (typeof block === "string") {
+    if (block.length === 0) return;
+    pushEntry(state, {
+      timestamp: timestamp?.text ?? null,
+      timestampMs: timestamp?.ms ?? null,
+      role: compactSummary ? "summary" : recordType,
+      kind: compactSummary ? "summary" : "text",
+      text: block,
+      meta,
+      tool: null,
+    });
+    return;
+  }
+  const obj = recordOf(block);
+  if (obj === null) {
+    return;
+  }
+  const type = stringOrNull(obj.type);
+  if (type === "text") {
+    parseContentBlock(
+      state,
+      stringOrNull(obj.text) ?? "",
+      recordType,
+      timestamp,
+      meta,
+      compactSummary,
+    );
+    return;
+  }
+  if (type === "thinking" || type === "redacted_thinking") {
+    const text =
+      stringOrNull(obj.thinking) ??
+      stringOrNull(obj.data) ??
+      (type === "redacted_thinking" ? "[redacted thinking]" : "");
+    pushEntry(state, {
+      timestamp: timestamp?.text ?? null,
+      timestampMs: timestamp?.ms ?? null,
+      role: "assistant",
+      kind: "thinking",
+      text,
+      meta,
+      tool: null,
+    });
+    return;
+  }
+  if (type === "tool_use" || type === "server_tool_use") {
+    parseToolCall(state, obj, timestamp, meta);
+    return;
+  }
+  if (type === "tool_result" || type === "web_search_tool_result") {
+    parseToolResult(state, obj, timestamp, meta);
+    return;
+  }
+  if (type === "image") {
+    pushEntry(state, {
+      timestamp: timestamp?.text ?? null,
+      timestampMs: timestamp?.ms ?? null,
+      role: recordType,
+      kind: "image",
+      text: "[image]",
+      meta,
+      tool: null,
+    });
+  }
+}
+
+function parseLine(state: ParseState, line: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    state.metadata.malformedLines++;
+    return;
+  }
+  const obj = recordOf(parsed);
+  if (obj === null) {
+    return;
+  }
+  updateMetadata(state, obj);
+  const type = stringOrNull(obj.type);
+  const timestamp = parseTimestamp(obj.timestamp);
+  if (type === "user" || type === "assistant") {
+    const message = recordOf(obj.message);
+    const content = message?.content;
+    const blocks = Array.isArray(content) ? content : [content];
+    const meta = obj.isMeta === true;
+    const compactSummary = obj.isCompactSummary === true;
+    for (const block of blocks) {
+      parseContentBlock(state, block, type, timestamp, meta, compactSummary);
+    }
+    return;
+  }
+  if (type === "summary") {
+    const text = contentText(obj.summary ?? obj.content);
+    if (text.length > 0) {
+      pushEntry(state, {
+        timestamp: timestamp?.text ?? null,
+        timestampMs: timestamp?.ms ?? null,
+        role: "summary",
+        kind: "summary",
+        text,
+        meta: false,
+        tool: null,
+      });
+    }
+    return;
+  }
+  if (type === "system") {
+    const subtype = stringOrNull(obj.subtype) ?? "system";
+    const text =
+      contentText(obj.content ?? obj.message) ||
+      `[${subtype.replaceAll("_", " ")}]`;
+    pushEntry(state, {
+      timestamp: timestamp?.text ?? null,
+      timestampMs: timestamp?.ms ?? null,
+      role: "system",
+      kind: "system",
+      text,
+      meta: true,
+      tool: null,
+    });
+  }
+}
+
+/** Parse one Claude JSONL transcript into the harness-neutral model. */
+export function parseClaudeTranscriptText(
+  text: string,
+  options: {
+    path: string;
+    sessionId: string;
+    source?: TranscriptSource;
+  },
+): TranscriptDocument {
+  const metadata: TranscriptMetadata = {
+    sessionId: options.sessionId,
+    harness: "claude",
+    path: options.path,
+    project: null,
+    title: null,
+    agentName: null,
+    model: null,
+    version: null,
+    gitBranch: null,
+    startedAt: null,
+    updatedAt: null,
+    malformedLines: 0,
+  };
+  const state: ParseState = {
+    source: options.source ?? "main",
+    entries: [],
+    toolNames: new Map(),
+    metadata,
+    minTimestamp: null,
+    maxTimestamp: null,
+  };
+  for (const line of text.split("\n")) {
+    if (line.trim().length > 0) {
+      parseLine(state, line);
+    }
+  }
+  metadata.startedAt = state.minTimestamp?.text ?? null;
+  metadata.updatedAt = state.maxTimestamp?.text ?? null;
+
+  // Tool results can precede the selected page. Resolve names after the full file
+  // is parsed so every result gets the call name when the id is available.
+  for (const entry of state.entries) {
+    if (
+      entry.kind === "tool_result" &&
+      entry.tool?.name === null &&
+      entry.tool.useId !== null
+    ) {
+      entry.tool.name = state.toolNames.get(entry.tool.useId) ?? null;
+    }
+  }
+  return { metadata, source: state.source, entries: state.entries };
+}
+
+export function readClaudeTranscript(
+  path: string,
+  sessionId: string,
+  source: TranscriptSource = "main",
+): TranscriptDocument {
+  return parseClaudeTranscriptText(readFileSync(path, "utf8"), {
+    path,
+    sessionId,
+    source,
+  });
+}
+
+function readSlice(path: string, start: number, length: number): string {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const bytes = readSync(fd, buffer, 0, length, start);
+    return buffer.subarray(0, bytes).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function metadataSample(path: string, bytes: number): string {
+  if (bytes <= METADATA_SLICE_BYTES * 2) {
+    return readFileSync(path, "utf8");
+  }
+  const head = readSlice(path, 0, METADATA_SLICE_BYTES);
+  const tail = readSlice(
+    path,
+    Math.max(0, bytes - METADATA_SLICE_BYTES),
+    METADATA_SLICE_BYTES,
+  );
+  const tailStart = tail.indexOf("\n");
+  return `${head}\n${tailStart >= 0 ? tail.slice(tailStart + 1) : tail}`;
+}
+
+function inspectClaudeFile(file: ClaudeSessionFile): TranscriptDocument {
+  return parseClaudeTranscriptText(metadataSample(file.path, file.bytes), {
+    path: file.path,
+    sessionId: file.sessionId,
+  });
+}
+
+function truncateInline(text: string, max = SUMMARY_PREVIEW_CHARS): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}...`;
+}
+
+function firstHumanPrompt(document: TranscriptDocument): string | null {
+  const entry = document.entries.find(
+    (candidate) =>
+      candidate.role === "user" &&
+      candidate.kind === "text" &&
+      !candidate.meta &&
+      candidate.text !== null,
+  );
+  return entry?.text === null || entry?.text === undefined
+    ? null
+    : truncateInline(entry.text);
+}
+
+function countSubagents(mainPath: string): number {
+  try {
+    return readdirSync(join(mainPath.slice(0, -".jsonl".length), "subagents"), {
+      withFileTypes: true,
+    }).filter(
+      (entry) =>
+        entry.isFile() &&
+        entry.name.startsWith("agent-") &&
+        entry.name.endsWith(".jsonl"),
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+function scanSessionFiles(
+  roots: readonly string[],
+  project: string | null,
+): ClaudeSessionFile[] {
+  const files: ClaudeSessionFile[] = [];
+  const seen = new Set<string>();
+  for (const dir of projectDirs(roots, project)) {
+    let entries: Array<{
+      name: string;
+      isFile(): boolean;
+    }>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
+        continue;
+      }
+      const sessionId = entry.name.slice(0, -".jsonl".length);
+      if (!isSafeSessionId(sessionId)) {
+        continue;
+      }
+      const path = join(dir, entry.name);
+      const real = safeRealpath(path) ?? path;
+      if (seen.has(real)) {
+        continue;
+      }
+      const info = fileInfo(path, sessionId);
+      if (info !== null) {
+        seen.add(real);
+        files.push(info);
+      }
+    }
+  }
+  return files;
+}
+
+/** List sessions by update time while parsing only the requested result page. */
+export function listClaudeSessions(
+  options: ClaudeListOptions,
+): ClaudeListResult {
+  const candidates = scanSessionFiles(options.roots, options.project)
+    .filter(
+      (file) =>
+        (options.sinceMs === null || file.modifiedMs >= options.sinceMs) &&
+        (options.untilMs === null || file.modifiedMs <= options.untilMs),
+    )
+    .sort(
+      (a, b) =>
+        b.modifiedMs - a.modifiedMs || a.sessionId.localeCompare(b.sessionId),
+    );
+  const selected = candidates.slice(
+    options.offset,
+    options.offset + options.limit,
+  );
+  const items = selected.map((file): TranscriptListItem => {
+    const document = inspectClaudeFile(file);
+    return {
+      sessionId: file.sessionId,
+      path: file.path,
+      project: document.metadata.project,
+      title: document.metadata.title,
+      startedAt: document.metadata.startedAt,
+      updatedAt:
+        document.metadata.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+      bytes: file.bytes,
+      subagentCount: countSubagents(file.path),
+      firstPrompt: firstHumanPrompt(document),
+    };
+  });
+  const end = options.offset + items.length;
+  return {
+    items,
+    total: candidates.length,
+    offset: options.offset,
+    nextOffset: end < candidates.length ? end : null,
+  };
+}
+
+function subagentDirectory(mainPath: string): string {
+  return join(mainPath.slice(0, -".jsonl".length), "subagents");
+}
+
+function normalizeSubagentId(filename: string): string {
+  return filename.slice("agent-".length, -".jsonl".length);
+}
+
+export function listClaudeSubagents(mainPath: string): SubagentSummary[] {
+  const dir = subagentDirectory(mainPath);
+  let names: string[];
+  try {
+    names = readdirSync(dir)
+      .filter((name) => name.startsWith("agent-") && name.endsWith(".jsonl"))
+      .sort();
+  } catch {
+    return [];
+  }
+  return names.flatMap((name): SubagentSummary[] => {
+    const path = join(dir, name);
+    const id = normalizeSubagentId(name);
+    const info = fileInfo(path, id);
+    if (info === null) {
+      return [];
+    }
+    const document = inspectClaudeFile(info);
+    return [
+      {
+        id,
+        path,
+        bytes: info.bytes,
+        startedAt: document.metadata.startedAt,
+        updatedAt:
+          document.metadata.updatedAt ??
+          new Date(info.modifiedMs).toISOString(),
+        task: firstHumanPrompt(document),
+      },
+    ];
+  });
+}
+
+function resolveSubagent(
+  subagents: readonly SubagentSummary[],
+  requested: string,
+): SubagentSummary | null {
+  const normalized = requested.replace(/^agent-/, "").replace(/\.jsonl$/, "");
+  const exact = subagents.find((subagent) => subagent.id === normalized);
+  if (exact !== undefined) {
+    return exact;
+  }
+  const prefixes = subagents.filter((subagent) =>
+    subagent.id.startsWith(normalized),
+  );
+  return prefixes.length === 1 ? (prefixes[0] ?? null) : null;
+}
+
+function assembleEntries(
+  documents: readonly TranscriptDocument[],
+): TranscriptEntry[] {
+  const entries = documents.flatMap((document) => document.entries);
+  if (documents.length > 1) {
+    entries.sort(
+      (a, b) =>
+        (a.timestampMs ?? Number.MAX_SAFE_INTEGER) -
+          (b.timestampMs ?? Number.MAX_SAFE_INTEGER) ||
+        a.source.localeCompare(b.source) ||
+        a.sourceOrdinal - b.sourceOrdinal,
+    );
+  }
+  return entries.map((entry, ordinal) => ({ ...entry, ordinal }));
+}
+
+/** Load the main transcript, one subagent, or an interleaved all-source view. */
+export function loadClaudeSession(
+  mainPath: string,
+  sessionId: string,
+  selected: "main" | "all" | string = "main",
+): TranscriptSession | { error: string } {
+  if (!existsSync(mainPath)) {
+    return { error: `transcript disappeared: ${mainPath}` };
+  }
+  const main = readClaudeTranscript(mainPath, sessionId);
+  const subagents = listClaudeSubagents(mainPath);
+  if (selected === "main") {
+    return {
+      main,
+      entries: assembleEntries([main]),
+      selectedSource: "main",
+      subagents,
+    };
+  }
+  if (selected === "all") {
+    const documents = [
+      main,
+      ...subagents.map((subagent) =>
+        readClaudeTranscript(
+          subagent.path,
+          sessionId,
+          `subagent:${subagent.id}`,
+        ),
+      ),
+    ];
+    return {
+      main,
+      entries: assembleEntries(documents),
+      selectedSource: "all",
+      subagents,
+    };
+  }
+  const subagent = resolveSubagent(subagents, selected);
+  if (subagent === null) {
+    return {
+      error: `subagent '${selected}' not found or ambiguous; available: ${
+        subagents.map((item) => item.id).join(", ") || "none"
+      }`,
+    };
+  }
+  const document = readClaudeTranscript(
+    subagent.path,
+    sessionId,
+    `subagent:${subagent.id}`,
+  );
+  return {
+    main,
+    entries: assembleEntries([document]),
+    selectedSource: `subagent:${subagent.id}`,
+    subagents,
+  };
+}
+
+/** Useful when an ambiguity needs to tell the caller which project owns a file. */
+export function transcriptHoldingDirectory(path: string): string {
+  return dirname(path);
+}

@@ -52,6 +52,7 @@ export const SUBCOMMANDS = [
   "setup-tmux",
   "tabs",
   "session",
+  "transcript",
   "search-history",
   "find-file-history",
   "show-job",
@@ -581,6 +582,7 @@ export async function main(): Promise<void> {
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
     tabs: async (argv) => (await import("./tabs")).main(argv),
     session: async (argv) => (await import("./session")).main(argv),
+    transcript: async (argv) => (await import("./transcript")).main(argv),
     "search-history": async (argv) =>
       (await import("./search-history")).main(argv),
     "find-file-history": async (argv) =>

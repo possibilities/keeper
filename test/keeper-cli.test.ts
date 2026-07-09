@@ -94,6 +94,7 @@ function makeHarness(): Harness {
       "setup-tmux": mkHandler("setup-tmux"),
       tabs: mkHandler("tabs"),
       session: mkHandler("session"),
+      transcript: mkHandler("transcript"),
       "search-history": mkHandler("search-history"),
       "find-file-history": mkHandler("find-file-history"),
       "show-job": mkHandler("show-job"),
@@ -233,6 +234,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("commit-work")).toBe(true);
     expect(isSubcommand("setup-tmux")).toBe(true);
     expect(isSubcommand("session")).toBe(true);
+    expect(isSubcommand("transcript")).toBe(true);
     expect(isSubcommand("search-history")).toBe(true);
     expect(isSubcommand("find-file-history")).toBe(true);
     expect(isSubcommand("show-job")).toBe(true);
@@ -389,6 +391,7 @@ describe("cli/keeper command index", () => {
         "prompt",
         "reclaim",
         "tabs",
+        "transcript",
       ].sort(),
     );
     // The metadata source of truth agrees with the projected index.
