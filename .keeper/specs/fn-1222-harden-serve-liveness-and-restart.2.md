@@ -56,5 +56,5 @@ all trigger state. Keep every case synthetic-clock pure.
 - [ ] CLAUDE.md's watchdog clause describes the new trigger set; the CLAUDE.md lint stays green
 
 ## Done summary
-
+Serve worker self-reports served latency (durations only) every ~12s; decideServeLivenessWatchdog is now a pure reducer with attempt-counted accept-stall plus serve-report-mute and serve-starvation triggers and a clock-jump guard that resets all trigger state. Dispatch timing runs unconditionally; the worker releases its histogram + interval on shutdown.
 ## Evidence
