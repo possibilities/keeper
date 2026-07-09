@@ -98,6 +98,7 @@ import {
   PROBE_SETTLE_INITIAL,
   type ProbeSettleEvent,
   type ProbeSettleState,
+  type ProbeTickOutcome,
   parseBlockedCategory,
   parseRestartLedger,
   prewarmWatcherAddon,
@@ -131,9 +132,15 @@ import {
   runMergeEscalationSweep,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
+  SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
-  SERVE_PROBE_STUCK_THRESHOLD_MS,
+  SERVE_PROBE_MAX_FAIL_STREAK,
+  SERVE_REPORT_MUTE_THRESHOLD_MS,
+  SERVE_STARVATION_MAX_BREACH_STREAK,
   SERVE_WATCHDOG_BOOT_GRACE_MS,
+  SERVE_WATCHDOG_INITIAL_STATE,
+  SERVE_WATCHDOG_INTERVAL_MS,
+  type ServeWatchdogTriggerState,
   SHARED_BASE_BROKEN_CATEGORY,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
@@ -1076,103 +1083,310 @@ test("decideGitSeedWatchdog: alive-but-never-seeding still grows stale from the 
 });
 
 // ---------------------------------------------------------------------------
-// fn-1082 — serve-liveness watchdog pure verdict
+// fn-1082 / fn-1222 — serve-liveness watchdog pure reducer
 // ---------------------------------------------------------------------------
 
-// Boot grace already elapsed; both sockets probed fresh this instant; no lag
-// breaches. The healthy steady state — every case below perturbs one axis.
-const SWD_BASE = {
-  nowMs: 1_000_000,
-  bootGraceUntilMs: 1_000_000 - SERVE_WATCHDOG_BOOT_GRACE_MS,
-  lastServerProbeOkAtMs: 1_000_000,
-  lastBusProbeOkAtMs: 1_000_000,
-  probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
-  consecutiveLagBreaches: 0,
-  maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+// One monotonic tick at NOW; the previous tick was one interval earlier. Threshold
+// inputs are hand-chosen (1s served-latency, floor of 20 samples) so every
+// expectation below is hand-reasoned, never re-derived by the reducer under test.
+const SWD_NOW = 1_000_000;
+const SWD_INTERVAL = SERVE_WATCHDOG_INTERVAL_MS;
+
+// A healthy carried state at the previous tick: every streak clear, the last report
+// just arrived, the prior tick one interval back.
+const SWD_STATE: ServeWatchdogTriggerState = {
+  serverProbeFailStreak: 0,
+  busProbeFailStreak: 0,
+  lagBreachStreak: 0,
+  starvationBreachStreak: 0,
+  reportBaselineMonoMs: SWD_NOW,
+  lastTickMonoMs: SWD_NOW - SWD_INTERVAL,
 };
 
-test("decideServeLivenessWatchdog: healthy — fresh probes, no lag → ok", () => {
-  expect(decideServeLivenessWatchdog({ ...SWD_BASE })).toEqual({ kind: "ok" });
+// Healthy tick inputs: boot grace elapsed, both probes live, no lag, a fresh report,
+// and quiet-but-not-breaching starvation terms. Each case perturbs one axis.
+const SWD_BASE = {
+  nowMonoMs: SWD_NOW,
+  bootGraceUntilMonoMs: SWD_NOW - SERVE_WATCHDOG_BOOT_GRACE_MS,
+  intervalMs: SWD_INTERVAL,
+  clockJumpFactor: SERVE_CLOCK_JUMP_FACTOR,
+  prev: SWD_STATE,
+  serverProbe: "live" as ProbeTickOutcome,
+  busProbe: "live" as ProbeTickOutcome,
+  maxProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+  lagBreached: false,
+  maxLagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  lastReportArrivalMonoMs: SWD_NOW as number | null,
+  reportMuteThresholdMs: SERVE_REPORT_MUTE_THRESHOLD_MS,
+  servedLatencyP99Ms: 5,
+  servedLatencyThresholdMs: 1_000,
+  queueing: false,
+  ourFault: false,
+  sampleCount: 100,
+  sampleFloor: 20,
+  maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
+};
+
+// Run one reducer tick with per-tick + carried-state overrides.
+function swd(
+  over: Partial<Omit<typeof SWD_BASE, "prev">> = {},
+  prevOver: Partial<ServeWatchdogTriggerState> = {},
+) {
+  return decideServeLivenessWatchdog({
+    ...SWD_BASE,
+    ...over,
+    prev: { ...SWD_STATE, ...prevOver },
+  });
+}
+
+// The full first-paint starvation conjunction for one window — every term breaching.
+const SWD_STARVATION_BREACH = {
+  servedLatencyP99Ms: 1_500,
+  queueing: true,
+  lagBreached: true,
+  ourFault: true,
+  sampleCount: 100,
+} as const;
+
+test("decideServeLivenessWatchdog: healthy — live probes, no lag, fresh report → ok", () => {
+  expect(swd().verdict).toEqual({ kind: "ok" });
 });
 
-test("decideServeLivenessWatchdog: within boot grace → ok even with stale probes and a full lag run", () => {
-  // The arm-time baselines are meaningless until workers bind + probe once; the
-  // grace window must suppress a verdict no matter how stale the inputs look.
+test("decideServeLivenessWatchdog: within boot grace → ok with every streak cleared, whatever the inputs look like", () => {
+  // Arm-time baselines are meaningless until workers bind + report once; the grace
+  // window suppresses the verdict AND holds every streak clear regardless of inputs.
+  const r = swd(
+    {
+      nowMonoMs: SWD_BASE.bootGraceUntilMonoMs - 1,
+      serverProbe: "dead",
+      busProbe: "dead",
+      lagBreached: true,
+    },
+    {
+      lastTickMonoMs: null,
+      serverProbeFailStreak: 5,
+      busProbeFailStreak: 5,
+      lagBreachStreak: 5,
+      starvationBreachStreak: 5,
+    },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.serverProbeFailStreak).toBe(0);
+  expect(r.state.busProbeFailStreak).toBe(0);
+  expect(r.state.lagBreachStreak).toBe(0);
+  expect(r.state.starvationBreachStreak).toBe(0);
+});
+
+test("decideServeLivenessWatchdog: accept-stall-server — the fail streak reaches the cap on a dead read", () => {
+  // Consecutive-attempt counting, not wall-clock age: one more dead read tips a
+  // streak already one short of the cap over, and the verdict NAMES the socket.
+  const r = swd(
+    { serverProbe: "dead" },
+    { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  );
+  expect(r.verdict).toEqual({
+    kind: "escalate",
+    trigger: "accept-stall-server",
+  });
+  expect(r.state.serverProbeFailStreak).toBe(SERVE_PROBE_MAX_FAIL_STREAK);
+});
+
+test("decideServeLivenessWatchdog: accept-stall-server one dead read short of the cap → ok", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      nowMs: SWD_BASE.bootGraceUntilMs - 1,
-      lastServerProbeOkAtMs: 0,
-      lastBusProbeOkAtMs: 0,
-      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
-    }),
+    swd(
+      { serverProbe: "dead" },
+      { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 2 },
+    ).verdict,
   ).toEqual({ kind: "ok" });
 });
 
-test("decideServeLivenessWatchdog: keeperd read stalled (low lag) → escalate names accept-stall-server", () => {
-  // The accept-stall mode: reads die, lag stays low. The server probe last
-  // succeeded past the window while the bus probe is fresh — either socket alone
-  // is enough to escalate, and the verdict NAMES which one tripped.
-  expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-    }),
-  ).toEqual({ kind: "escalate", trigger: "accept-stall-server" });
+test("decideServeLivenessWatchdog: a live read resets the accept-stall streak (consecutive, not cumulative)", () => {
+  // One proof-of-life read breaks the run — the streak must count consecutive
+  // failures, so a single answered probe zeroes an almost-tripped streak.
+  const r = swd(
+    { serverProbe: "live" },
+    { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.serverProbeFailStreak).toBe(0);
 });
 
-test("decideServeLivenessWatchdog: bus registry read stalled (low lag) → escalate names accept-stall-bus", () => {
+test("decideServeLivenessWatchdog: an unarmed socket never accumulates a fail streak (cannot false-trip)", () => {
+  // A not-served / not-yet-ready socket fires no probe: its tick outcome is
+  // `unarmed`, which resets rather than advances the streak.
+  const r = swd(
+    { serverProbe: "unarmed" },
+    { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.serverProbeFailStreak).toBe(0);
+});
+
+test("decideServeLivenessWatchdog: accept-stall-bus — the bus fail streak reaches the cap", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-    }),
+    swd(
+      { busProbe: "dead" },
+      { busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+    ).verdict,
   ).toEqual({ kind: "escalate", trigger: "accept-stall-bus" });
 });
 
 test("decideServeLivenessWatchdog: both sockets stalled → server trigger wins (deterministic)", () => {
-  // When both accept-stalls are live the server socket is checked first, so the
-  // named trigger is stable rather than order-dependent.
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-    }),
+    swd(
+      { serverProbe: "dead", busProbe: "dead" },
+      {
+        serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1,
+        busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1,
+      },
+    ).verdict,
   ).toEqual({ kind: "escalate", trigger: "accept-stall-server" });
 });
 
-test("decideServeLivenessWatchdog: probe age just under the window → ok", () => {
-  // One-off blips must not restart: a probe that succeeded moments inside the
-  // window (age === threshold − 1) is still healthy — escalate is `>=` only.
+test("decideServeLivenessWatchdog: busy-lag — lag breached for N consecutive windows → escalate", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastServerProbeOkAtMs:
-        SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
-      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
-    }),
-  ).toEqual({ kind: "ok" });
-});
-
-test("decideServeLivenessWatchdog: busy-wedge — lag breached for N consecutive intervals → escalate names busy-lag", () => {
-  expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
-    }),
+    swd(
+      { lagBreached: true },
+      { lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1 },
+    ).verdict,
   ).toEqual({ kind: "escalate", trigger: "busy-lag" });
 });
 
-test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer than N intervals → ok", () => {
-  // High lag this tick but the run has not reached N — a transient GC pause or a
-  // heavy-but-finite fold must not trip a false restart.
+test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer than N windows → ok", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1,
-    }),
+    swd(
+      { lagBreached: true },
+      { lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 2 },
+    ).verdict,
   ).toEqual({ kind: "ok" });
+});
+
+test("decideServeLivenessWatchdog: serve-report-mute — no report within the staleness bound (main's arrival clock)", () => {
+  // The serve loop froze and stopped posting: the newest arrival is exactly the mute
+  // bound old on main's own clock, so mute fires (`>=`).
+  const stale = SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS;
+  expect(
+    swd({ lastReportArrivalMonoMs: stale }, { reportBaselineMonoMs: stale })
+      .verdict,
+  ).toEqual({ kind: "escalate", trigger: "serve-report-mute" });
+});
+
+test("decideServeLivenessWatchdog: report arrival just inside the mute bound → ok", () => {
+  const almost = SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS + 1;
+  expect(
+    swd({ lastReportArrivalMonoMs: almost }, { reportBaselineMonoMs: almost })
+      .verdict,
+  ).toEqual({ kind: "ok" });
+});
+
+test("decideServeLivenessWatchdog: a fresh report advances the baseline and clears an aging mute", () => {
+  // A report arriving this tick re-bases the staleness clock; a stale prior baseline
+  // must not linger once a newer arrival lands.
+  const r = swd(
+    { lastReportArrivalMonoMs: SWD_NOW },
+    { reportBaselineMonoMs: SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.reportBaselineMonoMs).toBe(SWD_NOW);
+});
+
+test("decideServeLivenessWatchdog: serve-starvation — the full conjunction reaches N consecutive windows → escalate", () => {
+  const r = swd(SWD_STARVATION_BREACH, {
+    starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK - 1,
+  });
+  expect(r.verdict).toEqual({ kind: "escalate", trigger: "serve-starvation" });
+  expect(r.state.starvationBreachStreak).toBe(
+    SERVE_STARVATION_MAX_BREACH_STREAK,
+  );
+});
+
+test("decideServeLivenessWatchdog: serve-starvation one window short of the cap → ok", () => {
+  expect(
+    swd(SWD_STARVATION_BREACH, {
+      starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK - 2,
+    }).verdict,
+  ).toEqual({ kind: "ok" });
+});
+
+// Each starvation term is individually necessary: drop any one and the window is
+// inconclusive — the streak resets to zero and no escalation fires, even one window
+// from the cap.
+for (const [term, override] of [
+  ["served latency below threshold", { servedLatencyP99Ms: 5 }],
+  ["the worker loop is not queueing", { queueing: false }],
+  ["the daemon is not saturated", { lagBreached: false }],
+  ["the daemon is not burning its own cpu", { ourFault: false }],
+  ["the sample count is below the floor", { sampleCount: 5 }],
+] as const) {
+  test(`decideServeLivenessWatchdog: serve-starvation inconclusive when ${term} — streak resets, no escalate`, () => {
+    const r = swd(
+      { ...SWD_STARVATION_BREACH, ...override },
+      { starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK - 1 },
+    );
+    expect(r.verdict).toEqual({ kind: "ok" });
+    expect(r.state.starvationBreachStreak).toBe(0);
+  });
+}
+
+test("decideServeLivenessWatchdog: a clock discontinuity resets EVERY trigger's state and fires nothing across it", () => {
+  // Laptop suspend/resume: the tick gap leaps past the jump factor. Even with every
+  // streak at the cap and inputs that would otherwise escalate, the resume tick
+  // returns ok and zeroes all trigger state + re-bases the arrival clock to now.
+  const r = swd(
+    {
+      // A gap beyond clockJumpFactor× the interval since the prior tick, with every
+      // other input at its escalating value (starvation breach includes lagBreached).
+      serverProbe: "dead",
+      busProbe: "dead",
+      ...SWD_STARVATION_BREACH,
+      lastReportArrivalMonoMs: SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS * 10,
+    },
+    {
+      lastTickMonoMs:
+        SWD_NOW - (SERVE_CLOCK_JUMP_FACTOR * SWD_INTERVAL + SWD_INTERVAL),
+      serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+      busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+      lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+      starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
+      reportBaselineMonoMs: SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS * 10,
+    },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state).toEqual({
+    serverProbeFailStreak: 0,
+    busProbeFailStreak: 0,
+    lagBreachStreak: 0,
+    starvationBreachStreak: 0,
+    reportBaselineMonoMs: SWD_NOW,
+    lastTickMonoMs: SWD_NOW,
+  });
+});
+
+test("decideServeLivenessWatchdog: a gap exactly at the jump factor is NOT a discontinuity (normal eval)", () => {
+  // The guard is strictly `>`: a gap of exactly clockJumpFactor× the interval still
+  // evaluates the triggers, so a dead-read streak at the cap still escalates.
+  const r = swd(
+    { serverProbe: "dead" },
+    {
+      lastTickMonoMs: SWD_NOW - SERVE_CLOCK_JUMP_FACTOR * SWD_INTERVAL,
+      serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1,
+    },
+  );
+  expect(r.verdict).toEqual({
+    kind: "escalate",
+    trigger: "accept-stall-server",
+  });
+});
+
+test("SERVE_WATCHDOG_INITIAL_STATE is a clean zeroed state", () => {
+  expect(SERVE_WATCHDOG_INITIAL_STATE).toEqual({
+    serverProbeFailStreak: 0,
+    busProbeFailStreak: 0,
+    lagBreachStreak: 0,
+    starvationBreachStreak: 0,
+    reportBaselineMonoMs: null,
+    lastTickMonoMs: null,
+  });
 });
 
 // ---------------------------------------------------------------------------

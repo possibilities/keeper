@@ -224,6 +224,7 @@ import type {
   RequestHandoffResultMessage,
   RetryDispatchRequestMessage,
   RetryDispatchResultMessage,
+  ServeHealthMessage,
   ServerWorkerData,
   SetAutopilotConfigRequestMessage,
   SetAutopilotConfigResultMessage,
@@ -3480,13 +3481,6 @@ export const SERVE_WATCHDOG_INTERVAL_MS = 30_000;
  */
 export const SERVE_PROBE_TIMEOUT_MS = 5_000;
 /**
- * How stale the last SUCCESSFUL real-read on either socket may get before the
- * watchdog escalates. Three intervals' worth: a genuine wedge fails every probe,
- * so the age crosses this after ~3 consecutive dead ticks — enough to rule out a
- * one-off blip, short enough that an operator sees a restart, not a permanent hang.
- */
-export const SERVE_PROBE_STUCK_THRESHOLD_MS = 3 * SERVE_WATCHDOG_INTERVAL_MS;
-/**
  * Main-loop event-loop-delay p99 (ms) that counts as a BUSY-wedge breach for one
  * interval. ~1s of p99 lag means the main loop is starved — legitimate load rarely
  * sustains this. The accept-stall mode shows LOW lag, so this histogram detector is
@@ -3507,70 +3501,293 @@ export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 3;
  * sockets and answers the first probes well inside it.
  */
 export const SERVE_WATCHDOG_BOOT_GRACE_MS = 60_000;
-
 /**
- * Pure verdict for the serve-liveness watchdog (fn-1082). Mirrors
- * {@link decideGitSeedWatchdog} — clock/threshold arithmetic only, no I/O — so the
- * decision is unit-testable with synthetic clock, probe-age, and lag inputs.
- *
- * Two detectors for two wedge modes, both escalating straight to `fatalExit`
- * (LaunchAgent restart — never an in-process respawn):
- *   - ACCEPT-STALL (low lag, zero read throughput): a real-read probe on either
- *     socket last succeeded past `probeStuckThresholdMs`. The caller stamps
- *     `lastServerProbeOkAtMs`/`lastBusProbeOkAtMs` on each successful round-trip; a
- *     wedged read never stamps, so the age grows until it crosses the window.
- *   - BUSY-wedge (main loop starved): the main event-loop-delay p99 breached its
- *     threshold for `maxConsecutiveLagBreaches` consecutive intervals (the caller
- *     accumulates/resets the count per tick).
- *
- * Returns `{ kind: "ok" }` during the boot-grace window (arm-time baselines are not
- * yet meaningful) and whenever both detectors are clear; otherwise `{ kind:
- * "escalate", trigger }` NAMING which detector fired, so the producer's escalation
- * log pins the wedge mode (accept-stall on which socket, or a busy-lag spin) instead
- * of a bare "something wedged". The server socket is checked before the bus so the
- * trigger is deterministic when both stall at once.
+ * Consecutive FAILED real-read attempts (per socket) before accept-stall escalates.
+ * Attempt-counting replaces the old wall-clock age so a laptop suspend/resume gap
+ * cannot balloon a probe's age past the window (the clock-jump guard zeroes the
+ * streak on a detected discontinuity). Three failed reads in a row ≈ the old
+ * three-interval age window: enough to rule out a one-off blip.
  */
+export const SERVE_PROBE_MAX_FAIL_STREAK = 3;
+/**
+ * How long the serve worker may go without posting a `serve-health` report —
+ * judged by MAIN's OWN arrival clock, never the worker's timestamps — before the
+ * `serve-report-mute` trigger fires. A frozen serve loop stops reporting entirely;
+ * three watchdog intervals of silence rules out a dropped report while still
+ * surfacing a restart promptly.
+ */
+export const SERVE_REPORT_MUTE_THRESHOLD_MS = 3 * SERVE_WATCHDOG_INTERVAL_MS;
+/**
+ * Served-dispatch p99 (ms) that counts as a first-paint breach for one starvation
+ * window. ~1s to first paint is the starvation symptom; a healthy-but-loaded
+ * daemon answers a local dispatch well under this.
+ */
+export const SERVE_STARVATION_LATENCY_P99_THRESHOLD_MS = 1_000;
+/**
+ * Worker-loop-delay p99 (ms) that counts as QUEUEING — the serve worker's own
+ * event loop is backed up, so slow first paint is queue depth behind a starved
+ * loop, not a single heavy query. Reported by the worker; judged here.
+ */
+export const SERVE_STARVATION_QUEUEING_P99_THRESHOLD_MS = 250;
+/**
+ * Fraction of one core the daemon PROCESS must burn over the window for a
+ * starvation window to read as ourFault. `process.cpuUsage` is process-wide in Bun
+ * (`threadCpuUsage` is undefined), so this says "the daemon is burning CPU", not
+ * "the serve worker is" — the conjunction with queueing + saturation is what bounds
+ * the false-positive cost of that coarser granularity.
+ */
+export const SERVE_STARVATION_OURFAULT_CPU_FRACTION = 0.5;
+/**
+ * Minimum served-dispatch samples in a window before its p99 is trustworthy. A
+ * quieter window is INCONCLUSIVE — it resets the starvation streak, never counts
+ * as a breach — so an idle-but-slow blip cannot accumulate toward a restart.
+ */
+export const SERVE_STARVATION_SAMPLE_FLOOR = 20;
+/**
+ * Consecutive starvation breach windows before `serve-starvation` escalates.
+ * Requiring N in a row (not one window) keeps a transient load spike from tripping.
+ */
+export const SERVE_STARVATION_MAX_BREACH_STREAK = 3;
+/**
+ * A tick-to-tick gap beyond this multiple of the interval is a clock discontinuity
+ * (laptop suspend/resume, or an NTP step): the loop was frozen or the clock stepped,
+ * so every trigger's accumulated state is reset and the arrival baseline re-based to
+ * now, so the resume tick cannot false-trip any trigger — old or new.
+ */
+export const SERVE_CLOCK_JUMP_FACTOR = 3;
+
 export type ServeLivenessTrigger =
   | "accept-stall-server"
   | "accept-stall-bus"
-  | "busy-lag";
+  | "busy-lag"
+  | "serve-report-mute"
+  | "serve-starvation";
 
 export type ServeLivenessVerdict =
   | { kind: "ok" }
   | { kind: "escalate"; trigger: ServeLivenessTrigger };
 
+/**
+ * This tick's settled outcome for one socket's real-read probe: `"live"` (the
+ * probe proved life), `"dead"` (it timed out / failed), or `"unarmed"` (the socket
+ * is not served, or its worker has not signalled ready — no probe fired, so the
+ * streak stays fresh and cannot false-trip).
+ */
+export type ProbeTickOutcome = "live" | "dead" | "unarmed";
+
+/**
+ * All the accumulated trigger state the serve-liveness watchdog threads from one
+ * tick to the next. Every streak is reset to zero — and the arrival baseline
+ * re-based — whenever {@link decideServeLivenessWatchdog} detects a clock
+ * discontinuity, so a suspend/resume gap cannot false-trip any trigger.
+ */
+export interface ServeWatchdogTriggerState {
+  /** Consecutive failed server-socket probe attempts (accept-stall-server). */
+  serverProbeFailStreak: number;
+  /** Consecutive failed bus-socket probe attempts (accept-stall-bus). */
+  busProbeFailStreak: number;
+  /** Consecutive main-loop lag-breaching windows (busy-lag). */
+  lagBreachStreak: number;
+  /** Consecutive first-paint starvation windows (serve-starvation). */
+  starvationBreachStreak: number;
+  /**
+   * Freshest serve-health arrival stamp on MAIN's monotonic clock, the baseline
+   * the mute age measures from. `null` until the first report (or a reset). A
+   * stale stamp never regresses it, so a pre-reset report cannot re-trip mute.
+   */
+  reportBaselineMonoMs: number | null;
+  /** Main's monotonic clock at the previous tick; `null` on the first tick. */
+  lastTickMonoMs: number | null;
+}
+
+export const SERVE_WATCHDOG_INITIAL_STATE: ServeWatchdogTriggerState = {
+  serverProbeFailStreak: 0,
+  busProbeFailStreak: 0,
+  lagBreachStreak: 0,
+  starvationBreachStreak: 0,
+  reportBaselineMonoMs: null,
+  lastTickMonoMs: null,
+};
+
+/** A probe streak advances on a dead read and resets on a live/unarmed one. */
+function nextProbeFailStreak(prev: number, outcome: ProbeTickOutcome): number {
+  return outcome === "dead" ? prev + 1 : 0;
+}
+
+/**
+ * Pure step for the serve-liveness watchdog. Mirrors {@link decideGitSeedWatchdog}
+ * in spirit — clock/threshold arithmetic only, no I/O — but is a REDUCER: it folds
+ * one tick's signals over the carried {@link ServeWatchdogTriggerState} and returns
+ * both a verdict and the next state, so the whole decision (streak accumulation,
+ * clock-jump reset, arrival-baseline tracking) is unit-testable with a synthetic
+ * clock and zero real sockets.
+ *
+ * Trigger set, escalated straight to `fatalExit` (LaunchAgent restart — never an
+ * in-process respawn), in the deterministic order they are checked:
+ *   - `accept-stall-server` / `accept-stall-bus`: a socket's real-read probe failed
+ *     `maxProbeFailStreak` attempts in a row (send path alive, reads dark).
+ *   - `busy-lag`: MAIN's event-loop-delay p99 breached for `maxLagBreachStreak`
+ *     consecutive windows (a main-thread busy spin the read probes cannot see).
+ *   - `serve-report-mute`: the serve worker stopped posting `serve-health` — the
+ *     newest arrival is older than `reportMuteThresholdMs` on MAIN's arrival clock
+ *     (a frozen serve loop whose own timestamps would be late by construction).
+ *   - `serve-starvation`: `maxStarvationBreachStreak` consecutive windows where
+ *     served-latency p99 breached AND the worker loop was queueing AND the daemon
+ *     was saturated (main-loop lag) AND the daemon was burning its own CPU AND the
+ *     sample count cleared the floor — a quiet or single-axis window is inconclusive
+ *     (resets the streak), never breaching, so first-paint starvation must be
+ *     sustained AND own-caused to trip.
+ *
+ * A clock discontinuity (tick gap > `clockJumpFactor`× the interval) or the boot
+ * grace window returns `ok` with every streak cleared, so neither a suspend/resume
+ * nor a still-binding boot can trip any trigger.
+ */
 export function decideServeLivenessWatchdog(inputs: {
-  nowMs: number;
-  bootGraceUntilMs: number;
-  lastServerProbeOkAtMs: number;
-  lastBusProbeOkAtMs: number;
-  probeStuckThresholdMs: number;
-  consecutiveLagBreaches: number;
-  maxConsecutiveLagBreaches: number;
-}): ServeLivenessVerdict {
+  nowMonoMs: number;
+  bootGraceUntilMonoMs: number;
+  intervalMs: number;
+  clockJumpFactor: number;
+  prev: ServeWatchdogTriggerState;
+  serverProbe: ProbeTickOutcome;
+  busProbe: ProbeTickOutcome;
+  maxProbeFailStreak: number;
+  lagBreached: boolean;
+  maxLagBreachStreak: number;
+  lastReportArrivalMonoMs: number | null;
+  reportMuteThresholdMs: number;
+  servedLatencyP99Ms: number;
+  servedLatencyThresholdMs: number;
+  queueing: boolean;
+  ourFault: boolean;
+  sampleCount: number;
+  sampleFloor: number;
+  maxStarvationBreachStreak: number;
+}): { verdict: ServeLivenessVerdict; state: ServeWatchdogTriggerState } {
   const {
-    nowMs,
-    bootGraceUntilMs,
-    lastServerProbeOkAtMs,
-    lastBusProbeOkAtMs,
-    probeStuckThresholdMs,
-    consecutiveLagBreaches,
-    maxConsecutiveLagBreaches,
+    nowMonoMs,
+    bootGraceUntilMonoMs,
+    intervalMs,
+    clockJumpFactor,
+    prev,
+    serverProbe,
+    busProbe,
+    maxProbeFailStreak,
+    lagBreached,
+    maxLagBreachStreak,
+    lastReportArrivalMonoMs,
+    reportMuteThresholdMs,
+    servedLatencyP99Ms,
+    servedLatencyThresholdMs,
+    queueing,
+    ourFault,
+    sampleCount,
+    sampleFloor,
+    maxStarvationBreachStreak,
   } = inputs;
-  // Never trip mid-boot: workers may still be binding, first probes not yet landed.
-  if (nowMs < bootGraceUntilMs) return { kind: "ok" };
-  // Accept-stall on either socket — a real read has not answered within the window.
-  if (nowMs - lastServerProbeOkAtMs >= probeStuckThresholdMs) {
-    return { kind: "escalate", trigger: "accept-stall-server" };
+
+  const cleared = (
+    reportBaselineMonoMs: number,
+  ): ServeWatchdogTriggerState => ({
+    serverProbeFailStreak: 0,
+    busProbeFailStreak: 0,
+    lagBreachStreak: 0,
+    starvationBreachStreak: 0,
+    reportBaselineMonoMs,
+    lastTickMonoMs: nowMonoMs,
+  });
+
+  // 1. Clock discontinuity — the loop was frozen (suspend) or the clock stepped:
+  //    reset EVERY trigger's streak and re-base the arrival baseline to now, so the
+  //    resume tick cannot false-trip any trigger, old or new.
+  if (
+    prev.lastTickMonoMs != null &&
+    nowMonoMs - prev.lastTickMonoMs > clockJumpFactor * intervalMs
+  ) {
+    return { verdict: { kind: "ok" }, state: cleared(nowMonoMs) };
   }
-  if (nowMs - lastBusProbeOkAtMs >= probeStuckThresholdMs) {
-    return { kind: "escalate", trigger: "accept-stall-bus" };
+
+  // 2. Boot grace — arm-time baselines are not yet meaningful; hold every streak
+  //    clear and keep the arrival baseline fresh, verdict ok regardless of inputs.
+  if (nowMonoMs < bootGraceUntilMonoMs) {
+    return {
+      verdict: { kind: "ok" },
+      state: cleared(lastReportArrivalMonoMs ?? nowMonoMs),
+    };
   }
-  // Busy-wedge — main loop starved for N consecutive intervals.
-  if (consecutiveLagBreaches >= maxConsecutiveLagBreaches) {
-    return { kind: "escalate", trigger: "busy-lag" };
+
+  // Advance each streak from this tick's signals.
+  const serverProbeFailStreak = nextProbeFailStreak(
+    prev.serverProbeFailStreak,
+    serverProbe,
+  );
+  const busProbeFailStreak = nextProbeFailStreak(
+    prev.busProbeFailStreak,
+    busProbe,
+  );
+  const lagBreachStreak = lagBreached ? prev.lagBreachStreak + 1 : 0;
+
+  // First-paint starvation is a CONJUNCTION: slow served latency, a queueing worker
+  // loop, a saturated (lagging) main loop, the daemon burning its OWN cpu, and
+  // enough samples to trust the p99. Any missing term makes the window inconclusive
+  // — the streak resets, so only sustained, own-caused starvation trips.
+  const starvationBreachWindow =
+    servedLatencyP99Ms >= servedLatencyThresholdMs &&
+    queueing &&
+    lagBreached &&
+    ourFault &&
+    sampleCount >= sampleFloor;
+  const starvationBreachStreak = starvationBreachWindow
+    ? prev.starvationBreachStreak + 1
+    : 0;
+
+  // Arrival baseline advances only to a FRESHER report stamp; a stale stamp (older
+  // than the current baseline, e.g. a pre-reset report) never regresses it.
+  const priorBaseline = prev.reportBaselineMonoMs;
+  const reportBaselineMonoMs =
+    lastReportArrivalMonoMs != null &&
+    (priorBaseline == null || lastReportArrivalMonoMs > priorBaseline)
+      ? lastReportArrivalMonoMs
+      : (priorBaseline ?? nowMonoMs);
+
+  const state: ServeWatchdogTriggerState = {
+    serverProbeFailStreak,
+    busProbeFailStreak,
+    lagBreachStreak,
+    starvationBreachStreak,
+    reportBaselineMonoMs,
+    lastTickMonoMs: nowMonoMs,
+  };
+
+  // Deterministic check order: accept-stall (server before bus), busy-lag, mute,
+  // starvation. The named trigger is stable when several conditions hold at once.
+  if (serverProbeFailStreak >= maxProbeFailStreak) {
+    return {
+      verdict: { kind: "escalate", trigger: "accept-stall-server" },
+      state,
+    };
   }
-  return { kind: "ok" };
+  if (busProbeFailStreak >= maxProbeFailStreak) {
+    return {
+      verdict: { kind: "escalate", trigger: "accept-stall-bus" },
+      state,
+    };
+  }
+  if (lagBreachStreak >= maxLagBreachStreak) {
+    return { verdict: { kind: "escalate", trigger: "busy-lag" }, state };
+  }
+  if (nowMonoMs - reportBaselineMonoMs >= reportMuteThresholdMs) {
+    return {
+      verdict: { kind: "escalate", trigger: "serve-report-mute" },
+      state,
+    };
+  }
+  if (starvationBreachStreak >= maxStarvationBreachStreak) {
+    return {
+      verdict: { kind: "escalate", trigger: "serve-starvation" },
+      state,
+    };
+  }
+  return { verdict: { kind: "ok" }, state };
 }
 
 /**
@@ -6101,23 +6318,38 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let lastTmuxControlLivenessAtMs: number | null = null;
   let tmuxControlWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
-  // fn-1082 serve-liveness watchdog state. Each probe stamps its socket's
-  // `last…ProbeOkAtMs` on a successful real read (arm-time baseline until the first
-  // success), so a wedged read simply stops advancing it and the age grows across
-  // ticks. `serveLagConsecutiveBreaches` accumulates the main-loop lag-breach run
-  // (reset on a clean tick). The lag histogram measures MAIN's loop (the belt for a
-  // main-thread busy-spin — a wedged SERVE thread is caught by the read probes).
-  // {@link decideServeLivenessWatchdog} reads these.
+  // Serve-liveness watchdog state ({@link decideServeLivenessWatchdog}). Accept-stall
+  // is now attempt-counted, not age-based: each tick reads the PRIOR probe's settled
+  // outcome from `serverProbeLive`/`busProbeLive` (seeded live on arm, set by each
+  // settled probe), and the pure reducer folds it into a consecutive-fail streak. The
+  // `last…ProbeOkAtMs` stamps survive only for the escalation log. All accumulated
+  // streaks + the report-arrival baseline live in `serveWatchdogState`, so the single
+  // clock-jump guard inside the reducer can reset every trigger at once.
   let lastServerProbeOkAtMs = Date.now();
   let lastBusProbeOkAtMs = Date.now();
+  let serverProbeLive = true;
+  let busProbeLive = true;
   // Each served socket's probing arms only after its OWN worker posts
-  // `{kind:"ready"}` (listener bound). Until then the probe never fires and its
-  // age reads fresh, so a probe can never precede its socket and a bus-only boot
-  // arms its bus probing independently ({@link resolveProbeArming}). Arming
-  // re-stamps the socket's probe baseline so its stuck-age measures from ready.
+  // `{kind:"ready"}` (listener bound). Until then the probe never fires and its tick
+  // outcome reads `unarmed` (streak fresh), so a probe can never precede its socket
+  // and a bus-only boot arms its bus probing independently ({@link resolveProbeArming}).
   let serverProbeArmed = false;
   let busProbeArmed = false;
-  let serveLagConsecutiveBreaches = 0;
+  let serveWatchdogState: ServeWatchdogTriggerState = {
+    ...SERVE_WATCHDOG_INITIAL_STATE,
+  };
+  // Freshest serve-health report from the server worker, stamped with MAIN's OWN
+  // monotonic arrival clock (never the worker's timestamps — a starved worker's
+  // own stamps are late by construction). `null` until the first report lands.
+  let lastServeHealthArrivalMonoMs: number | null = null;
+  let latestServeHealth: {
+    dispatchP99Ms: number;
+    busyMs: number;
+    sampleCount: number;
+    loopDelayP99Ms: number;
+  } | null = null;
+  // Prior-tick process cpu snapshot for the ourFault (own-cpu) starvation term.
+  let prevWatchdogCpuUsage: ReturnType<typeof process.cpuUsage> | null = null;
   let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
@@ -6469,6 +6701,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | SetEpicArmedRequestMessage
         | RequestHandoffRequestMessage
         | BackstopMessage
+        | ServeHealthMessage
         | { kind: "ready" }
         | undefined
       >,
@@ -6476,10 +6709,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       const msg = ev.data;
       if (!msg) return;
       if (msg.kind === "ready") {
-        // The server listener is bound — arm its probe and baseline the stuck-age
-        // from NOW so a long boot drain never reads as instant staleness.
+        // The server listener is bound — arm its probe and seed it live so a long
+        // boot drain never reads as an instant fail streak.
         serverProbeArmed = true;
+        serverProbeLive = true;
         lastServerProbeOkAtMs = Date.now();
+        return;
+      }
+      if (msg.kind === "serve-health") {
+        // Served-latency self-report. Stamp arrival on MAIN's OWN monotonic clock
+        // (the worker's timestamps would be late by construction under starvation)
+        // and keep the freshest sample for the next watchdog tick's verdict.
+        lastServeHealthArrivalMonoMs = performance.now();
+        latestServeHealth = {
+          dispatchP99Ms: msg.dispatchP99Ms,
+          busyMs: msg.busyMs,
+          sampleCount: msg.sampleCount,
+          loopDelayP99Ms: msg.loopDelayP99Ms,
+        };
         return;
       }
       // fn-1096.3: a tolerated-NOTADB skip record — route to the sole
@@ -11673,6 +11920,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     bw.onmessage = (ev: MessageEvent<{ kind: "ready" } | undefined>): void => {
       if (ev.data?.kind === "ready") {
         busProbeArmed = true;
+        busProbeLive = true;
         lastBusProbeOkAtMs = Date.now();
       }
     };
@@ -11965,41 +12213,68 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Gated on actually serving a socket + out of the in-process tier.
   if ((serverWorker || busWorker) && !opts.disableNativeWatcher) {
     const busSockPath = resolveBusSockPath();
-    // The probe baselines are re-stamped per socket when its worker posts
-    // `{kind:"ready"}` (the arm handlers above), NOT at watchdog setup — a socket
-    // still binding is un-armed, reads fresh, and cannot trip. The boot grace is
-    // the belt for the window between arm and the first settled probe.
-    const bootGraceUntilMs = Date.now() + SERVE_WATCHDOG_BOOT_GRACE_MS;
+    // A socket fires + counts toward the verdict only once its worker posts
+    // `{kind:"ready"}` (the arm handlers above); un-armed / un-served sockets read
+    // `unarmed` (streak fresh) and cannot trip. Boot grace is the belt for the
+    // window between arm and the first settled probe. The watchdog runs on MAIN's
+    // MONOTONIC clock throughout (tick spacing, arrival aging, boot grace) so the
+    // one clock-jump guard's reset stays self-consistent under suspend/resume.
+    const bootGraceUntilMonoMs =
+      performance.now() + SERVE_WATCHDOG_BOOT_GRACE_MS;
     serveLagHistogram = monitorEventLoopDelay({ resolution: 20 });
     serveLagHistogram.enable();
     const lagHistogram = serveLagHistogram;
     serveLivenessWatchdogTimer = setInterval(() => {
       if (shuttingDown) return;
-      // Main-loop lag for this interval (ns → ms), then reset the window.
+      const nowMonoMs = performance.now();
+      // Main-loop lag for this window (ns → ms), then reset the window. High lag is
+      // both the busy-lag streak signal AND the SATURATION term of starvation.
       const lagP99Ms = lagHistogram.percentile(99) / 1e6;
       lagHistogram.reset();
-      serveLagConsecutiveBreaches =
-        lagP99Ms >= SERVE_LAG_P99_THRESHOLD_MS
-          ? serveLagConsecutiveBreaches + 1
-          : 0;
+      const lagBreached = lagP99Ms >= SERVE_LAG_P99_THRESHOLD_MS;
 
-      const verdictNowMs = Date.now();
-      // A socket fires + counts toward the verdict only once its worker is armed;
-      // un-armed / un-served sockets read fresh so they never false-trip.
+      // ourFault: the daemon PROCESS burned more than the threshold fraction of a
+      // core over the window. `process.cpuUsage` is process-wide in Bun
+      // (`threadCpuUsage` is undefined), so this reads "the daemon is burning cpu",
+      // not "the serve worker is" — the starvation conjunction bounds that coarseness.
+      const cpuNow = process.cpuUsage();
+      const prevTickMonoMs = serveWatchdogState.lastTickMonoMs;
+      let ourFault = false;
+      if (prevWatchdogCpuUsage != null && prevTickMonoMs != null) {
+        const cpuMicros =
+          cpuNow.user -
+          prevWatchdogCpuUsage.user +
+          (cpuNow.system - prevWatchdogCpuUsage.system);
+        const wallMicros = (nowMonoMs - prevTickMonoMs) * 1000;
+        ourFault =
+          wallMicros > 0 &&
+          cpuMicros / wallMicros >= SERVE_STARVATION_OURFAULT_CPU_FRACTION;
+      }
+      prevWatchdogCpuUsage = cpuNow;
+
       const arming = resolveProbeArming({
         serverServed: serverWorker != null,
         busServed: busWorker != null,
         serverArmed: serverProbeArmed,
         busArmed: busProbeArmed,
-        nowMs: verdictNowMs,
+        nowMs: nowMonoMs,
         lastServerProbeOkAtMs,
         lastBusProbeOkAtMs,
       });
 
-      // Fire a real read on each armed socket; stamp on success. A wedged read
-      // never resolves `true` inside its timeout, so the age grows across ticks.
-      // The probes are asynchronous — this tick's verdict reads the PRIOR tick's
-      // result (the timeout << interval, so the latest probe has always settled).
+      // This tick's verdict reads the PRIOR tick's settled probe outcome (the timeout
+      // << interval, so the latest probe has always settled), then fires the next.
+      const serverProbe: ProbeTickOutcome = arming.fireServerProbe
+        ? serverProbeLive
+          ? "live"
+          : "dead"
+        : "unarmed";
+      const busProbe: ProbeTickOutcome = arming.fireBusProbe
+        ? busProbeLive
+          ? "live"
+          : "dead"
+        : "unarmed";
+
       if (arming.fireServerProbe) {
         const id = crypto.randomUUID();
         void probeSocketRead(
@@ -12008,6 +12283,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           (f) => probeReplyProvesLife(f, id),
           SERVE_PROBE_TIMEOUT_MS,
         ).then((ok) => {
+          serverProbeLive = ok;
           if (ok) lastServerProbeOkAtMs = Date.now();
         });
       }
@@ -12023,39 +12299,55 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             ),
           SERVE_PROBE_TIMEOUT_MS,
         ).then((ok) => {
+          busProbeLive = ok;
           if (ok) lastBusProbeOkAtMs = Date.now();
         });
       }
 
-      const verdict = decideServeLivenessWatchdog({
-        nowMs: verdictNowMs,
-        bootGraceUntilMs,
-        lastServerProbeOkAtMs: arming.verdictServerProbeOkAtMs,
-        lastBusProbeOkAtMs: arming.verdictBusProbeOkAtMs,
-        probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
-        consecutiveLagBreaches: serveLagConsecutiveBreaches,
-        maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+      const health = latestServeHealth;
+      const { verdict, state } = decideServeLivenessWatchdog({
+        nowMonoMs,
+        bootGraceUntilMonoMs,
+        intervalMs: SERVE_WATCHDOG_INTERVAL_MS,
+        clockJumpFactor: SERVE_CLOCK_JUMP_FACTOR,
+        prev: serveWatchdogState,
+        serverProbe,
+        busProbe,
+        maxProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+        lagBreached,
+        maxLagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+        lastReportArrivalMonoMs: lastServeHealthArrivalMonoMs,
+        reportMuteThresholdMs: SERVE_REPORT_MUTE_THRESHOLD_MS,
+        servedLatencyP99Ms: health?.dispatchP99Ms ?? 0,
+        servedLatencyThresholdMs: SERVE_STARVATION_LATENCY_P99_THRESHOLD_MS,
+        queueing:
+          (health?.loopDelayP99Ms ?? 0) >=
+          SERVE_STARVATION_QUEUEING_P99_THRESHOLD_MS,
+        ourFault,
+        sampleCount: health?.sampleCount ?? 0,
+        sampleFloor: SERVE_STARVATION_SAMPLE_FLOOR,
+        maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
       });
+      serveWatchdogState = state;
+
       if (verdict.kind === "escalate") {
-        // Name the wedge mode + carry both probe ages and the lag-breach count so
-        // the crash-loop's cause is legible in server.stderr, not a bare "wedged".
-        const serverAgeMs = arming.fireServerProbe
-          ? verdictNowMs - lastServerProbeOkAtMs
-          : null;
-        const busAgeMs = arming.fireBusProbe
-          ? verdictNowMs - lastBusProbeOkAtMs
-          : null;
+        // Name the trigger + carry every streak and the report age so the
+        // crash-loop's cause is legible in server.stderr, not a bare "wedged".
+        const reportAge =
+          lastServeHealthArrivalMonoMs != null
+            ? `${Math.round(nowMonoMs - lastServeHealthArrivalMonoMs)}ms`
+            : "n/a";
+        const detail =
+          `server-probe-fails=${state.serverProbeFailStreak} ` +
+          `bus-probe-fails=${state.busProbeFailStreak} ` +
+          `lag-breaches=${state.lagBreachStreak}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES} ` +
+          `starvation-windows=${state.starvationBreachStreak}/${SERVE_STARVATION_MAX_BREACH_STREAK} ` +
+          `report-age=${reportAge}`;
         console.error(
-          `[keeperd] serve-liveness watchdog: ${verdict.trigger} — server-probe-age=${
-            serverAgeMs ?? "n/a"
-          }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES} — exiting for LaunchAgent restart`,
+          `[keeperd] serve-liveness watchdog: ${verdict.trigger} — ${detail} — exiting for LaunchAgent restart`,
         );
         if (!shuttingDown)
-          fatalExit(
-            `serve-liveness-watchdog: ${verdict.trigger} server-probe-age=${
-              serverAgeMs ?? "n/a"
-            }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES}`,
-          );
+          fatalExit(`serve-liveness-watchdog: ${verdict.trigger} ${detail}`);
       }
     }, SERVE_WATCHDOG_INTERVAL_MS);
   }

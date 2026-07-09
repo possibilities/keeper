@@ -44,6 +44,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { createHistogram, monitorEventLoopDelay } from "node:perf_hooks";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import {
@@ -108,6 +109,24 @@ export interface ServerWorkerData {
 /** Message posted to the parent when the listener is bound and serving. */
 export interface ReadyMessage {
   kind: "ready";
+}
+
+/**
+ * Periodic served-latency self-report to main (the serve-liveness watchdog's eyes
+ * on what real clients experience). DURATIONS ONLY — never timestamps: a starved
+ * serve loop's own clock is late by construction, so main stamps arrival on its own
+ * monotonic clock and judges report staleness from that, never from anything here.
+ *   - `dispatchP99Ms`: p99 of per-request dispatch latency over the window.
+ *   - `busyMs`: total time spent dispatching in the window (occupancy).
+ *   - `sampleCount`: dispatches measured — main floors the p99's trust on this.
+ *   - `loopDelayP99Ms`: the worker's OWN event-loop-delay p99 (the queueing signal).
+ */
+export interface ServeHealthMessage {
+  kind: "serve-health";
+  dispatchP99Ms: number;
+  busyMs: number;
+  sampleCount: number;
+  loopDelayP99Ms: number;
 }
 
 /** Message the parent sends to ask the worker to stop. */
@@ -466,6 +485,44 @@ const TRACE_FRAME_BYTES = (() => {
 let __nextConnId = 0;
 function srvTs(msg: string): void {
   console.error(`[srv-ts] T=${Date.now()} ${msg}`);
+}
+
+/**
+ * How often the worker posts a `serve-health` self-report to main. Several reports
+ * per watchdog interval, so a couple of dropped reports never reads as a mute; the
+ * mute threshold is multiple watchdog intervals, well above this.
+ */
+export const SERVE_HEALTH_REPORT_INTERVAL_MS = 12_000;
+
+/**
+ * Accumulates per-dispatch served-latency over a report window. The dispatch timing
+ * that feeds `record` runs UNCONDITIONALLY (a ~20ns `performance.now()` pair, no env
+ * gate — only the trace LOGGING stays behind `TRACE`), so the watchdog always has
+ * eyes on what real clients experience. Backed by a native histogram (bounded memory
+ * under a flood, unlike a growing array); busy-ms is summed alongside since a
+ * histogram has percentiles but no sum. `drain()` reads and resets the window.
+ */
+export class ServeLatencyMeter {
+  // Sub-ms dispatches matter for the tail, and the histogram floors at 1, so record
+  // in MICROSECONDS and convert the p99 back to ms on drain.
+  private readonly hist = createHistogram();
+  private busyMs = 0;
+
+  record(durMs: number): void {
+    const safe = durMs > 0 ? durMs : 0;
+    this.hist.record(Math.max(1, Math.round(safe * 1000)));
+    this.busyMs += safe;
+  }
+
+  drain(): { dispatchP99Ms: number; busyMs: number; sampleCount: number } {
+    const sampleCount = Number(this.hist.count);
+    const dispatchP99Ms =
+      sampleCount > 0 ? Number(this.hist.percentile(99)) / 1000 : 0;
+    const busyMs = this.busyMs;
+    this.hist.reset();
+    this.busyMs = 0;
+    return { dispatchP99Ms, busyMs, sampleCount };
+  }
 }
 
 /**
@@ -3055,6 +3112,13 @@ export interface RunningServer {
    * compose without a real-socket shim.
    */
   conns: Set<Writable>;
+  /**
+   * Served-latency window the dispatch loop feeds. The worker `main()` drains it
+   * every {@link SERVE_HEALTH_REPORT_INTERVAL_MS} into a `serve-health` report; a
+   * direct unit caller that never drains it just leaves the window growing (bounded
+   * — it is a histogram).
+   */
+  latencyMeter: ServeLatencyMeter;
   stop(): void;
 }
 
@@ -3100,6 +3164,10 @@ export function startServer(
   // ONE runQuery + ONE serialize. Owned here (not module-global) so a second
   // in-process server instance never cross-contaminates.
   const memo = newResultMemo();
+
+  // Per-server-instance served-latency window (same not-module-global discipline as
+  // `memo`). The dispatch loop feeds it; `main()` drains it into `serve-health`.
+  const latencyMeter = new ServeLatencyMeter();
 
   const listener = Bun.listen<ConnState>({
     unix: sockPath,
@@ -3200,7 +3268,16 @@ export function startServer(
         // querying conn is never idle-reaped; a silently-dead probe stops
         // bumping this and ages out.
         socket.data.lastActivityAt = t0;
-        handleData(db, socket, chunk, writerDb, bridge, memo, bootGate);
+        handleData(
+          db,
+          socket,
+          chunk,
+          writerDb,
+          bridge,
+          memo,
+          bootGate,
+          latencyMeter,
+        );
         const dur = Date.now() - t0;
         if (dur >= 5) {
           if (TRACE) srvTs(`conn ${id} handleData duration=${dur}ms`);
@@ -3242,6 +3319,7 @@ export function startServer(
   return {
     listener,
     conns,
+    latencyMeter,
     stop() {
       // Release the socket HERE — it's owned by the process, not the Worker
       // thread; the daemon's worker.terminate() won't release it.
@@ -3270,6 +3348,7 @@ function handleData(
   bridge: ReplayBridge | undefined,
   memo: ResultMemo,
   bootGate: BootGate = { ready: true },
+  meter?: ServeLatencyMeter,
 ): void {
   const w = socket as unknown as Writable;
   let lines: string[];
@@ -3317,8 +3396,10 @@ function handleData(
     // engaged the instant its frame lands, before the multi-second reply).
     socket.data.everEngaged = true;
     let frames: (ServerFrame | PreSerialized)[];
-    // DEBUG: time each dispatchLine so we can spot a slow query / RPC.
-    const _dispatchStart = Date.now();
+    // Time every dispatch UNCONDITIONALLY (the ~20ns `performance.now()` pair, no
+    // env gate) so the serve-liveness watchdog always sees served latency; only the
+    // trace LOGGING below stays behind `TRACE`.
+    const _dispatchStart = performance.now();
     let _frameType = "unknown";
     let _collection: string | undefined;
     try {
@@ -3358,13 +3439,15 @@ function handleData(
     // memo path is bypassed during catch-up, so any PreSerialized line here only
     // rides at steady state and stamps nothing).
     stampBootStatus(db, bootGate, frames);
-    const _dispatchDur = Date.now() - _dispatchStart;
+    const _dispatchDur = performance.now() - _dispatchStart;
+    // Feed the served-latency window unconditionally (the watchdog's eyes).
+    meter?.record(_dispatchDur);
     const _id = socket.data.id ?? -1;
     const _collTag = _collection ? ` coll=${_collection}` : "";
     if (_frameType === "query" || _dispatchDur >= 5) {
       if (TRACE)
         srvTs(
-          `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur}ms frames=${frames.length}`,
+          `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur.toFixed(2)}ms frames=${frames.length}`,
         );
     }
     if (frames.length > 0) {
@@ -3712,8 +3795,25 @@ function main(): void {
     resolvePollDone = resolve;
   });
 
+  // Worker-side served-latency self-report. `serveLoopDelayHist` measures THIS
+  // worker's own event-loop delay (the queueing signal main cannot see cross-thread)
+  // and pins a libuv handle, so it is released in `shutdown`; the report interval is
+  // cleared there too, and both the `stopping` guard below and that clear guarantee
+  // no `serve-health` is ever posted after stopping.
+  const serveLoopDelayHist = monitorEventLoopDelay({ resolution: 20 });
+  serveLoopDelayHist.enable();
+  let serveHealthReportTimer: ReturnType<typeof setInterval> | null = null;
+
   const shutdown = async (): Promise<void> => {
     stopping = true; // resolves the poll loop on its next iteration check
+    // Stop reporting FIRST (before any await) so no tick can post mid-teardown, and
+    // release the loop-delay monitor's libuv handle.
+    if (serveHealthReportTimer != null) clearInterval(serveHealthReportTimer);
+    try {
+      serveLoopDelayHist.disable();
+    } catch {
+      // best-effort — tearing down either way
+    }
     // Stop accepting + evict conns FIRST so a final diffTick has nothing to fan
     // out to, then WAIT for the poll loop to exit before closing the connection
     // it reads from — without the await, `db.close()` races a resumed pollLoop
@@ -3732,6 +3832,22 @@ function main(): void {
     }
     process.exit(0);
   };
+
+  // Drain the served-latency window + own loop-delay p99 into a periodic report.
+  // DURATIONS ONLY — main stamps arrival on its own clock and judges staleness there.
+  serveHealthReportTimer = setInterval(() => {
+    if (stopping) return; // never post after stopping
+    const { dispatchP99Ms, busyMs, sampleCount } = server.latencyMeter.drain();
+    const loopDelayP99Ms = serveLoopDelayHist.percentile(99) / 1e6;
+    serveLoopDelayHist.reset();
+    parentPort?.postMessage({
+      kind: "serve-health",
+      dispatchP99Ms,
+      busyMs,
+      sampleCount,
+      loopDelayP99Ms,
+    } satisfies ServeHealthMessage);
+  }, SERVE_HEALTH_REPORT_INTERVAL_MS);
 
   parentPort.on(
     "message",

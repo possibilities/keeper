@@ -73,8 +73,10 @@ file is imperative guardrails only.
 - **No in-process self-heal.** Any unrecoverable error calls `fatalExit` (non-zero exit — the
   LaunchAgent respawn is the sole recovery path); never respawn a worker in-process (carve-outs:
   closing a stale/EPIPE UDS client, the git seed-liveness watchdog's capped MAIN boot-seed re-runs
-  before it escalates to `fatalExit`, and the serve-liveness watchdog's bounded real-read socket
-  probes that `fatalExit` a wedged serve path, NAMING which socket/mode tripped). A sustained crash-loop is loud, not invisible: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
+  before it escalates to `fatalExit`, and the serve-liveness watchdog's real-read probes +
+  served-latency self-report that `fatalExit` a wedged serve path, NAMING the trigger:
+  accept-stall, busy-lag, serve-report-mute, serve-starvation (main clocks arrival; clock-jump
+  guard resets all on suspend/resume)). A sustained crash-loop is loud: main appends each boot to a durable restart ledger (state-dir sidecar, NOT a fold) and mints ONE sticky needs_human distress row, level-cleared once the boot rate recovers.
 - **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force` is passed.
 
 ## Worker contract
