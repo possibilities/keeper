@@ -39,5 +39,5 @@ Fast tier: injected suite-probe drives green→merge, red→park (sticky minted,
 - [ ] keeper fast suite green; the finalize slow tier passes with the new arms
 
 ## Done summary
-
+Gate worktree finalize on the prospective lane→default merge-result fast suite (scratch worktree, injected+memoized probe): green merges+pushes, red parks a visible worktree-finalize-suite-red sticky with local default unmoved, cannot-run degrades to a retry-skip.
 ## Evidence
