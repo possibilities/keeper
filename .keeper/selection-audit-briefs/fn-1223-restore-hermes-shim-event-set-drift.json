@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 22
+      },
+      "done_summary": "Exported HERMES_EVENT_MAP from the hermes hook and added a fast-tier test asserting its key set matches HERMES_SHIM_EVENTS from src/hermes-shim-contract.ts, restoring the drift guard.",
+      "input_hash": "68e2ae1ab1fc35936da2e8e408d3364fa05b352adca581ed64acc54fbd271617",
+      "model": "sonnet",
+      "spec_chars": 1663,
+      "spec_md": "## Description\n\nRestores the drift guarantee traded away by finding F1. Evidence path: the\ncontract list `HERMES_SHIM_EVENTS` is a hard-coded literal in\n`src/hermes-shim-contract.ts` (~line 17), while the hook's translation table\n`HERMES_EVENT_MAP` lives in `plugins/keeper/plugin/hooks/hermes-events-shim.ts`\n(~line 95) and is currently not exported. They are reconciled only by the\nDRIFT GUARD comments (contract ~line 12, hook ~lines 116-117). No test asserts\ntheir equality, so adding an event to one list without the other silently\nregisters a stale `hooks:` block and hermes never invokes the shim for the\nnew event.\n\nAdd a fast-tier (`bun test`, pure in-process) test that imports the contract\nlist and the hook's map and asserts `Object.keys(HERMES_EVENT_MAP).sort()`\ndeep-equals `[...HERMES_SHIM_EVENTS].sort()`. This requires exporting\n`HERMES_EVENT_MAP` from the hook (an additive export; keep hook fail-open and\ndep-discipline intact \u2014 no `bun:sqlite`/`src/db.ts` reachable from the hook).\n\nFiles:\n- `plugins/keeper/plugin/hooks/hermes-events-shim.ts` (export `HERMES_EVENT_MAP`)\n- `src/hermes-shim-contract.ts` (source of `HERMES_SHIM_EVENTS`)\n- a new fast-tier test under `test/`\n\n## Acceptance\n\n- [ ] Test deep-equals the map key set against the contract list, sorted\n- [ ] Test is red when the two lists diverge, green in the current matching state\n- [ ] `bun test` passes; hook keeps its `node:*` + dep-free-helper import discipline\n\n## Done summary\nExported HERMES_EVENT_MAP from the hermes hook and added a fast-tier test asserting its key set matches HERMES_SHIM_EVENTS from src/hermes-shim-contract.ts, restoring the drift guard.\n## Evidence\n",
+      "task_id": "fn-1223-restore-hermes-shim-event-set-drift.1",
+      "tier": "low",
+      "title": "Test hermes event-set drift"
+    }
+  ],
+  "created_at": "2026-07-09T21:54:37.198000Z",
+  "epic_id": "fn-1223-restore-hermes-shim-event-set-drift",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "selection_input_hash": "68e2ae1ab1fc35936da2e8e408d3364fa05b352adca581ed64acc54fbd271617",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
