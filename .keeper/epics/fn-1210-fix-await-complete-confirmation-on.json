@@ -7,7 +7,7 @@
     "fn-1207-debounce-await-complete-across-unwind"
   ],
   "id": "fn-1210-fix-await-complete-confirmation-on",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T00:56:53.375000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T00:56:52.673000Z"
+  "updated_at": "2026-07-09T00:56:53.375000Z"
 }
