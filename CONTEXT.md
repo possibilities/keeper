@@ -33,6 +33,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Ghost**: A not-yet-validated epic or task that renders dashed and blocks dispatch until it is armed. Avoid: draft, stub, placeholder.
 - **Tier**: The capability class assigned to a task that selects which model and worker cell runs it. Avoid: level, rank, weight.
 - **Worker cell**: The one `{model × tier}` `work` plugin a task's launcher selects at launch; a native cell runs its model in-session, a wrapped cell delegates to the model's serving provider. Avoid: variant, flavor, profile.
+- **Capability model**: The model-axis value a task carries, a bare capability token the host provider roster resolves at run time to a serving harness and native model id; native when the claude provider carries it, wrapped otherwise. Avoid: harness model, backend model, model alias.
 - **Provider**: A harness's entry in the host matrix config, tying it to the models it can serve and optionally aliasing each to its provider-native id. Avoid: vendor, backend, platform.
 - **Pecking order**: The provider list order in the host matrix config, cost-ascending, deciding at run time which provider serves a wrapped cell. Avoid: priority list, fallback chain, ranking.
 - **Wrapped cell**: A worker cell whose model claude does not serve natively; its worker is a claude wrapper that delegates implementation to the model's provider and owns the keeper close-out. Avoid: foreign cell, proxy worker, delegated task.
