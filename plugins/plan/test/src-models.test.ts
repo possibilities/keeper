@@ -3,8 +3,17 @@
 // relies on; normalizeEpic/normalizeTask pin the optional-field defaults.
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { mergeTaskState, normalizeEpic, normalizeTask } from "../src/models.ts";
+import {
+  configuredModels,
+  mergeTaskState,
+  normalizeEpic,
+  normalizeTask,
+  workerAgentFor,
+} from "../src/models.ts";
 
 describe("mergeTaskState", () => {
   test("absent runtime defaults to status todo", () => {
@@ -61,5 +70,74 @@ describe("normalizeEpic", () => {
     expect("draft" in e).toBe(false);
     expect("queue_jump" in e).toBe(false);
     expect(e.last_validated_at).toBeNull();
+  });
+});
+
+// models.ts's configured-axes seam reads the composed EFFECTIVE matrix (host
+// provider matrix when present, embedded snapshot when absent). Fixtures inject a
+// host matrix via KEEPER_CONFIG_DIR; the no-matrix case points at an empty config
+// dir so the embedded fallback holds regardless of the developer's host.
+describe("configured-axes read the effective matrix", () => {
+  function withConfigDir<T>(dir: string, fn: () => T): T {
+    const prev = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = dir;
+    try {
+      return fn();
+    } finally {
+      if (prev === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = prev;
+      }
+    }
+  }
+
+  test("a host matrix grows the model axis; workerAgentFor composes the host cell", () => {
+    const dir = mkdtempSync(join(tmpdir(), "models-eff-"));
+    try {
+      writeFileSync(
+        join(dir, "matrix.yaml"),
+        [
+          "efforts: [medium, high]",
+          "providers:",
+          "  - name: claude",
+          "    models: [opus]",
+          "  - name: codex",
+          "    models:",
+          "      - gpt-5.5: openai/gpt-5.5",
+          "subagents: [work]",
+          "wrapper_driver:",
+          "  model: sonnet",
+          "  effort: high",
+          "",
+        ].join("\n"),
+      );
+      withConfigDir(dir, () => {
+        expect(configuredModels()).toEqual(["opus", "gpt-5.5"]);
+        expect(workerAgentFor("high", "gpt-5.5")).toBe(
+          "plan:worker-gpt-5.5-high",
+        );
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("no host matrix falls back to the embedded axes (null-stop preserved)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "models-eff-none-"));
+    try {
+      withConfigDir(dir, () => {
+        expect(configuredModels()).toEqual(["opus", "sonnet"]);
+        expect(workerAgentFor("medium", "opus")).toBe(
+          "plan:worker-opus-medium",
+        );
+        expect(workerAgentFor(null, "opus")).toBeNull();
+        expect(() => workerAgentFor("high", "gpt-5.5")).toThrow(
+          /unknown model/,
+        );
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

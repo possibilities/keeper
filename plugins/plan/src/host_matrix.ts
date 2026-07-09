@@ -85,6 +85,23 @@ function isMatrixToken(value: unknown): value is string {
   );
 }
 
+/** The alias-TARGET charset: one or more strict matrix tokens joined by `/` (a
+ * provider-qualified native id like `openai/gpt-5.5`). RELAXED past isMatrixToken
+ * for the native id a capability aliases to — validated-then-discarded here for
+ * fail-loud parity with the launcher island (`src/agent/matrix.ts`
+ * `isValidMatrixAliasTarget`), which owns the value. Every `/`-segment stays
+ * strict (no empty segment, no leading dot, no path escape); alias keys + axis
+ * tokens stay strict. */
+function isMatrixAliasTarget(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value
+      .split("/")
+      .every((seg) => MATRIX_TOKEN_RE.test(seg) && !seg.startsWith("."))
+  );
+}
+
 /** The subset of the host matrix a plan consumer needs, parsed and validated. */
 interface HostMatrix {
   efforts: string[];
@@ -299,9 +316,9 @@ function coerceProviderModels(
         );
       }
       capability = alias[0];
-      if (!isMatrixToken(alias[1])) {
+      if (!isMatrixAliasTarget(alias[1])) {
         throw new SubagentsConfigError(
-          `host matrix provider '${provider}' alias '${capability}' native id must be a valid token`,
+          `host matrix provider '${provider}' alias '${capability}' native id must be '/'-joined [a-z0-9._-] segments (no leading dot, no empty segment)`,
           label,
         );
       }
