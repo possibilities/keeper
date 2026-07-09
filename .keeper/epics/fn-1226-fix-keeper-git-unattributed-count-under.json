@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T23:14:23.830000Z",
+  "created_by_close_of": "fn-1224-board-first-frame-stall-hunt",
+  "depends_on_epics": [
+    "fn-1224-board-first-frame-stall-hunt"
+  ],
+  "id": "fn-1226-fix-keeper-git-unattributed-count-under",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix keeper git unattributed count under the dirty-files cap",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T23:14:23.830000Z"
+}

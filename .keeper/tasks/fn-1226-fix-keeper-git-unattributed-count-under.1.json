@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T23:14:23.830000Z",
+  "depends_on": [],
+  "epic": "fn-1226-fix-keeper-git-unattributed-count-under",
+  "id": "fn-1226-fix-keeper-git-unattributed-count-under.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Stamp exact unattributed scalar",
+  "updated_at": "2026-07-09T23:14:23.830000Z"
+}
