@@ -39,5 +39,5 @@ Plan plugin fast suite green (consistency-skills resolves every fenced verb agai
 - [ ] The plan plugin fast suite is green, including the skill-prose consistency gate
 
 ## Done summary
-
+Collapsed the plan/defer/close selector beats onto keeper plan apply-selection: skills now pipe the selector's raw return verbatim to the verb (plus --from-followup for close), relay a failure envelope's details as VALIDATION_ERRORS to one fresh retry, then degrade via --degraded (live) or a verdict-less finalize (close). README documents the verb and consolidates the assign-cells paragraph around the shared apply core.
 ## Evidence
