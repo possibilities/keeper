@@ -1780,11 +1780,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       const { db } = ctx;
       // v47→v48: backend-exec coordinate columns on `events` + `jobs`. Generic
       // `backend_exec_*` naming lets a future tmux/wezterm backend slot in
-      // without a schema change. Whitelist-only Python read (see floor item 10:
-      // a SCHEMA_VERSION bump MUST add the version to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
-      // every keeper-py read fails host-wide; test/schema-version.test.ts
-      // enforces this on every later bump too).
+      // without a schema change.
       addColumnIfMissing(db, "events", "backend_exec_type", "TEXT");
       addColumnIfMissing(db, "events", "backend_exec_session_id", "TEXT");
       addColumnIfMissing(db, "events", "backend_exec_pane_id", "TEXT");
@@ -1798,7 +1794,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // v48→v49: task→committing-session link. NO new column — the field rides
   // FREE inside the embedded `tasks[].jobs[]` JSON-TEXT cell; pre-v49 stored
   // elements decode it as `undefined` and `buildEmbeddedJob` coerces to null
-  // for byte-deterministic re-fold. Whitelist-only Python bump (floor 10).
+  // for byte-deterministic re-fold.
   { version: 49, kind: "noop", apply: () => {} },
   // v49→v50: comment-only no-op — `pending_dispatches` is created above and
   // populates from the reducer's fold arms; the version stamp needs a slot. A
@@ -2207,10 +2203,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // transition), the recency key for the unified dash AGENTS timeline. NULL
       // default, NO backfill: `updated_at` is bumped on every event ("last
       // touched"), not "run started", so backfilling from it would conflate the
-      // two and break re-fold determinism. Whitelist-only Python read (a
-      // SCHEMA_VERSION bump MUST add the version to `SUPPORTED_SCHEMA_VERSIONS`
-      // in `keeper/api.py` in the SAME commit, or every keeper-py read fails
-      // host-wide; test/schema-version.test.ts enforces this).
+      // two and break re-fold determinism.
       addColumnIfMissing(db, "jobs", "active_since", "REAL");
     },
   },
@@ -2372,10 +2365,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // reducer's Killed fold copies it verbatim (opaque string, no liveness in
       // the fold). NULL default, NO cursor rewind: a historical Killed carries no
       // `close_kind` in its payload, so a from-scratch re-fold reproduces the
-      // column's NULL zero-event default. Whitelist-only Python read (this bump
-      // MUST add 70 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
-      // commit, or every keeper-py read fails host-wide; test/schema-version.test.ts
-      // enforces this).
+      // column's NULL zero-event default.
       addColumnIfMissing(db, "jobs", "close_kind", "TEXT");
     },
   },
@@ -2396,10 +2386,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // survives to restore time when the original tmux server is dead. NULL
       // default, NO cursor rewind: a historical event stream carries no
       // `WindowIndexSnapshot`, so a from-scratch re-fold reproduces the column's
-      // NULL zero-event default. Whitelist-only Python read (this bump MUST add
-      // 71 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit,
-      // or every keeper-py read fails host-wide; test/schema-version.test.ts
-      // enforces this).
+      // NULL zero-event default.
       addColumnIfMissing(db, "jobs", "window_index", "INTEGER");
     },
   },
@@ -2418,10 +2405,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // cursor rewind — a from-scratch re-fold reproduces byte-identical rows.
       // (The producer flip to `source='plan'` + the stored-row rewrite land
       // later at v74→v75.) Version-guarded so the rebuild runs once.
-      // Whitelist-only Python read (this bump MUST add 72 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
-      // every keeper-py read fails host-wide; test/schema-version.test.ts
-      // enforces this).
       if (preMigrateStoredVersion < 72) {
         // Drop any leftover temp table from an interrupted prior attempt.
         db.run("DROP TABLE IF EXISTS file_attributions_v72_tmp");
@@ -2479,10 +2462,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // lines, but the fold's COALESCE dual-read on the blob is UNCHANGED this
       // task (the .3 flip lands later), so there is NO cursor rewind — a
       // from-scratch re-fold reproduces byte-identical projection rows.
-      // Whitelist-only Python read (this bump MUST add 73 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
-      // every keeper-py read fails host-wide; test/schema-version.test.ts
-      // enforces this).
       addColumnIfMissing(db, "events", "mutation_path", "TEXT");
       for (const sql of CREATE_V73_INDEXES) {
         db.run(sql);
@@ -2596,12 +2575,8 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // AND every pre-flip stored row is migrated to `'plan'`, so a re-fold is
       // byte-identical. In-transaction with the schema_version stamp below (the
       // `.immediate()` tx), so the rewrite + version bump are atomic. No cursor
-      // rewind. Idempotent: a re-run finds no `'planctl'` rows. The CHECK already
-      // permits `'plan'` (v71→v72). Whitelist-only Python read — keeper-py never
-      // reads `file_attributions.source` — so this bump MUST add 75 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
-      // every keeper-py read fails host-wide; test/schema-version.test.ts
-      // enforces this.
+      // rewind. Idempotent: a re-run finds no `'planctl'` rows. The CHECK permits
+      // both values.
       if (preMigrateStoredVersion < 75) {
         db.run(
           "UPDATE file_attributions SET source = 'plan' WHERE source = 'planctl'",
@@ -2620,10 +2595,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // rewind-and-redrain DELETE list). NO cursor rewind: a from-scratch re-fold
   // replays the same `DispatchExpired` / bind / `DispatchCleared` stream and
   // re-derives byte-identical counter rows (empty on a pre-feature log).
-  // Whitelist-only Python read (keeper-py never reads this table) — this bump
-  // MUST add 76 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
-  // commit, or every keeper-py read fails host-wide; test/schema-version.test.ts
-  // enforces this.
   { version: 76, kind: "noop", apply: () => {} },
   {
     version: 77,
@@ -2651,10 +2622,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // historical backfills (v13→v14, v19→v20) were updated to the windowless
       // signatures in this SAME commit — their recomputed output is overwritten
       // by this wipe + re-fold, so the migrated-vs-refold end state stays
-      // byte-identical. Whitelist-only Python read (keeper-py reads `jobs` /
-      // `epics` over the socket, not these projection internals) — this bump MUST
-      // add 77 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
-      // commit; test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 77) {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
@@ -2693,10 +2660,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // CREATE-TABLE literals + the frozen `addColumnIfMissing("planctl_*")` ladder
       // steps stay spelled `planctl_*` (schema history, Decision A) but are now
       // version-guarded so a post-v78 reboot never resurrects a zombie `planctl_*`
-      // column; this v78 step is the sole forward rename. Whitelist-only Python
-      // read (keeper-py reads `jobs`/`epics` over the socket, not these projection
-      // internals) — this bump MUST add 78 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces.
+      // column; this v78 step is the sole forward rename.
       if (preMigrateStoredVersion < 78) {
         // 1. Column renames. `renameColumnIfPresent` is quad-state idempotent: it
         // runs the ALTER on old-present/new-absent (fresh-DB-walk + v77-upgrade)
@@ -2907,10 +2871,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // by the `event_id` PK with an `INSERT OR IGNORE` fold (`foldCommit`), so
       // the cursor-0 re-fold rebuilds it byte-identically from id 0 without a
       // wipe. `dead_letters` is not a reducer projection (never wiped).
-      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
-      // socket, not these projection internals) — this bump MUST add 80 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 80) {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
@@ -2980,10 +2940,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // replicated from v80's list so the cursor-0 re-fold cannot resurrect a phantom
       // `pending_dispatches` dispatch jam (test/refold-equivalence.test.ts guards it).
       //
-      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the socket,
-      // not these projection internals) — this bump MUST add 81 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 81) {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
@@ -3053,10 +3009,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       //    fold mints `'plan'` post-fn-831; no fold path can mint `'planctl'` under
       //    the narrowed CHECK), so the byte-faithful copy can't violate it.
       //
-      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
-      // socket, not these projection internals) — this bump MUST add 82 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 82) {
         // Step 1 — rewrite the historical Commit-event data keys.
         const commitRows = db
@@ -3176,11 +3128,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // columns, the `tmux_projection_state` control table, and the one-time
       // birth-session backfill the later tasks build on.
       //
-      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
-      // socket, not these projection internals) — this bump MUST add 83 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
-      //
       // NO cursor rewind-and-redrain: the two columns become live-only
       // (boot-seeded, not replayed), so history is never re-folded for them — the
       // backfill below + the boot-seed cover the existing rows. This deliberately
@@ -3231,9 +3178,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // first-activity handoff (`bound-pending`) without over-holding a
   // stopped-after-working one.
   //
-  // Whitelist-only Python read — this bump MUST add 84 to
-  // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-  // test/schema-version.test.ts enforces this.
   { version: 84, kind: "noop", apply: () => {} },
   {
     version: 85,
@@ -3250,10 +3194,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // CONVERGE every historical `epics` row under the new code (and to
       // self-validate the orderless fold's determinism).
       //
-      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
-      // socket, not these projection internals) — this bump MUST add 85 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 85) {
         // 1. `epics` column drop via the v82-style table rebuild (the only way to
         // drop the 3 cols AND re-declare the `default_visible` VIRTUAL generated
@@ -3367,10 +3307,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // re-fold replays the same `TaskSnapshot` / `BlockEscalation*` stream and
   // re-derives byte-identical latch rows (empty on a pre-feature log; a task
   // blocked across the upgrade re-arms on its next blocked transition, the
-  // `dispatch_never_bound` pre-feature-empty tolerance). Whitelist-only Python
-  // read (keeper-py never reads this table) — this bump MUST add 86 to
-  // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or every
-  // keeper-py read fails host-wide; test/schema-version.test.ts enforces this.
+  // `dispatch_never_bound` pre-feature-empty tolerance).
   { version: 86, kind: "noop", apply: () => {} },
   // v86→v87 (fn-946 task .1): the `keeper handoff` foundation — comment-only
   // no-op. The `handoffs` reducer projection (the durable `HandoffRequested`
@@ -3382,10 +3319,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // from-scratch re-fold replays the same `HandoffRequested` / dispatcher /
   // bind stream and re-derives byte-identical rows (empty on a pre-feature
   // log; the doc body rides inline in `events.data`, capped at WRITE time in
-  // task .2). Whitelist-only Python read (keeper-py never reads this table) —
-  // this bump MUST add 87 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
-  // in the SAME commit, or every keeper-py read fails host-wide;
-  // test/schema-version.test.ts enforces this.
   { version: 87, kind: "noop", apply: () => {} },
   {
     version: 88,
@@ -3402,9 +3335,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // column-shape parity tests stay byte-identical. Default `'[]'` matches the
       // zero-event projection — a re-fold over a pre-feature log re-derives `'[]'`
       // for every job that never initiated/received a handoff, so re-fold stays
-      // byte-identical. Whitelist-only Python read (keeper-py never reads this
-      // column) — this bump MUST add 88 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces.
       addColumnIfMissing(
         db,
         "jobs",
@@ -3425,10 +3355,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // simply has no row. LIVE-ONLY (in `LIVE_ONLY_PROJECTIONS`): a rewinding
   // migration wipes it via `rewindLiveProjection`, never a bare DELETE, and it
   // is excluded from the byte-identical re-fold charter (an empty log re-folds
-  // to an empty table). Whitelist-only Python read (keeper-py never reads this
-  // table) — this bump MUST add 89 to `SUPPORTED_SCHEMA_VERSIONS` in
-  // `keeper/api.py` in the SAME commit, or every keeper-py read fails
-  // host-wide; test/schema-version.test.ts enforces this.
   { version: 89, kind: "noop", apply: () => {} },
   {
     version: 90,
@@ -3446,10 +3372,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // at read time by the reconciler/board), so an addColumnIfMissing append is
       // re-fold-safe — a from-scratch re-fold re-derives byte-identical rows and
       // leaves the new column NULL (= DEFAULT). APPEND-via-ALTER keeps the
-      // `PRAGMA table_info` column-shape parity tests stable. Whitelist-only
-      // Python read (keeper-py never reads this column) — this bump MUST add 90
-      // to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
+      // `PRAGMA table_info` column-shape parity tests stable.
       addColumnIfMissing(
         db,
         "autopilot_state",
@@ -3473,10 +3396,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // resolves it `?? OFF` at read time), so an addColumnIfMissing append is
       // re-fold-safe — a from-scratch re-fold re-derives byte-identical rows and
       // leaves the new column NULL (= OFF). APPEND-via-ALTER keeps the
-      // `PRAGMA table_info` column-shape parity tests stable. Whitelist-only Python
-      // read (keeper-py never reads this column) — this bump MUST add 91 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
+      // `PRAGMA table_info` column-shape parity tests stable.
       addColumnIfMissing(db, "autopilot_state", "worktree_mode", "INTEGER");
     },
   },
@@ -3503,10 +3423,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // so a terminal row stays NULL on both axes without a re-fold — this pass
       // simply converges the existing rows the daemon will not re-fold.
       //
-      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the
-      // socket, not these projection internals) — this bump MUST add 92 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 92) {
         db.run(
           `UPDATE jobs
@@ -3531,9 +3447,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // flattens them here, and `keeper usage` renders them as additional body
       // rows. APPEND-via-ALTER keeps existing rows NULL (zero-event shape) and
       // a fresh scrape re-emits one UsageSnapshot to populate the columns; no
-      // cursor rewind is needed. Whitelist-only Python read (keeper-py does not
-      // inspect these columns) — this bump MUST add 93 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit.
       addColumnIfMissing(db, "usage", "codex_spark_session_percent", "REAL");
       addColumnIfMissing(db, "usage", "codex_spark_session_resets_at", "TEXT");
       addColumnIfMissing(db, "usage", "codex_spark_week_percent", "REAL");
@@ -3554,9 +3467,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // re-fold-safe: a pre-v94 event has no worktree value, so a from-scratch
       // re-fold leaves `jobs.worktree` NULL byte-identically. NO cursor rewind —
       // do NOT add to the rewind-and-redrain DELETE list (mirrors the prior
-      // usage-column add). Whitelist-only Python read (keeper-py never reads
-      // these columns) — this bump MUST add 94 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "events", "worktree", "TEXT");
       addColumnIfMissing(db, "jobs", "worktree", "TEXT");
     },
@@ -3575,10 +3485,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // rows NULL (the zero-event shape) and is re-fold-safe: a pre-v95 event
       // carries no `error_kind`, so a from-scratch re-fold leaves the column NULL
       // byte-identically. NO cursor rewind — do NOT add to the rewind-and-redrain
-      // DELETE list (mirrors the prior usage-column adds). Whitelist-only Python
-      // read (keeper-py never reads `usage`) — this bump MUST add 95 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // DELETE list (mirrors the prior usage-column adds).
       addColumnIfMissing(db, "usage", "error_kind", "TEXT");
     },
   },
@@ -3595,10 +3502,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // shape) and is re-fold-safe: a pre-v96 `HandoffRequested` event carries no
       // `target_dir`, so a from-scratch re-fold leaves the column NULL
       // byte-identically. NO cursor rewind — do NOT add to the rewind-and-redrain
-      // DELETE list (mirrors the prior column adds). Whitelist-only Python read
-      // (keeper-py never reads `handoffs`) — this bump MUST add 96 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // DELETE list (mirrors the prior column adds).
       addColumnIfMissing(db, "handoffs", "target_dir", "TEXT");
     },
   },
@@ -3616,9 +3520,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // re-fold-safe: a pre-v97 event carries no `account_state`, so a
       // from-scratch re-fold leaves the column NULL byte-identically. NO cursor
       // rewind — do NOT add to the rewind-and-redrain DELETE list (mirrors the
-      // prior usage-column adds). Whitelist-only Python read (keeper-py never
-      // reads `usage`) — this bump MUST add 97 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "usage", "account_state", "TEXT");
     },
   },
@@ -3638,9 +3539,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // NULL byte-identically; `foldDispatchFailed` preserves it across the
       // `ON CONFLICT` UPSERT and `DispatchCleared` drops it with the row. NO cursor
       // rewind — do NOT add to the rewind-and-redrain DELETE list (mirrors the prior
-      // column adds). Whitelist-only Python read (keeper-py never reads
-      // `dispatch_failures`) — this bump MUST add 98 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "dispatch_failures", "merge_escalated_at", "REAL");
     },
   },
@@ -3650,9 +3548,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // gains the empty table on this boot and the live producer repopulates it; no
   // ALTER / backfill / cursor rewind (a LIVE-ONLY table is excluded from the
   // re-fold charter and rewound by `rewindLiveProjection`, never a bare DELETE).
-  // This bump MUST add 99 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the
-  // SAME commit (keeper-py never reads `lane_merged`, but the whitelist is a hard
-  // membership set); test/schema-version.test.ts enforces it.
   { version: 99, kind: "noop", apply: () => {} },
   {
     version: 100,
@@ -3670,10 +3565,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // columns NULL byte-identically. Kept OUT of the `CREATE_JOBS` literal (the
       // :834 rule) so fresh-vs-migrated `PRAGMA table_info(jobs)` stays
       // byte-identical. NO cursor rewind — do NOT add to the rewind-and-redrain
-      // DELETE list (mirrors the prior display-column adds). Whitelist-only Python
-      // read (keeper-py never reads these columns) — this bump MUST add 100 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // DELETE list (mirrors the prior display-column adds).
       addColumnIfMissing(db, "jobs", "current_model_id", "TEXT");
       addColumnIfMissing(db, "jobs", "current_model_display", "TEXT");
       addColumnIfMissing(db, "jobs", "current_effort", "TEXT");
@@ -3700,10 +3592,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // reconciler resolves it `?? OFF` at read time), so an addColumnIfMissing
       // append is re-fold-safe — a from-scratch re-fold re-derives byte-identical
       // rows and leaves the new column NULL (= OFF). APPEND-via-ALTER keeps the
-      // `PRAGMA table_info` column-shape parity tests stable. Whitelist-only Python
-      // read (keeper-py never reads this column) — this bump MUST add 101 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces this.
+      // `PRAGMA table_info` column-shape parity tests stable.
       addColumnIfMissing(
         db,
         "autopilot_state",
@@ -3721,10 +3610,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // backfill / cursor rewind. Producer state (same class as `dead_letters`), NOT
   // a reducer projection — so it is DELIBERATELY excluded from
   // `EPHEMERAL_PROJECTIONS`, from the rewinding-migration DELETE list, and from
-  // the re-fold-equivalence charter. Whitelist-only Python read (keeper-py never
-  // reads `dispatch_mint_gate`, but the whitelist is a hard membership set) —
-  // this bump MUST add 102 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in
-  // the SAME commit; test/schema-version.test.ts enforces it.
   { version: 102, kind: "noop", apply: () => {} },
   {
     version: 103,
@@ -3744,10 +3629,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // NULL byte-identically (deterministic-replayed, NOT live-only — do NOT add
       // to `LIVE_ONLY_JOBS_COLUMNS`, and NO cursor rewind). Kept OUT of the
       // `CREATE_JOBS` literal (the :852 rule) so fresh-vs-migrated
-      // `PRAGMA table_info(jobs)` stays byte-identical. Whitelist-only Python read
-      // (keeper-py never reads this column) — this bump MUST add 103 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // `PRAGMA table_info(jobs)` stays byte-identical.
       addColumnIfMissing(db, "jobs", "kill_reason", "TEXT");
     },
   },
@@ -3773,10 +3655,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // placed AFTER the VIRTUAL `default_visible` column so `ALTER TABLE ADD
       // COLUMN` (which always appends) keeps fresh-vs-migrated
       // `PRAGMA table_info`/`table_xinfo(epics)` byte-identical (test/db.test.ts
-      // parity asserts). The fixed epics SELECT list in `keeper/api.py` names only
-      // `epic_id, project_dir, tasks, jobs`, so this bump MUST add 104 to
-      // `SUPPORTED_SCHEMA_VERSIONS` there in the SAME commit;
-      // test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "epics", "question", "TEXT");
     },
   },
@@ -3791,9 +3669,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
   // historical deaths, which is the correct deterministic-replayed projection).
   // A DETERMINISTIC-REPLAYED projection (like `dispatch_never_bound`), so a
   // future rewinding migration wipes-and-refolds it; this bump adds no rewind.
-  // Whitelist-only Python read (keeper-py never reads `dispatch_instant_death`)
-  // — this bump MUST add 105 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
-  // in the SAME commit; test/schema-version.test.ts enforces it.
   { version: 105, kind: "noop", apply: () => {} },
   {
     version: 106,
@@ -3813,10 +3688,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // so a from-scratch re-fold leaves the column NULL byte-identically;
       // `foldDispatchFailed` preserves it across the `ON CONFLICT` UPSERT and
       // `DispatchCleared` drops it with the row so a fresh conflict re-arms at NULL.
-      // NO cursor rewind (mirrors the `merge_escalated_at` add). Whitelist-only Python
-      // read (keeper-py never reads `dispatch_failures`) — this bump MUST add 106 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // NO cursor rewind (mirrors the `merge_escalated_at` add).
       addColumnIfMissing(
         db,
         "dispatch_failures",
@@ -3848,9 +3720,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // unconditionally on BOTH the fresh-CREATE and migrated paths, so the two
       // end schemas are byte-identical (no separate CREATE_EVENTS literal to keep
       // in lockstep). No cursor rewind, no backfill (the column materializes on
-      // read). Whitelist-only Python read (keeper-py never reads the column) —
-      // this bump MUST add 107 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
-      // in the SAME commit; test/schema-version.test.ts enforces it.
       addGeneratedColumnIfMissing(
         db,
         "events",
@@ -3882,10 +3751,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // byte-identically (deterministic-replayed like `kill_reason`, NOT live-only
       // — do NOT add to `LIVE_ONLY_JOBS_COLUMNS`, NO cursor rewind). Kept OUT of
       // the `CREATE_JOBS` literal (the :852 rule) so fresh-vs-migrated
-      // `PRAGMA table_info(jobs)` stays byte-identical. Whitelist-only Python read
-      // (keeper-py never reads this column) — this bump MUST add 108 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // `PRAGMA table_info(jobs)` stays byte-identical.
       addColumnIfMissing(db, "jobs", "dispatch_origin", "TEXT");
     },
   },
@@ -3914,10 +3780,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // NULL and read as claude everywhere; the fold copies the event's harness
       // verbatim and never synthesizes a value, so a from-scratch re-fold folds
       // both columns to NULL byte-identically on any pre-v109 stream. NO cursor
-      // rewind (mirrors `worktree`/`kill_reason`). Whitelist-only Python read
-      // (keeper-py reads neither new column) — this bump MUST add 109 to
-      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
-      // test/schema-version.test.ts enforces it.
+      // rewind (mirrors `worktree`/`kill_reason`).
       addColumnIfMissing(db, "events", "harness", "TEXT");
       addColumnIfMissing(db, "events", "resume_target", "TEXT");
       addColumnIfMissing(db, "jobs", "harness", "TEXT");
@@ -3952,9 +3815,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // NULL byte-identically (both folds read only the payload + `event.ts`).
       // Kept OUT of the CREATE literals (mirrors the sibling marker adds) so a
       // fresh DB gains the columns via this same idempotent ALTER on boot. NO
-      // cursor rewind. Whitelist-only Python read (keeper-py reads neither table)
-      // — this bump MUST add 110 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py`
-      // in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "dispatch_failures", "human_notified_at", "REAL");
       addColumnIfMissing(db, "block_escalations", "human_notified_at", "REAL");
     },
@@ -3991,9 +3851,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // folds copy `events.adopted` verbatim and never synthesize, and no fold
       // reads `codex_adoption`, so a from-scratch re-fold over any pre-v111 stream
       // leaves all three NULL byte-identically. NO cursor rewind (mirrors
-      // `worktree`/`harness`). Whitelist-only Python read (keeper-py reads none of
-      // the three) — this bump MUST add 111 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "events", "adopted", "INTEGER");
       addColumnIfMissing(db, "jobs", "adopted", "INTEGER");
       addColumnIfMissing(db, "autopilot_state", "codex_adoption", "INTEGER");
@@ -4052,9 +3909,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // The ephemeral `pending_dispatches` is wiped so the cursor-0 re-fold cannot
       // resurrect a phantom dispatch jam (the boot-truncate also clears it).
       //
-      // Whitelist-only Python read (keeper-py reads none of these projection
-      // internals) — this bump MUST add 113 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       if (preMigrateStoredVersion < 113) {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
@@ -4131,9 +3985,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // `instance_event_id` copies the event's own id, so a from-scratch re-fold
       // over any pre-v114 stream reproduces every stamp (and every corroboration
       // miss) byte-identically. NO cursor rewind (a plain additive ALTER, unlike the
-      // v113 stamp). Whitelist-only Python read (keeper-py reads neither column) —
-      // this bump MUST add 114 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in
-      // the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(db, "jobs", "escalation_instance", "INTEGER");
       addColumnIfMissing(
         db,
@@ -4165,9 +4016,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // pre-v115 stream carries no `RepairDispatched` event, so a from-scratch re-fold
       // leaves the column NULL byte-identically (the fold reads only the payload +
       // `event.ts`). Kept OUT of the CREATE literal (mirrors the sibling marker adds).
-      // NO cursor rewind. Whitelist-only Python read (keeper-py never reads
-      // `dispatch_failures`) — this bump MUST add 115 to `SUPPORTED_SCHEMA_VERSIONS`
-      // in `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       addColumnIfMissing(
         db,
         "dispatch_failures",
@@ -4202,9 +4050,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // The ephemeral `pending_dispatches` is wiped so the cursor-0 re-fold cannot
       // resurrect a phantom dispatch jam. Version-guarded — non-idempotent.
       //
-      // Whitelist-only Python read (keeper-py reads no epics selection-review
-      // surface) — this bump MUST add 116 to `SUPPORTED_SCHEMA_VERSIONS` in
-      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces it.
       if (preMigrateStoredVersion < 116) {
         dropColumnIfPresent(db, "epics", "selection_review");
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
@@ -4251,9 +4096,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
 
 /**
  * Current schema version — DERIVED from the ladder tail, never hand-typed.
- * Forward-only: never reduce, never branch. A new step (a bumped tail version)
- * MUST add that version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in
- * the same commit (test/schema-version.test.ts enforces it).
+ * Forward-only: never reduce and never branch.
  */
 export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
 

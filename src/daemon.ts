@@ -3236,8 +3236,8 @@ export async function dispatchEscalationSession(
  * connection is attached when the final TRUNCATE runs — main's writer is no longer
  * the only attachment. The reader is autocommit and idle between queries, so
  * TRUNCATE usually still collapses the WAL; if a poll-tick read happens to pin a
- * frame (or an external read-only attachment — keeper-py, the performance sitter,
- * dashctl — is present), `PRAGMA wal_checkpoint` returns a busy-status ROW rather
+ * frame (or an external read-only attachment is present), `PRAGMA wal_checkpoint`
+ * returns a busy-status ROW rather
  * than throwing, so the worst case DEGRADES to busy/PASSIVE semantics and the
  * steady-state PASSIVE heartbeat reclaims the space on its next cadence. Emptying
  * the WAL (when it succeeds) still means a worker's first `openDb` reads the main

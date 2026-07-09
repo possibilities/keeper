@@ -1,8 +1,6 @@
 node_modules/
 *.log
 dist/
-
-# Python (keeper-py package at repo root)
 .venv/
 __pycache__/
 *.egg-info/

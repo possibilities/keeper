@@ -85,8 +85,7 @@ test("a past-tense provenance word FAILs as a CONTENT finding", () => {
 });
 
 test("SCHEMA_VERSION is NOT a false positive (version regex is lowercase)", () => {
-  const line =
-    "- When you bump SCHEMA_VERSION, add it to SUPPORTED_SCHEMA_VERSIONS.";
+  const line = "- SCHEMA_VERSION derives from the migration ladder.";
   expect(scanText(line)).toEqual([]);
 });
 
@@ -161,8 +160,7 @@ test("scanReadme flags each re-narration fingerprint class", () => {
 });
 
 test("scanReadme carries the CLAUDE.md false-positive guards", () => {
-  const line =
-    "- When you bump SCHEMA_VERSION, add it to SUPPORTED_SCHEMA_VERSIONS.";
+  const line = "- SCHEMA_VERSION derives from the migration ladder.";
   expect(scanReadme(line)).toEqual([]);
 });
 

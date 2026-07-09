@@ -135,9 +135,9 @@ test("assessRepo: clean single (package.json only) is eligible", () => {
   });
 });
 
-test("assessRepo: keeper-oracle crisp polyglot (bun + zero-dep python sidecar) is eligible", () => {
-  w("package.json", JSON.stringify({ name: "keeper", version: "1.0.0" }));
-  w("pyproject.toml", '[project]\nname = "keeper"\n');
+test("assessRepo: crisp single-project polyglot is eligible", () => {
+  w("package.json", JSON.stringify({ name: "polyglot", version: "1.0.0" }));
+  w("pyproject.toml", '[project]\nname = "polyglot"\n');
   expect(assessRepo(tmpDir)).toEqual({
     eligible: true,
     reason: ELIGIBLE_REASON,

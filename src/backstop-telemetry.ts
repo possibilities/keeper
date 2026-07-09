@@ -25,9 +25,9 @@
  * rate-limited (the metric stays complete).
  *
  * OBSERVABILITY-ONLY: zero behavior change, no synthetic events, no
- * schema/keeper-py bump, no reducer change. The sidecar is a pure
- * consumer-side side-file — never read by the reducer, never feeds a
- * projection. The writer mirrors `src/readiness-diagnostics.ts`
+ * schema bump and no reducer change. The sidecar is a pure consumer-side
+ * side-file — never read by the reducer, never feeds a projection. The writer
+ * mirrors `src/readiness-diagnostics.ts`
  * `appendDiagnostic` near-verbatim (single appendFileSync, swallow-to-stderr,
  * never throws).
  */

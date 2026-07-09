@@ -55,7 +55,6 @@ import { openDb } from "../src/db";
  * any number of files. */
 export interface FileSet {
   db: string;
-  apiPy: string;
   tests: Record<string, string>;
 }
 
@@ -330,29 +329,6 @@ function rewriteLadderVersions(
   return out;
 }
 
-const FROZENSET_RE =
-  /(SUPPORTED_SCHEMA_VERSIONS\s*=\s*frozenset\(\s*\{)([^}]*)(\}\s*\))/s;
-
-/** Rewrite `keeper/api.py`'s `SUPPORTED_SCHEMA_VERSIONS` frozenset: shift the
- * lane-added versions and re-emit the whole set sorted ascending. The
- * derivability test compares the SET, so re-emitting sorted is semantically
- * exact (Black may reflow the literal on a later format pass). */
-function rewriteApiPyFrozenset(
-  apiPy: string,
-  shiftMap: Map<number, number>,
-): string {
-  const m = apiPy.match(FROZENSET_RE);
-  if (!m) return apiPy;
-  const nums = m[2]
-    .split(",")
-    .map((x) => x.trim())
-    .filter((x) => x.length > 0)
-    .map((x) => Number.parseInt(x, 10))
-    .map((n) => shiftMap.get(n) ?? n);
-  const sorted = Array.from(new Set(nums)).sort((a, b) => a - b);
-  return apiPy.replace(FROZENSET_RE, `$1${sorted.join(", ")}$3`);
-}
-
 /** Rewrite pinned version assertions in a test file, anchored to the two shapes
  * the schema tests establish: `toBe(N)` and the `vN:` fingerprint prefix. Only
  * numbers present in the shift map are touched — an unrelated `toBe(200)` is
@@ -459,7 +435,6 @@ export function apply(main: FileSet, lane: FileSet): ApplyResult {
     shifts,
     files: {
       db: rewriteLadderVersions(lane.db, laneSteps, shiftMap),
-      apiPy: rewriteApiPyFrozenset(lane.apiPy, shiftMap),
       tests: rewrittenTests,
     },
   };
@@ -522,16 +497,14 @@ export function applyFingerprintRepin(
 // ---------------------------------------------------------------------------
 
 const DB_PATH = "src/db.ts";
-const API_PY_PATH = "keeper/api.py";
-const TEST_PATHS = ["test/schema-version.test.ts", "test/db.test.ts"];
+const TEST_PATHS = ["test/db.test.ts"];
 
 const HELP = `rebase-schema-migration — renumber a colliding schema lane at merge time.
 
 Renumbers the lane's branch-local SCHEMA_STEPS onto main-tip+1..+k when every
-colliding step is provably additive-idempotent, updates the api.py whitelist and
-pinned version assertions, and re-pins SCHEMA_FINGERPRINT via an in-process
-recompute. REFUSES (exit non-zero, machine-readable envelope on stderr) on any
-non-additive collision.
+colliding step is provably additive-idempotent, updates pinned version assertions,
+and re-pins SCHEMA_FINGERPRINT via an in-process recompute. REFUSES (exit non-zero,
+machine-readable envelope on stderr) on any non-additive collision.
 
 Usage:
   bun scripts/rebase-schema-migration.ts [--base <ref>]
@@ -591,12 +564,10 @@ function main(argv: string[]): number {
 
   const mainFiles: FileSet = {
     db: mainDb,
-    apiPy: gitShow(base, API_PY_PATH) ?? "",
     tests: buildTests("base"),
   };
   const laneFiles: FileSet = {
     db: laneDb,
-    apiPy: readWorkingTree(root, API_PY_PATH) ?? "",
     tests: buildTests("tree"),
   };
 
@@ -621,9 +592,6 @@ function main(argv: string[]): number {
     join(root, DB_PATH),
     applyFingerprintRepin(result.files.db, fingerprint),
   );
-  if (laneFiles.apiPy.length > 0) {
-    writeFileSync(join(root, API_PY_PATH), result.files.apiPy);
-  }
   for (const [p, src] of Object.entries(result.files.tests)) {
     writeFileSync(join(root, p), src);
   }

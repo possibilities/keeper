@@ -1,6 +1,5 @@
 /**
- * Session dirty-file attribution reader — the native TypeScript port of
- * keeper-py's `get_session_dirty_files` (keeper/api.py:392).
+ * Session dirty-file attribution reader.
  *
  * Returns the files a Claude Code session is "on the hook" for: every file the
  * session has an UNDISCHARGED mutation row for in `file_attributions`
@@ -12,16 +11,11 @@
  * drop would produce an empty commit and lose attribution; the risk the epic
  * spec flags as fail-CLOSED).
  *
- * Two deliberate differences from the Python:
- *  - Reads keeper's DB DIRECTLY via `openDb({ readonly: true })` instead of the
- *    keeper-py reader. keeper owns the schema in this same binary, so there is
- *    NO `SUPPORTED_SCHEMA_VERSIONS` re-assertion — a hardcoded TS whitelist
- *    would self-reject the instant `SCHEMA_VERSION` bumps.
- *  - Board-dir exclusion is NOT done in {@link getSessionDirtyFiles} (it
- *    matches the Python's exclusion-agnostic shape exactly, for parity tests);
- *    the client-side partition lives in {@link discoverSessionFiles}, which
- *    selects the cwd's repo and drops `.keeper/` board paths (they commit via
- *    the plan-commit hook, not commit-work).
+ * Reads keeper's DB directly via `openDb({ readonly: true })`. Board-dir
+ * exclusion stays out of {@link getSessionDirtyFiles}; the client-side
+ * partition lives in {@link discoverSessionFiles}, which selects the cwd's repo
+ * and drops `.keeper/` board paths (they commit via the plan-commit hook, not
+ * commit-work).
  */
 
 import { openDb, resolveDbPath } from "../db";

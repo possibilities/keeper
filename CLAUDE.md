@@ -53,9 +53,7 @@ file is imperative guardrails only.
   is the SOLE migrator and never downgrades a DB stored above the binary's `SCHEMA_VERSION`.
 - **A schema change appends one `SCHEMA_STEPS` entry** (`{version, kind, apply}`); `SCHEMA_VERSION`
   derives from the ladder tail, never hand-typed. Re-pin `SCHEMA_FINGERPRINT` on EVERY schema change.
-  A derivability test keeps `keeper/api.py`'s `SUPPORTED_SCHEMA_VERSIONS` whitelist equal to the
-  derived set. The version stays PROVISIONAL until landed — fan-in renumbering rules unchanged
-  (docs/adr/0020, 0022).
+  The version stays PROVISIONAL until landed — fan-in renumbering rules unchanged (docs/adr/0020, 0022).
 
 ## Writes are tightly scoped — DO NOT widen them
 
@@ -91,7 +89,7 @@ file is imperative guardrails only.
 
 ## Test isolation
 
-- **One fast pure-in-process tier.** `bun test` is the keeper fast suite (only `test:opentui` splits out); `bun run test:full` gates all four suites serially — root, plan, python, prompt — and `test:full:slow` injects `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` to unlock the real-git/subprocess tiers. NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never hang or synchronously spin; production is the integration safety net.
+- **One fast pure-in-process tier.** `bun test` is the keeper fast suite (only `test:opentui` splits out); `bun run test:full` gates all three suites serially — root, plan, prompt — and `test:full:slow` injects `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` to unlock the real-git/subprocess tiers. NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never hang or synchronously spin; production is the integration safety net.
 - **Sandbox ALL SIX state classes** under the per-test tmpdir for any test on the real state surface:
   `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
   and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never `{ ...process.env, KEEPER_DB }`;

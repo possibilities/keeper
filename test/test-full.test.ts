@@ -1,5 +1,5 @@
 /**
- * Tests for the serial four-suite gate (`scripts/test-full.ts`). The runner
+ * Tests for the serial three-suite gate (`scripts/test-full.ts`). The runner
  * itself is a thin spawner — a live `bun run test:full` is the integration proof.
  * These drive the pure seam in-process: the suite plan (order, cwd, env
  * scrub/inject, timeout budgets), env patching, verdict classification, bail, and
@@ -20,10 +20,10 @@ import {
 const T = 300_000;
 
 describe("buildSuitePlan", () => {
-  test("runs the four suites serially with prompt last", () => {
+  test("runs the three suites serially with prompt last", () => {
     expect(
       buildSuitePlan("fast", { suiteTimeoutMs: T }).map((s) => s.name),
-    ).toEqual(["root", "plan", "python", "prompt"]);
+    ).toEqual(["root", "plan", "prompt"]);
   });
 
   test("each suite runs in its own cwd (bunfig/import resolution is cwd-relative)", () => {
@@ -33,7 +33,6 @@ describe("buildSuitePlan", () => {
     expect(byName).toEqual({
       root: ".",
       plan: "plugins/plan",
-      python: ".",
       prompt: "plugins/prompt",
     });
   });
@@ -63,21 +62,15 @@ describe("buildSuitePlan", () => {
     expect(planSuite.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
   });
 
-  test("slow mode leaves python and prompt scrubbed (no slow tier)", () => {
+  test("slow mode leaves prompt scrubbed (no slow tier)", () => {
     const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
-    for (const name of ["python", "prompt"]) {
-      const spec = plan.find((s) => s.name === name);
-      if (spec === undefined) {
-        throw new Error(`expected ${name} suite in the plan`);
-      }
-      expect(spec.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
-      expect(spec.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
+    const prompt = plan.find((s) => s.name === "prompt");
+    if (prompt === undefined) {
+      throw new Error("expected prompt suite in the plan");
     }
-    expect(plan.find((s) => s.name === "prompt")?.cmd).toEqual([
-      "bun",
-      "run",
-      "test",
-    ]);
+    expect(prompt.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
+    expect(prompt.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
+    expect(prompt.cmd).toEqual(["bun", "run", "test"]);
   });
 
   test("fast mode applies the per-suite timeout to every suite", () => {
@@ -95,30 +88,6 @@ describe("buildSuitePlan", () => {
   test("slow root floor never shrinks a larger configured budget", () => {
     const plan = buildSuitePlan("slow", { suiteTimeoutMs: 900_000 });
     expect(plan.find((s) => s.name === "root")?.timeoutMs).toBe(900_000);
-  });
-
-  test("only the python suite carries the zero-tests scan", () => {
-    for (const spec of buildSuitePlan("fast", { suiteTimeoutMs: T })) {
-      expect(Boolean(spec.zeroTestsScan)).toBe(spec.name === "python");
-    }
-  });
-
-  test("python runs unittest discover against tests/ (cwd repo root)", () => {
-    const python = buildSuitePlan("fast", { suiteTimeoutMs: T }).find(
-      (s) => s.name === "python",
-    );
-    if (python === undefined) {
-      throw new Error("expected python suite in the plan");
-    }
-    expect(python.cmd).toEqual([
-      "python3",
-      "-m",
-      "unittest",
-      "discover",
-      "-s",
-      "tests",
-    ]);
-    expect(python.cwd).toBe(".");
   });
 });
 
@@ -147,7 +116,7 @@ describe("classifyVerdict", () => {
     });
   });
 
-  test("fails on a non-zero exit (e.g. unittest collection-error exit 2)", () => {
+  test("fails on a non-zero exit", () => {
     expect(classifyVerdict({ exitCode: 2 })).toEqual({
       ok: false,
       reason: "exited 2",
@@ -171,13 +140,6 @@ describe("classifyVerdict", () => {
     expect(classifyVerdict({ timedOut: true, exitCode: 0 })).toEqual({
       ok: false,
       reason: "timed out (process group killed)",
-    });
-  });
-
-  test("classifies a zero-tests scan hit as a failure despite exit 0", () => {
-    expect(classifyVerdict({ exitCode: 0, zeroTestsDetected: true })).toEqual({
-      ok: false,
-      reason: "ran 0 tests",
     });
   });
 });

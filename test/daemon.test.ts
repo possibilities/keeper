@@ -3376,9 +3376,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // and to 78 via fn-864 task .1 (renaming the `plan_*` schema surface →
   // `plan_*` + rewriting historical `planctl_invocation` envelopes → forward —
   // value-preserving, NO cursor rewind, re-fold byte-identical across the
-  // rename), each of which bumped SCHEMA_VERSION AND added its version to
-  // `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md same-commit
-  // invariant. And to 79 via fn-868 task .1 (the LIVE-ONLY git projection: a new
+  // rename). And to 79 via fn-868 task .1 (the LIVE-ONLY git projection: a new
   // `git_projection_state` control singleton + skip-floor, additive table +
   // floor-raise, NO cursor rewind of the deterministic projections — the git
   // surface is carved out of the re-fold charter, the other ~16 stay

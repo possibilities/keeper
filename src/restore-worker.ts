@@ -27,8 +27,8 @@
  * `current.captured_at`).
  *
  * The restore file is a derived side-file, NOT an event-log projection: it
- * sidesteps the event-sourcing invariants entirely (no schema bump, no
- * `keeper/api.py` whitelist change, no restore-file reducer arm). It is still
+ * sidesteps the event-sourcing invariants entirely (no schema bump and no
+ * restore-file reducer arm). It is still
  * read by `scripts/restore-agents.ts --snapshot-current` (the runnable-script
  * escape hatch over the live mirror).
  *
@@ -253,9 +253,8 @@ const RESTORE_GENERATION_IDLE_MS = 1000;
  *
  * **v3 (epic fn-789): per-bucket backend type.** Each session bucket gains a
  * `backend` field stamped from its jobs' `backend_exec_type`. The bump landed
- * with the side-file's own `RESTORE_SCHEMA_VERSION` only — the DB
- * `SCHEMA_VERSION` and `keeper/api.py` do NOT move. A bucket without `backend`
- * coerces to `DEFAULT_EXEC_BACKEND`.
+ * with the side-file's own `RESTORE_SCHEMA_VERSION` only. A bucket without
+ * `backend` coerces to `DEFAULT_EXEC_BACKEND`.
  *
  * **v4 (epic fn-1102): resume_target is the session UUID.** Each agent's
  * `resume_target` flips from the latest session name to the job's `job_id` (the
@@ -263,15 +262,14 @@ const RESTORE_GENERATION_IDLE_MS = 1000;
  * re-attaches to the EXACT session instead of fuzzy-matching a name. The on-disk
  * field NAME is unchanged; only its meaning (and now-always-UUID value) moved, so
  * a restore-agents util reading a v3 file would resume by name — bump so it can
- * tell the two apart. Side-file version only; the DB `SCHEMA_VERSION` and
- * `keeper/api.py` do NOT move.
+ * tell the two apart. This changes only the side-file version.
  *
  * **v5 (epic fn-1103): resume_target is HARNESS-NATIVE + a `harness` tag rides.**
  * Each agent gains a `harness` field, and `resume_target` is now the harness's own
  * resume token — the session UUID for claude/pi, the back-filled native id for
  * codex/hermes (EMPTY when keeper never resolved one ⇒ not-resumable). A v4 reader
- * assumed `resume_target` was always the claude UUID, so bump. Side-file version
- * only; the DB `SCHEMA_VERSION` and `keeper/api.py` do NOT move.
+ * assumed `resume_target` was always the claude UUID, so bump only the side-file
+ * version.
  */
 export const RESTORE_SCHEMA_VERSION = 5;
 

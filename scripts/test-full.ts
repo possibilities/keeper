@@ -1,16 +1,15 @@
 #!/usr/bin/env bun
 /**
- * Serial four-suite gate. Root `bun run test` covers only the keeper fast tier;
- * the plan plugin, the prompt plugin, and the python whitelist suite each gate
- * nothing on their own, so a cross-cutting refactor can green root while breaking
- * them. This orchestrator runs all four through their EXISTING scripts, in order,
- * and aggregates one exit code — the "what else is broken" local gate.
+ * Serial three-suite gate. Root `bun run test` covers only the keeper fast tier;
+ * the plan and prompt plugins each gate nothing on their own, so a cross-cutting
+ * refactor can green root while breaking them. This orchestrator runs all three
+ * through their EXISTING scripts, in order, and aggregates one exit code — the
+ * "what else is broken" local gate.
  *
  * Suites run SERIALLY, prompt last (it is the slowest). Output streams
  * inherit-style: an === header before each suite, a one-line verdict after.
  * Verdicts come from EXIT CODES only — plan's test count drifts between runs, so
- * nothing here parses counts (the python zero-tests scan is the one narrow
- * exception, since unittest exits 0 on an empty discover).
+ * nothing here parses counts.
  *
  * The orchestrator OWNS the tier. Both slow gates key on env-var DEFINED-ness, so
  * an ambient `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` in the caller's shell would
@@ -53,8 +52,6 @@ export type SuiteSpec = {
   envPatch: Record<string, string | undefined>;
   /** Per-suite process-group kill budget. */
   timeoutMs: number;
-  /** Scan child output for `Ran 0 tests` (unittest exits 0 on an empty discover). */
-  zeroTestsScan?: boolean;
 };
 
 export type Verdict = { ok: boolean; reason: string };
@@ -100,14 +97,6 @@ export function buildSuitePlan(
       timeoutMs: t,
     },
     {
-      name: "python",
-      cmd: ["python3", "-m", "unittest", "discover", "-s", "tests"],
-      cwd: ".",
-      envPatch: scrubSlow(),
-      timeoutMs: t,
-      zeroTestsScan: true,
-    },
-    {
       name: "prompt",
       cmd: ["bun", "run", "test"],
       cwd: "plugins/prompt",
@@ -135,14 +124,13 @@ export function buildChildEnv(
 
 /**
  * Classify a suite's outcome into a pass/fail verdict from its exit code and the
- * distinct failure signals (spawn ENOENT, timeout kill, unittest zero-tests /
- * collection-error exit 2). Pure — the unit test drives every branch.
+ * distinct failure signals (spawn ENOENT and timeout kill). Pure — the unit
+ * test drives every branch.
  */
 export function classifyVerdict(result: {
   spawnError?: string;
   timedOut?: boolean;
   exitCode: number | null;
-  zeroTestsDetected?: boolean;
 }): Verdict {
   if (result.spawnError !== undefined) {
     const missing = result.spawnError === "ENOENT";
@@ -155,9 +143,6 @@ export function classifyVerdict(result: {
   }
   if (result.timedOut) {
     return { ok: false, reason: "timed out (process group killed)" };
-  }
-  if (result.zeroTestsDetected) {
-    return { ok: false, reason: "ran 0 tests" };
   }
   if (result.exitCode === 0) {
     return { ok: true, reason: "passed" };
@@ -204,27 +189,14 @@ function killGroup(pid: number): void {
 
 async function runSuite(spec: SuiteSpec, repoRoot: string): Promise<Verdict> {
   const env = buildChildEnv(process.env, spec.envPatch);
-  const tee = spec.zeroTestsScan === true;
   return await new Promise<Verdict>((resolve) => {
     const child = spawn(spec.cmd[0], spec.cmd.slice(1), {
       cwd: join(repoRoot, spec.cwd),
       env,
       detached: true,
-      stdio: tee ? ["inherit", "pipe", "pipe"] : "inherit",
+      stdio: "inherit",
     });
     currentChildPid = child.pid ?? null;
-
-    let output = "";
-    if (tee) {
-      child.stdout?.on("data", (chunk: Buffer) => {
-        process.stdout.write(chunk);
-        output += chunk.toString();
-      });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        process.stderr.write(chunk);
-        output += chunk.toString();
-      });
-    }
 
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -247,9 +219,7 @@ async function runSuite(spec: SuiteSpec, repoRoot: string): Promise<Verdict> {
     child.on("exit", (code) => {
       clearTimeout(timer);
       currentChildPid = null;
-      const zeroTestsDetected =
-        spec.zeroTestsScan === true && /Ran 0 tests/.test(output);
-      resolve(classifyVerdict({ timedOut, exitCode: code, zeroTestsDetected }));
+      resolve(classifyVerdict({ timedOut, exitCode: code }));
     });
   });
 }

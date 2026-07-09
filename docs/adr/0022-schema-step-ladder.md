@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Accepted. The external Python-whitelist agreement is superseded by ADR 0026;
+the explicit ladder, derived tail, kind discriminant, and fingerprint remain
+current.
 
 ## Context
 

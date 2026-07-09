@@ -39,11 +39,10 @@ const dbFile = (...steps: string[]): string =>
   `export const SCHEMA_STEPS = [\n${steps.join("\n")}\n];\n` +
   `export const SCHEMA_FINGERPRINT =\n  "v3:0000";\n`;
 
-const fileset = (
-  db: string,
-  apiPy = "",
-  tests: Record<string, string> = {},
-): FileSet => ({ db, apiPy, tests });
+const fileset = (db: string, tests: Record<string, string> = {}): FileSet => ({
+  db,
+  tests,
+});
 
 // --- parser -----------------------------------------------------------------
 
@@ -61,21 +60,14 @@ test("parseLadder extracts version, kind, and body for each entry", () => {
 // --- happy path --------------------------------------------------------------
 
 test("renumbers a single colliding additive lane step onto main-tip+1", () => {
-  const main = fileset(
-    dbFile(additive(2, "a"), additive(3, "b")),
-    "SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3})",
-  );
-  const lane = fileset(
-    dbFile(additive(2, "a"), additive(3, "c")),
-    "SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3})",
-    {
-      "t.test.ts": [
-        "expect(SCHEMA_VERSION).toBe(3);",
-        'const fp = "v3:abc";',
-        "expect(unrelated).toBe(99);",
-      ].join("\n"),
-    },
-  );
+  const main = fileset(dbFile(additive(2, "a"), additive(3, "b")));
+  const lane = fileset(dbFile(additive(2, "a"), additive(3, "c")), {
+    "t.test.ts": [
+      "expect(SCHEMA_VERSION).toBe(3);",
+      'const fp = "v3:abc";',
+      "expect(unrelated).toBe(99);",
+    ].join("\n"),
+  });
 
   const r = apply(main, lane);
   expect(r.refused).toBe(false);
@@ -87,9 +79,6 @@ test("renumbers a single colliding additive lane step onto main-tip+1", () => {
   // ladder entry: the lane's "c" step now sits at version 4.
   const moved = parseLadder(r.files.db).find((s) => s.bodyText.includes('"c"'));
   expect(moved?.version).toBe(4);
-
-  // whitelist expectation shifts 3 -> 4.
-  expect(r.files.apiPy).toContain("frozenset({2, 4})");
 
   // pinned version assertions shift; the unrelated toBe(99) is left alone.
   const t = r.files.tests["t.test.ts"];
@@ -306,8 +295,8 @@ test("composed: renumbering a synthetic colliding lane re-pins a fingerprint con
     throw new Error("could not locate SCHEMA_STEPS closing bracket");
   const laneDb = `${realDb.slice(0, closeIdx)}\n${extraStep}${realDb.slice(closeIdx)}`;
 
-  const main: FileSet = { db: realDb, apiPy: "", tests: {} };
-  const lane: FileSet = { db: laneDb, apiPy: "", tests: {} };
+  const main: FileSet = { db: realDb, tests: {} };
+  const lane: FileSet = { db: laneDb, tests: {} };
 
   const r = apply(main, lane);
   expect(r.refused).toBe(false);

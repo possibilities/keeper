@@ -45,8 +45,7 @@ const CONTENT_PATTERNS: { name: string; re: RegExp }[] = [
   // Plan ids — provenance that belongs in the commit/diff, not a guardrail.
   { name: "fn-id", re: /\bfn-\d+/ },
   // Lowercase schema/db version numbers (`v74`, `v86`). The `\d{2,}` lower
-  // bound + the lowercase `v` keep the all-caps `SCHEMA_VERSION` /
-  // `SUPPORTED_SCHEMA_VERSIONS` symbols clean.
+  // bound + the lowercase `v` keep the all-caps `SCHEMA_VERSION` symbol clean.
   { name: "version-number", re: /\bv\d{2,}\b/ },
   // ISO dates — incident timestamps are change history, not a rule.
   { name: "iso-date", re: /\b20\d{2}-\d{2}-\d{2}\b/ },
