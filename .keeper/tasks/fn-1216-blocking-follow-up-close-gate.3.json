@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T19:11:38.943000Z",
+  "depends_on": [
+    "fn-1216-blocking-follow-up-close-gate.2"
+  ],
+  "epic": "fn-1216-blocking-follow-up-close-gate",
+  "id": "fn-1216-blocking-follow-up-close-gate.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Close contracts and stop-guard",
+  "updated_at": "2026-07-09T19:11:38.943000Z"
+}
