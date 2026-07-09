@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 33
+      },
+      "done_summary": "Extended isModelGuidancePath to also match plugins/plan/skills/model-guidance/references/*.md so a references-only staged edit fires arm 13; added positive/negative predicate and dispatch tests.",
+      "input_hash": "11e13e53b6c0eea9a22d9ae2d5ae1ea31daed403debe3bf82adc44ce1f95ebd9",
+      "model": "sonnet",
+      "spec_chars": 1650,
+      "spec_md": "## Description\n\nSource finding: F2 (audit of fn-1206). Evidence path: `model-guidance-check.ts`\ninvariant (b) hashes `plugins/plan/skills/model-guidance/references/*.md`\nagainst the sha256s recorded in `plugins/plan/model-selector.yaml`\n(`reference:` entries resolve to `skills/model-guidance/references/{opus,sonnet}.md`),\nbut `isModelGuidancePath` in `src/commit-work/lint-matrix.ts` (predicate near\nline 122) matches only `plugins/plan/model-selector.yaml` and\n`plugins/plan/subagents.yaml`. A references-only staged edit \u2014 the exact hash\ndrift invariant (b) exists to catch \u2014 does not fire arm 13.\n\nFiles:\n- `src/commit-work/lint-matrix.ts` \u2014 extend `isModelGuidancePath` to also\n  match `path.startsWith(\"plugins/plan/skills/model-guidance/references/\")`.\n- `test/lint-matrix.test.ts` \u2014 add a trigger-predicate assertion (positive +\n  negative) that a references cache path fires arm 13 and unrelated paths do\n  not, in-process via the existing `deps.runTool` seam.\n\nKeep the change scoped to the predicate; do not touch arm 13's dispatch,\naggregation, or the zero-cost `stagedFiles.some(predicate)` gating.\n\n## Acceptance\n\n- [ ] `isModelGuidancePath` returns true for a `plugins/plan/skills/model-guidance/references/*.md` path\n- [ ] arm 13 fires on a references-only staged set and stays silent when nothing in its trigger set is staged\n- [ ] New predicate test passes in the fast in-process suite (no subprocess boot)\n\n## Done summary\nExtended isModelGuidancePath to also match plugins/plan/skills/model-guidance/references/*.md so a references-only staged edit fires arm 13; added positive/negative predicate and dispatch tests.\n## Evidence\n",
+      "task_id": "fn-1209-extend-model-guidance-drift-gate-to.1",
+      "tier": "low",
+      "title": "Fire arm 13 on references edits"
+    }
+  ],
+  "created_at": "2026-07-09T00:57:03.694000Z",
+  "epic_id": "fn-1209-extend-model-guidance-drift-gate-to",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "11e13e53b6c0eea9a22d9ae2d5ae1ea31daed403debe3bf82adc44ce1f95ebd9",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
