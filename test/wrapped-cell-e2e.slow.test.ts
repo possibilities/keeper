@@ -219,10 +219,10 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         probeRoute: () => defaultRouteProbe(model, load),
       });
 
-      // A wrapped model the roster serves routes; one no provider serves is a
-      // no-route; a native claude model routes.
+      // A wrapped model the roster serves is `wrapped`; one no provider serves is
+      // `no-route`; a native claude model is `routed`.
       expect(defaultRouteProbe("gpt-5.3-codex-spark", load)).toEqual({
-        kind: "routed",
+        kind: "wrapped",
       });
       expect(defaultRouteProbe("nonesuch-9", load)).toEqual({
         kind: "no-route",
@@ -232,14 +232,21 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
 
       // resolveWorkerCell threads those verdicts. The embedded subagents matrix
       // stays claude-only by design (the host matrix is the sole overlay), so a
-      // served wrapped model surfaces as a ROUTABLE out-of-matrix — distinct from
-      // the no-route reject an unserved one gets.
+      // served wrapped model's compose throws — yet the seam re-derives its
+      // rendered host cell dir and resolves OK, with the SAME manifest/shadow
+      // discipline a native cell runs (the end-to-end gap this closes).
       const spark = resolveWorkerCell(
         composeWorkerCellDir("gpt-5.3-codex-spark", "high"),
         probe("gpt-5.3-codex-spark"),
       );
-      expect(spark).toMatchObject({ ok: false, kind: "out-of-matrix" });
+      expect(spark.ok).toBe(true);
+      if (spark.ok) {
+        expect(spark.pluginDir).toContain(
+          join("workers", "gpt-5.3-codex-spark-high"),
+        );
+      }
 
+      // An unserved wrapped model stays the no-route reject (no cell to resolve).
       const unserved = resolveWorkerCell(
         composeWorkerCellDir("nonesuch-9", "high"),
         probe("nonesuch-9"),

@@ -50,6 +50,28 @@ function writePresets(body: string): void {
   writeFileSync(join(dir, "presets.yaml"), body);
 }
 
+/** Write a host provider matrix into the sandboxed config dir so the CLI's route
+ *  probe (`defaultRouteProbe` → `loadMatrix`) classifies a wrapped capability
+ *  model — fixture-injected, never the host `~/.config/keeper/matrix.yaml`. */
+function writeMatrix(body: string): void {
+  writeFileSync(join(dir, "matrix.yaml"), body);
+}
+
+/** A fixture roster: claude native (opus/sonnet) + a wrapped `gpt-5.5` served by
+ *  codex. Enough to route the wrapped candidate through the seam. */
+const WRAPPED_MATRIX = [
+  "efforts: [high]",
+  "providers:",
+  "  - name: claude",
+  "    models: [opus, sonnet]",
+  "  - name: codex",
+  "    models: [gpt-5.5]",
+  "subagents: [work]",
+  "wrapper_driver: { model: sonnet, effort: high }",
+  "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
+  "",
+].join("\n");
+
 interface CapturedLaunch {
   spec: LaunchSpec | undefined;
   /** The shell-wrapped launch argv the seam received (mirrors the dry-run line). */
@@ -375,6 +397,45 @@ test("plan work: an out-of-matrix cell refuses (exit 1, actionable), launches no
   expect(r.spec).toBeUndefined(); // never launched
   expect(r.stderr).toContain("no valid");
   expect(r.stderr).toContain("model/tier");
+});
+
+test("plan work: a routed WRAPPED model threads the resolved --plugin-dir into the spec AND the argv", async () => {
+  // CLI parity with the autopilot producer: a task whose capability model the
+  // fixture matrix serves via a wrapped provider resolves its rendered host cell
+  // and launches with it — in the structured spec AND the byte-pinned argv.
+  writeMatrix(WRAPPED_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "gpt-5.5", tier: "high" }),
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBeUndefined(); // launched
+  expect(r.spec?.pluginDir).toContain("plugins/plan/workers/gpt-5.5-high");
+  const argv = r.launchArgv ?? [];
+  const nameIdx = argv.indexOf("--name");
+  expect(nameIdx).toBeGreaterThanOrEqual(0);
+  expect(argv[nameIdx + 1]).toBe("work::fn-1-x.1");
+  expect(argv[nameIdx + 2]).toBe("--plugin-dir");
+  expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/gpt-5.5-high");
+});
+
+test("plan work: a WRAPPED model no provider serves refuses (exit 1) with worker-cell-no-route", async () => {
+  // Parity pin: a capability model absent from the embedded axes AND served by
+  // zero matrix providers keeps the byte-identical no-route refusal.
+  writeMatrix(WRAPPED_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "grok-9", tier: "high" }),
+    }),
+    dirExists: () => true,
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched
+  expect(r.stderr).toContain("wrapped model");
+  expect(r.stderr).toContain("worker-cell-no-route");
+  expect(r.stderr).toContain("grok-9");
 });
 
 test("plan work: a missing cell manifest refuses (exit 1) with the regenerate remedy", async () => {

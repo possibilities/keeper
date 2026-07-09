@@ -3758,6 +3758,145 @@ test("runReconcileCycle: an out-of-matrix worker cell blocks the launch with a s
   expect(state.inFlight.size).toBe(0);
 });
 
+test("runReconcileCycle: a routed WRAPPED-model work row dispatches with the resolved --plugin-dir (spec + argv)", async () => {
+  // A task whose capability model the host matrix serves via a WRAPPED provider.
+  // The embedded subagents matrix is claude-only, so pure reconcile carries a
+  // `pluginDirReject` (never resolving the cell) and threads the capability model
+  // onto the launch. The producer's route probe — bound to that TASK model, not
+  // the session model — classifies it `wrapped` against a FIXTURE matrix.yaml
+  // injected via KEEPER_CONFIG_DIR, and the seam re-derives + launches its rendered
+  // host cell dir in BOTH the structured spec AND the byte-pinned argv.
+  const cfgRoot = realpathSync(mkdtempSync(join(tmpdir(), "ap-wrapped-cfg-")));
+  const savedCfg = process.env.KEEPER_CONFIG_DIR;
+  try {
+    writeFileSync(
+      join(cfgRoot, "matrix.yaml"),
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: claude",
+        "    models: [opus, sonnet]",
+        "  - name: codex",
+        "    models: [gpt-5.5]",
+        "subagents: [work]",
+        "wrapper_driver: { model: sonnet, effort: high }",
+        "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
+        "",
+      ].join("\n"),
+    );
+    process.env.KEEPER_CONFIG_DIR = cfgRoot;
+
+    const { deps, log, setJobByKey } = makeFakeDeps({
+      // The rendered cell manifest "exists"; no shadowing `work` plugin.
+      dirExists: () => true,
+      probeShadowingWorkManifest: () => null,
+    });
+    // A bound job so `confirmRunning` records the durable dispatch (mirrors the
+    // clean-launch happy path); without it the launch fires but nothing confirms.
+    setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+    const epic = makeEpic({
+      epic_id: "fn-1-foo",
+      project_dir: "/repo",
+      tasks: [
+        makeTask({ task_id: "fn-1-foo.1", tier: "high", model: "gpt-5.5" }),
+      ],
+    });
+    const snap = makeSnapshot({ epics: [epic] });
+    const state = makeState();
+    const liveDispatches = new Map<string, LiveDispatch>();
+    const decision = reconcile(snap, state, 0);
+    // Pure reconcile can't resolve a wrapped cell (embedded axes are claude-only):
+    // a null pluginDir + a carried reject, and the capability model threaded on.
+    expect(decision.launches[0]?.pluginDir).toBeNull();
+    expect(decision.launches[0]?.pluginDirReject).toBeDefined();
+    expect(decision.launches[0]?.cellModel).toBe("gpt-5.5");
+
+    await runReconcileCycle(
+      decision,
+      state,
+      liveDispatches,
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+
+    // Launched, no sticky — the wrapped candidate resolved.
+    expect(log.emissions).toEqual([]);
+    expect(log.launches.length).toBe(1);
+    const launch = log.launches[0];
+    // The structured spec carries the LATE-resolved host cell dir…
+    expect(launch?.spec?.pluginDir).toContain(
+      "plugins/plan/workers/gpt-5.5-high",
+    );
+    // …and so does the byte-pinned argv: `--plugin-dir <dir>` right after `--name`.
+    const argvStr = (launch?.argv ?? []).join(" ");
+    expect(argvStr).toContain("--name work::fn-1-foo.1 --plugin-dir ");
+    expect(argvStr).toContain("plugins/plan/workers/gpt-5.5-high");
+    expect(liveDispatches.size).toBe(1);
+  } finally {
+    if (savedCfg === undefined) delete process.env.KEEPER_CONFIG_DIR;
+    else process.env.KEEPER_CONFIG_DIR = savedCfg;
+    rmSync(cfgRoot, { recursive: true, force: true });
+  }
+});
+
+test("runReconcileCycle: a WRAPPED model no provider serves stays a sticky worker-cell-no-route", async () => {
+  // Parity pin: a task model absent from the embedded axes AND served by zero
+  // matrix providers keeps the byte-identical no-route sticky (no resolution).
+  const cfgRoot = realpathSync(mkdtempSync(join(tmpdir(), "ap-noroute-cfg-")));
+  const savedCfg = process.env.KEEPER_CONFIG_DIR;
+  try {
+    writeFileSync(
+      join(cfgRoot, "matrix.yaml"),
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: claude",
+        "    models: [opus, sonnet]",
+        "  - name: codex",
+        "    models: [gpt-5.5]",
+        "subagents: [work]",
+        "wrapper_driver: { model: sonnet, effort: high }",
+        "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
+        "",
+      ].join("\n"),
+    );
+    process.env.KEEPER_CONFIG_DIR = cfgRoot;
+
+    const { deps, log } = makeFakeDeps({ dirExists: () => true });
+    const epic = makeEpic({
+      epic_id: "fn-1-foo",
+      project_dir: "/repo",
+      tasks: [
+        makeTask({ task_id: "fn-1-foo.1", tier: "high", model: "grok-9" }),
+      ],
+    });
+    const snap = makeSnapshot({ epics: [epic] });
+    const state = makeState();
+    const liveDispatches = new Map<string, LiveDispatch>();
+    const decision = reconcile(snap, state, 0);
+
+    await runReconcileCycle(
+      decision,
+      state,
+      liveDispatches,
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+
+    expect(log.launches).toEqual([]);
+    expect(log.emissions.length).toBe(1);
+    expect(log.emissions[0]?.reason).toContain("worker-cell-no-route");
+    expect(log.emissions[0]?.reason).toContain("grok-9");
+    expect(state.inFlight.size).toBe(0);
+  } finally {
+    if (savedCfg === undefined) delete process.env.KEEPER_CONFIG_DIR;
+    else process.env.KEEPER_CONFIG_DIR = savedCfg;
+    rmSync(cfgRoot, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // findShadowingWorkManifest — scan-dir probe for a `work`-plugin collision (fn-1042)
 // ---------------------------------------------------------------------------

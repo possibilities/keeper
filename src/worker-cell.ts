@@ -24,7 +24,10 @@
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { WORKERS_BASE } from "../plugins/plan/src/subagents_config.ts";
+import {
+  WORKERS_BASE,
+  workerCellDir,
+} from "../plugins/plan/src/subagents_config.ts";
 import { ConfigError, loadPluginSources } from "./agent/config";
 import {
   driverFor,
@@ -47,6 +50,22 @@ export const WORKER_CELL_BASE: string = join(
   "plan",
   WORKERS_BASE,
 );
+
+/**
+ * The ABSOLUTE rendered cell dir for a `{model, effort}` pair by the uniform
+ * `workers/<model>-<effort>` naming convention —
+ * `${KEEPER_ROOT}/plugins/plan/workers/<model>-<effort>`. PATH COMPOSITION ONLY:
+ * unlike the pure `workerCellPluginDir` it does NOT validate the pair against the
+ * embedded subagents axes (that validation is exactly what throws for a wrapped
+ * capability model claude does not serve). {@link resolveWorkerCell} reaches for
+ * this down its compose-reject arm once the route probe confirms a wrapped
+ * candidate, then applies the SAME manifest-absent + shadow probes a native cell
+ * runs — so a rendered wrapped cell resolves with identical guard discipline, and
+ * an unrendered one surfaces as the ordinary `missing` reject naming this dir.
+ */
+function hostWorkerCellDir(model: string, tier: string): string {
+  return join(KEEPER_ROOT, "plugins", "plan", workerCellDir(model, tier));
+}
 
 /**
  * Scan-dir probe for a non-cell `work`-named plugin that would shadow the
@@ -133,6 +152,17 @@ export function defaultShadowingWorkProbe(): string | null {
 export interface WorkerCellCompose {
   pluginDir: string | null;
   reject?: string;
+  /**
+   * The capability `{model, tier}` this compose was built from. Carried so the
+   * routed-wrapped arm can re-derive the host cell path
+   * ({@link hostWorkerCellDir}) without re-running the embedded-axis validation
+   * that threw. Both are guaranteed non-null whenever `reject` is set (the pure
+   * compose throws ONLY for a non-null out-of-matrix pair; a null EITHER axis is
+   * the cell-less stop, never a reject). Optional so a bare `{pluginDir}` /
+   * `{pluginDir, reject}` literal (a native or cell-less compose) stays valid.
+   */
+  model?: string | null;
+  tier?: string | null;
 }
 
 /**
@@ -148,11 +178,13 @@ export function composeWorkerCellDir(
   tier: string | null,
 ): WorkerCellCompose {
   try {
-    return { pluginDir: workerCellPluginDir(model, tier) };
+    return { pluginDir: workerCellPluginDir(model, tier), model, tier };
   } catch (err) {
     return {
       pluginDir: null,
       reject: err instanceof Error ? err.message : String(err),
+      model,
+      tier,
     };
   }
 }
@@ -160,15 +192,23 @@ export function composeWorkerCellDir(
 /**
  * The host-matrix route verdict for a WRAPPED-candidate cell — a `{model, tier}`
  * the compiled (claude-only) subagents matrix rejected, so it may be a capability
- * model claude does not serve. `no-route` carries the capability model: a wrapped
- * model no configured provider serves, OR a malformed matrix at probe time (the
- * daemon degrades a parse failure to the SAME visible no-route rather than
- * faulting). `routed` covers every non-no-route verdict — a native model, an
- * absent matrix (the claude-only world), or a wrapped model with ≥1 serving
- * provider — and leaves the generic out-of-matrix reject standing.
+ * model claude does not serve. Three outcomes drive three distinct seam actions:
+ *
+ * - `wrapped` — a capability model claude does not serve that ≥1 configured
+ *   provider DOES serve. The seam re-derives its rendered host cell dir
+ *   ({@link hostWorkerCellDir}) and applies the ordinary manifest + shadow probes,
+ *   so a rendered wrapped cell dispatches with native guard discipline.
+ * - `no-route` — carries the capability model: a wrapped model NO configured
+ *   provider serves, OR a malformed matrix at probe time (the daemon degrades a
+ *   parse failure to the SAME visible no-route rather than faulting). The seam
+ *   returns the `no-route` reject naming the model.
+ * - `routed` — a NATIVE model (a bad-tier native pair) or an ABSENT matrix (the
+ *   claude-only world). Neither is a wrapped cell, so the generic out-of-matrix
+ *   reject stands.
  */
 export type WorkerCellRoute =
   | { kind: "routed" }
+  | { kind: "wrapped" }
   | { kind: "no-route"; model: string };
 
 /**
@@ -182,8 +222,10 @@ export type WorkerCellRoute =
  * (`ConfigError`) becomes a `no-route` verdict so the daemon mints a visible
  * sticky naming the file instead of a `fatalExit` — fail-loud parsing stays a
  * CLI-only posture. An ABSENT matrix (`null`) is the claude-only world → `routed`
- * (a non-claude token there is a plain out-of-matrix, never a no-route). The
- * matrix loader is injected so tests drive every branch without touching disk.
+ * (a non-claude token there is a plain out-of-matrix, never a wrapped cell). A
+ * wrapped model ≥1 provider serves is `wrapped` (the seam resolves its rendered
+ * cell); one no provider serves is `no-route`. The matrix loader is injected so
+ * tests drive every branch without touching disk.
  */
 export function defaultRouteProbe(
   model: string,
@@ -202,7 +244,7 @@ export function defaultRouteProbe(
     return { kind: "routed" };
   }
   return providerOrderFor(matrix, model).length > 0
-    ? { kind: "routed" }
+    ? { kind: "wrapped" }
     : { kind: "no-route", model };
 }
 
@@ -258,38 +300,56 @@ export interface WorkerCellProbeDeps {
  * The host-matrix route probe fires ONLY down the compose-reject arm — a wrapped
  * capability model claude does not serve lands here as an out-of-matrix compose,
  * and the probe re-classifies it: no serving provider (or a malformed matrix) is
- * a `no-route` reject naming the model, ranked AHEAD of the generic
- * out-of-matrix; any other verdict leaves out-of-matrix standing. A native cell
- * (a real cell dir composed) skips this arm entirely and never touches the route
- * probe.
+ * a `no-route` reject naming the model, ranked AHEAD of the generic out-of-matrix;
+ * a `wrapped` verdict (≥1 serving provider) re-derives the host cell path from the
+ * uniform `workers/<model>-<effort>` convention ({@link hostWorkerCellDir}, path
+ * composition only — never the embedded-axis validation that threw) and FALLS
+ * THROUGH to the same manifest-absent + shadow probes a native cell runs; a plain
+ * `routed` verdict (a native bad-tier pair, or an absent matrix) leaves the
+ * generic out-of-matrix standing. A native cell (a real cell dir composed) skips
+ * this arm entirely and never touches the route probe.
  */
 export function resolveWorkerCell(
   compose: WorkerCellCompose,
   deps: WorkerCellProbeDeps,
 ): WorkerCellResult {
+  let pluginDir = compose.pluginDir;
   if (compose.reject !== undefined) {
     const route = deps.probeRoute();
     if (route.kind === "no-route") {
       return { ok: false, kind: "no-route", model: route.model };
     }
-    return { ok: false, kind: "out-of-matrix", message: compose.reject };
+    // A wrapped capability model ≥1 host provider serves — re-derive its rendered
+    // cell dir (PATH ONLY, the compose threw on the embedded-axis check) and fall
+    // through to the manifest/shadow probes below. `model`/`tier` are always set
+    // for a reject compose, but guard defensively: a missing axis (or a plain
+    // `routed`/native/absent-matrix verdict) leaves the generic out-of-matrix.
+    if (
+      route.kind === "wrapped" &&
+      compose.model != null &&
+      compose.tier != null
+    ) {
+      pluginDir = hostWorkerCellDir(compose.model, compose.tier);
+    } else {
+      return { ok: false, kind: "out-of-matrix", message: compose.reject };
+    }
   }
-  if (compose.pluginDir == null) {
+  if (pluginDir == null) {
     // Cell-less: either axis null, or a `close` row — no `--plugin-dir`.
     return { ok: true, pluginDir: null };
   }
-  const manifest = join(compose.pluginDir, ".claude-plugin", "plugin.json");
+  const manifest = join(pluginDir, ".claude-plugin", "plugin.json");
   if (!deps.dirExists(manifest)) {
-    return { ok: false, kind: "missing", pluginDir: compose.pluginDir };
+    return { ok: false, kind: "missing", pluginDir };
   }
   const shadowManifest = deps.probeShadow();
   if (shadowManifest != null) {
     return {
       ok: false,
       kind: "shadowed",
-      pluginDir: compose.pluginDir,
+      pluginDir,
       shadowManifest,
     };
   }
-  return { ok: true, pluginDir: compose.pluginDir };
+  return { ok: true, pluginDir };
 }
