@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 27
+      },
+      "done_summary": "Moved the tier-two carve-out's unconditional continue inside the plan-linked mint guard so a carved-out (planRef null or adopted) tier-two-stale row still falls through to the standalone clock-skew branch, matching ADR 0025 and the inline comment; added a test pinning the carved-out + tier-two-stale + clock-skewed edge.",
+      "input_hash": "ff4721fcd123bac62c69414753d5469b087e8c88fec1e3910ee469c7f7eba483",
+      "model": "sonnet",
+      "spec_chars": 2365,
+      "spec_md": "## Description\n\nFindings F1 (+ merged F3). In `src/exit-watcher.ts`, the tier-two block of\n`selectStuckSentinelVerdicts` reads (afacb594):\n\n    if (ageSecs >= STUCK_TIER2_MIN_AGE_SECS) {\n      // Interactive/adopted sessions (no plan linkage) are soft telemetry \u2014\n      // no tier-two ack-row, but they still fall through to the clock-skew\n      // detect below when applicable.\n      if (row.planRef != null && !row.adopted) { out.push(... tier 2 stale-working ...); }\n      continue;   // <-- unconditional: carved-out skewed rows never reach the standalone skew branch\n    }\n    if (clockSkew) { out.push(... tier 2 clock-skew ...); }\n\nThe `continue` is outside the mint guard, so a carved-out (planRef==null OR\nadopted) session that is tier-two-aged AND clock-skewed emits nothing. This\ncontradicts ADR 0025's Decision-section promise that the standalone\nclock-skew detect \"still fires regardless of plan linkage\", and the inline\ncomment (F3) claims a fall-through the code does not perform.\n\nReconcile all three surfaces into agreement \u2014 pick ONE:\n  (a) honor the ADR: let a carved-out tier-two-aged row fall through to the\n      standalone `if (clockSkew)` branch instead of the unconditional\n      `continue` (skew row still emitted, stale-working row still suppressed); OR\n  (b) suppress skew too for carved-out tier-two-aged rows, and amend ADR\n      0025's Decision + Consequences and the inline comment to state that.\n\nFiles: `src/exit-watcher.ts`, `docs/adr/0025-stuck-sentinel-interactive-carve-out.md`,\n`test/exit-watcher.test.ts`. Producer-side only \u2014 no fold/reducer change (respect\nADR 13's re-fold discipline; wall-clock reads stay in the producer).\n\n## Acceptance\n\n- [ ] The inline comment at the tier-two carve-out matches the actual control flow.\n- [ ] ADR 0025 and the code agree on skew emission for tier-two-aged carved-out rows.\n- [ ] A `selectStuckSentinelVerdicts` test asserts the output for a carved-out\n      (planRef null / adopted) row that is BOTH tier-two-stale AND clock-skewed.\n\n## Done summary\nMoved the tier-two carve-out's unconditional continue inside the plan-linked mint guard so a carved-out (planRef null or adopted) tier-two-stale row still falls through to the standalone clock-skew branch, matching ADR 0025 and the inline comment; added a test pinning the carved-out + tier-two-stale + clock-skewed edge.\n## Evidence\n",
+      "task_id": "fn-1211-fix-swallowed-clock-skew-in-sentinel.1",
+      "tier": "high",
+      "title": "Reconcile sentinel skew fall-through"
+    }
+  ],
+  "created_at": "2026-07-09T01:09:14.042000Z",
+  "epic_id": "fn-1211-fix-swallowed-clock-skew-in-sentinel",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "ff4721fcd123bac62c69414753d5469b087e8c88fec1e3910ee469c7f7eba483",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
