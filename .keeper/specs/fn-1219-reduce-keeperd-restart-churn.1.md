@@ -37,5 +37,5 @@ Daemon code must never value-import from cli/ — cli may import src, never the 
 - [ ] Full fast suite and typecheck are green
 
 ## Done summary
-
+Inverted the cli->src import edges: moved parseDuration, the five autopilot-config projection helpers, and HANDOFF_DOC_MAX_BYTES into new dep-free src/ leaves, with cli/ re-exporting each for existing callers.
 ## Evidence
