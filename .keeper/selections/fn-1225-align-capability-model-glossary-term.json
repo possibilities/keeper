@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "A single-word canonical-term rename in one glossary entry with fully-specified acceptance is mechanical, reversible text polish, so sonnet at the lowest band fits per the sonnet-first default.",
+      "task_id": "fn-1225-align-capability-model-glossary-term.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T23:08:54.195000Z",
+  "epic_id": "fn-1225-align-capability-model-glossary-term",
+  "input_hash": "955f91c51663eb515d438424882003ed656d42d6297fb677c5cbd722f8ebdc50",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2506068421,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"sonnet\",\"rationale\":\"A single-word canonical-term rename in one glossary entry with fully-specified acceptance is mechanical, reversible text polish, so sonnet at the lowest band fits per the sonnet-first default.\",\"confidence\":0.9}]}\n"
+}
