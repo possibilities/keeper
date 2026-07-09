@@ -22,7 +22,6 @@
 // Run: bun test plugins/prompt/test/parity.test.ts   (from keeper root)
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -40,6 +39,8 @@ import {
   DEFAULT_WRAPPER_MODEL,
   effectiveMatrixFromDisk,
 } from "../../plan/src/host_matrix.ts";
+import { run as runCheckGenerated } from "../src/check_generated.ts";
+import { run as runRender } from "../src/render.ts";
 import { renderTemplate } from "../src/render_engine.ts";
 import { runRenderPluginTemplates } from "../src/render_plugin_templates.ts";
 import type {
@@ -77,41 +78,99 @@ const roots: NormalizeRoots = {
   keeperRoot: KEEPER_ROOT,
 };
 
-/** An empty config dir every external `keeper prompt` spawn resolves as its
+/** An empty config dir every in-process render resolves as its
  *  `KEEPER_CONFIG_DIR`, so no host `~/.config/keeper/matrix.yaml` leaks into the
  *  golden compares — with no matrix present the render falls back to the embedded
  *  claude-only defaults, keeping the suite host-independent. */
 const SANDBOX_CONFIG_DIR = mkdtempSync(join(tmpdir(), "prompt-parity-cfg-"));
 afterAll(() => rmSync(SANDBOX_CONFIG_DIR, { recursive: true, force: true }));
 
-/** Run `keeper prompt <args>` from `cwd`. Returns raw stdout bytes + exit. */
-function runCandidate(
-  args: string[],
-  cwd: string,
-): { stdout: Buffer; code: number; stderr: string } {
-  const proc = spawnSync("keeper", ["prompt", ...args], {
-    cwd,
-    env: { ...process.env, KEEPER_CONFIG_DIR: SANDBOX_CONFIG_DIR },
-  });
-  return {
-    stdout: proc.stdout ?? Buffer.alloc(0),
-    code: proc.status ?? -1,
-    stderr: (proc.stderr ?? Buffer.alloc(0)).toString("utf-8"),
-  };
+interface CandidateRun {
+  stdout: Buffer;
+  code: number;
+  stderr: string;
 }
 
-/** True once `keeper prompt` is a wired subcommand. Kept as a precondition guard
- *  so a broken wiring fails with a clear "not wired" signal rather than a
- *  confusing byte diff. */
-function keeperPromptWired(): boolean {
-  const probe = spawnSync("keeper", ["prompt", "--help"], {
-    encoding: "utf-8",
+/** Run a prompt verb in-process with stdout/stderr captured. The parity suite is
+ *  a renderer regression pin, not a process-spawn contract; the actual verb
+ *  functions provide the candidate bytes for the golden comparison. */
+function runCandidate(args: string[], cwd: string): CandidateRun {
+  const [command, ...rest] = args;
+  return captureCandidate(() => {
+    switch (command) {
+      case "render":
+        return runRender(positional(rest), cwd, null);
+      case "check-generated":
+        return runCheckGenerated(positional(rest), option(rest, "--on"));
+      case "render-plugin-templates":
+        return runRenderPluginTemplates({
+          projectRoot: option(rest, "--project-root") ?? cwd,
+        });
+      default:
+        throw new Error(`unknown prompt candidate verb: ${command ?? ""}`);
+    }
   });
-  const text = `${probe.stdout ?? ""}${probe.stderr ?? ""}`;
-  return !/unknown subcommand 'prompt'/.test(text);
 }
 
-const PROMPT_WIRED = keeperPromptWired();
+function captureCandidate(run: () => number): CandidateRun {
+  const priorStdoutWrite = process.stdout.write;
+  const priorStderrWrite = process.stderr.write;
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
+  process.stdout.write = captureWrite(stdoutChunks);
+  process.stderr.write = captureWrite(stderrChunks);
+  const savedConfigDir = process.env.KEEPER_CONFIG_DIR;
+  process.env.KEEPER_CONFIG_DIR = SANDBOX_CONFIG_DIR;
+  try {
+    const code = run();
+    return {
+      stdout: Buffer.concat(stdoutChunks),
+      code,
+      stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+    };
+  } finally {
+    process.stdout.write = priorStdoutWrite;
+    process.stderr.write = priorStderrWrite;
+    if (savedConfigDir === undefined) {
+      delete process.env.KEEPER_CONFIG_DIR;
+    } else {
+      process.env.KEEPER_CONFIG_DIR = savedConfigDir;
+    }
+  }
+}
+
+function captureWrite(chunks: Buffer[]): typeof process.stdout.write {
+  return ((chunk: unknown, encodingOrCb?: unknown, cb?: unknown): boolean => {
+    if (typeof chunk === "string") {
+      chunks.push(Buffer.from(chunk, "utf-8"));
+    } else if (chunk instanceof Uint8Array) {
+      chunks.push(Buffer.from(chunk));
+    } else {
+      chunks.push(Buffer.from(String(chunk), "utf-8"));
+    }
+    const callback =
+      typeof encodingOrCb === "function"
+        ? encodingOrCb
+        : typeof cb === "function"
+          ? cb
+          : null;
+    callback?.();
+    return true;
+  }) as typeof process.stdout.write;
+}
+
+function positional(args: string[]): string | undefined {
+  return args.find((a) => !a.startsWith("-"));
+}
+
+function option(args: string[], name: string): string | undefined {
+  const eq = args.find((a) => a.startsWith(`${name}=`));
+  if (eq !== undefined) {
+    return eq.slice(name.length + 1);
+  }
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
+}
 
 /** Render the plan plugin into a throwaway copy with a synthetic `.git` marker,
  *  mirroring oracle/capture.ts. Returns the temp root (caller cleans up). The
@@ -120,12 +179,7 @@ const PROMPT_WIRED = keeperPromptWired();
  *  (gitignored) render tree is materialized in the live checkout. */
 function renderPlanTree(): string {
   const work = mkdtempSync(join(tmpdir(), "prompt-parity-plan-"));
-  const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
-  cpSync(livePlanRoot, work, { recursive: true });
-  writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
-  for (const kind of ["commands", "skills", "agents", "workers"]) {
-    rmSync(join(work, kind), { recursive: true, force: true });
-  }
+  copyPlanPluginSkeleton(work);
   const r = runCandidate(
     ["render-plugin-templates", "--project-root", work],
     work,
@@ -137,6 +191,14 @@ function renderPlanTree(): string {
     );
   }
   return work;
+}
+
+function copyPlanPluginSkeleton(work: string): void {
+  const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
+  for (const entry of [".claude-plugin", "template", "subagents.yaml"]) {
+    cpSync(join(livePlanRoot, entry), join(work, entry), { recursive: true });
+  }
+  writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
 }
 
 // ===========================================================================
@@ -240,12 +302,6 @@ describe("the canonicalizer applies ONLY machine-root tokenization", () => {
 // 2. REGRESSION PIN — the engine's output vs its recorded goldens
 // ===========================================================================
 
-describe("keeper prompt is a wired subcommand", () => {
-  test("`keeper prompt --help` resolves (not an unknown subcommand)", () => {
-    expect(PROMPT_WIRED).toBe(true);
-  });
-});
-
 describe("render: byte-identical vs golden across the full ref universe", () => {
   for (const fx of renderFixtures) {
     test(`render ${fx.ref}`, () => {
@@ -265,9 +321,7 @@ describe("check-generated: byte-identical envelope vs golden, both modes", () =>
   let planTree: string | null = null;
 
   beforeAll(() => {
-    if (PROMPT_WIRED) {
-      planTree = renderPlanTree();
-    }
+    planTree = renderPlanTree();
   });
   afterAll(() => {
     if (planTree) {
@@ -277,12 +331,8 @@ describe("check-generated: byte-identical envelope vs golden, both modes", () =>
 
   for (const fx of checkFixtures) {
     test(`check-generated ${fx.target_relative} --on ${fx.on}`, () => {
-      if (!PROMPT_WIRED || planTree === null) {
-        // Re-probe (not the narrowed const) so the type stays boolean.
-        expect(keeperPromptWired()).toBe(true);
-        return;
-      }
-      const work = planTree;
+      expect(planTree).not.toBeNull();
+      const work = planTree as string;
       const target = join(work, fx.target_relative);
       const r = runCandidate(["check-generated", target, "--on", fx.on], work);
       expect(r.code).toBe(fx.exit_code);
@@ -300,20 +350,9 @@ describe("check-generated: byte-identical envelope vs golden, both modes", () =>
 
 describe("render-plugin-templates: byte-identical tree + sidecars vs golden", () => {
   test("full plan-plugin render matches the golden tree", () => {
-    if (!PROMPT_WIRED) {
-      // Re-probe (not the narrowed const) so the type stays boolean.
-      expect(keeperPromptWired()).toBe(true);
-      return;
-    }
-
     const work = mkdtempSync(join(tmpdir(), "prompt-parity-rpt-"));
     try {
-      const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
-      cpSync(livePlanRoot, work, { recursive: true });
-      for (const kind of ["commands", "skills", "agents", "workers"]) {
-        rmSync(join(work, kind), { recursive: true, force: true });
-      }
-
+      copyPlanPluginSkeleton(work);
       const r = runCandidate(
         ["render-plugin-templates", "--project-root", work],
         work,
@@ -350,10 +389,9 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs golden", ()
 // ===========================================================================
 // 3. WRAPPED WORKER CELLS — host provider matrix overlay (ADR 0010)
 //
-// These run the ACTUAL worktree renderer IN-PROCESS (the external-keeper spawns
-// above exercise whatever `keeper` is on PATH). A sandboxed KEEPER_CONFIG_DIR
-// makes each render hermetic: an empty dir → embedded claude-only defaults, a dir
-// carrying a fixture matrix.yaml → the wrapped-cell axes it declares.
+// These run the worktree renderer in-process under a sandboxed KEEPER_CONFIG_DIR.
+// An empty dir → embedded claude-only defaults; a dir carrying a fixture
+// matrix.yaml → the wrapped-cell axes it declares.
 // ===========================================================================
 
 describe("wrapped worker cells: host provider matrix overlay", () => {
@@ -423,11 +461,7 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     rc: number;
   } {
     const work = mkdtempSync(join(tmpdir(), "prompt-wrapped-plan-"));
-    cpSync(join(KEEPER_ROOT, "plugins", "plan"), work, { recursive: true });
-    writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
-    for (const kind of ["commands", "skills", "agents", "workers"]) {
-      rmSync(join(work, kind), { recursive: true, force: true });
-    }
+    copyPlanPluginSkeleton(work);
     const saved = process.env.KEEPER_CONFIG_DIR;
     process.env.KEEPER_CONFIG_DIR = configDir;
     try {
