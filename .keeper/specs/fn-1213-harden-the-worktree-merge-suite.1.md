@@ -30,5 +30,5 @@ readPkgGateCommand:4977), test/autopilot-worker.test.ts.
 - [ ] `bun test` stays green
 
 ## Done summary
-
+Added fn-1213 unit tests driving every runMergeSuiteGate/runPackageSuiteGate verdict branch (install fail/timeout, no gate script, crashed->red, suite timeout, green, plan-suite chaining) and scratch-reap-on-every-path (including thrown), via a new injectable spawnFn seam so no real subprocess runs.
 ## Evidence
