@@ -349,6 +349,7 @@ test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row
       behind: 0,
       dirty_count: 0,
       orphaned_count: 0,
+      unattributed_to_live_count: 0,
       dirty_files: [],
     },
     {
@@ -358,6 +359,7 @@ test("renderRowBlocks: drops all-zero rows and emits one block per non-empty row
       behind: 1,
       dirty_count: 1,
       orphaned_count: 0,
+      unattributed_to_live_count: 0,
       dirty_files: [
         {
           xy: " M",
@@ -397,6 +399,7 @@ test("renderRowBlocks: ahead-only row shows +N on the project line, no unpushed 
       behind: 0,
       dirty_count: 0,
       orphaned_count: 0,
+      unattributed_to_live_count: 0,
       dirty_files: [],
     },
   ]);
@@ -425,6 +428,10 @@ test("renderRowBlocks: file-centric layout — multi-attribution, orphan, rename
       // one rename-with-attribution.
       dirty_count: 4,
       orphaned_count: 1,
+      // Two files are unattributed-to-live (the truly-orphan file plus the
+      // ended-session file) — the exact reducer-pass-4 scalar, not re-derived
+      // from `dirty_files[]`.
+      unattributed_to_live_count: 2,
       dirty_files: [
         // multi-attribution: tool + bash + inferred, three sessions, with
         // mixed last_touch_at to verify desc sort (bash@new should appear
@@ -544,6 +551,7 @@ test("renderRowBlocks: attribution truncation appends `+N more` for dense lines"
       behind: 0,
       dirty_count: 1,
       orphaned_count: 0,
+      unattributed_to_live_count: 0,
       dirty_files: [
         {
           xy: " M",

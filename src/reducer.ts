@@ -2323,17 +2323,22 @@ function projectGitStatus(db: Database, event: Event): void {
 
   // git_status write — after passes 1-4 populated file_attributions and the
   // per-job rollups. The rendered `dirty_files[].attributions[]` JSON is the
-  // materialized view the client reads; `dirty_count` / `orphaned_count` carry
-  // the scalars; `jobs` enumerates the canonical attribution set the retract
-  // walks. `orphaned_files` ships empty — the strict-mystery orphan set is just
+  // materialized view the client reads; `dirty_count` / `orphaned_count` /
+  // `unattributed_to_live_count` carry the EXACT project-wide scalars (the
+  // latter is pass 4's `unattributedToLiveCount`, folded from the FULL
+  // `snapshot.dirty_files` — never the wire-capped `renderedFiles` mirror, so
+  // `cli/git.ts` can render it directly instead of re-deriving from the capped
+  // array); `jobs` enumerates the canonical attribution set the retract walks.
+  // `orphaned_files` ships empty — the strict-mystery orphan set is just
   // `dirty_files where attributions.length == 0`, so a per-file list would
   // duplicate the `orphaned_count` scalar.
   db.run(
     `INSERT INTO git_status (
        project_dir, branch, head_oid, upstream, ahead, behind,
-       dirty_count, orphaned_count, dirty_files, orphaned_files, jobs,
+       dirty_count, orphaned_count, unattributed_to_live_count,
+       dirty_files, orphaned_files, jobs,
        last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(project_dir) DO UPDATE SET
        branch = excluded.branch,
        head_oid = excluded.head_oid,
@@ -2342,6 +2347,7 @@ function projectGitStatus(db: Database, event: Event): void {
        behind = excluded.behind,
        dirty_count = excluded.dirty_count,
        orphaned_count = excluded.orphaned_count,
+       unattributed_to_live_count = excluded.unattributed_to_live_count,
        dirty_files = excluded.dirty_files,
        orphaned_files = excluded.orphaned_files,
        jobs = excluded.jobs,
@@ -2356,6 +2362,7 @@ function projectGitStatus(db: Database, event: Event): void {
       snapshot.behind,
       snapshot.dirty_files.length,
       orphanCount,
+      unattributedToLiveCount,
       JSON.stringify(renderedFiles),
       JSON.stringify([]),
       JSON.stringify(projectionJobs),

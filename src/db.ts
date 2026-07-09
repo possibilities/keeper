@@ -4115,6 +4115,34 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(db, "epics", "blocks_closing_of", "TEXT");
     },
   },
+  {
+    version: 118,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v117→v118 (fn-1226 task .1): add `git_status.unattributed_to_live_count`
+      // — the EXACT project-wide count `projectGitStatus` pass 4 already computes
+      // (`unattributedToLiveCount`, folded from the FULL `snapshot.dirty_files` via
+      // the complete `fileToAttributions` map) but previously stamped ONLY onto
+      // `jobs.git_unattributed_to_live_count`, never the `git_status` row itself.
+      // `cli/git.ts` was re-deriving its `unattributed=` header by walking the
+      // MATERIALIZED (GIT_STATUS_DIRTY_FILES_WIRE_CAP-capped) `dirty_files[]`
+      // array, so a >200-dirty worktree undercounted and could render the
+      // logically-impossible `unattributed < orphan`. NOT NULL DEFAULT 0 mirrors
+      // `orphaned_count`'s shape; a pre-migration row reads 0 until its next
+      // GitSnapshot fold re-stamps the exact value.
+      //
+      // `git_status` is LIVE-ONLY ({@link LIVE_ONLY_PROJECTIONS}) — the boot-seed
+      // re-derives it from current git reality, so this additive column needs no
+      // rewind-and-redrain; no deterministic-replay concern.
+      addColumnIfMissing(
+        db,
+        "git_status",
+        "unattributed_to_live_count",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+    },
+  },
 ];
 
 /**
@@ -4135,7 +4163,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v117:52d19549c66eb4d29914db49e650dc947ae12877766fffd810f18d815d903aae";
+  "v118:a3a252e4d8073355a01198c57cfbbc69a76248ee96b114c3889ffc1e5c03dc55";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5232,6 +5260,7 @@ CREATE TABLE IF NOT EXISTS git_status (
     behind INTEGER,
     dirty_count INTEGER NOT NULL DEFAULT 0,
     orphaned_count INTEGER NOT NULL DEFAULT 0,
+    unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
     dirty_files TEXT NOT NULL DEFAULT '[]',
     orphaned_files TEXT NOT NULL DEFAULT '[]',
     jobs TEXT NOT NULL DEFAULT '[]',

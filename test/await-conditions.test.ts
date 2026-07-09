@@ -1620,6 +1620,7 @@ function makeGitStatus(overrides: Partial<GitStatus>): GitStatus {
     behind: null,
     dirty_count: 0,
     orphaned_count: 0,
+    unattributed_to_live_count: 0,
     dirty_files: [],
     orphaned_files: [],
     jobs: [],

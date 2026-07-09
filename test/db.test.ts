@@ -2862,7 +2862,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // fresh-vs-migrated identical; it widens the epics row shape but does not touch
   // the v62→v63 `default_visible`/`approval` rewrite this test exercises, fn-1216
   // task .1.
-  expect(SCHEMA_VERSION).toBe(117);
+  // v118 appends the nullable `git_status.unattributed_to_live_count` column
+  // (the exact pass-4 unattributed-to-live scalar) — an additive ALTER on the
+  // LIVE-ONLY `git_status` table; it does not touch the epics table SHAPE this
+  // test pins, fn-1226 task .1.
+  expect(SCHEMA_VERSION).toBe(118);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

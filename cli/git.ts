@@ -197,8 +197,10 @@ function renderAttributions(
  *
  * `dirty=` carries the project-wide dirty file count (`dirty_count`);
  * `orphan=` is the strict-mystery `orphaned_count` (files with zero
- * attributions); `unattributed=` is computed locally as the count of
- * dirty files whose attribution set contains no live session. Per-file
+ * attributions); `unattributed=` is the exact `unattributed_to_live_count`
+ * scalar the reducer's pass 4 folds from the FULL dirty-file snapshot —
+ * never re-derived from the wire-capped `dirty_files[]` mirror, so a
+ * >200-dirty worktree can't undercount below `orphan=`. Per-file
  * attributions ride on the `dirty_files[].attributions[]` JSON the
  * reducer writes — sorted `last_touch_at` desc, capped at
  * MAX_ATTRIBUTION_LINE with `+N more` truncation for dense lines.
@@ -224,31 +226,12 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
       ? (row.dirty_files as Record<string, unknown>[])
       : [];
 
-    // Local unattributed count — dirty files whose attribution set
-    // contains no live session (state ∈ {working, stopped}). The reducer
-    // stamps this onto `jobs.git_unattributed_to_live_count`, but the
-    // git_status row doesn't carry the scalar directly. We re-derive
-    // from the per-file attributions so the header line stays a pure
-    // function of the wire payload.
-    const LIVE_STATES = new Set(["working", "stopped"]);
-    let unattributedCount = 0;
-    for (const file of dirtyFiles) {
-      const atts = Array.isArray(file.attributions)
-        ? (file.attributions as AttributionEntry[])
-        : [];
-      if (atts.length === 0) {
-        unattributedCount++;
-        continue;
-      }
-      let hasLive = false;
-      for (const a of atts) {
-        if (LIVE_STATES.has(seg(a.state))) {
-          hasLive = true;
-          break;
-        }
-      }
-      if (!hasLive) unattributedCount++;
-    }
+    // Exact scalar from the reducer's pass 4 — folded from the FULL
+    // `snapshot.dirty_files`, never the wire-capped materialized array.
+    const unattributedCount =
+      typeof row.unattributed_to_live_count === "number"
+        ? row.unattributed_to_live_count
+        : 0;
 
     const lines = [
       `(${name}) [${branch}${ahead}${behind}] dirty=${dirtyCount} orphan=${orphanedCount} unattributed=${unattributedCount}`,
