@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical multi-file layering move with a well-specified acceptance and a named surface; the non-contiguous split risk warrants high but no intelligence-bound reason for opus.",
+      "task_id": "fn-1219-reduce-keeperd-restart-churn.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded hook-helper relocation following an existing dep-free pattern, verifiable by tests and lint; sonnet high fits, the fail-open constraint is well-specified not intelligence-bound.",
+      "task_id": "fn-1219-reduce-keeperd-restart-churn.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant: the boundary walker must model every real edge class or the claim is hollow, and the install reload gate's asymmetric failure directions must be exactly right on a contract-shaped fingerprint change.",
+      "task_id": "fn-1219-reduce-keeperd-restart-churn.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Single-surface pure predicate plus scheduler filter threading that mirrors an existing precedent with pytest guards; mechanical work at the medium band.",
+      "task_id": "fn-1219-reduce-keeperd-restart-churn.4",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T20:26:56.729000Z",
+  "epic_id": "fn-1219-reduce-keeperd-restart-churn",
+  "input_hash": "ec0dffffbf5fbd4573ac4fd14d95658247f4a7b7eb5f9aabf0622f22be5c8c0d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3960340479,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1219-reduce-keeperd-restart-churn.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Mechanical multi-file layering move with a well-specified acceptance and a named surface; the non-contiguous split risk warrants high but no intelligence-bound reason for opus.\",\"confidence\":0.8},{\"task_id\":\"fn-1219-reduce-keeperd-restart-churn.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded hook-helper relocation following an existing dep-free pattern, verifiable by tests and lint; sonnet high fits, the fail-open constraint is well-specified not intelligence-bound.\",\"confidence\":0.79},{\"task_id\":\"fn-1219-reduce-keeperd-restart-churn.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant: the boundary walker must model every real edge class or the claim is hollow, and the install reload gate's asymmetric failure directions must be exactly right on a contract-shaped fingerprint change.\",\"confidence\":0.76},{\"task_id\":\"fn-1219-reduce-keeperd-restart-churn.4\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Single-surface pure predicate plus scheduler filter threading that mirrors an existing precedent with pytest guards; mechanical work at the medium band.\",\"confidence\":0.82}]}"
+}
