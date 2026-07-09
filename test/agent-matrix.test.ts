@@ -16,6 +16,8 @@ import { main } from "../src/agent/main";
 import {
   cellSet,
   driverFor,
+  isValidMatrixAliasTarget,
+  isValidMatrixToken,
   loadMatrix,
   type Matrix,
   nativeIdFor,
@@ -327,6 +329,165 @@ describe("pure derivations", () => {
       driver: "wrapped",
       candidates: [],
     });
+  });
+});
+
+describe("alias-target charset (slashed native id)", () => {
+  // codex aliases the wrapped capability gpt-5.5 to a provider-qualified slashed
+  // native id — the shape pi rejects the bare capability for at startup.
+  const SLASHED_TARGET = [
+    "efforts:",
+    "  - high",
+    "providers:",
+    "  - name: claude",
+    "    models:",
+    "      - opus",
+    "  - name: codex",
+    "    models:",
+    "      - gpt-5.5: openai/gpt-5.5",
+    "subagents:",
+    "  - work",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  test("isValidMatrixAliasTarget: slash-joined strict segments, else reject; strict token stays slash-free", () => {
+    // Accept: a single strict token AND provider-qualified slash forms.
+    expect(isValidMatrixAliasTarget("gpt-5.5")).toBe(true);
+    expect(isValidMatrixAliasTarget("openai/gpt-5.5")).toBe(true);
+    expect(isValidMatrixAliasTarget("a/b/c")).toBe(true);
+    // Reject: empty, leading/trailing/double slash, path escape, leading dot, upper.
+    expect(isValidMatrixAliasTarget("")).toBe(false);
+    expect(isValidMatrixAliasTarget("/gpt")).toBe(false);
+    expect(isValidMatrixAliasTarget("gpt/")).toBe(false);
+    expect(isValidMatrixAliasTarget("a//b")).toBe(false);
+    expect(isValidMatrixAliasTarget("../x")).toBe(false);
+    expect(isValidMatrixAliasTarget("openai/.hidden")).toBe(false);
+    expect(isValidMatrixAliasTarget("UP/case")).toBe(false);
+    // The strict token charset (keys + axis tokens) never admits a slash.
+    expect(isValidMatrixToken("openai/gpt-5.5")).toBe(false);
+    expect(isValidMatrixToken("gpt-5.5")).toBe(true);
+  });
+
+  test("a provider-qualified slashed native id parses as an alias target", () => {
+    const m = loadMatrix(writeMatrix(SLASHED_TARGET)) as Matrix;
+    expect(nativeIdFor(m, "codex", "gpt-5.5")).toBe("openai/gpt-5.5");
+  });
+
+  test("resolveModel carries the slashed native id to model_id; preset name stays slash-free", () => {
+    const m = loadMatrix(writeMatrix(SLASHED_TARGET)) as Matrix;
+    expect(resolveModel(m, "gpt-5.5")).toEqual({
+      driver: "wrapped",
+      candidates: [
+        {
+          harness: "codex",
+          model_id: "openai/gpt-5.5",
+          preset_name: "codex-gpt-5.5",
+        },
+      ],
+    });
+  });
+
+  test("a slashed alias KEY (capability) is fail-loud — the strict/relaxed split", () => {
+    expect(() =>
+      loadMatrix(
+        writeMatrix(
+          [
+            "efforts:",
+            "  - high",
+            "providers:",
+            "  - name: codex",
+            "    models:",
+            "      - openai/gpt-5.5: gpt-5.5-codex",
+            "subagents:",
+            "  - work",
+            "wrapper_driver:",
+            "  model: sonnet",
+            "  effort: high",
+            "",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/model token .* must match/);
+  });
+
+  test("a slashed effort axis token is fail-loud", () => {
+    expect(() =>
+      loadMatrix(
+        writeMatrix(
+          [
+            "efforts:",
+            "  - hi/gh",
+            "providers:",
+            "  - name: claude",
+            "    models:",
+            "      - opus",
+            "subagents:",
+            "  - work",
+            "wrapper_driver:",
+            "  model: sonnet",
+            "  effort: high",
+            "",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/efforts entries must be tokens/);
+  });
+
+  test("providers resolve carries the slashed model_id through to the launch flag (pass-through)", async () => {
+    const h = makeHarness({
+      argv: ["providers", "resolve", "gpt-5.5", "high"],
+      rawArgv: true,
+      matrix: loadMatrix(writeMatrix(SLASHED_TARGET)) as Matrix,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const env = JSON.parse(h.out.join(""));
+    expect(env.candidates).toEqual([
+      {
+        harness: "codex",
+        model_id: "openai/gpt-5.5",
+        preset_name: "codex-gpt-5.5",
+      },
+    ]);
+  });
+});
+
+describe("committed example matrix (anti-rot)", () => {
+  // The example lives at docs/examples/matrix.example.yaml — outside every
+  // discovered config path — and is loaded here by explicit path only, through
+  // the SAME real loadMatrix a host `~/.config/keeper/matrix.yaml` would go
+  // through, so a behavior-changing edit to the example fails this test loud.
+  const EXAMPLE_PATH = join(
+    import.meta.dir,
+    "..",
+    "docs",
+    "examples",
+    "matrix.example.yaml",
+  );
+
+  test("parses with the real loader and resolves the codex/spark activation", () => {
+    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
+    expect(m).not.toBeNull();
+    expect(driverFor(m, "gpt-5.3-codex-spark")).toBe("wrapped");
+    expect(resolveModel(m, "gpt-5.3-codex-spark")).toEqual({
+      driver: "wrapped",
+      candidates: [
+        {
+          harness: "codex",
+          model_id: "gpt-5.3-codex-spark",
+          preset_name: "codex-gpt-5.3-codex-spark",
+        },
+      ],
+    });
+  });
+
+  test("claude models stay native", () => {
+    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
+    expect(driverFor(m, "opus")).toBe("native");
+    expect(driverFor(m, "sonnet")).toBe("native");
   });
 });
 

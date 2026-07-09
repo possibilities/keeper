@@ -117,17 +117,20 @@ models:
     default for well-specified implementation work; escalate to opus only for a
     named intelligence-bound reason per the hand_tuned policy.
   gpt-5.5: |
-    A high-capability generalist coding model with broad current knowledge and
-    strong multi-step reasoning. Strengths: from-scratch implementation against a
-    clear spec, algorithmic and data-transformation work, breadth across
-    languages and frameworks, and sustained progress on well-scoped agentic
-    tasks. Weaknesses: leans literal on an under-specified spec and can drift from
-    a codebase's established idioms unless the task names the pattern to follow;
-    less sure than the top capability tier at separating a real failure from a
-    flake in open-ended debugging. When to pick: bounded-to-moderate features and
-    mechanical-to-medium refactors with an explicit acceptance and a named
-    surface. When to avoid: contract-, schema-, or wire-shaped changes where a
-    wrong abstraction propagates, and hypothesis-free debugging — route those up.
+    A capable generalist coding model with strong multi-step reasoning and broad
+    language breadth — the first non-default worker tier, routed under a
+    deliberate trickle posture. Strengths: from-scratch implementation against a
+    clear spec, algorithmic and data-transformation work, and literal execution
+    of a bounded, well-specified acceptance. Weaknesses: leans literal on an
+    under-specified spec and can drift from a codebase's established idioms unless
+    the task names the pattern to follow; less sure than the top tier at telling
+    a real failure from a flake in open-ended debugging. When to pick: route it
+    ONLY to genuinely-bounded mechanical work in the low/medium band shapes —
+    single-surface edits, straight test additions, mechanical refactors with an
+    explicit acceptance and a named surface — widening its range only as
+    out-of-band cohort evidence grades it right-sized, never by default. When to
+    avoid: contract-, schema-, or wire-shaped changes and hypothesis-free
+    debugging; keep those on a higher tier.
   gpt-5.3-codex-spark: |
     A fast, lightweight coding model tuned for quick, tightly-scoped edits.
     Strengths: snappy single-file changes, straight test additions, mechanical
@@ -151,3 +154,10 @@ research:
   sonnet:
     reference: skills/model-guidance/references/sonnet.md
     sha256: cf88409ab1dafa43569e41b5c73d04bc6b9f18a3c3e52b78a9a3c2df3ad2990e
+  # Host-roster capability model absent from the embedded subagents.yaml axis. The
+  # research entry is tolerated by the host-blind gate, but the reference must
+  # exist and hash-match like any other; the guidance block is a pre-provisioned
+  # extra the runtime selection-brief seam gates on the effective matrix.
+  gpt-5.3-codex-spark:
+    reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
+    sha256: 02243b59cb4220c4b2f860355446b66e97bb5a02f189d9dc7b50117180426f18

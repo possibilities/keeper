@@ -80,6 +80,19 @@ export function isValidMatrixToken(token: string): boolean {
   return /^[a-z0-9._-]+$/.test(token) && !token.startsWith(".");
 }
 
+/**
+ * The alias-TARGET charset: one or more strict matrix tokens joined by `/`, so a
+ * provider-qualified native id like `openai/gpt-5.5` is expressible. RELAXED past
+ * {@link isValidMatrixToken} for the alias TARGET ONLY — the native id a
+ * capability resolves to, which providers-resolve carries verbatim to the launch
+ * model flag as pass-through. Every `/`-segment stays strictly validated (no empty
+ * segment, no leading dot, no path escape), and alias KEYS + axis tokens stay
+ * strict: the split keeps a slashed token out of any preset / cell / file name.
+ */
+export function isValidMatrixAliasTarget(token: string): boolean {
+  return token.length > 0 && token.split("/").every(isValidMatrixToken);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -243,9 +256,9 @@ function parseProviderModels(
         `provider '${provider}' model token '${capability}' must match [a-z0-9._-] with no leading dot in ${configPath}`,
       );
     }
-    if (!isValidMatrixToken(nativeId)) {
+    if (!isValidMatrixAliasTarget(nativeId)) {
       throw new ConfigError(
-        `provider '${provider}' native id '${nativeId}' must match [a-z0-9._-] with no leading dot in ${configPath}`,
+        `provider '${provider}' native id '${nativeId}' must be '/'-joined [a-z0-9._-] segments (no leading dot, no empty segment) in ${configPath}`,
       );
     }
     if (models.has(capability)) {

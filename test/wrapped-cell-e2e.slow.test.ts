@@ -6,17 +6,24 @@
  *
  * The chain, against one sandboxed `KEEPER_CONFIG_DIR/matrix.yaml`:
  *   1. RENDER   — `render-plugin-templates` fans the matrix into per-cell `work`
- *                 plugins: wrapped `gpt-5.5-*` cells (worker runs the wrapper
- *                 driver) beside native `opus/sonnet-*` cells.
+ *                 plugins: the wrapped `gpt-5.3-codex-spark` cell (worker runs the
+ *                 wrapper driver) beside native `opus/sonnet-*` cells.
  *   2. RESOLVE  — the producer route seam (`resolveWorkerCell` + `defaultRouteProbe`)
  *                 classifies the roster: a served wrapped model routes, an unserved
  *                 one is no-route, a native model resolves its cell dir.
- *   3. PROVIDERS— `agent providers resolve` orders the candidates by pecking order,
- *                 and reordering the roster flips which harness serves first.
+ *   3. PROVIDERS— `agent providers resolve` orders the candidates by pecking order;
+ *                 the fixture serves the spark capability token via a SINGLE codex
+ *                 provider, as a bare token (codex needs no alias — ADR 0010).
  *   4. RUN      — one real detached `keeper agent run <provider>` from a real git
  *                 worktree: the foreign harness's edit lands INSIDE that worktree
  *                 (the cwd-anchoring this design leans on) and the run captures a
  *                 `completed` envelope.
+ *   5. CLOSE-OUT— the wrapper's OWN Phase 3/4: it re-runs its authoritative test
+ *                 pass, soft-resets any foreign commit(s) back to the pre-launch
+ *                 base, stages the git-derived change set by explicit path, and
+ *                 lands exactly ONE commit carrying its OWN sanitized Task/Job-Id
+ *                 trailers (stripping any forged trailer the provider tried to
+ *                 smuggle into its declared `commit_message`).
  *
  * The foreign harness is a deterministic STUB on the launch PATH — this suite pins
  * keeper's launch/anchor/envelope plumbing, never a real model call (mirroring the
@@ -31,6 +38,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -71,16 +79,11 @@ if (SLOW_ENABLED && TMUX_BIN === null) {
 }
 
 /** A fixture roster: claude native (opus/sonnet), and the wrapped capability
- *  model `gpt-5.5` served by codex then pi (`order` = the cost pecking order). */
-function matrixYaml(order: "codex-first" | "pi-first"): string {
-  const codex = [
-    "  - name: codex",
-    "    models:",
-    "      - gpt-5.5: gpt-5.5-codex",
-  ];
-  const pi = ["  - name: pi", "    models:", "      - gpt-5.5"];
-  const wrapped =
-    order === "codex-first" ? [...codex, ...pi] : [...pi, ...codex];
+ *  model `gpt-5.3-codex-spark` served by a single codex provider AS A BARE
+ *  TOKEN — codex accepts bare model ids (ADR 0010), so activation needs no
+ *  alias. The provider-qualified slashed alias-target form pi requires is
+ *  unit/parity-proven on the axes task and needs no e2e duplication here. */
+function matrixYaml(): string {
   return [
     "efforts:",
     "  - medium",
@@ -90,7 +93,9 @@ function matrixYaml(order: "codex-first" | "pi-first"): string {
     "    models:",
     "      - opus",
     "      - sonnet",
-    ...wrapped,
+    "  - name: codex",
+    "    models:",
+    "      - gpt-5.3-codex-spark",
     "subagents:",
     "  - work",
     "wrapper_driver:",
@@ -137,7 +142,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
 
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), "wrapped-e2e-"));
-      configDir = configDirWith(root, "config", matrixYaml("codex-first"));
+      configDir = configDirWith(root, "config", matrixYaml());
 
       // Render the plan plugin into a throwaway copy (its `.git` marks the
       // project root; the generated trees are stripped first), so the fixture
@@ -176,11 +181,11 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
     test("render fans the roster into wrapped + native worker cells", () => {
       const workersDir = join(renderedPlan, "workers");
       const cells = readdirSync(workersDir).sort();
-      // Native claude cells (opus/sonnet) AND the wrapped gpt-5.5 cells, one per
+      // Native claude cells (opus/sonnet) AND the wrapped spark cell, one per
       // effort in the fixture roster.
       expect(cells).toEqual([
-        "gpt-5.5-high",
-        "gpt-5.5-medium",
+        "gpt-5.3-codex-spark-high",
+        "gpt-5.3-codex-spark-medium",
         "opus-high",
         "opus-medium",
         "sonnet-high",
@@ -190,7 +195,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
       // The wrapped cell's worker runs the WRAPPER DRIVER (sonnet/high) at the
       // wrapped turn cap, never the capability model itself.
       const wrapped = readFileSync(
-        join(workersDir, "gpt-5.5-high", "agents", "worker.md"),
+        join(workersDir, "gpt-5.3-codex-spark-high", "agents", "worker.md"),
         "utf8",
       );
       expect(wrapped).toContain("model: sonnet");
@@ -216,7 +221,9 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
 
       // A wrapped model the roster serves routes; one no provider serves is a
       // no-route; a native claude model routes.
-      expect(defaultRouteProbe("gpt-5.5", load)).toEqual({ kind: "routed" });
+      expect(defaultRouteProbe("gpt-5.3-codex-spark", load)).toEqual({
+        kind: "routed",
+      });
       expect(defaultRouteProbe("nonesuch-9", load)).toEqual({
         kind: "no-route",
         model: "nonesuch-9",
@@ -227,11 +234,11 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
       // stays claude-only by design (the host matrix is the sole overlay), so a
       // served wrapped model surfaces as a ROUTABLE out-of-matrix — distinct from
       // the no-route reject an unserved one gets.
-      const gpt = resolveWorkerCell(
-        composeWorkerCellDir("gpt-5.5", "high"),
-        probe("gpt-5.5"),
+      const spark = resolveWorkerCell(
+        composeWorkerCellDir("gpt-5.3-codex-spark", "high"),
+        probe("gpt-5.3-codex-spark"),
       );
-      expect(gpt).toMatchObject({ ok: false, kind: "out-of-matrix" });
+      expect(spark).toMatchObject({ ok: false, kind: "out-of-matrix" });
 
       const unserved = resolveWorkerCell(
         composeWorkerCellDir("nonesuch-9", "high"),
@@ -254,34 +261,22 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
       }
     });
 
-    test("providers resolve orders candidates by pecking order, and reordering flips it", () => {
-      const codexFirst = runKeeper(
-        ["agent", "providers", "resolve", "gpt-5.5", "high"],
+    test("providers resolve orders the codex candidate for the spark capability token", () => {
+      const result = runKeeper(
+        ["agent", "providers", "resolve", "gpt-5.3-codex-spark", "high"],
         { KEEPER_CONFIG_DIR: configDir },
       );
-      expect(codexFirst.status).toBe(0);
-      const env1 = JSON.parse(codexFirst.stdout);
-      expect(env1.driver).toBe("wrapped");
-      expect(
-        env1.candidates.map((c: { harness: string }) => c.harness),
-      ).toEqual(["codex", "pi"]);
-
-      // Reordering the roster changes which harness serves first — no rebuild,
-      // no re-render, a one-line host edit.
-      const flipped = configDirWith(
-        root,
-        "config-flip",
-        matrixYaml("pi-first"),
-      );
-      const piFirst = runKeeper(
-        ["agent", "providers", "resolve", "gpt-5.5", "high"],
-        { KEEPER_CONFIG_DIR: flipped },
-      );
-      expect(piFirst.status).toBe(0);
-      const env2 = JSON.parse(piFirst.stdout);
-      expect(
-        env2.candidates.map((c: { harness: string }) => c.harness),
-      ).toEqual(["pi", "codex"]);
+      expect(result.status).toBe(0);
+      const env = JSON.parse(result.stdout);
+      expect(env.driver).toBe("wrapped");
+      // A bare capability token: codex needs no native-id alias to serve it.
+      expect(env.candidates).toEqual([
+        {
+          harness: "codex",
+          model_id: "gpt-5.3-codex-spark",
+          preset_name: "codex-gpt-5.3-codex-spark",
+        },
+      ]);
     });
 
     test("a real detached wrapped run anchors the foreign edit in the worktree and captures a completed envelope", () => {
@@ -369,7 +364,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
           "pi",
           "write the file",
           "--model",
-          "gpt-5.5",
+          "gpt-5.3-codex-spark",
           "--effort",
           "high",
           "--output",
@@ -415,5 +410,329 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         rmSync(runRoot, { recursive: true, force: true });
       }
     });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Close-out extension — the wrapped worker's back half (worker-implement-
+// wrapped.md Phase 3/4), proven against a real detached leg and real git. Only
+// the foreign CLI is faked (the same `pi` stub harness the run leg above
+// proves the launch/anchor/envelope plumbing against); the re-test, the
+// soft-reset, the explicit-path staging, and the commit all run for real.
+//
+// Residual observed while extending, NOT asserted here (lifecycle-owner
+// territory, out of this task's scope): a wrapper that crashes mid-run leaves
+// its detached leg orphaned rather than reaped — `keeper agent wait` polls a
+// transcript path, not the wrapper's own liveness, so nothing here kills a leg
+// whose wrapper died. The landed pidfile records the leg's pid for a LIVE
+// wrapper to reap on resume; it carries no ownership signal once the wrapper
+// itself is gone.
+// ---------------------------------------------------------------------------
+
+const FEATURE_MARKER = "SPARK_OK";
+const FIXTURE_TASK_ID = "fn-0000-wrapped-e2e-fixture.1";
+const FORGED_JOB_ID = "11111111-1111-1111-1111-111111111111";
+const FORGED_SIGNOFF = "Evil Corp <evil@example.com>";
+
+/** Mirrors `cli/commit-work.ts`'s `FORBIDDEN_TRAILER_RE` — the wrapper's own
+ *  sanitize step, run on the provider's DECLARED `commit_message` before the
+ *  wrapper appends its OWN `Task:`/`Job-Id:` trailers via the explicit-path
+ *  escape hatch (the foreign edit is never session-attributed, so
+ *  `keeper commit-work` cannot stage it). */
+const FORBIDDEN_TRAILER_LINE_RE =
+  /^(Job-Id:|Session-Id:|Signed-off-by:|Planctl-[A-Za-z]+:)/;
+
+function sanitizeProviderMessage(msg: string): string {
+  return msg
+    .split("\n")
+    .filter((line) => !FORBIDDEN_TRAILER_LINE_RE.test(line))
+    .join("\n")
+    .replace(/\n+$/, "");
+}
+
+/** Run git for test setup/assertions; throws on a non-zero exit (a setup bug,
+ *  never an expected-failure path in this suite). */
+function gitCapture(args: string[], cwd: string, input?: string): string {
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", input });
+  if (r.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+  }
+  return r.stdout;
+}
+
+/** One close-out fixture case: the bash lines the STUB `pi` leg runs inside the
+ *  worktree (the "foreign work" — an edit, plus zero/one/many contract-
+ *  violating commits), and the wrapped-worker JSON envelope it returns as its
+ *  final message — the contract's `{status, summary, files_changed, tests,
+ *  commit_message}` shape, parsed and adjudicated by the wrapper exactly like a
+ *  real leg's claim would be. */
+interface CloseOutCase {
+  name: string;
+  foreignWork: string[];
+  message: {
+    status: string;
+    summary: string;
+    files_changed: string[];
+    tests: string;
+    commit_message: string;
+  };
+}
+
+const CLOSE_OUT_CASES: CloseOutCase[] = [
+  {
+    name: "a clean leg (no foreign commit) lands as one sanitized wrapper commit",
+    foreignWork: [`printf '${FEATURE_MARKER}\\n' > feature.txt`],
+    message: {
+      status: "completed",
+      summary: "Implemented the bounded change.",
+      files_changed: ["feature.txt"],
+      tests: "passed",
+      commit_message: "feat: add feature\n\nImplements the bounded change.",
+    },
+  },
+  {
+    name: "a single contract-violating foreign commit is soft-reset to one wrapper commit",
+    foreignWork: [
+      `printf '${FEATURE_MARKER}\\n' > feature.txt`,
+      "git add feature.txt",
+      'git commit -q -m "feat: sneaky provider commit"',
+    ],
+    message: {
+      status: "completed",
+      summary: "Implemented the bounded change.",
+      files_changed: ["feature.txt"],
+      tests: "passed",
+      commit_message: "feat: add feature",
+    },
+  },
+  {
+    name: "multiple contract-violating foreign commits normalize to one wrapper commit",
+    foreignWork: [
+      `printf '${FEATURE_MARKER}\\n' > feature.txt`,
+      "git add feature.txt",
+      'git commit -q -m "feat: first sneaky commit"',
+      `printf '${FEATURE_MARKER}\\nmore\\n' > feature.txt`,
+      "git add feature.txt",
+      'git commit -q -m "feat: second sneaky commit"',
+    ],
+    message: {
+      status: "completed",
+      summary: "Implemented the bounded change.",
+      files_changed: ["feature.txt"],
+      tests: "passed",
+      commit_message: "feat: add feature",
+    },
+  },
+  {
+    name: "a forged trailer smuggled into the declared commit message is sanitized before landing",
+    foreignWork: [`printf '${FEATURE_MARKER}\\n' > feature.txt`],
+    message: {
+      status: "completed",
+      summary: "Implemented the bounded change.",
+      files_changed: ["feature.txt"],
+      tests: "passed",
+      commit_message: `feat: add feature\n\nJob-Id: ${FORGED_JOB_ID}\nSigned-off-by: ${FORGED_SIGNOFF}`,
+    },
+  },
+];
+
+function runCloseOutCase(tc: CloseOutCase, tmuxTmpDirs: string[]): void {
+  const runRoot = mkdtempSync(join(tmpdir(), "wrapped-close-"));
+  const home = join(runRoot, "home");
+  mkdirSync(home, { recursive: true });
+  const binDir = join(runRoot, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const worktree = join(runRoot, "worktree");
+  mkdirSync(worktree, { recursive: true });
+  const tmuxTmp = mkdtempSync(join(tmpdir(), "kw-"));
+  tmuxTmpDirs.push(tmuxTmp);
+
+  const gitEnv = { ...process.env, HOME: home };
+  for (const args of [
+    ["init", "-q"],
+    ["config", "user.email", "e2e@keeper.test"],
+    ["config", "user.name", "e2e"],
+  ]) {
+    const g = spawnSync("git", args, { cwd: worktree, env: gitEnv });
+    if (g.status !== 0) {
+      throw new Error(`git ${args.join(" ")} failed: ${g.stderr}`);
+    }
+  }
+  // The wrapper's OWN re-test authority (Phase 3): a real, deterministic check
+  // the close-out runs post-leg — never the provider's `tests` claim.
+  writeFileSync(
+    join(worktree, "check.sh"),
+    `#!/usr/bin/env bash\nset -e\ngrep -q '${FEATURE_MARKER}' feature.txt\n`,
+  );
+  const addCheck = spawnSync("git", ["add", "check.sh"], {
+    cwd: worktree,
+    env: gitEnv,
+  });
+  if (addCheck.status !== 0) {
+    throw new Error(`git add check.sh failed: ${addCheck.stderr}`);
+  }
+  const commitCheck = spawnSync("git", ["commit", "-q", "-m", "base"], {
+    cwd: worktree,
+    env: gitEnv,
+  });
+  if (commitCheck.status !== 0) {
+    throw new Error(`git commit base failed: ${commitCheck.stderr}`);
+  }
+  const baseSha = gitCapture(["rev-parse", "HEAD"], worktree).trim();
+
+  writeFileSync(join(home, ".bash_profile"), `export PATH="${binDir}:$PATH"\n`);
+
+  // The leg's declared return value — attacker-influenced text in production,
+  // here a fixed fixture — rides as the pi transcript's final assistant text.
+  const messageJsonText = JSON.stringify(tc.message);
+  const stub = [
+    "#!/usr/bin/env bash",
+    'sid=""; prev=""',
+    'for a in "$@"; do',
+    '  [ "$prev" = "--session-id" ] && sid="$a"',
+    '  prev="$a"',
+    "done",
+    ...tc.foreignWork,
+    'if [ -n "$sid" ]; then',
+    "  enc=\"--$(pwd | sed 's:^/::; s:/*$::; s:/:-:g')--\"",
+    '  d="$HOME/.pi/agent/sessions/$enc"',
+    '  mkdir -p "$d"',
+    `  printf '%s\\n' '{"type":"message","message":{"role":"assistant","stopReason":"endTurn","content":[{"type":"text","text":${JSON.stringify(messageJsonText)}}]}}' > "$d/$sid.jsonl"`,
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
+  const stubPath = join(binDir, "pi");
+  writeFileSync(stubPath, stub);
+  chmodSync(stubPath, 0o755);
+
+  const envJson = join(runRoot, "envelope.json");
+  const runEnv: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    HOME: home,
+    SHELL: "/bin/bash",
+    TMUX_TMPDIR: tmuxTmp,
+    PATH: `${binDir}:${process.env.PATH}`,
+  };
+  delete runEnv.TMUX;
+
+  const r = spawnSync(
+    BUN,
+    [
+      KEEPER_CLI,
+      "agent",
+      "run",
+      "pi",
+      "write the file",
+      "--model",
+      "gpt-5.3-codex-spark",
+      "--effort",
+      "high",
+      "--output",
+      envJson,
+      "--stop-timeout",
+      "30s",
+    ],
+    { cwd: worktree, env: runEnv, encoding: "utf8", timeout: 120_000 },
+  );
+
+  try {
+    expect(r.status).toBe(0);
+    const envelope = JSON.parse(readFileSync(envJson, "utf8"));
+    expect(envelope.outcome).toBe("completed");
+    const parsed = JSON.parse(
+      envelope.message as string,
+    ) as CloseOutCase["message"];
+
+    // Phase 3 — adjudicate: the wrapper re-runs ITS OWN authoritative test
+    // pass; the provider's `tests` field is a claim, never evidence.
+    const check = spawnSync("bash", ["check.sh"], {
+      cwd: worktree,
+      encoding: "utf8",
+    });
+    expect(check.status).toBe(0);
+
+    // Phase 4 — normalize: soft-reset any foreign commit(s) back to the
+    // pre-launch base (single or multi, byte-identical handling).
+    const headAfterLeg = gitCapture(["rev-parse", "HEAD"], worktree).trim();
+    if (headAfterLeg !== baseSha) {
+      gitCapture(["reset", "--soft", baseSha], worktree);
+    }
+
+    // Stage the git-derived change set by explicit path — never `-A`/`.` —
+    // reconciled BOTH directions against the provider's own `files_changed`.
+    const tracked = gitCapture(["diff", "--name-only", baseSha], worktree)
+      .split("\n")
+      .filter(Boolean);
+    const untracked = gitCapture(
+      ["ls-files", "--others", "--exclude-standard"],
+      worktree,
+    )
+      .split("\n")
+      .filter(Boolean);
+    const changed = Array.from(new Set([...tracked, ...untracked])).sort();
+    expect(changed).toEqual([...parsed.files_changed].sort());
+    gitCapture(["add", "--", ...changed], worktree);
+
+    // Sanitize the provider's declared message through the forbidden-trailer
+    // gate, then land ONE commit carrying the wrapper's OWN Task/Job-Id
+    // trailers via `git interpret-trailers` (the escape-hatch commit path).
+    const sanitized = sanitizeProviderMessage(parsed.commit_message);
+    const jobId = randomUUID();
+    const trailered = gitCapture(
+      [
+        "interpret-trailers",
+        "--trailer",
+        `Task=${FIXTURE_TASK_ID}`,
+        "--trailer",
+        `Job-Id=${jobId}`,
+      ],
+      worktree,
+      sanitized,
+    );
+    gitCapture(["commit", "-F", "-"], worktree, trailered);
+
+    // Exactly ONE wrapper commit lands beyond the pre-launch base, whether the
+    // leg made zero, one, or two foreign commits.
+    expect(
+      gitCapture(["rev-list", `${baseSha}..HEAD`, "--count"], worktree).trim(),
+    ).toBe("1");
+
+    const finalMessage = gitCapture(["log", "-1", "--format=%B"], worktree);
+    expect(finalMessage).toContain(`Task: ${FIXTURE_TASK_ID}`);
+    expect(finalMessage).toContain(`Job-Id: ${jobId}`);
+    // A forged trailer smuggled into the provider's declared message never
+    // survives the sanitizer.
+    expect(finalMessage).not.toContain(FORGED_JOB_ID);
+    expect(finalMessage).not.toContain(FORGED_SIGNOFF);
+
+    // Tree state matches the landed commit exactly — nothing left uncommitted.
+    expect(gitCapture(["status", "--porcelain"], worktree).trim()).toBe("");
+    expect(readFileSync(join(worktree, "feature.txt"), "utf8")).toContain(
+      FEATURE_MARKER,
+    );
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
+  "wrapped-cell e2e — close-out: wrapper re-test, soft-reset, sanitized single commit (KEEPER_RUN_SLOW)",
+  () => {
+    const tmuxTmpDirs: string[] = [];
+
+    afterAll(() => {
+      for (const dir of tmuxTmpDirs) {
+        const env: NodeJS.ProcessEnv = { ...process.env, TMUX_TMPDIR: dir };
+        delete env.TMUX;
+        delete env.TMUX_PANE;
+        spawnSync("tmux", ["-L", "default", "kill-server"], { env });
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    for (const tc of CLOSE_OUT_CASES) {
+      test(tc.name, () => runCloseOutCase(tc, tmuxTmpDirs));
+    }
   },
 );

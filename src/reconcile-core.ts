@@ -24,8 +24,10 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { workerAgentFor } from "../plugins/plan/src/models.ts";
-import { workerCellDir } from "../plugins/plan/src/subagents_config.ts";
+import {
+  embeddedWorkerAgentFor,
+  workerCellDir,
+} from "../plugins/plan/src/subagents_config.ts";
 import { computeEligibleEpics } from "./armed-closure";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
@@ -205,19 +207,23 @@ export const KEEPER_ROOT: string = ((): string => {
  * or a `close` row) — the null return is load-bearing: it preserves the
  * null-either-axis stop and leaves the launch with no `--plugin-dir` (falling
  * back to the always-loaded `plan` plugin). THROWS for a non-null value outside
- * the configured matrix (reusing {@link workerAgentFor}'s corrupt-on-disk guard)
- * rather than blind-joining a bogus cell path — the caller catches the throw and
+ * the configured matrix (reusing {@link embeddedWorkerAgentFor}'s corrupt-on-disk
+ * guard) rather than blind-joining a bogus cell path — the caller catches the throw and
  * turns it into a visible sticky `DispatchFailed`, never an opaque
  * agent-not-found inside a spawned session. Pure: `subagentsMatrix()` is a
- * memoized embed parse (no I/O) and `KEEPER_ROOT` is resolved once at load.
+ * memoized embed parse (no I/O) and `KEEPER_ROOT` is resolved once at load. The
+ * embedded-only validator keeps the verdict path off the host matrix — a wrapped
+ * host-roster cell falls through to the producer's graceful no-route reject.
  */
 export function workerCellPluginDir(
   model: string | null,
   tier: string | null,
 ): string | null {
-  // Validate the pair against the matrix (throws on out-of-matrix) and reuse the
-  // null-either-axis stop — the composed agent name itself is discarded here.
-  if (workerAgentFor(tier, model) === null) {
+  // Validate the pair against the embedded matrix (throws on out-of-matrix) and
+  // reuse the null-either-axis stop — the composed agent name itself is discarded
+  // here. Embedded-only (never the host-effective workerAgentFor) so the pure
+  // reconcile closure never reads matrix.yaml.
+  if (embeddedWorkerAgentFor(tier, model) === null) {
     return null;
   }
   // Non-null here ⇒ both axes are non-null and in-matrix.

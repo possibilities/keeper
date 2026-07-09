@@ -246,4 +246,190 @@ describe("loadHostMatrix / loadMatrix cross-island parity", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // ── slashed-alias-target parity corpus ──────────────────────────────────────
+  // The alias TARGET (native id a capability resolves to) admits `/` so a
+  // provider-qualified id like `openai/gpt-5.5` is expressible; alias KEYS and axis
+  // tokens stay strict. Both islands must accept/reject the identical corpus.
+
+  const SLASHED_TARGET_ROSTER = [
+    "efforts: [high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    models:",
+    "      - gpt-5.5: openai/gpt-5.5",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  const SLASHED_KEY_ROSTER = [
+    "efforts: [high]",
+    "providers:",
+    "  - name: codex",
+    "    models:",
+    "      - openai/gpt-5.5: gpt-5.5-codex",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  const SLASHED_AXIS_ROSTER = [
+    "efforts: [hi/gh]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  test("both islands accept a slashed alias TARGET (launcher carries it, plan validates-then-discards)", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "matrix.yaml");
+      writeFileSync(path, SLASHED_TARGET_ROSTER);
+      const host = loadHostMatrix(path);
+      const launcher = loadMatrix(path);
+      expect(host).not.toBeNull();
+      expect(launcher).not.toBeNull();
+      // Plan island: the model axis is the capability tokens; the native id is discarded.
+      expect(host?.models).toEqual(["opus", "gpt-5.5"]);
+      // Launcher island: the native id is carried through verbatim as the alias target.
+      expect(
+        launcher?.providers
+          .find((p) => p.name === "codex")
+          ?.models.get("gpt-5.5"),
+      ).toBe("openai/gpt-5.5");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("both islands reject a slashed alias KEY (capability stays strict)", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "matrix.yaml");
+      writeFileSync(path, SLASHED_KEY_ROSTER);
+      expect(() => loadHostMatrix(path)).toThrow(SubagentsConfigError);
+      expect(() => loadMatrix(path)).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("both islands reject a slashed axis token (efforts stays strict)", () => {
+    const dir = tmp();
+    try {
+      const path = join(dir, "matrix.yaml");
+      writeFileSync(path, SLASHED_AXIS_ROSTER);
+      expect(() => loadHostMatrix(path)).toThrow(SubagentsConfigError);
+      expect(() => loadMatrix(path)).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// The configured-axes seam (configuredEfforts/configuredModels/workerAgentFor)
+// reads the composed EFFECTIVE matrix: the host provider matrix when present, the
+// embedded snapshot (byte-identical) when absent. A host matrix fixture is injected
+// via KEEPER_CONFIG_DIR (os.homedir ignores $HOME on macOS) — never the real host
+// file — and the no-matrix pins point at an empty config dir so they hold
+// regardless of the developer's own ~/.config/keeper.
+describe("configured-axes effective seam", () => {
+  function withConfigDir<T>(dir: string, fn: () => T): T {
+    const prev = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = dir;
+    try {
+      return fn();
+    } finally {
+      if (prev === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = prev;
+      }
+    }
+  }
+
+  // A host roster growing the model axis with the wrapped capability gpt-5.5 and
+  // narrowing the effort axis to [medium, high] — deliberately unlike the embedded
+  // defaults so a fall-through to the snapshot would be visible.
+  const HOST_ROSTER = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    models:",
+    "      - gpt-5.5: openai/gpt-5.5",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  test("a present host matrix drives the axes; a host-roster cell composes + validates", () => {
+    const dir = tmp();
+    try {
+      writeFileSync(join(dir, "matrix.yaml"), HOST_ROSTER);
+      withConfigDir(dir, () => {
+        expect(configuredEfforts()).toEqual(["medium", "high"]);
+        expect(configuredModels()).toEqual(["opus", "gpt-5.5"]);
+        // The host-roster wrapped model composes its agent instead of throwing.
+        expect(workerAgentFor("high", "gpt-5.5")).toBe(
+          "plan:worker-gpt-5.5-high",
+        );
+        expect(workerAgentFor("medium", "opus")).toBe(
+          "plan:worker-opus-medium",
+        );
+        // The effective axes REPLACE the embedded ones — a snapshot-only model/effort
+        // is now out-of-axis and throws (the corrupt-state backstop).
+        expect(() => workerAgentFor("high", "sonnet")).toThrow(/unknown model/);
+        expect(() => workerAgentFor("xhigh", "gpt-5.5")).toThrow(
+          /unknown tier/,
+        );
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an absent host matrix falls back to the embedded axes byte-identically", () => {
+    // An empty config dir (no matrix.yaml) → the embedded snapshot, host-independent.
+    const dir = tmp();
+    try {
+      withConfigDir(dir, () => {
+        expect(configuredEfforts()).toEqual([
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+        ]);
+        expect(configuredModels()).toEqual(["opus", "sonnet"]);
+        expect(workerAgentFor("medium", "opus")).toBe(
+          "plan:worker-opus-medium",
+        );
+        // A host-only capability is out-of-axis with no matrix present.
+        expect(() => workerAgentFor("high", "gpt-5.5")).toThrow(
+          /unknown model/,
+        );
+        // A null on either axis is still the /plan:work null-stop signal.
+        expect(workerAgentFor(null, "opus")).toBeNull();
+        expect(workerAgentFor("medium", null)).toBeNull();
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -4,7 +4,8 @@
 // spine utilities applying the same optional-field defaults Python does, so a
 // later mutating-verb wave inherits the shape rather than re-deriving it.
 
-import { subagentsMatrix } from "./subagents_config.ts";
+import { effectiveMatrix } from "./host_matrix.ts";
+import { composeWorkerAgent } from "./subagents_config.ts";
 
 export const SCHEMA_VERSION = 1;
 
@@ -132,46 +133,40 @@ export function taskPriority(taskData: Record<string, unknown>): number {
   return 999;
 }
 
-/** The canonical worker reasoning tiers (efforts), sourced from the committed
- * subagents.yaml matrix — the single source of truth workerAgentFor maps.
- * Read lazily (never at module eval) so a malformed config surfaces a typed
- * error at the call site inside a verb, not as an import-time crash. */
+/** The canonical worker reasoning tiers (efforts), sourced from the composed
+ * EFFECTIVE matrix — the host provider matrix when `matrix.yaml` is present, the
+ * embedded subagents snapshot (byte-identical to today) when absent. This is the
+ * single validation seam every membership-checking verb (assign-cells, scaffold,
+ * refine-apply, close-finalize) inherits, so a host-roster effort axis lands
+ * without each verb re-reading the embedded snapshot. Read lazily (never at module
+ * eval) so a malformed config surfaces a typed error at a verb call site, and
+ * re-read per call so an operator matrix edit lands with no rebuild. */
 export function configuredEfforts(): readonly string[] {
-  return subagentsMatrix().efforts;
+  return effectiveMatrix().efforts;
 }
 
-/** The canonical worker models, sourced from the committed subagents.yaml
- * matrix — the model axis of the {model × effort} matrix. Read lazily, same
- * contract as configuredEfforts. */
+/** The canonical worker models — the model axis of the composed EFFECTIVE matrix
+ * (host provider matrix when present, embedded snapshot when absent). Same seam
+ * and lazy/per-call contract as configuredEfforts. */
 export function configuredModels(): readonly string[] {
-  return subagentsMatrix().models;
+  return effectiveMatrix().models;
 }
 
-/** Derive a task's worker null-gate signal from its {tier, model}. The composed
- * string is `plan:worker-<model>-<effort>`, but only its NULL-NESS is
- * load-bearing: /plan:work spawns the constant `work:worker` (the launcher
- * selects the matching cell at launch via --plugin-dir), so the composed value
- * is vestigial for the spawn. Returns null when EITHER axis is null (a record
- * carrying no tier or no model) — the null return is what stops /plan:work
- * cleanly. Throws for a non-null value outside the configured efforts/models
- * (corrupt-on-disk guard). */
+/** Derive a task's worker null-gate signal from its {tier, model}, validated
+ * against the composed EFFECTIVE matrix (host-aware; embedded-identical when no
+ * matrix). The composed string is `plan:worker-<model>-<effort>`, but only its
+ * NULL-NESS is load-bearing: /plan:work spawns the constant `work:worker` (the
+ * launcher selects the matching cell at launch via --plugin-dir), so the composed
+ * value is vestigial for the spawn. Returns null when EITHER axis is null — the
+ * null return is what stops /plan:work cleanly. Throws for a non-null value outside
+ * the effective efforts/models: the corrupt-state backstop behind dispatch's
+ * graceful no-route reject, which fires first on any unroutable cell and gates
+ * claim. The reconcile verdict path uses the embedded-only sibling
+ * (`embeddedWorkerAgentFor`) so its host read stays off the pure core. */
 export function workerAgentFor(
   tier: string | null,
   model: string | null,
 ): string | null {
-  if (tier === null || model === null) {
-    return null;
-  }
-  const matrix = subagentsMatrix();
-  if (!matrix.efforts.includes(tier)) {
-    throw new Error(
-      `unknown tier ${JSON.stringify(tier)}; expected one of ${matrix.efforts.join(", ")} or null`,
-    );
-  }
-  if (!matrix.models.includes(model)) {
-    throw new Error(
-      `unknown model ${JSON.stringify(model)}; expected one of ${matrix.models.join(", ")} or null`,
-    );
-  }
-  return `plan:worker-${model}-${tier}`;
+  const matrix = effectiveMatrix();
+  return composeWorkerAgent(matrix.efforts, matrix.models, tier, model);
 }

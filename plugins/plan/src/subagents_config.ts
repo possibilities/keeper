@@ -138,3 +138,44 @@ export const WORKERS_BASE = "workers";
 export function workerCellDir(model: string, effort: string): string {
   return `${WORKERS_BASE}/${model}-${effort}`;
 }
+
+/** Pure {model, effort} → worker-agent-name composition over an EXPLICIT axis
+ * pair. Returns null on EITHER null axis (the /plan:work null-stop signal); throws
+ * the corrupt-on-disk guard for a non-null value outside its axis. The axis SOURCE
+ * — the embedded snapshot vs the host-effective matrix — is the caller's choice, so
+ * this composer stays fs-free and safe for the pure reconcile-core closure. */
+export function composeWorkerAgent(
+  efforts: readonly string[],
+  models: readonly string[],
+  tier: string | null,
+  model: string | null,
+): string | null {
+  if (tier === null || model === null) {
+    return null;
+  }
+  if (!efforts.includes(tier)) {
+    throw new Error(
+      `unknown tier ${JSON.stringify(tier)}; expected one of ${efforts.join(", ")} or null`,
+    );
+  }
+  if (!models.includes(model)) {
+    throw new Error(
+      `unknown model ${JSON.stringify(model)}; expected one of ${models.join(", ")} or null`,
+    );
+  }
+  return `plan:worker-${model}-${tier}`;
+}
+
+/** Worker-agent composition against the EMBEDDED snapshot only — the fs-free,
+ * closure-safe variant the reconcile verdict path uses to validate a task's
+ * {model, effort} cell. The host-effective variant (`workerAgentFor` in models.ts)
+ * reads the host matrix and lives OUTSIDE this pure closure; keeping the reconcile
+ * path on the embedded axes is what leaves a wrapped host-roster cell to the
+ * producer's graceful no-route reject rather than a verdict-path host read. */
+export function embeddedWorkerAgentFor(
+  tier: string | null,
+  model: string | null,
+): string | null {
+  const matrix = subagentsMatrix();
+  return composeWorkerAgent(matrix.efforts, matrix.models, tier, model);
+}
