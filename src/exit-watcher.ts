@@ -656,8 +656,8 @@ export function selectStuckSentinelVerdicts(
           heal: false,
           reason: sentinelReason("stale-working", clockSkew),
         });
+        continue;
       }
-      continue;
     }
     if (clockSkew) {
       out.push({
