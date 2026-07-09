@@ -8560,8 +8560,12 @@ function spawnedWorkerNames(opts?: {
     (globalThis as { Worker: unknown }).Worker = WorkerSpy;
     for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
     // Boot is fully synchronous up to the returned handle (every `new Worker`
-    // fires here, under the spy).
-    handle = startDaemon({ workers: opts?.workers });
+    // fires here, under the spy). Disable the single-instance flock: it runs on
+    // MAIN (not stubbed by WorkerSpy) and would otherwise take the real host lock.
+    handle = startDaemon({
+      workers: opts?.workers,
+      disableSingleInstanceLock: true,
+    });
   } finally {
     (globalThis as { Worker: unknown }).Worker = realWorker;
     for (const k of Object.keys(sandbox)) {

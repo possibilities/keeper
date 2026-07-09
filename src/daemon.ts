@@ -20,7 +20,13 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve as resolvePath, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  join,
+  resolve as resolvePath,
+  sep,
+} from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
@@ -118,6 +124,7 @@ import {
   resolveKeeperAgentPath,
   resolvePlanRoots,
   resolveRestartLedgerPath,
+  resolveSingleInstanceLockPath,
   resolveSockPath,
   resolveStatuslineRoot,
   resolveUsageRoot,
@@ -253,6 +260,7 @@ import type {
   TranscriptWorkerData,
 } from "./transcript-worker";
 import type { Job, SessionTelemetryMessage } from "./types";
+import { FileLock } from "./usage-flock";
 import type { UsageScraperWorkerData } from "./usage-scraper-worker";
 import type {
   UsageMessage,
@@ -5988,6 +5996,14 @@ export interface DaemonOptions {
    */
   disableNativeWatcher?: boolean;
   /**
+   * When `true`, {@link startDaemon} skips the single-instance flock gate — an
+   * in-process daemon never touches the host lock. Required for the in-process
+   * test tier: a Bun worker (and a second {@link startDaemon} in one process)
+   * shares main's pid AND the flock's open-file-description, so a real acquire
+   * would self-conflict. Mirrors {@link DaemonOptions.disableNativeWatcher}.
+   */
+  disableSingleInstanceLock?: boolean;
+  /**
    * Worker-set selector. When supplied, {@link startDaemon} spawns ONLY the named
    * workers; every unselected worker stays `null` with no handlers wired. OMITTED
    * (production default) spawns the full {@link ALL_WORKERS} set.
@@ -6078,6 +6094,93 @@ export function checkKeeperAgentPresence(
 }
 
 /**
+ * Outcome of the single-instance gate, split from its I/O so the fast suite
+ * covers the classification with no real daemon: `acquired` carries the held lock
+ * (main pins it in a module-scope singleton for the process lifetime); `refused`
+ * is a LIVE incumbent holding the flock (the caller exits 1 BEFORE the boot-ledger
+ * append, so a refused boot mints no entry); `degraded` is an inconclusive
+ * primitive — the caller logs loud and boots WITHOUT the gate (fail open).
+ */
+export type SingleInstanceGateOutcome =
+  | { kind: "acquired"; lock: FileLock }
+  | { kind: "refused" }
+  | { kind: "degraded"; reason: string };
+
+/**
+ * Pure classification of a single-instance-lock acquire attempt. `tryAcquire`
+ * mirrors {@link FileLock.tryAcquire}: it returns the held lock, `null` on
+ * contention (`EWOULDBLOCK` — a live incumbent), or THROWS on any other errno (an
+ * inconclusive primitive: dlopen/fcntl/flock failure). Contention fails CLOSED
+ * (`refused`); a throw fails OPEN (`degraded`), so a broken lock primitive can
+ * never wedge every boot.
+ */
+export function decideSingleInstanceGate(
+  tryAcquire: (lockPath: string) => FileLock | null,
+  lockPath: string,
+): SingleInstanceGateOutcome {
+  let lock: FileLock | null;
+  try {
+    lock = tryAcquire(lockPath);
+  } catch (err) {
+    return {
+      kind: "degraded",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return lock === null ? { kind: "refused" } : { kind: "acquired", lock };
+}
+
+/**
+ * The single-instance flock, pinned in module scope on MAIN for the whole daemon
+ * lifetime: NEVER released and NEVER handed to a worker — the flock's FD_CLOEXEC
+ * (set inside {@link FileLock.tryAcquire}) keeps a spawned subprocess from
+ * inheriting it, and a Bun worker shares main's open-file-description. A second
+ * {@link startDaemon} in one process self-conflicts on the flock, which is why
+ * the in-process test tier always sets `disableSingleInstanceLock`.
+ */
+let singleInstanceLock: FileLock | null = null;
+
+/**
+ * Acquire the single-instance flock at the very top of {@link startDaemon} —
+ * before `openDb`/`migrate`/any worker spawn AND before the boot-ledger append.
+ * A live incumbent exits 1 (naming the holder path + the launchctl kickstart
+ * recovery line), so a refused boot never opens the DB and mints no ledger entry.
+ * An inconclusive primitive logs loud and returns, booting WITHOUT the gate.
+ */
+function acquireSingleInstanceLock(): void {
+  if (singleInstanceLock !== null) {
+    // Already held in this process — a re-acquire would self-conflict on our own
+    // flock. Idempotent so a second in-process boot never blocks on itself.
+    return;
+  }
+  const lockPath = resolveSingleInstanceLockPath();
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  } catch {
+    // best-effort; a pre-existing state dir is fine — the flock open still runs
+  }
+  const outcome = decideSingleInstanceGate(
+    (p) => FileLock.tryAcquire(p),
+    lockPath,
+  );
+  if (outcome.kind === "degraded") {
+    console.error(
+      `[keeperd] WARNING: single-instance lock primitive inconclusive at ${lockPath} ` +
+        `(${outcome.reason}) — booting WITHOUT the single-instance gate`,
+    );
+    return;
+  }
+  if (outcome.kind === "refused") {
+    console.error(
+      `[keeperd] refusing to start: another keeperd already holds ${lockPath}\n` +
+        `[keeperd] recover with: launchctl kickstart -k gui/$(id -u)/arthack.keeperd`,
+    );
+    process.exit(1);
+  }
+  singleInstanceLock = outcome.lock;
+}
+
+/**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
  * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
  * but returns a handle whose `stop()` tears everything down WITHOUT
@@ -6088,6 +6191,15 @@ export function checkKeeperAgentPresence(
  */
 export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
+  // Single-instance gate (docs/adr/0030): take a kernel flock on a dedicated
+  // keeperd.lock BEFORE openDb/migrate/any worker spawn, so a second concurrent
+  // daemon can never open — let alone migrate — the DB. A live incumbent exits 1
+  // here (before the boot-ledger append below); an inconclusive primitive fails
+  // open. Skipped only by the in-process test opt (a same-process second boot
+  // shares the flock's open-file-description and would self-conflict).
+  if (!opts.disableSingleInstanceLock) {
+    acquireSingleInstanceLock();
+  }
   // Worker-set selector; omitted → ALL_WORKERS. `want(name)` gates each
   // `new Worker(...)` site below. The fold REDUCER runs on MAIN regardless.
   const selectedWorkers = new Set<WorkerName>(opts.workers ?? ALL_WORKERS);

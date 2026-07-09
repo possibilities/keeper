@@ -1,7 +1,8 @@
 /**
  * Server worker. Runs as keeperd's read-surface Worker thread: a UDS listener
  * speaking the NDJSON protocol from `src/protocol.ts`, its OWN read-only DB
- * connection, and the `<state-dir>/keeperd.lock` ownership lock.
+ * connection, and the `<state-dir>/keeperd.sock.lock` pid-file ownership lock
+ * (distinct from main's `keeperd.lock` single-instance flock).
  *
  * Three beats layer over the one-shot `query → result`: an independent
  * `data_version` poll (`pollLoop`) turns committed changes into per-entity
@@ -1181,6 +1182,40 @@ export function unlinkIfExists(path: string): void {
   } catch {
     // best-effort; a leftover file is reclaimed by the next ownership check
   }
+}
+
+/**
+ * Does the ownership lock at `lockPath` still record OUR pid? A dying stray whose
+ * lock a live successor already stole (the successor rewrote the pid) reads false
+ * here and MUST NOT unlink the successor's socket. A missing / unparseable lock
+ * is "not ours" — ownership can only be proven from our own pid.
+ */
+export function lockOwnedByUs(lockPath: string): boolean {
+  try {
+    if (!existsSync(lockPath)) {
+      return false;
+    }
+    const pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid === process.pid;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ownership-checked teardown: unlink the socket AND the lock ONLY while the lock
+ * still records our pid, so a dying stray never unlinks a live successor's socket
+ * (which a stale-reclaiming successor may have already rebound under this path).
+ */
+export function unlinkOwnedSocketAndLock(
+  lockPath: string,
+  sockPath: string,
+): void {
+  if (!lockOwnedByUs(lockPath)) {
+    return;
+  }
+  unlinkIfExists(sockPath);
+  unlinkIfExists(lockPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -3339,9 +3374,12 @@ export function startServer(
 ): RunningServer {
   acquireLock(lockPath, sockPath);
 
-  // AF_UNIX has no SO_REUSEADDR: a leftover socket file → EADDRINUSE. The lock
-  // is already ours, so unlinking here can't race another instance.
-  unlinkIfExists(sockPath);
+  // AF_UNIX has no SO_REUSEADDR: a leftover socket file → EADDRINUSE. acquireLock
+  // just wrote our pid, so the lock is ours; unlink the stale socket only WHILE we
+  // own the lock, so we never clear a live successor's rebound socket.
+  if (lockOwnedByUs(lockPath)) {
+    unlinkIfExists(sockPath);
+  }
 
   // Live connection registry. The realtime pollLoop iterates this each tick;
   // open() adds, close() removes. Entries are the sockets themselves (typed as
@@ -3516,8 +3554,10 @@ export function startServer(
       } catch {
         // best-effort
       }
-      unlinkIfExists(sockPath);
-      unlinkIfExists(lockPath);
+      // Ownership-checked: a live successor may have stolen the lock (and rebound
+      // the socket) while this instance was dying. Only unlink when the lock still
+      // records our pid, so a dying stray never unlinks a live daemon's socket.
+      unlinkOwnedSocketAndLock(lockPath, sockPath);
     },
   };
 }
