@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 2,
+        "insertions": 56
+      },
+      "done_summary": "Added docs/adr/0025-wrong-tree-write-guard.md capturing the shared-checkout-dirtying rationale and the guard's decision; rewrote wrong-tree-guard.ts header to be forward-facing, pointing to the ADR instead of narrating the incident.",
+      "input_hash": "6a1ace53242ca12ab5cc7ed9c637b6b97b4a416049ea649eff4d5dd9c8c3f37a",
+      "model": "sonnet",
+      "spec_chars": 1364,
+      "spec_md": "## Description\n\nResolves F3 (with F2 merged in) from the fn-1205 close audit. Evidence\npath: `plugins/keeper/plugin/hooks/wrong-tree-guard.ts` header lines 7-9\nnarrate a past incident in past tense (\"a lane worker wrote src/* into the\nshared main checkout while its lane sat clean, starving the repair route\"),\nviolating CLAUDE.md rule #0's ban on past-tense provenance in code\ncomments. F2 (no `docs/adr` entry for the new hook) shares this task\nbecause its remedy is the same canonical-home ADR.\n\nFiles:\n- `docs/adr/` \u2014 add a new ADR entry capturing the shared-checkout-dirtying\n  rationale and the wrong-tree-guard best-effort-audit decision (this is\n  the canonical home for the narrative currently in the code comment).\n- `plugins/keeper/plugin/hooks/wrong-tree-guard.ts` \u2014 rewrite the header\n  comment to be forward-facing (what the guard does now), removing the\n  past-tense incident narrative.\n\n## Acceptance\n\n- [ ] New `docs/adr` entry records the incident rationale and the guard decision.\n- [ ] `wrong-tree-guard.ts` header carries no past-tense provenance; describes current behavior only.\n\n## Done summary\nAdded docs/adr/0025-wrong-tree-write-guard.md capturing the shared-checkout-dirtying rationale and the guard's decision; rewrote wrong-tree-guard.ts header to be forward-facing, pointing to the ADR instead of narrating the incident.\n## Evidence\n",
+      "task_id": "fn-1208-home-wrong-tree-guard-rationale-in-an.1",
+      "tier": "medium",
+      "title": "Move guard rationale to ADR"
+    }
+  ],
+  "created_at": "2026-07-09T00:50:30.375000Z",
+  "epic_id": "fn-1208-home-wrong-tree-guard-rationale-in-an",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "6a1ace53242ca12ab5cc7ed9c637b6b97b4a416049ea649eff4d5dd9c8c3f37a",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
