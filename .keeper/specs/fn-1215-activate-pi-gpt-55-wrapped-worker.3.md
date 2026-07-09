@@ -5,16 +5,16 @@
 
 ### Approach
 
-The existing slow-tier wrapped e2e proves render → resolve → providers → one real detached foreign run, and stops once the foreign edit lands in the worktree. Extend it through the wrapped worker's close-out so first activation rests on a proven loop, faking ONLY the foreign CLI: the stub pi gains modes that (a) edit and exit clean, (b) make one contract-violating commit, and (c) make multiple commits — while the detach path, the re-test, the soft-reset, and the commit run real.
+The existing slow-tier wrapped e2e proves render → resolve → providers → one real detached foreign run, and stops once the foreign edit lands in the worktree. Extend it through the wrapped worker's close-out so first activation rests on a proven loop, faking ONLY the foreign CLI: the stub harness gains modes that (a) edit and exit clean, (b) make one contract-violating commit, and (c) make multiple commits — while the detach path, the re-test, the soft-reset, and the commit run real.
 
-The back half to prove, per the wrapped worker contract: the wrapper re-runs the authoritative (deterministic stub) test pass itself; a contract-violating foreign commit — single or multi — is normalized by soft-reset to the pre-launch base; the staging set derives from git against that base by explicit path (the foreign edit is not session-attributed, so the escape-hatch commit path is the one production takes); exactly ONE wrapper commit lands carrying Task and Job-Id trailers; and a forged trailer smuggled into the foreign agent's declared commit message (a fake Job-Id or sign-off) is stripped by the sanitizer before landing. The fixture matrix adopts the provider-qualified slashed alias for pi so the charset relaxation is exercised end-to-end, not only in unit corpus. Note the residual to observe while extending: the crashed-wrapper case (leg outliving a dead wrapper) is lifecycle-owner territory — assert whatever the landed pidfile/wait contract provides and record what it does not.
+The fixture routes the wrapped cell the way activation will: a codex provider serving gpt-5.3-codex-spark as a bare capability token (the slashed provider-qualified alias form is unit/parity-proven in the axes task and needs no e2e duplication). The back half to prove, per the wrapped worker contract: the wrapper re-runs the authoritative (deterministic stub) test pass itself; a contract-violating foreign commit — single or multi — is normalized by soft-reset to the pre-launch base; the staging set derives from git against that base by explicit path (the foreign edit is not session-attributed, so the escape-hatch commit path is the one production takes); exactly ONE wrapper commit lands carrying Task and Job-Id trailers; and a forged trailer smuggled into the foreign agent's declared commit message (a fake Job-Id or sign-off) is stripped by the sanitizer before landing. Note the residual to observe while extending: the crashed-wrapper case (leg outliving a dead wrapper) is lifecycle-owner territory — assert whatever the landed pidfile/wait contract provides and record what it does not.
 
 ### Investigation targets
 
 *Verify before relying — planner-verified file:line at authoring time, but the repo moves.*
 
 **Required** (read before coding):
-- test/wrapped-cell-e2e.slow.test.ts:75-104 (fixture incl. the pi provider entry to switch to the slashed alias), :107 configDirWith, :210 loadMatrix use, :403 (where coverage currently ends), the stub-harness scaffolding and tmux/SLOW gating to reuse
+- test/wrapped-cell-e2e.slow.test.ts:75-104 (fixture roster to retarget at codex/gpt-5.3-codex-spark), :107 configDirWith, :210 loadMatrix use, :403 (where coverage currently ends), the stub-harness scaffolding and tmux/SLOW gating to reuse
 - plugins/plan/template/_partials/worker-implement-wrapped.md — the contract being proven: base-sha capture, chunked wait, adjudicate/re-test (:41-45), soft-reset (:49), explicit-path staging + trailer discipline + forged-trailer sanitizer (:53)
 - plugins/plan/test/worktree-lifecycle.test.ts — the real-git slow-block shape (provision → commit → merge → teardown) to model the git half on
 - plugins/keeper/plugin/hooks/branch-guard.ts — confirm the deny set (branch create/switch, mutating stash) does not catch the wrapper's own git reset
@@ -34,7 +34,7 @@ One describe extension (or sibling slow file) covering: clean-leg → wrapper co
 ## Acceptance
 
 - [ ] The slow-tier wrapped e2e proves, against a real detached leg and real git: wrapper-owned re-test, soft-reset normalization of single and multi contract-violating foreign commits, exactly one landed wrapper commit whose trailers are sanitized against forgery, staged by explicit path from the git-derived set
-- [ ] The e2e fixture routes pi through a provider-qualified slashed alias end-to-end
+- [ ] The e2e fixture routes the wrapped cell through a codex provider serving the spark capability token
 - [ ] The suite loud-skips without the slow flag or tmux, and the fast tiers remain green
 
 ## Done summary
