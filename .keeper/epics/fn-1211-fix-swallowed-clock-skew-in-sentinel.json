@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T01:02:28.004000Z",
+  "created_by_close_of": "fn-1202-age-deferred-sweeps-into-visibility",
+  "depends_on_epics": [
+    "fn-1202-age-deferred-sweeps-into-visibility"
+  ],
+  "id": "fn-1211-fix-swallowed-clock-skew-in-sentinel",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix swallowed clock-skew in sentinel carve-out",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T01:02:28.004000Z"
+}
