@@ -7,7 +7,7 @@
     "fn-1219-reduce-keeperd-restart-churn"
   ],
   "id": "fn-1223-restore-hermes-shim-event-set-drift",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T21:34:07.102000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T21:34:06.025000Z"
+  "updated_at": "2026-07-09T21:34:07.102000Z"
 }
