@@ -43,5 +43,5 @@ Pure in-process per the repo test rules: fingerprint recompute, migrated-vs-fres
 - [ ] The root fast suite is green
 
 ## Done summary
-
+Fold the nullable epics.blocks_closing_of column (schema v117) from the plan snapshot and gate a source epic's close row on it: readiness builds one reverse index per pass and holds the source blocked:close-followup until the follow-up is status-done and close-idle. The reason is non-occupying; a source with no pointing follow-up is byte-identical to today.
 ## Evidence
