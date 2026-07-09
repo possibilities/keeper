@@ -434,9 +434,11 @@ export const COMPLETE_DWELL_MS = 250;
  * subscribe snapshots AND its bounded re-evaluation timer. `since` is the
  * unix-ms at which the current uninterrupted `completed`-at-`watermark`
  * observation began (`null` when the last observation was not `completed`);
- * `watermark` is the target row's version anchoring that dwell, so a version
- * MOVE (a flap's coalesced higher-version `completed`, or a rewound/stale
- * re-delivery) restarts the dwell rather than counting toward it. A pure value —
+ * `watermark` is the target's version anchoring that dwell (an epic target's
+ * own `last_event_id`; a task target's per-task job watermark — see
+ * {@link completeWatermark}), so a version MOVE (a flap's coalesced
+ * higher-version `completed`, or a rewound/stale re-delivery) restarts the
+ * dwell rather than counting toward it. A pure value —
  * the command owns the mutation and supplies the clock, this module only
  * advances it.
  */
@@ -499,14 +501,33 @@ export function advanceCompleteStability(
 }
 
 /**
- * The monotonic version watermark for a `complete` await target — the containing
- * epic's `last_event_id`. A task rides its parent epic's row (which re-folds on
- * any embedded task/job change); an epic rides its own row. This value is
- * ALREADY carried on the subscribe snapshot's `epics` — the stability
+ * The monotonic version watermark for a `complete` await target — the anchor
+ * {@link advanceCompleteStability} watches for a MOVE to restart the dwell.
+ *
+ *   - EPIC target: the epic's own `last_event_id`.
+ *   - TASK target: the MAX `last_event_id` across the task's OWN embedded jobs
+ *     (its `work`/`approve` rows) — a PER-TASK anchor, NOT the containing epic's
+ *     `last_event_id`.
+ *
+ * The task anchor is deliberately per-task. The `epics` row re-folds — bumping
+ * its `last_event_id` — on ANY embedded task/job change, so in a multi-task epic
+ * a sibling task's benign churn would move an epic-scoped anchor and keep
+ * resetting the target's dwell until the WHOLE epic quiets — a task-complete
+ * await that never settles. A task's own embedded jobs, by contrast, only
+ * re-version when THAT task's own worker writes, which is exactly the
+ * `completed`↔`running` flap driver: the owning worker re-activating during
+ * close-out bumps its embedded job's `last_event_id` (even when diffTick
+ * coalesces the intervening `running` into a single higher-version `completed`
+ * patch). So sibling churn no longer registers as a move, while a genuine
+ * target-task flap still restarts the dwell.
+ *
+ * Both values are ALREADY carried on the subscribe snapshot (the epic row's
+ * version, and the embedded jobs nested in the `tasks` blob) — the stability
  * confirmation needs no extra plumbing. Returns `null` when the target isn't
- * present in `epics`, resolves ambiguously (a bare `fn-N` matching 2+ epics), or
- * the row carries no version (a pre-fold reading), degrading the confirmation to
- * the pure consecutive count.
+ * present in `epics`, an epic resolves ambiguously (a bare `fn-N` matching 2+
+ * epics), or a task carries no embedded jobs / no versioned row (a pre-fold
+ * reading) — degrading the confirmation to the pure elapsed dwell, the version
+ * being a secondary guard.
  */
 export function completeWatermark(
   epics: readonly Epic[],
@@ -514,12 +535,31 @@ export function completeWatermark(
 ): number | null {
   if (target.kind === "task") {
     const hit = findTaskById(epics, target.id);
-    return hit?.epic.last_event_id ?? null;
+    return hit === null ? null : taskWatermark(hit.task);
   }
   const resolved = findEpicByIdOrBare(epics, target.id);
   return resolved.kind === "found"
     ? (resolved.epic.last_event_id ?? null)
     : null;
+}
+
+/**
+ * The per-task version anchor: the MAX `last_event_id` across a task's OWN
+ * embedded jobs, or `null` when the task carries none. Each embedded job's
+ * `last_event_id` bumps only when THAT job's row is written, so the max is
+ * invariant to sibling-task churn and moves exactly when the target task's own
+ * worker re-activates — the flap the dwell must catch. Reads only numeric
+ * versions (a malformed foreign-process element is skipped, never throws).
+ */
+function taskWatermark(task: Task): number | null {
+  let max: number | null = null;
+  for (const job of task.jobs) {
+    const v = job.last_event_id;
+    if (typeof v === "number" && (max === null || v > max)) {
+      max = v;
+    }
+  }
+  return max;
 }
 
 // ---------------------------------------------------------------------------

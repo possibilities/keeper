@@ -521,11 +521,22 @@ test("complete-stability: dwellMs <= 0 confirms immediately on the first complet
   expect(step.confirmed).toBe(true);
 });
 
-test("completeWatermark: a task target reads its parent epic's last_event_id, an epic target its own, absent → null", () => {
+test("completeWatermark: a task target reads the MAX of its OWN embedded-job versions, NOT the parent epic's last_event_id", () => {
+  // The parent epic's last_event_id (99) re-folds on ANY sibling churn; the
+  // per-task anchor must instead read the TARGET task's own embedded-job
+  // versions (max 7), so benign sibling churn can never move it.
   const epic = makeEpic({
     epic_id: "fn-1-foo",
-    last_event_id: 42,
-    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    last_event_id: 99,
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        jobs: [
+          makeEmbeddedJob({ job_id: "w1", last_event_id: 5 }),
+          makeEmbeddedJob({ job_id: "w2", last_event_id: 7 }),
+        ],
+      }),
+    ],
   });
   expect(
     completeWatermark([epic], {
@@ -533,14 +544,22 @@ test("completeWatermark: a task target reads its parent epic's last_event_id, an
       kind: "task",
       condition: "complete",
     }),
-  ).toBe(42);
+  ).toBe(7);
+});
+
+test("completeWatermark: a task with no embedded jobs → null (degrades to pure elapsed dwell); absent task → null", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    last_event_id: 99,
+    tasks: [makeTask({ task_id: "fn-1-foo.1", jobs: [] })],
+  });
   expect(
     completeWatermark([epic], {
-      id: "fn-1-foo",
-      kind: "epic",
+      id: "fn-1-foo.1",
+      kind: "task",
       condition: "complete",
     }),
-  ).toBe(42);
+  ).toBeNull();
   expect(
     completeWatermark([epic], {
       id: "fn-9-absent.1",
@@ -548,6 +567,21 @@ test("completeWatermark: a task target reads its parent epic's last_event_id, an
       condition: "complete",
     }),
   ).toBeNull();
+});
+
+test("completeWatermark: an epic target reads its own last_event_id; absent epic → null", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    last_event_id: 42,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  expect(
+    completeWatermark([epic], {
+      id: "fn-1-foo",
+      kind: "epic",
+      condition: "complete",
+    }),
+  ).toBe(42);
   expect(
     completeWatermark([], {
       id: "fn-1-foo",
@@ -555,6 +589,142 @@ test("completeWatermark: a task target reads its parent epic's last_event_id, an
       condition: "complete",
     }),
   ).toBeNull();
+});
+
+test("complete-stability (F3 sibling-churn): a sibling task's churn does NOT reset a task-complete dwell", () => {
+  // A multi-task epic. The TARGET fn-1-foo.1 is done+idle carrying its own work
+  // job at version 5; a SIBLING fn-1-foo.2 is in flight. Sibling churn re-folds
+  // the epic row's last_event_id — the regression the epic-scoped anchor caused
+  // was resetting the target's dwell on this benign churn, so a task-complete
+  // await never settled until the WHOLE epic quiet. The per-task anchor holds.
+  const targetSpec = {
+    id: "fn-1-foo.1",
+    kind: "task",
+    condition: "complete",
+  } as const;
+  const target = makeTask({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    worker_phase: "done",
+    jobs: [
+      makeEmbeddedJob({ job_id: "w1", state: "stopped", last_event_id: 5 }),
+    ],
+  });
+
+  // t=1000: first completed observation — dwell anchored at the TARGET's own job
+  // watermark (5), never the epic's last_event_id (20 here).
+  const epicV1 = makeEpic({
+    last_event_id: 20,
+    tasks: [
+      target,
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        jobs: [
+          makeEmbeddedJob({ job_id: "w2", state: "working", last_event_id: 8 }),
+        ],
+      }),
+    ],
+  });
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(
+    st,
+    true,
+    completeWatermark([epicV1], targetSpec),
+    1000,
+  );
+  st = step.next;
+  expect(st.watermark).toBe(5);
+  expect(step.confirmed).toBe(false);
+
+  // The SIBLING churns: fn-1-foo.2's job advances 8 → 12, re-folding the epic row
+  // to last_event_id 21. The TARGET's own job is untouched (still 5). At the dwell
+  // boundary the target still reads `completed` and its per-task anchor held at 5
+  // through the sibling churn, so the dwell CONFIRMS — an epic-scoped anchor would
+  // have moved (20 → 21) and reset here, hanging the await.
+  const epicV2 = makeEpic({
+    last_event_id: 21,
+    tasks: [
+      target,
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        jobs: [
+          makeEmbeddedJob({
+            job_id: "w2",
+            state: "working",
+            last_event_id: 12,
+          }),
+        ],
+      }),
+    ],
+  });
+  expect(completeWatermark([epicV2], targetSpec)).toBe(5);
+  step = advanceCompleteStability(
+    st,
+    true,
+    completeWatermark([epicV2], targetSpec),
+    1000 + COMPLETE_DWELL_MS,
+  );
+  expect(step.confirmed).toBe(true);
+});
+
+test("complete-stability (F3 target flap): the target task's OWN job re-versioning restarts the dwell (coalesced running→completed)", () => {
+  // The counterpart to the sibling-churn case: here the TARGET's own worker
+  // re-activates and re-idles during close-out. diffTick coalesces the
+  // intervening `running` into one higher-version `completed` patch — the
+  // target's OWN embedded-job version moves (5 → 9) even though the epic row's
+  // last_event_id is held fixed at 20 here, proving the anchor is the task's
+  // job version, not the epic's. The move restarts the dwell.
+  const targetSpec = {
+    id: "fn-1-foo.1",
+    kind: "task",
+    condition: "complete",
+  } as const;
+  const v1 = makeEpic({
+    last_event_id: 20,
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        jobs: [
+          makeEmbeddedJob({ job_id: "w1", state: "stopped", last_event_id: 5 }),
+        ],
+      }),
+    ],
+  });
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(
+    st,
+    true,
+    completeWatermark([v1], targetSpec),
+    1000,
+  );
+  st = step.next;
+  expect(st.watermark).toBe(5);
+
+  const v2 = makeEpic({
+    last_event_id: 20,
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        jobs: [
+          makeEmbeddedJob({ job_id: "w1", state: "stopped", last_event_id: 9 }),
+        ],
+      }),
+    ],
+  });
+  step = advanceCompleteStability(
+    st,
+    true,
+    completeWatermark([v2], targetSpec),
+    1000 + COMPLETE_DWELL_MS,
+  );
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.watermark).toBe(9);
+  expect(st.since).toBe(1000 + COMPLETE_DWELL_MS);
 });
 
 // ---------------------------------------------------------------------------
