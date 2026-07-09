@@ -34,5 +34,5 @@ Pure predicate tests: plan-linked working+stale row still verdicts tier-two; pla
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Carved parked-idle interactive/adopted sessions (plan_ref null) out of tier-two stale-working ack-row minting in selectStuckSentinelVerdicts; tier-one self-heal and the standalone clock-skew detect stay unchanged for all session kinds. Recorded as ADR 0025, amending the 0013/0024 sentinel lineage.
 ## Evidence
