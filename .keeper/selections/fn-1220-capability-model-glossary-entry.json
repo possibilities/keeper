@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-default",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Operator canary: first live wrapped-cell run \u2014 a bounded single-file mechanical glossary edit, exactly the trickle-class work spark guidance names.",
+      "task_id": "fn-1220-capability-model-glossary-entry.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T20:29:08.192000Z",
+  "epic_id": "fn-1220-capability-model-glossary-entry",
+  "input_hash": "900c18e1960f9dbf15e4ee261f674c54732f6464a3872551cfad353fb7e9d09c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2416711905,
+  "verdict_raw": "operator hand-assignment for the wrapped-path live canary"
+}
