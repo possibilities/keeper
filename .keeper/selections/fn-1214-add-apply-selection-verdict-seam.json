@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped new verb with fail-closed layered validation of untrusted model output, provenance pinning, and a byte-identical shared-core extraction guarded by an in-lock concurrency invariant \u2014 a nameable security/correctness intelligence-bound reason.",
+      "task_id": "fn-1214-add-apply-selection-verdict-seam.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Multi-file skill-prose and README rewrite following an established beat pattern with cross-beat consistency to preserve, but no algorithm, contract, or correctness invariant that would warrant opus.",
+      "task_id": "fn-1214-add-apply-selection-verdict-seam.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T18:41:22.529000Z",
+  "epic_id": "fn-1214-add-apply-selection-verdict-seam",
+  "input_hash": "61dd24b0706c7434ed43636e92fc8c7b27f5dfb3bba346f89b8587692d247446",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1641882800,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1214-add-apply-selection-verdict-seam.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped new verb with fail-closed layered validation of untrusted model output, provenance pinning, and a byte-identical shared-core extraction guarded by an in-lock concurrency invariant \u2014 a nameable security/correctness intelligence-bound reason.\",\"confidence\":0.8},{\"task_id\":\"fn-1214-add-apply-selection-verdict-seam.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Multi-file skill-prose and README rewrite following an established beat pattern with cross-beat consistency to preserve, but no algorithm, contract, or correctness invariant that would warrant opus.\",\"confidence\":0.82}]}"
+}
