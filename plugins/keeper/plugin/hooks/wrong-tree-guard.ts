@@ -5,8 +5,8 @@
 // denies a subagent's branch mutation and escalation-guard scopes an escalation
 // session's Bash surface, this hook denies a WORKTREE-LANE worker's write that
 // lands in a tracked repo working tree that is NOT its own lane — the mechanical
-// half of the shared-checkout-dirtying incident (a lane worker wrote src/* into
-// the shared main checkout while its lane sat clean, starving the repair route).
+// half of keeping a shared checkout clean so the repair route stays available.
+// Rationale for why a stray write into the shared checkout matters: docs/adr/0025.
 //
 // Jurisdiction is marker-keyed like escalation-guard, but the marker is the
 // launch-injected lane PATH `KEEPER_PLAN_WORKTREE` (realpath-normalized at the
