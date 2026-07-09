@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant \u2014 distinguishing a coalesced target-task flap from benign sibling churn in dwell timing \u2014 with a path (a) option that touches the reducer fold under re-fold-determinism and zero-event-projection invariants, a contract-shaped decision warranting opus at the contract-touching band.",
+      "task_id": "fn-1212-scope-await-complete-dwell-to-the.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T01:29:47.531000Z",
+  "epic_id": "fn-1212-scope-await-complete-dwell-to-the",
+  "input_hash": "eb5ebdc4ab66ba009f0cfa1f8ed82baf4ebf68ced207b803b2887df00e8b9ad6",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3948854724,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant \u2014 distinguishing a coalesced target-task flap from benign sibling churn in dwell timing \u2014 with a path (a) option that touches the reducer fold under re-fold-determinism and zero-event-projection invariants, a contract-shaped decision warranting opus at the contract-touching band.\",\"confidence\":0.72}]}"
+}
