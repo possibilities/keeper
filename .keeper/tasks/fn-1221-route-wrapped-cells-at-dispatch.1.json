@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-09T21:08:19.338000Z",
+  "depends_on": [],
+  "epic": "fn-1221-route-wrapped-cells-at-dispatch",
+  "id": "fn-1221-route-wrapped-cells-at-dispatch.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Route wrapped cells at dispatch",
+  "updated_at": "2026-07-09T21:08:19.338000Z"
+}
