@@ -47,5 +47,5 @@ gets census-level tests; the end-to-end starvation → recovery arc runs in the 
 - [ ] Fast suite passes; the harness arc is documented in the task evidence
 
 ## Done summary
-
+Characterized the ghost-subscription mechanism (harness proves abandon-live wedges while a well-behaved give-up hard-closes and self-evicts; recorded finding) and fixed the serve-saturation class: added reapAbandonedSubs (SUBSCRIBED_SILENCE_TTL_MS, keyed on the client's 15s heartbeat contract) to reap the reaper-missed live-pid subscribed ghost, and sliceFanout/MAX_SUBS_PER_TICK to bound per-tick diff fan-out round-robin so no accumulation starves the loop.
 ## Evidence
