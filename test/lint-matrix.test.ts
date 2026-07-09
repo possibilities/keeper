@@ -71,6 +71,22 @@ describe("trigger-set predicates", () => {
     expect(isModelGuidancePath("model-selector.yaml")).toBe(false);
   });
 
+  test("isModelGuidancePath also matches the references research-cache tree", () => {
+    expect(
+      isModelGuidancePath(
+        "plugins/plan/skills/model-guidance/references/opus.md",
+      ),
+    ).toBe(true);
+    expect(
+      isModelGuidancePath(
+        "plugins/plan/skills/model-guidance/references/sonnet.md",
+      ),
+    ).toBe(true);
+    expect(
+      isModelGuidancePath("plugins/plan/skills/model-guidance/SKILL.md"),
+    ).toBe(false);
+  });
+
   test("isPlanBoundaryPath matches anything under plugins/plan/src/ only", () => {
     expect(isPlanBoundaryPath("plugins/plan/src/cli.ts")).toBe(true);
     expect(isPlanBoundaryPath("plugins/plan/src/verbs/done.ts")).toBe(true);
@@ -111,6 +127,21 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
     await runScopedLint(["plugins/plan/subagents.yaml"], REPO_ROOT, {
       runTool,
     });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cmd).toEqual([
+      "bun",
+      join(REPO_ROOT, "plugins", "plan", "scripts", "model-guidance-check.ts"),
+      "--check",
+    ]);
+  });
+
+  test("a references-only staged edit fires only the model-guidance stage", async () => {
+    const { runTool, calls } = fakeRunTool();
+    await runScopedLint(
+      ["plugins/plan/skills/model-guidance/references/opus.md"],
+      REPO_ROOT,
+      { runTool },
+    );
     expect(calls).toHaveLength(1);
     expect(calls[0].cmd).toEqual([
       "bun",
