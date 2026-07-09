@@ -12,5 +12,5 @@ Add one glossary entry to CONTEXT.md: Capability model — the model-axis value 
 - [ ] CONTEXT.md carries a Capability model entry in the established shape (definition + Avoid line) within the worker-cell vocabulary cluster, consistent with the neighboring Provider and Wrapped cell entries
 
 ## Done summary
-
+Added Capability model glossary entry to CONTEXT.md, placed adjacent to Worker cell / Provider / Wrapped cell cluster with definition + Avoid line.
 ## Evidence
