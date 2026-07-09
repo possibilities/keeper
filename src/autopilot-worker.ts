@@ -40,7 +40,7 @@
  * state pause/play.
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -63,6 +63,12 @@ import {
   type ToolchainFingerprint,
   writeRequest,
 } from "./baseline-store";
+import {
+  classifyRun,
+  gatePhaseCommand,
+  parseGateOutput,
+  runDetached,
+} from "./baseline-worker";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -108,6 +114,7 @@ import {
   STUCK_SENTINEL_DISTRESS_VERB,
   stuckSentinelJobId,
   WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_LANE_PREMERGE_REASON_PREFIX,
 } from "./dispatch-failure-key";
 import {
@@ -167,6 +174,7 @@ import {
   type WorktreeEligibility,
 } from "./worktree-eligibility";
 import {
+  baselineScratchPathFor,
   type EpicLaneBranchSet,
   epicIdFromKeeperLaneEntry,
   abortInterruptedMerge as gitAbortInterruptedMerge,
@@ -194,6 +202,8 @@ import {
   isKeeperLaneEntry,
   type LockAcquirer,
   type MergeResult,
+  provisionScratchWorktree,
+  removeScratchWorktree,
   shortBranchName,
   type WorktreeEntry,
 } from "./worktree-git";
@@ -236,6 +246,7 @@ export {
   STUCK_SENTINEL_DISTRESS_VERB,
   stuckSentinelJobId,
   WORKTREE_FINALIZE_ID_PREFIX,
+  WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
 export type {
@@ -854,6 +865,16 @@ export interface ConfirmRunningDeps {
    */
   isEpicDone(epicId: string): Promise<boolean>;
   /**
+   * The merge-suite gate probe threaded into `worktree.finalizeEpic` (the {@link
+   * isEpicDone} precedent): given a PROSPECTIVE lane→default merged commit, run the
+   * fast suite against it in a scratch worktree and return green / red / cannot-run.
+   * OPTIONAL — omitted (fake-deps reconcile tests, which finalize via a fake driver)
+   * makes finalize skip the gate and merge as before. Production wires {@link
+   * runMergeSuiteGate}; the fast/slow finalize-gate tests inject a fake to drive the
+   * three verdicts purely.
+   */
+  runMergeSuite?: MergeSuiteProbe;
+  /**
    * Tuning knobs — exposed as deps so tests can drive a 5ms / 50ms
    * cadence instead of seconds. Defaults applied in `runConfirmCycle`
    * when undefined.
@@ -861,6 +882,34 @@ export interface ConfirmRunningDeps {
   pollIntervalMs?: number;
   ceilingMs?: number;
 }
+
+/**
+ * The verdict of running the fast suite against a PROSPECTIVE lane→default merge
+ * result (fn-1204). `green` clears the merge to advance local default; `red` is the
+ * semantic-merge-conflict jam (two individually-green sides whose merged tree breaks
+ * the suite) that parks the epic on a visible sticky; `cannot-run` is a gate that
+ * could not produce a verdict (scratch provision / frozen-lockfile install failure /
+ * suite crash / timeout) and degrades to a non-sticky retry-skip — NEVER a silent
+ * push and NEVER a permanent silent block.
+ */
+export type MergeSuiteVerdict =
+  | { kind: "green" }
+  | { kind: "red"; detail: string }
+  | { kind: "cannot-run"; detail: string };
+
+/**
+ * Run the fast suite against the prospective merged commit `mergedCommit` checked
+ * out in a scratch worktree of `repoDir`. `runsPlanSuite` is true when the merge
+ * introduces changes under `plugins/plan` (the merged packages the gate must cover:
+ * the root fast suite always, plus the plan suite when the plan plugin is touched).
+ * Injected so the fast tier drives the three verdicts purely; production wires the
+ * real scratch-provision-plus-suite-run ({@link runMergeSuiteGate}).
+ */
+export type MergeSuiteProbe = (args: {
+  repoDir: string;
+  mergedCommit: string;
+  runsPlanSuite: boolean;
+}) => Promise<MergeSuiteVerdict>;
 
 /**
  * The producer git driver for worktree mode — the side-effect seam
@@ -918,20 +967,30 @@ export interface WorktreeDriver {
    * `done`. The lane-ahead half of the gate is the shared merge routine's
    * `not-ahead` check.
    *
+   * `runMergeSuite` (fn-1204) is the merge-suite gate probe: BEFORE local default
+   * advances, the prospective merged commit's fast suite runs on a scratch worktree.
+   * Green proceeds to the existing merge+push; red parks a VISIBLE sticky (no
+   * `retry` — local default never advances, nothing pushed); a gate that cannot run
+   * degrades to a retry-skip. OMITTED → the gate is skipped and finalize merges as
+   * before (the fake-driver reconcile tests and the direct degrade tests that never
+   * inject it).
+   *
    * A failure is one of two kinds, distinguished by `retry`:
    *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a content merge
-   *    conflict, a dirty-LANE teardown refusal, OR an origin-ahead non-fast-forward
-   *    needing an operator). The producer mints a STICKY `close::<epic>`
-   *    DispatchFailed a human clears with `retry_dispatch`.
+   *    conflict, a dirty-LANE teardown refusal, an origin-ahead non-fast-forward, OR
+   *    a red merge-suite gate) needing an operator. The producer mints a STICKY
+   *    `close::<epic>` DispatchFailed a human clears with `retry_dispatch`.
    *  - `{ ok: false, retry: true, reason }` — a transient environment state on the
-   *    SHARED main checkout (dirty / off-branch / mid-rebase). The producer STOPS
-   *    this epic's finalize but mints NO sticky failure; the next cycle retries
-   *    once the tree settles. NEVER an un-clearable close, and NEVER the
-   *    divergent-content or origin-ahead non-ff case (those stay loud sticky blocks).
+   *    SHARED main checkout (dirty / off-branch / mid-rebase / merge-suite gate
+   *    unavailable). The producer STOPS this epic's finalize but mints NO sticky
+   *    failure; the next cycle retries once the tree settles. NEVER an un-clearable
+   *    close, and NEVER the divergent-content, origin-ahead non-ff, or red-suite case
+   *    (those stay loud sticky blocks).
    */
   finalizeEpic(
     info: WorktreeLaunchInfo,
     isEpicDone: (epicId: string) => Promise<boolean>,
+    runMergeSuite?: MergeSuiteProbe,
   ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
   /**
    * OFF-mode assertion: confirm `cwd` is on the repo's resolved default branch.
@@ -3846,7 +3905,11 @@ export async function runReconcileCycle(
         closeKeyEpicId(info),
         info.repoDir,
       );
-      const result = await deps.worktree.finalizeEpic(info, deps.isEpicDone);
+      const result = await deps.worktree.finalizeEpic(
+        info,
+        deps.isEpicDone,
+        deps.runMergeSuite,
+      );
       if (result.ok) {
         // Clean finalize (base merged + torn down) OR the lane is already gone —
         // eligible to level-clear this repo's synthetic row below.
@@ -3971,6 +4034,14 @@ export function createWorktreeDriver(
   // escalates. Omitted (fake-deps / direct-call tests) → a no-op, byte-identical merge.
   onResyncSkipped?: (repoDir: string) => void,
 ): WorktreeDriver {
+  // Merge-suite gate memo (fn-1204), keyed by the prospective merged-commit OID: a
+  // TERMINAL verdict (green/red) is cached so a parked epic's finalize retries never
+  // recompute an UNCHANGED merge. The OID is a pure function of the two tips, so an
+  // advanced default (another lane landed) mints a fresh key and re-runs the suite;
+  // a cannot-run verdict is NEVER cached (it is transient and must recompute). Lives
+  // on the driver closure, so it persists across reconcile cycles for the daemon's
+  // one long-lived driver, and is fresh per driver in a test.
+  const mergeSuiteMemo = new Map<string, MergeSuiteVerdict>();
   return {
     async provision(info, liveAttributedDirty) {
       const { assignment, repoDir, parentBranch } = info;
@@ -4125,7 +4196,7 @@ export function createWorktreeDriver(
         };
       }
     },
-    async finalizeEpic(info, isEpicDone) {
+    async finalizeEpic(info, isEpicDone, runMergeSuite) {
       const { repoDir, baseBranch, baseWorktreePath, laneOrder } = info;
       try {
         // A never-forked epic (a `done` epic that completed before worktree mode,
@@ -4165,6 +4236,75 @@ export function createWorktreeDriver(
           console.error(`[autopilot-worker] finalize ${epicId}: ${reason}`);
           return { ok: false, retry: true, reason };
         };
+        // Merge-suite gate (fn-1204): BEFORE local default advances, test the
+        // PROSPECTIVE lane→default merge result's fast suite on a scratch worktree, so
+        // a lost-update merge (two individually-green sides whose merged tree fails the
+        // suite — a semantic conflict git cannot see) never lands red trunk. ONLY a
+        // merge that would actually introduce new content is gated: an already-merged
+        // base (ancestor of local default) has no new tree and falls straight through
+        // to the idempotent merge/teardown below. The prospective merged commit is the
+        // SAME deterministic OID {@link mergeLaneBaseIntoDefault} will advance to, so
+        // the suite runs on exactly the tree that lands. A conflict / plumbing degrade
+        // is NOT gated here — it falls through so the shared merge routine surfaces its
+        // own discriminant (a conflict sticky, an unsupported retry-skip) unchanged.
+        // Omitting `runMergeSuite` skips the gate entirely (merges as before).
+        if (
+          runMergeSuite !== undefined &&
+          !(await gitIsAncestorOf(repoDir, baseBranch, defaultBranch, run))
+        ) {
+          const prospect = await computeProspectiveMerge(
+            repoDir,
+            baseBranch,
+            defaultBranch,
+            run,
+          );
+          if (prospect.kind === "computed") {
+            let verdict = mergeSuiteMemo.get(prospect.newValue);
+            if (verdict === undefined) {
+              // Merged packages the gate must cover: the root fast suite always, plus
+              // the plan suite when the merge introduces changes under `plugins/plan`.
+              const runsPlanSuite = await mergeIntroducesPlanChange(
+                repoDir,
+                prospect.defaultTip,
+                prospect.newValue,
+                run,
+              );
+              verdict = await runMergeSuite({
+                repoDir,
+                mergedCommit: prospect.newValue,
+                runsPlanSuite,
+              });
+              // Cache only a TERMINAL verdict — a cannot-run is transient (a scratch
+              // hiccup) and MUST recompute next cycle, never latch a parked epic.
+              if (verdict.kind !== "cannot-run") {
+                mergeSuiteMemo.set(prospect.newValue, verdict);
+              }
+            }
+            if (verdict.kind === "red") {
+              // A VISIBLE non-retry sticky (mirrors the non-ff arm): local default
+              // never advanced and nothing was pushed, so the desync producer sees
+              // nothing. Cleared by `retry_dispatch` once an operator reconciles the
+              // semantic conflict. The reason keys the row on WORKTREE_FINALIZE_ID_PREFIX
+              // (via the producer's per-repo finalize key) exactly like non-ff.
+              return {
+                ok: false,
+                reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the prospective merge of ${baseBranch} into ${defaultBranch} in ${repoDir} (merged commit ${prospect.newValue}) — ${verdict.detail}`,
+              };
+            }
+            if (verdict.kind === "cannot-run") {
+              // A gate that could not produce a verdict (scratch provision / install /
+              // suite crash / timeout) degrades to a NON-sticky retry-skip — never a
+              // silent push, never a permanent silent block.
+              return retrySkip(
+                `worktree-finalize-suite-gate-unavailable: the merge-suite gate for ${baseBranch} into ${defaultBranch} in ${repoDir} could not run (${verdict.detail}) — deferring the base merge until the gate can run`,
+              );
+            }
+            // green → fall through to the merge+push below.
+          }
+          // A non-`computed` prospect (conflict / merge-tree-unsupported / timeout /
+          // plumbing-failed) is NOT gated: fall through so mergeLaneBaseIntoDefault
+          // re-derives and surfaces its own MergeLaneResult discriminant.
+        }
         // The base merge lands IN THE MAIN worktree (the repo dir is the human's
         // shared checkout) via the ONE shared {@link mergeLaneBaseIntoDefault}
         // routine. It degrades — NEVER stomps WIP or fights an in-flight
@@ -4649,6 +4789,351 @@ function isPlausibleBranchName(name: string): boolean {
 }
 
 /**
+ * The prospective lane→default merged commit, computed WITHOUT advancing any ref —
+ * the shared front-half of {@link mergeLaneBaseIntoDefault} that the finalize
+ * merge-suite gate ({@link runMergeSuiteGate}) also runs so both derive the IDENTICAL
+ * `newValue` OID (the suite runs on exactly the tree that will land). `computed`
+ * carries the resolved `defaultTip` (the CAS `<old>`) plus `newValue` (a pure
+ * fast-forward's base tip, or a real 3-way `merge-tree`/`commit-tree` merge commit
+ * with the pinned identity + base-tip date, so the OID is deterministic across a
+ * crash-retry). Every other arm is a {@link MergeLaneResult} member the caller returns
+ * straight; the base-already-ancestor short-circuit is the CALLER's concern (it needs
+ * the origin-containment re-push), so this is only reached for a base AHEAD of default.
+ */
+type ProspectiveMerge =
+  | { kind: "computed"; defaultTip: string; newValue: string }
+  | { kind: "conflict"; stderr: string }
+  | { kind: "local-timeout" }
+  | { kind: "merge-tree-unsupported" }
+  | { kind: "plumbing-failed"; detail: string };
+
+async function computeProspectiveMerge(
+  repo: string,
+  baseBranch: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+): Promise<ProspectiveMerge> {
+  // Resolve both tips to explicit OIDs: the CAS `<old>` needs the exact current
+  // default tip, and pinning the commit-tree parents to OIDs (not branch names)
+  // keeps the merge commit OID deterministic across a crash-retry.
+  const defaultTip = await revParseCommit(repo, defaultBranch, run);
+  if (defaultTip === null) {
+    return {
+      kind: "plumbing-failed",
+      detail: `cannot resolve the default tip refs/heads/${defaultBranch}`,
+    };
+  }
+  const baseTip = await revParseCommit(repo, baseBranch, run);
+  if (baseTip === null) {
+    return {
+      kind: "plumbing-failed",
+      detail: `cannot resolve the base tip refs/heads/${baseBranch}`,
+    };
+  }
+  // A pure fast-forward (default is an ancestor of base) resolves straight to the base
+  // tip — NO commit-tree, since feeding an FF tree to commit-tree mints a bogus
+  // 2-parent merge. A DIVERGENT base takes the real 3-way plumbing merge.
+  if (await gitIsAncestorOf(repo, defaultBranch, baseBranch, run)) {
+    return { kind: "computed", defaultTip, newValue: baseTip };
+  }
+  // git >= 2.38's `merge-tree --write-tree`; an older git degrades to a DISTINCT
+  // transient skip rather than a hard error (worktree mode is default-off, so never a
+  // boot fatalExit).
+  if (!(await gitSupportsMergeTreeWriteTree(repo, run))) {
+    return { kind: "merge-tree-unsupported" };
+  }
+  const mt = await run(
+    ["merge-tree", "--write-tree", "--end-of-options", defaultTip, baseTip],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (mt.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "local-timeout" };
+  }
+  // Drive conflict off the EXIT CODE: 0 clean, 1 conflict → the EXISTING sticky
+  // conflict escalation, > 1 a hard error → the failure arm. merge-tree is tree-vs-tree,
+  // so it detects content conflicts equivalently to a porcelain merge without ever
+  // touching (or seeing) the working tree.
+  if (mt.code === 1) {
+    return { kind: "conflict", stderr: (mt.stdout + mt.stderr).trim() };
+  }
+  if (mt.code !== 0) {
+    return {
+      kind: "plumbing-failed",
+      detail: `git merge-tree --write-tree exited ${mt.code}: ${(mt.stdout + mt.stderr).trim()}`,
+    };
+  }
+  const tree = parseGitOid(mt.stdout); // OID is stdout line 1 in --write-tree mode
+  if (tree === null) {
+    return {
+      kind: "plumbing-failed",
+      detail: `git merge-tree --write-tree returned an unparseable tree oid: ${JSON.stringify(mt.stdout.slice(0, 200))}`,
+    };
+  }
+  // Pin the commit dates to the base tip's OWN committer date (never wall-clock) so
+  // the merge commit OID is deterministic across a crash-retry.
+  const dateRes = await run(
+    ["show", "-s", "--format=%cI", "--end-of-options", baseTip],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (dateRes.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "local-timeout" };
+  }
+  const pinnedDate = dateRes.stdout.trim();
+  if (dateRes.code !== 0 || pinnedDate.length === 0) {
+    return {
+      kind: "plumbing-failed",
+      detail: `cannot read the base-tip committer date for ${baseTip}: exit ${dateRes.code}`,
+    };
+  }
+  const ct = await run(
+    [
+      "commit-tree",
+      tree,
+      "-p",
+      defaultTip,
+      "-p",
+      baseTip,
+      "-m",
+      `Merge branch '${baseBranch}' into ${defaultBranch}`,
+    ],
+    {
+      cwd: repo,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      env: {
+        GIT_AUTHOR_NAME: BASE_MERGE_COMMIT_NAME,
+        GIT_AUTHOR_EMAIL: BASE_MERGE_COMMIT_EMAIL,
+        GIT_COMMITTER_NAME: BASE_MERGE_COMMIT_NAME,
+        GIT_COMMITTER_EMAIL: BASE_MERGE_COMMIT_EMAIL,
+        GIT_AUTHOR_DATE: pinnedDate,
+        GIT_COMMITTER_DATE: pinnedDate,
+      },
+    },
+  );
+  if (ct.code === GIT_SPAWN_TIMEOUT_CODE) {
+    return { kind: "local-timeout" };
+  }
+  if (ct.code !== 0) {
+    return {
+      kind: "plumbing-failed",
+      detail: `git commit-tree exited ${ct.code}: ${(ct.stdout + ct.stderr).trim()}`,
+    };
+  }
+  const newCommit = parseGitOid(ct.stdout);
+  if (newCommit === null) {
+    return {
+      kind: "plumbing-failed",
+      detail: `git commit-tree returned an unparseable commit oid: ${JSON.stringify(ct.stdout.slice(0, 200))}`,
+    };
+  }
+  return { kind: "computed", defaultTip, newValue: newCommit };
+}
+
+/**
+ * The one package the finalize merge-suite gate conditionally covers BEYOND the root
+ * fast suite — the plan plugin, whose own suite the root `bun test` does not run and
+ * whose semantic merge conflicts git's `merge-tree` cannot see.
+ */
+const MERGE_GATE_PLAN_PKG_DIR = "plugins/plan";
+
+/**
+ * Does the prospective merge INTRODUCE any change under `plugins/plan` (relative to
+ * the current default tip)? Decides whether the merge-suite gate also runs the plan
+ * suite. A non-zero / timed-out diff is treated as "yes" — conservatively cover the
+ * plan suite rather than skip it on an unclear diff. Pure git via the runner.
+ */
+async function mergeIntroducesPlanChange(
+  repo: string,
+  defaultTip: string,
+  mergedCommit: string,
+  run: WorktreeGitRunner,
+): Promise<boolean> {
+  const diff = await run(
+    [
+      "diff",
+      "--name-only",
+      "--end-of-options",
+      defaultTip,
+      mergedCommit,
+      "--",
+      MERGE_GATE_PLAN_PKG_DIR,
+    ],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (diff.code !== 0) {
+    return true; // unclear → cover the plan suite
+  }
+  return diff.stdout.trim().length > 0;
+}
+
+/** Deadlines for the finalize merge-suite gate's inline scratch suite run — a hung
+ *  install/suite is group-killed at the deadline and degrades to `cannot-run`. */
+const MERGE_GATE_INSTALL_TIMEOUT_MS = 10 * 60_000;
+const MERGE_GATE_SUITE_DEADLINE_MS = 15 * 60_000;
+/** Cap on the failing-test names carried in a red verdict's detail. */
+const MERGE_GATE_MAX_FAILING_NAMES = 8;
+
+/** Read one package dir's gate-phase test command (the `<gate> && …` first segment),
+ *  or null when it has no runnable `test` script. */
+function readPkgGateCommand(pkgDir: string): string | null {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(join(pkgDir, "package.json"), "utf8"),
+    ) as { scripts?: { test?: unknown } };
+    const testScript =
+      typeof pkg.scripts?.test === "string" ? pkg.scripts.test : "";
+    return gatePhaseCommand(testScript);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run ONE package's fast gate suite in `pkgDir` (a scratch-worktree subdir): a
+ * frozen-lockfile install, then the gate-phase command. Classifies via the SAME pure
+ * baseline-runner core so a compile-error/bail (`crashed`) is never folded to green:
+ *  - install fail/timeout, no gate script, or suite timeout → `cannot-run` (a
+ *    transient/infra gate that could not produce a verdict).
+ *  - the suite ran clean → `green`.
+ *  - the suite reported failing tests → `red`.
+ *  - the suite exited non-zero with NO failing-test signal (a compile error / bail in
+ *    the merged tree) → `red` — a broken merged build is a VISIBLE park an operator
+ *    fixes, never a silent forever-retry.
+ */
+async function runPackageSuiteGate(
+  pkgDir: string,
+  opts: { installTimeoutMs: number; suiteDeadlineMs: number },
+): Promise<MergeSuiteVerdict> {
+  const install = await runDetached(
+    "bun",
+    ["install", "--frozen-lockfile"],
+    pkgDir,
+    opts.installTimeoutMs,
+  );
+  if (install.timedOut) {
+    return {
+      kind: "cannot-run",
+      detail: `frozen-lockfile install timed out in ${pkgDir}`,
+    };
+  }
+  if (install.exitCode !== 0) {
+    return {
+      kind: "cannot-run",
+      detail: `frozen-lockfile install failed in ${pkgDir} (exit ${install.exitCode})`,
+    };
+  }
+  const gateCmd = readPkgGateCommand(pkgDir);
+  if (gateCmd === null) {
+    return {
+      kind: "cannot-run",
+      detail: `no test-gate script in ${pkgDir}/package.json`,
+    };
+  }
+  const raw = await runDetached(
+    "/bin/sh",
+    ["-c", gateCmd],
+    pkgDir,
+    opts.suiteDeadlineMs,
+  );
+  if (raw.timedOut) {
+    return { kind: "cannot-run", detail: `suite timed out in ${pkgDir}` };
+  }
+  const parsed = parseGateOutput(raw.output);
+  const cls = classifyRun(raw.exitCode, parsed);
+  if (cls === "clean") {
+    return { kind: "green" };
+  }
+  if (cls === "failed") {
+    const names = parsed.failingTests.slice(0, MERGE_GATE_MAX_FAILING_NAMES);
+    const more =
+      parsed.failingTests.length > names.length
+        ? ` (+${parsed.failingTests.length - names.length} more)`
+        : "";
+    return {
+      kind: "red",
+      detail: `${pkgDir}: ${names.join("; ")}${more}`,
+    };
+  }
+  // crashed: non-zero exit with no failing-test signal — the merged tree does not
+  // even build/run. Park it VISIBLY rather than silently retry-skip forever.
+  return {
+    kind: "red",
+    detail: `${pkgDir}: suite crashed (non-zero exit, no failing-test output)`,
+  };
+}
+
+/**
+ * The production {@link MergeSuiteProbe}: provision a detached scratch worktree at the
+ * prospective merged commit, run the root fast suite there (plus the plan suite when
+ * the merge touches `plugins/plan`), and classify green / red / cannot-run. Runs
+ * INLINE on the reconcile worker (a producer git+suite side effect, never a fold);
+ * the scratch worktree is reaped on EVERY path. NEVER throws — any unexpected error
+ * folds to `cannot-run` (a retry-skip), never a silent push. `run`/`worktreesRoot`
+ * are injectable seams; production passes `gitExec` and the default root.
+ */
+export async function runMergeSuiteGate(
+  args: { repoDir: string; mergedCommit: string; runsPlanSuite: boolean },
+  opts: {
+    run?: WorktreeGitRunner;
+    worktreesRoot?: string;
+    installTimeoutMs?: number;
+    suiteDeadlineMs?: number;
+  } = {},
+): Promise<MergeSuiteVerdict> {
+  const run = opts.run ?? gitExec;
+  const installTimeoutMs =
+    opts.installTimeoutMs ?? MERGE_GATE_INSTALL_TIMEOUT_MS;
+  const suiteDeadlineMs = opts.suiteDeadlineMs ?? MERGE_GATE_SUITE_DEADLINE_MS;
+  const scratchPath = baselineScratchPathFor(
+    args.repoDir,
+    args.mergedCommit,
+    opts.worktreesRoot,
+  );
+  try {
+    const prov = await provisionScratchWorktree(
+      args.repoDir,
+      scratchPath,
+      args.mergedCommit,
+      run,
+    );
+    if (prov.kind !== "ready") {
+      return {
+        kind: "cannot-run",
+        detail: `scratch checkout of ${args.mergedCommit} failed: ${prov.detail}`,
+      };
+    }
+    const rootVerdict = await runPackageSuiteGate(scratchPath, {
+      installTimeoutMs,
+      suiteDeadlineMs,
+    });
+    if (rootVerdict.kind !== "green" || !args.runsPlanSuite) {
+      return rootVerdict;
+    }
+    // The merge touched plugins/plan — cover its own suite too (git's merge-tree
+    // cannot see a semantic conflict there any more than in the root).
+    return await runPackageSuiteGate(
+      join(scratchPath, MERGE_GATE_PLAN_PKG_DIR),
+      {
+        installTimeoutMs,
+        suiteDeadlineMs,
+      },
+    );
+  } catch (err) {
+    return {
+      kind: "cannot-run",
+      detail: `merge-suite gate error: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    try {
+      await removeScratchWorktree(args.repoDir, scratchPath, run);
+    } catch (err) {
+      console.error(
+        `[autopilot-worker] merge-suite gate scratch reap failed for ${scratchPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
+/**
  * The ONE guarded lane-base→default merge sequence shared by
  * {@link WorktreeDriver.finalizeEpic} and {@link recoverWorktrees} pass-2. Runs IN
  * the main checkout (`repo`) and never stamps a reason string — it returns a
@@ -4768,122 +5253,21 @@ export async function mergeLaneBaseIntoDefault(
       detail: `refusing to advance an implausible default ref name: ${JSON.stringify(defaultBranch)}`,
     };
   }
-  // Resolve both tips to explicit OIDs: the CAS `<old>` needs the exact current
-  // default tip, and pinning the commit-tree parents to OIDs (not branch names)
-  // keeps the merge commit OID deterministic across a crash-retry.
-  const defaultTip = await revParseCommit(repo, defaultBranch, run);
-  if (defaultTip === null) {
-    return {
-      kind: "plumbing-failed",
-      detail: `cannot resolve the default tip refs/heads/${defaultBranch}`,
-    };
+  // Compute the prospective merged commit (the ONE shared routine the finalize
+  // merge-suite gate also runs, so both derive the IDENTICAL OID). A degrade arm
+  // (conflict / local-timeout / merge-tree-unsupported / plumbing-failed) is a
+  // MergeLaneResult member — return it straight; a `computed` result carries the
+  // exact `defaultTip` (the CAS `<old>`) and `newValue` (the CAS `<new>`).
+  const merged = await computeProspectiveMerge(
+    repo,
+    baseBranch,
+    defaultBranch,
+    run,
+  );
+  if (merged.kind !== "computed") {
+    return merged;
   }
-  const baseTip = await revParseCommit(repo, baseBranch, run);
-  if (baseTip === null) {
-    return {
-      kind: "plumbing-failed",
-      detail: `cannot resolve the base tip refs/heads/${baseBranch}`,
-    };
-  }
-  // The value the default ref will CAS to: a pure fast-forward (default is an
-  // ancestor of base) advances straight to the base tip — NO commit-tree, since
-  // feeding an FF tree to commit-tree mints a bogus 2-parent merge. A DIVERGENT base
-  // takes the real 3-way plumbing merge.
-  let newValue: string;
-  if (await gitIsAncestorOf(repo, defaultBranch, baseBranch, run)) {
-    newValue = baseTip; // pure fast-forward
-  } else {
-    // git >= 2.38's `merge-tree --write-tree`; an older git degrades to a DISTINCT
-    // transient skip rather than a hard error (worktree mode is default-off, so
-    // never a boot fatalExit).
-    if (!(await gitSupportsMergeTreeWriteTree(repo, run))) {
-      return { kind: "merge-tree-unsupported" };
-    }
-    const mt = await run(
-      ["merge-tree", "--write-tree", "--end-of-options", defaultTip, baseTip],
-      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-    );
-    if (mt.code === GIT_SPAWN_TIMEOUT_CODE) {
-      return { kind: "local-timeout" };
-    }
-    // Drive conflict off the EXIT CODE: 0 clean, 1 conflict → the EXISTING sticky
-    // conflict escalation, > 1 a hard error → the failure arm. merge-tree is
-    // tree-vs-tree, so it detects content conflicts equivalently to a porcelain
-    // merge without ever touching (or seeing) the working tree.
-    if (mt.code === 1) {
-      return { kind: "conflict", stderr: (mt.stdout + mt.stderr).trim() };
-    }
-    if (mt.code !== 0) {
-      return {
-        kind: "plumbing-failed",
-        detail: `git merge-tree --write-tree exited ${mt.code}: ${(mt.stdout + mt.stderr).trim()}`,
-      };
-    }
-    const tree = parseGitOid(mt.stdout); // OID is stdout line 1 in --write-tree mode
-    if (tree === null) {
-      return {
-        kind: "plumbing-failed",
-        detail: `git merge-tree --write-tree returned an unparseable tree oid: ${JSON.stringify(mt.stdout.slice(0, 200))}`,
-      };
-    }
-    // Pin the commit dates to the base tip's OWN committer date (never wall-clock)
-    // so the merge commit OID is deterministic across a crash-retry.
-    const dateRes = await run(
-      ["show", "-s", "--format=%cI", "--end-of-options", baseTip],
-      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-    );
-    if (dateRes.code === GIT_SPAWN_TIMEOUT_CODE) {
-      return { kind: "local-timeout" };
-    }
-    const pinnedDate = dateRes.stdout.trim();
-    if (dateRes.code !== 0 || pinnedDate.length === 0) {
-      return {
-        kind: "plumbing-failed",
-        detail: `cannot read the base-tip committer date for ${baseTip}: exit ${dateRes.code}`,
-      };
-    }
-    const ct = await run(
-      [
-        "commit-tree",
-        tree,
-        "-p",
-        defaultTip,
-        "-p",
-        baseTip,
-        "-m",
-        `Merge branch '${baseBranch}' into ${defaultBranch}`,
-      ],
-      {
-        cwd: repo,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-        env: {
-          GIT_AUTHOR_NAME: BASE_MERGE_COMMIT_NAME,
-          GIT_AUTHOR_EMAIL: BASE_MERGE_COMMIT_EMAIL,
-          GIT_COMMITTER_NAME: BASE_MERGE_COMMIT_NAME,
-          GIT_COMMITTER_EMAIL: BASE_MERGE_COMMIT_EMAIL,
-          GIT_AUTHOR_DATE: pinnedDate,
-          GIT_COMMITTER_DATE: pinnedDate,
-        },
-      },
-    );
-    if (ct.code === GIT_SPAWN_TIMEOUT_CODE) {
-      return { kind: "local-timeout" };
-    }
-    if (ct.code !== 0) {
-      return {
-        kind: "plumbing-failed",
-        detail: `git commit-tree exited ${ct.code}: ${(ct.stdout + ct.stderr).trim()}`,
-      };
-    }
-    const newCommit = parseGitOid(ct.stdout);
-    if (newCommit === null) {
-      return {
-        kind: "plumbing-failed",
-        detail: `git commit-tree returned an unparseable commit oid: ${JSON.stringify(ct.stdout.slice(0, 200))}`,
-      };
-    }
-    newValue = newCommit;
-  }
+  const { defaultTip, newValue } = merged;
   // The ref advance + best-effort resync run under the COMMON-dir commit-work flock:
   // the merge no longer sits IN the shared checkout, but it still advances the shared
   // refs/heads/<default> and may resync the shared working tree, so it must not race
@@ -7362,6 +7746,10 @@ function main(): void {
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
     // same `isEpicDoneById` the recover glue threads into `worktree.recover`.
     isEpicDone: (epicId) => isEpicDoneById(db, epicId),
+    // The merge-suite gate probe: finalize runs the fast suite against the prospective
+    // merged commit on a scratch worktree BEFORE local default advances (fn-1204).
+    // Real git + a real inline suite run (a producer side effect, never a fold).
+    runMergeSuite: (a) => runMergeSuiteGate(a),
   };
 
   // Single-flight reconcile drive. `watchLoop` fires this on every

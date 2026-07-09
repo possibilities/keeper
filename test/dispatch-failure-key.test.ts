@@ -604,6 +604,7 @@ describe("single vocabulary source", () => {
     ).toEqual([
       ["worktree-multi-repo", "multi-repo"],
       ["worktree-finalize-non-fast-forward", "non-ff"],
+      ["worktree-finalize-suite-red", "suite-red"],
       ["worktree-finalize-conflict", "merge-conflict"],
       ["worktree-recover-conflict", "merge-conflict"],
       ["worktree-recover-dirty-checkout", "dirty-tree"],

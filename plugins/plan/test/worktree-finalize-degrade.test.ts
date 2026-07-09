@@ -1,11 +1,13 @@
-// Real-git proof that finalize DEGRADES GRACEFULLY on a shared main checkout — the
-// slow-tier counterpart to the pure fake-runner finalize-degrade tests. Drives the
-// production `createWorktreeDriver().finalizeEpic` against a real temp repo for the
-// two cases a fake runner cannot fully prove on real git:
-//   1. a DIRTY main checkout (human WIP) → skip-and-retry (retry:true), never a
-//      stomp of the WIP and never a merge/teardown;
-//   2. an IDEMPOTENT re-run after a partial (post-merge/post-push) teardown crash →
-//      the already-merged base is a no-op merge and teardown RESUMES to completion.
+// Real-git proof of the shared-main-checkout finalize contract — the slow-tier
+// counterpart to the pure fake-runner finalize tests. Drives the production
+// `createWorktreeDriver().finalizeEpic` against a real temp repo for the cases a fake
+// runner cannot fully prove on real git:
+//   1. the WORKING-TREE-FREE base merge LANDS regardless of a dirty / would-clobber
+//      shared checkout (ADR 0008) while never stomping the human's uncommitted content;
+//   2. a NON-TURN-KEY / OFF-BRANCH push degrades to a non-sticky retry-skip;
+//   3. an IDEMPOTENT re-run after a partial teardown crash resumes to completion; and
+//   4. the fn-1204 merge-suite gate (injected verdict): green merges + pushes + tears
+//      down, red parks a visible sticky with local default UNMOVED and nothing pushed.
 //
 // Gated describe.skipIf(!SLOW_ENABLED): the default `bun test` skips it; only the
 // wired `bun run test:slow` (KEEPER_PLAN_RUN_SLOW=1) spawns the real `git`.
@@ -112,7 +114,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     }
   });
 
-  test("a DIRTY main checkout → skip-and-retry (retry:true), no merge, no teardown, WIP untouched", async () => {
+  test("a DIRTY main checkout NO LONGER blocks the working-tree-free base merge — it lands + tears down, the human's staged WIP untouched", async () => {
     const epicId = "fn-985-dirty";
     const base = `keeper/epic/${epicId}`;
     const reserved = reserveLane();
@@ -122,9 +124,7 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     const baseLane = realpathSync(reserved);
     commitLaneAhead(baseLane, epicId);
 
-    // The human has uncommitted work in the shared main checkout. Stage it so
-    // the readiness check (status --porcelain --untracked-files=no) sees it as
-    // dirty — an untracked-only tree is intentionally treated as clean now.
+    // The human has staged uncommitted work in the shared main checkout.
     writeFileSync(join(main, "human-wip.txt"), "do not stomp me\n");
     git(["add", "human-wip.txt"], main);
     const mainHeadBefore = headSha(main);
@@ -134,19 +134,20 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
       async () => true,
     );
 
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.retry).toBe(true);
-      expect(res.reason).toContain("worktree-finalize-dirty-checkout");
-    }
-    // The base was NOT merged into main, and the WIP is still there.
-    expect(headSha(main)).toBe(mainHeadBefore);
-    expect(Bun.file(join(main, "human-wip.txt")).size).toBeGreaterThan(0);
-    // No teardown — the lane survives for a retry once the tree is clean.
+    // ADR 0008: the base merge is WORKING-TREE-FREE — a `merge-tree`/`commit-tree`/
+    // `update-ref`-CAS plumbing pipeline that never runs `git merge` in the checkout —
+    // so a dirty shared checkout no longer blocks or corrupts it. Finalize lands the
+    // merge and tears the lanes down, and the human's uncommitted WIP is never stomped.
+    expect(res).toEqual({ ok: true });
+    expect(headSha(main)).not.toBe(mainHeadBefore); // local default advanced
+    expect(await Bun.file(join(main, "human-wip.txt")).text()).toBe(
+      "do not stomp me\n",
+    );
+    // Teardown completed — nothing leaks.
     expect(
       git(["worktree", "list", "--porcelain"], main).includes(baseLane),
-    ).toBe(true);
-    expect(git(["branch", "--list", base], main).trim()).not.toBe("");
+    ).toBe(false);
+    expect(git(["branch", "--list", base], main).trim()).toBe("");
   });
 
   test("a NON-TURN-KEY push (origin unreachable) → skip-and-retry (retry:true), no merge, lane survives", async () => {
@@ -186,11 +187,12 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     expect(git(["branch", "--list", base], main).trim()).not.toBe("");
   });
 
-  test("a WOULD-CLOBBER untracked file (incoming tracked path ∩ main untracked) → skip-and-retry, no merge, file untouched", async () => {
-    // The lane adds a NEW tracked file; main has an UNTRACKED file at the same
-    // path. A real `git merge` hard-aborts ("untracked working tree files would be
-    // overwritten"); the would-clobber precheck must catch it BEFORE the merge and
-    // degrade to a non-sticky retry, never stomping the human's untracked content.
+  test("a WOULD-CLOBBER untracked file NO LONGER blocks the working-tree-free base merge — the ref advances + tears down, the untracked content survives verbatim", async () => {
+    // The lane adds a NEW tracked file; main has an UNTRACKED file at the same path. A
+    // real `git merge` would hard-abort, but the working-tree-free plumbing advances
+    // refs/heads/main WITHOUT a `git merge` in the checkout, so it lands regardless; the
+    // stale-aware catch-up then ABORTS all-or-nothing on the collision rather than stomp,
+    // so the human's untracked content survives verbatim.
     const epicId = "fn-988-clobber";
     const base = `keeper/epic/${epicId}`;
     const reserved = reserveLane();
@@ -213,22 +215,18 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
       async () => true,
     );
 
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.retry).toBe(true);
-      expect(res.reason).toContain("worktree-finalize-would-clobber");
-      expect(res.reason).toContain("incoming.txt");
-    }
-    // The base was NOT merged and the untracked content survives verbatim.
-    expect(headSha(main)).toBe(mainHeadBefore);
+    // The merge LANDED (local default advanced + torn down) and the untracked content
+    // survives verbatim — the catch-up aborted rather than overwrite it.
+    expect(res).toEqual({ ok: true });
+    expect(headSha(main)).not.toBe(mainHeadBefore); // local default advanced
     expect(await Bun.file(join(main, "incoming.txt")).text()).toBe(
       "human untracked — do not stomp\n",
     );
-    // The lane survives for a retry once the path is cleared.
+    // Teardown completed — nothing leaks.
     expect(
       git(["worktree", "list", "--porcelain"], main).includes(baseLane),
-    ).toBe(true);
-    expect(git(["branch", "--list", base], main).trim()).not.toBe("");
+    ).toBe(false);
+    expect(git(["branch", "--list", base], main).trim()).toBe("");
   });
 
   test("a BENIGN untracked-only main checkout (no incoming overlap) → finalize merges + tears down", async () => {
@@ -314,6 +312,81 @@ describe.skipIf(!SLOW_ENABLED)("worktree finalize degrade (real git)", () => {
     // The merge was idempotent (base already an ancestor) — main HEAD did not move.
     expect(headSha(main)).toBe(mainHeadAfterMerge);
     // Teardown RESUMED: the lingering base worktree + branch are gone, nothing leaks.
+    expect(
+      git(["worktree", "list", "--porcelain"], main).includes(baseLane),
+    ).toBe(false);
+    expect(git(["branch", "--list", base], main).trim()).toBe("");
+  });
+
+  // ── fn-1204 — the merge-suite gate (real git, injected suite verdict) ────────
+  // The suite-run is an injected probe (the real scratch+suite run is exercised by the
+  // production path, not a temp repo), but the merge / park / default-ref / teardown are
+  // all REAL git: green advances local default + pushes + tears down; red leaves local
+  // default UNMOVED with nothing pushed and the lane intact for a retry.
+
+  test("fn-1204 a RED merge-suite gate parks a VISIBLE sticky with local default UNMOVED and nothing pushed", async () => {
+    const epicId = "fn-1204-red";
+    const base = `keeper/epic/${epicId}`;
+    const reserved = reserveLane();
+    git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
+    const baseLane = realpathSync(reserved);
+    commitLaneAhead(baseLane, epicId);
+    const mainHeadBefore = headSha(main);
+    const originMainBefore = git(["rev-parse", "origin/main"], main).trim();
+
+    // The prospective merge result's fast suite FAILS (a semantic merge conflict).
+    const res = await createWorktreeDriver().finalizeEpic(
+      finalizeInfo(epicId, baseLane),
+      async () => true,
+      async () => ({
+        kind: "red",
+        detail: "2 failing test(s): merged tree breaks",
+      }),
+    );
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      // A VISIBLE sticky (mirrors the non-ff arm), never a retry-skip.
+      expect(res.retry).not.toBe(true);
+      expect(res.reason.startsWith("worktree-finalize-suite-red:")).toBe(true);
+    }
+    // Local default NEVER advanced and origin was never pushed — no false
+    // shared-checkout-desync, no rollback machinery.
+    expect(headSha(main)).toBe(mainHeadBefore);
+    expect(git(["rev-parse", "origin/main"], main).trim()).toBe(
+      originMainBefore,
+    );
+    // The lane survives for a retry_dispatch once the conflict is reconciled.
+    expect(
+      git(["worktree", "list", "--porcelain"], main).includes(baseLane),
+    ).toBe(true);
+    expect(git(["branch", "--list", base], main).trim()).not.toBe("");
+  });
+
+  test("fn-1204 a GREEN merge-suite gate proceeds through the real merge+push path and tears the lane down", async () => {
+    const epicId = "fn-1204-green";
+    const base = `keeper/epic/${epicId}`;
+    const reserved = reserveLane();
+    git(["worktree", "add", "-b", base, reserved, "HEAD"], main);
+    const baseLane = realpathSync(reserved);
+    commitLaneAhead(baseLane, epicId);
+    const laneTip = headSha(baseLane);
+    let probeSawMerged: string | null = null;
+
+    const res = await createWorktreeDriver().finalizeEpic(
+      finalizeInfo(epicId, baseLane),
+      async () => true,
+      async (a) => {
+        probeSawMerged = a.mergedCommit;
+        return { kind: "green" };
+      },
+    );
+
+    expect(res).toEqual({ ok: true });
+    // A pure fast-forward: the gate saw (and the merge advanced to) the exact lane tip.
+    expect(probeSawMerged).toBe(laneTip);
+    expect(headSha(main)).toBe(laneTip);
+    // Teardown completed — the lane worktree + branch are gone, nothing leaks.
     expect(
       git(["worktree", "list", "--porcelain"], main).includes(baseLane),
     ).toBe(false);

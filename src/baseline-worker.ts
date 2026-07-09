@@ -106,6 +106,11 @@ const DEFAULT_KILL_GRACE_MS = 5_000;
 
 /** Data the parent passes via `new Worker(url, { workerData })`. All optional — production omits them and takes the defaults. */
 export interface BaselineWorkerData {
+  /** The role marker the bootstrap gates on so `main()` boots ONLY in a Worker
+   *  spawned AS the baseline runner — NEVER as a stowaway when another worker
+   *  module (e.g. `autopilot-worker`, for the merge-suite gate's pure suite-run
+   *  helpers) imports this one. Mirrors `autopilot-worker`'s role gate. */
+  role?: "baseline";
   /** Override the state dir (spool + leaf root); production omits → keeperStateDir(). */
   stateDir?: string;
   /** Override the out-of-repo scratch worktree root; production omits → `${homedir()}/worktrees`. */
@@ -926,8 +931,14 @@ function main(): void {
   })();
 }
 
-// Only run inside a real Worker; a plain import on the main thread (tests driving
-// the pure decision core) is inert.
-if (!isMainThread) {
+// Only run inside a real Worker spawned AS the baseline runner (`role: "baseline"`).
+// A plain import on the main thread (tests driving the pure decision core) is inert;
+// an import from ANOTHER worker module that pulls the pure suite-run helpers from here
+// (e.g. `autopilot-worker`'s merge-suite gate) must NOT boot a stowaway baseline
+// runner in that thread — the role gate enforces that (mirrors `autopilot-worker`).
+if (
+  !isMainThread &&
+  (workerData as BaselineWorkerData | undefined)?.role === "baseline"
+) {
   main();
 }

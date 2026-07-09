@@ -66,8 +66,9 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * `needs_human.parked_questions` count; v5 adds the additive
  * `needs_human.instant_death_wall` count (the instant-death circuit breaker);
  * v7 drops the `needs_human.selection_reviews` count (close-time selection
- * grading retires — grading moves out-of-band). */
-export const STATUS_SCHEMA_VERSION = 7;
+ * grading retires — grading moves out-of-band); v8 adds the additive
+ * `needs_human.finalize_suite_red` count (the merge-suite-gate finalize jam). */
+export const STATUS_SCHEMA_VERSION = 8;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -186,6 +187,11 @@ export interface StatusData {
     block_escalations: number;
     stuck_dispatches: number;
     finalize_non_ff: number;
+    // Count of per-repo finalize rows parked by the merge-suite gate (the
+    // prospective lane→default merge result's fast suite failed). Additive, a
+    // SUBSET of `stuck_dispatches` (never double-counted into `total`, like
+    // `finalize_non_ff`).
+    finalize_suite_red: number;
     // Count of epics carrying a non-null parked-closer question. Additive
     // (v4) — a distinct needs-human signal from the dispatch-failure family
     // (never mints a `dispatch_failures` row), included in `total`.
@@ -381,6 +387,7 @@ export function buildStatusEnvelope(
       block_escalations: needsHuman.blockEscalations,
       stuck_dispatches: needsHuman.stuckDispatches,
       finalize_non_ff: needsHuman.finalizeNonFf,
+      finalize_suite_red: needsHuman.finalizeSuiteRed,
       parked_questions: needsHuman.parkedQuestions,
       instant_death_wall: needsHuman.instantDeathWall,
       blocked_work: needsHuman.blockedWork,

@@ -11863,7 +11863,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // scratch worktrees itself.
   const baselineWorker = want("baseline")
     ? new Worker(new URL("./baseline-worker.ts", import.meta.url).href, {
-        workerData: {} satisfies BaselineWorkerData,
+        workerData: { role: "baseline" } satisfies BaselineWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;
 
