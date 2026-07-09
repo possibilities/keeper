@@ -22,8 +22,6 @@ import {
 import { homedir } from "node:os";
 import { basename, join, resolve as resolvePath, sep } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { projectAutopilotPaused } from "../cli/autopilot";
-import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import {
   type AdoptableCodexRollout,
   findAdoptableCodexRollouts,
@@ -33,6 +31,7 @@ import type {
   AutocloseIntentMessage,
   AutocloseWorkerData,
 } from "./autoclose-worker";
+import { projectAutopilotPaused } from "./autopilot-projection";
 import type {
   AutopilotWorkerData,
   DispatchClearedMessage,
@@ -178,6 +177,7 @@ import type {
   GitWorkerData,
   GitWorkerMessage,
 } from "./git-worker";
+import { HANDOFF_DOC_MAX_BYTES } from "./handoff-contract";
 import { handoffSlugExists } from "./handoff-slug";
 import type {
   HandoffDispatchingAckMessage,

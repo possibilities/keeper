@@ -18,7 +18,7 @@
  * stays db-free (pinned by the hygiene import-scan test).
  */
 
-import { parseDuration } from "../../cli/duration";
+import { parseDuration } from "../duration";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_NAME_SET } from "./harness";
 import type {

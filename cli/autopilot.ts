@@ -29,6 +29,13 @@
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import {
+  projectAutopilotPaused,
+  projectMaxConcurrentJobs,
+  projectMaxConcurrentPerRoot,
+  projectWorktreeMode,
+  projectWorktreeMultiRepo,
+} from "../src/autopilot-projection";
+import {
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
   effectivePerRootCap,
   resolveSockPath,
@@ -392,68 +399,6 @@ export function projectFailedRows(
 }
 
 /**
- * Coerce a singleton `autopilot_state` wire row's `paused` column (INTEGER:
- * `1` paused, `0` playing) to the banner boolean. An empty row set (singleton
- * not yet folded) returns `null` so the caller leaves the seed untouched; a
- * non-0/1 value falls back to `true` (the safer side, matching the daemon's
- * boot default). Pure — exported for tests.
- */
-export function projectAutopilotPaused(
-  rows: Record<string, unknown>[],
-): boolean | null {
-  if (rows.length === 0) {
-    return null;
-  }
-  const raw = rows[0]?.paused;
-  if (typeof raw !== "number") {
-    return true;
-  }
-  return raw !== 0;
-}
-
-/**
- * Coerce a singleton `autopilot_state` wire row's `max_concurrent_jobs` column
- * (NULLABLE INTEGER: a positive cap, or NULL = unlimited) to the banner cap.
- * Sourced ENTIRELY over the socket — the viewer NEVER reads config.yaml. The
- * whole absent → unlimited path (empty row set, NULL, missing column, or any
- * non-positive / non-integer value) returns `null` (rendered `∞`); only a
- * positive integer returns a numeric cap. Pure — exported for tests.
- */
-export function projectMaxConcurrentJobs(
-  rows: Record<string, unknown>[],
-): number | null {
-  if (rows.length === 0) {
-    return null;
-  }
-  const raw = rows[0]?.max_concurrent_jobs;
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
-    return null;
-  }
-  return raw;
-}
-
-/**
- * Coerce a singleton `autopilot_state` wire row's `max_concurrent_per_root`
- * column (NULLABLE INTEGER) to the banner's per-root count. Unlike the global
- * cap there is NO unlimited sentinel: NULL / empty rows / a non-positive or
- * non-integer value ALL resolve to `DEFAULT_MAX_CONCURRENT_PER_ROOT` (= 1)
- * inside the projection, so this always returns a concrete `number`. Pure —
- * exported for tests.
- */
-export function projectMaxConcurrentPerRoot(
-  rows: Record<string, unknown>[],
-): number {
-  if (rows.length === 0) {
-    return DEFAULT_MAX_CONCURRENT_PER_ROOT;
-  }
-  const raw = rows[0]?.max_concurrent_per_root;
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
-    return DEFAULT_MAX_CONCURRENT_PER_ROOT;
-  }
-  return raw;
-}
-
-/**
  * Coerce a singleton `autopilot_state` wire row's `mode` column (TEXT:
  * `'yolo'` work-everything, `'armed'` armed-set-only) to the banner enum. An
  * empty row set returns `null` so the caller leaves the seed untouched; any
@@ -470,37 +415,19 @@ export function projectAutopilotMode(
   return raw === "armed" ? "armed" : "yolo";
 }
 
-/**
- * Coerce a singleton `autopilot_state` wire row's `worktree_mode` column
- * (NULLABLE INTEGER: `1` ON, NULL/0 OFF) to the banner boolean. An empty row set
- * (singleton not yet folded) returns `null` so the caller leaves the seed
- * untouched; only a stored `1` is ON, every other value (NULL, 0, absent column,
- * non-1) is OFF — the byte-identical default. Pure — exported for tests.
- */
-export function projectWorktreeMode(
-  rows: Record<string, unknown>[],
-): boolean | null {
-  if (rows.length === 0) {
-    return null;
-  }
-  return rows[0]?.worktree_mode === 1;
-}
-
-/**
- * Coerce a singleton `autopilot_state` wire row's `worktree_multi_repo` column
- * (NULLABLE INTEGER: `1` ON, NULL/0 OFF — the durable multi-repo rollout flag) to
- * a boolean. Mirrors {@link projectWorktreeMode}: an empty row set returns `null`
- * so a caller can leave its seed untouched; only a stored `1` is ON, every other
- * value (NULL, 0, absent column, non-1) is OFF. Pure — exported for tests.
- */
-export function projectWorktreeMultiRepo(
-  rows: Record<string, unknown>[],
-): boolean | null {
-  if (rows.length === 0) {
-    return null;
-  }
-  return rows[0]?.worktree_multi_repo === 1;
-}
+// `projectAutopilotPaused` / `projectMaxConcurrentJobs` /
+// `projectMaxConcurrentPerRoot` / `projectWorktreeMode` /
+// `projectWorktreeMultiRepo` live in `../src/autopilot-projection` (imported
+// above) so daemon-side modules can reach them without crossing into cli/;
+// re-exported here for existing cli-side importers (`cli/board.ts`, tests)
+// that still resolve `../cli/autopilot`.
+export {
+  projectAutopilotPaused,
+  projectMaxConcurrentJobs,
+  projectMaxConcurrentPerRoot,
+  projectWorktreeMode,
+  projectWorktreeMultiRepo,
+};
 
 /**
  * Project the `armed_epics` wire rows to a sorted list of the explicitly-armed

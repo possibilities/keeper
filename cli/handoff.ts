@@ -42,6 +42,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
+import { HANDOFF_DOC_MAX_BYTES } from "../src/handoff-contract";
 import { slugifyHandoffSlug } from "../src/handoff-slug";
 import type { ClientFrame, ServerFrame } from "../src/protocol";
 import { queryCollection, roundTrip } from "./control-rpc";
@@ -147,11 +148,11 @@ export function resolveTargetDir(
   return { ok: true, dir: abs };
 }
 
-/** Doc-body cap (bytes, UTF-8). The brief rides inline in `events.data` forever
- *  (the canonical fold source), so an uncapped body is a re-fold time-bomb. This
- *  is a SEPARATE replay-cost cap from the dispatch argv cap. Over-cap → exit 2,
- *  never truncate. */
-export const HANDOFF_DOC_MAX_BYTES = 64 * 1024;
+// `HANDOFF_DOC_MAX_BYTES` lives in `../src/handoff-contract` (imported above)
+// so `src/daemon.ts` can reach it without crossing into cli/; re-exported here
+// for existing cli-side importers (tests) that still resolve
+// `../cli/handoff`.
+export { HANDOFF_DOC_MAX_BYTES };
 
 /** Discriminated result of {@link validateHandoffDoc}. */
 export type ValidateDocResult = { ok: true } | { ok: false; error: string };

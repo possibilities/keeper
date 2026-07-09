@@ -33,9 +33,9 @@
  * all-success: the agent keys off the verdict's `ok` flag.
  *
  * No keeper.db write, no RPC, no third-party deps — `node:*` plus the dep-free
- * `src/agent/config` + `src/agent/launch-config` + `src/keeper-agent-path` +
- * `src/keeper-state-dir` + `src/usage-flock` (the per-slug advisory lock) leaves
- * only.
+ * `src/agent/config` + `src/agent/launch-config` + `src/duration` +
+ * `src/keeper-agent-path` + `src/keeper-state-dir` + `src/usage-flock` (the
+ * per-slug advisory lock) leaves only.
  */
 
 import {
@@ -51,7 +51,6 @@ import {
 import { uptime } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { parseDuration } from "../../cli/duration";
 import {
   ConfigError,
   loadPanelSelections,
@@ -66,6 +65,7 @@ import {
   type AgentCli,
   loadRolePrompt,
 } from "../agent/launch-config";
+import { parseDuration } from "../duration";
 import { resolveKeeperAgentPathDepFree } from "../keeper-agent-path";
 import { keeperStateDir } from "../keeper-state-dir";
 import { slugify } from "../slug";

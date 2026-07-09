@@ -66,13 +66,13 @@
  *   - SIGINT remains the CALLER's concern.
  */
 
+import { computeEligibleEpics } from "./armed-closure";
 import {
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
   projectWorktreeMode,
   projectWorktreeMultiRepo,
-} from "../cli/autopilot";
-import { computeEligibleEpics } from "./armed-closure";
+} from "./autopilot-projection";
 import { getCollection } from "./collections";
 import { effectivePerRootCap } from "./db";
 import {
