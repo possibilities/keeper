@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 19,
+        "files_changed": 5,
+        "insertions": 370
+      },
+      "done_summary": "Verified the done-unwind window remains observable to await complete (fn-1200's latch closed only the proven-dead ghost path, not owning-job re-activation), then gated the complete met latch on a stability confirmation \u2014 met is withheld until the completed verdict holds across COMPLETE_CONFIRMATIONS consecutive subscribe snapshots with the target row's last_event_id watermark non-regressing.",
+      "input_hash": "6282b5901a4a427df0b29e8ea359ac941645f411f8599a1fb5f8740553096c2d",
+      "model": "opus",
+      "spec_chars": 2478,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/await.ts, src/await-conditions.ts, test (await fixtures)\n\n### Approach\n\nVerify-first: build a fixture replaying the observed unwind shape (verdict completed on one snapshot, regressed on the next, completed again) against the post-fn-1200 verdict stream and determine whether the await surface can still observe a transient completed. If not, land the fixture as regression coverage and close as a no-op with the evidence. If it can: gate the met latch on stability \u2014 the completion must hold across a small number of consecutive subscribe snapshots (2-3) with the target row's version watermark non-regressing; any regression resets the confirmation. Verify whether the snapshot payload already threads a per-row version to the await slot; if not, add that plumbing minimally. The bar only tightens: met must never fire earlier than current behavior, and steady-state latency added to a genuinely-complete await stays bounded to the confirmation snapshots.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/await-conditions.ts:73-81,477-492,654,736 \u2014 the completed reads and evaluators\n- cli/await.ts:42 and ~857 \u2014 the met one-shot latch (PlanSlotState.met)\n- fn-1200.3's landed terminality latch \u2014 what the verdict stream now guarantees\n\n### Risks\n\n- Double-latching what fn-1200 already fixed adds latency for nothing \u2014 hence verify-first with the fixture as the decider.\n\n### Test notes\n\nFixture-driven: transient-completed sequence \u2192 no met; stable-completed sequence \u2192 met after the confirmation window; watermark regression during confirmation \u2192 reset.\n\n## Acceptance\n\n- [ ] The window verdict (remains / closed) is documented with the reproducing fixture\n- [ ] If closed: fixture lands as regression; if open: transient completions never fire met and stable ones fire within the bounded window\n- [ ] met never fires earlier than current behavior\n- [ ] keeper fast suite green\n\n## Done summary\nVerified the done-unwind window remains observable to await complete (fn-1200's latch closed only the proven-dead ghost path, not owning-job re-activation), then gated the complete met latch on a stability confirmation \u2014 met is withheld until the completed verdict holds across COMPLETE_CONFIRMATIONS consecutive subscribe snapshots with the target row's last_event_id watermark non-regressing.\n## Evidence\n",
+      "task_id": "fn-1207-debounce-await-complete-across-unwind.1",
+      "tier": "xhigh",
+      "title": "Verify and close unwind window"
+    }
+  ],
+  "created_at": "2026-07-09T00:56:47.760000Z",
+  "epic_id": "fn-1207-debounce-await-complete-across-unwind",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "6282b5901a4a427df0b29e8ea359ac941645f411f8599a1fb5f8740553096c2d",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
