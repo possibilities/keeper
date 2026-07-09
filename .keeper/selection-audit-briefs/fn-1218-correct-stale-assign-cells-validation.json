@@ -1,0 +1,19 @@
+{
+  "auditable_tasks": [],
+  "created_at": "2026-07-09T20:30:38.604000Z",
+  "epic_id": "fn-1218-correct-stale-assign-cells-validation",
+  "excluded_tasks": [
+    {
+      "reason": "degraded-default",
+      "task_id": "fn-1218-correct-stale-assign-cells-validation.1"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "",
+  "selection_input_hash": "b41affcf14cab42f5b75a97015ed9c17b476c88a62e59bc64be6e4c9a77c04c6",
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  }
+}
