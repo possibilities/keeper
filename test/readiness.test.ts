@@ -89,6 +89,7 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     question: null,
+    blocks_closing_of: null,
     ...overrides,
   };
 }
@@ -269,6 +270,15 @@ test("fn-756: the approval-pending occupants (job-pending / git verdicts) NO LON
   expect(isRootOccupant(blocked({ kind: "job-pending" }))).toBe(false);
   expect(isRootOccupant(blocked({ kind: "git-uncommitted" }))).toBe(false);
   expect(isRootOccupant(blocked({ kind: "git-orphans" }))).toBe(false);
+});
+
+test("fn-1216: the close-followup gate verdict is NON-occupying", () => {
+  // The blocking-follow-up gate is a healthy wait, not live work: it must NOT
+  // hold the per-root mutex or count against the autopilot cap, so a source
+  // epic held open by its follow-up never starves an unrelated same-root epic.
+  expect(
+    isRootOccupant(blocked({ kind: "close-followup", followup: "fn-9-fu" })),
+  ).toBe(false);
 });
 
 test("isRootOccupant: a launch-window dispatch-pending row occupies (fn-721)", () => {
@@ -1185,6 +1195,191 @@ test("fn-779 close-row: status:done + working close job occupies the per-root mu
   expect(snap.perTask.get("fn-2-bar.1")).toEqual(
     blocked({ kind: "single-task-per-root" }),
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-1216: the blocking-follow-up close gate. A source epic whose tasks are all
+// complete (so its close row would otherwise read `ready`) is held
+// `blocked:close-followup` while an open follow-up points its `blocks_closing_of`
+// at it, releasing exactly when the follow-up is done-AND-close-idle — the same
+// liveness bar predicate 9 (dep-on-epic) uses. The reason is informational and
+// NON-occupying, and a source with no pointing follow-up is byte-identical to
+// today. Predicate ranks after all-tasks-complete (10) and before
+// dispatch-pending (10.5). Driven through `run` and asserted via `perCloseRow`.
+// ---------------------------------------------------------------------------
+
+// The completed source epic every gate test starts from: status `open` (so the
+// terminal-completed predicate never fires), all tasks done, idle closer.
+function completedSource(overrides: Partial<Epic> = {}): Epic {
+  return makeEpic({
+    epic_id: "fn-1-src",
+    epic_number: 1,
+    status: "open",
+    tasks: [makeTask({ task_id: "fn-1-src.1", worker_phase: "done" })],
+    ...overrides,
+  });
+}
+
+test("fn-1216 gate: an open follow-up holds the source close row blocked:close-followup (not completed)", () => {
+  const source = completedSource();
+  // The follow-up is not done (its own tasks are unfinished), so the gate holds.
+  const followup = makeEpic({
+    epic_id: "fn-9-followup",
+    epic_number: 9,
+    status: "open",
+    blocks_closing_of: "fn-1-src",
+    project_dir: "/other",
+    tasks: [makeTask({ task_id: "fn-9-followup.1", epic_id: "fn-9-followup" })],
+  });
+  const snap = run([source, followup]);
+  const verdict = snap.perCloseRow.get("fn-1-src");
+  expect(verdict).toEqual(
+    blocked({ kind: "close-followup", followup: "fn-9-followup" }),
+  );
+  // The gated source (status open) must NEVER read completed — the whole point
+  // is to hold the close open so no dependent builds on the flaw.
+  expect(verdict).not.toEqual({ tag: "completed" });
+});
+
+test("fn-1216 gate: the source close row flips ready when the follow-up is done and close-idle", () => {
+  const source = completedSource();
+  // Follow-up done, all tasks done, NO close-scope job → close-idle → release.
+  const followup = makeEpic({
+    epic_id: "fn-9-followup",
+    epic_number: 9,
+    status: "done",
+    blocks_closing_of: "fn-1-src",
+    project_dir: "/other",
+    tasks: [
+      makeTask({
+        task_id: "fn-9-followup.1",
+        epic_id: "fn-9-followup",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = run([source, followup]);
+  expect(snap.perCloseRow.get("fn-1-src")).toEqual({ tag: "ready" });
+});
+
+test("fn-1216 gate: a done-but-close-busy follow-up keeps the source blocked (done-AND-idle bar)", () => {
+  const source = completedSource();
+  // Follow-up status done but its closer is still winding down (a working
+  // epic-level close job) → epicHasLiveCloseScopeWork true → gate still holds,
+  // mirroring predicate 9's satisfied-but-live gate.
+  const followup = makeEpic({
+    epic_id: "fn-9-followup",
+    epic_number: 9,
+    status: "done",
+    blocks_closing_of: "fn-1-src",
+    project_dir: "/other",
+    tasks: [
+      makeTask({
+        task_id: "fn-9-followup.1",
+        epic_id: "fn-9-followup",
+        worker_phase: "done",
+      }),
+    ],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-9",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const snap = run([source, followup]);
+  expect(snap.perCloseRow.get("fn-1-src")).toEqual(
+    blocked({ kind: "close-followup", followup: "fn-9-followup" }),
+  );
+});
+
+test("fn-1216 gate: a source with no pointing follow-up reads ready (byte-identical to today)", () => {
+  const source = completedSource();
+  const snap = run([source]);
+  expect(snap.perCloseRow.get("fn-1-src")).toEqual({ tag: "ready" });
+});
+
+test("fn-1216 gate: a deleted follow-up (no row points at the source) un-blocks the close row", () => {
+  const source = completedSource();
+  // A sibling epic that does NOT point at the source — models the follow-up
+  // having been deleted (nothing carries blocks_closing_of=fn-1-src), so the
+  // reverse index has no entry and the source close row un-blocks. Downstream
+  // escalation of a deleted follow-up is the saga verb's job, not readiness's.
+  const other = makeEpic({
+    epic_id: "fn-9-other",
+    epic_number: 9,
+    status: "open",
+    project_dir: "/other",
+    tasks: [makeTask({ task_id: "fn-9-other.1", epic_id: "fn-9-other" })],
+  });
+  const snap = run([source, other]);
+  expect(snap.perCloseRow.get("fn-1-src")).toEqual({ tag: "ready" });
+});
+
+test("fn-1216 gate: a follow-up gated by ITS OWN follow-up is simply not-done — the wait nests", () => {
+  const source = completedSource();
+  // F1 gates the source; F2 gates F1. F1's tasks are all done and it has no
+  // close job, BUT F1's status is still `open` (its own close is held by F2),
+  // so F1 is not `status==="done"` → the source stays blocked. No special case.
+  const f1 = makeEpic({
+    epic_id: "fn-9-f1",
+    epic_number: 9,
+    status: "open",
+    blocks_closing_of: "fn-1-src",
+    project_dir: "/other",
+    tasks: [
+      makeTask({
+        task_id: "fn-9-f1.1",
+        epic_id: "fn-9-f1",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const f2 = makeEpic({
+    epic_id: "fn-10-f2",
+    epic_number: 10,
+    status: "open",
+    blocks_closing_of: "fn-9-f1",
+    project_dir: "/other2",
+    tasks: [makeTask({ task_id: "fn-10-f2.1", epic_id: "fn-10-f2" })],
+  });
+  const snap = run([source, f1, f2]);
+  expect(snap.perCloseRow.get("fn-1-src")).toEqual(
+    blocked({ kind: "close-followup", followup: "fn-9-f1" }),
+  );
+  // And F1's own close row is held by F2 (the nesting is symmetric).
+  expect(snap.perCloseRow.get("fn-9-f1")).toEqual(
+    blocked({ kind: "close-followup", followup: "fn-10-f2" }),
+  );
+});
+
+test("fn-1216 gate: the held-open source does NOT occupy its root (a same-root sibling's ready task is not demoted)", () => {
+  // Integration proof the close-followup verdict is non-occupying: the source's
+  // gated close row shares /repo with a sibling epic that has a ready task. If
+  // the gate occupied the root, the sibling would demote to single-task-per-root.
+  const source = completedSource({ project_dir: "/repo" });
+  const sibling = makeEpic({
+    epic_id: "fn-2-sib",
+    epic_number: 2,
+    status: "open",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-2-sib.1", epic_id: "fn-2-sib" })],
+  });
+  // The follow-up lives on a different root so it contributes nothing to /repo.
+  const followup = makeEpic({
+    epic_id: "fn-9-followup",
+    epic_number: 9,
+    status: "open",
+    blocks_closing_of: "fn-1-src",
+    project_dir: "/other",
+    tasks: [makeTask({ task_id: "fn-9-followup.1", epic_id: "fn-9-followup" })],
+  });
+  const snap = run([source, sibling, followup]);
+  expect(snap.perCloseRow.get("fn-1-src")).toEqual(
+    blocked({ kind: "close-followup", followup: "fn-9-followup" }),
+  );
+  expect(snap.perTask.get("fn-2-sib.1")).toEqual({ tag: "ready" });
 });
 
 // ---------------------------------------------------------------------------

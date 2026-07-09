@@ -484,6 +484,8 @@ test("buildEpicMessage maps primary_repo → projectDir, parses number", () => {
     lastValidatedAt: null,
     // No `question` arg passed — defaults to null (no parked question).
     question: null,
+    // No `blocks_closing_of` on the raw epic → null (an ordinary epic).
+    blocksClosingOf: null,
   });
   expect(buildEpicMessage({})).toBeNull();
 });
@@ -548,6 +550,7 @@ test("onChange emits an epic snapshot then change-gates an identical re-scan", (
       dependsOnEpics: [],
       lastValidatedAt: null,
       question: null,
+      blocksClosingOf: null,
     },
   ]);
 
@@ -970,6 +973,7 @@ test("seedFromDb reconstructs last_validated_at field-identically (no synthetic 
     dependsOnEpics: [],
     lastValidatedAt: "2026-05-24T00:00:00Z",
     question: null,
+    blocksClosingOf: null,
   };
   expect(JSON.stringify(fromBuild)).toBe(JSON.stringify(fromSeed));
 
@@ -989,6 +993,93 @@ test("seedFromDb reconstructs last_validated_at field-identically (no synthetic 
   expect(emitted.length).toBe(1);
   expect((emitted[0] as { lastValidatedAt: string }).lastValidatedAt).toBe(
     "2026-05-25T00:00:00Z",
+  );
+});
+
+test("buildEpicMessage extracts blocks_closing_of; seedFromDb reconstructs it identically (no re-emit, schema v117)", () => {
+  // A follow-up epic file carries a top-level `blocks_closing_of`. The producer
+  // must extract it AND the boot-seed reconstruct it in the SAME object-literal
+  // slot, or the change-gate re-emits one synthetic EpicSnapshot per epic every
+  // boot. Two epics cover both branches: (a) a stored pointer round-trips; (b)
+  // NULL stored matches a file that omits the field.
+  expect(
+    buildEpicMessage({
+      id: "fn-9-followup",
+      title: "FU",
+      status: "open",
+      primary_repo: "/repo",
+      blocks_closing_of: "fn-1-source",
+    })?.blocksClosingOf,
+  ).toBe("fn-1-source");
+
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, blocks_closing_of)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "fn-9-followup",
+      9,
+      "FU",
+      "/repo",
+      "open",
+      1,
+      0,
+      "[]",
+      "fn-1-source",
+      "fn-8-ordinary",
+      8,
+      "Ord",
+      "/repo",
+      "open",
+      1,
+      0,
+      "[]",
+      null,
+    ],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+  db.close();
+
+  // (a) Stored pointer → on-disk file carries the same value → no re-emit.
+  scanner.onChange(
+    writeEpic("fn-9-followup", {
+      title: "FU",
+      status: "open",
+      primary_repo: "/repo",
+      blocks_closing_of: "fn-1-source",
+    }),
+  );
+  // (b) Stored NULL → on-disk file omits the field → asString(undefined)===null
+  // matches the NULL seed → no re-emit.
+  scanner.onChange(
+    writeEpic("fn-8-ordinary", {
+      title: "Ord",
+      status: "open",
+      primary_repo: "/repo",
+    }),
+  );
+  expect(emitted).toEqual([]);
+
+  // A real change to blocks_closing_of DOES re-emit — the change-gate is keyed
+  // on the field, so the seed did not blanket-suppress.
+  scanner.onChange(
+    writeEpic("fn-9-followup", {
+      title: "FU",
+      status: "open",
+      primary_repo: "/repo",
+      blocks_closing_of: "fn-2-other-source",
+    }),
+  );
+  expect(emitted.length).toBe(1);
+  expect((emitted[0] as { blocksClosingOf: string }).blocksClosingOf).toBe(
+    "fn-2-other-source",
   );
 });
 
@@ -2238,6 +2329,7 @@ test("fn-759: boot-seed asymmetry — seeded lastEmitted + empty pathToId → un
     dependsOnEpics: [],
     lastValidatedAt: null,
     question: null,
+    blocksClosingOf: null,
   };
   scanner.seed("fn-3-demo", JSON.stringify(expectedMsg));
 

@@ -14,6 +14,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -52,6 +53,11 @@ describe("closeStopAllowed", () => {
       "partial-followup surface",
       "Partial follow-up for `fn-1-x` (expected 3 tasks, found 1).",
     ],
+    [
+      "followup_blocks_close deferred-close report",
+      "`fn-1-x` held open by blocking follow-up `fn-2-y` — the source " +
+        "closes once the follow-up lands.",
+    ],
   ];
   for (const [label, message] of allowed) {
     test(`allows: ${label}`, () => {
@@ -74,6 +80,36 @@ describe("closeStopAllowed", () => {
       expect(closeStopAllowed(message)).toBe(false);
     });
   }
+});
+
+// The deferred blocking-close report phrasing lives in skills/close/SKILL.md; the
+// sanctioning pattern lives in CLOSE_ALLOW_PATTERNS. They can drift independently,
+// so this pins BOTH: the SKILL must carry the phrase, and a realized instance of
+// its report must pass the guard's allow-list. If either surface moves, one of
+// these two assertions fails.
+describe("deferred blocking-close report ↔ stop-guard lockstep", () => {
+  const CLOSE_SKILL = join(
+    import.meta.dir,
+    "..",
+    "skills",
+    "close",
+    "SKILL.md",
+  );
+
+  test("the close SKILL carries the deferred-close report phrase", () => {
+    expect(readFileSync(CLOSE_SKILL, "utf-8")).toContain(
+      "held open by blocking follow-up",
+    );
+  });
+
+  test("a realized deferred-close report is sanctioned by closeStopAllowed", () => {
+    expect(
+      closeStopAllowed(
+        "`fn-9-x` held open by blocking follow-up `fn-9-y` — the source " +
+          "closes once the follow-up lands.",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("workBlockReason", () => {
@@ -617,6 +653,19 @@ describe("stop-guard ladder", () => {
       }),
     );
     expect(stdout).toBe("");
+  });
+
+  test("close marker + deferred blocking-close report → allow", async () => {
+    writeCloseMarker("fn-1-x");
+    const { stdout, planCliCalled } = await run(
+      stopPayload({
+        last_assistant_message:
+          "`fn-1-x` held open by blocking follow-up `fn-2-y` — the source " +
+          "closes once the follow-up lands.",
+      }),
+    );
+    expect(stdout).toBe("");
+    expect(planCliCalled).toBe(false);
   });
 
   test("unparseable stdin fails open", async () => {

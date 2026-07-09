@@ -1561,6 +1561,9 @@ function getEpic(epicId: string) {
     // Schema v104 (fn-1083 task .2): nullable TEXT carrying the epic-level
     // parked-closer question.
     question: string | null;
+    // Schema v117 (fn-1216 task .1): nullable TEXT carrying the blocking
+    // follow-up close-gate pointer (the source epic id a follow-up gates).
+    blocks_closing_of: string | null;
   } | null;
 }
 
@@ -1669,6 +1672,10 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // Schema v104 (fn-1083 task .2): no `question` in the blob → folds to
     // NULL (no parked closer question, the zero-event reading).
     question: null,
+    // Schema v117 (fn-1216 task .1): no `blocks_closing_of` in the blob → folds
+    // to NULL (an ordinary epic, not a blocking follow-up — the zero-event
+    // reading).
+    blocks_closing_of: null,
   });
   expect(epic?.last_event_id).toBe(id);
   expect(getCursor()).toBe(id);

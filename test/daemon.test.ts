@@ -3550,7 +3550,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // key folds away unread, so a from-scratch re-fold over any stream produces the
   // narrower epics shape byte-identically; `commit_trailer_facts` spared per the
   // same carve-out).
-  expect(SCHEMA_VERSION).toBe(116);
+  // And to 117 via fn-1216 task .1 (appending the nullable `epics.blocks_closing_of`
+  // TEXT column — the blocking-follow-up close-gate pointer, sibling of `question`;
+  // an additive ALTER declared in the `CREATE_EPICS` literal too, NO cursor rewind:
+  // a pre-v117 EpicSnapshot carries no `blocks_closing_of` key, so a from-scratch
+  // re-fold leaves it NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(117);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

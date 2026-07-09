@@ -267,6 +267,7 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     resolved_epic_deps: null,
     last_validated_at: "2026-05-24T00:00:00Z",
     question: null,
+    blocks_closing_of: null,
     ...overrides,
   };
 }

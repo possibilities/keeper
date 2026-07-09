@@ -7,6 +7,8 @@
 //     {
 //       "fatal": bool,
 //       "fatal_reason": str,
+//       "blocks_closing": bool,          # optional; absent = legacy non-blocking
+//       "blocks_closing_reason": str,    # optional; non-empty iff blocks_closing
 //       "decisions": [
 //         {"fid": str, "action": "kept"|"culled"|"merged-into-<fid>",
 //          "task": int|null, "rationale": str},
@@ -35,6 +37,10 @@ const MERGED_INTO_PREFIX = "merged-into-";
 
 const ACTION_PATTERN = "^(kept|culled|merged-into-.+)$";
 
+/** Length cap on the optional `blocks_closing_reason` — a bounded one-paragraph
+ * justification, never an essay. Exported so a test can pin the boundary. */
+export const BLOCKS_CLOSING_REASON_MAX = 2000;
+
 export interface ErrorRow {
   loc: string;
   type: string;
@@ -57,6 +63,15 @@ export const VERDICT_SCHEMA: Schema = {
   properties: {
     fatal: { type: "boolean" },
     fatal_reason: { type: "string" },
+    // Optional close-gate pair, shaped exactly like fatal/fatal_reason: a strict
+    // boolean plus its length-capped reason (non-empty when true, cross-checked
+    // below). Absent means legacy non-blocking; a non-boolean or over-cap reason
+    // is rejected at submit so garbage never coerces toward the irreversible close.
+    blocks_closing: { type: "boolean" },
+    blocks_closing_reason: {
+      type: "string",
+      maxLength: BLOCKS_CLOSING_REASON_MAX,
+    },
     decisions: {
       type: "array",
       items: {
@@ -243,6 +258,14 @@ function validateString(
           : `${pyRepr(value)} is too short`,
     });
   }
+  const maxLength = schema.maxLength as number | undefined;
+  if (maxLength !== undefined && value.length > maxLength) {
+    rows.push({
+      loc: loc || "<root>",
+      type: "maxLength",
+      msg: `${pyRepr(value)} is too long`,
+    });
+  }
   const pattern = schema.pattern as string | undefined;
   if (pattern !== undefined && !new RegExp(pattern).test(value)) {
     rows.push({
@@ -286,6 +309,24 @@ export function crossFieldErrors(verdict: Record<string, unknown>): ErrorRow[] {
       loc: "fatal_reason",
       type: "fatal_reason_required",
       msg: "fatal: true requires a non-empty fatal_reason",
+    });
+  }
+
+  // The close-gate pair, enforced exactly like fatal/fatal_reason: a true
+  // blocking decision demands a non-empty reason.
+  const blocksClosing = verdict.blocks_closing;
+  const blocksClosingReason = verdict.blocks_closing_reason ?? "";
+  if (
+    blocksClosing === true &&
+    !(
+      typeof blocksClosingReason === "string" &&
+      blocksClosingReason.trim() !== ""
+    )
+  ) {
+    errors.push({
+      loc: "blocks_closing_reason",
+      type: "blocks_closing_reason_required",
+      msg: "blocks_closing: true requires a non-empty blocks_closing_reason",
     });
   }
 
@@ -373,15 +414,18 @@ function schemaFragmentForLoc(loc: string): Schema {
     return { [head]: props[head] as Schema };
   }
 
-  // Fallback anchor: top-level skeleton (required keys + their bare types).
+  // Fallback anchor: top-level skeleton (required keys + their bare types). The
+  // optional close-gate pair is deliberately excluded — the retry anchor names
+  // only the fields a valid verdict MUST carry.
+  const required = (VERDICT_SCHEMA.required as string[]) ?? [];
   const skeleton: Record<string, Schema> = {};
   for (const [k, v] of Object.entries(props)) {
-    if ("type" in v) {
+    if ("type" in v && required.includes(k)) {
       skeleton[k] = { type: v.type as unknown as Schema };
     }
   }
   return {
-    required: (VERDICT_SCHEMA.required as string[]) ?? [],
+    required,
     properties: skeleton,
   };
 }

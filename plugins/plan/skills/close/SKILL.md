@@ -5,7 +5,7 @@ description: >-
   finalize the close. Use when the human types `/plan:close <epic_id>` once
   every task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
-allowed-tools: Bash(keeper plan:*), Read, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Bash(keeper autopilot:*), Read, Task, SendMessage
 disallowed-tools: Edit, NotebookEdit, TodoWrite
 disable-model-invocation: true
 ---
@@ -16,7 +16,7 @@ Content-blind coordinator for the epic-close phase. The closer drives PROCESS on
 
 The human types `/plan:close <epic_id>` once every task in the epic is `done`. The session is named `close::<epic_id>`.
 
-`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. When survivors will scaffold a follow-up, the closer interposes a content-blind **pre-select beat** (Phase 3.5) between the planner's `followup submit` and finalize — briefing the stored follow-up, spawning `plan:model-selector` blind, and piping its return to `apply-selection --from-followup` so the follow-up tasks are born with researched cells. The beat degrades to a verdict-less finalize on any hitch, so the close never blocks on selection. After the agents return, the closer's job is the pre-select beat (when a follow-up was planned), the selection-audit brief capture (Phase 3.6, always) then one `close-finalize` call and a total switch over its four outcomes.
+`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. When survivors will scaffold a follow-up, the closer interposes a content-blind **pre-select beat** (Phase 3.5) between the planner's `followup submit` and finalize — briefing the stored follow-up, spawning `plan:model-selector` blind, and piping its return to `apply-selection --from-followup` so the follow-up tasks are born with researched cells. The beat degrades to a verdict-less finalize on any hitch, so the close never blocks on selection. After the agents return, the closer's job is the pre-select beat (when a follow-up was planned), the selection-audit brief capture (Phase 3.6, always) then one `close-finalize` call and a total switch over its five outcomes.
 
 ---
 
@@ -40,6 +40,8 @@ keeper plan close-preflight "$ARGUMENTS"
 **Pin the depth band.** Read `brief_ref` with the Read tool and extract only the `depth.band` string field (`lean` / `standard` / `deep`) — a mechanical field lookup, not opening or reasoning over brief prose. Pin it as `DEPTH_BAND`. A missing or unreadable field pins `DEPTH_BAND` as `lean` (the degrade floor) rather than blocking the audit spawn.
 
 Capture the `[instructions]` tail (anything after the epic id in `$ARGUMENTS`) verbatim as `INSTRUCTIONS` if present — it rides into the close-planner spawn as an opaque directive.
+
+**Blocking-gate re-entry short-circuit.** The preflight envelope also carries `blocking_followup` — `{id, status}` when a prior close already minted a **blocking follow-up** that gates this source (discovered by its committed `blocks_closing_of` pointer), else `null`. When it is **non-null**, a gate is already in flight: SKIP Phases 2, 3, 3.5, and 3.6 and go **straight to Phase 4 (finalize)**. Do not re-spawn the auditor or planner — a second audit would author a divergent verdict and risk a duplicate mint. `close-finalize` re-enters on the same committed pointer and either adopts the now-`done` follow-up (`closed_with_followup`) or re-emits `followup_blocks_close` idempotently. On a `null` `blocking_followup` (the ordinary close), proceed to Phase 2.
 
 ---
 
@@ -223,14 +225,33 @@ keeper plan close-finalize <epic_id> --project <primary_repo>
 
 `close-finalize` is idempotent — a re-run after a crash derives its position from observable state (a closed epic, an existing follow-up) and never double-creates. It refuses on a `commit_set_hash` mismatch (a commit landed after the audit) rather than closing against stale artifacts.
 
-**Total switch over the four `CloseOutcome` members** (`data.outcome` on the success envelope). The switch MUST stay total — the task-3 exhaustiveness test enforces it; if an outcome is added, update both this switch and that test together:
+**Total switch over the five `CloseOutcome` members** (`data.outcome` on the success envelope). The switch MUST stay total — the exhaustiveness test enforces it; if an outcome is added, update both this switch and that test together:
 
 - **`closed_clean`** → the epic closed with no follow-up (no findings, or every finding culled). Report the clean format.
 - **`closed_with_followup`** → the epic closed and a follow-up epic was scaffolded AND armed (`close-finalize` flips its validation marker to ready so autopilot can dispatch it — a fresh scaffold mints a not-ready ghost). Read `data.new_epic_id`. Report the with-followup format.
 - **`fatal_halt`** → the planner flagged a ship-block; the epic stays OPEN, nothing closed. Read `data.fatal_reason`. Report the fatal-halt format.
 - **`partial_followup`** → a prior `/plan:close` crashed mid-scaffold and left an incomplete follow-up (`data.expected_tasks` vs `data.actual_tasks`). The epic stays OPEN. Surface it and stop: *"Partial follow-up for `<epic_id>` (expected `<expected_tasks>` tasks, found `<actual_tasks>`). A prior `/plan:close` crashed mid-scaffold. Inspect and complete or delete it, then re-run `/plan:close <epic_id>`."*
+- **`followup_blocks_close`** → the close audit required a **blocking follow-up**: `close-finalize` minted and armed the follow-up epic (flipped its validation marker to ready) but left the source epic OPEN — the gate holds the source (and every dependent) until the follow-up is done, then a re-dispatched closer adopts it into a `closed_with_followup`. Read `data.new_epic_id`. **Armed-mode guard (so the gate cannot wedge):** an armed-mode board dispatches only explicitly-armed epics plus their transitive upstreams, and nothing points at a fresh follow-up — so read the board mode and, when it is `armed`, arm the follow-up on the autopilot surface:
+
+    ```bash
+    keeper autopilot show
+    ```
+
+    ```bash
+    keeper autopilot arm <new_epic_id>
+    ```
+
+    On `yolo` mode (or an unreachable daemon — no autopilot is driving, so the follow-up dispatches on ordinary readiness or a human is at the wheel), skip the arm. If the arm is needed but fails, say so plainly — the gate then **waits on a human** to arm it. A `keeper await` monitor on the follow-up may be armed as a latency shortcut, but **end the turn cleanly either way**: the durable board gate, not a parked session, is what closes the source. The source is NOT closed; surface it and stop: *"`<epic_id>` held open by blocking follow-up `<new_epic_id>` — the source closes once the follow-up lands."*
 
 **Typed errors** — on a `{"success": false, "error": {"code", "message", "details"}}` envelope, surface `error.message` verbatim and stop. The codes include `STALE_ARTIFACTS` (the source commit set moved since the audit — re-run `/plan:close` to re-audit), `VERDICT_MISSING` / `VERDICT_CORRUPT`, `FOLLOWUP_MISSING`, `SCAFFOLD_FAILED`, and `EPIC_NOT_FOUND`. None of these are retried by the skill — the human reads the message and acts.
+
+**Exception — `BLOCKING_FOLLOWUP_DELETED`:** the blocking follow-up minted for this source was deleted while it was still gating the close, so there is nothing to adopt and the source must never close silently against a vanished gate. Escalate it the way a planner `QUESTION:` escalates — stamp the source epic so the board shows a parked closer (a needs-human `keeper status` signal), closing with the unstick sentence that names the fix, then end the turn:
+
+    ```bash
+    keeper plan epic-question <epic_id> "<error.message> to proceed, tell me exactly: restore or re-plan the deleted blocking follow-up (its minted id is in error.details.minted_followup_id), then re-run /plan:close <epic_id>."
+    ```
+
+    Under autopilot this behaves like `BLOCKED` — the chain halts and the source stays open until a human acts.
 
 ---
 

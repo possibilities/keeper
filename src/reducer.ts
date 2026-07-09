@@ -596,6 +596,13 @@ interface PlanSnapshot {
    * reproduces the same row across re-fold.
    */
   question?: string | null;
+  /**
+   * The blocking-follow-up source pointer (EpicSnapshot blob, epic-level
+   * only) — the source epic id this follow-up gates the close of. Absent /
+   * NULL folds to `null` (an ordinary epic) so a pre-this-feature blob
+   * reproduces the same row across re-fold.
+   */
+  blocks_closing_of?: string | null;
 }
 
 /**
@@ -678,8 +685,8 @@ function projectPlanRow(db: Database, event: Event): void {
     // EpicSnapshot re-fold would wipe the provenance, job-link, and
     // resolved-deps projections.
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, last_event_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, blocks_closing_of, last_event_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
@@ -688,6 +695,7 @@ function projectPlanRow(db: Database, event: Event): void {
          depends_on_epics = excluded.depends_on_epics,
          last_validated_at = excluded.last_validated_at,
          question = excluded.question,
+         blocks_closing_of = excluded.blocks_closing_of,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at`,
       [
@@ -703,6 +711,9 @@ function projectPlanRow(db: Database, event: Event): void {
         // The parked-closer question — a missing / NULL blob value folds to
         // NULL (no parked question, the zero-event reading).
         snapshot.question ?? null,
+        // The blocking-follow-up source pointer — a missing / NULL blob value
+        // folds to NULL (an ordinary epic, the zero-event reading).
+        snapshot.blocks_closing_of ?? null,
         event.id,
         ts,
       ],
@@ -7827,6 +7838,7 @@ function epicLiteToEpic(row: EpicLite): Epic {
     last_validated_at: null,
     resolved_epic_deps: null,
     question: null,
+    blocks_closing_of: null,
   };
 }
 

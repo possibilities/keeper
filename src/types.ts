@@ -981,6 +981,16 @@ export interface Epic {
    * board signal.
    */
   question: string | null;
+  /**
+   * When this epic is a blocking follow-up, the id of the SOURCE epic whose
+   * close it gates — the single committed pointer of the blocking-follow-up
+   * close gate. `null` for an ordinary epic. Folded from the `EpicSnapshot`
+   * blob's `blocks_closing_of` field, sourced from the epic file. Readiness
+   * builds a reverse index (source id → its blocking follow-up) over the
+   * non-null values and holds the source's close row `blocked:close-followup`
+   * until the follow-up is done and close-idle.
+   */
+  blocks_closing_of: string | null;
 }
 
 /**

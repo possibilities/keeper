@@ -147,6 +147,12 @@ export interface PlanEpicMessage {
    * `null` when no question is parked (never-observed / cleared).
    */
   question: string | null;
+  /**
+   * When this epic is a blocking follow-up, the source epic id it gates — the
+   * top-level `blocks_closing_of` field on the epic file. `null` for an
+   * ordinary epic (missing / empty / non-string collapses via {@link asString}).
+   */
+  blocksClosingOf: string | null;
 }
 
 /** Snapshot message for one `.keeper/tasks/*.json` file. */
@@ -564,6 +570,7 @@ interface RawEpic {
   primary_repo?: unknown;
   depends_on_epics?: unknown;
   last_validated_at?: unknown;
+  blocks_closing_of?: unknown;
 }
 
 /** Raw plan task JSON shape — only the fields we project. */
@@ -2030,6 +2037,7 @@ export function buildEpicMessage(
     dependsOnEpics: asStringArray(raw.depends_on_epics),
     lastValidatedAt: asString(raw.last_validated_at),
     question,
+    blocksClosingOf: asString(raw.blocks_closing_of),
   };
 }
 
@@ -2826,7 +2834,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
   // (the worst-case feedback loop documented in the epic's Risks section).
   const epics = db
     .query(
-      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, tasks FROM epics",
+      "SELECT epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, question, blocks_closing_of, tasks FROM epics",
     )
     .all() as {
     epic_id: string;
@@ -2837,6 +2845,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
     depends_on_epics: string | null;
     last_validated_at: string | null;
     question: string | null;
+    blocks_closing_of: string | null;
     tasks: string | null;
   }[];
   for (const e of epics) {
@@ -2861,6 +2870,12 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       // always a non-empty string or NULL, so this is defensive-only). Slot
       // position MUST match `buildEpicMessage`'s return.
       question: asString(e.question),
+      // `blocks_closing_of` is a nullable TEXT column; `asString` collapses any
+      // non-string / empty-string stored value to `null`, mirroring
+      // `buildEpicMessage`'s producer-side coercion. Slot position MUST match
+      // `buildEpicMessage`'s return, or the change-gate re-emits one synthetic
+      // `EpicSnapshot` per epic every boot.
+      blocksClosingOf: asString(e.blocks_closing_of),
     };
     scanner.seed(e.epic_id, JSON.stringify(msg));
 

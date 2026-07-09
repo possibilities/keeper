@@ -281,6 +281,13 @@ export type BlockReason =
   | { kind: "single-task-per-epic" }
   | { kind: "single-task-per-root" }
   | { kind: "epic-no-tasks" }
+  // A close-row-only reason: the epic is the SOURCE of an open blocking
+  // follow-up (some epic points its `blocks_closing_of` at this one) that is
+  // not yet done-and-close-idle, so the source's close is held. `followup`
+  // carries the gating follow-up's epic id for board legibility. Informational
+  // and NON-occupying — it stays out of `isLiveWorkOccupant`, so a healthy
+  // wait neither holds the per-root mutex nor blocks reaps.
+  | { kind: "close-followup"; followup: string }
   | { kind: "dispatch-pending" }
   | { kind: "bound-pending" }
   | { kind: "runtime-blocked" }
@@ -599,9 +606,25 @@ export function computeReadiness(
   // (which may not be computed yet for a forward-referenced upstream).
   const epicsById = new Map<string, Epic>();
   const epicsArr: Epic[] = [];
+  // Reverse index for the blocking-follow-up close gate: SOURCE epic id → the
+  // follow-up epic whose `blocks_closing_of` points at it. Built ONCE per pass
+  // over the (typically empty) set of epics carrying a non-null pointer, so the
+  // close-row predicate is an O(1) lookup and the pass never goes quadratic on
+  // board size (the epic Risks bar). At most one follow-up per source by the
+  // idempotent-child-identity design (docs/adr/0028); a first-write-wins keep
+  // is deterministic under the caller's stable epic order.
+  const blockingFollowupBySource = new Map<string, Epic>();
   for (const epic of epics) {
     epicsArr.push(epic);
     epicsById.set(epic.epic_id, epic);
+    const source = epic.blocks_closing_of;
+    if (
+      source != null &&
+      source !== "" &&
+      !blockingFollowupBySource.has(source)
+    ) {
+      blockingFollowupBySource.set(source, epic);
+    }
     for (const task of epic.tasks) {
       taskById.set(task.task_id, task);
     }
@@ -649,6 +672,7 @@ export function computeReadiness(
       now,
       pendingKeys,
       matchedPendingKeys,
+      blockingFollowupBySource,
     );
     perCloseRow.set(epic.epic_id, closeVerdict);
   }
@@ -1124,6 +1148,10 @@ function evaluateCloseRow(
   // `dispatch-pending` verdict below.
   pendingKeys: Set<string>,
   matchedPendingKeys: Set<string>,
+  // Reverse index (SOURCE epic id → its blocking follow-up epic) built once per
+  // pass in `computeReadiness`. Read O(1) by the close-followup predicate below;
+  // the close row otherwise receives no cross-epic lookup.
+  blockingFollowupBySource: Map<string, Epic>,
 ): Verdict {
   // Record a matched `close::<epic_id>` dispatch (before the pipeline returns)
   // so the root-fallback never double-synthesizes a root occupant for it.
@@ -1257,6 +1285,37 @@ function evaluateCloseRow(
         reason: { kind: "dep-on-task", upstream: task.task_id },
       };
     }
+  }
+
+  // 10.4. close-followup — the blocking-follow-up close gate (docs/adr/0028).
+  // When some epic points its `blocks_closing_of` at THIS epic (a blocking
+  // follow-up the close audit minted to correct a consumer-observable flaw),
+  // the source's close is held OPEN until that follow-up lands, so no dependent
+  // builds on the flaw. RANKED after all-tasks-complete (predicate 10) — the
+  // source's own tasks are all done here, so the close would otherwise read
+  // `ready` — and before dispatch-pending. The release bar is the SAME
+  // done-AND-idle liveness the dep-on-epic predicate uses: the follow-up must
+  // be `status==="done"` AND carry no live close-scope work
+  // (`epicHasLiveCloseScopeWork`), so a re-dispatched closer only adopts the
+  // source once the follow-up is genuinely settled. A follow-up itself gated by
+  // its OWN follow-up is simply not-done — the wait nests naturally, no special
+  // case. When no epic points at this source (a deleted follow-up), the index
+  // has no entry and the row un-blocks; downstream escalation of a deleted
+  // follow-up is the saga verb's job, not readiness's. The reason is
+  // informational and NON-occupying (out of `isLiveWorkOccupant`), so a healthy
+  // wait neither holds the per-root mutex nor blocks reaps.
+  const followup = blockingFollowupBySource.get(epic.epic_id);
+  if (
+    followup !== undefined &&
+    !(
+      followup.status === "done" &&
+      !epicHasLiveCloseScopeWork(followup, subRunningByJobId, now)
+    )
+  ) {
+    return {
+      tag: "blocked",
+      reason: { kind: "close-followup", followup: followup.epic_id },
+    };
   }
 
   // 10.5. dispatch-pending — close-row twin. A `close::<epic_id>` worker was
@@ -2565,6 +2624,10 @@ function formatReasonShort(reason: BlockReason): string {
       return "single-task-per-root";
     case "epic-no-tasks":
       return "epic-no-tasks";
+    case "close-followup":
+      // Names the gating follow-up so the board reads `blocked:close-followup
+      // <followup-id>` — legible like `dep-on-task <id>`.
+      return `close-followup ${reason.followup}`;
     case "dispatch-pending":
       return "dispatch-pending";
     case "bound-pending":

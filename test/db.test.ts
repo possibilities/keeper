@@ -335,6 +335,47 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
   migrated.close();
 });
 
+test("the v104 question + v117 blocks_closing_of are the byte-identical epics tail on fresh vs migrated (fn-1083 task .2, fn-1216 task .1)", () => {
+  // Both are declared in the `CREATE_EPICS` literal (after the VIRTUAL
+  // `default_visible`) AND appended by an `ALTER TABLE ADD COLUMN` migration
+  // step, so they must land as the SAME trailing columns of `table_xinfo(epics)`
+  // — in the same order — on both the fresh CREATE path and a migrated-from-old
+  // path. `table_xinfo` (not `table_info`) is used because the epics table
+  // carries the VIRTUAL `default_visible` generated column; the two scalar tail
+  // columns follow it. `blocks_closing_of` (v117) is the current final column,
+  // trailing `question` (v104).
+  const expectedTail = ["question", "blocks_closing_of"];
+  const tailOf = (database: Database): string[] => {
+    const names = (
+      database.prepare("PRAGMA table_xinfo(epics)").all() as { name: string }[]
+    ).map((c) => c.name);
+    return names.slice(-expectedTail.length);
+  };
+
+  const { db: fresh } = openDb(":memory:");
+  expect(tailOf(fresh)).toEqual(expectedTail);
+  fresh.close();
+
+  // A v5-shaped DB has no epics table at all; migrate() creates it (v85 rebuild
+  // shape) then appends `question` (v104) and `blocks_closing_of` (v117) via
+  // idempotent ALTERs, ending with the two-column tail above.
+  const old = new Database(dbPath, { create: true });
+  old.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  old.run("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
+  old.close();
+
+  const { db: migrated } = openDb(dbPath);
+  expect(
+    (
+      migrated
+        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value: string }
+    ).value,
+  ).toBe(String(SCHEMA_VERSION));
+  expect(tailOf(migrated)).toEqual(expectedTail);
+  migrated.close();
+});
+
 test("SCHEMA_FINGERPRINT pins the fully-migrated schema shape — re-pin it with EVERY schema change", () => {
   // The pinned constant is the schema's lock file: any schema change (new
   // migration block, CREATE-literal edit, bare version bump) moves the live
@@ -1991,6 +2032,11 @@ test("v5 DB migrates to v7: epics table added (embedded tasks), no tasks table, 
     // `CREATE_EPICS` so a fresh CREATE and a migrated `ALTER TABLE ADD
     // COLUMN` (which always appends) produce the same trailing column order.
     "question",
+    // Schema v117 (fn-1216 task .1): nullable TEXT carrying the blocking
+    // follow-up close-gate pointer (the SOURCE epic id a follow-up gates).
+    // Declared AFTER `question` in `CREATE_EPICS` so a fresh CREATE and the
+    // migrated `ALTER TABLE ADD COLUMN` append in the same trailing slot.
+    "blocks_closing_of",
   ]);
 
   // Schema v11 rewind-and-redrain wipes the directly-inserted `old` jobs
@@ -2810,7 +2856,13 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // re-fold). It narrows the epics row shape — but AFTER the `question` column
   // (the trailing append), so the `default_visible`/`approval` rewrite this test
   // exercises is untouched and the migrated table stays byte-clean, fn-1172 task .3.
-  expect(SCHEMA_VERSION).toBe(116);
+  // v117 appends the nullable `epics.blocks_closing_of` column (the blocking
+  // follow-up close-gate pointer) — an additive ALTER declared in the fresh
+  // `CREATE_EPICS` literal too, placed after `question` so column order stays
+  // fresh-vs-migrated identical; it widens the epics row shape but does not touch
+  // the v62→v63 `default_visible`/`approval` rewrite this test exercises, fn-1216
+  // task .1.
+  expect(SCHEMA_VERSION).toBe(117);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

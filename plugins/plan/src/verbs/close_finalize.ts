@@ -20,6 +20,15 @@
 //     (crash-resume); wired+partial → partial_followup (stop); absent →
 //     scaffold from followup.yaml → closed_with_followup.
 //
+// Blocking close-gate: a verdict carrying `blocks_closing:true` routes the
+// scaffold branch to followup_blocks_close — the follow-up is minted with the
+// source's still-resolving deps substituted (never the source, a cycle) and a
+// committed `blocks_closing_of` pointer, but the source epic stays OPEN, holding
+// every dependent. A durable minted-marker records the mint. A re-dispatched
+// closer re-enters FIRST (before any verdict re-derive): a done follow-up adopts
+// into closed_with_followup, an alive one re-emits followup_blocks_close, and a
+// deleted-while-gated follow-up (marker but no pointer) is a typed failure.
+//
 // On the fresh-scaffold branch an optional `--selection-verdict` pre-selects the
 // follow-up cells: its ordinal-keyed {tier, model} fold into the scaffold input
 // (a merged temp YAML) so the tasks are BORN selected, scaffold's own tier/model
@@ -52,14 +61,17 @@ import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
   computeCommitSetHash,
   followupPath,
+  readBlockingFollowupMarker,
   reportMetaPath,
   verdictPath,
+  writeBlockingFollowupMarker,
 } from "../audit_artifacts.ts";
 import {
   AllReposBrokenError,
   type CommitGroupResult,
   findCommitGroups,
 } from "../commit_lookup.ts";
+import { resolveEpicGlobally } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
@@ -83,14 +95,17 @@ import { runEpicClose } from "./epic_close.ts";
 import { runScaffold } from "./scaffold.ts";
 import { armEpicValidated } from "./validate.ts";
 
-/** The four terminal outcomes the close coordinator switches on. Every member
- * MUST have a /plan:close skill handler — the exhaustiveness test pins it.
- * Mirrors CloseOutcome. */
+/** The terminal outcomes the close coordinator switches on. Every member MUST
+ * have a /plan:close skill handler — the exhaustiveness test pins it. Mirrors
+ * CloseOutcome. `followup_blocks_close` is the sole member that leaves the
+ * source epic OPEN after a successful (non-error) run: the blocking follow-up
+ * gate holds the close until the follow-up lands. */
 export const CLOSE_OUTCOMES = {
   CLOSED_CLEAN: "closed_clean",
   CLOSED_WITH_FOLLOWUP: "closed_with_followup",
   FATAL_HALT: "fatal_halt",
   PARTIAL_FOLLOWUP: "partial_followup",
+  FOLLOWUP_BLOCKS_CLOSE: "followup_blocks_close",
 } as const;
 
 export type CloseOutcome = (typeof CLOSE_OUTCOMES)[keyof typeof CLOSE_OUTCOMES];
@@ -233,6 +248,68 @@ function findFollowupEpic(
   return null;
 }
 
+/** Return the follow-up epic a blocking close-gate minted for sourceEpicId,
+ * discovered by its committed `blocks_closing_of === sourceEpicId` pointer in
+ * ANY status (open OR done — a done follow-up is what an adopt closes on).
+ * Separate from findFollowupEpic so that finder's two open-only, provenance-keyed
+ * callers stay byte-identical. First-seen wins via sorted glob. Returns
+ * {epicId, status} or null. close-preflight reuses it to surface the in-flight
+ * gate so the skill short-circuits the audit phases on re-entry. */
+export function findFollowupByBlocksClosingOf(
+  dataDir: string,
+  sourceEpicId: string,
+): { epicId: string; status: string | undefined } | null {
+  const epicsDir = join(dataDir, "epics");
+  if (!existsSync(epicsDir)) {
+    return null;
+  }
+  const epicFiles = readdirSync(epicsDir)
+    .filter((n) => n.endsWith(".json"))
+    .sort();
+  for (const file of epicFiles) {
+    const stem = file.slice(0, -".json".length);
+    if (stem === sourceEpicId) {
+      continue;
+    }
+    const epDef = loadJsonSafe(join(epicsDir, file));
+    if (epDef === null || epDef.blocks_closing_of !== sourceEpicId) {
+      continue;
+    }
+    return {
+      epicId: (epDef.id as string | undefined) ?? stem,
+      status: epDef.status as string | undefined,
+    };
+  }
+  return null;
+}
+
+/** The still-resolving subset of the source epic's epic-deps, canonicalized to
+ * their full slug ids — the dep substitution a blocking follow-up inherits so it
+ * never depends on the source it gates (a cycle) yet keeps every upstream the
+ * source itself waited on. A dep is KEPT iff it resolves to exactly one project
+ * (exists, unambiguous — status is irrelevant, matching scaffold's status-blind
+ * validator) and is not the source. Dedupes; never the source. */
+function substituteGateDeps(
+  sourceEpicId: string,
+  sourceDeps: string[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const dep of sourceDeps) {
+    const res = resolveEpicGlobally(dep);
+    if (!res.resolved || res.ambiguous || res.resolvedId === null) {
+      continue;
+    }
+    const id = res.resolvedId;
+    if (id === sourceEpicId || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 /** Run a delegate (epic close / scaffold) in-process with cwd set to the
  * project path and stdout captured (finalize emits its OWN terminal envelope —
  * the delegate's envelope is internal plumbing). Returns the delegate's return
@@ -289,12 +366,15 @@ function scaffoldFollowup(
   followupYamlPath: string,
   sourceEpicId: string,
   format: OutputFormat | null,
+  gate?: { blocksClosingOf: string; dependsOnEpicsOverride: string[] },
 ): string {
   const { result: rc, output } = runCaptured(ctx.projectPath, () =>
     runScaffold({
       file: followupYamlPath,
       allowDuplicate: false,
       createdByCloseOf: sourceEpicId,
+      blocksClosingOf: gate?.blocksClosingOf ?? null,
+      dependsOnEpicsOverride: gate?.dependsOnEpicsOverride ?? null,
     }),
   );
 
@@ -559,6 +639,59 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     return;
   }
 
+  // 3.5 Blocking close-gate RE-ENTRY — runs BEFORE any verdict/audit machinery
+  //     so a re-dispatched closer never re-derives (and cannot re-scaffold) a
+  //     live gate. Discovery rides the committed `blocks_closing_of` pointer
+  //     (authoritative, any status); the durable minted-marker only disambiguates
+  //     the no-pointer case. Reached only while the source stays OPEN, which the
+  //     gate holds it — a non-blocking close carries neither pointer nor marker
+  //     and falls straight through.
+  const gatedFollowup = findFollowupByBlocksClosingOf(stateCtx.dataDir, epicId);
+  if (gatedFollowup !== null) {
+    if (gatedFollowup.status === "done") {
+      // The follow-up landed — adopt it and close the source (the ordinary
+      // closed_with_followup terminal).
+      closeEpic(stateCtx, epicId);
+      emitOutcome(
+        CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
+        epicId,
+        ctx,
+        format,
+        stateCtx,
+        { newEpicId: gatedFollowup.epicId },
+      );
+      return;
+    }
+    // Alive but not done — re-emit the gate outcome idempotently (no re-scaffold),
+    // leaving the source open.
+    emitOutcome(
+      CLOSE_OUTCOMES.FOLLOWUP_BLOCKS_CLOSE,
+      epicId,
+      ctx,
+      format,
+      stateCtx,
+      { newEpicId: gatedFollowup.epicId },
+    );
+    return;
+  }
+  const blockingMarker = readBlockingFollowupMarker(primaryRepo, epicId);
+  if (blockingMarker !== null) {
+    // A mint happened (marker present) but the pointer resolves to nothing — the
+    // follow-up was deleted while gating. NEVER an implicit close, never a blind
+    // re-scaffold: a typed failure surfaced through the sticky dispatch-failure
+    // needs-human machinery (a failed close dispatch stays parked and visible).
+    emitFinalizeError(
+      "BLOCKING_FOLLOWUP_DELETED",
+      `the blocking follow-up ${
+        blockingMarker.followupEpicId || "(id unrecorded)"
+      } minted for ${epicId} no longer exists — it was deleted while gating the ` +
+        "source close. Restore or re-plan the follow-up (the source epic stays " +
+        "open); close-finalize refuses to close against a vanished gate.",
+      format,
+      { minted_followup_id: blockingMarker.followupEpicId },
+    );
+  }
+
   // 4. read the persisted verdict — synthesize empty when findings==0.
   const vp = verdictPath(primaryRepo, epicId);
   let verdict: Record<string, unknown>;
@@ -578,6 +711,13 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
       );
     }
   }
+
+  // A strict-true blocking decision routes the surviving-findings scaffold down
+  // the gate branch (mint but do NOT close). Anything else — absent, false, or a
+  // non-boolean the submit verb would have rejected anyway — is legacy
+  // non-blocking. The re-entry above already handled a gate that was minted on a
+  // prior pass, so reaching here with a true flag is a FIRST pass.
+  const blockingDecision = verdict.blocks_closing === true;
 
   // 5. re-derive commit_set_hash FRESH; mismatch → STALE_ARTIFACTS.
   const taskIds = loadTasksForEpic(stateCtx, epicId)
@@ -701,19 +841,54 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     mergedFile = writeMergedFollowup(followupDoc.doc, selection.cells, format);
     scaffoldFile = mergedFile;
   }
+  // On a blocking first pass the follow-up must never depend on the source it
+  // gates (a cycle). Substitute the source's still-resolving epic-deps and stamp
+  // the `blocks_closing_of` pointer — both ride scaffold's SAME internal-arg path
+  // createdByCloseOf uses, so pointer and epic land atomically in the one scaffold
+  // commit. Computed before the scaffold so a substitution failure never leaves a
+  // half-minted tree.
+  const gate = blockingDecision
+    ? {
+        blocksClosingOf: epicId,
+        dependsOnEpicsOverride: substituteGateDeps(
+          epicId,
+          (epicDef.depends_on_epics as string[] | undefined) ?? [],
+        ),
+      }
+    : undefined;
   let newEpicId: string;
   try {
-    newEpicId = scaffoldFollowup(stateCtx, scaffoldFile, epicId, format);
+    newEpicId = scaffoldFollowup(stateCtx, scaffoldFile, epicId, format, gate);
   } finally {
     if (mergedFile !== null) {
       unlinkQuiet(mergedFile);
     }
   }
 
-  // Sidecar BEFORE closeEpic: its atomic write records the touched path, and epic
-  // close's auto-commit sweeps the (dirty) top-level selections/ file into the
-  // close commit — finalize itself draws no commit.
+  // Sidecar BEFORE the terminal: its atomic write records the touched path, and
+  // the next auto-commit (epic close on the non-blocking path, the follow-up arm
+  // on the gate path) sweeps the (dirty) top-level selections/ file — finalize
+  // itself draws no commit.
   writeCloseSelectionSidecar(stateCtx.dataDir, newEpicId, selection);
+
+  if (blockingDecision) {
+    // Blocking gate: persist the durable minted-marker AFTER a successful
+    // scaffold (so it never claims a mint that did not land — this is what later
+    // distinguishes an adopt from a deleted follow-up), then terminate WITHOUT
+    // closing the source. emitOutcome arms the follow-up and releases the
+    // close-exclusive claim exactly as the closing outcomes do — without the
+    // release the re-dispatched closer would die on the claim.
+    writeBlockingFollowupMarker(primaryRepo, epicId, newEpicId);
+    emitOutcome(
+      CLOSE_OUTCOMES.FOLLOWUP_BLOCKS_CLOSE,
+      epicId,
+      ctx,
+      format,
+      stateCtx,
+      { newEpicId },
+    );
+    return;
+  }
 
   closeEpic(stateCtx, epicId);
   emitOutcome(
@@ -764,18 +939,20 @@ function emitOutcome(
     data.actual_tasks = extra.actualTasks;
   }
 
-  // Arm the follow-up at the single terminal chokepoint. A closed_with_followup
-  // epic is dispatchable only once its validation marker flips null→timestamp;
-  // this covers ALL three closing paths (fresh scaffold + both crash-resume
-  // adopt paths) and deliberately EXCLUDES partial_followup (a half-built tree
-  // must stay a non-dispatchable ghost). The seam is idempotent, so an adopt
-  // path re-arming an already-armed follow-up is a no-op. State routes through
-  // stateCtx (the primary repo): in worktree mode the follow-up lives there, not
-  // in the cwd lane. An arm failure folds INTO this envelope (surfaced verbatim)
-  // rather than hard-exiting after the irreversible close — the dashed ghost is
-  // swept by the next .keeper/ commit.
+  // Arm the follow-up at the single terminal chokepoint. A follow-up epic is
+  // dispatchable only once its validation marker flips null→timestamp; this
+  // covers every path that mints or adopts one — a closed_with_followup fresh
+  // scaffold, both crash-resume adopt paths, AND a followup_blocks_close gate
+  // (armed so an armed-mode board cannot wedge waiting on it) — and deliberately
+  // EXCLUDES partial_followup (a half-built tree must stay a non-dispatchable
+  // ghost). The seam is idempotent, so a re-emit re-arming an already-armed
+  // follow-up is a no-op. State routes through stateCtx (the primary repo): in
+  // worktree mode the follow-up lives there, not in the cwd lane. An arm failure
+  // folds INTO this envelope (surfaced verbatim) rather than hard-exiting — the
+  // dashed ghost is swept by the next .keeper/ commit.
   if (
-    outcome === CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP &&
+    (outcome === CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP ||
+      outcome === CLOSE_OUTCOMES.FOLLOWUP_BLOCKS_CLOSE) &&
     extra?.newEpicId !== undefined
   ) {
     const arm = armEpicValidated(
