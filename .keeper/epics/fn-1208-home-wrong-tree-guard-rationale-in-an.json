@@ -7,7 +7,7 @@
     "fn-1205-guard-lane-workers-from-wrong-tree"
   ],
   "id": "fn-1208-home-wrong-tree-guard-rationale-in-an",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T00:43:30.085000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T00:43:29.661000Z"
+  "updated_at": "2026-07-09T00:43:30.085000Z"
 }
