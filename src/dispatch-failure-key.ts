@@ -161,20 +161,22 @@ export function isSharedWedgeDistressKey(verb: string, id: string): boolean {
 }
 
 /**
- * The SIBLING synthetic PER-REPO distress signal for a shared MAIN checkout that
- * stays DIRTY — a non-clean working tree with NO MERGE_HEAD — past the recover grace
- * watermark. A dirty (non-mid-merge) checkout degrades every epic finalize into a
- * silent non-sticky retry skip; this is the escalation layer ON TOP of the immediate
- * per-cycle `worktree-recover-dirty-checkout` recover reason, mirroring the
- * mid-merge {@link SHARED_WEDGE_DISTRESS_VERB} idiom EXACTLY but on its own id/reason
- * so the two never cross-clear. Shares the un-retryable synthetic `daemon` verb
- * (routes as {@link routeDispatchFailure}'s `unknown` arm, never in `failedKeys`,
- * never `retry_dispatch`-clearable), the boot orphan-GC exemption, and the recover
- * level-clear; the per-repo `id` (`shared-checkout-dirty:<repoHash>`) keeps two
- * checkouts on a multi-repo board independent. Its ONLY clear is the recover pass's
- * level-trigger observing the checkout clean (the `reason` lives OUTSIDE {@link
- * WORKTREE_RECOVER_REASON_PREFIX}). In-memory grace tracking, so a daemon restart
- * re-emits at most once per still-present dirt.
+ * The PER-REPO distress signal for a shared MAIN checkout that stays DIRTY — a
+ * non-clean working tree with NO MERGE_HEAD — past the grace watermark. UNLIKE its
+ * mid-merge {@link SHARED_WEDGE_DISTRESS_VERB} sibling (a neutered false positive the
+ * boot orphan sweep DRAINS — a dirty/mid-merge checkout no longer blocks the
+ * working-tree-free base merge), this is a LIVE producer: the daemon's repair-escalation
+ * sweep is the surface that genuinely still starves on the dirt (a write-capable
+ * `repair::<repo>` session cannot launch into a dirty tree, so it DEFERS), and it feeds
+ * the sustained-dirt tracker. Mirrors the wedge idiom on its own id/reason so the two
+ * never cross-clear: the un-retryable synthetic `daemon` verb (routes as {@link
+ * routeDispatchFailure}'s `unknown` arm, never in `failedKeys`, never
+ * `retry_dispatch`-clearable) with a per-repo `id` (`shared-checkout-dirty:<repoHash>`)
+ * so two checkouts on a multi-repo board stay independent. As a LIVE producer it IS boot
+ * orphan-GC-EXEMPT (a level-trigger owns dropping it, UNLIKE the drained wedge row). Its
+ * ONLY clear is the repair sweep's level-trigger observing the checkout clean (the
+ * `reason` lives OUTSIDE {@link WORKTREE_RECOVER_REASON_PREFIX}). In-memory grace
+ * tracking, so a daemon restart re-emits at most once per still-present dirt.
  */
 export const SHARED_DIRTY_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
 export const SHARED_DIRTY_DISTRESS_ID_PREFIX = "shared-checkout-dirty:";
@@ -182,12 +184,13 @@ export const SHARED_DIRTY_DISTRESS_REASON = "shared-checkout-dirty";
 
 /**
  * True iff `(verb, id)` is a shared-checkout-DIRTY distress key — the synthetic
- * `daemon` verb plus the {@link SHARED_DIRTY_DISTRESS_ID_PREFIX} per-repo id. The
- * boot orphan-GC exempts it (like the mid-merge wedge + crash-loop keys) since the
- * operator surface never clears it; pure, dep-free, NEVER throws. Disjoint from
- * {@link isSharedWedgeDistressKey}: the id prefixes (`shared-checkout-dirty:` vs
- * `shared-checkout-wedge:`) never mutually match, so the two distress rows never
- * cross-classify or cross-clear.
+ * `daemon` verb plus the {@link SHARED_DIRTY_DISTRESS_ID_PREFIX} per-repo id. The boot
+ * orphan-GC EXEMPTS it (like the crash-loop / desync / lane-wedge keys, UNLIKE the
+ * DRAINED mid-merge wedge row) since a live level-trigger — the repair sweep observing
+ * the checkout clean — not the operator surface, clears it; pure, dep-free, NEVER
+ * throws. Disjoint from {@link isSharedWedgeDistressKey}: the id prefixes
+ * (`shared-checkout-dirty:` vs `shared-checkout-wedge:`) never mutually match, so the
+ * two distress rows never cross-classify or cross-clear.
  */
 export function isSharedDirtyDistressKey(verb: string, id: string): boolean {
   return (

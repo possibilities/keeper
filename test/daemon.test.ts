@@ -44,6 +44,7 @@ import {
   buildDeconflictHumanNotifyBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
+  buildSharedDirtyObservation,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   checkKeeperAgentPresence,
@@ -309,12 +310,13 @@ test("gcUnretryableDispatchFailures: the crash-loop distress row is EXEMPT (self
   db.close();
 });
 
-test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout wedge/dirty distress rows, EXEMPTS the still-live lane-wedge + crash-loop rows", () => {
+test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout WEDGE row, EXEMPTS the now-live shared-checkout-DIRTY + lane-wedge + crash-loop + desync rows", () => {
   const { db } = freshMemDb();
-  // Post base-merge decouple the shared-checkout mid-merge/dirty distress family is a
-  // false positive with no live producer, so the orphan sweep DRAINS any such row left
-  // open (it is no longer exempt). The per-lane fan-in wedge + crash-loop rows are
-  // still live, self-managed signals and stay EXEMPT.
+  // Post base-merge decouple the shared-checkout mid-merge WEDGE distress is a false
+  // positive with no live producer, so the orphan sweep DRAINS any such row left open (it
+  // is no longer exempt). Its SIBLING plain-DIRTY row regained a LIVE producer (the
+  // repair-escalation sweep), so it is EXEMPT alongside the per-lane fan-in wedge +
+  // crash-loop + desync rows — all still-live, self-managed signals a level-trigger owns.
   const insert = db.prepare(
     `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, 100, ?, 100, 100)`,
@@ -364,14 +366,13 @@ test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout wedge/d
     cleared.push({ verb, id }),
   );
 
-  // Exactly the two shared-checkout rows are drained; the lane-wedge + crash-loop +
-  // desync rows are left untouched (assert the drained set, order-independent).
-  expect(swept).toBe(2);
-  const clearedIds = cleared.map((c) => c.id).sort();
-  expect(clearedIds).toEqual([dirtyId, wedgeId].sort());
-  expect(cleared.every((c) => c.verb === SHARED_WEDGE_DISTRESS_VERB)).toBe(
-    true,
-  );
+  // ONLY the mid-merge wedge row is drained; the now-live dirty + lane-wedge + crash-loop
+  // + desync rows are left untouched (assert the drained set, order-independent).
+  expect(swept).toBe(1);
+  expect(cleared.map((c) => c.id)).toEqual([wedgeId]);
+  expect(cleared.some((c) => c.id === dirtyId)).toBe(false);
+  expect(cleared.some((c) => c.id === laneId)).toBe(false);
+  expect(cleared.some((c) => c.id === CRASH_LOOP_DISTRESS_ID)).toBe(false);
   expect(cleared.some((c) => c.id === desyncId)).toBe(false);
   db.close();
 });
@@ -4893,6 +4894,8 @@ function fakeRepairSweepDeps(opts: {
   rows?: PendingRepairRow[];
   /** repo_dirs whose shared checkout is DIRTY (DEFER). */
   dirty?: Set<string>;
+  /** repo_dir → active shared-checkout-dirty distress row id (defer-note naming). */
+  activeDirty?: Map<string, string>;
   /** repo_dirs whose base reads GREEN (positive-evidence clear gate). */
   green?: Set<string>;
   dispatch?: (group: RepairGroup) => Promise<EscalationDispatchOutcome>;
@@ -4925,6 +4928,7 @@ function fakeRepairSweepDeps(opts: {
       return opts.rows ?? [];
     },
     isDirtyCheckout: (dir) => opts.dirty?.has(dir) ?? false,
+    activeDirtyDistressId: (dir) => opts.activeDirty?.get(dir) ?? null,
     isBaseGreen: (dir) => opts.green?.has(dir) ?? false,
     dispatchRepair: async (group) => {
       dispatches.push(group);
@@ -5008,10 +5012,82 @@ test("runRepairEscalationSweep: a dirty shared checkout DEFERS — no dispatch, 
   expect(mints).toEqual([]);
   // Regression guard (fn-1198): the incident dirty-defer was invisible — every defer
   // MUST now emit a class-stable, token+dir-keyed diagnostic so a starving repair route
-  // is greppable instead of looking like a dead feature.
+  // is greppable instead of looking like a dead feature. With no ACTIVE dirt distress row
+  // yet (sustained dirt has not crossed grace), the note carries no `distress=` suffix.
   expect(notes).toEqual([
     "# repair-defer token=repo-abc class=dirty_checkout dir=/repo",
   ]);
+});
+
+test("runRepairEscalationSweep: a dirty defer NAMES the active shared-checkout-dirty distress row (one incident, two consumers)", async () => {
+  // Once sustained dirt has crossed grace and minted its per-repo distress row, the
+  // repair-defer trace names that SAME row so a greppable defer and the operator-visible
+  // needs-human row are the one incident — the whole point of routing the two consumers
+  // (the sweep defer + the distress family) through one `shared-checkout-dirty:<hash>` id.
+  const distressId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`;
+  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    dirty: new Set(["/repo"]),
+    activeDirty: new Map([["/repo", distressId]]),
+  });
+  await runRepairEscalationSweep(deps);
+  // Still a pure DEFER — no dispatch, no repair row minted (the naming is diagnostic-only).
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+  expect(notes).toEqual([
+    `# repair-defer token=repo-abc class=dirty_checkout dir=/repo distress=${distressId}`,
+  ]);
+});
+
+test("buildSharedDirtyObservation: candidate-scoped GENUINE dirt mints; unseeded/clean never; open rows RETAIN until observed clean", () => {
+  const clean = "/clean";
+  const dirtyRepo = "/dirty";
+  const unseeded = "/unseeded";
+  const staleRepo = "/stale"; // an open distress row's repo, no live candidate
+  // Hand-computed dirty_count fixtures (an independent source of truth, never re-derived).
+  const counts = new Map<string, number | null>([
+    [clean, 0],
+    [dirtyRepo, 3],
+    [unseeded, null],
+    [staleRepo, 2],
+  ]);
+  const dirtyCount = (dir: string) =>
+    counts.has(dir) ? (counts.get(dir) as number | null) : null;
+
+  const candidates = [
+    repairCandidate("fn-1-a", "fn-1-a.1", {
+      repo_dir: clean,
+      repo_token: "clean-t",
+    }),
+    repairCandidate("fn-2-b", "fn-2-b.1", {
+      repo_dir: dirtyRepo,
+      repo_token: "dirty-t",
+    }),
+    repairCandidate("fn-3-c", "fn-3-c.1", {
+      repo_dir: unseeded,
+      repo_token: "unseeded-t",
+    }),
+  ];
+  // Two open distress rows: one whose checkout is still dirty (RETAIN), one now clean (DROP).
+  const openRows = [
+    { id: `${SHARED_DIRTY_DISTRESS_ID_PREFIX}stale`, dir: staleRepo },
+    { id: `${SHARED_DIRTY_DISTRESS_ID_PREFIX}wasdirty`, dir: clean },
+  ];
+
+  const obs = buildSharedDirtyObservation(candidates, openRows, dirtyCount);
+
+  // MINT: only the genuinely-dirty candidate (dirty_count > 0) is observed. A clean
+  // candidate (0) and an unseeded/unknown one (null) never enter the map (no page on the
+  // human's own clean checkout, no false page on an unseeded surface).
+  expect(obs.has(dirtyRepo)).toBe(true);
+  expect(obs.has(clean)).toBe(false);
+  expect(obs.has(unseeded)).toBe(false);
+  // RETAIN: the open distress row whose checkout is STILL dirty stays in the map so the
+  // tracker's level-clear retains it — cleared ONLY on observed clean, never on the
+  // candidate resolving elsewhere while dirt remains.
+  expect(obs.has(staleRepo)).toBe(true);
+  // The exact set — no extra keys leaked in.
+  expect([...obs.keys()].sort()).toEqual([dirtyRepo, staleRepo].sort());
 });
 
 test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO RepairDispatched (re-sweeps), with an observable skip trace", async () => {

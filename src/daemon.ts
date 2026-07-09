@@ -48,6 +48,7 @@ import type {
 } from "./autopilot-worker";
 import {
   classifyResolverOutcome,
+  createSharedCheckoutDirtyTracker,
   WORKER_EFFORT,
   WORKER_MODEL,
 } from "./autopilot-worker";
@@ -134,8 +135,12 @@ import {
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isSharedDesyncDistressKey,
+  isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_REASON,
+  SHARED_DIRTY_DISTRESS_VERB,
   SHARED_WEDGE_DISTRESS_VERB,
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
@@ -372,11 +377,13 @@ export function drainToCompletion(
  * the default tip / the repair sweep observing the base green) owns dropping them — so
  * the orphan sweep must never reap a self-managed row out from under its signal.
  *
- * The per-repo shared-checkout-wedge/-dirty distress family is DELIBERATELY NOT exempt:
- * a dirty or mid-merge shared checkout no longer blocks the working-tree-free base
- * merge, so that signal is a neutered false positive with no live producer — the sweep
- * DRAINS any such row still open so an operator is not left with an un-clearable
- * daemon-verb row.
+ * The per-repo shared-checkout-WEDGE (mid-merge) distress row is DELIBERATELY NOT exempt:
+ * a mid-merge shared checkout no longer blocks the working-tree-free base merge, so that
+ * signal is a neutered false positive with no live producer — the sweep DRAINS any such
+ * row still open so an operator is not left with an un-clearable daemon-verb row. Its
+ * SIBLING shared-checkout-DIRTY row ({@link isSharedDirtyDistressKey}) IS exempt: it
+ * regained a LIVE producer (the repair-escalation sweep, which starves on a dirty tree),
+ * so a level-trigger — the sweep observing the checkout clean — owns dropping it.
  */
 export function gcUnretryableDispatchFailures(
   db: Database,
@@ -415,6 +422,15 @@ export function gcUnretryableDispatchFailures(
     // level-trigger owns dropping it, so the orphan sweep must not reap it out from under
     // its signal.
     if (isSharedDesyncDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the per-repo shared-checkout-DIRTY distress row — a LIVE producer (the
+    // repair-escalation sweep, which DEFERS on a dirty shared checkout it cannot launch a
+    // write-capable repair session into) owns it: its own `shared-checkout-dirty:` id
+    // prefix rides the synthetic `daemon` verb, and the sweep's per-cycle level-trigger
+    // (the checkout observed clean) owns dropping it, so the orphan sweep must not reap it
+    // out from under its signal. (Its mid-merge WEDGE sibling stays DRAINED above.)
+    if (isSharedDirtyDistressKey(row.verb, row.id)) {
       continue;
     }
     // And the per-(project,number) duplicate-epic-number distress row — a LIVE producer
@@ -1666,6 +1682,12 @@ export interface RepairEscalationSweepDeps {
    *  (no attempt consumed, and no row minted when none exists yet), per the finalize
    *  dirty-degrade precedent. Production reads the `git_status` projection. */
   readonly isDirtyCheckout: (repoDir: string) => boolean;
+  /** The id of the ACTIVE `shared-checkout-dirty` distress row for `repoDir`, or null
+   *  when none is open — used ONLY to name the row in the dirty-checkout DEFER diagnostic
+   *  so a starving repair route correlates to the one operator-visible incident row.
+   *  Optional (an absent hook keeps the bare defer note); the row's own mint/level-clear
+   *  lifecycle is owned OUTSIDE the pure sweep, by the sustained-dirt grace tracker. */
+  readonly activeDirtyDistressId?: (repoDir: string) => string | null;
   /** True iff the repo's shared base reads GREEN — the positive-evidence gate the clear
    *  requires (combined with zero remaining candidates). Anything else (red / unknown /
    *  unseeded) RETAINS the sticky row ("retained on no report"). */
@@ -1721,6 +1743,54 @@ function compareRepairCandidate(
   return (
     a.epic_id.localeCompare(b.epic_id) || a.task_id.localeCompare(b.task_id)
   );
+}
+
+/**
+ * Build the shared-checkout-DIRTY distress observation the sustained-dirt grace tracker
+ * ({@link createSharedCheckoutDirtyTracker}) folds — the LIVE producer feed the neutered
+ * recover-pass tracker no longer supplies. Keyed by shared-checkout repo dir; the value
+ * is the human-readable attribution the mint reason quotes. Pure; the `git_status`
+ * dirty-count read is injected (`dirtyCount`, `null` = unseeded/unknown) so a fixture
+ * pins every arm. Two clauses on a DELIBERATE asymmetry between MINT and CLEAR:
+ *
+ *  - MINT: a repair candidate whose shared checkout is GENUINELY dirty (`dirty_count > 0`,
+ *    NOT merely unseeded) — the repair sweep is deferring its `repair::<repo>` launch, so
+ *    the dirt is actively starving the base-repair route. Only a candidate-scoped dirt
+ *    mints, so a human's own dirty checkout with no pending repair never pages.
+ *  - RETAIN: an already-OPEN dirt row whose checkout is NOT positively clean
+ *    (`dirty_count !== 0` — dirty OR unknown) stays in the map so the tracker's level-clear
+ *    RETAINS it. The row therefore clears ONLY on observed-clean (`dirty_count === 0`),
+ *    never merely because the starving candidate resolved by other means while dirt
+ *    remains, and never on a `null` no-report (positive-evidence clear).
+ */
+export function buildSharedDirtyObservation(
+  candidates: readonly RepairCandidate[],
+  openDirtyRows: readonly { id: string; dir: string }[],
+  dirtyCount: (repoDir: string) => number | null,
+): Map<string, string> {
+  const dirty = new Map<string, string>();
+  for (const c of candidates) {
+    if (c.repo_dir === "") continue;
+    const n = dirtyCount(c.repo_dir);
+    if (n != null && n > 0) {
+      dirty.set(
+        c.repo_dir,
+        `repair::${c.repo_token} cannot launch a write-capable session into a dirty ` +
+          `shared checkout (${n} dirty path(s)) — the base repair is deferring`,
+      );
+    }
+  }
+  for (const row of openDirtyRows) {
+    if (row.dir === "" || dirty.has(row.dir)) continue;
+    // Not positively clean (dirty OR unknown) → retain the open row (clear only on clean).
+    if (dirtyCount(row.dir) !== 0) {
+      dirty.set(
+        row.dir,
+        `${row.dir} has not been observed clean — dirt distress retained`,
+      );
+    }
+  }
+  return dirty;
 }
 
 /**
@@ -1829,8 +1899,13 @@ export async function runRepairEscalationSweep(
     // broken feature. Emitted every deferring tick (bounded by the concurrently-broken
     // token count), keyed so an operator can grep "why is repair not dispatching".
     if (deps.isDirtyCheckout(group.repo_dir)) {
+      // Name the ACTIVE shared-checkout-dirty distress row (once sustained dirt has
+      // crossed grace and minted one) so the greppable defer trace and the one
+      // operator-visible needs-human row are the SAME incident, two consumers.
+      const distress = deps.activeDirtyDistressId?.(group.repo_dir) ?? null;
       note(
-        `# repair-defer token=${token} class=dirty_checkout dir=${group.repo_dir}`,
+        `# repair-defer token=${token} class=dirty_checkout dir=${group.repo_dir}` +
+          (distress ? ` distress=${distress}` : ""),
       );
       continue;
     }
@@ -8064,7 +8139,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         // synthetic `daemon`-verb row. The worker's grace tracker already decided
         // exactly-once mint / level-clear; main just executes it.
         if (msg.action === "mint") {
-          mintSharedWedgeDistress(
+          mintSharedCheckoutDistress(
             msg.id,
             msg.reason ?? "",
             msg.ts ?? Date.now() / 1000,
@@ -8422,15 +8497,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint a PER-REPO shared-checkout-wedge distress `DispatchFailed` on the synthetic
+   * Mint a PER-REPO shared-checkout distress `DispatchFailed` on the synthetic
    * `${SHARED_WEDGE_DISTRESS_VERB}::${id}` key — the crash-loop distress shape, but
-   * per-repo (the `id` carries `shared-checkout-wedge:<repoHash>`) and carrying the
-   * wedged `dir`. The worker's grace tracker gates it to exactly-once per wedge
-   * episode; the fold UPSERTs on `(verb, id)`, so a re-mint after a restart is
-   * idempotent. `reason` starts with the shared-wedge display prefix so the pill
-   * maps; `ts` is producer-stamped for re-fold determinism. NON-FATAL on failure.
+   * per-repo (the `id` carries a `shared-checkout-{wedge,dirty}:<repoHash>` prefix) and
+   * carrying the affected `dir`. VERB-NEUTRAL over the `daemon`-verb shared-checkout
+   * family (the mid-merge wedge and the plain-dirty rows share this minter; the `id`
+   * prefix selects the family): a grace tracker gates it to exactly-once per episode,
+   * and the fold UPSERTs on `(verb, id)`, so a re-mint after a restart is idempotent.
+   * `reason` starts with the family display prefix so the pill maps; `ts` is
+   * producer-stamped for re-fold determinism. NON-FATAL on failure.
    */
-  function mintSharedWedgeDistress(
+  function mintSharedCheckoutDistress(
     id: string,
     reason: string,
     tsSec: number,
@@ -8480,7 +8557,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       pumpWakes();
     } catch (err) {
       console.error(
-        `[keeperd] shared-checkout-wedge distress mint threw (non-fatal): ${
+        `[keeperd] shared-checkout distress mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -10138,6 +10215,35 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // The LIVE producer for the shared-checkout-DIRTY distress family the neutered
+  // recover-pass tracker no longer feeds: sustained dirt on a repair candidate's shared
+  // checkout (which the repair sweep DEFERS on) crosses the grace watermark into ONE
+  // per-repo `shared-checkout-dirty:<hash>` row, level-cleared on observed-clean. In
+  // main memory only; a restart re-arms it (the projection-driven clear still fires).
+  const sharedDirtyDistressTracker = createSharedCheckoutDirtyTracker();
+
+  // The OPEN `shared-checkout-dirty` distress rows (per-repo `daemon`-verb) — the grace
+  // tracker's clear surface + the id the repair-defer diagnostic names. A read failure
+  // degrades to an empty set (the next tick re-reads).
+  function selectOpenSharedDirtyRows(): { id: string; dir: string }[] {
+    try {
+      return (
+        db
+          .query(
+            "SELECT id, dir FROM dispatch_failures WHERE verb = ? AND id LIKE ?",
+          )
+          .all(
+            SHARED_DIRTY_DISTRESS_VERB,
+            `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
+          ) as { id: string; dir: string | null }[]
+      )
+        .map((r) => ({ id: r.id, dir: r.dir ?? "" }))
+        .filter((r) => r.dir !== "");
+    } catch {
+      return [];
+    }
+  }
+
   // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
   // checkout (the repo dir itself — NOT the lane-or-project resolution unblock uses),
   // where the base branch lives and `keeper commit-work` lands a trunk commit; the prompt
@@ -10237,14 +10343,32 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // shared-base breakage on a paused board defers BOTH the repair dispatch and the page
     // until play.
     if (autopilotPaused) return;
+    const note = (line: string) => console.error(`[keeperd] ${line}`);
+    // Read the candidates ONCE this tick — the fs-reason read + its class-stable drop
+    // diagnostics fire once, and the same set drives BOTH the dispatch sweep and the
+    // sustained-dirt distress step below. A candidate-read throw skips the whole tick.
+    let candidates: RepairCandidate[];
+    try {
+      candidates = selectRepairCandidates(db, readTaskBlockedReason, note);
+    } catch (err) {
+      note(
+        `# warn: repair-escalation sweep candidate read threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    const openDirty = selectOpenSharedDirtyRows();
+    const openDirtyById = new Map(openDirty.map((r) => [r.dir, r.id]));
+
     await runRepairEscalationSweep({
-      selectCandidates: () =>
-        selectRepairCandidates(db, readTaskBlockedReason, (line) =>
-          console.error(`[keeperd] ${line}`),
-        ),
+      selectCandidates: () => candidates,
       selectRepairRows: () => selectRepairRows(),
       isDirtyCheckout: (repoDir) => isRepairCheckoutDirty(repoDir),
       isBaseGreen: (repoDir) => isRepairBaseGreen(repoDir),
+      // Name the active dirt distress row in the defer diagnostic (once one is open) so
+      // the greppable defer trace and the operator-visible needs-human row correlate.
+      activeDirtyDistressId: (repoDir) => openDirtyById.get(repoDir) ?? null,
       dispatchRepair: (group) => dispatchRepair(group),
       repairOutcome: (token) =>
         classifyEscalationOutcome(
@@ -10271,8 +10395,34 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       mintNotified: (token, outcome) =>
         mintRepairHumanNotifiedEvent(token, outcome),
       clearRow: (token) => mintDispatchClearedEvent("repair", token),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
+      noteLine: note,
     });
+
+    // Sustained-dirt distress step — the LIVE producer for the `shared-checkout-dirty`
+    // family. Runs AFTER the sweep so a row minted this tick names itself on the NEXT
+    // tick's defer (a row is "active" only once it is open, never mid-mint). The tracker
+    // owns grace + exactly-once mint + observed-clean level-clear.
+    const dirty = buildSharedDirtyObservation(
+      candidates,
+      openDirty,
+      repoDirtyCount,
+    );
+    const decision = sharedDirtyDistressTracker.step({
+      dirty,
+      openDistressDirs: new Set(openDirty.map((r) => r.dir)),
+      nowSec: Date.now() / 1000,
+    });
+    for (const m of decision.mint) {
+      mintSharedCheckoutDistress(
+        m.id,
+        m.reason ?? SHARED_DIRTY_DISTRESS_REASON,
+        Date.now() / 1000,
+        m.dir,
+      );
+    }
+    for (const c of decision.clear) {
+      mintDispatchClearedEvent(SHARED_DIRTY_DISTRESS_VERB, c.id);
+    }
   }
   // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
   // launcher is reachable. Rides the same 60s heartbeat as the block-escalation sweep.
