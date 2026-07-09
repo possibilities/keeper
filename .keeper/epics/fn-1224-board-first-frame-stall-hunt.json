@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T21:43:56.915000Z",
+  "depends_on_epics": [],
+  "id": "fn-1224-board-first-frame-stall-hunt",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Board first-frame stall hunt",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T21:43:56.915000Z"
+}
