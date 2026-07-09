@@ -4765,6 +4765,90 @@ test("EpicSnapshot ON CONFLICT update never wipes tasks/jobs when setting questi
 });
 
 // ---------------------------------------------------------------------------
+// Schema v117 / fn-1216 task .1 — epics.blocks_closing_of (the blocking
+// follow-up close-gate pointer)
+// ---------------------------------------------------------------------------
+
+function getBlocksClosingOf(epicId: string): string | null {
+  const row = db
+    .query("SELECT blocks_closing_of FROM epics WHERE epic_id = ?")
+    .get(epicId) as { blocks_closing_of: string | null } | null;
+  return row?.blocks_closing_of ?? null;
+}
+
+test("EpicSnapshot with blocks_closing_of folds onto epics.blocks_closing_of; absent folds to NULL (fn-1216.1)", () => {
+  epicSnapshotEvent("fn-40-followup", {
+    epic_number: 40,
+    title: "followup",
+    status: "open",
+    blocks_closing_of: "fn-1-source",
+  });
+  drainAll();
+  expect(getBlocksClosingOf("fn-40-followup")).toBe("fn-1-source");
+
+  // A later EpicSnapshot with no `blocks_closing_of` key folds to NULL (clears
+  // it) — the fold is a pure function of the CURRENT blob, not a merge.
+  epicSnapshotEvent("fn-40-followup", {
+    epic_number: 40,
+    title: "followup",
+    status: "open",
+  });
+  drainAll();
+  expect(getBlocksClosingOf("fn-40-followup")).toBeNull();
+});
+
+test("a fresh epic row with no EpicSnapshot.blocks_closing_of reads NULL (zero-event default) (fn-1216.1)", () => {
+  epicSnapshotEvent("fn-41-ordinary", { epic_number: 41, status: "open" });
+  drainAll();
+  expect(getBlocksClosingOf("fn-41-ordinary")).toBeNull();
+});
+
+test("from-scratch re-fold reproduces epics.blocks_closing_of byte-identically (fn-1216.1)", () => {
+  epicSnapshotEvent("fn-42-replay-fu", {
+    epic_number: 42,
+    status: "open",
+    blocks_closing_of: "fn-1-source",
+  });
+  epicSnapshotEvent("fn-43-replay-ord", { epic_number: 43, status: "open" });
+  drainAll();
+  const before = db
+    .query("SELECT epic_id, blocks_closing_of FROM epics ORDER BY epic_id ASC")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_tombstones");
+  drainAll();
+  const after = db
+    .query("SELECT epic_id, blocks_closing_of FROM epics ORDER BY epic_id ASC")
+    .all();
+  expect(after).toEqual(before);
+  expect(getBlocksClosingOf("fn-42-replay-fu")).toBe("fn-1-source");
+  expect(getBlocksClosingOf("fn-43-replay-ord")).toBeNull();
+});
+
+test("EpicSnapshot ON CONFLICT update never wipes tasks/jobs when setting blocks_closing_of (fn-1216.1)", () => {
+  // A task lands first (shell-inserts the epic row with a non-empty `tasks`
+  // array), then an EpicSnapshot carrying blocks_closing_of — the scalar-only
+  // ON CONFLICT update must preserve the embedded tasks array.
+  taskSnapshotEvent("fn-44-fu-with-tasks.1", {
+    epic_id: "fn-44-fu-with-tasks",
+    task_number: 1,
+    title: "t1",
+  });
+  drainAll();
+  expect(getTask("fn-44-fu-with-tasks.1")).not.toBeNull();
+
+  epicSnapshotEvent("fn-44-fu-with-tasks", {
+    epic_number: 44,
+    status: "open",
+    blocks_closing_of: "fn-1-source",
+  });
+  drainAll();
+  expect(getBlocksClosingOf("fn-44-fu-with-tasks")).toBe("fn-1-source");
+  expect(getTask("fn-44-fu-with-tasks.1")).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // A historical EpicSnapshot blob still carrying a retired `selection_review`
 // key folds safely to the current (narrower) epics shape — the fold reads
 // around the unknown key, never throws, and re-fold stays deterministic.

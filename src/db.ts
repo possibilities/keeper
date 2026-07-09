@@ -4092,6 +4092,29 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       }
     },
   },
+  {
+    version: 117,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v116→v117 (fn-1216 task .1): add the nullable `epics.blocks_closing_of`
+      // TEXT column — the SOURCE epic id a blocking follow-up gates the close
+      // of, the single committed pointer of the blocking-follow-up close gate
+      // (docs/adr/0028). Folded from the `EpicSnapshot` synthetic event's
+      // `blocks_closing_of` field, sourced from the epic file, mirroring
+      // `question` / `last_validated_at`. Nullable, NO default: NULL = an
+      // ordinary epic (the zero-event reading) and a `DEFAULT` would poison
+      // that invariant. A historical EpicSnapshot payload carries no
+      // `blocks_closing_of` key, so a from-scratch re-fold folds the column to
+      // NULL byte-identically (deterministic-replayed, NO cursor rewind needed
+      // — migration and re-fold agree at NULL until a fresh post-upgrade
+      // EpicSnapshot lands). Declared in the `CREATE_EPICS` literal too (like
+      // `question`) — placed AFTER it so `ALTER TABLE ADD COLUMN` (which always
+      // appends) keeps fresh-vs-migrated `PRAGMA table_info`/`table_xinfo(epics)`
+      // byte-identical.
+      addColumnIfMissing(db, "epics", "blocks_closing_of", "TEXT");
+    },
+  },
 ];
 
 /**
@@ -4112,7 +4135,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v116:b2caf5d9c6fa05f9f1f85ce6819ac3234205a2dab3c0b131df878f3122b465b9";
+  "v117:52d19549c66eb4d29914db49e650dc947ae12877766fffd810f18d815d903aae";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5132,7 +5155,13 @@ CREATE TABLE IF NOT EXISTS epics (
     -- Declared AFTER the VIRTUAL default_visible column so a fresh CREATE and
     -- a migrated ALTER TABLE ... ADD COLUMN (which always appends) produce
     -- byte-identical table_info/table_xinfo column order.
-    question TEXT
+    question TEXT,
+    -- blocks_closing_of: nullable TEXT, the SOURCE epic id a blocking
+    -- follow-up gates the close of (the single committed pointer of the
+    -- blocking-follow-up close gate; NULL for an ordinary epic). Declared
+    -- AFTER question so a fresh CREATE and a migrated ALTER TABLE ... ADD
+    -- COLUMN append in the same trailing slot.
+    blocks_closing_of TEXT
 )
 `;
 
@@ -6515,6 +6544,7 @@ function backfillResolvedEpicDeps(db: Database): void {
       last_validated_at: null,
       resolved_epic_deps: null,
       question: null,
+      blocks_closing_of: null,
     };
     epicById.set(row.epic_id, epic);
     if (row.epic_number != null) {
@@ -6561,6 +6591,7 @@ function backfillResolvedEpicDeps(db: Database): void {
           last_validated_at: null,
           resolved_epic_deps: null,
           question: null,
+          blocks_closing_of: null,
         };
         let depTokens: string[] = [];
         if (row.depends_on_epics != null && row.depends_on_epics.length > 0) {

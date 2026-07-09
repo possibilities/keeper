@@ -252,6 +252,11 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // Display-only (out of `jsonColumns`/`sortable`/`filters`) — `keeper
     // status` reads it to render the needs-human board pill.
     "question",
+    // `blocks_closing_of`: nullable scalar TEXT, the SOURCE epic id a blocking
+    // follow-up gates the close of. Read-only pointer (out of
+    // `jsonColumns`/`sortable`/`filters`) — readiness builds a reverse index
+    // over it to gate the source's close row.
+    "blocks_closing_of",
   ],
   pk: "epic_id",
   version: "last_event_id",

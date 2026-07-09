@@ -7271,6 +7271,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // blob like every other plan-native field (no schema surprise; the
           // reducer folds it onto `epics.question`).
           question: msg.question,
+          // The blocking-follow-up source pointer (`blocks_closing_of` on the
+          // epic file) — the reducer folds it onto `epics.blocks_closing_of`,
+          // the single committed pointer readiness gates the source's close
+          // row on. `null` for an ordinary epic.
+          blocks_closing_of: msg.blocksClosingOf,
         });
       } else if (msg.kind === "plan-task") {
         hookEvent = "TaskSnapshot";
