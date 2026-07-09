@@ -23,6 +23,23 @@ re-read every pulse, so a flip needs no daemon restart) and `autoclose_grace_sec
 govern it. A finished `unblock`/`deconflict`/`resolve` escalation window is reaped under the same
 knobs once its block or conflict instance is resolved.
 
+### Reload trigger
+
+`install.sh` reloads keeperd only when the daemon's **load surface** changed — not on every commit.
+That surface is the set of paths the resident daemon actually holds in memory, declared in
+`scripts/daemon-load-roots.txt`: the source tree `src/daemon.ts` transitively imports, the
+plan-engine modules and embedded matrix config it reaches, the dependency lockfile pair, and its
+own plist. `scripts/daemon-fingerprint.ts` hashes those roots content-addressed at HEAD (the
+manifest's own blob folds in) into one composite, and the installer bounces the LaunchAgent only
+when the composite moves. So a docs-only or plan-board-checkpoint commit leaves the running daemon
+untouched, while a `src/` edit reloads it. Failure directions are asymmetric: a declared root that
+fails to resolve at HEAD fails the install loudly (a manifest bug to fix), while git being wholly
+undeterminable degrades to the plist-content gate alone (a fresh-machine install). The fast-tier
+`test/daemon-load-surface.test.ts` walks the daemon's real import closure — worker-spawn and
+attribute-import edges included — and asserts it stays inside the manifest, so the fingerprint can
+never quietly lie about the boundary. See
+[ADR 0029](./adr/0029-daemon-load-surface-fingerprint.md).
+
 ## Plugins
 
 `keeper agent` loads keeper's own two plugins (`plugins/keeper`, `plugins/plan`) from

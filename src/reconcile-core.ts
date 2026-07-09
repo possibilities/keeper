@@ -1416,7 +1416,7 @@ export interface SlotOccupancyDecision {
   clears: { verb: Verb; id: string }[];
 }
 
-const slotKey = (verb: Verb, id: string): string => `${verb} ${id}`;
+const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
 
 /**
  * Surface — and, when provably dead, reclaim — a slot held by a stopped-but-LIVE
