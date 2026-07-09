@@ -38,5 +38,5 @@ Daemon code must never import hook modules; shared pieces become sanctioned dep-
 - [ ] Full fast suite is green
 
 ## Done summary
-
+Fixed the src->hooks import inversion by moving parseLinuxStarttime/splitArgsLstart and HERMES_SHIM_EVENTS/HERMES_SHIM_VERSION into new dep-free src/proc-starttime.ts and src/hermes-shim-contract.ts modules; both hooks now import them back from src, bus-worker/seed-sweep/launch-handle import straight from src, and CLAUDE.md's sanctioned helper list is extended.
 ## Evidence
