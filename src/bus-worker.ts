@@ -42,10 +42,6 @@ import type { Database } from "bun:sqlite";
 import { chmodSync } from "node:fs";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
-  parseLinuxStarttime,
-  splitArgsLstart,
-} from "../plugins/keeper/plugin/hooks/events-writer";
-import {
   appendMessage,
   type ChannelRow,
   DELIVERED_AFTER_WAKE,
@@ -67,6 +63,7 @@ import {
   resolveTarget,
 } from "./bus-identity";
 import { openDb, resolveBusDbPath, resolveBusSockPath } from "./db";
+import { parseLinuxStarttime, splitArgsLstart } from "./proc-starttime";
 import { LineBuffer } from "./protocol";
 import { readOsStartTime } from "./seed-sweep";
 import {

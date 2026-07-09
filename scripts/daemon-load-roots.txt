@@ -1,0 +1,17 @@
+# Daemon load surface — the paths keeperd (src/daemon.ts) transitively loads into
+# memory, declared once so the install reload gate and the boundary test share a
+# single source of truth. scripts/daemon-fingerprint.ts hashes these roots
+# content-addressed at HEAD to key the reload; test/daemon-load-surface.test.ts
+# enforces that the daemon's import closure stays inside them.
+#
+# One path per line; `#` starts a full-line comment; keep sorted. A directory root
+# covers its whole subtree, a file root matches exactly. Editing this file moves
+# the fingerprint — the manifest's own blob hash folds into the composite. Not
+# every root is import-reachable: bun.lock, package.json, and the plist are the
+# dependency + launch surface the resident daemon also loads.
+bun.lock
+package.json
+plist/arthack.keeperd.plist
+plugins/plan/src
+plugins/plan/subagents.yaml
+src

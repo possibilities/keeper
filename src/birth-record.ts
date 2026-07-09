@@ -302,10 +302,11 @@ export function buildBirthDraft(
 
 /**
  * Parse the platform-tagged start_time from a darwin `ps -o lstart=` stdout, or
- * null. Copied from the hook's `splitArgsLstart` slice (the leaf must stay
- * db-free, and seed-sweep's `readOsStartTime` drags `bun:sqlite`). The 24-char
- * fixed-width ctime(3) `Day Mon DD HH:MM:SS YYYY` shape MUST stay byte-identical
- * to the hook's so seed-sweep's verbatim recycle compare holds.
+ * null. Copied from `src/proc-starttime.ts`'s `splitArgsLstart` slice (the leaf
+ * must stay db-free, and seed-sweep's `readOsStartTime` drags `bun:sqlite`).
+ * The 24-char fixed-width ctime(3) `Day Mon DD HH:MM:SS YYYY` shape MUST stay
+ * byte-identical to `src/proc-starttime.ts`'s so seed-sweep's verbatim recycle
+ * compare holds.
  */
 export function darwinLstartToStartTime(psStdout: string): string | null {
   const trimmed = psStdout.replace(/^\s+|\s+$/g, "");
@@ -326,8 +327,8 @@ export function darwinLstartToStartTime(psStdout: string): string | null {
 /**
  * Parse the platform-tagged start_time from a linux `/proc/<pid>/stat` body, or
  * null. Field 22 (`starttime`, clock ticks since boot). Field 2 (`comm`) may hold
- * spaces/parens, so bracket on the LAST `)` then split. Mirrors the hook's
- * `parseLinuxStarttime` (drift-guarded by comment).
+ * spaces/parens, so bracket on the LAST `)` then split. Mirrors
+ * `src/proc-starttime.ts`'s `parseLinuxStarttime` (drift-guarded by comment).
  */
 export function linuxStatToStartTime(statText: string): string | null {
   const close = statText.lastIndexOf(")");

@@ -18,8 +18,9 @@
  *   stdout back as a block/continue/context JSON directive). The shim is an
  *   OBSERVER: it emits nothing on stdout, so hermes reads an empty no-op response.
  * - **No bun:sqlite / no third-party deps** — only `node:*`, the dep-free
- *   `src/dead-letter` serializer, and the dep-free `src/exec-backend` env-name
- *   helper, so cold start stays inside hermes's hook timeout.
+ *   `src/dead-letter` serializer, the dep-free `src/exec-backend` env-name
+ *   helper, and the dep-free `src/hermes-shim-contract` constants, so cold
+ *   start stays inside hermes's hook timeout.
  * - **Attacker-influenced payload** — `tool_input` and friends are model/tool
  *   output, AND (on the self-seed path) the harness-native `session_id` is
  *   user-writable. The whole record is emitted as ONE `JSON.stringify` line, so
@@ -70,6 +71,12 @@ import type {
 } from "../../../../src/dead-letter";
 import { serializeEventLogRecord } from "../../../../src/dead-letter";
 import { execBackendEnvMeta } from "../../../../src/exec-backend";
+import {
+  HERMES_SHIM_EVENTS,
+  HERMES_SHIM_VERSION,
+} from "../../../../src/hermes-shim-contract";
+
+export { HERMES_SHIM_EVENTS, HERMES_SHIM_VERSION };
 
 /**
  * Map a hermes lifecycle event name onto keeper's `(hook_event, event_type)`
@@ -106,19 +113,12 @@ const HERMES_EVENT_MAP: Record<
   },
 };
 
-/** The lifecycle events the shim handles — the seeder registers exactly this set
- *  in hermes's `hooks:` block so hermes only ever invokes the shim for a mapped
- *  event. Exported so `src/hermes-trust.ts` (via the launch wiring) and this shim
- *  share ONE source of truth. */
-export const HERMES_SHIM_EVENTS: readonly string[] =
-  Object.keys(HERMES_EVENT_MAP);
-
-/** Managed-block version for the seeder's sentinel. Bump when the registered
- *  event set or the shim's config/line contract changes, so the seeder re-seeds an
- *  older block on the next launch (hooks bind at hermes startup). Stamped on
- *  self-seeded lines (`shim_version`) so the daemon can branch on old-shim records;
- *  the ingest surface keeps accepting version-less lines (additive-only). */
-export const HERMES_SHIM_VERSION = 2;
+// DRIFT GUARD: `HERMES_EVENT_MAP`'s key set MUST equal the imported
+// `HERMES_SHIM_EVENTS` list (`src/hermes-shim-contract.ts`) byte-for-byte —
+// the map's event-name → `{hookEvent, eventType}` translation logic stays
+// here because it is shim-internal, while the event-name LIST itself lives in
+// the dep-free contract module so `src/agent/launch-handle.ts` (the seeder)
+// can import it without reaching into hook code.
 
 /** Upper bound on the raw payload stored in `data` (opaque triage bytes). A
  *  runaway `tool_input` must not balloon a single NDJSON line; the reducer arms

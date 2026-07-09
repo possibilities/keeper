@@ -1,14 +1,10 @@
 /**
- * Structural import-boundary pin for the pure verdict core. Generalizes the
- * single-file `run-capture` hygiene grep into a TRANSITIVE walker: starting at
- * `src/reconcile-core.ts` it resolves and walks the relative-import closure
- * (comment-stripped source reads only — fast tier, no subprocess) and fails if any
- * module in that closure VALUE-imports an impure driver or calls a wall-clock.
- *
- * Per-statement import-type aware: `import type` / `export type` are erased at
- * runtime and legal across the boundary, so they are DROPPED before every check
- * (an inline `import { type Foo, bar }` is still a value statement — it pulls `bar`
- * at runtime — so it is NOT dropped). Only value imports are banned or followed.
+ * Structural import-boundary pin for the pure verdict core. Walks the transitive
+ * relative-import closure from `src/reconcile-core.ts` (via the shared
+ * `test/helpers/depgraph` walker — comment-stripped source reads only, fast tier)
+ * and fails if any module in that closure VALUE-imports an impure driver or calls
+ * a wall-clock. Import-type classification, comment stripping, and resolution live
+ * in the shared helper; this file owns only the reconcile-specific bans below.
  *
  * Banned value imports (each a runtime edge that would drag the daemon's impure
  * graph onto the re-fold-safe verdict path):
@@ -32,108 +28,15 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { resolve } from "node:path";
+import {
+  parseImports,
+  repoRoot,
+  stripComments,
+  walkClosure,
+} from "./helpers/depgraph.ts";
 
-const repoRoot = realpathSync(resolve(dirname(import.meta.dirname), "."));
 const CLOSURE_ROOT = resolve(repoRoot, "src/reconcile-core.ts");
-
-/** Source extensions the walker follows / scans. A relative import that resolves
- *  to anything else (a `.yaml` / `.json` data asset) is a leaf: it holds no
- *  imports and no runtime code, so it is neither followed nor scanned. */
-const SOURCE_EXTS = [".ts", ".tsx", ".js", ".mjs", ".cjs"];
-
-/** Strip block + line comments before any scan — a module's own prose names the
- *  very specifiers we ban, so a naive full-text grep would false-positive. Same
- *  idiom as `test/agent-run-capture-depgraph.test.ts`. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-}
-
-interface ParsedImport {
-  spec: string;
-  /** `import type` / `export type` — erased at runtime, dropped before checks. */
-  typeOnly: boolean;
-}
-
-/** Parse every import/export specifier out of already-comment-stripped code,
- *  classifying each STATEMENT (not the whole module) as type-only or value. */
-function parseImports(code: string): ParsedImport[] {
-  const out: ParsedImport[] = [];
-  // `import … from "spec"` and `export … from "spec"` (static + re-export),
-  // spanning newlines for multi-line clauses. Type-only iff the clause between
-  // the keyword and `from` starts with the `type` word (`import type …`,
-  // `export type …`) — an inline `{ type Foo, bar }` starts with `{`, so the
-  // statement stays a value import.
-  const fromRe = /\b(?:import|export)\b([\s\S]*?)\bfrom\s*['"]([^'"]+)['"]/g;
-  let m = fromRe.exec(code);
-  while (m !== null) {
-    out.push({ spec: m[2], typeOnly: /^\s*type\b/.test(m[1]) });
-    m = fromRe.exec(code);
-  }
-  // Bare side-effect import `import "spec"` (always a value edge).
-  const bareRe = /\bimport\s+['"]([^'"]+)['"]/g;
-  m = bareRe.exec(code);
-  while (m !== null) {
-    out.push({ spec: m[1], typeOnly: false });
-    m = bareRe.exec(code);
-  }
-  // Dynamic `import("spec")` (always a value edge).
-  const dynRe = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-  m = dynRe.exec(code);
-  while (m !== null) {
-    out.push({ spec: m[1], typeOnly: false });
-    m = dynRe.exec(code);
-  }
-  return out;
-}
-
-/** Resolve a RELATIVE specifier to a source file in the closure, or `null` for a
- *  bare/`node:` specifier (not walked) or a non-source asset (a leaf). */
-function resolveSource(fromFile: string, spec: string): string | null {
-  if (!spec.startsWith(".")) return null;
-  const base = resolve(dirname(fromFile), spec);
-  const candidates = [
-    base,
-    ...SOURCE_EXTS.map((e) => base + e),
-    ...SOURCE_EXTS.map((e) => resolve(base, `index${e}`)),
-  ];
-  for (const c of candidates) {
-    if (SOURCE_EXTS.some((e) => c.endsWith(e)) && existsSync(c)) return c;
-  }
-  return null;
-}
-
-interface ClosureFile {
-  abs: string;
-  rel: string;
-  code: string;
-  valueSpecs: string[];
-}
-
-/** Walk the transitive relative-import closure from `rootAbs`, returning every
- *  visited source file with its comment-stripped code + value-import specifiers. */
-function walkClosure(rootAbs: string): ClosureFile[] {
-  const visited = new Set<string>();
-  const queue = [rootAbs];
-  const files: ClosureFile[] = [];
-  while (queue.length > 0) {
-    const abs = queue.shift() as string;
-    if (visited.has(abs)) continue;
-    visited.add(abs);
-    const code = stripComments(readFileSync(abs, "utf8"));
-    const imports = parseImports(code);
-    const valueSpecs: string[] = [];
-    for (const imp of imports) {
-      if (imp.typeOnly) continue;
-      valueSpecs.push(imp.spec);
-      const next = resolveSource(abs, imp.spec);
-      if (next !== null) queue.push(next);
-    }
-    files.push({ abs, rel: relative(repoRoot, abs), code, valueSpecs });
-  }
-  return files;
-}
 
 /** Impure-driver value-import bans — each edge would pull the daemon's IO graph
  *  onto the verdict path. Ordered list of `{match, why}` so a hit reports WHY. */
@@ -218,7 +121,7 @@ function wallClockHits(rel: string, code: string): string[] {
 }
 
 describe("reconcile-core.ts pure import boundary", () => {
-  const closure = walkClosure(CLOSURE_ROOT);
+  const closure = walkClosure(CLOSURE_ROOT).files;
 
   test("walk is non-vacuous (guards a silent resolution bug)", () => {
     // A resolution bug that visited only the root would make every ban below

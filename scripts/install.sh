@@ -88,17 +88,36 @@ echo "install: rendering plan-plugin generated files"
 #
 #    Source-change trigger: the plist rarely changes, so a pure code change (new
 #    src/*.ts after a `bun link`) would otherwise leave the running daemon on
-#    stale code — the buildbot `keeper-install` job never bounces keeperd on a
-#    source-only build. Fingerprint the repo HEAD sha across runs (mirroring the
-#    arthack installer's fingerprint pattern) and reload when it advanced. A
-#    missing/undeterminable sha degrades to the plist gate alone (no crash, no
-#    forced bounce).
+#    stale code. But most commits — board checkpoints, docs, tests — never reach
+#    the resident daemon, so fingerprinting the whole repo HEAD bounced keeperd
+#    near-continuously. Key instead on the daemon LOAD SURFACE:
+#    scripts/daemon-fingerprint.ts hashes only the declared load roots
+#    (scripts/daemon-load-roots.txt) content-addressed at HEAD, so a docs-only or
+#    board-checkpoint commit leaves the composite — and the daemon — unchanged.
+#    Asymmetric failure directions: a declared root that fails to resolve exits 1
+#    (loud red — a manifest bug someone must fix); git wholly undeterminable exits
+#    3 and degrades to the plist gate alone (no crash, no forced bounce), matching
+#    a fresh-machine install. See docs/adr/0029.
 fingerprint_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/keeper"
 fingerprint_file="${fingerprint_dir}/install.head"
-current_sha="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
-last_sha="$(cat "${fingerprint_file}" 2>/dev/null || true)"
+# stdout carries the composite; the seam's own stderr explains a loud/degrade
+# outcome. Capture in an `if` condition so a non-zero exit does not trip `set -e`.
 source_changed=0
-if [ -n "${current_sha}" ] && [ "${current_sha}" != "${last_sha}" ]; then
+current_fp=""
+if current_fp="$( cd "${repo_root}" && bun run scripts/daemon-fingerprint.ts )"; then
+  fp_rc=0
+else
+  fp_rc=$?
+fi
+if [ "${fp_rc}" -eq 1 ]; then
+  echo "install: daemon load-surface fingerprint failed (a declared root did not resolve at HEAD); fix scripts/daemon-load-roots.txt" >&2
+  exit 1
+elif [ "${fp_rc}" -ne 0 ]; then
+  # git wholly undeterminable (exit 3) — degrade to the plist gate alone.
+  current_fp=""
+fi
+last_fp="$(cat "${fingerprint_file}" 2>/dev/null || true)"
+if [ -n "${current_fp}" ] && [ "${current_fp}" != "${last_fp}" ]; then
   source_changed=1
 fi
 if cmp -s "${repo_plist}" "${live_plist}" \
@@ -134,11 +153,13 @@ else
     echo "  launchctl bootstrap ${domain} ${live_plist}" >&2
     exit 1
   fi
-  # Record the reloaded source sha ONLY after keeperd is confirmed loaded, so a
-  # failed reload never latches a fingerprint that would suppress the next retry.
-  if [ -n "${current_sha}" ]; then
+  # Record the reloaded load-surface composite ONLY after keeperd is confirmed
+  # loaded, so a failed reload never latches a fingerprint that suppresses the
+  # next retry. Empty on a degraded (git-undeterminable) run — skip, exactly as a
+  # missing sha did before.
+  if [ -n "${current_fp}" ]; then
     mkdir -p "${fingerprint_dir}"
-    printf '%s\n' "${current_sha}" >"${fingerprint_file}"
+    printf '%s\n' "${current_fp}" >"${fingerprint_file}"
   fi
   echo "install: keeperd reloaded and loaded"
 fi
