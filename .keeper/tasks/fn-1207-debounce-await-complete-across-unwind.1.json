@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Verify and close unwind window",
-  "updated_at": "2026-07-08T23:59:51.916000Z"
+  "updated_at": "2026-07-09T00:38:35.531000Z",
+  "worker_done_at": "2026-07-09T00:38:35.531000Z"
 }

@@ -32,5 +32,5 @@ Fixture-driven: transient-completed sequence → no met; stable-completed sequen
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Verified the done-unwind window remains observable to await complete (fn-1200's latch closed only the proven-dead ghost path, not owning-job re-activation), then gated the complete met latch on a stability confirmation — met is withheld until the completed verdict holds across COMPLETE_CONFIRMATIONS consecutive subscribe snapshots with the target row's last_event_id watermark non-regressing.
 ## Evidence
