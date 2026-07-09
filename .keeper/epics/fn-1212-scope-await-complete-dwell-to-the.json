@@ -7,7 +7,7 @@
     "fn-1210-fix-await-complete-confirmation-on"
   ],
   "id": "fn-1212-scope-await-complete-dwell-to-the",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T01:29:47.728000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T01:29:47.310000Z"
+  "updated_at": "2026-07-09T01:29:47.728000Z"
 }
