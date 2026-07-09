@@ -31,5 +31,5 @@ Gate green via `bun plugins/plan/scripts/model-guidance-check.ts --check` and th
 - [ ] The model-guidance drift gate and the plan fast suite pass
 
 ## Done summary
-
+Retargeted model-guidance research from gpt-5.5 to gpt-5.3-codex-spark: authored a hash-anchored provenance reference with a trickle-posture guidance block, and dropped gpt-5.5's research entry and reference file. Model-guidance gate and plan fast suite pass.
 ## Evidence
