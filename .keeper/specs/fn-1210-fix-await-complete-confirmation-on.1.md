@@ -38,5 +38,5 @@ confirms while a genuine reconcile flap still resets.
 - [ ] A test arms `complete`, delivers NO further frame after the first `completed`, and asserts `met` fires (the live-delivery interaction current tests assume by hand).
 
 ## Done summary
-
+Reworked keeper await complete confirmation from counting change-driven subscribe frames to debouncing on elapsed dwell at a stable target-row version. A quiet board now confirms via a bounded re-evaluation timer with no second frame (fixing the F1 indefinite hang), while a done-unwind flap — including one whose intervening running is coalesced away by diffTick — bumps the row version and restarts the dwell.
 ## Evidence
