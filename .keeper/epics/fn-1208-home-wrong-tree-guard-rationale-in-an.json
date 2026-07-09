@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T00:43:29.661000Z",
+  "created_by_close_of": "fn-1205-guard-lane-workers-from-wrong-tree",
+  "depends_on_epics": [
+    "fn-1205-guard-lane-workers-from-wrong-tree"
+  ],
+  "id": "fn-1208-home-wrong-tree-guard-rationale-in-an",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Home wrong-tree-guard rationale in an ADR",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T00:43:29.661000Z"
+}
