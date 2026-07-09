@@ -394,6 +394,108 @@ export function findEpicByIdOrBare(
 }
 
 // ---------------------------------------------------------------------------
+// Complete-condition stability confirmation
+// ---------------------------------------------------------------------------
+
+/**
+ * Consecutive `completed` observations a `complete` await must see before it
+ * fires `met`. The done-AND-idle readiness verdict can still flap back to
+ * `running` when a done task's owning worker re-activates during close-out
+ * reconciliation: the terminal-completed gate latches only the proven-dead
+ * ghost-liveness path, never the owning job's own working clause, so a
+ * momentarily-idle done task reads `completed`, then `running` again the instant
+ * its session re-activates. `keeper await complete` fires on the FIRST
+ * `completed` snapshot, so without confirmation it can latch that transient.
+ * Requiring the verdict to HOLD across N consecutive subscribe snapshots
+ * debounces the single-pass flip — an intervening non-completed tick resets the
+ * count — so `met` only fires on a completion that survives the reconcile.
+ *
+ * N >= 2 so `met` never fires earlier than the single-snapshot behavior; the
+ * added steady-state latency for a genuinely-complete await is bounded to
+ * (N - 1) confirmation snapshots (sub-second under close-out churn, one heartbeat
+ * apart on an otherwise-quiet board).
+ */
+export const COMPLETE_CONFIRMATIONS = 2;
+
+/**
+ * Per-`complete`-slot confirmation state the await command threads across
+ * subscribe snapshots. `streak` counts consecutive `completed` observations;
+ * `watermark` is the high-water target-row version across the current streak, so
+ * a version REGRESSION (a rewound or stale re-delivered snapshot) restarts the
+ * confirmation rather than counting toward it. A pure value — the command owns
+ * the mutation, this module only advances it.
+ */
+export interface CompleteStability {
+  streak: number;
+  watermark: number | null;
+}
+
+/** The zero state: no completed observation seen yet. */
+export function initCompleteStability(): CompleteStability {
+  return { streak: 0, watermark: null };
+}
+
+/**
+ * Advance a `complete` slot's stability confirmation by one observation.
+ *
+ *   - `isComplete` — did THIS snapshot read the `completed` verdict for the
+ *                    target (the present-branch `met`)?
+ *   - `version`    — the target row's monotonic version watermark this tick
+ *                    (see {@link completeWatermark}), or `null` when unavailable.
+ *
+ * A non-completed observation resets the streak to zero (the flap's intervening
+ * `running` tick). A completed observation extends the streak UNLESS the version
+ * regressed below the streak's high-water basis, which restarts it at one. The
+ * completion is `confirmed` once the streak reaches `confirmations`. A `null`
+ * version never triggers a regression — the watermark is a secondary guard, the
+ * consecutive count is the primary one.
+ */
+export function advanceCompleteStability(
+  prev: CompleteStability,
+  isComplete: boolean,
+  version: number | null,
+  confirmations: number = COMPLETE_CONFIRMATIONS,
+): { next: CompleteStability; confirmed: boolean } {
+  if (!isComplete) {
+    return { next: initCompleteStability(), confirmed: false };
+  }
+  const regressed =
+    prev.watermark !== null && version !== null && version < prev.watermark;
+  const restart = prev.streak === 0 || regressed;
+  const streak = restart ? 1 : prev.streak + 1;
+  const watermark = restart
+    ? version
+    : version === null
+      ? prev.watermark
+      : Math.max(prev.watermark ?? version, version);
+  return { next: { streak, watermark }, confirmed: streak >= confirmations };
+}
+
+/**
+ * The monotonic version watermark for a `complete` await target — the containing
+ * epic's `last_event_id`. A task rides its parent epic's row (which re-folds on
+ * any embedded task/job change); an epic rides its own row. This value is
+ * ALREADY carried on the subscribe snapshot's `epics` — the stability
+ * confirmation needs no extra plumbing. Returns `null` when the target isn't
+ * present in `epics`, resolves ambiguously (a bare `fn-N` matching 2+ epics), or
+ * the row carries no version (a pre-fold reading), degrading the confirmation to
+ * the pure consecutive count.
+ */
+export function completeWatermark(
+  epics: readonly Epic[],
+  target: AwaitTarget,
+): number | null {
+  if (target.kind === "task") {
+    const hit = findTaskById(epics, target.id);
+    return hit?.epic.last_event_id ?? null;
+  }
+  const resolved = findEpicByIdOrBare(epics, target.id);
+  return resolved.kind === "found"
+    ? (resolved.epic.last_event_id ?? null)
+    : null;
+}
+
+// ---------------------------------------------------------------------------
 // Epic-unblocked: read off perTask + perCloseRow, NOT perEpic
 // ---------------------------------------------------------------------------
 

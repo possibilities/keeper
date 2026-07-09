@@ -55,15 +55,20 @@ import {
   type AwaitInputs,
   type AwaitState,
   type AwaitTarget,
+  advanceCompleteStability,
   agentsIdleState,
   type BoardSignatureInput,
+  COMPLETE_CONFIRMATIONS,
+  type CompleteStability,
   changedSignature,
   classifyTargetId,
+  completeWatermark,
   drainedState,
   epicAddedMet,
   epicRemovedMet,
   evaluateAwaitCondition,
   gitCleanState,
+  initCompleteStability,
   landedState,
   type MonitorSelector,
   monitorRunningState,
@@ -867,6 +872,15 @@ interface PlanSlotState {
   everSeen: boolean;
   /** Verdict-change throttle for stderr progress. */
   lastVerdictPhrase: string | null;
+  /**
+   * `complete`-condition stability confirmation across subscribe snapshots.
+   * The done-AND-idle `completed` verdict can flap back to `running` when a done
+   * task's owning worker re-activates during close-out reconciliation, so `met`
+   * is withheld until the completion holds across `COMPLETE_CONFIRMATIONS`
+   * consecutive snapshots (watermark non-regressing). Inert for
+   * `unblocked`/`started` slots (never advanced off a non-`complete` target).
+   */
+  completeStability: CompleteStability;
 }
 
 /**
@@ -1115,6 +1129,7 @@ export async function runAwait(
         presentThisConnection: false,
         everSeen: false,
         lastVerdictPhrase: null,
+        completeStability: initCompleteStability(),
       };
     }
     if (seg.condition === "monitor-running") {
@@ -1666,10 +1681,36 @@ export async function runAwait(
       slot.everSeen = true;
     }
 
+    // Stability confirmation for `complete`: the done-AND-idle `completed`
+    // verdict can flap back to `running` when a done task's owning worker
+    // re-activates during close-out reconciliation. `met` fires on the FIRST
+    // completed snapshot, so withhold it until the completion HOLDS across
+    // `COMPLETE_CONFIRMATIONS` consecutive snapshots (target-row watermark
+    // non-regressing); an intervening non-completed tick resets the count. Only
+    // the PRESENT branch reaches `met` here (the re-query `met` is Pass 2 and is
+    // already terminal), so a completed-but-unconfirmed observation downgrades to
+    // `waiting`; every other verdict resets the streak and passes through. Inert
+    // for `unblocked`/`started`.
+    let result = evalState;
+    if (slot.target.condition === "complete") {
+      const { next, confirmed } = advanceCompleteStability(
+        slot.completeStability,
+        evalState.kind === "met",
+        completeWatermark(inputs.epics, slot.target),
+      );
+      slot.completeStability = next;
+      if (evalState.kind === "met" && !confirmed) {
+        result = {
+          kind: "waiting",
+          detail: `completion holding (${next.streak}/${COMPLETE_CONFIRMATIONS})`,
+        };
+      }
+    }
+
     // Reconnect-blip gate: a post-reconnect baseline absence that would
     // commit `deleted` is swallowed (only AFTER we've armed).
     if (isReconnectBaseline && state.armed && evalState.kind === "deleted") {
-      return { result: evalState, blip: true, needsReQuery: false };
+      return { result, blip: true, needsReQuery: false };
     }
 
     const needsReQuery =
@@ -1678,7 +1719,7 @@ export async function runAwait(
         slot.target.kind === "epic" &&
         slot.everSeen &&
         !inputs.epics.some((e) => e.epic_id === slot.target.id));
-    return { result: evalState, blip: false, needsReQuery };
+    return { result, blip: false, needsReQuery };
   };
 
   /**

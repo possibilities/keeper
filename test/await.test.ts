@@ -965,9 +965,11 @@ test("task complete: armed line + met terminal (exit 0)", async () => {
   expect(h.stdout[0]).toContain("condition=complete");
   expect(h.exitCode).toBeNull();
 
-  // Second snapshot: task is done + approved → met.
+  // Second snapshot: task is done + idle → the `completed` verdict. The
+  // stability gate withholds `met` for one confirmation (holding 1/2), guarding
+  // against a done stamp the close-out reconcile unwinds back to running — so no
+  // terminal yet.
   const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
-  // Bump rev so the helper folds it as a new result.
   sock.deliver([
     resultFrame(
       "epics",
@@ -976,7 +978,18 @@ test("task complete: armed line + met terminal (exit 0)", async () => {
       2,
     ),
   ]);
+  expect(h.stdout).toHaveLength(1);
+  expect(h.exitCode).toBeNull();
 
+  // Third snapshot: the completion HOLDS a second consecutive snapshot → met.
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ tasks: [taskDone] })],
+      3,
+    ),
+  ]);
   expect(h.stdout).toHaveLength(2);
   expect(h.stdout[1]).toContain("[keeper-await] met");
   expect(h.stdout[1]).toContain("target=fn-1-foo.1");
@@ -1459,15 +1472,17 @@ test("--no-armed-line: skips armed, still emits terminal", async () => {
     throw new Error("mock socket never installed");
   }
   sock.takeOutbound();
-  deliverFiveWithEpic(
-    sock,
-    idPrefix,
-    makeEpicRow({
-      tasks: [makeTaskRow({ worker_phase: "done", approval: "approved" })],
-    }),
-  );
+  const doneEpic = makeEpicRow({
+    tasks: [makeTaskRow({ worker_phase: "done", approval: "approved" })],
+  });
+  // First completed snapshot holds for one confirmation (1/2); --no-armed-line
+  // suppresses the armed line, so stdout is still empty and there is no terminal.
+  deliverFiveWithEpic(sock, idPrefix, doneEpic);
+  expect(h.stdout).toHaveLength(0);
+  expect(h.exitCode).toBeNull();
 
-  // Only the terminal line on stdout — no armed.
+  // Second consecutive completed snapshot confirms → only the terminal met line.
+  sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [doneEpic], 2)]);
   expect(h.stdout).toHaveLength(1);
   expect(h.stdout[0]).toContain("[keeper-await] met");
   expect(h.exitCode).toBe(0);
@@ -1631,9 +1646,22 @@ test("fn-1015 epic complete: done epic in recent-done window + idle close-row �
     resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
   ]);
 
-  const lines = h.stdout.join("");
-  expect(lines).toContain("[keeper-await] armed");
-  expect(lines).toContain("[keeper-await] met");
+  // Present + completed via the recent-done window → armed, but the stability
+  // gate holds `met` for one confirmation (holding 1/2) — no terminal yet.
+  expect(h.stdout.join("")).toContain("[keeper-await] armed");
+  expect(h.stdout.join("")).not.toContain("[keeper-await] met");
+  expect(h.exitCode).toBeNull();
+
+  // Second consecutive completed snapshot confirms → met.
+  sock.deliver([
+    resultFrame(
+      "epics_recent_done",
+      `${idPrefix}-epics-recent-done`,
+      [doneEpic],
+      2,
+    ),
+  ]);
+  expect(h.stdout.join("")).toContain("[keeper-await] met");
   expect(h.exitCode).toBe(0);
 });
 
@@ -2067,7 +2095,12 @@ test("default path: no --connect-timeout reconnects forever; bounce past 30s yie
   }
   reSock.takeOutbound();
   const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
-  deliverFiveWithEpic(reSock, idPrefix, makeEpicRow({ tasks: [taskDone] }));
+  const doneEpic = makeEpicRow({ tasks: [taskDone] });
+  // Re-paint completed post-reconnect: the first snapshot holds (1/2), the
+  // second consecutive one confirms → met.
+  deliverFiveWithEpic(reSock, idPrefix, doneEpic);
+  expect(h.stdout.join("")).not.toContain("[keeper-await] met");
+  reSock.deliver([resultFrame("epics", `${idPrefix}-epics`, [doneEpic], 2)]);
 
   const lines = h.stdout.join("");
   expect(lines).toContain("[keeper-await] met");
