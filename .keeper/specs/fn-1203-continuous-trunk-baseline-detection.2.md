@@ -35,5 +35,5 @@ Injected-deps sweep tests: confirmed-red leaf with no blocked tasks yields one d
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Add a baseline-sourced repair candidate: a confirmed-red newest-tip baseline leaf mints a task-less repair candidate coalescing by repo token with worker blocks; single-run/flaky red defers to the store's confirming re-run; infra/timeout never dispatch. Split the conflated 'green' into distinct checkout-clean DEFER and suite-green CLEAR gates.
 ## Evidence
