@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 12,
+        "files_changed": 5,
+        "insertions": 249
+      },
+      "done_summary": "Added --project to apply-selection, re-rooted plan-state through the epic's primary_repo (matching close_preflight/close_finalize), threaded --project <primary_repo> through the /plan:close 3.5c beat, and covered a brief-in-primary / apply-from-lane close with a cross-cwd test.",
+      "input_hash": "88cc3925235a78f4d98fbe2eaeeb7ee58493aab9824b10c39054992b81e81169",
+      "model": "sonnet",
+      "spec_chars": 2105,
+      "spec_md": "## Description\n\nFinding F1 (Axis 1 Should-fix), with merged F3 (test gap). Evidence path:\n`plugins/plan/src/verbs/apply_selection.ts:103` calls `resolveProject(null)`\n(cwd git-root) and `ApplySelectionArgs` (lines 62-69) carries no project field;\n`plugins/plan/src/descriptor.ts:344` exposes no `--project` option and\n`plugins/plan/src/cli.ts:773` threads none. Sibling verbs\n`plugins/plan/src/verbs/selection_brief.ts` (via `resolvePlanStateContext`) and\n`plugins/plan/src/verbs/close_preflight.ts:268-311` both take `--project` and\nre-root plan state through `contextForRoot(primary_repo)`; the close skill\n`plugins/plan/skills/close/SKILL.md:187` omits `--project` on apply-selection\nwhile passing it to every sibling call. Fix: add a `--project` option to the\napply-selection descriptor + cli, thread it into `runApplySelection`, and resolve\nthe state context through the epic's `primary_repo` (matching close_preflight's\n`contextForRoot(primaryRepo)` re-root), then pass `--project <primary_repo>` from\nthe `/plan:close` 3.5c beat. F3: cover a brief-in-primary / apply-from-lane\n(cwd != primary_repo) case in the plan test suite, asserting researched cells land.\n\nFiles: `plugins/plan/src/verbs/apply_selection.ts`,\n`plugins/plan/src/descriptor.ts`, `plugins/plan/src/cli.ts`,\n`plugins/plan/skills/close/SKILL.md`, plus a plan test.\n\n## Acceptance\n\n- [ ] `apply-selection` accepts `--project <abs_path>` (absolute-only, matching close_preflight's guard) and re-roots plan-state reads/writes through the epic's primary_repo.\n- [ ] The `/plan:close` 3.5c beat passes `--project <primary_repo>` to apply-selection.\n- [ ] A cross-cwd (brief-in-primary / apply-from-lane) close test asserts the researched cells land rather than degrading to defaults.\n- [ ] `bun test` (plan fast suite) is green.\n\n## Done summary\nAdded --project to apply-selection, re-rooted plan-state through the epic's primary_repo (matching close_preflight/close_finalize), threaded --project <primary_repo> through the /plan:close 3.5c beat, and covered a brief-in-primary / apply-from-lane close with a cross-cwd test.\n## Evidence\n",
+      "task_id": "fn-1217-fix-apply-selection-cross-cwd-state.1",
+      "tier": "high",
+      "title": "Thread project into apply-selection"
+    }
+  ],
+  "created_at": "2026-07-09T20:18:43.510000Z",
+  "epic_id": "fn-1217-fix-apply-selection-cross-cwd-state",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "88cc3925235a78f4d98fbe2eaeeb7ee58493aab9824b10c39054992b81e81169",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
