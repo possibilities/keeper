@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical multi-file plumbing of a --project option that mirrors the established sibling close_preflight/contextForRoot pattern plus a test, with a clear path and no intelligence-bound reason for opus.",
+      "task_id": "fn-1217-fix-apply-selection-cross-cwd-state.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T19:56:13.491000Z",
+  "epic_id": "fn-1217-fix-apply-selection-cross-cwd-state",
+  "input_hash": "88cc3925235a78f4d98fbe2eaeeb7ee58493aab9824b10c39054992b81e81169",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2295085349,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Mechanical multi-file plumbing of a --project option that mirrors the established sibling close_preflight/contextForRoot pattern plus a test, with a clear path and no intelligence-bound reason for opus.\",\"confidence\":0.82}]}"
+}
