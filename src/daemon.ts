@@ -64,6 +64,14 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { type BackupResult, liveBackupPage } from "./backup";
+import {
+  type BaselineResult,
+  baselineKey,
+  currentToolchain,
+  leafPath,
+  readLeaf,
+  type SuiteRedResult,
+} from "./baseline-store";
 import type { BaselineWorkerData } from "./baseline-worker";
 import type {
   BirthIngestWorkerData,
@@ -1657,6 +1665,130 @@ export function selectRepairCandidates(
     });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// fn-1203 — baseline-sourced repair candidates (the SECOND candidate source)
+// ---------------------------------------------------------------------------
+//
+// The repair sweep's FIRST candidate source is a worker-stamped SHARED_BASE_BROKEN
+// block ({@link selectRepairCandidates}). This SECOND source needs no worker casualty:
+// the daemon reads each open-epic repo's newest default-tip baseline LEAF and, on a
+// CONFIRMED-red result, mints a task-less repair candidate that coalesces by repo token
+// with any worker block on the same repo. The confirming re-run is the STORE's own
+// multi-run classification (baseline-worker run1→run2), never a daemon re-spool — the
+// spool is compute-once per key, so a single unconfirmed run DEFERS to that mechanism
+// rather than dispatching on thin evidence.
+
+/** A repo's newest default-tip baseline leaf, or null (miss / computing / unreadable) —
+ *  the pure input {@link buildBaselineRepairCandidates} classifies. The producer composes
+ *  it from the `git_status` tip + the compute-once leaf on disk; a test passes leafs as
+ *  data. */
+export interface BaselineTipLeaf {
+  repoDir: string;
+  leaf: BaselineResult | null;
+}
+
+/** The repair verdict a newest-tip baseline leaf carries:
+ *   - `confirmed-red` — suite-red across the confirming re-run (≥2 runs) with a hard
+ *     (non-flaky) failure: mints a repair candidate.
+ *   - `rerun` — suite-red but NOT yet confirmed (a single run, or every failure
+ *     flaky-suspect): the store's multi-run classification is the confirming re-run, so
+ *     DEFER rather than dispatch on thin evidence.
+ *   - `none` — green / infra-error / timeout / absent: never a repair candidate. */
+export type BaselineRepairVerdict = "confirmed-red" | "rerun" | "none";
+
+/** True iff a suite-red leaf is CONFIRMED red: the confirming re-run actually ran (≥2
+ *  runs — a single run has no flake signal) AND at least one test failed EVERY run
+ *  (`flakySuspect` false). A single-run red or an all-flaky red is unconfirmed. Pure. */
+export function baselineRedIsConfirmed(leaf: SuiteRedResult): boolean {
+  return leaf.runs.length >= 2 && leaf.failing.some((f) => !f.flakySuspect);
+}
+
+/** Classify a newest-tip baseline leaf for the repair sweep ({@link BaselineRepairVerdict}).
+ *  An infra-error or timeout leaf is NEVER red for this purpose — only a confirmed
+ *  suite-red mints a candidate. Pure; total; never throws. */
+export function classifyBaselineForRepair(
+  leaf: BaselineResult | null,
+): BaselineRepairVerdict {
+  if (leaf == null || leaf.status !== "suite-red") return "none";
+  return baselineRedIsConfirmed(leaf) ? "confirmed-red" : "rerun";
+}
+
+/** The defect fingerprint for a confirmed-red baseline candidate — the digest of the
+ *  HARD-failing test ids (the confirmed defect), so a re-key never flaps and two tips of
+ *  the same breakage collapse onto one repair. Shares {@link fingerprintFailure} with the
+ *  worker path; the two sources coalesce by repo TOKEN regardless, so an exact fingerprint
+ *  match is not required for a single sticky. Pure. */
+export function baselineRepairFingerprint(leaf: SuiteRedResult): string {
+  const hard = leaf.failing.filter((f) => !f.flakySuspect).map((f) => f.id);
+  return fingerprintFailure(hard.join("\n"));
+}
+
+/**
+ * Build the baseline-sourced repair candidates from each open-epic repo's newest-tip
+ * leaf. A CONFIRMED-red leaf yields one task-less {@link RepairCandidate} keyed on
+ * {@link repoToken}(repoDir) so it coalesces with any worker-stamped SHARED_BASE_BROKEN
+ * block on the same repo (the sweep groups by repo token). An unconfirmed red (single
+ * run / all-flaky) yields NO candidate and a class-stable `# baseline-repair-rerun` trace
+ * — the confirming re-run is the store's multi-run classification, not a dispatch. A
+ * green / infra / timeout / absent leaf yields nothing. PURE (leafs passed as data);
+ * never throws.
+ */
+export function buildBaselineRepairCandidates(
+  observations: readonly BaselineTipLeaf[],
+  note: (line: string) => void = () => {},
+): RepairCandidate[] {
+  const out: RepairCandidate[] = [];
+  for (const { repoDir, leaf } of observations) {
+    if (repoDir === "") continue;
+    // green / infra-error / timeout / miss (null) — never a repair candidate.
+    if (leaf == null || leaf.status !== "suite-red") continue;
+    if (!baselineRedIsConfirmed(leaf)) {
+      // suite-red but unconfirmed — DEFER to the store's confirming re-run, never
+      // dispatch on a single run or an all-flaky red. Greppable, bounded by repo count.
+      const why = leaf.runs.length >= 2 ? "flake_suspect" : "single_run";
+      note(
+        `# baseline-repair-rerun repo=${repoDir} sha=${leaf.sha} class=${why}`,
+      );
+      continue;
+    }
+    const token = repoToken(repoDir);
+    out.push({
+      // Task-less: the candidate is repo-scoped, minted with NO blocked task. The
+      // synthetic id sorts the candidate deterministically and never collides with a
+      // real `<epic>.<ordinal>` task id.
+      epic_id: "",
+      task_id: `baseline-tip::${token}`,
+      repo_dir: repoDir,
+      repo_token: token,
+      fingerprint: baselineRepairFingerprint(leaf),
+    });
+  }
+  return out;
+}
+
+/**
+ * DEFER gate — checkout cleanliness. A repo whose shared checkout is dirty (`>0`) OR
+ * unseeded (`null` count, no `git_status` row) is NOT safe for a write-capable repair
+ * launch, so DEFER on both. DISTINCT from {@link repairTipBaselineGreen}: this asks "is
+ * the working tree clean enough to commit into", NEVER "does the suite pass" — the sweep
+ * must not conflate the two. Pure.
+ */
+export function repairCheckoutDirty(dirtyCount: number | null): boolean {
+  return dirtyCount == null || dirtyCount > 0;
+}
+
+/**
+ * CLEAR gate — suite-green positive evidence. A sticky repair row clears (once zero
+ * candidates remain) ONLY when the newest default-tip baseline LEAF reads `green` — the
+ * suite ran clean at the tip. DISTINCT from {@link repairCheckoutDirty}: a clean checkout
+ * does not prove the suite passes, so the clear gate consults the tested result, never
+ * checkout cleanliness. Red / infra / timeout / miss (null) RETAINS the row — no false
+ * clear on no report. Pure.
+ */
+export function repairTipBaselineGreen(leaf: BaselineResult | null): boolean {
+  return leaf != null && leaf.status === "green";
 }
 
 /** The outcome the repair sweep records on `RepairDispatched`. The TERMINAL
@@ -10188,16 +10320,59 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       return null;
     }
   }
-  // DEFER gate: a repo whose shared checkout is dirty (>0) OR unknown (no seeded row) is
-  // NOT safe for a write-capable repair launch, so DEFER conservatively on both.
-  function isRepairCheckoutDirty(repoDir: string): boolean {
-    const n = repoDirtyCount(repoDir);
-    return n == null || n > 0;
+  // The live toolchain fingerprint half of the baseline key — read once (env), shared by
+  // every newest-tip leaf read this daemon does. Matches the tip producer's + worker's +
+  // CLI's `currentToolchain()`, so all compose the identical key for one (repo, tip).
+  const baselineToolchain = currentToolchain();
+
+  // Read a repo's current default-branch tip off the `git_status` projection (the
+  // git-worker's feed) — the sha half of the newest-tip baseline key. Null when no seeded
+  // row / head exists. Producer read only, NEVER a fold.
+  function readRepoTipSha(repoDir: string): string | null {
+    try {
+      const row = db
+        .query("SELECT head_oid FROM git_status WHERE project_dir = ?")
+        .get(repoDir) as { head_oid: string | null } | null | undefined;
+      const head = row?.head_oid;
+      return typeof head === "string" && head !== "" ? head : null;
+    } catch {
+      return null;
+    }
   }
-  // Positive-evidence gate: the base reads green only when the shared checkout is seeded
-  // AND clean (dirty_count === 0). Unknown / dirty RETAINS the sticky row (no false clear).
-  function isRepairBaseGreen(repoDir: string): boolean {
-    return repoDirtyCount(repoDir) === 0;
+
+  // Read a repo's NEWEST default-tip baseline LEAF: compose the compute-once key from
+  // (repoDir, current tip, toolchain) and read the leaf on disk. Null on no tip / miss /
+  // computing / unreadable. Fail-open — the baseline worker is the SOLE leaf writer, so
+  // this only ever READS. The SAME key derivation the tip producer + CLI + worker use.
+  function readNewestTipLeaf(repoDir: string): BaselineResult | null {
+    const tip = readRepoTipSha(repoDir);
+    if (repoDir === "" || tip == null) return null;
+    try {
+      return readLeaf(
+        leafPath(
+          baselineKey({ repoDir, sha: tip, toolchain: baselineToolchain }),
+        ),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  // Every open-epic repo dir (`status != 'done'`) — the bounded set the baseline candidate
+  // source scans, one newest-tip leaf per repo. DISTINCT open dirs only; a read failure
+  // degrades to an empty set (no baseline candidates this tick).
+  function selectOpenEpicRepoDirs(): string[] {
+    try {
+      const rows = db
+        .query(
+          `SELECT DISTINCT project_dir AS dir FROM epics
+             WHERE status IS NOT 'done' AND project_dir IS NOT NULL AND project_dir <> ''`,
+        )
+        .all() as { dir: string }[];
+      return rows.map((r) => r.dir);
+    } catch {
+      return [];
+    }
   }
 
   // Read the existing sticky repair rows off the writable connection (sequenced inside
@@ -10358,14 +10533,44 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       );
       return;
     }
+    // fn-1203 — the SECOND candidate source: a confirmed-red newest-tip baseline mints a
+    // task-less repair candidate even with ZERO blocked tasks. Read one newest-tip leaf
+    // per open-epic repo, classify, and merge the confirmed-red candidates in — they
+    // coalesce by repo token with any worker-stamped block. Fail-open; an unconfirmed red
+    // DEFERS to the store's confirming re-run (a `# baseline-repair-rerun` trace), never a
+    // dispatch. A read throw contributes no baseline candidate (the worker source stands).
+    let baselineCandidates: RepairCandidate[] = [];
+    try {
+      baselineCandidates = buildBaselineRepairCandidates(
+        selectOpenEpicRepoDirs().map((repoDir) => ({
+          repoDir,
+          leaf: readNewestTipLeaf(repoDir),
+        })),
+        note,
+      );
+    } catch (err) {
+      note(
+        `# warn: baseline repair-candidate read threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const candidatesAll = [...candidates, ...baselineCandidates];
     const openDirty = selectOpenSharedDirtyRows();
     const openDirtyById = new Map(openDirty.map((r) => [r.dir, r.id]));
 
     await runRepairEscalationSweep({
-      selectCandidates: () => candidates,
+      selectCandidates: () => candidatesAll,
       selectRepairRows: () => selectRepairRows(),
-      isDirtyCheckout: (repoDir) => isRepairCheckoutDirty(repoDir),
-      isBaseGreen: (repoDir) => isRepairBaseGreen(repoDir),
+      // DEFER gate — checkout cleanliness (dirty / unseeded → defer the write-capable
+      // launch), DISTINCT from the suite-green clear gate below.
+      isDirtyCheckout: (repoDir) =>
+        repairCheckoutDirty(repoDirtyCount(repoDir)),
+      // CLEAR gate — the newest-tip baseline LEAF reads SUITE-GREEN. A clean checkout does
+      // NOT prove the suite passes, so the clear gate consults the tested result, never
+      // checkout cleanliness — the green ambiguity the gap analysis named.
+      isBaseGreen: (repoDir) =>
+        repairTipBaselineGreen(readNewestTipLeaf(repoDir)),
       // Name the active dirt distress row in the defer diagnostic (once one is open) so
       // the greppable defer trace and the operator-visible needs-human row correlate.
       activeDirtyDistressId: (repoDir) => openDirtyById.get(repoDir) ?? null,
@@ -10403,7 +10608,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // tick's defer (a row is "active" only once it is open, never mid-mint). The tracker
     // owns grace + exactly-once mint + observed-clean level-clear.
     const dirty = buildSharedDirtyObservation(
-      candidates,
+      candidatesAll,
       openDirty,
       repoDirtyCount,
     );

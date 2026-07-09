@@ -24,6 +24,13 @@ import {
   appendBackstopRecord,
   BackstopCounters,
 } from "../src/backstop-telemetry";
+import type {
+  GreenResult,
+  InfraErrorResult,
+  SuiteRedResult,
+  TimeoutResult,
+  ToolchainFingerprint,
+} from "../src/baseline-store";
 import {
   ALL_WORKERS,
   AUDIT_READY_ORCHESTRATOR_GRACE_MS,
@@ -40,6 +47,9 @@ import {
   type BlockHumanNotifySweepDeps,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
+  baselineRedIsConfirmed,
+  baselineRepairFingerprint,
+  buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
   buildPendingDispatchSweepRecords,
@@ -48,6 +58,7 @@ import {
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   checkKeeperAgentPresence,
+  classifyBaselineForRepair,
   classifyEscalationOutcome,
   countLiveEscalationSessions,
   type DaemonHandle,
@@ -102,7 +113,9 @@ import {
   readRestartLedger,
   readTaskBlockedReason,
   recoverOneDeadLetter,
+  repairCheckoutDirty,
   repairReasonFor,
+  repairTipBaselineGreen,
   resolveEscalationJobsFor,
   routeBlockedCategory,
   runBlockEscalationSweep,
@@ -162,7 +175,7 @@ import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
 import type { Event, Job } from "../src/types";
-import { worktreePathFor } from "../src/worktree-plan";
+import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { sandboxEnv } from "./helpers/sandbox-env";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
@@ -5430,6 +5443,283 @@ test("RepairCandidateDropClass: the class union is stable (alarm/grep contract)"
     "empty_token",
   ];
   expect(classes.length).toBe(5);
+});
+
+// ---- fn-1203 baseline-sourced repair candidate source ------------------------
+
+const BL_TC: ToolchainFingerprint = {
+  bunVersion: "1.3.14",
+  platform: "test-x64",
+};
+
+function greenLeaf(sha = "aaaaaaa"): GreenResult {
+  return {
+    key: `k-${sha}`,
+    sha,
+    toolchain: BL_TC,
+    computedAt: 1000,
+    status: "green",
+    runs: [{ startedAt: 0, durationMs: 1, exitCode: 0, failingTests: [] }],
+  };
+}
+
+/** A suite-red leaf with `runs` runs, `hard` tests failing every run (flakySuspect
+ *  false) and `flaky` tests marked flakySuspect — the two shapes the confirmed-red gate
+ *  discriminates. */
+function suiteRedLeaf(opts: {
+  runs: number;
+  hard?: string[];
+  flaky?: string[];
+  sha?: string;
+}): SuiteRedResult {
+  const sha = opts.sha ?? "bbbbbbb";
+  const allIds = [...(opts.hard ?? []), ...(opts.flaky ?? [])];
+  return {
+    key: `k-${sha}`,
+    sha,
+    toolchain: BL_TC,
+    computedAt: 1000,
+    status: "suite-red",
+    failing: [
+      ...(opts.hard ?? []).map((id) => ({ id, flakySuspect: false })),
+      ...(opts.flaky ?? []).map((id) => ({ id, flakySuspect: true })),
+    ],
+    runs: Array.from({ length: opts.runs }, (_, i) => ({
+      startedAt: i,
+      durationMs: 1,
+      exitCode: 1,
+      failingTests: allIds,
+    })),
+  };
+}
+
+function infraLeaf(sha = "ccccccc"): InfraErrorResult {
+  return {
+    key: `k-${sha}`,
+    sha,
+    toolchain: BL_TC,
+    computedAt: 1000,
+    status: "infra-error",
+    kind: "checkout",
+    message: "checkout failed",
+  };
+}
+
+function timeoutLeaf(sha = "ddddddd"): TimeoutResult {
+  return {
+    key: `k-${sha}`,
+    sha,
+    toolchain: BL_TC,
+    computedAt: 1000,
+    status: "timeout",
+    deadlineMs: 60000,
+    runs: [],
+  };
+}
+
+test("classifyBaselineForRepair: a confirmed suite-red (>=2 runs + a hard fail) is confirmed-red", () => {
+  expect(
+    classifyBaselineForRepair(suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] })),
+  ).toBe("confirmed-red");
+});
+
+test("classifyBaselineForRepair: a single-run red is rerun — a single run has no flake signal", () => {
+  expect(
+    classifyBaselineForRepair(suiteRedLeaf({ runs: 1, hard: ["alpha_fail"] })),
+  ).toBe("rerun");
+});
+
+test("classifyBaselineForRepair: an all-flaky suite-red (fail-then-pass) is rerun, not a dispatch", () => {
+  expect(
+    classifyBaselineForRepair(suiteRedLeaf({ runs: 2, flaky: ["alpha_fail"] })),
+  ).toBe("rerun");
+});
+
+test("classifyBaselineForRepair: green / infra-error / timeout / null are none (never red)", () => {
+  expect(classifyBaselineForRepair(greenLeaf())).toBe("none");
+  expect(classifyBaselineForRepair(infraLeaf())).toBe("none");
+  expect(classifyBaselineForRepair(timeoutLeaf())).toBe("none");
+  expect(classifyBaselineForRepair(null)).toBe("none");
+});
+
+test("baselineRedIsConfirmed: requires BOTH >=2 runs AND a non-flaky failure", () => {
+  expect(baselineRedIsConfirmed(suiteRedLeaf({ runs: 2, hard: ["a"] }))).toBe(
+    true,
+  );
+  // Single run — the confirming re-run never ran.
+  expect(baselineRedIsConfirmed(suiteRedLeaf({ runs: 1, hard: ["a"] }))).toBe(
+    false,
+  );
+  // Two runs but every failure flaky (fail-then-pass).
+  expect(baselineRedIsConfirmed(suiteRedLeaf({ runs: 2, flaky: ["a"] }))).toBe(
+    false,
+  );
+  // A mixed leaf is confirmed on its hard failure.
+  expect(
+    baselineRedIsConfirmed(
+      suiteRedLeaf({ runs: 2, hard: ["a"], flaky: ["b"] }),
+    ),
+  ).toBe(true);
+});
+
+test("buildBaselineRepairCandidates: a confirmed-red leaf with ZERO blocked tasks yields exactly one task-less candidate", () => {
+  const notes: string[] = [];
+  const out = buildBaselineRepairCandidates(
+    [
+      {
+        repoDir: "/repo",
+        leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }),
+      },
+    ],
+    (l) => notes.push(l),
+  );
+  expect(out.length).toBe(1);
+  const c = out[0] as RepairCandidate;
+  expect(c.repo_dir).toBe("/repo");
+  expect(c.repo_token).toBe(repoToken("/repo"));
+  expect(c.task_id).toBe(`baseline-tip::${repoToken("/repo")}`);
+  expect(c.epic_id).toBe("");
+  expect(c.fingerprint.length).toBeGreaterThan(0);
+  // A confirmed-red is a candidate, NOT a rerun trace.
+  expect(notes).toEqual([]);
+});
+
+test("buildBaselineRepairCandidates: a single-run red yields NO candidate + a class=single_run rerun trace", () => {
+  const notes: string[] = [];
+  const out = buildBaselineRepairCandidates(
+    [
+      {
+        repoDir: "/repo",
+        leaf: suiteRedLeaf({ runs: 1, hard: ["alpha_fail"], sha: "deadbee" }),
+      },
+    ],
+    (l) => notes.push(l),
+  );
+  expect(out).toEqual([]);
+  expect(notes).toEqual([
+    "# baseline-repair-rerun repo=/repo sha=deadbee class=single_run",
+  ]);
+});
+
+test("buildBaselineRepairCandidates: a flake-suspect red yields NO candidate + a class=flake_suspect rerun trace", () => {
+  const notes: string[] = [];
+  const out = buildBaselineRepairCandidates(
+    [
+      {
+        repoDir: "/repo",
+        leaf: suiteRedLeaf({ runs: 2, flaky: ["alpha_fail"], sha: "beefbee" }),
+      },
+    ],
+    (l) => notes.push(l),
+  );
+  expect(out).toEqual([]);
+  expect(notes).toEqual([
+    "# baseline-repair-rerun repo=/repo sha=beefbee class=flake_suspect",
+  ]);
+});
+
+test("buildBaselineRepairCandidates: infra / timeout / green / null / empty-dir yield nothing (no candidate, no rerun)", () => {
+  const notes: string[] = [];
+  const out = buildBaselineRepairCandidates(
+    [
+      { repoDir: "/a", leaf: infraLeaf() },
+      { repoDir: "/b", leaf: timeoutLeaf() },
+      { repoDir: "/c", leaf: greenLeaf() },
+      { repoDir: "/d", leaf: null },
+      { repoDir: "", leaf: suiteRedLeaf({ runs: 2, hard: ["x"] }) },
+    ],
+    (l) => notes.push(l),
+  );
+  expect(out).toEqual([]);
+  expect(notes).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a confirmed-red baseline candidate with ZERO blocked tasks drives ONE dispatch + one sticky row", async () => {
+  const baseline = buildBaselineRepairCandidates([
+    { repoDir: "/repo", leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }) },
+  ]);
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidates: baseline,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches.length).toBe(1);
+  expect((dispatches[0] as RepairGroup).repo_token).toBe(repoToken("/repo"));
+  expect(mints.filter((m) => m.kind === "row").length).toBe(1);
+  expect(mints.filter((m) => m.kind === "dispatched").length).toBe(1);
+});
+
+test("runRepairEscalationSweep: a worker-stamped block + a baseline-red candidate on one repo+fingerprint coalesce to ONE sticky", async () => {
+  const baseline = buildBaselineRepairCandidates([
+    { repoDir: "/repo", leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }) },
+  ]);
+  const bc = baseline[0] as RepairCandidate;
+  // A worker-sourced candidate on the SAME repo (same token) + SAME fingerprint.
+  const worker: RepairCandidate = {
+    epic_id: "fn-9-x",
+    task_id: "fn-9-x.1",
+    repo_dir: bc.repo_dir,
+    repo_token: bc.repo_token,
+    fingerprint: bc.fingerprint,
+  };
+  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+    candidates: [worker, bc],
+  });
+  await runRepairEscalationSweep(deps);
+  // Coalesced by repo token → exactly one dispatch + one sticky row.
+  expect(dispatches.length).toBe(1);
+  expect((dispatches[0] as RepairGroup).repo_token).toBe(bc.repo_token);
+  expect(mints.filter((m) => m.kind === "row").length).toBe(1);
+  expect(mints.filter((m) => m.kind === "dispatched").length).toBe(1);
+});
+
+test("repairCheckoutDirty (DEFER gate): dirty (>0) or unseeded (null) defers; a clean 0 does not", () => {
+  expect(repairCheckoutDirty(null)).toBe(true);
+  expect(repairCheckoutDirty(3)).toBe(true);
+  expect(repairCheckoutDirty(0)).toBe(false);
+});
+
+test("repairTipBaselineGreen (CLEAR gate): green ONLY on a suite-green leaf; red / infra / timeout / null retain", () => {
+  expect(repairTipBaselineGreen(greenLeaf())).toBe(true);
+  expect(repairTipBaselineGreen(suiteRedLeaf({ runs: 2, hard: ["a"] }))).toBe(
+    false,
+  );
+  expect(repairTipBaselineGreen(infraLeaf())).toBe(false);
+  expect(repairTipBaselineGreen(timeoutLeaf())).toBe(false);
+  expect(repairTipBaselineGreen(null)).toBe(false);
+});
+
+test("the suite-green and checkout-clean gates are DISTINCT: a clean checkout does not imply suite-green", () => {
+  // The exact ambiguity the gap analysis named: a checkout can be pristine (nothing to
+  // commit) while the suite is red at that tip. The DEFER gate reads clean; the CLEAR
+  // gate reads NOT green — the sweep must never conflate them into one "green".
+  expect(repairCheckoutDirty(0)).toBe(false); // checkout clean → not deferred
+  expect(
+    repairTipBaselineGreen(suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] })),
+  ).toBe(false); // suite red at tip → row RETAINED
+});
+
+test("baselineRepairFingerprint: deterministic + stable across sha/flaky noise, keyed on the hard failures", () => {
+  const a = baselineRepairFingerprint(
+    suiteRedLeaf({
+      runs: 2,
+      hard: ["alpha_fail", "beta_fail"],
+      sha: "1111111",
+    }),
+  );
+  const b = baselineRepairFingerprint(
+    suiteRedLeaf({
+      runs: 2,
+      hard: ["alpha_fail", "beta_fail"],
+      flaky: ["gamma_fail"],
+      sha: "2222222",
+    }),
+  );
+  // Same hard failures — a different sha + an extra flaky test are incidental noise.
+  expect(a).toBe(b);
+  // A structurally different failure set fingerprints differently.
+  expect(
+    baselineRepairFingerprint(suiteRedLeaf({ runs: 2, hard: ["zeta_fail"] })),
+  ).not.toBe(a);
 });
 
 // ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------
