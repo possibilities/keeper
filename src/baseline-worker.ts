@@ -418,6 +418,10 @@ function stringifyErr(err: unknown): string {
 let activeChild: ChildProcess | null = null;
 let activeScratch: { repoDir: string; path: string } | null = null;
 
+/** Injectable spawn override for {@link runDetached} — same shape as node's `spawn`,
+ *  exported so other producers (the merge-suite gate) can share the same seam type. */
+export type SpawnFn = typeof spawn;
+
 /** SIGKILL an entire detached process group (pgid = child pid). Best-effort. */
 function killGroup(pid: number | undefined): void {
   if (pid === undefined) return;
@@ -446,7 +450,7 @@ export function runDetached(
   args: string[],
   cwd: string,
   deadlineMs: number,
-  opts?: { spawnFn?: typeof spawn; killGraceMs?: number },
+  opts?: { spawnFn?: SpawnFn; killGraceMs?: number },
 ): Promise<RawRun> {
   const spawnFn = opts?.spawnFn ?? spawn;
   const killGraceMs = opts?.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
