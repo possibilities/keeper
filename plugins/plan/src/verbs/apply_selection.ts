@@ -4,7 +4,13 @@
 // brief and either lands the cells (live) or stages the verdict document
 // close-finalize consumes (follow-up).
 //
-//   keeper plan apply-selection <epic_id> [--from-followup] [--degraded <reason>] --file -
+//   keeper plan apply-selection <epic_id> [--from-followup] [--degraded <reason>]
+//     [--project <abs_path>] --file -
+//
+// --project bypasses the cwd-walk to LOCATE the epic; plan-state reads/writes
+// always re-root through the located epic's primary_repo regardless (matching
+// close_preflight/close_finalize), so an apply from a worktree lane (cwd !=
+// primary_repo) finds the brief primary wrote and stages the verdict there.
 //
 // GUIDED (default): read the selector's raw JSON from stdin (`--file -`; a single
 // optional ```json fenced block is tolerated so a Task return pipes verbatim),
@@ -39,15 +45,21 @@
 // them as VALIDATION_ERRORS: verdict_invalid, brief_missing, cell_invalid (from
 // the shared core), plus the standard epic_not_found.
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join, resolve as resolveAbs } from "node:path";
 
+import { loadEpic } from "../api.ts";
 import { emitFailureEnvelope, emitReadonly } from "../emit.ts";
 import { isEpicId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { configuredEfforts, configuredModels } from "../models.ts";
-import { type ProjectContext, resolveProject } from "../project.ts";
+import {
+  contextForRoot,
+  type ProjectContext,
+  resolveProject,
+} from "../project.ts";
 import { SELECTION_SCHEMA_VERSION } from "../selection_sidecar.ts";
+import { hasDataDir } from "../state_path.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
 import { readPayloadCapped, SubmitError } from "../submit_common.ts";
 import {
@@ -66,6 +78,13 @@ export interface ApplySelectionArgs {
   degraded: string | null;
   /** `-` (stdin) by default; the guided branch reads the verdict from here. */
   file: string;
+  /** `--project <abs_path>`, or null to resolve from cwd. Locates the epic
+   * (cwd-walk or this override), then plan-state re-roots through the epic's
+   * `primary_repo` regardless — matching close_preflight/close_finalize's
+   * `contextForRoot(primaryRepo)` reroot, so an apply from a worktree lane
+   * (cwd != primary_repo) still finds the brief primary wrote and stages the
+   * verdict under primary's `state/` instead of the lane's stale/empty copy. */
+  project: string | null;
 }
 
 /** A cell parsed + shape-validated from the selector verdict. `taskId` is a real
@@ -80,7 +99,7 @@ interface VerdictCell {
 }
 
 export function runApplySelection(args: ApplySelectionArgs): number {
-  const { epicId, fromFollowup, degraded } = args;
+  const { epicId, fromFollowup, degraded, project } = args;
   const fileArg = args.file || "-";
 
   // --degraded is live-only — reject the flag combined with --from-followup.
@@ -100,16 +119,49 @@ export function runApplySelection(args: ApplySelectionArgs): number {
     ]);
     return 1;
   }
-  const ctx = resolveProject(null);
-  const epicPath = join(ctx.dataDir, "epics", `${epicId}.json`);
+
+  // --project <abs_path> bypasses the cwd-walk (absolute-only, matching
+  // close_preflight's guard). Unset falls through to the ordinary cwd-walk.
+  let locateCtx: ProjectContext;
+  if (project !== null) {
+    const projectPathObj = expandUser(project);
+    if (!isAbsolute(projectPathObj)) {
+      usageError(`--project requires an absolute path, got: ${project}`);
+    }
+    const projectRoot = realpathOr(resolveAbs(projectPathObj));
+    if (!hasDataDir(projectRoot)) {
+      emitFailureEnvelope(
+        "epic_not_found",
+        `No plan project found at ${projectRoot}. Run 'keeper plan init' first.`,
+        [`project: ${projectRoot}`],
+      );
+      return 1;
+    }
+    locateCtx = contextForRoot(projectRoot);
+  } else {
+    locateCtx = resolveProject(null);
+  }
+  const epicPath = join(locateCtx.dataDir, "epics", `${epicId}.json`);
   if (!existsSync(epicPath)) {
     emitFailureEnvelope(
       "epic_not_found",
-      `Epic not found in ${ctx.projectPath}: ${epicId}`,
+      `Epic not found in ${locateCtx.projectPath}: ${epicId}`,
       [`epic_id: ${epicId}`],
     );
     return 1;
   }
+
+  // Re-root plan-state through the epic's primary_repo — matching
+  // close_preflight's contextForRoot(primaryRepo) reroot — so a worktree-lane
+  // cwd (or --project pointed at a lane) still reads/writes primary's state.
+  // A null primary_repo (single-repo board) degrades to the locate root (a
+  // no-op when it already equals the primary).
+  const epicDef = loadEpic(locateCtx, epicId);
+  const primaryRepo = realpathOr(
+    (epicDef.primary_repo as string | null | undefined) ||
+      locateCtx.projectPath,
+  );
+  const ctx = contextForRoot(primaryRepo);
 
   // --degraded: live-only re-assert, no stdin, no brief requirement.
   if (degraded !== null) {
@@ -570,4 +622,38 @@ function pinnedString(v: unknown): string {
 
 function describeError(exc: unknown): string {
   return exc instanceof Error ? exc.message : String(exc);
+}
+
+/** click UsageError shape: usage + try-help on stderr, exit 2. Mirrors
+ * close_preflight's / close_finalize's --project absolute-path guard. */
+function usageError(message: string): never {
+  process.stderr.write(
+    "Usage: keeper plan apply-selection [OPTIONS] EPIC_ID\n",
+  );
+  process.stderr.write(
+    "Try 'keeper plan apply-selection --help' for help.\n\n",
+  );
+  process.stderr.write(`Error: ${message}\n`);
+  process.exit(2);
+}
+
+function realpathOr(p: string): string {
+  const abs = resolveAbs(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+function isAbsolute(p: string): boolean {
+  return p.startsWith("/");
+}
+
+function expandUser(p: string): string {
+  if (p === "~" || p.startsWith("~/")) {
+    const home = process.env.HOME ?? "";
+    return home + p.slice(1);
+  }
+  return p;
 }
