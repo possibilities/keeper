@@ -22,5 +22,5 @@ Files:
 - [ ] `wrong-tree-guard.ts` header carries no past-tense provenance; describes current behavior only.
 
 ## Done summary
-
+Added docs/adr/0025-wrong-tree-write-guard.md capturing the shared-checkout-dirtying rationale and the guard's decision; rewrote wrong-tree-guard.ts header to be forward-facing, pointing to the ADR instead of narrating the incident.
 ## Evidence
