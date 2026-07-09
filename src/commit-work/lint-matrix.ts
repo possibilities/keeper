@@ -25,6 +25,19 @@
  *  - `uvx ty check` — typecheck is inherently cross-file.
  *  - `./scripts/lint-cli-boundaries.py` — fast regardless of repo size.
  *
+ * **Staged-path-conditional drift gates** (fire on a staged-PATH match, independent
+ * of file type; each is self-contained and sub-second):
+ *  - the vendored prompt corpus or a hack/panel skill body staged →
+ *    `bun scripts/vendor-corpus.ts --check`
+ *  - the plan model-selector config or subagents matrix staged →
+ *    `bun plugins/plan/scripts/model-guidance-check.ts --check`
+ *  - the plan package's `src/` tree staged → the root
+ *    `test/reconcile-core-depgraph.test.ts` import-boundary ratchet (never the
+ *    whole root suite — kept sub-second on purpose)
+ * `KEEPER_COMMIT_WORK_SKIP_DRIFT_GATES` (any truthy value) skips just these
+ * three, logging a loud stderr warning; every other linter arm still runs, and
+ * the skip is opt-in only — never the default path.
+ *
  * **Failure aggregation:** every checker runs to completion; a single failure
  * surfaces as `linter=<name>`, multiple as `linter="multiple"` with labelled
  * `--- <linter> ---` stderr blocks and a union of implicated files.
@@ -90,6 +103,33 @@ function isDockerfile(path: string): boolean {
     name.startsWith("Dockerfile.") ||
     name.startsWith("Containerfile.")
   );
+}
+
+/** True when `path` sits in the vendored prompt corpus or is a hack/panel skill
+ * body carrying BAKE guards — the vendor-corpus drift check's trigger set.
+ * Exported for direct trigger-set testing (the check itself spawns a
+ * subprocess, which the fast suite never boots). */
+export function isVendorCorpusPath(path: string): boolean {
+  return (
+    path.startsWith("plugins/prompt/corpus/") ||
+    path === "plugins/plan/skills/hack/SKILL.md" ||
+    path === "plugins/plan/skills/panel/SKILL.md"
+  );
+}
+
+/** True when `path` is the plan model-selector config or the subagents matrix
+ * it is checked against — the model-guidance drift check's trigger set. */
+export function isModelGuidancePath(path: string): boolean {
+  return (
+    path === "plugins/plan/model-selector.yaml" ||
+    path === "plugins/plan/subagents.yaml"
+  );
+}
+
+/** True when `path` sits under the plan package's `src/` tree — the
+ * import-boundary ratchet's trigger set. */
+export function isPlanBoundaryPath(path: string): boolean {
+  return path.startsWith("plugins/plan/src/");
 }
 
 /** Lowercased file extension, or `""` (mirrors Python `Path(f).suffix.lower()`). */
@@ -162,8 +202,13 @@ function groupJsTsByPkg(
   return groups;
 }
 
+/** A non-git subprocess runner: real by default ({@link spawnTool}), injectable
+ * via {@link runScopedLint}'s `deps.runTool` so the conditional-stage trigger
+ * and failure-aggregation logic is testable without spawning a subprocess. */
+export type ToolRunner = (cmd: string[], cwd: string) => Promise<GitExecResult>;
+
 /** Spawn `cmd` (non-git) draining both pipes concurrently; returns exit + output. */
-async function runTool(cmd: string[], cwd: string): Promise<GitExecResult> {
+async function spawnTool(cmd: string[], cwd: string): Promise<GitExecResult> {
   const proc = Bun.spawn(cmd, {
     cwd,
     stdin: "ignore",
@@ -189,7 +234,23 @@ async function runTool(cmd: string[], cwd: string): Promise<GitExecResult> {
 export async function runScopedLint(
   stagedFiles: string[],
   cwd: string,
+  deps: { runTool?: ToolRunner } = {},
 ): Promise<void> {
+  const runTool = deps.runTool ?? spawnTool;
+
+  // Loud, opt-in escape hatch for the three staged-path-conditional drift
+  // gates below (vendor-corpus, model-guidance, import-boundary) — never the
+  // default path, and never the other linter arms above.
+  const skipDriftGates = Boolean(
+    process.env.KEEPER_COMMIT_WORK_SKIP_DRIFT_GATES,
+  );
+  if (skipDriftGates) {
+    process.stderr.write(
+      "commit-work: KEEPER_COMMIT_WORK_SKIP_DRIFT_GATES set — skipping the " +
+        "vendor-corpus/model-guidance/import-boundary drift gates for this commit\n",
+    );
+  }
+
   const pyFiles = stagedFiles.filter((f) => suffixLower(f) === ".py");
   const tsFiles = stagedFiles.filter((f) => TS_SUFFIXES.has(suffixLower(f)));
   const shFiles = stagedFiles.filter((f) => suffixLower(f) === ".sh");
@@ -202,6 +263,15 @@ export async function runScopedLint(
   const hasPyproject = existsSync(join(cwd, "pyproject.toml"));
   const cliBoundariesScript = join(cwd, "scripts", "lint-cli-boundaries.py");
   const tsconfigPath = join(cwd, "tsconfig.json");
+  const vendorCorpusScript = join(cwd, "scripts", "vendor-corpus.ts");
+  const modelGuidanceScript = join(
+    cwd,
+    "plugins",
+    "plan",
+    "scripts",
+    "model-guidance-check.ts",
+  );
+  const boundaryTestFile = join(cwd, "test", "reconcile-core-depgraph.test.ts");
 
   // Each task resolves to a RecordedFailure or null. They run concurrently;
   // the `order` index pins a stable aggregation order independent of finish
@@ -429,6 +499,73 @@ export async function runScopedLint(
     tasks.push({
       order: 11,
       run: () => runDomainDocsLint(stagedFiles, cwd),
+    });
+  }
+
+  // 12 --- vendor-corpus drift (staged path touches the vendored prompt corpus
+  //        or a hack/panel skill BAKE guard body; self-contained, sub-second). ---
+  if (
+    !skipDriftGates &&
+    stagedFiles.some(isVendorCorpusPath) &&
+    existsSync(vendorCorpusScript)
+  ) {
+    tasks.push({
+      order: 12,
+      run: async () => {
+        const r = await runTool(["bun", vendorCorpusScript, "--check"], cwd);
+        return r.code !== 0
+          ? {
+              linter: "vendor-corpus",
+              files: stagedFiles.filter(isVendorCorpusPath),
+              stderr: failureStderr("vendor-corpus", r),
+            }
+          : null;
+      },
+    });
+  }
+
+  // 13 --- model-guidance drift (staged path touches the plan model-selector
+  //        config or the subagents matrix it is checked against). ---
+  if (
+    !skipDriftGates &&
+    stagedFiles.some(isModelGuidancePath) &&
+    existsSync(modelGuidanceScript)
+  ) {
+    tasks.push({
+      order: 13,
+      run: async () => {
+        const r = await runTool(["bun", modelGuidanceScript, "--check"], cwd);
+        return r.code !== 0
+          ? {
+              linter: "model-guidance",
+              files: stagedFiles.filter(isModelGuidancePath),
+              stderr: failureStderr("model-guidance", r),
+            }
+          : null;
+      },
+    });
+  }
+
+  // 14 --- import-boundary ratchet (staged path touches the plan package's
+  //        src/ tree). Scoped to the one fast structural pin, never the whole
+  //        root suite. ---
+  if (
+    !skipDriftGates &&
+    stagedFiles.some(isPlanBoundaryPath) &&
+    existsSync(boundaryTestFile)
+  ) {
+    tasks.push({
+      order: 14,
+      run: async () => {
+        const r = await runTool(["bun", "test", boundaryTestFile], cwd);
+        return r.code !== 0
+          ? {
+              linter: "import-boundary",
+              files: stagedFiles.filter(isPlanBoundaryPath),
+              stderr: failureStderr("import-boundary", r),
+            }
+          : null;
+      },
     });
   }
 
