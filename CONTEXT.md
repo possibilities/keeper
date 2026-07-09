@@ -118,6 +118,13 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Load surface**: The set of checked-in files the resident daemon process actually loads — what the reload fingerprint hashes and the boundary test encloses; per-invocation code (CLI, hooks, skills) is outside it. Avoid: footprint, source tree, codebase.
 - **Roots manifest**: The checked-in declaration of load-surface roots that the install fingerprint and the boundary test both consume through one seam, so the hashed boundary and the enforced boundary cannot disagree. Avoid: allowlist, path list, fingerprint config.
 
+## Daemon liveness and restart forensics
+
+- **Daemon boot**: One keeperd process lifetime from exec to exit, the unit the restart ledger records under a `boot_id`. Distinct from a Generation (one tmux server boot) — the "boot id" that entry rejects refers to the tmux concept, never to this one. Avoid: generation, instance, run.
+- **Served latency**: How long the serve worker takes to answer a real client query, self-reported to main as windowed duration percentiles; never measured by an external probe. Avoid: probe latency, response time, lag (that is event-loop delay).
+- **Serve starvation**: The degraded wedge where the serve worker answers trivial probes fast while real first-paint queries queue past the client give-up; detectable only from served latency, invisible to an accept-stall probe. Avoid: accept-stall (reads die entirely there), busy-lag (main-loop starvation), brownout.
+- **Single-instance lock**: The kernel flock on the dedicated `keeperd.lock` file main acquires before opening the DB, making a second concurrent daemon impossible rather than merely detectable; the kernel releases it on process death, so a stale lock cannot exist. Avoid: pid file, sock lock (the server worker's separate per-socket lock file), mutex.
+
 ## Panels and presets
 
 - **Preset**: A named harness-and-model combination in the agent catalog that launches and pairs consistently wherever it is referenced. Avoid: profile, config, model alias.
