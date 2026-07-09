@@ -26,5 +26,5 @@ aggregation, or the zero-cost `stagedFiles.some(predicate)` gating.
 - [ ] New predicate test passes in the fast in-process suite (no subprocess boot)
 
 ## Done summary
-
+Extended isModelGuidancePath to also match plugins/plan/skills/model-guidance/references/*.md so a references-only staged edit fires arm 13; added positive/negative predicate and dispatch tests.
 ## Evidence
