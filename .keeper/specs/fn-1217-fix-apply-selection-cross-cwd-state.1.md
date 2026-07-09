@@ -28,5 +28,5 @@ Files: `plugins/plan/src/verbs/apply_selection.ts`,
 - [ ] `bun test` (plan fast suite) is green.
 
 ## Done summary
-
+Added --project to apply-selection, re-rooted plan-state through the epic's primary_repo (matching close_preflight/close_finalize), threaded --project <primary_repo> through the /plan:close 3.5c beat, and covered a brief-in-primary / apply-from-lane close with a cross-cwd test.
 ## Evidence
