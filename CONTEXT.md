@@ -113,6 +113,11 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Coverage verdict**: The trailer's honest claim about frame completeness — continuous only when one uninterrupted run provably dropped nothing, gap_possible otherwise. Avoid: gapless guarantee, completeness flag.
 - **Hyper mode**: The supervision mode that consumes one bounded frame chunk per pass and judges each change as a human proxy — truthful, legible, stable — filing UI defects rather than editing renderers. Avoid: frame mode, firehose mode, vigilant mode.
 
+## Install and reload
+
+- **Load surface**: The set of checked-in files the resident daemon process actually loads — what the reload fingerprint hashes and the boundary test encloses; per-invocation code (CLI, hooks, skills) is outside it. Avoid: footprint, source tree, codebase.
+- **Roots manifest**: The checked-in declaration of load-surface roots that the install fingerprint and the boundary test both consume through one seam, so the hashed boundary and the enforced boundary cannot disagree. Avoid: allowlist, path list, fingerprint config.
+
 ## Panels and presets
 
 - **Preset**: A named harness-and-model combination in the agent catalog that launches and pairs consistently wherever it is referenced. Avoid: profile, config, model alias.
