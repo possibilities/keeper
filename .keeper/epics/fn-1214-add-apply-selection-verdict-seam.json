@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T18:39:49.942000Z",
+  "depends_on_epics": [],
+  "id": "fn-1214-add-apply-selection-verdict-seam",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Add apply-selection verdict seam",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T18:39:49.942000Z"
+}
