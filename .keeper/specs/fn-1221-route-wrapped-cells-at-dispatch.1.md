@@ -42,5 +42,5 @@ Seam units (fixture matrix injected): routed wrapped + rendered cell → ok(cell
 - [ ] The slow wrapped e2e asserts a successful wrapped-cell resolution through the shared seam
 
 ## Done summary
-
+Wrapped capability cells now dispatch: the shared seam resolves a routed wrapped candidate to its rendered workers/<model>-<effort> cell (manifest + shadow guards intact), and the task's capability model is threaded onto the launch so the producer and dispatch CLI bind the route probe to the cell's model and launch the late-resolved --plugin-dir in both the spec and the byte-pinned argv. Native cells, cell-less rows, and every existing sticky-reason pin stay byte-identical.
 ## Evidence
