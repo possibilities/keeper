@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reconcile sentinel skew fall-through",
-  "updated_at": "2026-07-09T01:02:28.004000Z"
+  "updated_at": "2026-07-09T01:07:06.050000Z",
+  "worker_done_at": "2026-07-09T01:07:06.050000Z"
 }

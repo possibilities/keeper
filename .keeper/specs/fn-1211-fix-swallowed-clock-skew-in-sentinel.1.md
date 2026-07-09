@@ -37,5 +37,5 @@ ADR 13's re-fold discipline; wall-clock reads stay in the producer).
       (planRef null / adopted) row that is BOTH tier-two-stale AND clock-skewed.
 
 ## Done summary
-
+Moved the tier-two carve-out's unconditional continue inside the plan-linked mint guard so a carved-out (planRef null or adopted) tier-two-stale row still falls through to the standalone clock-skew branch, matching ADR 0025 and the inline comment; added a test pinning the carved-out + tier-two-stale + clock-skewed edge.
 ## Evidence
