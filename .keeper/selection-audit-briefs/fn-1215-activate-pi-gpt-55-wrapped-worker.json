@@ -1,0 +1,49 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 79,
+        "files_changed": 3,
+        "insertions": 78
+      },
+      "done_summary": "Retargeted model-guidance research from gpt-5.5 to gpt-5.3-codex-spark: authored a hash-anchored provenance reference with a trickle-posture guidance block, and dropped gpt-5.5's research entry and reference file. Model-guidance gate and plan fast suite pass.",
+      "input_hash": "72563b6ef25a3fd8dafabd42b5aca7b99330f8df92c08c47cb0f2e32a83bb3b5",
+      "model": "sonnet",
+      "spec_chars": 2945,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/model-selector.yaml, plugins/plan/skills/model-guidance/references/gpt-5.3-codex-spark.md, plugins/plan/skills/model-guidance/references/gpt-5.5.md, plugins/plan/test/consistency-model-selector.test.ts\n\n### Approach\n\nThe research backfill landed before the epic retargeted from gpt-5.5 to gpt-5.3-codex-spark, so the guidance config may anchor research for the wrong model. Reconcile the config to the retargeted intent, working from whatever state the prior backfill actually left: gpt-5.3-codex-spark ends with a real researched reference file (provenance header with date and sources, strengths/weaknesses/when-to-pick, per the established per-model reference shape \u2014 author it through the model-guidance flow if absent) and a hash-anchored research entry, and its guidance block reads as trickle-posture selection advice (route only genuinely-bounded mechanical work until cell-review cohorts justify promotion). gpt-5.5 ends as a tolerated guidance-only extra: no research entry; drop its reference file if one was added by the prior pass (or leave it orphaned only if the gate tolerates unreferenced files \u2014 prefer removal for a clean references/ tree). The gate's tolerance semantics (extra research entries allowed, hash parity always enforced) are landed behavior to rely on, not to change here.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/model-selector.yaml \u2014 the research: map and both model guidance blocks as the prior task left them (inspect actual state first; the prior backfill may have targeted gpt-5.5, spark, or both)\n- plugins/plan/skills/model-guidance/references/ \u2014 which reference files exist post-backfill\n- plugins/plan/scripts/model-guidance-check.ts \u2014 the landed tolerance + hash-parity behavior the reconciliation must keep green\n- plugins/plan/skills/model-guidance/SKILL.md \u2014 the research\u2192cache\u2192distill flow for authoring the spark reference if missing\n\n### Risks\n\n- The guidance prose rides inside every selector prompt \u2014 keep the spark block short; raw research stays in the reference file\n\n### Test notes\n\nGate green via `bun plugins/plan/scripts/model-guidance-check.ts --check` and the consistency test; extend assertions only if they pin the old target.\n\n## Acceptance\n\n- [ ] The guidance config anchors hash-valid research for gpt-5.3-codex-spark with a trickle-posture guidance block distilled from a provenance-headed reference, and carries no research entry for gpt-5.5\n- [ ] The model-guidance drift gate and the plan fast suite pass\n\n## Done summary\nRetargeted model-guidance research from gpt-5.5 to gpt-5.3-codex-spark: authored a hash-anchored provenance reference with a trickle-posture guidance block, and dropped gpt-5.5's research entry and reference file. Model-guidance gate and plan fast suite pass.\n## Evidence\n",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.5",
+      "tier": "high",
+      "title": "Spark research reconciliation"
+    }
+  ],
+  "created_at": "2026-07-09T20:17:53.274000Z",
+  "epic_id": "fn-1215-activate-pi-gpt-55-wrapped-worker",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.2"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.3"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.4"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "72563b6ef25a3fd8dafabd42b5aca7b99330f8df92c08c47cb0f2e32a83bb3b5",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
