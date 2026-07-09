@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Single-instance flock gate",
-  "updated_at": "2026-07-09T21:28:15.020000Z"
+  "updated_at": "2026-07-09T23:59:29.541000Z",
+  "worker_done_at": "2026-07-09T23:59:29.541000Z"
 }

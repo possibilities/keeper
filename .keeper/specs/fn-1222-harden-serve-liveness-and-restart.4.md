@@ -57,5 +57,5 @@ branch is a pure-seam test on the errno classification.
 - [ ] CLAUDE.md carries one gate guardrail line and the lint stays green
 
 ## Done summary
-
+Kernel flock single-instance gate at startDaemon top (before openDb/migrate/ledger): live incumbent exits 1 naming holder+kickstart recovery, inconclusive primitive fails open; FD_CLOEXEC module-scope fd no worker inherits. New resolveSingleInstanceLockPath (keeperd.lock, env-overridable, sandboxed), disableSingleInstanceLock opt, and ownership-checked socket/lock unlinks. Pure decideSingleInstanceGate seam + real-flock/ownership tests.
 ## Evidence
