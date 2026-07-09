@@ -41,5 +41,5 @@ reducer/projection surface only if path (a) is chosen.
 - [ ] `bun test` and the plan suite stay green.
 
 ## Done summary
-
+Anchored a task-complete await's dwell on a per-task version: completeWatermark now returns the MAX last_event_id across the target task's own embedded jobs, not the containing epic's last_event_id. Sibling-task churn (which re-folds the shared epic row) no longer resets the dwell, while the target's own worker re-activation (the coalesced running->completed flap) still restarts it. Pure client-side change (data already on the subscribe snapshot) — no reducer/migration touched. Added F3 sibling-churn + target-flap tests at the module and command level.
 ## Evidence
