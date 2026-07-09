@@ -113,7 +113,12 @@ function taskStatus(t: Record<string, unknown>): string {
   return typeof raw === "string" && raw !== "" ? raw : "todo";
 }
 
-function selectionBriefPath(
+/** Absolute path to a per-epic selection artifact under gitignored state:
+ * `<stateDir>/selections/<epic_id>/<basename>`. Defaults to the live `brief.json`;
+ * callers pass `followup-brief.json` / `followup-verdict.json` for the follow-up
+ * artifacts. Shared with apply-selection, which reads the brief + stages the
+ * follow-up verdict here. */
+export function selectionBriefPath(
   stateDir: string,
   epicId: string,
   basename = "brief.json",

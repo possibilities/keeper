@@ -590,17 +590,17 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 ## Phase 6.5 — Select model+effort cells (create path only)
 
-Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets the `plan:model-selector` subagent overwrite those cells with a researched {tier, model} per task, landing the writes plus a git-committed selection sidecar via `keeper plan assign-cells`. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path runs the equivalent beat at **R6** over the re-ghosted epic's remaining todo tasks — the create-path mechanics documented here.
+Runs after Phase 6 wires deps and **before** Phase 7 arms. Scaffold stamped every task the mechanical default (`xhigh` / `opus`); this beat lets the `plan:model-selector` subagent overwrite those cells with a researched {tier, model} per task, landed through the trusted `apply-selection` verb (ADR 0027) — the ONE apply seam that validates the raw verdict against the on-disk brief and writes the cells plus a git-committed selection sidecar. **Every failure mode degrades to the stamped defaults and still arms in Phase 7 — no path may leave a stuck ghost.** The refine path runs the equivalent beat at **R6** over the re-ghosted epic's remaining todo tasks — the create-path mechanics documented here.
 
 ### 6.5a — Build the content-blind selector brief
 
-Run the brief handoff verb and pin its envelope fields (`brief_ref`, `config_hash`, `input_hash`, `shuffle_seed`, `task_ids`, `candidate_cells`). The verb writes the full selector context under gitignored state: selector policy config, epic spec, todo task specs, and candidate cells. Do **not** open the brief and do not inline spec prose into the selector prompt.
+Run the brief handoff verb and pin `brief_ref`. The verb writes the full selector context under gitignored state: selector policy config, epic spec, todo task specs, and candidate cells. Do **not** open the brief and do not inline spec prose into the selector prompt.
 
 ```bash
 keeper plan selection-brief <epic_id>
 ```
 
-If this fails (missing config/specs, no todo tasks, bad id), skip the selector subagent and go straight to the degrade path (6.5d) with `degraded:selection-brief-failed`.
+If this fails (missing config/specs, no todo tasks, bad id), skip the selector subagent and go straight to the degrade path (6.5c) with `degraded:selection-brief-failed`.
 
 ### 6.5b — Spawn the selector subagent blind
 
@@ -619,48 +619,21 @@ BRIEF_REF: <brief_ref from selection-brief>
 )
 ```
 
-### 6.5c — Extract + validate the verdict
+### 6.5c — Apply via apply-selection, one retry, then degrade
 
-Parse the Task return as raw JSON (fenced ```` ```json ```` block fallback if the model wrapped it). Then validate, rejecting on any miss:
-
-- schema shape (`cells:` list, one cell per task with `task_id` / `tier` / `model` / `rationale` / `confidence`);
-- **enum-clamp** each `tier` / `model` against the `candidate_cells` from the `selection-brief` envelope;
-- the cell set covers **exactly** the `task_ids` from the `selection-brief` envelope — no missing, extra, or duplicate id.
-
-A clean verdict → apply it (6.5e, `label_source: heuristic-guided`). A Task failure, an error-shaped return, or a validation miss → one repair retry (6.5d).
-
-### 6.5d — One repair retry, then degrade
-
-On the **first** Task failure / error-shaped return / validation miss only, relaunch a **fresh** `plan:model-selector` with the same config-only prompt plus a short `VALIDATION_ERRORS:` block naming only the schema errors (no spec prose). Re-validate once. If it still fails, **degrade**: stop (never loop) and apply the stamped defaults via 6.5e with `outcome: degraded:<reason>` and `label_source: heuristic-default`.
-
-### 6.5e — Apply cells via assign-cells
-
-Feed the cell set to the batch verb — a YAML with a `cells:` list (one cell per todo task, the full set) and a `selection:` provenance block:
+Pipe the Task return VERBATIM — no parsing, no fenced-block extraction, no enum-clamp, no coverage check; the verb does all of that against the on-disk brief — to the trusted apply seam:
 
 ```bash
-keeper plan assign-cells <epic_id> --file - <<'YAML_EOF'
-cells:
-  - task_id: <epic_id>.1
-    tier: <tier>
-    model: <model>
-    rationale: <one-line why>
-    confidence: <0-1 or a label>
-    label_source: heuristic-guided       # heuristic-default on a degrade
-  # … one cell per todo task, covering the exact set
-selection:
-  harness: subagent
-  model: plan:model-selector
-  config_hash: <selection-brief config_hash>
-  input_hash: <selection-brief input_hash>
-  shuffle_seed: <selection-brief shuffle_seed>
-  outcome: completed                     # or degraded:<reason>
-  verdict_raw: <the selector's raw message, or null>
-YAML_EOF
+keeper plan apply-selection <epic_id> --file -
 ```
 
-On success the verb overwrites every cell, writes the schema-versioned sidecar to `.keeper/selections/<epic_id>.json`, and lands both in one auto-commit. Failure codes: `bad_yaml` (shape/type), `cell_invalid` (out-of-axis tier/model, or an unknown / duplicate / missing / non-todo task id — the full-set + todo-only contract). A verb rejection of a real verdict is a validation miss (one repair retry, then degrade).
+A success envelope means the cells landed (`label_source: heuristic-guided`) plus the sidecar write, both in one auto-commit — proceed to Phase 7. On a failure envelope (`verdict_invalid`, `brief_missing`, `cell_invalid`), relay its `details` array as a `VALIDATION_ERRORS:` block (no spec prose) to **one fresh** `plan:model-selector` spawn (same config-only prompt as 6.5b), then retry `apply-selection` once. If it still fails, **degrade**: stop (never loop) and re-assert the stamped defaults with a degrade reason:
 
-**On ANY failure path** (`selection-brief` failure, Task failure, error-shaped return, parse-or-schema failure after the one retry, or `assign-cells` rejection) call assign-cells with the **stamped default cells** (`xhigh` / `opus`), `outcome: degraded:<reason>`, and `label_source: heuristic-default`, so the sidecar records the failure for offline analysis. If even that degrade write fails, **log one line and proceed** — Phase 7 still arms.
+```bash
+keeper plan apply-selection <epic_id> --degraded <reason>
+```
+
+This re-asserts each todo task's own current cell under `label_source: heuristic-default` and writes a `degraded:<reason>` sidecar so the failure is recorded for offline analysis — it exits 0 whenever the sidecar write lands. If even that degrade call fails, **log one line and proceed** — Phase 7 still arms.
 
 ### Failure invariant
 
@@ -810,9 +783,9 @@ After R5b or R5c, run **R6** below, then jump to **Phase 7 (Validate)**.
 
 ### R6. Re-select remaining todo cells
 
-Both routes converge here. Run the same content-blind selection beat the create path runs at **Phase 6.5** — `keeper plan selection-brief <epic_id>`, spawn `plan:model-selector` blind, validate the verdict, then `keeper plan assign-cells <epic_id>` — over the re-ghosted epic. R1's `refine-context --invalidate` already nulled the marker and re-ghosted the epic before the delta applied, so the beat is race-free: no task can dispatch mid-selection.
+Both routes converge here. Run the same content-blind selection beat the create path runs at **Phase 6.5** — `keeper plan selection-brief <epic_id>`, spawn `plan:model-selector` blind, then pipe its return to `keeper plan apply-selection <epic_id> --file -` — over the re-ghosted epic. R1's `refine-context --invalidate` already nulled the marker and re-ghosted the epic before the delta applied, so the beat is race-free: no task can dispatch mid-selection.
 
-`assign-cells` takes the **full todo set**, so a refine re-selects **every remaining todo task's cell**, not only the tasks this refine added or rewrote. This overwrites a deliberate earlier manual cell pick on an untouched todo task — an accepted, disclosed cost of one whole-epic content-blind re-selection, not a silent bug; there is no partial-set assign. Every failure mode degrades to the stamped defaults exactly as Phase 6.5 spells out, so no path leaves a stuck ghost.
+`apply-selection` validates against the brief's **full todo set**, so a refine re-selects **every remaining todo task's cell**, not only the tasks this refine added or rewrote. This overwrites a deliberate earlier manual cell pick on an untouched todo task — an accepted, disclosed cost of one whole-epic content-blind re-selection, not a silent bug; there is no partial-set apply. Every failure mode degrades to the stamped defaults exactly as Phase 6.5 spells out, so no path leaves a stuck ghost.
 
 A refine that leaves **zero todo tasks** (every task already done or in progress) skips the beat cleanly: `selection-brief` returns `NO_TODO_TASKS`, and the flow proceeds straight to the Phase 7 arm with no selector spawn.
 

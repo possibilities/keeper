@@ -335,7 +335,7 @@ describe("plan skill refine selection beat", () => {
     const text = readFileSync(PLAN_SKILL, "utf-8");
     expect(text).toContain("### R6.");
     expect(text).toContain("keeper plan selection-brief");
-    expect(text).toContain("keeper plan assign-cells");
+    expect(text).toContain("keeper plan apply-selection");
   });
 
   test("states the full-set re-select and the clean zero-todo skip", () => {

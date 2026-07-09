@@ -144,7 +144,8 @@ once the operation clears is the whole recovery.
 | code                 | meaning                                                        | recovery                                                                    |
 | -------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | `bad_yaml`           | The scaffold / refine YAML is malformed.                      | Fix the reported parse or shape error in the input and re-run.              |
-| `cell_invalid`       | An `assign-cells` cell set is invalid: an out-of-axis tier/model, or an unknown, duplicate, missing, or non-todo task id (the full-set + todo-only contract). | Correct the cells so every todo task of the epic is covered exactly once with in-axis values, then re-run. |
+| `brief_missing`      | `apply-selection` found no selection brief on disk for the epic, or the brief's `from_followup` flag does not match the invocation. | Run `keeper plan selection-brief <epic_id>` (add `--from-followup` for a follow-up) before applying the verdict. |
+| `cell_invalid`       | An `assign-cells` or `apply-selection` cell set is invalid: an out-of-axis tier/model, or an unknown, duplicate, missing, or non-todo task id (the full-set + todo-only contract), including a brief-vs-live axis divergence detected at `apply-selection` apply time. | Correct the cells so every todo task of the epic is covered exactly once with in-axis values, then re-run. |
 | `dep_cycle`          | The task dependency graph has a cycle.                        | Break the cycle among the listed tasks, then re-run.                        |
 | `dep_invalid`        | A declared task dependency does not resolve.                  | Correct the referenced task id (or remove the edge) and re-run.            |
 | `epic_dep_invalid`   | A declared epic dependency does not resolve.                  | Correct the referenced epic id (or remove the edge) and re-run.           |
@@ -158,6 +159,7 @@ once the operation clears is the whole recovery.
 | `tier_invalid`       | The declared tier is out of range.                           | Set a supported tier value and re-run.                                     |
 | `repo_invalid`       | The repo path is not a valid git repo root.                 | Correct the repo path and re-run.                                         |
 | `missing_session_id` | No session id is available for a mutating verb.             | Ensure the invocation carries a session id and re-run.                    |
+| `verdict_invalid`    | An `apply-selection` selector verdict is malformed: unparseable JSON, an error-shaped `{"error": ...}` return, an unknown top-level key, or a cell out of the brief's candidate axes or coverage (also the `--degraded` + `--from-followup` combination). | Fix every issue listed in `error.details` and re-pipe the verdict on stdin. |
 | *(unlisted)*         | Any other accumulate-all failure code.                       | Fix the reported problems in the input and re-run; `details` lists them.   |
 
 ### Selection-audit verbs (`selection-audit-brief`, `selection-review-submit`)

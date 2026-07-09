@@ -303,6 +303,7 @@ describe("INTEGRITY_GATE_VERBS membership", () => {
       "mv-repo",
       "refine-apply",
       "assign-cells",
+      "apply-selection",
     ];
     expect([...INTEGRITY_GATE_VERBS]).toEqual(canonical);
   });

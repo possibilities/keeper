@@ -230,8 +230,17 @@ const PLAN_ERROR_RECOVERY: Record<string, string> = {
     "error in the input and re-run the verb.",
   cell_invalid:
     "A selection cell set is invalid (an out-of-axis tier/model, or an unknown, " +
-    "duplicate, missing, or non-todo task id). Correct the cells so every todo " +
-    "task of the epic is covered exactly once with in-axis values, then re-run.",
+    "duplicate, missing, or non-todo task id, or a brief-vs-live axis divergence " +
+    "at apply time). Correct the cells so every todo task of the epic is covered " +
+    "exactly once with in-axis values, then re-run.",
+  verdict_invalid:
+    "The selector verdict is malformed (unparseable, an error-shaped return, an " +
+    "unknown top-level key, or a cell out of the brief's axes or coverage). Fix " +
+    "every issue in error.details and re-pipe the verdict.",
+  brief_missing:
+    "No selection brief is on disk for this epic (or its from_followup flag does " +
+    "not match the invocation). Run `keeper plan selection-brief <epic_id>` " +
+    "(add --from-followup for a follow-up) before applying the verdict.",
   dep_cycle:
     "The task dependency graph has a cycle. Break the cycle among the listed " +
     "tasks so the graph is acyclic, then re-run.",

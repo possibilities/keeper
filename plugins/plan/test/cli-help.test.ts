@@ -26,6 +26,7 @@ import { runCli } from "./harness.ts";
 // from the cli.ts dispatch switch + the subgroup runner tables — NOT read back
 // from the descriptor the code under test exposes.
 const EXPECTED_TOP_LEVEL = [
+  "apply-selection",
   "assign-cells",
   "audit",
   "block",

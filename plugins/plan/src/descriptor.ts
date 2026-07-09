@@ -341,6 +341,27 @@ const WORKER_SUBCOMMANDS: readonly PlanCommand[] = [
 
 export const PLAN_COMMANDS: readonly PlanCommand[] = [
   {
+    name: "apply-selection",
+    summary:
+      "Apply a validated selector verdict: land cells or stage a follow-up verdict.",
+    args: [{ name: "EPIC_ID" }],
+    options: [
+      OPT_FILE,
+      {
+        name: "--from-followup",
+        takesValue: false,
+        summary:
+          "Stage a follow-up verdict document instead of landing live cells",
+      },
+      {
+        name: "--degraded",
+        takesValue: true,
+        summary:
+          "Re-assert current cells with a degrade reason (live-only, no stdin)",
+      },
+    ],
+  },
+  {
     name: "assign-cells",
     summary:
       "Batch-overwrite a ghost epic's tier/model cells + write a sidecar.",
