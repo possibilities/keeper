@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Fully-specified single-predicate extension plus a positive/negative test with a named surface and no design choice \u2014 mechanical, reversible work that sits squarely in sonnet's low band.",
+      "task_id": "fn-1209-extend-model-guidance-drift-gate-to.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T00:48:29.133000Z",
+  "epic_id": "fn-1209-extend-model-guidance-drift-gate-to",
+  "input_hash": "11e13e53b6c0eea9a22d9ae2d5ae1ea31daed403debe3bf82adc44ce1f95ebd9",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 299974227,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"sonnet\",\"rationale\":\"Fully-specified single-predicate extension plus a positive/negative test with a named surface and no design choice \u2014 mechanical, reversible work that sits squarely in sonnet's low band.\",\"confidence\":0.9}]}"
+}
