@@ -68,6 +68,7 @@ import {
   gatePhaseCommand,
   parseGateOutput,
   runDetached,
+  type SpawnFn,
 } from "./baseline-worker";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
@@ -4974,7 +4975,7 @@ const MERGE_GATE_MAX_FAILING_NAMES = 8;
 
 /** Read one package dir's gate-phase test command (the `<gate> && …` first segment),
  *  or null when it has no runnable `test` script. */
-function readPkgGateCommand(pkgDir: string): string | null {
+export function readPkgGateCommand(pkgDir: string): string | null {
   try {
     const pkg = JSON.parse(
       readFileSync(join(pkgDir, "package.json"), "utf8"),
@@ -4998,16 +4999,25 @@ function readPkgGateCommand(pkgDir: string): string | null {
  *  - the suite exited non-zero with NO failing-test signal (a compile error / bail in
  *    the merged tree) → `red` — a broken merged build is a VISIBLE park an operator
  *    fixes, never a silent forever-retry.
+ *
+ * `opts.spawnFn` is the injectable seam (tests): overrides the underlying `spawn`
+ * both the install and the gate-command run go through, so a fake suite runner can
+ * exercise every verdict branch without a real subprocess.
  */
-async function runPackageSuiteGate(
+export async function runPackageSuiteGate(
   pkgDir: string,
-  opts: { installTimeoutMs: number; suiteDeadlineMs: number },
+  opts: {
+    installTimeoutMs: number;
+    suiteDeadlineMs: number;
+    spawnFn?: SpawnFn;
+  },
 ): Promise<MergeSuiteVerdict> {
   const install = await runDetached(
     "bun",
     ["install", "--frozen-lockfile"],
     pkgDir,
     opts.installTimeoutMs,
+    { spawnFn: opts.spawnFn },
   );
   if (install.timedOut) {
     return {
@@ -5033,6 +5043,7 @@ async function runPackageSuiteGate(
     ["-c", gateCmd],
     pkgDir,
     opts.suiteDeadlineMs,
+    { spawnFn: opts.spawnFn },
   );
   if (raw.timedOut) {
     return { kind: "cannot-run", detail: `suite timed out in ${pkgDir}` };
@@ -5067,8 +5078,9 @@ async function runPackageSuiteGate(
  * the merge touches `plugins/plan`), and classify green / red / cannot-run. Runs
  * INLINE on the reconcile worker (a producer git+suite side effect, never a fold);
  * the scratch worktree is reaped on EVERY path. NEVER throws — any unexpected error
- * folds to `cannot-run` (a retry-skip), never a silent push. `run`/`worktreesRoot`
- * are injectable seams; production passes `gitExec` and the default root.
+ * folds to `cannot-run` (a retry-skip), never a silent push. `run`/`worktreesRoot`/
+ * `spawnFn` are injectable seams; production passes `gitExec`, the default root,
+ * and the real `spawn`.
  */
 export async function runMergeSuiteGate(
   args: { repoDir: string; mergedCommit: string; runsPlanSuite: boolean },
@@ -5077,6 +5089,7 @@ export async function runMergeSuiteGate(
     worktreesRoot?: string;
     installTimeoutMs?: number;
     suiteDeadlineMs?: number;
+    spawnFn?: SpawnFn;
   } = {},
 ): Promise<MergeSuiteVerdict> {
   const run = opts.run ?? gitExec;
@@ -5104,6 +5117,7 @@ export async function runMergeSuiteGate(
     const rootVerdict = await runPackageSuiteGate(scratchPath, {
       installTimeoutMs,
       suiteDeadlineMs,
+      spawnFn: opts.spawnFn,
     });
     if (rootVerdict.kind !== "green" || !args.runsPlanSuite) {
       return rootVerdict;
@@ -5115,6 +5129,7 @@ export async function runMergeSuiteGate(
       {
         installTimeoutMs,
         suiteDeadlineMs,
+        spawnFn: opts.spawnFn,
       },
     );
   } catch (err) {
