@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified multi-file plumbing in a known pattern \u2014 stamp an already-computed reducer scalar onto a live-only projection, render it, and extend a regression test \u2014 with exact line numbers and no named intelligence-bound reason to escalate off the sonnet default, and the schema step is a well-trodden version-guarded template.",
+      "task_id": "fn-1226-fix-keeper-git-unattributed-count-under.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T23:14:24.297000Z",
+  "epic_id": "fn-1226-fix-keeper-git-unattributed-count-under",
+  "input_hash": "d10e49ffc221e1befa27bfbc0585ede317fd68f56b6571c31433d8231fd8e20a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3507374591,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Well-specified multi-file plumbing in a known pattern \u2014 stamp an already-computed reducer scalar onto a live-only projection, render it, and extend a regression test \u2014 with exact line numbers and no named intelligence-bound reason to escalate off the sonnet default, and the schema step is a well-trodden version-guarded template.\",\"confidence\":0.74}]}\n"
+}
