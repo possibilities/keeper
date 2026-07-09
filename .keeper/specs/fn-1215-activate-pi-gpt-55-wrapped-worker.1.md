@@ -46,5 +46,5 @@ Parity corpus additions: slashed target accepted both islands, slashed KEY rejec
 - [ ] Root and plan fast suites green
 
 ## Done summary
-
+Relaxed the matrix alias-target charset to admit provider-qualified slashed native ids in both islands (keys/axis tokens stay strict), and switched the plan configured-axes seam (configuredEfforts/Models/workerAgentFor) to the composed effective matrix while re-homing reconcile-core's validation to an embedded-only helper to preserve the pure verdict-path boundary.
 ## Evidence
