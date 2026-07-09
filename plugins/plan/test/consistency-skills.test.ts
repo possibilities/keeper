@@ -472,6 +472,48 @@ describe("close skill pre-select beat", () => {
 });
 
 // ---------------------------------------------------------------------------
+// close skill blocking-follow-up gate: the SKILL must drive every new gate beat
+// — the preflight re-entry short-circuit, the armed-mode arm, and the
+// deleted-follow-up epic-question escalation — and grant the autopilot Bash it
+// needs to arm. Pinned so the gate contract cannot silently rot back to the
+// non-blocking flow.
+// ---------------------------------------------------------------------------
+
+describe("close skill blocking-follow-up gate contract", () => {
+  const body = () => readFileSync(CLOSE_SKILL, "utf-8");
+
+  test("frontmatter grants the autopilot Bash the armed-mode arm needs", () => {
+    const fm = parseFrontmatter(frontmatterBlock(CLOSE_SKILL));
+    expect(fm["allowed-tools"]).toContain("Bash(keeper autopilot:*)");
+  });
+
+  test("re-entry short-circuits on the preflight blocking_followup field", () => {
+    const text = body();
+    expect(text).toContain("blocking_followup");
+    // The short-circuit skips the audit/plan spawns straight to finalize.
+    expect(text).toContain("straight to Phase 4");
+  });
+
+  test("the followup_blocks_close branch arms the follow-up under armed mode", () => {
+    const text = body();
+    expect(text).toContain("keeper autopilot show");
+    expect(text).toContain("keeper autopilot arm");
+    // The gate defers to a human when the arm cannot land, never wedging.
+    expect(text).toContain("waits on a human");
+  });
+
+  test("a deleted follow-up escalates via the source epic-question", () => {
+    const text = body();
+    expect(text).toContain("BLOCKING_FOLLOWUP_DELETED");
+    expect(text).toContain("keeper plan epic-question");
+  });
+
+  test("carries the followup_blocks_close deferred-close report phrase", () => {
+    expect(body()).toContain("held open by blocking follow-up");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // close-planner: follow-up template stamps both tier and model, with the
 // full configured axes — derived from subagents.yaml so axis drift trips
 // this pin instead of silently rotting the template.
@@ -497,6 +539,29 @@ describe("close-planner follow-up template tier/model shape", () => {
   test("task-spec rules prose requires both tier and model", () => {
     const text = readFileSync(CLOSE_PLANNER, "utf-8");
     expect(text).toContain("`tier` and `model` are both required per task");
+  });
+});
+
+describe("close-planner blocking-decision contract", () => {
+  const body = () => readFileSync(CLOSE_PLANNER, "utf-8");
+
+  test("verdict shape carries the blocks_closing / blocks_closing_reason pair", () => {
+    const text = body();
+    expect(text).toContain('"blocks_closing"');
+    expect(text).toContain('"blocks_closing_reason"');
+  });
+
+  test("the rubric is consumer-observable with a default-to-not-block", () => {
+    const text = body();
+    expect(text).toContain("consumer-observable");
+    expect(text).toContain("When torn, do not block");
+  });
+
+  test("the blocking case drops the source dep and adds an Overview provenance line", () => {
+    const text = body();
+    // The blocking follow-up omits the source-link the finalize verb substitutes.
+    expect(text).toMatch(/omit.*depends_on_epics/i);
+    expect(text).toContain("blocks the close of");
   });
 });
 

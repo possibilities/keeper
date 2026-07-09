@@ -39,13 +39,20 @@ import {
  *  - `QUESTION:` — the Phase 3 close-planner judgement-call relay.
  *  - `{"success": false` — a surfaced typed-error envelope (preflight/finalize).
  *  - "Halted `"        — the fatal-halt report format.
- *  - "Partial follow-up" — the partial_followup outcome surface. */
+ *  - "Partial follow-up" — the partial_followup outcome surface.
+ *  - "held open by blocking follow-up" — the followup_blocks_close deferred-close
+ *    report: finalize minted the gate and left the source open. Like fatal_halt
+ *    and partial_followup this outcome clears the marker on success, so this
+ *    pattern is the belt-and-suspenders that keeps a marker-still-present stop
+ *    (a swallowed clear, or a re-entry that re-claimed) from a wrong mid-saga
+ *    block. Kept in lockstep with skills/close/SKILL.md's report phrasing. */
 export const CLOSE_ALLOW_PATTERNS: RegExp[] = [
   /^\s*BLOCKED:/m,
   /QUESTION:/,
   /\{"success":\s*false/,
   /Halted `/,
   /Partial follow-up/,
+  /held open by blocking follow-up/,
 ];
 
 /** True when the last assistant message carries a sanctioned close stop. */

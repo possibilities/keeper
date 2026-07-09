@@ -92,6 +92,18 @@ After every finding has a verdict, partition: `kept_or_merged` (action `kept` or
 
 **Title rule:** `<verb> <area-of-change>`, themed by the surviving work — NOT by the originating epic. Do not include any source epic id in the title; the follow-up epic is its own first-class container. The originating epic id lives in the `## Audit decisions` table, not the title.
 
+### Block decision (survivors present, non-fatal only)
+
+With the survivors clustered, decide ONE more disposition before the verdict: does this follow-up **block the source's close**? A blocking follow-up holds the source epic OPEN — and every epic that depends on it frozen — until the follow-up lands, so the bar is narrow and the default is NOT to block. Skip this step entirely when there are no survivors (nothing to gate with) or the verdict is `fatal` (no follow-up is authored).
+
+Set `blocks_closing: true` ONLY when the surviving work corrects something the source epic **establishes and exposes** — a contract, schema, API shape, or invariant a consumer would build on wrongly if it shipped as-is. Internal cleanup, added test coverage, docs, and perf work NEVER block, however valuable — they change nothing a dependent observes. The calibrated line is *consumer-observable*:
+
+- **Block even with zero current dependents** when the flaw is consumer-observable — the gate covers every future dependent for free, so a not-yet-written consumer is reason enough.
+- A client-side reverse-dependent scan (`keeper query epics`, filtering epics whose `depends_on_epics` resolve to `<EPIC_ID>`) is **confirming evidence** that a dependent already exists, never the gate itself: a consumer-observable flaw blocks whether or not the scan finds one.
+- **When torn, do not block** — the same default-to-not the `fatal` check holds.
+
+Carry the decision into the verdict as the `blocks_closing` / `blocks_closing_reason` pair (Phase 4) and, when true, into the follow-up's authoring (Phase 5) and your one-line return (Phase 7).
+
 ## Phase 4 — Submit the verdict
 
 Assemble the verdict JSON. Shape (exact keys, `additionalProperties` forbidden everywhere):
@@ -100,6 +112,8 @@ Assemble the verdict JSON. Shape (exact keys, `additionalProperties` forbidden e
 {
   "fatal": false,
   "fatal_reason": "",
+  "blocks_closing": false,
+  "blocks_closing_reason": "",
   "decisions": [
     {"fid": "F1", "action": "kept", "task": 1, "rationale": "<one line citing the evidence path>"},
     {"fid": "F2", "action": "culled", "task": null, "rationale": "<one line, e.g. no occurrences in current code>"},
@@ -114,6 +128,7 @@ Invariants the verb enforces at emission — hold to them so you don't waste a s
 - A `merged-into-<fid>` row's `task` ordinal MUST equal its merge target's ordinal (many findings → one task), and its `rationale` MUST name BOTH the source fid and the target fid.
 - Every `merged-into-<fid>` target must be a real `fid` present in `decisions`.
 - `fatal: true` requires a non-empty `fatal_reason`; `fatal: false` pairs with `fatal_reason: ""`.
+- `blocks_closing: true` requires a non-empty `blocks_closing_reason` (≤ 2000 chars) naming the consumer-observable contract/schema/API/invariant the follow-up corrects; `blocks_closing: false` pairs with `blocks_closing_reason: ""` — the SAME non-empty-iff-true pairing the verb enforces for `fatal`/`fatal_reason`. Only a non-fatal verdict with survivors can carry `blocks_closing: true`; leave it `false` on a fatal or all-culled verdict (no follow-up exists to gate). Absent is treated as `false` (legacy non-blocking), but emit the explicit pair to keep the decision auditable.
 - The set of distinct non-null `task` ordinals = the number of follow-up tasks you author in Phase 5. The follow-up submit cross-checks this — keep them aligned.
 - Use ASCII structural punctuation inside the JSON (`,` `:` `"`). Em dashes inside string values are fine.
 - Emit the JSON pretty-printed (indent=2 multi-line), matching the example block above exactly — one key per line, nested objects indented. The submit verb parses the indented shape identically.
@@ -142,12 +157,14 @@ Only when survivors exist and `fatal: false`. Assemble the follow-up YAML — th
 ```yaml
 epic:
   title: <chosen title from Phase 3 — verb + area, never the source epic id>
-  depends_on_epics: [<EPIC_ID>]   # the source-link: provenance + lineage
+  depends_on_epics: [<EPIC_ID>]   # non-blocking source-link (provenance + lineage); DROP this line on a blocking follow-up — see the split below
   spec: |
     ## Overview
 
     <2–3 sentences on the work surviving audit and why it matters,
-    themed by type-of-work, not by the originating epic.>
+    themed by type-of-work, not by the originating epic.
+    On a blocking follow-up, add ONE provenance line here naming the
+    source and that this follow-up blocks its close — see the split below.>
 
     ## Acceptance
 
@@ -194,6 +211,11 @@ tasks:
       ## Evidence
 ```
 
+**Blocking vs non-blocking follow-up (the `blocks_closing` split):**
+
+- **Non-blocking** (`blocks_closing: false`, the default): author the follow-up exactly as today — `depends_on_epics: [<EPIC_ID>]` is the real source-link (provenance + lineage) and the Overview reads normally.
+- **Blocking** (`blocks_closing: true`): **omit** the `depends_on_epics: [<EPIC_ID>]` source-link entirely. A follow-up→source edge deadlocks the gate (the follow-up would wait on source-done while the source's close waits on the follow-up), so `close-finalize` substitutes the source's own still-resolving epic-deps at mint and enforces never-the-source — whatever you write in `depends_on_epics` is overridden, so pointing it at the source only invites a self-reference. In its place add **one** provenance line at the end of `## Overview` naming the source and that this follow-up gates it, e.g. *"This follow-up blocks the close of `<EPIC_ID>`: the source stays open until this lands."* Everything else — title, acceptance, the audit-decisions table, per-task specs — is identical to the non-blocking case.
+
 **Audit-decisions table schema rules** (locked, hold for every row):
 
 - Columns are exactly `Source | Action | Task | Rationale`. No reorder, no extra columns.
@@ -238,10 +260,12 @@ A `QUESTION:` is emitted INSTEAD of submitting a verdict — nothing is persiste
 
 Return EXACTLY ONE LINE as your Task return value — process facts only, no prose body, no fences:
 
-- Clean follow-up: `fatal=false kept=K culled=C merged=M title="<title>" verdict_ref=<path> followup_ref=<path>`
-- All culled (no follow-up): `fatal=false kept=0 culled=C merged=0 verdict_ref=<path> followup_ref=none`
+- Clean follow-up: `fatal=false blocks_closing=<true|false> [blocks_closing_reason="<one sentence>" ONLY when true] kept=K culled=C merged=M title="<title>" verdict_ref=<path> followup_ref=<path>`
+- All culled (no follow-up): `fatal=false blocks_closing=false kept=0 culled=C merged=0 verdict_ref=<path> followup_ref=none`
 - Fatal halt: `fatal=true reason="<one sentence>" verdict_ref=<path>`
 - Question pending: `QUESTION: <text>` (this is the whole return; nothing persisted)
+
+`blocks_closing` / `blocks_closing_reason` on the return follow the same non-empty-iff-true pairing as `fatal` / `reason`. The closer reads the authoritative outcome from `close-finalize` (which re-reads the verdict), so this token is a human-visible trace, not a control signal.
 
 The closer parses this line mechanically. The verdict and follow-up content live on disk at their refs — the closer reads them by path, never from your return value.
 
