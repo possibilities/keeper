@@ -32,10 +32,11 @@
  *   - require `backend_exec_session_id` — no backend coords ⇒ nothing to replay.
  *   - exclude `plan_verb='work'` — autopilot workers are reconciler-managed; the
  *     reconciler re-dispatches them, restore must not double-spawn them.
- *   - exclude `job_id`s already occupying a LIVE backend (the UUID-liveness dedup
- *     / idempotence guard — prevents a double-spawn race with autopilot). The
- *     live set is computed from the SAME DB read (`state ∈ {working, stopped}`),
- *     so no socket is needed. [fn-817 best-practice: probe by UUID, never name.]
+ *   - exclude Keeper job ids and harness-native resume identities already LIVE
+ *     (the idempotence guard — prevents both a respawn race and two Keeper launch
+ *     associations from reopening one Codex/Pi/Hermes conversation). The live set
+ *     is computed from the SAME DB read (`state ∈ {working, stopped}`), so no
+ *     socket is needed. [fn-817 best-practice: probe by identity, never name.]
  *   - exclude rows idle beyond {@link DEFAULT_IDLE_CUTOFF_SECS} (last activity
  *     older than the cutoff), but COUNT and SURFACE the excluded number — a
  *     just-over-cutoff session is a false-negative we make visible, never a
@@ -343,6 +344,63 @@ export function compareCandidates(
 }
 
 /**
+ * Collapse multiple Keeper job records that point at the same harness-native
+ * conversation. Keeper job ids describe launch associations; the native resume
+ * target is what `codex/pi/hermes --resume` actually opens, so launching two job
+ * ids with one target duplicates a conversation and can produce conflicting cwd
+ * prompts. The newest association is canonical; empty targets remain separate
+ * so every not-resumable job is still surfaced. Output keeps visual sort order.
+ */
+function dedupeCandidatesByResumeIdentity(
+  input: RestoreCandidate[],
+): RestoreCandidate[] {
+  const unique: RestoreCandidate[] = [];
+  const byIdentity = new Map<string, RestoreCandidate>();
+  for (const candidate of input) {
+    const target = seg(candidate.resume_target);
+    if (target === "") {
+      unique.push(candidate);
+      continue;
+    }
+    const key = resumeIdentityKey(candidate.harness, target) as string;
+    const prior = byIdentity.get(key);
+    if (prior === undefined) {
+      byIdentity.set(key, candidate);
+      continue;
+    }
+    const candidateCreated = Number.isFinite(candidate.created_at)
+      ? candidate.created_at
+      : 0;
+    const priorCreated = Number.isFinite(prior.created_at)
+      ? prior.created_at
+      : 0;
+    if (
+      candidateCreated > priorCreated ||
+      (candidateCreated === priorCreated &&
+        seg(candidate.job_id).localeCompare(seg(prior.job_id)) > 0)
+    ) {
+      byIdentity.set(key, candidate);
+    }
+  }
+  unique.push(...byIdentity.values());
+  unique.sort(compareCandidates);
+  return unique;
+}
+
+/** A harness-scoped native conversation key, or null when no resume target is
+ * available. Harness scoping prevents unrelated tools whose ids happen to match
+ * from suppressing each other. */
+function resumeIdentityKey(
+  harness: string | null | undefined,
+  target: string,
+): string | null {
+  const normalizedTarget = seg(target);
+  return normalizedTarget === ""
+    ? null
+    : `${harnessOrClaude(harness)}\0${normalizedTarget}`;
+}
+
+/**
  * Pure: from the FULL set of killed rows' Killed-event rowids, compute the set
  * of rowids that sit inside a contiguous burst cluster of size ≥
  * {@link BURST_MIN_SIZE}. "Contiguous" = consecutive integer rowids with no gap
@@ -430,6 +488,7 @@ interface CandidateWithEventId {
 function loadRows(db: Database): {
   killed: KilledJobRow[];
   liveJobIds: Set<string>;
+  liveResumeIdentities: Set<string>;
 } {
   const killed = db
     .query(
@@ -443,22 +502,42 @@ function loadRows(db: Database): {
     )
     .all() as KilledJobRow[];
   const liveRows = db
-    .query(`SELECT job_id FROM jobs WHERE state IN ('working', 'stopped')`)
-    .all() as { job_id: string }[];
+    .query(
+      `SELECT job_id, harness, resume_target
+         FROM jobs
+        WHERE state IN ('working', 'stopped')`,
+    )
+    .all() as {
+    job_id: string;
+    harness: string | null;
+    resume_target: string | null;
+  }[];
   const liveJobIds = new Set<string>();
+  const liveResumeIdentities = new Set<string>();
   for (const r of liveRows) {
     const id = seg(r.job_id);
     if (id !== "") {
       liveJobIds.add(id);
+      const identity = resumeIdentityKey(
+        r.harness,
+        resumeTarget({
+          job_id: id,
+          harness: r.harness,
+          resume_target: r.resume_target,
+        }),
+      );
+      if (identity !== null) {
+        liveResumeIdentities.add(identity);
+      }
     }
   }
-  return { killed, liveJobIds };
+  return { killed, liveJobIds, liveResumeIdentities };
 }
 
 /**
  * Derive the crash-restore candidate set from a read-only `keeper.db`
  * connection. The module's whole job — membership (crash-like close_kind +
- * burst backstop), filters (backend coords, autopilot workers, live-UUID dedup,
+ * burst backstop), filters (backend coords, autopilot workers, live-identity dedup,
  * idle cutoff), and visual-order sort — folded into one read.
  *
  * Empty / zero-killed inputs return `{ candidates: [], excludedIdleCount: 0 }`
@@ -471,8 +550,9 @@ export function deriveRestoreSet(
 ): RestoreSetResult {
   const { collected, excludedIdleCount, adoptedCoordlessSkipCount } =
     collectCrashCandidates(db, options);
-  const candidates = collected.map((c) => c.candidate);
-  candidates.sort(compareCandidates);
+  const candidates = dedupeCandidatesByResumeIdentity(
+    collected.map((c) => c.candidate),
+  );
   return { candidates, excludedIdleCount, adoptedCoordlessSkipCount };
 }
 
@@ -480,7 +560,7 @@ export function deriveRestoreSet(
  * The shared membership/filter pass behind both {@link deriveRestoreSet} and
  * {@link deriveLastGenerationSet}: read the killed cohort, apply crash-like
  * membership (close_kind + burst backstop) and every filter (backend coords,
- * autopilot workers, live-UUID dedup, idle cutoff), and return each surviving
+ * autopilot workers, live-identity dedup, idle cutoff), and return each surviving
  * candidate PAIRED with its Killed-event rowid (the generation-window sort key).
  * UNORDERED — the callers sort (`deriveRestoreSet` after dropping the rowid;
  * `deriveLastGenerationSet` after the window bound). Never throws on data.
@@ -497,7 +577,7 @@ function collectCrashCandidates(
   const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
   const idleBefore = now - idleCutoffSecs;
 
-  const { killed, liveJobIds } = loadRows(db);
+  const { killed, liveJobIds, liveResumeIdentities } = loadRows(db);
 
   // Burst set is computed over the FULL killed cohort's Killed-event rowids, so
   // an `unknown`/NULL row's membership sees the same cluster the boot sweep made
@@ -533,9 +613,20 @@ function collectCrashCandidates(
     if (row.plan_verb === "work") {
       continue;
     }
-    // Filter: already live under this UUID ⇒ the session still occupies a
-    // backend; restoring it would double-spawn. (The idempotence guard.)
-    if (liveJobIds.has(jobId)) {
+    const harness = harnessOrClaude(row.harness);
+    const nativeTarget = resumeTarget({
+      job_id: jobId,
+      harness: row.harness,
+      resume_target: row.resume_target,
+    });
+    const nativeIdentity = resumeIdentityKey(harness, nativeTarget);
+    // Filter: already live under this Keeper id OR the same harness-native
+    // conversation ⇒ restoring it would double-spawn. The native check catches
+    // duplicate Keeper launch associations for one Codex/Pi/Hermes session.
+    if (
+      liveJobIds.has(jobId) ||
+      (nativeIdentity !== null && liveResumeIdentities.has(nativeIdentity))
+    ) {
       continue;
     }
     // Filter: idle past the cutoff — EXCLUDE but COUNT (surface, never silent).
@@ -546,18 +637,13 @@ function collectCrashCandidates(
     }
 
     const label = row.title != null && row.title !== "" ? row.title : jobId;
-    const harness = harnessOrClaude(row.harness);
     collected.push({
       candidate: {
         job_id: jobId,
         // Per-harness: claude resolves to its session UUID (`job_id`); a
         // non-claude harness resolves to the stored `resume_target` (EMPTY when
         // never back-filled ⇒ not-resumable, surfaced downstream).
-        resume_target: resumeTarget({
-          job_id: jobId,
-          harness: row.harness,
-          resume_target: row.resume_target,
-        }),
+        resume_target: nativeTarget,
         label,
         harness,
         window_index:
@@ -694,8 +780,9 @@ export function deriveLastGenerationSet(
     }
   }
 
-  const candidates = kept.map((c) => c.candidate);
-  candidates.sort(compareCandidates);
+  const candidates = dedupeCandidatesByResumeIdentity(
+    kept.map((c) => c.candidate),
+  );
   return { candidates, excludedIdleCount, adoptedCoordlessSkipCount };
 }
 
@@ -857,8 +944,9 @@ export function selectGenerationFromEnriched(
  * `session_name` is the restore location and
  * its `window_index` the visual order. The idempotence filters are reused
  * VERBATIM: require backend coords, exclude `plan_verb='work'`
- * (reconciler-managed), and exclude any `job_id` already occupying a LIVE
- * backend (the double-spawn guard). Candidates sort by {@link compareCandidates}.
+ * (reconciler-managed), and exclude any Keeper id or harness-native resume
+ * identity already LIVE (the double-spawn guard). Candidates sort by
+ * {@link compareCandidates}.
  *
  * FALLBACK. No candidate generation at all, OR every candidate is degenerate, OR
  * zero restorable everywhere ⇒ delegate to {@link deriveLastGenerationSet} (the
@@ -990,9 +1078,15 @@ function loadEnrichedGenerations(
     }
     // Older dead generations past the bound are never decoded.
   }
-  const { liveJobIds } = loadRows(db);
+  const { liveJobIds, liveResumeIdentities } = loadRows(db);
   return toEnrich.map((raw) =>
-    enrichGeneration(db, raw, currentGenerationId, liveJobIds),
+    enrichGeneration(
+      db,
+      raw,
+      currentGenerationId,
+      liveJobIds,
+      liveResumeIdentities,
+    ),
   );
 }
 
@@ -1142,6 +1236,7 @@ function enrichGeneration(
   raw: RawGenerationSummary,
   currentGenerationId: string | null,
   liveJobIds: Set<string>,
+  liveResumeIdentities: Set<string>,
 ): EnrichedGeneration {
   // A canonicalized generation may fold snapshots stored under more than one id
   // (a bare-pid legacy alias + its full-form sibling); read each source id's
@@ -1173,6 +1268,7 @@ function enrichGeneration(
         snap.sourceId,
         snap.panes,
         liveJobIds,
+        liveResumeIdentities,
       );
       if (built.length > 0) {
         candidates = built;
@@ -1253,7 +1349,7 @@ function readGenerationSnapshotsDesc(
  * Build the restore candidates from one decoded snapshot's panes: resolve each
  * pane's `job_id` (payload, then the `(generation_id, pane_id)` projection join),
  * apply the idempotence filters VERBATIM (backend coords required,
- * `plan_verb='work'` excluded, live-UUID excluded), and sort by
+ * `plan_verb='work'` excluded, live identity excluded), and sort by
  * {@link compareCandidates}. Returns `[]` when no pane yields a candidate — the
  * signal {@link enrichGeneration} uses to step back to the attributed sibling.
  *
@@ -1269,6 +1365,7 @@ function buildCandidatesFromSnapshot(
   generationId: string,
   panes: TmuxTopologyPaneLike[],
   liveJobIds: Set<string>,
+  liveResumeIdentities: Set<string>,
 ): RestoreCandidate[] {
   const candidates: RestoreCandidate[] = [];
   const seen = new Set<string>();
@@ -1287,8 +1384,19 @@ function buildCandidatesFromSnapshot(
     if (row.plan_verb === "work") {
       continue;
     }
-    //  - already live under this UUID ⇒ restoring would double-spawn.
-    if (liveJobIds.has(jobId)) {
+    const harness = harnessOrClaude(row.harness);
+    const nativeTarget = resumeTarget({
+      job_id: jobId,
+      harness: row.harness,
+      resume_target: row.resume_target,
+    });
+    const nativeIdentity = resumeIdentityKey(harness, nativeTarget);
+    //  - already live under this Keeper id OR native conversation ⇒ restoring
+    //    would double-spawn, even when two job rows adopted one Codex rollout.
+    if (
+      liveJobIds.has(jobId) ||
+      (nativeIdentity !== null && liveResumeIdentities.has(nativeIdentity))
+    ) {
       continue;
     }
     // Restore LOCATION is the pane's live session (the snapshot's whole point);
@@ -1304,13 +1412,9 @@ function buildCandidatesFromSnapshot(
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: resumeTarget({
-        job_id: jobId,
-        harness: row.harness,
-        resume_target: row.resume_target,
-      }),
+      resume_target: nativeTarget,
       label,
-      harness: harnessOrClaude(row.harness),
+      harness,
       window_index:
         typeof pane.window_index === "number" &&
         Number.isFinite(pane.window_index)
@@ -1321,8 +1425,7 @@ function buildCandidatesFromSnapshot(
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
     });
   }
-  candidates.sort(compareCandidates);
-  return candidates;
+  return dedupeCandidatesByResumeIdentity(candidates);
 }
 
 /** A snapshot pane as decoded by {@link extractTmuxTopologySnapshot} — the shape

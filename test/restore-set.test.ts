@@ -639,6 +639,50 @@ test("deriveRestoreSet: a codex candidate is harness-tagged and resumes by its s
   expect(isRestorableCandidate(c as RestoreCandidate)).toBe(true);
 });
 
+test("deriveRestoreSet: duplicate native resume identities keep the newest Keeper association", () => {
+  seedJob(kdb.db, {
+    job_id: "dotfiles-job",
+    close_kind: "server_gone",
+    harness: "codex",
+    resume_target: "shared-rollout",
+    title: "dotfiles-102",
+    cwd: "/repo/dotfiles",
+    window_index: 4,
+    created_at: NOW - 200,
+  });
+  seedJob(kdb.db, {
+    job_id: "keeper-job",
+    close_kind: "server_gone",
+    harness: "codex",
+    resume_target: "shared-rollout",
+    title: "keeper-840",
+    cwd: "/repo/keeper",
+    window_index: 2,
+    created_at: NOW - 100,
+  });
+
+  const candidates = derive().candidates;
+  expect(candidates.map((c) => c.job_id)).toEqual(["keeper-job"]);
+  expect(candidates[0]?.cwd).toBe("/repo/keeper");
+});
+
+test("deriveRestoreSet: a live native identity suppresses a stale killed association", () => {
+  seedJob(kdb.db, {
+    job_id: "dotfiles-job",
+    close_kind: "server_gone",
+    harness: "codex",
+    resume_target: "shared-rollout",
+  });
+  seedJob(kdb.db, {
+    job_id: "keeper-job",
+    state: "stopped",
+    harness: "codex",
+    resume_target: "shared-rollout",
+  });
+
+  expect(derive().candidates).toEqual([]);
+});
+
 test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED but not-resumable", () => {
   // The rest of the generation still restores — the not-resumable agent is
   // surfaced (an empty resume_target), never dropped.
@@ -1348,6 +1392,73 @@ test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot p
   expect(res.candidates.map((c) => c.label)).toEqual(["beta", "alpha"]);
   expect(res.candidates[0]?.backend_exec_session_id).toBe("work");
   expect(res.fallbackNote).toBeUndefined();
+});
+
+test("deriveLastGenerationSetFromTopology: one Codex rollout is restored only once", () => {
+  seedJob(kdb.db, {
+    job_id: "dotfiles-job",
+    state: "killed",
+    title: "dotfiles-102",
+    cwd: "/repo/dotfiles",
+    harness: "codex",
+    resume_target: "shared-rollout",
+    created_at: NOW - 200,
+  });
+  seedJob(kdb.db, {
+    job_id: "keeper-job",
+    state: "killed",
+    title: "keeper-840",
+    cwd: "/repo/keeper",
+    harness: "codex",
+    resume_target: "shared-rollout",
+    created_at: NOW - 100,
+  });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 4,
+      job_id: "dotfiles-job",
+    },
+    {
+      pane_id: "%2",
+      session_name: "work",
+      window_index: 2,
+      job_id: "keeper-job",
+    },
+  ]);
+
+  const res = deriveTopo("gen-now");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["keeper-job"]);
+  expect(res.candidates[0]?.cwd).toBe("/repo/keeper");
+});
+
+test("deriveLastGenerationSetFromTopology: a live Codex rollout suppresses a stale snapshot association", () => {
+  seedJob(kdb.db, {
+    job_id: "dotfiles-job",
+    state: "killed",
+    title: "dotfiles-102",
+    harness: "codex",
+    resume_target: "shared-rollout",
+  });
+  seedJob(kdb.db, {
+    job_id: "keeper-job",
+    state: "stopped",
+    title: "keeper-840",
+    harness: "codex",
+    resume_target: "shared-rollout",
+  });
+  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
+    {
+      pane_id: "%1",
+      session_name: "work",
+      window_index: 4,
+      job_id: "dotfiles-job",
+    },
+    PAD_PANE,
+  ]);
+
+  expect(deriveTopo("gen-now").candidates).toEqual([]);
 });
 
 test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback when payload carries no job_id", () => {

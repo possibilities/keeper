@@ -853,6 +853,52 @@ test("applyRestoreVerified: a verified verdict → verified outcome + a verified
   expect(writes.map((w) => w.state)).toEqual(["launched", "verified"]);
 });
 
+test("applyRestoreVerified: later launches do not wait for an earlier verification timeout", async () => {
+  const plan = planRestore(
+    [
+      fakeCandidate({ job_id: "a", window_index: 0 }),
+      fakeCandidate({ job_id: "b", window_index: 1 }),
+    ],
+    null,
+  );
+  const { sink } = recordingIntent();
+  const launched: string[] = [];
+  let releaseFirst: ((verdict: "launched-unverified") => void) | undefined;
+  const firstVerdict = new Promise<"launched-unverified">((resolve) => {
+    releaseFirst = resolve;
+  });
+  let markSecondLaunched: (() => void) | undefined;
+  const secondLaunched = new Promise<void>((resolve) => {
+    markSecondLaunched = resolve;
+  });
+
+  const applying = applyRestoreVerified(plan, {
+    ensureLaunched: async (_s, _r, _c, _h, jobId) => {
+      launched.push(jobId);
+      if (jobId === "b") {
+        markSecondLaunched?.();
+      }
+      return { ok: true };
+    },
+    verify: async (candidate) =>
+      candidate.job_id === "a" ? await firstVerdict : "verified",
+    intent: sink,
+    makeIntent: baseIntentFor,
+    sleep: async () => {},
+  });
+
+  const launchedBeforeFirstSettled = await Promise.race([
+    secondLaunched.then(() => true),
+    Bun.sleep(50).then(() => false),
+  ]);
+  releaseFirst?.("launched-unverified");
+  const out = await applying;
+
+  expect(launchedBeforeFirstSettled).toBe(true);
+  expect(launched).toEqual(["a", "b"]);
+  expect(out.map((o) => o.kind)).toEqual(["launched-unverified", "verified"]);
+});
+
 test("applyRestoreVerified: a launch failure → failed outcome, verify never runs", async () => {
   const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
   const { writes, sink } = recordingIntent();

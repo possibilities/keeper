@@ -353,8 +353,11 @@ export const VERIFY_UNVERIFIED_REASON =
  * intent — cleared on `verified`, rewritten `failed` / `launched-unverified`
  * otherwise so the tab resurfaces in `keeper tabs list` until it verifies. A
  * transport failure (or a thrown launch) is `failed` with no verify. Continues
- * past a single tab's failure, and paces {@link INTER_WINDOW_PAUSE_MS} between
+ * past a single tab's failure and paces {@link INTER_WINDOW_PAUSE_MS} between
  * consecutive launches (outside the per-tab try, like {@link applyRestore}).
+ * Verification waits overlap after each sequential launch, so one 20-second
+ * evidence timeout cannot block every later tab; returned outcomes retain plan
+ * order through the ordered promise array.
  */
 export async function applyRestoreVerified(
   plan: AgentOutcome[],
@@ -362,11 +365,11 @@ export async function applyRestoreVerified(
 ): Promise<AgentOutcome[]> {
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
-  const out: AgentOutcome[] = [];
+  const out: Promise<AgentOutcome>[] = [];
   let launched = 0;
   for (const entry of plan) {
     if (entry.kind !== "would-restore") {
-      out.push(entry);
+      out.push(Promise.resolve(entry));
       continue;
     }
     const candidate = entry.candidate;
@@ -378,7 +381,7 @@ export async function applyRestoreVerified(
     // inter-window pause + launch counter so a no-op costs no pacing; the existing
     // verified marker is left untouched.
     if (deps.isLive?.(candidate) === true) {
-      out.push({ kind: "verified", candidate });
+      out.push(Promise.resolve({ kind: "verified", candidate }));
       continue;
     }
     if (launched > 0) {
@@ -402,33 +405,57 @@ export async function applyRestoreVerified(
       );
       if (!res.ok) {
         deps.intent.write(touchIntent(base, "failed", res.error));
-        out.push({ kind: "failed", candidate, error: res.error });
+        out.push(
+          Promise.resolve({ kind: "failed", candidate, error: res.error }),
+        );
         continue;
       }
-      const verdict = await deps.verify(candidate, launchStartMs);
-      if (verdict === "verified") {
-        deps.intent.write(touchIntent(base, "verified", ""));
-        out.push({ kind: "verified", candidate });
-      } else if (verdict === "failed") {
-        deps.intent.write(touchIntent(base, "failed", VERIFY_FAILED_REASON));
-        out.push({ kind: "failed", candidate, error: VERIFY_FAILED_REASON });
-      } else {
-        deps.intent.write(
-          touchIntent(base, "launched-unverified", VERIFY_UNVERIFIED_REASON),
-        );
-        out.push({
-          kind: "launched-unverified",
-          candidate,
-          reason: VERIFY_UNVERIFIED_REASON,
-        });
-      }
+      // Begin verification immediately but do not await it before launching the
+      // next paced tab. Each task settles its own durable intent and outcome.
+      out.push(
+        (async (): Promise<AgentOutcome> => {
+          try {
+            const verdict = await deps.verify(candidate, launchStartMs);
+            if (verdict === "verified") {
+              deps.intent.write(touchIntent(base, "verified", ""));
+              return { kind: "verified", candidate };
+            }
+            if (verdict === "failed") {
+              deps.intent.write(
+                touchIntent(base, "failed", VERIFY_FAILED_REASON),
+              );
+              return {
+                kind: "failed",
+                candidate,
+                error: VERIFY_FAILED_REASON,
+              };
+            }
+            deps.intent.write(
+              touchIntent(
+                base,
+                "launched-unverified",
+                VERIFY_UNVERIFIED_REASON,
+              ),
+            );
+            return {
+              kind: "launched-unverified",
+              candidate,
+              reason: VERIFY_UNVERIFIED_REASON,
+            };
+          } catch (err) {
+            const reason = (err as Error).message;
+            deps.intent.write(touchIntent(base, "failed", reason));
+            return { kind: "failed", candidate, error: reason };
+          }
+        })(),
+      );
     } catch (err) {
       const reason = (err as Error).message;
       deps.intent.write(touchIntent(base, "failed", reason));
-      out.push({ kind: "failed", candidate, error: reason });
+      out.push(Promise.resolve({ kind: "failed", candidate, error: reason }));
     }
   }
-  return out;
+  return await Promise.all(out);
 }
 
 /** Transition an intent to a new state/reason, stamping `updated_at` (a side-file

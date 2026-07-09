@@ -19,6 +19,7 @@ import {
   guardConfSource,
   HELP,
   isBusyCommand,
+  isRestoreSessionSkeleton,
   main,
   parseBusyPanes,
   type RestoreOffer,
@@ -298,6 +299,24 @@ describe("isBusyCommand", () => {
 
   test("empty command is not busy", () => {
     expect(isBusyCommand("")).toBe(false);
+  });
+});
+
+describe("restore session skeleton classification", () => {
+  test("accepts exactly one known shell pane", () => {
+    expect(isRestoreSessionSkeleton("work\t0\tzsh\tshell\n")).toBe(true);
+    expect(isRestoreSessionSkeleton("work\t0\t-bash\tshell\n")).toBe(true);
+  });
+
+  test("rejects active, multi-pane, empty, and malformed sweeps", () => {
+    expect(isRestoreSessionSkeleton("work\t0\tcodex\tdotfiles-102\n")).toBe(
+      false,
+    );
+    expect(
+      isRestoreSessionSkeleton("work\t0\tzsh\tshell\nwork\t1\tzsh\tanother\n"),
+    ).toBe(false);
+    expect(isRestoreSessionSkeleton("")).toBe(false);
+    expect(isRestoreSessionSkeleton("work 0 zsh shell\n")).toBe(false);
   });
 });
 
@@ -820,6 +839,7 @@ function makeOfferStub(
   presentExits: Record<string, number>,
   calls: string[][],
   restoreResult?: SyncSpawnResult,
+  paneOutputs: Record<string, string> = {},
 ): SyncSpawnFn {
   return (cmd): SyncSpawnResult => {
     calls.push([...cmd]);
@@ -828,6 +848,14 @@ function makeOfferStub(
       return {
         exitCode: presentExits[target] ?? 1,
         stdout: Buffer.from(""),
+        stderr: Buffer.from(""),
+      };
+    }
+    if (cmd[1] === "list-panes") {
+      const target = (cmd[4] ?? "").replace(/^=/, "");
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(paneOutputs[target] ?? ""),
         stderr: Buffer.from(""),
       };
     }
@@ -1080,10 +1108,12 @@ describe("main() restore-last-session offer", () => {
     expect(retryStore.read().work).toBeUndefined();
   });
 
-  test("work present ⇒ no offer, no spawn", async () => {
+  test("work present with an active agent ⇒ no offer, no spawn", async () => {
     const calls: string[][] = [];
-    const spawn = makeOfferStub({ work: 0 }, calls);
-    // count>0 and TTY would otherwise prompt — presence must short-circuit.
+    const spawn = makeOfferStub({ work: 0 }, calls, undefined, {
+      work: "work\t0\tcodex\tkeeper-840\n",
+    });
+    // count>0 and TTY would otherwise prompt — active content short-circuits.
     await runWithTTY({
       spawn,
       offers: { work: offerFor(5) },
@@ -1091,6 +1121,20 @@ describe("main() restore-last-session offer", () => {
       answer: "y",
     });
     expect(spawnedAnyRestore(calls)).toBe(false);
+  });
+
+  test("work present as one-shell skeleton ⇒ accepted restore still spawns", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({ work: 0 }, calls, undefined, {
+      work: "work\t0\tzsh\tshell\n",
+    });
+    await runWithTTY({
+      spawn,
+      offers: { work: offerFor(5) },
+      tty: true,
+      answer: "y",
+    });
+    expect(spawnedRestoreFor(calls, "work")).toBe(true);
   });
 
   test("work absent + count>0 + TTY + N (EOF) ⇒ no spawn", async () => {
@@ -1191,6 +1235,23 @@ describe("main() ambiguous restore escalate-or-refuse", () => {
     expect(
       writes.some((w) => w.includes("gen 111") && w.includes("gen 222")),
     ).toBe(true);
+    expect(spawnedRestoreFor(calls, "work")).toBe(true);
+  });
+
+  test("ambiguous picker choice restores into an existing one-shell skeleton", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({ work: 0 }, calls, undefined, {
+      work: "work\t0\tzsh\tshell\n",
+    });
+    await runWithTTY({
+      spawn,
+      offers: { work: offerFor(2) },
+      ambiguous: true,
+      eligible: [genSummary("111"), genSummary("222")],
+      pickedOffers: { work: offerFor(5) },
+      tty: true,
+      answer: "2",
+    });
     expect(spawnedRestoreFor(calls, "work")).toBe(true);
   });
 

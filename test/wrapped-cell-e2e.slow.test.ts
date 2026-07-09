@@ -162,9 +162,10 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
 
     afterAll(() => {
       for (const dir of tmuxTmpDirs) {
-        spawnSync("tmux", ["kill-server"], {
-          env: { ...process.env, TMUX_TMPDIR: dir },
-        });
+        const env: NodeJS.ProcessEnv = { ...process.env, TMUX_TMPDIR: dir };
+        delete env.TMUX;
+        delete env.TMUX_PANE;
+        spawnSync("tmux", ["-L", "default", "kill-server"], { env });
         rmSync(dir, { recursive: true, force: true });
       }
       if (root !== undefined) {

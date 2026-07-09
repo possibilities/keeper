@@ -21,7 +21,7 @@
  * exported and unit-tested through an injectable sync-spawn seam; this file's
  * `main` is the thin spawn-and-act layer.
  *
- * When the human `work` session is ABSENT after a
+ * When the human `work` session is absent or only a one-shell skeleton after a
  * crash and the last tmux-server generation left crashed agents for it, the
  * first `setup-tmux` offers — one combined y/N TTY prompt carrying the picked
  * generation's age + agent count — to relaunch them by spawning
@@ -73,8 +73,8 @@ keeper-managed session (autopilot/pair/panels/agentbus) prompts before a
 keyboard-triggered window/split creation. Only activates if your tmux.conf
 sources conf.d/*.conf. Refuses to clobber a real (non-symlink) file there.
 
-When the work session ('work') is ABSENT (the first run
-after a crash) and the last tmux-server generation left crashed agents for it,
+When the work session ('work') is absent or only a one-shell skeleton (the first
+run after a crash) and the last tmux-server generation left crashed agents for it,
 it offers — ONE combined y/N prompt on a TTY only, never auto — to relaunch them.
 The prompt carries the picked generation's age + agent count (a skeleton is
 recognizable at the prompt); on confirm it spawns 'keeper tabs restore --apply'
@@ -85,8 +85,8 @@ unverified breakdown when some tabs failed, or the verbatim failure incl. the
 autopilot-gate refusal for any other non-zero exit. An accepted batch is marked
 for retry before apply and cleared only after a successful restore; a marked
 retry is offered even when the session now exists. The managed 'autopilot'
-session is never offered. A present session without a retry marker, zero
-candidates, or a non-TTY skips that session's offer.
+session is never offered. A present non-skeleton session without a retry marker,
+zero candidates, or a non-TTY skips that session's offer.
 
 A CONTESTED auto-pick — the richest generation isn't the freshest, or the
 derived cohort disagrees with the last non-empty disaster mirror — never silently
@@ -405,6 +405,32 @@ export function isBusyCommand(command: string): boolean {
   return base !== "" && !SHELL_COMMANDS.has(base);
 }
 
+/** True only for the one idle-shell pane setup-tmux provisions as a session
+ * skeleton. Malformed output, zero panes, multiple panes, and any foreground
+ * command other than a known shell are all treated as non-skeletons. */
+export function isRestoreSessionSkeleton(sweepOutput: string): boolean {
+  let panes = 0;
+  for (const line of sweepOutput.split("\n")) {
+    if (line === "") {
+      continue;
+    }
+    const parts = line.split("\t");
+    if (parts.length < 4) {
+      return false;
+    }
+    const command = parts[2] ?? "";
+    const base = command.startsWith("-") ? command.slice(1) : command;
+    if (!SHELL_COMMANDS.has(base)) {
+      return false;
+    }
+    panes++;
+    if (panes > 1) {
+      return false;
+    }
+  }
+  return panes === 1;
+}
+
 /**
  * Parse the TAB-delimited `list-panes` sweep for ONE session into its busy
  * panes. `window_name` is LAST and may itself contain TABs, so the split is
@@ -631,6 +657,23 @@ function ensureWorkSessions(spawn: SyncSpawnFn): void {
       runChecked(spawn, buildWorkNewSessionArgs(session));
     }
   }
+}
+
+/** A fresh restore may target an absent session or the exact one-shell
+ * skeleton setup-tmux provisions. A real session is left alone; accepted retry
+ * markers use their separate idempotent path. */
+function canAcceptFreshRestore(spawn: SyncSpawnFn, session: string): boolean {
+  if (run(spawn, buildHasSessionArgs(session)).exitCode !== 0) {
+    return true;
+  }
+  const sweep = run(
+    spawn,
+    buildListPanesArgs(session),
+    localeDefaultedEnv(process.env),
+  );
+  return (
+    sweep.exitCode === 0 && isRestoreSessionSkeleton(sweep.stdout.toString())
+  );
 }
 
 /** Sweep the sweep/kill sessions for busy panes under a locale-defaulted env so
@@ -1127,8 +1170,8 @@ export async function main(
     // kill-anchored window). rebuildDash lives on a SEPARATE `-L dash` server
     // and no longer perturbs the default-server anchor, but the offer stays here
     // ahead of provisioning regardless. A fresh session is offered only when it
-    // is ABSENT (the first setup-tmux after a crash) AND has >0 candidates in the
-    // picked generation. A marked retry is offered even when the session now
+    // is absent or a one-shell skeleton AND has >0 candidates in the picked
+    // generation. A marked retry is offered even when the session now
     // exists, so a failed apply remains reachable after setup created the empty
     // shell session. Offers are read ONCE up front off the SAME selection seam
     // the apply reads, and RESTORABLE (not the offer-map keys) is the iteration
@@ -1138,6 +1181,17 @@ export async function main(
     const retryOffers = retryStore.read();
     const nowSecs = Date.now() / 1000;
     const tty = process.stdout.isTTY === true && process.stdin.isTTY === true;
+    // Probe once, before the picker. Besides distinguishing setup's blank shell
+    // from a real active session, caching this decision makes an accepted picker
+    // choice durable across the later dash rebuild / session ensure operations.
+    const freshEligibility = new Map(
+      RESTORABLE.map((session) => [
+        session,
+        (bundle.offers[session]?.count ?? 0) > 0
+          ? canAcceptFreshRestore(spawn, session)
+          : false,
+      ]),
+    );
 
     // Escalate-or-refuse a CONTESTED fresh auto-pick BEFORE anything is restored
     // — never a silent auto-pick, never a silent drop. `ambiguous` fires when the
@@ -1154,7 +1208,11 @@ export async function main(
     // Explicit skip bypasses BOTH fresh offers and previously accepted retry
     // markers, so setup can finish without launching any restore tabs.
     let skipRestore = false;
-    const freshHasOffer = Object.values(freshOffers).some((o) => o.count > 0);
+    const freshHasOffer = RESTORABLE.some(
+      (session) =>
+        freshEligibility.get(session) === true &&
+        (freshOffers[session]?.count ?? 0) > 0,
+    );
     if (bundle.ambiguous && freshHasOffer) {
       if (tty) {
         process.stdout.write(
@@ -1215,7 +1273,7 @@ export async function main(
       if (retryOffers[session] !== undefined) {
         return true;
       }
-      return run(spawn, buildHasSessionArgs(session)).exitCode !== 0;
+      return freshEligibility.get(session) === true;
     });
     let restoreSessions: readonly string[] = [];
     if (offered.length > 0) {
