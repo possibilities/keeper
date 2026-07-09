@@ -56,5 +56,5 @@ New saga-apply-selection.test.ts (in-process harness, fake VCS, stdin via runCli
 - [ ] docs/problem-codes.md registers the new codes in this same change
 
 ## Done summary
-
+Added the apply-selection verb: validates a model-selector verdict against the on-disk brief, lands cells live through a core shared with assign-cells, or stages a follow-up verdict document close-finalize consumes. Provenance pinned from the brief; new verdict_invalid/brief_missing codes registered.
 ## Evidence
