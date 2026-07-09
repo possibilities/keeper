@@ -69,18 +69,16 @@
 
 import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import {
-  parseLinuxStarttime,
-  splitArgsLstart,
-} from "../plugins/keeper/plugin/hooks/events-writer";
 import { classifyCloseKind, type KillReason } from "./exec-backend";
+import { parseLinuxStarttime, splitArgsLstart } from "./proc-starttime";
 import { isPidAlive } from "./server-worker";
 
 /**
  * Re-read a live pid's start_time in the SAME platform-tagged opaque shape the
  * SessionStart hook produces (`darwin:<lstart-text>` / `linux:<jiffies>`).
- * Reused from the hook's parsers so the format is guaranteed identical to what
- * gets persisted — the recycle test is a verbatim string compare against the
+ * Reused from `src/proc-starttime.ts`'s parsers (the SAME dep-free module the
+ * hook itself imports) so the format is guaranteed identical to what gets
+ * persisted — the recycle test is a verbatim string compare against the
  * stored `jobs.start_time`.
  *
  * Returns `null` on any failure (ps timeout, missing pid in /proc, unknown
