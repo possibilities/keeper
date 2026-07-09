@@ -92,7 +92,7 @@ export { HERMES_SHIM_EVENTS, HERMES_SHIM_VERSION };
  * → ApiError lands the error pill (its `data.kind` folds to "unknown", which is
  * the correct degrade); `pre_approval_request` → the permission-prompt Notification.
  */
-const HERMES_EVENT_MAP: Record<
+export const HERMES_EVENT_MAP: Record<
   string,
   { hookEvent: string; eventType: string }
 > = {
