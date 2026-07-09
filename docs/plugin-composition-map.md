@@ -82,6 +82,16 @@ inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
 worker argv recovers the byte-identical interactive argv — pinned by the additive
 test.
 
+A **wrapped cell** (a worker model claude does not serve natively) rides this exact
+same additive `--plugin-dir <cell>` channel — there is no separate wrapped-cell
+launch path. Its manifest's driver is the fixed claude wrapper (the `wrapper_driver`
+model/effort from the host matrix), and the wrapper delegates implementation to the
+resolved foreign provider before re-owning tests and the close-out commit. The host
+`~/.config/keeper/matrix.yaml` ([ADR 0010](./adr/0010-host-provider-matrix-and-wrapped-worker-cells.md))
+is the composition INPUT that makes wrapped cells render at all: `render-plugin-templates`
+fans the matrix's roster into the per-cell manifests under `plugins/plan/workers/`, and
+with no matrix present only native claude cells exist to compose in.
+
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —
 autopilot provisions each task's lane, so a hand-fired shared-checkout worker is

@@ -54,10 +54,15 @@ serving provider at run time. `keeper agent providers check` validates the roste
 harnesses. With no matrix present, rendering, selection, and dispatch stay byte-identical to the
 claude-only default. Standing up the first wrapped task on a host:
 
-1. Author `~/.config/keeper/matrix.yaml` — the provider roster (cost-ascending) and the models each serves.
+1. Author `~/.config/keeper/matrix.yaml` — the provider roster (cost-ascending) and the models each
+   serves. [`docs/examples/matrix.example.yaml`](./examples/matrix.example.yaml) is a committed,
+   load-tested reference shape (claude native models, a codex-served capability model, the wrapper
+   driver) to copy from; it is not itself a discovered config path.
 2. For a new model, add its selector guidance with `/plan:model-guidance <model>` (the drift gate fails until every roster model has a block).
 3. Re-render the worker cells: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/`).
-4. Verify routing: `keeper agent providers resolve <model> <effort>`.
+4. Verify routing: `keeper agent providers resolve <model> <effort>`. `keeper agent providers check`
+   fails loud when the roster names a harness whose binary is missing from the host — install the
+   binary or drop the provider, rather than treating the failure as a bug.
 5. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
 
 ## Shell completions

@@ -455,6 +455,42 @@ describe("alias-target charset (slashed native id)", () => {
   });
 });
 
+describe("committed example matrix (anti-rot)", () => {
+  // The example lives at docs/examples/matrix.example.yaml — outside every
+  // discovered config path — and is loaded here by explicit path only, through
+  // the SAME real loadMatrix a host `~/.config/keeper/matrix.yaml` would go
+  // through, so a behavior-changing edit to the example fails this test loud.
+  const EXAMPLE_PATH = join(
+    import.meta.dir,
+    "..",
+    "docs",
+    "examples",
+    "matrix.example.yaml",
+  );
+
+  test("parses with the real loader and resolves the codex/spark activation", () => {
+    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
+    expect(m).not.toBeNull();
+    expect(driverFor(m, "gpt-5.3-codex-spark")).toBe("wrapped");
+    expect(resolveModel(m, "gpt-5.3-codex-spark")).toEqual({
+      driver: "wrapped",
+      candidates: [
+        {
+          harness: "codex",
+          model_id: "gpt-5.3-codex-spark",
+          preset_name: "codex-gpt-5.3-codex-spark",
+        },
+      ],
+    });
+  });
+
+  test("claude models stay native", () => {
+    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
+    expect(driverFor(m, "opus")).toBe("native");
+    expect(driverFor(m, "sonnet")).toBe("native");
+  });
+});
+
 describe("providerCheckFindings", () => {
   test("an unreachable provider binary is one finding", () => {
     const m = validMatrix();
