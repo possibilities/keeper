@@ -7,7 +7,7 @@
     "fn-1202-age-deferred-sweeps-into-visibility"
   ],
   "id": "fn-1211-fix-swallowed-clock-skew-in-sentinel",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-09T01:02:28.402000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-09T01:02:28.004000Z"
+  "updated_at": "2026-07-09T01:02:28.402000Z"
 }
