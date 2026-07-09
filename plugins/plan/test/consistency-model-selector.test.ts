@@ -2,8 +2,9 @@
 // in the fast tier as pure disk reads — no subprocess, daemon, or git. Pins the
 // on-disk config against the subagents.yaml axes (both directions) and against
 // the model-guidance skill's references/ cache (hash parity), then drives the
-// four failure modes through the pure check core with hand-built inputs whose
-// expected outcomes are independent of the config under test.
+// coverage + research-hash failure modes through the pure check core with
+// hand-built inputs whose expected outcomes are independent of the config under
+// test.
 
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -167,6 +168,9 @@ describe("on-disk selector config", () => {
 const HASH = "a".repeat(64);
 const OTHER_HASH = "b".repeat(64);
 const REF = "skills/model-guidance/references/opus.md";
+// A distinct reference path for a tolerated host-roster extra (a research entry
+// whose key is not a configured axis model).
+const EXTRA_REF = "skills/model-guidance/references/gpt-5.5.md";
 
 function baseInput(): GuidanceCheckInput {
   return {
@@ -304,7 +308,11 @@ describe("model-guidance check core", () => {
     expect(result.errors.some((e) => e.includes("missing on disk"))).toBe(true);
   });
 
-  test("a research entry for a non-model fails", () => {
+  test("a tolerated research entry for a non-configured model with a matching hash passes", () => {
+    // Host-roster extra: a research entry keyed on a capability model absent from
+    // the embedded axis is tolerated (mirroring the extra-guidance-block
+    // tolerance) as long as its reference exists and hash-matches — the gate stays
+    // host-blind, so a matrix that adds gpt-5.5 does not fail the fast suite.
     const input = baseInput();
     const result = checkModelGuidance({
       ...input,
@@ -312,12 +320,57 @@ describe("model-guidance check core", () => {
         ...input.config,
         research: {
           ...input.config.research,
-          ghost: { reference: "x", sha256: HASH },
+          "gpt-5.5": { reference: EXTRA_REF, sha256: HASH },
+        },
+      },
+    });
+    expect(result).toEqual({ ok: true, errors: [] });
+  });
+
+  test("a tolerated research entry whose recorded hash diverges from its file fails", () => {
+    // The tolerance is only for the non-configured KEY; every entry's reference
+    // must still hash-match, so a divergent extra fails loud rather than passing.
+    const input = baseInput();
+    const result = checkModelGuidance({
+      ...input,
+      config: {
+        ...input.config,
+        research: {
+          ...input.config.research,
+          "gpt-5.5": { reference: EXTRA_REF, sha256: OTHER_HASH },
         },
       },
     });
     expect(result.ok).toBe(false);
-    expect(result.errors.some((e) => e.includes("ghost"))).toBe(true);
+    expect(
+      result.errors.some(
+        (e) => e.includes("gpt-5.5") && e.includes("does not match"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a tolerated research entry whose reference file is missing fails", () => {
+    // A typo'd or dangling extra entry self-reveals as a missing reference file
+    // rather than silently passing — the skip-continue is gone. The opus entry
+    // still hash-matches (only the extra ref resolves to null).
+    const input = baseInput();
+    const result = checkModelGuidance({
+      ...input,
+      config: {
+        ...input.config,
+        research: {
+          ...input.config.research,
+          "gpt-5.5": { reference: EXTRA_REF, sha256: HASH },
+        },
+      },
+      referenceHash: (ref) => (ref === REF ? HASH : null),
+    });
+    expect(result.ok).toBe(false);
+    expect(
+      result.errors.some(
+        (e) => e.includes("gpt-5.5") && e.includes("missing on disk"),
+      ),
+    ).toBe(true);
   });
 });
 

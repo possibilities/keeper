@@ -9,9 +9,10 @@
 //       models, read from DISK via the loader's disk mode) has exactly one
 //       guidance block in model-selector.yaml, and no block exists for a
 //       non-axis value.
-//   (b) hash parity — every configured model has a research entry whose recorded
-//       sha256 matches the current references/ cache file, and every research
-//       entry names a configured model.
+//   (b) hash parity — every configured model has a research entry, and EVERY
+//       research entry (a configured model OR a tolerated host-roster extra,
+//       mirroring the extra-guidance-block tolerance) names a references/ cache
+//       file that exists and whose recorded sha256 matches it on disk.
 //
 // The check core (`checkModelGuidance`) is a pure function over already-loaded
 // data so the fast suite drives its failure modes in-process; `--check` wires it
@@ -218,17 +219,17 @@ export function checkModelGuidance(input: GuidanceCheckInput): GuidanceCheckResu
     ),
   );
 
-  const modelSet = new Set(input.models);
   for (const model of input.models) {
     if (!(model in input.config.research)) {
       errors.push(`research: no research entry for configured model "${model}"`);
     }
   }
+  // A research entry for a non-configured model is TOLERATED (a host-roster extra,
+  // mirroring the extra-guidance-block tolerance, keeping the gate host-blind) —
+  // but EVERY entry's reference file must exist and hash-match. There is no
+  // skip-continue: a typo'd entry self-reveals as a missing reference file rather
+  // than silently passing.
   for (const [model, entry] of Object.entries(input.config.research)) {
-    if (!modelSet.has(model)) {
-      errors.push(`research: entry "${model}" is not a configured model`);
-      continue;
-    }
     const actual = input.referenceHash(entry.reference);
     if (actual === null) {
       errors.push(
