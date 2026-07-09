@@ -398,77 +398,104 @@ export function findEpicByIdOrBare(
 // ---------------------------------------------------------------------------
 
 /**
- * Consecutive `completed` observations a `complete` await must see before it
- * fires `met`. The done-AND-idle readiness verdict can still flap back to
- * `running` when a done task's owning worker re-activates during close-out
- * reconciliation: the terminal-completed gate latches only the proven-dead
- * ghost-liveness path, never the owning job's own working clause, so a
- * momentarily-idle done task reads `completed`, then `running` again the instant
- * its session re-activates. `keeper await complete` fires on the FIRST
- * `completed` snapshot, so without confirmation it can latch that transient.
- * Requiring the verdict to HOLD across N consecutive subscribe snapshots
- * debounces the single-pass flip — an intervening non-completed tick resets the
- * count — so `met` only fires on a completion that survives the reconcile.
+ * Elapsed dwell (unix-ms) a `complete` await must observe the target hold the
+ * done-AND-idle `completed` verdict at a STABLE row version before it fires
+ * `met`. The done-AND-idle verdict can flap back to `running` when a done task's
+ * owning worker re-activates during close-out reconciliation: the
+ * terminal-completed gate latches only the proven-dead ghost-liveness path, never
+ * the owning job's own working clause, so a momentarily-idle done task reads
+ * `completed`, then `running` again the instant its session re-activates.
+ * `keeper await complete` fires on the FIRST `completed` observation, so without
+ * confirmation it can latch that transient.
  *
- * N >= 2 so `met` never fires earlier than the single-snapshot behavior; the
- * added steady-state latency for a genuinely-complete await is bounded to
- * (N - 1) confirmation snapshots (sub-second under close-out churn, one heartbeat
- * apart on an otherwise-quiet board).
+ * Confirmation CANNOT count subscribe FRAMES: the daemon's subscribe stream is
+ * change-driven (`diffTick` emits once per `data_version` advance and freezes on
+ * a DB-quiet board), so a target that reads `completed` as the FINAL board
+ * activity delivers exactly ONE frame — a frame-count gate stalls at one and
+ * hangs forever on precisely the completion it exists to detect. Instead the
+ * confirmation debounces on elapsed dwell at a stable version: the completion
+ * must hold `completed` for `COMPLETE_DWELL_MS` without the target row's version
+ * moving. A quiet board keeps the version frozen, so the command's bounded
+ * re-evaluation timer fires the dwell and confirms with NO second frame; a
+ * close-out flap appends events that bump the row version — even one whose
+ * intervening `running` is coalesced away by `diffTick` into a single
+ * higher-version `completed` patch — which restarts the dwell, so a flap only
+ * confirms once the board settles quiet at a stable version.
+ *
+ * Sized a few `diffTick` poll cadences (`DEFAULT_POLL_MS = 50`) above the
+ * single-poll flap window so a coalesced flap's higher-version frame reliably
+ * lands and resets the dwell before it elapses, while keeping the added
+ * steady-state latency for a genuinely-complete await modest.
  */
-export const COMPLETE_CONFIRMATIONS = 2;
+export const COMPLETE_DWELL_MS = 250;
 
 /**
  * Per-`complete`-slot confirmation state the await command threads across
- * subscribe snapshots. `streak` counts consecutive `completed` observations;
- * `watermark` is the high-water target-row version across the current streak, so
- * a version REGRESSION (a rewound or stale re-delivered snapshot) restarts the
- * confirmation rather than counting toward it. A pure value — the command owns
- * the mutation, this module only advances it.
+ * subscribe snapshots AND its bounded re-evaluation timer. `since` is the
+ * unix-ms at which the current uninterrupted `completed`-at-`watermark`
+ * observation began (`null` when the last observation was not `completed`);
+ * `watermark` is the target row's version anchoring that dwell, so a version
+ * MOVE (a flap's coalesced higher-version `completed`, or a rewound/stale
+ * re-delivery) restarts the dwell rather than counting toward it. A pure value —
+ * the command owns the mutation and supplies the clock, this module only
+ * advances it.
  */
 export interface CompleteStability {
-  streak: number;
+  since: number | null;
   watermark: number | null;
 }
 
 /** The zero state: no completed observation seen yet. */
 export function initCompleteStability(): CompleteStability {
-  return { streak: 0, watermark: null };
+  return { since: null, watermark: null };
 }
 
 /**
- * Advance a `complete` slot's stability confirmation by one observation.
+ * Advance a `complete` slot's dwell confirmation by one observation.
  *
- *   - `isComplete` — did THIS snapshot read the `completed` verdict for the
+ *   - `isComplete` — did THIS observation read the `completed` verdict for the
  *                    target (the present-branch `met`)?
- *   - `version`    — the target row's monotonic version watermark this tick
- *                    (see {@link completeWatermark}), or `null` when unavailable.
+ *   - `version`    — the target row's monotonic version watermark (see
+ *                    {@link completeWatermark}), or `null` when unavailable.
+ *   - `nowMs`      — the observation's wall-clock (unix-ms). The command supplies
+ *                    it (`Date.now`, or an injected clock under test), keeping
+ *                    this module pure.
+ *   - `dwellMs`    — the elapsed dwell the completion must hold at a stable
+ *                    version before it is `confirmed` (defaults to
+ *                    {@link COMPLETE_DWELL_MS}).
  *
- * A non-completed observation resets the streak to zero (the flap's intervening
- * `running` tick). A completed observation extends the streak UNLESS the version
- * regressed below the streak's high-water basis, which restarts it at one. The
- * completion is `confirmed` once the streak reaches `confirmations`. A `null`
- * version never triggers a regression — the watermark is a secondary guard, the
- * consecutive count is the primary one.
+ * A non-completed observation resets the dwell (the flap's intervening `running`
+ * tick). A completed observation whose version MOVED off the dwell's anchor (a
+ * coalesced flap, or a stale/rewound re-delivery) restarts the dwell at `nowMs`.
+ * A completed observation holding the SAME version extends the dwell and is
+ * `confirmed` once `nowMs - since >= dwellMs`. A `null` version never registers a
+ * move — the dwell then degrades to pure elapsed time, the version being a
+ * secondary guard. `confirmed` fires the first observation the dwell has elapsed;
+ * a `dwellMs <= 0` confirms immediately on the first completed observation.
  */
 export function advanceCompleteStability(
   prev: CompleteStability,
   isComplete: boolean,
   version: number | null,
-  confirmations: number = COMPLETE_CONFIRMATIONS,
+  nowMs: number,
+  dwellMs: number = COMPLETE_DWELL_MS,
 ): { next: CompleteStability; confirmed: boolean } {
   if (!isComplete) {
     return { next: initCompleteStability(), confirmed: false };
   }
-  const regressed =
-    prev.watermark !== null && version !== null && version < prev.watermark;
-  const restart = prev.streak === 0 || regressed;
-  const streak = restart ? 1 : prev.streak + 1;
-  const watermark = restart
-    ? version
-    : version === null
-      ? prev.watermark
-      : Math.max(prev.watermark ?? version, version);
-  return { next: { streak, watermark }, confirmed: streak >= confirmations };
+  const versionMoved =
+    prev.watermark !== null && version !== null && version !== prev.watermark;
+  if (prev.since === null || versionMoved) {
+    return {
+      next: { since: nowMs, watermark: version },
+      confirmed: dwellMs <= 0,
+    };
+  }
+  const watermark = version === null ? prev.watermark : version;
+  return {
+    next: { since: prev.since, watermark },
+    confirmed: nowMs - prev.since >= dwellMs,
+  };
 }
 
 /**

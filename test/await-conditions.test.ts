@@ -30,7 +30,7 @@ import {
   type AwaitState,
   advanceCompleteStability,
   agentsIdleState,
-  COMPLETE_CONFIRMATIONS,
+  COMPLETE_DWELL_MS,
   changedSignature,
   classifyTargetId,
   completeWatermark,
@@ -356,15 +356,17 @@ test("fn-1015 task-complete: done BUT embedded job still working → waiting (no
 });
 
 // ---------------------------------------------------------------------------
-// Complete-condition stability confirmation (done-unwind debounce).
+// Complete-condition dwell confirmation (done-unwind debounce).
 //
 // The done-AND-idle `completed` verdict can still flap back to `running` when a
 // done task's owning worker re-activates during close-out reconciliation: the
 // terminal-completed gate latches only the proven-dead ghost-liveness path,
 // never the owning job's own working clause. `keeper await complete` fires on
-// the FIRST completed snapshot, so the command-side stability gate withholds
-// `met` until the completion HOLDS across COMPLETE_CONFIRMATIONS consecutive
-// snapshots (target-row watermark non-regressing).
+// the FIRST completed observation, so the command-side gate withholds `met`
+// until the completion HOLDS `completed` at a stable target-row version for
+// COMPLETE_DWELL_MS. Confirmation is elapsed-dwell, NOT a frame count: the
+// change-driven stream delivers no second frame on a quiet board, so counting
+// frames would hang — while a flap bumps the row version and restarts the dwell.
 // ---------------------------------------------------------------------------
 
 test("complete-stability window: computeReadiness flaps completed→running→completed when a done task's owning job re-activates, and the await surface fires met on the transient", () => {
@@ -409,78 +411,113 @@ test("complete-stability window: computeReadiness flaps completed→running→co
   ).toBe("met");
 });
 
-test("complete-stability: a transient completed→running→completed sequence never confirms", () => {
-  let st = initCompleteStability();
-  let step = advanceCompleteStability(st, true, 10); // s1 completed
-  st = step.next;
+test("complete-stability: the first completed observation is withheld — never fires on the transient", () => {
+  // The FIRST completed observation (today's fire point) starts the dwell but is
+  // never confirmed, so `met` can never fire earlier than a single snapshot.
+  const step = advanceCompleteStability(
+    initCompleteStability(),
+    true,
+    10,
+    1000,
+  );
   expect(step.confirmed).toBe(false);
-  expect(st.streak).toBe(1);
-
-  step = advanceCompleteStability(st, false, 11); // s2 running → reset
-  st = step.next;
-  expect(step.confirmed).toBe(false);
-  expect(st.streak).toBe(0);
-
-  step = advanceCompleteStability(st, true, 12); // s3 completed → back to one
-  st = step.next;
-  expect(step.confirmed).toBe(false);
-  expect(st.streak).toBe(1);
+  expect(step.next.since).toBe(1000);
+  expect(step.next.watermark).toBe(10);
 });
 
-test("complete-stability: a stable completed sequence confirms after COMPLETE_CONFIRMATIONS snapshots", () => {
+test("complete-stability: a stable completed observation confirms once the dwell elapses", () => {
   let st = initCompleteStability();
-  const seen: boolean[] = [];
-  for (let i = 0; i < COMPLETE_CONFIRMATIONS; i++) {
-    const step = advanceCompleteStability(st, true, 10);
-    st = step.next;
-    seen.push(step.confirmed);
-  }
-  // Only the final (Nth) observation confirms; every earlier one holds.
-  expect(seen.slice(0, -1).every((c) => c === false)).toBe(true);
-  expect(seen.at(-1)).toBe(true);
-  expect(st.streak).toBe(COMPLETE_CONFIRMATIONS);
-});
-
-test("complete-stability: never fires earlier than a single snapshot — the first completed observation is withheld", () => {
-  // The bar only tightens: the first completed snapshot (today's fire point) is
-  // never confirmed, so `met` can never fire earlier than the pre-debounce path.
-  const step = advanceCompleteStability(initCompleteStability(), true, 10);
-  expect(step.confirmed).toBe(false);
-});
-
-test("complete-stability: a watermark regression during confirmation resets the streak", () => {
-  let st = initCompleteStability();
-  let step = advanceCompleteStability(st, true, 20); // streak 1, basis 20
+  // t=1000: first completed, dwell starts.
+  let step = advanceCompleteStability(st, true, 10, 1000);
   st = step.next;
   expect(step.confirmed).toBe(false);
 
-  // A rewound / stale re-delivered snapshot: still completed, but the row
-  // version regressed below the basis → restart at one, do NOT confirm.
-  step = advanceCompleteStability(st, true, 12);
+  // A re-check BEFORE the dwell elapses still holds.
+  step = advanceCompleteStability(st, true, 10, 1000 + COMPLETE_DWELL_MS - 1);
   st = step.next;
   expect(step.confirmed).toBe(false);
-  expect(st.streak).toBe(1);
+
+  // A re-check AT the dwell boundary confirms — no second distinct frame needed,
+  // just the same completed verdict at a stable version after the dwell.
+  step = advanceCompleteStability(st, true, 10, 1000 + COMPLETE_DWELL_MS);
+  expect(step.confirmed).toBe(true);
+  expect(step.next.since).toBe(1000);
+});
+
+test("complete-stability: an intervening running observation resets the dwell", () => {
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, 10, 1000); // completed, dwell starts
+  st = step.next;
+  expect(st.since).toBe(1000);
+
+  // s2 running → reset; `since` clears so no stale dwell carries over.
+  step = advanceCompleteStability(st, false, 11, 1000 + COMPLETE_DWELL_MS);
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.since).toBeNull();
+
+  // s3 completed → a FRESH dwell starts at the new now; the earlier elapsed time
+  // does not count, so this observation does not confirm.
+  step = advanceCompleteStability(st, true, 12, 1000 + COMPLETE_DWELL_MS);
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.since).toBe(1000 + COMPLETE_DWELL_MS);
+});
+
+test("complete-stability: a version MOVE restarts the dwell — a coalesced flap does not confirm", () => {
+  // The done-unwind flap whose intervening `running` is coalesced away by
+  // diffTick: a single higher-version `completed` patch. The version bump is the
+  // flap's fingerprint, so it restarts the dwell rather than confirming.
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, 20, 1000); // dwell anchored at v20
+  st = step.next;
+
+  // Coalesced flap: still completed, but the row version moved to 21 — restart
+  // at the new now, do NOT confirm even though the dwell would otherwise have
+  // elapsed against the ORIGINAL anchor.
+  step = advanceCompleteStability(st, true, 21, 1000 + COMPLETE_DWELL_MS);
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.since).toBe(1000 + COMPLETE_DWELL_MS);
+  expect(st.watermark).toBe(21);
+
+  // Holding steady at the new version for the dwell confirms.
+  step = advanceCompleteStability(st, true, 21, 1000 + 2 * COMPLETE_DWELL_MS);
+  expect(step.confirmed).toBe(true);
+});
+
+test("complete-stability: a version regression also restarts the dwell", () => {
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, 20, 1000);
+  st = step.next;
+  // A rewound / stale re-delivered snapshot: still completed, but the row version
+  // regressed below the anchor → restart, do NOT confirm.
+  step = advanceCompleteStability(st, true, 12, 1000 + COMPLETE_DWELL_MS);
+  st = step.next;
+  expect(step.confirmed).toBe(false);
   expect(st.watermark).toBe(12);
-
-  // Holding steady from the new basis confirms.
-  step = advanceCompleteStability(st, true, 12);
-  expect(step.confirmed).toBe(true);
+  expect(st.since).toBe(1000 + COMPLETE_DWELL_MS);
 });
 
-test("complete-stability: an ADVANCING watermark is normal churn — it still confirms; only a regression resets", () => {
+test("complete-stability: a null version degrades to pure elapsed dwell (no false restart)", () => {
   let st = initCompleteStability();
-  let step = advanceCompleteStability(st, true, 10);
-  st = step.next;
-  step = advanceCompleteStability(st, true, 15); // advanced, not a regression
-  expect(step.confirmed).toBe(true);
-});
-
-test("complete-stability: a null watermark degrades to the pure consecutive count (no false reset)", () => {
-  let st = initCompleteStability();
-  let step = advanceCompleteStability(st, true, null);
+  let step = advanceCompleteStability(st, true, null, 1000);
   st = step.next;
   expect(step.confirmed).toBe(false);
-  step = advanceCompleteStability(st, true, null);
+  // A null version can never register a move, so the dwell keeps accruing from
+  // the original `since` and confirms once it elapses.
+  step = advanceCompleteStability(st, true, null, 1000 + COMPLETE_DWELL_MS);
+  expect(step.confirmed).toBe(true);
+});
+
+test("complete-stability: dwellMs <= 0 confirms immediately on the first completed observation", () => {
+  const step = advanceCompleteStability(
+    initCompleteStability(),
+    true,
+    10,
+    1000,
+    0,
+  );
   expect(step.confirmed).toBe(true);
 });
 
