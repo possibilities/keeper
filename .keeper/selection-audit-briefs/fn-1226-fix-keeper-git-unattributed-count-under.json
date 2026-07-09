@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 37,
+        "files_changed": 9,
+        "insertions": 90
+      },
+      "done_summary": "git_status now carries an exact unattributed_to_live_count scalar (SCHEMA_STEPS v118) stamped from the reducer's pass-4 full-snapshot rollup; keeper git renders it directly instead of re-deriving from the wire-capped dirty_files[] mirror, fixing the impossible unattributed < orphan display on >200-dirty worktrees. Hardened the daemon.test.ts git first-frame regression to assert orphaned_count and the new scalar both equal N.",
+      "input_hash": "d10e49ffc221e1befa27bfbc0585ede317fd68f56b6571c31433d8231fd8e20a",
+      "model": "sonnet",
+      "spec_chars": 3040,
+      "spec_md": "## Description\n\nFixes audit finding F1 (with F3 merged in) from\nfn-1224-board-first-frame-stall-hunt.\n\nEvidence path (verified this audit):\n- `src/reducer.ts:2187-2207` \u2014 pass 4 computes `unattributedToLiveCount` per\n  project_dir by folding over the FULL `snapshot.dirty_files` via the complete\n  `fileToAttributions` map. It is stamped onto `jobs.git_unattributed_to_live_count`\n  (line 2252) but the `git_status` INSERT (`src/reducer.ts:2301-2317`) persists\n  `orphaned_count` and NOT this unattributed-to-live count.\n- `cli/git.ts:227-251` \u2014 because the git_status row carries no unattributed\n  scalar, `keeper git` re-derives `unattributedCount` by walking `row.dirty_files`,\n  which commit 922bc117 capped at GIT_STATUS_DIRTY_FILES_WIRE_CAP=200. For a\n  worktree with >200 dirty files the header undercounts and, since `orphan=`\n  reads the exact `row.orphaned_count` (line 220/254), can display the\n  impossible `unattributed < orphan`.\n\nFix: add an `unattributed_to_live_count` column to the `git_status` projection\nand stamp the pass-4 scalar (`unattributedToLiveCount`) onto it in the INSERT\nat `src/reducer.ts:2301`, then have `cli/git.ts` render that scalar instead of\nre-deriving from the capped `row.dirty_files`.\n\nFiles:\n- `src/reducer.ts` \u2014 add the column stamp in projectGitStatus pass 4 / INSERT;\n  this is a schema change to the live-only git_status projection, so append one\n  SCHEMA_STEPS entry (version-guarded) and re-pin SCHEMA_FINGERPRINT per the\n  migrations rules. git_status is live-only (boot-seed re-derives), so no\n  deterministic-replay concern.\n- `cli/git.ts` \u2014 render the new scalar; delete the LIVE_STATES re-derivation\n  loop (lines ~227-251) that walks the capped array.\n- `test/daemon.test.ts` \u2014 the F3 merge: extend the existing \"git first-frame\"\n  regression test's SELECT to also fetch `orphaned_count` and add\n  `expect(row.orphaned_count).toBe(N)` (the 6000 attribution-less fixture files\n  are all orphans), proving the pass-4 rollup folds from the full snapshot and\n  not the capped 200-entry array; add a parallel assertion that the new\n  unattributed scalar equals N.\n\n## Acceptance\n\n- [ ] git_status carries an exact `unattributed_to_live_count` scalar stamped\n      from the full-snapshot pass-4 count; schema step + fingerprint re-pinned\n- [ ] `keeper git` renders `unattributed=` from that scalar; a >200-dirty\n      worktree shows unattributed >= orphan, never the impossible inversion\n- [ ] The regression test asserts orphaned_count (and the new unattributed\n      scalar) equal N, exercising the rollup-from-full-map invariant\n\n## Done summary\ngit_status now carries an exact unattributed_to_live_count scalar (SCHEMA_STEPS v118) stamped from the reducer's pass-4 full-snapshot rollup; keeper git renders it directly instead of re-deriving from the wire-capped dirty_files[] mirror, fixing the impossible unattributed < orphan display on >200-dirty worktrees. Hardened the daemon.test.ts git first-frame regression to assert orphaned_count and the new scalar both equal N.\n## Evidence\n",
+      "task_id": "fn-1226-fix-keeper-git-unattributed-count-under.1",
+      "tier": "high",
+      "title": "Stamp exact unattributed scalar"
+    }
+  ],
+  "created_at": "2026-07-09T23:56:05.215000Z",
+  "epic_id": "fn-1226-fix-keeper-git-unattributed-count-under",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "selection_input_hash": "d10e49ffc221e1befa27bfbc0585ede317fd68f56b6571c31433d8231fd8e20a",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
