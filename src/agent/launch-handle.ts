@@ -15,14 +15,14 @@
  */
 
 import { fileURLToPath } from "node:url";
-import {
-  HERMES_SHIM_EVENTS,
-  HERMES_SHIM_VERSION,
-} from "../../plugins/keeper/plugin/hooks/hermes-events-shim";
 import type {
   CodexTrustStatus,
   EnsureCodexDirTrustOptions,
 } from "../codex-trust";
+import {
+  HERMES_SHIM_EVENTS,
+  HERMES_SHIM_VERSION,
+} from "../hermes-shim-contract";
 import type {
   EnsureHermesShimTrustOptions,
   HermesTrustStatus,
