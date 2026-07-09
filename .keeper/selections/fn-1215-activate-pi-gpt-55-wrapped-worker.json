@@ -9,29 +9,21 @@
       "confidence": 0.72,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "Bounded single-file slow-tier test extension proving an already-landed wrapper contract by following an existing real-git template; named surfaces and line refs, no design work.",
-      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.3",
+      "rationale": "Bounded multi-file config/docs reconciliation following the established model-guidance research flow with a clear gate-green acceptance; no design, contract, or security reason for opus.",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.5",
       "tier": "high"
-    },
-    {
-      "confidence": 0.8,
-      "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "Mechanical committed-example plus forward-facing docs and one fast-tier parse test with fully-specified acceptance and a named glossary collision to resolve.",
-      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.4",
-      "tier": "medium"
     }
   ],
   "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
-  "created_at": "2026-07-09T19:11:57.885000Z",
+  "created_at": "2026-07-09T19:36:00.052000Z",
   "epic_id": "fn-1215-activate-pi-gpt-55-wrapped-worker",
-  "input_hash": "2a915b42cfbd28d5f131553e603d601c1f6067bec5846e968535bc84d393ba8c",
+  "input_hash": "72563b6ef25a3fd8dafabd42b5aca7b99330f8df92c08c47cb0f2e32a83bb3b5",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 714169154,
-  "verdict_raw": "re-selection after codex/spark retarget; tasks 1-2 excluded as in_progress"
+  "shuffle_seed": 1918253934,
+  "verdict_raw": "single-cell re-selection for the added reconciliation task"
 }
