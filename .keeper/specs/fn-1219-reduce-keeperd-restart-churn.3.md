@@ -43,5 +43,5 @@ One checked-in roots manifest (scripts/daemon-load-roots.txt: one path per line,
 - [ ] docs/install.md states the reload-trigger contract; full fast suite green
 
 ## Done summary
-
+Re-keyed the keeperd install reload gate onto a daemon load-surface fingerprint: a checked-in roots manifest (scripts/daemon-load-roots.txt) hashed content-addressed at HEAD by a pure seam (scripts/daemon-fingerprint.ts), enforced by a fast-tier boundary test walking worker-spawn and attribute-import edges, plus escaping the raw NUL in reconcile-core's slotKey so rg reads it as text.
 ## Evidence
