@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Additive export plus one deep-equal assertion test with a fully-specified acceptance and no design choice \u2014 mechanical single-surface work at the lowest band, sonnet as the default with no intelligence-bound reason for opus.",
+      "task_id": "fn-1223-restore-hermes-shim-event-set-drift.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "created_at": "2026-07-09T21:34:06.592000Z",
+  "epic_id": "fn-1223-restore-hermes-shim-event-set-drift",
+  "input_hash": "68e2ae1ab1fc35936da2e8e408d3364fa05b352adca581ed64acc54fbd271617",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1759686170,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"sonnet\",\"rationale\":\"Additive export plus one deep-equal assertion test with a fully-specified acceptance and no design choice \u2014 mechanical single-surface work at the lowest band, sonnet as the default with no intelligence-bound reason for opus.\",\"confidence\":0.85}]}\n"
+}
