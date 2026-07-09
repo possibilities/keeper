@@ -35,5 +35,5 @@ Hook-level tests with synthetic payloads: lane-marked + shared-checkout target �
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Added the wrong-tree-guard PreToolUse hook (Write|Edit|MultiEdit|Bash) that denies a worktree-lane worker's write into any non-lane tracked repo tree — direct file_path plus best-effort Bash redirect/heredoc/tee/sed -i vectors — while allowing .keeper plan-state, temp/home/state, and own-lane writes, denying .git/config+credentials regardless of lane, and failing open. Registered the dual matcher, bumped CLAUDE.md to seven hooks, and added a 67-case pure+real-fs test suite.
 ## Evidence
