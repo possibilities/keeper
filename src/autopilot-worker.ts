@@ -3607,6 +3607,8 @@ export async function runReconcileCycle(
     const cell = resolveWorkerCell(
       {
         pluginDir: plan.pluginDir,
+        model: plan.cellModel,
+        tier: plan.tier,
         ...(plan.pluginDirReject !== undefined
           ? { reject: plan.pluginDirReject }
           : {}),
@@ -3614,7 +3616,10 @@ export async function runReconcileCycle(
       {
         dirExists,
         probeShadow: probeShadowMemoized,
-        probeRoute: () => defaultRouteProbe(plan.model),
+        // Bind the route probe to the TASK's capability model (the model the cell
+        // names), NOT the orchestrator session `plan.model` — a wrapped cell's
+        // resolution turns on classifying the model it actually runs.
+        probeRoute: () => defaultRouteProbe(plan.cellModel ?? ""),
       },
     );
     if (!cell.ok) {
@@ -3665,6 +3670,12 @@ export async function runReconcileCycle(
       });
       continue;
     }
+    // The LATE-resolved cell dir. For a native cell it equals `plan.pluginDir`;
+    // for a routed WRAPPED candidate the seam re-derived the host cell path the
+    // pure embedded compose could not (`plan.pluginDir` is null there). Thread
+    // THIS — never the stale `plan.pluginDir` — into both launch shapes below, or
+    // the wrapped worker launches without its cell plugin (the bug, one layer down).
+    const resolvedPluginDir = cell.pluginDir;
     // Worktree-mode producer step, BEFORE `confirmRunning` mints the
     // durable Dispatched. `launchCwd` is the cwd `confirmRunning` actually launches
     // into; it starts as the pure `plan.cwd` and is OVERRIDDEN to the lane worktree
@@ -3738,8 +3749,12 @@ export async function runReconcileCycle(
     // drift-guarded `cd <path>` prefix matches the actual launch cwd. (keeper agent
     // reads `spec` + the `cwd` arg, not this string — but keeping them consistent
     // preserves the parity the builders intend.)
+    // Rebuild the shell twin when worktree mode re-pointed the cwd OR the seam
+    // late-resolved a dir the pure `plan.workerCommand` did not bake (a wrapped
+    // candidate: `plan.pluginDir` null, `resolvedPluginDir` the host cell). A
+    // native / cell-less launch keeps `plan.workerCommand` byte-identical.
     const workerCommand =
-      launchCwd === plan.cwd
+      launchCwd === plan.cwd && resolvedPluginDir === plan.pluginDir
         ? plan.workerCommand
         : buildWorkerCommand(
             plan.verb,
@@ -3747,7 +3762,7 @@ export async function runReconcileCycle(
             launchCwd,
             plan.model,
             plan.effort,
-            plan.pluginDir,
+            resolvedPluginDir,
           );
     const argv = buildLaunchArgv(shell, workerCommand);
     const spec = buildPlannedLaunchSpec(
@@ -3757,7 +3772,7 @@ export async function runReconcileCycle(
       plan.effort,
       worktreeLane,
       worktreeBranch,
-      plan.pluginDir,
+      resolvedPluginDir,
     );
     try {
       const outcome = await confirmRunning(

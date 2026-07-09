@@ -76,16 +76,34 @@ test("composeWorkerCellDir: an in-matrix (model, tier) resolves the absolute cel
 });
 
 test("composeWorkerCellDir: a null EITHER axis is legitimately cell-less (pluginDir null, no reject)", () => {
-  expect(composeWorkerCellDir(null, "max")).toEqual({ pluginDir: null });
-  expect(composeWorkerCellDir("opus", null)).toEqual({ pluginDir: null });
-  expect(composeWorkerCellDir(null, null)).toEqual({ pluginDir: null });
+  // The `{model, tier}` axes are carried verbatim (the routed-wrapped arm needs
+  // them) — but a null EITHER axis stays cell-less: pluginDir null, no reject.
+  expect(composeWorkerCellDir(null, "max")).toEqual({
+    pluginDir: null,
+    model: null,
+    tier: "max",
+  });
+  expect(composeWorkerCellDir("opus", null)).toEqual({
+    pluginDir: null,
+    model: "opus",
+    tier: null,
+  });
+  expect(composeWorkerCellDir(null, null)).toEqual({
+    pluginDir: null,
+    model: null,
+    tier: null,
+  });
 });
 
-test("composeWorkerCellDir: an out-of-matrix pair is carried as a reject (never a throw)", () => {
+test("composeWorkerCellDir: an out-of-matrix pair is carried as a reject (never a throw), axes retained", () => {
   const c = composeWorkerCellDir("opus", "ludicrous");
   expect(c.pluginDir).toBeNull();
   expect(typeof c.reject).toBe("string");
   expect(c.reject).not.toBe("");
+  // The axes ride the reject so the seam's routed-wrapped arm can re-derive the
+  // host cell path without re-running the embedded-axis validation that threw.
+  expect(c.model).toBe("opus");
+  expect(c.tier).toBe("ludicrous");
 });
 
 // ---------------------------------------------------------------------------
@@ -104,13 +122,13 @@ test("defaultRouteProbe: a native (claude-served) model → routed", () => {
   expect(defaultRouteProbe("opus", () => matrix)).toEqual({ kind: "routed" });
 });
 
-test("defaultRouteProbe: a wrapped model with ≥1 serving provider → routed", () => {
+test("defaultRouteProbe: a wrapped model with ≥1 serving provider → wrapped", () => {
   const matrix = mkMatrix([
     ["claude", ["opus"]],
     ["codex", ["gpt-5.5"]],
   ]);
   expect(defaultRouteProbe("gpt-5.5", () => matrix)).toEqual({
-    kind: "routed",
+    kind: "wrapped",
   });
 });
 
@@ -199,6 +217,91 @@ test("resolveWorkerCell: a reject compose + no-route probe → no-route carrying
     },
   );
   expect(cell).toEqual({ ok: false, kind: "no-route", model: "gpt-5.5" });
+});
+
+test("resolveWorkerCell: a reject compose + wrapped probe + rendered manifest → ok, resolves the host cell dir", () => {
+  // The headline fix: a routed WRAPPED candidate re-derives its rendered host cell
+  // path from the {model, tier} the compose carried (PATH ONLY — the embedded-axis
+  // validation is what threw) and falls through to the manifest probe, resolving
+  // OK with the cell dir — the same discipline a native cell dispatches under.
+  const cell = resolveWorkerCell(
+    {
+      pluginDir: null,
+      reject: 'unknown model "gpt-5.5"',
+      model: "gpt-5.5",
+      tier: "high",
+    },
+    {
+      dirExists: () => true,
+      probeShadow: () => null,
+      probeRoute: (): WorkerCellRoute => ({ kind: "wrapped" }),
+    },
+  );
+  expect(cell.ok).toBe(true);
+  if (cell.ok) {
+    // Absolute, cwd-independent, under keeper's generated workers tree — the SAME
+    // shape a native cell composes, just the wrapped capability model's name.
+    expect(cell.pluginDir?.startsWith("/")).toBe(true);
+    expect(cell.pluginDir).toContain("plugins/plan/workers/gpt-5.5-high");
+  }
+});
+
+test("resolveWorkerCell: a wrapped probe + ABSENT manifest → missing naming the host cell dir (regen hint upstream)", () => {
+  // A routed-but-UNRENDERED wrapped cell surfaces as the ordinary `missing` reject
+  // carrying the composed host cell dir (the caller composes the regenerate hint),
+  // BEFORE the shadow probe — proving the wrapped arm honors the full precedence.
+  const cell = resolveWorkerCell(
+    { pluginDir: null, reject: "x", model: "gpt-5.5", tier: "high" },
+    {
+      dirExists: () => false,
+      probeShadow: neverProbe.probeShadow,
+      probeRoute: (): WorkerCellRoute => ({ kind: "wrapped" }),
+    },
+  );
+  expect(cell.ok).toBe(false);
+  if (!cell.ok) {
+    expect(cell.kind).toBe("missing");
+    if (cell.kind === "missing") {
+      expect(cell.pluginDir).toContain("plugins/plan/workers/gpt-5.5-high");
+    }
+  }
+});
+
+test("resolveWorkerCell: a wrapped routed cell still honors the shadow probe (same guard as native)", () => {
+  const cell = resolveWorkerCell(
+    { pluginDir: null, reject: "x", model: "gpt-5.5", tier: "high" },
+    {
+      dirExists: () => true,
+      probeShadow: () => "/scan/arthack-work/plugin.json",
+      probeRoute: (): WorkerCellRoute => ({ kind: "wrapped" }),
+    },
+  );
+  expect(cell.ok).toBe(false);
+  if (!cell.ok && cell.kind === "shadowed") {
+    expect(cell.pluginDir).toContain("plugins/plan/workers/gpt-5.5-high");
+    expect(cell.shadowManifest).toBe("/scan/arthack-work/plugin.json");
+  } else {
+    throw new Error(`expected shadowed, got ${JSON.stringify(cell)}`);
+  }
+});
+
+test("resolveWorkerCell: a wrapped verdict on a reject compose MISSING its axes → out-of-matrix (defensive)", () => {
+  // A wrapped verdict but no {model, tier} on the compose (never a real reject
+  // compose — the pure compose always carries the axes) leaves the generic
+  // out-of-matrix standing rather than composing a bogus path. fs probes untouched.
+  const cell = resolveWorkerCell(
+    { pluginDir: null, reject: "bad pair" },
+    {
+      dirExists: neverProbe.dirExists,
+      probeShadow: neverProbe.probeShadow,
+      probeRoute: (): WorkerCellRoute => ({ kind: "wrapped" }),
+    },
+  );
+  expect(cell).toEqual({
+    ok: false,
+    kind: "out-of-matrix",
+    message: "bad pair",
+  });
 });
 
 test("resolveWorkerCell: an absent cell manifest → missing, BEFORE the shadow probe, never routes", () => {

@@ -912,6 +912,16 @@ export interface PlannedLaunch {
   /** Task `tier`, only set for `work` rows. */
   tier: string | null;
   /**
+   * The task's CAPABILITY model — the model axis the cell names, distinct from
+   * the orchestrator session {@link model}. Set for a `work` row (`task.model`),
+   * null for a `close` row or a cell-less task. Threaded so the producer's
+   * host-matrix route probe binds to the model the cell actually names (not the
+   * session model), the one thread the wrapped-cell resolution needs; the pure
+   * compose stays I/O-free and embedded-only, so the route classification itself
+   * lives producer-side.
+   */
+  cellModel: string | null;
+  /**
    * The resolved ABSOLUTE per-cell worker plugin dir for a `work` row whose task
    * carries an in-matrix {model, effort} pair
    * (`${KEEPER_ROOT}/plugins/plan/workers/<model>-<effort>`), else `null` (a
@@ -1849,6 +1859,7 @@ export function reconcile(
         model: snapshot.workerModel,
         effort: snapshot.workerEffort,
         tier: verb === "work" ? task.tier : null,
+        cellModel: verb === "work" ? (task.model ?? null) : null,
         pluginDir,
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
       });
@@ -1925,7 +1936,9 @@ export function reconcile(
           model: snapshot.workerModel,
           effort: snapshot.workerEffort,
           tier: null,
-          // A `close` row is cell-less — it loads no per-cell worker plugin.
+          // A `close` row is cell-less — it loads no per-cell worker plugin, and
+          // names no capability model.
+          cellModel: null,
           pluginDir: null,
           // Every close-row launch is an epic finalizer (`close`);
           // the cycle glue stamps the per-epic guard for these.
