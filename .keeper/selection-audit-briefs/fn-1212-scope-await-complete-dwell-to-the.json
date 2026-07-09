@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 29,
+        "files_changed": 3,
+        "insertions": 353
+      },
+      "done_summary": "Anchored a task-complete await's dwell on a per-task version: completeWatermark now returns the MAX last_event_id across the target task's own embedded jobs, not the containing epic's last_event_id. Sibling-task churn (which re-folds the shared epic row) no longer resets the dwell, while the target's own worker re-activation (the coalesced running->completed flap) still restarts it. Pure client-side change (data already on the subscribe snapshot) \u2014 no reducer/migration touched. Added F3 sibling-churn + target-flap tests at the module and command level.",
+      "input_hash": "eb5ebdc4ab66ba009f0cfa1f8ed82baf4ebf68ced207b803b2887df00e8b9ad6",
+      "model": "opus",
+      "spec_chars": 2691,
+      "spec_md": "## Description\n\nFixes F1 (with the F3 test gap folded in). Evidence path from the close\naudit (commit 8e43ff96):\n\n- `src/await-conditions.ts` \u2014 `advanceCompleteStability` restarts the dwell\n  on `versionMoved = prev.watermark !== null && version !== null && version\n  !== prev.watermark` (ANY move, needed to catch a diffTick-coalesced\n  running\u2192completed flap whose UP move a `<`-only check would miss).\n- `src/await-conditions.ts` \u2014 `completeWatermark` returns\n  `hit?.epic.last_event_id` for a task target. The `epics` row re-folds on\n  any embedded task/job change (reducer `UPDATE epics SET tasks=?,\n  last_event_id=?`), and tasks are an embedded JSON blob with NO per-task\n  version column \u2014 so benign sibling churn moves the anchor and resets a\n  task-complete dwell.\n\nDecide and implement ONE resolution:\n(a) Anchor a task target's dwell on a per-task version (e.g. a task-scoped\n    last-touched event id folded into the tasks blob and surfaced on the\n    subscribe snapshot) so sibling churn no longer registers as a move \u2014\n    note this touches the reducer fold and must hold the re-fold-determinism\n    and zero-event-projection-default invariants; OR\n(b) Consciously accept the epic-settle tradeoff and document it at the\n    `advanceCompleteStability` / `completeWatermark` doc blocks and the\n    done_summary, since an epic-scoped watermark cannot distinguish a\n    coalesced flap from sibling churn.\n\nFiles: `src/await-conditions.ts`, `cli/await.ts` (wiring, if the anchor\nchanges), `test/await-conditions.test.ts`, `test/await.test.ts`; plus the\nreducer/projection surface only if path (a) is chosen.\n\n## Acceptance\n\n- [ ] Sibling-task churn in a multi-task epic does not reset a task-complete\n      await's dwell (path a), or the epic-settle tradeoff is documented at the\n      doc blocks and done_summary (path b).\n- [ ] A genuine target-task flap \u2014 including a diffTick-coalesced\n      running\u2192completed \u2014 still restarts the dwell.\n- [ ] A new test names the sibling-churn scenario and asserts the intended\n      outcome (the F3 gap).\n- [ ] `bun test` and the plan suite stay green.\n\n## Done summary\nAnchored a task-complete await's dwell on a per-task version: completeWatermark now returns the MAX last_event_id across the target task's own embedded jobs, not the containing epic's last_event_id. Sibling-task churn (which re-folds the shared epic row) no longer resets the dwell, while the target's own worker re-activation (the coalesced running->completed flap) still restarts it. Pure client-side change (data already on the subscribe snapshot) \u2014 no reducer/migration touched. Added F3 sibling-churn + target-flap tests at the module and command level.\n## Evidence\n",
+      "task_id": "fn-1212-scope-await-complete-dwell-to-the.1",
+      "tier": "xhigh",
+      "title": "Anchor await dwell per task"
+    }
+  ],
+  "created_at": "2026-07-09T02:04:18.861000Z",
+  "epic_id": "fn-1212-scope-await-complete-dwell-to-the",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "eb5ebdc4ab66ba009f0cfa1f8ed82baf4ebf68ced207b803b2887df00e8b9ad6",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
