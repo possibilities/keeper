@@ -41,6 +41,7 @@ import { getTaskSection } from "../specs.ts";
 import { hasDataDir } from "../state_path.ts";
 import { getVcs } from "../vcs.ts";
 import { parseYamlInput } from "../yaml_input.ts";
+import { findFollowupByBlocksClosingOf } from "./close_finalize.ts";
 
 /** Emit a typed close-preflight error envelope and exit 1. Shape
  * {success:false, error:{code,message,details?}} — no plan_invocation line
@@ -467,6 +468,14 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
     );
   }
 
+  // Surface an in-flight blocking follow-up (discovered by its committed
+  // `blocks_closing_of` pointer, any status) so the close skill can short-circuit
+  // past the audit phases on re-entry — a second audit would re-author a divergent
+  // verdict and risk a duplicate mint. Null on the ordinary (non-gated) close.
+  const gated = findFollowupByBlocksClosingOf(stateCtx.dataDir, epicId);
+  const blockingFollowup =
+    gated !== null ? { id: gated.epicId, status: gated.status ?? null } : null;
+
   formatOutput(
     {
       success: true,
@@ -475,6 +484,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       all_done: true,
       brief_ref: briefRef,
       commit_set_hash: commitSetHash,
+      blocking_followup: blockingFollowup,
     },
     format,
   );

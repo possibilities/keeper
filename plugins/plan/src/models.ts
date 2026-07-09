@@ -46,6 +46,9 @@ export function normalizeEpic(
   if (!("created_by_close_of" in data)) {
     data.created_by_close_of = null;
   }
+  if (!("blocks_closing_of" in data)) {
+    data.blocks_closing_of = null;
+  }
   return data;
 }
 

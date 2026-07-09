@@ -22,6 +22,7 @@ import {
   computeCommitSetHash,
   writeArtifact,
 } from "../src/audit_artifacts.ts";
+import { BLOCKS_CLOSING_REASON_MAX } from "../src/verdict_schema.ts";
 import { parseCliOutput, runCli, seedState, withProject } from "./harness.ts";
 
 const EID = "fn-7-demo-epic";
@@ -286,5 +287,95 @@ describe("verdict submit", () => {
     });
     expect(code).toBe(0);
     expect(output.includes('"files":[')).toBe(false);
+  });
+
+  // --- Optional close-gate pair: blocks_closing / blocks_closing_reason -------
+  // Shaped and enforced exactly like fatal / fatal_reason.
+
+  test("a true blocking verdict with a non-empty reason persists", () => {
+    const proj = getProj();
+    seedBrief(proj.root);
+    const { code, output } = submit(proj, {
+      fatal: false,
+      fatal_reason: "",
+      blocks_closing: true,
+      blocks_closing_reason:
+        "ships a consumer-observable flaw a follow-up fixes",
+      decisions: [{ fid: "f1", action: "kept", task: 1, rationale: "real" }],
+    });
+    expect(code).toBe(0);
+    const record = JSON.parse(
+      readFileSync(parseCliOutput(output).verdict_ref as string, "utf-8"),
+    );
+    expect(record.blocks_closing).toBe(true);
+    expect(record.blocks_closing_reason).toBeTruthy();
+  });
+
+  test("absent close-gate fields persist unchanged (legacy non-blocking)", () => {
+    const proj = getProj();
+    seedBrief(proj.root);
+    const { code, output } = submit(proj, {
+      fatal: false,
+      fatal_reason: "",
+      decisions: [],
+    });
+    expect(code).toBe(0);
+    const record = JSON.parse(
+      readFileSync(parseCliOutput(output).verdict_ref as string, "utf-8"),
+    );
+    expect("blocks_closing" in record).toBe(false);
+  });
+
+  test("blocks_closing:true with an empty reason rejects (pairing rule)", () => {
+    const proj = getProj();
+    seedBrief(proj.root);
+    const { code, output } = submit(proj, {
+      fatal: false,
+      fatal_reason: "",
+      blocks_closing: true,
+      blocks_closing_reason: "",
+      decisions: [],
+    });
+    expect(code).toBe(1);
+    const error = parseCliOutput(output).error as Record<string, unknown>;
+    expect(error.code).toBe("VERDICT_INVALID");
+    const types = errorRows(output).map((r) => r.type);
+    expect(types).toContain("blocks_closing_reason_required");
+  });
+
+  test("a non-boolean blocks_closing rejects (strict boolean)", () => {
+    const proj = getProj();
+    seedBrief(proj.root);
+    const { code, output } = submit(proj, {
+      fatal: false,
+      fatal_reason: "",
+      blocks_closing: "true",
+      blocks_closing_reason: "x",
+      decisions: [],
+    });
+    expect(code).toBe(1);
+    const error = parseCliOutput(output).error as Record<string, unknown>;
+    expect(error.code).toBe("VERDICT_INVALID");
+    const rows = errorRows(output);
+    expect(
+      rows.some((r) => r.loc === "blocks_closing" && r.type === "type"),
+    ).toBe(true);
+  });
+
+  test("an over-cap blocks_closing_reason rejects (length-capped)", () => {
+    const proj = getProj();
+    seedBrief(proj.root);
+    const { code, output } = submit(proj, {
+      fatal: false,
+      fatal_reason: "",
+      blocks_closing: true,
+      blocks_closing_reason: "x".repeat(BLOCKS_CLOSING_REASON_MAX + 1),
+      decisions: [],
+    });
+    expect(code).toBe(1);
+    const error = parseCliOutput(output).error as Record<string, unknown>;
+    expect(error.code).toBe("VERDICT_INVALID");
+    const types = errorRows(output).map((r) => r.type);
+    expect(types).toContain("maxLength");
   });
 });

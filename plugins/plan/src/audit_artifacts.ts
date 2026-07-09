@@ -26,7 +26,7 @@ import {
 import { join, resolve } from "node:path";
 
 import { resolveDataDirOrDefault } from "./state_path.ts";
-import { atomicWriteRaw, serializeStateJson } from "./store.ts";
+import { atomicWriteRaw, nowIso, serializeStateJson } from "./store.ts";
 
 /** Audit-artifact schema version. Integer, starts at 1; additive-only within a
  * version. computeCommitSetHash folds this in, so a bump invalidates every
@@ -106,6 +106,72 @@ export function verdictPath(primaryRepo: string, epicId: string): string {
 
 export function followupPath(primaryRepo: string, epicId: string): string {
   return join(auditDir(primaryRepo, epicId), FOLLOWUP_BASENAME);
+}
+
+/** The durable minted-marker basename a blocking close-gate stamps once it
+ * scaffolds the follow-up. */
+export const BLOCKING_FOLLOWUP_BASENAME = "blocking-followup.json";
+
+/** `audits/<source_epic_id>/blocking-followup.json` (a pure path — never
+ * created here, so a reader draws no side-effect). The marker's PRESENCE, paired
+ * with the committed `blocks_closing_of` pointer on the follow-up epic, is the
+ * disambiguator: pointer-found is an adopt/re-emit, marker-but-no-pointer is a
+ * deleted-while-gated follow-up (a typed failure), neither is a never-minted
+ * first pass. */
+export function blockingFollowupPath(
+  primaryRepo: string,
+  sourceEpicId: string,
+): string {
+  return join(
+    auditsRoot(primaryRepo),
+    sourceEpicId,
+    BLOCKING_FOLLOWUP_BASENAME,
+  );
+}
+
+/** Persist the blocking-followup minted-marker for `sourceEpicId` COMMIT-FREE
+ * (0600), recording which epic the gate scaffolded. Written only AFTER a
+ * successful follow-up scaffold, so the marker never claims a mint that did not
+ * land. Creates the per-epic audit tree. Returns the resolved path. */
+export function writeBlockingFollowupMarker(
+  primaryRepo: string,
+  sourceEpicId: string,
+  followupEpicId: string,
+): string {
+  auditDir(primaryRepo, sourceEpicId);
+  return writeArtifact(
+    blockingFollowupPath(primaryRepo, sourceEpicId),
+    serializeStateJson({
+      schema_version: AUDIT_SCHEMA_VERSION,
+      source_epic_id: sourceEpicId,
+      followup_epic_id: followupEpicId,
+      minted_at: nowIso(),
+    }),
+  );
+}
+
+/** Read the blocking-followup minted-marker for `sourceEpicId`; null when
+ * absent (never minted). A present-but-corrupt marker still returns non-null
+ * (with an empty id) — a mint DID happen, so the caller fails closed rather than
+ * blindly re-scaffolding. Never throws. */
+export function readBlockingFollowupMarker(
+  primaryRepo: string,
+  sourceEpicId: string,
+): { followupEpicId: string } | null {
+  const path = blockingFollowupPath(primaryRepo, sourceEpicId);
+  if (!existsSync(path)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    const id = parsed.followup_epic_id;
+    return { followupEpicId: typeof id === "string" ? id : "" };
+  } catch {
+    return { followupEpicId: "" };
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -356,6 +356,31 @@ describe("scaffold epic deps", () => {
       (err.details as string[]).some((d) => d.includes("duplicated")),
     ).toBe(true);
   });
+
+  test("an all-done dep list still passes — the validator is STATUS-BLIND", () => {
+    // Carve-out guarding the blocking close-gate dep substitution: the gate
+    // substitutes the source's still-resolving epic-deps (status irrelevant) into
+    // the follow-up, then scaffold re-validates them. A future "only depend on
+    // non-done epics" hardening would silently break that substitution, so pin
+    // that a dependent may declare a DONE dep and scaffold accepts it.
+    const dep = seedEpic("done dep");
+    const depPath = join(project.root, ".keeper", "epics", `${dep}.json`);
+    const depDef = JSON.parse(readFileSync(depPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    depDef.status = "done";
+    writeFileSync(depPath, `${JSON.stringify(depDef, null, 2)}\n`, "utf-8");
+
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml(`[${dep}]`, "depends on a done epic")),
+    ]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`epics/${epicId}.json`).depends_on_epics).toEqual([dep]);
+  });
 });
 
 // ---------------------------------------------------------------------------
