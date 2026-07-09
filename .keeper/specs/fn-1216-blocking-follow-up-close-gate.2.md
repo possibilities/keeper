@@ -45,5 +45,5 @@ In-process truth-table describes on the suite's main(argv) harness (no subproces
 - [ ] Preflight reports the in-flight blocking follow-up's id and status, and the plan-plugin suite is green
 
 ## Done summary
-
+Added the close saga's blocking-follow-up branch: a verdict blocks_closing:true mints an armed follow-up with substituted (still-resolving, never-source) deps plus a committed blocks_closing_of pointer, holds the source open (followup_blocks_close), and a re-dispatched closer adopts a done follow-up, re-emits idempotently for a live one, or fails typed on a deleted one. Verdict schema gained the optional blocks_closing/blocks_closing_reason pair; close-preflight surfaces the in-flight gate.
 ## Evidence
