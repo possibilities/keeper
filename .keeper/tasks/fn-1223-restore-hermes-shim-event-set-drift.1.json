@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "low",
   "title": "Test hermes event-set drift",
-  "updated_at": "2026-07-09T21:34:06.025000Z"
+  "updated_at": "2026-07-09T21:50:54.928000Z",
+  "worker_done_at": "2026-07-09T21:50:54.928000Z"
 }

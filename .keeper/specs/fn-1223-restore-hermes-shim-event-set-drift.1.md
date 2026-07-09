@@ -28,5 +28,5 @@ Files:
 - [ ] `bun test` passes; hook keeps its `node:*` + dep-free-helper import discipline
 
 ## Done summary
-
+Exported HERMES_EVENT_MAP from the hermes hook and added a fast-tier test asserting its key set matches HERMES_SHIM_EVENTS from src/hermes-shim-contract.ts, restoring the drift guard.
 ## Evidence
