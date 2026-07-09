@@ -21,10 +21,11 @@
 // still rejects the batch.
 //
 // The verb NEVER reads model-selector.yaml — axis validation comes from the
-// embedded subagents matrix only (configuredEfforts/configuredModels). The
-// `selection:` block is captured verbatim into the sidecar; the verb does not
-// police its values beyond shape. The tier-audit stamp + degrade-SOFT policy read
-// live in the shared core.
+// effective composed matrix (embedded subagents snapshot plus a host
+// provider matrix.yaml overlay when present), via configuredEfforts /
+// configuredModels. The `selection:` block is captured verbatim into the
+// sidecar; the verb does not police its values beyond shape. The tier-audit
+// stamp + degrade-SOFT policy read live in the shared core.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
