@@ -37,5 +37,5 @@ Gate cases: tolerated extra research entry with matching hash → green; tolerat
 - [ ] Plan fast suite green including the extended consistency test
 
 ## Done summary
-
+Restructured the model-guidance research-map check to tolerate a non-configured (host-roster) research entry while hash-enforcing EVERY entry's reference (skip-continue removed), backfilled a researched references/gpt-5.5.md with a hash-anchored research entry, refreshed the gpt-5.5 guidance block to trickle posture, and extended the consistency test with the tolerated-extra pass/mismatch/missing cases.
 ## Evidence
