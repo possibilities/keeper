@@ -375,6 +375,37 @@ function makeEpicRow(
   };
 }
 
+/**
+ * A wire-shape embedded `work` job for a task element's `jobs` sub-array. Its
+ * `last_event_id` is the per-task version the `complete` dwell anchors on (see
+ * `completeWatermark`): only THIS task's own worker re-versioning bumps it, so a
+ * sibling task's churn never moves the target's anchor. `state: "stopped"` keeps
+ * a `worker_phase: "done"` task reading the idle `completed` verdict.
+ */
+function workJobRow(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    job_id: "w1",
+    plan_verb: "work",
+    state: "stopped",
+    title: null,
+    created_at: 0,
+    updated_at: 0,
+    last_event_id: 0,
+    last_api_error_at: null,
+    last_api_error_kind: null,
+    last_input_request_at: null,
+    last_input_request_kind: null,
+    last_permission_prompt_at: null,
+    last_permission_prompt_kind: null,
+    git_dirty_count: 0,
+    git_unattributed_to_live_count: 0,
+    git_orphan_count: 0,
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // RunDeps harness
 // ---------------------------------------------------------------------------
@@ -1046,7 +1077,7 @@ test("fn-1210 quiet board: complete fires met with NO second frame after the fir
 // anchor. Only once the board settles quiet at a stable version does it confirm.
 // ---------------------------------------------------------------------------
 
-test("fn-1210 coalesced flap: a version-bumping completed patch restarts the dwell, no premature met", async () => {
+test("fn-1210 coalesced flap: the target task's own job re-versioning restarts the dwell, no premature met", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   let clock = 1000;
@@ -1061,36 +1092,119 @@ test("fn-1210 coalesced flap: a version-bumping completed patch restarts the dwe
   }
   sock.takeOutbound();
 
-  // First paint: done + idle at epic version 10 → armed, dwell anchored at v10.
-  const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
+  // First paint: done + idle, the target's own work job at version 10 → armed,
+  // dwell anchored at the TASK's own job watermark (10).
+  const taskV1 = makeTaskRow({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [workJobRow({ last_event_id: 10 })],
+  });
   deliverFiveWithEpic(
     sock,
     idPrefix,
-    makeEpicRow({ last_event_id: 10, tasks: [taskDone] }),
+    makeEpicRow({ last_event_id: 10, tasks: [taskV1] }),
   );
   expect(h.stdout).toHaveLength(1);
   expect(h.stdout[0]).toContain("[keeper-await] armed");
 
-  // The dwell would elapse now — but a coalesced flap lands: still `completed`,
-  // at a bumped version 11 (the intervening `running` events advanced the epic
-  // row's last_event_id, coalesced by diffTick into one higher-version patch).
-  // The version move restarts the dwell, so NO met fires despite the elapsed time.
+  // The dwell would elapse now — but a coalesced flap lands: the target's OWN
+  // worker re-activated and re-idled during close-out, diffTick coalescing the
+  // intervening `running` into one higher-version `completed` patch. Its own
+  // embedded-job version moved 10 → 11 (and the epic row re-folded to 11 with
+  // it). The per-task anchor moved, so the dwell restarts — NO met despite the
+  // elapsed time.
   clock += COMPLETE_DWELL_MS;
+  const taskV2 = makeTaskRow({
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [workJobRow({ last_event_id: 11 })],
+  });
   sock.deliver([
     resultFrame(
       "epics",
       `${idPrefix}-epics`,
-      [makeEpicRow({ last_event_id: 11, tasks: [taskDone] })],
+      [makeEpicRow({ last_event_id: 11, tasks: [taskV2] })],
       2,
     ),
   ]);
   expect(h.stdout).toHaveLength(1);
   expect(h.exitCode).toBeNull();
 
-  // The board finally settles quiet at v11. After the FULL dwell from the flap,
-  // the re-evaluation timer confirms → met.
+  // The board finally settles quiet at the target's job version 11. After the
+  // FULL dwell from the flap, the re-evaluation timer confirms → met.
   clock += COMPLETE_DWELL_MS;
   h.fireDeadline();
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1212 (F3): sibling-task churn in a multi-task epic must NOT reset a
+// task-complete dwell. A task target anchors on its OWN embedded-job version, so
+// a sibling task's churn — which re-folds the shared epic row's last_event_id —
+// no longer moves the anchor. Before the per-task anchor, sibling churn (siblings
+// emit events < COMPLETE_DWELL_MS apart) reset the dwell faster than it elapsed,
+// so a task-complete await never settled until the WHOLE epic quiet.
+// ---------------------------------------------------------------------------
+
+test("fn-1212 sibling churn: a sibling task's churn does NOT reset a task-complete dwell → met still fires", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  let clock = 1000;
+  h.deps.now = () => clock;
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: the TARGET fn-1-foo.1 is done+idle with its own work job at
+  // version 10; a SIBLING fn-1-foo.2 is in flight. Armed, dwell anchored at the
+  // target's own job watermark (10), NOT the epic's last_event_id (30).
+  const target = makeTaskRow({
+    task_id: "fn-1-foo.1",
+    task_number: 1,
+    worker_phase: "done",
+    approval: "approved",
+    jobs: [workJobRow({ job_id: "w1", last_event_id: 10 })],
+  });
+  const siblingV1 = makeTaskRow({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    jobs: [workJobRow({ job_id: "w2", state: "working", last_event_id: 8 })],
+  });
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ last_event_id: 30, tasks: [target, siblingV1] }),
+  );
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+
+  // The SIBLING churns: fn-1-foo.2's job advances 8 → 12, re-folding the epic row
+  // to last_event_id 31. The TARGET's own job is untouched (still 10). At the
+  // dwell boundary the target still reads `completed` and its per-task anchor held
+  // at 10 through the sibling churn — so the delivered frame CONFIRMS → met. An
+  // epic-scoped anchor would have moved (30 → 31) and reset here, hanging forever.
+  clock += COMPLETE_DWELL_MS;
+  const siblingV2 = makeTaskRow({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    jobs: [workJobRow({ job_id: "w2", state: "working", last_event_id: 12 })],
+  });
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ last_event_id: 31, tasks: [target, siblingV2] })],
+      2,
+    ),
+  ]);
   expect(h.stdout).toHaveLength(2);
   expect(h.stdout[1]).toContain("[keeper-await] met");
   expect(h.exitCode).toBe(0);
