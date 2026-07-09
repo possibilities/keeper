@@ -32,5 +32,7 @@ Fast-tier where the seam allows (pure timing harness over the pass + a stubbed s
 - [ ] A regression guard fails if first-frame assembly can again be starved past the default snapshot window; full fast suite green
 
 ## Done summary
-
+Debug-first root cause: the board first-frame stall was NOT serve-loop/retention/WAL starvation against the grown DB but an oversized git-collection NDJSON frame. A worktree with thousands of dirty files renders a git_status.dirty_files array past 1 MiB; the subscribe first-frame ships the git result as ONE NDJSON line, and the viewer's parser rejects any line over MAX_LINE_LENGTH (1 MiB, src/protocol.ts) and reconnect-loops, so no first frame ever lands. This explains the intermittency fingerprint: the stall tracks worktree dirty-file count, not DB size, so it recurs across restarts and vanishes once the tree cleans. Fix (src/reducer.ts): cap the MATERIALIZED dirty_files mirror at GIT_STATUS_DIRTY_FILES_WIRE_CAP=200 at the FOLD, keeping each worktree's serialized contribution ~50 KB so the served frame is always deliverable. dirty_count stays EXACT and pass-4 per-job rollups fold from the FULL snapshot (not the bounded array), so no board scalar or dispatch decision changes; readiness's per-file consumer is retained-but-unread.
 ## Evidence
+- Commits: 922bc117
+- Tests: test/daemon.test.ts — git first-frame: a worktree with thousands of dirty files serves a git snapshot frame under the NDJSON line cap, dirty_count stays exact (asserts dirty_files array caps at GIT_STATUS_DIRTY_FILES_WIRE_CAP=200, dirty_count==N exact, served frame JSON length < MAX_LINE_LENGTH, guards-the-guard via perEntryBytes*N > MAX_LINE_LENGTH)
