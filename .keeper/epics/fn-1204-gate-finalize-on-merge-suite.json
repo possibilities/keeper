@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-09T03:38:58.140000Z",
   "created_at": "2026-07-08T23:57:06.891000Z",
   "depends_on_epics": [
     "fn-1203-continuous-trunk-baseline-detection"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-07-08T23:59:52.432000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Gate finalize on merge suite",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-08T23:59:52.432000Z"
+  "updated_at": "2026-07-09T03:38:58.140000Z"
 }

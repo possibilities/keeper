@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-surface test addition against explicitly-named injectable seams and enumerated verdict branches \u2014 mechanical, do-exactly-this acceptance fits sonnet at medium.",
+      "task_id": "fn-1213-harden-the-worktree-merge-suite.1",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Primary path introduces a dedicated off-drive suite worker into the autopilot daemon lifecycle with a subtle correctness invariant (identical deterministic merged OID derived outside the commit-work flock) \u2014 a contract-shaped, cross-cutting change warranting opus at xhigh.",
+      "task_id": "fn-1213-harden-the-worktree-merge-suite.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T03:38:58.139000Z",
+  "epic_id": "fn-1213-harden-the-worktree-merge-suite",
+  "input_hash": "8141dde0722850d9d521ddbbde3f770d2f374a2915f3b76ce2f1776fbfc61fb7",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2168577504,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-surface test addition against explicitly-named injectable seams and enumerated verdict branches \u2014 mechanical, do-exactly-this acceptance fits sonnet at medium.\",\"confidence\":0.85},{\"task_id\":\"2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Primary path introduces a dedicated off-drive suite worker into the autopilot daemon lifecycle with a subtle correctness invariant (identical deterministic merged OID derived outside the commit-work flock) \u2014 a contract-shaped, cross-cutting change warranting opus at xhigh.\",\"confidence\":0.72}]}"
+}
