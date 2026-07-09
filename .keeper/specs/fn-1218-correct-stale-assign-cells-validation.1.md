@@ -25,5 +25,5 @@ model-selector.yaml" clause verbatim — it is still accurate
 - [ ] No behavioral code change — comment-only edit.
 
 ## Done summary
-
+Corrected assign_cells.ts header comment to describe the effective composed matrix (embedded snapshot + host overlay) as the validation source, preserving the NEVER-reads-model-selector.yaml clause.
 ## Evidence
