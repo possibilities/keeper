@@ -1,0 +1,49 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 6,
+        "files_changed": 3,
+        "insertions": 461
+      },
+      "done_summary": "Added fn-1213 unit tests driving every runMergeSuiteGate/runPackageSuiteGate verdict branch (install fail/timeout, no gate script, crashed->red, suite timeout, green, plan-suite chaining) and scratch-reap-on-every-path (including thrown), via a new injectable spawnFn seam so no real subprocess runs.",
+      "input_hash": "8141dde0722850d9d521ddbbde3f770d2f374a2915f3b76ce2f1776fbfc61fb7",
+      "model": "sonnet",
+      "spec_chars": 1924,
+      "spec_md": "## Description\n\nFrom audit findings F1 + F5 (merged): the production merge-suite gate probe\nships with no direct test coverage. Evidence path: `git grep` across every\ntest file returns ZERO references to `runMergeSuiteGate` (src/autopilot-worker.ts:5073),\n`runPackageSuiteGate` (:5002), or `readPkgGateCommand` (:4977); the only\ncoverage is 8 injected-fake finalize tests (test/autopilot-worker.test.ts:11971-12112)\nthat exercise finalize's REACTION to a verdict, never how the probe MAPS real\nrunner results to a verdict. A regression there (e.g. a crashed merged build\nfolding to green/cannot-run instead of red) would ship uncaught.\n\nAdd unit tests injecting the existing seams (`run: WorktreeGitRunner`,\n`worktreesRoot`, `installTimeoutMs`, `suiteDeadlineMs`) plus a fake suite\nrunner to assert each verdict branch:\n- install-fail / install-timeout -> cannot-run\n- no test-gate script (readPkgGateCommand -> null) -> cannot-run\n- classifyRun == \"crashed\" -> red\n- suite-timeout -> cannot-run\n- a passing suite -> green\n- root green + runsPlanSuite -> the plan-package suite is chained (runPackageSuiteGate called on the plan dir)\n- the always-runs `finally` reaps the scratch worktree on EVERY path (green, red, cannot-run, thrown)\n\nFiles: src/autopilot-worker.ts (runMergeSuiteGate:5073, runPackageSuiteGate:5002,\nreadPkgGateCommand:4977), test/autopilot-worker.test.ts.\n\n## Acceptance\n\n- [ ] Each verdict branch above has an assertion driven through the injected `run`/suite seams\n- [ ] Scratch-reap-on-every-path is asserted, including the thrown/error path\n- [ ] `bun test` stays green\n\n## Done summary\nAdded fn-1213 unit tests driving every runMergeSuiteGate/runPackageSuiteGate verdict branch (install fail/timeout, no gate script, crashed->red, suite timeout, green, plan-suite chaining) and scratch-reap-on-every-path (including thrown), via a new injectable spawnFn seam so no real subprocess runs.\n## Evidence\n",
+      "task_id": "fn-1213-harden-the-worktree-merge-suite.1",
+      "tier": "medium",
+      "title": "Cover the merge-suite gate probe"
+    },
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 5,
+        "files_changed": 1,
+        "insertions": 27
+      },
+      "done_summary": "Documented the inline worktree-mode merge-suite finalize gate as an accepted, bounded opt-in tradeoff (the sanctioned alternative to off-drive isolation): forward-facing rationale added at the runMergeSuite dep wiring and the runMergeSuiteGate doc-comment in src/autopilot-worker.ts. No behavior change \u2014 the suite still runs outside the commit-work flock on the identical deterministic merged OID.",
+      "input_hash": "8141dde0722850d9d521ddbbde3f770d2f374a2915f3b76ce2f1776fbfc61fb7",
+      "model": "opus",
+      "spec_chars": 2707,
+      "spec_md": "## Description\n\nFrom audit finding F7: the production merge-suite gate runs INLINE on the\nsingle-flight reconcile drive. Evidence path: `runMergeSuiteGate` is wired as\nthe finalize probe at src/autopilot-worker.ts:7752 (`runMergeSuite: (a) =>\nrunMergeSuiteGate(a)`), reached via runReconcileCycle -> finalizeEpic. With\nMERGE_GATE_INSTALL_TIMEOUT_MS (~10min) + MERGE_GATE_SUITE_DEADLINE_MS (~15min)\nper package, a green finalize can block the reconcile loop ~25min (root) to\n~50min (root + plugins/plan), during which autopilot dispatches nothing,\nfinalizes no other epic, and runs no recover/escalation pass board-wide. Green\nis never pre-cached, so this cost is paid on EVERY successful worktree-mode close.\n\nREFUTED sub-concern (do not chase it): a mid-suite `fatalExit`+respawn cannot\nhappen. The serve-liveness watchdog (`decideServeLivenessWatchdog`,\nsrc/daemon.ts:3512) escalates only on (a) accept-stall of a real-read probe on\nthe serve SOCKETS (a separate serve-worker thread) and (b) main-loop\nevent-loop-delay p99 lag. A reconcile cycle blocked in `await runMergeSuiteGate`\ninside the autopilot WORKER thread stalls neither the serve sockets nor the\nmain event loop (it awaits async git subprocesses). So this task is scoped to\nliveness ISOLATION, not crash-safety.\n\nFix direction: run the gate off the reconcile drive in a dedicated worker,\nmirroring how the baseline runner (src/baseline-worker.ts) already isolates\nsuite runs off the main drive \u2014 the established in-repo pattern fn-1204 did not\nfollow. If isolation is rejected on design grounds, instead DOCUMENT the inline\nblock as an accepted opt-in tradeoff (worktree mode is default-OFF) in the\nrelevant ADR / code rationale so the next reader is not surprised.\n\nFiles: src/autopilot-worker.ts (finalize gate wiring ~7752, runMergeSuiteGate:5073),\nsrc/baseline-worker.ts (reference isolation pattern), src/daemon.ts (worker spawn site if a dedicated worker is added).\n\n## Acceptance\n\n- [ ] A green worktree-mode close no longer blocks board-wide dispatch/recover/escalation for the suite's duration, OR the inline block is documented as an accepted tradeoff with rationale\n- [ ] The suite still runs OUTSIDE the commit-work flock and derives the identical deterministic merged OID\n- [ ] `bun test` stays green\n\n## Done summary\nDocumented the inline worktree-mode merge-suite finalize gate as an accepted, bounded opt-in tradeoff (the sanctioned alternative to off-drive isolation): forward-facing rationale added at the runMergeSuite dep wiring and the runMergeSuiteGate doc-comment in src/autopilot-worker.ts. No behavior change \u2014 the suite still runs outside the commit-work flock on the identical deterministic merged OID.\n## Evidence\n",
+      "task_id": "fn-1213-harden-the-worktree-merge-suite.2",
+      "tier": "xhigh",
+      "title": "Isolate the gate off the reconcile drive"
+    }
+  ],
+  "created_at": "2026-07-09T19:00:06.711000Z",
+  "epic_id": "fn-1213-harden-the-worktree-merge-suite",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "8141dde0722850d9d521ddbbde3f770d2f374a2915f3b76ce2f1776fbfc61fb7",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
