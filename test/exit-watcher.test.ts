@@ -727,6 +727,32 @@ test("sentinel predicate: a stale-working row with NO plan linkage mints no tier
   expect(out).toEqual([]);
 });
 
+test("sentinel predicate: a carved-out (no plan linkage) tier-two-stale row STILL mints the standalone clock-skew row (ADR 0025)", () => {
+  // Tier-two-aged AND clock-skewed AND carved out (planRef null) — the
+  // stale-working ack-row is suppressed by the interactive carve-out, but the
+  // standalone clock-skew detect fires regardless of plan linkage per ADR 0025.
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        workerDone: false,
+        lastEventTs: STALE_T2,
+        lastLifecycleTs: FUTURE_SKEW,
+        planRef: null,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: clock-skew",
+    },
+  ]);
+});
+
 test("sentinel predicate: a stale-working ADOPTED row mints no tier-two ack-row even if plan_ref is somehow set", () => {
   const out = selectStuckSentinelVerdicts(
     [
