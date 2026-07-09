@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Spool baselines on new trunk tips",
-  "updated_at": "2026-07-08T23:59:51.062000Z"
+  "updated_at": "2026-07-09T01:28:11.039000Z",
+  "worker_done_at": "2026-07-09T01:28:11.039000Z"
 }

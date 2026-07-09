@@ -33,5 +33,5 @@ Pure producer tests: tip-change snapshots yield one spool request for the latest
 - [ ] keeper fast suite green
 
 ## Done summary
-
+Added a tip-triggered baseline producer to the autopilot reconciler: it spools one trunk baseline request per open-epic repo whose git_status default-branch tip moved, coalesced to the latest tip and idempotent across cycles/boots, joining the keeper baseline CLI as a sanctioned spool writer (re-scoped in CLAUDE.md, baseline-store.ts, cli/baseline.ts).
 ## Evidence
