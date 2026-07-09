@@ -19,6 +19,7 @@ import {
   leafUsageError,
   renderLeafHelp,
 } from "./subgroup.ts";
+import { runApplySelection } from "./verbs/apply_selection.ts";
 import { runAssignCells } from "./verbs/assign_cells.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
@@ -769,6 +770,21 @@ function dispatch(parsed: ParsedArgs): number {
     case "task":
       dispatchGroup(TASK_GROUP, rest, format);
       return 0;
+    case "apply-selection": {
+      // Self-emits (emitMutating live/degraded, emitReadonly follow-up, or a
+      // failure envelope) and owns its exit code — return it directly. --file and
+      // --degraded are value-taking, so the positional scan skips their values.
+      const epicId = readPositionalSkipping(
+        rest,
+        new Set(["--file", "--degraded"]),
+      );
+      return runApplySelection({
+        epicId,
+        fromFollowup: readFlag(rest, "--from-followup"),
+        degraded: readOption(rest, "--degraded"),
+        file: readOption(rest, "--file") ?? "-",
+      });
+    }
     case "assign-cells": {
       // Self-emits (emitMutating on success / emitFailureEnvelope or the integrity
       // gate's integrity_failed line on failure) and owns its exit code — return

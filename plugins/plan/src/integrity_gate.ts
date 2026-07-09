@@ -41,6 +41,7 @@ export const INTEGRITY_GATE_VERBS: readonly string[] = [
   "mv-repo",
   "refine-apply",
   "assign-cells",
+  "apply-selection",
 ];
 
 /** The compact integrity_failed envelope shape the gate prints. */

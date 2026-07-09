@@ -5,88 +5,51 @@
 // BATCH-ONLY by contract: it reads one YAML cell set that must cover EVERY todo
 // task of the epic exactly once (choosing the default is an explicit cell) plus a
 // `selection:` provenance block, asserts the whole batch (assert-all,
-// collect-all), mutates every task JSON under the epic flock, writes the
-// provenance sidecar, then re-validates the tree through the shared post-write
-// integrity gate (the marker is left untouched — a ghost stays a ghost until the
-// trailing `validate --epic` arm). There is no single-task form, ever — that is
-// what keeps assign-cells outside the removed incremental `task set-tier` verb
-// class.
+// collect-all), then routes the applied cells through the shared apply core
+// (selection_apply_core.ts) — the flock mutate + provenance sidecar + integrity
+// gate + auto-commit spine it shares with apply-selection. There is no
+// single-task form, ever.
 //
 // Failure codes, priority-ordered:
 //   - bad_yaml     — shape/type errors (top-level not a mapping, cells not a
 //                    non-empty list, a cell/selection field of the wrong type).
 //   - cell_invalid — out-of-axis tier/model, or an unknown / duplicate / missing
-//                    / non-todo task id (the full-set + todo-only contract).
-// No partial writes on any failure: shape + axis + membership + coverage all
-// assert BEFORE the flock mutate, and the flock RE-READS task status so a task
-// claimed between the outer read and the lock still rejects the batch.
+//                    / non-todo task id (the full-set + todo-only contract), or a
+//                    brief-vs-live axis divergence at apply time.
+// No partial writes on any failure: shape asserts BEFORE the core, and the core's
+// flock RE-READS task status so a task claimed between the outer read and the lock
+// still rejects the batch.
 //
 // The verb NEVER reads model-selector.yaml — axis validation comes from the
-// embedded subagents matrix only (configuredEfforts/configuredModels), keeping
-// the guidance config off the verb/embed path. The `selection:` block is captured
-// verbatim into the sidecar; the verb does not police its values beyond shape.
-//
-// It DOES read audit-policy.yaml (the plan-time sizing seam), degrade-SOFT: a cell
-// whose selected tier is policy-flagged gets `audit_required: true` stamped on its
-// task JSON, else false. An absent or malformed policy degrades to no task flagged
-// and is recorded in the sidecar's `audit_policy` provenance block — never an
-// error. KEEPER_PLAN_AUDIT_POLICY overrides the policy path (test seam + lever).
+// embedded subagents matrix only (configuredEfforts/configuredModels). The
+// `selection:` block is captured verbatim into the sidecar; the verb does not
+// police its values beyond shape. The tier-audit stamp + degrade-SOFT policy read
+// live in the shared core.
 
-import { existsSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
-import {
-  acquirePlanCommitGuard,
-  type RollbackEntry,
-  restoreForRollback,
-  snapshotForRollback,
-} from "../commit.ts";
-import { emitFailureEnvelope, emitMutating } from "../emit.ts";
-import { withEpicIdLock } from "../flock.ts";
+import { emitFailureEnvelope } from "../emit.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
-import { integrityGateOrFail } from "../integrity_gate.ts";
-import {
-  configuredEfforts,
-  configuredModels,
-  mergeTaskState,
-} from "../models.ts";
+import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
-import {
-  SELECTION_SCHEMA_VERSION,
-  type SelectionSidecar,
-  type SidecarAuditPolicy,
-  selectionSidecarPath,
-  writeSelectionSidecar,
-} from "../selection_sidecar.ts";
-import {
-  atomicWriteJson,
-  LocalFileStateStore,
-  loadJson,
-  loadJsonSafe,
-  nowIso,
-} from "../store.ts";
 import {
   parseYamlInput,
   readYamlBytes,
   YamlInputError,
 } from "../yaml_input.ts";
+import {
+  isPlainObject,
+  isStr,
+  landSelectionCells,
+  type SelectionCoreCell,
+  type SelectionCoreProvenance,
+  validateSelectionCells,
+} from "./selection_apply_core.ts";
 
 interface AssignCellsArgs {
   epicId: string;
   file: string;
-}
-
-/** A cell parsed + shape-validated from the input YAML. Axis / membership /
- * coverage checks run later (cell_invalid), so a value here may still be
- * out-of-axis or target a non-todo / unknown task. */
-interface ParsedCell {
-  taskId: string;
-  tier: string;
-  model: string;
-  rationale: string | null;
-  confidence: number | string | null;
-  labelSource: string;
 }
 
 export function runAssignCells(args: AssignCellsArgs): number {
@@ -104,7 +67,6 @@ export function runAssignCells(args: AssignCellsArgs): number {
 
   const ctx = resolveProject(null);
   const dataDir = ctx.dataDir;
-  const primaryRepo = ctx.projectPath;
 
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
   if (!existsSync(epicPath)) {
@@ -170,7 +132,7 @@ export function runAssignCells(args: AssignCellsArgs): number {
   }
 
   // --- per-cell shape (collect-all) ---------------------------------
-  const parsedCells: ParsedCell[] = [];
+  const parsedCells: SelectionCoreCell[] = [];
   for (let idx = 0; idx < cellsList.length; idx += 1) {
     const prefix = `cells #${idx + 1}`;
     const entry = cellsList[idx];
@@ -286,236 +248,49 @@ export function runAssignCells(args: AssignCellsArgs): number {
   }
 
   // ------------------------------------------------------------------
-  // Phase 3+4: assert membership/axis/coverage + mutate, under the epic flock.
-  // The flock guards the enumerate-status -> validate -> write region so the
-  // full-set + todo-only contract holds against a concurrently-claimed task. On
-  // any failure the closure returns a sentinel so emit/gate run OUTSIDE the
-  // lock; success carries out the applied task-id list for the emit payload.
+  // Phase 3+: assert membership/axis/coverage + mutate + commit, through the
+  // shared apply core. The final axis gate reads the LIVE configuredEfforts/Models
+  // (computed once here, before the flock); the core re-reads todo status in-lock.
   // ------------------------------------------------------------------
   const efforts = configuredEfforts();
   const models = configuredModels();
+  const provenance: SelectionCoreProvenance = {
+    harness: selHarness,
+    model: selModel,
+    configHash,
+    inputHash,
+    shuffleSeed,
+    outcome,
+    verdictRaw,
+  };
 
-  // Load the audit policy degrade-SOFT (outside the lock — a pure disk read). A
-  // flagged tier stamps audit_required on its task; absent/malformed degrades to
-  // no flag, captured in the sidecar's audit_policy provenance.
-  const auditLoad = loadAuditFlags();
-
-  // Merge-window guard + commit-work serialization (commit-work OUTER, epic-id
-  // flock INNER): refuse a mid-operation write before touching state, else hold
-  // the shared lock across the write -> auto-commit window, released via finally.
-  const commitGuard = acquirePlanCommitGuard(primaryRepo);
-  if (commitGuard.kind === "refused") {
-    emitFailureEnvelope("merge_in_progress", commitGuard.message, [
-      commitGuard.detail,
-    ]);
-    return 1;
-  }
-  try {
-    type FlockOutcome =
-      | { kind: "failure"; code: string; message: string; details: string[] }
-      | { kind: "success"; taskIds: string[]; rollback: RollbackEntry[] };
-
-    const outcomeResult = withEpicIdLock<FlockOutcome>(() => {
-      const stateStore = new LocalFileStateStore(ctx.stateDir);
-
-      // Enumerate the epic's tasks + their live status (re-read INSIDE the lock).
-      const epicTaskIds = new Set(epicTaskStems(dataDir, epicId));
-      const todo = new Set<string>();
-      for (const tid of epicTaskIds) {
-        const def = loadJsonSafe(join(dataDir, "tasks", `${tid}.json`)) ?? {};
-        const status = mergeTaskState(def, stateStore.loadRuntime(tid)).status;
-        if (status === "todo") {
-          todo.add(tid);
-        }
-      }
-
-      const cellErrors: string[] = [];
-      const seen = new Set<string>();
-      for (let idx = 0; idx < parsedCells.length; idx += 1) {
-        const c = parsedCells[idx] as ParsedCell;
-        const prefix = `cells #${idx + 1} (${c.taskId})`;
-        if (!efforts.includes(c.tier)) {
-          cellErrors.push(
-            `${prefix}: tier ${pyReprStr(c.tier)} is not one of ${efforts.join(", ")}`,
-          );
-        }
-        if (!models.includes(c.model)) {
-          cellErrors.push(
-            `${prefix}: model ${pyReprStr(c.model)} is not one of ${models.join(", ")}`,
-          );
-        }
-        if (!epicTaskIds.has(c.taskId)) {
-          cellErrors.push(
-            `${prefix}: unknown task id — not a task of epic ${epicId}`,
-          );
-        } else if (!todo.has(c.taskId)) {
-          cellErrors.push(
-            `${prefix}: task is not in \`todo\` status — assign-cells targets ` +
-              "todo tasks only",
-          );
-        }
-        if (seen.has(c.taskId)) {
-          cellErrors.push(`${prefix}: duplicate cell for task ${c.taskId}`);
-        }
-        seen.add(c.taskId);
-      }
-
-      // Full-set contract: every todo task must be covered by exactly one cell.
-      for (const tid of [...todo].sort()) {
-        if (!seen.has(tid)) {
-          cellErrors.push(
-            `coverage: todo task ${tid} is not covered by any cell ` +
-              "(full-set contract — choosing the default is an explicit cell)",
-          );
-        }
-      }
-
-      if (cellErrors.length > 0) {
-        return {
-          kind: "failure",
-          code: "cell_invalid",
-          message: "One or more selection cells are invalid",
-          details: cellErrors,
-        };
-      }
-
-      // Snapshot every path this verb writes BEFORE mutating — the per-cell task
-      // JSONs + the selection sidecar (both here) and the epic JSON (its
-      // updated_at bump lands in Phase 4.5, OUTSIDE the lock, but the commit
-      // covers it). All are existing files bar a first-time sidecar, so a
-      // commit-failure rollback restores each one's prior bytes (or unlinks a
-      // fresh sidecar) and unstages the set.
-      const rollbackPaths: string[] = [
-        epicPath,
-        selectionSidecarPath(dataDir, epicId),
-      ];
-      for (const c of parsedCells) {
-        rollbackPaths.push(join(dataDir, "tasks", `${c.taskId}.json`));
-      }
-      const rollback = snapshotForRollback(rollbackPaths);
-
-      // --- mutate: overwrite tier/model + stamp audit_required per cell ------
-      // audit_required is written explicitly (true or false) on every cell so a
-      // re-run after a policy change correctly flips a stale flag; a degrade loads
-      // no flags, so every cell resolves false.
-      const now = nowIso();
-      const flaggedTaskIds: string[] = [];
-      for (const c of parsedCells) {
-        const tp = join(dataDir, "tasks", `${c.taskId}.json`);
-        const tdef = loadJson(tp);
-        tdef.tier = c.tier;
-        tdef.model = c.model;
-        const flagged = auditLoad.ok && auditLoad.flags[c.tier] === true;
-        tdef.audit_required = flagged;
-        if (flagged) {
-          flaggedTaskIds.push(c.taskId);
-        }
-        tdef.updated_at = now;
-        atomicWriteJson(tp, tdef, dataDir);
-      }
-
-      const auditPolicy: SidecarAuditPolicy = auditLoad.ok
-        ? { status: "applied", reason: null, flagged_task_ids: flaggedTaskIds }
-        : {
-            status: "degraded",
-            reason: auditLoad.reason,
-            flagged_task_ids: [],
-          };
-
-      // --- sidecar: schema-versioned provenance, REPLACE (no append) --
-      const sidecar: SelectionSidecar = {
-        schema_version: SELECTION_SCHEMA_VERSION,
-        epic_id: epicId,
-        created_at: now,
-        selector: { harness: selHarness, model: selModel },
-        config_hash: configHash,
-        input_hash: inputHash,
-        shuffle_seed: shuffleSeed,
-        outcome,
-        verdict_raw: verdictRaw,
-        cells: parsedCells.map((c) => ({
-          task_id: c.taskId,
-          tier: c.tier,
-          model: c.model,
-          rationale: c.rationale,
-          confidence: c.confidence,
-          label_source: c.labelSource,
-        })),
-        audit_policy: auditPolicy,
-      };
-      writeSelectionSidecar(dataDir, sidecar);
-
-      return {
-        kind: "success",
-        taskIds: parsedCells.map((c) => c.taskId),
-        rollback,
-      };
-    });
-
-    if (outcomeResult.kind === "failure") {
-      emitFailureEnvelope(
-        outcomeResult.code,
-        outcomeResult.message,
-        outcomeResult.details,
-      );
-      return 1;
-    }
-
-    // ------------------------------------------------------------------
-    // Phase 4.5: post-write integrity gate (OUTSIDE the lock). assign-cells IS an
-    // INTEGRITY_GATE_VERBS member: re-validate the post-mutation tree and bump the
-    // epic's updated_at on a clean result — the marker stays untouched.
-    // checkFilesystemRepos stays false — the verb changes only tier/model, never
-    // repo paths, so re-probing repos on disk would add nothing but a spurious
-    // failure surface.
-    // ------------------------------------------------------------------
-    integrityGateOrFail(epicId, dataDir, { verb: "assign-cells" });
-    const epicDefAfter = loadJson(epicPath);
-    epicDefAfter.updated_at = nowIso();
-    atomicWriteJson(epicPath, epicDefAfter, dataDir);
-
-    // ------------------------------------------------------------------
-    // Phase 5: emit ONE envelope covering the whole batch (OUTSIDE the lock). The
-    // auto-commit stages the mutated task JSONs, the epic updated_at bump, AND the
-    // sidecar (a non-gitignored `selections/` path) in one commit before this prints.
-    // ------------------------------------------------------------------
-    emitMutating(
-      {
-        epic_id: epicId,
-        assigned_task_ids: outcomeResult.taskIds,
-        outcome,
-      },
-      {
+  return landSelectionCells({
+    verb: "assign-cells",
+    epicId,
+    ctx,
+    provenance,
+    resolveCells: ({ todo, epicTaskIds }) => {
+      const cellErrors = validateSelectionCells(parsedCells, {
+        epicId,
         verb: "assign-cells",
-        target: epicId,
-        repoRoot: ctx.projectPath,
-        primaryRepo,
-        onCommitFailure: () =>
-          restoreForRollback(outcomeResult.rollback, primaryRepo),
-      },
-    );
-    return 0;
-  } finally {
-    commitGuard.release();
-  }
+        todo,
+        epicTaskIds,
+        efforts,
+        models,
+      });
+      return cellErrors.length > 0
+        ? {
+            kind: "invalid",
+            code: "cell_invalid",
+            message: "One or more selection cells are invalid",
+            details: cellErrors,
+          }
+        : { kind: "ok", cells: parsedCells };
+    },
+  });
 }
 
 // --- Local helpers ---------------------------------------------------------
-
-/** YAML implicit-typing guard: an actual string, not a bool/number/Date the
- * parser coerced from a norway boolean / numeric / ISO-date scalar. */
-function isStr(v: unknown): v is string {
-  return typeof v === "string";
-}
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return (
-    typeof v === "object" &&
-    v !== null &&
-    !Array.isArray(v) &&
-    !(v instanceof Date)
-  );
-}
 
 /** Python type(doc).__name__ for the top-level shape error message. */
 function typeName(v: unknown): string {
@@ -538,77 +313,4 @@ function typeName(v: unknown): string {
     return "datetime.date";
   }
   return "dict";
-}
-
-/** Python `!r` for a string scalar — single-quoted, for the out-of-axis message. */
-function pyReprStr(v: string): string {
-  return `'${v}'`;
-}
-
-/** The audit-policy path: KEEPER_PLAN_AUDIT_POLICY override, else the committed
- * plugin-root audit-policy.yaml. Resolved off import.meta.url so it works from
- * the interpreted plan CLI at an arbitrary cwd (mirrors selection-brief). */
-function auditPolicyPath(): string {
-  const override = process.env.KEEPER_PLAN_AUDIT_POLICY;
-  if (override !== undefined && override !== "") {
-    return override;
-  }
-  const planRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-  return join(planRoot, "audit-policy.yaml");
-}
-
-/** Degrade-SOFT read of the tier→audit-flag map. An absent file, unparseable
- * YAML, or a missing / non-mapping `tier_audit` all degrade (no flags); a present
- * mapping yields its boolean entries (a non-boolean or unmapped tier reads
- * unflagged). Fail-loud validation is the drift gate's job (audit-policy-check),
- * never the runtime stamp. */
-type AuditFlagLoad =
-  | { ok: true; flags: Record<string, boolean> }
-  | { ok: false; reason: string };
-
-function loadAuditFlags(): AuditFlagLoad {
-  const path = auditPolicyPath();
-  if (!existsSync(path)) {
-    return { ok: false, reason: "absent" };
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseYamlInput(readYamlBytes(path), path);
-  } catch {
-    return { ok: false, reason: "malformed" };
-  }
-  if (!isPlainObject(parsed) || !isPlainObject(parsed.tier_audit)) {
-    return { ok: false, reason: "malformed" };
-  }
-  const flags: Record<string, boolean> = {};
-  for (const [tier, value] of Object.entries(parsed.tier_audit)) {
-    if (typeof value === "boolean") {
-      flags[tier] = value;
-    }
-  }
-  return { ok: true, flags };
-}
-
-/** Stems of direct-child `tasks/<epicId>.<m>.json` files (one directory glob),
- * excluding nested-dot ids. Mirrors refine-apply's globTaskStems. */
-function epicTaskStems(dataDir: string, epicId: string): string[] {
-  const tasksDir = join(dataDir, "tasks");
-  let entries: string[];
-  try {
-    entries = readdirSync(tasksDir);
-  } catch {
-    return [];
-  }
-  const prefix = `${epicId}.`;
-  const out: string[] = [];
-  for (const entry of entries) {
-    if (entry.startsWith(prefix) && entry.endsWith(".json")) {
-      const stem = entry.slice(0, -".json".length);
-      const middle = stem.slice(prefix.length);
-      if (middle.length > 0 && !middle.includes(".")) {
-        out.push(stem);
-      }
-    }
-  }
-  return out;
 }
