@@ -3574,6 +3574,159 @@ export function decideServeLivenessWatchdog(inputs: {
 }
 
 /**
+ * Per-socket probe arming for the serve-liveness watchdog. A socket's probing
+ * arms only once its OWN worker reports `{kind:"ready"}` (the listener is bound),
+ * so no probe fires before its socket exists and a bus-only boot arms its bus
+ * probing independently. Until armed — or on a socket this daemon does not serve —
+ * the probe is not fired AND its age reads perpetually fresh, so a late-binding
+ * socket can never trip {@link decideServeLivenessWatchdog} before it is ready
+ * (its own boot grace measures from arm time, never shortened by a sibling).
+ * Pure — arithmetic over the arm flags — so the wiring is unit-testable.
+ */
+export interface ProbeArmingInputs {
+  serverServed: boolean;
+  busServed: boolean;
+  serverArmed: boolean;
+  busArmed: boolean;
+  nowMs: number;
+  lastServerProbeOkAtMs: number;
+  lastBusProbeOkAtMs: number;
+}
+
+export interface ProbeArming {
+  fireServerProbe: boolean;
+  fireBusProbe: boolean;
+  /** Ages fed to {@link decideServeLivenessWatchdog}; fresh until armed. */
+  verdictServerProbeOkAtMs: number;
+  verdictBusProbeOkAtMs: number;
+}
+
+export function resolveProbeArming(i: ProbeArmingInputs): ProbeArming {
+  const serverLive = i.serverServed && i.serverArmed;
+  const busLive = i.busServed && i.busArmed;
+  return {
+    fireServerProbe: serverLive,
+    fireBusProbe: busLive,
+    verdictServerProbeOkAtMs: serverLive ? i.lastServerProbeOkAtMs : i.nowMs,
+    verdictBusProbeOkAtMs: busLive ? i.lastBusProbeOkAtMs : i.nowMs,
+  };
+}
+
+/**
+ * Well-formed server admission-control rejection codes a probe scores as
+ * proof-of-life. A cap rejection (`server-worker.ts` `too_many_connections` /
+ * `max_connections`) is emitted from the accept handler BEFORE the request line
+ * is read, so it structurally cannot echo the probe's correlation id — yet it
+ * proves the serve worker's accept→write path answered this connection, so it is
+ * life, never death. This is the exact link the incident's
+ * probe-orphan → per-pid-cap → id-less-reject → false-death chain turned into a
+ * self-inflicted restart. Keep in sync with the reject codes in `server-worker.ts`.
+ */
+export const PROBE_LIFE_ADMISSION_CODES: ReadonlySet<string> = new Set([
+  "too_many_connections",
+  "max_connections",
+]);
+
+/**
+ * Score one parsed probe reply frame as proof-of-life for the serve-liveness
+ * watchdog. A frame proves the serve loop is live when it ANSWERS this probe:
+ *   - it echoes the probe's `correlationId` — a `result`, or ANY well-formed
+ *     error frame (an rpc error, a boot-gate reject) that threads the id: all
+ *     prove the worker read the request to echo its id, the exact accept→read→
+ *     write path an accept-stall wedge kills; OR
+ *   - it is an accept-time admission rejection ({@link PROBE_LIFE_ADMISSION_CODES})
+ *     that precedes the request read and so cannot carry the id; OR
+ *   - the caller's `extraMatch` accepts it (the bus probe's `ack`-shape reply,
+ *     which carries no rpc id).
+ * Pure — no I/O — so the matcher is unit-testable without a real socket.
+ */
+export function probeReplyProvesLife(
+  frame: Record<string, unknown>,
+  correlationId: string | null,
+  extraMatch?: (frame: Record<string, unknown>) => boolean,
+): boolean {
+  if (correlationId != null && frame.id === correlationId) return true;
+  if (
+    frame.type === "error" &&
+    typeof frame.code === "string" &&
+    PROBE_LIFE_ADMISSION_CODES.has(frame.code)
+  ) {
+    return true;
+  }
+  if (extraMatch?.(frame)) return true;
+  return false;
+}
+
+/** Immutable state of the probe settle machine ({@link probeSettleStep}). */
+export interface ProbeSettleState {
+  /** True once the promise has resolved; every later event is idempotent. */
+  settled: boolean;
+  /**
+   * True once `open` delivered a socket the caller is holding. The leak class the
+   * machine closes: a `timeout` (or `close`/`error`) settles BEFORE `open`, so
+   * there is no socket to end at settle — then `open` hands the caller a live
+   * connection nobody would otherwise close.
+   */
+  haveSocket: boolean;
+}
+
+/** An event the probe connection lifecycle feeds to {@link probeSettleStep}. */
+export type ProbeSettleEvent =
+  | { kind: "open" }
+  | { kind: "match" }
+  | { kind: "timeout" }
+  | { kind: "close" }
+  | { kind: "error" };
+
+/**
+ * A side effect the caller runs after a {@link probeSettleStep} transition.
+ * `resolve` settles the probe promise; `close-socket` ends the connection the
+ * caller holds (the ONLY way a post-settle `open` frees its orphaned socket).
+ */
+export type ProbeSettleAction =
+  | { kind: "resolve"; ok: boolean }
+  | { kind: "close-socket" };
+
+export const PROBE_SETTLE_INITIAL: ProbeSettleState = {
+  settled: false,
+  haveSocket: false,
+};
+
+/**
+ * Pure transition for the real-read probe's connection lifecycle. Factored out of
+ * `probeSocketRead` so the fast tier covers every settle path — timeout-before-open,
+ * open-after-settled, a matched frame, a bare close/error — with zero real sockets.
+ *
+ * The invariant: a probe connection is closed on EVERY settle path. `close-socket`
+ * is emitted whenever the machine both is (or becomes) settled AND holds a socket,
+ * so a socket arriving after settling (`open` while `settled`) is always ended.
+ */
+export function probeSettleStep(
+  state: ProbeSettleState,
+  event: ProbeSettleEvent,
+): { state: ProbeSettleState; actions: ProbeSettleAction[] } {
+  if (state.settled) {
+    // Already resolved. The only consequential late event is a socket we now hold
+    // for the first time — close it so a timeout-before-open never leaks a conn.
+    if (event.kind === "open" && !state.haveSocket) {
+      return {
+        state: { ...state, haveSocket: true },
+        actions: [{ kind: "close-socket" }],
+      };
+    }
+    return { state, actions: [] };
+  }
+  if (event.kind === "open") {
+    return { state: { ...state, haveSocket: true }, actions: [] };
+  }
+  const ok = event.kind === "match";
+  const actions: ProbeSettleAction[] = [{ kind: "resolve", ok }];
+  // Close now iff we hold the socket; otherwise a later `open` closes it above.
+  if (state.haveSocket) actions.push({ kind: "close-socket" });
+  return { state: { ...state, settled: true }, actions };
+}
+
+/**
  * One real-read round-trip on a fresh UDS connection for the serve-liveness
  * watchdog: connect, write `request` (newline-delimited JSON — the wire format both
  * the keeperd and bus relays speak), and resolve `true` on the first parsed frame
@@ -3595,22 +3748,31 @@ async function probeSocketRead(
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let remainder = "";
-    let settled = false;
+    let state = PROBE_SETTLE_INITIAL;
     let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
 
-    const settle = (ok: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        sock?.end();
-      } catch {
-        // best-effort — we're done with this connection either way
+    // Drive the pure settle machine and run the side effects it directs: resolve
+    // the promise (clearing the timer) and close whatever connection we hold —
+    // INCLUDING one that arrives after we already settled (the timeout-before-open
+    // leak the machine closes on the late `open`).
+    const apply = (event: ProbeSettleEvent): void => {
+      const next = probeSettleStep(state, event);
+      state = next.state;
+      for (const action of next.actions) {
+        if (action.kind === "resolve") {
+          clearTimeout(timer);
+          resolve(action.ok);
+        } else {
+          try {
+            sock?.end();
+          } catch {
+            // best-effort — we're done with this connection either way
+          }
+        }
       }
-      resolve(ok);
     };
 
-    const timer = setTimeout(() => settle(false), timeoutMs);
+    const timer = setTimeout(() => apply({ kind: "timeout" }), timeoutMs);
     timer.unref?.();
 
     Bun.connect({
@@ -3618,10 +3780,14 @@ async function probeSocketRead(
       socket: {
         open(s) {
           sock = s;
+          apply({ kind: "open" });
+          // A timeout that fired before this open already settled us and `apply`
+          // just closed `s` — never write to a socket the machine has retired.
+          if (state.settled) return;
           try {
             s.write(`${JSON.stringify(request)}\n`);
           } catch {
-            settle(false);
+            apply({ kind: "error" });
           }
         },
         data(_s, chunk) {
@@ -3639,7 +3805,7 @@ async function probeSocketRead(
                 continue; // ignore a malformed line, keep reading
               }
               if (isMatch(frame)) {
-                settle(true);
+                apply({ kind: "match" });
                 return;
               }
             }
@@ -3647,13 +3813,13 @@ async function probeSocketRead(
           }
         },
         close() {
-          settle(false);
+          apply({ kind: "close" });
         },
         error() {
-          settle(false);
+          apply({ kind: "error" });
         },
       },
-    }).catch(() => settle(false));
+    }).catch(() => apply({ kind: "error" }));
   });
 }
 
@@ -5944,6 +6110,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // {@link decideServeLivenessWatchdog} reads these.
   let lastServerProbeOkAtMs = Date.now();
   let lastBusProbeOkAtMs = Date.now();
+  // Each served socket's probing arms only after its OWN worker posts
+  // `{kind:"ready"}` (listener bound). Until then the probe never fires and its
+  // age reads fresh, so a probe can never precede its socket and a bus-only boot
+  // arms its bus probing independently ({@link resolveProbeArming}). Arming
+  // re-stamps the socket's probe baseline so its stuck-age measures from ready.
+  let serverProbeArmed = false;
+  let busProbeArmed = false;
   let serveLagConsecutiveBreaches = 0;
   let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
@@ -6285,7 +6458,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
     // Server-worker → main bridge. Every inbound message carries a `kind`
     // discriminator so a stale reply for one verb can't wrong-resolve another.
-    // The `{kind:"ready"}` signal is one-way (worker→main) and matches no branch.
+    // The `{kind:"ready"}` signal arms the serve-liveness watchdog's server probe.
     sw.onmessage = (
       ev: MessageEvent<
         | ReplayRequestMessage
@@ -6302,6 +6475,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     ): void => {
       const msg = ev.data;
       if (!msg) return;
+      if (msg.kind === "ready") {
+        // The server listener is bound — arm its probe and baseline the stuck-age
+        // from NOW so a long boot drain never reads as instant staleness.
+        serverProbeArmed = true;
+        lastServerProbeOkAtMs = Date.now();
+        return;
+      }
       // fn-1096.3: a tolerated-NOTADB skip record — route to the sole
       // sidecar writer.
       if (msg.kind === "backstop") {
@@ -11483,11 +11663,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (busWorker) {
     const bw = busWorker;
-    // NO onmessage handler: the bus is a pure relay actuator — it reads keeper's
-    // jobs projection READ-ONLY and writes ONLY its own bus.db, never keeper.db,
-    // and posts NOTHING to main. Only the lifecycle onerror + close guards
-    // escalate to the single recovery path (a bus boot failure bounces the
+    // The bus is a pure relay actuator — it reads keeper's jobs projection
+    // READ-ONLY and writes ONLY its own bus.db, never keeper.db. It posts main
+    // exactly ONE message: `{kind:"ready"}` when its listener is bound, which arms
+    // the serve-liveness watchdog's bus probe (and baselines its stuck-age from
+    // ready, so a bus-only boot arms correctly). The lifecycle onerror + close
+    // guards escalate to the single recovery path (a bus boot failure bounces the
     // daemon; the documented fallback is the sibling --bus-only LaunchAgent).
+    bw.onmessage = (ev: MessageEvent<{ kind: "ready" } | undefined>): void => {
+      if (ev.data?.kind === "ready") {
+        busProbeArmed = true;
+        lastBusProbeOkAtMs = Date.now();
+      }
+    };
     bw.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] bus worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
@@ -11777,14 +11965,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Gated on actually serving a socket + out of the in-process tier.
   if ((serverWorker || busWorker) && !opts.disableNativeWatcher) {
     const busSockPath = resolveBusSockPath();
-    // Re-stamp the probe baselines at ARM time (the sockets are bound now), so the
-    // stuck-age measures from a fresh anchor, not the early declaration — a long
-    // boot drain must not read as instant staleness. Mirrors the git seed
-    // watchdog's arm-time baseline. Combined with the boot grace below, the first
-    // post-grace tick still measures well under the stuck window even if the
-    // opening probe missed.
-    lastServerProbeOkAtMs = Date.now();
-    lastBusProbeOkAtMs = Date.now();
+    // The probe baselines are re-stamped per socket when its worker posts
+    // `{kind:"ready"}` (the arm handlers above), NOT at watchdog setup — a socket
+    // still binding is un-armed, reads fresh, and cannot trip. The boot grace is
+    // the belt for the window between arm and the first settled probe.
     const bootGraceUntilMs = Date.now() + SERVE_WATCHDOG_BOOT_GRACE_MS;
     serveLagHistogram = monitorEventLoopDelay({ resolution: 20 });
     serveLagHistogram.enable();
@@ -11799,41 +11983,55 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           ? serveLagConsecutiveBreaches + 1
           : 0;
 
-      // Fire a real read on each served socket; stamp on success. A wedged read
+      const verdictNowMs = Date.now();
+      // A socket fires + counts toward the verdict only once its worker is armed;
+      // un-armed / un-served sockets read fresh so they never false-trip.
+      const arming = resolveProbeArming({
+        serverServed: serverWorker != null,
+        busServed: busWorker != null,
+        serverArmed: serverProbeArmed,
+        busArmed: busProbeArmed,
+        nowMs: verdictNowMs,
+        lastServerProbeOkAtMs,
+        lastBusProbeOkAtMs,
+      });
+
+      // Fire a real read on each armed socket; stamp on success. A wedged read
       // never resolves `true` inside its timeout, so the age grows across ticks.
       // The probes are asynchronous — this tick's verdict reads the PRIOR tick's
       // result (the timeout << interval, so the latest probe has always settled).
-      if (serverWorker) {
+      if (arming.fireServerProbe) {
         const id = crypto.randomUUID();
         void probeSocketRead(
           sockPath,
           { type: "query", id, collection: "autopilot_state", limit: 0 },
-          (f) => f.id === id,
+          (f) => probeReplyProvesLife(f, id),
           SERVE_PROBE_TIMEOUT_MS,
         ).then((ok) => {
           if (ok) lastServerProbeOkAtMs = Date.now();
         });
       }
-      if (busWorker) {
+      if (arming.fireBusProbe) {
         void probeSocketRead(
           busSockPath,
           { op: "list" },
-          (f) => f.type === "ack" && f.op === "list",
+          (f) =>
+            probeReplyProvesLife(
+              f,
+              null,
+              (fr) => fr.type === "ack" && fr.op === "list",
+            ),
           SERVE_PROBE_TIMEOUT_MS,
         ).then((ok) => {
           if (ok) lastBusProbeOkAtMs = Date.now();
         });
       }
 
-      const verdictNowMs = Date.now();
       const verdict = decideServeLivenessWatchdog({
         nowMs: verdictNowMs,
         bootGraceUntilMs,
-        // A socket we do not serve never trips: keep its age perpetually fresh.
-        lastServerProbeOkAtMs: serverWorker
-          ? lastServerProbeOkAtMs
-          : verdictNowMs,
-        lastBusProbeOkAtMs: busWorker ? lastBusProbeOkAtMs : verdictNowMs,
+        lastServerProbeOkAtMs: arming.verdictServerProbeOkAtMs,
+        lastBusProbeOkAtMs: arming.verdictBusProbeOkAtMs,
         probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
         consecutiveLagBreaches: serveLagConsecutiveBreaches,
         maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -11841,10 +12039,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (verdict.kind === "escalate") {
         // Name the wedge mode + carry both probe ages and the lag-breach count so
         // the crash-loop's cause is legible in server.stderr, not a bare "wedged".
-        const serverAgeMs = serverWorker
+        const serverAgeMs = arming.fireServerProbe
           ? verdictNowMs - lastServerProbeOkAtMs
           : null;
-        const busAgeMs = busWorker ? verdictNowMs - lastBusProbeOkAtMs : null;
+        const busAgeMs = arming.fireBusProbe
+          ? verdictNowMs - lastBusProbeOkAtMs
+          : null;
         console.error(
           `[keeperd] serve-liveness watchdog: ${verdict.trigger} — server-probe-age=${
             serverAgeMs ?? "n/a"

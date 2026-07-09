@@ -590,18 +590,48 @@ function probeRealRead(sockPath: string, timeoutMs: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let remainder = "";
     let settled = false;
+    let haveSocket = false;
     let sock: { end: () => void; write: (s: string) => number } | null = null;
 
-    const settle = (ok: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+    const closeSock = (): void => {
       try {
         sock?.end();
       } catch {
         // best-effort
       }
+    };
+
+    // Close whatever connection we hold on EVERY settle path — including one that
+    // arrives after we already settled (a timeout that fired before `open`), the
+    // orphan-conn leak this detector must not itself reproduce. Faithful copy of
+    // src/daemon.ts probeSocketRead / probeSettleStep.
+    const settle = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (haveSocket) closeSock();
       resolve(ok);
+    };
+
+    // A reply proves life when it ANSWERS this probe: a `result` / any frame
+    // echoing our id, or an accept-time admission rejection (which precedes the
+    // request read and so cannot carry the id) — faithful copy of src/daemon.ts
+    // probeReplyProvesLife, so a probe's own cap-reject is never a false death.
+    const provesLife = (frame: {
+      type?: string;
+      id?: string;
+      code?: string;
+    }): boolean => {
+      if (frame.id === "probe") return true;
+      if (frame.type === "result") return true;
+      if (
+        frame.type === "error" &&
+        (frame.code === "too_many_connections" ||
+          frame.code === "max_connections")
+      ) {
+        return true;
+      }
+      return false;
     };
 
     const timer = setTimeout(() => settle(false), timeoutMs);
@@ -612,6 +642,13 @@ function probeRealRead(sockPath: string, timeoutMs: number): Promise<boolean> {
       socket: {
         open(s) {
           sock = s as unknown as typeof sock;
+          haveSocket = true;
+          // A timeout that already settled us just left this socket unclosed —
+          // end it now so a timeout-before-open never leaks a connection.
+          if (settled) {
+            closeSock();
+            return;
+          }
           try {
             s.write(
               `${JSON.stringify({ type: "query", collection: "jobs", id: "probe" })}\n`,
@@ -628,8 +665,12 @@ function probeRealRead(sockPath: string, timeoutMs: number): Promise<boolean> {
             remainder = remainder.slice(nl + 1);
             if (line.length > 0) {
               try {
-                const frame = JSON.parse(line) as { type?: string };
-                if (frame.type === "result") {
+                const frame = JSON.parse(line) as {
+                  type?: string;
+                  id?: string;
+                  code?: string;
+                };
+                if (provesLife(frame)) {
                   settle(true);
                   return;
                 }

@@ -1750,6 +1750,13 @@ function main(): void {
     process.exit(1);
   }
 
+  // The listener is bound and serving — tell main so it ARMS the serve-liveness
+  // watchdog's bus probe (baselining its stuck-age from ready, so a bus-only boot
+  // arms correctly and no probe fires before the socket is bound). This is the
+  // ONLY message the bus worker posts to main; it mirrors the server worker's
+  // ready emit. `parentPort` is non-null here (guarded + `process.exit` above).
+  parentPort.postMessage({ kind: "ready" });
+
   let stopping = false;
   const shutdown = (): void => {
     if (stopping) return;

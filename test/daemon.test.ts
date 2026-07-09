@@ -94,10 +94,16 @@ import {
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
+  PROBE_LIFE_ADMISSION_CODES,
+  PROBE_SETTLE_INITIAL,
+  type ProbeSettleEvent,
+  type ProbeSettleState,
   parseBlockedCategory,
   parseRestartLedger,
   prewarmWatcherAddon,
   probeAuditOrchestrator,
+  probeReplyProvesLife,
+  probeSettleStep,
   pruneRecoveredDeadLetters,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
@@ -117,6 +123,7 @@ import {
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolveProbeArming,
   routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
@@ -173,7 +180,12 @@ import type { ResolverOutcome } from "../src/reconcile-core";
 import { classifyResolverOutcome } from "../src/reconcile-core";
 import { drain, extractSessionTelemetry } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
-import { isPidAlive } from "../src/server-worker";
+import {
+  type CensusConnView,
+  censusConns,
+  isDaemonSelfConn,
+  isPidAlive,
+} from "../src/server-worker";
 import type { Event, Job } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { sandboxEnv } from "./helpers/sandbox-env";
@@ -1161,6 +1173,265 @@ test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer th
       consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1,
     }),
   ).toEqual({ kind: "ok" });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1222 — serve-liveness probe hardening: the probe cannot kill the daemon it
+// protects. Pure seams only — the fast tier covers the settle machine, the
+// proof-of-life matcher, the self-exempt census, and per-worker arming with zero
+// real sockets.
+// ---------------------------------------------------------------------------
+
+// -- probeSettleStep: a probe connection is closed on EVERY settle path ---------
+
+test("probeSettleStep: timeout BEFORE open settles false, then the late open closes the orphaned socket", () => {
+  // The exact leak the incident rode: the timeout fires before the connection
+  // opens, so settle has no socket to end — then open hands us a live socket
+  // nobody would otherwise close, orphaning a connection every tick.
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+
+  const t = probeSettleStep(state, { kind: "timeout" });
+  state = t.state;
+  // Settled false; no socket held yet, so no close is directed at settle time.
+  expect(t.actions).toEqual([{ kind: "resolve", ok: false }]);
+  expect(state.settled).toBe(true);
+
+  const o = probeSettleStep(state, { kind: "open" });
+  state = o.state;
+  // The socket that arrived AFTER settling MUST be closed — zero lingering conns.
+  expect(o.actions).toEqual([{ kind: "close-socket" }]);
+  expect(state.haveSocket).toBe(true);
+});
+
+test("probeSettleStep: open then a matched frame settles true and closes the held socket", () => {
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  state = probeSettleStep(state, { kind: "open" }).state;
+  const m = probeSettleStep(state, { kind: "match" });
+  expect(m.actions).toEqual([
+    { kind: "resolve", ok: true },
+    { kind: "close-socket" },
+  ]);
+  expect(m.state.settled).toBe(true);
+});
+
+test("probeSettleStep: open then timeout settles false and closes the held socket", () => {
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  state = probeSettleStep(state, { kind: "open" }).state;
+  expect(probeSettleStep(state, { kind: "timeout" }).actions).toEqual([
+    { kind: "resolve", ok: false },
+    { kind: "close-socket" },
+  ]);
+});
+
+test("probeSettleStep: a close before open settles false, then the late open still closes the socket", () => {
+  const state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  const c = probeSettleStep(state, { kind: "close" });
+  expect(c.actions).toEqual([{ kind: "resolve", ok: false }]);
+  const o = probeSettleStep(c.state, { kind: "open" });
+  expect(o.actions).toEqual([{ kind: "close-socket" }]);
+});
+
+test("probeSettleStep: post-settle events other than the first open are inert (idempotent, no double-close)", () => {
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  state = probeSettleStep(state, { kind: "open" }).state; // haveSocket
+  state = probeSettleStep(state, { kind: "match" }).state; // settled, already closed
+  for (const ev of [
+    { kind: "match" },
+    { kind: "close" },
+    { kind: "error" },
+    { kind: "timeout" },
+    { kind: "open" }, // socket already held — no second close
+  ] as ProbeSettleEvent[]) {
+    expect(probeSettleStep(state, ev).actions).toEqual([]);
+  }
+});
+
+// -- probeReplyProvesLife: proof-of-life scoring --------------------------------
+
+test("probeReplyProvesLife: a result frame echoing the correlation id proves life", () => {
+  expect(
+    probeReplyProvesLife(
+      { type: "result", id: "abc-123", rows: [] },
+      "abc-123",
+    ),
+  ).toBe(true);
+});
+
+test("probeReplyProvesLife: an error frame echoing the correlation id proves life", () => {
+  // The worker read the request to echo the id and answered — the accept→read→
+  // write path an accept-stall wedge kills is alive even when the answer errors.
+  expect(
+    probeReplyProvesLife(
+      { type: "error", id: "abc-123", code: "rpc_failed" },
+      "abc-123",
+    ),
+  ).toBe(true);
+});
+
+test("probeReplyProvesLife: a cap rejection proves life even though it cannot carry the id", () => {
+  // Emitted at accept time, before the request line is read — so it cannot echo
+  // the correlation id, yet it proves the accept path answered this connection.
+  // This is the id-less-reject the incident wrongly scored as a death.
+  expect(
+    probeReplyProvesLife(
+      { type: "error", code: "too_many_connections" },
+      "abc-123",
+    ),
+  ).toBe(true);
+  expect(
+    probeReplyProvesLife({ type: "error", code: "max_connections" }, "abc-123"),
+  ).toBe(true);
+});
+
+test("probeReplyProvesLife: a frame for a DIFFERENT correlation id is not life", () => {
+  expect(probeReplyProvesLife({ type: "result", id: "other" }, "abc-123")).toBe(
+    false,
+  );
+});
+
+test("probeReplyProvesLife: an unrelated id-less error is not life", () => {
+  // A bad_frame error that neither echoes the id nor is an admission rejection is
+  // NOT life — an id-carrying answer (proving the read path) is the bar.
+  expect(
+    probeReplyProvesLife({ type: "error", code: "bad_frame" }, "abc-123"),
+  ).toBe(false);
+});
+
+test("probeReplyProvesLife: the bus ack (no rpc id) proves life via extraMatch only", () => {
+  const busMatch = (f: Record<string, unknown>): boolean =>
+    f.type === "ack" && f.op === "list";
+  expect(
+    probeReplyProvesLife({ type: "ack", op: "list" }, null, busMatch),
+  ).toBe(true);
+  expect(
+    probeReplyProvesLife({ type: "ack", op: "other" }, null, busMatch),
+  ).toBe(false);
+});
+
+test("PROBE_LIFE_ADMISSION_CODES holds exactly the two cap-rejection codes", () => {
+  // Independent source of truth: the codes server-worker.ts emits at cap-reject.
+  expect([...PROBE_LIFE_ADMISSION_CODES].sort()).toEqual([
+    "max_connections",
+    "too_many_connections",
+  ]);
+});
+
+// -- isDaemonSelfConn + censusConns: self-exemption + distinct census bucket ----
+
+test("isDaemonSelfConn: an exact pid match only; null / another pid is external", () => {
+  expect(isDaemonSelfConn(4242, 4242)).toBe(true);
+  expect(isDaemonSelfConn(4243, 4242)).toBe(false);
+  expect(isDaemonSelfConn(null, 4242)).toBe(false);
+});
+
+function makeCensusConn(o: {
+  peerPid: number | null;
+  subs?: number;
+  pending?: boolean;
+  everEngaged?: boolean;
+  connectedAt?: number;
+}): CensusConnView {
+  const subs = new Map<string | null, unknown>();
+  for (let i = 0; i < (o.subs ?? 0); i++) subs.set(String(i), {});
+  return {
+    data: {
+      peerPid: o.peerPid,
+      pending: o.pending ? { bytes: new Uint8Array(0), offset: 0 } : null,
+      subs: subs as unknown as CensusConnView["data"]["subs"],
+      everEngaged: o.everEngaged ?? false,
+      connectedAt: o.connectedAt ?? 0,
+    },
+  };
+}
+
+test("censusConns: the daemon's own conns land in a distinct self bucket, apart from external classification", () => {
+  const SELF = 4242;
+  const NOW = 1_000_000;
+  const TTL = 30_000;
+  const conns: CensusConnView[] = [
+    // Three self-probes (peer pid == daemon pid) — the self bucket, never
+    // double-counted into pending / zero_sub / sub_* even when subscribed or
+    // backpressured.
+    makeCensusConn({ peerPid: SELF }),
+    makeCensusConn({ peerPid: SELF, subs: 2 }),
+    makeCensusConn({ peerPid: SELF, pending: true }),
+    // External clients across the reaper-mirroring buckets (5000 alive, 6000 dead).
+    makeCensusConn({ peerPid: 5000, subs: 1 }), // sub_live
+    makeCensusConn({ peerPid: 6000, subs: 1 }), // sub_dead
+    makeCensusConn({ peerPid: null, subs: 1 }), // sub_unknown
+    makeCensusConn({ peerPid: 5000, connectedAt: NOW, everEngaged: true }), // zero_sub, fresh
+    makeCensusConn({ peerPid: 6000 }), // zero_sub + dead
+    makeCensusConn({ peerPid: 5000, connectedAt: 0, everEngaged: false }), // zero_sub + unengaged
+    makeCensusConn({ peerPid: 5000, subs: 1, pending: true }), // sub_live + pending
+  ];
+  const c = censusConns(conns, {
+    selfPid: SELF,
+    nowMs: NOW,
+    unengagedTtlMs: TTL,
+    isPidAlive: (pid) => pid === 5000,
+  });
+  // Hand-computed from the fixtures above (independent of the implementation).
+  expect(c).toEqual({
+    total: 10,
+    self: 3,
+    pending: 1, // only the external sub_live+pending conn; the self one is exempt
+    zeroSub: 3,
+    zeroSubDead: 1,
+    zeroSubUnengaged: 1,
+    subLive: 2,
+    subDead: 1,
+    subUnknown: 1,
+  });
+});
+
+// -- resolveProbeArming: each socket arms only after its own worker is ready ----
+
+test("resolveProbeArming: an un-armed served socket does not fire and reads fresh (cannot false-trip)", () => {
+  const r = resolveProbeArming({
+    serverServed: true,
+    busServed: true,
+    serverArmed: false, // the server worker has not reported ready yet
+    busArmed: true,
+    nowMs: 2_000,
+    lastServerProbeOkAtMs: 0, // stale, but un-armed → ignored
+    lastBusProbeOkAtMs: 1_500,
+  });
+  expect(r.fireServerProbe).toBe(false);
+  expect(r.verdictServerProbeOkAtMs).toBe(2_000); // fresh = nowMs, never trips
+  expect(r.fireBusProbe).toBe(true);
+  expect(r.verdictBusProbeOkAtMs).toBe(1_500); // armed → real probe anchor
+});
+
+test("resolveProbeArming: an armed served socket fires and uses its real probe anchor", () => {
+  const r = resolveProbeArming({
+    serverServed: true,
+    busServed: false, // bus not served this boot
+    serverArmed: true,
+    busArmed: false,
+    nowMs: 2_000,
+    lastServerProbeOkAtMs: 1_200,
+    lastBusProbeOkAtMs: 0,
+  });
+  expect(r.fireServerProbe).toBe(true);
+  expect(r.verdictServerProbeOkAtMs).toBe(1_200);
+  expect(r.fireBusProbe).toBe(false);
+  expect(r.verdictBusProbeOkAtMs).toBe(2_000); // unserved → fresh
+});
+
+test("resolveProbeArming: a bus-only boot arms its bus probe and leaves the unserved server fresh", () => {
+  const r = resolveProbeArming({
+    serverServed: false,
+    busServed: true,
+    serverArmed: false,
+    busArmed: true,
+    nowMs: 5_000,
+    lastServerProbeOkAtMs: 0,
+    lastBusProbeOkAtMs: 4_900,
+  });
+  expect(r.fireServerProbe).toBe(false);
+  expect(r.verdictServerProbeOkAtMs).toBe(5_000);
+  expect(r.fireBusProbe).toBe(true);
+  expect(r.verdictBusProbeOkAtMs).toBe(4_900);
 });
 
 // ---------------------------------------------------------------------------

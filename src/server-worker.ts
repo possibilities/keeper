@@ -2508,54 +2508,132 @@ export function pidConnCount(conns: Iterable<Writable>, pid: number): number {
 }
 
 /**
- * Log a one-line conn-state census on a cap-hit, classifying every live conn so
- * the reason the sweep did or did not recover a slot is attributable from one
- * log line (the diagnostic the 2026-06-12 stall lacked). Buckets mirror the
- * reaper arms: `pending` (backpressured — stuck-pending candidate), `zero_sub`
- * (idle-sweep candidate), `sub_live` (subscribed, peer alive — the protected
- * board), `sub_dead` (subscribed, peer gone — dead-peer candidate), and
- * `sub_unknown` (subscribed, peerPid null — never liveness-reaped). Pure read.
+ * Whether a connection is the daemon's OWN — its peer pid equals this process's
+ * pid. Main's serve-liveness probe connects to a worker thread in the SAME
+ * process, so its peer pid IS the daemon pid; those conns are exempt from the
+ * per-pid cap (a self-probe must never be cap-rejected into a false death) and
+ * censused in a distinct `self` bucket. Precise by design — an exact pid match
+ * only, never a broad exemption that would re-open the cap the reapers rely on.
  */
-function logCapCensus(conns: Set<Writable>): void {
-  const now = Date.now();
-  let pending = 0;
-  let zeroSub = 0;
-  let zeroSubDead = 0;
-  let zeroSubUnengaged = 0;
-  let subLive = 0;
-  let subDead = 0;
-  let subUnknown = 0;
+export function isDaemonSelfConn(
+  peerPid: number | null,
+  selfPid: number,
+): boolean {
+  return peerPid != null && peerPid === selfPid;
+}
+
+/**
+ * A connection's census view — the `socket.data` fields the cap census reads,
+ * narrowed so the pure seam takes plain objects in tests (no real socket).
+ */
+export type CensusConnView = {
+  data: Pick<
+    ConnState,
+    "peerPid" | "pending" | "subs" | "everEngaged" | "connectedAt"
+  >;
+};
+
+/** Cap-census bucket counts ({@link censusConns}). */
+export interface ConnCensus {
+  total: number;
+  /**
+   * The daemon's OWN connections (peer pid == daemon pid) — self-probes, exempt
+   * from the per-pid cap and never peer-liveness-reaped. Broken out so a cap
+   * census settles whether the capped peers are our probes or external clients.
+   */
+  self: number;
+  pending: number;
+  zeroSub: number;
+  zeroSubDead: number;
+  zeroSubUnengaged: number;
+  subLive: number;
+  subDead: number;
+  subUnknown: number;
+}
+
+/**
+ * Classify a connection set into the cap-census buckets. Pure — `isPidAlive` and
+ * the clock are injected — so the fast tier covers the bucketing (including the
+ * `self` bucket) without a real socket. {@link logCapCensus} formats the result.
+ * Buckets mirror the reaper arms: `pending` (backpressured — stuck-pending
+ * candidate), `zero_sub` (idle-sweep candidate), `sub_live` (subscribed, peer
+ * alive — the protected board), `sub_dead` (subscribed, peer gone — dead-peer
+ * candidate), `sub_unknown` (subscribed, peerPid null — never liveness-reaped),
+ * with `self` pulled out ahead of all of them.
+ */
+export function censusConns(
+  conns: Iterable<CensusConnView>,
+  opts: {
+    selfPid: number;
+    nowMs: number;
+    unengagedTtlMs: number;
+    isPidAlive: (pid: number) => boolean;
+  },
+): ConnCensus {
+  const c: ConnCensus = {
+    total: 0,
+    self: 0,
+    pending: 0,
+    zeroSub: 0,
+    zeroSubDead: 0,
+    zeroSubUnengaged: 0,
+    subLive: 0,
+    subDead: 0,
+    subUnknown: 0,
+  };
   for (const sock of conns) {
-    if (sock.data.pending !== null) {
-      pending++;
-    }
+    c.total++;
     const pid = sock.data.peerPid;
-    const dead = pid != null && !isPidAlive(pid);
+    // The daemon's own conns are exempt from the per-pid cap and never reaped on
+    // peer-liveness — count them apart from external clients and skip the rest.
+    if (isDaemonSelfConn(pid, opts.selfPid)) {
+      c.self++;
+      continue;
+    }
+    if (sock.data.pending !== null) {
+      c.pending++;
+    }
+    const dead = pid != null && !opts.isPidAlive(pid);
     if (sock.data.subs.size === 0) {
-      zeroSub++;
+      c.zeroSub++;
       if (dead) {
-        zeroSubDead++;
+        c.zeroSubDead++;
       } else if (
         !sock.data.everEngaged &&
-        now - sock.data.connectedAt >= UNENGAGED_CONN_TTL_MS
+        opts.nowMs - sock.data.connectedAt >= opts.unengagedTtlMs
       ) {
-        zeroSubUnengaged++;
+        c.zeroSubUnengaged++;
       }
       continue;
     }
     if (pid == null) {
-      subUnknown++;
+      c.subUnknown++;
     } else if (dead) {
-      subDead++;
+      c.subDead++;
     } else {
-      subLive++;
+      c.subLive++;
     }
   }
+  return c;
+}
+
+/**
+ * Log a one-line conn-state census on a cap-hit, classifying every live conn so
+ * the reason the sweep did or did not recover a slot is attributable from one log
+ * line (the diagnostic the 2026-06-12 stall lacked).
+ */
+function logCapCensus(conns: Set<Writable>): void {
+  const c = censusConns(conns, {
+    selfPid: process.pid,
+    nowMs: Date.now(),
+    unengagedTtlMs: UNENGAGED_CONN_TTL_MS,
+    isPidAlive,
+  });
   console.error(
     `[server-worker] conn-cap census (${conns.size}/${MAX_CONNECTIONS}): ` +
-      `pending=${pending} zero_sub=${zeroSub} (dead=${zeroSubDead} ` +
-      `unengaged=${zeroSubUnengaged}) sub_live=${subLive} sub_dead=${subDead} ` +
-      `sub_unknown=${subUnknown}`,
+      `self=${c.self} pending=${c.pending} zero_sub=${c.zeroSub} ` +
+      `(dead=${c.zeroSubDead} unengaged=${c.zeroSubUnengaged}) ` +
+      `sub_live=${c.subLive} sub_dead=${c.subDead} sub_unknown=${c.subUnknown}`,
   );
 }
 
@@ -3045,9 +3123,16 @@ export function startServer(
           // client (a runaway `keeper board`) can never monopolize the table and
           // wedge every other client out of the global cap. Sweep first (the
           // loop's own dead / unengaged conns free here), then reject if it holds.
+          // The daemon's OWN conns (the serve-liveness probe from main, same pid)
+          // are EXEMPT — a self-probe cap-rejected into a false death is exactly
+          // the incident this hardening closes. The reject frame is emitted here
+          // at accept time, BEFORE the request line is read, so it cannot echo the
+          // probe's correlation id; the probe's matcher scores the admission code
+          // itself as proof-of-life (see daemon.ts `probeReplyProvesLife`).
           const pid = socket.data.peerPid;
           if (
             pid != null &&
+            !isDaemonSelfConn(pid, process.pid) &&
             pidConnCount(conns, pid) >= PER_PID_MAX_CONNECTIONS
           ) {
             reapConns([...conns], conns);
