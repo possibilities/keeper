@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded multi-surface bug fix with the root cause and files already named (unconditional continue in exit-watcher.ts, ADR 0025, one test), a clear reconcile-the-three-surfaces acceptance and no contract or fold change, so sonnet at the default high band fits.",
+      "task_id": "fn-1211-fix-swallowed-clock-skew-in-sentinel.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T01:02:28.230000Z",
+  "epic_id": "fn-1211-fix-swallowed-clock-skew-in-sentinel",
+  "input_hash": "ff4721fcd123bac62c69414753d5469b087e8c88fec1e3910ee469c7f7eba483",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4282851836,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded multi-surface bug fix with the root cause and files already named (unconditional continue in exit-watcher.ts, ADR 0025, one test), a clear reconcile-the-three-surfaces acceptance and no contract or fold change, so sonnet at the default high band fits.\",\"confidence\":0.82}]}"
+}
