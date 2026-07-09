@@ -1,0 +1,19 @@
+{
+  "auditable_tasks": [],
+  "created_at": "2026-07-09T23:14:17.502000Z",
+  "epic_id": "fn-1224-board-first-frame-stall-hunt",
+  "excluded_tasks": [
+    {
+      "reason": "degraded-default",
+      "task_id": "fn-1224-board-first-frame-stall-hunt.1"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "selection_input_hash": "6cd9980a86d9daf0762db7d0ebd05201ceeb1c49b1d33f5e32fc025fd2db4a5b",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
