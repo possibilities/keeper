@@ -22,5 +22,5 @@ Files:
 - [ ] bun scripts/lint-claude-md.ts stays green.
 
 ## Done summary
-
+Replaced 'host provider roster' with the cluster's canonical 'host matrix config' in the Capability model glossary entry (CONTEXT.md:36), matching Provider/Pecking order/Wrapper driver. No other wording, definition, or Avoid-line text touched.
 ## Evidence
