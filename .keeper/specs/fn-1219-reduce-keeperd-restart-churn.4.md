@@ -37,5 +37,5 @@ keeper's plan tooling checkpoints board state under `.keeper/` — the majority 
 - [ ] The predicate lives in a pure module covered by pytest and the repo's full test suite stays green
 
 ## Done summary
-
+Added is_keeper_state_only_change predicate in deploypath.py and threaded an optional per-project filter_fn through normalize_jobs so the keeper build scheduler's ChangeFilter suppresses .keeper/-only commits (fail-open on empty/mixed change.files); covered by new pytest cases and checkconfig/ruff/ty all green.
 ## Evidence

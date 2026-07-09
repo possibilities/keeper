@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/agentbuilds",
   "tier": "medium",
   "title": "Buildbot skips keeper-state-only commits",
-  "updated_at": "2026-07-09T20:26:56.729000Z"
+  "updated_at": "2026-07-09T20:32:29.661000Z",
+  "worker_done_at": "2026-07-09T20:32:29.661000Z"
 }
