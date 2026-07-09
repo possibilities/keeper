@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "E2E proof of a security control (soft-reset, forged-trailer sanitization) needing subprocess-sim fidelity to the real path.",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Forward-facing docs, committed example matrix, pure fast-tier anti-rot parse test; mechanical with clear acceptance.",
+      "task_id": "fn-1215-activate-pi-gpt-55-wrapped-worker.4",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "created_at": "2026-07-09T19:00:26.697000Z",
+  "epic_id": "fn-1215-activate-pi-gpt-55-wrapped-worker",
+  "input_hash": "1fa96bc1bfc8578fab44be4010de5358a3732c67dff7dc416f8e1b81b0320037",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 531196865,
+  "verdict_raw": "verdict for tasks 1-2 arrived after their yolo dispatch on default cells; applied set covers the remaining todo tasks"
+}
