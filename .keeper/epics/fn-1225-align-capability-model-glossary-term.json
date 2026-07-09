@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-09T23:08:53.796000Z",
+  "created_by_close_of": "fn-1220-capability-model-glossary-entry",
+  "depends_on_epics": [
+    "fn-1220-capability-model-glossary-entry"
+  ],
+  "id": "fn-1225-align-capability-model-glossary-term",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Align capability-model glossary term",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-09T23:08:53.796000Z"
+}
