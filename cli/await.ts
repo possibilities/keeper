@@ -58,7 +58,7 @@ import {
   advanceCompleteStability,
   agentsIdleState,
   type BoardSignatureInput,
-  COMPLETE_CONFIRMATIONS,
+  COMPLETE_DWELL_MS,
   type CompleteStability,
   changedSignature,
   classifyTargetId,
@@ -873,12 +873,14 @@ interface PlanSlotState {
   /** Verdict-change throttle for stderr progress. */
   lastVerdictPhrase: string | null;
   /**
-   * `complete`-condition stability confirmation across subscribe snapshots.
-   * The done-AND-idle `completed` verdict can flap back to `running` when a done
-   * task's owning worker re-activates during close-out reconciliation, so `met`
-   * is withheld until the completion holds across `COMPLETE_CONFIRMATIONS`
-   * consecutive snapshots (watermark non-regressing). Inert for
-   * `unblocked`/`started` slots (never advanced off a non-`complete` target).
+   * `complete`-condition dwell confirmation across subscribe snapshots and the
+   * bounded re-evaluation timer. The done-AND-idle `completed` verdict can flap
+   * back to `running` when a done task's owning worker re-activates during
+   * close-out reconciliation, so `met` is withheld until the completion holds
+   * `completed` at a stable row version for `COMPLETE_DWELL_MS` — a quiet board
+   * confirms via the timer with no second frame, a flap's version bump restarts
+   * the dwell. Inert for `unblocked`/`started` slots (never advanced off a
+   * non-`complete` target).
    */
   completeStability: CompleteStability;
 }
@@ -1256,12 +1258,28 @@ export async function runAwait(
   let gitHandle: ReadinessClientHandle | null = null;
   let jobsHandle: ReadinessClientHandle | null = null;
   let deadlineHandle: unknown = null;
+  // fn-1210: the `complete`-dwell re-evaluation timer. The subscribe stream is
+  // change-driven and freezes on a DB-quiet board, so a completion that reads as
+  // the final board activity delivers no second frame — this timer re-runs
+  // `evaluate` after the dwell so the elapsed-time confirmation fires anyway.
+  // Armed on demand (`ensureDwellTimer`) whenever a `complete` slot is holding an
+  // unconfirmed completion; self-reschedules until it confirms or the world moves.
+  let dwellHandle: unknown = null;
   let unregisterSignals: (() => void) | null = null;
+
+  // Wall-clock accessor for the `complete`-dwell confirmation. Injected under
+  // test (`deps.now`) so the fake-timer harness drives the dwell deterministically;
+  // production falls back to `Date.now`.
+  const nowMs = (): number => deps.now?.() ?? Date.now();
 
   const cleanupSubscriptions = (): void => {
     if (deadlineHandle !== null) {
       deps.clearTimer(deadlineHandle);
       deadlineHandle = null;
+    }
+    if (dwellHandle !== null) {
+      deps.clearTimer(dwellHandle);
+      dwellHandle = null;
     }
     for (const h of [readinessHandle, gitHandle, jobsHandle]) {
       if (h !== null) {
@@ -1681,28 +1699,31 @@ export async function runAwait(
       slot.everSeen = true;
     }
 
-    // Stability confirmation for `complete`: the done-AND-idle `completed`
-    // verdict can flap back to `running` when a done task's owning worker
-    // re-activates during close-out reconciliation. `met` fires on the FIRST
-    // completed snapshot, so withhold it until the completion HOLDS across
-    // `COMPLETE_CONFIRMATIONS` consecutive snapshots (target-row watermark
-    // non-regressing); an intervening non-completed tick resets the count. Only
-    // the PRESENT branch reaches `met` here (the re-query `met` is Pass 2 and is
-    // already terminal), so a completed-but-unconfirmed observation downgrades to
-    // `waiting`; every other verdict resets the streak and passes through. Inert
-    // for `unblocked`/`started`.
+    // Dwell confirmation for `complete`: the done-AND-idle `completed` verdict
+    // can flap back to `running` when a done task's owning worker re-activates
+    // during close-out reconciliation. `met` fires on the FIRST completed
+    // observation, so withhold it until the completion HOLDS `completed` at a
+    // stable target-row version for `COMPLETE_DWELL_MS`. Counting FRAMES would
+    // hang on a quiet board (the change-driven stream delivers no second frame),
+    // so the elapsed-dwell basis lets the bounded re-evaluation timer confirm a
+    // quiet completion with no further frame while a version-bumping flap (even a
+    // coalesced one) restarts the dwell. Only the PRESENT branch reaches `met`
+    // here (the re-query `met` is Pass 2 and already terminal), so a
+    // completed-but-unconfirmed observation downgrades to `waiting`; every other
+    // verdict resets the dwell and passes through. Inert for `unblocked`/`started`.
     let result = evalState;
     if (slot.target.condition === "complete") {
       const { next, confirmed } = advanceCompleteStability(
         slot.completeStability,
         evalState.kind === "met",
         completeWatermark(inputs.epics, slot.target),
+        nowMs(),
       );
       slot.completeStability = next;
       if (evalState.kind === "met" && !confirmed) {
         result = {
           kind: "waiting",
-          detail: `completion holding (${next.streak}/${COMPLETE_CONFIRMATIONS})`,
+          detail: "completion holding (dwell not yet elapsed)",
         };
       }
     }
@@ -1878,6 +1899,34 @@ export async function runAwait(
    * every opened subscription has first-painted we neither arm nor eval,
    * so a slow stream can't let the AND glitch-fire early.
    */
+  // Is any `complete` slot holding an unconfirmed completion (completed at least
+  // once, dwell not yet elapsed, not latched `met`)? Such a slot needs the
+  // bounded re-evaluation timer because the change-driven stream may deliver no
+  // further frame to re-check the dwell.
+  const anyCompleteHolding = (): boolean =>
+    slots.some(
+      (s) =>
+        s.kind === "plan" &&
+        s.target.condition === "complete" &&
+        !s.met &&
+        s.completeStability.since !== null,
+    );
+
+  // Arm the `complete`-dwell re-evaluation timer if it isn't already pending. The
+  // timer re-runs `evaluate` after the dwell; on a quiet board the re-run sees the
+  // elapsed dwell and confirms with no second frame. Self-rescheduling: if the
+  // dwell still hasn't elapsed at fire time (a version bump reset it), `evaluate`
+  // re-arms it. Idempotent while pending so back-to-back frames don't stack timers.
+  const ensureDwellTimer = (): void => {
+    if (dwellHandle !== null || state.terminating) {
+      return;
+    }
+    dwellHandle = deps.setTimer(() => {
+      dwellHandle = null;
+      void evaluate();
+    }, COMPLETE_DWELL_MS);
+  };
+
   const evaluate = async (): Promise<void> => {
     if (state.terminating) {
       return;
@@ -2147,6 +2196,15 @@ export async function runAwait(
     // Aggregate met: every slot latched met.
     if (slots.every((s) => s.met)) {
       emitAggregateMet();
+    }
+
+    // A `complete` slot holding an unconfirmed completion needs the bounded
+    // re-evaluation timer: the change-driven stream freezes on a DB-quiet board,
+    // so without a self-scheduled re-check the dwell would never elapse and a
+    // quiet completion would hang. `emitAggregateMet` sets `terminating` when it
+    // fires, so this is a no-op once the aggregate is met.
+    if (!state.terminating && anyCompleteHolding()) {
+      ensureDwellTimer();
     }
   };
 

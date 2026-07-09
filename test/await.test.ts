@@ -28,6 +28,7 @@ import {
   type RunDeps,
   runAwait,
 } from "../cli/await";
+import { COMPLETE_DWELL_MS } from "../src/await-conditions";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
 import type {
   ConnectFactory,
@@ -941,6 +942,9 @@ test("parseAwaitArgs: duplicate monitor-running selector → usage error", () =>
 test("task complete: armed line + met terminal (exit 0)", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
+  // Inject a controllable clock so the dwell confirmation is deterministic.
+  let clock = 1000;
+  h.deps.now = () => clock;
   // Track the idPrefix the runner picks (`await-<pid>`) so we can address
   // the right subscription ids on the wire.
   const idPrefix = `await-${process.pid}`;
@@ -965,10 +969,10 @@ test("task complete: armed line + met terminal (exit 0)", async () => {
   expect(h.stdout[0]).toContain("condition=complete");
   expect(h.exitCode).toBeNull();
 
-  // Second snapshot: task is done + idle → the `completed` verdict. The
-  // stability gate withholds `met` for one confirmation (holding 1/2), guarding
-  // against a done stamp the close-out reconcile unwinds back to running — so no
-  // terminal yet.
+  // Second snapshot: task is done + idle → the `completed` verdict. The dwell
+  // gate withholds `met` — the completion must HOLD `completed` at a stable
+  // version for the dwell, guarding against a close-out reconcile that unwinds
+  // back to running — so no terminal yet, and the re-evaluation timer is armed.
   const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
   sock.deliver([
     resultFrame(
@@ -981,18 +985,114 @@ test("task complete: armed line + met terminal (exit 0)", async () => {
   expect(h.stdout).toHaveLength(1);
   expect(h.exitCode).toBeNull();
 
-  // Third snapshot: the completion HOLDS a second consecutive snapshot → met.
+  // The board goes quiet — NO further frame is delivered. The dwell elapses and
+  // the bounded re-evaluation timer fires: the completion confirms with no
+  // second frame.
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("[keeper-await] met");
+  expect(h.stdout[1]).toContain("target=fn-1-foo.1");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1210: the quiet-board completion. A target that reads `completed` as the
+// FINAL board activity delivers ONE frame — the change-driven subscribe stream
+// (`diffTick`) freezes on a DB-quiet board, so NO second frame ever arrives.
+// The dwell confirmation fires `met` off the bounded re-evaluation timer, never
+// a second frame delivery. This is the direct/scripted caller that armed on an
+// already-complete target and then settled quiet — the F1 hang regression.
+// ---------------------------------------------------------------------------
+
+test("fn-1210 quiet board: complete fires met with NO second frame after the first completed", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  let clock = 1000;
+  h.deps.now = () => clock;
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First (and ONLY) paint: the task is already done + idle → the `completed`
+  // verdict is the final board activity. Armed, but the dwell gate holds `met`.
+  const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskDone] }));
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+  expect(h.exitCode).toBeNull();
+
+  // NO further frame is delivered — the board is DB-quiet, `diffTick` frozen.
+  // Only the dwell timer can advance the confirmation. It fires after the dwell
+  // and, with the completion still holding at a stable version, confirms → met.
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1210: the done-unwind flap whose intervening `running` is coalesced away by
+// `diffTick`. The flap surfaces as a single higher-version `completed` patch; the
+// version bump is the flap's fingerprint, so it restarts the dwell — the flap is
+// NOT confirmed even though the dwell would have elapsed against the original
+// anchor. Only once the board settles quiet at a stable version does it confirm.
+// ---------------------------------------------------------------------------
+
+test("fn-1210 coalesced flap: a version-bumping completed patch restarts the dwell, no premature met", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  let clock = 1000;
+  h.deps.now = () => clock;
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: done + idle at epic version 10 → armed, dwell anchored at v10.
+  const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ last_event_id: 10, tasks: [taskDone] }),
+  );
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+
+  // The dwell would elapse now — but a coalesced flap lands: still `completed`,
+  // at a bumped version 11 (the intervening `running` events advanced the epic
+  // row's last_event_id, coalesced by diffTick into one higher-version patch).
+  // The version move restarts the dwell, so NO met fires despite the elapsed time.
+  clock += COMPLETE_DWELL_MS;
   sock.deliver([
     resultFrame(
       "epics",
       `${idPrefix}-epics`,
-      [makeEpicRow({ tasks: [taskDone] })],
-      3,
+      [makeEpicRow({ last_event_id: 11, tasks: [taskDone] })],
+      2,
     ),
   ]);
+  expect(h.stdout).toHaveLength(1);
+  expect(h.exitCode).toBeNull();
+
+  // The board finally settles quiet at v11. After the FULL dwell from the flap,
+  // the re-evaluation timer confirms → met.
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
   expect(h.stdout).toHaveLength(2);
   expect(h.stdout[1]).toContain("[keeper-await] met");
-  expect(h.stdout[1]).toContain("target=fn-1-foo.1");
   expect(h.exitCode).toBe(0);
 });
 
@@ -1460,6 +1560,8 @@ test("--json: emits JSON-shaped lines", async () => {
 test("--no-armed-line: skips armed, still emits terminal", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
+  let clock = 1000;
+  h.deps.now = () => clock;
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
@@ -1475,14 +1577,16 @@ test("--no-armed-line: skips armed, still emits terminal", async () => {
   const doneEpic = makeEpicRow({
     tasks: [makeTaskRow({ worker_phase: "done", approval: "approved" })],
   });
-  // First completed snapshot holds for one confirmation (1/2); --no-armed-line
-  // suppresses the armed line, so stdout is still empty and there is no terminal.
+  // First completed snapshot starts the dwell; --no-armed-line suppresses the
+  // armed line, so stdout is still empty and there is no terminal yet.
   deliverFiveWithEpic(sock, idPrefix, doneEpic);
   expect(h.stdout).toHaveLength(0);
   expect(h.exitCode).toBeNull();
 
-  // Second consecutive completed snapshot confirms → only the terminal met line.
-  sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [doneEpic], 2)]);
+  // Quiet board: the dwell elapses and the re-evaluation timer confirms → only
+  // the terminal met line.
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
   expect(h.stdout).toHaveLength(1);
   expect(h.stdout[0]).toContain("[keeper-await] met");
   expect(h.exitCode).toBe(0);
@@ -1496,6 +1600,9 @@ test("--require-transition: skip already-true first paint, fire on next snapshot
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
+
+  let clock = 1000;
+  h.deps.now = () => clock;
 
   await runAndCatch(
     singleArgs("complete", "fn-1-foo.1", "task", { requireTransition: true }),
@@ -1515,10 +1622,11 @@ test("--require-transition: skip already-true first paint, fire on next snapshot
   expect(h.exitCode).toBeNull();
   expect(h.stdout).toHaveLength(1);
 
-  // Re-deliver an identical snapshot: still met (predicate sees done +
-  // approved). Now we DO terminate — the "edge" is the next snapshot
-  // after arm, not a verdict-shape change. The flag just means "don't
-  // exit on the same tick we armed."
+  // Re-deliver an identical snapshot after the dwell has elapsed: the "edge" is
+  // the next snapshot after arm (not a verdict-shape change), and the completion
+  // has held `completed` at a stable version for the dwell → met. The flag just
+  // means "don't exit on the same tick we armed."
+  clock += COMPLETE_DWELL_MS;
   sock.deliver([
     resultFrame(
       "epics",
@@ -1605,6 +1713,8 @@ test("epic complete: present-then-drop + re-query hit → met (exit 0)", async (
 test("fn-1015 epic complete: done epic in recent-done window + idle close-row → met (no drop)", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
+  let clock = 1000;
+  h.deps.now = () => clock;
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
@@ -1646,21 +1756,16 @@ test("fn-1015 epic complete: done epic in recent-done window + idle close-row �
     resultFrame("lane_merged", `${idPrefix}-lane-merged`, []),
   ]);
 
-  // Present + completed via the recent-done window → armed, but the stability
-  // gate holds `met` for one confirmation (holding 1/2) — no terminal yet.
+  // Present + completed via the recent-done window → armed, but the dwell gate
+  // holds `met` — no terminal yet, and the re-evaluation timer is armed.
   expect(h.stdout.join("")).toContain("[keeper-await] armed");
   expect(h.stdout.join("")).not.toContain("[keeper-await] met");
   expect(h.exitCode).toBeNull();
 
-  // Second consecutive completed snapshot confirms → met.
-  sock.deliver([
-    resultFrame(
-      "epics_recent_done",
-      `${idPrefix}-epics-recent-done`,
-      [doneEpic],
-      2,
-    ),
-  ]);
+  // Quiet board (no further frame): the dwell elapses and the re-evaluation
+  // timer confirms → met.
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
   expect(h.stdout.join("")).toContain("[keeper-await] met");
   expect(h.exitCode).toBe(0);
 });
@@ -2096,11 +2201,12 @@ test("default path: no --connect-timeout reconnects forever; bounce past 30s yie
   reSock.takeOutbound();
   const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
   const doneEpic = makeEpicRow({ tasks: [taskDone] });
-  // Re-paint completed post-reconnect: the first snapshot holds (1/2), the
-  // second consecutive one confirms → met.
+  // Re-paint completed post-reconnect: the first snapshot starts the dwell and
+  // holds, then the quiet-board re-evaluation timer confirms after the dwell → met.
   deliverFiveWithEpic(reSock, idPrefix, doneEpic);
   expect(h.stdout.join("")).not.toContain("[keeper-await] met");
-  reSock.deliver([resultFrame("epics", `${idPrefix}-epics`, [doneEpic], 2)]);
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
 
   const lines = h.stdout.join("");
   expect(lines).toContain("[keeper-await] met");
@@ -2584,6 +2690,8 @@ test("AND git-clean + agents-idle: met only after both paint and hold", async ()
 test("AND complete + git-clean: rides readiness snapshot (one connection, no extra git sub)", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
+  let clock = 1000;
+  h.deps.now = () => clock;
   const idPrefix = `await-${process.pid}`;
 
   await runAndCatch(
@@ -2634,7 +2742,8 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
   expect(h.exitCode).toBeNull();
 
-  // Task done+approved AND repo clean → aggregate met.
+  // Task done+approved AND repo clean → the git-clean slot is met, but the
+  // complete slot starts its dwell and holds, so the aggregate is not yet met.
   deliverFiveWith(sock, idPrefix, {
     epics: [
       makeEpicRow({
@@ -2644,6 +2753,15 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     git: [gitRow({ project_dir: "/repo", dirty_count: 0 })],
     rev: 2,
   });
+  expect(h.exitCode).toBeNull();
+  expect(h.stdout.filter((l) => l.includes("[keeper-await] met"))).toHaveLength(
+    0,
+  );
+
+  // Quiet board: the complete slot's dwell elapses and the re-evaluation timer
+  // fires → every slot met → aggregate met.
+  clock += COMPLETE_DWELL_MS;
+  h.fireDeadline();
   expect(h.exitCode).toBe(0);
   expect(h.stdout.filter((l) => l.includes("[keeper-await] met"))).toHaveLength(
     1,
