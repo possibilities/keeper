@@ -41,6 +41,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Audit depth**: The lean, standard, or deep band a close audit runs at, derived from plan signals through the audit policy. Avoid: review level, thoroughness, rigor.
 - **Audited task**: A task whose selected tier is policy-flagged for review, parking AUDIT_READY instead of stamping done until its audit clears. Avoid: keystone task, gated task, flagged task.
 - **Audit gate**: The block-machinery hold between a worker finishing and its done-stamp, where the task-scoped audit decides resume or escalation. Avoid: review gate, done gate, checkpoint.
+- **Blocking follow-up**: A follow-up epic the close audit requires to complete before its source epic may stamp done; the source stays open, holding every epic that depends on it. Avoid: gating epic, close blocker.
 
 ## Autopilot and dispatch
 
