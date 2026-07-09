@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Replaced 'host provider roster' with the cluster's canonical 'host matrix config' in the Capability model glossary entry (CONTEXT.md:36), matching Provider/Pecking order/Wrapper driver. No other wording, definition, or Avoid-line text touched.",
+      "input_hash": "955f91c51663eb515d438424882003ed656d42d6297fb677c5cbd722f8ebdc50",
+      "model": "sonnet",
+      "spec_chars": 1284,
+      "spec_md": "## Description\n\nFinding F1 (auditor, CONTEXT.md:36). The Capability model glossary entry\nreads \"...a bare capability token the host provider roster resolves at run\ntime...\". The sibling cluster entries all use the canonical term \"host\nmatrix config\": Provider (\"A harness's entry in the host matrix config\"),\nPecking order (\"The provider list order in the host matrix config\"), and\nWrapper driver (\"set in the host matrix config\"). Replace the coined\n\"host provider roster\" with the cluster's canonical wording so the entry\nis consistent, without introducing any further synonym or disturbing the\ndefinition or its Avoid line.\n\nFiles:\n- CONTEXT.md (the Capability model glossary entry)\n\n## Acceptance\n\n- [ ] The Capability model entry no longer uses \"host provider roster\";\n      it names the artifact with the cluster's canonical term.\n- [ ] The entry keeps a precise definition, its native-vs-wrapped rule,\n      and its Avoid line; no other entry is touched.\n- [ ] bun scripts/lint-claude-md.ts stays green.\n\n## Done summary\nReplaced 'host provider roster' with the cluster's canonical 'host matrix config' in the Capability model glossary entry (CONTEXT.md:36), matching Provider/Pecking order/Wrapper driver. No other wording, definition, or Avoid-line text touched.\n## Evidence\n",
+      "task_id": "fn-1225-align-capability-model-glossary-term.1",
+      "tier": "low",
+      "title": "Fix capability-model glossary term"
+    }
+  ],
+  "created_at": "2026-07-09T23:51:42.616000Z",
+  "epic_id": "fn-1225-align-capability-model-glossary-term",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "159a2fe017f219c401ec62c50fc37ba0cdb2fcd942bf093603fcc446cc7f6f7e",
+  "selection_input_hash": "955f91c51663eb515d438424882003ed656d42d6297fb677c5cbd722f8ebdc50",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
