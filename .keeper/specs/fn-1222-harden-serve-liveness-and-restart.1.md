@@ -49,5 +49,5 @@ faithful probe copy gets the same fix so its detector stays honest. No real sock
 - [ ] Fast suite passes with the new seams covered; no test opens a real socket
 
 ## Done summary
-
+Made the serve-liveness probe incapable of killing its daemon: a pure settle state machine closes the probe conn on every path (fixing the timeout-before-open leak), the matcher scores id-carrying frames and accept-time cap rejections as proof-of-life, the daemon's own conns are per-pid-cap-exempt and censused in a distinct self bucket, and each socket's probing arms on its worker's ready message (bus worker gains the ready emit). Pure seams covered by the fast tier; no test opens a real socket.
 ## Evidence
