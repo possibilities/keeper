@@ -169,11 +169,16 @@ import {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
+import { MAX_LINE_LENGTH } from "../src/protocol";
 import type { ResolverOutcome } from "../src/reconcile-core";
 import { classifyResolverOutcome } from "../src/reconcile-core";
-import { drain, extractSessionTelemetry } from "../src/reducer";
+import {
+  drain,
+  extractSessionTelemetry,
+  GIT_STATUS_DIRTY_FILES_WIRE_CAP,
+} from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
-import { isPidAlive } from "../src/server-worker";
+import { isPidAlive, runQuery } from "../src/server-worker";
 import type { Event, Job } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { sandboxEnv } from "./helpers/sandbox-env";
@@ -239,6 +244,81 @@ test("boot drain folds a pre-seeded events table to completion", () => {
     .query("SELECT state FROM jobs WHERE job_id = 'sess-b'")
     .get() as { state: string };
   expect(jobB.state).toBe("ended");
+
+  db.close();
+});
+
+test("git first-frame: a worktree with thousands of dirty files serves a git snapshot frame under the NDJSON line cap, dirty_count stays exact", () => {
+  const { db } = freshMemDb();
+
+  // A single plan-backed worktree with a pathological dirty-file count — the
+  // observed board-stall trigger. Rendered whole, one worktree's `dirty_files[]`
+  // array serializes past 1 MiB on its own; the board's subscribe first-frame
+  // ships the `git` result as ONE NDJSON line, so an over-`MAX_LINE_LENGTH` frame
+  // is REJECTED by the viewer's parser — it reconnect-loops and no first frame
+  // ever lands (a snapshot timeout even past the default window).
+  const N = 6000;
+  const projectDir = "/repo/worktree";
+  const dirtyFiles = Array.from({ length: N }, (_, i) => ({
+    // Long, realistically-nested paths so the UNCAPPED array clears 1 MiB.
+    path: `src/${"deeply/nested/".repeat(8)}module_${i}/component.ts`,
+    xy: " M",
+    mtime_ms: null,
+  }));
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+       VALUES (?, ?, ?, 'GitSnapshot', 'git_snapshot', ?, ?)`,
+    [
+      5000,
+      projectDir,
+      null,
+      projectDir,
+      JSON.stringify({
+        project_dir: projectDir,
+        branch: "main",
+        head_oid: "abc123",
+        upstream: "origin/main",
+        ahead: 0,
+        behind: 0,
+        dirty_files: dirtyFiles,
+      }),
+    ],
+  );
+
+  drainToCompletion(db);
+
+  const row = db
+    .query(
+      "SELECT dirty_count, dirty_files FROM git_status WHERE project_dir = ?",
+    )
+    .get(projectDir) as { dirty_count: number; dirty_files: string };
+
+  // The scalar the board actually renders stays EXACT — the full dirty count.
+  expect(row.dirty_count).toBe(N);
+  // The materialized mirror is bounded, so no single row can blow the frame.
+  const storedFiles = JSON.parse(row.dirty_files) as unknown[];
+  expect(storedFiles.length).toBe(GIT_STATUS_DIRTY_FILES_WIRE_CAP);
+
+  // The served first-frame — one NDJSON line — stays under the cap the viewer
+  // enforces, so it is actually deliverable. Without the fold cap the row would
+  // carry all N entries and this line would blow past MAX_LINE_LENGTH.
+  const worldRev = (
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
+      last_event_id: number;
+    }
+  ).last_event_id;
+  const frame = runQuery(db, worldRev, {
+    type: "query",
+    collection: "git",
+    limit: 0,
+  });
+  expect(frame.type).toBe("result");
+  expect(JSON.stringify(frame).length).toBeLessThan(MAX_LINE_LENGTH);
+
+  // Guard the guard: the cap is load-bearing — N unbounded entries at this
+  // per-entry size WOULD exceed the line cap (a lower bound on the uncapped frame).
+  const perEntryBytes = JSON.stringify(storedFiles[0]).length;
+  expect(perEntryBytes * N).toBeGreaterThan(MAX_LINE_LENGTH);
 
   db.close();
 });
