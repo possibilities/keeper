@@ -28,15 +28,19 @@
 import { expect, test } from "bun:test";
 import {
   type AwaitState,
+  advanceCompleteStability,
   agentsIdleState,
+  COMPLETE_CONFIRMATIONS,
   changedSignature,
   classifyTargetId,
+  completeWatermark,
   drainedState,
   epicAddedMet,
   epicRemovedMet,
   evaluateAwaitCondition,
   findEpicByIdOrBare,
   gitCleanState,
+  initCompleteStability,
   isJamReason,
   landedState,
   monitorRunningState,
@@ -349,6 +353,171 @@ test("fn-1015 task-complete: done BUT embedded job still working → waiting (no
     { id: task.task_id, kind: "task", condition: "complete" },
   );
   expect(state.kind).toBe("waiting");
+});
+
+// ---------------------------------------------------------------------------
+// Complete-condition stability confirmation (done-unwind debounce).
+//
+// The done-AND-idle `completed` verdict can still flap back to `running` when a
+// done task's owning worker re-activates during close-out reconciliation: the
+// terminal-completed gate latches only the proven-dead ghost-liveness path,
+// never the owning job's own working clause. `keeper await complete` fires on
+// the FIRST completed snapshot, so the command-side stability gate withholds
+// `met` until the completion HOLDS across COMPLETE_CONFIRMATIONS consecutive
+// snapshots (target-row watermark non-regressing).
+// ---------------------------------------------------------------------------
+
+test("complete-stability window: computeReadiness flaps completed→running→completed when a done task's owning job re-activates, and the await surface fires met on the transient", () => {
+  // The observed unwind shape, replayed against the real verdict pipeline: a
+  // done task whose owning job goes idle (completed), re-activates to working
+  // (running), then re-idles (completed). Each snapshot is a fresh
+  // computeReadiness — the producer, not a hand-stamped verdict.
+  const doneIdle = makeEpic({
+    last_event_id: 10,
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        jobs: [makeEmbeddedJob({ job_id: "w1", state: "stopped" })],
+      }),
+    ],
+  });
+  const reactivated = makeEpic({
+    last_event_id: 11,
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        worker_phase: "done",
+        jobs: [makeEmbeddedJob({ job_id: "w1", state: "working" })],
+      }),
+    ],
+  });
+  const s1 = run([doneIdle]);
+  const s2 = run([reactivated]);
+  const s3 = run([doneIdle]);
+  expect(s1.perTask.get("fn-1-foo.1")).toEqual({ tag: "completed" });
+  expect(s2.perTask.get("fn-1-foo.1")?.tag).toBe("running");
+  expect(s3.perTask.get("fn-1-foo.1")).toEqual({ tag: "completed" });
+
+  // The pure single-snapshot await evaluator fires `met` on the TRANSIENT s1 —
+  // the window the command-side stability gate debounces.
+  expect(
+    evaluateAwaitCondition(
+      { epics: [doneIdle], snapshot: s1, priorPresence: true },
+      { id: "fn-1-foo.1", kind: "task", condition: "complete" },
+    ).kind,
+  ).toBe("met");
+});
+
+test("complete-stability: a transient completed→running→completed sequence never confirms", () => {
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, 10); // s1 completed
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.streak).toBe(1);
+
+  step = advanceCompleteStability(st, false, 11); // s2 running → reset
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.streak).toBe(0);
+
+  step = advanceCompleteStability(st, true, 12); // s3 completed → back to one
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.streak).toBe(1);
+});
+
+test("complete-stability: a stable completed sequence confirms after COMPLETE_CONFIRMATIONS snapshots", () => {
+  let st = initCompleteStability();
+  const seen: boolean[] = [];
+  for (let i = 0; i < COMPLETE_CONFIRMATIONS; i++) {
+    const step = advanceCompleteStability(st, true, 10);
+    st = step.next;
+    seen.push(step.confirmed);
+  }
+  // Only the final (Nth) observation confirms; every earlier one holds.
+  expect(seen.slice(0, -1).every((c) => c === false)).toBe(true);
+  expect(seen.at(-1)).toBe(true);
+  expect(st.streak).toBe(COMPLETE_CONFIRMATIONS);
+});
+
+test("complete-stability: never fires earlier than a single snapshot — the first completed observation is withheld", () => {
+  // The bar only tightens: the first completed snapshot (today's fire point) is
+  // never confirmed, so `met` can never fire earlier than the pre-debounce path.
+  const step = advanceCompleteStability(initCompleteStability(), true, 10);
+  expect(step.confirmed).toBe(false);
+});
+
+test("complete-stability: a watermark regression during confirmation resets the streak", () => {
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, 20); // streak 1, basis 20
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+
+  // A rewound / stale re-delivered snapshot: still completed, but the row
+  // version regressed below the basis → restart at one, do NOT confirm.
+  step = advanceCompleteStability(st, true, 12);
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  expect(st.streak).toBe(1);
+  expect(st.watermark).toBe(12);
+
+  // Holding steady from the new basis confirms.
+  step = advanceCompleteStability(st, true, 12);
+  expect(step.confirmed).toBe(true);
+});
+
+test("complete-stability: an ADVANCING watermark is normal churn — it still confirms; only a regression resets", () => {
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, 10);
+  st = step.next;
+  step = advanceCompleteStability(st, true, 15); // advanced, not a regression
+  expect(step.confirmed).toBe(true);
+});
+
+test("complete-stability: a null watermark degrades to the pure consecutive count (no false reset)", () => {
+  let st = initCompleteStability();
+  let step = advanceCompleteStability(st, true, null);
+  st = step.next;
+  expect(step.confirmed).toBe(false);
+  step = advanceCompleteStability(st, true, null);
+  expect(step.confirmed).toBe(true);
+});
+
+test("completeWatermark: a task target reads its parent epic's last_event_id, an epic target its own, absent → null", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    last_event_id: 42,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  expect(
+    completeWatermark([epic], {
+      id: "fn-1-foo.1",
+      kind: "task",
+      condition: "complete",
+    }),
+  ).toBe(42);
+  expect(
+    completeWatermark([epic], {
+      id: "fn-1-foo",
+      kind: "epic",
+      condition: "complete",
+    }),
+  ).toBe(42);
+  expect(
+    completeWatermark([epic], {
+      id: "fn-9-absent.1",
+      kind: "task",
+      condition: "complete",
+    }),
+  ).toBeNull();
+  expect(
+    completeWatermark([], {
+      id: "fn-1-foo",
+      kind: "epic",
+      condition: "complete",
+    }),
+  ).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

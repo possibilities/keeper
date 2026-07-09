@@ -131,9 +131,15 @@ If the target is on-board and the condition isn't already met, continue to step
 unblocked` with an already-workable target fires `met` immediately, which is
 correct.)
 
-> **`complete` is done-AND-idle.** The live wait can HOLD a beat past plan-done
-> while a stale subagent settles, even though the pre-check's `runtime_status ==
-> "done"` already reads as "popped off the board."
+> **`complete` is done-AND-idle, held until it settles.** The live wait can HOLD
+> a beat past plan-done — while a stale subagent settles, AND until the
+> done-AND-idle verdict survives a short confirmation window (a couple of
+> consecutive board snapshots with the target row's version not regressing) — so
+> a completion the close-out reconcile briefly unwinds back to running never
+> fires `met`. The pre-check's `runtime_status == "done"` already reads as
+> "popped off the board," but the live wait is deliberately the stricter of the
+> two; the added steady-state latency for a genuine completion is bounded to
+> those confirmation snapshots.
 
 > **`started --require-transition` warns.** `started` is a monotonic latch with
 > NO second edge; pairing it with `--require-transition` against an
