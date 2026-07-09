@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 194,
+        "files_changed": 11,
+        "insertions": 927
+      },
+      "done_summary": "Gate worktree finalize on the prospective lane\u2192default merge-result fast suite (scratch worktree, injected+memoized probe): green merges+pushes, red parks a visible worktree-finalize-suite-red sticky with local default unmoved, cannot-run degrades to a retry-skip.",
+      "input_hash": "366fcce51c3cb9a4c8eb500f09e95f1685c9713343bebfba032b5b53c85a2066",
+      "model": "opus",
+      "spec_chars": 3405,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/autopilot-worker.ts, src/worktree-git.ts, src/dispatch-failure-key.ts, src/needs-human.ts, plugins/plan/test/worktree-finalize-degrade.test.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nInsert a suite gate into finalize ahead of the local default merge: construct the prospective merge result in a scratch worktree (the scratch-provision primitive exists), run the fast suite there, and only on green proceed to the existing merge+push path. Red parks the epic on a new visible sticky family (prefix-disjoint reason + display rule + needs-human classification; mirror the non-fast-forward arm's visible non-retry shape, cleared via the existing retry_dispatch re-arm) \u2014 local default never advances on red, so the desync producer sees nothing. A gate that cannot run (scratch provision failure, install drift, timeout) degrades to the existing non-sticky retry-skip shape rather than blocking or silently pushing. Memoize the verdict by merged-tree key so a parked epic's finalize retries do not recompute an unchanged merge. Thread the suite-run as an injected probe on the finalize driver (the isEpicDone precedent) so the fast-tier tests drive decisions purely; the end-to-end red/green paths land in the slow real-git tier.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/autopilot-worker.ts:4118 finalizeEpic, :4169/:4499-4760 mergeLaneBaseIntoDefault + push, :4177-4237 the merge.kind degrade arms (the new arm's home)\n- src/worktree-git.ts:1796 provisionScratchWorktree / BASELINE_SCRATCH_PREFIX\n- src/dispatch-failure-key.ts \u2014 family registration contract (prefix-disjoint, DISPLAY_RULES, assertNever tripwires)\n- docs/adr/0008 \u2014 the recorded merge-push sequence\n\n**Optional** (reference as needed):\n- plugins/plan/test/worktree-finalize-degrade.test.ts \u2014 the degrade-arm test harness to extend\n- fn-1203's baseline runner wiring \u2014 share the suite-run harness where practical, but the merged tree needs its own run (no pre-existing leaf)\n\n### Risks\n\n- Suite duration adds latency to every finalize; the fast tier (~20s) is the ceiling \u2014 never the full four-suite gate here.\n- Which suites run must cover the merged packages: default to the root fast suite plus the plan suite when the merge touches plugins/plan; state the mapping in code.\n\n### Test notes\n\nFast tier: injected suite-probe drives green\u2192merge, red\u2192park (sticky minted, no merge call), cannot-run\u2192retry-skip; memoization returns the cached verdict for an unchanged merged-tree key. Slow tier: real-git red merge parks with default untouched.\n\n## Acceptance\n\n- [ ] A red merge-result suite parks the epic on a visible sticky with local default unmoved and no push\n- [ ] Green proceeds through the unchanged merge+push path\n- [ ] A gate that cannot run degrades to the visible retry-skip class, never a silent push\n- [ ] Finalize retries on an unchanged merge reuse the memoized verdict\n- [ ] keeper fast suite green; the finalize slow tier passes with the new arms\n\n## Done summary\nGate worktree finalize on the prospective lane\u2192default merge-result fast suite (scratch worktree, injected+memoized probe): green merges+pushes, red parks a visible worktree-finalize-suite-red sticky with local default unmoved, cannot-run degrades to a retry-skip.\n## Evidence\n",
+      "task_id": "fn-1204-gate-finalize-on-merge-suite.1",
+      "tier": "xhigh",
+      "title": "Test merge result before push"
+    }
+  ],
+  "created_at": "2026-07-09T03:38:53.710000Z",
+  "epic_id": "fn-1204-gate-finalize-on-merge-suite",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "cdecf590ca36485f88b866abf602d1afa178121cabd950536a4910b75046f097",
+  "selection_input_hash": "366fcce51c3cb9a4c8eb500f09e95f1685c9713343bebfba032b5b53c85a2066",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
