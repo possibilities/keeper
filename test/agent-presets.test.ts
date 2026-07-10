@@ -10,9 +10,16 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { ConfigError, type PresetCatalog } from "../src/agent/config";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
-import type { Matrix } from "../src/agent/matrix";
+import {
+  loadMatrixV2,
+  MatrixConfigError,
+  type MatrixV2,
+} from "../src/agent/matrix";
 import {
   formatTriple,
   parseTriple,
@@ -449,32 +456,45 @@ describe("presets resolve JSON contract", () => {
 });
 
 describe("presets list discovery surface", () => {
-  const listMatrix: Matrix = {
-    efforts: ["low", "high"],
-    providers: [
-      {
-        name: "claude",
-        route: true,
-        models: new Map([["opus", "opus"]]),
-        modelEfforts: new Map(),
-      },
-      {
-        name: "pi",
-        route: false,
-        models: new Map([["spark", "pi/spark"]]),
-        modelEfforts: new Map(),
-      },
-    ],
-    subagents: ["work"],
-    wrapper_driver: { model: "sonnet", effort: "high" },
-    defaults: { stop_timeout_ms: 7200000, max_attempts: 2 },
-  };
+  // A minimal v2 roster: claude native opus (a cell); pi launch-only "spark"
+  // (aliased to pi/spark, absent from subagent_models — enumerable, no cell).
+  let tmpDir: string;
+  function writeAndLoad(body: string): MatrixV2 {
+    tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-presets-"));
+    const p = join(tmpDir, "matrix.yaml");
+    writeFileSync(p, body);
+    try {
+      return loadMatrixV2(p);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+  const LIST_MATRIX_BODY = [
+    "efforts:",
+    "  - low",
+    "  - high",
+    "subagent_templates:",
+    "  - template/agents/worker.md.tmpl",
+    "subagent_models:",
+    "  - opus",
+    "providers:",
+    "  - name: claude",
+    "    models:",
+    "      - opus",
+    "  - name: pi",
+    "    models:",
+    "      - id: pi/spark",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
 
   test("--json emits the virtual cube, the four defaults, and panels", async () => {
     const h = makeHarness({
       argv: ["presets", "list", "--json"],
       rawArgv: true,
-      matrix: listMatrix,
+      matrix: writeAndLoad(LIST_MATRIX_BODY),
       hostTriples: {
         defaults: {
           claude: "claude::opus::high",
@@ -493,37 +513,39 @@ describe("presets list discovery surface", () => {
       harnesses: [
         {
           harness: "claude",
-          route: true,
           triples: [
             {
               triple: "claude::opus::low",
               capability: "opus",
               native_id: "opus",
               effort: "low",
+              cell: true,
             },
             {
               triple: "claude::opus::high",
               capability: "opus",
               native_id: "opus",
               effort: "high",
+              cell: true,
             },
           ],
         },
         {
           harness: "pi",
-          route: false,
           triples: [
             {
               triple: "pi::pi/spark::low",
               capability: "spark",
               native_id: "pi/spark",
               effort: "low",
+              cell: false,
             },
             {
               triple: "pi::pi/spark::high",
               capability: "spark",
               native_id: "pi/spark",
               effort: "high",
+              cell: false,
             },
           ],
         },
@@ -545,7 +567,7 @@ describe("presets list discovery surface", () => {
     const h = makeHarness({
       argv: ["presets", "list"],
       rawArgv: true,
-      matrix: listMatrix,
+      matrix: writeAndLoad(LIST_MATRIX_BODY),
       hostTriples: {
         defaults: { claude: "claude::opus::high" },
         worker: null,
@@ -558,7 +580,7 @@ describe("presets list discovery surface", () => {
     expect(code).toBe(0);
     const text = h.out.join("");
     expect(text).toContain("claude::opus::low");
-    expect(text).toContain("pi (launch-only)");
+    expect(text).toContain("pi::pi/spark::low (launch-only)");
     expect(text).toContain("claude_default  claude::opus::high");
     expect(text).toContain("codex_default  (unset)");
     expect(text).toContain("duo");
@@ -578,11 +600,53 @@ describe("presets list discovery surface", () => {
   test("a malformed matrix is fail-loud (exit 2), not a crash", async () => {
     const h = makeHarness({ argv: ["presets", "list"], rawArgv: true });
     h.deps.loadMatrixFn = () => {
-      throw new ConfigError("Unknown top-level key 'x' in /x/matrix.yaml.");
+      throw new MatrixConfigError(
+        "schema-invalid",
+        "/x/matrix.yaml",
+        "Unknown top-level key 'x'",
+      );
     };
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
     expect(h.err.join("")).toContain("Unknown top-level key");
+  });
+
+  test("loads the committed v2 example matrix without a v1 unknown-key error (F1/F4)", async () => {
+    // The regression this task fixes: the three verbs used to parse the
+    // mandated v2 matrix.yaml with the v1 loader, which hard-rejects
+    // `subagent_templates`/`subagent_models`. Loading the committed example
+    // through `presets list` must now succeed.
+    const EXAMPLE_PATH = join(
+      import.meta.dir,
+      "..",
+      "docs",
+      "examples",
+      "matrix.example.yaml",
+    );
+    const h = makeHarness({
+      argv: ["presets", "list", "--json"],
+      rawArgv: true,
+      matrix: loadMatrixV2(EXAMPLE_PATH),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const parsed = JSON.parse(h.out.join(""));
+    const harnessNames = parsed.harnesses.map(
+      (g: { harness: string }) => g.harness,
+    );
+    expect(harnessNames).toEqual(["claude", "codex", "pi"]);
+    const codex = parsed.harnesses.find(
+      (g: { harness: string }) => g.harness === "codex",
+    );
+    expect(
+      codex.triples.map((t: { triple: string; cell: boolean }) => [
+        t.triple,
+        t.cell,
+      ]),
+    ).toEqual([
+      ["codex::gpt-5.3-codex-spark::high", true],
+      ["codex::gpt-5.3-codex-spark::xhigh", true],
+    ]);
   });
 });
 

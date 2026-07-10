@@ -13,7 +13,11 @@ import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-sessi
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
 import type { MainDeps } from "../../src/agent/main";
-import type { Matrix } from "../../src/agent/matrix";
+import {
+  MatrixConfigError,
+  type MatrixV2,
+  matrixConfigPath,
+} from "../../src/agent/matrix";
 import type { ResumeDecision } from "../../src/agent/resume-policy";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
@@ -137,8 +141,9 @@ export interface HarnessOptions {
   hostTriples?: HostTriples;
   /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
   findShadowProfileDirs?: () => ShadowProfileFinding[];
-  /** Host matrix loadMatrixFn returns (default null → claude-only world). */
-  matrix?: Matrix | null;
+  /** Host matrix loadMatrixFn returns (default null → absent, so loadMatrixFn
+   *  throws the typed `absent` {@link MatrixConfigError}, matching production). */
+  matrix?: MatrixV2 | null;
   /** Provider-binary reachability probe (default: every provider reachable). */
   providerReachable?: (harness: HarnessName) => boolean;
   spawn?: SpawnFn;
@@ -243,7 +248,16 @@ export function makeHarness(opts: HarnessOptions): Harness {
       return [profileDir, false];
     },
     findShadowProfileDirsFn: opts.findShadowProfileDirs ?? (() => []),
-    loadMatrixFn: () => opts.matrix ?? null,
+    loadMatrixFn: () => {
+      if (opts.matrix === undefined || opts.matrix === null) {
+        throw new MatrixConfigError(
+          "absent",
+          matrixConfigPath(),
+          "no matrix.yaml found",
+        );
+      }
+      return opts.matrix;
+    },
     providerReachableFn: opts.providerReachable ?? (() => true),
     startCodexSessionNameIndexerFn: (opts: CodexSessionNameIndexerOptions) => {
       codexSessionNameIndexers.push(opts);
