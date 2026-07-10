@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Delicate instructional-prose wording and in-repo idiom matching across skill templates that must read correctly and stay clear of content-blind consistency guards while preserving the backoff's meaning routes to sonnet; the acceptance is well-specified and single-surface with exact strings named, so medium effort fits without a contract-shaped or intelligence-bound reason to escalate.",
+      "task_id": "fn-1247-backgrounded-worker-wait-discipline.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T22:57:09.297000Z",
+  "epic_id": "fn-1247-backgrounded-worker-wait-discipline",
+  "input_hash": "06cf9281bc77af6ccd72689023217720025025456eaa7f2fc93d0477b07cf145",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 114266753,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1247-backgrounded-worker-wait-discipline.1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Delicate instructional-prose wording and in-repo idiom matching across skill templates that must read correctly and stay clear of content-blind consistency guards while preserving the backoff's meaning routes to sonnet; the acceptance is well-specified and single-surface with exact strings named, so medium effort fits without a contract-shaped or intelligence-bound reason to escalate.\",\"confidence\":0.72}]}\n"
+}
