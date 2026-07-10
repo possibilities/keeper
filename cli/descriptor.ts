@@ -757,7 +757,13 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "no-armed-line",
         type: "boolean",
-        summary: "Suppress the periodic armed-state progress line",
+        summary: "Suppress the initial armed line",
+      },
+      {
+        name: "heartbeat",
+        type: "string",
+        summary:
+          "Stderr progress interval naming holders (duration or 'off'; default 60s)",
       },
       {
         name: "require-transition",

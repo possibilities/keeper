@@ -157,6 +157,8 @@ Flags:
   --scope <plan|inflight|board>  drained scope (default plan; board = the
                          strict whole-board gate). Inert for other conditions
   --no-armed-line        Suppress the initial armed line
+  --heartbeat <dur|off>  Stderr progress line naming the wait's holders on a
+                         cadence (default 60s; 'off' silences it)
   --require-transition   A condition true at arm time waits for a real edge
   --json                 Emit armed/terminal lines as JSON
   --sock <path>          Socket override ($KEEPER_SOCK / default)
@@ -332,6 +334,14 @@ export interface ParsedArgs {
   requireTransition: boolean;
   json: boolean;
   sock: string;
+  /**
+   * Wall-clock heartbeat cadence (task 2): a periodic STDERR-only progress
+   * line naming what currently holds the wait, so a long silent wait stays
+   * legible. Defaults to 60s when `--heartbeat` is omitted; `--heartbeat off`
+   * disables it (`null`); `--heartbeat <dur>` sets a custom cadence. Never
+   * touches the byte-stable stdout terminal contract.
+   */
+  heartbeatMs: number | null;
 }
 
 /**
@@ -439,6 +449,9 @@ export function parseMonitorSelector(token: string): MonitorSelector | null {
 
 /** Exit code for a usage/grammar fault (a bad flag value). */
 const EXIT_USAGE = 2;
+
+/** Default `--heartbeat` cadence (task 2) when the flag is omitted: on, ~60s. */
+const DEFAULT_HEARTBEAT_MS = 60_000;
 
 interface ParseFailure {
   ok: false;
@@ -818,6 +831,27 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     scope = scopeRaw;
   }
 
+  // `--heartbeat <dur|off>` (task 2): defaults ON at DEFAULT_HEARTBEAT_MS
+  // when omitted; the literal `off` disables it (`null`); otherwise the
+  // shared duration grammar, same fault shape as `--timeout`.
+  let heartbeatMs: number | null = DEFAULT_HEARTBEAT_MS;
+  const heartbeatRaw = values.heartbeat;
+  if (typeof heartbeatRaw === "string" && heartbeatRaw.length > 0) {
+    if (heartbeatRaw === "off") {
+      heartbeatMs = null;
+    } else {
+      const parsed = parseDuration(heartbeatRaw);
+      if (!parsed.ok) {
+        return {
+          ok: false,
+          message: `--heartbeat ${parsed.message}`,
+          exitCode: EXIT_USAGE,
+        };
+      }
+      heartbeatMs = parsed.ms;
+    }
+  }
+
   return {
     ok: true,
     args: {
@@ -830,6 +864,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       requireTransition: values["require-transition"] === true,
       json: values.json === true,
       sock,
+      heartbeatMs,
     },
   };
 }
@@ -1316,6 +1351,12 @@ export async function runAwait(
   // Armed on demand (`ensureDwellTimer`) whenever a `complete` slot is holding an
   // unconfirmed completion; self-reschedules until it confirms or the world moves.
   let dwellHandle: unknown = null;
+  // Task 2: the periodic stderr-only heartbeat timer, self-rescheduling like
+  // `dwellHandle`. Armed once arming completes (`ensureHeartbeatTimer`,
+  // regardless of `--no-armed-line` — that flag governs only the initial
+  // armed line); cleared in `cleanupSubscriptions` so it never leaks past a
+  // terminal or SIGTERM.
+  let heartbeatHandle: unknown = null;
   let unregisterSignals: (() => void) | null = null;
 
   // Wall-clock accessor for the `complete`-dwell confirmation. Injected under
@@ -1331,6 +1372,10 @@ export async function runAwait(
     if (dwellHandle !== null) {
       deps.clearTimer(dwellHandle);
       dwellHandle = null;
+    }
+    if (heartbeatHandle !== null) {
+      deps.clearTimer(heartbeatHandle);
+      heartbeatHandle = null;
     }
     for (const h of [readinessHandle, gitHandle, jobsHandle]) {
       if (h !== null) {
@@ -1527,6 +1572,11 @@ export async function runAwait(
     if (!single) {
       base.from = slotLabel(slot);
     }
+    // Task 2: `stuck` is an operator-jam refusal, never self-clearing from
+    // the wait's own perspective — not retryable by re-arming the same await.
+    if (reason === "stuck") {
+      base.retryable = "false";
+    }
     emitTerminal("failed", code, base);
   };
 
@@ -1568,6 +1618,10 @@ export async function runAwait(
     }
     if (!single) {
       base.from = slotLabel(slot);
+    }
+    // Task 2: mirrors `emitPlanFailure`'s stuck classification.
+    if (reason === "stuck") {
+      base.retryable = "false";
     }
     emitTerminal("failed", code, base);
   };
@@ -1958,6 +2012,109 @@ export async function runAwait(
   };
 
   /**
+   * Max holder/slot entries a heartbeat line names before it truncates to a
+   * literal `+N more` tail (task 2). Holder labels are attacker-influenced (a
+   * session/monitor title), so the list is bounded regardless of board size.
+   */
+  const MAX_HEARTBEAT_ENTRIES = 5;
+
+  /** Bound a display list to `MAX_HEARTBEAT_ENTRIES`, appending a `+N more`
+   *  tail once it overruns. `eventLine` sanitizes each element (CR/LF strip)
+   *  when it renders the line — this only bounds cardinality. */
+  const boundedList = (items: readonly string[]): string[] => {
+    if (items.length <= MAX_HEARTBEAT_ENTRIES) {
+      return [...items];
+    }
+    return [
+      ...items.slice(0, MAX_HEARTBEAT_ENTRIES),
+      `+${items.length - MAX_HEARTBEAT_ENTRIES} more`,
+    ];
+  };
+
+  /**
+   * Periodic stderr-only progress line (task 2) — `logProgress` generalized
+   * from a verdict-change throttle to a wall-clock cadence, so a long silent
+   * wait stays legible. NEVER touches stdout (the byte-stable terminal
+   * contract) and never re-runs `evaluate()` — it only renders the slots'
+   * current latched state, so it cannot double-fire the eval loop.
+   *
+   * While any stream the active slots depend on hasn't yet painted a FRESH
+   * snapshot since its last reconnect, names the reconnecting state instead
+   * of stale pre-drop holders (reuses `reconnectStable`/`paintGate` — the
+   * same "has this stream painted since its last drop" signal the blip gate
+   * already maintains, rather than tracking connection state twice). Once a
+   * post-reconnect snapshot lands, `evaluate()` flips it back before this
+   * next fires. Otherwise names each not-yet-met slot's condition/state,
+   * plus — for a `drained`-family slot — its structured {@link DrainedHolder}
+   * list (task 1), size-bounded via {@link boundedList}.
+   */
+  const emitHeartbeat = (): void => {
+    if (state.terminating) {
+      return;
+    }
+    const reconnecting =
+      (openReadiness && !reconnectStable.readiness) ||
+      (openGitCollection && !reconnectStable.git) ||
+      (openJobsCollection && !reconnectStable.jobs) ||
+      (openServerUp && !paintGate.serverUp);
+    if (reconnecting) {
+      deps.writeStderr(
+        eventLine(args.json, "heartbeat", {
+          state: "reconnecting",
+          detail: "reconnecting to keeperd — holder list stale, withheld",
+        }),
+      );
+      return;
+    }
+    const waiting = slots.filter((s) => !s.met);
+    if (waiting.length === 0) {
+      // Every slot already latched met — a met/failed terminal is imminent
+      // (or already fired and cleared this timer); nothing to name.
+      return;
+    }
+    const fields: Record<string, string | string[]> = {
+      state: "waiting",
+      waiting: boundedList(
+        waiting.map((s) => {
+          const ev = s.lastEval;
+          const phrase = ev?.detail ?? ev?.kind ?? "waiting";
+          return `${slotLabel(s)}: ${sanitizeValue(phrase)}`;
+        }),
+      ),
+    };
+    const holders = waiting.flatMap((s) => s.lastEval?.holders ?? []);
+    if (holders.length > 0) {
+      fields.holders = boundedList(
+        holders.map((h) => `${h.label} (${h.kind})`),
+      );
+    }
+    deps.writeStderr(eventLine(args.json, "heartbeat", fields));
+  };
+
+  /**
+   * Arm the periodic heartbeat if `--heartbeat` isn't `off` and it isn't
+   * already pending — idempotent-while-pending like `ensureDwellTimer`, so
+   * repeated arm-detection calls under `--no-armed-line` (which never flips
+   * `state.armed`, see {@link emitArmed}) can't stack timers. Self-
+   * reschedules after every fire until `cleanupSubscriptions` clears it on
+   * terminate, so it never leaks past a met/failed/SIGTERM exit.
+   */
+  const ensureHeartbeatTimer = (): void => {
+    if (
+      args.heartbeatMs === null ||
+      heartbeatHandle !== null ||
+      state.terminating
+    ) {
+      return;
+    }
+    heartbeatHandle = deps.setTimer(() => {
+      heartbeatHandle = null;
+      emitHeartbeat();
+      ensureHeartbeatTimer();
+    }, args.heartbeatMs);
+  };
+
+  /**
    * Shared re-evaluation pass — the ONE place the AND gate is computed.
    * Walks every slot, evaluates each off the latest rows it cares about,
    * latches `met`, short-circuits on any plan terminal failure, and
@@ -2149,6 +2306,12 @@ export async function runAwait(
       }
       emitArmed(evals.map((e) => e ?? { kind: "waiting" }));
       justArmed = state.armed;
+      // Task 2: arm the heartbeat once we've passed every synchronous refusal
+      // above — regardless of `--no-armed-line` (which only suppresses the
+      // line `emitArmed` itself would print, never `state.armed`'s flip; see
+      // that function). Idempotent, so this re-running every tick under
+      // `--no-armed-line` (state.armed never flips there) is harmless.
+      ensureHeartbeatTimer();
     }
 
     // --require-transition: a slot already met on the very tick we armed
@@ -2358,6 +2521,34 @@ export async function runAwait(
       }
     };
 
+  /**
+   * Task 2: "what held this wait at the deadline" — persisted per slot via
+   * `slot.lastEval` (every eval branch above sets it, met or waiting alike),
+   * so a timeout/unreachable terminal can report the last known state even
+   * though neither is driven by a fresh eval of its own. Single-segment:
+   * that slot's own detail. Aggregate: the first not-yet-met slot's labeled
+   * detail (mirrors the `from=` single-holder convention elsewhere in this
+   * file). `undefined` when nothing has painted yet (e.g. `unreachable`
+   * firing before any snapshot ever landed) — the caller omits the field
+   * rather than emit an empty one.
+   */
+  const lastWaitingDetail = (): string | undefined => {
+    if (single) {
+      const detail = slots[0]?.lastEval?.detail;
+      return detail !== undefined && detail.length > 0 ? detail : undefined;
+    }
+    for (const slot of slots) {
+      if (slot.met) {
+        continue;
+      }
+      const detail = slot.lastEval?.detail;
+      if (detail !== undefined && detail.length > 0) {
+        return `${slotLabel(slot)}: ${detail}`;
+      }
+    }
+    return undefined;
+  };
+
   // Custom onFatal — the helper's default `process.exit(1)` would
   // bypass the terminal-line protocol. Route to a proper terminal line.
   // fn-750.2: the give-up driver fires `onFatal({ code: "unreachable" })`
@@ -2369,10 +2560,16 @@ export async function runAwait(
   // swallow (whichever fires first wins, the rest no-op).
   const onFatal = (err: FatalError): void => {
     if (err.code === "unreachable") {
+      const detail = lastWaitingDetail();
       emitTerminal("failed", 1, {
         reason: "unreachable",
         advice: "wait with 'keeper await server-up' then re-arm this command",
         message: err.message,
+        // Task 2: unreachable is a give-up-deadline artifact of the daemon
+        // link, not of the condition itself — retrying the same await (once
+        // the daemon is back) is exactly the advice above.
+        retryable: "true",
+        ...(detail !== undefined ? { detail } : {}),
       });
       return;
     }
@@ -2386,6 +2583,14 @@ export async function runAwait(
   // Aggregate timeout fields. Single-plan is byte-identical; otherwise
   // a generalized shape.
   const timeoutFields = (): Record<string, string> => {
+    const detail = lastWaitingDetail();
+    // Task 2: a `--timeout`/SIGTERM deadline is the CALLER's own budget
+    // running out, not a terminal verdict on the condition — re-arming the
+    // same await is exactly what a caller does next.
+    const extra: Record<string, string> = {
+      retryable: "true",
+      ...(detail !== undefined ? { detail } : {}),
+    };
     if (single && slots[0]?.kind === "plan") {
       const t = slots[0].target;
       return {
@@ -2393,11 +2598,13 @@ export async function runAwait(
         target: t.id,
         kind: t.kind,
         condition: t.condition,
+        ...extra,
       };
     }
     return {
       reason: "timeout",
       conditions: slots.map(slotLabel).join(" and "),
+      ...extra,
     };
   };
 

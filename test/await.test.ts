@@ -28,6 +28,7 @@ import {
   type RunDeps,
   runAwait,
 } from "../cli/await";
+import { nativeDescriptor } from "../cli/descriptor";
 import { COMPLETE_DWELL_MS } from "../src/await-conditions";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
 import type {
@@ -57,6 +58,25 @@ test("HELP documents the drained --scope axis and the new plan default", () => {
   // Agent-help names the axis + the flip too.
   expect(AWAIT_AGENT_HELP).toContain("--scope");
   expect(AWAIT_AGENT_HELP).toContain("--scope board");
+});
+
+test("HELP documents --heartbeat (task 2)", () => {
+  expect(AWAIT_HELP).toContain("--heartbeat");
+});
+
+test("descriptor: --no-armed-line summary matches its actual behavior (the initial line only)", () => {
+  const descriptor = nativeDescriptor("await");
+  const flag = descriptor?.flags.find((f) => f.name === "no-armed-line");
+  expect(flag).toBeDefined();
+  expect(flag?.summary).toContain("initial");
+  expect(flag?.summary).not.toContain("periodic");
+});
+
+test("descriptor: --heartbeat is declared (task 2)", () => {
+  const descriptor = nativeDescriptor("await");
+  const flag = descriptor?.flags.find((f) => f.name === "heartbeat");
+  expect(flag).toBeDefined();
+  expect(flag?.type).toBe("string");
 });
 
 test("--agent-help routes to the runbook signal before any I/O", () => {
@@ -515,6 +535,10 @@ function singleArgs(
     requireTransition: false,
     json: false,
     sock: "/tmp/keeper-mock.sock",
+    // Off by default so the shared single-slot timer mock (`h.fireDeadline`)
+    // isn't clobbered by an unrelated heartbeat timer registration; heartbeat
+    // tests opt in explicitly via `overrides.heartbeatMs`.
+    heartbeatMs: null,
     ...overrides,
     scope: overrides.scope ?? "plan",
   };
@@ -534,6 +558,10 @@ function argsFor(
     requireTransition: false,
     json: false,
     sock: "/tmp/keeper-mock.sock",
+    // Off by default so the shared single-slot timer mock (`h.fireDeadline`)
+    // isn't clobbered by an unrelated heartbeat timer registration; heartbeat
+    // tests opt in explicitly via `overrides.heartbeatMs`.
+    heartbeatMs: null,
     ...overrides,
     scope: overrides.scope ?? "plan",
   };
@@ -722,6 +750,43 @@ test("parseAwaitArgs: --connect-timeout + server-up → usage error", () => {
   expect(r.ok).toBe(false);
   if (!r.ok) {
     expect(r.message).toContain("cannot be combined");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// parseAwaitArgs — task 2 --heartbeat <dur|off>
+// ---------------------------------------------------------------------------
+
+test("parseAwaitArgs: --heartbeat omitted defaults to 60s (on)", () => {
+  const r = parseAwaitArgs(["drained"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.heartbeatMs).toBe(60_000);
+});
+
+test("parseAwaitArgs: --heartbeat off disables it", () => {
+  const r = parseAwaitArgs(["drained", "--heartbeat", "off"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.heartbeatMs).toBeNull();
+});
+
+test("parseAwaitArgs: --heartbeat 5m sets a custom cadence", () => {
+  const r = parseAwaitArgs(["drained", "--heartbeat", "5m"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.heartbeatMs).toBe(300_000);
+});
+
+test("parseAwaitArgs: bad --heartbeat duration → usage error", () => {
+  const r = parseAwaitArgs(["drained", "--heartbeat", "abc"]);
+  expect(r.ok).toBe(false);
+  if (!r.ok) {
+    expect(r.exitCode).toBe(2);
+    expect(r.message).toContain("--heartbeat");
   }
 });
 
@@ -1573,6 +1638,10 @@ test("--timeout deadline → failed reason=timeout exit 3", async () => {
   h.fireDeadline();
   expect(h.stdout[1]).toContain("reason=timeout");
   expect(h.exitCode).toBe(3);
+  // Task 2: timeout is the caller's own budget, not a verdict on the
+  // condition — retryable, and it names what was still held at the deadline.
+  expect(h.stdout[1]).toContain("retryable=true");
+  expect(h.stdout[1]).toContain("detail=");
 });
 
 // ---------------------------------------------------------------------------
@@ -1665,6 +1734,9 @@ test("--fail-on-stuck: stuck verdict → failed reason=stuck exit 5", async () =
   expect(failed).toBeDefined();
   expect(failed).toContain("reason=stuck");
   expect(h.exitCode).toBe(5);
+  // Task 2: an operator-jam refusal never clears itself — not retryable by
+  // re-arming the same await.
+  expect(failed).toContain("retryable=false");
 });
 
 // ---------------------------------------------------------------------------
@@ -2271,6 +2343,11 @@ test("unreachable: post-paint-drop past --connect-timeout → reason=unreachable
   expect(failed).toBeDefined();
   expect(failed).toContain("reason=unreachable");
   expect(h.exitCode).toBe(1);
+  // Task 2: unreachable is a link problem, not a verdict on the condition —
+  // retryable, and it names the last state seen before the daemon link died
+  // (the task painted `open` once before the drop).
+  expect(failed).toContain("retryable=true");
+  expect(failed).toContain("detail=");
 });
 
 test("unreachable: emitted once across handles (terminating latch dedups)", async () => {
@@ -3202,6 +3279,7 @@ test("await drained --fail-on-stuck: jam sticky → stuck exit 5", async () => {
   expect(failed.length).toBeGreaterThanOrEqual(1);
   expect(failed[0]).toContain("reason=stuck");
   expect(h.exitCode).toBe(5);
+  expect(failed[0]).toContain("retryable=false");
 });
 
 test("await drained --fail-on-stuck: recover* sticky is NOT a jam → met", async () => {
@@ -3227,6 +3305,170 @@ test("await drained --fail-on-stuck: recover* sticky is NOT a jam → met", asyn
   // recover* is auto-clearing, never an operator jam → drained met, not stuck.
   expect(h.exitCode).toBe(0);
   expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Heartbeat (task 2): periodic stderr-only progress naming what holds a
+// long wait. Never touches stdout — every assertion here reads `h.stderr`.
+// ---------------------------------------------------------------------------
+
+test("--heartbeat: fires on cadence naming the drained holders", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { heartbeatMs: 60_000 }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // A keeper-dispatched worker holds plan-scope drained.
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.stderr).toHaveLength(0);
+
+  // The cadence fires — no stdout emission (byte-stable terminal contract),
+  // one stderr line naming the holder.
+  h.fireDeadline();
+  expect(h.stdout.some((l) => l.includes("[keeper-await]"))).toBe(true);
+  expect(h.stdout.filter((l) => l.includes("[keeper-await]"))).toHaveLength(1);
+  expect(h.stderr).toHaveLength(1);
+  expect(h.stderr[0]).toContain("[keeper-await] heartbeat");
+  expect(h.stderr[0]).toContain("w-1");
+  expect(h.exitCode).toBeNull();
+});
+
+test("--heartbeat off: no stderr progress line even past the cadence", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  // Default builder heartbeatMs is already `null` (off); spelled out here.
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { heartbeatMs: null }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+
+  // No timer was ever registered for a heartbeat, so firing the (unrelated,
+  // never-armed) deadline slot is a no-op.
+  h.fireDeadline();
+  expect(h.stderr).toHaveLength(0);
+});
+
+test("--heartbeat --json: one parseable stderr line naming the holders", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { heartbeatMs: 60_000, json: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+
+  h.fireDeadline();
+  expect(h.stderr).toHaveLength(1);
+  const line = h.stderr[0] as string;
+  // One parseable JSON line — no trailing garbage, no embedded newline.
+  expect(line.trimEnd().split("\n")).toHaveLength(1);
+  const parsed = JSON.parse(line) as Record<string, unknown>;
+  expect(parsed.event).toBe("heartbeat");
+  expect(JSON.stringify(parsed)).toContain("w-1");
+});
+
+test("--heartbeat: --no-armed-line does not suppress the heartbeat (it only governs the armed line)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], {
+      heartbeatMs: 60_000,
+      noArmedLine: true,
+    }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+  // No armed line on stdout (suppressed) …
+  expect(h.stdout).toHaveLength(0);
+
+  // … but the heartbeat still fires.
+  h.fireDeadline();
+  expect(h.stderr).toHaveLength(1);
+  expect(h.stderr[0]).toContain("[keeper-await] heartbeat");
+});
+
+test("--heartbeat: while reconnecting, names the reconnecting state rather than stale holders", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { heartbeatMs: 60_000 }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+
+  // Drop the connection — mid-reconnect, no fresh snapshot has landed yet.
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  h.fireDeadline();
+  expect(h.stderr).toHaveLength(1);
+  expect(h.stderr[0]).toContain("reconnecting");
+  expect(h.stderr[0]).not.toContain("w-1");
 });
 
 test("await epic-added: new epic across two frames → met (exit 0)", async () => {
