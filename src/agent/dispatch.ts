@@ -88,7 +88,7 @@ Usage:
   keeper agent run <cli> <prompt> [--read-only] [--stop-timeout <dur>]
                                   [--system-file <path> | --system <text>]
                                   [--preset <name>] [--session <name>]
-                                  [--output <path>]
+                                  [--output <path>] [--resume <name-or-id>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
                                     --read-only prepends a directive (prompting-only).
@@ -96,8 +96,14 @@ Usage:
                                     System: block (uniform across harnesses).
                                     --preset applies a launch-config preset (its
                                     harness must == <cli>); --session names the
-                                    tmux grouping; --output atomically writes the
-                                    envelope to a file on every outcome.
+                                    tmux GROUPING (not a resume key); --output
+                                    atomically writes the envelope to a file on
+                                    every outcome. --resume CONTINUES a prior
+                                    partner (by current/former name or id) of the
+                                    SAME <cli> and captures its new answer; it
+                                    forbids --model/--effort/--preset (the resumed
+                                    session owns its config) and refuses a live
+                                    target (points at keeper bus chat send).
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.

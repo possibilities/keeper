@@ -150,10 +150,14 @@ export interface HarnessOptions {
    *  argv byte-pins stay path-independent). Pass `["-e", "<fake>"]` to exercise
    *  the injection. */
   resolvePiExtensionArgs?: () => string[];
-  /** `resume` verb decision seam (default: `{kind:"unknown", target}` — no
-   *  fixture db, no real subprocess spawn). Pass a fixed `ResumeDecision` or a
-   *  function of the target to drive the resume route's branches. */
-  resolveResumeDecision?: ResumeDecision | ((target: string) => ResumeDecision);
+  /** `resume` verb + `run --resume` decision seam (default: `{kind:"unknown",
+   *  target}` — no fixture db, no real subprocess spawn). Pass a fixed
+   *  `ResumeDecision` or a function of the target (and the optional
+   *  `requireHarness` the `run <cli> --resume` path passes) to drive the resume
+   *  route's branches. */
+  resolveResumeDecision?:
+    | ResumeDecision
+    | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
 }
 
 /**
@@ -253,10 +257,10 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.resolveStatuslineSettingsPath ??
       (() => "/fake-home/code/keeper/plugins/keeper/settings.json"),
     resolvePiExtensionArgsFn: opts.resolvePiExtensionArgs ?? (() => []),
-    resolveResumeDecisionFn: (target: string) => {
+    resolveResumeDecisionFn: (target: string, requireHarness?: HarnessName) => {
       const decision = opts.resolveResumeDecision;
       if (typeof decision === "function") {
-        return decision(target);
+        return decision(target, requireHarness);
       }
       return decision ?? { kind: "unknown", target };
     },

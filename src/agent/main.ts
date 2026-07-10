@@ -139,6 +139,7 @@ import {
   buildRunCaptureEnvelope,
   captureFromHandle,
   composeRunCapture,
+  type ParseRunArgsResult,
   parseRunArgs,
   type RunCaptureDeps,
   type RunCaptureEnvelope,
@@ -303,7 +304,11 @@ export interface MainDeps {
   resolvePiExtensionArgsFn: () => string[];
   /**
    * Resolve `target` (a current name, former name, session id, id prefix, or
-   * current-title substring) to a {@link ResumeDecision} for the `resume` verb.
+   * current-title substring) to a {@link ResumeDecision} for the `resume` verb and
+   * `agent run --resume`. `requireHarness`, when set, restricts the match to that
+   * harness (the `agent run <cli>` positional supplies it so a same-name match on a
+   * different CLI reports a distinct `harness-mismatch` rather than launching the
+   * wrong harness); omitted (the harness-agnostic `resume` verb) matches any.
    * Throws on a tool-level failure (db open, a malformed subprocess result) —
    * a resolved-but-non-"ok" decision (live/ambiguous/unknown/no-target) is a
    * SUCCESSFUL return, never a throw. `realDeps()` binds it to a SUBPROCESS
@@ -311,7 +316,10 @@ export interface MainDeps {
    * `resolveResumeDecision` (see the import-site comment for why); a test
    * injects a pure fake, so the fast suite never touches a real db or spawn.
    */
-  resolveResumeDecisionFn: (target: string) => ResumeDecision;
+  resolveResumeDecisionFn: (
+    target: string,
+    requireHarness?: HarnessName,
+  ) => ResumeDecision;
 }
 
 /** Parse a host YAML file to its raw body, or null when the file is absent (the
@@ -391,11 +399,12 @@ export function realDeps(): MainDeps {
     runTmuxCommandFn: defaultTmuxCommandRunner,
     resolveStatuslineSettingsPathFn: resolveKeeperPluginStatuslineSettingsPath,
     resolvePiExtensionArgsFn: () => piExtensionArgs(),
-    resolveResumeDecisionFn: (target) =>
+    resolveResumeDecisionFn: (target, requireHarness) =>
       resolveResumeDecisionViaSubprocess(
         process.execPath,
         resumeResolveCliPath(),
         target,
+        requireHarness,
       ),
   };
 }
@@ -421,8 +430,13 @@ function resolveResumeDecisionViaSubprocess(
   bunBin: string,
   scriptPath: string,
   target: string,
+  requireHarness?: HarnessName,
 ): ResumeDecision {
-  const result = spawnSync(bunBin, [scriptPath, target], {
+  const argv =
+    requireHarness === undefined
+      ? [scriptPath, target]
+      : [scriptPath, target, requireHarness];
+  const result = spawnSync(bunBin, argv, {
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
   });
@@ -1251,6 +1265,14 @@ async function runRunCaptureSubcommand(
       buildRunCaptureEnvelope({ outcome: "bad_args" }),
       parsed.output,
     );
+  // RESUME: `agent run <cli> "<ask>" --resume <name-or-id>` continues a prior
+  // partner conversation instead of a fresh launch. It is a wholly separate path
+  // — resolve the target, run the refuse-live / harness-match / cwd checks, then
+  // launch+capture in the RECORDED cwd — and skips the fresh-launch readiness
+  // gate below (the resumed session already owns its model/effort).
+  if (parsed.resume !== null) {
+    return runResumeCaptureSubcommand(deps, parsed, agent, verbDeps);
+  }
   // Fresh-launch readiness gate (mirrors the interactive launcher gate through
   // the shared {@link resolveLaunchReadiness} core, each keeping its OWN emission
   // contract — here bad_args, there exit 2). `agent run` is always a fresh
@@ -1312,51 +1334,16 @@ async function runRunCaptureSubcommand(
       return runBadArgs();
     }
   }
-  // Resolve the `--system-file`/`--system` seam to text HANDLER-SIDE (the pure
-  // parser never reads the fs). A relative `--system-file` resolves against the
-  // caller cwd; a missing/unreadable file is `bad_args` (exit 2), never a throw.
-  let systemText: string | null = null;
-  if (parsed.systemFile !== null) {
-    const path = isAbsolute(parsed.systemFile)
-      ? parsed.systemFile
-      : join(deps.cwd, parsed.systemFile);
-    try {
-      systemText = readFileSync(path, "utf8").trim();
-    } catch (err) {
-      deps.writeErr(
-        `agent: cannot read --system-file ${path}: ${(err as Error).message}\n`,
-      );
-      return emitRunCapture(
-        deps,
-        buildRunCaptureEnvelope({ outcome: "bad_args" }),
-        parsed.output,
-      );
-    }
-  } else if (parsed.system !== null) {
-    systemText = parsed.system.trim();
+  const composed = composeRunPrompt(deps, parsed);
+  if (!composed.ok) {
+    deps.writeErr(composed.error);
+    return emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+      parsed.output,
+    );
   }
-  // Compose CALLER-SIDE (raw `\n\n` join, no `User:` scaffold — `agent run` has
-  // no role framing):
-  // [read-only directive]? → [final-message directive] → [System: <text>]? →
-  // [user prompt], UNIFORM across claude/codex/pi/hermes. The shared launch
-  // helper stays directive-free so the caller is the sole prepender. Read-only
-  // is prompting-only: the directive is the whole mechanism (keeper enforces
-  // nothing — no tool strip, no changed-files audit). The final-message
-  // directive is always-on (no flag gates it, harmless to a harness that has
-  // no background-agent concept of its own). The `System:` block is user-turn
-  // text, NOT a privileged system prompt — the native `--append-system-prompt`
-  // upgrade is a deliberate future step. An empty-after-trim system value is a
-  // no-op skip.
-  const promptParts: string[] = [];
-  if (parsed.readOnly) {
-    promptParts.push(READ_ONLY_DIRECTIVE);
-  }
-  promptParts.push(FINAL_MESSAGE_DIRECTIVE);
-  if (systemText !== null && systemText !== "") {
-    promptParts.push(`System: ${systemText}`);
-  }
-  promptParts.push(parsed.prompt);
-  const prompt = promptParts.join("\n\n");
+  const prompt = composed.prompt;
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),
@@ -1373,6 +1360,208 @@ async function runRunCaptureSubcommand(
             name: parsed.name ?? undefined,
           },
           stopTimeoutMs: parsed.stopTimeoutMs,
+        }),
+    },
+    verbDeps,
+    agent,
+  );
+  return emitRunCapture(deps, result, parsed.output);
+}
+
+/** A successfully-parsed `agent run` argv (the `ok:true` arm of parseRunArgs). */
+type ParsedRunArgs = Extract<ParseRunArgsResult, { ok: true }>;
+
+/** Compose result: the assembled prompt, or a stderr-ready error line (a
+ *  `--system-file` that cannot be read) the caller maps to bad_args. */
+type ComposedPrompt =
+  | { ok: true; prompt: string }
+  | { ok: false; error: string };
+
+/**
+ * Compose the `agent run` prompt CALLER-SIDE (raw `\n\n` join, no `User:` scaffold
+ * — `agent run` has no role framing): [read-only directive]? → [final-message
+ * directive] → [System: <text>]? → [user prompt], UNIFORM across claude/codex/pi/
+ * hermes and across fresh AND resume runs (a resumed leg carries the same directive
+ * contract). The shared launch helper stays directive-free so this is the sole
+ * prepender. Read-only is prompting-only (the directive is the whole mechanism —
+ * keeper enforces nothing); the final-message directive is always-on; the `System:`
+ * block is user-turn text, not a privileged system prompt. Resolves the
+ * `--system-file`/`--system` seam to text here (the pure parser never reads the fs):
+ * a relative `--system-file` resolves against the CALLER cwd (not the resumed
+ * partner's), and a missing/unreadable file is `bad_args`, never a throw. An
+ * empty-after-trim system value is a no-op skip.
+ */
+function composeRunPrompt(
+  deps: MainDeps,
+  parsed: ParsedRunArgs,
+): ComposedPrompt {
+  let systemText: string | null = null;
+  if (parsed.systemFile !== null) {
+    const path = isAbsolute(parsed.systemFile)
+      ? parsed.systemFile
+      : join(deps.cwd, parsed.systemFile);
+    try {
+      systemText = readFileSync(path, "utf8").trim();
+    } catch (err) {
+      return {
+        ok: false,
+        error: `agent: cannot read --system-file ${path}: ${(err as Error).message}\n`,
+      };
+    }
+  } else if (parsed.system !== null) {
+    systemText = parsed.system.trim();
+  }
+  const promptParts: string[] = [];
+  if (parsed.readOnly) {
+    promptParts.push(READ_ONLY_DIRECTIVE);
+  }
+  promptParts.push(FINAL_MESSAGE_DIRECTIVE);
+  if (systemText !== null && systemText !== "") {
+    promptParts.push(`System: ${systemText}`);
+  }
+  promptParts.push(parsed.prompt);
+  return { ok: true, prompt: promptParts.join("\n\n") };
+}
+
+/**
+ * `agent run <cli> "<ask>" --resume <name-or-id>`: continue a prior partner
+ * conversation, then capture the resumed session's NEW final answer into the same
+ * uniform envelope. The resumed session OWNS its config, so `--model`/`--effort`/
+ * `--preset` alongside `--resume` is bad_args; resolution goes through the
+ * resume-policy module REQUIRING the `<cli>` positional's harness (a same-name
+ * match on a different harness is a distinct `harness-mismatch`, never a wrong-CLI
+ * launch). A refuse-live / unknown / ambiguous / no-target decision each emits a
+ * distinct actionable bad_args with the envelope still written to `--output`.
+ * Launch + capture happen in the RECORDED cwd (resume is cwd-scoped — the native
+ * CLI finds the session only there), pinning the resumed session's id on the handle
+ * so discovery + the envelope resume_target resolve the POST-resume id: claude's
+ * freshly-forked CHILD uuid, codex's unchanged rollout uuid.
+ */
+async function runResumeCaptureSubcommand(
+  deps: MainDeps,
+  parsed: ParsedRunArgs,
+  agent: AgentKind,
+  verbDeps: VerbDeps,
+): Promise<never> {
+  const target = parsed.resume as string;
+  const emitBad = (): Promise<never> =>
+    emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+      parsed.output,
+    );
+
+  // The resumed session keeps its own model/effort/preset — passing them here is a
+  // contradiction, not an override. Fail loud rather than silently drop them.
+  if (
+    parsed.model !== null ||
+    parsed.effort !== null ||
+    parsed.preset !== null
+  ) {
+    deps.writeErr(
+      "agent: --model/--effort/--preset cannot be combined with --resume — " +
+        "the resumed session keeps its own config.\n",
+    );
+    return emitBad();
+  }
+
+  let decision: ResumeDecision;
+  try {
+    decision = deps.resolveResumeDecisionFn(target, agent);
+  } catch (err) {
+    deps.writeErr(
+      `agent: --resume cannot resolve '${target}': ${(err as Error).message}\n`,
+    );
+    return emitBad();
+  }
+
+  if (decision.kind === "unknown") {
+    deps.writeErr(
+      `agent: --resume: no partner session found matching '${target}'.\n`,
+    );
+    return emitBad();
+  }
+  if (decision.kind === "harness-mismatch") {
+    deps.writeErr(
+      `agent: --resume '${target}' did not resolve to a ${decision.require_harness} ` +
+        `session (newest match: ${displayAgent(decision.harness)} job ` +
+        `${decision.job_id}). Run it as \`keeper agent run ${decision.harness} ` +
+        `… --resume ${target}\` to resume the ${decision.harness} session instead.\n`,
+    );
+    return emitBad();
+  }
+  if (decision.kind === "live") {
+    deps.writeErr(
+      `agent: --resume '${target}' resolves to a LIVE ${displayAgent(decision.harness)} ` +
+        `session (job ${decision.job_id}${decision.title !== null ? `, "${decision.title}"` : ""}). ` +
+        `It is still running — message it instead: ` +
+        `keeper bus chat send ${decision.job_id} "<msg>"\n`,
+    );
+    return emitBad();
+  }
+  if (decision.kind === "ambiguous") {
+    deps.writeErr(
+      `agent: --resume '${target}' is ambiguous among ${decision.candidates.length} ` +
+        "equally-recent sessions — resume by the exact job id.\n",
+    );
+    return emitBad();
+  }
+  if (decision.kind === "no-target") {
+    deps.writeErr(
+      `agent: --resume: matched ${displayAgent(decision.harness)} job ` +
+        `${decision.job_id} has no resume target — it cannot be resumed.\n`,
+    );
+    return emitBad();
+  }
+
+  // decision.kind === "ok". Resume is cwd-scoped — the native CLI can locate the
+  // session only under its recorded cwd, so launch + discover THERE, not deps.cwd.
+  const resumeCwd = decision.cwd;
+  if (resumeCwd === null || resumeCwd === "" || !existsSync(resumeCwd)) {
+    deps.writeErr(
+      `agent: --resume: the recorded cwd for ${displayAgent(decision.harness)} job ` +
+        `${decision.job_id}${resumeCwd ? ` ('${resumeCwd}')` : ""} no longer exists ` +
+        "— cannot resume there.\n",
+    );
+    return emitBad();
+  }
+
+  const composed = composeRunPrompt(deps, parsed);
+  if (!composed.ok) {
+    deps.writeErr(composed.error);
+    return emitBad();
+  }
+
+  // claude forks a NEW child session file on --resume (ADR 0034); mint + pin the
+  // child uuid so strict discovery resolves the child (never the parent) and the
+  // envelope reports it as the POST-resume id. codex/pi resume their existing
+  // session in place, so the resumed id IS the target; hermes has no file
+  // transcript (store-based capture attributes by cwd + time).
+  const childSessionId =
+    decision.harness === "claude" ? deps.randomUuid() : undefined;
+  const discoverySessionId =
+    decision.harness === "claude"
+      ? (childSessionId as string)
+      : decision.harness === "hermes"
+        ? null
+        : decision.resume_target;
+
+  const result = await composeRunCapture(
+    {
+      ...runCaptureSeams(deps),
+      launch: () =>
+        launchToResolvedHandle({
+          deps: { ...launchHandleDeps(deps), cwd: resumeCwd },
+          agent,
+          prompt: composed.prompt,
+          // The resumed session owns its config — no posture overlay.
+          posture: {},
+          stopTimeoutMs: parsed.stopTimeoutMs,
+          resume: {
+            target: decision.resume_target,
+            childSessionId,
+            sessionId: discoverySessionId,
+          },
         }),
     },
     verbDeps,

@@ -166,6 +166,65 @@ describe("golden: buildAgentLaunchArgv", () => {
     ]);
   });
 
+  test("claude RESUME launch — fork pins (--session-id + --fork-session) and a dash-guarded prompt, no trailing positional", () => {
+    expect(
+      buildAgentLaunchArgv({
+        launcherArgvPrefix: PREFIX,
+        cli: "claude",
+        prompt: "keep going",
+        name: "reviewer",
+        resumeTarget: "parent-uuid",
+        resumeSessionId: "child-uuid",
+      }),
+    ).toEqual([
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+      "claude",
+      "--x-tmux",
+      "--x-tmux-detached",
+      "--x-no-confirm",
+      "--x-tmux-window-name",
+      "reviewer",
+      "--permission-mode",
+      "acceptEdits",
+      "--dangerously-skip-permissions",
+      "--name",
+      "reviewer",
+      "--resume",
+      "parent-uuid",
+      "--session-id",
+      "child-uuid",
+      "--fork-session",
+      "--",
+      "keep going",
+    ]);
+  });
+
+  test("codex RESUME launch — verb-position resume LEADS, dash-guarded prompt trails, no separate positional", () => {
+    expect(
+      buildAgentLaunchArgv({
+        launcherArgvPrefix: PREFIX,
+        cli: "codex",
+        prompt: "keep going",
+        resumeTarget: "rollout-uuid",
+      }),
+    ).toEqual([
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+      "codex",
+      "--x-tmux",
+      "--x-tmux-detached",
+      "--x-no-confirm",
+      "resume",
+      "rollout-uuid",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--",
+      "keep going",
+    ]);
+  });
+
   test("pi read-only launch (model + session) — posture-independent flags (no strip)", () => {
     expect(
       buildAgentLaunchArgv({

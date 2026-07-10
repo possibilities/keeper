@@ -48,6 +48,14 @@ export interface ResolvedHandle {
    * `show-last-message` shares this resolver and tolerantly ignores it.
    */
   stopTimeoutMs: number | null;
+  /**
+   * Resume marker threaded into transcript discovery: a resumed codex leg resolves
+   * its PRE-EXISTING rollout by the known uuid (`sessionId`) rather than the
+   * fresh-launch created-at floor. claude/pi stay strict-pinned; every harness's
+   * stop-scan still anchors at `startedAtMs` so a pre-resume stop is skipped.
+   * Absent/false = fresh launch, byte-unchanged.
+   */
+  isResume?: boolean;
 }
 
 export interface ResolveHandleArgs {
@@ -259,6 +267,7 @@ export async function runWaitForStop(
     homeDir: deps.homeDir,
     startedAtMs: handle.startedAtMs,
     sessionId: handle.sessionId,
+    isResume: handle.isResume,
     transcriptPath,
     stopTimeoutMs: handle.stopTimeoutMs ?? undefined,
   });
@@ -331,6 +340,7 @@ async function resolveTranscriptPath(
     homeDir: deps.homeDir,
     startedAtMs: handle.startedAtMs,
     sessionId: handle.sessionId,
+    isResume: handle.isResume,
   });
 }
 
