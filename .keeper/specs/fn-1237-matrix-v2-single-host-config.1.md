@@ -24,26 +24,30 @@ workerCellDir, and the pure {model, effort} → worker-agent compose (over expli
 subagents_config.ts, which stays in place untouched this task (consumers cut over in dependent tasks; the
 deletion task removes it). The new module must import no node:fs/node:os so the reconcile closure can adopt
 it. Keep host_matrix's EffectiveMatrix export shape working (the subagents.yaml base-compose path survives
-until the plan cutover task; only the parse layer beneath goes v2). Launcher side: reshape
-parseProviderModels; nativeIdFor becomes the capability → launch-id lookup from the winning entry; the
-`keeper agent` providers-resolve absent-matrix claude-native fallback flips to the typed loud error.
-Rewrite docs/examples/matrix.example.yaml to v2 in this task — the anti-rot test loads it by explicit path,
-so example and parser move together; keep it comment-heavy and outside every discovered config path.
+until the plan cutover task; only the parse layer beneath goes v2).
+
+ADDITIVE ONLY on the launcher side (early-proof-point re-scope: an in-place launcher reshape broke dispatch
+route-probe tests owned by task 2, so that cutover moves there). This task adds the v2 loader/parser to
+src/agent/matrix.ts BESIDE the existing v1 surface — parseRoute, parseProviderModels, nativeIdFor,
+assertNoClaudeOverlap, providerOrderFor, cellSet, and every caller of them (src/worker-cell.ts's
+defaultRouteProbe, the `keeper agent` providers resolve in src/agent/main.ts) are UNCHANGED by this task and
+keep passing today's tests. Task 2 reshapes parseProviderModels/nativeIdFor into the capability → launch-id
+lookup and flips the providers-resolve claude-native fallback to the typed loud error, in lockstep with its
+own resolveWorkerCell/defaultRouteProbe rewrite. Rewrite docs/examples/matrix.example.yaml to v2 in this
+task — the anti-rot test loads it by explicit path against the NEW v2 loader, so example and v2 parser move
+together; keep it comment-heavy and outside every discovered config path.
 
 ### Investigation targets
 
 *Verify before relying — these file:line refs are planner-verified at authoring time, but the repo moves.*
 
 **Required** (read before coding):
-- src/agent/matrix.ts:330-410 — parseProviderModels, the launcher long-form parser to reshape
-- src/agent/matrix.ts:302-321, 497-517, 531-539, 589-605 — parseRoute / assertNoClaudeOverlap / providerOrderFor / cellSet: the route/pecking seams
-- src/agent/matrix.ts:569 — nativeIdFor; :105-107 isValidMatrixAliasTarget; :79-85 defaults + matrixConfigPath
 - plugins/plan/src/host_matrix.ts:294-410 — coerceProviders/coerceProviderModels (coerceRoute :384, retired-alias-map rejection :436-441)
 - plugins/plan/src/host_matrix.ts:97-110 — isMatrixAliasTarget (per-segment strict tokens: basename derivation is safe by construction)
 - plugins/plan/src/host_matrix.ts:70-81, 186-190, 508-541 — keeperConfigDir, the parsed-then-discarded subagents key, composeEffective
 - plugins/plan/src/subagents_config.ts:128-188 — WORKERS_BASE / workerCellDir / composeWorkerAgent to copy into the new leaf
-- test/agent-matrix.test.ts — the cross-island parity + example anti-rot suite
-- src/agent/main.ts:1996-2020 — providers resolve fallback to flip loud
+- test/agent-matrix.test.ts — the cross-island parity + example anti-rot suite (targets the new v2 loader; the legacy route/dispatch surface is out of scope this task)
+- src/agent/matrix.ts:79-85 — defaults + matrixConfigPath (the config-path resolution the new v2 loader shares with v1)
 
 **Optional** (reference as needed):
 - src/agent/config.ts:82 — launcher-side config-dir resolution
@@ -51,15 +55,15 @@ so example and parser move together; keep it comment-heavy and outside every dis
 
 ### Risks
 
-- The two parsers drifting — the parity test over shared v2 fixtures is the guard; land both islands in this one task
-- Keeping composeEffective's base path alive while re-shaping the parse layer beneath it (dependent tasks rely on it until the cutover)
+- The two parsers drifting — the parity test over shared v2 fixtures is the guard; land both islands' v2 loader in this one task
+- Keeping composeEffective's base path AND the launcher's v1 route/dispatch surface alive while the v2 loader lands beside them — cutting either over is out of scope here (task 2 owns the launcher's dispatch path; the deletion task owns the rest)
 
 ### Test notes
 
 Shared fixture set: valid claude-only; valid multi-provider with ragged {id, efforts} + a provider-qualified
 pi launch-id; one fixture per retired key; one per failure state; same-provider collision; cross-provider
-dedup with shadow. Parity test asserts both islands parse each fixture identically; anti-rot test green on
-the rewritten example.
+dedup with shadow. Parity test asserts both islands' v2 loader parses each fixture identically; anti-rot test
+green on the rewritten example.
 
 ## Acceptance
 
@@ -68,9 +72,9 @@ the rewritten example.
 - [ ] The four failure states produce four distinguishable typed errors, each naming the resolved config path and the copy-the-example fix
 - [ ] A same-provider basename collision errors at load; a cross-provider duplicate resolves to the first provider with its effort list and the shadowed entry is observable in the loader result
 - [ ] A subagent_models entry no provider serves errors at load; a provider model absent from subagent_models loads as launch-only enumeration
-- [ ] docs/examples/matrix.example.yaml parses under the new loaders and demonstrates a bare launch-id, an {id, efforts} band, and a provider-qualified entry; the anti-rot test passes
+- [ ] docs/examples/matrix.example.yaml parses under the new v2 loaders and demonstrates a bare launch-id, an {id, efforts} band, and a provider-qualified entry; the anti-rot test passes
 - [ ] A new plan-island leaf module exports the worker-cell path/compose helpers and imports no node:fs or node:os
-- [ ] keeper agent provider resolution with no matrix present emits the typed loud error instead of a claude-native fallback candidate
+- [ ] The existing v1 launcher surface (parseRoute, parseProviderModels, nativeIdFor, defaultRouteProbe, `keeper agent` providers resolve) is untouched, and worker-cell.test.ts, dispatch-cli.test.ts, and wrapped-cell-e2e.slow.test.ts stay green exactly as they pass today
 
 ## Done summary
 
