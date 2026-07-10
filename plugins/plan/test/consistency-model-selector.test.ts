@@ -85,9 +85,11 @@ describe("on-disk selector config", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
-    // Content-blind selector guidance must stay capability-shaped: cost and
-    // provider ordering live in the host matrix, never in the usage rule, the
-    // hand_tuned policy, or any efforts/models guidance block.
+    // Skill-authored selector guidance must stay capability-shaped: cost and
+    // provider ordering live in the host matrix, never in the usage rule or any
+    // efforts/models guidance block. hand_tuned is exempt — the HUMAN-OWNED
+    // routing policy is sanctioned to carry the family split's economics
+    // (the GPT-first rule names the families and their cost posture outright).
     const forbidden = [
       "cost",
       "cheap",
@@ -102,7 +104,6 @@ describe("on-disk selector config", () => {
     ];
     const blocks = [
       config.usage,
-      config.hand_tuned,
       ...Object.values(config.efforts),
       ...Object.values(config.models),
     ];
@@ -127,7 +128,7 @@ describe("on-disk selector config", () => {
     expect(lower).toContain("anti-anchor");
   });
 
-  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the sonnet-first burden-of-proof + anti-anchor rule", () => {
+  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the burden-of-proof + anti-anchor rule", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );

@@ -29,33 +29,36 @@ usage: |
   think?) — they are independent axes. The effort axis carries most of the signal:
   match the band to the task's true difficulty (its acceptance shape and blast
   radius), never its line count. On the model axis the binding `hand_tuned` policy
-  governs: sonnet is the default implementation workhorse and opus is the
-  exception, chosen only on a concrete, nameable intelligence-bound reason. When
-  uncertain on the model axis, resolve DOWN to sonnet absent such a reason; when
-  uncertain on the effort axis for mechanical work, resolve to the lower band.
+  governs the family split: gpt tiers are the default for well-specified work
+  that does not need deep judgment or taste; sonnet is the workhorse for
+  judgment-heavy work, and opus the exception, chosen only on a concrete,
+  nameable intelligence-bound reason. When uncertain on the model axis, bounded
+  well-specified work resolves to a GPT tier and open-ended or judgment-heavy
+  work resolves to sonnet; when uncertain on the effort axis for mechanical
+  work, resolve to the lower band.
 
 # HUMAN-OWNED binding routing policy — the highest-precedence tie-break, carried
 # verbatim in every selector brief. NOT authored or refreshed by the
-# model-guidance research pass; a human hand-tunes it. Capability-shaped only.
+# model-guidance research pass; a human hand-tunes it. Capability- and
+# economics-shaped.
 hand_tuned: |
-  The burden of proof is on opus. Choose opus ONLY on a concrete, nameable
-  intelligence-bound reason: a novel algorithm or design, a cross-cutting
-  multi-file architectural cascade, a subtle correctness or security invariant, or
-  long-horizon planning. On a tie, or absent such a reason, choose sonnet — the
-  default implementation workhorse. Security- or correctness-critical work is a
-  hard opus gate that overrides the sonnet-first default regardless of size.
-  Mechanical or templated work takes sonnet at low or medium effort. Trickle
-  lane: when the candidate cells offer a model beyond the sonnet/opus pair and
-  a task is genuinely bounded mechanical work — a single-surface edit, a
-  straight test addition, or a mechanical refactor with a fully-specified
-  acceptance and a named surface, in the low or medium band — PREFER that
-  trickle model over sonnet for the task (its own guidance block below governs
-  fit); this deliberate routing builds the cohort evidence that can widen its
-  range. Any doubt about boundedness, or anything contract-, security-, or
-  investigation-shaped, stays on sonnet or opus. Anti-anchor
-  clause: spec length and difficulty adjectives are not difficulty — a short spec
-  can be intelligence-bound and a long spec mechanical. Model and effort are
-  independent axes: cranking sonnet's effort is not an opus substitute.
+  Two families, one split: Claude models carry the best taste, creativity, and
+  judgment; GPT models are faster and almost always cheaper per token. PREFER a
+  GPT tier whenever Claude-tuned capabilities are not needed — well-specified
+  work whose quality bar is correctness against a nameable acceptance routes to
+  the GPT model whose guidance block fits it. Reach for sonnet when the task
+  genuinely needs Claude-tuned judgment: ambiguous or under-specified
+  acceptance, design and API-surface taste, user-facing wording, creative or
+  greenfield shaping, or delicate in-repo idiom matching. The burden of proof
+  is on opus. Choose opus ONLY on a concrete, nameable intelligence-bound
+  reason: a novel algorithm or design, a cross-cutting multi-file architectural
+  cascade, a subtle correctness or security invariant, or long-horizon
+  planning. Security- or correctness-critical work is a hard opus gate that
+  overrides the GPT-first default regardless of size. Anti-anchor clause: spec
+  length and difficulty adjectives are not difficulty — a short spec can be
+  intelligence-bound and a long spec mechanical. Model and effort are
+  independent axes: cranking a cheaper tier's effort is not a substitute for a
+  more capable model.
 
 # Provenance for the efforts guidance blocks as a whole — the effort axis has no
 # per-value research cache, so one review stamp covers the set. OPTIONAL and
@@ -115,32 +118,88 @@ models:
     / custom tools unless the prompt names when to use them, and narrates and
     deliberates more than the prior generation. When to pick: only on a concrete,
     nameable intelligence-bound reason per the hand_tuned policy — otherwise
-    sonnet.
+    route down per hand_tuned.
   sonnet: |
-    The default implementation workhorse: near-top-tier quality on bounded coding
-    and agentic work, with every effort band available. Strengths: routine
+    The implementation workhorse for judgment-heavy work: near-top-tier quality
+    on bounded coding and agentic work, with every effort band available, and
+    the strongest judgment, taste, and idiom-matching short of opus. Strengths: routine
     implementation, template-following, mechanical refactors, targeted tests, and
     fixes with a named surface; follows a tightly-scoped spec literally and
     precisely. Weaknesses: that literalism means an under-specified task fails
     harder here — less margin than opus on ambiguous design, contract/schema/wire
-    work, cross-repo changes, migrations, and gnarly debugging. When to pick: the
-    default for well-specified implementation work; escalate to opus only for a
-    named intelligence-bound reason per the hand_tuned policy.
+    work, cross-repo changes, migrations, and gnarly debugging. When to pick: per
+    the hand_tuned policy, the tier for judgment-heavy or under-specified work
+    that does not need opus — ambiguous acceptance, design and API-surface taste,
+    user-facing wording, delicate idiom matching; well-specified bounded work
+    routes GPT-first instead.
+  gpt-5.6-sol: |
+    The GPT flagship tier — the highest GPT-side reasoning ceiling, built for
+    complex reasoning over large codebases and demanding long-horizon agentic
+    work, with a very large (1M-token) context and the best complex-edit safety
+    of its family. Strengths: hard multi-file changes with an explicit
+    acceptance, big-working-set navigation, long tool-heavy trajectories.
+    Weaknesses: documented over-persistence — can push past stated intent
+    (scope-exceeding cleanups, over-claimed results), strongest at the top
+    reasoning efforts; give it explicit stop conditions and an allowed
+    change-scope, and keep it off unsupervised destructive scope. When to pick:
+    the top gpt-side choice for the hardest well-specified work that needs no
+    deep design judgment or taste; opus still owns nameable intelligence-bound
+    reasons.
   gpt-5.5: |
-    A capable generalist coding model with strong multi-step reasoning and broad
-    language breadth — the first non-default worker tier, routed under a
-    deliberate trickle posture. Strengths: from-scratch implementation against a
-    clear spec, algorithmic and data-transformation work, and literal execution
-    of a bounded, well-specified acceptance. Weaknesses: leans literal on an
-    under-specified spec and can drift from a codebase's established idioms unless
-    the task names the pattern to follow; less sure than the top tier at telling
-    a real failure from a flake in open-ended debugging. When to pick: route it
-    ONLY to genuinely-bounded mechanical work in the low/medium band shapes —
-    single-surface edits, straight test additions, mechanical refactors with an
-    explicit acceptance and a named surface — widening its range only as
-    out-of-band cohort evidence grades it right-sized, never by default. When to
-    avoid: contract-, schema-, or wire-shaped changes and hypothesis-free
-    debugging; keep those on a higher tier.
+    A frontier-class GPT tier a half-step below the 5.6 flagship; its vendor
+    sweet spot is multi-step agentic coding — plan, navigate, edit across
+    files, verify — with precise tool use over large surfaces, efficient
+    reasoning, and a very large (1M-token) context. Strengths: substantial
+    well-specified implementation — spec'd features and multi-file mechanical
+    changes in a known pattern — executed literally and thoroughly. Weaknesses:
+    documented over-eagerness (may act when only asked to answer, or drift past
+    the stated change-scope); overthinks under weak stopping criteria; drifts
+    from house idiom unless the pattern is named. When to pick: the GPT
+    workhorse for substantial well-specified work — name the acceptance, the
+    allowed scope, and a stop condition; step up to gpt-5.6-sol for the hardest
+    bounded work.
+  gpt-5.6-terra: |
+    The balanced middle of the 5.6 family: near-frontier everyday coding
+    capability at a lighter weight, a full-size (1M-token) context, and the
+    family's best resistance to prompt injection in tool results. Strengths:
+    ordinary well-specified implementation — bounded features, multi-step
+    edits, tool-driven loops with a named acceptance. Weaknesses: below sol on
+    reasoning ceiling and complex-edit safety (gnarly multi-file edits carry
+    more overwrite risk); shares the family's over-eager tendency — name scope
+    and stop conditions. When to pick: the everyday GPT tier and first reach
+    for ordinary well-specified work; step up to sol or gpt-5.5 for genuinely
+    hard multi-file reasoning, down to a light tier for tiny mechanical edits.
+  gpt-5.4: |
+    The prior-generation GPT flagship: strong production-grade agentic coding,
+    close repo-pattern adherence, a very large (1M-token) context, and
+    token-efficient long tool-heavy trajectories. Strengths: multi-file
+    mechanical changes with an explicit shape, big-working-set edits, faithful
+    instruction-following. Weaknesses: a step below gpt-5.5 and sol in
+    reasoning ceiling; under-thinks if dispatched without an explicit effort
+    band. When to pick: well-specified multi-file work where a large context or
+    strict repo-pattern adherence is the deciding factor and the path is
+    explicit; prefer terra or gpt-5.5 when the reasoning gets hard.
+  gpt-5.4-mini: |
+    The strongest GPT light tier: real reasoning headroom and a large (400K)
+    context in a fast, high-volume class — trails the full 5.4 only modestly on
+    agentic-coding evals. Strengths: high-volume bounded edits, straight test
+    additions, mechanical refactors, and bounded agent loops needing some
+    reasoning — carries bounded-but-not-tiny tasks that spark would strand.
+    Weaknesses: below the full-model ceiling — give it the choice pre-made;
+    contract-shaped blast radius stays off it. When to pick: bounded mechanical
+    work with real reasoning or working-set demand — prefer it over spark and
+    luna there; step up to terra or gpt-5.5 when work spans surfaces or needs
+    design judgment.
+  gpt-5.6-luna: |
+    The 5.6 family's lightweight tier: the fastest of the family, with a
+    full-size (1M-token) context despite its light weight — built for small,
+    fast, high-volume tasks. Strengths: snappy single-surface edits, straight
+    test additions, template-following with a named pattern, big-input reads.
+    Weaknesses: the lowest reasoning ceiling of the GPT tiers and the family's
+    weakest complex-edit safety — keep it off multi-file edits and anything
+    with overwrite risk; shares the family's over-eager tendency. When to pick:
+    tiny-to-small fully-specified mechanical work; prefer gpt-5.4-mini when a
+    bounded task needs more reasoning, terra when it grows past one surface.
   gpt-5.3-codex-spark: |
     A fast, lightweight coding model tuned for quick, tightly-scoped edits.
     Strengths: snappy single-file changes, straight test additions, mechanical
@@ -175,13 +234,45 @@ research:
     card:
       reference: skills/model-guidance/references/cards/sonnet.md
       sha256: 5b7494c21726a3bd74fa10b5aa7d09c78cc903b66da515b7d26c1b73e529292a
-  # Host-roster capability model absent from the claude-only default axis. The
-  # research entry is tolerated by the host-blind gate, but the reference must
-  # exist and hash-match like any other; the guidance block is a pre-provisioned
-  # extra the runtime selection-brief seam gates on the effective matrix.
   gpt-5.3-codex-spark:
     reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
-    sha256: fe58cf92782857d47536711f34045dd84923cf84054195e5dd4e10ac73327f09
+    sha256: 6a9833d3a9199887b725bbb36dddd4a9f394a6cd162b326f5d0215f9c7f1c28c
     card:
       reference: skills/model-guidance/references/cards/gpt-5.3-codex-spark.md
       sha256: b2d909a0616523cbc0ec4ef47e9bbc6c039bf72fbfc4bcacdcee6c632b4a8f32
+  gpt-5.4:
+    reference: skills/model-guidance/references/gpt-5.4.md
+    sha256: b3b80dbac5f34fd5dceeb48914c1fc987f6df3e4301c55a1f6127eca788654e4
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.4.md
+      sha256: 0f0ce4f969176e21c00169c18ca8c38d802c9b9fdbe13c7e7e86fd687c11223c
+  gpt-5.4-mini:
+    reference: skills/model-guidance/references/gpt-5.4-mini.md
+    sha256: a9e35cda918b8fd47b16b7d5e5e5850d516fa951d02a48685824b613e9491a21
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.4-mini.md
+      sha256: d6685f7cccfc8e3d8c66229e35b8db6faad22f2a24c27e26c747fd1e2dabf646
+  gpt-5.5:
+    reference: skills/model-guidance/references/gpt-5.5.md
+    sha256: 381f6ec7b9b5f2f8afd3cd5ee794ea0ffb43d9a3e0c025979b2ebf045b88e7a8
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.5.md
+      sha256: bbf8887d08564ffe7d58d28b2bd771a8892828a05b6f489de126654b1baa11f0
+  gpt-5.6-sol:
+    reference: skills/model-guidance/references/gpt-5.6-sol.md
+    sha256: 1e4cdaa25a71c9d23c4aa4e45f8c1bfc0815402928b675235558633849aa0e52
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.6-sol.md
+      sha256: 135bd1927d665e481718e1639b5a512c8bb777a3016b0e4c070feefe554175ed
+  gpt-5.6-terra:
+    reference: skills/model-guidance/references/gpt-5.6-terra.md
+    sha256: 184cd8988fb9dc92f16b23697dbda577cd050adf255b2ca2c83e5c4b6920a754
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.6-terra.md
+      sha256: 57b0f72b7a45c83107cc3f604bb1e9ec49313a1840cdb4d64a980b7248c899ce
+  gpt-5.6-luna:
+    reference: skills/model-guidance/references/gpt-5.6-luna.md
+    sha256: c2272ed98a58ea9af9bb7dcd2eeaa2427137befd9c08f0cabdf663a550a42e89
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.6-luna.md
+      sha256: 19e48de300e9170699f4118191e357d33f9561eab82c88e321abe0101b55e330

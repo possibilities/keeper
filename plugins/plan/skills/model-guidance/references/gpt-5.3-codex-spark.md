@@ -20,7 +20,7 @@ prompt-sized distillation; the depth and citations live here. The drift gate
 file's bytes, so an edit here without re-distilling + re-hashing fails the fast suite.
 
 Re-run this research when the `gpt-5.3-codex-spark` capability id is re-pointed to a newer model
-version, or when out-of-band cell-review cohorts justify widening its trickle-posture routing range.
+version, or when out-of-band cell-review cohort evidence materially re-grades its routing fit.
 
 ## What `gpt-5.3-codex-spark` is
 
@@ -29,10 +29,10 @@ wrapper delegates implementation to the model's serving provider (the `codex` ha
 matrix) and re-owns the keeper close-out (tests, soft-reset of foreign commits, the single sanitized
 trailer commit). It is a fast, lightweight coding tier tuned for quick, tightly-scoped edits — the
 low end of the codex model family, built for snappy turnaround on small, well-bounded work rather
-than deep multi-step reasoning. On the plan board it is introduced under a deliberate **trickle
-posture** — routed only to genuinely-bounded mechanical work until graded cell-review cohorts justify
-promotion — so "pick gpt-5.3-codex-spark" is not yet a broad default but a narrow, evidence-gated
-routing choice.
+than deep multi-step reasoning. On the plan board it routes per the binding `hand_tuned` GPT-first
+policy, and its capability ceiling keeps its lane narrow — small, fully-specified mechanical work —
+with out-of-band cell-review cohorts grading fit and re-tuning this guidance as evidence
+accumulates.
 
 A dispatch note the launch path (not this capability research) owns: the codex provider's host matrix
 entry accepts the bare `gpt-5.3-codex-spark` capability id directly, so this model needs no
@@ -60,10 +60,10 @@ bare id at startup.
   tiers over an extended multi-step task, so a long investigation-then-implement loop degrades faster
   here.
 - **Contract-shaped blast radius.** Higher risk on contract-, schema-, or wire-shaped changes where a
-  wrong abstraction propagates past the task — exactly the class the trickle posture keeps it away
+  wrong abstraction propagates past the task — exactly the class the routing policy keeps it away
   from.
 
-## When to pick (under the trickle posture)
+## When to pick
 
 Route `gpt-5.3-codex-spark` **only** to small, reversible, near-mechanical work with a fully-specified
 acceptance — single-file edits, straight test additions, mechanical refactors with an explicit
