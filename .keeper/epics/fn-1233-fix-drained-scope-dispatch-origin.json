@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-10T03:46:58.708000Z",
+  "created_by_close_of": "fn-1229-agent-friendly-await-scope-and",
+  "depends_on_epics": [
+    "fn-1229-agent-friendly-await-scope-and"
+  ],
+  "id": "fn-1233-fix-drained-scope-dispatch-origin",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix drained scope dispatch-origin projection",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-10T03:46:58.708000Z"
+}
