@@ -53,5 +53,5 @@ state writes nothing; assert an escaping subagent_templates entry is rejected up
 - [ ] Per-cell plugin.json still carries manifest_description; an inventory-listed template missing it errors
 
 ## Done summary
-
+Renderer fans out worker cells from the required v2 host matrix: subagent_templates membership + subagent_models x effortsFor into the fixed workers/<model>-<effort>/ convention (shared workerCellDir), render_to machinery deleted, absent/invalid matrix aborts with the typed four-state error and no partial tree. Suites pinned at committed claude-only fixtures.
 ## Evidence
