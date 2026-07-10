@@ -106,6 +106,7 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 - **Restore**: Relaunching a dead generation's agent tabs so each re-attaches to its exact prior conversation, proven per tab from attach evidence — window creation alone never counts as restored. Avoid: revive (that is the runnable dump-script artifact), resurrect, respawn.
 - **Harness resume**: One harness re-attaching to its own persisted session by native id — the per-tab primitive a restore drives. Distinct from the Resume cursor (a fold checkpoint) and from unblocking a task. Avoid: reconnect, reload, restore (that is the whole-generation flow).
 - **Resume target**: The harness-native id a harness resume needs — the claude session id, or the stored native id for pi/codex/hermes; empty means not-resumable, and a display title is never a resume key. Avoid: session name, label, job id (identity, not the resume key).
+- **Refuse-live**: The resume-time gate that never re-attaches a currently live session — liveness is pid + start-time identity, and a running agent is reached over the bus instead. Avoid: force-resume, live takeover, double-attach.
 
 ## Frame stream and supervision
 
