@@ -6,7 +6,7 @@
     "fn-1239-replace-usage-with-account-routing"
   ],
   "id": "fn-1242-multi-harness-keeper-transcript",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T19:25:07.180000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T19:24:55.190000Z"
+  "updated_at": "2026-07-10T19:25:07.180000Z"
 }
