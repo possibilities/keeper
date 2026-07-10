@@ -57,5 +57,5 @@ ERR_CHILD_PROCESS_STDIO_MAXBUFFER error object if the structure permits.
 - [ ] The extension remains node:*-only and fail-open; pi-extension tests stay green and spawn no subprocess
 
 ## Done summary
-
+Hardened the pi keeper_transcript tool bridge: clamps oversized limit/max_chars (surfacing applied clamps in result details), re-routes maxBuffer overflow to return truncated content with a notice instead of failing, validates session_id/subagent shape before any spawn, and documents (with empirical verification) that pi 0.80.6 accepts plain JSON Schema — dropping the inert '~kind' marker. Extension stays node:*-only and fail-open.
 ## Evidence
