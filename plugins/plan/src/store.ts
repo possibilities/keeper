@@ -6,8 +6,9 @@
 //
 // Writes go through atomicWrite/atomicWriteJson: tmp file in the target's
 // directory, fsync, rename, parent-dir fsync, tmp unlinked on any throw — and
-// each records a touched-path under the session log (CLAUDE_CODE_SESSION_ID
-// fail-OPEN). atomicWriteJson serializes with a recursive key sort + indent 2 +
+// each records a touched-path under the current tracked session log
+// (fail-OPEN when no supported harness identity exists). atomicWriteJson
+// serializes with a recursive key sort + indent 2 +
 // trailing newline, byte-identical to Python json.dumps(indent=2,
 // sort_keys=True)+newline (JSON.stringify does not sort, so sortKeysDeep does).
 //
@@ -39,6 +40,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { getExec } from "./exec.ts";
 import { flockOrThrow, LOCK_EX, LOCK_UN } from "./flock.ts";
+import { resolvePlanSessionId } from "./session_id.ts";
 import { resolveDataDir } from "./state_path.ts";
 import { readStdinText } from "./stdin.ts";
 
@@ -193,13 +195,13 @@ export function atomicWriteRaw(path: string, content: string): void {
 /** Append `path` to the current session's touched-paths log, then return.
  * Layout: `<data-dir>/state/sessions/<sid>/touched/<uuid4hex>.txt`, content =
  * the repo-relative POSIX path + newline. Mirrors planctl/store.py _record_touched:
- * CLAUDE_CODE_SESSION_ID fail-OPEN (no sid -> silent skip), walk up <=20 levels
+ * session identity fail-OPEN (no sid -> silent skip), walk up <=20 levels
  * for a data dir, all exceptions swallowed — a recorder failure never surfaces to
  * a caller (it degrades to wildcard staging at commit, which the hook rejects). */
 export function recordTouched(path: string, dataDir?: string): void {
   try {
-    const sid = process.env.CLAUDE_CODE_SESSION_ID;
-    if (!sid) {
+    const sid = resolvePlanSessionId();
+    if (sid === null) {
       return;
     }
 

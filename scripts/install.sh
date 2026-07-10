@@ -76,6 +76,10 @@ fi
 echo "install: rendering plan-plugin generated files"
 ( cd "${repo_root}/plugins/prompt" && bun install )
 ( cd "${repo_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${repo_root}" )
+if command -v pi >/dev/null 2>&1; then
+  echo "install: rendering Pi plan agents"
+  ( cd "${repo_root}" && PI_CODING_AGENT_DIR="${HOME}/.pi/agent" bun scripts/install-pi-plan-agents.ts )
+fi
 
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when

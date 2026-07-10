@@ -642,6 +642,19 @@ describe("scaffold mint boundary", () => {
     }
   });
 
+  test("a tracked Pi job supplies scaffold's commit identity", () => {
+    const r = runCli(["scaffold", "--file", writeYaml(twoTaskYaml())], {
+      cwd: project.root,
+      home: project.home,
+      env: { CLAUDE_CODE_SESSION_ID: "", KEEPER_JOB_ID: "pi-job" },
+    });
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(
+      (payload.plan_invocation as Record<string, unknown>).session_id,
+    ).toBe("pi-job");
+  });
+
   test("missing session id fails closed before any write or commit", () => {
     // test_scaffold.py::test_scaffold_missing_session_id_writes_nothing
     const logBefore = gitLogCount(project.root);

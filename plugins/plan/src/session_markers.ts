@@ -7,8 +7,8 @@
 // created_at}. The TS hook dispatchers (plugin/hooks/lib.ts) read these files;
 // the field names + `kind` values are the contract.
 //
-// Fail OPEN: the session id comes from CLAUDE_CODE_SESSION_ID — absent makes
-// every helper a silent no-op. All filesystem errors are swallowed: marker IO
+// Fail OPEN: an absent tracked harness identity makes every helper a silent
+// no-op. All filesystem errors are swallowed: marker IO
 // never fails the verb. Callers invoke these strictly on the success path (a
 // marker for an unclaimed task would lock out commits).
 
@@ -23,6 +23,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { resolvePlanSessionId } from "./session_id.ts";
 import { nowIso } from "./store.ts";
 
 const SCHEMA_VERSION = 1;
@@ -37,7 +38,7 @@ const CLOSE_CLAIM_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Resolve the session id from the env, fail-open (empty/absent → null). */
 function sessionId(): string | null {
-  return process.env.CLAUDE_CODE_SESSION_ID || null;
+  return resolvePlanSessionId();
 }
 
 /** `~/.local/state/keeper/sessions` honoring a mutated $HOME (tests). Mirrors

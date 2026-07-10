@@ -10,7 +10,7 @@
  * parameterized core:
  *
  *  - **Family A** (id-clearing CLI-spawn — commit-work / session-state):
- *    clears the ambient `CLAUDE_CODE_SESSION_ID` /
+ *    clears the ambient `CLAUDE_CODE_SESSION_ID` / `KEEPER_JOB_ID` /
  *    `JOBCTL_SESSION_ID` / `JOBCTL_JOB_ID` so attribution + the Job-Id trailer
  *    are fully test-controlled, and sets the six state paths.
  *    Reproduce with `clearAmbientIds: true` (the default).
@@ -76,7 +76,7 @@ export interface SandboxEnvOptions {
   /** Path to the sandboxed `keeper.db` (usually `join(tmpDir, "keeper.db")`). */
   dbPath: string;
   /**
-   * Clear `CLAUDE_CODE_SESSION_ID` / `JOBCTL_SESSION_ID` / `JOBCTL_JOB_ID`
+   * Clear `CLAUDE_CODE_SESSION_ID` / `KEEPER_JOB_ID` / `JOBCTL_SESSION_ID` / `JOBCTL_JOB_ID`
    * (Family A). Default `true`. Set `false` for hook-spawn tests (Family B)
    * that rely on the ambient ids.
    */
@@ -103,6 +103,7 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   // + the Job-Id trailer. A real Claude session sets CLAUDE_CODE_SESSION_ID.
   if (clearAmbientIds) {
     env.CLAUDE_CODE_SESSION_ID = undefined;
+    env.KEEPER_JOB_ID = undefined;
     env.JOBCTL_SESSION_ID = undefined;
     env.JOBCTL_JOB_ID = undefined;
   }

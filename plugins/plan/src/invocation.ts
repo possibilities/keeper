@@ -7,8 +7,8 @@
 // buildPlanInvocationReadonly: read-only verbs touch nothing, so files/subject
 // are null and touched_path_files is empty; repo_root === state_repo.
 //
-// buildPlanInvocation (mutating): session id fail-CLOSED (throws when
-// CLAUDE_CODE_SESSION_ID is absent); files = the sorted intersection of the
+// buildPlanInvocation (mutating): session id fail-CLOSED (throws when no
+// supported harness identity is present); files = the sorted intersection of the
 // session's touched-paths log with git's dirty data-dir set; subject from
 // buildSubject; session_id rides after state_repo.
 
@@ -16,6 +16,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { buildSubject } from "./commit.ts";
+import { resolvePlanSessionId } from "./session_id.ts";
 import { DATA_DIR_NAMES, resolveDataDirOrDefault } from "./state_path.ts";
 import { getVcs } from "./vcs.ts";
 
@@ -58,7 +59,7 @@ export interface MutatingInvocation {
 
 /** Build the mutating plan_invocation payload. Mirrors
  * planctl.invocation.build_planctl_invocation:
- *  - session id from CLAUDE_CODE_SESSION_ID, fail-CLOSED (throw when absent),
+ *  - session id from the neutral harness resolver, fail-CLOSED when absent,
  *  - touched_path_files = the session's recorded touched-log filenames,
  *  - files = sorted(touched-paths content ∩ dirty data-dir set),
  *  - state_repo = primaryRepo when given, else repoRoot.
@@ -78,16 +79,12 @@ export function buildPlanInvocation(
   const { repoRoot, primaryRepo = null } = opts;
   const dataDir = resolveDataDirOrDefault(repoRoot);
 
-  // Session id — CLAUDE_CODE_SESSION_ID is the sole source. Fail-closed on
-  // absence: the claude binary ships it intrinsically on every session, so it is
-  // always present for a mutating verb inside a Claude harness.
-  const sessionId = process.env.CLAUDE_CODE_SESSION_ID || null;
+  const sessionId = resolvePlanSessionId();
   if (sessionId === null) {
     throw new Error(
       "planctl build_planctl_invocation requires a resolvable session_id; " +
-        "CLAUDE_CODE_SESSION_ID must be set (the claude binary ships it " +
-        "intrinsically inside a Claude harness; tests and manual invocations " +
-        "must set it themselves).",
+        "set KEEPER_PLAN_SESSION_ID for an explicit invocation, or run inside " +
+        "a tracked Claude or Keeper agent session.",
     );
   }
 

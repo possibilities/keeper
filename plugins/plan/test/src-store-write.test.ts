@@ -43,17 +43,24 @@ import {
 
 let root: string;
 const savedSid = process.env.CLAUDE_CODE_SESSION_ID;
+const savedKeeperJobId = process.env.KEEPER_JOB_ID;
+const savedPlanSid = process.env.KEEPER_PLAN_SESSION_ID;
 
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "planctl-write-test-")));
+  delete process.env.KEEPER_JOB_ID;
+  delete process.env.KEEPER_PLAN_SESSION_ID;
 });
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
-  if (savedSid === undefined) {
-    delete process.env.CLAUDE_CODE_SESSION_ID;
-  } else {
-    process.env.CLAUDE_CODE_SESSION_ID = savedSid;
+  for (const [key, value] of [
+    ["CLAUDE_CODE_SESSION_ID", savedSid],
+    ["KEEPER_JOB_ID", savedKeeperJobId],
+    ["KEEPER_PLAN_SESSION_ID", savedPlanSid],
+  ] as const) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
 });
 
@@ -175,6 +182,20 @@ describe("recordTouched (session touched-paths log)", () => {
     expect(readFileSync(join(touchedDir, entries[0] as string), "utf-8")).toBe(
       ".keeper/tasks/fn-1-x.1.json\n",
     );
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  test("a tracked Pi job records into the same touched-path layout", () => {
+    const { repoRoot, dataDir } = seedPlanctl();
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    process.env.KEEPER_JOB_ID = "pi-job";
+    const target = join(dataDir, "tasks", "fn-1-x.1.json");
+    mkdirSync(join(dataDir, "tasks"), { recursive: true });
+    writeFileSync(target, "{}");
+    recordTouched(target);
+    expect(
+      readdirSync(join(dataDir, "state", "sessions", "pi-job", "touched")),
+    ).toHaveLength(1);
     rmSync(repoRoot, { recursive: true, force: true });
   });
 

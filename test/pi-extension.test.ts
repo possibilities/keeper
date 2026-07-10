@@ -410,10 +410,24 @@ describe("pi extension — factory arming + fail-open", () => {
 
   function fakePi() {
     const handlers = new Map<string, ((e: PiObservedEvent) => void)[]>();
+    const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
     const tools = new Map<string, unknown>();
     return {
       handlers,
       tools,
+      events: {
+        on(event: string, handler: (data: unknown) => void) {
+          const set = eventHandlers.get(event) ?? new Set();
+          set.add(handler);
+          eventHandlers.set(event, set);
+          return () => set.delete(handler);
+        },
+        emit(event: string, data: unknown) {
+          for (const handler of [...(eventHandlers.get(event) ?? [])]) {
+            handler(data);
+          }
+        },
+      },
       on(kind: string, h: (e: PiObservedEvent) => void) {
         const list = handlers.get(kind) ?? [];
         list.push(h);
@@ -470,7 +484,7 @@ describe("pi extension — factory arming + fail-open", () => {
       "tool_call",
       "tool_result",
     ]);
-    expect([...pi.tools.keys()]).toEqual(["keeper_transcript"]);
+    expect([...pi.tools.keys()]).toEqual(["keeper_transcript", "Task"]);
   });
 
   test("a fired event appends the translated line to the per-pid file", () => {

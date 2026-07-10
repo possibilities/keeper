@@ -145,6 +145,32 @@ describe("marker writer schema", () => {
     expect((rec.created_at as string).length).toBeGreaterThan(0);
   });
 
+  test("a tracked Pi job owns its work marker", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffold(proj, "Pi marker epic");
+    expect(cli(["validate", "--epic", epicId], proj).code).toBe(0);
+    const claimed = runCli(
+      ["claim", taskIds[0] as string, "--project", proj.root],
+      {
+        cwd: proj.root,
+        home: proj.home,
+        env: { CLAUDE_CODE_SESSION_ID: "", KEEPER_JOB_ID: "pi-job" },
+      },
+    );
+    expect(claimed.code).toBe(0);
+    const path = join(
+      proj.home,
+      ".local",
+      "state",
+      "keeper",
+      "sessions",
+      "pi-job.json",
+    );
+    const rec = JSON.parse(readFileSync(path, "utf8"));
+    expect(rec.session_id).toBe("pi-job");
+    expect(rec.task_id).toBe(taskIds[0]);
+  });
+
   // test_session_markers.py::test_write_close_marker_schema
   test("close-preflight writes a schema-1 close marker carrying epic_id", () => {
     const proj = getProj();

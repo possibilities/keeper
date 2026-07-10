@@ -104,13 +104,14 @@ Environment variables:
 
 - `KEEPER_PLAN_ACTOR` (override identity)
 - `KEEPER_PLAN_NOW` (overrides the clock source for all timestamp stamping in `%Y-%m-%dT%H:%M:%S.%fZ` format; any conforming implementation must honor it)
-- `CLAUDE_CODE_SESSION_ID` (sole source of the session id used to key the touched-paths log under `.keeper/state/sessions/<session_id>/`; required for every mutating verb except `init`, the session-id-free verb that builds its own commit payload — the claude binary ships it intrinsically on every session including resumed ones, tests and manual invocations set it explicitly)
+- `KEEPER_PLAN_SESSION_ID` (explicit session identity override for manual or embedded plan invocations)
+- `CLAUDE_CODE_SESSION_ID` / `KEEPER_JOB_ID` (ambient tracked-harness identities; Claude identity takes precedence when both are present). The resolved id keys the touched-paths log under `.keeper/state/sessions/<session_id>/` and is required for every mutating verb except `init`.
 
 ## Auto-commit
 
 Mutating verbs emit a `plan_invocation` NDJSON envelope on stdout scoped to that write, and land a `chore(plan): <op> <target>` commit inline at `output.emit()` via `auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.keeper/` commit landed. Read-only / inspection verbs emit exactly one top-level JSON value and no `plan_invocation` trailer (nothing consumes it on a read, and a second root breaks `json.load` / `jq`). Runtime-only verbs like `claim`/`block` mutate but land no commit (`files` is empty → no-op). `claim` writes the worker brief to `<primary_repo>/.keeper/state/briefs/<task_id>.json` and returns a `brief_ref` handle, but that brief lives under gitignored `state/`, so it too lands no commit. On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
 
-`init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor `CLAUDE_CODE_SESSION_ID`. It lands a `chore(plan): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
+`init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor a tracked harness identity. It lands a `chore(plan): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
 
 For source-code commits from worker agents, use `keeper commit-work`:
 

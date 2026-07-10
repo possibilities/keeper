@@ -48,6 +48,7 @@ import { checkEpicTreeInMemory } from "../integrity.ts";
 import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
+import { resolvePlanSessionId } from "../session_id.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
 import { resolveDataDir } from "../state_path.ts";
 import {
@@ -606,17 +607,17 @@ export function runScaffold(args: ScaffoldArgs): number {
     dependsOnEpicsOverride = null,
   } = args;
 
-  // Fail closed on a missing CLAUDE_CODE_SESSION_ID BEFORE any write — without
-  // it scaffold could not build its commit envelope, so it refuses up front
-  // rather than writing a tree it could not commit. The invocation builder
+  // Fail closed on a missing tracked harness identity BEFORE any write —
+  // without it scaffold could not build its commit envelope, so it refuses up
+  // front rather than writing a tree it could not commit. The invocation builder
   // re-checks this and stays the authoritative raise; this is the early guard.
-  if (!process.env.CLAUDE_CODE_SESSION_ID) {
+  if (resolvePlanSessionId() === null) {
     emitFailureEnvelope(
       "missing_session_id",
-      "CLAUDE_CODE_SESSION_ID is unset; scaffold cannot build its commit " +
-        "envelope and refuses to write a tree it could not commit. The claude " +
-        "binary ships it intrinsically inside a Claude harness; tests and " +
-        "manual invocations must set it themselves.",
+      "No tracked session identity is available; scaffold cannot build its " +
+        "commit envelope and refuses to write a tree it could not commit. Set " +
+        "KEEPER_PLAN_SESSION_ID for a manual invocation, or run inside a " +
+        "tracked Claude or Keeper agent session.",
       [],
     );
     return 1;

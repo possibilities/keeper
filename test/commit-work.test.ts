@@ -40,10 +40,12 @@ beforeEach(() => {
     CLAUDE_CODE_SESSION_ID: process.env.CLAUDE_CODE_SESSION_ID,
     JOBCTL_SESSION_ID: process.env.JOBCTL_SESSION_ID,
     JOBCTL_JOB_ID: process.env.JOBCTL_JOB_ID,
+    KEEPER_JOB_ID: process.env.KEEPER_JOB_ID,
   };
   delete process.env.CLAUDE_CODE_SESSION_ID;
   delete process.env.JOBCTL_SESSION_ID;
   delete process.env.JOBCTL_JOB_ID;
+  delete process.env.KEEPER_JOB_ID;
 });
 afterEach(() => {
   for (const [k, v] of Object.entries(savedEnv)) {

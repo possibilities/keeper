@@ -56,7 +56,7 @@ Arguments:
   MSG                  Commit message (required unless --preview-files)
 
 Options:
-  --session-id <id>    Claude Code session id (auto-resolved if omitted)
+  --session-id <id>    Tracked agent session id (auto-resolved if omitted)
   --preview-files      List files that would be committed; no commit is made
   --max-files <n>      Abort when the post-filter file count exceeds <n>
                        (default 500; pass 0 to disable)
@@ -334,8 +334,8 @@ async function stagedFileNames(cwd: string, run: GitRunner): Promise<string[]> {
  * Resolve the `Job-Id:` trailer value, or `null`. Mirrors the Python's
  * `current_job_id()`: `JOBCTL_JOB_ID` override first, then the resolved session
  * id (the keeper invariant is `job_id === session_id`). The psutil ancestor-pid
- * walk is dropped — `CLAUDE_CODE_SESSION_ID` is present in every real session,
- * so it never fired in practice (same rationale as session-id.ts).
+ * walk is dropped because tracked harnesses carry an explicit session identity
+ * (same rationale as session-id.ts).
  */
 function resolveJobId(): string | null {
   const envJob = process.env.JOBCTL_JOB_ID;
@@ -504,7 +504,7 @@ async function runInner(
       success: false,
       error: "no_session_id",
       hint:
-        "commit-work attributes files by Claude Code session id, which isn't " +
+        "commit-work attributes files by tracked agent session id, which isn't " +
         "set here. Commit with git directly instead: stage ONLY the files you " +
         "changed, by explicit path (git add <path> … — never -A or .), then " +
         "git commit and git push.",

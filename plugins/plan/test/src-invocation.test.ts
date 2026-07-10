@@ -26,6 +26,8 @@ import {
 
 let repo: string;
 const savedSid = process.env.CLAUDE_CODE_SESSION_ID;
+const savedKeeperJobId = process.env.KEEPER_JOB_ID;
+const savedPlanSid = process.env.KEEPER_PLAN_SESSION_ID;
 
 /** Seed a touched-log record for `sid` naming `relPath`, and write the file so
  * the fake dirty-discovery sees it dirty. Returns relPath. */
@@ -50,20 +52,25 @@ beforeEach(() => {
   repo = realpathSync(mkdtempSync(join(tmpdir(), "planctl-inv-test-")));
   fakeInitRepo(repo);
   mkdirSync(join(repo, ".keeper"), { recursive: true });
+  delete process.env.KEEPER_JOB_ID;
+  delete process.env.KEEPER_PLAN_SESSION_ID;
 });
 
 afterEach(() => {
   resetVcs();
   rmSync(repo, { recursive: true, force: true });
-  if (savedSid === undefined) {
-    delete process.env.CLAUDE_CODE_SESSION_ID;
-  } else {
-    process.env.CLAUDE_CODE_SESSION_ID = savedSid;
+  for (const [key, value] of [
+    ["CLAUDE_CODE_SESSION_ID", savedSid],
+    ["KEEPER_JOB_ID", savedKeeperJobId],
+    ["KEEPER_PLAN_SESSION_ID", savedPlanSid],
+  ] as const) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
 });
 
 describe("buildPlanctlInvocation session-id (fail-closed)", () => {
-  test("throws when CLAUDE_CODE_SESSION_ID is absent", () => {
+  test("throws when no tracked harness identity is present", () => {
     delete process.env.CLAUDE_CODE_SESSION_ID;
     expect(() =>
       buildPlanInvocation("claim", "fn-1-x.1", null, { repoRoot: repo }),
@@ -76,6 +83,15 @@ describe("buildPlanctlInvocation session-id (fail-closed)", () => {
       repoRoot: repo,
     });
     expect(inv.session_id).toBe("sid-123");
+  });
+
+  test("a tracked Pi job supplies the invocation identity", () => {
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    process.env.KEEPER_JOB_ID = "pi-job-123";
+    const inv = buildPlanInvocation("claim", "fn-1-x.1", null, {
+      repoRoot: repo,
+    });
+    expect(inv.session_id).toBe("pi-job-123");
   });
 });
 

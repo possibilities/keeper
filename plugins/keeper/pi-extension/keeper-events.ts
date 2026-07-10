@@ -50,6 +50,7 @@ import { execFile } from "node:child_process";
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
 
 // ---------------------------------------------------------------------------
 // pi event shapes (minimal structural subset)
@@ -78,7 +79,8 @@ export interface PiObservedEvent {
  *  the file needs no import from the pi package; pi passes an object with `.on`. */
 export interface PiExtensionApi {
   on(event: string, handler: (event: PiObservedEvent) => void): void;
-  registerTool?(tool: PiToolDefinition): void;
+  events?: PiTaskEventBus;
+  registerTool?(tool: PiToolDefinition<unknown>): void;
 }
 
 export interface PiTranscriptParams {
@@ -98,16 +100,17 @@ export interface PiTranscriptParams {
   include_thinking?: boolean;
 }
 
-interface PiToolDefinition {
+interface PiToolDefinition<TParams> {
   name: string;
   label: string;
   description: string;
+  executionMode?: "parallel" | "sequential";
   promptSnippet?: string;
   promptGuidelines?: string[];
   parameters: Record<string, unknown>;
   execute(
     toolCallId: string,
-    params: PiTranscriptParams,
+    params: TParams,
     signal?: AbortSignal,
   ): Promise<{
     content: Array<{ type: "text"; text: string }>;
@@ -619,7 +622,7 @@ async function executeTranscriptTool(
   });
 }
 
-const TRANSCRIPT_TOOL: PiToolDefinition = {
+const TRANSCRIPT_TOOL: PiToolDefinition<PiTranscriptParams> = {
   name: "keeper_transcript",
   label: "Keeper Transcript",
   description:
@@ -706,6 +709,9 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     }
     if (typeof pi.registerTool === "function") {
       pi.registerTool(TRANSCRIPT_TOOL);
+      if (pi.events !== undefined) {
+        pi.registerTool(createTaskFacadeTool(pi.events));
+      }
     }
   } catch {
     // Top-level fail-open: a load-time throw would ABORT pi's launch. Swallow so

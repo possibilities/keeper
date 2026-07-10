@@ -4,7 +4,7 @@
  * tasks build on:
  *
  *   - session-id resolution precedence (arg → JOBCTL_SESSION_ID →
- *     CLAUDE_CODE_SESSION_ID → null);
+ *     CLAUDE_CODE_SESSION_ID → KEEPER_JOB_ID → null);
  *   - the `get_session_dirty_files` attribution reader against a temp git repo
  *     + sandboxed KEEPER_DB (parity output, per-repo fail-open, cwd_repo
  *     resolution, `.keeper/` board-dir client-side exclusion);
@@ -72,8 +72,15 @@ describe("resolveSessionId", () => {
 
   test("falls back to CLAUDE_CODE_SESSION_ID", () => {
     expect(
-      resolveSessionId(null, { CLAUDE_CODE_SESSION_ID: "claude-sid" }),
+      resolveSessionId(null, {
+        CLAUDE_CODE_SESSION_ID: "claude-sid",
+        KEEPER_JOB_ID: "pi-job",
+      }),
     ).toBe("claude-sid");
+  });
+
+  test("uses KEEPER_JOB_ID for tracked Pi sessions", () => {
+    expect(resolveSessionId(null, { KEEPER_JOB_ID: "pi-job" })).toBe("pi-job");
   });
 
   test("returns null when no source is set", () => {
