@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T01:42:58.887000Z",
+  "depends_on": [
+    "fn-1228-harden-keeper-transcript-extraction.1",
+    "fn-1228-harden-keeper-transcript-extraction.2"
+  ],
+  "epic": "fn-1228-harden-keeper-transcript-extraction",
+  "id": "fn-1228-harden-keeper-transcript-extraction.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Resilient list and CLI polish",
+  "updated_at": "2026-07-10T01:42:58.887000Z"
+}
