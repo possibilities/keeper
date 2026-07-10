@@ -4764,7 +4764,14 @@ function extractMergeEscalationAttemptedPayload(
     if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
       return null;
     }
-    return { id: parsed.id, outcome: parsed.outcome };
+    // `verb` is OPTIONAL on the wire: a historical close event (minted `{id, outcome}`)
+    // carries no verb, so a missing/blank/non-string value defaults to `close`, keeping
+    // that fold byte-identical. The WORK fan-in path mints an explicit `verb:"work"`.
+    const verb =
+      typeof parsed.verb === "string" && parsed.verb.length > 0
+        ? parsed.verb
+        : "close";
+    return { id: parsed.id, outcome: parsed.outcome, verb };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse MergeEscalationAttempted payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4777,16 +4784,18 @@ function extractMergeEscalationAttemptedPayload(
  * Fold one synthetic `MergeEscalationAttempted` event. For a TERMINAL outcome
  * (the escalation-dispatch `dispatched`, or a delivered bus-send `sent` /
  * `queued_for_wake`) it stamps the once-marker `merge_escalated_at = event.ts` on
- * the sticky `worktree-merge-conflict` close row, gated `merge_escalated_at IS
- * NULL` so the first observation wins and a re-fold reproduces it byte-identically.
- * Every other outcome (`dispatch_failed` / `send_failed` / undelivered / unknown)
- * is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
- * re-attempts on the next tick — mirroring `foldBlockEscalationAttempted`'s
- * non-terminal rule. The branch reads ONLY the payload `outcome` + `event.ts` (no
- * wall-clock/fs/liveness), so re-fold stays byte-deterministic. The UPDATE no-ops
- * on a missing row (the clear-before-mint race) and NEVER clears the row — only
- * `DispatchCleared` (`retry_dispatch`) does. Malformed/missing payload → safe
- * no-op.
+ * the sticky `worktree-merge-conflict` row identified by the payload's
+ * verb-parameterized `(verb, id)` key, gated `merge_escalated_at IS NULL` so the
+ * first observation wins and a re-fold reproduces it byte-identically. The `verb`
+ * defaults to `close` for a legacy verb-less payload, so historical close events fold
+ * exactly as before; the WORK fan-in path stamps the `(work, taskId)` row. Every other
+ * outcome (`dispatch_failed` / `send_failed` / undelivered / unknown) is NON-TERMINAL
+ * and folds to a no-op, leaving the marker NULL so the sweep re-attempts on the next
+ * tick — mirroring `foldBlockEscalationAttempted`'s non-terminal rule. The branch reads
+ * ONLY the payload (`outcome` + `verb`) + `event.ts` (no wall-clock/fs/liveness), so
+ * re-fold stays byte-deterministic. The UPDATE no-ops on a missing row (the
+ * clear-before-mint race) and NEVER clears the row — only `DispatchCleared`
+ * (`retry_dispatch`) does. Malformed/missing payload → safe no-op.
  */
 function foldMergeEscalationAttempted(db: Database, event: Event): void {
   const payload = extractMergeEscalationAttemptedPayload(event);
@@ -4803,8 +4812,8 @@ function foldMergeEscalationAttempted(db: Database, event: Event): void {
   db.run(
     `UPDATE dispatch_failures
         SET merge_escalated_at = ?
-      WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NULL`,
-    [event.ts, payload.id],
+      WHERE verb = ? AND id = ? AND merge_escalated_at IS NULL`,
+    [event.ts, payload.verb, payload.id],
   );
 }
 
@@ -4829,7 +4838,14 @@ function extractResolverDispatchAttemptedPayload(
     if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
       return null;
     }
-    return { id: parsed.id, outcome: parsed.outcome };
+    // `verb` is OPTIONAL on the wire: a historical close event (minted `{id, outcome}`)
+    // carries no verb, so a missing/blank/non-string value defaults to `close`, keeping
+    // that fold byte-identical. The WORK fan-in path mints an explicit `verb:"work"`.
+    const verb =
+      typeof parsed.verb === "string" && parsed.verb.length > 0
+        ? parsed.verb
+        : "close";
+    return { id: parsed.id, outcome: parsed.outcome, verb };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse ResolverDispatchAttempted payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4841,13 +4857,16 @@ function extractResolverDispatchAttemptedPayload(
 /**
  * Fold one synthetic `ResolverDispatchAttempted` event — the resolver-dispatch
  * once-latch, sibling to {@link foldMergeEscalationAttempted}. For the TERMINAL
- * `dispatched` outcome (the daemon sweep launched the `resolve::<epic>` worker) it
+ * `dispatched` outcome (the daemon sweep launched the `resolve::<id>` worker) it
  * stamps `resolver_dispatched_at = event.ts` on the sticky `worktree-merge-conflict`
- * close row, gated `resolver_dispatched_at IS NULL` so the first observation wins and
- * a re-fold reproduces it byte-identically. Every other outcome (`dispatch_failed` /
+ * row identified by the payload's verb-parameterized `(verb, id)` key, gated
+ * `resolver_dispatched_at IS NULL` so the first observation wins and a re-fold
+ * reproduces it byte-identically. The `verb` defaults to `close` for a legacy
+ * verb-less payload, so historical close events fold exactly as before; the WORK fan-in
+ * path stamps the `(work, taskId)` row. Every other outcome (`dispatch_failed` /
  * unknown) is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
- * re-attempts on the next tick. The branch reads ONLY the payload `outcome` +
- * `event.ts` (no wall-clock/fs/liveness), so re-fold stays byte-deterministic. The
+ * re-attempts on the next tick. The branch reads ONLY the payload (`outcome` + `verb`)
+ * + `event.ts` (no wall-clock/fs/liveness), so re-fold stays byte-deterministic. The
  * UPDATE no-ops on a missing row (the clear-before-mint race) and NEVER clears the row
  * — only `DispatchCleared` (`retry_dispatch`) does, which re-arms the marker at NULL.
  * Independent of `merge_escalated_at`: a row can be human-escalated, resolver-
@@ -4864,8 +4883,8 @@ function foldResolverDispatchAttempted(db: Database, event: Event): void {
   db.run(
     `UPDATE dispatch_failures
         SET resolver_dispatched_at = ?
-      WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL`,
-    [event.ts, payload.id],
+      WHERE verb = ? AND id = ? AND resolver_dispatched_at IS NULL`,
+    [event.ts, payload.verb, payload.id],
   );
 }
 
@@ -4888,7 +4907,14 @@ function extractMergeHumanNotifiedPayload(
     if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
       return null;
     }
-    return { id: parsed.id, outcome: parsed.outcome };
+    // `verb` is OPTIONAL on the wire: a historical close event (minted `{id, outcome}`)
+    // carries no verb, so a missing/blank/non-string value defaults to `close`, keeping
+    // that fold byte-identical. The WORK fan-in path mints an explicit `verb:"work"`.
+    const verb =
+      typeof parsed.verb === "string" && parsed.verb.length > 0
+        ? parsed.verb
+        : "close";
+    return { id: parsed.id, outcome: parsed.outcome, verb };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse MergeHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4899,20 +4925,23 @@ function extractMergeHumanNotifiedPayload(
 
 /**
  * Fold one synthetic `MergeHumanNotified` event — the terminal "human notified"
- * once-latch of the DECONFLICT path, sibling to {@link foldMergeEscalationAttempted}
- * and {@link foldResolverDispatchAttempted}. For the TERMINAL `notified` outcome
- * (the daemon delivered the one botctl notification about a declined/dead
- * `deconflict::<epic>` session) it stamps `human_notified_at = event.ts` on the
- * sticky `worktree-merge-conflict` close row, gated `human_notified_at IS NULL` so
- * the first observation wins and a re-fold reproduces it byte-identically. Every
- * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
- * leaving the marker NULL so the sweep re-attempts on the next tick. The branch
- * reads ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so
- * re-fold stays byte-deterministic. The UPDATE no-ops on a missing row (the
- * clear-before-mint race) and NEVER clears the row — only `DispatchCleared`
- * (`retry_dispatch`) does, which re-arms the marker at NULL. Independent of
- * `merge_escalated_at` / `resolver_dispatched_at`. Malformed/missing payload →
- * safe no-op.
+ * once-latch of a `worktree-merge-conflict` escalation path, sibling to {@link
+ * foldMergeEscalationAttempted} and {@link foldResolverDispatchAttempted}. For the
+ * TERMINAL `notified` outcome (the daemon delivered the one botctl notification —
+ * about a declined/dead `deconflict::<epic>` session on the close path, or straight
+ * away for a stuck `work::<taskId>` fan-in conflict on the work path) it stamps
+ * `human_notified_at = event.ts` on the sticky row identified by the payload's
+ * verb-parameterized `(verb, id)` key, gated `human_notified_at IS NULL` so the first
+ * observation wins and a re-fold reproduces it byte-identically. The `verb` defaults
+ * to `close` for a legacy verb-less payload, so historical close events fold exactly
+ * as before. Every other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds
+ * to a no-op, leaving the marker NULL so the sweep re-attempts on the next tick. The
+ * branch reads ONLY the payload (`outcome` + `verb`) + `event.ts` (no
+ * wall-clock/fs/liveness), so re-fold stays byte-deterministic. The UPDATE no-ops on a
+ * missing row (the clear-before-mint race) and NEVER clears the row — only
+ * `DispatchCleared` (`retry_dispatch`) does, which re-arms the marker at NULL.
+ * Independent of `merge_escalated_at` / `resolver_dispatched_at`. Malformed/missing
+ * payload → safe no-op.
  */
 function foldMergeHumanNotified(db: Database, event: Event): void {
   const payload = extractMergeHumanNotifiedPayload(event);
@@ -4925,8 +4954,8 @@ function foldMergeHumanNotified(db: Database, event: Event): void {
   db.run(
     `UPDATE dispatch_failures
         SET human_notified_at = ?
-      WHERE verb = 'close' AND id = ? AND human_notified_at IS NULL`,
-    [event.ts, payload.id],
+      WHERE verb = ? AND id = ? AND human_notified_at IS NULL`,
+    [event.ts, payload.verb, payload.id],
   );
 }
 
@@ -8493,22 +8522,27 @@ function projectJobsRow(db: Database, event: Event): void {
               .get(plan_ref) as { blocked_since: number } | null;
             escalationInstance = latch?.blocked_since ?? null;
           } else if (plan_verb === "deconflict") {
-            // deconflict::<epic> — corroborate the sticky close row whose merge was
+            // deconflict::<id> — corroborate the sticky row whose merge was
             // human-escalated (`merge_escalated_at` set). Instance = the row's
-            // first-appearance `instance_event_id`.
+            // first-appearance `instance_event_id`. `verb IN ('close','work')`: a
+            // `deconflict::<epic>` matches the close row (epic id), a
+            // `deconflict::<taskId>` the work fan-in row (task id) — the two id
+            // namespaces are disjoint, so at most one row matches, and a legacy
+            // close event resolves the same close row as before (re-fold-identical).
             const row = db
               .query(
-                "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NOT NULL",
+                "SELECT instance_event_id FROM dispatch_failures WHERE verb IN ('close', 'work') AND id = ? AND merge_escalated_at IS NOT NULL",
               )
               .get(plan_ref) as { instance_event_id: number | null } | null;
             escalationInstance = row?.instance_event_id ?? null;
           } else {
-            // resolve::<epic> — corroborate the sticky close row whose resolver was
-            // dispatched (`resolver_dispatched_at` set). Instance = the SAME
-            // first-appearance `instance_event_id`.
+            // resolve::<id> — corroborate the sticky row whose resolver was dispatched
+            // (`resolver_dispatched_at` set). Instance = the SAME first-appearance
+            // `instance_event_id`. Same `verb IN ('close','work')` disjoint-namespace
+            // match as the deconflict arm above.
             const row = db
               .query(
-                "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NOT NULL",
+                "SELECT instance_event_id FROM dispatch_failures WHERE verb IN ('close', 'work') AND id = ? AND resolver_dispatched_at IS NOT NULL",
               )
               .get(plan_ref) as { instance_event_id: number | null } | null;
             escalationInstance = row?.instance_event_id ?? null;

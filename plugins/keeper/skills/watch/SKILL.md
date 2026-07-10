@@ -271,16 +271,18 @@ Note them in the triage; take no action.
 
 ### Rung 2 — daemon-already-handled: verify, then step in ONLY on the gap
 
-The daemon's own escalation sweeps handle most stuck closes. Verify via
-sanctioned reads and NEVER double-handle:
+The daemon's own escalation sweeps handle most stuck closes and stuck work-verb
+fan-in conflicts alike. Verify via sanctioned reads and NEVER double-handle:
 
-- On a `dispatch_failures` row, read the `merge_escalated_at` and
-  `resolver_dispatched_at` latch columns (`keeper query dispatch_failures`) and
-  the `block_escalations` outcomes.
-- **Respect the sequencing invariant:** the autonomous `resolve::<epic>`
-  merge-resolver goes FIRST; the `planner@<epic>` escalation is gated behind that
-  resolver's TERMINAL verdict. Never act as if the escalation fired while a
-  resolver is still live or undispatched.
+- On a `dispatch_failures` row (`close::<epic>` OR `work::<taskId>`), read the
+  `merge_escalated_at` and `resolver_dispatched_at` latch columns (`keeper query
+  dispatch_failures`) and the `block_escalations` outcomes.
+- **Respect the sequencing invariant, same for both verbs:** the autonomous
+  `resolve::<epic>`/`resolve::<taskId>` merge-resolver goes FIRST; the
+  `deconflict::<epic>`/`deconflict::<taskId>` session is gated behind that
+  resolver's TERMINAL verdict; the human page (botctl) is gated behind the
+  deconflict session's OWN terminal decline/death. Never act as if a later stage
+  fired while an earlier one is still live or undispatched.
 
 Step in only on a genuine GAP the daemon left:
 
@@ -321,7 +323,10 @@ this wake:
 These NEVER auto-clear — surface them, do not act:
 
 - Finalize `worktree-finalize-non-fast-forward` stickies.
-- Genuine close-sink content conflicts.
+- Genuine fan-in content conflicts that survive resolver + deconflict, whether
+  epic-scoped (`close::<epic>`) or task-scoped (`work::<taskId>`) — both are a
+  live escalation channel (paged by the daemon itself), never a silent gap to
+  notice by hand.
 - `shared-checkout-wedge` distress rows.
 - Parked worker questions and the instant-death wall (`instant_death_wall >= 2`
   is the likely account/quota wall — see the autopilot skill).
