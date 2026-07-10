@@ -58,5 +58,5 @@ snippet is updated.
 - [ ] Skill and corpus lint gates are green
 
 ## Done summary
-
+Rewrote the await skill's steering (when-to-use table, drained scope-split row, --probe section, heartbeat/retryable terminal grammar, corrected reconnect-forever prose) and added CONTEXT.md's Drained scope + Board-work session vocabulary; corpus/vendor.lock left untouched (Docs-gap item, not in Files list).
 ## Evidence
