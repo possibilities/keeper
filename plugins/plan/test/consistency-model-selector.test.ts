@@ -170,10 +170,15 @@ describe("on-disk selector config", () => {
     const state = withClaudeOnlyMatrix(() =>
       classifyModelGuidanceFromDisk(PLAN_ROOT),
     );
-    expect(state.models.opus.state).toBe("fresh");
-    expect(state.models.opus.hash_parity).toBe(true);
-    expect(state.models.sonnet.state).toBe("fresh");
-    expect(state.models.sonnet.hash_parity).toBe(true);
+    // The committed tree is all-fresh INCLUDING card parity: each axis model has a
+    // present, hash-matching vendor card, so reasons is empty.
+    for (const model of ["opus", "sonnet"]) {
+      expect(state.models[model].state).toBe("fresh");
+      expect(state.models[model].hash_parity).toBe(true);
+      expect(state.models[model].card_present).toBe(true);
+      expect(state.models[model].card_hash_parity).toBe(true);
+      expect(state.models[model].reasons).toEqual([]);
+    }
     for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
       expect(state.efforts[effort].state).toBe("present");
     }
@@ -190,6 +195,9 @@ describe("on-disk selector config", () => {
 const HASH = "a".repeat(64);
 const OTHER_HASH = "b".repeat(64);
 const REF = "skills/model-guidance/references/opus.md";
+// A distinct card path for the opus notes entry (a research entry's optional
+// vendor system-card cache, hashed like the notes reference).
+const CARD_REF = "skills/model-guidance/references/cards/opus.md";
 // A distinct reference path for a tolerated host-roster extra (a research entry
 // whose key is not a configured axis model).
 const EXTRA_REF = "skills/model-guidance/references/gpt-5.5.md";
@@ -421,6 +429,75 @@ describe("model-guidance check core", () => {
       ),
     ).toBe(true);
   });
+
+  // A research entry carrying a declared `card` sub-mapping — the card is hashed
+  // exactly like the notes reference. Independent hashes authored above.
+  function withCard(sha256: string): GuidanceCheckInput {
+    const input = baseInput();
+    return {
+      ...input,
+      config: {
+        ...input.config,
+        research: {
+          opus: {
+            reference: REF,
+            sha256: HASH,
+            card: { reference: CARD_REF, sha256 },
+          },
+        },
+      },
+    };
+  }
+
+  test("a research entry with no card key skips card hashing (cards optional)", () => {
+    // baseInput declares no card — only the notes reference is hashed.
+    expect(checkModelGuidance(baseInput())).toEqual({ ok: true, errors: [] });
+  });
+
+  test("a declared card present with a matching hash passes", () => {
+    // Both notes and card resolve to HASH; the card pin equals HASH too.
+    expect(checkModelGuidance(withCard(HASH))).toEqual({
+      ok: true,
+      errors: [],
+    });
+  });
+
+  test("a declared card whose file is missing fails --check", () => {
+    const result = checkModelGuidance({
+      ...withCard(HASH),
+      referenceHash: (ref) => (ref === REF ? HASH : null),
+    });
+    expect(result.ok).toBe(false);
+    expect(
+      result.errors.some(
+        (e) =>
+          e.includes("opus") &&
+          e.includes("card") &&
+          e.includes("missing on disk"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a declared card whose recorded hash diverges from its file fails --check", () => {
+    // Notes hash-match (HASH) but the card pin is OTHER_HASH while the file hashes
+    // to HASH — the card mismatch is flagged, the notes are not.
+    const result = checkModelGuidance(withCard(OTHER_HASH));
+    expect(result.ok).toBe(false);
+    expect(
+      result.errors.some(
+        (e) =>
+          e.includes("opus") &&
+          e.includes("card") &&
+          e.includes("does not match"),
+      ),
+    ).toBe(true);
+    // The notes reference (matching) produces no error.
+    expect(
+      result.errors.some(
+        (e) => e.includes("does not match") && !e.includes("card"),
+      ),
+    ).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -432,6 +509,12 @@ describe("model-guidance check core", () => {
 const STATE_HASH = "c".repeat(64);
 const STATE_OTHER_HASH = "d".repeat(64);
 const STATE_REF = "skills/model-guidance/references/opus.md";
+// The opus notes entry's vendor card: a distinct path, an independent hash, and a
+// plain markdown body (the gate never parses card headers, so any body works).
+const STATE_CARD_REF = "skills/model-guidance/references/cards/opus.md";
+const STATE_CARD_HASH = "e".repeat(64);
+const STATE_CARD_OTHER_HASH = "f".repeat(64);
+const STATE_CARD_TEXT = "# Model card — `opus`\n\nCard body, never parsed.\n";
 
 // A reference file with the given provenance body inside its first comment
 // block. The H1 precedes the block (the parser is not byte-0-anchored) and the
@@ -486,33 +569,57 @@ function baseStateInput(): GuidanceStateInput {
       hand_tuned: "burden of proof on opus; sonnet by default",
       efforts: { medium: "m", high: "h" },
       models: { opus: "o" },
-      research: { opus: { reference: STATE_REF, sha256: STATE_HASH } },
+      research: {
+        opus: {
+          reference: STATE_REF,
+          sha256: STATE_HASH,
+          card: { reference: STATE_CARD_REF, sha256: STATE_CARD_HASH },
+        },
+      },
       efforts_provenance: { status: "researched", last_reviewed: "2026-07-06" },
     },
-    referenceText: () => RESEARCHED_REF,
-    referenceHash: () => STATE_HASH,
+    // Path-dispatching resolvers: the notes and card carry independent text and
+    // hashes so a lattice case can drift one without the other.
+    referenceText: (ref) =>
+      ref === STATE_REF
+        ? RESEARCHED_REF
+        : ref === STATE_CARD_REF
+          ? STATE_CARD_TEXT
+          : null,
+    referenceHash: (ref) =>
+      ref === STATE_REF
+        ? STATE_HASH
+        : ref === STATE_CARD_REF
+          ? STATE_CARD_HASH
+          : null,
   };
 }
 
 describe("model-guidance state core", () => {
-  test("researched status with hash parity is fresh, emitting the parsed facts", () => {
+  test("researched notes with both hash parities and a present card is fresh, emitting the parsed facts and empty reasons", () => {
     const result = classifyModelGuidance(baseStateInput());
     expect(result.models.opus).toEqual({
       state: "fresh",
       hash_parity: true,
+      card_present: true,
+      card_hash_parity: true,
+      reasons: [],
       status: "researched",
       researched: "2026-07-04",
       resolves_to: "claude-opus-4-8",
     });
   });
 
-  test("researched status with a drifted hash is stale, never fresh", () => {
+  test("researched notes with a drifted notes hash is stale, never fresh, reasons [notes-hash-drift]", () => {
     const result = classifyModelGuidance({
       ...baseStateInput(),
-      referenceHash: () => STATE_OTHER_HASH,
+      // Only the notes hash drifts; the card path still resolves + matches.
+      referenceHash: (ref) =>
+        ref === STATE_CARD_REF ? STATE_CARD_HASH : STATE_OTHER_HASH,
     });
     expect(result.models.opus.state).toBe("stale");
     expect(result.models.opus.hash_parity).toBe(false);
+    expect(result.models.opus.reasons).toEqual(["notes-hash-drift"]);
   });
 
   test("an explicit stub status is stub even with hash parity", () => {
@@ -606,13 +713,21 @@ describe("model-guidance state core", () => {
       hand_tuned: "burden of proof on opus; sonnet by default",
       efforts: { medium: "m", high: "h" },
       models: { opus: "o" },
-      research: { opus: { reference: STATE_REF, sha256: STATE_HASH } },
+      research: {
+        opus: {
+          reference: STATE_REF,
+          sha256: STATE_HASH,
+          card: { reference: STATE_CARD_REF, sha256: STATE_HASH },
+        },
+      },
     };
     const result = classifyModelGuidance({
       efforts: ["medium", "high"],
       models: ["opus"],
       config,
       referenceText: () => RESEARCHED_REF,
+      // A uniform resolver: notes and card both hash to STATE_HASH, matching both
+      // pins, so opus is fresh while the efforts provenance defaults to stub.
       referenceHash: () => STATE_HASH,
     });
     expect(result.efforts_provenance).toEqual({
@@ -621,5 +736,208 @@ describe("model-guidance state core", () => {
     });
     expect(result.models.opus.state).toBe("fresh");
     expect(result.efforts.medium.state).toBe("present");
+  });
+
+  test("researched notes with parity but NO card declared is missing (backfill), reasons [no-card]", () => {
+    const input = baseStateInput();
+    const result = classifyModelGuidance({
+      ...input,
+      config: {
+        ...input.config,
+        research: { opus: { reference: STATE_REF, sha256: STATE_HASH } }, // no card key
+      },
+    });
+    expect(result.models.opus.state).toBe("missing");
+    expect(result.models.opus.card_present).toBe(false);
+    expect(result.models.opus.card_hash_parity).toBeNull();
+    expect(result.models.opus.reasons).toEqual(["no-card"]);
+    // The notes themselves are fresh — the card is the only gap.
+    expect(result.models.opus.hash_parity).toBe(true);
+    expect(result.models.opus.status).toBe("researched");
+  });
+
+  test("researched notes with parity but a declared card whose file is absent is missing, reasons [no-card]", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      // The card path resolves to null (file missing); the notes still match.
+      referenceHash: (ref) => (ref === STATE_REF ? STATE_HASH : null),
+    });
+    expect(result.models.opus.state).toBe("missing");
+    expect(result.models.opus.card_present).toBe(false);
+    expect(result.models.opus.card_hash_parity).toBeNull();
+    expect(result.models.opus.reasons).toEqual(["no-card"]);
+  });
+
+  test("researched notes with parity but a drifted card hash is stale, reasons [card-hash-drift]", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      // The card file is present but hashes to a value the pin does not match.
+      referenceHash: (ref) =>
+        ref === STATE_REF ? STATE_HASH : STATE_CARD_OTHER_HASH,
+    });
+    expect(result.models.opus.state).toBe("stale");
+    expect(result.models.opus.card_present).toBe(true);
+    expect(result.models.opus.card_hash_parity).toBe(false);
+    expect(result.models.opus.reasons).toEqual(["card-hash-drift"]);
+  });
+
+  test("a never-researched model stays stub regardless of a present, matching card", () => {
+    const result = classifyModelGuidance({
+      ...baseStateInput(),
+      referenceText: (ref) => (ref === STATE_REF ? STUB_REF : STATE_CARD_TEXT),
+    });
+    expect(result.models.opus.state).toBe("stub");
+    // Card irrelevant: it is present and matches, but contributes no reason.
+    expect(result.models.opus.reasons).toEqual(["notes-not-researched"]);
+  });
+
+  test("a model absent from both the blocks and the research map lists every structural reason", () => {
+    const input = baseStateInput();
+    const result = classifyModelGuidance({
+      ...input,
+      config: { ...input.config, models: {}, research: {} },
+    });
+    expect(result.models.opus.state).toBe("missing");
+    expect(result.models.opus.reasons).toEqual([
+      "no-block",
+      "no-research-entry",
+    ]);
+    expect(result.models.opus.card_present).toBe(false);
+    expect(result.models.opus.card_hash_parity).toBeNull();
+  });
+
+  test("every entry carries card_present, card_hash_parity, and reasons — reasons empty iff fresh — and no fixture throws", () => {
+    // Drive one input per lattice row through the classifier and assert the
+    // envelope shape holds and reasons is empty exactly when fresh. Expected
+    // freshness is authored here, independent of the classifier.
+    const base = baseStateInput();
+    const noCardResearch = {
+      opus: { reference: STATE_REF, sha256: STATE_HASH },
+    };
+    const cases: Array<{ input: GuidanceStateInput; fresh: boolean }> = [
+      { input: base, fresh: true },
+      { input: { ...base, referenceText: () => STUB_REF }, fresh: false },
+      {
+        input: {
+          ...base,
+          referenceHash: (ref: string) =>
+            ref === STATE_CARD_REF ? STATE_CARD_HASH : STATE_OTHER_HASH,
+        },
+        fresh: false,
+      },
+      {
+        input: {
+          ...base,
+          config: { ...base.config, research: noCardResearch },
+        },
+        fresh: false,
+      },
+      {
+        input: {
+          ...base,
+          referenceHash: (ref: string) =>
+            ref === STATE_REF ? STATE_HASH : STATE_CARD_OTHER_HASH,
+        },
+        fresh: false,
+      },
+      {
+        input: {
+          ...base,
+          config: { ...base.config, models: {}, research: {} },
+        },
+        fresh: false,
+      },
+      { input: { ...base, referenceText: () => null }, fresh: false },
+    ];
+    for (const { input, fresh } of cases) {
+      const entry = classifyModelGuidance(input).models.opus;
+      expect(typeof entry.card_present).toBe("boolean");
+      expect(
+        entry.card_hash_parity === null ||
+          typeof entry.card_hash_parity === "boolean",
+      ).toBe(true);
+      expect(Array.isArray(entry.reasons)).toBe(true);
+      expect(entry.reasons.length === 0).toBe(fresh);
+      expect(entry.state === "fresh").toBe(fresh);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// card coercion — the optional research.<model>.card sub-mapping. A hand-built
+// document (independent of the on-disk config) drives each coercion outcome.
+// ---------------------------------------------------------------------------
+
+const NOTES_PATH = "skills/model-guidance/references/opus.md";
+const CARD_PATH = "skills/model-guidance/references/cards/opus.md";
+function docWithResearch(
+  researchOpus: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    selector: { harness: "claude", model: "opus" },
+    usage: "u",
+    hand_tuned: "burden of proof on opus; sonnet by default",
+    efforts: { low: "l" },
+    models: { opus: "o" },
+    research: { opus: researchOpus },
+  };
+}
+
+describe("research card coercion", () => {
+  test("a research entry with no card key loads with card undefined", () => {
+    const config = coerceModelSelectorConfig(
+      docWithResearch({ reference: NOTES_PATH, sha256: "a".repeat(64) }),
+    );
+    expect(config.research.opus.card).toBeUndefined();
+  });
+
+  test("a full card mapping loads verbatim", () => {
+    const config = coerceModelSelectorConfig(
+      docWithResearch({
+        reference: NOTES_PATH,
+        sha256: "a".repeat(64),
+        card: { reference: CARD_PATH, sha256: "b".repeat(64) },
+      }),
+    );
+    expect(config.research.opus.card).toEqual({
+      reference: CARD_PATH,
+      sha256: "b".repeat(64),
+    });
+  });
+
+  test("a partial card mapping (missing sha256) fails loud naming the model", () => {
+    expect(() =>
+      coerceModelSelectorConfig(
+        docWithResearch({
+          reference: NOTES_PATH,
+          sha256: "a".repeat(64),
+          card: { reference: CARD_PATH },
+        }),
+      ),
+    ).toThrow("research.opus.card.sha256");
+  });
+
+  test("a non-mapping card fails loud naming the model", () => {
+    expect(() =>
+      coerceModelSelectorConfig(
+        docWithResearch({
+          reference: NOTES_PATH,
+          sha256: "a".repeat(64),
+          card: "not a mapping",
+        }),
+      ),
+    ).toThrow("research.opus.card");
+  });
+
+  test("a card reference equal to the notes reference is rejected loud (copy-paste guard)", () => {
+    expect(() =>
+      coerceModelSelectorConfig(
+        docWithResearch({
+          reference: NOTES_PATH,
+          sha256: "a".repeat(64),
+          card: { reference: NOTES_PATH, sha256: "b".repeat(64) },
+        }),
+      ),
+    ).toThrow("copy-paste guard");
   });
 });
