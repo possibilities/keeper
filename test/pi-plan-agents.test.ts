@@ -79,7 +79,17 @@ describe("Pi plan agent renderer", () => {
     const targetDir = mkdtempSync(join(tmpdir(), "pi-plan-agents-"));
     temps.push(targetDir);
     const first = installPiPlanAgents({ sourceDir: SOURCE_DIR, targetDir });
-    expect(first.checked).toHaveLength(11);
+    // practice-scout.md is a gitignored GENERATED agent (rendered from
+    // template/agents/practice-scout.md.tmpl at install time), so a clean
+    // checkout — including the baseline's frozen-lockfile scratch worktree —
+    // carries only the committed agents. Assert the fixed committed roster
+    // (guards accidental add/remove) plus the generated one iff its source is
+    // present, so this fast-suite gate stays green pre- and post-render.
+    const COMMITTED_PLAN_AGENTS = 10;
+    const generatedPresent = existsSync(join(SOURCE_DIR, "practice-scout.md"));
+    expect(first.checked).toHaveLength(
+      COMMITTED_PLAN_AGENTS + (generatedPresent ? 1 : 0),
+    );
     expect(first.changed.length).toBeGreaterThan(0);
 
     const second = installPiPlanAgents({ sourceDir: SOURCE_DIR, targetDir });
