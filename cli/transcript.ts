@@ -223,11 +223,19 @@ export function parseTranscriptTime(
     const year = Number(dateOnly[1]);
     const month = Number(dateOnly[2]) - 1;
     const day = Number(dateOnly[3]);
-    const localMidnight = new Date(year, month, day, 0, 0, 0, 0).getTime();
-    if (!Number.isFinite(localMidnight)) {
+    const localMidnight = new Date(year, month, day, 0, 0, 0, 0);
+    // Date normalizes out-of-range components (e.g. Feb 30 -> Mar 2) instead
+    // of yielding an Invalid Date, so a round-trip is the only way to catch
+    // an out-of-range date-only bound; this guards both the since return
+    // below and the next-local-midnight construction until relies on.
+    if (
+      localMidnight.getFullYear() !== year ||
+      localMidnight.getMonth() !== month ||
+      localMidnight.getDate() !== day
+    ) {
       return `invalid --${edge} time '${raw}'; use ISO-8601 or 30m/8h/7d`;
     }
-    if (edge === "since") return localMidnight;
+    if (edge === "since") return localMidnight.getTime();
     const nextLocalMidnight = new Date(
       year,
       month,

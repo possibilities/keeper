@@ -746,6 +746,13 @@ test("time parser supports relative durations and inclusive local-day until", ()
   expect(parseTranscriptTime("nonsense", NOW, "since")).toContain("invalid");
 });
 
+test("out-of-range date-only since/until returns the invalid time error", () => {
+  expect(parseTranscriptTime("2026-02-30", NOW, "since")).toContain("invalid");
+  expect(parseTranscriptTime("2026-02-30", NOW, "until")).toContain("invalid");
+  expect(parseTranscriptTime("2026-13-01", NOW, "since")).toContain("invalid");
+  expect(parseTranscriptTime("2026-13-01", NOW, "until")).toContain("invalid");
+});
+
 test("date-only since/until select local calendar days across DST boundaries", () => {
   const originalTz = process.env.TZ;
   process.env.TZ = "America/New_York";
