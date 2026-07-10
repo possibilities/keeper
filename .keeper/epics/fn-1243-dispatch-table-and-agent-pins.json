@@ -7,7 +7,7 @@
     "fn-1241-complete-v2-matrix-cutover-on-operator"
   ],
   "id": "fn-1243-dispatch-table-and-agent-pins",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T19:35:10.292000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T19:35:02.307000Z"
+  "updated_at": "2026-07-10T19:35:10.292000Z"
 }
