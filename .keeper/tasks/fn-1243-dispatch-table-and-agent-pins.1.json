@@ -5,11 +5,11 @@
   "depends_on": [],
   "epic": "fn-1243-dispatch-table-and-agent-pins",
   "id": "fn-1243-dispatch-table-and-agent-pins.1",
-  "model": "sonnet",
+  "model": "gpt-5.6-sol",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Dispatch table parse and verb resolver",
-  "updated_at": "2026-07-10T19:35:02.145000Z"
+  "updated_at": "2026-07-10T21:29:10.981000Z"
 }
