@@ -57,5 +57,5 @@ byte-stability for opus/sonnet across the cutover; saga suites green under pinne
 - [ ] sandboxEnv sandboxes KEEPER_CONFIG_DIR and the plan suite passes with it pinned at fixtures, never reading the live config dir
 
 ## Done summary
-
+Cut plan verbs and gates over to the required v2 host matrix: models.ts axes + selection_brief/assign/apply-selection resolve from matrix.yaml (no embedded fallback, byte-identical worker_agent), no-matrix emits a typed loud envelope, gates go host-blind, and sandboxEnv + a test preload pin a committed claude-only fixture so no test reads the live config.
 ## Evidence
