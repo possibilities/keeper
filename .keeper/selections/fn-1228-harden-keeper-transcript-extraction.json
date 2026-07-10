@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Bounded single-surface encoder fix plus a fully-specified hard-coded-bucket regression fixture with a named chokepoint \u2014 trickle-lane mechanical work.",
+      "task_id": "fn-1228-harden-keeper-transcript-extraction.1",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Interlocking pagination-label and char-budget contract fixes touching help/descriptor/JSON semantics, but prescriptively specified so sonnet at a contract-touching band fits.",
+      "task_id": "fn-1228-harden-keeper-transcript-extraction.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Five independent, named hardening moves across three files in a known pattern \u2014 breadth of well-specified bug fixes rather than intelligence-bound depth.",
+      "task_id": "fn-1228-harden-keeper-transcript-extraction.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security invariant (argv-injection input validation before spawn) plus genuine investigation of pi's TypeBox tool contract under strict isolation constraints \u2014 a nameable intelligence-bound reason.",
+      "task_id": "fn-1228-harden-keeper-transcript-extraction.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T01:44:41.440000Z",
+  "epic_id": "fn-1228-harden-keeper-transcript-extraction",
+  "input_hash": "e22444d9c8d2e6b5665a43b7e52c46b0eb9cc0542ca7613afb216abec1d4dccc",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3794027737,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1228-harden-keeper-transcript-extraction.1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Bounded single-surface encoder fix plus a fully-specified hard-coded-bucket regression fixture with a named chokepoint \u2014 trickle-lane mechanical work.\",\"confidence\":0.78},{\"task_id\":\"fn-1228-harden-keeper-transcript-extraction.2\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Interlocking pagination-label and char-budget contract fixes touching help/descriptor/JSON semantics, but prescriptively specified so sonnet at a contract-touching band fits.\",\"confidence\":0.72},{\"task_id\":\"fn-1228-harden-keeper-transcript-extraction.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Five independent, named hardening moves across three files in a known pattern \u2014 breadth of well-specified bug fixes rather than intelligence-bound depth.\",\"confidence\":0.76},{\"task_id\":\"fn-1228-harden-keeper-transcript-extraction.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security invariant (argv-injection input validation before spawn) plus genuine investigation of pi's TypeBox tool contract under strict isolation constraints \u2014 a nameable intelligence-bound reason.\",\"confidence\":0.7}]}\n"
+}
