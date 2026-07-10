@@ -7,7 +7,7 @@
     "fn-1228-harden-keeper-transcript-extraction"
   ],
   "id": "fn-1231-validate-transcript-date-only-bounds",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T03:00:45.786000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T03:00:44.838000Z"
+  "updated_at": "2026-07-10T03:00:45.786000Z"
 }
