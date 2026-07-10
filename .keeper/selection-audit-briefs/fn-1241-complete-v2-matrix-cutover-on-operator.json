@@ -1,0 +1,49 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 101,
+        "files_changed": 6,
+        "insertions": 564
+      },
+      "done_summary": "Cut keeper agent presets list/providers resolve/providers check over to loadMatrixV2, adding v2 derivations (resolveModelV2, providerCheckFindingsV2, enumerateTriplesV2, lintHostTriplesV2) that mirror v1's shapes while honoring v2 shadowing (single roster-first winner) and per-capability launch-only membership; added tests loading docs/examples/matrix.example.yaml through all three verbs.",
+      "input_hash": "09c63dcbab939ba6530aec7155245b257dcac54d10ca980528d32f32e1932872",
+      "model": "sonnet",
+      "spec_chars": 1890,
+      "spec_md": "## Description\n\nFinding F1 (with merged test-gap F4). `keeper agent presets list`,\n`keeper agent providers resolve`, and `keeper agent providers check` still\nparse `~/.config/keeper/matrix.yaml` with the v1 `loadMatrix`\n(`src/agent/main.ts:411` wires `loadMatrixFn: loadMatrix`; the verbs call it\nat `:1716`, `:1985`, `:2085`). v1 guards top-level keys against\n`ALLOWED_MATRIX_KEYS` (`src/agent/matrix.ts:204`) and hard-rejects the v2\n`subagent_templates`/`subagent_models` keys, so the moment an operator\ninstalls the mandated v2 config (per `docs/install.md` step 4) all three\nverbs exit non-zero calling the required config malformed.\n\nCut the three verbs to `loadMatrixV2` (deriving the triples/driver they need\nfrom the v2 roster). Merged finding F4: no test exercises these verbs against\na v2-shaped `matrix.yaml` \u2014 the doctor-verb suites (test/agent-presets,\ntest/agent-dispatch, test/agent-matrix) still feed v1 `route:`/`native:`/\n`subagents:` fixtures, which is what let the collision ship green. Add a case\nthat loads the committed v2 example (`docs/examples/matrix.example.yaml`)\nthrough each verb.\n\nFiles: src/agent/main.ts, src/agent/matrix.ts, and the doctor-verb test\nsuites (test/agent-presets, test/agent-dispatch, test/agent-matrix).\n\n## Acceptance\n\n- [ ] All three verbs load the committed v2 example without a v1 unknown-key error\n- [ ] Each verb has a test asserting success against the v2 example\n- [ ] Core dispatch/launch behavior is unchanged\n\n## Done summary\nCut keeper agent presets list/providers resolve/providers check over to loadMatrixV2, adding v2 derivations (resolveModelV2, providerCheckFindingsV2, enumerateTriplesV2, lintHostTriplesV2) that mirror v1's shapes while honoring v2 shadowing (single roster-first winner) and per-capability launch-only membership; added tests loading docs/examples/matrix.example.yaml through all three verbs.\n## Evidence\n",
+      "task_id": "fn-1241-complete-v2-matrix-cutover-on-operator.1",
+      "tier": "high",
+      "title": "Cut operator verbs to v2 matrix"
+    },
+    {
+      "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 17,
+        "files_changed": 3,
+        "insertions": 7
+      },
+      "done_summary": "Reworded CONTEXT.md/install.md shadow claims to match actual behavior (computed, not surfaced) and rewrote models.ts's workerAgentFor comment to name the effectiveMatrix() seam instead of the deleted embeddedWorkerAgentFor sibling; trimmed CONTEXT.md's spacer lines back under the glossary line cap.",
+      "input_hash": "09c63dcbab939ba6530aec7155245b257dcac54d10ca980528d32f32e1932872",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1847,
+      "spec_md": "## Description\n\nTwo accuracy corrections against the shipped v2-only reality.\n\nFinding F2: the cross-provider dedup shadow is computed and stored\n(`src/agent/matrix.ts:911`, `plugins/plan/src/host_matrix.ts:374`) but no\nproduction path reads `.shadowed` (only tests do). Yet `CONTEXT.md:37`\n(\"every other entry shadowed and logged\") and `docs/install.md:78`\n(\"shadowed entries are logged visibly\") claim it is surfaced. Either emit the\nshadow list from a reading surface (e.g. a `providers check` finding or a\nstderr line at load) or soften the claim in `CONTEXT.md` and\n`docs/install.md` until a consumer exists \u2014 pick one and make the docs match\nthe code.\n\nFinding F3: the `workerAgentFor` doc-comment at `plugins/plan/src/models.ts:165`\nstill asserts the reconcile verdict path uses the embedded-only sibling\n`embeddedWorkerAgentFor`, which was deleted with `subagents_config.ts`; the\npath now composes cells via the producer-injected matrix axes. The comment at\n`:152` also still describes an \"embedded snapshot when absent\" that no longer\nexists (the matrix is required). Rewrite both to describe the injected-axes\narchitecture.\n\nFiles: CONTEXT.md, docs/install.md, plugins/plan/src/models.ts (and\nsrc/agent/matrix.ts / plugins/plan/src/host_matrix.ts if surfacing the shadow\nrather than softening the wording).\n\n## Acceptance\n\n- [ ] CONTEXT.md and install.md shadow claims match actual behavior (surfaced or reworded)\n- [ ] models.ts comments name no deleted symbol and describe the injected-matrix architecture\n\n## Done summary\nReworded CONTEXT.md/install.md shadow claims to match actual behavior (computed, not surfaced) and rewrote models.ts's workerAgentFor comment to name the effectiveMatrix() seam instead of the deleted embeddedWorkerAgentFor sibling; trimmed CONTEXT.md's spacer lines back under the glossary line cap.\n## Evidence\n",
+      "task_id": "fn-1241-complete-v2-matrix-cutover-on-operator.2",
+      "tier": "medium",
+      "title": "Align stale v2 matrix claims and comments"
+    }
+  ],
+  "created_at": "2026-07-10T19:43:53.209000Z",
+  "epic_id": "fn-1241-complete-v2-matrix-cutover-on-operator",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "selection_input_hash": "09c63dcbab939ba6530aec7155245b257dcac54d10ca980528d32f32e1932872",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
