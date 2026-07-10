@@ -37,5 +37,5 @@ Fixtures: a panel with the same triple twice (two legs, ordinal labels, distinct
 - [ ] Panel resolution output identifies members by raw triple plus ordinal
 
 ## Done summary
-
+panel.yaml members are now launch triples: loadPanelSelections parses each with the shared grammar (fail-loud on malformed/non-panel-eligible), and resolvePanelMembers mints ordinal-disambiguated slug leg names (hash-suffix + 1-based ordinal) carrying the raw triple + ordinal identity, so duplicate or slug-colliding triples never collide on a tmux name or output path.
 ## Evidence
