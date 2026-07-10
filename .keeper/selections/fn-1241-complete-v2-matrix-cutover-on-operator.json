@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded multi-file loader swap with a fully-named root cause and surfaces plus test additions, in a known pattern and explicitly scoped away from dispatch/schema \u2014 sonnet's implementation sweet spot with no intelligence-bound reason for opus.",
+      "task_id": "fn-1241-complete-v2-matrix-cutover-on-operator.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Genuinely bounded, near-mechanical doc/comment alignment with fully-specified acceptance and named surfaces (soften-or-surface with soften spelled out), a clean trickle-lane fit in the medium band.",
+      "task_id": "fn-1241-complete-v2-matrix-cutover-on-operator.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "created_at": "2026-07-10T18:29:49.473000Z",
+  "epic_id": "fn-1241-complete-v2-matrix-cutover-on-operator",
+  "input_hash": "09c63dcbab939ba6530aec7155245b257dcac54d10ca980528d32f32e1932872",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 163986891,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded multi-file loader swap with a fully-named root cause and surfaces plus test additions, in a known pattern and explicitly scoped away from dispatch/schema \u2014 sonnet's implementation sweet spot with no intelligence-bound reason for opus.\",\"confidence\":0.8},{\"task_id\":\"2\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Genuinely bounded, near-mechanical doc/comment alignment with fully-specified acceptance and named surfaces (soften-or-surface with soften spelled out), a clean trickle-lane fit in the medium band.\",\"confidence\":0.7}]}\n"
+}
