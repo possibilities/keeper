@@ -61,8 +61,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Parked question**: A question a worker left on its epic awaiting a human answer, surfaced as a needs-human signal until it is answered. Avoid: blocker, prompt, open ask.
 - **Pinned epic**: The full epic block a live close/work dispatch failure keeps rendered on the board after the epic closes — display-only, its lifetime exactly the failure row's. Avoid: sticky epic, ghost epic, zombie row.
 - **Selection review**: The committed, per-epic dataset of out-of-band verdicts grading whether each executed worker cell was underpowered, right-sized, or overpowered; a human-invoked skill assembles and grades it after the epic closes, and it is advisory input to model-selector policy, never a live board signal. Avoid: selection score, rating, quality audit.
-- **Selector verdict**: The raw JSON cell-set a model-selector subagent returns as its final message — untrusted input the calling skill pipes verbatim to the trusted apply seam, never applied by the selector itself. Avoid: assignment, selection (alone).
-- **Selection verdict document**: The staged ordinal-keyed verdict file the apply seam writes under gitignored selection state for close-finalize to consume when a follow-up epic's tasks are born pre-selected. Avoid: verdict file, followup verdict (as a distinct concept).
+- **Selector verdict**: The raw JSON cell-set a model-selector subagent returns as its final message — untrusted input the calling skill pipes verbatim to the trusted apply seam, which stages it as the ordinal-keyed verdict document under gitignored selection state for close-finalize to consume. Avoid: assignment, selection (alone), verdict file.
 - **Instant-death wall**: The needs-human threshold reached when enough dispatch keys trip the instant-death breaker at once that the failures read as an account or quota wall rather than isolated crashes. Avoid: crash wall, breaker count, death spiral.
 - **Distress row**: The single sticky signal keeper mints when it is crash-looping, cleared only once the boot rate recovers. Avoid: alert, log line, exception.
 - **Escalation dispatch**: The autopilot response to a stuck task or merge that fires a purpose-built session carrying an assembled incident brief, rather than waking the work's original creator. Bounded by a global concurrent cap on turn-active occupancy (a stopped-with-idle-backend session does not count as live) and per-epic serialization; the human is paged exactly once, only when a session declines or dies. Avoid: creator-wake, planner-notify, page.
@@ -85,15 +84,12 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
 - **Lane pre-merge**: The guard that vets a dependent task's base lane before its fan-in merges the completed siblings in — restoring a provably-redundant leak to the base's HEAD, deferring a base it cannot safely settle to a self-clearing row, and escalating a persistent wedge to a needs-human distress. Avoid: clean, cleanup, premerge fixup.
 
-## Account routing
+## Account routing and usage scraping
 
 - **Capacity observation**: A freshness-bounded report from optional external tools that may inform selection for one new agent process, but is never durable truth. Avoid: usage projection, account state, balance record.
 - **Account route**: The account execution path selected independently for one new agent process, including a process resuming or restoring an existing conversation; it never binds that conversation to the account for a later launch. Avoid: profile, pin, affinity, session account.
 - **Launch attribution**: The immutable fact of which Account route one process used, retained for explanation and forensics but never consumed to route a later process. Avoid: account affinity, profile name, pin.
 - **Launch reservation**: Short-lived, non-exclusive pressure applied during concurrent account selection so new processes do not stampede one route; it conveys no durable ownership. Avoid: lease, lock, affinity.
-
-## Usage scraping
-
 - **Usage-model registry**: The `usage_models` keeper-config map declaring which claude profiles and codex the usage scraper produces envelopes for, keyed by envelope id with an optional display alias per entry; an absent or malformed map idles the producer rather than erroring. Avoid: profile catalog, account list, scrape targets.
 - **agentusage**: The frozen on-disk namespace the usage scraper writes and reads — the envelope root, the tmux socket, and the path-filter token that share this name — pinned as a fixed wire/on-disk contract independent of any project directory. Avoid: the agentusage project, external scraper.
 
@@ -103,6 +99,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
 - **Tmux session**: The terminal-multiplexer container workers, viewers, and panels launch into; an unqualified "session" in a launch or dispatch context means this one. Avoid: workspace, window group, terminal.
 - **Claude session**: One agent conversation with its own transcript, identified by an immutable session id; jobs and forensics key on it. Avoid: job, chat, conversation.
+- **Transcript reader**: The per-harness discovery-and-parse module behind `keeper transcript`, owning where that harness's sessions live on disk and folding them into one harness-neutral transcript model; the transcript registry's key set is its own membership root, deliberately narrower than the launchable harness list. Avoid: transcript watcher (the run-capture stop-scan), transcript worker (the statusline tail-watch), parser.
 - **Session title**: The human-renamable display name of a Claude session, distinct from its id; matching by title is a convenience lookup, never an identity. Avoid: session name, label.
 - **Sidecar**: The private per-turn docs mirror a session maintains alongside its work, owned by hooks and never the doc body itself. Avoid: backup, shadow copy, cache.
 - **Adopted job**: A tracked session a non-launcher path minted — a hand-started hermes self-seed or a claimed codex rollout — rather than the keeper agent launcher, marked so the board pills it distinctly and restore surfaces it. Avoid: orphan, imported session, unmanaged job.
@@ -113,8 +110,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 
 - **Generation**: One tmux server boot — every window and agent observed between a server start and its death, the cohort crash-restore scopes to. One boot carries exactly one keeper-stamped identity, so a probe-format change can never split it in two. Avoid: server epoch, boot id, killed cohort (that is the fallback derivation model, not the concept).
 - **Restore**: Relaunching a dead generation's agent tabs so each re-attaches to its exact prior conversation, proven per tab from attach evidence — window creation alone never counts as restored. Avoid: revive (that is the runnable dump-script artifact), resurrect, respawn.
-- **Harness resume**: One harness re-attaching to its own persisted session by native id — the per-tab primitive a restore drives. Distinct from the Resume cursor (a fold checkpoint) and from unblocking a task. Avoid: reconnect, reload, restore (that is the whole-generation flow).
-- **Resume target**: The harness-native id a harness resume needs — the claude session id, or the stored native id for pi/codex/hermes; empty means not-resumable, and a display title is never a resume key. Avoid: session name, label, job id (identity, not the resume key).
+- **Harness resume**: One harness re-attaching to its own persisted session — the per-tab primitive a restore drives — by its resume target: the harness-native id (claude session id, or the stored native id for pi/codex/hermes), where empty means not-resumable and a display title is never a resume key. Distinct from the Resume cursor (a fold checkpoint). Avoid: reconnect, reload, session name (for the key).
 - **Refuse-live**: The resume-time gate that never re-attaches a currently live session — liveness is pid + start-time identity, and a running agent is reached over the bus instead. Avoid: force-resume, live takeover, double-attach.
 
 ## Frame stream and supervision
@@ -124,13 +120,10 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Coverage verdict**: The trailer's honest claim about frame completeness — continuous only when one uninterrupted run provably dropped nothing, gap_possible otherwise. Avoid: gapless guarantee, completeness flag.
 - **Hyper mode**: The supervision mode that consumes one bounded frame chunk per pass and judges each change as a human proxy — truthful, legible, stable — filing UI defects rather than editing renderers. Avoid: frame mode, firehose mode, vigilant mode.
 
-## Install and reload
+## Install, reload, and daemon liveness
 
 - **Shared-source leaf**: A harness's global-instruction discovery path (e.g. `~/.codex/AGENTS.md`, `~/.pi/agent/AGENTS.md`), re-asserted as a symlink into keeper's one `system/shared/AGENTS.md` source on every launch; healed by deleting the source, never the leaf, and distinct from the repo-root `AGENTS.md -> CLAUDE.md` convention symlink. Avoid: config leaf, stow target, dotfile link.
 - **Load surface**: The set of checked-in files the resident daemon process actually loads — what the reload fingerprint hashes and the boundary test encloses via the checked-in **roots manifest** declaring its roots through one seam, so the hashed and enforced boundaries cannot disagree; per-invocation code (CLI, hooks, skills) sits outside it. Avoid: footprint, source tree, codebase, allowlist, path list, fingerprint config.
-
-## Daemon liveness and restart forensics
-
 - **Daemon boot**: One keeperd process lifetime from exec to exit, the unit the restart ledger records under a `boot_id`. Distinct from a Generation (one tmux server boot) — the "boot id" that entry rejects refers to the tmux concept, never to this one. Avoid: generation, instance, run.
 - **Served latency**: How long the serve worker takes to answer a real client query, self-reported to main as windowed duration percentiles; never measured by an external probe. Avoid: probe latency, response time, lag (that is event-loop delay).
 - **Serve starvation**: The degraded wedge where the serve worker answers trivial probes fast while real first-paint queries queue past the client give-up; detectable only from served latency, invisible to an accept-stall probe. Avoid: accept-stall (reads die entirely there), busy-lag (main-loop starvation), brownout.
@@ -142,5 +135,4 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Panel**: A named, ordered selection of launch triples convened to answer one question in parallel, each member blind to the others, with a judge fusing the answers; a duplicated member is a distinct leg. Avoid: ensemble, quorum, committee.
 - **Panel strength**: A panel's capacity for independent cross-checking, read from its member count and harness diversity; a stronger panel costs proportionally more and runs as slow as its slowest member. Avoid: level, size, tier.
 - **Default panel**: The panel the config's top-level `default` pointer names, used whenever no panel is chosen; the reserved word `default` always resolves to it and is never a panel's own name. Avoid: fallback panel, primary panel, default level.
-- **Background agent**: A child a harness session launches without blocking its turn; the parent's transcript records the launch and, when the child finishes, a task-notification that re-invokes the parent. Distinct from a Reaper (keeper's own background sweep) and from a plan Task. Avoid: background task, async subagent, detached child.
-- **Settled stop**: A transcript stop marker the capture stack accepts as terminal because the session shows no live background agents at that point; an unsettled stop is deferred, bounded by the stop timeout. Avoid: final stop, quiescence, real stop.
+- **Settled stop**: A transcript stop marker the capture stack accepts as terminal because the session shows no live background agents — children a session launches without blocking its turn, whose launch and finish the parent transcript records (distinct from a Reaper, keeper's own background sweep); an unsettled stop is deferred, bounded by the stop timeout. Avoid: final stop, quiescence, real stop.
