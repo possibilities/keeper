@@ -75,7 +75,8 @@ capability the `claude` provider serves is **native** (its worker runs that mode
 other renders as a **wrapped cell** whose claude worker delegates implementation to the
 cost-preferred serving provider at run time. The same derived capability served by more than one
 provider is one axis value — the first provider in the pecking order wins and owns its effort list,
-shadowed entries are logged visibly. A roster capability absent from `subagent_models` is
+and every other entry is recorded as a shadow in the parsed matrix (not yet surfaced by any reading
+path). A roster capability absent from `subagent_models` is
 **launch-only**: it stays enumerable as a launch triple (pairing, panels, `presets list`) but never
 joins a worker cell. `keeper agent providers check` validates the roster and lints the operator's
 configured host launch triples (the four `<harness>_default` triples, `worker`, `escalation`, panel
