@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T19:31:44.515000Z",
+  "depends_on": [
+    "fn-1243-dispatch-table-and-agent-pins.1"
+  ],
+  "epic": "fn-1243-dispatch-table-and-agent-pins",
+  "id": "fn-1243-dispatch-table-and-agent-pins.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Reroute dispatch consumers and retire role keys",
+  "updated_at": "2026-07-10T19:31:44.515000Z"
+}

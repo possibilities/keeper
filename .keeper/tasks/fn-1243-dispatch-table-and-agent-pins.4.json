@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T19:31:44.515000Z",
+  "depends_on": [],
+  "epic": "fn-1243-dispatch-table-and-agent-pins",
+  "id": "fn-1243-dispatch-table-and-agent-pins.4",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "agent_pins in both matrix parsers",
+  "updated_at": "2026-07-10T19:31:44.515000Z"
+}
