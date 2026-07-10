@@ -17,10 +17,6 @@
     ],
     "defaultMode": "default"
   },
-  "statusLine": {
-    "type": "command",
-    "command": "claudectl show-statusline"
-  },
   "enabledPlugins": {
     "swift-lsp@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
