@@ -14,13 +14,14 @@ file is imperative guardrails only.
 
 ## Repo facts
 
-- **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
+- **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate — distinct
+  from a harness's shared-source leaf, healed by deleting the source, never the leaf.
 - **Three peers live under `plugins/`** — `plugins/keeper/` (hooks + `keeper:*` skills) and `plugins/plan/`
   (behind `keeper plan`, `plan:*` skills) are claude-plugins, each with exactly ONE `<plugin>/.claude-plugin/plugin.json`
   (keeper exactly ONE `hooks/hooks.json`); `plugins/prompt/` is the engine behind `keeper prompt` and carries NO
   `.claude-plugin` manifest. `plugins/plan/` also renders the `subagents.yaml` model × effort matrix as per-cell
-  `work`-plugin manifests under `workers/<model>-<effort>/`, added via `--plugin-dir` ATOP the full plugins.yaml (keeper+plan+arthack) every launch inherits. Never duplicate a manifest, never add a
-  `~/.claude/plugins/keeper` symlink (double-registers the hook); the daemon, `cli/`, `src/`, and the `keeper` binary stay at the repo root.
+  `work`-plugin manifests under `workers/<model>-<effort>/`, added via `--plugin-dir` ATOP the full plugins.yaml (keeper+plan+arthack) every launch inherits. Never duplicate a manifest or add a
+  `~/.claude/plugins/keeper` symlink (double-registers); daemon, `cli/`, `src/`, `keeper` binary stay at repo root.
 - **The Agent Bus inbox watcher is a session Monitor** in `plugins/keeper/monitors.json` — STRICTLY
   separate from `hooks.json`; never fold in.
 - **A `keeper bus chat send` MUST NOT join the live registry** (`send_only:true`); only a subscribed `keeper bus watch` channel establishes bus presence.
@@ -43,7 +44,7 @@ file is imperative guardrails only.
 ## Hook rules
 
 - **Seven hooks under `plugins/keeper/plugin/hooks/`** — events-writer (logs every Bash call, NEVER blocks), branch-guard (`PreToolUse(Bash)`, hard-denies a SUBAGENT (`agent_id` present) from branch create/switch/worktree-add and mutating `git stash` (list/show/create allowed); the in-daemon producer shells git with no `agent_id`, NOT gated), escalation-guard (`PreToolUse(Bash)`, role-keyed on `KEEPER_ESCALATION_ROLE` — unblock/resolve diagnosis-only, deconflict/repair write-capable, interpreter/heredoc/redirect denied; FAILS CLOSED when marked, else inert), wrong-tree-guard (`PreToolUse(Write|Edit|MultiEdit|Bash)`, keyed on lane path `KEEPER_PLAN_WORKTREE` — denies a lane worker's write into a non-lane `.git`-bounded tree (direct `file_path` + best-effort Bash vectors); `.keeper`/temp/home/own-lane allowed, `.git/config`+credentials denied; FAILS OPEN), sidecar-writer (`PostToolUse`, owns the `~/docs` sidecar + git state, NEVER the `.md` body), docs-pusher (`Stop`, pushes `~/docs` once per turn), context-hint (`SessionStart`, node-only, surfaces the repo's `CONTEXT.md`). Two events-log writers share the discipline — the hermes shim (`hooks/hermes-events-shim.ts`, self-seeds an identity absent `KEEPER_JOB_ID`) and the pi extension (`plugins/keeper/pi-extension/`, armed via `-e`), both gated on `KEEPER_JOB_ID`.
-- **Always exit 0 / fail-open** — a non-zero exit can fail-closed the human's session; a throwing shim/extension degrades to presence-only, NEVER crashing its turn. The PreToolUse guards deny via the envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows+logs). A shim NEVER writes host stdout (the hook control channel) and logs failures privately.
+- **Always exit 0 / fail-open** — a non-zero exit can fail-closed the human's session; a throwing shim/extension degrades to presence-only, NEVER crashing. The PreToolUse guards deny via the envelope (`permissionDecision:"deny"`), NOT a non-zero exit; a `Stop` hook exiting 2 BLOCKS stopping (docs-pusher swallows+logs). A shim NEVER writes host stdout (the hook control channel); it logs failures privately.
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts` in a hook or events-log writer.** Keep imports to `node:*` + the dep-free `src/{dead-letter,derivers,exec-backend,sidecar,doc-commit,proc-starttime,hermes-shim-contract}.ts` helpers; never the plan plugin (the pi extension loads in ISOLATION via jiti — `node:*` + its own contract copy only). Hook/shim payloads are attacker-influenced: emit each record as ONE JSON line (no NDJSON injection, no shell interpolation), size-bounded.
 - **A `~/docs` hook may spawn a bounded git subprocess** — read-only probes against the session repo are fine; the hard line is NO mutating git or DB write outside the `~/docs` repo, and never `git fetch`/rebase/force-push there.
 
@@ -52,8 +53,8 @@ file is imperative guardrails only.
 - **Forward-only** via `meta(schema_version)`; non-idempotent steps are version-guarded. The daemon
   is the SOLE migrator and never downgrades a DB stored above the binary's `SCHEMA_VERSION`.
 - **A schema change appends one `SCHEMA_STEPS` entry** (`{version, kind, apply}`); `SCHEMA_VERSION`
-  derives from the ladder tail, never hand-typed. Re-pin `SCHEMA_FINGERPRINT` on EVERY schema change.
-  The version stays PROVISIONAL until landed — fan-in renumbering rules unchanged.
+  derives from the ladder tail, never hand-typed. Re-pin `SCHEMA_FINGERPRINT` on EVERY schema change;
+  version stays PROVISIONAL until landed (fan-in renumbering unchanged).
 
 ## Writes are tightly scoped — DO NOT widen them
 
@@ -64,7 +65,7 @@ file is imperative guardrails only.
 - **Plans are READ-ONLY.** The plan worker folds `.keeper/{epics,tasks}` snapshots into `epics`; no RPC writes a plan field. **Board-orient before acting** with `keeper status`; per-task detail via `keeper query tasks` — never hand-parse a `keeper plan <verb>` read.
 - **Sole-writer rules.** The events-log per-pid NDJSON tree has a writer CLASS keyed on the keeper job id — the claude events-writer hook, hermes shell shim, and pi extension each write ONLY their own `<pid>.ndjson`, never the DB; `keeper agent` is SOLE writer of the births tree. sidecar-writer + docs-pusher write ONLY the `~/docs` repo. The events-log ingester is sole writer of hook-sourced `events` rows; main writes all synthetic events + `dead_letters` + the replay path (birth-ingest/codex-state producers feed it, never the DB), workers feed via main. `src/{codex,hermes}-trust.ts` are the ONLY writers of their config dirs, fail-open. `keeper statusline*` SOLE-write the statusLine leafs (never DB/socket); `keeper agent panel start` SOLE writer of `~/.local/state/keeper/panels/`. `keeper baseline` + the autopilot tip-triggered producer write the request spool, the baseline worker its result leafs; the plan CLI of the id ledger, max(scan,ledger)+1.
 - **Profile-dir names are guarded — never hand-create `~/.claude-profiles/default`.**
-  `assertProfileDirNameAllowed` fail-loud rejects (StateError→exit 1) the reserved set (`""`/`default`/`auto`, trimmed) + path-escape (separator/`..`/NUL, checked on RAW input) at every `mkdir` site.
+  `assertProfileDirNameAllowed` fail-loud rejects (StateError→exit 1) the reserved set (`""`/`default`/`auto`, trimmed) + path-escape (separator/`..`/NUL, on raw input) at every `mkdir` site.
 
 ## Process & DB-watch invariants
 
@@ -79,7 +80,7 @@ file is imperative guardrails only.
   NDJSON restart ledger (sidecar, NOT a fold; runtime-qualified count), minting ONE sticky
   distress row cleared once the boot rate recovers.
 - **A `flock` single-instance gate tops `startDaemon()`** before `openDb`/`migrate`; its `FD_CLOEXEC` lock fd never leaves main.
-- **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force`.
+- **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed) unless `--force`.
 
 ## Worker contract
 
@@ -93,7 +94,7 @@ file is imperative guardrails only.
 
 ## Test isolation
 
-- **One fast pure-in-process tier.** `bun test` is the keeper fast suite (only `test:opentui` splits out); `bun run test:full` gates all three suites serially — root, plan, prompt — and `test:full:slow` injects `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` to unlock the real-git/subprocess tiers. NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never hang or synchronously spin; production is the integration safety net.
+- **One fast pure-in-process tier.** `bun test` is the keeper fast suite (only `test:opentui` splits out); `bun run test:full` gates all three suites serially — root, plan, prompt — and `test:full:slow` injects `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` to unlock the real-git/subprocess tiers. NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never hang or synchronously spin; production is the safety net.
 - **Sandbox ALL SIX state classes** under the per-test tmpdir for any test on the real state surface:
   `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
   and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never `{ ...process.env, KEEPER_DB }`;
