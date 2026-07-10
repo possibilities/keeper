@@ -55,5 +55,5 @@ covers exactly; the pure predicate needs no change.
       self-exclusion via `ownSessionId` through the CLI drained projection.
 
 ## Done summary
-
+Served jobs.dispatch_origin on the shared jobs wire (JOBS_DESCRIPTOR) so keeper await drained's plan/inflight scopes gate on keeper-dispatched work instead of reading undefined; extracted projectDrainedRunningJobs and added real-projection integration coverage (runQuery -> CLI projection -> drainedState) asserting provenance sourcing and ownSessionId self-exclusion.
 ## Evidence
