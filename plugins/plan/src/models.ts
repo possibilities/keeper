@@ -161,9 +161,10 @@ export function configuredModels(): readonly string[] {
  * spawn. Returns null when EITHER axis is null — the null return is what stops
  * /plan:work cleanly. Throws for a non-null value outside the matrix
  * efforts/models: the corrupt-state backstop behind dispatch's graceful no-route
- * reject, which fires first on any unroutable cell and gates claim. The reconcile
- * verdict path uses the embedded-only sibling (`embeddedWorkerAgentFor`) so its
- * host read stays off the pure core. */
+ * reject, which fires first on any unroutable cell and gates claim. Composes
+ * through the same `effectiveMatrix()` seam as configuredEfforts/configuredModels
+ * above — the reconcile verdict path takes its {efforts, models} axes from
+ * that producer-injected matrix, with no separate embedded-only path. */
 export function workerAgentFor(
   tier: string | null,
   model: string | null,

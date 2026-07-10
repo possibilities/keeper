@@ -3,7 +3,6 @@
 keeper's terms of art, grouped by bounded context. Each entry is a role-and-behavior definition plus an `Avoid:` line naming rejected synonyms — concepts only, never files, code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 
 ## Event-sourcing core
-
 - **Event**: An immutable, totally-ordered record of something that happened, and the only source of truth keeper derives state from. Avoid: message, log entry, mutation.
 - **Synthetic event**: An event keeper mints itself to record a mutation, so every state change round-trips through the same append-only stream a real event would. Avoid: command, direct write, side effect.
 - **Projection**: A read-optimized view keeper derives purely by folding the event stream; it is disposable and rebuildable, never a source of truth. Avoid: cache, materialized view, table of record.
@@ -19,7 +18,6 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Schema singleton**: The property that keeper's schema is one lane-at-a-time resource, so two concurrent schema edits are meant to collide at merge rather than compose silently. Avoid: shared resource, lock file, mutex.
 
 ## Plan board
-
 - **Board**: The read-only plan state — epics, tasks, and their readiness — that an agent orients on before acting. Avoid: backlog, kanban, queue.
 - **Epic**: A tracked unit of work holding a spec and an ordered set of dependent tasks. Avoid: project, story, milestone.
 - **Task**: One acceptance-bounded slice of an epic that a single worker implements end-to-end. Avoid: subtask, issue, chore.
@@ -34,7 +32,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Capability model**: The model-axis value a task carries, a capability token derived from a Provider's launch id (the segment after its last `/`, the whole id when slash-free); native when the claude provider serves it, wrapped otherwise. Avoid: harness model, backend model, model alias.
 - **Launch id**: A Provider's model entry, the string a harness CLI receives verbatim — a bare scalar or an `{id, efforts}` form carrying a per-model effort-list override — from which the Capability model derives by basename. Avoid: alias target, model alias, native alias.
 - **Provider**: A harness's entry in the host matrix config, tying it to the launch ids it serves. Avoid: vendor, backend, platform.
-- **Pecking order**: The provider list order in the host matrix config, cost-ascending, deciding at run time which provider serves a wrapped cell; the same derived capability served by more than one provider is one axis value, owned by the first provider in the order, with every other entry shadowed and logged. Avoid: priority list, fallback chain, ranking.
+- **Pecking order**: The provider list order in the host matrix config, cost-ascending, deciding at run time which provider serves a wrapped cell; the same derived capability served by more than one provider is one axis value, owned by the first provider in the order, with every other entry recorded as a shadow — tracked in the parsed matrix, not yet surfaced on any reading path. Avoid: priority list, fallback chain, ranking.
 - **Worker-cell eligibility list**: The host matrix's `subagent_models` list, the explicit capability tokens eligible to render and select as worker cells; a roster capability absent from it still enumerates as a launch triple but never joins the cell set — the sole per-capability launch-only mechanism. Avoid: model roster, capability list, launch-only provider.
 - **Cell-template inventory**: The host matrix's `subagent_templates` list, the explicit template paths the renderer fans out over the Worker-cell eligibility list × efforts into rendered worker cells. Avoid: template list, frontmatter marker, self-declared template.
 - **Wrapped cell**: A worker cell whose model claude does not serve natively; its worker is a claude wrapper that delegates implementation to the model's provider and owns the keeper close-out. Avoid: foreign cell, proxy worker, delegated task.
@@ -46,7 +44,6 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Blocking follow-up**: A follow-up epic the close audit requires to complete before its source epic may stamp done; the source stays open, holding every epic that depends on it. Avoid: gating epic, close blocker.
 
 ## Autopilot and dispatch
-
 - **Autopilot**: The server-side loop that reconciles the board against running work, dispatching ready tasks and closing finished epics without a human. Avoid: scheduler, cron, orchestrator.
 - **Reconciler**: The level-triggered core of autopilot that re-derives what should be running from current state each cycle. Avoid: dispatcher, poller, event loop.
 - **Dispatch**: To fire one worker at a task or a close, whether by autopilot or by hand. Avoid: launch, spawn, enqueue.
@@ -76,7 +73,6 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Per-root cap**: The per-repo concurrent-dispatch limit stored as durable intent, applying while worktree mode is on. The effective cap dispatch honors is derived at read time and floors to one whenever worktree mode is off. Avoid: pinned cap; conflating stored with effective.
 
 ## Worktree and merge
-
 - **Lane**: A per-task worktree the autopilot derives from the dependency graph each cycle to run tasks in parallel. Avoid: branch, checkout, slot.
 - **Worktree mode**: A producer-only autopilot setting that gives each ready task its own isolated checkout instead of sharing one. Avoid: parallel mode, multi-branch, fork mode.
 - **Merge-gate**: The check that holds a dependent lane until every upstream it needs has truly merged into the local default branch. Avoid: barrier, dependency wait, lock.
@@ -86,19 +82,16 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Lane pre-merge**: The guard that vets a dependent task's base lane before its fan-in merges the completed siblings in — restoring a provably-redundant leak to the base's HEAD, deferring a base it cannot safely settle to a self-clearing row, and escalating a persistent wedge to a needs-human distress. Avoid: clean, cleanup, premerge fixup.
 
 ## Account routing
-
 - **Capacity observation**: A freshness-bounded report from optional external tools that may inform selection for one new agent process, but is never durable truth. Avoid: usage projection, account state, balance record.
 - **Account route**: The account execution path selected independently for one new agent process, including a process resuming or restoring an existing conversation; it never binds that conversation to the account for a later launch. Avoid: profile, pin, affinity, session account.
 - **Launch attribution**: The immutable fact of which Account route one process used, retained for explanation and forensics but never consumed to route a later process. Avoid: account affinity, profile name, pin.
 - **Launch reservation**: Short-lived, non-exclusive pressure applied during concurrent account selection so new processes do not stampede one route; it conveys no durable ownership. Avoid: lease, lock, affinity.
 
 ## Usage scraping
-
 - **Usage-model registry**: The `usage_models` keeper-config map declaring which claude profiles and codex the usage scraper produces envelopes for, keyed by envelope id with an optional display alias per entry; an absent or malformed map idles the producer rather than erroring. Avoid: profile catalog, account list, scrape targets.
 - **agentusage**: The frozen on-disk namespace the usage scraper writes and reads — the envelope root, the tmux socket, and the path-filter token that share this name — pinned as a fixed wire/on-disk contract independent of any project directory. Avoid: the agentusage project, external scraper.
 
 ## Bus, presence, and session surface
-
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
 - **Tmux session**: The terminal-multiplexer container workers, viewers, and panels launch into; an unqualified "session" in a launch or dispatch context means this one. Avoid: workspace, window group, terminal.
@@ -110,7 +103,6 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Originator**: The ownership signal on a codex rollout marking it keeper-launched; strictly absent or empty means keeper never owned it, so a sole unambiguous rollout becomes adoptable. Avoid: owner tag, launch marker, origin flag.
 
 ## Crash restore
-
 - **Generation**: One tmux server boot — every window and agent observed between a server start and its death, the cohort crash-restore scopes to. One boot carries exactly one keeper-stamped identity, so a probe-format change can never split it in two. Avoid: server epoch, boot id, killed cohort (that is the fallback derivation model, not the concept).
 - **Restore**: Relaunching a dead generation's agent tabs so each re-attaches to its exact prior conversation, proven per tab from attach evidence — window creation alone never counts as restored. Avoid: revive (that is the runnable dump-script artifact), resurrect, respawn.
 - **Harness resume**: One harness re-attaching to its own persisted session by native id — the per-tab primitive a restore drives. Distinct from the Resume cursor (a fold checkpoint) and from unblocking a task. Avoid: reconnect, reload, restore (that is the whole-generation flow).
@@ -118,26 +110,22 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Refuse-live**: The resume-time gate that never re-attaches a currently live session — liveness is pid + start-time identity, and a running agent is reached over the bus instead. Avoid: force-resume, live takeover, double-attach.
 
 ## Frame stream and supervision
-
 - **Frame**: One rendered snapshot of a viewer's body text, minted only when the rendered content actually changes; the unit the frame stream emits and a sidecar triple records. Avoid: screen, repaint, delta (that is the coarse tail's unit).
 - **Resume cursor**: The fold-cursor checkpoint stamped on frames and trailers so a later chunk can anchor where the last one left off; a non-unique checkpoint, never a per-frame id. Avoid: offset, timestamp cursor, seq.
 - **Coverage verdict**: The trailer's honest claim about frame completeness — continuous only when one uninterrupted run provably dropped nothing, gap_possible otherwise. Avoid: gapless guarantee, completeness flag.
 - **Hyper mode**: The supervision mode that consumes one bounded frame chunk per pass and judges each change as a human proxy — truthful, legible, stable — filing UI defects rather than editing renderers. Avoid: frame mode, firehose mode, vigilant mode.
 
 ## Install and reload
-
 - **Shared-source leaf**: A harness's global-instruction discovery path (e.g. `~/.codex/AGENTS.md`, `~/.pi/agent/AGENTS.md`), re-asserted as a symlink into keeper's one `system/shared/AGENTS.md` source on every launch; healed by deleting the source, never the leaf, and distinct from the repo-root `AGENTS.md -> CLAUDE.md` convention symlink. Avoid: config leaf, stow target, dotfile link.
 - **Load surface**: The set of checked-in files the resident daemon process actually loads — what the reload fingerprint hashes and the boundary test encloses via the checked-in **roots manifest** declaring its roots through one seam, so the hashed and enforced boundaries cannot disagree; per-invocation code (CLI, hooks, skills) sits outside it. Avoid: footprint, source tree, codebase, allowlist, path list, fingerprint config.
 
 ## Daemon liveness and restart forensics
-
 - **Daemon boot**: One keeperd process lifetime from exec to exit, the unit the restart ledger records under a `boot_id`. Distinct from a Generation (one tmux server boot) — the "boot id" that entry rejects refers to the tmux concept, never to this one. Avoid: generation, instance, run.
 - **Served latency**: How long the serve worker takes to answer a real client query, self-reported to main as windowed duration percentiles; never measured by an external probe. Avoid: probe latency, response time, lag (that is event-loop delay).
 - **Serve starvation**: The degraded wedge where the serve worker answers trivial probes fast while real first-paint queries queue past the client give-up; detectable only from served latency, invisible to an accept-stall probe. Avoid: accept-stall (reads die entirely there), busy-lag (main-loop starvation), brownout.
 - **Single-instance lock**: The kernel flock on the dedicated `keeperd.lock` file main acquires before opening the DB, making a second concurrent daemon impossible rather than merely detectable; the kernel releases it on process death, so a stale lock cannot exist. Avoid: pid file, sock lock (the server worker's separate per-socket lock file), mutex.
 
 ## Panels and launch triples
-
 - **Launch triple**: The context-free `<harness>::<model>::<effort>` token naming one launchable configuration — the harness-native model id carried verbatim, the effort translated to the harness's own axis; every well-formed triple is launchable, enumerated by the matrix but never gated by it. A capability absent from the Worker-cell eligibility list still enumerates as a launch triple — launch-only is per-capability, not per-provider. Avoid: preset, virtual preset, profile, model alias.
 - **Panel**: A named, ordered selection of launch triples convened to answer one question in parallel, each member blind to the others, with a judge fusing the answers; a duplicated member is a distinct leg. Avoid: ensemble, quorum, committee.
 - **Panel strength**: A panel's capacity for independent cross-checking, read from its member count and harness diversity; a stronger panel costs proportionally more and runs as slow as its slowest member. Avoid: level, size, tier.
