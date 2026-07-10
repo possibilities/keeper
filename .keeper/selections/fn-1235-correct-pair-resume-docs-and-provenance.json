@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Fully-specified, near-mechanical text/comment edits across three named files with no runtime change \u2014 the bounded low-band shape the trickle model is preferred for.",
+      "task_id": "fn-1235-correct-pair-resume-docs-and-provenance.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "created_at": "2026-07-10T09:16:18.447000Z",
+  "epic_id": "fn-1235-correct-pair-resume-docs-and-provenance",
+  "input_hash": "934bbdfb82832b1befe72561a0fe6d6d89d561a7669ff5fecc200206d9ca49fd",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2471214587,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fully-specified, near-mechanical text/comment edits across three named files with no runtime change \u2014 the bounded low-band shape the trickle model is preferred for.\",\"confidence\":0.86}]}\n"
+}
