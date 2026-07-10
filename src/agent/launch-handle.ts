@@ -29,7 +29,7 @@ import type {
 } from "../hermes-trust";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
-import { HARNESS_DESCRIPTORS } from "./harness";
+import { HARNESS_DESCRIPTORS, ResumeLaunchUnsupportedError } from "./harness";
 import { buildAgentLaunchArgv, stripClaudeEnv } from "./launch-config";
 import type { ResolvedHandle } from "./pair-subcommands";
 import type { RunLaunchResult } from "./run-capture";
@@ -173,6 +173,29 @@ export function launchEnvForAgent(
     : stripClaudeEnv(env as Record<string, string | undefined>);
 }
 
+/**
+ * Resume-launch inputs for {@link launchToResolvedHandle}. When present, the
+ * launch composes a RESUME argv (via {@link buildAgentLaunchArgv}'s resume opts)
+ * instead of a fresh one, and the returned handle carries `isResume` plus the
+ * harness-correct pinned session id for discovery. The caller (the run-capture
+ * resume handler) resolves the target and mints any child id — this module just
+ * threads the values through. Omitted = fresh launch, byte-unchanged.
+ */
+export interface LaunchResume {
+  /** The native resume token forwarded to the harness (buildAgentLaunchArgv's
+   *  `resumeTarget`): claude parent uuid / codex rollout uuid / pi session id /
+   *  hermes session id. */
+  target: string;
+  /** claude-only: the fresh CHILD uuid `--resume` forks into (buildAgentLaunchArgv's
+   *  `resumeSessionId`), minted by the caller. Undefined for the other harnesses,
+   *  which resume their existing session in place. */
+  childSessionId?: string;
+  /** The handle's `sessionId` — the strict-pin transcript-discovery key AND the
+   *  envelope resume_target base: claude → the child uuid; codex/pi → the resumed
+   *  session's own id (== target); hermes → null (store-based capture, no file). */
+  sessionId: string | null;
+}
+
 /** Inputs to {@link launchToResolvedHandle}. */
 export interface LaunchHandleArgs {
   deps: LaunchHandleDeps;
@@ -182,6 +205,8 @@ export interface LaunchHandleArgs {
   posture: LaunchPosture;
   /** Caller-supplied stop-wait ceiling threaded into the handle; null = default. */
   stopTimeoutMs: number | null;
+  /** Resume-launch inputs; omitted = a fresh launch (byte-unchanged). */
+  resume?: LaunchResume;
 }
 
 /**
@@ -191,35 +216,61 @@ export interface LaunchHandleArgs {
  * is held LOCALLY by the caller's compose (no run.json re-resolution, no
  * cross-process kill margin, no self-transcript-collision exposure). A
  * parse/launch failure maps to `{ok:false}`; diagnostics go to stderr.
+ *
+ * A RESUME launch ({@link LaunchHandleArgs.resume} set) composes the harness's
+ * native resume argv instead of a fresh one, pins the resumed session's id on the
+ * handle (so strict discovery + the envelope resume_target resolve it), and marks
+ * the handle `isResume` (so codex discovery resolves its pre-existing rollout by
+ * uuid). An unsupported resume composition maps to `{ok:false}` like a tmux error.
  */
 export function launchToResolvedHandle(
   args: LaunchHandleArgs,
 ): RunLaunchResult {
-  const { deps, agent, prompt, posture, stopTimeoutMs } = args;
+  const { deps, agent, prompt, posture, stopTimeoutMs, resume } = args;
   // Build with an EMPTY launcherArgvPrefix so the cli token sits first; `.slice(1)`
   // then drops it, leaving the inner args. The REAL prefix rides on the launch
-  // request below, where the detached pane re-execs through it.
-  const launchArgv = buildAgentLaunchArgv({
-    launcherArgvPrefix: [],
-    cli: agent,
-    prompt,
-    model: posture.model,
-    effort: posture.effort,
-    session: posture.session,
-    preset: posture.preset,
-    name: posture.name,
-  });
+  // request below, where the detached pane re-execs through it. A resume launch
+  // threads the harness's own resume token/pins through the resume opts (the
+  // builder embeds the dash-guarded prompt at the harness-correct position).
+  let launchArgv: string[];
+  try {
+    launchArgv = buildAgentLaunchArgv({
+      launcherArgvPrefix: [],
+      cli: agent,
+      prompt,
+      model: posture.model,
+      effort: posture.effort,
+      session: posture.session,
+      preset: posture.preset,
+      name: posture.name,
+      resumeTarget: resume?.target,
+      resumeSessionId: resume?.childSessionId,
+    });
+  } catch (exc) {
+    // A harness that cannot compose a resume launch (claude missing the child
+    // uuid; pi/hermes handed a leading-dash prompt they can't dash-guard) is a
+    // launch failure, not a crash — surface it as `{ok:false}` like a tmux error.
+    if (exc instanceof ResumeLaunchUnsupportedError) {
+      deps.writeErr(`agent: ${exc.message}\n`);
+      return { ok: false, error: exc.message };
+    }
+    throw exc;
+  }
   const tmuxLaunch = parseKeeperAgentTmuxArgs(launchArgv.slice(1));
   if (tmuxLaunch.error !== null) {
     deps.writeErr(`agent: ${tmuxLaunch.error}\n`);
     return { ok: false, error: tmuxLaunch.error };
   }
   const startedAtMs = deps.now();
-  const transcriptSessionId = tmuxTranscriptSessionId(
-    agent,
-    tmuxLaunch.remainingArgs,
-    deps.randomUuid,
-  );
+  // A resume launch pins the resumed session's id on the HANDLE for discovery
+  // (claude → the forked child uuid, which also rides the argv's own --session-id;
+  // codex/pi → the resumed session's own id). The pane env carrier stays null so
+  // no fresh --session-id is minted or double-pushed — the inner re-exec keeps the
+  // native resume argv verbatim (it skips the mint whenever --resume/--continue is
+  // present). A fresh launch keeps the minted-uuid carrier, byte-unchanged.
+  const transcriptSessionId = resume
+    ? null
+    : tmuxTranscriptSessionId(agent, tmuxLaunch.remainingArgs, deps.randomUuid);
   // Seed codex trust before the launch (codex-only; keyed on agent, not session
   // id). Fail-open by contract — the seam never throws, so an unseedable trust
   // merely lets codex re-prompt (reaped by the stop-wait timeout), never worse
@@ -260,10 +311,11 @@ export function launchToResolvedHandle(
     const handle: ResolvedHandle = {
       agent,
       cwd: deps.cwd,
-      sessionId: transcriptSessionId,
+      sessionId: resume ? resume.sessionId : transcriptSessionId,
       startedAtMs,
       transcriptPath: null,
       stopTimeoutMs,
+      isResume: resume !== undefined,
     };
     return { ok: true, handle, runId: result.id };
   } catch (exc) {

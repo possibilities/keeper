@@ -70,6 +70,41 @@ export interface ResumeArgvForm {
   token: string;
 }
 
+/**
+ * How a harness's OWN CLI parser can be trusted not to misread a leading-dash
+ * PROMPT as a new flag when the prompt rides alongside a resume target on a
+ * resume-LAUNCH (an existing session + a freshly composed prompt) — distinct
+ * from {@link ResumeArgvForm}, which only spells the bare resume token/target
+ * pair for the prompt-less daemon-restore path. Probe-verified per harness
+ * against a live binary (a bogus resume target isolates whether a failure is
+ * the CLI's own argv-parse error or its target-validation error):
+ *  - `double-dash`: a bare `--` immediately before the prompt reliably ends
+ *    option parsing (claude, codex — both probe-confirmed).
+ *  - `equals-join`: the prompt must ride joined by `=` onto the flag that
+ *    owns it, never as a separate token (hermes `-z=<prompt>`; argparse reads
+ *    a separate `-z <dash-prompt>` token as a NEW unrecognized flag).
+ *  - `unsupported`: no safe composition exists — pi's parser honors neither
+ *    `--` nor a joined form for its bare `--session <target> <prompt>`
+ *    positional (probe-confirmed: both leave a leading-dash prompt read as
+ *    "Unknown option"), so a resume-launch builder must fail loud on a
+ *    leading-dash prompt rather than risk silently misrouting it.
+ */
+export type DashPromptGuard = "double-dash" | "equals-join" | "unsupported";
+
+/**
+ * One harness's resume-LAUNCH composition capability — how it accepts a
+ * resume target ALONGSIDE a brand-new prompt, the shape `keeper agent run
+ * <cli> "<ask>" --resume <x>` composes. Distinct from the bare {@link
+ * ResumeArgvForm} the prompt-less daemon-restore path uses. Probe-settled per
+ * docs/adr/0034 (claude/codex) plus live CLI probes run for this capability
+ * (pi/hermes).
+ */
+export interface ResumeLaunchForm {
+  /** The end-of-options / dash-safety strategy a resume-launch builder must
+   *  apply so a prompt starting with `-` is never misread as a flag. */
+  dashGuard: DashPromptGuard;
+}
+
 /** One harness's full behavioral row: identity, launch, second axis, and the
  *  capability flags that gate downstream behavior. */
 export interface HarnessDescriptor {
@@ -105,6 +140,10 @@ export interface HarnessDescriptor {
   /** How this harness's resume target is spelled on its native CLI (the verb
    *  or option token keeper emits after `keeper agent <name>` to re-attach). */
   resumeArgv: ResumeArgvForm;
+  /** How this harness composes a resume-LAUNCH (resume target + a NEW
+   *  prompt) — the capability the launch-config native builders' resume
+   *  branches read instead of re-inlining a per-harness dash-guard switch. */
+  resumeLaunch: ResumeLaunchForm;
 }
 
 /** codex and pi expose the same reasoning-band vocabulary
@@ -136,6 +175,10 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     mintsOwnSessionId: false,
     hookMechanism: "claude-hooks",
     resumeArgv: { kind: "flag", token: "--resume" },
+    // Probe-verified (live claude binary): a bare `--` ahead of the prompt
+    // ends option parsing cleanly, so a leading-dash prompt reaches claude's
+    // resume-target validation instead of an "unknown option" parse error.
+    resumeLaunch: { dashGuard: "double-dash" },
   },
   codex: {
     name: "codex",
@@ -153,6 +196,11 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // Codex resumes via a VERB-POSITION subcommand (`codex resume <uuid>`), not an
     // option flag — the argv builder must lead the forwarded args with it.
     resumeArgv: { kind: "subcommand", token: "resume" },
+    // Probe-verified (live codex binary, clap parser): a bare `--` ahead of
+    // the prompt ends option parsing (clap itself suggests it on a rejected
+    // dash-led positional), so it reaches the TUI/session layer rather than
+    // an argv-parse error.
+    resumeLaunch: { dashGuard: "double-dash" },
   },
   pi: {
     name: "pi",
@@ -169,6 +217,11 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     hookMechanism: "pi-extension",
     // Pi pins its session id at launch and resumes by it via `pi --session <id>`.
     resumeArgv: { kind: "flag", token: "--session" },
+    // Probe-verified (live pi binary): pi's parser honors NEITHER a bare `--`
+    // nor an `=`-joined form for its bare `--session <target> <prompt>`
+    // positional — a leading-dash prompt is read as "Unknown option" either
+    // way, so composing one must fail loud rather than guess a shape.
+    resumeLaunch: { dashGuard: "unsupported" },
   },
   hermes: {
     name: "hermes",
@@ -191,6 +244,11 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // Hermes resumes by native session id: `hermes --resume <id>` (option flag,
     // MEDIUM confidence — verified against `src/agent/args.ts`'s hermes predicate).
     resumeArgv: { kind: "flag", token: "--resume" },
+    // Probe-verified (live hermes binary, argparse): `-z <dash-prompt>` as a
+    // SEPARATE token is read as a new unrecognized flag, but the `=`-joined
+    // form (`-z=<prompt>`) reaches the model unchanged — argparse only
+    // accepts a dash-led option VALUE unambiguously when joined.
+    resumeLaunch: { dashGuard: "equals-join" },
   },
 };
 
@@ -260,4 +318,65 @@ export function buildHarnessResumeArgv(
 ): string[] {
   const d = HARNESS_DESCRIPTORS[harnessOrClaude(name)];
   return [d.resumeArgv.token, target];
+}
+
+/**
+ * Thrown when a resume-launch cannot be safely or correctly composed for a
+ * harness — a leading-dash prompt with no safe {@link DashPromptGuard}
+ * (pi), or a required per-harness input missing (claude's pinned child
+ * session id). The typed-unsupported failure path: callers surface it rather
+ * than silently emitting an argv shape that could misroute or drop the ask.
+ */
+export class ResumeLaunchUnsupportedError extends Error {}
+
+/**
+ * Compose the argv element(s) carrying a resume-launch's NEW prompt text,
+ * applying `name`'s {@link ResumeLaunchForm.dashGuard} (probe-verified per
+ * harness) so a leading-dash prompt is never misread as a flag by the
+ * harness's own CLI parser:
+ *  - `double-dash` (claude, codex): `["--", prompt]`, emitted UNCONDITIONALLY
+ *    — not just for a leading-dash prompt — so the argv shape is one
+ *    deterministic path, not two, and "--" is a no-op ahead of a normal
+ *    prompt.
+ *  - `equals-join` (hermes): `[\`${joinFlagToken}=${prompt}\`]`, folding the
+ *    prompt onto the flag that owns it as ONE token (also unconditional, for
+ *    the same reason); `joinFlagToken` is required and throws
+ *    {@link ResumeLaunchUnsupportedError} when omitted.
+ *  - `unsupported` (pi): a normal prompt passes through as `[prompt]`
+ *    unchanged (pi's bare `--session <target> <prompt>` composes fine); a
+ *    leading-dash prompt throws {@link ResumeLaunchUnsupportedError} instead
+ *    of emitting a shape pi's parser could misread as a new flag.
+ * `joinFlagToken` is used only for `equals-join`; ignored otherwise. Pure.
+ */
+export function buildResumeLaunchPromptTail(
+  name: string | null | undefined,
+  prompt: string,
+  joinFlagToken?: string,
+): string[] {
+  const harness = harnessOrClaude(name);
+  const { dashGuard } = HARNESS_DESCRIPTORS[harness].resumeLaunch;
+  switch (dashGuard) {
+    case "double-dash":
+      return ["--", prompt];
+    case "equals-join":
+      if (joinFlagToken === undefined || joinFlagToken === "") {
+        throw new ResumeLaunchUnsupportedError(
+          `resume-launch prompt tail for '${harness}' requires a joinFlagToken (equals-join guard)`,
+        );
+      }
+      return [`${joinFlagToken}=${prompt}`];
+    case "unsupported":
+      if (prompt.startsWith("-")) {
+        throw new ResumeLaunchUnsupportedError(
+          `${harness} cannot safely compose a resume-launch prompt starting with '-'`,
+        );
+      }
+      return [prompt];
+    default: {
+      const exhaustive: never = dashGuard;
+      throw new ResumeLaunchUnsupportedError(
+        `unknown dashGuard '${String(exhaustive)}' for '${harness}'`,
+      );
+    }
+  }
 }

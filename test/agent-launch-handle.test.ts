@@ -131,8 +131,81 @@ describe("launchToResolvedHandle", () => {
       startedAtMs: 12345,
       transcriptPath: null,
       stopTimeoutMs: 5000,
+      // Fresh launch: not a resume, so discovery keeps its strict-pin/floor path.
+      isResume: false,
     });
     expect(errs).toEqual([]);
+  });
+
+  test("claude resume launch → handle carries isResume + the pinned CHILD id (not the parent)", () => {
+    const errs: string[] = [];
+    const result = launchToResolvedHandle({
+      deps: deps({ tmuxCommand: tmuxRunner(0), errs, now: 999 }),
+      agent: "claude",
+      prompt: "keep going",
+      posture: {},
+      stopTimeoutMs: null,
+      resume: {
+        target: "parent-uuid",
+        childSessionId: "child-uuid",
+        sessionId: "child-uuid",
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.handle).toEqual({
+      agent: "claude",
+      cwd: "/work/proj",
+      // The forked CHILD id — strict discovery resolves the child file, and the
+      // envelope reports it as the POST-resume id (never the parent).
+      sessionId: "child-uuid",
+      startedAtMs: 999,
+      transcriptPath: null,
+      stopTimeoutMs: null,
+      isResume: true,
+    });
+    expect(errs).toEqual([]);
+  });
+
+  test("codex resume launch → handle pins the target rollout uuid (no child mint)", () => {
+    const errs: string[] = [];
+    const result = launchToResolvedHandle({
+      deps: deps({ tmuxCommand: tmuxRunner(0), errs, now: 7 }),
+      agent: "codex",
+      prompt: "again",
+      posture: {},
+      stopTimeoutMs: null,
+      resume: { target: "rollout-uuid", sessionId: "rollout-uuid" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.handle).toEqual({
+      agent: "codex",
+      cwd: "/work/proj",
+      // codex appends to the SAME rollout — the resumed id IS the target uuid.
+      sessionId: "rollout-uuid",
+      startedAtMs: 7,
+      transcriptPath: null,
+      stopTimeoutMs: null,
+      isResume: true,
+    });
+  });
+
+  test("a claude resume launch missing the child id → ok:false (ResumeLaunchUnsupportedError)", () => {
+    const errs: string[] = [];
+    const result = launchToResolvedHandle({
+      deps: deps({ tmuxCommand: tmuxRunner(0), errs }),
+      agent: "claude",
+      prompt: "keep going",
+      posture: {},
+      stopTimeoutMs: null,
+      // childSessionId omitted — claude's --resume MUST pin a fresh child uuid.
+      resume: { target: "parent-uuid", sessionId: "" },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("resumeSessionId");
+    expect(errs.join("")).toContain("resumeSessionId");
   });
 
   test("TmuxLaunchError → ok:false, diagnostic routed to stderr", () => {

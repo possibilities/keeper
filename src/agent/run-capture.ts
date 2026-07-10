@@ -161,6 +161,12 @@ export type ParseRunArgsResult =
        *  has none). An explicit name suppresses the interactive auto-mint on the
        *  detached re-exec. Null when unset. */
       name: string | null;
+      /** Raw `--resume` value — a partner name / former name / session id / id
+       *  prefix / current-title substring to RESUME (resolution, refuse-live, and
+       *  the harness-match check all stay handler-side; the parser only extracts
+       *  the string). DISTINCT from `--session`, which merely names the tmux window
+       *  GROUPING — `--resume` continues a prior conversation. Null when unset. */
+      resume: string | null;
     }
   | { ok: false; error: string };
 
@@ -175,9 +181,13 @@ export type ParseRunArgsResult =
  * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
  * the parser returns the RAW path/text — the handler reads any file.
  * `--preset <name>` / `--model <m>` / `--effort <e>` / `--session <name>` /
- * `--output <path>` / `--name <n>` are additive value flags (both split and `=` forms): the
- * parser returns the RAW values (config resolution, the launch-posture overlay,
- * and the atomic write happen handler-side). ALL default-absent, so an argv
+ * `--output <path>` / `--name <n>` / `--resume <name-or-id>` are additive value
+ * flags (both split and `=` forms): the parser returns the RAW values (config
+ * resolution, the launch-posture overlay, the atomic write, and resume resolution
+ * all happen handler-side). `--resume` is DISTINCT from `--session`: `--session`
+ * names the tmux window GROUPING, `--resume` continues a prior partner
+ * conversation (and forbids `--model`/`--effort`/`--preset`, which the resumed
+ * session already owns — enforced handler-side). ALL default-absent, so an argv
  * without them stays byte-identical. Pure — exported for tests.
  */
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
@@ -192,6 +202,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   let session: string | null = null;
   let output: string | null = null;
   let name: string | null = null;
+  let resume: string | null = null;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
@@ -325,6 +336,19 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       name = arg.slice("--name=".length);
       continue;
     }
+    if (arg === "--resume") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--resume requires a value" };
+      }
+      resume = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--resume=")) {
+      resume = arg.slice("--resume=".length);
+      continue;
+    }
     if (arg.startsWith("--")) {
       return { ok: false, error: `unknown flag: ${arg}` };
     }
@@ -371,6 +395,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     session,
     output,
     name,
+    resume,
   };
 }
 

@@ -33,6 +33,7 @@ import type {
   VerbDeps,
   WaitForStopResult,
 } from "../src/agent/pair-subcommands";
+import type { ResumeDecision } from "../src/agent/resume-policy";
 import {
   buildRunCaptureEnvelope,
   captureFromHandle,
@@ -43,6 +44,10 @@ import {
   type RunLaunchResult,
   runCaptureExitCode,
 } from "../src/agent/run-capture";
+import {
+  waitForTranscriptPath,
+  waitForTranscriptStop,
+} from "../src/agent/transcript-watch";
 import { buildPanelLegArgv, type PanelMember } from "../src/pair/panel";
 import {
   expectExit,
@@ -195,6 +200,7 @@ function okParse(
     session: null,
     output: null,
     name: null,
+    resume: null,
     ...overrides,
   };
 }
@@ -327,6 +333,20 @@ describe("parseRunArgs", () => {
     );
   });
 
+  test("--resume parses as a value flag (split + = forms), distinct from --session", () => {
+    expect(parseRunArgs(["claude", "p", "--resume", "reviewer"])).toEqual(
+      okParse({ resume: "reviewer" }),
+    );
+    expect(parseRunArgs(["codex", "p", "--resume=abc-123"])).toEqual(
+      okParse({ cli: "codex", resume: "abc-123" }),
+    );
+    // --session (tmux GROUPING) and --resume (continue a conversation) are
+    // independent axes — both parse, neither swallows the other.
+    expect(
+      parseRunArgs(["claude", "p", "--session", "grp", "--resume", "rev"]),
+    ).toEqual(okParse({ session: "grp", resume: "rev" }));
+  });
+
   test("--system-file + --system together → bad_args (one input, two spellings)", () => {
     const res = parseRunArgs([
       "claude",
@@ -366,6 +386,7 @@ describe("parseRunArgs", () => {
     [["claude", "p", "--session"], "--session requires a value"],
     [["claude", "p", "--output"], "--output requires a value"],
     [["claude", "p", "--name"], "--name requires a value"],
+    [["claude", "p", "--resume"], "--resume requires a value"],
   ] as const)("rejects %p", (rest, needle) => {
     const res = parseRunArgs([...rest]);
     expect(res.ok).toBe(false);
@@ -1068,5 +1089,377 @@ describe("main() — agent wait", () => {
       schema_version: 1,
       outcome: "bad_args",
     });
+  });
+});
+
+/** One codex rollout `task_complete` stop line, timestamped for the watermark. */
+function codexTaskComplete(message: string, timestamp: string): string {
+  return JSON.stringify({
+    type: "event_msg",
+    timestamp,
+    payload: { type: "task_complete", last_agent_message: message },
+  });
+}
+
+/**
+ * Write a codex rollout under `<codexHome>/sessions/YYYY/MM/DD/rollout-…-<uuid>.jsonl`
+ * with a session_meta head (created FAR in the past by default, so the fresh-launch
+ * created-at floor rejects it) followed by the given stop lines. Returns the path.
+ */
+function writeCodexRollout(
+  codexHome: string,
+  uuid: string,
+  eventLines: string[],
+  opts: { metaCreatedAt?: string; cwd?: string } = {},
+): string {
+  const dir = join(codexHome, "sessions", "2026", "07", "10");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `rollout-2026-07-10T12-00-00-${uuid}.jsonl`);
+  const meta = JSON.stringify({
+    type: "session_meta",
+    timestamp: opts.metaCreatedAt ?? "2000-01-01T00:00:00.000Z",
+    payload: {
+      id: uuid,
+      cwd: opts.cwd ?? "/work/proj",
+      originator: "codex-tui",
+    },
+  });
+  writeFileSync(path, `${[meta, ...eventLines].join("\n")}\n`);
+  return path;
+}
+
+describe("resume codex transcript discovery + watermark (fixtures)", () => {
+  const CWD = "/work/proj";
+
+  test("isResume resolves a pre-existing rollout by uuid, bypassing the created-at floor", async () => {
+    const home = tempDir();
+    const codexHome = join(home, ".codex");
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const rollout = writeCodexRollout(codexHome, uuid, [
+      codexTaskComplete("prior answer", "2026-07-10T11:00:00.000Z"),
+    ]);
+
+    const resolved = await waitForTranscriptPath({
+      agent: "codex",
+      cwd: CWD,
+      env: { CODEX_HOME: codexHome },
+      homeDir: home,
+      startedAtMs: Date.now(),
+      sessionId: uuid,
+      isResume: true,
+      pathTimeoutMs: 200,
+    });
+
+    expect(resolved).toEqual({ ok: true, path: rollout });
+  });
+
+  test("the FRESH codex path rejects the same rollout (created-at floor) — the resume branch is additive", async () => {
+    const home = tempDir();
+    const codexHome = join(home, ".codex");
+    const uuid = "22222222-2222-2222-2222-222222222222";
+    writeCodexRollout(codexHome, uuid, [
+      codexTaskComplete("prior answer", "2026-07-10T11:00:00.000Z"),
+    ]);
+
+    // Same file, same uuid, but a FRESH launch (isResume false): the rollout's
+    // session-start predates the launch, so the created-at floor refuses to
+    // attribute it — a retryable path timeout, never a wrong-file guess.
+    const resolved = await waitForTranscriptPath({
+      agent: "codex",
+      cwd: CWD,
+      env: { CODEX_HOME: codexHome },
+      homeDir: home,
+      startedAtMs: Date.now(),
+      sessionId: uuid,
+      isResume: false,
+      pathTimeoutMs: 200,
+    });
+
+    expect(resolved.ok).toBe(false);
+  });
+
+  test("the stop-scan anchors PAST the pre-resume stop (watermark returns the new answer)", async () => {
+    const home = tempDir();
+    const codexHome = join(home, ".codex");
+    const uuid = "33333333-3333-3333-3333-333333333333";
+    const path = writeCodexRollout(codexHome, uuid, [
+      codexTaskComplete("PRE-RESUME ANSWER", "2026-07-10T11:59:00.000Z"),
+      codexTaskComplete("POST-RESUME ANSWER", "2026-07-10T12:00:10.000Z"),
+    ]);
+
+    const stop = await waitForTranscriptStop({
+      agent: "codex",
+      cwd: CWD,
+      env: { CODEX_HOME: codexHome },
+      homeDir: home,
+      startedAtMs: Date.parse("2026-07-10T12:00:00.000Z"),
+      sessionId: uuid,
+      isResume: true,
+      transcriptPath: path,
+      stopTimeoutMs: 1000,
+    });
+
+    expect(stop.ok).toBe(true);
+    if (stop.ok) {
+      expect(stop.stop.message).toBe("POST-RESUME ANSWER");
+    }
+  });
+
+  test("the watermark is load-bearing: with startedAtMs=0 the SAME scan returns the pre-resume stop", async () => {
+    const home = tempDir();
+    const codexHome = join(home, ".codex");
+    const uuid = "44444444-4444-4444-4444-444444444444";
+    const path = writeCodexRollout(codexHome, uuid, [
+      codexTaskComplete("PRE-RESUME ANSWER", "2026-07-10T11:59:00.000Z"),
+      codexTaskComplete("POST-RESUME ANSWER", "2026-07-10T12:00:10.000Z"),
+    ]);
+
+    // No watermark (startedAtMs=0): the first stop in the file — the OLD one — is
+    // captured. This is exactly the bug the resume watermark prevents.
+    const stop = await waitForTranscriptStop({
+      agent: "codex",
+      cwd: CWD,
+      env: { CODEX_HOME: codexHome },
+      homeDir: home,
+      startedAtMs: 0,
+      sessionId: uuid,
+      isResume: true,
+      transcriptPath: path,
+      stopTimeoutMs: 1000,
+    });
+
+    expect(stop.ok).toBe(true);
+    if (stop.ok) {
+      expect(stop.stop.message).toBe("PRE-RESUME ANSWER");
+    }
+  });
+});
+
+/** A faked-tmux command runner that reports a created session/window. */
+function fakeTmux(cmd: string[]): {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+} {
+  return cmd.includes("has-session")
+    ? { exitCode: 1, stdout: "", stderr: "no session" }
+    : { exitCode: 0, stdout: "keeper agent\x01@1\x01%1\n", stderr: "" };
+}
+
+/** A ResumeDecision `ok` fixture with the two fields under test filled in. */
+function okDecision(
+  over: Partial<Extract<ResumeDecision, { kind: "ok" }>>,
+): ResumeDecision {
+  return {
+    kind: "ok",
+    job_id: "job-1",
+    harness: "claude",
+    resume_target: "parent",
+    cwd: "/work/proj",
+    title: "reviewer",
+    ...over,
+  };
+}
+
+describe("main() — agent run --resume", () => {
+  test("claude resume: composes a resume launch, captures the CHILD transcript, resume_target = the new child id", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    // The recorded resume cwd differs from the caller cwd — resume is cwd-scoped.
+    const resumeCwd = mkdtempSync(join(tmpdir(), "resume-cwd-"));
+    const parentUuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const childUuid = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    const transcriptPath = writeClaudeTranscript(
+      home,
+      resumeCwd,
+      childUuid,
+      "resumed answer",
+    );
+
+    let seenTarget: string | undefined;
+    let seenHarness: string | undefined;
+    const h = makeHarness({
+      argv: ["run", "claude", "follow up", "--resume", "reviewer"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd: "/caller/elsewhere",
+      randomUuid: () => childUuid,
+      resolveResumeDecision: (target, requireHarness) => {
+        seenTarget = target;
+        seenHarness = requireHarness;
+        return okDecision({
+          harness: "claude",
+          resume_target: parentUuid,
+          cwd: resumeCwd,
+        });
+      },
+      tmuxCommand: fakeTmux,
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    // The <cli> positional is passed as the required harness so a same-name match
+    // on another CLI would mismatch rather than launch the wrong harness.
+    expect(seenTarget).toBe("reviewer");
+    expect(seenHarness).toBe("claude");
+    expect(parseEnvelope(h.out)).toMatchObject({
+      outcome: "completed",
+      agent: "claude",
+      // The POST-resume id — the freshly-forked child, distinct from the parent,
+      // so feeding it back continues the newer lineage.
+      resume_target: childUuid,
+      message: "resumed answer",
+      transcript_path: transcriptPath,
+    });
+    // A launch actually fired in the RECORDED cwd (not the caller cwd).
+    expect(h.tmuxCommands.length).toBeGreaterThan(0);
+  });
+
+  test("codex resume: discovers the rollout by uuid, resume_target = the unchanged rollout uuid", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const codexHome = join(home, ".codex");
+    const resumeCwd = mkdtempSync(join(tmpdir(), "resume-cwd-"));
+    const uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    writeCodexRollout(
+      codexHome,
+      uuid,
+      [
+        codexTaskComplete("PRE answer", "2026-07-10T11:00:00.000Z"),
+        codexTaskComplete("NEW answer", "2026-07-10T12:00:10.000Z"),
+      ],
+      { cwd: resumeCwd },
+    );
+    const startedAtMs = Date.parse("2026-07-10T12:00:00.000Z");
+
+    const h = makeHarness({
+      argv: ["run", "codex", "again", "--resume", uuid],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      env: { CODEX_HOME: codexHome },
+      cwd: "/caller/elsewhere",
+      now: () => startedAtMs,
+      resolveResumeDecision: () =>
+        okDecision({
+          harness: "codex",
+          resume_target: uuid,
+          cwd: resumeCwd,
+          title: null,
+        }),
+      tmuxCommand: fakeTmux,
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    expect(parseEnvelope(h.out)).toMatchObject({
+      outcome: "completed",
+      agent: "codex",
+      resume_target: uuid,
+      message: "NEW answer",
+    });
+  });
+
+  test("harness mismatch → bad_args naming both harnesses, no launch", async () => {
+    const h = makeHarness({
+      argv: ["run", "codex", "hi", "--resume", "reviewer"],
+      rawArgv: true,
+      resolveResumeDecision: () => ({
+        kind: "harness-mismatch",
+        job_id: "job-1",
+        harness: "claude",
+        require_harness: "codex",
+        title: "reviewer",
+      }),
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    const err = h.err.join("");
+    expect(err).toContain("did not resolve to a codex");
+    expect(err).toContain("claude");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("unknown target → bad_args, no launch", async () => {
+    const h = makeHarness({
+      argv: ["run", "claude", "hi", "--resume", "ghost"],
+      rawArgv: true,
+      resolveResumeDecision: () => ({ kind: "unknown", target: "ghost" }),
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.err.join("")).toContain(
+      "no partner session found matching 'ghost'",
+    );
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("live target → bad_args pointing at keeper bus chat send, no launch", async () => {
+    const h = makeHarness({
+      argv: ["run", "claude", "hi", "--resume", "reviewer"],
+      rawArgv: true,
+      resolveResumeDecision: () => ({
+        kind: "live",
+        job_id: "job-9",
+        harness: "claude",
+        title: "reviewer",
+      }),
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    const err = h.err.join("");
+    expect(err).toContain("LIVE");
+    expect(err).toContain("keeper bus chat send job-9");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("config flags alongside --resume → bad_args BEFORE the resolver is consulted, envelope written to --output", async () => {
+    const outDir = tempDir();
+    const outPath = join(outDir, "leg.json");
+    let consulted = false;
+    const h = makeHarness({
+      argv: [
+        "run",
+        "claude",
+        "hi",
+        "--resume",
+        "reviewer",
+        "--model",
+        "opus",
+        "--output",
+        outPath,
+      ],
+      rawArgv: true,
+      resolveResumeDecision: () => {
+        consulted = true;
+        return { kind: "unknown", target: "reviewer" };
+      },
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    expect(h.err.join("")).toContain("cannot be combined with --resume");
+    expect(consulted).toBe(false);
+    // The result-file sink still gets the bad_args envelope (write-on-every-outcome).
+    expect(existsSync(outPath)).toBe(true);
+    const fileEnvelope = JSON.parse(readFileSync(outPath, "utf8")) as {
+      outcome: string;
+    };
+    expect(fileEnvelope.outcome).toBe("bad_args");
+    expect(h.tmuxCommands.length).toBe(0);
   });
 });

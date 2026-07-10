@@ -14,6 +14,7 @@ import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
 import type { MainDeps } from "../../src/agent/main";
 import type { Matrix } from "../../src/agent/matrix";
+import type { ResumeDecision } from "../../src/agent/resume-policy";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
@@ -149,6 +150,14 @@ export interface HarnessOptions {
    *  argv byte-pins stay path-independent). Pass `["-e", "<fake>"]` to exercise
    *  the injection. */
   resolvePiExtensionArgs?: () => string[];
+  /** `resume` verb + `run --resume` decision seam (default: `{kind:"unknown",
+   *  target}` — no fixture db, no real subprocess spawn). Pass a fixed
+   *  `ResumeDecision` or a function of the target (and the optional
+   *  `requireHarness` the `run <cli> --resume` path passes) to drive the resume
+   *  route's branches. */
+  resolveResumeDecision?:
+    | ResumeDecision
+    | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
 }
 
 /**
@@ -248,6 +257,13 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.resolveStatuslineSettingsPath ??
       (() => "/fake-home/code/keeper/plugins/keeper/settings.json"),
     resolvePiExtensionArgsFn: opts.resolvePiExtensionArgs ?? (() => []),
+    resolveResumeDecisionFn: (target: string, requireHarness?: HarnessName) => {
+      const decision = opts.resolveResumeDecision;
+      if (typeof decision === "function") {
+        return decision(target, requireHarness);
+      }
+      return decision ?? { kind: "unknown", target };
+    },
   };
 
   return {

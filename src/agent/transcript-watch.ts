@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
+import { codexSessionIdFromRolloutPath } from "./codex-session-index";
 import type { AgentKind } from "./dispatch";
 
 export interface TranscriptStop {
@@ -39,6 +40,18 @@ export interface TranscriptWatchOptions {
   pollIntervalMs?: number;
   pathTimeoutMs?: number;
   stopTimeoutMs?: number;
+  /**
+   * Resume marker: when true, transcript DISCOVERY resolves a PRE-EXISTING
+   * session file rather than a fresh one. codex resolves its rollout strictly by
+   * the known resume-target uuid (carried on {@link sessionId}), bypassing the
+   * fresh-launch created-at floor that would reject a rollout whose session-start
+   * predates this launch — codex appends to the SAME rollout on resume. claude/pi
+   * are already strict-pinned by their session id, so their discovery is
+   * unchanged. The stop-scan anchors at {@link startedAtMs} for every harness
+   * regardless, so a pre-resume terminal stop already in the file is never
+   * captured as the answer. Omitted/false = fresh launch, byte-unchanged.
+   */
+  isResume?: boolean;
 }
 
 /** A `waitForTranscriptStop` result that timed out before any stop appeared. */
@@ -254,6 +267,21 @@ function findCodexTranscriptPath(
     const name = basename(path);
     return name.startsWith("rollout-") && name.endsWith(".jsonl");
   });
+  // RESUME: `codex resume <uuid>` appends to the SAME rollout, so the file
+  // already exists and its session-start predates this launch — the fresh-launch
+  // created-at floor below would wrongly reject it. Resolve strictly by the known
+  // resume-target uuid (carried on `sessionId`, the same uuid the rollout is
+  // named after) instead: the rollout whose filename uuid matches IS the resumed
+  // session, no freshness/cwd guessing. A uuid is unique so at most one matches;
+  // none yet keeps polling for the file to appear.
+  if (opts.isResume && opts.sessionId !== null) {
+    const match = files.find(
+      (path) => codexSessionIdFromRolloutPath(path) === opts.sessionId,
+    );
+    return match === undefined
+      ? { kind: "pending" }
+      : { kind: "found", path: match };
+  }
   // Positive attribution, NEVER a newest-by-mtime guess. A codex leg cannot pin
   // its session id at launch, so a rollout is attributable to the leg only when
   // it is (a) still being written since launch (fresh mtime), (b) CREATED at or
