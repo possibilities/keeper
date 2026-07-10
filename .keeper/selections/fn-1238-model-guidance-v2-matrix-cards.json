@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded data-gathering: fetch/convert vendor cards and add inert sha256 sub-mappings against a fully-specified acceptance, with fetch-judgment that rules out the trickle lane but needs no opus-tier reasoning.",
+      "task_id": "fn-1238-model-guidance-v2-matrix-cards.1",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A subtle correctness invariant \u2014 a total throw-free precedence lattice plus loud schema coercion and a stable jq-contract envelope other tasks byte-align to \u2014 is a named intelligence-bound, contract-touching reason.",
+      "task_id": "fn-1238-model-guidance-v2-matrix-cards.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Forward-facing doc rewire across four files that must quote landed field names verbatim \u2014 precise but mechanical following, no design or correctness invariant.",
+      "task_id": "fn-1238-model-guidance-v2-matrix-cards.3",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "created_at": "2026-07-10T15:15:03.426000Z",
+  "epic_id": "fn-1238-model-guidance-v2-matrix-cards",
+  "input_hash": "45584e5d0fe6484d45a86b7d21227d8d136f745375863df866da3803f178d20b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1163415133,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1238-model-guidance-v2-matrix-cards.1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded data-gathering: fetch/convert vendor cards and add inert sha256 sub-mappings against a fully-specified acceptance, with fetch-judgment that rules out the trickle lane but needs no opus-tier reasoning.\",\"confidence\":0.78},{\"task_id\":\"fn-1238-model-guidance-v2-matrix-cards.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A subtle correctness invariant \u2014 a total throw-free precedence lattice plus loud schema coercion and a stable jq-contract envelope other tasks byte-align to \u2014 is a named intelligence-bound, contract-touching reason.\",\"confidence\":0.8},{\"task_id\":\"fn-1238-model-guidance-v2-matrix-cards.3\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Forward-facing doc rewire across four files that must quote landed field names verbatim \u2014 precise but mechanical following, no design or correctness invariant.\",\"confidence\":0.8}]}\n"
+}
