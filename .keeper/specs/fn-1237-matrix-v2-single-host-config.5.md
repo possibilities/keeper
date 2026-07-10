@@ -45,5 +45,5 @@ nothing; `bun run build` in plugins/plan succeeds; full test:full green.
 - [ ] The load-surface, depgraph, promote, and commit-gate guards all pass with the deletion reflected
 
 ## Done summary
-
+Deleted plugins/plan/subagents.yaml and subagents_config.ts, relocating the SubagentsConfigError type and worker-cell compose helpers into host_matrix.ts/worker_cells.ts, and swept every remaining code/script/test reference (lint-matrix, promote.sh, daemon-load-roots manifest, depgraph grandfather list, model-guidance-check, audit-policy, model-selector.yaml, and the consistency/parity test suites) onto the required v2 host matrix.
 ## Evidence

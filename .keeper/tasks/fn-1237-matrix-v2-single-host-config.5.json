@@ -15,5 +15,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Delete subagents.yaml and sweep embed",
-  "updated_at": "2026-07-10T14:53:46.262000Z"
+  "updated_at": "2026-07-10T17:51:39.323000Z",
+  "worker_done_at": "2026-07-10T17:51:39.323000Z"
 }
