@@ -198,7 +198,12 @@ function writeGitConfig(home: string): string {
  * last. Mirrors conftest._subprocess_env: scratch-built, HOME + XDG_* +
  * GIT_CONFIG_GLOBAL/SYSTEM + PATH + KEEPER_PLAN_ACTOR, forwarding
  * CLAUDE_CODE_SESSION_ID + KEEPER_PLAN_NOW when set in the parent env. The
- * default session id is pre-set (mutating verbs fail closed without it). */
+ * default session id is pre-set (mutating verbs fail closed without it).
+ * KEEPER_CONFIG_DIR pins to a fresh scratch dir (no matrix.yaml) so the host
+ * provider matrix (ADR 0010) never leaks in from the developer's real
+ * ~/.config/keeper — os.homedir() ignores $HOME on macOS, so HOME alone
+ * doesn't isolate it. A test wanting a host matrix layers its own
+ * KEEPER_CONFIG_DIR via `override`. */
 export function buildEnv(
   home: string,
   override?: Record<string, string>,
@@ -210,6 +215,7 @@ export function buildEnv(
     XDG_STATE_HOME: join(home, ".local", "state"),
     XDG_DATA_HOME: join(home, ".local", "share"),
     XDG_CACHE_HOME: join(home, ".cache"),
+    KEEPER_CONFIG_DIR: join(home, ".config", "keeper"),
     GIT_CONFIG_GLOBAL: gitconfig,
     GIT_CONFIG_SYSTEM: "/dev/null",
     PATH: process.env.PATH ?? "",

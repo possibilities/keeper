@@ -23,8 +23,8 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
 import { readMarker } from "../plugin/hooks/lib.ts";
+import { effectiveMatrixFromDisk } from "../src/host_matrix.ts";
 import { writeWorkMarker } from "../src/session_markers.ts";
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 
 const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
@@ -127,7 +127,7 @@ describe("generated work plugins match the subagents.yaml matrix", () => {
   test.skipIf(!WORKERS_RENDERED)(
     "on-disk workers/ cell set equals the {model × effort} cartesian product",
     () => {
-      const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+      const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
       const expected = new Set<string>();
       for (const model of matrix.models) {
         for (const effort of matrix.efforts) {

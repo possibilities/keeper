@@ -68,25 +68,42 @@ describe("subagents matrix loader", () => {
     expect(matrix.subagents.length).toBeGreaterThan(0);
   });
 
+  // configuredEfforts/configuredModels read the composed EFFECTIVE matrix (host
+  // matrix when present, embedded snapshot otherwise), so this pins against an
+  // empty config dir (no matrix.yaml) — host-independent, regardless of the
+  // developer's own ~/.config/keeper. See "configured-axes effective seam" below
+  // for the host-present composition coverage.
   test("configuredEfforts/configuredModels source the axes; workerAgentFor composes exactly them", () => {
-    const efforts = configuredEfforts();
-    expect(efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    const models = configuredModels();
-    expect(models).toEqual(["opus", "sonnet"]);
-    for (const model of models) {
-      for (const effort of efforts) {
-        expect(workerAgentFor(effort, model)).toBe(
-          `plan:worker-${model}-${effort}`,
-        );
+    const dir = tmp();
+    const prevConfigDir = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = dir;
+    try {
+      const efforts = configuredEfforts();
+      expect(efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+      const models = configuredModels();
+      expect(models).toEqual(["opus", "sonnet"]);
+      for (const model of models) {
+        for (const effort of efforts) {
+          expect(workerAgentFor(effort, model)).toBe(
+            `plan:worker-${model}-${effort}`,
+          );
+        }
       }
+      // A null on EITHER axis returns null (the /plan:work null-stop signal).
+      expect(workerAgentFor(null, models[0] as string)).toBeNull();
+      expect(workerAgentFor(efforts[0] as string, null)).toBeNull();
+      expect(workerAgentFor(null, null)).toBeNull();
+      // A non-null value outside the configured sets throws (corrupt-on-disk guard).
+      expect(() => workerAgentFor("turbo", models[0] as string)).toThrow();
+      expect(() => workerAgentFor(efforts[0] as string, "gpt")).toThrow();
+    } finally {
+      if (prevConfigDir === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = prevConfigDir;
+      }
+      rmSync(dir, { recursive: true, force: true });
     }
-    // A null on EITHER axis returns null (the /plan:work null-stop signal).
-    expect(workerAgentFor(null, models[0] as string)).toBeNull();
-    expect(workerAgentFor(efforts[0] as string, null)).toBeNull();
-    expect(workerAgentFor(null, null)).toBeNull();
-    // A non-null value outside the configured sets throws (corrupt-on-disk guard).
-    expect(() => workerAgentFor("turbo", models[0] as string)).toThrow();
-    expect(() => workerAgentFor(efforts[0] as string, "gpt")).toThrow();
   });
 
   test("workerCellDir composes the shared workers/<model>-<effort> cell path for every matrix cell", () => {
