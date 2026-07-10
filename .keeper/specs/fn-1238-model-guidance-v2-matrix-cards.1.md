@@ -53,5 +53,5 @@ suite) green WITH the yaml entries present, before any schema change exists.
 - [ ] The drift gate and the plan fast suite pass with the new entries present (inert-data proof)
 
 ## Done summary
-
+Backfilled provenance-headed vendor system-card caches for opus, sonnet, and gpt-5.3-codex-spark under references/cards/, with sha256-pinned card sub-mappings in model-selector.yaml. Landed as inert data (--check and the plan fast suite pass unchanged) since the current coercion ignores unknown research-entry keys.
 ## Evidence

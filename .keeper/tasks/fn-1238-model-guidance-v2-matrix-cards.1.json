@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Backfill vendor model cards",
-  "updated_at": "2026-07-10T15:15:03.426000Z"
+  "updated_at": "2026-07-10T19:06:03.463000Z",
+  "worker_done_at": "2026-07-10T19:06:03.463000Z"
 }
