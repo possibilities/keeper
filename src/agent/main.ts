@@ -153,7 +153,9 @@ import {
 } from "./shadow-profiles";
 import {
   defaultClaudeStowDir,
+  defaultSharedStowDir,
   ensureClaudeStateSharing,
+  ensureCodexStateSharing,
   ensureKeeperAgentPiProfileDir,
   ensureKeeperAgentProfileDir,
   ensurePiStateSharing,
@@ -223,6 +225,14 @@ export interface MainDeps {
     listProfilesFn: () => string[],
     actionLog: string[],
   ) => void;
+  /**
+   * Re-assert codex's canonical `<CODEX_HOME|~/.codex>/AGENTS.md` link onto the one
+   * shared source. HOME/env-coupled, so a seam; `realDeps()` binds it against
+   * `homedir()` + `process.env` + `defaultSharedStowDir()`. Runs unconditionally on
+   * every codex launch (codex is almost always passthrough), warn-and-respect so a
+   * human-edited file never aborts the launch.
+   */
+  ensureCodexStateSharingFn: (actionLog: string[]) => void;
   ensureKeeperAgentProfileDirFn: (
     profileName: string,
     trustPaths: string[] | null,
@@ -372,12 +382,32 @@ export function realDeps(): MainDeps {
         actionLog,
         homedir(),
         defaultClaudeStowDir(),
+        defaultSharedStowDir(),
+      ),
+    ensureCodexStateSharingFn: (actionLog) =>
+      ensureCodexStateSharing(
+        actionLog,
+        homedir(),
+        process.env,
+        defaultSharedStowDir(),
       ),
     ensureKeeperAgentProfileDirFn: ensureKeeperAgentProfileDir,
     ensurePiStateSharingFn: (listProfilesFn, actionLog) =>
-      ensurePiStateSharing(listProfilesFn, actionLog, homedir()),
+      ensurePiStateSharing(
+        listProfilesFn,
+        actionLog,
+        homedir(),
+        defaultSharedStowDir(),
+        process.env,
+      ),
     ensureKeeperAgentPiProfileDirFn: (profileName, actionLog) =>
-      ensureKeeperAgentPiProfileDir(profileName, actionLog, homedir()),
+      ensureKeeperAgentPiProfileDir(
+        profileName,
+        actionLog,
+        homedir(),
+        defaultSharedStowDir(),
+        process.env,
+      ),
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
     loadMatrixFn: loadMatrix,
@@ -2669,10 +2699,33 @@ export async function main(deps: MainDeps): Promise<never> {
       }
       throw exc;
     }
-  } else if (agent === "pi" && !shouldPassthrough) {
+  } else if (agent === "codex") {
+    // Codex is almost always a passthrough invocation, so the canonical
+    // AGENTS.md leaf guard runs UNCONDITIONALLY (matching claude's guard) or it
+    // would never reach real codex launches. Warn-and-respect: a human-edited
+    // codex AGENTS.md is left in place, never a throw — but a wrong-target
+    // symlink is repaired, which is codex's cutover onto keeper's shared source.
+    try {
+      phase("ensure shared Codex state", () => {
+        deps.ensureCodexStateSharingFn(actionLog);
+      });
+    } catch (exc) {
+      if (exc instanceof StateError) {
+        deps.writeErr(`Error: ${exc.message}\n`);
+        return deps.exit(1);
+      }
+      throw exc;
+    }
+  } else if (agent === "pi") {
+    // The canonical ~/.pi/agent/AGENTS.md leaf is asserted on EVERY pi launch
+    // (passthrough default-account launches included); the heavy per-profile
+    // farm stays gated on a real launch by feeding it no profiles on passthrough.
     try {
       phase("ensure shared Pi state", () => {
-        deps.ensurePiStateSharingFn(deps.listProfilesFn, actionLog);
+        deps.ensurePiStateSharingFn(
+          shouldPassthrough ? () => [] : deps.listProfilesFn,
+          actionLog,
+        );
       });
     } catch (exc) {
       if (exc instanceof StateError) {

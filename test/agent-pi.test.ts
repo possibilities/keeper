@@ -242,4 +242,28 @@ describe("ensureKeeperAgentPiProfileDir", () => {
       true,
     );
   });
+
+  test("materializes the canonical AGENTS.md BEFORE the profile loop (named-profile link present)", () => {
+    // The one shared source lives in a temp system/shared dir.
+    const sharedDir = join(tmpDir, "repo", "system", "shared");
+    mkdirSync(sharedDir, { recursive: true });
+    const sharedSrc = join(sharedDir, "AGENTS.md");
+    writeFileSync(sharedSrc, "# shared canonical\n");
+
+    const log: string[] = [];
+    ensureKeeperAgentPiProfileDir("work", log, home, sharedDir);
+
+    // Canonical ~/.pi/agent/AGENTS.md is a symlink onto the ONE shared source.
+    const canonicalAgents = join(home, ".pi", "agent", "AGENTS.md");
+    expect(lstatSync(canonicalAgents).isSymbolicLink()).toBe(true);
+    expect(realpathSync(canonicalAgents)).toBe(realpathSync(sharedSrc));
+
+    // The named-profile AGENTS.md link is present — it is ONLY reached when the
+    // canonical AGENTS.md already exists, so its presence proves the canonical
+    // leaf was materialized before the per-profile link loop ran (the ordering
+    // trap: a late materialization skips AGENTS.md for every profile).
+    const profileAgents = join(home, ".pi-profiles", "work", "AGENTS.md");
+    expect(lstatSync(profileAgents).isSymbolicLink()).toBe(true);
+    expect(realpathSync(profileAgents)).toBe(realpathSync(sharedSrc));
+  });
 });

@@ -85,6 +85,9 @@ export interface Harness {
   err: string[];
   /** Profile names ensureKeeperAgentProfileDirFn was called with, in order. */
   bootstrappedProfiles: string[];
+  /** Action logs ensureCodexStateSharingFn was invoked with, in order (call count
+   *  = length) — the codex leaf-guard reaches every codex launch, passthrough too. */
+  codexStateSharingCalls: string[][];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
   /** Every birth record the launcher emitted (draft + child pid), in order. */
@@ -170,6 +173,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const out: string[] = [];
   const err: string[] = [];
   const bootstrappedProfiles: string[] = [];
+  const codexStateSharingCalls: string[][] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
@@ -219,6 +223,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.panelSelections ?? { panels: {}, default: null },
     loadHostTriplesFn: () => opts.hostTriples ?? DEFAULT_HOST_TRIPLES,
     ensureClaudeStateSharingFn: () => {},
+    ensureCodexStateSharingFn: (actionLog: string[]) => {
+      codexStateSharingCalls.push(actionLog);
+    },
     ensureKeeperAgentProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);
       return [profileDir, false];
@@ -272,6 +279,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     out,
     err,
     bootstrappedProfiles,
+    codexStateSharingCalls,
     codexSessionNameIndexers,
     birthRecords,
     tmuxCommands,
