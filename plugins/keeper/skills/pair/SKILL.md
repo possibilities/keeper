@@ -2,18 +2,22 @@
 name: pair
 description: >-
   Pair with another model CLI — fan ONE task out to claude, codex, pi, or
-  hermes, wait, then read its answer. Use when the user wants a second opinion, a cross-check,
-  or to "ask claude / ask codex / ask another model", a code review or co-plan
-  from a different model, or a read-only audit by a partner — even when they
-  never say "keeper" or "pair". Drives `keeper agent` from THIS session: a
-  blocking `agent run` for a quick single-shot, or a detached `agent panel
-  start` + chunked blocking `agent panel wait` loop for a longer or multi-model
-  ask, then reads the partner's JSON answer envelope. NOT for launching a keeper
-  worker on plan work (that is `keeper:dispatch`), NOT for messaging another
-  RUNNING agent (that is `keeper:bus`), NOT for a multi-model consensus panel
-  (that is `/plan:panel`, which itself fans out via this).
+  hermes, wait, then read its answer; or resume a prior partner conversation by
+  name instead of starting cold. Use when the user wants a second opinion, a
+  cross-check, or to "ask claude / ask codex / ask another model", a code review
+  or co-plan from a different model, a read-only audit by a partner, or to
+  continue talking to a partner from earlier ("resume the codex session",
+  "ask that partner a follow-up") — even when they never say "keeper" or "pair".
+  Drives `keeper agent` from THIS session: a blocking `agent run` (optionally
+  `--resume <name>`) for a quick single-shot, a detached `agent panel start` +
+  chunked blocking `agent panel wait` loop for a longer or multi-model ask, or
+  the interactive `agent resume <name>` verb to re-attach a dead partner — then
+  reads the partner's JSON answer envelope. NOT for launching a keeper worker on
+  plan work (that is `keeper:dispatch`), NOT for messaging another RUNNING agent
+  (that is `keeper:bus`), NOT for a multi-model consensus panel (that is
+  `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash
-argument-hint: <what to ask> [--preset <harness::model::effort> | --cli claude|codex|pi|hermes] [--role …] [--read-only]
+argument-hint: <what to ask> [--preset <harness::model::effort> | --cli claude|codex|pi|hermes] [--resume <name-or-id>] [--name <n>] [--role …] [--read-only]
 ---
 
 # pair
@@ -22,15 +26,22 @@ Pairing fans ONE task out to another model CLI — `claude`, `codex`, `pi`, or
 `hermes` — launched as a detached **interactive TUI** partner via `keeper agent`,
 and reads the partner's final answer back as a uniform JSON envelope. It is
 keeper's pairing surface: a second opinion, a cross-vendor cross-check, a code
-review or co-plan from a different model, or a read-only audit. Each harness that
-needs a first-use consent step is pre-seeded so the window never stalls, all
-fail-open: for a codex partner keeper seeds the cwd's codex directory-trust
-before launch so it never hangs on codex's "trust this directory?" prompt; a pi
-partner launches with `-na` (`--no-approve`), ignoring the cwd's project-local
-`.pi/` resources so it likewise never stalls on pi's trust prompt; a hermes
-partner has its shell-hook allowlist + keeper events-shim pre-seeded so it
-reports live state with no interactive hook-approval prompt (degrading to
-presence-only tracking if the seed can't be written).
+review or co-plan from a different model, or a read-only audit. There are two
+entry states: **fresh-launch** starts a brand-new partner conversation, and
+**resume** continues a prior one by name instead of starting cold (see
+*Resuming a partner* below). Each harness that needs a first-use consent step is
+pre-seeded so the window never stalls, all fail-open: for a codex partner keeper
+seeds the cwd's codex directory-trust before launch so it never hangs on codex's
+"trust this directory?" prompt; a pi partner launches with `-na`
+(`--no-approve`), ignoring the cwd's project-local `.pi/` resources so it
+likewise never stalls on pi's trust prompt; a hermes partner has its shell-hook
+allowlist + keeper events-shim pre-seeded so it reports live state with no
+interactive hook-approval prompt (degrading to presence-only tracking if the
+seed can't be written).
+
+**Name your partners.** Pass `--name <n>` on every launch (fresh or resumed) so
+the partner is resumable by name later — an unnamed partner is still resumable
+by job id, but a name is far easier to recall and to hand to a follow-up turn.
 
 You wait with **blocking Bash calls**, never a Monitor — a blocking call bills
 zero tokens while it blocks (the model is suspended between emitting the tool_use
@@ -58,7 +69,7 @@ answer envelope to `--output`. Issue it with the Bash tool's `timeout`
 parameter set explicitly to `600000`:
 
 ```bash
-keeper agent run codex "$(cat /tmp/ask.md)" --read-only --output /tmp/ans.json
+keeper agent run codex "$(cat /tmp/ask.md)" --read-only --name codereview-1 --output /tmp/ans.json
 # issue with Bash tool timeout: 600000 — blocks until the partner stops, then
 # exits 0 — read /tmp/ans.json
 ```
@@ -72,6 +83,9 @@ keeper agent run codex "$(cat /tmp/ask.md)" --read-only --output /tmp/ans.json
   open — use the detached shape below (or run the `agent run` in the
   background and poll `--output`, which appears atomically only once
   complete).
+- To continue an existing partner instead of starting fresh, add `--resume
+  <name-or-id>` in place of `--preset`/`--model`/`--effort`/`--session` (the
+  resumed session keeps its own config) — see *Resuming a partner* below.
 
 ## Detached + chunked wait (`agent panel start|wait`)
 
@@ -188,6 +202,46 @@ returned promptly instead of spinning), re-issue `keeper agent panel start … -
 prune` GCs aged-out terminal run dirs under the panels root — never a live or
 in-reconcile run — for occasional housekeeping.
 
+## Resuming a partner
+
+A name is a lookup, never a resume key — `--resume <name-or-id>` (or the
+`resume` verb below) resolves the name against the current job's title, its
+former names, or a job/session-id prefix, and continues that partner's
+conversation rather than starting cold. Resolution rules:
+
+- **Current or former name, or id.** A partner renamed mid-conversation is
+  still found by any name it has ever carried.
+- **Newest-non-live wins, and is echoed.** Several non-live matches for a name
+  collapse to the most recently updated one; keeper prints which job/harness it
+  picked. An exact tie among equally-recent matches is ambiguous — resume by
+  the exact job id instead.
+- **A live target refuses, pointing at the bus.** A partner still running is
+  never resumed (that would create two writers on one conversation) — message
+  it instead: `keeper bus chat send <name-or-id> "<msg>"`.
+- **Resume is cwd-scoped.** Both shapes below launch in the matched partner's
+  recorded cwd, because claude and codex store sessions per-cwd.
+- **Resuming chains.** Each resume mints a fresh session carrying the matched
+  partner's name, so resuming the same name again continues the newest
+  lineage, not the original conversation.
+
+**Interactive re-attach** — `keeper agent resume <name-or-id> "<follow-up ask>"`
+drops you into the partner's TUI with the follow-up already queued:
+
+```bash
+keeper agent resume codereview-1 "now check the error-handling paths too"
+```
+
+**Resumed capture** — add `--resume <name-or-id>` to `agent run` to deliver a
+follow-up ask and capture the resumed session's new final answer in the same
+uniform envelope (`--model`/`--effort`/`--preset` are rejected alongside
+`--resume` — the resumed session keeps its own config):
+
+```bash
+keeper agent run codex "now check the error-handling paths too" \
+  --resume codereview-1 --output /tmp/ans2.json
+# issue with Bash tool timeout: 600000 — read /tmp/ans2.json on exit 0
+```
+
 ## Reading the answer
 
 Each partner's `--output` (or a panel member's `yaml`) is the uniform
@@ -204,7 +258,9 @@ schema-versioned JSON envelope. The fields:
 - `transcript_path` — the partner's per-backend transcript JSONL, the drill-down
   for the FULL conversation when `message` alone isn't enough. Read it only if you
   need the partner's reasoning/steps, not just its conclusion.
-- `handle` / `resume_target` — the `keeper agent` launch handle + resume key.
+- `handle` / `resume_target` — the `keeper agent` launch handle + the native
+  id `--resume` would need to continue this exact session (prefer resuming by
+  the `--name` you gave the partner instead — a name outlives any one id).
 - `elapsed_seconds` — wall time of the partner's turn.
 - `outcome` — `completed` / `no_message` (success), or `timed_out` /
   `no_transcript` / `launch_failed` / `bad_args` (no usable answer — surface it to
@@ -225,6 +281,8 @@ effort range, then compose the triple from what you found.
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi/hermes member is an arg fault; hermes is model-only, pi takes thinking not effort). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner` (rides the leg as a `--system` block on the panel path; pairs with `--cli`, not with a bare triple). Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
+| `--name <n>` | **`agent run` only.** Names the partner so it is resumable by name later — pass it on every launch. |
+| `--resume <name-or-id>` | **`agent run` only.** Continues a prior partner by current/former name or id instead of launching fresh (see *Resuming a partner*). Rejects `--preset`/`--model`/`--effort`/`--session`. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a sensible
 default (a cross-vendor partner, `default` role) and say what you chose — don't
