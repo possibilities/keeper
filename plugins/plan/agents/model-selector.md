@@ -54,7 +54,10 @@ Choose exactly one `{tier, model}` cell per task:
 
 ## Output contract
 
-Return exactly one raw JSON object, no markdown fences, no prose before or after.
+Return exactly one raw JSON object, no markdown fences, no prose before or after. Your ENTIRE final
+message must parse with `JSON.parse` as-is — any character outside the object risks a
+`verdict_invalid` rejection and a degrade to default cells. Every sentence of reasoning belongs
+inside a cell's `rationale` field, never around the object.
 
 Shape:
 
