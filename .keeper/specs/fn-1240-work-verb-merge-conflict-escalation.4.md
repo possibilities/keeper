@@ -47,5 +47,5 @@ fn-ids / dates / past-tense provenance in any forward-facing doc.
 - [ ] No fn-ids, dates, or past-tense provenance in any forward-facing doc edited.
 
 ## Done summary
-
+Reconciled CLAUDE.md/CONTEXT.md/watch SKILL.md so the resolve/deconflict/page escalation pipeline reads verb-agnostic (close::<epic> and work::<taskId>) instead of close-only, disambiguated the merge-conflict vs lane-premerge classification, and pruned CONTEXT.md's pre-existing line-cap overrun.
 ## Evidence
