@@ -8,13 +8,18 @@
 // matrix-less host (the axes now live in the required v2 host matrix, absent in CI):
 //   (a) structural validation — the config coerces (a malformed section fails loud).
 //   (b) research-hash parity — EVERY research entry names a references/ cache file
-//       that exists and whose recorded sha256 matches it on disk.
+//       that exists and whose recorded sha256 matches it on disk, AND every
+//       DECLARED vendor card (references/cards/) hashes the same way. Presence +
+//       hash only: the gate NEVER parses a card's provenance header — fetched
+//       vendor content stays out of the gate parser.
 // The axis-coverage directions are dropped from the gate; the model-guidance-v2
 // follow-up epic owns the coverage UX against the host matrix. The pure coverage
 // core (`checkModelGuidance`) is retained for the in-process failure-mode tests.
 //
 // `--state` classifies every configured axis value against the model-selector.yaml
-// guidance, reading its axes from the required v2 host matrix (`matrix.yaml`).
+// guidance, reading its axes from the required v2 host matrix (`matrix.yaml`). A
+// model classifies `fresh` only with researched notes AND a present, hash-matching
+// card; the envelope carries card_present / card_hash_parity / reasons per model.
 //
 // The pure cores (`checkModelGuidance` / `classifyModelGuidance`) are functions over
 // already-loaded data so the fast suite drives their failure modes in-process. The
@@ -30,10 +35,21 @@ import { loadYamlInput, parseYamlInput } from "../src/yaml_input.ts";
 /** Plan plugin root — model-selector.yaml sits here. */
 export const PLAN_ROOT = resolve(import.meta.dir, "..");
 
-/** One research-provenance entry: a references/ cache file + its content hash. */
+/** A vendor system-card cache pin: the converted-markdown card under
+ * references/cards/ + its content hash. The gate hashes the committed markdown,
+ * never upstream bytes, and NEVER parses the card's provenance header. */
+export interface CardEntry {
+  readonly reference: string;
+  readonly sha256: string;
+}
+
+/** One research-provenance entry: a references/ cache file + its content hash,
+ * plus an OPTIONAL vendor system-card cache. An absent `card` key means no card
+ * (inert until backfilled); a card is REQUIRED for a model to classify `fresh`. */
 export interface ResearchEntry {
   readonly reference: string;
   readonly sha256: string;
+  readonly card?: CardEntry;
 }
 
 /** Provenance for the efforts guidance blocks as a whole — the effort axis has
@@ -108,6 +124,28 @@ function dateFieldToString(raw: unknown): string | null {
   return typeof raw === "string" ? raw : null;
 }
 
+/** Coerce a research entry's OPTIONAL nested `card` mapping. An absent key is
+ * handled by the caller (no card); a PRESENT key must be a full `{reference,
+ * sha256}` string mapping — a non-mapping or a partial/malformed card fails loud
+ * naming the model, exactly like the notes fields (a declared-but-broken pin
+ * never passes silently). A card path equal to the notes reference is a
+ * copy-paste error and is rejected loud. */
+function coerceCardEntry(
+  raw: unknown,
+  notesReference: string,
+  label: string,
+): CardEntry {
+  const c = asMapping(raw, label);
+  const reference = asString(c.reference, `${label}.reference`);
+  const sha256 = asString(c.sha256, `${label}.sha256`);
+  if (reference === notesReference) {
+    throw new ModelSelectorConfigError(
+      `${label}.reference must differ from the notes reference "${notesReference}" (copy-paste guard)`,
+    );
+  }
+  return { reference, sha256 };
+}
+
 /** Coerce the optional `efforts_provenance` block fail-closed — never throws, so
  * the state classifier stays total. A non-mapping, an absent status, or a
  * coerced (non-string) status all read as a `stub` stamp. */
@@ -137,9 +175,14 @@ export function coerceModelSelectorConfig(
     asMapping(doc.research, "research"),
   )) {
     const e = asMapping(entry, `research.${model}`);
+    const reference = asString(e.reference, `research.${model}.reference`);
     research[model] = {
-      reference: asString(e.reference, `research.${model}.reference`),
+      reference,
       sha256: asString(e.sha256, `research.${model}.sha256`),
+      // Absent `card` key means no card; a present key coerces loud.
+      ...(e.card !== undefined
+        ? { card: coerceCardEntry(e.card, reference, `research.${model}.card`) }
+        : {}),
     };
   }
   return {
@@ -227,6 +270,42 @@ export interface GuidanceCheckInput {
   readonly referenceHash: (reference: string) => string | null;
 }
 
+/** Hash-parity errors for one research entry: its notes cache AND its declared
+ * card (if any). A declared card is hashed exactly like the notes reference —
+ * presence + hash only, NEVER a header parse — so fetched vendor content stays
+ * out of the gate parser; an absent card key is skipped (cards are optional).
+ * The notes messages are byte-stable so a typo self-reveals as a missing file. */
+function researchEntryParityErrors(
+  model: string,
+  entry: ResearchEntry,
+  referenceHash: (reference: string) => string | null,
+): string[] {
+  const errors: string[] = [];
+  const notesActual = referenceHash(entry.reference);
+  if (notesActual === null) {
+    errors.push(
+      `research: ${model} reference "${entry.reference}" is missing on disk`,
+    );
+  } else if (notesActual !== entry.sha256) {
+    errors.push(
+      `research: ${model} recorded sha256 ${entry.sha256} does not match file ${notesActual} (${entry.reference})`,
+    );
+  }
+  if (entry.card !== undefined) {
+    const cardActual = referenceHash(entry.card.reference);
+    if (cardActual === null) {
+      errors.push(
+        `research: ${model} card "${entry.card.reference}" is missing on disk`,
+      );
+    } else if (cardActual !== entry.card.sha256) {
+      errors.push(
+        `research: ${model} card recorded sha256 ${entry.card.sha256} does not match file ${cardActual} (${entry.card.reference})`,
+      );
+    }
+  }
+  return errors;
+}
+
 /** The pure check core: coverage (both directions, both axes) + research hash
  * parity. Returns accumulated errors so callers report all drift at once. */
 export function checkModelGuidance(
@@ -258,20 +337,11 @@ export function checkModelGuidance(
   }
   // A research entry for a non-configured model is TOLERATED (a host-roster extra,
   // mirroring the extra-guidance-block tolerance, keeping the gate host-blind) —
-  // but EVERY entry's reference file must exist and hash-match. There is no
-  // skip-continue: a typo'd entry self-reveals as a missing reference file rather
-  // than silently passing.
+  // but EVERY entry's reference file (notes AND any declared card) must exist and
+  // hash-match. There is no skip-continue: a typo'd entry self-reveals as a
+  // missing reference file rather than silently passing.
   for (const [model, entry] of Object.entries(input.config.research)) {
-    const actual = input.referenceHash(entry.reference);
-    if (actual === null) {
-      errors.push(
-        `research: ${model} reference "${entry.reference}" is missing on disk`,
-      );
-    } else if (actual !== entry.sha256) {
-      errors.push(
-        `research: ${model} recorded sha256 ${entry.sha256} does not match file ${actual} (${entry.reference})`,
-      );
-    }
+    errors.push(...researchEntryParityErrors(model, entry, input.referenceHash));
   }
 
   return { ok: errors.length === 0, errors };
@@ -290,26 +360,18 @@ export function referenceHashFromDisk(
   };
 }
 
-/** Host-blind research-hash parity: EVERY research entry's reference file exists
- * and its recorded sha256 matches on disk. No axis read (the coverage directions
- * are dropped from the integrity gate), so the gate stays green on a matrix-less
- * host. A typo'd entry self-reveals as a missing reference file. */
+/** Host-blind research-hash parity: EVERY research entry's notes reference AND
+ * declared card file exists and its recorded sha256 matches on disk. No axis read
+ * (the coverage directions are dropped from the integrity gate), so the gate
+ * stays green on a matrix-less host, and it never parses a card header — presence
+ * + hash only. A typo'd entry self-reveals as a missing reference file. */
 export function checkResearchParity(
   config: ModelSelectorConfig,
   referenceHash: (reference: string) => string | null,
 ): GuidanceCheckResult {
   const errors: string[] = [];
   for (const [model, entry] of Object.entries(config.research)) {
-    const actual = referenceHash(entry.reference);
-    if (actual === null) {
-      errors.push(
-        `research: ${model} reference "${entry.reference}" is missing on disk`,
-      );
-    } else if (actual !== entry.sha256) {
-      errors.push(
-        `research: ${model} recorded sha256 ${entry.sha256} does not match file ${actual} (${entry.reference})`,
-      );
-    }
+    errors.push(...researchEntryParityErrors(model, entry, referenceHash));
   }
   return { ok: errors.length === 0, errors };
 }
@@ -329,11 +391,14 @@ export function checkModelGuidanceFromDisk(
 // core. Every configured axis value maps to exactly one state, no throw path.
 // ---------------------------------------------------------------------------
 
-/** A model guidance value's state on the fail-closed lattice. `fresh` needs
- * positive evidence (an exact `researched` status AND hash parity); a researched
- * stamp whose reference hash drifted is `stale`; any other, absent, unparseable,
- * or coerced provenance is `stub`; a missing guidance block, research entry, or
- * reference file is `missing`. */
+/** A model guidance value's state on the fail-closed lattice, precedence pinned:
+ * structural absence (no guidance block / no research entry / no notes file) →
+ * `missing`; notes provenance not `researched` → `stub` (card irrelevant); notes
+ * researched but notes-hash drift → `stale`; notes researched + parity but the
+ * card is absent (undeclared OR declared-but-file-missing) → `missing` (the
+ * backfill class); notes researched + parity + card present but card-hash drift →
+ * `stale`; both parities plus card presence → `fresh`. A card is REQUIRED for
+ * `fresh`, and the classifier is total (no throw path). */
 export type ModelGuidanceState = "missing" | "stub" | "stale" | "fresh";
 
 /** An effort guidance value's state: a present block, or none. */
@@ -347,11 +412,22 @@ export interface ModelProvenance {
   readonly resolves_to: string | null;
 }
 
-/** One model value's classification plus the facts that drove it. */
+/** One model value's classification plus the facts that drove it. The
+ * `card_present`, `card_hash_parity`, and `reasons` field names are the stable
+ * jq contract the skill-docs surface quotes byte-aligned. */
 export interface ModelStateEntry extends ModelProvenance {
   readonly state: ModelGuidanceState;
-  /** Recorded-vs-actual reference hash; null when the reference is absent. */
+  /** Recorded-vs-actual notes reference hash; null when the reference is absent. */
   readonly hash_parity: boolean | null;
+  /** A vendor card is declared AND its file resolves on disk. A declared card
+   * whose file is missing reads exactly like no card (false). */
+  readonly card_present: boolean;
+  /** Recorded-vs-actual card hash; null when no card is present on disk. */
+  readonly card_hash_parity: boolean | null;
+  /** Every contributing cause the model is not `fresh`, drawn exactly from
+   * [no-block, no-research-entry, no-notes-file, notes-not-researched,
+   * notes-hash-drift, no-card, card-hash-drift] — empty exactly when `fresh`. */
+  readonly reasons: readonly string[];
 }
 
 /** One effort value's classification. */
@@ -437,33 +513,85 @@ function parseProvenance(text: string): ModelProvenance {
   };
 }
 
-/** Classify one configured model value against the fail-closed lattice. */
+/** Classify one configured model value against the fail-closed lattice. Total:
+ * every path returns, no throw. `reasons` accumulates every contributing cause at
+ * and above the first failing precedence gate; it is empty exactly when `fresh`. */
 function classifyModel(
   model: string,
   input: GuidanceStateInput,
 ): ModelStateEntry {
+  const reasons: string[] = [];
   const block = input.config.models[model];
   const research = input.config.research[model];
-  // missing: no guidance block, no research entry, or no reference on disk.
-  if (block === undefined || block.length === 0 || research === undefined) {
-    return { state: "missing", hash_parity: null, ...ABSENT_PROVENANCE };
+
+  const hasBlock = block !== undefined && block.length > 0;
+  if (!hasBlock) {
+    reasons.push("no-block");
   }
-  const text = input.referenceText(research.reference);
-  if (text === null) {
-    return { state: "missing", hash_parity: null, ...ABSENT_PROVENANCE };
-  }
-  const facts = parseProvenance(text);
-  const actual = input.referenceHash(research.reference);
-  const hashParity = actual === null ? null : actual === research.sha256;
-  // fresh needs positive evidence on BOTH axes; a researched stamp without parity
-  // is stale; anything else is stub.
-  let state: ModelGuidanceState;
-  if (facts.status === "researched") {
-    state = hashParity === true ? "fresh" : "stale";
+
+  // Notes: text + provenance + hash parity, evaluable only when the entry and its
+  // file both exist.
+  let facts: ModelProvenance = ABSENT_PROVENANCE;
+  let notesParity: boolean | null = null;
+  let notesResearched = false;
+  let notesFilePresent = false;
+  if (research === undefined) {
+    reasons.push("no-research-entry");
   } else {
-    state = "stub";
+    const text = input.referenceText(research.reference);
+    if (text === null) {
+      reasons.push("no-notes-file");
+    } else {
+      notesFilePresent = true;
+      facts = parseProvenance(text);
+      const actual = input.referenceHash(research.reference);
+      notesParity = actual === null ? null : actual === research.sha256;
+      notesResearched = facts.status === "researched";
+    }
   }
-  return { state, hash_parity: hashParity, ...facts };
+
+  // Card facts for the envelope — computed independently of state so the fields
+  // are always truthful. A declared card whose file is absent reads as no card.
+  let cardPresent = false;
+  let cardHashParity: boolean | null = null;
+  if (research?.card !== undefined) {
+    const cardActual = input.referenceHash(research.card.reference);
+    if (cardActual !== null) {
+      cardPresent = true;
+      cardHashParity = cardActual === research.card.sha256;
+    }
+  }
+
+  // Precedence lattice — the first failing gate fixes the state; the card gates
+  // apply ONLY once the notes are researched-with-parity (below them the card is
+  // irrelevant and contributes no reason).
+  let state: ModelGuidanceState;
+  if (!hasBlock || research === undefined || !notesFilePresent) {
+    state = "missing";
+  } else if (!notesResearched) {
+    reasons.push("notes-not-researched");
+    state = "stub";
+  } else if (notesParity !== true) {
+    reasons.push("notes-hash-drift");
+    state = "stale";
+  } else if (!cardPresent) {
+    reasons.push("no-card");
+    state = "missing";
+  } else if (cardHashParity !== true) {
+    reasons.push("card-hash-drift");
+    state = "stale";
+  } else {
+    state = "fresh";
+  }
+
+  return {
+    state,
+    hash_parity: notesParity,
+    card_present: cardPresent,
+    card_hash_parity: cardHashParity,
+    reasons,
+    ...facts,
+  };
 }
 
 /** The pure state core: classify every configured axis value with no throw. */
