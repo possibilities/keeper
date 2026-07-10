@@ -6,6 +6,10 @@ Accepted. Partially supersedes ADR 0010: only its preset-catalog clause ("the pr
 catalog auto-generates one `<provider>-<model>` preset per roster pair in memory at
 load"); the model-axis, wrapped-cell, and pecking-order decisions stand.
 
+Partially superseded by ADR 0040: the `worker`/`escalation` catalog keys this record
+established are replaced by the per-verb `dispatch:` table; the triple grammar,
+named-catalog retirement, and `<harness>_default` pointers stand.
+
 ## Context
 
 Launch configuration named presets twice: a hand-authored catalog (`presets.yaml`)
