@@ -24,48 +24,53 @@ answers meet. Cross-pollination before the judge defeats the entire mechanism.
 ## Defining the panel
 
 The panel's members come from a named `panels.<name>` array in `~/.config/keeper/panel.yaml`, each
-member a named preset in the catalog `~/.config/keeper/presets.yaml` — a `{harness, model, effort}`
-triple. Eligibility is **capability-derived**: a preset is panel-valid when its harness is *capturable*
-(keeper can read that harness's final message) — a capability flag, never a harness-name allowlist.
-Today that is every harness keeper drives — claude, codex, pi, and hermes — so any of the four is a
-valid panelist; a preset on a non-capturable harness is rejected when the panel resolves. Run
-`keeper agent presets list` to see the configured presets + panels.
+member a launch triple `<harness>::<model>::<effort>` (ADR 0033) drawn from the host matrix's
+enumerable cube — no separate preset catalog names them. Eligibility is **capability-derived**: a
+triple is panel-valid when its harness is *capturable* (keeper can read that harness's final message)
+AND carries a second reasoning axis (an effort or thinking rung to compare across panelists) — a
+capability flag, never a harness-name allowlist. Today that is claude, codex, and pi; hermes is
+axisless (no second reasoning axis), so it is never panel-eligible. A triple on a non-panel-eligible
+harness is rejected when the panel loads. Run `keeper agent presets list` (`--json` for structure) to
+see the enumerable cube plus the configured panels.
 `keeper agent presets resolve <panel>` returns the members in declaration order, each identified by its
-**preset name** (not its harness), so two panelists on the same harness but different models stay
-distinguishable. Every member answers **in parallel** via a detached
-`keeper agent run <harness> --preset <member> --read-only` leg that writes its answer as a uniform JSON
+**triple** (not just its harness), so two panelists on the same harness but different models or efforts
+stay distinguishable; duplicate identical triples are legal too — each gets a 1-based ordinal so
+repeats stay distinct. Every member answers **in parallel** via a detached
+`keeper agent run <harness> --preset <triple> --read-only` leg that writes its answer as a uniform JSON
 result envelope (`--output`), then the `plan:panel-judge` subagent fuses them:
 
-- **A claude member** (`harness: claude`) runs `keeper agent run claude --preset <member> --read-only`.
-  `--read-only` prepends an explore-only directive to the prompt — it reads, greps, and runs bash to
-  research, then reports.
-- **A codex member** (`harness: codex`) is the cross-family diversity the panel is built to harvest.
-  Codex's read-only posture is carried by the same prompt directive (agent run's read-only is
+- **A claude member** (`claude::<model>::<effort>`) runs `keeper agent run claude --preset <triple>
+  --read-only`. `--read-only` prepends an explore-only directive to the prompt — it reads, greps, and
+  runs bash to research, then reports.
+- **A codex member** (`codex::<model>::<effort>`) is the cross-family diversity the panel is built to
+  harvest. Codex's read-only posture is carried by the same prompt directive (agent run's read-only is
   prompting-only — keeper enforces nothing) — panelists are explorers, so a best-effort directive is
   acceptable. A codex member runs as an interactive TUI with its cwd directory-trust pre-seeded
   (fail-open), so its window never hangs on codex's trust prompt.
 
 No member gets an assigned role or persona — every member answers the human's task straight, and the
-diversity comes from running the panel's preset spread cold (see "No lenses, no personas" above).
+diversity comes from running the panel's triple spread cold (see "No lenses, no personas" above).
 
-**Config is required.** With no catalog, no `panel.yaml`, or an unknown panel name, `presets resolve`
+**Config is required.** With no `panel.yaml`, or an unknown panel name, `presets resolve`
 exits 2 with a specific message (file path + bad name + sorted available names) — there is no silent
 fallback. The one reserved name is `default`: `keeper agent presets resolve default` aliases to whichever
 panel the top-level `default:` pointer names (it is never itself a panel name), and stays fail-loud with a
 message naming what was typed when no default is configured. Run `keeper agent presets list` to see what is
-configured. An example pair — the catalog (`~/.config/keeper/presets.yaml`) mapping each preset name to a
-`{harness, model, effort}` triple, and the panel file (`~/.config/keeper/panel.yaml`) naming one or more
-panels over those presets with a top-level `default:` pointer at one of them:
+configured. An example pair — the host matrix (`~/.config/keeper/matrix.yaml`) enumerating the launchable
+cube, and the panel file (`~/.config/keeper/panel.yaml`) naming a panel over triples drawn from it, with a
+top-level `default:` pointer:
 
 ```yaml
-# ~/.config/keeper/presets.yaml — preset name -> {harness, model, effort}
-presets:
-  fast-claude: {harness: claude, model: <model>, effort: <effort>}
-  cross-codex: {harness: codex,  model: <model>, effort: <effort>}
+# ~/.config/keeper/matrix.yaml — the launchable cube (see docs/install.md's Host provider matrix walkthrough)
+providers:
+  - name: claude
+    models: [sonnet]
+  - name: codex
+    models: [<model>]
 
-# ~/.config/keeper/panel.yaml — panels over those presets, plus the default pointer
+# ~/.config/keeper/panel.yaml — a panel over launch triples, plus the default pointer
 panels:
-  core: [fast-claude, cross-codex]
+  core: ["claude::sonnet::high", "codex::<model>::<effort>"]
 default: core   # the literal `default` resolves here; never name a panel `default`
 ```
 

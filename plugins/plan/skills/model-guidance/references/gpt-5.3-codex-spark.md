@@ -10,7 +10,7 @@ provenance:
   sources:
     - OpenAI Codex gpt-5.3-codex-spark model card / capability docs: a fast, lightweight coding tier tuned for quick, tightly-scoped edits with a lower reasoning ceiling than the heavier codex tiers
     - keeper wrapped-cell architecture (ADR 0010): gpt-5.3-codex-spark is a host-roster capability model claude does not serve natively; a claude wrapper delegates implementation to the codex provider and re-owns tests/commit
-    - planning-session live probe: the host codex preset runs the bare `gpt-5.3-codex-spark` capability id directly at startup — unlike pi's provider-qualified slashed-id requirement, codex needs no matrix alias target for this model
+    - planning-session live probe: the codex provider's host matrix entry runs the bare `gpt-5.3-codex-spark` capability id directly at startup — unlike pi's provider-qualified slashed-id requirement, codex needs no matrix alias target for this model
 -->
 
 This file is the raw research backing the distilled `models.gpt-5.3-codex-spark` guidance block in
@@ -34,10 +34,10 @@ posture** — routed only to genuinely-bounded mechanical work until graded cell
 promotion — so "pick gpt-5.3-codex-spark" is not yet a broad default but a narrow, evidence-gated
 routing choice.
 
-A dispatch note the launch path (not this capability research) owns: the host codex preset accepts
-the bare `gpt-5.3-codex-spark` capability id directly, so this model needs no provider-qualified
-slashed alias target in the host matrix — unlike `pi`-served models, which reject a bare id at
-startup.
+A dispatch note the launch path (not this capability research) owns: the codex provider's host matrix
+entry accepts the bare `gpt-5.3-codex-spark` capability id directly, so this model needs no
+provider-qualified slashed alias target in the host matrix — unlike `pi`-served models, which reject a
+bare id at startup.
 
 ## Strengths (worker-relevant)
 

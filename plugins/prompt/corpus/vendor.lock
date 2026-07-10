@@ -10,7 +10,7 @@ upstream:
 filter_rule: whole snippet domains {engineering, source-dirs} + whole bundle {engineering-rules}; covers every `keeper prompt render` cite in keeper/plan skill bodies plus the engineering-rules members for coherent bundle renders
 files:
   claude/arthack/template/_partials/bundles/engineering-rules.yaml: 3f32d67c88790afc7eb51684ec9be06a169c879b8721e9ba807ad34675e05141
-  claude/arthack/template/_partials/snippets/_index.yaml: 04081948f6a1df29cec1ae29697c4d66080efd5e0d207d2534da269d6e334ee0
+  claude/arthack/template/_partials/snippets/_index.yaml: 80b33f4945ead6a52b4709067bd150e1589946c9276fb8c65b212ee38c09bbcc
   claude/arthack/template/_partials/snippets/engineering/agents-md-symlink.md.tmpl: 61b73be6a5c6fb55c9bb838fc3065bec00b086fed59f1d9164ebb07637f7c245
   claude/arthack/template/_partials/snippets/engineering/build-forward-no-fallback.md.tmpl: 508fa1c40b0c61de5b8a1d2f0dee17482af4d8a62ac2d5440d03d9c555ca5577
   claude/arthack/template/_partials/snippets/engineering/claude-md-scope.md.tmpl: d0f71007fc15872b078ecaf55dfc6b74ef6d985af712b9871de243ff2613c694
@@ -25,7 +25,7 @@ files:
   claude/arthack/template/_partials/snippets/engineering/network-service-hardening.md.tmpl: 6d9a3470a9b956f06429d6be68457999fc71a5ed9af77fc6ce3e00df3c346d14
   claude/arthack/template/_partials/snippets/engineering/never-assume-tests-pass.md.tmpl: c1fc670fa48477d05131aec375095d55cd9aa404457b904620221e7b1c1117a3
   claude/arthack/template/_partials/snippets/engineering/orient.md.tmpl: 9a39a73c6c3b5f0e1ab63724b11bbe9091a5a89f964be70f1df9896a3aa31b32
-  claude/arthack/template/_partials/snippets/engineering/panel-strength.md.tmpl: 4fe3fa9f55aa0596de9f77ef7eb0f3d40854888ba12b20d04125a505d2d072c3
+  claude/arthack/template/_partials/snippets/engineering/panel-strength.md.tmpl: faa3db1adc4e7a8aa23995f3f5a76fbf3836ac8090074bffeb39c864dd372396
   claude/arthack/template/_partials/snippets/engineering/script-shebang-hygiene.md.tmpl: fcdb00c0dfe0e6d1476424c83d7b4fa5b517b3965261ea18c892338ac164cc24
   claude/arthack/template/_partials/snippets/engineering/tmp-file-unique-path.md.tmpl: 4f00bf6453ff15e20b08d7722f8e6d782f8adb9d12e4ca52ffe2b82ece91257f
   claude/arthack/template/_partials/snippets/source-dirs/docs-dir-and-gist-open.md.tmpl: 9d2e2850ec6d9789dfceb99b28f2bd16517798c30e62c2636f3d70fe38bae821
