@@ -59,6 +59,10 @@ import {
   type FatalError,
   type GiveUpPolicy,
   HEARTBEAT_IDLE_MS,
+  MAX_IDLE_POLL_MS,
+  nextIdlePollDelayMs,
+  POLL_IDLE_GROWTH_FACTOR,
+  POLL_MS,
   type ReadinessClientSnapshot,
   type ReadinessSocket,
   type SocketHandlers,
@@ -4391,4 +4395,275 @@ test("fn-1199 epoch guard: a stable generation across reconnect fires no generat
   expect(lifecycle.some((e) => e.event === "generation_change")).toBe(false);
 
   handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// Adaptive idle poll interval (fn-1229.4) — grow/reset/cap
+//
+// `nextIdlePollDelayMs` is a pure number-in/number-out step: no clock, no
+// timer, so the grow/reset/cap contract is pinned directly. The integration
+// tests below drive the real poll loop (via `installTimerHarness`'s captured
+// handler) to confirm the driver actually re-arms at the computed delay and
+// that an in-flight query or a fresh frame resets it to the floor.
+// ---------------------------------------------------------------------------
+
+test("nextIdlePollDelayMs: idle grows by the factor each step, capped at MAX_IDLE_POLL_MS", () => {
+  let delay = POLL_MS;
+  const steps: number[] = [delay];
+  for (let i = 0; i < 6; i += 1) {
+    delay = nextIdlePollDelayMs(delay, false);
+    steps.push(delay);
+  }
+  expect(steps).toEqual([
+    POLL_MS,
+    POLL_MS * POLL_IDLE_GROWTH_FACTOR,
+    POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 2,
+    POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 3,
+    MAX_IDLE_POLL_MS,
+    MAX_IDLE_POLL_MS,
+    MAX_IDLE_POLL_MS,
+  ]);
+  // The cap is never exceeded, however many more idle steps follow.
+  expect(nextIdlePollDelayMs(MAX_IDLE_POLL_MS, false)).toBe(MAX_IDLE_POLL_MS);
+});
+
+test("nextIdlePollDelayMs: activity resets to the POLL_MS floor immediately, from any grown or capped delay", () => {
+  expect(nextIdlePollDelayMs(POLL_MS, true)).toBe(POLL_MS);
+  expect(nextIdlePollDelayMs(POLL_MS * 2, true)).toBe(POLL_MS);
+  expect(nextIdlePollDelayMs(MAX_IDLE_POLL_MS, true)).toBe(POLL_MS);
+});
+
+test("nextIdlePollDelayMs: never exceeds the cap in one idle step even from just below it", () => {
+  const justBelowCap = MAX_IDLE_POLL_MS - 1;
+  expect(nextIdlePollDelayMs(justBelowCap, false)).toBe(MAX_IDLE_POLL_MS);
+});
+
+test("adaptive poll interval: an idle steady state grows the live timer past POLL_MS, capped", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const handle = subscribeCollection({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-adaptive-grow",
+      collection: "jobs",
+      onRows: () => {},
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) throw new Error("mock socket never installed");
+    const subId = "test-adaptive-grow-jobs";
+    // First paint: nothing in flight afterward.
+    sock.deliver([emptyResult("jobs", subId)]);
+    sock.takeOutbound();
+
+    // Exactly one live poll timer at the floor right after paint.
+    expect(spy.count(POLL_MS)).toBe(1);
+
+    // The first tick post-paint still counts the paint's own result as
+    // recent activity (it arrived after `open` with no prior tick to
+    // checkpoint against) — stays at the floor, re-arming at the SAME delay.
+    spy.fire(POLL_MS);
+    expect(spy.count(POLL_MS)).toBe(1);
+
+    // A genuinely idle second tick (nothing since the first) grows.
+    spy.fire(POLL_MS);
+    expect(spy.count(POLL_MS)).toBe(0);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR)).toBe(1);
+
+    // A third, still-idle tick grows again.
+    spy.fire(POLL_MS * POLL_IDLE_GROWTH_FACTOR);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR)).toBe(0);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 2)).toBe(1);
+
+    handle.dispose();
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 2)).toBe(0);
+  } finally {
+    spy.restore();
+  }
+});
+
+test("adaptive poll interval: growth caps at MAX_IDLE_POLL_MS and stays there while idle", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const handle = subscribeCollection({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-adaptive-cap",
+      collection: "jobs",
+      onRows: () => {},
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) throw new Error("mock socket never installed");
+    sock.deliver([emptyResult("jobs", "test-adaptive-cap-jobs")]);
+    sock.takeOutbound();
+
+    // One warm-up tick at the floor (the paint's own result still counts as
+    // recent activity — see the grow test above), then drive enough idle
+    // ticks to reach the cap (500→1000→2000→4000→8000).
+    spy.fire(POLL_MS);
+    let ms = POLL_MS;
+    for (let i = 0; i < 4; i += 1) {
+      spy.fire(ms);
+      ms = nextIdlePollDelayMs(ms, false);
+    }
+    expect(ms).toBe(MAX_IDLE_POLL_MS);
+    expect(spy.count(MAX_IDLE_POLL_MS)).toBe(1);
+
+    // One more idle tick at the cap re-arms at the SAME delay — no new timer
+    // entry is created (the delay didn't change), the existing one persists.
+    spy.fire(MAX_IDLE_POLL_MS);
+    expect(spy.count(MAX_IDLE_POLL_MS)).toBe(1);
+
+    handle.dispose();
+  } finally {
+    spy.restore();
+  }
+});
+
+test("adaptive poll interval: an in-flight query resets the delay to the floor, never delaying slow-flight/timeout", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-adaptive-active",
+      onSnapshot: () => {},
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) throw new Error("mock socket never installed");
+    deliverReadinessPaint(sock, "test-adaptive-active");
+    sock.takeOutbound();
+
+    // Warm-up tick (paint activity), then one genuinely idle tick to grow.
+    spy.fire(POLL_MS);
+    spy.fire(POLL_MS);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR)).toBe(1);
+
+    // A `meta` nudge puts `epics` back in flight (unmergeable from one row,
+    // always refetches — unlike a direct-merge `patch`). Left un-resolved.
+    sock.deliver([
+      {
+        type: "meta",
+        id: "test-adaptive-active-epics",
+        collection: "epics",
+        rev: 2,
+        total: 0,
+      },
+    ]);
+    sock.takeOutbound();
+
+    // The next tick (fired manually here; production ticks real time)
+    // observes the in-flight query and resets straight back to the floor.
+    spy.fire(POLL_MS * POLL_IDLE_GROWTH_FACTOR);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR)).toBe(0);
+    expect(spy.count(POLL_MS)).toBe(1);
+
+    handle.dispose();
+  } finally {
+    spy.restore();
+  }
+});
+
+test("adaptive poll interval: a fresh inbound frame between ticks resets the delay even with nothing left in flight", () => {
+  const spy = installIntervalSpy();
+  try {
+    const { factory, socketRef } = makeMockConnect();
+    const handle = subscribeCollection({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-adaptive-frame",
+      collection: "jobs",
+      onRows: () => {},
+      connect: factory,
+    });
+    const sock = socketRef.current;
+    if (!sock) throw new Error("mock socket never installed");
+    const subId = "test-adaptive-frame-jobs";
+    sock.deliver([emptyResult("jobs", subId)]);
+    sock.takeOutbound();
+
+    // Warm-up tick (paint activity), then two genuinely idle ticks to grow
+    // twice.
+    spy.fire(POLL_MS);
+    spy.fire(POLL_MS);
+    spy.fire(POLL_MS * POLL_IDLE_GROWTH_FACTOR);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 2)).toBe(1);
+
+    // A patch arrives (the sidecar's direct-merge path — pk-mismatched here
+    // so it's DROPPED, a no-op that never goes in flight) — the frame itself
+    // is still "activity": resets the delay on the next tick even though
+    // nothing was ever in flight.
+    sock.deliver([patchFrame("jobs", subId, 2)]);
+    sock.takeOutbound();
+
+    spy.fire(POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 2);
+    expect(spy.count(POLL_MS * POLL_IDLE_GROWTH_FACTOR ** 2)).toBe(0);
+    expect(spy.count(POLL_MS)).toBe(1);
+
+    handle.dispose();
+  } finally {
+    spy.restore();
+  }
+});
+
+test("adaptive poll interval: a triggered reconnect never re-arms a timer for the dead connection", () => {
+  // `pollTick` checks `currentSock`/`shuttingDown` AFTER calling `pollAll`,
+  // so a tick that triggers a reconnect (query_timeout) must not re-arm a
+  // timer against the just-torn-down connection. Combines the fake-clock
+  // pattern (for a real QUERY_TIMEOUT_MS-aged in-flight query) with the
+  // interval spy (to observe the poll timer is gone post-teardown, not
+  // doubled or leaked).
+  const spy = installIntervalSpy();
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    const { factory, sockets } = makeMultiConnect();
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-adaptive-timeout",
+      onSnapshot: () => {},
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      connect: factory,
+    });
+    const sock1 = sockets[0];
+    if (!sock1) throw new Error("mock socket #1 never installed");
+    deliverReadinessPaint(sock1, "test-adaptive-timeout");
+    sock1.takeOutbound();
+    expect(spy.count(POLL_MS)).toBe(1);
+
+    // Force a fresh in-flight query on `epics` via a meta nudge.
+    sock1.deliver([
+      {
+        type: "meta",
+        id: "test-adaptive-timeout-epics",
+        collection: "epics",
+        rev: 2,
+        total: 0,
+      },
+    ]);
+    sock1.takeOutbound();
+
+    // Age it past QUERY_TIMEOUT_MS and fire the still-floor-cadence tick —
+    // triggers `triggerReconnect` → `teardownConnection` (destroys the poll
+    // timer, nulls `currentSock`). The mock's `terminate()` doesn't itself
+    // fire a `close` callback (unlike a real socket eventually would), so no
+    // further reconnect happens here — the load-bearing assertion is that
+    // the guard in `pollTick` left NO live poll timer behind (never a stray
+    // re-arm against the torn-down connection).
+    now += QUERY_TIMEOUT_MS + 50;
+    spy.fire(POLL_MS);
+    expect(lifecycle.filter((e) => e.event === "query_timeout")).toHaveLength(
+      1,
+    );
+    expect(spy.count(POLL_MS)).toBe(0);
+    expect(sock1.terminated ?? 0).toBeGreaterThanOrEqual(1);
+
+    handle.dispose();
+  } finally {
+    Date.now = realNow;
+    spy.restore();
+  }
 });

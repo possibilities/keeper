@@ -42,11 +42,12 @@
  *     opt-in `giveUpPolicy` bounds the CONTINUOUS-UNPAINTED window: when no
  *     first `result` lands within `deadlineMs` the driver tears down and fires
  *     `onFatal({ code: "unreachable" })` once.
- *   - Poll loop (500 ms): slow-flight/timeout detection on any IN-FLIGHT query,
- *     plus a steady-state LIVENESS HEARTBEAT — after `HEARTBEAT_IDLE_MS` with no
- *     inbound frame and nothing in flight it sends ONE probe refetch, so a
- *     silently-dead socket (a bounce leaving the transport half-open, or an
- *     app-level eviction) is torn down + reconnected instead of holding stale
+ *   - Poll loop (`POLL_MS` floor, ADAPTIVE while idle — see `nextIdlePollDelayMs`):
+ *     slow-flight/timeout detection on any IN-FLIGHT query, plus a steady-state
+ *     LIVENESS HEARTBEAT — after `HEARTBEAT_IDLE_MS` with no inbound frame and
+ *     nothing in flight it sends ONE probe refetch, so a silently-dead socket
+ *     (a bounce leaving the transport half-open, or an app-level eviction) is
+ *     torn down + reconnected instead of holding stale
  *     state forever. Real-time `patch`/`meta` frames drive data freshness.
  *   - Epoch guard: the boot header's per-daemon-boot `generation` nonce is
  *     tracked across reconnects; a change forces the re-baseline path (drop every
@@ -137,7 +138,23 @@ const LANE_MERGED_PAGE_LIMIT = 0;
 // instant-death-wall threshold, so a silent page-cap truncation is the worse
 // failure than an unbounded small collection (ADR 0011).
 const DISPATCH_FAILURES_PAGE_LIMIT = 0;
-const POLL_MS = 500;
+export const POLL_MS = 500;
+/**
+ * Adaptive idle-poll growth factor + cap (steady-state level-triggered
+ * waiting). `pollAll`'s own per-tick work is trivial, but firing it
+ * unconditionally every `POLL_MS` for the lifetime of a reconnect-forever
+ * `keeper await` is the dominant steady-state cost purely by TIME COVERAGE —
+ * it runs the whole connected window, unlike the catching-up backstop (a few
+ * short post-bounce windows) or per-frame re-evaluation (bounded by genuine
+ * board activity, near-zero on the quiet board the incident hit). While IDLE
+ * (nothing in flight AND no inbound frame since the last tick) the poll delay
+ * DOUBLES each tick up to `MAX_IDLE_POLL_MS`; ANY in-flight query, a fresh
+ * inbound frame, or a just-fired heartbeat probe resets it to the `POLL_MS`
+ * floor so slow-flight/timeout detection on active work is never delayed. See
+ * `nextIdlePollDelayMs`.
+ */
+export const POLL_IDLE_GROWTH_FACTOR = 2;
+export const MAX_IDLE_POLL_MS = 8_000;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
 // Cap-reject (capacity-transient) backoff base. A `max_connections` reject was
@@ -200,6 +217,26 @@ export const CATCHUP_BACKSTOP_MS = 3000;
  * settling probe).
  */
 export const HEARTBEAT_IDLE_MS = 15_000;
+
+/**
+ * Pure adaptive-interval step for the steady-poll cadence. `active` means
+ * "this tick saw something happening" (an in-flight query, a fresh inbound
+ * frame since the last tick, or a heartbeat probe just fired) — active always
+ * resets to the `POLL_MS` floor, immediately, regardless of how far the delay
+ * had grown. Idle instead grows the delay by `POLL_IDLE_GROWTH_FACTOR`,
+ * capped at `MAX_IDLE_POLL_MS`. A plain number-in/number-out function (no
+ * clock, no timer) so the grow/reset/cap contract is pinned by fast-tier
+ * tests independent of the real poll-loop wiring.
+ */
+export function nextIdlePollDelayMs(
+  currentDelayMs: number,
+  active: boolean,
+): number {
+  if (active) {
+    return POLL_MS;
+  }
+  return Math.min(currentDelayMs * POLL_IDLE_GROWTH_FACTOR, MAX_IDLE_POLL_MS);
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -826,6 +863,20 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
    */
   let reconnecting = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // ---- adaptive idle poll-interval state (see `nextIdlePollDelayMs`) ----
+  // The CURRENT live poll delay in ms. Reset to `POLL_MS` on every fresh
+  // `open`; grows while idle, resets to the floor on any activity.
+  let currentPollDelayMs = POLL_MS;
+  // Monotonic count of inbound frames on the CURRENT connection, bumped
+  // alongside `lastInboundAt` in `handleFrame`. `pollTick` compares this
+  // against `lastPollFrameSeq` (the value observed as of the previous tick)
+  // to detect "a frame arrived since the last tick" — the activity signal
+  // `nextIdlePollDelayMs` resets on. A COUNTER, not a `Date.now()` compare:
+  // two frames landing in the same wall-clock millisecond (real under
+  // batched delivery, routine in a fast test) must still register as
+  // activity, which a `>` timestamp compare would miss on a tie.
+  let inboundFrameSeq = 0;
+  let lastPollFrameSeq = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   // ---- steady-state liveness heartbeat (see HEARTBEAT_IDLE_MS) ----
   // Wall-clock (`Date.now`, matching the slow-flight machinery) of the last
@@ -1059,9 +1110,16 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     teardownConnection();
   }
 
-  function pollAll(): void {
-    // Two jobs on each `POLL_MS` tick, both reading the wall clock (in-process
-    // state cleared on teardown, so `Date.now()` is correct here):
+  /**
+   * Returns whether this tick was ACTIVE (something in flight, or a heartbeat
+   * probe just went out) — `pollTick` folds this into the adaptive-interval
+   * decision. `false` on the early return from a triggered reconnect is
+   * irrelevant: `pollTick` checks `currentSock`/`shuttingDown` first and never
+   * consults the return value on that path.
+   */
+  function pollAll(): boolean {
+    // Two jobs on each tick, both reading the wall clock (in-process state
+    // cleared on teardown, so `Date.now()` is correct here):
     //   1. SLOW-FLIGHT DETECTION: walk every state, compare `Date.now() -
     //      queryInFlightSince` against the thresholds, and emit a one-shot
     //      `query_slow_flight` or trigger a reconnect. No data refetch is
@@ -1083,7 +1141,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       const age = now - s.queryInFlightSince;
       if (age >= QUERY_TIMEOUT_MS) {
         triggerReconnect(s);
-        return;
+        return true;
       }
       if (age >= SLOW_FLIGHT_MS && s.lastSlowFlightAt === null) {
         emit("query_slow_flight", {
@@ -1100,6 +1158,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     // when the opening queries are all in flight) and idle past the threshold.
     // The probe rides the shared coalescer; its reply re-stamps `lastInboundAt`
     // and, being byte-identical on a quiet board, repaints nothing.
+    let heartbeatFired = false;
     if (
       !anyInFlight &&
       currentSock !== null &&
@@ -1109,7 +1168,41 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     ) {
       emit("heartbeat_probe", { sock: sockPath, idle_ms: now - lastInboundAt });
       scheduleRefetchFor(states[0]);
+      heartbeatFired = true;
     }
+    return anyInFlight || heartbeatFired;
+  }
+
+  /**
+   * The live `pollTimer` handler. Wraps `pollAll` with the adaptive
+   * idle-interval decision (`nextIdlePollDelayMs`): "activity" is anything
+   * `pollAll` reports OR a frame having arrived since the last tick (detected
+   * via `inboundFrameSeq`, a monotonic counter — a patch/meta/result that
+   * resolves between two ticks still counts, so a genuinely busy board never
+   * grows the interval). When the computed delay changes, the live timer is
+   * re-armed at the new delay; when it doesn't (the common capped-idle or
+   * floor-active steady case), the existing timer is left running untouched.
+   * `pollAll` may itself trigger a reconnect (tearing down `currentSock` +
+   * `pollTimer`); this checks both AFTER calling it so it never re-arms a
+   * timer for a connection that's gone — the fresh connection's `open`
+   * handler arms its own floor-cadence timer.
+   */
+  function pollTick(): void {
+    const hadInbound = inboundFrameSeq !== lastPollFrameSeq;
+    lastPollFrameSeq = inboundFrameSeq;
+    const active = pollAll() || hadInbound;
+    if (shuttingDown || currentSock === null) {
+      return;
+    }
+    const nextDelayMs = nextIdlePollDelayMs(currentPollDelayMs, active);
+    if (nextDelayMs === currentPollDelayMs) {
+      return;
+    }
+    currentPollDelayMs = nextDelayMs;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+    }
+    pollTimer = setInterval(pollTick, currentPollDelayMs);
   }
 
   /**
@@ -1201,8 +1294,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   function handleFrame(frame: ServerFrame): void {
     // Stamp the liveness clock on EVERY inbound frame (result/patch/meta/error)
     // so `pollAll`'s heartbeat measures true connection idleness, not just
-    // gaps between full results.
+    // gaps between full results. `inboundFrameSeq` bumps alongside it for
+    // `pollTick`'s activity detection (see its declaration).
     lastInboundAt = Date.now();
+    inboundFrameSeq += 1;
     if (frame.type === "result") {
       // fn-897 B1: surface the boot-status header (present during catch-up) so a
       // consumer can detect an unseeded git surface / still-draining reducer. Fired
@@ -1367,6 +1462,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       clearInterval(pollTimer);
       pollTimer = null;
     }
+    // Reset the adaptive poll delay to the floor — the next connection's
+    // `open` re-arms at `POLL_MS` regardless, but resetting here too keeps
+    // the state consistent for any read between teardown and the next open.
+    currentPollDelayMs = POLL_MS;
     // Reset the catching-up latch to READY and disarm the backstop — the next
     // connection's first `result` re-derives both. Silent (no `onCatchingUp`):
     // a disconnect surfaces via the `disconnected` lifecycle event, not a latch
@@ -1409,8 +1508,14 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         reconnecting = false;
         currentSock = sock;
         // Seed the liveness clock at connect so the heartbeat measures idleness
-        // from the fresh connection, not a stale prior-connection stamp.
+        // from the fresh connection, not a stale prior-connection stamp. The
+        // frame-seq checkpoint is left as-is (both sides of the fresh
+        // connection's first comparison start at whatever `inboundFrameSeq`
+        // already is — nothing has arrived on THIS connection yet, so the
+        // first tick correctly sees no inbound activity).
         lastInboundAt = Date.now();
+        lastPollFrameSeq = inboundFrameSeq;
+        currentPollDelayMs = POLL_MS;
         emit("connected", { sock: sockPath });
         // Send every subscribed query up front, stamping `queryInFlightSince`
         // and resetting `lastSlowFlightAt` so the post-reconnect window is clean.
@@ -1421,7 +1526,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
           s.lastSlowFlightAt = null;
           sock.write(encodeFrame(s.query));
         }
-        pollTimer = setInterval(pollAll, POLL_MS);
+        pollTimer = setInterval(pollTick, POLL_MS);
       },
       data(sock, chunk) {
         let lines: string[];
