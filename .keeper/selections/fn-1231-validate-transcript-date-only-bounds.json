@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Fully-specified single-surface guard addition plus a straight regression test in a named file (cli/transcript.ts) with the exact validation logic spelled out \u2014 the trickle lane's bounded mechanical low-band profile.",
+      "task_id": "fn-1231-validate-transcript-date-only-bounds.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T03:00:45.358000Z",
+  "epic_id": "fn-1231-validate-transcript-date-only-bounds",
+  "input_hash": "611d8b5cc3fdb821aa224bbb96e52431d11f67a2a49c79e082b96a3f73b61970",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1629326172,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fully-specified single-surface guard addition plus a straight regression test in a named file (cli/transcript.ts) with the exact validation logic spelled out \u2014 the trickle lane's bounded mechanical low-band profile.\",\"confidence\":0.82}]}\n"
+}
