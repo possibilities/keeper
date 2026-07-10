@@ -6,32 +6,32 @@
   },
   "cells": [
     {
-      "confidence": 0.94,
+      "confidence": 0.72,
       "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Branch-aware transcript reduction introduces a public JSON contract with subtle correctness invariants around ancestry, completion, truncation, and failure semantics.",
+      "model": "gpt-5.6-sol",
+      "rationale": "Well-specified new transcript-turn JSON contract with a branch-walking reducer whose edge cases are fully enumerated in acceptance, so GPT-first at the contract-shaped xhigh band on the strongest well-specified tier.",
       "task_id": "fn-1244-pi-transcript-backed-session-rename.1",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.96,
+      "confidence": 0.78,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "OAuth isolation, secret safety, concurrent stale-result prevention, and fail-open cross-module title propagation make this security- and correctness-critical work.",
+      "rationale": "Clears the opus burden via a subtle concurrency/staleness correctness invariant, a fail-open OAuth/no-secret-logging security boundary, and delicate pi-extension isolation idiom matching across a cross-cutting registration-to-renamer path.",
       "task_id": "fn-1244-pi-transcript-backed-session-rename.2",
       "tier": "xhigh"
     }
   ],
-  "config_hash": "5a17bddabc7e3f99ac738b07e00cddd2c7b7405003e0373647f2fdb6bbe07dae",
-  "created_at": "2026-07-10T20:20:46.163000Z",
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T21:31:19.724000Z",
   "epic_id": "fn-1244-pi-transcript-backed-session-rename",
-  "input_hash": "31af3269863d0501151ecf359810c63c35ea960362bd80e8aea6b803616356ac",
+  "input_hash": "d83cbc867658e5ac1c3dee6fe27031913055cb77d3cbaa73123c28baa962da08",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 833565289,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1244-pi-transcript-backed-session-rename.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Branch-aware transcript reduction introduces a public JSON contract with subtle correctness invariants around ancestry, completion, truncation, and failure semantics.\",\"confidence\":0.94},{\"task_id\":\"fn-1244-pi-transcript-backed-session-rename.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"OAuth isolation, secret safety, concurrent stale-result prevention, and fail-open cross-module title propagation make this security- and correctness-critical work.\",\"confidence\":0.96}]}"
+  "shuffle_seed": 3627859078,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1244-pi-transcript-backed-session-rename.1\",\"tier\":\"xhigh\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Well-specified new transcript-turn JSON contract with a branch-walking reducer whose edge cases are fully enumerated in acceptance, so GPT-first at the contract-shaped xhigh band on the strongest well-specified tier.\",\"confidence\":0.72},{\"task_id\":\"fn-1244-pi-transcript-backed-session-rename.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Clears the opus burden via a subtle concurrency/staleness correctness invariant, a fail-open OAuth/no-secret-logging security boundary, and delicate pi-extension isolation idiom matching across a cross-cutting registration-to-renamer path.\",\"confidence\":0.78}]}\n"
 }

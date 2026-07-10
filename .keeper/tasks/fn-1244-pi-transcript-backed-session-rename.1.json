@@ -5,11 +5,11 @@
   "depends_on": [],
   "epic": "fn-1244-pi-transcript-backed-session-rename",
   "id": "fn-1244-pi-transcript-backed-session-rename.1",
-  "model": "opus",
+  "model": "gpt-5.6-sol",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Expose latest transcript turn",
-  "updated_at": "2026-07-10T20:20:46.163000Z"
+  "updated_at": "2026-07-10T21:31:19.724000Z"
 }
