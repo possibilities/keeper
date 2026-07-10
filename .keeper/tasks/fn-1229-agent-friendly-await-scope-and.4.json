@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-10T01:58:36.663000Z",
   "depends_on": [],
   "epic": "fn-1229-agent-friendly-await-scope-and",
   "id": "fn-1229-agent-friendly-await-scope-and.4",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Measure and fix reconnect loop cost",
-  "updated_at": "2026-07-10T01:58:36.663000Z"
+  "updated_at": "2026-07-10T02:00:08.148000Z"
 }

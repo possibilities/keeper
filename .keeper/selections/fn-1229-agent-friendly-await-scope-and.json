@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle provenance-discriminator correctness invariant (must cover resolver/deconflict/repair, not the plan_verb whitelist) plus a contract-shaped flip of a shipped default that HELP/AGENT_HELP/board-scope byte-identity all depend on.",
+      "task_id": "fn-1229-agent-friendly-await-scope-and.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded, well-specified stderr-only heartbeat feature over a named timer seam and sanitized emitter with no stdout-contract change, squarely the sonnet-workhorse sweet spot.",
+      "task_id": "fn-1229-agent-friendly-await-scope-and.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.77,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Small multi-file probe feature riding the existing first-paint eval pass with a fully-specified acceptance and a mechanical exit-registry/descriptor lockstep, no intelligence-bound reason for opus.",
+      "task_id": "fn-1229-agent-friendly-await-scope-and.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Measure-then-fix with the dominant cost suspects already named and the fix a known adaptive-backoff (grow/reset/cap) pattern pinned by pure-function tests, so hypothesis is guided rather than open-ended.",
+      "task_id": "fn-1229-agent-friendly-await-scope-and.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Docs revise-and-consolidate cross-checked against the shipped CLI with lint gates as acceptance, mechanical single-surface work in the lower band.",
+      "task_id": "fn-1229-agent-friendly-await-scope-and.5",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T02:00:08.148000Z",
+  "epic_id": "fn-1229-agent-friendly-await-scope-and",
+  "input_hash": "c73ac83f52fb3b4f634b49f3b531111b28c160f095d2fe42941a09cd09a9a0c2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3342518335,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1229-agent-friendly-await-scope-and.1\",\"tier\":\"xhigh\",\"model\":\"opus\"},{\"task_id\":\"fn-1229-agent-friendly-await-scope-and.2\",\"tier\":\"high\",\"model\":\"sonnet\"},{\"task_id\":\"fn-1229-agent-friendly-await-scope-and.3\",\"tier\":\"high\",\"model\":\"sonnet\"},{\"task_id\":\"fn-1229-agent-friendly-await-scope-and.4\",\"tier\":\"high\",\"model\":\"sonnet\"},{\"task_id\":\"fn-1229-agent-friendly-await-scope-and.5\",\"tier\":\"medium\",\"model\":\"sonnet\"}]}"
+}
