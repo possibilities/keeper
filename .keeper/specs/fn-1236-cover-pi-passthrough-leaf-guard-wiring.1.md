@@ -21,5 +21,5 @@ Files:
 - [ ] The test asserts the fn is fed an empty profile list on passthrough (the () => [] arm), so a re-gate behind !shouldPassthrough fails it
 
 ## Done summary
-
+Added a main()-level pi passthrough test in test/agent-pi.test.ts asserting ensurePiStateSharingFn runs exactly once, fed the empty-profile-list arm, mirroring codex's symmetric passthrough guard test.
 ## Evidence
