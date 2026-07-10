@@ -1,8 +1,6 @@
 # CONTEXT — keeper ubiquitous language
 
-keeper's terms of art, grouped by bounded context. Each entry is a role-and-behavior
-definition plus an `Avoid:` line naming rejected synonyms — concepts only, never files,
-code, or history (decisions live in `docs/adr/`, provenance in commit messages).
+keeper's terms of art, grouped by bounded context. Each entry is a role-and-behavior definition plus an `Avoid:` line naming rejected synonyms — concepts only, never files, code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 
 ## Event-sourcing core
 
@@ -119,8 +117,8 @@ code, or history (decisions live in `docs/adr/`, provenance in commit messages).
 
 ## Install and reload
 
-- **Load surface**: The set of checked-in files the resident daemon process actually loads — what the reload fingerprint hashes and the boundary test encloses; per-invocation code (CLI, hooks, skills) is outside it. Avoid: footprint, source tree, codebase.
-- **Roots manifest**: The checked-in declaration of load-surface roots that the install fingerprint and the boundary test both consume through one seam, so the hashed boundary and the enforced boundary cannot disagree. Avoid: allowlist, path list, fingerprint config.
+- **Shared-source leaf**: A harness's global-instruction discovery path (e.g. `~/.codex/AGENTS.md`, `~/.pi/agent/AGENTS.md`), re-asserted as a symlink into keeper's one `system/shared/AGENTS.md` source on every launch; healed by deleting the source, never the leaf, and distinct from the repo-root `AGENTS.md -> CLAUDE.md` convention symlink. Avoid: config leaf, stow target, dotfile link.
+- **Load surface**: The set of checked-in files the resident daemon process actually loads — what the reload fingerprint hashes and the boundary test encloses via the checked-in **roots manifest** declaring its roots through one seam, so the hashed and enforced boundaries cannot disagree; per-invocation code (CLI, hooks, skills) sits outside it. Avoid: footprint, source tree, codebase, allowlist, path list, fingerprint config.
 
 ## Daemon liveness and restart forensics
 
