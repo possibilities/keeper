@@ -53,6 +53,7 @@ import {
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_REASON,
   STUCK_SENTINEL_DISTRESS_VERB,
+  stuckSentinelJobId,
   WORKTREE_CLOSE_KEY_PREFIXES,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_NON_FF_REASON,
@@ -1126,7 +1127,26 @@ describe("fn-1164.3 stuck-state-sentinel distress vocabulary", () => {
     expect(
       classifyDispatchFailure("stuck-sentinel: stale-working (clock-skew)"),
     ).toBe("stuck-sentinel");
+    // The detect-only cwd-missing reason (ADR 0031) composes with the same
+    // prefix rule — no display change needed for the new class.
+    expect(classifyDispatchFailure("stuck-sentinel: cwd-missing")).toBe(
+      "stuck-sentinel",
+    );
     // Prefix-disjoint from every other display rule — no sibling shadows it.
     expect(classifyDispatchFailure("stale-base-lane: x")).toBe("stale-base");
+  });
+
+  test("the cwd-missing reason composes with the reason-agnostic sentinel key predicates", () => {
+    // The cwd-missing row shares the close::stuck-sentinel:<jobId> key with every
+    // other sentinel reason, so the key predicates and job-id extraction that key
+    // off the id prefix (never the reason) cover it unchanged.
+    const cwdMissingKey = `${STUCK_SENTINEL_DISTRESS_ID_PREFIX}sess-zombie`;
+    expect(
+      isStuckSentinelDistressKey(STUCK_SENTINEL_DISTRESS_VERB, cwdMissingKey),
+    ).toBe(true);
+    expect(stuckSentinelJobId(cwdMissingKey)).toBe("sess-zombie");
+    expect(
+      isRetryableDispatchKey(STUCK_SENTINEL_DISTRESS_VERB, cwdMissingKey),
+    ).toBe(true);
   });
 });

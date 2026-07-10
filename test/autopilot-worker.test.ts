@@ -7559,6 +7559,73 @@ test("fn-972 BUG 3 reconcile: a finished closer JOB collects the finalize WITHOU
   expect(reconcile(noJob, makeState(), 0).worktreeFinalize).toEqual([]);
 });
 
+test("fn-1227.1 reconcile: a DONE epic whose close job still OCCUPIES defers finalize; a crashed/finished/absent closer collects it (ADR 0031)", () => {
+  // The incident ordering, reproduced end-to-end through the reconcile seam: the
+  // epic folds `done` (its close row reads `completed`, so the projection-done
+  // finalize arm fires) WHILE the closer session is still mid-turn inside the lane.
+  // Collecting finalize would merge + tear the lane out from under the live closer,
+  // deleting its cwd → posix_spawn ENOENT → a `working` zombie ghost-holding the
+  // slot. The close-occupancy gate must DEFER finalize until the closer exits — the
+  // SAME shared `isOccupyingJob` seam the closer-finished arm already encodes.
+  const epicId = "fn-1-foo";
+  const doneEpic = (): Epic =>
+    makeEpic({
+      epic_id: epicId,
+      project_dir: "/repo",
+      status: "done", // folded done → completedRowIds contains the epic
+      tasks: [
+        makeTask({
+          task_id: "fn-1-foo.1",
+          runtime_status: "done",
+          worker_phase: "done",
+        }),
+      ],
+    });
+  const closeJob = (state: "working" | "stopped", paneId?: string): Job =>
+    makeJob({
+      job_id: "j-close",
+      plan_verb: "close",
+      plan_ref: epicId,
+      state,
+      backend_exec_pane_id: paneId ?? null,
+    });
+  const finalizeBranches = (snap: ReconcileSnapshot): string[] =>
+    reconcile(snap, makeState(), 0).worktreeFinalize.map((f) => f.baseBranch);
+  const withJob = (
+    job: Job | null,
+    livePaneIds: ReadonlySet<string> | null,
+  ): ReconcileSnapshot =>
+    makeSnapshot({
+      epics: [doneEpic()],
+      worktreeMode: true,
+      jobs: job === null ? new Map() : new Map([[job.job_id, job]]),
+      livePaneIds,
+    });
+
+  // 1. `working` close job ALWAYS occupies → finalize DEFERRED (not collected).
+  //    This is the incident: before the gate, `completedRowIds` collected it anyway.
+  expect(finalizeBranches(withJob(closeJob("working"), new Set()))).toEqual([]);
+  // 2. `stopped` closer whose pane is LIVE (parked-alive, mid-turn) → DEFERRED.
+  expect(
+    finalizeBranches(withJob(closeJob("stopped", "%42"), new Set(["%42"]))),
+  ).toEqual([]);
+  // 3. DEGRADED pane probe (`livePaneIds === null`, tmux unavailable) → every
+  //    stopped row occupies → DEFERRED (fail-closed under an un-probeable cycle).
+  expect(finalizeBranches(withJob(closeJob("stopped", "%42"), null))).toEqual(
+    [],
+  );
+  // 4. CRASHED / finished closer — `stopped`, its pane GONE (probe available) →
+  //    does NOT occupy → finalize COLLECTED. Projection-done crash robustness kept.
+  expect(
+    finalizeBranches(withJob(closeJob("stopped", "%42"), new Set())),
+  ).toEqual(["keeper/epic/fn-1-foo"]);
+  // 5. A done epic with NO close job (never-forked / done-before-worktree) never
+  //    occupies → finalizes exactly as before the gate.
+  expect(finalizeBranches(withJob(null, new Set()))).toEqual([
+    "keeper/epic/fn-1-foo",
+  ]);
+});
+
 test("fn-990 finalizeEpic: a crashed closer (NOT done in the main projection) → no-op, never merges (incomplete lane is not pushed to default)", async () => {
   const cmds: string[] = [];
   const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
@@ -10300,6 +10367,54 @@ test("fn-990 recoverWorktrees pass-3: a merged orphan base (worktree + branch) o
     true,
   );
   expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(true);
+  expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
+});
+
+test("fn-1227.1 recoverWorktrees pass-3: an OCCUPYING close/work job preserves its lane; a genuinely orphaned base is still swept (ADR 0031)", async () => {
+  // The teardown seam of the incident: pass-3 sweeps a done/absent epic's merged
+  // base, but a done epic whose CLOSER is still mid-turn INSIDE its lane must NOT
+  // have its cwd torn out from under it (posix_spawn ENOENT → a `working` zombie).
+  // The occupancy gate preserves the occupied lane while STILL reclaiming a genuine
+  // orphan in the same repo — the same shared occupancy authority finalize gates on.
+  const occupied = "keeper/epic/fn-1-live";
+  const occupiedPath = "/repo.worktrees/keeper-epic-fn-1-live";
+  const orphan = "keeper/epic/fn-2-dead";
+  const orphanPath = "/repo.worktrees/keeper-epic-fn-2-dead";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${occupiedPath}\nHEAD y\nbranch refs/heads/${occupied}\n\n` +
+      `worktree ${orphanPath}\nHEAD z\nbranch refs/heads/${orphan}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [occupied, orphan],
+    defaultBranch: "main",
+    ancestors: new Set([occupied, orphan]), // both merged → sweepable absent the gate
+    repoHead: "main",
+  });
+  // Both epics report inactive (done/absent) so pass-3 WOULD sweep both — but the
+  // occupancy gate reports fn-1-live still OCCUPIED (its closer is mid-turn).
+  const { failures } = await recoverWorktrees(
+    ["/repo"],
+    async () => false, // pass-2 done-probe: neither base needs merging
+    run,
+    undefined,
+    async () => false, // epicPresentAndNotDone: both inactive → not preserved here
+    () => false, // hasActiveResolver: none
+    undefined, // onResyncSkipped
+    (epicId) => epicId === "fn-1-live", // epicHasOccupyingJob: only the live one
+  );
+  expect(failures).toEqual([]);
+  // The OCCUPIED lane is PRESERVED — neither its worktree removed nor branch deleted.
+  expect(calls.some((c) => c.args === `worktree remove ${occupiedPath}`)).toBe(
+    false,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${occupied}`)).toBe(false);
+  // The genuinely ORPHANED lane is still SWEPT — worktree removed, then branch -D.
+  expect(calls.some((c) => c.args === `worktree remove ${orphanPath}`)).toBe(
+    true,
+  );
+  expect(calls.some((c) => c.args === `branch -D ${orphan}`)).toBe(true);
+  // Never `--contains` (force-deletes siblings).
   expect(calls.some((c) => c.args.includes("--contains"))).toBe(false);
 });
 

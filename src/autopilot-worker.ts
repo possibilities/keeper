@@ -134,6 +134,7 @@ import {
   dispatchKey,
   type EpicRecoverVerdict,
   epicHasActiveResolver,
+  epicHasOccupyingJob,
   FINALIZER_GUARD_S,
   isFinalizerVerb,
   isStoppedJobLive,
@@ -286,6 +287,7 @@ export {
   computeSlotOccupancy,
   dispatchKey,
   epicHasActiveResolver,
+  epicHasOccupyingJob,
   FINALIZER_GUARD_S,
   isBareShellCommand,
   isEpicInFlight,
@@ -1025,7 +1027,11 @@ export interface WorktreeDriver {
    *  3. ORPHAN-LANE PRUNE: tear down each `keeper/epic/<id>` lane (base AND rib)
    *     whose epic `epicPresentAndNotDone` reports inactive (ABSENT or done),
    *     gated by a SECONDARY is-ancestor-of-default safety. A live epic's lanes
-   *     are PRESERVED (an omitted probe defaults to preserve — fail-safe).
+   *     are PRESERVED (an omitted probe defaults to preserve — fail-safe). ALSO
+   *     PRESERVED: a lane whose epic has an OCCUPYING close or work job
+   *     (`epicHasOccupyingJob`) — a done epic's closer is still mid-turn INSIDE the
+   *     lane, so tearing it down would delete its cwd (ADR 0031). A plain skip (a
+   *     live occupant self-resolves when its pane dies), never a failure row.
    *
    * Returns a {@link WorktreeRecoveryOutcome} — transient `failures` (auto-clear
    * scope), terminal `escalations` (the bare `close::<epic>` merge-escalation scope),
@@ -1041,6 +1047,7 @@ export interface WorktreeDriver {
     isEpicDone: (epicId: string) => Promise<boolean | EpicRecoverVerdict>,
     epicPresentAndNotDone: (epicId: string) => Promise<boolean>,
     hasActiveResolver: (epicId: string) => boolean,
+    epicHasOccupyingJob: (epicId: string) => boolean,
   ): Promise<WorktreeRecoveryOutcome>;
 }
 
@@ -4561,7 +4568,13 @@ export function createWorktreeDriver(
         };
       }
     },
-    recover(repos, isEpicDone, epicPresentAndNotDone, hasActiveResolver) {
+    recover(
+      repos,
+      isEpicDone,
+      epicPresentAndNotDone,
+      hasActiveResolver,
+      epicHasOccupyingJob,
+    ) {
       return recoverWorktrees(
         repos,
         isEpicDone,
@@ -4570,6 +4583,7 @@ export function createWorktreeDriver(
         epicPresentAndNotDone,
         hasActiveResolver,
         onResyncSkipped,
+        epicHasOccupyingJob,
       );
     },
   };
@@ -5703,6 +5717,13 @@ export async function recoverWorktrees(
   // pass-2's base→default merge advanced the ref but the shared checkout's resync was
   // skipped/aborted, so it trails the default tip. Omitted (direct-call tests) → a no-op.
   onResyncSkipped?: (repoDir: string) => void,
+  // Per-epic occupancy gate: true while a `close::<epic>` OR `work::<task>` job still
+  // OCCUPIES the epic's slot (`epicHasOccupyingJob` off the SAME snapshot the cycle
+  // reconciled). Pass-3's orphan-lane teardown SKIPS such a lane — a done epic's
+  // closer is still mid-turn INSIDE it, so removing its cwd would zombie the session
+  // (ADR 0031). Defaults to "never occupying" so every existing caller (and the OFF
+  // path) is byte-identical. A pure projection read (jobs + read-time liveness).
+  epicHasOccupyingJob: (epicId: string) => boolean = () => false,
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -6087,7 +6108,10 @@ export async function recoverWorktrees(
     // --- Pass 3: prune orphan lanes (`keeper/epic/<id>` bases AND ribs) whose
     // epic is no longer active. --- TRI-STATE on epic activity: a lane is
     // PRESERVED while its epic is PRESENT-in-projection AND NOT done, and SWEPT
-    // only once its epic is ABSENT (reaped / EpicDeleted) OR done. A lane is BORN
+    // only once its epic is ABSENT (reaped / EpicDeleted) OR done — AND its epic
+    // has no OCCUPYING close/work job (`epicHasOccupyingJob`, ADR 0031: a done
+    // epic's closer mid-turn INSIDE the lane must never have its cwd deleted). A
+    // lane is BORN
     // at the default tip (provision forks off it) and is-ancestor is REFLEXIVE, so
     // an OPEN epic's base — and a clean freshly-provisioned rib before its first
     // commit — IS an ancestor of default; an ancestry-ONLY sweep destroyed it
@@ -6127,6 +6151,17 @@ export async function recoverWorktrees(
       try {
         if (await epicPresentAndNotDone(lane.epicId)) {
           continue; // epic still active — preserve its lane (finalize reclaims it)
+        }
+        // ADR 0031: an OCCUPYING close/work job holds this lane — a done epic's
+        // closer is still mid-turn INSIDE it (or a work session is), so tearing the
+        // worktree down would delete its cwd (posix_spawn ENOENT → a `working`
+        // zombie). Defer teardown: a live occupant is SELF-RESOLVING (its pane dies,
+        // normally via autoclose's reap), so this is a plain `continue`, never a
+        // failure row — the same shared occupancy seam the finalize collection gates
+        // on, so reconciler and board never drift. A genuinely orphaned base
+        // (absent/done epic, no live job) is unaffected and still swept below.
+        if (epicHasOccupyingJob(lane.epicId)) {
+          continue;
         }
         if (!(await gitIsAncestorOf(repo, lane.branch, defaultBranch, run))) {
           continue; // unmerged lane — leave it for a human, never force-delete
@@ -7944,6 +7979,9 @@ function main(): void {
               snapshot.worktreeRepoByEpicId,
               snapshot.worktreeKnownRoots ?? [],
             );
+            // The SAME snapshot the cycle reconciled, indexed by epic id so the
+            // pass-3 occupancy gate can enumerate an epic's tasks for the work-arm.
+            const epicById = new Map(snapshot.epics.map((e) => [e.epic_id, e]));
             const {
               failures,
               escalations,
@@ -7967,6 +8005,17 @@ function main(): void {
                   epicId,
                   snapshot.livePaneIds,
                 ),
+              // Per-epic occupancy gate (ADR 0031): pass-3 preserves a lane whose
+              // epic has an OCCUPYING close/work job so a done epic's mid-turn closer
+              // never has its cwd torn down. An absent epic (no snapshot row) has no
+              // live job → not occupying → its genuinely-orphaned base is still swept.
+              (epicId) => {
+                const epic = epicById.get(epicId);
+                return (
+                  epic !== undefined &&
+                  epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)
+                );
+              },
             );
             for (const f of failures) {
               deps.emitDispatchFailed({
