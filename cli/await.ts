@@ -14,11 +14,12 @@
  * (verdict-change progress) go to stderr only.
  *
  * Exit codes:
- *   0  met
+ *   0  met (or, under --probe, the condition holds now)
  *   1  not-found / usage / connection fatal / unreachable
  *   3  timeout (SIGTERM or our own --timeout deadline)
  *   4  deleted (was on board, vanished, re-query miss)
  *   5  stuck under --fail-on-stuck (default: keep waiting)
+ *   9  --probe only: evaluated cleanly, condition does not hold
  *
  * `reason=unreachable` (exit 1) is distinct from `reason=connect`: connect
  * is a terminal query-shape error keeperd rejected; unreachable is the
@@ -28,7 +29,19 @@
  * `--connect-timeout <dur>` to arm the bounded path for a non-interactive /
  * CI caller that wants a give-up deadline. `server-up` is permanently
  * give-up-exempt (reconnect-forever, and `--connect-timeout` is rejected
- * with it at parse time).
+ * with it at parse time) EXCEPT under `--probe`, which implies its own
+ * bounded connect deadline (a probe that hangs on a down daemon defeats
+ * its "evaluate once and exit" purpose) — see `--probe` below.
+ *
+ * `--probe` evaluates the armed condition(s) exactly ONCE, against the
+ * first painted snapshot, then exits: 0 when it holds, 9 when it evaluates
+ * cleanly and does not (never 124 — that's `timeout(1)`'s GNU collision
+ * code). Edge-triggered conditions (`changed` / `epic-added` /
+ * `epic-removed`) have no instantaneous truth value and are a usage error
+ * (exit 2) under `--probe`. `--probe` implies a bounded connect deadline
+ * (default when `--connect-timeout` is unset); an unreachable daemon still
+ * reports the existing `reason=unreachable` exit 1 within that deadline,
+ * distinct from a clean does-not-hold.
  *
  * Authority for both "on board" and "verdict" is `subscribeReadiness`
  * (board-scoped). Tasks live embedded inside epics; the scope-exempt
@@ -160,18 +173,24 @@ Flags:
   --heartbeat <dur|off>  Stderr progress line naming the wait's holders on a
                          cadence (default 60s; 'off' silences it)
   --require-transition   A condition true at arm time waits for a real edge
+  --probe                Evaluate once against the first snapshot and exit:
+                         0 holds, 9 evaluated-clean-does-not-hold. Implies a
+                         bounded connect deadline. Rejects edge-triggered
+                         conditions (changed/epic-added/epic-removed)
   --json                 Emit armed/terminal lines as JSON
   --sock <path>          Socket override ($KEEPER_SOCK / default)
   --help                 Show this help
 
 Exit codes:
-  0 met
+  0 met (or, under --probe, holds now)
   1 not-found / no-match / no-git-root / usage / connect / unreachable
   3 timeout    4 deleted    5 stuck (only under --fail-on-stuck)
+  9 --probe only: evaluated cleanly, condition does not hold
 
 Examples:
   keeper await complete fn-12-add-oauth.3
   keeper await git-clean and agents-idle
+  keeper await drained --probe        # one-shot check; 0 holds, 9 does not
 
 Reason glossary, reconnect/give-up semantics, and the agent workflow live in
 skills/await/SKILL.md.
@@ -192,6 +211,7 @@ literal 'and' to wait for ALL. Durations are unit-required (30s, 5m).
   keeper await needs-human                # ANY needs-human signal present (umbrella)
   keeper await stuck-dispatch since:S     # re-arm anti-spin: fire only on a NEW signal
   keeper await <cond> --timeout 5m --json # own deadline + JSON envelope lines
+  keeper await drained --probe            # one-shot: "would this fire now?" 0 holds, 9 does not
 
 drained --scope axis (default plan): plan waits on open KEEPER-DISPATCHED work only —
 autopilot + escalation (unblock/deconflict/resolve/repair) sessions, YOUR own session and
@@ -215,10 +235,24 @@ capture it to re-arm. Arming a per-signal token AND the umbrella wakes twice for
 event (an intended choice). since: is the preferred re-arm idiom over --require-transition
 (which applies per-slot as always: a condition true at arm time waits for the next edge).
 
-Exit codes: 0 met · 1 not-found/usage/connect/unreachable · 3 timeout · 4 target
-deleted · 5 stuck (only under --fail-on-stuck). Footguns: server-up can't be ANDed
-or take --connect-timeout (no id); epic-added/epic-removed/changed are edge-triggered
-(never fire on first paint); 'complete' is done+idle, 'landed' is the later merge.
+--probe answers "would this fire now, and why not" without blocking: evaluates every
+segment once against the first painted snapshot, prints one envelope naming each slot's
+state (plus drained-family holders), and exits — 0 when every slot holds, 9 when it
+evaluated cleanly and does not (documented registry code, never 124 — that's
+timeout(1)'s GNU collision). Implies its own bounded connect deadline (default when
+--connect-timeout is unset) — a down daemon still reports reason=unreachable exit 1
+within that deadline, distinct from a clean does-not-hold. Edge-triggered conditions
+(changed/epic-added/epic-removed) have no instantaneous truth value and are a usage
+error under --probe. A stuck plan/drained verdict under --probe --fail-on-stuck still
+surfaces as its own exit 5, not folded into the generic does-not-hold.
+
+Exit codes: 0 met (or --probe holds) · 1 not-found/usage/connect/unreachable · 3 timeout
+· 4 target deleted · 5 stuck (only under --fail-on-stuck) · 9 --probe only: evaluated
+cleanly, does not hold. Footguns: server-up can't be ANDed or take an explicit
+--connect-timeout (no id) — under bare --probe it still gets a bounded deadline (the
+probe default), only the explicit flag combo is rejected; epic-added/epic-removed/changed
+are edge-triggered (never fire on first paint, and are a usage error under --probe);
+'complete' is done+idle, 'landed' is the later merge.
 `;
 
 // ---------------------------------------------------------------------------
@@ -342,6 +376,17 @@ export interface ParsedArgs {
    * touches the byte-stable stdout terminal contract.
    */
   heartbeatMs: number | null;
+  /**
+   * One-shot mode (task 3): evaluate every segment ONCE against the first
+   * painted snapshot, emit a `probe` envelope naming each slot's state (plus
+   * drained-family holders), and exit — 0 when every slot holds, the
+   * additive `EXIT_PROBE_DOES_NOT_HOLD` when it evaluates cleanly and does
+   * not. Rejected at parse time alongside an edge-triggered segment
+   * (`changed` / `epic-added` / `epic-removed`), which has no instantaneous
+   * truth value. Implies a bounded connect deadline (an explicit
+   * `--connect-timeout` still wins) — see `runAwait`'s `giveUpExtras`.
+   */
+  probe: boolean;
 }
 
 /**
@@ -452,6 +497,23 @@ const EXIT_USAGE = 2;
 
 /** Default `--heartbeat` cadence (task 2) when the flag is omitted: on, ~60s. */
 const DEFAULT_HEARTBEAT_MS = 60_000;
+
+/**
+ * `--probe`'s additive terminal code (task 3, registered in `cli/keeper.ts`'s
+ * `EXIT_CODES` and mirrored in `cli/descriptor.ts`'s await `exit_codes`):
+ * every segment evaluated cleanly against the first painted snapshot and did
+ * NOT hold. Frozen 3/4/5 stay untouched; deliberately not 124 (GNU
+ * `timeout(1)`'s "still running" collision).
+ */
+const EXIT_PROBE_DOES_NOT_HOLD = 9;
+
+/**
+ * `--probe`'s implied connect deadline (task 3) when `--connect-timeout` is
+ * NOT explicitly set — a probe that reconnects forever on a down daemon
+ * defeats its "evaluate once and exit" purpose. An explicit
+ * `--connect-timeout` always wins over this default.
+ */
+const PROBE_DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 
 interface ParseFailure {
   ok: false;
@@ -776,6 +838,27 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     };
   }
 
+  // `--probe` (task 3) evaluates the armed condition(s) exactly ONCE, against
+  // the first painted snapshot — the edge-triggered family (`changed` /
+  // `epic-added` / `epic-removed`) has no instantaneous truth value (its
+  // whole meaning is a DELTA against a captured baseline), so it's a usage
+  // error under probe rather than a silent forever-"does not hold".
+  if (values.probe === true) {
+    const edgeTriggered = segments.find(
+      (s) =>
+        s.condition === "changed" ||
+        s.condition === "epic-added" ||
+        s.condition === "epic-removed",
+    );
+    if (edgeTriggered !== undefined) {
+      return {
+        ok: false,
+        message: `condition '${edgeTriggered.condition}' has no instantaneous truth value under --probe (edge-triggered)`,
+        exitCode: EXIT_USAGE,
+      };
+    }
+  }
+
   let timeoutMs: number | null = null;
   const timeoutRaw = values.timeout;
   if (typeof timeoutRaw === "string" && timeoutRaw.length > 0) {
@@ -865,6 +948,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       json: values.json === true,
       sock,
       heartbeatMs,
+      probe: values.probe === true,
     },
   };
 }
@@ -1402,10 +1486,12 @@ export async function runAwait(
   /**
    * Terminal write — atomic check-and-set on `terminating` so the
    * SIGTERM ↔ met race can't double-emit. The flush callback runs
-   * `exit` so a piped fd actually drains.
+   * `exit` so a piped fd actually drains. `probe` (task 3) is the
+   * `--probe`-only explanation envelope — its own event kind, never
+   * conflated with the byte-stable `met`/`failed` terminal contract.
    */
   const emitTerminal = (
-    event: "met" | "failed",
+    event: "met" | "failed" | "probe",
     code: number,
     fields: Record<string, string | string[]>,
   ): void => {
@@ -2439,6 +2525,186 @@ export async function runAwait(
     }
   };
 
+  /**
+   * `--probe` (task 3) terminal envelope: one `probe` event naming every
+   * slot's condition + state (`detail` if present, else the bare `kind`),
+   * plus the flattened, size-bounded `holders` list any drained-family slot
+   * carries. `result` is `holds` (exit 0) when every slot latched `met`,
+   * else `does-not-hold` (exit {@link EXIT_PROBE_DOES_NOT_HOLD}) — the
+   * caller already resolved the more specific not-found/ambiguous/no-match/
+   * stuck codes before falling through here (see `evaluateProbe`).
+   */
+  const emitProbeResult = (evals: readonly (AwaitState | null)[]): void => {
+    const holds = slots.every((s) => s.met);
+    const states = slots.map((s, i) => {
+      const ev = evals[i];
+      const phrase = ev?.detail ?? ev?.kind ?? "waiting";
+      return `${slotLabel(s)}: ${sanitizeValue(phrase)}`;
+    });
+    const holders = evals.flatMap((e) => e?.holders ?? []);
+    const fields: Record<string, string | string[]> = {
+      result: holds ? "holds" : "does-not-hold",
+      states,
+    };
+    if (holders.length > 0) {
+      fields.holders = boundedList(
+        holders.map((h) => `${h.label} (${h.kind})`),
+      );
+    }
+    emitTerminal("probe", holds ? 0 : EXIT_PROBE_DOES_NOT_HOLD, fields);
+  };
+
+  /**
+   * `--probe` (task 3) one-shot evaluation, run in place of `evaluate()`
+   * when `args.probe` is set. Mirrors `evaluate()`'s Pass-1 SYNCHRONOUS
+   * per-slot evaluators exactly (same helper functions, same results) but
+   * drops everything that only matters to a long-lived wait: no deferred
+   * scope-exempt re-query (structurally unreachable on a first pass —
+   * `deleted` requires `priorPresence`, which starts false, see
+   * `absentBranch`), no reconnect-blip bookkeeping, no dwell/heartbeat
+   * timers, no `armed` line. It reads exactly the FIRST painted snapshot
+   * once and answers.
+   *
+   * Definitive refusals reuse the SAME codes the ordinary arm path already
+   * establishes — not-found=1, ambiguous=6, monitor no-match=1, stuck under
+   * `--fail-on-stuck`=5 — so a jam sticky surfaces distinctly rather than
+   * reading as a generic does-not-hold (task 3 risk). Only once none of
+   * those apply does it fall back to the new probe verdict.
+   */
+  const evaluateProbe = (): void => {
+    if (state.terminating || !allPainted()) {
+      return;
+    }
+
+    const evals: (AwaitState | null)[] = slots.map(() => null);
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      if (slot === undefined) {
+        continue;
+      }
+      if (slot.kind === "plan") {
+        if (latestReadiness === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const { result } = evalPlanSlotSync(slot, latestReadiness, false);
+        slot.lastEval = result;
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (slot.kind === "git-clean") {
+        if (latestGitRows === null || deps.gitRoot === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const result = gitCleanState(
+          deps.gitRoot,
+          latestGitRows,
+          latestGitSeedRequired,
+        );
+        slot.lastEval = result;
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (slot.kind === "agents-idle") {
+        if (latestJobRows === null || deps.gitRoot === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const result = agentsIdleState(
+          deps.gitRoot,
+          deps.ownSessionId,
+          latestJobRows,
+        );
+        slot.lastEval = result;
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (slot.kind === "monitor-running") {
+        if (latestJobRows === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const result = monitorRunningState(
+          deps.ownSessionId,
+          slot.selector,
+          latestJobRows,
+        );
+        slot.lastEval = result;
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (slot.kind === "server-up") {
+        // Reaching here means `paintGate.serverUp` cleared — the daemon
+        // already served its first snapshot, which IS the condition.
+        const result: AwaitState = { kind: "met", detail: "serving" };
+        slot.lastEval = result;
+        slot.met = true;
+        evals[i] = result;
+      } else if (isBoardSlot(slot)) {
+        if (latestReadiness === null) {
+          evals[i] = { kind: "waiting" };
+          continue;
+        }
+        const result = evalBoardSlot(slot, latestReadiness);
+        slot.lastEval = result;
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      }
+    }
+
+    // Definitive arm-time-shaped refusals — same codes as the ordinary path.
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      const ev = evals[i];
+      if (slot?.kind === "plan" && ev?.kind === "not-found") {
+        emitPlanFailure(slot, "not-found", 1, undefined);
+        return;
+      }
+      if (slot?.kind === "plan" && ev?.kind === "ambiguous") {
+        emitPlanFailure(slot, "ambiguous", 6, ev.detail);
+        return;
+      }
+      if (slot?.kind === "monitor-running" && ev?.kind === "met") {
+        emitMonitorNoMatch(slot);
+        return;
+      }
+    }
+
+    // A jam sticky is distinct from a plain does-not-hold, mirroring the
+    // ordinary `--fail-on-stuck` short-circuit (task 3 risk note).
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      const ev = evals[i];
+      if (slot?.kind === "plan" && ev?.kind === "stuck" && args.failOnStuck) {
+        emitPlanFailure(slot, "stuck", 5, ev.detail);
+        return;
+      }
+    }
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      const ev = evals[i];
+      if (
+        slot === undefined ||
+        ev === undefined ||
+        ev === null ||
+        // Mirrors `evaluate()`'s board-stuck check: only `drained` actually
+        // produces a `stuck` verdict (`drainedState`'s jam predicate) — the
+        // other board kinds (`landed`, needs-human) never reach it, so the
+        // set stays hand-enumerated rather than the broader `isBoardSlot`.
+        slot.kind !== "drained"
+      ) {
+        continue;
+      }
+      if (ev.kind === "stuck" && args.failOnStuck) {
+        emitBoardFailure(slot, "stuck", 5, ev.detail);
+        return;
+      }
+    }
+
+    emitProbeResult(evals);
+  };
+
+  // Which re-evaluation pass a fresh snapshot drives: the ordinary
+  // long-lived `evaluate()`, or `--probe`'s one-shot `evaluateProbe()`.
+  const evaluateActive = args.probe ? evaluateProbe : evaluate;
+
   // ---- stream callbacks ----------------------------------------------
 
   const onReadinessSnapshot = (snap: ReadinessClientSnapshot): void => {
@@ -2462,13 +2728,13 @@ export async function runAwait(
         typeof r.reason === "string" ? r.reason : "",
       );
     }
-    void evaluate();
+    void evaluateActive();
   };
 
   const onGitRows = (rows: Record<string, unknown>[]): void => {
     latestGitRows = rows as unknown as GitStatus[];
     paintGate.git = true;
-    void evaluate();
+    void evaluateActive();
   };
 
   // fn-897 B1: latch `git_seed_required` off the boot-status header (carried on
@@ -2488,16 +2754,16 @@ export async function runAwait(
   const onJobRows = (rows: Record<string, unknown>[]): void => {
     latestJobRows = rows as unknown as Job[];
     paintGate.jobs = true;
-    void evaluate();
+    void evaluateActive();
   };
 
   // `server-up` (fn-750.2): first-paint IS the signal. We deliberately read
   // NO rows off the snapshot — the daemon serving its first composed
   // readiness frame is the whole condition. Flip the paint flag and let
-  // `evaluate()` latch the slot `met`.
+  // `evaluate()`/`evaluateProbe()` latch the slot `met`.
   const onServerUpSnapshot = (_snap: ReadinessClientSnapshot): void => {
     paintGate.serverUp = true;
-    void evaluate();
+    void evaluateActive();
   };
 
   const onLifecycle =
@@ -2637,20 +2903,31 @@ export async function runAwait(
   }
 
   // The give-up policy + injected clock the give-up-eligible streams carry
-  // (fn-757). Built ONLY when `--connect-timeout` is set and > 0 (mirrors the
-  // `--timeout > 0` arming guard below); `0`/absent = no deadline =
-  // reconnect-forever, the default. When unset we spread NOTHING, so the
-  // streams default to reconnect-forever exactly like `server-up`. `now` is a
-  // test-only clock that rides INSIDE the policy object so it stays paired
-  // with `giveUpPolicy` — never forwarded when the flag is unset (otherwise a
-  // stranded `now` could drive the driver's give-up anchor with no policy).
+  // (fn-757). Built ONLY when a deadline is in effect; `null` = no deadline =
+  // reconnect-forever, the default. `now` is a test-only clock that rides
+  // INSIDE the policy object so it stays paired with `giveUpPolicy` — never
+  // forwarded when the flag is unset (otherwise a stranded `now` could drive
+  // the driver's give-up anchor with no policy).
+  //
+  // `--probe` (task 3) implies its OWN bounded connect deadline: an explicit
+  // `--connect-timeout` always wins (honored verbatim, exactly as before);
+  // bare `--probe` falls back to `PROBE_DEFAULT_CONNECT_TIMEOUT_MS` — a probe
+  // that reconnects forever on a down daemon defeats its "evaluate once and
+  // exit" purpose. Every non-probe invocation keeps the fn-757 default
+  // (reconnect forever, no deadline) exactly as before.
+  const effectiveConnectTimeoutMs: number | null =
+    args.connectTimeoutMs !== null && args.connectTimeoutMs > 0
+      ? args.connectTimeoutMs
+      : args.probe
+        ? PROBE_DEFAULT_CONNECT_TIMEOUT_MS
+        : null;
   const giveUpExtras: {
     giveUpPolicy: GiveUpPolicy;
     now?: () => number;
   } | null =
-    args.connectTimeoutMs !== null && args.connectTimeoutMs > 0
+    effectiveConnectTimeoutMs !== null
       ? {
-          giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
+          giveUpPolicy: { deadlineMs: effectiveConnectTimeoutMs },
           ...(deps.now === undefined ? {} : { now: deps.now }),
         }
       : null;
@@ -2708,12 +2985,20 @@ export async function runAwait(
   }
   // `server-up` (fn-750.2): its OWN minimal readiness subscribe that is
   // PERMANENTLY give-up-exempt (reconnect-forever — the slow-cold-boot escape
-  // hatch; `--connect-timeout` is rejected with it at parse time). We don't
-  // read any rows off the snapshot; the first `onSnapshot` IS the signal
-  // ("the daemon is serving"), so `onServerUpSnapshot` flips the paint flag
-  // and `evaluate()` latches `met` on first paint. NEVER any give-up extras
-  // and NO plan re-query machinery. (fn-757: the give-up-eligible streams
-  // above are ALSO exempt unless `--connect-timeout` arms `giveUpExtras`.)
+  // hatch; an explicit `--connect-timeout` is rejected with it at parse
+  // time). We don't read any rows off the snapshot; the first `onSnapshot`
+  // IS the signal ("the daemon is serving"), so `onServerUpSnapshot` flips
+  // the paint flag and `evaluate()`/`evaluateProbe()` latches `met` on first
+  // paint. NO give-up extras for the ordinary WAIT form, and NO plan
+  // re-query machinery. (fn-757: the give-up-eligible streams above are ALSO
+  // exempt unless `--connect-timeout` arms `giveUpExtras`.)
+  //
+  // `--probe server-up` (task 3) is the one exception: it's an ORDINARY
+  // bounded reachability check, not the reconnect-forever WAIT form — it
+  // carries `giveUpExtras` (the probe default, since the parse-time
+  // exclusivity check above only rejects an EXPLICIT `--connect-timeout`
+  // alongside `server-up`) so an unreachable daemon still reports
+  // `reason=unreachable` within a bounded deadline instead of hanging.
   if (openServerUp) {
     readinessHandle = subscribeReadiness({
       sockPath: args.sock,
@@ -2721,6 +3006,7 @@ export async function runAwait(
       onSnapshot: onServerUpSnapshot,
       onLifecycle: onLifecycle("serverUp"),
       onFatal,
+      ...(args.probe ? (giveUpExtras ?? {}) : {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
   }

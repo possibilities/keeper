@@ -730,6 +730,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       "3": "own-deadline timeout",
       "4": "watched target was deleted",
       "5": "stuck verdict (only under --fail-on-stuck)",
+      "9": "--probe: evaluated cleanly, condition does not hold",
     },
     flags: [
       FLAG_HELP,
@@ -770,6 +771,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         type: "boolean",
         summary:
           "Require an observed transition, not an already-true condition",
+      },
+      {
+        name: "probe",
+        type: "boolean",
+        summary:
+          "Evaluate once and exit (0 holds, 9 does not); rejects edge-triggered conditions",
       },
       { name: "json", type: "boolean", summary: "Emit the JSON envelope" },
       FLAG_SOCK,

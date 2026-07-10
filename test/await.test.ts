@@ -64,6 +64,13 @@ test("HELP documents --heartbeat (task 2)", () => {
   expect(AWAIT_HELP).toContain("--heartbeat");
 });
 
+test("HELP and agent-help document --probe and its exit code (task 3)", () => {
+  expect(AWAIT_HELP).toContain("--probe");
+  expect(AWAIT_HELP).toContain("9 --probe only");
+  expect(AWAIT_AGENT_HELP).toContain("--probe");
+  expect(AWAIT_AGENT_HELP).toContain("9 --probe only");
+});
+
 test("descriptor: --no-armed-line summary matches its actual behavior (the initial line only)", () => {
   const descriptor = nativeDescriptor("await");
   const flag = descriptor?.flags.find((f) => f.name === "no-armed-line");
@@ -77,6 +84,26 @@ test("descriptor: --heartbeat is declared (task 2)", () => {
   const flag = descriptor?.flags.find((f) => f.name === "heartbeat");
   expect(flag).toBeDefined();
   expect(flag?.type).toBe("string");
+});
+
+test("descriptor: --probe is declared (task 3)", () => {
+  const descriptor = nativeDescriptor("await");
+  const flag = descriptor?.flags.find((f) => f.name === "probe");
+  expect(flag).toBeDefined();
+  expect(flag?.type).toBe("boolean");
+});
+
+test("exit-code registry lockstep: await's descriptor mirror agrees with the central EXIT_CODES table (task 3, incl. the new 9)", async () => {
+  const { EXIT_CODES } = await import("../cli/keeper");
+  const descriptor = nativeDescriptor("await");
+  const mirror = descriptor?.exit_codes ?? {};
+  expect(Object.keys(mirror).length).toBeGreaterThan(0);
+  for (const code of Object.keys(mirror)) {
+    expect(EXIT_CODES[code]).toBeDefined();
+  }
+  // The additive probe code specifically — never silently drift apart.
+  expect(mirror["9"]).toBeDefined();
+  expect(EXIT_CODES["9"]).toBeDefined();
 });
 
 test("--agent-help routes to the runbook signal before any I/O", () => {
@@ -539,6 +566,7 @@ function singleArgs(
     // isn't clobbered by an unrelated heartbeat timer registration; heartbeat
     // tests opt in explicitly via `overrides.heartbeatMs`.
     heartbeatMs: null,
+    probe: false,
     ...overrides,
     scope: overrides.scope ?? "plan",
   };
@@ -562,6 +590,7 @@ function argsFor(
     // isn't clobbered by an unrelated heartbeat timer registration; heartbeat
     // tests opt in explicitly via `overrides.heartbeatMs`.
     heartbeatMs: null,
+    probe: false,
     ...overrides,
     scope: overrides.scope ?? "plan",
   };
@@ -787,6 +816,56 @@ test("parseAwaitArgs: bad --heartbeat duration → usage error", () => {
   if (!r.ok) {
     expect(r.exitCode).toBe(2);
     expect(r.message).toContain("--heartbeat");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// parseAwaitArgs — task 3 --probe
+// ---------------------------------------------------------------------------
+
+test("parseAwaitArgs: --probe omitted defaults to false", () => {
+  const r = parseAwaitArgs(["drained"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.probe).toBe(false);
+});
+
+test("parseAwaitArgs: --probe wires through", () => {
+  const r = parseAwaitArgs(["drained", "--probe"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.probe).toBe(true);
+});
+
+test("parseAwaitArgs: --probe + an edge-triggered condition → usage error", () => {
+  for (const argv of [
+    ["changed", "--probe"],
+    ["epic-added", "--probe"],
+    ["epic-removed", "fn-1-foo", "--probe"],
+  ]) {
+    const r = parseAwaitArgs(argv);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.exitCode).toBe(2);
+      expect(r.message).toContain("--probe");
+      expect(r.message).toContain("edge-triggered");
+    }
+  }
+});
+
+test("parseAwaitArgs: --probe + a level-triggered board condition is fine", () => {
+  for (const argv of [
+    ["drained", "--probe"],
+    ["landed", "fn-1-foo", "--probe"],
+    ["needs-human", "--probe"],
+  ]) {
+    const r = parseAwaitArgs(argv);
+    if (!r.ok) {
+      throw new Error(`expected ok for ${argv.join(" ")}, got ${r.message}`);
+    }
+    expect(r.args.probe).toBe(true);
   }
 });
 
@@ -3661,5 +3740,292 @@ test("await changed: an epic status move fires met (exit 0)", async () => {
       3,
     ),
   ]);
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// --probe (task 3): one-shot evaluate-and-exit. No armed line, no heartbeat —
+// a single `probe` envelope naming per-slot state (+ drained-family holders),
+// then exit: 0 holds, 9 evaluated-clean-does-not-hold. Existing definitive
+// codes (not-found=1, ambiguous=6, deleted=4 [unreachable on a first pass],
+// stuck under --fail-on-stuck=5) still take priority over the generic 9.
+// ---------------------------------------------------------------------------
+
+test("--probe: condition holds now → exit 0, one probe envelope, no armed line", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { probe: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Empty board, no jobs, no pending dispatches → drained holds immediately.
+  deliverFiveEmpty(sock, idPrefix);
+
+  expect(h.exitCode).toBe(0);
+  expect(h.stdout.some((l) => l.includes("[keeper-await] armed"))).toBe(false);
+  const probeLines = h.stdout.filter((l) => l.includes("[keeper-await]"));
+  expect(probeLines).toHaveLength(1);
+  expect(probeLines[0]).toContain("probe");
+  expect(probeLines[0]).toContain("result=holds");
+});
+
+test("--probe: condition does not hold → the new additive exit 9, envelope names the holder", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { probe: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // A keeper-dispatched worker holds plan-scope drained.
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+
+  expect(h.exitCode).toBe(9);
+  const probeLine = h.stdout.find((l) => l.includes("[keeper-await] probe"));
+  expect(probeLine).toBeDefined();
+  expect(probeLine).toContain("result=does-not-hold");
+  expect(probeLine).toContain("holders=");
+  expect(probeLine).toContain("w-1");
+});
+
+test("--probe: unreachable daemon terminates within the bounded default deadline, exit 1", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  // No --connect-timeout: --probe implies its own default bounded deadline
+  // (PROBE_DEFAULT_CONNECT_TIMEOUT_MS = 5s) rather than reconnecting forever.
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { probe: true }),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Still connecting/unpainted, before the deadline → no terminal.
+  expect(h.exitCode).toBeNull();
+
+  clock = 6_000;
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=unreachable");
+  expect(h.exitCode).toBe(1);
+});
+
+test("--probe: an explicit --connect-timeout still wins over the probe default", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], {
+      probe: true,
+      connectTimeoutMs: 30_000,
+    }),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Past the probe default (5s) but well under the explicit 30s → no terminal.
+  clock = 6_000;
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+  expect(h.exitCode).toBeNull();
+
+  clock = 31_000;
+  const reSock = socketRef.current;
+  if (!reSock) {
+    throw new Error("reconnect socket never installed");
+  }
+  reSock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=unreachable");
+  expect(h.exitCode).toBe(1);
+});
+
+test("--probe server-up: an ordinary bounded reachability check (not reconnect-forever)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(
+    argsFor([{ condition: "server-up" }], { probe: true }),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  expect(h.exitCode).toBeNull();
+
+  clock = 6_000;
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=unreachable");
+  expect(h.exitCode).toBe(1);
+});
+
+test("--probe server-up: holds immediately once the daemon serves", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+
+  await runAndCatch(
+    argsFor([{ condition: "server-up" }], { probe: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveEmpty(sock, `await-${process.pid}`);
+
+  expect(h.exitCode).toBe(0);
+  const probeLine = h.stdout.find((l) => l.includes("[keeper-await] probe"));
+  expect(probeLine).toBeDefined();
+  expect(probeLine).toContain("result=holds");
+});
+
+test("--probe: not-found still exits 1, not the generic does-not-hold", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    singleArgs("complete", "fn-1-foo.1", "task", { probe: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveEmpty(sock, idPrefix);
+
+  expect(h.exitCode).toBe(1);
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=not-found");
+});
+
+test("--probe --fail-on-stuck: a jam sticky surfaces as its own exit 5, not a generic does-not-hold", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { probe: true, failOnStuck: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWith(sock, idPrefix, {
+    dispatchFailures: [{ reason: "worktree-finalize-non-fast-forward" }],
+  });
+
+  expect(h.exitCode).toBe(5);
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=stuck");
+});
+
+test("--probe: AND aggregate reports each slot's own state in the envelope", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }, { condition: "git-clean" }], {
+      probe: true,
+    }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Board empty (drained holds) but the git root is dirty (git-clean does not).
+  deliverFiveWith(sock, idPrefix, {
+    git: [gitRow({ dirty_count: 1, dirty_files: ["a.txt"] })],
+  });
+
+  expect(h.exitCode).toBe(9);
+  const probeLine = h.stdout.find((l) => l.includes("[keeper-await] probe"));
+  expect(probeLine).toBeDefined();
+  expect(probeLine).toContain("result=does-not-hold");
+  expect(probeLine).toContain("drained");
+  expect(probeLine).toContain("git-clean");
+});
+
+test("--probe --json: one parseable JSON envelope", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { probe: true, json: true }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveEmpty(sock, idPrefix);
+
+  expect(h.stdout).toHaveLength(1);
+  const line = h.stdout[0] as string;
+  expect(line.trimEnd().split("\n")).toHaveLength(1);
+  const parsed = JSON.parse(line) as Record<string, unknown>;
+  expect(parsed.event).toBe("probe");
+  expect(parsed.result).toBe("holds");
   expect(h.exitCode).toBe(0);
 });
