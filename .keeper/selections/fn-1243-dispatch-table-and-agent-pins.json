@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified new leaf module, but the shared launch-config return type and compile-time-total floor map ripple into every downstream consumer, making it contract-touching and warranting the xhigh band on the default sonnet workhorse.",
+      "task_id": "fn-1243-dispatch-table-and-agent-pins.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting multi-file cascade rerouting every dispatch site (daemon, autopilot, reconcile-core, handoff, cli) with a subtle byte-identical-argv correctness invariant and fn-1240 merge adjacency, a nameable intelligence-bound reason for opus.",
+      "task_id": "fn-1243-dispatch-table-and-agent-pins.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded extension of existing triple-harvest and presets-list output surfaces against a landed v2 pattern, template-following with a fully-specified acceptance.",
+      "task_id": "fn-1243-dispatch-table-and-agent-pins.3",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical symmetric parser-field addition across two islands with schema validation and a verbatim example block, bounded and named, but the lockstep parity coordination keeps it on sonnet rather than the trickle lane.",
+      "task_id": "fn-1243-dispatch-table-and-agent-pins.4",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Multi-file template conversion following the existing practice-scout/workers render pattern with byte-verbatim bodies and golden re-capture, a known-pattern feature spanning a few files.",
+      "task_id": "fn-1243-dispatch-table-and-agent-pins.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.73,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "A fully-enumerated host-blind partition drift gate plus forward-facing docs prose sweep, bounded work with a do-exactly-this acceptance and named failure cases.",
+      "task_id": "fn-1243-dispatch-table-and-agent-pins.6",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "5a17bddabc7e3f99ac738b07e00cddd2c7b7405003e0373647f2fdb6bbe07dae",
+  "created_at": "2026-07-10T19:35:02.145000Z",
+  "epic_id": "fn-1243-dispatch-table-and-agent-pins",
+  "input_hash": "69342cc295924f51972f9908637a01ed619b73ae79e3854ec6832d01cb700b77",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1765027010,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1243-dispatch-table-and-agent-pins.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Well-specified new leaf module, but the shared launch-config return type and compile-time-total floor map ripple into every downstream consumer, making it contract-touching and warranting the xhigh band on the default sonnet workhorse.\",\"confidence\":0.72},{\"task_id\":\"fn-1243-dispatch-table-and-agent-pins.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting multi-file cascade rerouting every dispatch site (daemon, autopilot, reconcile-core, handoff, cli) with a subtle byte-identical-argv correctness invariant and fn-1240 merge adjacency, a nameable intelligence-bound reason for opus.\",\"confidence\":0.74},{\"task_id\":\"fn-1243-dispatch-table-and-agent-pins.3\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded extension of existing triple-harvest and presets-list output surfaces against a landed v2 pattern, template-following with a fully-specified acceptance.\",\"confidence\":0.78},{\"task_id\":\"fn-1243-dispatch-table-and-agent-pins.4\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Mechanical symmetric parser-field addition across two islands with schema validation and a verbatim example block, bounded and named, but the lockstep parity coordination keeps it on sonnet rather than the trickle lane.\",\"confidence\":0.74},{\"task_id\":\"fn-1243-dispatch-table-and-agent-pins.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Multi-file template conversion following the existing practice-scout/workers render pattern with byte-verbatim bodies and golden re-capture, a known-pattern feature spanning a few files.\",\"confidence\":0.7},{\"task_id\":\"fn-1243-dispatch-table-and-agent-pins.6\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"A fully-enumerated host-blind partition drift gate plus forward-facing docs prose sweep, bounded work with a do-exactly-this acceptance and named failure cases.\",\"confidence\":0.73}]}\n"
+}
