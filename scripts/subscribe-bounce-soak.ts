@@ -43,6 +43,16 @@
  *   - bounce: a HEALTHY server stopped + relistened each cycle, with one
  *     long-lived reconnect-forever client (the board/TUI default). Each bounce
  *     is a peer-initiated close → reconnect → re-paint.
+ *   - steady: a HEALTHY server that never bounces, with one long-lived
+ *     reconnect-forever client sitting IDLE — the direct analogue of the
+ *     fn-1229.4 incident (a `keeper await` watching a quiet board for hours).
+ *     Quiet by default, so the adaptive idle poll interval
+ *     (`nextIdlePollDelayMs` in `src/readiness-client.ts`) grows to its cap
+ *     and stays there. `--patch-interval-ms <n>` instead keeps the server
+ *     pushing a fresh frame every `n` ms, which is real ACTIVITY that pins the
+ *     poll interval at the floor — the A/B knob used to measure the
+ *     steady-poll-cadence CPU cost in isolation (compare a quiet run against
+ *     a `--patch-interval-ms` run below the poll floor).
  *
  * RSS is sampled per cycle. The verdict is SLOPE-AWARE: a leak is LINEAR (never
  * plateaus), so PASS requires both absolute growth within `--bound-mb` AND a
@@ -50,6 +60,13 @@
  * `--no-gc` samples RAW RSS so the native-buffer accumulation shows; forcing a
  * GC every sample (the default) masks it because the leak is invisible to the
  * JS heap and so never triggers a heap-pressure collection.
+ *
+ * Alongside RSS, every mode also samples cumulative process CPU
+ * (`process.cpuUsage()`, user+system) and asserts a CPU BUDGET: the run's
+ * average CPU utilization (total CPU ms ÷ wall ms) must stay under
+ * `--cpu-budget-pct` (a generous, order-of-magnitude bound per Risks — this
+ * catches a gross regression class, e.g. a busy-loop reintroduced into the
+ * poll/backstop machinery, not a tight per-tick budget).
  *
  * BOUNDED / OPT-IN / MANUAL. Never imported by the default test tier; spawns no
  * daemon, opens no production DB, writes no events/RPC. The UDS server is a
@@ -59,12 +76,16 @@
  *   bun scripts/subscribe-bounce-soak.ts [options]
  *
  * Options:
- *   --mode <m>         churn (default) | bounce
- *   --cycles <n>       Number of cycles (default: churn 2000, bounce 200)
+ *   --mode <m>         churn (default) | bounce | steady
+ *   --cycles <n>       Number of cycles (default: churn 2000, bounce 200, steady 40)
  *   --down-ms <n>      Server-DOWN window per bounce cycle (default: 15)
- *   --up-ms <n>        UP / per-cycle window in ms (default: 35)
- *   --sample-every <n> Sample RSS every N cycles (default: churn 200, bounce 10)
+ *   --up-ms <n>        UP / per-cycle window in ms (default: churn+bounce 35, steady 1000)
+ *   --sample-every <n> Sample RSS every N cycles (default: churn 200, bounce 10, steady 5)
  *   --bound-mb <n>     PASS threshold: max RSS growth start→end (default: 50)
+ *   --cpu-budget-pct <n>  PASS threshold: average CPU utilization, percent of one
+ *                      core (default: churn 150, bounce 60, steady 20)
+ *   --patch-interval-ms <n>  steady mode only: push a server patch every n ms
+ *                      instead of staying quiet (default: 0 = quiet)
  *   --heap-snapshot    Write a heap snapshot at the high-water mark
  *   --no-gc            Sample RAW RSS (no forced GC) — exposes the leak (pre-fix)
  *   --json             Emit the report as JSON
@@ -72,7 +93,8 @@
  *   --help, -h         Show this help
  *
  * Exit code: 0 when RSS is flat (growth within `--bound-mb` AND slope below the
- * leak threshold), 1 when it leaks — so it doubles as a manual go/no-go gate.
+ * leak threshold) AND CPU stays within `--cpu-budget-pct`; 1 otherwise — so it
+ * doubles as a manual go/no-go gate.
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -87,24 +109,34 @@ import {
 } from "../src/protocol";
 import { type FatalError, subscribeCollection } from "../src/readiness-client";
 
-const HELP = `subscribe-bounce-soak — fn-750.3 reconnect-leak repro + evidence gate
+const HELP = `subscribe-bounce-soak — reconnect-leak + steady-poll-cadence evidence gate
 
 Usage:
   bun scripts/subscribe-bounce-soak.ts [options]
 
 Options:
-  --mode <m>         churn (default) | bounce
+  --mode <m>         churn (default) | bounce | steady
                        churn  — FAITHFUL leak repro: half-up server (accepts,
                                 never replies); client gives up + disposes each
                                 cycle → client-initiated destroy of an OPEN
                                 socket against a non-responsive peer.
                        bounce — healthy server stopped/relistened each cycle;
                                 one reconnect-forever client (board/TUI default).
-  --cycles <n>       Number of cycles (default: churn 2000, bounce 200)
+                       steady — healthy server, never bounces; one long-lived
+                                reconnect-forever client sitting IDLE (the
+                                quiet-board long-lived-await scenario). Quiet
+                                by default; --patch-interval-ms keeps the
+                                interval pinned at the floor instead, for A/B
+                                comparison.
+  --cycles <n>       Number of cycles (default: churn 2000, bounce 200, steady 40)
   --down-ms <n>      Server-DOWN window per bounce cycle (default: 15)
-  --up-ms <n>        UP / per-cycle window in ms (default: 35)
-  --sample-every <n> Sample RSS every N cycles (default: churn 200, bounce 10)
+  --up-ms <n>        UP / per-cycle window in ms (default: churn+bounce 35, steady 1000)
+  --sample-every <n> Sample RSS every N cycles (default: churn 200, bounce 10, steady 5)
   --bound-mb <n>     PASS threshold: max RSS growth start→end MB (default: 50)
+  --cpu-budget-pct <n>  PASS threshold: average CPU utilization, percent of one
+                     core (default: churn 150, bounce 60, steady 20)
+  --patch-interval-ms <n>  steady mode only: push a server patch every n ms
+                     instead of staying quiet (default: 0 = quiet)
   --heap-snapshot    Write a heap snapshot at the high-water mark
   --no-gc            Sample RAW RSS (no forced GC) — exposes the native-buffer
                      leak (pre-fix); use with --mode churn for the repro
@@ -113,18 +145,22 @@ Options:
   --help, -h         Show this help
 
 Drives a real subscribe client against a real Bun.listen UDS server, sampling
-RSS per cycle. Exits 0 when RSS stays flat within --bound-mb, 1 when it grows
-past the bound. Standalone — no daemon, no production DB.
+RSS + CPU per cycle. Exits 0 when RSS stays flat within --bound-mb AND average
+CPU stays within --cpu-budget-pct, 1 otherwise. Standalone — no daemon, no
+production DB.
 
 Repro the leak (run on the PRE-FIX checkout):
   bun scripts/subscribe-bounce-soak.ts --mode churn --no-gc --cycles 4000
 Validate the fix (current checkout):
   bun scripts/subscribe-bounce-soak.ts --mode churn --no-gc --cycles 4000
+Measure the steady-poll-cadence CPU cost (quiet vs. pinned-floor A/B):
+  bun scripts/subscribe-bounce-soak.ts --mode steady --cycles 60 --up-ms 1000
+  bun scripts/subscribe-bounce-soak.ts --mode steady --cycles 60 --up-ms 1000 --patch-interval-ms 400
 `;
 
 // ── CLI parsing (models scripts/git-worker-cpu-soak.ts) ──────────────────────
 
-type Mode = "bounce" | "churn";
+type Mode = "bounce" | "churn" | "steady";
 
 interface Args {
   mode: Mode;
@@ -133,6 +169,8 @@ interface Args {
   upMs: number;
   sampleEvery: number;
   boundMb: number;
+  cpuBudgetPct: number;
+  patchIntervalMs: number;
   heapSnapshot: boolean;
   noGc: boolean;
   json: boolean;
@@ -149,6 +187,8 @@ function parse(argv: string[]): Args | "help" {
       "up-ms": { type: "string" },
       "sample-every": { type: "string" },
       "bound-mb": { type: "string" },
+      "cpu-budget-pct": { type: "string" },
+      "patch-interval-ms": { type: "string" },
       "heap-snapshot": { type: "boolean", default: false },
       "no-gc": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -173,26 +213,59 @@ function parse(argv: string[]): Args | "help" {
     return n;
   };
 
+  // Like `numOr` but allows 0 — `--patch-interval-ms 0` is the explicit
+  // "stay quiet" default, a meaningful value rather than an omission.
+  const numOrNonNegative = (
+    raw: string | undefined,
+    dflt: number,
+    label: string,
+  ): number => {
+    if (raw === undefined) return dflt;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new Error(`--${label} must be a non-negative number`);
+    }
+    return n;
+  };
+
   const mode = values.mode ?? "churn";
-  if (mode !== "bounce" && mode !== "churn") {
-    throw new Error(`--mode must be "bounce" or "churn" (got "${mode}")`);
+  if (mode !== "bounce" && mode !== "churn" && mode !== "steady") {
+    throw new Error(
+      `--mode must be "bounce", "churn", or "steady" (got "${mode}")`,
+    );
   }
+
+  const cpuBudgetDefault = mode === "churn" ? 150 : mode === "bounce" ? 60 : 20;
 
   return {
     mode,
     cycles: Math.floor(
-      numOr(values.cycles, mode === "churn" ? 2000 : 200, "cycles"),
+      numOr(
+        values.cycles,
+        mode === "churn" ? 2000 : mode === "bounce" ? 200 : 40,
+        "cycles",
+      ),
     ),
     downMs: numOr(values["down-ms"], 15, "down-ms"),
-    upMs: numOr(values["up-ms"], 35, "up-ms"),
+    upMs: numOr(values["up-ms"], mode === "steady" ? 1000 : 35, "up-ms"),
     sampleEvery: Math.floor(
       numOr(
         values["sample-every"],
-        mode === "churn" ? 200 : 10,
+        mode === "churn" ? 200 : mode === "bounce" ? 10 : 5,
         "sample-every",
       ),
     ),
     boundMb: numOr(values["bound-mb"], 50, "bound-mb"),
+    cpuBudgetPct: numOr(
+      values["cpu-budget-pct"],
+      cpuBudgetDefault,
+      "cpu-budget-pct",
+    ),
+    patchIntervalMs: numOrNonNegative(
+      values["patch-interval-ms"],
+      0,
+      "patch-interval-ms",
+    ),
     heapSnapshot: values["heap-snapshot"] ?? false,
     noGc: values["no-gc"] ?? false,
     json: values.json ?? false,
@@ -245,13 +318,23 @@ type Listener = ReturnType<typeof Bun.listen<ConnData>>;
  * (give-up / dispose). Combined with the client-churn loop, this is the
  * faithful, fast repro of the leak: a client-initiated destroy of an OPEN
  * socket against a peer that never sends its FIN.
+ *
+ * `onOpen`, when given, is handed the raw socket as each connection opens —
+ * STEADY mode's optional `--patch-interval-ms` A/B knob uses it to hold a
+ * reference it can push server-initiated `patch` frames on later, independent
+ * of the request/reply loop below.
  */
-function startServer(sockPath: string, halfUp: boolean): Listener {
+function startServer(
+  sockPath: string,
+  halfUp: boolean,
+  onOpen?: (socket: Bun.Socket<ConnData>) => void,
+): Listener {
   return Bun.listen<ConnData>({
     unix: sockPath,
     socket: {
       open(socket) {
         socket.data = { buffer: new LineBuffer() };
+        onOpen?.(socket);
       },
       data(socket, chunk) {
         let lines: string[];
@@ -287,12 +370,17 @@ function startServer(sockPath: string, halfUp: boolean): Listener {
   });
 }
 
-// ── RSS sampling ─────────────────────────────────────────────────────────────
+// ── RSS + CPU sampling ───────────────────────────────────────────────────────
 
 interface Sample {
   cycle: number;
   rssMb: number;
   heapMb: number;
+  // Cumulative process CPU (user+system) since process start, ms.
+  // `process.cpuUsage()` with no argument returns this directly — a delta
+  // between two samples is the CPU consumed over that window, no separate
+  // baseline capture needed.
+  cpuMs: number;
 }
 
 const MB = 1024 * 1024;
@@ -311,10 +399,12 @@ function sample(cycle: number, noGc: boolean): Sample {
     Bun.gc(true);
   }
   const mem = process.memoryUsage();
+  const cpu = process.cpuUsage();
   return {
     cycle,
     rssMb: mem.rss / MB,
     heapMb: mem.heapUsed / MB,
+    cpuMs: (cpu.user + cpu.system) / 1000,
   };
 }
 
@@ -369,6 +459,12 @@ interface Report {
   boundMb: number;
   slopeMbPer1k: number;
   slopeThresholdMbPer1k: number;
+  wallMs: number;
+  cpuMsTotal: number;
+  cpuPct: number;
+  cpuBudgetPct: number;
+  rssPass: boolean;
+  cpuPass: boolean;
   pass: boolean;
   heapSnapshotPath: string | null;
 }
@@ -376,11 +472,13 @@ interface Report {
 function progress(args: Args, first: Sample, s: Sample): void {
   if (args.quiet || args.json) return;
   const delta = s.rssMb - first.rssMb;
+  const cpuDelta = s.cpuMs - first.cpuMs;
   const head =
     s.cycle === first.cycle
       ? `cycle ${String(s.cycle).padStart(6)}  rss ${s.rssMb.toFixed(1)} MB  heap ${s.heapMb.toFixed(1)} MB`
       : `cycle ${String(s.cycle).padStart(6)}  rss ${s.rssMb.toFixed(1)} MB  ` +
-        `heap ${s.heapMb.toFixed(1)} MB  Δrss ${delta >= 0 ? "+" : ""}${delta.toFixed(1)} MB`;
+        `heap ${s.heapMb.toFixed(1)} MB  Δrss ${delta >= 0 ? "+" : ""}${delta.toFixed(1)} MB  ` +
+        `cpu ${cpuDelta.toFixed(0)} ms`;
   process.stderr.write(`${head}\n`);
 }
 
@@ -492,15 +590,94 @@ async function runChurn(
   return { peakRssMb, fatal };
 }
 
+/**
+ * STEADY mode (fn-1229.4): one long-lived reconnect-forever client against a
+ * HEALTHY server that never bounces — the direct analogue of a `keeper await`
+ * watching a quiet board for hours, the scenario the steady-poll-cadence CPU
+ * measurement targets. Quiet by default (`--patch-interval-ms 0`), so the
+ * adaptive idle poll interval (`nextIdlePollDelayMs`) grows to its cap and
+ * stays there for the rest of the run. `--patch-interval-ms > 0` instead
+ * pushes a server `patch` on that cadence — real activity that pins the poll
+ * interval at the `POLL_MS` floor — giving an A/B pair against the quiet run
+ * for isolating the steady-poll-cadence cost from everything else the
+ * process does.
+ */
+async function runSteady(
+  args: Args,
+  sockPath: string,
+  samples: Sample[],
+): Promise<{ peakRssMb: number; fatal: FatalError | null }> {
+  let liveSocket: Bun.Socket<ConnData> | null = null;
+  const server = startServer(sockPath, false, (sock) => {
+    liveSocket = sock;
+  });
+  let fatal: FatalError | null = null;
+  let patchTimer: ReturnType<typeof setInterval> | null = null;
+  let patchSeq = 1;
+
+  const handle = subscribeCollection({
+    sockPath,
+    idPrefix: "soak",
+    collection: "jobs",
+    limit: 0,
+    onRows() {},
+    onFatal(err) {
+      fatal = err;
+    },
+  });
+
+  if (args.patchIntervalMs > 0) {
+    patchTimer = setInterval(() => {
+      patchSeq += 1;
+      liveSocket?.write(
+        encodeFrame({
+          type: "patch",
+          id: "soak-jobs",
+          collection: "jobs",
+          rev: patchSeq,
+          row: { ...SAMPLE_ROW, version: patchSeq },
+        }),
+      );
+    }, args.patchIntervalMs);
+  }
+
+  await sleep(args.upMs);
+  const first = sample(0, args.noGc);
+  samples.push(first);
+  let peakRssMb = first.rssMb;
+  progress(args, first, first);
+
+  for (let cycle = 1; cycle <= args.cycles; cycle += 1) {
+    await sleep(args.upMs);
+    if (cycle % args.sampleEvery === 0 || cycle === args.cycles) {
+      const s = sample(cycle, args.noGc);
+      samples.push(s);
+      if (s.rssMb > peakRssMb) peakRssMb = s.rssMb;
+      progress(args, first, s);
+    }
+  }
+
+  if (patchTimer !== null) {
+    clearInterval(patchTimer);
+  }
+  handle.dispose();
+  server.stop(true);
+  return { peakRssMb, fatal };
+}
+
 async function runSoak(args: Args): Promise<Report> {
   const tmpDir = mkdtempSync(join(tmpdir(), "keeper-subscribe-bounce-soak-"));
   const sockPath = join(tmpDir, "soak.sock");
   const samples: Sample[] = [];
+  const wallStartMs = Date.now();
 
   const { peakRssMb, fatal } =
     args.mode === "bounce"
       ? await runBounce(args, sockPath, samples)
-      : await runChurn(args, sockPath, samples);
+      : args.mode === "steady"
+        ? await runSteady(args, sockPath, samples)
+        : await runChurn(args, sockPath, samples);
+  const wallMs = Date.now() - wallStartMs;
 
   let heapSnapshotPath: string | null = null;
   if (args.heapSnapshot) {
@@ -524,6 +701,14 @@ async function runSoak(args: Args): Promise<Report> {
   const endRssMb = samples[samples.length - 1]?.rssMb ?? startRssMb;
   const growthMb = endRssMb - startRssMb;
   const slopeMbPer1k = steadySlopeMbPer1k(samples);
+  const startCpuMs = first?.cpuMs ?? 0;
+  const endCpuMs = samples[samples.length - 1]?.cpuMs ?? startCpuMs;
+  const cpuMsTotal = endCpuMs - startCpuMs;
+  // Percent of one core over the run's wall time. `wallMs` covers slightly
+  // more than the first→last sample window (the pre-first-sample warm-up
+  // sleep), which only makes this a touch conservative — fine for a
+  // generous, order-of-magnitude budget.
+  const cpuPct = wallMs > 0 ? (cpuMsTotal / wallMs) * 100 : 0;
 
   if (fatal !== null && args.mode === "bounce") {
     process.stderr.write(
@@ -532,12 +717,23 @@ async function runSoak(args: Args): Promise<Report> {
     );
   }
 
-  // PASS requires BOTH: absolute growth within the bound AND a flat steady-state
-  // slope. The slope is the load-bearing check — a leak is LINEAR (never
-  // plateaus), so a short run can stay under an absolute bound while still
-  // leaking; the slope catches that regardless of run length.
-  const pass =
-    growthMb <= args.boundMb && slopeMbPer1k <= SLOPE_LEAK_THRESHOLD_MB_PER_1K;
+  // PASS requires BOTH a flat RSS AND CPU within budget — EXCEPT `steady`
+  // mode, which never churns connections (one client, one server, no
+  // reconnects) so there is no leak surface to exercise; its RSS trace is
+  // GC/allocator jitter over a handful of samples, not a signal. `steady`
+  // exists purely to measure the CPU budget in the quiet-board scenario, so
+  // it gates on CPU alone (RSS is still reported for visibility). `churn` and
+  // `bounce` gate on both: absolute RSS growth within the bound, a flat
+  // steady-state RSS slope (a leak is LINEAR — never plateaus, so a short run
+  // can stay under an absolute bound while still leaking; the slope catches
+  // that regardless of run length), AND average CPU utilization within the
+  // (generous, order-of-magnitude) budget.
+  const rssPass =
+    args.mode === "steady" ||
+    (growthMb <= args.boundMb &&
+      slopeMbPer1k <= SLOPE_LEAK_THRESHOLD_MB_PER_1K);
+  const cpuPass = cpuPct <= args.cpuBudgetPct;
+  const pass = rssPass && cpuPass;
 
   return {
     mode: args.mode,
@@ -550,6 +746,12 @@ async function runSoak(args: Args): Promise<Report> {
     boundMb: args.boundMb,
     slopeMbPer1k,
     slopeThresholdMbPer1k: SLOPE_LEAK_THRESHOLD_MB_PER_1K,
+    wallMs,
+    cpuMsTotal,
+    cpuPct,
+    cpuBudgetPct: args.cpuBudgetPct,
+    rssPass,
+    cpuPass,
     pass,
     heapSnapshotPath,
   };
@@ -558,9 +760,10 @@ async function runSoak(args: Args): Promise<Report> {
 function printSummary(report: Report): void {
   const w = (label: string, val: string): string =>
     `  ${label.padEnd(16)} ${val}\n`;
-  let out = "\nsubscribe-bounce-soak — fn-750.3 reconnect-leak gate\n";
+  let out = "\nsubscribe-bounce-soak — reconnect-leak + CPU-budget gate\n";
   out += w("mode", report.mode);
   out += w("cycles", String(report.cycles));
+  out += w("wall time", `${(report.wallMs / 1000).toFixed(1)} s`);
   out += w("start RSS", `${report.startRssMb.toFixed(1)} MB`);
   out += w("end RSS", `${report.endRssMb.toFixed(1)} MB`);
   out += w("peak RSS", `${report.peakRssMb.toFixed(1)} MB`);
@@ -574,10 +777,20 @@ function printSummary(report: Report): void {
     `${report.slopeMbPer1k >= 0 ? "+" : ""}${report.slopeMbPer1k.toFixed(2)} MB/1k cycles ` +
       `(leak >${report.slopeThresholdMbPer1k.toFixed(1)})`,
   );
+  out += w(
+    "cpu",
+    `${report.cpuMsTotal.toFixed(0)} ms total, ${report.cpuPct.toFixed(1)}% avg ` +
+      `(budget ${report.cpuBudgetPct.toFixed(0)}%)`,
+  );
   if (report.heapSnapshotPath !== null) {
     out += w("heap snapshot", report.heapSnapshotPath);
   }
-  out += w("verdict", report.pass ? "PASS (flat)" : "FAIL (leaking)");
+  out += w(
+    "verdict",
+    report.pass
+      ? "PASS (flat + within CPU budget)"
+      : `FAIL (${!report.rssPass ? "leaking" : ""}${!report.rssPass && !report.cpuPass ? ", " : ""}${!report.cpuPass ? "over CPU budget" : ""})`,
+  );
   process.stderr.write(out);
 }
 

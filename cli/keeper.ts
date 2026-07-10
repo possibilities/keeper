@@ -170,11 +170,11 @@ function mergedCommandTree(): readonly CommandDescriptor[] {
 /**
  * The shared exit-code taxonomy, published in `keeper --help --json` so every
  * one-shot command's exit semantics live in one machine-readable place. Codes
- * 0/1/2 are the common core; 3–5 are await-specific (and 3 doubles as handoff's
- * slug-collision). The one deliberate DIVERGENCE: `keeper <sub>` unknown-
- * subcommand exits 1, but the `plan`/`prompt` sub-CLIs exit 2 on an unknown
- * VERB (Click/argparse parity is frozen for Python byte-compat) — documented
- * here rather than silently reconciled.
+ * 0/1/2 are the common core; 3–5 and 9 are await-specific (and 3 doubles as
+ * handoff's slug-collision). The one deliberate DIVERGENCE: `keeper <sub>`
+ * unknown-subcommand exits 1, but the `plan`/`prompt` sub-CLIs exit 2 on an
+ * unknown VERB (Click/argparse parity is frozen for Python byte-compat) —
+ * documented here rather than silently reconciled.
  */
 export const EXIT_CODES: Record<string, string> = {
   "0": "success — a bad board/domain state is still ok:true data at exit 0, never a nonzero exit",
@@ -186,6 +186,7 @@ export const EXIT_CODES: Record<string, string> = {
   "6": "tabs restore: refused a non-TTY AMBIGUOUS selection (ranked table on stderr) — re-run with --generation <id> or on a TTY",
   "7": "tabs restore --apply: ZERO candidates without --allow-empty",
   "8": "tabs restore --apply: PARTIAL launch failure (restored/failed summary printed)",
+  "9": "await --probe: evaluated cleanly, condition does not hold",
   "124":
     "agent panel wait: a chunk elapsed with no terminal answer — a re-issue signal to poll again, NOT a failure",
 };

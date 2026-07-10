@@ -34,6 +34,9 @@ import {
   changedSignature,
   classifyTargetId,
   completeWatermark,
+  type DrainedHolder,
+  type DrainedInputs,
+  type DrainedJob,
   drainedState,
   epicAddedMet,
   epicRemovedMet,
@@ -42,6 +45,7 @@ import {
   gitCleanState,
   initCompleteStability,
   isJamReason,
+  isKeeperDispatched,
   landedState,
   monitorRunningState,
   type NeedsHumanSignal,
@@ -1970,117 +1974,306 @@ test("isJamReason: finalize-non-ff + merge-conflict are jams; recover* is NOT", 
   expect(isJamReason("worktree-merge-local-timeout")).toBe(false);
 });
 
-test("drained: empty open board → met", () => {
-  const r = drainedState({
+// Drained scope-axis fixtures (ADR 0032). Base inputs default to the shipped
+// `plan` scope; each test overrides only what it exercises.
+function drainedInputs(over: Partial<DrainedInputs> = {}): DrainedInputs {
+  return {
+    scope: "plan",
     perTask: new Map(),
     perCloseRow: new Map(),
     openEpicCount: 0,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
+    pendingDispatches: [],
+    runningJobs: [],
+    ownSessionId: null,
     catchingUp: false,
-  });
+    ...over,
+  };
+}
+const extJob = (jobId: string): DrainedJob => ({
+  jobId,
+  dispatchOrigin: null,
+  label: jobId,
+});
+const autopilotJob = (jobId: string): DrainedJob => ({
+  jobId,
+  dispatchOrigin: "autopilot",
+  label: jobId,
+});
+const escalationJob = (jobId: string): DrainedJob => ({
+  jobId,
+  dispatchOrigin: "escalation",
+  label: jobId,
+});
+const pendingHolder = (id: string): DrainedHolder => ({
+  kind: "pending",
+  id,
+  label: id,
+});
+
+test("isKeeperDispatched: autopilot + escalation yes; null / plan-verb no", () => {
+  expect(isKeeperDispatched("autopilot")).toBe(true);
+  expect(isKeeperDispatched("escalation")).toBe(true);
+  expect(isKeeperDispatched(null)).toBe(false);
+  // The `plan_verb` whitelist tokens are NOT dispatch-origin values — a
+  // verb-based gate is exactly the wrong discriminator (misses escalation).
+  expect(isKeeperDispatched("work")).toBe(false);
+  expect(isKeeperDispatched("resolve")).toBe(false);
+});
+
+test("drained: empty open board → met", () => {
+  const r = drainedState(drainedInputs());
   expect(r.kind).toBe("met");
 });
 
 test("drained: all verdicts completed → met", () => {
-  const r = drainedState({
-    perTask: new Map([["fn-1-a.1", DONE]]),
-    perCloseRow: new Map([["fn-1-a", DONE]]),
-    openEpicCount: 1,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
-    catchingUp: false,
-  });
+  const r = drainedState(
+    drainedInputs({
+      perTask: new Map([["fn-1-a.1", DONE]]),
+      perCloseRow: new Map([["fn-1-a", DONE]]),
+      openEpicCount: 1,
+    }),
+  );
   expect(r.kind).toBe("met");
 });
 
 test("drained: a ready (deferred-style) verdict → waiting (not drained)", () => {
-  const r = drainedState({
-    perTask: new Map([["fn-1-a.1", READY]]),
-    perCloseRow: new Map(),
-    openEpicCount: 1,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
-    catchingUp: false,
-  });
+  const r = drainedState(
+    drainedInputs({
+      perTask: new Map([["fn-1-a.1", READY]]),
+      openEpicCount: 1,
+    }),
+  );
   expect(r.kind).toBe("waiting");
 });
 
-test("drained: a running job → waiting", () => {
-  const r = drainedState({
-    perTask: new Map([["fn-1-a.1", DONE]]),
-    perCloseRow: new Map(),
-    openEpicCount: 1,
-    pendingDispatchCount: 0,
-    runningJobCount: 1,
-    catchingUp: false,
-  });
+test("drained: a keeper-dispatched running job → waiting", () => {
+  const r = drainedState(
+    drainedInputs({
+      perTask: new Map([["fn-1-a.1", DONE]]),
+      openEpicCount: 1,
+      runningJobs: [autopilotJob("w-1")],
+    }),
+  );
   expect(r.kind).toBe("waiting");
 });
 
-test("drained: a pending dispatch → waiting", () => {
-  const r = drainedState({
-    perTask: new Map(),
-    perCloseRow: new Map(),
-    openEpicCount: 0,
-    pendingDispatchCount: 1,
-    runningJobCount: 0,
-    catchingUp: false,
-  });
-  expect(r.kind).toBe("waiting");
+test("drained: a pending dispatch → waiting (every scope)", () => {
+  for (const scope of ["plan", "inflight", "board"] as const) {
+    const r = drainedState(
+      drainedInputs({
+        scope,
+        pendingDispatches: [pendingHolder("work::fn-1-a.1")],
+      }),
+    );
+    expect(r.kind).toBe("waiting");
+  }
 });
 
 test("drained: catching_up → waiting even when otherwise drained", () => {
-  const r = drainedState({
-    perTask: new Map(),
-    perCloseRow: new Map(),
-    openEpicCount: 0,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
-    catchingUp: true,
-  });
+  const r = drainedState(drainedInputs({ catchingUp: true }));
   expect(r.kind).toBe("waiting");
 });
 
-test("drained: jam sticky + --fail-on-stuck → stuck", () => {
-  const r = drainedState({
-    perTask: new Map(),
-    perCloseRow: new Map(),
-    openEpicCount: 0,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
-    catchingUp: false,
-    dispatchFailureReasons: ["worktree-finalize-non-fast-forward"],
-    failOnStuck: true,
-  });
-  expect(r.kind).toBe("stuck");
+// ---- the incident fixture: board empty, external sessions live -------------
+
+test("drained plan (default): external working sessions never hold; met", () => {
+  // The reproduced incident — board empty, two external sessions state=working.
+  const r = drainedState(
+    drainedInputs({ runningJobs: [extJob("shell-1"), extJob("research-2")] }),
+  );
+  expect(r.kind).toBe("met");
+});
+
+test("drained board: the SAME external sessions keep it waiting (strict gate)", () => {
+  const r = drainedState(
+    drainedInputs({
+      scope: "board",
+      runningJobs: [extJob("shell-1"), extJob("research-2")],
+    }),
+  );
+  expect(r.kind).toBe("waiting");
+  // Both external jobs surface as holders even though board counts them.
+  expect(r.holders?.map((h) => h.id)).toEqual(["shell-1", "research-2"]);
+});
+
+test("drained plan: a live escalation (resolver/deconflict/repair) session holds", () => {
+  // dispatch_origin='escalation' — the case the plan_verb whitelist misses.
+  const r = drainedState(
+    drainedInputs({ runningJobs: [escalationJob("resolve-1")] }),
+  );
+  expect(r.kind).toBe("waiting");
+  expect(r.holders?.map((h) => h.id)).toEqual(["resolve-1"]);
+});
+
+test("drained plan: the caller's own dispatched session is self-excluded", () => {
+  // A keeper-dispatched job that IS the caller never holds (mirrors agents-idle).
+  const r = drainedState(
+    drainedInputs({
+      runningJobs: [autopilotJob("me")],
+      ownSessionId: "me",
+    }),
+  );
+  expect(r.kind).toBe("met");
+});
+
+test("drained plan: caller-exclusion spares OTHER dispatched sessions", () => {
+  const r = drainedState(
+    drainedInputs({
+      runningJobs: [autopilotJob("me"), autopilotJob("sibling")],
+      ownSessionId: "me",
+    }),
+  );
+  expect(r.kind).toBe("waiting");
+  expect(r.holders?.map((h) => h.id)).toEqual(["sibling"]);
+});
+
+// ---- inflight scope --------------------------------------------------------
+
+test("drained inflight: fires when dispatched work + pending hit zero despite ready rows", () => {
+  const r = drainedState(
+    drainedInputs({
+      scope: "inflight",
+      // A ready-but-undispatched row would hold plan/board — inflight ignores it.
+      perTask: new Map([["fn-1-a.1", READY]]),
+      openEpicCount: 1,
+    }),
+  );
+  expect(r.kind).toBe("met");
+});
+
+test("drained inflight: a pending dispatch still holds it", () => {
+  const r = drainedState(
+    drainedInputs({
+      scope: "inflight",
+      pendingDispatches: [pendingHolder("work::fn-1-a.1")],
+      perTask: new Map([["fn-1-a.1", READY]]),
+      openEpicCount: 1,
+    }),
+  );
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained inflight: a running dispatched job still holds it", () => {
+  const r = drainedState(
+    drainedInputs({
+      scope: "inflight",
+      runningJobs: [autopilotJob("w-1")],
+    }),
+  );
+  expect(r.kind).toBe("waiting");
+});
+
+test("drained plan: the SAME ready row (no in-flight work) DOES hold", () => {
+  // Contrast with inflight above — plan still holds on open plan rows.
+  const r = drainedState(
+    drainedInputs({
+      scope: "plan",
+      perTask: new Map([["fn-1-a.1", READY]]),
+      openEpicCount: 1,
+    }),
+  );
+  expect(r.kind).toBe("waiting");
+});
+
+// ---- byte-stable board-scope detail + holder list --------------------------
+
+test("drained board: detail strings are byte-identical to the prior predicate", () => {
+  // in-flight (an external job counts under board).
+  expect(
+    drainedState(
+      drainedInputs({ scope: "board", runningJobs: [extJob("j-1")] }),
+    ).detail,
+  ).toBe("in-flight (pending=0 running=1)");
+  // board empty.
+  expect(drainedState(drainedInputs({ scope: "board" })).detail).toBe(
+    "board empty (drained)",
+  );
+  // a non-completed task row.
+  expect(
+    drainedState(
+      drainedInputs({
+        scope: "board",
+        perTask: new Map([["fn-1-a.1", READY]]),
+        openEpicCount: 1,
+      }),
+    ).detail,
+  ).toBe("task verdict=ready (not drained)");
+  // a non-completed close row (all tasks done).
+  expect(
+    drainedState(
+      drainedInputs({
+        scope: "board",
+        perTask: new Map([["fn-1-a.1", DONE]]),
+        perCloseRow: new Map([["fn-1-a", READY]]),
+        openEpicCount: 1,
+      }),
+    ).detail,
+  ).toBe("close-row verdict=ready (not drained)");
+  // all rows completed.
+  expect(
+    drainedState(
+      drainedInputs({
+        scope: "board",
+        perTask: new Map([["fn-1-a.1", DONE]]),
+        openEpicCount: 1,
+      }),
+    ).detail,
+  ).toBe("all rows completed (drained)");
+});
+
+test("drained: waiting holders enumerate every non-completed row", () => {
+  const r = drainedState(
+    drainedInputs({
+      scope: "plan",
+      perTask: new Map<string, Verdict>([
+        ["fn-1-a.1", DONE],
+        ["fn-1-a.2", READY],
+      ]),
+      perCloseRow: new Map([["fn-1-a", READY]]),
+      openEpicCount: 1,
+    }),
+  );
+  expect(r.kind).toBe("waiting");
+  expect(r.holders).toEqual([
+    { kind: "task", id: "fn-1-a.2", label: "fn-1-a.2" },
+    { kind: "close-row", id: "fn-1-a", label: "fn-1-a" },
+  ]);
+});
+
+// ---- jam check is scope-independent ----------------------------------------
+
+test("drained: jam sticky + --fail-on-stuck → stuck (every scope)", () => {
+  for (const scope of ["plan", "inflight", "board"] as const) {
+    const r = drainedState(
+      drainedInputs({
+        scope,
+        // An external session live — must NOT mask the jam under plan/inflight.
+        runningJobs: [extJob("shell-1")],
+        dispatchFailureReasons: ["worktree-finalize-non-fast-forward"],
+        failOnStuck: true,
+      }),
+    );
+    expect(r.kind).toBe("stuck");
+  }
 });
 
 test("drained: recover* sticky + --fail-on-stuck → NOT stuck (met when at rest)", () => {
-  const r = drainedState({
-    perTask: new Map(),
-    perCloseRow: new Map(),
-    openEpicCount: 0,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
-    catchingUp: false,
-    dispatchFailureReasons: ["worktree-recover-conflict"],
-    failOnStuck: true,
-  });
+  const r = drainedState(
+    drainedInputs({
+      dispatchFailureReasons: ["worktree-recover-conflict"],
+      failOnStuck: true,
+    }),
+  );
   expect(r.kind).toBe("met");
 });
 
 test("drained: jam sticky WITHOUT --fail-on-stuck → not escalated (met at rest)", () => {
-  const r = drainedState({
-    perTask: new Map(),
-    perCloseRow: new Map(),
-    openEpicCount: 0,
-    pendingDispatchCount: 0,
-    runningJobCount: 0,
-    catchingUp: false,
-    dispatchFailureReasons: ["worktree-merge-conflict: x"],
-    failOnStuck: false,
-  });
+  const r = drainedState(
+    drainedInputs({
+      dispatchFailureReasons: ["worktree-merge-conflict: x"],
+      failOnStuck: false,
+    }),
+  );
   expect(r.kind).toBe("met");
 });
 

@@ -730,6 +730,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       "3": "own-deadline timeout",
       "4": "watched target was deleted",
       "5": "stuck verdict (only under --fail-on-stuck)",
+      "9": "--probe: evaluated cleanly, condition does not hold",
     },
     flags: [
       FLAG_HELP,
@@ -750,15 +751,32 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         summary: "Exit 5 on a stuck verdict instead of waiting",
       },
       {
+        name: "scope",
+        type: "string",
+        summary: "drained scope: plan (default) | inflight | board (strict)",
+      },
+      {
         name: "no-armed-line",
         type: "boolean",
-        summary: "Suppress the periodic armed-state progress line",
+        summary: "Suppress the initial armed line",
+      },
+      {
+        name: "heartbeat",
+        type: "string",
+        summary:
+          "Stderr progress interval naming holders (duration or 'off'; default 60s)",
       },
       {
         name: "require-transition",
         type: "boolean",
         summary:
           "Require an observed transition, not an already-true condition",
+      },
+      {
+        name: "probe",
+        type: "boolean",
+        summary:
+          "Evaluate once and exit (0 holds, 9 does not); rejects edge-triggered conditions",
       },
       { name: "json", type: "boolean", summary: "Emit the JSON envelope" },
       FLAG_SOCK,

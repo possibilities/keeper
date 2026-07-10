@@ -48,9 +48,9 @@ the literal `and` token.
 | `unblocked <id>` | A keeper plan id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). A `runtime-blocked` task the daemon has escalated to the planner reports `waiting` (escalation in flight), not `stuck`, while the autopilot is paused — see the escalated-but-paused note under *Defaults and overrides*. | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
-| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot — i.e. the moment the READ socket opens, right after `migrate()` while the reducer may still be CATCHING UP. So `server-up` means "the control plane is reachable", NOT "the board has fully caught up"; an early board read may be provisional (its frames carry a `catching_up` boot-status header until the drain reaches head + the git surface is seeded). Reconnects FOREVER (permanently give-up-exempt), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors). | `server-up` |
+| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot — i.e. the moment the READ socket opens, right after `migrate()` while the reducer may still be CATCHING UP. So `server-up` means "the control plane is reachable", NOT "the board has fully caught up"; an early board read may be provisional (its frames carry a `catching_up` boot-status header until the drain reaches head + the git surface is seeded). Reconnect-forever is the DEFAULT for every condition (see the reconnect note below) — `server-up` is special only in that it is PERMANENTLY exempt from opting out of that default: it **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors), so it's the one condition that always blocks through a daemon bounce with no escape hatch needed. | `server-up` |
 | `monitor-running <selector>` | Any "wait until my dev server / script / background task / build watcher finishes" phrasing. Scoped to THIS session's own monitors. **Takes one selector token:** `cmd:<full command>`, `kind:<monitor\|bash-bg\|ambient>`, or a bare token (= `cmd:<token>`). Exact match, never substring. | `monitor-running cmd:bun run dev` |
-| `drained` | Any "wait until the whole board is done / at rest / there's nothing left to run" phrasing. **No id.** Holds until no in-flight launch, no running job, every row completed, and not catching up. Distinguishes a JAM (a sticky `dispatch_failures` row) from true drain — add `--fail-on-stuck` to exit 5 on an operator jam instead of waiting. | `drained` |
+| `drained [--scope S]` | Any "wait until the board / plan / everything is done, at rest, nothing left to run" phrasing. **No id.** A dual-scope condition — see the *Which condition?* table below for which of the three axes fits. Distinguishes a JAM (a sticky `dispatch_failures` row) from true drain in every scope — add `--fail-on-stuck` to exit 5 on an operator jam instead of waiting. | `drained` (plan scope, the default) |
 | `epic-added [id]` | "ping me when a new epic shows up" (bare) or "when fn-X appears on the board" (a specific id). **Edge-triggered:** never satisfied on first paint, so it always waits for a real appearance. | `epic-added` / `epic-added fn-…` |
 | `epic-removed <id>` | "when fn-X leaves the board / is done or deleted." **One id, edge-triggered.** | `epic-removed fn-…` |
 | `changed [since:R]` | "ping me when anything on the board moves" — an epic appears/leaves, a verdict flips, or autopilot config changes. **Edge-triggered;** optional `since:<hash>` anchors against a prior `changed` baseline so you can detect movement since a known point. | `changed` / `changed since:<hash>` |
@@ -59,6 +59,20 @@ the literal `and` token.
 | Field | How to derive | Example |
 |---|---|---|
 | `follow-up` | The clause after "then" / "and" / "and then" — what to run when the condition(s) hold. | "do a full review" |
+
+## Which condition?
+
+The vocabulary overlaps on purpose — pick by what "done" means to the caller:
+
+| You want to know when… | Condition | Why not the others |
+|---|---|---|
+| …this one task/epic is done AND its work session has settled | `complete <id>` | `landed` fires later (needs the merge); `started` fires earlier (needs only a begin) |
+| …an epic's code has actually MERGED to the local default branch | `landed <epic>` | `complete` can fire before the worktree finalize merge lands; `landed` is epic-only |
+| …work has begun on a task/epic at all | `started <id>` | Monotonic — never use it to detect a re-run; it doesn't un-fire |
+| …no keeper-dispatched plan work is left — the natural "board's clear for planning" check | `drained` (`--scope plan`, the default) | Ignores your own shell and any adopted/external session, so an unrelated live terminal never blocks it |
+| …in-flight dispatched work has drained, on a paused board (no new dispatches will start) | `drained --scope inflight` | Ignores ready-but-undispatched rows — pair with a paused autopilot, not a playing one |
+| …the WHOLE board — every session, including hand-started/adopted/external ones — is at rest | `drained --scope board` | The strict prior gate; the one `--scope` a strict consumer (e.g. the watch wedge alarm) must ask for explicitly |
+| …a condition holds RIGHT NOW, without blocking (a pre-flight sanity check, a CI gate) | any condition + `--probe` | See *One-shot check* below — evaluates once and exits, never wired through Monitor |
 
 **The `and` grammar.** When the user names more than one condition,
 join them with the literal `and` token:
@@ -222,13 +236,35 @@ aggregate:
 …or a terminal `failed` instead of `met`:
 
 ```
-[keeper-await] failed target=<id> reason=<reason> …
-[keeper-await] failed reason=<reason> conditions=<…> …   # aggregate
+[keeper-await] failed target=<id> reason=<reason> … [detail=<…>] [retryable=<true|false>]
+[keeper-await] failed reason=<reason> conditions=<…> … [detail=<…>] [retryable=<true|false>]   # aggregate
 ```
 
 For an AND aggregate, a plan sub-condition that fails names which
 condition fired via a `from=<condition-label>` field on the `failed`
-line.
+line. A `timeout`/`unreachable` failure additionally carries the LAST
+waiting detail it observed (`detail=` — the condition's own last-known
+state, e.g. `2 running jobs`) and `retryable=true` (re-arming the same
+`keeper await` invocation is the right next move once the caller's
+deadline or the daemon link recovers). A `stuck` failure carries
+`retryable=false` instead — an operator jam needs a human, not a re-arm.
+
+**Heartbeats (stderr, not the terminal contract).** While the wait is
+still open, `keeper await` emits a periodic STDERR-only progress line —
+default every 60s, `--heartbeat <dur>` to change the cadence, `--heartbeat
+off` to silence it. It never touches stdout and never counts as a
+terminal line:
+
+```
+[keeper-await] heartbeat state=waiting waiting=<slot: detail>[,…] [holders=<label (kind)>[,…]]
+[keeper-await] heartbeat state=reconnecting detail=reconnecting to keeperd — holder list stale, withheld
+```
+
+`waiting` names each not-yet-met slot's condition and last-seen detail;
+`holders` — present only for a `drained`-family slot with something
+still open — names up to 5 concrete holders (job/pending-dispatch/task/
+close-row) before truncating to a `+N more` tail. Treat heartbeats as
+progress narration for the human, not a signal to act on.
 
 **`followup=<id>`** appears ONLY on a single `complete <epic>` met, and only
 when the closer that finished this epic minted follow-up epic(s) for it
@@ -247,10 +283,11 @@ Reasons + exit codes:
 | `failed reason=no-git-root …` | 1 | A `git-clean` / `agents-idle` condition was requested but the cwd isn't inside a git worktree. | Tell the user; the wait can't be evaluated. Do NOT run the follow-up. |
 | `failed reason=no-match …` | 1 | A `monitor-running` selector matched no running monitor in this session at arm time (likely armed the same turn the monitor launched, or the selector is wrong). | Tell the user nothing matched; suggest re-arming after the monitor shows in `keeper jobs`, or fixing the selector. Do NOT run the follow-up. |
 | `failed reason=connect …` | 1 | A terminal query-SHAPE error keeperd rejected — a malformed/unrecoverable query (e.g. `bad_frame` / `unknown_collection`). NOT a capacity condition: a `max_connections` cap reject is transient and rides the reconnect loop (it never surfaces here). | Tell the user the query was rejected; the wait can't proceed. |
-| `failed reason=unreachable …` | 1 | **Only with `--connect-timeout`.** keeperd stayed unreachable past that opt-in deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=`. A plain await (no flag) NEVER emits this — it reconnects forever. | Tell the user the daemon is down. To block THROUGH the bounce, drop `--connect-timeout` (a plain await waits forever), or `keeper await server-up` first then re-arm once it's back. Do NOT run the follow-up. |
+| `failed reason=unreachable …` | 1 | **Only with `--connect-timeout`** (or implicitly under `--probe`, which always carries a bounded deadline). keeperd stayed unreachable past that deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=` and `retryable=true`. **Reconnect-forever is the default for every condition** — a plain await with no `--connect-timeout` NEVER emits this, it just keeps reconnecting; `server-up` is the one condition permanently barred from opting out (see the `server-up` row above). | Tell the user the daemon is down. To block THROUGH the bounce, drop `--connect-timeout` (a plain await waits forever), or `keeper await server-up` first then re-arm once it's back. Do NOT run the follow-up. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
-| `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit. | Tell the user it timed out; ask whether to extend or move on. |
-| `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. | Tell the user the target is stuck; surface the verdict. |
+| `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit (or your own `--timeout`). Carries `retryable=true` — the caller's budget ran out, not a verdict on the condition. | Tell the user it timed out; ask whether to extend or re-arm. |
+| `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. Carries `retryable=false` — an operator jam, not self-clearing. | Tell the user the target is stuck; surface the verdict. |
+| `probe result=does-not-hold …` | 9 | **`--probe` only.** Evaluated cleanly against the first snapshot; the condition just doesn't hold right now. Never 124 (that's GNU `timeout(1)`'s collision code). | Tell the user it doesn't hold yet; surface the `states=`/`holders=` detail. Do NOT run the follow-up. |
 
 The `armed` line is information only — proceed past it. The first
 `met` / `failed` line is terminal; act on it.
@@ -269,6 +306,42 @@ shell command, run it via Bash.
 
 On any `failed`, surface the terminal line to the user verbatim and ask
 how they want to proceed — do NOT silently run the follow-up.
+
+## One-shot check (`--probe`)
+
+For "would this fire right now, and if not, why?" without blocking — a
+pre-flight sanity check, a CI gate, deciding whether a wait is even
+needed — run `keeper await <condition…> --probe` directly via Bash, NOT
+through Monitor (it's one-shot; there's nothing to stream). It evaluates
+every segment once against the first painted snapshot and exits:
+
+```
+[keeper-await] probe result=holds states=<slot: detail>[,…] [holders=<label (kind)>[,…]]
+```
+
+- **Exit 0** — every segment holds right now (`result=holds`).
+- **Exit 9** — evaluated cleanly, at least one segment does not hold
+  (`result=does-not-hold`). Never 124 — that's `timeout(1)`'s GNU
+  collision code, deliberately avoided since agents commonly wrap awaits
+  in `timeout(1)`.
+- The ordinary refusal codes still apply first and are more specific
+  than a generic does-not-hold: not-found=1, ambiguous=6,
+  `monitor-running` no-match=1, and a stuck plan/`drained` verdict under
+  `--fail-on-stuck` still surfaces as its own exit 5.
+- `--probe` implies its own bounded connect deadline (the same one
+  `--connect-timeout` would set, when you didn't set one explicitly) —
+  a down daemon still reports `reason=unreachable` exit 1 within that
+  deadline rather than hanging forever, since a probe that never returns
+  defeats its own "evaluate once and exit" purpose.
+- **Edge-triggered conditions are a usage error under `--probe`**
+  (`changed` / `epic-added` / `epic-removed` have no instantaneous truth
+  value — exit 2).
+
+```
+keeper await drained --probe                    # "is the plan clear right now?"
+keeper await drained --scope board --probe      # "is the WHOLE board at rest right now?"
+keeper await complete fn-12-add-oauth.3 --probe # "is this task done+idle right now?"
+```
 
 ## Examples
 
