@@ -1132,3 +1132,105 @@ export function matrixV2Cells(matrix: MatrixV2): MatrixCell[] {
     driver: matrix.driverByModel.get(model) ?? "wrapped",
   }));
 }
+
+// ── v2 pure derivations (operator diagnostic verbs) ──────────────────────────
+//
+// The v2 counterparts of the v1 derivations above, feeding `presets list` /
+// `providers resolve` / `providers check` (main.ts). Model-agnostic to
+// `subagent_models` cell membership — even a launch-only capability resolves a
+// driver/candidate, matching v1's route-agnostic `effortsFor`/`driverFor`.
+
+/** claude membership → native; every other model (including one no provider
+ *  serves) → wrapped. */
+export function driverForV2(matrix: MatrixV2, model: string): Driver {
+  const claude = matrix.providers.find((p) => p.name === "claude");
+  return claude?.models.has(model) === true ? "native" : "wrapped";
+}
+
+/** The SOLE roster-first provider serving a wrapped model — the pecking-order
+ *  winner (ADR 0010/0036): a capability served by more than one provider is one
+ *  axis value owned by the first, every later entry shadowed and excluded from
+ *  serving. Null when no configured provider serves it (the no_route condition). */
+export function servingProviderForV2(
+  matrix: MatrixV2,
+  model: string,
+): HarnessName | null {
+  for (const p of matrix.providers) {
+    if (p.name !== "claude" && p.models.has(model)) {
+      return p.name;
+    }
+  }
+  return null;
+}
+
+/** The provider-native launch id for a capability model under a given provider —
+ *  null when that provider does not serve the model. */
+export function nativeIdForV2(
+  matrix: MatrixV2,
+  provider: HarnessName,
+  model: string,
+): string | null {
+  return (
+    matrix.providers.find((p) => p.name === provider)?.models.get(model) ?? null
+  );
+}
+
+/**
+ * Resolve a model to its driver + serving candidate under the v2 roster. A
+ * native (claude) model yields the single claude candidate; a wrapped model
+ * yields the single pecking-order-winning candidate (empty when no provider
+ * serves it — the caller treats an empty wrapped result as no_route). Unlike
+ * v1's multi-candidate fallback chain, v2 shadowing means only the winner ever
+ * actually serves the capability.
+ */
+export function resolveModelV2(matrix: MatrixV2, model: string): ResolveResult {
+  const driver = driverForV2(matrix, model);
+  if (driver === "native") {
+    return {
+      driver,
+      candidates: [
+        {
+          harness: "claude",
+          model_id: nativeIdForV2(matrix, "claude", model) ?? model,
+          preset_name: presetNameFor("claude", model),
+        },
+      ],
+    };
+  }
+  const winner = servingProviderForV2(matrix, model);
+  if (winner === null) {
+    return { driver, candidates: [] };
+  }
+  return {
+    driver,
+    candidates: [
+      {
+        harness: winner,
+        model_id: nativeIdForV2(matrix, winner, model) ?? model,
+        preset_name: presetNameFor(winner, model),
+      },
+    ],
+  };
+}
+
+/**
+ * Build the `providers check` roster findings under the v2 roster — pure over
+ * the matrix and an injected reachability probe. One finding per provider whose
+ * harness binary is not reachable, regardless of cell/shadow status.
+ */
+export function providerCheckFindingsV2(
+  matrix: MatrixV2,
+  isReachable: (harness: HarnessName) => boolean,
+): ProviderCheckFinding[] {
+  const findings: ProviderCheckFinding[] = [];
+  for (const p of matrix.providers) {
+    if (!isReachable(p.name)) {
+      findings.push({
+        kind: "binary-unreachable",
+        provider: p.name,
+        binary: HARNESS_DESCRIPTORS[p.name].binaryName,
+      });
+    }
+  }
+  return findings;
+}

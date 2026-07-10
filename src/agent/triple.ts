@@ -30,7 +30,13 @@ import {
   isHarnessName,
   KEEPER_EFFORTS,
 } from "./harness";
-import { effortsFor, isValidMatrixAliasTarget, type Matrix } from "./matrix";
+import {
+  effortsFor,
+  isValidMatrixAliasTarget,
+  type Matrix,
+  type MatrixV2,
+  matrixV2EffortsFor,
+} from "./matrix";
 
 /** The `na` effort sentinel an axisless harness (hermes) carries in its triple —
  *  it exposes no second reasoning axis, so no keeper effort applies. */
@@ -271,6 +277,116 @@ export function lintHostTriples(
   refs: readonly HostTripleRef[],
 ): HostTripleFinding[] {
   const cube = enumerateTripleStrings(matrix);
+  const findings: HostTripleFinding[] = [];
+  for (const ref of refs) {
+    const parsed = parseTriple(ref.raw);
+    if (!parsed.ok) {
+      findings.push({
+        kind: "malformed-triple",
+        source: ref.source,
+        triple: ref.raw,
+        error: parsed.error,
+      });
+      continue;
+    }
+    const canonical = formatTriple(parsed.triple);
+    if (!cube.has(canonical)) {
+      findings.push({
+        kind: "off-cube-triple",
+        source: ref.source,
+        triple: canonical,
+      });
+    }
+  }
+  return findings;
+}
+
+// ── v2 cube enumeration (operator diagnostic verbs) ──────────────────────────
+//
+// The v2 counterpart of {@link enumerateTriples}/{@link lintHostTriples},
+// feeding `presets list`/`providers check` (main.ts) from a v2 {@link
+// MatrixV2}. v2 retires the per-PROVIDER `route:` flag — launch-only is a
+// per-CAPABILITY fact (absence from `subagent_models`, ADR 0036) — so each
+// triple carries its own `cell` membership rather than one flag per harness.
+
+/** One enumerated v2 cube cell: the launch triple plus the capability token,
+ *  the provider-native launch id it derives from, the effort rung, and whether
+ *  the capability is a worker cell (`subagent_models` membership) — false means
+ *  launch-only: enumerable here, but never in the cell set. */
+export interface EnumeratedTripleV2 {
+  triple: string;
+  capability: string;
+  launch_id: string;
+  effort: string;
+  cell: boolean;
+}
+
+/** One harness's slice of the v2 virtual cube — every triple its matrix
+ *  provider fans out, each individually tagged with its cell membership. */
+export interface HarnessCubeV2 {
+  harness: HarnessName;
+  triples: EnumeratedTripleV2[];
+}
+
+/**
+ * Enumerate the v2 virtual launch cube: every provider fans its models (by
+ * launch id) over its effective effort list ({@link matrixV2EffortsFor}),
+ * except an axisless harness (hermes) which emits a single `na` triple per
+ * model. The order is provider declaration order, then model declaration
+ * order, then canonical ascending efforts. Pure over the matrix.
+ */
+export function enumerateTriplesV2(matrix: MatrixV2): HarnessCubeV2[] {
+  const cells = new Set(matrix.subagentModels);
+  const cube: HarnessCubeV2[] = [];
+  for (const provider of matrix.providers) {
+    const axisless = HARNESS_DESCRIPTORS[provider.name].secondAxis === "none";
+    const triples: EnumeratedTripleV2[] = [];
+    for (const [capability, launchId] of provider.models) {
+      const efforts = axisless
+        ? [TRIPLE_EFFORT_NA]
+        : matrixV2EffortsFor(matrix, capability);
+      for (const effort of efforts) {
+        triples.push({
+          triple: formatTriple({
+            harness: provider.name,
+            model: launchId,
+            effort,
+          }),
+          capability,
+          launch_id: launchId,
+          effort,
+          cell: cells.has(capability),
+        });
+      }
+    }
+    cube.push({ harness: provider.name, triples });
+  }
+  return cube;
+}
+
+/** The set of every enumerable v2 triple string in the cube — the membership
+ *  oracle the doctor lints host triples against. */
+export function enumerateTripleStringsV2(matrix: MatrixV2): Set<string> {
+  const set = new Set<string>();
+  for (const group of enumerateTriplesV2(matrix)) {
+    for (const t of group.triples) {
+      set.add(t.triple);
+    }
+  }
+  return set;
+}
+
+/**
+ * Lint the operator's configured launch triples against the v2 enumerable
+ * cube. Each ref parses: a rejection is a `malformed-triple` fault carrying the
+ * grammar error; a well-formed triple whose canonical form is absent from the
+ * cube is `off-cube-triple` drift. Pure over (matrix, refs).
+ */
+export function lintHostTriplesV2(
+  matrix: MatrixV2,
+  refs: readonly HostTripleRef[],
+): HostTripleFinding[] {
+  const cube = enumerateTripleStringsV2(matrix);
   const findings: HostTripleFinding[] = [];
   for (const ref of refs) {
     const parsed = parseTriple(ref.raw);

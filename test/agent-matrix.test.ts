@@ -839,10 +839,32 @@ describe("alias-target charset (slashed native id)", () => {
   });
 
   test("providers resolve carries the slashed model_id through to the launch flag (pass-through)", async () => {
+    // v2 equivalent of SLASHED_TARGET: codex derives capability gpt-5.5 from the
+    // provider-qualified launch id openai/gpt-5.5 (basename after the last slash).
+    const SLASHED_TARGET_V2 = [
+      "efforts:",
+      "  - high",
+      "subagent_templates:",
+      "  - template/agents/worker.md.tmpl",
+      "subagent_models:",
+      "  - opus",
+      "  - gpt-5.5",
+      "providers:",
+      "  - name: claude",
+      "    models:",
+      "      - opus",
+      "  - name: codex",
+      "    models:",
+      "      - openai/gpt-5.5",
+      "wrapper_driver:",
+      "  model: sonnet",
+      "  effort: high",
+      "",
+    ].join("\n");
     const h = makeHarness({
       argv: ["providers", "resolve", "gpt-5.5", "high"],
       rawArgv: true,
-      matrix: loadMatrix(writeMatrix(SLASHED_TARGET)) as Matrix,
+      matrix: loadMatrixV2(writeMatrix(SLASHED_TARGET_V2)),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
@@ -1250,12 +1272,50 @@ describe("providerCheckFindings", () => {
   });
 });
 
+/** A valid v2 roster for the resolve verb: claude native (opus/sonnet); codex
+ *  (roster-first) and pi both deriving the wrapped capability gpt-5.5 — codex
+ *  wins, pi is shadowed (a single candidate, not v1's multi-candidate chain). */
+const V2_VALID_MATRIX = [
+  "efforts:",
+  "  - low",
+  "  - high",
+  "  - xhigh",
+  "subagent_templates:",
+  "  - template/agents/worker.md.tmpl",
+  "subagent_models:",
+  "  - opus",
+  "  - sonnet",
+  "  - gpt-5.5",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "      - sonnet",
+  "  - name: codex",
+  "    models:",
+  "      - gpt-5.5",
+  "  - name: pi",
+  "    models:",
+  "      - openai/gpt-5.5",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "defaults:",
+  "  stop_timeout_ms: 3600000",
+  "  max_attempts: 5",
+  "",
+].join("\n");
+
+function validMatrixV2(): MatrixV2 {
+  return loadMatrixV2(writeMatrix(V2_VALID_MATRIX));
+}
+
 describe("providers resolve verb", () => {
-  test("a wrapped model emits the cost-ordered candidate envelope (exit 0)", async () => {
+  test("a wrapped model emits the pecking-order-winning candidate envelope (exit 0)", async () => {
     const h = makeHarness({
       argv: ["providers", "resolve", "gpt-5.5", "high"],
       rawArgv: true,
-      matrix: validMatrix(),
+      matrix: validMatrixV2(),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
@@ -1264,13 +1324,14 @@ describe("providers resolve verb", () => {
       model: "gpt-5.5",
       effort: "high",
       driver: "wrapped",
+      // codex is roster-first, so it wins gpt-5.5; pi's entry is shadowed
+      // (ADR 0036/0010) and never a resolve candidate.
       candidates: [
         {
           harness: "codex",
-          model_id: "gpt-5.5-codex",
+          model_id: "gpt-5.5",
           preset_name: "codex-gpt-5.5",
         },
-        { harness: "pi", model_id: "gpt-5.5", preset_name: "pi-gpt-5.5" },
       ],
       defaults: { stop_timeout_ms: 3600000, max_attempts: 5 },
     });
@@ -1280,7 +1341,7 @@ describe("providers resolve verb", () => {
     const h = makeHarness({
       argv: ["providers", "resolve", "opus", "xhigh"],
       rawArgv: true,
-      matrix: validMatrix(),
+      matrix: validMatrixV2(),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
@@ -1295,7 +1356,7 @@ describe("providers resolve verb", () => {
     const h = makeHarness({
       argv: ["providers", "resolve", "ghost", "high"],
       rawArgv: true,
-      matrix: validMatrix(),
+      matrix: validMatrixV2(),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(3);
@@ -1307,20 +1368,24 @@ describe("providers resolve verb", () => {
     const h = makeHarness({
       argv: ["providers", "resolve", "GPT_5", "high"],
       rawArgv: true,
-      matrix: validMatrix(),
+      matrix: validMatrixV2(),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
     expect(h.err.join("")).toContain("not a valid token");
   });
 
-  test("a malformed matrix (ConfigError) exits 2", async () => {
+  test("a malformed matrix (MatrixConfigError) exits 2", async () => {
     const h = makeHarness({
       argv: ["providers", "resolve", "gpt-5.5", "high"],
       rawArgv: true,
     });
     h.deps.loadMatrixFn = () => {
-      throw new ConfigError("Unknown top-level key 'x' in /m.yaml");
+      throw new MatrixConfigError(
+        "schema-invalid",
+        "/m.yaml",
+        "Unknown top-level key 'x'",
+      );
     };
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
@@ -1342,14 +1407,85 @@ describe("providers resolve verb", () => {
     expect(h.err.join("")).toContain("matrix.example.yaml");
     expect(h.out.join("")).toBe("");
   });
+
+  test("loads the committed v2 example matrix without a v1 unknown-key error (F1/F4)", async () => {
+    // The regression this task fixes: `providers resolve` used to parse the
+    // mandated v2 matrix.yaml with the v1 loader, which hard-rejects
+    // `subagent_templates`/`subagent_models`.
+    const EXAMPLE_PATH = join(
+      import.meta.dir,
+      "..",
+      "docs",
+      "examples",
+      "matrix.example.yaml",
+    );
+    const h = makeHarness({
+      argv: ["providers", "resolve", "gpt-5.3-codex-spark", "high"],
+      rawArgv: true,
+      matrix: loadMatrixV2(EXAMPLE_PATH),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const env = JSON.parse(h.out.join(""));
+    expect(env.driver).toBe("wrapped");
+    // codex is roster-first for gpt-5.3-codex-spark; pi's entry is shadowed.
+    expect(env.candidates).toEqual([
+      {
+        harness: "codex",
+        model_id: "gpt-5.3-codex-spark",
+        preset_name: "codex-gpt-5.3-codex-spark",
+      },
+    ]);
+  });
 });
+
+/** A v2 roster exercising the check-verb axes: claude native (top-level efforts
+ *  [low, high]); codex with a provider effort override [high, xhigh]; pi
+ *  launch-only (its capability absent from subagent_models) with a slashed
+ *  launch id; hermes axisless. */
+const V2_CUBE_MATRIX = [
+  "efforts:",
+  "  - low",
+  "  - high",
+  "subagent_templates:",
+  "  - template/agents/worker.md.tmpl",
+  "subagent_models:",
+  "  - opus",
+  "  - sonnet",
+  "  - gpt-5.5-codex",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "      - sonnet",
+  "  - name: codex",
+  "    efforts:",
+  "      - high",
+  "      - xhigh",
+  "    models:",
+  "      - gpt-5.5-codex",
+  "  - name: pi",
+  "    models:",
+  "      - id: pi/spark-preview",
+  "  - name: hermes",
+  "    models:",
+  "      - hermes-m",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "",
+].join("\n");
+
+function cubeMatrixV2(): MatrixV2 {
+  return loadMatrixV2(writeMatrix(V2_CUBE_MATRIX));
+}
 
 describe("providers check verb", () => {
   test("a consistent roster with in-cube host triples is clean (exit 0)", async () => {
     const h = makeHarness({
       argv: ["providers", "check"],
       rawArgv: true,
-      matrix: cubeMatrix(),
+      matrix: cubeMatrixV2(),
       hostTriples: {
         defaults: { claude: "claude::opus::low" },
         worker: "claude::sonnet::high",
@@ -1368,7 +1504,7 @@ describe("providers check verb", () => {
     const h = makeHarness({
       argv: ["providers", "check"],
       rawArgv: true,
-      matrix: cubeMatrix(),
+      matrix: cubeMatrixV2(),
       // opus enumerates only at low/high — xhigh is a well-formed off-cube triple.
       hostTriples: {
         defaults: { claude: "claude::opus::xhigh" },
@@ -1391,7 +1527,7 @@ describe("providers check verb", () => {
     const h = makeHarness({
       argv: ["providers", "check"],
       rawArgv: true,
-      matrix: cubeMatrix(),
+      matrix: cubeMatrixV2(),
       hostTriples: {
         defaults: {},
         // Two segments — the grammar rejects it (fault, not drift).
@@ -1417,7 +1553,7 @@ describe("providers check verb", () => {
     const h = makeHarness({
       argv: ["providers", "check"],
       rawArgv: true,
-      matrix: cubeMatrix(),
+      matrix: cubeMatrixV2(),
       providerReachable: () => true,
     });
     const code = await expectExit(main(h.deps));
@@ -1445,10 +1581,34 @@ describe("providers check verb", () => {
       rawArgv: true,
     });
     h.deps.loadMatrixFn = () => {
-      throw new ConfigError("bad matrix");
+      throw new MatrixConfigError("schema-invalid", "/m.yaml", "bad matrix");
     };
     const code = await expectExit(main(h.deps));
     expect(code).toBe(1);
     expect(h.err.join("")).toContain("bad matrix");
+  });
+
+  test("loads the committed v2 example matrix without a v1 unknown-key error (F1/F4)", async () => {
+    // The regression this task fixes: `providers check` used to parse the
+    // mandated v2 matrix.yaml with the v1 loader, which hard-rejects
+    // `subagent_templates`/`subagent_models`.
+    const EXAMPLE_PATH = join(
+      import.meta.dir,
+      "..",
+      "docs",
+      "examples",
+      "matrix.example.yaml",
+    );
+    const h = makeHarness({
+      argv: ["providers", "check"],
+      rawArgv: true,
+      matrix: loadMatrixV2(EXAMPLE_PATH),
+      providerReachable: () => true,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const parsed = JSON.parse(h.out.join(""));
+    expect(parsed.matrix_present).toBe(true);
+    expect(parsed.findings).toEqual([]);
   });
 });

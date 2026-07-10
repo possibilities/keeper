@@ -89,13 +89,13 @@ import {
 } from "./launch-handle";
 import {
   isValidMatrixToken,
-  loadMatrix,
-  type Matrix,
+  loadMatrixV2,
   MatrixConfigError,
+  type MatrixV2,
   matrixConfigPath,
-  providerCheckFindings,
+  providerCheckFindingsV2,
   type ResolveResult,
-  resolveModel,
+  resolveModelV2,
 } from "./matrix";
 import {
   resolveHandle,
@@ -171,13 +171,13 @@ import {
 } from "./tmux-launch";
 import type { TranscriptStop } from "./transcript-watch";
 import {
-  enumerateTriples,
+  enumerateTriplesV2,
   extractHostTriples,
   formatTriple,
   type HostTripleFinding,
   type HostTriples,
   hostTripleRefs,
-  lintHostTriples,
+  lintHostTriplesV2,
   parseTriple,
   type Triple,
 } from "./triple";
@@ -251,12 +251,13 @@ export interface MainDeps {
    */
   findShadowProfileDirsFn: () => ShadowProfileFinding[];
   /**
-   * Read the host provider matrix from `matrix.yaml`; null when absent (the
-   * caller falls back to claude-only embedded defaults). Producer-side launch
-   * config, re-parsed per call, never a fold input. Injected so the `providers`
-   * verbs are testable against fixture matrices without a real `~/.config`.
+   * Read the host provider matrix from `matrix.yaml` (v2, ADR 0036) — REQUIRED,
+   * never null: an absent/unparseable/empty/schema-invalid file throws the typed
+   * four-state {@link MatrixConfigError}. Producer-side launch config, re-parsed
+   * per call, never a fold input. Injected so the `presets`/`providers` verbs
+   * are testable against fixture matrices without a real `~/.config`.
    */
-  loadMatrixFn: () => Matrix | null;
+  loadMatrixFn: () => MatrixV2;
   /**
    * Read the operator's launch triples from the host files — the four harness
    * defaults + worker/escalation from `presets.yaml` and the panel members from
@@ -408,7 +409,7 @@ export function realDeps(): MainDeps {
       ),
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
-    loadMatrixFn: loadMatrix,
+    loadMatrixFn: loadMatrixV2,
     loadHostTriplesFn: () =>
       extractHostTriples(
         readYamlFileIfPresent(presetsCatalogPath()),
@@ -1699,9 +1700,28 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
 }
 
 /**
+ * Load the v2 host matrix as `MatrixV2 | null` — `absent` flattens to null (the
+ * `presets list`/`providers check` claude-only-world handling predates ADR 0036
+ * and stays as-is), while any OTHER four-state failure (unparseable/valid-but-
+ * empty/schema-invalid) still throws {@link MatrixConfigError} for the caller to
+ * render fail-loud. `providers resolve` calls {@link MainDeps.loadMatrixFn}
+ * directly instead — an absent matrix there IS the fail-loud case.
+ */
+function loadMatrixOrNull(deps: MainDeps): MatrixV2 | null {
+  try {
+    return deps.loadMatrixFn();
+  } catch (exc) {
+    if (exc instanceof MatrixConfigError && exc.state === "absent") {
+      return null;
+    }
+    throw exc;
+  }
+}
+
+/**
  * `presets list [--json]`: the discovery surface — the virtual launch cube plus
  * the four harness defaults and the configured panels. Enumerates every triple the
- * host matrix defines (routed AND launch-only providers, native ids fanned over
+ * host matrix defines (cell AND launch-only capabilities, launch ids fanned over
  * effective efforts, an axisless harness emitting `na`) grouped per harness, and
  * echoes the four `<harness>_default` triples and each panel's ordered members
  * read from the host files. Human-readable by default, `--json`
@@ -1710,20 +1730,20 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
  * matrix is the claude-only world with an empty cube, never a crash.
  */
 function runPresetsList(deps: MainDeps, json: boolean): never {
-  let matrix: Matrix | null;
+  let matrix: MatrixV2 | null;
   let host: HostTriples;
   try {
-    matrix = deps.loadMatrixFn();
+    matrix = loadMatrixOrNull(deps);
     host = deps.loadHostTriplesFn();
   } catch (exc) {
-    if (exc instanceof ConfigError) {
+    if (exc instanceof MatrixConfigError || exc instanceof ConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
       return deps.exit(2);
     }
     throw exc;
   }
 
-  const harnesses = matrix === null ? [] : enumerateTriples(matrix);
+  const harnesses = matrix === null ? [] : enumerateTriplesV2(matrix);
   const defaults = {
     claude: host.defaults.claude ?? null,
     codex: host.defaults.codex ?? null,
@@ -1738,12 +1758,12 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
         kind: "presets-list",
         harnesses: harnesses.map((group) => ({
           harness: group.harness,
-          route: group.route,
           triples: group.triples.map((t) => ({
             triple: t.triple,
             capability: t.capability,
-            native_id: t.native_id,
+            native_id: t.launch_id,
             effort: t.effort,
+            cell: t.cell,
           })),
         })),
         defaults,
@@ -1764,13 +1784,13 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     );
   } else {
     for (const group of harnesses) {
-      const tag = group.route ? "" : " (launch-only)";
-      lines.push(`  ${group.harness}${tag}:`);
+      lines.push(`  ${group.harness}:`);
       if (group.triples.length === 0) {
         lines.push("    (no models)");
       } else {
         for (const t of group.triples) {
-          lines.push(`    ${t.triple}`);
+          const tag = t.cell ? "" : " (launch-only)";
+          lines.push(`    ${t.triple}${tag}`);
         }
       }
     }
@@ -1954,14 +1974,16 @@ const PROVIDERS_CHECK_DRIFT_EXIT = 9;
 const PROVIDERS_CHECK_FAULT_EXIT = 1;
 
 /**
- * `providers resolve <model> <effort>`: emit the cost-ordered serving candidates
- * for a model from the host matrix, plus the defaults block. A native (claude)
- * model resolves to the single claude candidate; a wrapped model resolves to its
- * pecking-ordered foreign candidates. An UNROUTABLE wrapped model (no configured
- * provider) exits with the distinct `no_route` code; a bad model/effort token
- * exits 2; a malformed matrix exits 2. An ABSENT matrix is a typed loud failure
- * (ADR 0036 — the host matrix is REQUIRED): it exits 2 naming the absent state and
- * the copy-the-example fix, never a silent claude-native fallback candidate.
+ * `providers resolve <model> <effort>`: emit the winning serving candidate for a
+ * model from the host matrix, plus the defaults block. A native (claude) model
+ * resolves to the single claude candidate; a wrapped model resolves to the
+ * pecking-order-winning foreign candidate (v2/ADR 0036/0010: a capability served
+ * by more than one provider is one axis value owned by the first, every later
+ * entry shadowed). An UNROUTABLE wrapped model (no configured provider) exits
+ * with the distinct `no_route` code; a bad model/effort token exits 2; a
+ * malformed matrix exits 2. An ABSENT matrix is a typed loud failure (ADR 0036 —
+ * the host matrix is REQUIRED): it exits 2 naming the absent state and the
+ * copy-the-example fix, never a silent claude-native fallback candidate.
  */
 function runProvidersResolve(
   deps: MainDeps,
@@ -1980,32 +2002,17 @@ function runProvidersResolve(
       return deps.exit(2);
     }
   }
-  let matrix: Matrix | null;
+  let matrix: MatrixV2;
   try {
     matrix = deps.loadMatrixFn();
   } catch (exc) {
-    if (exc instanceof ConfigError) {
+    if (exc instanceof MatrixConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
       return deps.exit(2);
     }
     throw exc;
   }
-  if (matrix === null) {
-    // v2 (ADR 0036): the host worker matrix is REQUIRED — an absent (or empty)
-    // matrix is a typed loud failure, never a silent claude-native fallback. The
-    // MatrixConfigError message names the state, where it looked, and the exact fix.
-    deps.writeErr(
-      `Error: ${
-        new MatrixConfigError(
-          "absent",
-          matrixConfigPath(),
-          "no matrix.yaml found",
-        ).message
-      }\n`,
-    );
-    return deps.exit(2);
-  }
-  const result: ResolveResult = resolveModel(matrix, model);
+  const result: ResolveResult = resolveModelV2(matrix, model);
   if (result.driver === "wrapped" && result.candidates.length === 0) {
     deps.writeErr(
       `agent providers resolve: no configured provider serves the wrapped ` +
@@ -2077,11 +2084,11 @@ function renderHostTripleFinding(
  * config.
  */
 function runProvidersCheck(deps: MainDeps): never {
-  let matrix: Matrix | null;
+  let matrix: MatrixV2 | null;
   try {
-    matrix = deps.loadMatrixFn();
+    matrix = loadMatrixOrNull(deps);
   } catch (exc) {
-    if (exc instanceof ConfigError) {
+    if (exc instanceof MatrixConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
       return deps.exit(PROVIDERS_CHECK_FAULT_EXIT);
     }
@@ -2120,9 +2127,9 @@ function runProvidersCheck(deps: MainDeps): never {
       throw exc;
     }
   }
-  const tripleFindings = lintHostTriples(matrix, hostTripleRefs(host));
+  const tripleFindings = lintHostTriplesV2(matrix, hostTripleRefs(host));
   const rendered: RenderedProviderFinding[] = [
-    ...providerCheckFindings(matrix, deps.providerReachableFn).map((f) => ({
+    ...providerCheckFindingsV2(matrix, deps.providerReachableFn).map((f) => ({
       kind: f.kind,
       provider: f.provider,
       binary: f.binary,
