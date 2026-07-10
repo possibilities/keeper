@@ -21,7 +21,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import {
+  CWD_MISSING_GRACE_PULSES,
   diffLoop,
+  observeCwdMissing,
   type ReprobeRow,
   reprobeLoop,
   type SentinelMemoEntry,
@@ -538,6 +540,7 @@ function srow(over: Partial<SentinelRow> = {}): SentinelRow {
     hasFreshSubagent: false,
     planRef: "fn-9-x.1",
     adopted: false,
+    cwdMissing: false,
     ...over,
   };
 }
@@ -816,6 +819,208 @@ test("sentinel predicate: tier-one self-heal fires for a plan_ref-null (interact
 });
 
 // ---------------------------------------------------------------------------
+// selectStuckSentinelVerdicts — the cwd-missing detect-only clause (ADR 0031).
+// The producer resolves the debounced, recycle-checked observation into
+// `cwdMissing`; the predicate is a pure boolean read scoped to plan sessions.
+// ---------------------------------------------------------------------------
+
+test("sentinel predicate: cwd-missing + live pid + plan-linked working row → detect-only verdict (heal false)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: true })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: cwd-missing",
+    },
+  ]);
+});
+
+test("sentinel predicate: cwd-missing fires INDEPENDENT of event staleness (null lastEventTs still pages)", () => {
+  // The cwd-missing clause sits ahead of the `lastEventTs == null` skip — a
+  // zombie whose events are unreadable still surfaces.
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: true, lastEventTs: null })],
+    SNOW,
+    sAlive,
+  );
+  expect(out.map((v) => v.reason)).toEqual(["stuck-sentinel: cwd-missing"]);
+});
+
+test("sentinel predicate: cwd-missing on a DEAD pid mints nothing (death fold owns terminalization)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: true })],
+    SNOW,
+    sDead,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: cwd-missing covers a close:: job (workerDone structurally false, still pages)", () => {
+  // A closer carries no task row, so workerDone is false — the cwd-missing
+  // clause is independent of the tier-one workerDone gate and still fires.
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: true, workerDone: false, planRef: "fn-9-x" })],
+    SNOW,
+    sAlive,
+  );
+  expect(out.map((v) => v.reason)).toEqual(["stuck-sentinel: cwd-missing"]);
+});
+
+test("sentinel predicate: cwd-missing takes PRIORITY over the tier-one heal (a zombie never gets a StopReconciled)", () => {
+  // worker-done + stale + live would be a tier-one heal — but cwd-missing sits
+  // ahead of it, so the verdict is the detect-only cwd-missing row, heal false.
+  const out = selectStuckSentinelVerdicts(
+    [
+      srow({
+        cwdMissing: true,
+        workerDone: true,
+        lastEventTs: STALE_T1,
+        lastLifecycleTs: STALE_T1,
+      }),
+    ],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      tier: 2,
+      heal: false,
+      reason: "stuck-sentinel: cwd-missing",
+    },
+  ]);
+});
+
+test("sentinel predicate: cwd-missing on a NON-plan (planRef null) session is excluded (interactive carve-out)", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: true, planRef: null })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: cwd-missing on an ADOPTED session is excluded even with a plan_ref set", () => {
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: true, adopted: true, planRef: "fn-9-x.1" })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+test("sentinel predicate: cwdMissing false (cwd present again, probe-error, or grace unmet) → no cwd-missing verdict", () => {
+  // A not-yet-debounced / cleared / probe-suppressed row carries cwdMissing
+  // false and falls through to the ordinary staleness tiers only.
+  const out = selectStuckSentinelVerdicts(
+    [srow({ cwdMissing: false, lastEventTs: FRESH_EVT })],
+    SNOW,
+    sAlive,
+  );
+  expect(out).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// observeCwdMissing — the pure, recycle-checked RAW cwd-missing observation the
+// sentinel loop debounces. Injected fs + start-time probes; no real syscalls.
+// ---------------------------------------------------------------------------
+
+const absent = () => false; // dirExists: the launch dir is gone.
+const present = () => true; // dirExists: the launch dir still exists.
+
+test("observeCwdMissing: recorded cwd absent + same-process pid → true", () => {
+  expect(
+    observeCwdMissing(
+      "/w/lane",
+      4242,
+      "darwin:start-a",
+      absent,
+      () => "darwin:start-a",
+    ),
+  ).toBe(true);
+});
+
+test("observeCwdMissing: recorded cwd still present → false", () => {
+  expect(
+    observeCwdMissing(
+      "/w/lane",
+      4242,
+      "darwin:start-a",
+      present,
+      () => "darwin:start-a",
+    ),
+  ).toBe(false);
+});
+
+test("observeCwdMissing: NULL/empty cwd → false (nothing to probe), fs probe never consulted", () => {
+  const neverStat = (): boolean => {
+    throw new Error("dirExists must not be called for an unrecorded cwd");
+  };
+  expect(
+    observeCwdMissing(null, 4242, "darwin:s", neverStat, () => "darwin:s"),
+  ).toBe(false);
+  expect(
+    observeCwdMissing("", 4242, "darwin:s", neverStat, () => "darwin:s"),
+  ).toBe(false);
+});
+
+test("observeCwdMissing: a RECYCLED pid (stored start_time differs from live) → false, fs probe never consulted", () => {
+  const neverStat = (): boolean => {
+    throw new Error("dirExists must not be called for a recycled pid");
+  };
+  expect(
+    observeCwdMissing(
+      "/w/lane",
+      4242,
+      "darwin:old",
+      neverStat,
+      () => "darwin:new",
+    ),
+  ).toBe(false);
+});
+
+test("observeCwdMissing: NULL stored start_time → recycle unprovable, fall through to fs probe (dir absent → true)", () => {
+  const neverReadStart = (): string | null => {
+    throw new Error(
+      "readStartTime must not be called without a stored start_time",
+    );
+  };
+  expect(observeCwdMissing("/w/lane", 4242, null, absent, neverReadStart)).toBe(
+    true,
+  );
+});
+
+test("observeCwdMissing: a failed start-time probe (null) can't prove recycle → fall through to fs probe", () => {
+  expect(
+    observeCwdMissing("/w/lane", 4242, "darwin:s", absent, () => null),
+  ).toBe(true);
+});
+
+test("observeCwdMissing: a throwing fs probe propagates (the loop catches it → fail-closed)", () => {
+  const throwingStat = (): boolean => {
+    throw new Error("stat blew up");
+  };
+  expect(() =>
+    observeCwdMissing(
+      "/w/lane",
+      4242,
+      "darwin:s",
+      throwingStat,
+      () => "darwin:s",
+    ),
+  ).toThrow("stat blew up");
+});
+
+test("CWD_MISSING_GRACE_PULSES is a two-pulse debounce", () => {
+  expect(CWD_MISSING_GRACE_PULSES).toBe(2);
+});
+
+// ---------------------------------------------------------------------------
 // sentinelReason — the class-stable reason builder
 // ---------------------------------------------------------------------------
 
@@ -1012,6 +1217,139 @@ test("sentinelLoop: a parked-idle interactive session (no plan_ref) past the tie
   );
 
   // Give the loop several ticks to prove it never emits for this row.
+  await Bun.sleep(150);
+  shutdown = true;
+  await loop;
+
+  expect(posted).toEqual([]);
+
+  writer.close();
+  reader.close();
+});
+
+// ---------------------------------------------------------------------------
+// sentinelLoop — the cwd-missing detect-only clause end-to-end: the candidate
+// query pulls `cwd`/`start_time`, the producer probes fs existence + the pid
+// recycle identity, debounces over the grace, and mints the detect-only row.
+// ---------------------------------------------------------------------------
+
+/** Seed a `working` plan job carrying a recorded cwd + start_time. */
+function seedWorkingPlanJobWithCwd(
+  db: ReturnType<typeof openDb>["db"],
+  jobId: string,
+  pid: number,
+  planVerb: string,
+  planRef: string,
+  cwd: string,
+  startTime: string,
+  lastLifecycleTs: number,
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                       updated_at, plan_verb, plan_ref, last_lifecycle_ts, start_time)
+       VALUES (?, ?, ?, ?, 'working', 0, ?, ?, ?, ?, ?)`,
+    [
+      jobId,
+      lastLifecycleTs,
+      cwd,
+      pid,
+      lastLifecycleTs,
+      planVerb,
+      planRef,
+      lastLifecycleTs,
+      startTime,
+    ],
+  );
+}
+
+test("sentinelLoop: a plan job whose recorded cwd is missing pages ONCE with the cwd-missing reason (detect-only)", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+
+  const nowSecs = 4_000_000;
+  // Fresh event so no staleness tier fires — the cwd-missing clause is the only
+  // possible verdict, and it is independent of event age anyway.
+  seedWorkingPlanJobWithCwd(
+    writer,
+    "sess-zombie",
+    7001,
+    "close",
+    "fn-9-x",
+    "/w/torn-down-lane",
+    "darwin:launch-a",
+    nowSecs - 5,
+  );
+  seedEvent(writer, "sess-zombie", nowSecs - 5);
+
+  const posted: StuckSentinelMessage[] = [];
+  let shutdown = false;
+  const loop = sentinelLoop(
+    reader,
+    (msg) => posted.push(msg),
+    () => shutdown,
+    {
+      intervalMs: 25,
+      reemitMs: 10 * 60_000,
+      nowSecs: () => nowSecs,
+      isAlive: (pid) => pid === 7001, // live, same-process
+      dirExists: () => false, // the launch dir is gone
+      readStartTime: () => "darwin:launch-a", // matches → not recycled
+    },
+  );
+
+  const got = await retryUntil(
+    () => (posted.length > 0 ? posted : null),
+    5_000,
+  );
+  // Prove the change-gate holds it at one across several more ticks.
+  await Bun.sleep(150);
+  shutdown = true;
+  await loop;
+
+  expect(got).not.toBeNull();
+  expect(posted.length).toBe(1);
+  expect(posted[0]?.jobId).toBe("sess-zombie");
+  expect(posted[0]?.heal).toBe(false); // detect-only — no StopReconciled
+  expect(posted[0]?.reason).toBe("stuck-sentinel: cwd-missing");
+
+  writer.close();
+  reader.close();
+});
+
+test("sentinelLoop: a plan job whose recorded cwd still exists never pages", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+
+  const nowSecs = 5_000_000;
+  seedWorkingPlanJobWithCwd(
+    writer,
+    "sess-healthy",
+    7002,
+    "work",
+    "fn-9-y.1",
+    "/w/live-lane",
+    "darwin:launch-b",
+    nowSecs - 5,
+  );
+  seedEvent(writer, "sess-healthy", nowSecs - 5); // fresh — no staleness tier
+
+  const posted: StuckSentinelMessage[] = [];
+  let shutdown = false;
+  const loop = sentinelLoop(
+    reader,
+    (msg) => posted.push(msg),
+    () => shutdown,
+    {
+      intervalMs: 25,
+      reemitMs: 10 * 60_000,
+      nowSecs: () => nowSecs,
+      isAlive: (pid) => pid === 7002,
+      dirExists: () => true, // the launch dir is present
+      readStartTime: () => "darwin:launch-b",
+    },
+  );
+
+  // Several ticks prove the cwd-missing clause never trips for a live dir.
   await Bun.sleep(150);
   shutdown = true;
   await loop;

@@ -56,6 +56,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import { openDb } from "./db";
@@ -524,6 +525,17 @@ export const STUCK_SENTINEL_SKEW_EPSILON_SECS = 5 * 60;
 export const STUCK_SENTINEL_SUBAGENT_GAP_SEC = 120;
 
 /**
+ * Consecutive pulses observing a plan session's recorded cwd absent (while its
+ * recycle-checked pid stays alive) before the detect-only `cwd-missing` clause
+ * mints its distress row. A short (two-pulse) debounce so a job about to fold
+ * `Killed` during legitimate lane teardown — the window between its cwd being
+ * removed and the re-probe reap folding its death — never flaps a row. The
+ * observation resets to zero the moment cwd reappears or the row leaves
+ * `working`, so only a persistent zombie crosses the grace.
+ */
+export const CWD_MISSING_GRACE_PULSES = 2;
+
+/**
  * One `working` candidate row with every signal the pure predicate needs already
  * RESOLVED off the DB (worker-done, subagent freshness, staleness) — so the
  * predicate stays pure and tests drive it clause-by-clause with plain values.
@@ -555,6 +567,14 @@ export interface SentinelRow {
    *  signal alongside `planRef == null` — an adopted session is soft
    *  telemetry even in the (unobserved) case it somehow carries a plan_ref. */
   adopted: boolean;
+  /** The producer's DEBOUNCED, RECYCLE-CHECKED cwd-missing observation: `true`
+   *  only once the recorded `cwd` has been stat-confirmed absent on disk for
+   *  {@link CWD_MISSING_GRACE_PULSES} consecutive pulses while the same-process
+   *  pid stayed alive. `false` when the cwd exists, is unrecorded, the fs probe
+   *  threw (fail-closed), the pid was recycled (its death fold owns terminalization),
+   *  or the grace is not yet met. Resolved producer-side in {@link sentinelLoop};
+   *  the predicate stays a pure boolean read. */
+  cwdMissing: boolean;
 }
 
 /** One sentinel verdict — the stuck row plus what to do about it. */
@@ -574,7 +594,11 @@ export interface StuckSentinelVerdict {
  * class so it re-surfaces exactly once. Pure.
  */
 export function sentinelReason(
-  cls: "worker-done-while-working" | "stale-working" | "clock-skew",
+  cls:
+    | "worker-done-while-working"
+    | "stale-working"
+    | "clock-skew"
+    | "cwd-missing",
   clockSkew: boolean,
 ): string {
   const base = `stuck-sentinel: ${cls}`;
@@ -590,6 +614,17 @@ export function sentinelReason(
  *   - NULL pid → skip (the diff loop's pidless-reap job).
  *   - pid DEAD (`isAlive` false) → skip: a dead pid is the exit-watcher's reap,
  *     keeping the two producers DISJOINT (tier one requires a LIVE pid).
+ *   - CWD-MISSING (detect-only, ADR 0031): `cwdMissing` (the producer's
+ *     debounced + recycle-checked observation that the recorded launch dir
+ *     vanished on disk) on a PLAN-linked, non-adopted row → a distress verdict
+ *     with the `cwd-missing` reason and `heal: false` (the daemon NEVER acts on
+ *     it — a torn-down-lane zombie is reclaimed by an operator). Checked BEFORE
+ *     the worker-done tier-one gate so a `close::` job (which carries no task
+ *     row, so `workerDone` is structurally false) is covered, and so a zombie
+ *     never receives a corrective `StopReconciled`. Independent of event
+ *     staleness — evaluated even for a NULL-`lastEventTs` row. Scoped to
+ *     plan-dispatched sessions (mirrors the tier-two carve-out) so a human
+ *     deleting their own interactive session's dir never pages.
  *   - NULL `lastEventTs` → skip (staleness uncomputable).
  *   - TIER ONE (heal): `workerDone` AND NOT `hasFreshSubagent` AND event age
  *     `>= STUCK_TIER1_MIN_AGE_SECS`. The worker-done contradiction + the
@@ -623,6 +658,19 @@ export function selectStuckSentinelVerdicts(
     }
     if (!isAlive(row.pid)) {
       continue; // dead pid → exit-watcher's reap; keep the producers disjoint.
+    }
+    if (row.cwdMissing && row.planRef != null && !row.adopted) {
+      // Detect-only: a plan session whose recorded cwd vanished while its
+      // recycle-checked pid is alive is a torn-down-lane zombie (ADR 0031).
+      // Placed ahead of the tier-one gate so close:: jobs are covered and no
+      // StopReconciled is minted; heal:false — the daemon never acts on it.
+      out.push({
+        jobId: row.jobId,
+        tier: 2,
+        heal: false,
+        reason: sentinelReason("cwd-missing", false),
+      });
+      continue;
     }
     if (row.lastEventTs == null) {
       continue; // no events → staleness uncomputable.
@@ -699,6 +747,40 @@ export function shouldEmitSentinel(
 }
 
 /**
+ * Producer-side RAW cwd-missing observation for one working row — pure but for
+ * the two injected live probes. Returns `true` iff a launch `cwd` is recorded,
+ * the pid is NOT a recycle (its stored `start_time` still matches the live
+ * process), AND the directory is absent on disk. Returns `false` for an
+ * unrecorded cwd, a recycled pid (the death fold owns terminalizing the
+ * original — never page), or a directory that still exists.
+ *
+ * The fs probe (`dirExists`) may throw — the caller catches and treats a throw
+ * as no observation (fail-closed: suppress the page, never mint). The recycle
+ * probe (`readStartTime`) is consulted ONLY when a stored `start_time` is
+ * present; a null read (probe failed) can't prove a recycle, so it falls through
+ * to the fs check (the pid is already confirmed alive by the predicate). NEVER
+ * debounces here — {@link sentinelLoop} owns the consecutive-pulse grace.
+ */
+export function observeCwdMissing(
+  cwd: string | null,
+  pid: number,
+  startTime: string | null,
+  dirExists: (dir: string) => boolean,
+  readStartTime: (pid: number) => string | null,
+): boolean {
+  if (cwd == null || cwd === "") {
+    return false; // no recorded launch dir → nothing to probe.
+  }
+  if (startTime != null) {
+    const osStart = readStartTime(pid);
+    if (osStart != null && osStart !== startTime) {
+      return false; // pid recycled → original is gone; the death fold owns it.
+    }
+  }
+  return !dirExists(cwd);
+}
+
+/**
  * Resolve the freshest `events.ts` for a session (`MAX(ts)`) — the staleness
  * anchor, NULL when the session has no events. Indexed by `idx_events_session`.
  */
@@ -761,6 +843,10 @@ interface SentinelCandidateRow {
   plan_ref: string | null;
   last_lifecycle_ts: number | null;
   adopted: number | null;
+  /** The recorded launch dir — the cwd-missing clause's fs probe target. */
+  cwd: string | null;
+  /** The stored `(pid, start_time)` recycle identity for the cwd-missing probe. */
+  start_time: string | null;
 }
 
 /**
@@ -786,18 +872,28 @@ export async function sentinelLoop(
     reemitMs?: number;
     nowSecs?: () => number;
     isAlive?: (pid: number) => boolean;
+    dirExists?: (dir: string) => boolean;
+    readStartTime?: (pid: number) => string | null;
   } = {},
 ): Promise<void> {
   const interval = opts.intervalMs ?? STUCK_SENTINEL_MS;
   const reemitMs = opts.reemitMs ?? STUCK_SENTINEL_REEMIT_MS;
   const nowSecs = opts.nowSecs ?? (() => Date.now() / 1000);
   const isAlive = opts.isAlive ?? isPidAlive;
+  const dirExists = opts.dirExists ?? ((dir: string) => existsSync(dir));
+  const readStartTime = opts.readStartTime ?? readOsStartTime;
   const candidatesQuery = db.query(
-    `SELECT job_id, pid, plan_verb, plan_ref, last_lifecycle_ts, adopted FROM jobs
+    `SELECT job_id, pid, plan_verb, plan_ref, last_lifecycle_ts, adopted, cwd,
+            start_time FROM jobs
        WHERE state = 'working' AND pid IS NOT NULL`,
   );
   // Per-session change-gate memo: jobId → last emitted {reason, lastEmitMs}.
   const memo = new Map<string, SentinelMemoEntry>();
+  // Per-session consecutive-pulse counter for the cwd-missing debounce: jobId →
+  // number of back-to-back sweeps observing the recorded cwd absent (recycle-
+  // checked). Reset to zero (entry dropped) the moment cwd reappears or the row
+  // leaves the candidate set, so only a persistent zombie crosses the grace.
+  const cwdMissingStreak = new Map<string, number>();
 
   while (!isShutdown()) {
     // Sleep FIRST (like the re-probe loop): the contradiction is a permanent
@@ -822,9 +918,41 @@ export async function sentinelLoop(
     }
     const now = nowSecs();
     const rows: SentinelRow[] = [];
+    const candidateIds = new Set<string>();
     for (const c of candidates) {
+      candidateIds.add(c.job_id);
       // Per-row try/catch so one bad resolve (read race) never wedges the sweep.
       try {
+        // Recycle-checked raw cwd-missing observation, then the consecutive-
+        // pulse debounce. A throwing fs probe is fail-closed: no observation
+        // this tick (the streak resets), never a mint. Producer-side, never a
+        // fold.
+        let observedMissing = false;
+        if (c.pid != null) {
+          try {
+            observedMissing = observeCwdMissing(
+              c.cwd,
+              c.pid,
+              c.start_time,
+              dirExists,
+              readStartTime,
+            );
+          } catch (err) {
+            console.error(
+              `[exit-watcher] cwd-missing probe failed for job_id=${c.job_id} (fail-closed):`,
+              err,
+            );
+            observedMissing = false;
+          }
+        }
+        const streak = observedMissing
+          ? (cwdMissingStreak.get(c.job_id) ?? 0) + 1
+          : 0;
+        if (streak > 0) {
+          cwdMissingStreak.set(c.job_id, streak);
+        } else {
+          cwdMissingStreak.delete(c.job_id);
+        }
         rows.push({
           jobId: c.job_id,
           pid: c.pid,
@@ -839,12 +967,23 @@ export async function sentinelLoop(
           ),
           planRef: c.plan_ref,
           adopted: c.adopted === 1,
+          cwdMissing: streak >= CWD_MISSING_GRACE_PULSES,
         });
       } catch (err) {
         console.error(
           `[exit-watcher] sentinel resolve failed for job_id=${c.job_id}:`,
           err,
         );
+      }
+    }
+    // Drop streak entries for rows that left the candidate set (no longer
+    // `working`, or reaped) — a positive-evidence reset so a future re-stuck
+    // starts a fresh grace.
+    if (cwdMissingStreak.size > candidateIds.size) {
+      for (const jobId of cwdMissingStreak.keys()) {
+        if (!candidateIds.has(jobId)) {
+          cwdMissingStreak.delete(jobId);
+        }
       }
     }
     let verdicts: StuckSentinelVerdict[];
