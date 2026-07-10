@@ -58,5 +58,5 @@ Parallelize the existing per-leaf guard tests (creates-when-absent / no-op-when-
 - [ ] `bun test` is green including the new guard/pi coverage and regenerated golden pins.
 
 ## Done summary
-
+Added system/shared/AGENTS.md as the one keeper-owned global-instruction source and generalized the launch-time canonical-stow guard into a per-harness leaf table (source/linkPath/compare/onDivergence): claude CLAUDE.md, codex AGENTS.md, and pi's canonical AGENTS.md all re-link to it, with claude hard-erroring and codex/pi warn-and-respecting a divergent human-edited file. Codex leaf-guard runs unconditionally; pi canonical AGENTS.md materializes before the profile loop (SYSTEM.md dropped, APPEND_SYSTEM.md kept).
 ## Evidence
