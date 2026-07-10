@@ -59,5 +59,5 @@ bucket + session id -> hint names --config-dir.
 - [ ] Date-only --since/--until select whole local calendar days across DST boundaries, covered by TZ-independent unit tests
 
 ## Done summary
-
+Fault-isolated listClaudeSessions rows against scan-to-parse races, fixed the ambiguous-session hint (--config-dir vs --project), consolidated the two ellipsize helpers into one exact-max implementation, stripped slash-command XML wrappers from first-prompt previews, and switched date-only --since/--until to DST-correct local calendar days.
 ## Evidence
