@@ -67,5 +67,5 @@ against the existing terminal-shape fixtures.
 - [ ] Fast suite green
 
 ## Done summary
-
+Added --heartbeat <dur|off> (default 60s) for periodic stderr-only progress naming a wait's holders (drained holder list, size-bounded +N-more tail, or reconnecting state), enriched timeout/stuck/unreachable terminals with last-waiting-detail + a retryable classification, and fixed the descriptor's stale --no-armed-line summary.
 ## Evidence
