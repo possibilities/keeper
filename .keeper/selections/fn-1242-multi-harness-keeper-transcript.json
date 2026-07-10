@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting architectural seam: the TranscriptReader contract and registry both sibling readers build on, plus a behavior-preserving CLI grammar flip across the largest surface of the epic, is a nameable multi-file cascade warranting opus at the contract-introduction band.",
+      "task_id": "fn-1242-multi-harness-keeper-transcript.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded single-file reader implementation against the established task-1 seam with a named reference to re-express and a fully-specified entry mapping, well within sonnet's literal-implementation sweet spot at the model-default band.",
+      "task_id": "fn-1242-multi-harness-keeper-transcript.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "The hardest reader with subtle but fully-specified rules (top-level-timestamp ordering, event_msg dedup, encrypted-reasoning exclusion, meta backfill) is literal execution against a detailed spec, so sonnet at xhigh for the edge-case density rather than escalating the model.",
+      "task_id": "fn-1242-multi-harness-keeper-transcript.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "5a17bddabc7e3f99ac738b07e00cddd2c7b7405003e0373647f2fdb6bbe07dae",
+  "created_at": "2026-07-10T19:24:54.948000Z",
+  "epic_id": "fn-1242-multi-harness-keeper-transcript",
+  "input_hash": "bdeaa5b733f6301a632200b74f173a046d96f3b49eb35f0c67f2299701e9f16b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3186271671,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting architectural seam: the TranscriptReader contract and registry both sibling readers build on, plus a behavior-preserving CLI grammar flip across the largest surface of the epic, is a nameable multi-file cascade warranting opus at the contract-introduction band.\",\"confidence\":0.72},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-file reader implementation against the established task-1 seam with a named reference to re-express and a fully-specified entry mapping, well within sonnet's literal-implementation sweet spot at the model-default band.\",\"confidence\":0.7},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.3\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"The hardest reader with subtle but fully-specified rules (top-level-timestamp ordering, event_msg dedup, encrypted-reasoning exclusion, meta backfill) is literal execution against a detailed spec, so sonnet at xhigh for the edge-case density rather than escalating the model.\",\"confidence\":0.6}]}\n"
+}
