@@ -194,7 +194,7 @@ function renderPlanTree(): string {
 
 function copyPlanPluginSkeleton(work: string): void {
   const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
-  for (const entry of [".claude-plugin", "template", "subagents.yaml"]) {
+  for (const entry of [".claude-plugin", "template"]) {
     cpSync(join(livePlanRoot, entry), join(work, entry), { recursive: true });
   }
   writeFileSync(join(work, ".git"), ""); // synthetic project-root marker

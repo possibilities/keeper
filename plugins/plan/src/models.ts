@@ -5,7 +5,7 @@
 // later mutating-verb wave inherits the shape rather than re-deriving it.
 
 import { effectiveMatrix } from "./host_matrix.ts";
-import { composeWorkerAgent } from "./subagents_config.ts";
+import { composeWorkerAgent } from "./worker_cells.ts";
 
 export const SCHEMA_VERSION = 1;
 

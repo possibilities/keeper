@@ -77,8 +77,6 @@ const FS_OS_GRANDFATHER: Record<string, Set<string>> = {
   // homedir() is the worktrees-root fallback when the producer omits the injected
   // root; the verdict path passes `worktreesRoot` in, so it stays env-free there.
   "src/worktree-plan.ts": new Set(["node:os"]),
-  // readFileSync loads the embedded model×effort matrix YAML at config-parse time.
-  "plugins/plan/src/yaml_input.ts": new Set(["node:fs"]),
   // readFileSync / readSync read stdin for the plan-config loader.
   "plugins/plan/src/stdin.ts": new Set(["node:fs"]),
 };

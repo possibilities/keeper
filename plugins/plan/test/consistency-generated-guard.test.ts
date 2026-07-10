@@ -148,7 +148,7 @@ describe("hooks.json wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
-// per-cell work plugin set ↔ subagents.yaml matrix (both directions)
+// per-cell work plugin set ↔ required host matrix (both directions)
 // ---------------------------------------------------------------------------
 
 describe("generated work plugins match the host worker matrix", () => {

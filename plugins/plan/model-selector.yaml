@@ -8,10 +8,11 @@
 # The `model-guidance` skill (plugins/plan/skills/model-guidance/) OWNS the
 # content here: every efforts:/models: block is authored and refreshed by that
 # skill, and the research: map's hashes are drift-gated against the skill's
-# references/ cache. Axis source of truth is subagents.yaml (efforts: + models:);
-# this file must carry exactly one guidance block per configured axis value.
-# Adding an axis value = edit subagents.yaml, then run the model-guidance skill
-# to backfill here. The gate fails until backfilled:
+# references/ cache. Axis source of truth is the required host matrix
+# (~/.config/keeper/matrix.yaml; efforts: + subagent_models:); this file must
+# carry exactly one guidance block per configured axis value. Adding an axis
+# value = edit matrix.yaml, then run the model-guidance skill to backfill here.
+# The gate fails until backfilled:
 #   bun plugins/plan/scripts/model-guidance-check.ts --check
 
 # Selector source metadata retained for the config schema.
@@ -64,10 +65,10 @@ efforts_provenance:
   last_reviewed: 2026-07-06
   status: researched
 
-# One guidance block per configured `efforts:` axis value (subagents.yaml).
-# Concrete, behavioral, worker-facing selection advice — when to route a task to
-# this effort. Keep each block short: the whole config rides in every selector
-# brief.
+# One guidance block per configured `efforts:` axis value (the required host
+# matrix). Concrete, behavioral, worker-facing selection advice — when to route
+# a task to this effort. Keep each block short: the whole config rides in every
+# selector brief.
 efforts:
   low: |
     Tiny, reversible, near-mechanical edits where the acceptance leaves no
@@ -96,9 +97,10 @@ efforts:
     Diminishing returns and overthinking risk on anything routine; never a
     generic "be careful" upgrade over xhigh.
 
-# One guidance block per configured `models:` axis value (subagents.yaml), plus
-# pre-provisioned blocks for host-roster capability models a matrix.yaml may add
-# (the runtime selection-brief seam enforces one block per effective model).
+# One guidance block per configured `models:` axis value (the required host
+# matrix), plus pre-provisioned blocks for host-roster capability models a
+# matrix.yaml may add (the runtime selection-brief seam enforces one block per
+# effective model).
 # Distilled from the skill's references/ research — strengths, weaknesses,
 # when-to-pick. Blocks are strictly capability-shaped: never cost or provider
 # ordering, which live in the host matrix and stay invisible to the content-blind
@@ -162,7 +164,7 @@ research:
   sonnet:
     reference: skills/model-guidance/references/sonnet.md
     sha256: cf88409ab1dafa43569e41b5c73d04bc6b9f18a3c3e52b78a9a3c2df3ad2990e
-  # Host-roster capability model absent from the embedded subagents.yaml axis. The
+  # Host-roster capability model absent from the claude-only default axis. The
   # research entry is tolerated by the host-blind gate, but the reference must
   # exist and hash-match like any other; the guidance block is a pre-provisioned
   # extra the runtime selection-brief seam gates on the effective matrix.

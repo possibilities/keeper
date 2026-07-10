@@ -1,8 +1,7 @@
 /**
- * Plan-island v2 host-matrix coverage (ADR 0036) — the additive `loadHostMatrixV2`
- * loader beside the unchanged v1 `loadHostMatrix`/`composeEffective` base path, plus
- * the new fs/os-free `worker_cells.ts` leaf. Cross-island parity (this loader vs the
- * launcher island's `loadMatrixV2`) lives in the root `test/agent-matrix.test.ts`;
+ * Plan-island v2 host-matrix coverage (ADR 0036) — the `loadHostMatrixV2` loader
+ * plus the fs/os-free `worker_cells.ts` leaf. Cross-island parity (this loader vs
+ * the launcher island's `loadMatrixV2`) lives in the root `test/agent-matrix.test.ts`;
  * this file pins the plan island's own parse behavior + the leaf's boundary.
  */
 

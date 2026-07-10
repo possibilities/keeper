@@ -1,14 +1,11 @@
 // Worker-cell path + compose helpers — the fs/os-free leaf the reconcile-core
-// closure can adopt (ADR 0036). Holds the {model × effort} cell-path convention
+// closure adopts (ADR 0036). Holds the {model × effort} cell-path convention
 // and the pure {model, effort} → worker-agent compose over EXPLICIT axes, so the
 // axis SOURCE (a host matrix snapshot) is the caller's choice and this module
 // never reads the filesystem or environment.
 //
 // This module imports NO node:fs / node:os (the reconcile-core relative-import
-// closure bans them; test/reconcile-core-depgraph.test.ts pins the boundary). Its
-// contents are relocated copies of the same helpers subagents_config.ts still
-// exports; the consumers cut over to this leaf in the dependent tasks, and the
-// deletion task removes the subagents_config.ts originals.
+// closure bans them; test/reconcile-core-depgraph.test.ts pins the boundary).
 
 /** The workers-base directory (relative to the plan plugin root) under which the
  * renderer fans out one self-contained `work` plugin per {model × effort} cell.

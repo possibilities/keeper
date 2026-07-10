@@ -31,7 +31,7 @@ import { CANONICAL_EFFORTS } from "../src/host_matrix.ts";
 import { DEPTH_BAND_THRESHOLD_KEYS } from "../src/verbs/close_preflight.ts";
 import { loadYamlInput } from "../src/yaml_input.ts";
 
-/** Plan plugin root — audit-policy.yaml and subagents.yaml sit here. */
+/** Plan plugin root — audit-policy.yaml sits here. */
 export const PLAN_ROOT = resolve(import.meta.dir, "..");
 
 /** The fixed close-depth vocabulary a `depth_bands` entry may name. Ordered

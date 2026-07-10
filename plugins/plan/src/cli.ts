@@ -13,8 +13,7 @@
 
 import { PLAN_COMMANDS, planCommand, SUBGROUP_NAMES } from "./descriptor.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
-import { HostMatrixConfigError } from "./host_matrix.ts";
-import { SubagentsConfigError } from "./subagents_config.ts";
+import { HostMatrixConfigError, SubagentsConfigError } from "./host_matrix.ts";
 import {
   dispatchGroup,
   type GroupSpec,

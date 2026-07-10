@@ -64,9 +64,8 @@ describe("trigger-set predicates", () => {
     expect(isVendorCorpusPath("README.md")).toBe(false);
   });
 
-  test("isModelGuidancePath matches exactly the model-selector config and subagents matrix", () => {
+  test("isModelGuidancePath matches exactly the model-selector config", () => {
     expect(isModelGuidancePath("plugins/plan/model-selector.yaml")).toBe(true);
-    expect(isModelGuidancePath("plugins/plan/subagents.yaml")).toBe(true);
     expect(isModelGuidancePath("plugins/plan/other.yaml")).toBe(false);
     expect(isModelGuidancePath("model-selector.yaml")).toBe(false);
   });
@@ -91,7 +90,7 @@ describe("trigger-set predicates", () => {
     expect(isPlanBoundaryPath("plugins/plan/src/cli.ts")).toBe(true);
     expect(isPlanBoundaryPath("plugins/plan/src/verbs/done.ts")).toBe(true);
     expect(isPlanBoundaryPath("plugins/plan/test/cli.test.ts")).toBe(false);
-    expect(isPlanBoundaryPath("plugins/plan/subagents.yaml")).toBe(false);
+    expect(isPlanBoundaryPath("plugins/plan/model-selector.yaml")).toBe(false);
     expect(isPlanBoundaryPath("src/reconcile-core.ts")).toBe(false);
   });
 });
@@ -122,9 +121,9 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
     );
   });
 
-  test("the subagents matrix staged fires only the model-guidance stage", async () => {
+  test("the model-selector config staged fires only the model-guidance stage", async () => {
     const { runTool, calls } = fakeRunTool();
-    await runScopedLint(["plugins/plan/subagents.yaml"], REPO_ROOT, {
+    await runScopedLint(["plugins/plan/model-selector.yaml"], REPO_ROOT, {
       runTool,
     });
     expect(calls).toHaveLength(1);
@@ -225,7 +224,10 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
     let caught: unknown;
     try {
       await runScopedLint(
-        ["plugins/prompt/corpus/vendor.lock", "plugins/plan/subagents.yaml"],
+        [
+          "plugins/prompt/corpus/vendor.lock",
+          "plugins/plan/model-selector.yaml",
+        ],
         REPO_ROOT,
         { runTool },
       );
@@ -239,7 +241,7 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
     expect(failure.stderr).toContain("--- model-guidance ---");
     expect(failure.files).toEqual([
       "plugins/prompt/corpus/vendor.lock",
-      "plugins/plan/subagents.yaml",
+      "plugins/plan/model-selector.yaml",
     ]);
   });
 
@@ -257,7 +259,7 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
       await runScopedLint(
         [
           "plugins/prompt/corpus/vendor.lock",
-          "plugins/plan/subagents.yaml",
+          "plugins/plan/model-selector.yaml",
           "plugins/plan/src/example.txt",
         ],
         REPO_ROOT,

@@ -1,6 +1,6 @@
 # Post-selection audit policy — the plan-time sizing seam for variable-depth
-# automated review. Two sections, both drift-gated against the subagents.yaml
-# axes and the fixed depth vocabulary:
+# automated review. Two sections, both drift-gated against the canonical effort
+# vocabulary and the fixed depth vocabulary:
 #   bun plugins/plan/scripts/audit-policy-check.ts --check
 # (test/consistency-audit-policy.test.ts asserts the same in the fast suite).
 #
@@ -9,8 +9,8 @@
 # and (later, at close) a lean depth band, by construction. The
 # KEEPER_PLAN_AUDIT_POLICY env var overrides the path (test seam + operator lever).
 
-# Per-tier audit-flag decision. Every configured effort tier (the subagents.yaml
-# `efforts` axis) MUST map to an explicit true/false — the gate fails on an
+# Per-tier audit-flag decision. Every configured effort tier (the canonical
+# effort vocabulary) MUST map to an explicit true/false — the gate fails on an
 # unmapped tier or a mapping for a non-axis tier. A flagged tier's selected tasks
 # park for a per-task audit before their done-latch releases; ship conservative
 # so the false-positive cost stays measurable before the flags widen. Only the

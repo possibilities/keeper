@@ -27,7 +27,7 @@ import { join, resolve } from "node:path";
 import { loadHostMatrixV2 } from "../src/host_matrix.ts";
 import { loadYamlInput, parseYamlInput } from "../src/yaml_input.ts";
 
-/** Plan plugin root — model-selector.yaml and subagents.yaml sit here. */
+/** Plan plugin root — model-selector.yaml sits here. */
 export const PLAN_ROOT = resolve(import.meta.dir, "..");
 
 /** One research-provenance entry: a references/ cache file + its content hash. */
@@ -197,10 +197,10 @@ function coverageErrors(
 }
 
 /** Union the effort tokens across every configured scope, first-appearance order.
- * The subagents.yaml axis is a single flat scope, but a host provider matrix
- * expresses efforts as several scopes (a top-level axis plus per-provider and
- * per-model overrides); the guidance gate must cover their union so no scope's
- * effort token can slip past coverage. This host-blind gate reads only the disk
+ * A single flat effort axis is one scope, but a host provider matrix expresses
+ * efforts as several scopes (a top-level axis plus per-provider and per-model
+ * overrides); the guidance gate must cover their union so no scope's effort
+ * token can slip past coverage. This host-blind gate reads only the disk
  * config's scopes, so today the union collapses to the single flat axis — the
  * union shape keeps coverage correct wherever the effort axis carries more than
  * one scope. */

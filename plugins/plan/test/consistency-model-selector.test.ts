@@ -1,10 +1,10 @@
 // Drift gate for the selector policy config (../model-selector.yaml), asserted
 // in the fast tier as pure disk reads — no subprocess, daemon, or git. Pins the
-// on-disk config against the subagents.yaml axes (both directions) and against
-// the model-guidance skill's references/ cache (hash parity), then drives the
-// coverage + research-hash failure modes through the pure check core with
-// hand-built inputs whose expected outcomes are independent of the config under
-// test.
+// on-disk config against the required host matrix axes (both directions) and
+// against the model-guidance skill's references/ cache (hash parity), then
+// drives the coverage + research-hash failure modes through the pure check core
+// with hand-built inputs whose expected outcomes are independent of the config
+// under test.
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -23,7 +23,7 @@ import {
   type ModelSelectorConfig,
   unionEfforts,
 } from "../scripts/model-guidance-check.ts";
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { effectiveMatrix } from "../src/host_matrix.ts";
 
 const PLAN_ROOT = resolve(import.meta.dir, "..");
 
@@ -65,9 +65,7 @@ describe("on-disk selector config", () => {
   });
 
   test("is readable off disk with no compile step and carries selector + usage + a block per axis value", () => {
-    const matrix = loadSubagentsMatrixFromDisk(
-      join(PLAN_ROOT, "subagents.yaml"),
-    );
+    const matrix = effectiveMatrix();
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
@@ -164,11 +162,6 @@ describe("on-disk selector config", () => {
     expect(agentLower).toContain("burden of proof");
     expect(agentLower).toContain("intelligence-bound");
     expect(agentLower).toContain("not difficulty");
-  });
-
-  test("subagents.yaml header cross-references model-selector.yaml", () => {
-    const text = readFileSync(join(PLAN_ROOT, "subagents.yaml"), "utf-8");
-    expect(text).toContain("model-selector.yaml");
   });
 
   test("state mode classifies every model fresh and every effort present", () => {

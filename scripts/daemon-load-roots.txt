@@ -13,5 +13,4 @@ bun.lock
 package.json
 plist/arthack.keeperd.plist
 plugins/plan/src
-plugins/plan/subagents.yaml
 src

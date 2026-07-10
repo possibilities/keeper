@@ -91,8 +91,7 @@ describe("daemon load-surface boundary", () => {
     );
     // Genuine roots pass, both directory and file forms.
     expect(underRoot("src/daemon.ts")).toBe(true);
-    expect(underRoot("plugins/plan/src/subagents_config.ts")).toBe(true);
-    expect(underRoot("plugins/plan/subagents.yaml")).toBe(true);
+    expect(underRoot("plugins/plan/src/host_matrix.ts")).toBe(true);
     expect(underRoot("package.json")).toBe(true);
   });
 });
@@ -142,7 +141,6 @@ describe("daemon-fingerprint seam (pure core)", () => {
     expect(roots.length).toBeGreaterThan(0);
     expect(roots).toContain("src");
     expect(roots).toContain("plugins/plan/src");
-    expect(roots).toContain("plugins/plan/subagents.yaml");
   });
 
   test("composeRevParseArgs builds an argv array with no shell interpolation", () => {
