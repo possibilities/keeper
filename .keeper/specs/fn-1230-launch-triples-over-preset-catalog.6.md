@@ -39,5 +39,5 @@ bun scripts/vendor-corpus.ts --check green; plugins/plan and plugins/prompt suit
 - [ ] No prose outside docs/adr and commit history references the named preset catalog
 
 ## Done summary
-
+Rewrote pair/dispatch/panel skills, panel-runner/panel-judge agents, install/composition-map/plan-README docs, and the gpt-5.3-codex-spark research cache to teach the launch-triple grammar exclusively; re-vendored the panel-strength corpus snippet and re-baked its two SKILL.md consumers with vendor.lock/model-selector.yaml hashes updated.
 ## Evidence
