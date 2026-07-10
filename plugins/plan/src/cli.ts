@@ -12,7 +12,9 @@
 // plan_invocation into their own single envelope via the emit.ts self-emitters.
 
 import { PLAN_COMMANDS, planCommand, SUBGROUP_NAMES } from "./descriptor.ts";
-import type { OutputFormat } from "./format.ts";
+import { compactJson, type OutputFormat } from "./format.ts";
+import { HostMatrixConfigError } from "./host_matrix.ts";
+import { SubagentsConfigError } from "./subagents_config.ts";
 import {
   dispatchGroup,
   type GroupSpec,
@@ -654,6 +656,34 @@ function dispatch(parsed: ParsedArgs): number {
     noSuchCommand(command);
   }
 
+  try {
+    return dispatchCommand(command, format, rest);
+  } catch (err) {
+    // A verb reading the axes with an absent or malformed host matrix throws a
+    // typed four-state error; surface it as a loud compact error envelope (the
+    // mutating-verb envelope shape) + exit 1 rather than an uncaught stack. Every
+    // other throw propagates unchanged (the harness ExitCode carrier included, so
+    // a verb's own process.exit is never swallowed).
+    if (err instanceof SubagentsConfigError) {
+      const error: Record<string, unknown> = {
+        code: "MATRIX_INVALID",
+        message: err.message,
+      };
+      if (err instanceof HostMatrixConfigError) {
+        error.details = { state: err.state, path: err.label };
+      }
+      process.stdout.write(`${compactJson({ success: false, error })}\n`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
+function dispatchCommand(
+  command: string,
+  format: OutputFormat | null,
+  rest: string[],
+): number {
   switch (command) {
     case "state-path": {
       const taskId = readOption(rest, "--task");

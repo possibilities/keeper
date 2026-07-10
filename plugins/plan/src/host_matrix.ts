@@ -29,7 +29,6 @@ import {
   loadSubagentsMatrixFromDisk,
   SubagentsConfigError,
   type SubagentsMatrix,
-  subagentsMatrix,
 } from "./subagents_config.ts";
 import { parseYamlInput } from "./yaml_input.ts";
 
@@ -113,8 +112,16 @@ function isMatrixAliasTarget(value: unknown): value is string {
 /** keeper's canonical five-rung effort vocabulary, ascending — MIRRORS the
  * launcher island's `src/agent/harness.ts` KEEPER_EFFORTS. The plan island cannot
  * import src/agent, so the list is duplicated here; the cross-island parity test
- * pins both parsers to identical subset + normalization behavior against it. */
-const CANONICAL_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+ * pins both parsers to identical subset + normalization behavior against it. It is
+ * also the tier vocabulary the host-blind audit-policy gate validates tier keys
+ * against, so the gate never reads a host file. */
+export const CANONICAL_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
 const CANONICAL_EFFORT_SET: ReadonlySet<string> = new Set(CANONICAL_EFFORTS);
 
 /** The subset of the host matrix a plan consumer needs, parsed and validated. */
@@ -540,11 +547,15 @@ function composeEffective(base: SubagentsMatrix): EffectiveMatrix {
   };
 }
 
-/** The runtime effective matrix: the compile-time embedded snapshot as the
- * claude-native base, overlaid by the host matrix when present. For the plan
- * verbs (which run from the compiled binary at an arbitrary cwd). */
+/** The runtime effective matrix, resolved from the REQUIRED v2 host matrix
+ * (`~/.config/keeper/matrix.yaml`). Throws a typed four-state
+ * {@link HostMatrixConfigError} when the matrix is absent or malformed — v2 has no
+ * embedded fallback, so a plan verb reading the axes surfaces the loud error
+ * instead of a silent default. For the plan verbs (which run from the compiled
+ * binary at an arbitrary cwd); re-reads per call so an operator matrix edit lands
+ * with no rebuild. */
 export function effectiveMatrix(): EffectiveMatrix {
-  return composeEffective(subagentsMatrix());
+  return hostMatrixV2ToEffective(loadHostMatrixV2());
 }
 
 /** The build-time effective matrix: the on-disk subagents.yaml at `path` as the
@@ -985,4 +996,19 @@ export function hostMatrixV2EffortsFor(
   model: string,
 ): string[] {
   return [...(host.effortsByModel.get(model) ?? host.efforts)];
+}
+
+/** Adapt a loaded {@link HostMatrixV2} into the {@link EffectiveMatrix} shape the
+ * plan verbs consume (model axis = `subagent_models`, `subagents` = the template
+ * inventory). The driver map defaults an unlisted model to wrapped, matching the
+ * v1 adapter. */
+export function hostMatrixV2ToEffective(host: HostMatrixV2): EffectiveMatrix {
+  return {
+    efforts: host.efforts,
+    models: host.models,
+    subagents: host.subagentTemplates,
+    wrapper_driver: host.wrapper_driver,
+    driverFor: (model) => host.driverByModel.get(model) ?? "wrapped",
+    effortsFor: (model) => hostMatrixV2EffortsFor(host, model),
+  };
 }

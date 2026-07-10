@@ -136,36 +136,34 @@ export function taskPriority(taskData: Record<string, unknown>): number {
   return 999;
 }
 
-/** The canonical worker reasoning tiers (efforts), sourced from the composed
- * EFFECTIVE matrix — the host provider matrix when `matrix.yaml` is present, the
- * embedded subagents snapshot (byte-identical to today) when absent. This is the
- * single validation seam every membership-checking verb (assign-cells, scaffold,
- * refine-apply, close-finalize) inherits, so a host-roster effort axis lands
- * without each verb re-reading the embedded snapshot. Read lazily (never at module
- * eval) so a malformed config surfaces a typed error at a verb call site, and
+/** The canonical worker reasoning tiers (efforts), sourced from the REQUIRED v2
+ * host matrix (`matrix.yaml`) — its top-level effort axis. This is the single
+ * validation seam every membership-checking verb (assign-cells, scaffold,
+ * refine-apply, close-finalize) inherits, so the effort axis lands without each
+ * verb re-reading the config. Read lazily (never at module eval) so an absent or
+ * malformed matrix surfaces the typed four-state error at a verb call site, and
  * re-read per call so an operator matrix edit lands with no rebuild. */
 export function configuredEfforts(): readonly string[] {
   return effectiveMatrix().efforts;
 }
 
-/** The canonical worker models — the model axis of the composed EFFECTIVE matrix
- * (host provider matrix when present, embedded snapshot when absent). Same seam
- * and lazy/per-call contract as configuredEfforts. */
+/** The canonical worker models — the `subagent_models` cell axis of the required
+ * v2 host matrix. Same seam and lazy/per-call contract as configuredEfforts. */
 export function configuredModels(): readonly string[] {
   return effectiveMatrix().models;
 }
 
 /** Derive a task's worker null-gate signal from its {tier, model}, validated
- * against the composed EFFECTIVE matrix (host-aware; embedded-identical when no
- * matrix). The composed string is `plan:worker-<model>-<effort>`, but only its
- * NULL-NESS is load-bearing: /plan:work spawns the constant `work:worker` (the
- * launcher selects the matching cell at launch via --plugin-dir), so the composed
- * value is vestigial for the spawn. Returns null when EITHER axis is null — the
- * null return is what stops /plan:work cleanly. Throws for a non-null value outside
- * the effective efforts/models: the corrupt-state backstop behind dispatch's
- * graceful no-route reject, which fires first on any unroutable cell and gates
- * claim. The reconcile verdict path uses the embedded-only sibling
- * (`embeddedWorkerAgentFor`) so its host read stays off the pure core. */
+ * against the required v2 host matrix. The composed string is
+ * `plan:worker-<model>-<effort>`, but only its NULL-NESS is load-bearing:
+ * /plan:work spawns the constant `work:worker` (the launcher selects the matching
+ * cell at launch via --plugin-dir), so the composed value is vestigial for the
+ * spawn. Returns null when EITHER axis is null — the null return is what stops
+ * /plan:work cleanly. Throws for a non-null value outside the matrix
+ * efforts/models: the corrupt-state backstop behind dispatch's graceful no-route
+ * reject, which fires first on any unroutable cell and gates claim. The reconcile
+ * verdict path uses the embedded-only sibling (`embeddedWorkerAgentFor`) so its
+ * host read stays off the pure core. */
 export function workerAgentFor(
   tier: string | null,
   model: string | null,

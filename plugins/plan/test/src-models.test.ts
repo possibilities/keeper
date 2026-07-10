@@ -73,11 +73,11 @@ describe("normalizeEpic", () => {
   });
 });
 
-// models.ts's configured-axes seam reads the composed EFFECTIVE matrix (host
-// provider matrix when present, embedded snapshot when absent). Fixtures inject a
-// host matrix via KEEPER_CONFIG_DIR; the no-matrix case points at an empty config
-// dir so the embedded fallback holds regardless of the developer's host.
-describe("configured-axes read the effective matrix", () => {
+// models.ts's configured-axes seam reads the REQUIRED v2 host matrix
+// (`subagent_models` cell axis). Fixtures inject a matrix via KEEPER_CONFIG_DIR;
+// the no-matrix case points at an empty config dir and must fail loud (v2 has no
+// embedded fallback).
+describe("configured-axes read the required v2 host matrix", () => {
   function withConfigDir<T>(dir: string, fn: () => T): T {
     const prev = process.env.KEEPER_CONFIG_DIR;
     process.env.KEEPER_CONFIG_DIR = dir;
@@ -92,21 +92,21 @@ describe("configured-axes read the effective matrix", () => {
     }
   }
 
-  test("a host matrix grows the model axis; workerAgentFor composes the host cell", () => {
+  test("the matrix's subagent_models is the model axis; workerAgentFor composes the wrapped cell", () => {
     const dir = mkdtempSync(join(tmpdir(), "models-eff-"));
     try {
       writeFileSync(
         join(dir, "matrix.yaml"),
         [
           "efforts: [medium, high]",
+          "subagent_templates: [template/agents/worker.md.tmpl]",
+          "subagent_models: [opus, gpt-5.5]",
           "providers:",
           "  - name: claude",
           "    models: [opus]",
           "  - name: codex",
           "    models:",
-          "      - name: gpt-5.5",
-          "        native: openai/gpt-5.5",
-          "subagents: [work]",
+          "      - gpt-5.5",
           "wrapper_driver:",
           "  model: sonnet",
           "  effort: high",
@@ -115,27 +115,29 @@ describe("configured-axes read the effective matrix", () => {
       );
       withConfigDir(dir, () => {
         expect(configuredModels()).toEqual(["opus", "gpt-5.5"]);
+        // The stamped worker-agent shape is byte-identical to the pre-v2 form.
         expect(workerAgentFor("high", "gpt-5.5")).toBe(
           "plan:worker-gpt-5.5-high",
         );
+        expect(workerAgentFor("medium", "opus")).toBe(
+          "plan:worker-opus-medium",
+        );
+        // The null-stop signal is preserved: a null axis returns null (no throw).
+        expect(workerAgentFor(null, "opus")).toBeNull();
+        // A model outside the axis is the corrupt-state backstop throw.
+        expect(() => workerAgentFor("high", "sonnet")).toThrow(/unknown model/);
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("no host matrix falls back to the embedded axes (null-stop preserved)", () => {
+  test("an absent matrix fails loud — v2 has no embedded fallback", () => {
     const dir = mkdtempSync(join(tmpdir(), "models-eff-none-"));
     try {
       withConfigDir(dir, () => {
-        expect(configuredModels()).toEqual(["opus", "sonnet"]);
-        expect(workerAgentFor("medium", "opus")).toBe(
-          "plan:worker-opus-medium",
-        );
-        expect(workerAgentFor(null, "opus")).toBeNull();
-        expect(() => workerAgentFor("high", "gpt-5.5")).toThrow(
-          /unknown model/,
-        );
+        expect(() => configuredModels()).toThrow(/matrix\.yaml/);
+        expect(() => workerAgentFor("medium", "opus")).toThrow(/matrix\.yaml/);
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });

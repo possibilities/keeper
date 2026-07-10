@@ -126,11 +126,22 @@ describe("generated work plugins match the subagents.yaml matrix", () => {
   test.skipIf(!WORKERS_RENDERED)(
     "on-disk workers/ cell set equals the ragged {model × effort} product",
     () => {
-      // The renderer fans out over the EFFECTIVE matrix (embedded base overlaid by
-      // a host matrix when present) using each model's OWN effort list, so the gate
-      // computes the ragged product from the same source. With no host matrix every
-      // model shares the flat axis and the product is the rectangular cartesian.
-      const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
+      // The committed workers/ tree is the embedded claude-only render, so read the
+      // EFFECTIVE matrix with NO host override — pin an empty config dir so neither
+      // the test-suite fixture nor the developer's live ~/.config/keeper composes
+      // in — then restore the env. With no host matrix every model shares the flat
+      // axis and the product is the rectangular cartesian.
+      const noHostCfg = mkdtempSync(join(tmpdir(), "genguard-nohost-"));
+      const prevCfg = process.env.KEEPER_CONFIG_DIR;
+      process.env.KEEPER_CONFIG_DIR = noHostCfg;
+      let matrix: ReturnType<typeof effectiveMatrixFromDisk>;
+      try {
+        matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
+      } finally {
+        if (prevCfg === undefined) delete process.env.KEEPER_CONFIG_DIR;
+        else process.env.KEEPER_CONFIG_DIR = prevCfg;
+        rmSync(noHostCfg, { recursive: true, force: true });
+      }
       const expected = new Set<string>();
       for (const model of matrix.models) {
         for (const effort of matrix.effortsFor(model)) {
