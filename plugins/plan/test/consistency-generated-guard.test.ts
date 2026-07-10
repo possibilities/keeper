@@ -7,15 +7,7 @@
 // `keeper prompt`, (3) the post-hook additionalContext plumbing, and (4) the
 // work marker write→read round-trip through the production writer + reader.
 
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  test,
-} from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -30,28 +22,8 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { readMarker } from "../plugin/hooks/lib.ts";
-import {
-  hostMatrixV2EffortsFor,
-  loadHostMatrixV2,
-} from "../src/host_matrix.ts";
+import { CANONICAL_EFFORTS } from "../src/host_matrix.ts";
 import { writeWorkMarker } from "../src/session_markers.ts";
-
-/** The pinned claude-only v2 host matrix the generated-cell guard resolves under,
- * so the expected cell set is host-blind — the operator's live
- * `~/.config/keeper/matrix.yaml` never leaks in. Its cell set (opus/sonnet × the
- * five efforts, all native) is the workers/ tree a claude-only render produces. */
-const CLAUDE_ONLY_MATRIX = [
-  "efforts: [low, medium, high, xhigh, max]",
-  "subagent_templates: [template/agents/worker.md.tmpl]",
-  "subagent_models: [opus, sonnet]",
-  "providers:",
-  "  - name: claude",
-  "    models: [opus, sonnet]",
-  "wrapper_driver:",
-  "  model: sonnet",
-  "  effort: high",
-  "",
-].join("\n");
 
 const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
@@ -60,7 +32,7 @@ const POST_HOOK = join(REPO, "plugin", "hooks", "post-hook.ts");
 // workers/ is gitignored (rendered per-cell from the host worker matrix), so a
 // clean checkout that never ran render-plugin-templates has no cells on disk. The
 // two tests that enumerate real cells skip there instead of failing hard;
-// promote.sh renders before its drift guards, so promotion-time coverage is
+// promote.sh renders before these guards, so promotion-time coverage is
 // preserved.
 const WORKERS_RENDERED = existsSync(join(REPO, "workers"));
 
@@ -151,45 +123,41 @@ describe("hooks.json wiring", () => {
 // per-cell work plugin set ↔ required host matrix (both directions)
 // ---------------------------------------------------------------------------
 
-describe("generated work plugins match the host worker matrix", () => {
-  let cfgDir: string;
-  const savedConfigDir = process.env.KEEPER_CONFIG_DIR;
-  beforeAll(() => {
-    cfgDir = realpathSync(mkdtempSync(join(tmpdir(), "planctl-guard-cfg-")));
-    writeFileSync(join(cfgDir, "matrix.yaml"), CLAUDE_ONLY_MATRIX);
-    process.env.KEEPER_CONFIG_DIR = cfgDir;
-  });
-  afterAll(() => {
-    rmSync(cfgDir, { recursive: true, force: true });
-    if (savedConfigDir === undefined) {
-      delete process.env.KEEPER_CONFIG_DIR;
-    } else {
-      process.env.KEEPER_CONFIG_DIR = savedConfigDir;
-    }
-  });
+describe("on-disk work-plugin cells are well-formed", () => {
+  // The model segment of a cell dir is a host-matrix capability token (mirrors
+  // host_matrix.ts MATRIX_TOKEN_RE); a capability may carry hyphens/dots
+  // (`gpt-5.3-codex-spark`), so the effort is the final hyphen-delimited segment.
+  const CELL_MODEL_RE = /^[a-z0-9._-]+$/;
 
   test.skipIf(!WORKERS_RENDERED)(
-    "on-disk workers/ cell set equals the ragged {model × effort} product",
+    "every on-disk workers/ cell name is a <model>-<canonical-effort> pair",
     () => {
-      // The renderer fans out over the v2 host worker matrix using each
-      // capability's OWN effort list, so the gate computes the ragged product from
-      // the same source under a pinned claude-only fixture. A claude-only roster
-      // shares the flat axis, so the product is the rectangular cartesian.
-      const matrix = loadHostMatrixV2();
-      const expected = new Set<string>();
-      for (const model of matrix.models) {
-        for (const effort of hostMatrixV2EffortsFor(matrix, model)) {
-          expected.add(`${model}-${effort}`);
+      // The exact {model × effort} roster a matrix renders is pinned hermetically
+      // in the prompt suite (parity.test.ts renders the plan plugin in-process
+      // against fixture matrices). A plan test can't read the live host matrix
+      // (the preload pins a claude-only fixture, ADR 0036), so it can't re-derive
+      // that roster — it holds the host-blind structural invariant instead: every
+      // cell name parses as <model>-<effort> with a canonical effort and a valid
+      // capability token.
+      const cells = readdirSync(join(REPO, "workers"), { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+      // WORKERS_RENDERED gated us in, so a real render left at least one cell.
+      expect(cells.length).toBeGreaterThan(0);
+      const malformed = cells.filter((name) => {
+        const cut = name.lastIndexOf("-");
+        if (cut <= 0) {
+          return true;
         }
-      }
-      const actual = new Set(
-        readdirSync(join(REPO, "workers"), { withFileTypes: true })
-          .filter((e) => e.isDirectory())
-          .map((e) => e.name),
-      );
-      // Both directions: a missing cell fails, and a stale cell dir (a removed
-      // {model × effort} whose tree lingers) fails too.
-      expect([...actual].sort()).toEqual([...expected].sort());
+        const model = name.slice(0, cut);
+        const effort = name.slice(cut + 1);
+        return !(
+          CELL_MODEL_RE.test(model) &&
+          !model.startsWith(".") &&
+          (CANONICAL_EFFORTS as readonly string[]).includes(effort)
+        );
+      });
+      expect(malformed).toEqual([]);
     },
   );
 

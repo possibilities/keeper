@@ -35,14 +35,17 @@ echo "promote: building dist/keeper-plan-bun (hard prerequisite)"
 
 keeper_root="$(cd "${repo_root}/../.." && pwd)"
 
-# Render the per-cell work plugins so the slow-tier cell-set guard below sees
-# them on disk. `bun run test:slow` runs consistency-generated-guard.test.ts,
-# whose WORKERS_RENDERED-gated tests pin the workers/ cell set against the
-# required host matrix in BOTH directions (missing cell fails, stale cell
-# fails) — the real render↔config drift check; without this render they
-# silently skip. A `git status` diff here would be dead: every rendered output
-# (workers/, agents/practice-scout.md) is gitignored and so invisible to
-# porcelain, and the hand-authored agents/ files are never rendered.
+# Render the per-cell work plugins so the WORKERS_RENDERED-gated guards in
+# consistency-generated-guard.test.ts see them on disk. Those guards hold
+# host-blind structural invariants on the rendered tree — every cell name parses
+# as <model>-<canonical-effort>, and no non-cell `work`-named plugin shadows the
+# cells. The exact {model × effort} roster a matrix must render is pinned
+# separately and hermetically by the prompt suite's parity.test.ts (which renders
+# the plan plugin in-process against fixture matrices); a plan test can't read the
+# live host matrix, so it validates well-formedness, not the roster. Without this
+# render the plan guards silently skip. A `git status` diff here would be dead:
+# every rendered output (workers/, agents/practice-scout.md) is gitignored and so
+# invisible to porcelain, and the hand-authored agents/ files are never rendered.
 echo "promote: rendering per-cell work plugins for the slow-tier cell-set guard"
 ( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" )
 
