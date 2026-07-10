@@ -30,5 +30,5 @@ rather than softening the wording).
 - [ ] models.ts comments name no deleted symbol and describe the injected-matrix architecture
 
 ## Done summary
-
+Reworded CONTEXT.md/install.md shadow claims to match actual behavior (computed, not surfaced) and rewrote models.ts's workerAgentFor comment to name the effectiveMatrix() seam instead of the deleted embeddedWorkerAgentFor sibling; trimmed CONTEXT.md's spacer lines back under the glossary line cap.
 ## Evidence
