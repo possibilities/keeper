@@ -8,7 +8,7 @@
  * the no-blind-force remove, the flock-around-merge).
  */
 
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   lstatSync,
@@ -1922,7 +1922,13 @@ test("provisionScratchWorktree: HEAD lands off the requested sha → checkout-fa
       argvHas(c.args, "--force"),
   );
   expect(forced.length).toBeGreaterThanOrEqual(1);
-  expect(forced[0].args).toEqual(["worktree", "remove", "--force", scratch]);
+  expect(forced[0].args).toEqual([
+    "worktree",
+    "remove",
+    "--force",
+    "--force",
+    scratch,
+  ]);
 });
 
 test("provisionScratchWorktree: dirty scratch tree → checkout-failed (never a clean-key result), reaped", async () => {
@@ -1958,7 +1964,41 @@ test("removeScratchWorktree: registered scratch → force-removed + pruned (idem
   ]);
   await removeScratchWorktree("/repo", scratch, run);
   const rm = calls.find((c) => argvStartsWith(c.args, "worktree", "remove"));
-  expect(rm?.args).toEqual(["worktree", "remove", "--force", scratch]);
+  // Double `--force`: the second is what clears git's own `initializing` lock
+  // on a scratch whose `worktree add` was cut mid-flight.
+  expect(rm?.args).toEqual([
+    "worktree",
+    "remove",
+    "--force",
+    "--force",
+    scratch,
+  ]);
+  expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+    true,
+  );
+});
+
+test("removeScratchWorktree: a failed remove is logged, never thrown, and the admin prune still runs", async () => {
+  const scratch = baselineScratchPathFor("/repo", SCRATCH_SHA, "/wtroot");
+  const { run, calls } = fakeAsyncGit([
+    worktreeListRule(scratchEntryLine(scratch)),
+    {
+      when: (a) => argvStartsWith(a, "worktree", "remove"),
+      result: {
+        exitCode: 128,
+        stderr:
+          "fatal: cannot remove a locked working tree, lock reason: initializing",
+      },
+    },
+  ]);
+  const errSpy = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await removeScratchWorktree("/repo", scratch, run);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0]?.[0])).toContain("scratch reap failed");
+  } finally {
+    errSpy.mockRestore();
+  }
   expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
     true,
   );

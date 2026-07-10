@@ -1935,12 +1935,17 @@ export async function provisionScratchWorktree(
 /**
  * Remove a baseline scratch worktree, idempotently. Unlike {@link removeWorktree}
  * (which NEVER blind-`--force`s, protecting a lane that may hold real work), this
- * DOES `--force`: a scratch tree is a throwaway keyed by (repo, sha) holding only
- * a checkout + build artifacts (nothing human), and a killed suite run leaves it
- * dirty in a way a bare remove would refuse. The force is gated on the path
- * carrying the {@link BASELINE_SCRATCH_PREFIX} — a non-scratch path THROWS (a
- * producer bug), so a lane can never reach this force. Always prunes the admin
- * husk after (idempotent), so a vanished-dir orphan entry is cleared too.
+ * DOES `--force` — TWICE: a scratch tree is a throwaway keyed by (repo, sha)
+ * holding only a checkout + build artifacts (nothing human), a killed suite run
+ * leaves it dirty in a way a bare remove would refuse, and a run cut mid-
+ * `worktree add` leaves git's own `initializing` lock, which a single `--force`
+ * refuses (and `worktree prune` skips) — only the double force clears such an
+ * orphan. The force is gated on the path carrying the
+ * {@link BASELINE_SCRATCH_PREFIX} — a non-scratch path THROWS (a producer bug),
+ * so a lane can never reach this force. A failed remove is logged and never
+ * thrown (the caller's reap is best-effort; the next boot prune retries).
+ * Always prunes the admin husk after (idempotent), so a vanished-dir orphan
+ * entry is cleared too.
  */
 export async function removeScratchWorktree(
   mainRepoCwd: string,
@@ -1954,10 +1959,18 @@ export async function removeScratchWorktree(
   }
   const existing = await listWorktrees(mainRepoCwd, run);
   if (existing.some((e) => samePath(e.path, scratchPath))) {
-    await run(["worktree", "remove", "--force", scratchPath], {
-      cwd: mainRepoCwd,
-      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-    });
+    const rm = await run(
+      ["worktree", "remove", "--force", "--force", scratchPath],
+      {
+        cwd: mainRepoCwd,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      },
+    );
+    if (rm.code !== 0) {
+      console.error(
+        `[worktree-git] scratch reap failed (exit ${rm.code}) for ${scratchPath}: ${(rm.stdout + rm.stderr).trim()}`,
+      );
+    }
   }
   await pruneWorktrees(mainRepoCwd, run);
 }
