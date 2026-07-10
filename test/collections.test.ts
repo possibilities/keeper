@@ -16,6 +16,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { projectDrainedRunningJobs } from "../cli/await";
+import { drainedState } from "../src/await-conditions";
 import {
   AUTOPILOT_STATE_DESCRIPTOR,
   BUILDS_DESCRIPTOR,
@@ -45,7 +47,9 @@ import {
   WORKTREE_RECOVER_KEY_PREFIX,
 } from "../src/dispatch-failure-key";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
+import type { Verdict } from "../src/readiness";
 import { runQuery } from "../src/server-worker";
+import type { Job } from "../src/types";
 import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -125,13 +129,15 @@ function seedJob(
     plan_ref: string;
     state: string;
     last_event_id: number;
+    title: string;
+    dispatch_origin: string;
   }> = {},
 ): void {
   db.query(
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state,
-       last_event_id, plan_verb, plan_ref, epic_links
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       last_event_id, plan_verb, plan_ref, epic_links, title, dispatch_origin
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     job_id,
     1,
@@ -141,6 +147,8 @@ function seedJob(
     opts.plan_verb ?? null,
     opts.plan_ref ?? null,
     opts.epic_links ?? "[]",
+    opts.title ?? null,
+    opts.dispatch_origin ?? null,
   );
 }
 
@@ -284,6 +292,105 @@ test("JOBS_DESCRIPTOR serves worktree for the durable lane pill (v94)", () => {
   expect(JOBS_DESCRIPTOR.sortable.has("worktree")).toBe(false);
   expect(JOBS_DESCRIPTOR.filters.worktree).toBeUndefined();
   expect(JOBS_DESCRIPTOR.jsonColumns.has("worktree")).toBe(false);
+});
+
+test("runQuery serves jobs.dispatch_origin on the wire row for the drained scope gate", () => {
+  // `dispatch_origin` is a write-path column (DB column + reducer stamp), but the
+  // shared jobs wire must PROJECT it: `keeper await drained`'s plan/inflight
+  // scopes read it off `snap.jobs` to gate on keeper-dispatched work (see
+  // `isKeeperDispatched`). A column absent from the descriptor reads back
+  // `undefined` → `null`, so every job looks manual and the discriminator dies
+  // silently. This drives the REAL `runQuery` projection so a future strip fails
+  // here, not only in production.
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedJob(db, "w-1", { state: "working", dispatch_origin: "escalation" });
+  const res = asResult(runQuery(db, 1, { type: "query", collection: "jobs" }));
+  expect(res.total).toBe(1);
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected one jobs row");
+  expect(row.dispatch_origin).toBe("escalation");
+  // A provenance/predicate input — never a sort/filter/json key.
+  expect(JOBS_DESCRIPTOR.columns).toContain("dispatch_origin");
+  expect(JOBS_DESCRIPTOR.sortable.has("dispatch_origin")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.dispatch_origin).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("dispatch_origin")).toBe(false);
+  db.close();
+});
+
+test("drained CLI projection: dispatch_origin sourced through runQuery gates plan/inflight scope and self-excludes the caller via ownSessionId", () => {
+  // End-to-end through the REAL layers, no injected fixture field: seed working
+  // jobs, page them through `runQuery` (the server jobs-wire projection), map the
+  // wire rows with the CLI's `projectDrainedRunningJobs`, then run the pure
+  // `drainedState` predicate. A stripped `dispatch_origin` would read `null` here
+  // and every job would look manual — the plan/inflight gate would go inert.
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // The caller's OWN autopilot job, a sibling escalation session, and a manual
+  // (non-keeper-dispatched) session — all working.
+  seedJob(db, "me", { state: "working", dispatch_origin: "autopilot" });
+  seedJob(db, "sib", { state: "working", dispatch_origin: "escalation" });
+  // No `dispatch_origin` → NULL: a manual / non-keeper-dispatched session.
+  seedJob(db, "manual", { state: "working" });
+  const wireRows = asResult(
+    runQuery(db, 3, { type: "query", collection: "jobs" }),
+  ).rows as unknown as Job[];
+  const runningJobs = projectDrainedRunningJobs(wireRows);
+  expect(runningJobs).toHaveLength(3);
+  // The provenance survived runQuery → the CLI projection (not `undefined`).
+  expect(runningJobs.find((j) => j.jobId === "sib")?.dispatchOrigin).toBe(
+    "escalation",
+  );
+
+  // inflight scope, caller = "me": the manual job drops by provenance, the
+  // caller's own "me" job by self-exclusion, leaving only the escalation sibling
+  // holding → waiting.
+  const held = drainedState({
+    scope: "inflight",
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatches: [],
+    runningJobs,
+    ownSessionId: "me",
+    catchingUp: false,
+  });
+  expect(held.kind).toBe("waiting");
+  expect((held.holders ?? []).map((h) => h.id)).toEqual(["sib"]);
+
+  // The sibling ends; only the caller's own + the manual job remain → both
+  // excluded (self + provenance) → inflight met.
+  const cleared = drainedState({
+    scope: "inflight",
+    perTask: new Map(),
+    perCloseRow: new Map(),
+    openEpicCount: 0,
+    pendingDispatches: [],
+    runningJobs: projectDrainedRunningJobs(
+      wireRows.filter((r) => r.job_id !== "sib"),
+    ),
+    ownSessionId: "me",
+    catchingUp: false,
+  });
+  expect(cleared.kind).toBe("met");
+
+  // plan scope: a live escalation session holds even when every plan/close row
+  // reads completed — provenance, not `plan_verb` (NULL on an escalation
+  // session), is the discriminator.
+  const completed: Verdict = { tag: "completed" };
+  const planHeld = drainedState({
+    scope: "plan",
+    perTask: new Map<string, Verdict>([["fn-x.1", completed]]),
+    perCloseRow: new Map<string, Verdict>([["fn-x", completed]]),
+    openEpicCount: 1,
+    pendingDispatches: [],
+    runningJobs: projectDrainedRunningJobs(
+      wireRows.filter((r) => r.job_id === "sib"),
+    ),
+    ownSessionId: null,
+    catchingUp: false,
+  });
+  expect(planHeld.kind).toBe("waiting");
+  expect((planHeld.holders ?? []).map((h) => h.id)).toEqual(["sib"]);
+  db.close();
 });
 
 test("getCollection resolves the profiles collection (fn-639)", () => {

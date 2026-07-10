@@ -115,11 +115,11 @@ export type AutocloseBucket = "autopilot" | "panel" | "escalation";
 
 /**
  * The narrow `jobs` row the decision core reads. A PURPOSE-BUILT projection, not
- * the full {@link import("./types").Job}: it carries the two columns the shared
- * jobs descriptor deliberately omits (`dispatch_origin` — the airtight
- * autopilot-vs-manual discriminator — and `backend_exec_generation_id` — the
- * live-pane-resolved marker), so the pulse reads it via a direct SELECT rather
- * than the descriptor read path.
+ * the full {@link import("./types").Job}: it carries the airtight
+ * autopilot-vs-manual `dispatch_origin` discriminator plus
+ * `backend_exec_generation_id` (the live-pane-resolved marker the shared jobs
+ * descriptor omits), so the pulse reads it via a direct SELECT rather than the
+ * descriptor read path.
  */
 export interface AutocloseJob {
   job_id: string;
@@ -463,11 +463,11 @@ function readAutopilotPaused(db: Database): boolean {
   return typeof raw === "number" ? raw !== 0 : true;
 }
 
-/** Read the stopped candidate rows via a direct SELECT — the two provenance
- *  columns (`dispatch_origin`, `backend_exec_generation_id`) are omitted from
- *  the shared jobs descriptor, so the descriptor read path can't surface them.
- *  Only `state = 'stopped'` rows are ever candidates; a resumed row simply
- *  vanishes from this set and its grace entry is pruned by absence. */
+/** Read the stopped candidate rows via a direct SELECT — `backend_exec_generation_id`
+ *  (the live-pane-resolved marker) is omitted from the shared jobs descriptor, so
+ *  the descriptor read path can't surface it. Only `state = 'stopped'` rows are
+ *  ever candidates; a resumed row simply vanishes from this set and its grace
+ *  entry is pruned by absence. */
 function readAutocloseJobs(db: Database): AutocloseJob[] {
   return db
     .prepare(
