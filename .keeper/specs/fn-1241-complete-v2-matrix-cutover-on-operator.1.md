@@ -28,5 +28,5 @@ suites (test/agent-presets, test/agent-dispatch, test/agent-matrix).
 - [ ] Core dispatch/launch behavior is unchanged
 
 ## Done summary
-
+Cut keeper agent presets list/providers resolve/providers check over to loadMatrixV2, adding v2 derivations (resolveModelV2, providerCheckFindingsV2, enumerateTriplesV2, lintHostTriplesV2) that mirror v1's shapes while honoring v2 shadowing (single roster-first winner) and per-capability launch-only membership; added tests loading docs/examples/matrix.example.yaml through all three verbs.
 ## Evidence
