@@ -21,5 +21,5 @@ Files: `cli/transcript.ts` (date-only parse branch) and its time-parser test fil
 - [ ] A regression test (TG1) asserts the out-of-range case errors, covering both `since` and `until` edges.
 
 ## Done summary
-
+Validate the date-only --since/--until round-trip against parsed year/month/day and return the existing invalid-time error on mismatch, since Date silently normalizes out-of-range components; added a regression test covering both edges.
 ## Evidence
