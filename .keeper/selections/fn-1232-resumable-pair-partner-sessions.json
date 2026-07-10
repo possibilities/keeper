@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Pure resolver module with a fully-specified contract and every union branch spelled out; correctness invariants (recycle identity, newest collapse) are clearly enumerated, so well-specified sonnet work at the model-default band.",
+      "task_id": "fn-1232-resumable-pair-partner-sessions.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract-touching per-harness argv/wire composition with byte-identical fresh-launch goldens and option-injection safety warrants xhigh, but it extends an existing descriptor pattern so sonnet suffices.",
+      "task_id": "fn-1232-resumable-pair-partner-sessions.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Multi-file CLI verb following the known Dispatch-union/route pattern with clear birth-record lineage rules; execution spans a few files on a clear path.",
+      "task_id": "fn-1232-resumable-pair-partner-sessions.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The load-bearing codex resume watermark is a subtle correctness invariant (a mis-anchored scan silently returns the pre-resume answer) cascading across seven capture/transcript/envelope files under byte-stable goldens.",
+      "task_id": "fn-1232-resumable-pair-partner-sessions.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Single-file SKILL.md prose rework with a fully-specified acceptance, but the framing/pruning and CONTEXT.md vocabulary judgment keep it on sonnet rather than the trickle lane.",
+      "task_id": "fn-1232-resumable-pair-partner-sessions.5",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T03:35:07.030000Z",
+  "epic_id": "fn-1232-resumable-pair-partner-sessions",
+  "input_hash": "cc7da5e0dc37ed5b4deb7ed5964e5067b3611b21ec1bf2c3bc8118c90acf3c9d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3430786528,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1232-resumable-pair-partner-sessions.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Pure resolver module with a fully-specified contract and every union branch spelled out; correctness invariants (recycle identity, newest collapse) are clearly enumerated, so well-specified sonnet work at the model-default band.\",\"confidence\":0.72},{\"task_id\":\"fn-1232-resumable-pair-partner-sessions.2\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Contract-touching per-harness argv/wire composition with byte-identical fresh-launch goldens and option-injection safety warrants xhigh, but it extends an existing descriptor pattern so sonnet suffices.\",\"confidence\":0.68},{\"task_id\":\"fn-1232-resumable-pair-partner-sessions.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Multi-file CLI verb following the known Dispatch-union/route pattern with clear birth-record lineage rules; execution spans a few files on a clear path.\",\"confidence\":0.7},{\"task_id\":\"fn-1232-resumable-pair-partner-sessions.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The load-bearing codex resume watermark is a subtle correctness invariant (a mis-anchored scan silently returns the pre-resume answer) cascading across seven capture/transcript/envelope files under byte-stable goldens.\",\"confidence\":0.7},{\"task_id\":\"fn-1232-resumable-pair-partner-sessions.5\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Single-file SKILL.md prose rework with a fully-specified acceptance, but the framing/pruning and CONTEXT.md vocabulary judgment keep it on sonnet rather than the trickle lane.\",\"confidence\":0.66}]}\n"
+}
