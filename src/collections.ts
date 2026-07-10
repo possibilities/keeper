@@ -187,6 +187,16 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // can pill an adopted job distinctly. Display-only — never a `sortable` /
     // `filters` / `jsonColumns` key.
     "adopted",
+    // `dispatch_origin`: the keeper-DISPATCH provenance discriminator —
+    // `'autopilot'` for an autopilot work/close worker, `'escalation'` for an
+    // unblock/deconflict/resolve/repair session, NULL for a manual/adopted/
+    // external session. Served so `keeper await drained`'s `plan`/`inflight`
+    // scopes gate on keeper-dispatched work off the shared jobs wire (see
+    // `isKeeperDispatched`) — a readiness-predicate input like the `git_*_count`
+    // cluster, never a `sortable` / `filters` / `jsonColumns` key. The autoclose
+    // pulse reads its own narrow direct-SELECT projection (it also needs
+    // `backend_exec_generation_id`, which the descriptor still omits).
+    "dispatch_origin",
   ],
   pk: "job_id",
   version: "last_event_id",

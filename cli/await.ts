@@ -1174,6 +1174,30 @@ interface RunnerState {
 }
 
 /**
+ * Project the wire `jobs` snapshot into the {@link DrainedJob} set the `drained`
+ * predicate weighs: every `state === "working"` row, carrying the real
+ * `dispatch_origin` the `plan`/`inflight` scopes gate on (the scope's provenance
+ * + self-exclusion filter lives in {@link drainedState}, never here). Sourced off
+ * the shared jobs wire, so `dispatch_origin` MUST be a served `JOBS_DESCRIPTOR`
+ * column — an unserved column reads back `undefined` → `null` and every job looks
+ * manual. Exported so the projection is driven against REAL wire rows, not a
+ * fixture that injects the field.
+ */
+export function projectDrainedRunningJobs(jobs: Iterable<Job>): DrainedJob[] {
+  const runningJobs: DrainedJob[] = [];
+  for (const job of jobs) {
+    if (job.state === "working") {
+      runningJobs.push({
+        jobId: job.job_id,
+        dispatchOrigin: job.dispatch_origin ?? null,
+        label: job.title ?? job.job_id,
+      });
+    }
+  }
+  return runningJobs;
+}
+
+/**
  * Run the await loop. Returns the result struct AFTER `exit()` has
  * fired (tests resolve via captured state). Production `exit()` calls
  * `process.exit` which never returns, so this fn never returns there.
@@ -2015,19 +2039,8 @@ export async function runAwait(
     }
     if (slot.kind === "drained") {
       // Project every working job into a scoped holder input — the pure
-      // predicate applies the scope's provenance + self-exclusion filter (never
-      // here). `dispatch_origin` carries the keeper-dispatch provenance the
-      // plan/inflight scopes key on.
-      const runningJobs: DrainedJob[] = [];
-      for (const job of snap.jobs.values()) {
-        if (job.state === "working") {
-          runningJobs.push({
-            jobId: job.job_id,
-            dispatchOrigin: job.dispatch_origin ?? null,
-            label: job.title ?? job.job_id,
-          });
-        }
-      }
+      // predicate applies the scope's provenance + self-exclusion filter.
+      const runningJobs = projectDrainedRunningJobs(snap.jobs.values());
       const pendingDispatches: DrainedHolder[] = snap.pendingDispatches.map(
         (p) => ({
           kind: "pending",
