@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 3,
+        "files_changed": 2,
+        "insertions": 18
+      },
+      "done_summary": "Validate the date-only --since/--until round-trip against parsed year/month/day and return the existing invalid-time error on mismatch, since Date silently normalizes out-of-range components; added a regression test covering both edges.",
+      "input_hash": "611d8b5cc3fdb821aa224bbb96e52431d11f67a2a49c79e082b96a3f73b61970",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1499,
+      "spec_md": "## Description\n\nClose finding F1 (with merged test gap TG1) from the fn-1228 close audit.\nIn `cli/transcript.ts` the date-only branch (around lines 221-244 as of commit\ndd279623) constructs `new Date(year, month, day, 0,0,0,0)` and guards only on\n`Number.isFinite(localMidnight)`. Numeric `Date` components never yield an Invalid\nDate \u2014 `2026-02-30` normalizes to Mar 2, `2026-13-01` to next January \u2014 so the guard\nis dead code and out-of-range values silently bound the wrong window. After\nconstructing the `Date`, validate the round-trip\n(`d.getFullYear() === year && d.getMonth() === month && d.getDate() === day`) and\nreturn the existing `invalid --${edge} time '${raw}'; use ISO-8601 or 30m/8h/7d`\nerror on mismatch. Apply the same check to the `since` and `until`\n(next-local-midnight) constructions.\n\nFiles: `cli/transcript.ts` (date-only parse branch) and its time-parser test file.\n\n## Acceptance\n\n- [ ] Out-of-range date-only `--since`/`--until` (e.g. `2026-02-30`, `2026-13-01`) returns the `invalid --<edge> time` error.\n- [ ] In-range date-only, relative (`30m`/`8h`/`7d`), and ISO-8601 values parse unchanged.\n- [ ] A regression test (TG1) asserts the out-of-range case errors, covering both `since` and `until` edges.\n\n## Done summary\nValidate the date-only --since/--until round-trip against parsed year/month/day and return the existing invalid-time error on mismatch, since Date silently normalizes out-of-range components; added a regression test covering both edges.\n## Evidence\n",
+      "task_id": "fn-1231-validate-transcript-date-only-bounds.1",
+      "tier": "low",
+      "title": "Reject out-of-range date bounds"
+    }
+  ],
+  "created_at": "2026-07-10T03:20:27.922000Z",
+  "epic_id": "fn-1231-validate-transcript-date-only-bounds",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "selection_input_hash": "611d8b5cc3fdb821aa224bbb96e52431d11f67a2a49c79e082b96a3f73b61970",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
