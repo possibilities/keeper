@@ -7,7 +7,7 @@
     "fn-1232-resumable-pair-partner-sessions"
   ],
   "id": "fn-1235-correct-pair-resume-docs-and-provenance",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T09:16:18.819000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T09:16:17.968000Z"
+  "updated_at": "2026-07-10T09:16:18.819000Z"
 }
