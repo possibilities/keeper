@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { ConfigError, loadPresetCatalog } from "../src/agent/config";
 import {
   buildHarnessResumeArgv,
+  buildResumeLaunchPromptTail,
   HARNESS_DESCRIPTORS,
   HARNESS_NAME_SET,
   HARNESS_NAMES,
@@ -22,9 +23,16 @@ import {
   harnessOrClaude,
   isCapturableHarness,
   isHarnessName,
+  ResumeLaunchUnsupportedError,
   type SecondAxis,
 } from "../src/agent/harness";
 import { AGENT_CLIS } from "../src/agent/launch-config";
+
+const DASH_PROMPT_GUARDS: ReadonlySet<string> = new Set([
+  "double-dash",
+  "equals-join",
+  "unsupported",
+]);
 
 const SECOND_AXES: ReadonlySet<SecondAxis> = new Set([
   "effort",
@@ -58,6 +66,7 @@ describe("harness registry — descriptor completeness", () => {
       expect(["flag", "subcommand"]).toContain(d.resumeArgv.kind);
       expect(typeof d.resumeArgv.token).toBe("string");
       expect(d.resumeArgv.token.length).toBeGreaterThan(0);
+      expect(DASH_PROMPT_GUARDS.has(d.resumeLaunch.dashGuard)).toBe(true);
     }
   });
 
@@ -146,6 +155,26 @@ describe("harness registry — membership + capability predicates", () => {
     });
   });
 
+  test("resumeLaunch dash-prompt guard is pinned per harness (probe-verified live)", () => {
+    // claude/codex: a live-probed `--` end-of-options guard reliably ends
+    // option parsing (docs/adr/0034 + this task's own claude/codex probes).
+    expect(HARNESS_DESCRIPTORS.claude.resumeLaunch).toEqual({
+      dashGuard: "double-dash",
+    });
+    expect(HARNESS_DESCRIPTORS.codex.resumeLaunch).toEqual({
+      dashGuard: "double-dash",
+    });
+    // pi: probe-verified NEITHER `--` nor an `=`-joined form is safe for its
+    // bare positional prompt — a resume-launch builder must fail loud.
+    expect(HARNESS_DESCRIPTORS.pi.resumeLaunch).toEqual({
+      dashGuard: "unsupported",
+    });
+    // hermes: probe-verified only the `=`-joined oneshot form is safe.
+    expect(HARNESS_DESCRIPTORS.hermes.resumeLaunch).toEqual({
+      dashGuard: "equals-join",
+    });
+  });
+
   test("buildHarnessResumeArgv emits the [token, target] pair, defaulting unknown/NULL to claude", () => {
     expect(buildHarnessResumeArgv("claude", "u")).toEqual(["--resume", "u"]);
     expect(buildHarnessResumeArgv("codex", "r")).toEqual(["resume", "r"]);
@@ -180,6 +209,68 @@ describe("harness registry — membership + capability predicates", () => {
 describe("harness registry — parallel unions derive from it", () => {
   test("AGENT_CLIS (launch-config) is the registry name set", () => {
     expect([...AGENT_CLIS].sort()).toEqual([...HARNESS_NAMES].sort());
+  });
+});
+
+describe("buildResumeLaunchPromptTail — per-harness dash-prompt guard", () => {
+  test("double-dash (claude, codex): always [--, prompt], even for a normal prompt", () => {
+    expect(buildResumeLaunchPromptTail("claude", "hello")).toEqual([
+      "--",
+      "hello",
+    ]);
+    expect(buildResumeLaunchPromptTail("codex", "hello")).toEqual([
+      "--",
+      "hello",
+    ]);
+  });
+
+  test("double-dash (claude, codex): a leading-dash prompt rides safely behind --", () => {
+    expect(buildResumeLaunchPromptTail("claude", "-dash-prompt")).toEqual([
+      "--",
+      "-dash-prompt",
+    ]);
+    expect(buildResumeLaunchPromptTail("codex", "-dash-prompt")).toEqual([
+      "--",
+      "-dash-prompt",
+    ]);
+  });
+
+  test("equals-join (hermes): folds the prompt onto the owning flag with =, even for a normal prompt", () => {
+    expect(buildResumeLaunchPromptTail("hermes", "hello", "-z")).toEqual([
+      "-z=hello",
+    ]);
+  });
+
+  test("equals-join (hermes): a leading-dash prompt rides safely joined, never as a separate token", () => {
+    expect(buildResumeLaunchPromptTail("hermes", "-dash-prompt", "-z")).toEqual(
+      ["-z=-dash-prompt"],
+    );
+  });
+
+  test("equals-join (hermes) without a joinFlagToken throws ResumeLaunchUnsupportedError", () => {
+    expect(() => buildResumeLaunchPromptTail("hermes", "hello")).toThrow(
+      ResumeLaunchUnsupportedError,
+    );
+  });
+
+  test("unsupported (pi): a normal prompt passes through unchanged", () => {
+    expect(buildResumeLaunchPromptTail("pi", "hello world")).toEqual([
+      "hello world",
+    ]);
+  });
+
+  test("unsupported (pi): a leading-dash prompt fails loud — never silently dropped or misrouted", () => {
+    expect(() => buildResumeLaunchPromptTail("pi", "-dash-prompt")).toThrow(
+      ResumeLaunchUnsupportedError,
+    );
+  });
+
+  test("unknown/NULL harness defaults to claude's double-dash guard", () => {
+    expect(buildResumeLaunchPromptTail(null, "hello")).toEqual(["--", "hello"]);
+    expect(buildResumeLaunchPromptTail("grok", "hello")).toEqual([
+      "--",
+      "hello",
+    ]);
   });
 });
 
