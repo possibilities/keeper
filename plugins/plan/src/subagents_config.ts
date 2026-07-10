@@ -139,13 +139,17 @@ export function workerCellDir(model: string, effort: string): string {
   return `${WORKERS_BASE}/${model}-${effort}`;
 }
 
-/** Pure {model, effort} → worker-agent-name composition over an EXPLICIT axis
- * pair. Returns null on EITHER null axis (the /plan:work null-stop signal); throws
- * the corrupt-on-disk guard for a non-null value outside its axis. The axis SOURCE
- * — the embedded snapshot vs the host-effective matrix — is the caller's choice, so
- * this composer stays fs-free and safe for the pure reconcile-core closure. */
+/** Pure {model, effort} → worker-agent-name composition over an explicit model
+ * axis + a per-model effort resolver. Returns null on EITHER null axis (the
+ * /plan:work null-stop signal); throws the corrupt-on-disk guard for a non-null
+ * value outside its axis. The tier is validated against the MODEL's effective
+ * effort list (`effortsFor`), so a ragged host roster rejects a tier the model
+ * cannot render; an unknown model resolves the top-level fallback, leaving the
+ * separate model-membership throw to name it. The axis SOURCE — the embedded
+ * snapshot vs the host-effective matrix — is the caller's choice, so this composer
+ * stays fs-free and safe for the pure reconcile-core closure. */
 export function composeWorkerAgent(
-  efforts: readonly string[],
+  effortsFor: (model: string) => readonly string[],
   models: readonly string[],
   tier: string | null,
   model: string | null,
@@ -153,6 +157,7 @@ export function composeWorkerAgent(
   if (tier === null || model === null) {
     return null;
   }
+  const efforts = effortsFor(model);
   if (!efforts.includes(tier)) {
     throw new Error(
       `unknown tier ${JSON.stringify(tier)}; expected one of ${efforts.join(", ")} or null`,
@@ -177,5 +182,7 @@ export function embeddedWorkerAgentFor(
   model: string | null,
 ): string | null {
   const matrix = subagentsMatrix();
-  return composeWorkerAgent(matrix.efforts, matrix.models, tier, model);
+  // The embedded snapshot is the flat claude base — no per-model overrides — so
+  // every model resolves the same global effort axis (the cube stays rectangular).
+  return composeWorkerAgent(() => matrix.efforts, matrix.models, tier, model);
 }

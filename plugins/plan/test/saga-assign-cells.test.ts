@@ -12,8 +12,15 @@
 // Every fixture is a withProject epic scaffolded through the binary (tasks land
 // tier=medium/model=opus), so assign-cells overwrites real committed defs.
 
-import { beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { recoveryForPlanCode } from "../src/emit.ts";
@@ -420,6 +427,75 @@ describe("assign-cells cell_invalid", () => {
       firstJsonPayload(r.output).error as Record<string, unknown>
     ).details as string[];
     expect(details.some((d) => d.includes("'gpt'"))).toBe(true);
+  });
+
+  // Ragged host roster: opus's own effort list is narrowed to [medium], so a tier
+  // valid in the top-level axis but outside that model's list is rejected, naming
+  // the model. This is the per-model (ragged) axis gate — a flat global check would
+  // silently accept a tier the model cannot render.
+  const cfgDirs: string[] = [];
+  afterAll(() => {
+    for (const d of cfgDirs) {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+  function cfgWithMatrix(matrixYaml: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "assign-ragged-cfg-"));
+    cfgDirs.push(dir);
+    writeFileSync(join(dir, "matrix.yaml"), matrixYaml);
+    return dir;
+  }
+  const RAGGED_MATRIX = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models:",
+    "      - name: opus",
+    "        efforts: [medium]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: medium",
+    "",
+  ].join("\n");
+
+  test("a tier outside the model's own effort list rejects, naming the model", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const cfg = cfgWithMatrix(RAGGED_MATRIX);
+    // `high` is in the top-level axis but NOT in opus's narrowed list [medium].
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "high", model: "opus" },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)], {
+      env: { KEEPER_CONFIG_DIR: cfg },
+    });
+    expect(r.code).toBe(1);
+    expect(errCode(r.output)).toBe("cell_invalid");
+    const details = (
+      firstJsonPayload(r.output).error as Record<string, unknown>
+    ).details as string[];
+    const tierErr = details.find((d) => d.includes("'high'"));
+    expect(tierErr).toBeDefined();
+    // Ragged: the rejection names the model and the model's own list.
+    expect(tierErr as string).toContain("for model 'opus'");
+    expect(tierErr as string).toContain("medium");
+    // No write landed — the task keeps its scaffolded default cell.
+    expect(readTask(taskIds[0] as string).tier).toBe("medium");
+  });
+
+  test("the same tier inside the model's own effort list is accepted", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const cfg = cfgWithMatrix(RAGGED_MATRIX);
+    // `medium` IS in opus's narrowed list — the ragged gate accepts it.
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "medium", model: "opus" },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)], {
+      env: { KEEPER_CONFIG_DIR: cfg },
+    });
+    expect(r.code).toBe(0);
+    expect(readTask(taskIds[0] as string).tier).toBe("medium");
+    expect(readTask(taskIds[0] as string).model).toBe("opus");
   });
 
   test("a non-string tier is bad_yaml (shape), not cell_invalid", () => {

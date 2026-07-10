@@ -1,8 +1,12 @@
 # The embedded DEFAULT plan worker {model × effort} matrix — every model here is
-# claude-native. A host `~/.config/keeper/matrix.yaml` (ADR 0010), when present,
-# overrides these axes at run time: an ordered provider roster grows the model
-# axis with capability models served by non-claude harnesses (wrapped cells).
-# With no host matrix, selection, rendering, and dispatch use exactly these axes.
+# claude-native, with a single global effort axis (no per-model overrides needed).
+# A host `~/.config/keeper/matrix.yaml` (ADR 0010), when present, overrides these
+# axes at run time: an ordered provider roster grows the model axis with capability
+# models served by non-claude harnesses (wrapped cells), each provider or model may
+# narrow its effort list via a per-provider / per-model `efforts:` override (making
+# the {model × effort} cube ragged), and a provider may set `route: false` to
+# enumerate for launch only without entering the capability cell set. With no host
+# matrix, selection, rendering, and dispatch use exactly these axes.
 #
 # Two consumers route through the shared loader (src/subagents_config.ts):
 #   - build time: render-plugin-templates reads this file (composed with the host

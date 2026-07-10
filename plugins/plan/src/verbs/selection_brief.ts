@@ -295,8 +295,11 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
       ? epicDef.primary_repo
       : ctx.projectPath;
 
+  // Ragged candidate enumeration: each model contributes only the efforts it can
+  // render (its host per-model override, else the top-level axis). With no host
+  // matrix every model shares the axis and the product is rectangular.
   const candidateCells = effective.models.flatMap((model) =>
-    effective.efforts.map((effort) => ({ model, tier: effort })),
+    effective.effortsFor(model).map((effort) => ({ model, tier: effort })),
   );
 
   const source = args.fromFollowup

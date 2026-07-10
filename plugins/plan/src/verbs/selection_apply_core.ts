@@ -98,11 +98,14 @@ function pyReprStr(v: string): string {
 }
 
 /** Validate a cell set against the LIVE axes + the in-lock todo set: out-of-axis
- * tier/model, unknown / non-todo task id, duplicate cells, and the full-set
- * coverage contract (every todo task covered exactly once). Returns the
- * accumulate-all `cell_invalid` detail list (empty on a clean set). Shared by
- * both guided callers so the assign-cells regression net covers apply-selection's
- * final axis gate too. */
+ * model, a tier the cell's model cannot render, unknown / non-todo task id,
+ * duplicate cells, and the full-set coverage contract (every todo task covered
+ * exactly once). The tier gate is per-model (`effortsFor(model)`): a ragged host
+ * roster rejects a tier outside that model's own effort list, naming the model; an
+ * unknown model resolves the top-level fallback so its tier error stays meaningful
+ * beside the separate model error. Returns the accumulate-all `cell_invalid`
+ * detail list (empty on a clean set). Shared by both guided callers so the
+ * assign-cells regression net covers apply-selection's final axis gate too. */
 export function validateSelectionCells(
   parsedCells: readonly SelectionCoreCell[],
   opts: {
@@ -110,19 +113,21 @@ export function validateSelectionCells(
     verb: string;
     todo: ReadonlySet<string>;
     epicTaskIds: ReadonlySet<string>;
-    efforts: readonly string[];
+    effortsFor: (model: string) => readonly string[];
     models: readonly string[];
   },
 ): string[] {
-  const { epicId, verb, todo, epicTaskIds, efforts, models } = opts;
+  const { epicId, verb, todo, epicTaskIds, effortsFor, models } = opts;
   const cellErrors: string[] = [];
   const seen = new Set<string>();
   for (let idx = 0; idx < parsedCells.length; idx += 1) {
     const c = parsedCells[idx] as SelectionCoreCell;
     const prefix = `cells #${idx + 1} (${c.taskId})`;
-    if (!efforts.includes(c.tier)) {
+    const modelEfforts = effortsFor(c.model);
+    if (!modelEfforts.includes(c.tier)) {
       cellErrors.push(
-        `${prefix}: tier ${pyReprStr(c.tier)} is not one of ${efforts.join(", ")}`,
+        `${prefix}: tier ${pyReprStr(c.tier)} is not one of ` +
+          `${modelEfforts.join(", ")} for model ${pyReprStr(c.model)}`,
       );
     }
     if (!models.includes(c.model)) {

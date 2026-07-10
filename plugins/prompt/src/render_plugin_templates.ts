@@ -128,9 +128,9 @@ function sourceVariants(templatePath: string): string[] {
  * no `subagents.yaml`. The plugin's committed config is the claude-native base;
  * a host `~/.config/keeper/matrix.yaml`, when present, overrides the model axis
  * (adding wrapped capability cells) and the wrapper driver. Read once per
- * renderAgents pass; a listed agent template fans out over the sorted cartesian
- * product instead of the 1-D `variants:` path. A malformed config throws
- * (fail-loud build). */
+ * renderAgents pass; a listed agent template fans out over the ragged {model ×
+ * effort} product (each model's own effective effort list) instead of the 1-D
+ * `variants:` path. A malformed config throws (fail-loud build). */
 function pluginEffectiveMatrix(pluginDir: string): EffectiveMatrix | null {
   const configPath = join(pluginDir, "subagents.yaml");
   if (!isFile(configPath)) {
@@ -567,16 +567,19 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
     };
 
     if (matrixCell !== null) {
-      // 2-D {model × effort} fan-out: one generated agent per cell, both axes
-      // sorted before the cartesian product for stable output ordering. Each cell
-      // also carries its driver (native/wrapped) and the wrapper driver, so the
-      // composed template can branch a wrapped cell onto its foreign harness
-      // while a native cell stays byte-identical.
+      // Ragged {model × effort} fan-out: one generated agent per cell, models
+      // sorted and each model's OWN effective effort list sorted for stable output
+      // ordering. With no host matrix every model shares the top-level axis (the
+      // product stays rectangular); a host roster's per-model effort overrides make
+      // the cube ragged, so the effort list is resolved per model, not once. Each
+      // cell carries its driver (native/wrapped) and the wrapper driver, so the
+      // composed template can branch a wrapped cell onto its foreign harness while a
+      // native cell stays byte-identical.
       const models = [...matrixCell.models].sort();
-      const efforts = [...matrixCell.efforts].sort();
       const wrapperModel = matrixCell.wrapper_driver.model;
       const wrapperEffort = matrixCell.wrapper_driver.effort;
       for (const model of models) {
+        const efforts = [...matrixCell.effortsFor(model)].sort();
         for (const effort of efforts) {
           const defaultOut = join(agentsDir, `${stem}-${model}-${effort}.md`);
           const [rendered, failed] = renderOne(tmpl, {

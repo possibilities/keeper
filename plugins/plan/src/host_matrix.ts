@@ -41,12 +41,20 @@ export type Driver = "native" | "wrapped";
  * `wrapper_driver` is the fixed claude model-and-effort a wrapped cell's wrapper
  * runs at. */
 export interface EffectiveMatrix {
+  /** The top-level effort axis — the global effort vocabulary and the default a
+   * model inherits when no per-model override narrows it. */
   readonly efforts: readonly string[];
   readonly models: readonly string[];
   readonly subagents: readonly string[];
   readonly wrapper_driver: { readonly model: string; readonly effort: string };
   /** `native` for a claude-served model, `wrapped` for every other. */
   driverFor(model: string): Driver;
+  /** The effective effort list for a model — the host per-model override when the
+   * matrix narrows it, else the top-level axis. With no host matrix every model
+   * returns the base axis, so the {model × effort} cube stays rectangular; a host
+   * roster's per-model overrides make it ragged. The renderer, the selection-brief
+   * candidate enumeration, and the cell-write axis gate all fan out over this. */
+  effortsFor(model: string): readonly string[];
 }
 
 /** The wrapper driver the embedded defaults imply when no host matrix overrides
@@ -516,6 +524,7 @@ function composeEffective(base: SubagentsMatrix): EffectiveMatrix {
       subagents: base.subagents,
       wrapper_driver: host.wrapper_driver,
       driverFor: (model) => driverByModel.get(model) ?? "wrapped",
+      effortsFor: (model) => effortsFor(host, model),
     };
   }
   return {
@@ -527,6 +536,7 @@ function composeEffective(base: SubagentsMatrix): EffectiveMatrix {
       effort: DEFAULT_WRAPPER_EFFORT,
     },
     driverFor: () => "native",
+    effortsFor: () => base.efforts,
   };
 }
 

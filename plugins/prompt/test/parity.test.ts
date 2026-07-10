@@ -491,6 +491,11 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     const m = effectiveUnder(tmpConfig());
     expect([...m.models].sort()).toEqual(["opus", "sonnet"]);
     expect([...m.efforts]).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // With no host matrix every model shares the flat axis — the cube stays
+    // rectangular (each model's effortsFor equals the top-level efforts).
+    for (const model of m.models) {
+      expect([...m.effortsFor(model)]).toEqual([...m.efforts]);
+    }
     expect(m.driverFor("opus")).toBe("native");
     expect(m.driverFor("sonnet")).toBe("native");
     expect(m.wrapper_driver).toEqual({
@@ -595,6 +600,62 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
           ),
         ),
       ).toBe(true);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  // A ragged roster: opus renders only [high], gpt-5.5 renders only [medium], so
+  // the {model × effort} cube is non-rectangular. Each model's own effort list
+  // drives its fan-out.
+  const RAGGED_MATRIX = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models:",
+    "      - name: opus",
+    "        efforts: [high]",
+    "  - name: codex",
+    "    models:",
+    "      - name: gpt-5.5",
+    "        native: gpt-5.5-codex",
+    "        efforts: [medium]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: xhigh",
+    "",
+  ].join("\n");
+
+  test("acceptance 2 (ragged) — per-model effort overrides fan out a non-rectangular cell set", () => {
+    // effortsFor(opus)=[high], effortsFor(gpt-5.5)=[medium] — the effective matrix
+    // exposes the ragged lists.
+    const m = effectiveUnder(tmpConfig(RAGGED_MATRIX));
+    expect([...m.effortsFor("opus")]).toEqual(["high"]);
+    expect([...m.effortsFor("gpt-5.5")]).toEqual(["medium"]);
+
+    const { work, rc } = renderPlanInProcess(tmpConfig(RAGGED_MATRIX));
+    try {
+      expect(rc).toBe(0);
+      // Ragged product: opus-high + gpt-5.5-medium ONLY — never the rectangular
+      // opus-medium / gpt-5.5-high the flat cartesian would have emitted.
+      expect(workerCellDirs(work)).toEqual(["gpt-5.5-medium", "opus-high"]);
+      expect(existsSync(join(work, "workers", "opus-medium"))).toBe(false);
+      expect(existsSync(join(work, "workers", "gpt-5.5-high"))).toBe(false);
+      // The rendered cells still bake their own driver: native opus keeps its model
+      // + effort, the wrapped gpt-5.5 cell bakes the wrapper driver.
+      const native = readFileSync(
+        join(work, "workers", "opus-high", "agents", "worker.md"),
+        "utf-8",
+      );
+      expect(native).toContain("model: opus");
+      expect(native).toContain('effort: "high"');
+      const wrapped = readFileSync(
+        join(work, "workers", "gpt-5.5-medium", "agents", "worker.md"),
+        "utf-8",
+      );
+      expect(wrapped).toContain("model: sonnet");
+      expect(wrapped).toContain("model `gpt-5.5`, keeper effort `medium`");
     } finally {
       rmSync(work, { recursive: true, force: true });
     }

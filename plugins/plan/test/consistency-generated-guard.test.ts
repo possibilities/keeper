@@ -21,10 +21,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-
 import { readMarker } from "../plugin/hooks/lib.ts";
+import { effectiveMatrixFromDisk } from "../src/host_matrix.ts";
 import { writeWorkMarker } from "../src/session_markers.ts";
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 
 const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
@@ -125,12 +124,16 @@ describe("hooks.json wiring", () => {
 
 describe("generated work plugins match the subagents.yaml matrix", () => {
   test.skipIf(!WORKERS_RENDERED)(
-    "on-disk workers/ cell set equals the {model × effort} cartesian product",
+    "on-disk workers/ cell set equals the ragged {model × effort} product",
     () => {
-      const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+      // The renderer fans out over the EFFECTIVE matrix (embedded base overlaid by
+      // a host matrix when present) using each model's OWN effort list, so the gate
+      // computes the ragged product from the same source. With no host matrix every
+      // model shares the flat axis and the product is the rectangular cartesian.
+      const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
       const expected = new Set<string>();
       for (const model of matrix.models) {
-        for (const effort of matrix.efforts) {
+        for (const effort of matrix.effortsFor(model)) {
           expected.add(`${model}-${effort}`);
         }
       }

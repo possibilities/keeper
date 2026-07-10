@@ -5,10 +5,10 @@
 //   bun plugins/plan/scripts/model-guidance-check.ts --check   (default) verify
 //
 // Two invariants, both self-contained (no network, pure disk reads):
-//   (a) coverage, both directions — every subagents.yaml axis value (efforts AND
-//       models, read from DISK via the loader's disk mode) has exactly one
-//       guidance block in model-selector.yaml, and no block exists for a
-//       non-axis value.
+//   (a) coverage, both directions — every subagents.yaml axis value (models, and
+//       the UNION of effort tokens across the config's effort scopes, read from
+//       DISK via the loader's disk mode) has exactly one guidance block in
+//       model-selector.yaml, and no block exists for a non-axis value.
 //   (b) hash parity — every configured model has a research entry, and EVERY
 //       research entry (a configured model OR a tolerated host-roster extra,
 //       mirroring the extra-guidance-block tolerance) names a references/ cache
@@ -194,6 +194,30 @@ function coverageErrors(
   return errors;
 }
 
+/** Union the effort tokens across every configured scope, first-appearance order.
+ * The subagents.yaml axis is a single flat scope, but a host provider matrix
+ * expresses efforts as several scopes (a top-level axis plus per-provider and
+ * per-model overrides); the guidance gate must cover their union so no scope's
+ * effort token can slip past coverage. This host-blind gate reads only the disk
+ * config's scopes, so today the union collapses to the single flat axis — the
+ * union shape keeps coverage correct wherever the effort axis carries more than
+ * one scope. */
+export function unionEfforts(
+  scopes: readonly (readonly string[])[],
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const scope of scopes) {
+    for (const effort of scope) {
+      if (!seen.has(effort)) {
+        seen.add(effort);
+        out.push(effort);
+      }
+    }
+  }
+  return out;
+}
+
 /** Inputs to the pure check — axes + config + a hash resolver, no disk access. */
 export interface GuidanceCheckInput {
   readonly efforts: readonly string[];
@@ -265,7 +289,7 @@ export function checkModelGuidanceFromDisk(
   const matrix = loadSubagentsMatrixFromDisk(join(planRoot, "subagents.yaml"));
   const config = loadModelSelectorConfig(join(planRoot, "model-selector.yaml"));
   return checkModelGuidance({
-    efforts: matrix.efforts,
+    efforts: unionEfforts([matrix.efforts]),
     models: matrix.models,
     config,
     referenceHash: referenceHashFromDisk(planRoot),
