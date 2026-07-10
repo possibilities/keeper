@@ -39,5 +39,5 @@ Extend test/agent-matrix.test.ts (launcher) and the parity test (both islands) w
 - [ ] The committed matrix example demonstrates overrides and the route flag and its anti-rot test passes
 
 ## Done summary
-
+Extended matrix.yaml schema identically in both firewalled parsers (launcher src/agent/matrix.ts + plan host_matrix.ts): model long form {name,native?,efforts?} retiring the one-pair alias, per-provider/per-model effort overrides with clobber-inherit-normalize (effortsFor exported from both), and a per-provider route flag excluding launch-only providers from the pecking order and cell set. Cross-island parity fixtures and the committed example demonstrate the new shape.
 ## Evidence
