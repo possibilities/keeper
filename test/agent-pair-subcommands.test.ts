@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { main } from "../src/agent/main";
 import { resolveHandle, runWaitForStop } from "../src/agent/pair-subcommands";
 import {
+  defaultTranscriptPathTimeoutMs,
   findLastMessage,
   waitForTranscriptPath,
   waitForTranscriptStop,
@@ -28,6 +29,12 @@ import {
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "keeper-agent-pair-test-"));
 }
+
+test("Pi transcript discovery tolerates cold profile package startup", () => {
+  expect(defaultTranscriptPathTimeoutMs("pi")).toBe(120_000);
+  expect(defaultTranscriptPathTimeoutMs("claude")).toBe(30_000);
+  expect(defaultTranscriptPathTimeoutMs("codex")).toBe(30_000);
+});
 
 /** Write a run.json under the state dir so a run-id handle resolves. */
 function writeRunJson(

@@ -81,6 +81,18 @@ export type WaitForPathOutcome =
 
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_PATH_TIMEOUT_MS = 30_000;
+const PI_PATH_TIMEOUT_MS = 120_000;
+
+/**
+ * Pi discovers and initializes profile packages before it creates a session
+ * transcript. A cold package graph can legitimately exceed the ordinary path
+ * window, so detached Pi runs get a wider discovery ceiling. Callers can still
+ * override it explicitly in focused tests and probes.
+ */
+export function defaultTranscriptPathTimeoutMs(agent: AgentKind): number {
+  return agent === "pi" ? PI_PATH_TIMEOUT_MS : DEFAULT_PATH_TIMEOUT_MS;
+}
+
 /**
  * Wall-clock ceiling for the stop wait. A real model turn runs minutes (codex
  * took 238s observed), so this is generous — it is a fail-loud backstop against
@@ -93,7 +105,9 @@ export async function waitForTranscriptPath(
   opts: TranscriptWatchOptions,
 ): Promise<WaitForPathOutcome> {
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const deadline = Date.now() + (opts.pathTimeoutMs ?? DEFAULT_PATH_TIMEOUT_MS);
+  const deadline =
+    Date.now() +
+    (opts.pathTimeoutMs ?? defaultTranscriptPathTimeoutMs(opts.agent));
 
   while (true) {
     const lookup = findTranscriptPath(opts);
