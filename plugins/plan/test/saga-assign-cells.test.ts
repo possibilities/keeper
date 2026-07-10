@@ -447,12 +447,13 @@ describe("assign-cells cell_invalid", () => {
   }
   const RAGGED_MATRIX = [
     "efforts: [medium, high]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus]",
     "providers:",
     "  - name: claude",
     "    models:",
-    "      - name: opus",
+    "      - id: opus",
     "        efforts: [medium]",
-    "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: medium",
@@ -481,6 +482,23 @@ describe("assign-cells cell_invalid", () => {
     expect(tierErr as string).toContain("medium");
     // No write landed — the task keeps its scaffolded default cell.
     expect(readTask(taskIds[0] as string).tier).toBe("medium");
+  });
+
+  test("no host matrix present fails loud with the typed MATRIX_INVALID envelope", () => {
+    // assign-cells reads the axes but does not catch internally — the dispatch-level
+    // catch converts the required-matrix-absent throw into a typed error envelope
+    // rather than an uncaught stack (v2 has no embedded fallback).
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    const emptyCfg = mkdtempSync(join(tmpdir(), "assign-nomatrix-"));
+    cfgDirs.push(emptyCfg);
+    const yaml = assignYaml([
+      { taskId: taskIds[0] as string, tier: "xhigh", model: "opus" },
+    ]);
+    const r = run(["assign-cells", epicId, "--file", writeInput(yaml)], {
+      env: { KEEPER_CONFIG_DIR: emptyCfg },
+    });
+    expect(r.code).toBe(1);
+    expect(errCode(r.output)).toBe("MATRIX_INVALID");
   });
 
   test("the same tier inside the model's own effort list is accepted", () => {

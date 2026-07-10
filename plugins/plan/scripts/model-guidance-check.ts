@@ -4,25 +4,27 @@
 //
 //   bun plugins/plan/scripts/model-guidance-check.ts --check   (default) verify
 //
-// Two invariants, both self-contained (no network, pure disk reads):
-//   (a) coverage, both directions — every subagents.yaml axis value (models, and
-//       the UNION of effort tokens across the config's effort scopes, read from
-//       DISK via the loader's disk mode) has exactly one guidance block in
-//       model-selector.yaml, and no block exists for a non-axis value.
-//   (b) hash parity — every configured model has a research entry, and EVERY
-//       research entry (a configured model OR a tolerated host-roster extra,
-//       mirroring the extra-guidance-block tolerance) names a references/ cache
-//       file that exists and whose recorded sha256 matches it on disk.
+// `--check` is a HOST-BLIND integrity gate — no axis read, so it is green on a
+// matrix-less host (the axes now live in the required v2 host matrix, absent in CI):
+//   (a) structural validation — the config coerces (a malformed section fails loud).
+//   (b) research-hash parity — EVERY research entry names a references/ cache file
+//       that exists and whose recorded sha256 matches it on disk.
+// The axis-coverage directions are dropped from the gate; the model-guidance-v2
+// follow-up epic owns the coverage UX against the host matrix. The pure coverage
+// core (`checkModelGuidance`) is retained for the in-process failure-mode tests.
 //
-// The check core (`checkModelGuidance`) is a pure function over already-loaded
-// data so the fast suite drives its failure modes in-process; `--check` wires it
-// to disk. The model-guidance skill OWNS the config content — this only verifies.
+// `--state` classifies every configured axis value against the model-selector.yaml
+// guidance, reading its axes from the required v2 host matrix (`matrix.yaml`).
+//
+// The pure cores (`checkModelGuidance` / `classifyModelGuidance`) are functions over
+// already-loaded data so the fast suite drives their failure modes in-process. The
+// model-guidance skill OWNS the config content — this only verifies.
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { loadHostMatrixV2 } from "../src/host_matrix.ts";
 import { loadYamlInput, parseYamlInput } from "../src/yaml_input.ts";
 
 /** Plan plugin root — model-selector.yaml and subagents.yaml sit here. */
@@ -202,9 +204,7 @@ function coverageErrors(
  * config's scopes, so today the union collapses to the single flat axis — the
  * union shape keeps coverage correct wherever the effort axis carries more than
  * one scope. */
-export function unionEfforts(
-  scopes: readonly (readonly string[])[],
-): string[] {
+export function unionEfforts(scopes: readonly (readonly string[])[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const scope of scopes) {
@@ -229,10 +229,16 @@ export interface GuidanceCheckInput {
 
 /** The pure check core: coverage (both directions, both axes) + research hash
  * parity. Returns accumulated errors so callers report all drift at once. */
-export function checkModelGuidance(input: GuidanceCheckInput): GuidanceCheckResult {
+export function checkModelGuidance(
+  input: GuidanceCheckInput,
+): GuidanceCheckResult {
   const errors: string[] = [];
   errors.push(
-    ...coverageErrors("efforts", input.efforts, Object.keys(input.config.efforts)),
+    ...coverageErrors(
+      "efforts",
+      input.efforts,
+      Object.keys(input.config.efforts),
+    ),
   );
   errors.push(
     ...coverageErrors(
@@ -245,7 +251,9 @@ export function checkModelGuidance(input: GuidanceCheckInput): GuidanceCheckResu
 
   for (const model of input.models) {
     if (!(model in input.config.research)) {
-      errors.push(`research: no research entry for configured model "${model}"`);
+      errors.push(
+        `research: no research entry for configured model "${model}"`,
+      );
     }
   }
   // A research entry for a non-configured model is TOLERATED (a host-roster extra,
@@ -282,18 +290,38 @@ export function referenceHashFromDisk(
   };
 }
 
-/** Run the full check against the on-disk config + subagents axes. */
+/** Host-blind research-hash parity: EVERY research entry's reference file exists
+ * and its recorded sha256 matches on disk. No axis read (the coverage directions
+ * are dropped from the integrity gate), so the gate stays green on a matrix-less
+ * host. A typo'd entry self-reveals as a missing reference file. */
+export function checkResearchParity(
+  config: ModelSelectorConfig,
+  referenceHash: (reference: string) => string | null,
+): GuidanceCheckResult {
+  const errors: string[] = [];
+  for (const [model, entry] of Object.entries(config.research)) {
+    const actual = referenceHash(entry.reference);
+    if (actual === null) {
+      errors.push(
+        `research: ${model} reference "${entry.reference}" is missing on disk`,
+      );
+    } else if (actual !== entry.sha256) {
+      errors.push(
+        `research: ${model} recorded sha256 ${entry.sha256} does not match file ${actual} (${entry.reference})`,
+      );
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/** Run the host-blind integrity gate against the on-disk config: structural
+ * validation (a malformed section fails loud in `loadModelSelectorConfig`) plus
+ * research-hash parity. No host matrix read, so the gate passes with no matrix. */
 export function checkModelGuidanceFromDisk(
   planRoot: string = PLAN_ROOT,
 ): GuidanceCheckResult {
-  const matrix = loadSubagentsMatrixFromDisk(join(planRoot, "subagents.yaml"));
   const config = loadModelSelectorConfig(join(planRoot, "model-selector.yaml"));
-  return checkModelGuidance({
-    efforts: unionEfforts([matrix.efforts]),
-    models: matrix.models,
-    config,
-    referenceHash: referenceHashFromDisk(planRoot),
-  });
+  return checkResearchParity(config, referenceHashFromDisk(planRoot));
 }
 
 // ---------------------------------------------------------------------------
@@ -476,12 +504,14 @@ export function referenceTextFromDisk(
   };
 }
 
-/** Run the full state classification against the on-disk config + subagents
- * axes (the state-mode parallel of checkModelGuidanceFromDisk). */
+/** Run the full state classification against the on-disk config + the required v2
+ * host matrix axes (the state-mode parallel of checkModelGuidanceFromDisk). A
+ * minimal source swap: the axes come from `matrix.yaml` (fail-loud when absent);
+ * the classification semantics are otherwise unchanged. */
 export function classifyModelGuidanceFromDisk(
   planRoot: string = PLAN_ROOT,
 ): GuidanceStateResult {
-  const matrix = loadSubagentsMatrixFromDisk(join(planRoot, "subagents.yaml"));
+  const matrix = loadHostMatrixV2();
   const config = loadModelSelectorConfig(join(planRoot, "model-selector.yaml"));
   return classifyModelGuidance({
     efforts: matrix.efforts,
@@ -495,7 +525,7 @@ export function classifyModelGuidanceFromDisk(
 function reportOrExit(result: GuidanceCheckResult): void {
   if (result.ok) {
     process.stdout.write(
-      "model-guidance-check: config matches subagents axes; research hashes match references/\n",
+      "model-guidance-check: config coerces; research hashes match references/\n",
     );
     return;
   }

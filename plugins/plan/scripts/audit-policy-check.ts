@@ -4,10 +4,11 @@
 //
 //   bun plugins/plan/scripts/audit-policy-check.ts --check   (default) verify
 //
-// Two invariants, both self-contained (no network, pure disk reads):
-//   (a) tier coverage, both directions — every subagents.yaml `efforts` axis
-//       value has an explicit true/false in `tier_audit`, and no `tier_audit`
-//       key exists for a non-axis tier.
+// Two invariants, both self-contained (no network, pure disk reads) and
+// host-blind (tiers validate against the canonical effort vocabulary, no host file):
+//   (a) tier coverage, both directions — every canonical effort tier has an
+//       explicit true/false in `tier_audit`, and no `tier_audit` key exists for a
+//       non-canonical tier.
 //   (b) band validity — every `depth_bands` entry names a depth in the fixed
 //       lean/standard/deep vocabulary.
 //
@@ -26,7 +27,7 @@
 
 import { join, resolve } from "node:path";
 
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { CANONICAL_EFFORTS } from "../src/host_matrix.ts";
 import { DEPTH_BAND_THRESHOLD_KEYS } from "../src/verbs/close_preflight.ts";
 import { loadYamlInput } from "../src/yaml_input.ts";
 
@@ -156,7 +157,9 @@ export function checkAuditPolicy(
   const mapped = new Set(Object.keys(input.policy.tier_audit));
   for (const tier of input.efforts) {
     if (!mapped.has(tier)) {
-      errors.push(`tier_audit: no audit decision for configured tier "${tier}"`);
+      errors.push(
+        `tier_audit: no audit decision for configured tier "${tier}"`,
+      );
     }
   }
   for (const tier of mapped) {
@@ -175,13 +178,14 @@ export function checkAuditPolicy(
   return { ok: errors.length === 0, errors };
 }
 
-/** Run the full check against the on-disk config + subagents efforts axis. */
+/** Run the full check against the on-disk config + the canonical effort
+ * vocabulary. Host-blind: tier keys are validated against CANONICAL_EFFORTS (the
+ * fixed tier vocabulary), never a host file, so the gate is green with no matrix. */
 export function checkAuditPolicyFromDisk(
   planRoot: string = PLAN_ROOT,
 ): AuditPolicyCheckResult {
-  const matrix = loadSubagentsMatrixFromDisk(join(planRoot, "subagents.yaml"));
   const policy = loadAuditPolicy(join(planRoot, "audit-policy.yaml"));
-  return checkAuditPolicy({ efforts: matrix.efforts, policy });
+  return checkAuditPolicy({ efforts: CANONICAL_EFFORTS, policy });
 }
 
 function reportOrExit(result: AuditPolicyCheckResult): void {

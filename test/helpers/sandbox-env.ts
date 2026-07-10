@@ -23,7 +23,52 @@
  * delete keys) can never re-strand a state key back at its production default.
  */
 
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
+/**
+ * The committed claude-only v2 host matrix body — the test-isolation fixture.
+ * Its axes (five-rung efforts × [opus, sonnet]) match the default plan worker
+ * cube, so a task's stamped worker_agent stays byte-identical under it. Mirrors
+ * `plugins/plan/test/fixtures/matrix-claude-only.yaml`.
+ */
+export const CLAUDE_ONLY_MATRIX_YAML = [
+  "efforts:",
+  "  - low",
+  "  - medium",
+  "  - high",
+  "  - xhigh",
+  "  - max",
+  "subagent_templates:",
+  "  - template/agents/worker.md.tmpl",
+  "subagent_models:",
+  "  - opus",
+  "  - sonnet",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "      - sonnet",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "",
+].join("\n");
+
+/**
+ * Seed the committed claude-only v2 host matrix into `configDir` (the
+ * `KEEPER_CONFIG_DIR` a spawn points at), so a test exercising a plan verb that
+ * reads the required host matrix resolves valid axes instead of the loud
+ * missing-matrix error — while never touching the live `~/.config/keeper`.
+ */
+export function seedClaudeOnlyMatrix(configDir: string): void {
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(
+    join(configDir, "matrix.yaml"),
+    CLAUDE_ONLY_MATRIX_YAML,
+    "utf-8",
+  );
+}
 
 export interface SandboxEnvOptions {
   /** Per-test tmpdir; all derived state paths live under it. */
@@ -60,6 +105,15 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
     env.CLAUDE_CODE_SESSION_ID = undefined;
     env.JOBCTL_SESSION_ID = undefined;
     env.JOBCTL_JOB_ID = undefined;
+  }
+
+  // Sandbox the host worker matrix dir by DEFAULT (only when the inherited env
+  // does not already point somewhere), so an unset var never strands at the live
+  // `~/.config/keeper` (os.homedir ignores $HOME). A caller's `extra` — or a
+  // pre-set value pointing at a fixture — still wins; seed a matrix into it with
+  // `seedClaudeOnlyMatrix` when the spawn exercises a plan verb.
+  if (env.KEEPER_CONFIG_DIR === undefined || env.KEEPER_CONFIG_DIR === "") {
+    env.KEEPER_CONFIG_DIR = join(tmpDir, "keeper-config");
   }
 
   // Caller overlay (an `undefined` value deletes the key).

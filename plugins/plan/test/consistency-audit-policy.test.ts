@@ -1,9 +1,9 @@
 // Drift gate for the audit policy config (../audit-policy.yaml), asserted in the
-// fast tier as pure disk reads — no subprocess, daemon, or git. Pins the on-disk
-// config against the subagents.yaml efforts axis (both directions) and the fixed
-// depth vocabulary, then drives the check core + coercion failure modes through
-// hand-built inputs whose expected outcomes are independent of the config under
-// test.
+// fast tier as pure disk reads — no subprocess, daemon, or git. Host-blind: pins
+// the on-disk config against the canonical effort vocabulary (both directions) and
+// the fixed depth vocabulary, then drives the check core + coercion failure modes
+// through hand-built inputs whose expected outcomes are independent of the config
+// under test.
 
 import { describe, expect, test } from "bun:test";
 import { join, resolve } from "node:path";
@@ -17,28 +17,25 @@ import {
   coerceAuditPolicy,
   loadAuditPolicy,
 } from "../scripts/audit-policy-check.ts";
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { CANONICAL_EFFORTS } from "../src/host_matrix.ts";
 import { DEPTH_BAND_THRESHOLD_KEYS } from "../src/verbs/close_preflight.ts";
 
 const PLAN_ROOT = resolve(import.meta.dir, "..");
 
 // ---------------------------------------------------------------------------
-// on-disk config ↔ live efforts axis
+// on-disk config ↔ canonical effort vocabulary (host-blind)
 // ---------------------------------------------------------------------------
 
 describe("on-disk audit policy", () => {
-  test("passes the drift gate (tier coverage both directions + valid bands)", () => {
+  test("passes the host-blind drift gate (tier coverage both directions + valid bands)", () => {
     const result = checkAuditPolicyFromDisk(PLAN_ROOT);
     expect(result.errors).toEqual([]);
     expect(result.ok).toBe(true);
   });
 
-  test("maps every configured effort tier and defines valid depth bands", () => {
-    const matrix = loadSubagentsMatrixFromDisk(
-      join(PLAN_ROOT, "subagents.yaml"),
-    );
+  test("maps every canonical effort tier and defines valid depth bands", () => {
     const policy = loadAuditPolicy(join(PLAN_ROOT, "audit-policy.yaml"));
-    for (const tier of matrix.efforts) {
+    for (const tier of CANONICAL_EFFORTS) {
       expect(typeof policy.tier_audit[tier]).toBe("boolean");
     }
     expect(policy.depth_bands.length).toBeGreaterThan(0);

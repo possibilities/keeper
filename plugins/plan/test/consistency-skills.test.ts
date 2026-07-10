@@ -10,10 +10,19 @@
 // of the retired audited_into / draft fields.
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { effectiveMatrixFromDisk } from "../src/host_matrix.ts";
+import {
+  type EffectiveMatrix,
+  effectiveMatrixFromDisk,
+} from "../src/host_matrix.ts";
 import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
 import { runCli } from "./harness.ts";
@@ -777,11 +786,28 @@ describe("work.md.tmpl agentId capture regex", () => {
   });
 });
 
+// The committed workers/ tree is the embedded claude-only render, so read the
+// EFFECTIVE matrix with NO host override — pin an empty config dir so neither the
+// test-suite fixture nor the developer's live ~/.config/keeper composes in — then
+// restore the env immediately so no other test module inherits the change.
+function embeddedRenderMatrix(): EffectiveMatrix {
+  const dir = mkdtempSync(join(tmpdir(), "skills-nohost-"));
+  const prev = process.env.KEEPER_CONFIG_DIR;
+  process.env.KEEPER_CONFIG_DIR = dir;
+  try {
+    return effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
+  } finally {
+    if (prev === undefined) delete process.env.KEEPER_CONFIG_DIR;
+    else process.env.KEEPER_CONFIG_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe("generated work plugins in the plan plugin", () => {
   // The renderer fans out over the EFFECTIVE matrix using each model's own effort
   // list, so this per-cell existence gate walks the same ragged product. With no
   // host matrix every model shares the flat axis (rectangular cartesian).
-  const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
+  const matrix = embeddedRenderMatrix();
   for (const model of matrix.models) {
     for (const effort of matrix.effortsFor(model)) {
       test.skipIf(!WORKERS_RENDERED)(

@@ -18,6 +18,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -194,21 +195,40 @@ function writeGitConfig(home: string): string {
   return path;
 }
 
+/** The committed claude-only v2 host matrix fixture body, seeded into every
+ * scratch config dir so a plan verb reading the REQUIRED host matrix resolves
+ * axes byte-identical to the default worker cube. Read once from the committed
+ * file so it stays the single source of truth. */
+const CLAUDE_ONLY_MATRIX = readFileSync(
+  join(import.meta.dir, "fixtures", "matrix-claude-only.yaml"),
+  "utf-8",
+);
+
+/** Seed the committed claude-only host matrix into `<home>/.config/keeper`, the
+ * KEEPER_CONFIG_DIR buildEnv pins. A test wanting a different roster layers its
+ * own KEEPER_CONFIG_DIR via `override`, whose dir carries its own matrix.yaml. */
+function writeHostMatrix(home: string): void {
+  const dir = join(home, ".config", "keeper");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "matrix.yaml"), CLAUDE_ONLY_MATRIX, "utf-8");
+}
+
 /** Build the minimal explicit subprocess env for *home*, layering *override*
  * last. Mirrors conftest._subprocess_env: scratch-built, HOME + XDG_* +
  * GIT_CONFIG_GLOBAL/SYSTEM + PATH + KEEPER_PLAN_ACTOR, forwarding
  * CLAUDE_CODE_SESSION_ID + KEEPER_PLAN_NOW when set in the parent env. The
  * default session id is pre-set (mutating verbs fail closed without it).
- * KEEPER_CONFIG_DIR pins to a fresh scratch dir (no matrix.yaml) so the host
- * provider matrix (ADR 0010) never leaks in from the developer's real
- * ~/.config/keeper — os.homedir() ignores $HOME on macOS, so HOME alone
- * doesn't isolate it. A test wanting a host matrix layers its own
+ * KEEPER_CONFIG_DIR pins to a scratch dir seeded with the committed claude-only
+ * host matrix so the required v2 matrix (ADR 0036) resolves without leaking the
+ * developer's real ~/.config/keeper — os.homedir() ignores $HOME on macOS, so
+ * HOME alone doesn't isolate it. A test wanting a different roster layers its own
  * KEEPER_CONFIG_DIR via `override`. */
 export function buildEnv(
   home: string,
   override?: Record<string, string>,
 ): Record<string, string> {
   const gitconfig = writeGitConfig(home);
+  writeHostMatrix(home);
   const base: Record<string, string> = {
     HOME: home,
     XDG_CONFIG_HOME: join(home, ".config"),

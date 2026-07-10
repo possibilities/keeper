@@ -1,0 +1,4 @@
+[test]
+# Pin KEEPER_CONFIG_DIR to a seeded claude-only host matrix before any test runs,
+# so no plan test reads the live ~/.config/keeper (see test/preload-host-matrix.ts).
+preload = ["./test/preload-host-matrix.ts"]

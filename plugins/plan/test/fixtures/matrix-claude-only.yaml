@@ -1,0 +1,24 @@
+# Committed claude-only v2 host matrix — the test-isolation fixture every plan
+# disk-mode test pins via KEEPER_CONFIG_DIR so no test reads the live
+# ~/.config/keeper. Its axes (efforts × subagent_models) match the default plan
+# worker cube, so a task's stamped worker_agent stays byte-identical under the
+# fixture. Two native cells, no wrapped providers.
+efforts:
+  - low
+  - medium
+  - high
+  - xhigh
+  - max
+subagent_templates:
+  - template/agents/worker.md.tmpl
+subagent_models:
+  - opus
+  - sonnet
+providers:
+  - name: claude
+    models:
+      - opus
+      - sonnet
+wrapper_driver:
+  model: sonnet
+  effort: high
