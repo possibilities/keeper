@@ -25,9 +25,9 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  embeddedWorkerAgentFor,
+  composeWorkerAgent,
   workerCellDir,
-} from "../plugins/plan/src/subagents_config.ts";
+} from "../plugins/plan/src/worker_cells.ts";
 import { computeEligibleEpics } from "./armed-closure";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
@@ -197,6 +197,41 @@ export const KEEPER_ROOT: string = ((): string => {
   }
 })();
 
+/** The four discriminated host-matrix load-failure states (ADR 0036) — the same
+ *  vocabulary the launcher island's `MatrixConfigError` carries, restated inline so
+ *  the pure verdict core never imports the fs-touching matrix loader. Structurally
+ *  identical, so a producer maps `MatrixConfigError.state` onto it directly. */
+export type MatrixFailureState =
+  | "absent"
+  | "unparseable"
+  | "schema-invalid"
+  | "valid-but-empty";
+
+/** The parsed host-matrix cell axes the pure core composes worker cells over —
+ *  `subagent_models` (the worker-cell model axis, native + wrapped), each model's
+ *  effective effort list, and the top-level effort fallback. */
+export interface HostMatrixAxes {
+  /** `subagent_models` — the worker-cell eligibility axis, declaration order. */
+  models: string[];
+  /** capability → its effective effort list (canonical ascending). A model absent
+   *  here inherits {@link efforts}. */
+  effortsByModel: Map<string, string[]>;
+  /** the top-level effort axis — the fallback a model no entry narrows inherits. */
+  efforts: string[];
+}
+
+/**
+ * The serializable host-matrix field carried on the reconcile snapshot: the parsed
+ * cell axes when `matrix.yaml` loaded clean, or a four-state failure discriminator
+ * when it did not. Built PRODUCER-SIDE once per cycle in `loadReconcileSnapshot`
+ * (never re-read on the verdict path), so one reconcile cycle sees exactly one
+ * matrix verdict — a mid-cycle edit cannot flip it. A failure parks every `work`
+ * dispatch behind a visible distress sticky naming the state, never a `fatalExit`.
+ */
+export type HostMatrixSnapshot =
+  | ({ ok: true } & HostMatrixAxes)
+  | { ok: false; state: MatrixFailureState; detail: string };
+
 /**
  * Resolve the ABSOLUTE per-cell worker plugin dir for a task's {model, effort}
  * pair — `${KEEPER_ROOT}/plugins/plan/workers/<model>-<effort>`. The launcher
@@ -207,23 +242,26 @@ export const KEEPER_ROOT: string = ((): string => {
  * or a `close` row) — the null return is load-bearing: it preserves the
  * null-either-axis stop and leaves the launch with no `--plugin-dir` (falling
  * back to the always-loaded `plan` plugin). THROWS for a non-null value outside
- * the configured matrix (reusing {@link embeddedWorkerAgentFor}'s corrupt-on-disk
- * guard) rather than blind-joining a bogus cell path — the caller catches the throw and
- * turns it into a visible sticky `DispatchFailed`, never an opaque
- * agent-not-found inside a spawned session. Pure: `subagentsMatrix()` is a
- * memoized embed parse (no I/O) and `KEEPER_ROOT` is resolved once at load. The
- * embedded-only validator keeps the verdict path off the host matrix — a wrapped
- * host-roster cell falls through to the producer's graceful no-route reject.
+ * the injected matrix axes (reusing {@link composeWorkerAgent}'s corrupt-on-disk
+ * guard) rather than blind-joining a bogus cell path — the caller catches the throw
+ * and turns it into a visible sticky `DispatchFailed`, never an opaque
+ * agent-not-found inside a spawned session. Pure: the axes arrive as injected
+ * snapshot data (`loadReconcileSnapshot` reads `matrix.yaml` producer-side) and
+ * `KEEPER_ROOT` is resolved once at load, so the verdict path reaches no filesystem.
  */
 export function workerCellPluginDir(
   model: string | null,
   tier: string | null,
+  axes: HostMatrixAxes,
 ): string | null {
-  // Validate the pair against the embedded matrix (throws on out-of-matrix) and
-  // reuse the null-either-axis stop — the composed agent name itself is discarded
-  // here. Embedded-only (never the host-effective workerAgentFor) so the pure
-  // reconcile closure never reads matrix.yaml.
-  if (embeddedWorkerAgentFor(tier, model) === null) {
+  // Validate the pair against the injected axes (throws on out-of-matrix) and reuse
+  // the null-either-axis stop — the composed agent name itself is discarded here.
+  // The per-model effort resolver honors a ragged host roster (a provider/model that
+  // narrowed its effort list); an unknown model falls back to the top-level axis and
+  // is named by composeWorkerAgent's separate model-membership throw.
+  const effortsFor = (m: string): readonly string[] =>
+    axes.effortsByModel.get(m) ?? axes.efforts;
+  if (composeWorkerAgent(effortsFor, axes.models, tier, model) === null) {
     return null;
   }
   // Non-null here ⇒ both axes are non-null and in-matrix.
@@ -586,6 +624,17 @@ export interface ReconcileSnapshot {
   workerModel: string;
   workerEffort: string;
   /**
+   * The host worker matrix (`~/.config/keeper/matrix.yaml`, ADR 0036), loaded ONCE
+   * per cycle in {@link loadReconcileSnapshot} and attached as a serializable
+   * discriminated field: the parsed cell axes when the file is good, or a
+   * four-state {@link MatrixFailureState} failure when it is not. The pure
+   * `reconcile` composes each `work` row's cell from the good axes, or threads the
+   * failure onto the launch as a {@link PlannedLaunch.matrixReject} the producer
+   * mints as a distress sticky — so one cycle sees exactly one matrix verdict and a
+   * bad matrix parks dispatch without a `fatalExit`. NEVER a fold input.
+   */
+  hostMatrix: HostMatrixSnapshot;
+  /**
    * The global concurrency cap, read FRESH from the `autopilot_state` singleton's
    * `max_concurrent_jobs` column each cycle (resolved `column ?? DEFAULT` — an
    * absent/never-set row or NULL = the in-memory {@link DEFAULT_MAX_CONCURRENT_JOBS}
@@ -915,10 +964,9 @@ export interface PlannedLaunch {
    * The task's CAPABILITY model — the model axis the cell names, distinct from
    * the orchestrator session {@link model}. Set for a `work` row (`task.model`),
    * null for a `close` row or a cell-less task. Threaded so the producer's
-   * host-matrix route probe binds to the model the cell actually names (not the
-   * session model), the one thread the wrapped-cell resolution needs; the pure
-   * compose stays I/O-free and embedded-only, so the route classification itself
-   * lives producer-side.
+   * worker-cell resolution names the model the cell actually runs (not the session
+   * model) in a reject reason; the pure compose validates it against the injected
+   * matrix axes and the producer applies the filesystem probes.
    */
   cellModel: string | null;
   /**
@@ -941,6 +989,15 @@ export interface PlannedLaunch {
    * (a deterministic throw would silently wedge the whole cycle).
    */
   pluginDirReject?: string;
+  /**
+   * Set IFF the cycle's host matrix (`snapshot.hostMatrix`) FAILED to load — the
+   * four-state discriminator (ADR 0036). Carried on EVERY `work` row of a bad-matrix
+   * cycle: with no matrix there is no cell to compose, so the producer mints a
+   * visible per-state distress `DispatchFailed` (cleared by `retry_dispatch`) and
+   * launches nothing, per-key, and the daemon loop continues (never a `fatalExit`).
+   * Mutually exclusive with {@link pluginDir} / {@link pluginDirReject}.
+   */
+  matrixReject?: { state: MatrixFailureState; detail: string };
   /**
    * `true` IFF this is an EPIC-level finalizer (`close` at the close-row site,
    * keyed by epic id). The cycle glue stamps `state.finalizerGuard[id]` for these
@@ -1854,20 +1911,40 @@ export function reconcile(
         continue;
       }
       // Resolve the launch-time worker-plugin cell from the TASK's {model, tier}
-      // (NOT the orchestrator's session model/effort). Compose in a try/catch so
-      // a corrupt out-of-matrix pair becomes a per-launch reject the producer
-      // mints as a sticky `DispatchFailed` — a raw throw here would deterministically
-      // wedge the whole reconcile cycle (`driveCycle`'s backstop logs and re-drives).
+      // (NOT the orchestrator's session model/effort) against the cycle's ONE host
+      // matrix snapshot. A cell-BEARING row (both axes set) consults the matrix: a
+      // bad matrix threads the four-state reject onto the launch; a good matrix
+      // composes in a try/catch so a corrupt out-of-matrix pair becomes a per-launch
+      // reject the producer mints as a sticky `DispatchFailed` (a raw throw here
+      // would deterministically wedge the whole cycle — `driveCycle`'s backstop logs
+      // and re-drives). A cell-LESS row (null EITHER axis) is matrix-independent — it
+      // launches the always-loaded base `plan` plugin with no `--plugin-dir`.
       let pluginDir: string | null = null;
       let pluginDirReject: string | undefined;
+      let matrixReject:
+        | { state: MatrixFailureState; detail: string }
+        | undefined;
       if (verb === "work") {
-        try {
-          pluginDir = workerCellPluginDir(
-            task.model ?? null,
-            task.tier ?? null,
-          );
-        } catch (err) {
-          pluginDirReject = err instanceof Error ? err.message : String(err);
+        const cellModel = task.model ?? null;
+        const cellTier = task.tier ?? null;
+        if (cellModel !== null && cellTier !== null) {
+          if (!snapshot.hostMatrix.ok) {
+            matrixReject = {
+              state: snapshot.hostMatrix.state,
+              detail: snapshot.hostMatrix.detail,
+            };
+          } else {
+            try {
+              pluginDir = workerCellPluginDir(
+                cellModel,
+                cellTier,
+                snapshot.hostMatrix,
+              );
+            } catch (err) {
+              pluginDirReject =
+                err instanceof Error ? err.message : String(err);
+            }
+          }
         }
       }
       launches.push({
@@ -1889,6 +1966,7 @@ export function reconcile(
         cellModel: verb === "work" ? (task.model ?? null) : null,
         pluginDir,
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
+        ...(matrixReject !== undefined ? { matrixReject } : {}),
       });
       budget--;
     }

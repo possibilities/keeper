@@ -1327,25 +1327,20 @@ describe("providers resolve verb", () => {
     expect(h.err.join("")).toContain("Unknown top-level key");
   });
 
-  test("an absent matrix resolves every model native (byte-identical to today)", async () => {
+  test("an absent matrix is a typed loud failure (exit 2), never a claude-native fallback", async () => {
+    // v2 (ADR 0036): the host matrix is REQUIRED. An absent matrix exits 2 with the
+    // typed four-state error NAMING the absent state + the copy-the-example fix, and
+    // emits no candidate on stdout — never the pre-v2 silent claude-native fallback.
     const h = makeHarness({
       argv: ["providers", "resolve", "anything-goes", "high"],
       rawArgv: true,
       matrix: null,
     });
     const code = await expectExit(main(h.deps));
-    expect(code).toBe(0);
-    const env = JSON.parse(h.out.join(""));
-    expect(env.driver).toBe("native");
-    expect(env.candidates).toEqual([
-      {
-        harness: "claude",
-        model_id: "anything-goes",
-        preset_name: "claude-anything-goes",
-      },
-    ]);
-    // The fixed default block rides an absent matrix.
-    expect(env.defaults).toEqual({ stop_timeout_ms: 7200000, max_attempts: 2 });
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("no matrix.yaml found");
+    expect(h.err.join("")).toContain("matrix.example.yaml");
+    expect(h.out.join("")).toBe("");
   });
 });
 

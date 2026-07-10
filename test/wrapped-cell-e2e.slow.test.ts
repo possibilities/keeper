@@ -8,9 +8,10 @@
  *   1. RENDER   — `render-plugin-templates` fans the matrix into per-cell `work`
  *                 plugins: the wrapped `gpt-5.3-codex-spark` cell (worker runs the
  *                 wrapper driver) beside native `opus/sonnet-*` cells.
- *   2. RESOLVE  — the producer route seam (`resolveWorkerCell` + `defaultRouteProbe`)
- *                 classifies the roster: a served wrapped model routes, an unserved
- *                 one is no-route, a native model resolves its cell dir.
+ *   2. RESOLVE  — the producer worker-cell seam (`resolveWorkerCell` +
+ *                 `composeWorkerCellDir`) composes each cell from the v2 host matrix
+ *                 (ADR 0036): a wrapped model in subagent_models resolves its cell
+ *                 dir like a native one; a model outside it is an out-of-matrix reject.
  *   3. PROVIDERS— `agent providers resolve` orders the candidates by pecking order;
  *                 the fixture serves the spark capability token via a SINGLE codex
  *                 provider, as a bare token (codex needs no alias — ADR 0010).
@@ -53,12 +54,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadMatrix } from "../src/agent/matrix.ts";
-import {
-  composeWorkerCellDir,
-  defaultRouteProbe,
-  resolveWorkerCell,
-} from "../src/worker-cell.ts";
+import type { MatrixV2 } from "../src/agent/matrix.ts";
+import { composeWorkerCellDir, resolveWorkerCell } from "../src/worker-cell.ts";
 
 const SLOW_ENABLED = process.env.KEEPER_RUN_SLOW !== undefined;
 /** The real detached-pane substrate. Its absence is the loud skip below. */
@@ -211,33 +208,29 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
       expect(native).toContain("maxTurns: 300");
     });
 
-    test("the producer route seam classifies the fixture roster", () => {
-      const load = () => loadMatrix(join(configDir, "matrix.yaml"));
-      const probe = (model: string) => ({
-        dirExists: () => true,
-        probeShadow: () => null,
-        probeRoute: () => defaultRouteProbe(model, load),
+    test("the producer worker-cell seam composes each rendered cell from the v2 host matrix", () => {
+      // The v2 host matrix IS the one cell axis (ADR 0036): subagent_models carries
+      // native AND wrapped capabilities, so each composes its `workers/<model>-<effort>`
+      // cell in the pure compose — no route probe, no re-derivation. The injected
+      // matrix mirrors the fixture roster the render step fanned out.
+      const load = (): MatrixV2 => ({
+        efforts: ["medium", "high"],
+        subagentTemplates: ["template/agents/worker.md.tmpl"],
+        subagentModels: ["opus", "sonnet", "gpt-5.3-codex-spark"],
+        providers: [],
+        wrapper_driver: { model: "sonnet", effort: "high" },
+        defaults: { stop_timeout_ms: 3600000, max_attempts: 2 },
+        driverByModel: new Map(),
+        effortsByModel: new Map(),
+        shadowed: [],
       });
+      const probe = { dirExists: () => true, probeShadow: () => null };
 
-      // A wrapped model the roster serves is `wrapped`; one no provider serves is
-      // `no-route`; a native claude model is `routed`.
-      expect(defaultRouteProbe("gpt-5.3-codex-spark", load)).toEqual({
-        kind: "wrapped",
-      });
-      expect(defaultRouteProbe("nonesuch-9", load)).toEqual({
-        kind: "no-route",
-        model: "nonesuch-9",
-      });
-      expect(defaultRouteProbe("opus", load)).toEqual({ kind: "routed" });
-
-      // resolveWorkerCell threads those verdicts. The embedded subagents matrix
-      // stays claude-only by design (the host matrix is the sole overlay), so a
-      // served wrapped model's compose throws — yet the seam re-derives its
-      // rendered host cell dir and resolves OK, with the SAME manifest/shadow
-      // discipline a native cell runs (the end-to-end gap this closes).
+      // A wrapped capability in subagent_models resolves its rendered host cell dir
+      // with the SAME manifest/shadow discipline a native cell runs.
       const spark = resolveWorkerCell(
-        composeWorkerCellDir("gpt-5.3-codex-spark", "high"),
-        probe("gpt-5.3-codex-spark"),
+        composeWorkerCellDir("gpt-5.3-codex-spark", "high", load),
+        probe,
       );
       expect(spark.ok).toBe(true);
       if (spark.ok) {
@@ -246,26 +239,22 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         );
       }
 
-      // An unserved wrapped model stays the no-route reject (no cell to resolve).
-      const unserved = resolveWorkerCell(
-        composeWorkerCellDir("nonesuch-9", "high"),
-        probe("nonesuch-9"),
-      );
-      expect(unserved).toEqual({
-        ok: false,
-        kind: "no-route",
-        model: "nonesuch-9",
-      });
-
       // A native model resolves cleanly to its own cell dir.
       const opus = resolveWorkerCell(
-        composeWorkerCellDir("opus", "high"),
-        probe("opus"),
+        composeWorkerCellDir("opus", "high", load),
+        probe,
       );
       expect(opus.ok).toBe(true);
       if (opus.ok) {
         expect(opus.pluginDir).toContain(join("workers", "opus-high"));
       }
+
+      // A model outside subagent_models has no cell to compose → out-of-matrix.
+      const unserved = resolveWorkerCell(
+        composeWorkerCellDir("nonesuch-9", "high", load),
+        probe,
+      );
+      expect(unserved).toMatchObject({ ok: false, kind: "out-of-matrix" });
     });
 
     test("providers resolve orders the codex candidate for the spark capability token", () => {
