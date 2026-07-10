@@ -33,47 +33,20 @@ export const DEFAULT_HOST_TRIPLES: HostTriples = {
 
 /**
  * The default preset catalog the harness injects when a test names none: a
- * complete `<harness>_default` per harness so a bare fresh launch resolves a
- * model + effort/thinking (matching the production requirement that a fresh
- * launch pin them) instead of the fresh-launch fail-loud. Bare launches that
+ * complete `<harness>_default` launch triple per harness so a bare fresh launch
+ * resolves a model + effort/thinking (matching the production requirement that a
+ * fresh launch pin them) instead of the fresh-launch fail-loud. Bare launches that
  * don't assert the exact command are unaffected; exact-command tests either see
- * these injected values or pass their own catalog / explicit flags.
+ * these injected values or pass their own catalog / explicit flags. `presets` is
+ * empty (the freeform named catalog is retired); pi's effort segment `high`
+ * translates to its thinking band, hermes carries the axisless `na`.
  */
 export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
-  presets: {
-    "claude-default": {
-      harness: "claude",
-      model: "opus",
-      effort: "high",
-      thinking: null,
-      role: null,
-    },
-    "codex-default": {
-      harness: "codex",
-      model: "gpt",
-      effort: "high",
-      thinking: null,
-      role: null,
-    },
-    "pi-default": {
-      harness: "pi",
-      model: "glm",
-      effort: null,
-      thinking: "high",
-      role: null,
-    },
-    "hermes-default": {
-      harness: "hermes",
-      model: "gpt-5.5",
-      effort: null,
-      thinking: null,
-      role: null,
-    },
-  },
-  claude_default: "claude-default",
-  codex_default: "codex-default",
-  pi_default: "pi-default",
-  hermes_default: "hermes-default",
+  presets: {},
+  claude_default: { harness: "claude", model: "opus", effort: "high" },
+  codex_default: { harness: "codex", model: "gpt", effort: "high" },
+  pi_default: { harness: "pi", model: "glm", effort: "high" },
+  hermes_default: { harness: "hermes", model: "gpt-5.5", effort: "na" },
 };
 
 /** Throwing exit so a test sees the exit code without killing the runner. */

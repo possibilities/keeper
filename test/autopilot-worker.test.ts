@@ -4102,14 +4102,11 @@ test("resolveWorkerLaunchConfig: no registry file → WORKER_* constants", () =>
   }
 });
 
-test("resolveWorkerLaunchConfig: a `worker` preset overrides model/effort", () => {
+test("resolveWorkerLaunchConfig: a `worker` triple overrides model/effort", () => {
   const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
   try {
     const path = join(dir, "presets.yaml");
-    writeFileSync(
-      path,
-      "presets:\n  worker:\n    harness: claude\n    model: opus\n    effort: high\n",
-    );
+    writeFileSync(path, "worker: claude::opus::high\n");
     const cfg = resolveWorkerLaunchConfig(path);
     expect(cfg).toEqual({ model: "opus", effort: "high" });
   } finally {
@@ -4117,30 +4114,12 @@ test("resolveWorkerLaunchConfig: a `worker` preset overrides model/effort", () =
   }
 });
 
-test("resolveWorkerLaunchConfig: a partial `worker` preset layers per-field over the constants", () => {
+test("resolveWorkerLaunchConfig: no `worker` key in a present registry → constants", () => {
   const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
   try {
     const path = join(dir, "presets.yaml");
-    // model-only preset → effort falls back to WORKER_EFFORT.
-    writeFileSync(
-      path,
-      "presets:\n  worker:\n    harness: claude\n    model: opus\n",
-    );
-    const cfg = resolveWorkerLaunchConfig(path);
-    expect(cfg).toEqual({ model: "opus", effort: WORKER_EFFORT });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveWorkerLaunchConfig: no `worker` preset in a present registry → constants", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
-  try {
-    const path = join(dir, "presets.yaml");
-    writeFileSync(
-      path,
-      "presets:\n  other:\n    harness: claude\n    model: opus\n",
-    );
+    // A catalog with an escalation triple but no worker → worker falls to constants.
+    writeFileSync(path, "escalation: claude::haiku::high\n");
     const cfg = resolveWorkerLaunchConfig(path);
     expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
   } finally {
@@ -4152,8 +4131,8 @@ test("resolveWorkerLaunchConfig: a malformed registry FALLS BACK to constants wi
   const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
   try {
     const path = join(dir, "presets.yaml");
-    // `presets` as a list (not a mapping) → ConfigError, must be swallowed.
-    writeFileSync(path, "presets:\n  - not-a-mapping\n");
+    // A malformed worker triple → ConfigError, must be swallowed to constants.
+    writeFileSync(path, "worker: not-a-triple\n");
     const cfg = resolveWorkerLaunchConfig(path);
     expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
   } finally {
@@ -4170,14 +4149,11 @@ test("resolveWorkerLaunchConfig: a non-claude worker harness warns ONCE per valu
   };
   try {
     const codexPath = join(dir, "codex.yaml");
-    writeFileSync(
-      codexPath,
-      "presets:\n  worker:\n    harness: codex\n    model: gpt\n    effort: high\n",
-    );
+    writeFileSync(codexPath, "worker: codex::gpt::high\n");
     // A fresh per-call memo standing in for the reconcile cycle's process memo.
     const warned = new Set<string>();
     // The harness is DROPPED, not honored — model/effort still resolve from the
-    // preset so the launch proceeds on claude with the configured knobs.
+    // triple so the launch proceeds on claude with the configured knobs.
     const first = resolveWorkerLaunchConfig(codexPath, warned);
     expect(first).toEqual({ model: "gpt", effort: "high" });
     // A second reconcile cycle re-resolves the SAME offending value: no new warn.
@@ -4187,10 +4163,7 @@ test("resolveWorkerLaunchConfig: a non-claude worker harness warns ONCE per valu
 
     // A DISTINCT offending value (pi) warns once more against the same memo.
     const piPath = join(dir, "pi.yaml");
-    writeFileSync(
-      piPath,
-      "presets:\n  worker:\n    harness: pi\n    model: glm\n    thinking: high\n",
-    );
+    writeFileSync(piPath, "worker: pi::glm::high\n");
     resolveWorkerLaunchConfig(piPath, warned);
     resolveWorkerLaunchConfig(piPath, warned);
     const piWarns = errs.filter((e) => e.includes("pins harness 'pi'"));

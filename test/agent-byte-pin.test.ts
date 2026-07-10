@@ -275,20 +275,11 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
     transcriptHomeDir: home,
     cwd,
     randomUuid: () => RUN_UUID,
-    // A claude-harness preset so `--preset` validation (harness == <cli>) passes;
-    // claude_default lets a bare `agent run claude` clear the fresh-launch gate,
-    // which requires the resolved default to supply BOTH model + second axis.
+    // A claude default triple lets a bare `agent run claude` clear the fresh-launch
+    // gate, which requires the resolved default to supply BOTH model + second axis.
     presetCatalog: {
-      presets: {
-        opus: {
-          harness: "claude",
-          model: "opus",
-          effort: "high",
-          thinking: null,
-          role: null,
-        },
-      },
-      claude_default: "opus",
+      presets: {},
+      claude_default: { harness: "claude", model: "opus", effort: "high" },
     },
     tmuxCommand: (cmd) =>
       cmd.includes("has-session")
@@ -400,13 +391,13 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
       launcherArgvPrefix: [],
       cli: "claude",
       prompt: "say hi",
-      preset: "opus",
+      preset: "claude::opus::high",
       session: "panels",
     });
-    // The preset rides as a launcher flag (keeper agent owns model/effort
+    // The launch triple rides as a launcher flag (keeper agent owns model/effort
     // resolution); the session rides as the tmux grouping flag.
     expect(cmd).toContain("--x-preset");
-    expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("opus");
+    expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("claude::opus::high");
     expect(cmd).toContain("--x-tmux-session");
     expect(cmd[cmd.indexOf("--x-tmux-session") + 1]).toBe("panels");
     // claude's session grouping also mints the tracked-job env carrier.
@@ -425,13 +416,13 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
     expect(cmd.join(" ")).not.toContain("KEEPER_TMUX_SESSION");
   });
 
-  test("agent run --preset threads --x-preset into the launched command", async () => {
-    const cmd = await runCommand({ preset: "opus" });
+  test("agent run --preset threads the launch triple as --x-preset into the launched command", async () => {
+    const cmd = await runCommand({ preset: "claude::opus::high" });
     // --x-preset survives into the pane's inner argv (the tmux parser leaves it
     // for the detached re-exec to resolve); --x-tmux-session is consumed into the
     // session grouping, so it is pinned at the buildAgentLaunchArgv level above.
     expect(cmd).toContain("--x-preset");
-    expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("opus");
+    expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("claude::opus::high");
   });
 
   test("agent run without --preset/--session carries no wrapper posture (regression)", async () => {

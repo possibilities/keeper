@@ -6,15 +6,17 @@
  * booleans); the config corpus is boolean-free.
  *
  * `plugins.yaml` supplies the Claude plugin sources (fail-loud on a missing
- * file). The preset catalog (`presets.yaml`) is the SINGLE source of a launch's
- * model/effort/thinking: it holds the named presets plus the top-level
- * `<harness>_default` pointers (`claude_default`/`codex_default`/`pi_default`/
- * `hermes_default`) naming the preset a bare `keeper agent <harness>` launch
- * resolves. The panel selections (`panel.yaml`)
- * name ordered panels over those presets. All are REQUIRED + validated: a preset
- * referenced by name, a dangling `<harness>_default`, and every panel op fail-loud
- * (`ConfigError`) on a missing or invalid file — the autopilot worker is the sole
- * fail-open consumer (it catches the throw and coalesces to its constants).
+ * file). The launch-config catalog (`presets.yaml`) holds ONLY launch triples
+ * (ADR 0033): the four `<harness>_default` keys (`claude_default`/`codex_default`/
+ * `pi_default`/`hermes_default`) naming the `<harness>::<model>::<effort>` triple a
+ * bare `keeper agent <harness>` launch resolves, plus the `worker`/`escalation`
+ * machine-launch triples. The freeform named-preset catalog is retired — a leftover
+ * `presets:` block fails loud with a migration hint. The panel selections
+ * (`panel.yaml`) name ordered panels; the panel-member resolution path (task .5)
+ * still reads a {@link Preset} shape. All files are REQUIRED + validated: a missing
+ * file, a malformed triple, or a `<harness>_default` whose harness disagrees with
+ * its key fail-loud (`ConfigError`) — the worker/escalation resolvers are the sole
+ * fail-open consumers (they catch the throw and coalesce to their constants).
  */
 
 import {
@@ -26,14 +28,8 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import {
-  HARNESS_DESCRIPTORS,
-  HARNESS_NAME_SET,
-  HARNESS_NAMES,
-  type HarnessName,
-  isCapturableHarness,
-} from "./harness";
-import { loadMatrix, type Matrix, presetNameFor } from "./matrix";
+import { type HarnessName, isCapturableHarness } from "./harness";
+import { parseTriple, type Triple } from "./triple";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
 export class ConfigError extends Error {}
@@ -269,11 +265,13 @@ function parseWorkerPluginIsolation(
 export type PresetHarness = HarnessName;
 
 /**
- * A named launch-config triple. `model`/`effort`/`thinking` are partial: a
- * preset that omits a field sends no override for it (the fresh-launch fail-loud
- * gate then rejects the launch unless a flag supplies it). `effort` is
- * claude/codex-only, `thinking` is pi-only (never both). `role` is an optional
- * pair-only label carried verbatim.
+ * A resolved launch posture the panel-member path (task .5) still reads.
+ * `model`/`effort`/`thinking` are partial: an omitted field sends no override for
+ * it. `effort` is claude/codex-only, `thinking` is pi-only (never both). `role` is
+ * an optional pair-only label carried verbatim. The launch path derives one of
+ * these from a parsed {@link Triple} via `presetFromTriple` (`src/agent/main.ts`);
+ * the freeform named-preset catalog that once populated {@link
+ * PresetCatalog.presets} is retired.
  */
 export interface Preset {
   harness: PresetHarness;
@@ -284,24 +282,36 @@ export interface Preset {
 }
 
 /**
- * The catalog of available presets, parsed from `presets.yaml`: the full set of
- * named `{harness, model?, effort?, thinking?, role?}` triples a launch may pin,
- * plus the top-level `<harness>_default` pointers naming the preset a bare
- * `keeper agent <harness>` launch resolves. Read ONLY by this dep-free config
- * island — the launcher import graph never reaches `src/db.ts`. An empty
- * `presets:` mapping is valid (worker tolerance); each `<harness>_default` is
- * optional but, when set, must name a defined preset whose harness matches.
+ * The launch-config catalog parsed from `presets.yaml` (ADR 0033) — ONLY launch
+ * triples: the four `<harness>_default` keys naming the triple a bare `keeper agent
+ * <harness>` launch resolves, plus the `worker`/`escalation` machine-launch
+ * triples. Each is an optional `<harness>::<model>::<effort>` value, parsed to a
+ * {@link Triple}; a `<harness>_default` whose harness disagrees with its key
+ * prefix fails loud, while `worker`/`escalation` accept any harness (the
+ * autopilot/escalation resolvers warn-and-ignore a non-claude one). Read ONLY by
+ * this dep-free config island — the launcher import graph never reaches
+ * `src/db.ts`. `presets` is retained (always empty) for the panel-member
+ * resolution path (task .5) that still resolves a {@link Preset}; the freeform
+ * `presets:` block is retired and fails loud at load.
  */
 export interface PresetCatalog {
+  /** Retired freeform named-preset map — always empty from {@link
+   *  loadPresetCatalog}; retained for the panel-member path (task .5). */
   presets: Record<string, Preset>;
-  /** Preset a bare `keeper agent claude` resolves; null/absent when unset. */
-  claude_default?: string | null;
-  /** Preset a bare `keeper agent codex` resolves; null/absent when unset. */
-  codex_default?: string | null;
-  /** Preset a bare `keeper agent pi` resolves; null/absent when unset. */
-  pi_default?: string | null;
-  /** Preset a bare `keeper agent hermes` resolves; null/absent when unset. */
-  hermes_default?: string | null;
+  /** Triple a bare `keeper agent claude` resolves; null/absent when unset. */
+  claude_default?: Triple | null;
+  /** Triple a bare `keeper agent codex` resolves; null/absent when unset. */
+  codex_default?: Triple | null;
+  /** Triple a bare `keeper agent pi` resolves; null/absent when unset. */
+  pi_default?: Triple | null;
+  /** Triple a bare `keeper agent hermes` resolves; null/absent when unset. */
+  hermes_default?: Triple | null;
+  /** Machine worker-launch triple (`work`/`close` dispatch); any harness, the
+   *  autopilot resolver warns-and-ignores a non-claude one. Null/absent = unset. */
+  worker?: Triple | null;
+  /** Machine escalation-launch triple; independent of `worker`, same non-claude
+   *  warn-and-ignore posture. Null/absent = unset. */
+  escalation?: Triple | null;
 }
 
 /**
@@ -317,10 +327,8 @@ export interface PanelSelections {
   default: string | null;
 }
 
-const PRESET_HARNESSES: ReadonlySet<string> = HARNESS_NAME_SET;
-
 /**
- * Names a preset / panel may NOT take — they would collide with a launcher
+ * Names a panel may NOT take — they would collide with a launcher
  * subcommand or with a downstream YAML-1.1 boolean re-parse. `Bun.YAML.parse`
  * is YAML 1.2 (boolean-free), but a name consumed by a 1.1 re-parser (jq,
  * another yaml lib) could silently coerce, so reserve them here.
@@ -346,27 +354,9 @@ const RESERVED_PRESET_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 // Lowercase alnum, hyphen, underscore, dot — with no LEADING dot (so a name
-// never reads as a hidden file). The dot admits a dotted capability token like
-// `gpt-5.5` inside an auto-generated `<provider>-<model>` preset name.
+// never reads as a hidden file). The dot admits a dotted token like `gpt-5.5`.
+// Retained for panel-name validation (`loadPanelSelections`).
 const PRESET_NAME_PATTERN = /^[a-z0-9_-][a-z0-9._-]*$/;
-
-function presetStringField(
-  raw: Record<string, unknown>,
-  key: string,
-  name: string,
-  configPath: string,
-): string | null {
-  const v = raw[key];
-  if (v === null || v === undefined) {
-    return null;
-  }
-  if (typeof v !== "string" || !v.trim()) {
-    throw new ConfigError(
-      `Preset '${name}' field ${key} must be a non-empty string in ${configPath}`,
-    );
-  }
-  return v.trim();
-}
 
 function validatePresetName(name: string, configPath: string): void {
   if (!PRESET_NAME_PATTERN.test(name)) {
@@ -381,55 +371,16 @@ function validatePresetName(name: string, configPath: string): void {
   }
 }
 
-function parsePreset(name: string, value: unknown, configPath: string): Preset {
-  if (!isRecord(value)) {
-    throw new ConfigError(
-      `Preset '${name}' must be a mapping in ${configPath}`,
-    );
-  }
-  const harness = value.harness;
-  if (typeof harness !== "string" || !PRESET_HARNESSES.has(harness)) {
-    throw new ConfigError(
-      `Preset '${name}' harness must be one of ${HARNESS_NAMES.join("|")} in ${configPath}`,
-    );
-  }
-  const effort = presetStringField(value, "effort", name, configPath);
-  const thinking = presetStringField(value, "thinking", name, configPath);
-  if (effort !== null && thinking !== null) {
-    throw new ConfigError(
-      `Preset '${name}' cannot set both effort and thinking in ${configPath}`,
-    );
-  }
-  // The second-reasoning-axis gate reads the descriptor's `secondAxis` (never a
-  // harness-name literal): a preset may set only the axis its harness exposes. A
-  // model-only harness (hermes, `secondAxis: "none"`) accepts neither.
-  const descriptor = HARNESS_DESCRIPTORS[harness as PresetHarness];
-  if (thinking !== null && descriptor.secondAxis !== "thinking") {
-    throw new ConfigError(
-      `Preset '${name}' thinking is pi-only, not ${harness} in ${configPath}`,
-    );
-  }
-  if (effort !== null && descriptor.secondAxis !== "effort") {
-    throw new ConfigError(
-      `Preset '${name}' effort is claude/codex-only, not ${harness} in ${configPath}`,
-    );
-  }
-  return {
-    harness: harness as PresetHarness,
-    model: presetStringField(value, "model", name, configPath),
-    effort,
-    thinking,
-    role: presetStringField(value, "role", name, configPath),
-  };
-}
-
-/** Top-level keys each file admits — anything else is a strict-reject. */
+/** The four `<harness>_default` catalog keys plus the two machine-launch keys —
+ *  the ONLY top-level keys `presets.yaml` admits (ADR 0033). Anything else is a
+ *  strict-reject; a legacy `presets:` block is caught with a migration hint. */
 const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
-  "presets",
   "claude_default",
   "codex_default",
   "pi_default",
   "hermes_default",
+  "worker",
+  "escalation",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
 
@@ -449,134 +400,112 @@ function rejectUnknownKeys(
 }
 
 /**
- * Read the preset catalog from `presets.yaml`. REQUIRED + validated: a missing
- * file is fail-LOUD (ConfigError) — the reversal of the old fail-open posture. An
- * empty `presets:` mapping is still valid (the worker tolerates a catalog with no
- * presets). Also fail-loud on malformed YAML, an unknown top-level key, any
- * invalid entry (a bad harness, cross-harness effort+thinking, a reserved /
- * non-matching name), or a `<harness>_default` pointer that names no defined
- * preset or one whose harness does not match the key prefix.
- *
- * The parsed catalog is then augmented IN MEMORY with one auto-generated
- * `<provider>-<model>` preset per host-matrix roster pair (ADR 0010) — nothing is
- * ever written back to presets.yaml. `matrix` defaults to the host
- * `matrix.yaml`; an absent matrix (null) leaves the catalog byte-identical to the
- * hand-authored file. Pass `matrix` explicitly (including `null`) to load the raw
- * hand-authored catalog without the roster augmentation.
+ * Read the launch-config catalog from `presets.yaml` (ADR 0033). REQUIRED +
+ * validated: a missing file is fail-LOUD (ConfigError). The file holds ONLY launch
+ * triples — the four `<harness>_default` keys and the `worker`/`escalation`
+ * machine-launch keys, each an optional `<harness>::<model>::<effort>` string. A
+ * leftover freeform `presets:` block fails loud with a migration hint; any other
+ * unknown key is a strict-reject; a malformed triple or a `<harness>_default` whose
+ * harness disagrees with its key prefix is fail-loud. An empty/whitespace file is a
+ * valid empty catalog (every key null). `presets` is always empty — retained for
+ * the panel-member path (task .5).
  */
 export function loadPresetCatalog(
   configPath: string = presetsCatalogPath(),
-  matrix: Matrix | null = loadMatrix(),
 ): PresetCatalog {
   if (!isFile(configPath)) {
     throw new ConfigError(`Preset catalog missing at ${configPath}.`);
   }
   const raw = readMapping(configPath);
+  if ("presets" in raw) {
+    throw new ConfigError(
+      `The freeform 'presets:' catalog is retired (ADR 0033) in ${configPath}. ` +
+        `presets.yaml now holds only launch triples: the four <harness>_default ` +
+        `keys plus worker and escalation, each a '<harness>::<model>::<effort>' ` +
+        `string. See 'keeper agent presets list'.`,
+    );
+  }
   rejectUnknownKeys(raw, ALLOWED_CATALOG_KEYS, configPath);
 
-  const presets: Record<string, Preset> = {};
-  const presetsRaw = raw.presets ?? {};
-  if (!isRecord(presetsRaw)) {
-    throw new ConfigError(`Expected presets to be a mapping in ${configPath}`);
-  }
-  for (const [name, value] of Object.entries(presetsRaw)) {
-    validatePresetName(name, configPath);
-    presets[name] = parsePreset(name, value, configPath);
-  }
-  // Merge the host-matrix roster cells BEFORE the `<harness>_default` pointers
-  // resolve, so a pointer may name an auto-generated preset.
-  augmentCatalogWithMatrix(presets, matrix, configPath);
   return {
-    presets,
-    claude_default: parseHarnessDefault(raw, "claude", presets, configPath),
-    codex_default: parseHarnessDefault(raw, "codex", presets, configPath),
-    pi_default: parseHarnessDefault(raw, "pi", presets, configPath),
-    hermes_default: parseHarnessDefault(raw, "hermes", presets, configPath),
+    presets: {},
+    claude_default: parseDefaultTriple(raw, "claude", configPath),
+    codex_default: parseDefaultTriple(raw, "codex", configPath),
+    pi_default: parseDefaultTriple(raw, "pi", configPath),
+    hermes_default: parseDefaultTriple(raw, "hermes", configPath),
+    worker: parseMachineTriple(raw, "worker", configPath),
+    escalation: parseMachineTriple(raw, "escalation", configPath),
   };
 }
 
-/**
- * Augment the parsed catalog in memory with one `<provider>-<model>` preset per
- * host-matrix roster pair (ADR 0010). Each auto-preset pins the roster provider's
- * harness and the model's provider-native id, carrying NO effort/thinking — the
- * second reasoning axis arrives per-run through the descriptor map, never baked
- * here. Absent matrix (null) → no-op, the catalog stays byte-identical. An
- * auto-generated name colliding with a hand-authored preset OR a reserved name is
- * fail-loud, so the operator renames rather than silently shadowing a roster
- * cell. Auto-names are globally unique (a distinct provider × model pair each), so
- * no auto-vs-auto collision is possible — those two guarded cases are the only
- * ones.
- */
-function augmentCatalogWithMatrix(
-  presets: Record<string, Preset>,
-  matrix: Matrix | null,
-  configPath: string,
-): void {
-  if (matrix === null) {
-    return;
-  }
-  for (const provider of matrix.providers) {
-    for (const [capability, nativeId] of provider.models) {
-      const name = presetNameFor(provider.name, capability);
-      if (RESERVED_PRESET_NAMES.has(name)) {
-        throw new ConfigError(
-          `Auto-generated preset '${name}' (matrix provider ${provider.name}, model ${capability}) is a reserved name in ${configPath}.`,
-        );
-      }
-      if (name in presets) {
-        throw new ConfigError(
-          `Auto-generated preset '${name}' (matrix provider ${provider.name}, model ${capability}) collides with a hand-authored preset in ${configPath} — rename the hand-authored preset.`,
-        );
-      }
-      presets[name] = {
-        harness: provider.name,
-        model: nativeId,
-        effort: null,
-        thinking: null,
-        role: null,
-      };
-    }
-  }
-}
-
-/**
- * Parse + strict-validate one `<harness>_default` pointer. A structural key
- * (exempt from `validatePresetName`, mirroring the panel `default` precedent): an
- * unset key is null; a present one must name a defined preset whose harness
- * matches the key prefix, else fail-loud with a message naming the file, key,
- * offending name, and expected harness (mirroring `resolvePreset`).
- */
-function parseHarnessDefault(
+/** Read a raw catalog value as a required non-empty triple STRING, or null when
+ *  the key is unset. A present-but-non-string / empty value is fail-loud. */
+function tripleStringField(
   raw: Record<string, unknown>,
-  harness: PresetHarness,
-  presets: Record<string, Preset>,
+  key: string,
   configPath: string,
 ): string | null {
-  const key = `${harness}_default`;
   const v = raw[key];
   if (v === null || v === undefined) {
     return null;
   }
   if (typeof v !== "string" || !v.trim()) {
     throw new ConfigError(
-      `${key} must be a non-empty string naming a preset in ${configPath}`,
+      `${key} must be a non-empty '<harness>::<model>::<effort>' triple string in ${configPath}`,
     );
   }
-  const name = v.trim();
-  const preset = presets[name];
-  if (preset === undefined) {
-    const available = Object.keys(presets).sort();
-    const list = available.length > 0 ? available.join(", ") : "(none)";
+  return v.trim();
+}
+
+/**
+ * Parse + strict-validate one `<harness>_default` launch triple. An unset key is
+ * null; a present one must be a well-formed triple (`parseTriple`) whose harness
+ * matches the key prefix, else fail-loud naming the file, key, and the offending
+ * segment/harness.
+ */
+function parseDefaultTriple(
+  raw: Record<string, unknown>,
+  harness: HarnessName,
+  configPath: string,
+): Triple | null {
+  const key = `${harness}_default`;
+  const value = tripleStringField(raw, key, configPath);
+  if (value === null) {
+    return null;
+  }
+  const parsed = parseTriple(value);
+  if (!parsed.ok) {
+    throw new ConfigError(`${key} in ${configPath}: ${parsed.error}`);
+  }
+  if (parsed.triple.harness !== harness) {
     throw new ConfigError(
-      `${key} '${name}' is not a defined preset in ${configPath}. Available: ${list}`,
+      `${key} '${value}' pins harness ${parsed.triple.harness}, expected ${harness} in ${configPath}`,
     );
   }
-  if (preset.harness !== harness) {
-    throw new ConfigError(
-      `${key} '${name}' pins harness ${preset.harness}, expected ${harness} in ${configPath}`,
-    );
+  return parsed.triple;
+}
+
+/**
+ * Parse one machine-launch triple (`worker`/`escalation`). An unset key is null; a
+ * present one must be a well-formed triple (fail-loud on malformed — the resolvers
+ * swallow the throw to their constants), but its harness is UNCHECKED here: the
+ * autopilot / escalation resolvers accept any harness and warn-and-ignore a
+ * non-claude one.
+ */
+function parseMachineTriple(
+  raw: Record<string, unknown>,
+  key: string,
+  configPath: string,
+): Triple | null {
+  const value = tripleStringField(raw, key, configPath);
+  if (value === null) {
+    return null;
   }
-  return name;
+  const parsed = parseTriple(value);
+  if (!parsed.ok) {
+    throw new ConfigError(`${key} in ${configPath}: ${parsed.error}`);
+  }
+  return parsed.triple;
 }
 
 /**

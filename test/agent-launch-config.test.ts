@@ -373,16 +373,16 @@ test("buildAgentLaunchArgv: --x-tmux-session appended when session supplied", ()
   expect(argv[idx + 1]).toBe("pair-sess");
 });
 
-test("buildAgentLaunchArgv: --preset forwards --x-preset so the launcher owns model/effort", () => {
+test("buildAgentLaunchArgv: --preset forwards the launch triple as --x-preset", () => {
   const argv = buildAgentLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "claude",
     prompt: "P",
-    preset: "claude-opus-xhigh",
+    preset: "claude::opus::xhigh",
   });
   const idx = argv.indexOf("--x-preset");
   expect(idx).toBeGreaterThanOrEqual(0);
-  expect(argv[idx + 1]).toBe("claude-opus-xhigh");
+  expect(argv[idx + 1]).toBe("claude::opus::xhigh");
   // The base wrapper-flag triad stays the first three flags after the cli token —
   // preset rides AFTER them, never reordering the load-bearing prefix.
   expect(argv.slice(LAP.length + 1, LAP.length + 4)).toEqual([

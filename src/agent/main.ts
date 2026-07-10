@@ -50,7 +50,6 @@ import {
   parseYaml,
   pluginConfigPath,
   presetsCatalogPath,
-  resolvePreset,
 } from "./config";
 import { checkCwdInProjectRoot } from "./cwd-confirm";
 import { migrateLegacyAgentStateDir, nextCwdOrdinal } from "./cwd-ordinal";
@@ -165,6 +164,7 @@ import {
   hostTripleRefs,
   lintHostTriples,
   parseTriple,
+  type Triple,
 } from "./triple";
 import { readSingleChar } from "./tty";
 
@@ -684,13 +684,13 @@ function unresolvedDefaultMessage(agent: AgentKind): string {
   );
 }
 
-/** The `<harness>_default` pointer for a harness — the preset a bare
+/** The `<harness>_default` launch triple for a harness — the triple a bare
  *  `keeper agent <harness>` resolves. Keyed per harness so a new harness's default
  *  never silently falls through to another's. */
-function harnessDefaultName(
+function harnessDefaultTriple(
   agent: AgentKind,
   catalog: PresetCatalog,
-): string | null {
+): Triple | null {
   switch (agent) {
     case "claude":
       return catalog.claude_default ?? null;
@@ -701,6 +701,25 @@ function harnessDefaultName(
     case "hermes":
       return catalog.hermes_default ?? null;
   }
+}
+
+/**
+ * Bridge a parsed launch {@link Triple} into the {@link Preset} shape the launch
+ * resolver machinery consumes. The triple's single `effort` segment routes onto the
+ * harness's own second axis (descriptor-driven): claude/codex take it as `effort`,
+ * pi as `thinking`, and an axisless harness (hermes, effort `na`) takes neither.
+ * The launch path then translates that band per-harness at argv-build time exactly
+ * as a hand-authored preset did. `role` is never carried by a triple.
+ */
+function presetFromTriple(t: Triple): Preset {
+  const axis = HARNESS_DESCRIPTORS[t.harness].secondAxis;
+  return {
+    harness: t.harness,
+    model: t.model,
+    effort: axis === "effort" ? t.effort : null,
+    thinking: axis === "thinking" ? t.effort : null,
+    role: null,
+  };
 }
 
 /**
@@ -1162,15 +1181,12 @@ async function runRunCaptureSubcommand(
   const runBothExplicit = parsed.model !== null && parsed.effort !== null;
   let runPreset: Preset | null = null;
   if (parsed.preset !== null) {
-    try {
-      runPreset = resolvePreset(deps.loadPresetCatalogFn(), parsed.preset);
-    } catch (exc) {
-      if (exc instanceof ConfigError) {
-        deps.writeErr(`agent: ${exc.message}\n`);
-        return runBadArgs();
-      }
-      throw exc;
+    const parsedTriple = parseTriple(parsed.preset);
+    if (!parsedTriple.ok) {
+      deps.writeErr(`agent: --preset ${parsedTriple.error}\n`);
+      return runBadArgs();
     }
+    runPreset = presetFromTriple(parsedTriple.triple);
     if (runPreset.harness !== agent) {
       deps.writeErr(
         `agent: --preset ${parsed.preset} pins harness ${runPreset.harness}, ` +
@@ -1189,12 +1205,12 @@ async function runRunCaptureSubcommand(
       }
       throw exc;
     }
-    const defaultName = harnessDefaultName(agent, catalog);
-    if (defaultName !== null) {
-      runPreset = resolvePreset(catalog, defaultName);
+    const defaultTriple = harnessDefaultTriple(agent, catalog);
+    if (defaultTriple !== null) {
+      runPreset = presetFromTriple(defaultTriple);
     }
   }
-  // Route the resolved preset (or default) plus the explicit --model/--effort
+  // Route the resolved triple (or default) plus the explicit --model/--effort
   // flags through the shared readiness core. The both-explicit escape already
   // supplies both axes, so it skips the check.
   if (!runBothExplicit) {
@@ -1207,7 +1223,7 @@ async function runRunCaptureSubcommand(
       deps.writeErr(
         `agent: no model/effort resolved for a fresh ${agent} run. ` +
           `Set ${agent}_default in presets.yaml (see 'keeper agent presets list'), ` +
-          `or pass --preset <name> or --model <model> --effort <effort>.\n`,
+          `or pass --preset <triple> or --model <model> --effort <effort>.\n`,
       );
       return runBadArgs();
     }
@@ -1911,26 +1927,21 @@ export async function main(deps: MainDeps): Promise<never> {
   }
 
   // Resolve the leading-token harness. `run` carries it directly; the
-  // harnessless `run-preset` form drives it from the named preset's harness.
-  // The preset name (CLI flag or harnessless head) is resolved per field below
-  // the explicit-flag / env slots; a head agent disagreeing with the preset's
-  // harness is rejected.
+  // harnessless `run-preset` form drives it from the launch triple's harness
+  // segment. The triple (CLI flag or harnessless head) resolves per field below the
+  // explicit-flag / env slots; a head agent disagreeing with the triple's harness
+  // is rejected.
   let agent: AgentKind;
   let argv: string[];
   let dispatchPresetName: string | null = null;
   if (dispatch.kind === "run-preset") {
     dispatchPresetName = dispatch.presetName;
-    let preset: Preset;
-    try {
-      preset = resolvePreset(deps.loadPresetCatalogFn(), dispatch.presetName);
-    } catch (exc) {
-      if (exc instanceof ConfigError) {
-        deps.writeErr(`Error: ${exc.message}\n`);
-        return deps.exit(2);
-      }
-      throw exc;
+    const parsedTriple = parseTriple(dispatch.presetName);
+    if (!parsedTriple.ok) {
+      deps.writeErr(`Error: --x-preset ${parsedTriple.error}\n`);
+      return deps.exit(2);
     }
-    agent = preset.harness;
+    agent = parsedTriple.triple.harness;
     argv = dispatch.rest;
   } else {
     agent = dispatch.agent;
@@ -2024,23 +2035,20 @@ export async function main(deps: MainDeps): Promise<never> {
   const { launcherCodexSessionName } = parsed;
   let { launcherProfile, explicitLauncherProfile } = parsed;
 
-  // Named preset resolution: the `--x-preset` flag (or the harnessless
-  // head, already mirrored onto parsed.launcherPreset). Resolve it once here so
-  // its model/effort/thinking can layer into the resolver default slots BELOW
-  // the explicit-flag / effort-env precedence. A head agent disagreeing with the
-  // preset's harness is fail-loud — never silently re-route the launch.
+  // Launch-triple resolution: the `--x-preset` flag value (or the harnessless
+  // head, already mirrored onto parsed.launcherPreset). Parse it once here so its
+  // model/effort/thinking can layer into the resolver default slots BELOW the
+  // explicit-flag / effort-env precedence. A head agent disagreeing with the
+  // triple's harness is fail-loud — never silently re-route the launch.
   const presetName = parsed.launcherPreset ?? dispatchPresetName;
   let resolvedPreset: Preset | null = null;
   if (presetName !== null) {
-    try {
-      resolvedPreset = resolvePreset(deps.loadPresetCatalogFn(), presetName);
-    } catch (exc) {
-      if (exc instanceof ConfigError) {
-        deps.writeErr(`Error: ${exc.message}\n`);
-        return deps.exit(2);
-      }
-      throw exc;
+    const parsedTriple = parseTriple(presetName);
+    if (!parsedTriple.ok) {
+      deps.writeErr(`Error: --x-preset ${parsedTriple.error}\n`);
+      return deps.exit(2);
     }
+    resolvedPreset = presetFromTriple(parsedTriple.triple);
     if (dispatch.kind === "run" && resolvedPreset.harness !== agent) {
       deps.writeErr(
         `Error: --x-preset ${presetName} pins harness ` +
@@ -2049,7 +2057,7 @@ export async function main(deps: MainDeps): Promise<never> {
       return deps.exit(2);
     }
     actionLog.push(
-      `Resolved preset '${presetName}' (${resolvedPreset.harness})`,
+      `Resolved triple '${presetName}' (${resolvedPreset.harness})`,
     );
   }
 
@@ -2137,15 +2145,17 @@ export async function main(deps: MainDeps): Promise<never> {
         }
         throw exc;
       }
-      const defaultName = harnessDefaultName(agent, catalog);
-      if (defaultName !== null) {
-        resolvedPreset = resolvePreset(catalog, defaultName);
-        actionLog.push(`Resolved ${agent}_default preset '${defaultName}'`);
+      const defaultTriple = harnessDefaultTriple(agent, catalog);
+      if (defaultTriple !== null) {
+        resolvedPreset = presetFromTriple(defaultTriple);
+        actionLog.push(
+          `Resolved ${agent}_default triple '${formatTriple(defaultTriple)}'`,
+        );
       }
     }
     // Shared readiness core (same as the run gate): the resolved model AND the
     // harness's second axis (effort for claude/codex, thinking for pi) must both
-    // resolve from the preset or an explicit flag.
+    // resolve from the triple or an explicit flag.
     if (!resolveLaunchReadiness(agent, resolvedPreset, launchSignals)) {
       deps.writeErr(unresolvedDefaultMessage(agent));
       return deps.exit(2);

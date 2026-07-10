@@ -1,20 +1,16 @@
 /**
- * Launcher config surface: the `--x-preset` flag still drives an in-session
- * launch's harness/model/effort through main()'s resolver default slots at
- * `explicit > env > preset > yaml > native` per field (the named-preset launch
- * path, retired in a later task); the launch-triple grammar (`parseTriple` /
- * `slugifyTriple`) validates `harness::model::effort` by construction; and the
- * reshaped `presets resolve` / `presets list` verbs emit the triple + virtual-cube
- * contracts. A cold-start guard proves the launcher import graph never reaches
- * src/db.ts (bun:sqlite).
+ * Launcher config surface: the `--x-preset` flag drives an in-session launch's
+ * harness/model/effort by parsing its value as a launch triple
+ * (`harness::model::effort`) through main()'s resolver default slots at `explicit >
+ * env > triple > native` per field; the `<harness>_default` catalog keys are triples
+ * too; the launch-triple grammar (`parseTriple` / `slugifyTriple`) validates by
+ * construction; and the reshaped `presets resolve` / `presets list` verbs emit the
+ * triple + virtual-cube contracts. A cold-start guard proves the launcher import
+ * graph never reaches src/db.ts (bun:sqlite).
  */
 
 import { describe, expect, test } from "bun:test";
-import {
-  ConfigError,
-  type Preset,
-  type PresetCatalog,
-} from "../src/agent/config";
+import { ConfigError, type PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import type { Matrix } from "../src/agent/matrix";
 import {
@@ -31,43 +27,28 @@ import {
   runAndCapture,
 } from "./helpers/agent-main-harness";
 
-function preset(
-  over: Partial<Preset> & { harness: Preset["harness"] },
-): Preset {
-  return {
-    model: null,
-    effort: null,
-    thinking: null,
-    role: null,
-    ...over,
-  };
-}
-
-function catalog(presets: Record<string, Preset>): PresetCatalog {
-  return { presets };
-}
-
 describe("--x-preset precedence (claude)", () => {
-  test("preset model + effort feed the default slot", async () => {
+  test("triple model + effort feed the default slot", async () => {
     const h = makeHarness({
-      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "claude::opus::xhigh", "hi"],
       listProfiles: () => ["default"],
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-      }),
     });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--model")).toEqual(["opus"]);
     expect(flagValues(cmd, "--effort")).toEqual(["xhigh"]);
   });
 
-  test("explicit --model wins over the preset; preset effort still applies", async () => {
+  test("explicit --model wins over the triple; triple effort still applies", async () => {
     const h = makeHarness({
-      argv: ["--x-no-confirm", "--x-preset", "p", "--model", "sonnet", "hi"],
+      argv: [
+        "--x-no-confirm",
+        "--x-preset",
+        "claude::opus::xhigh",
+        "--model",
+        "sonnet",
+        "hi",
+      ],
       listProfiles: () => ["default"],
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-      }),
     });
     const cmd = await runAndCapture(h, main);
     // Explicit --model is forwarded verbatim; the wrapper adds no second --model.
@@ -75,86 +56,76 @@ describe("--x-preset precedence (claude)", () => {
     expect(flagValues(cmd, "--effort")).toEqual(["xhigh"]);
   });
 
-  test("CLAUDE_CODE_EFFORT_LEVEL env beats the preset effort", async () => {
+  test("CLAUDE_CODE_EFFORT_LEVEL env beats the triple effort", async () => {
     const h = makeHarness({
-      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "claude::opus::xhigh", "hi"],
       env: { CLAUDE_CODE_EFFORT_LEVEL: "low" },
       listProfiles: () => ["default"],
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-      }),
     });
     const cmd = await runAndCapture(h, main);
-    // Env wins → the wrapper adds NO --effort; model still from the preset.
+    // Env wins → the wrapper adds NO --effort; model still from the triple.
     expect(flagValues(cmd, "--effort")).toEqual([]);
     expect(flagValues(cmd, "--model")).toEqual(["opus"]);
   });
 
-  test("a model-only preset with no effort is fail-loud on a fresh launch", async () => {
+  test("a malformed --x-preset triple is fail-loud (exit 2), naming the segment", async () => {
     const h = makeHarness({
-      argv: ["--x-no-confirm", "--x-preset", "p", "hi"],
+      // Two segments — the grammar rejects it, naming the offending shape.
+      argv: ["--x-no-confirm", "--x-preset", "claude::opus", "hi"],
       listProfiles: () => ["default"],
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus" }),
-      }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
-    expect(h.err.join("")).toContain("--effort");
+    expect(h.err.join("")).toContain("three");
     expect(h.spawned.length).toBe(0);
   });
 });
 
 describe("--x-preset precedence (codex + pi)", () => {
-  test("codex preset model + effort feed the resolver default slot", async () => {
+  test("codex triple model + effort feed the resolver default slot", async () => {
     const h = makeHarness({
       agent: "codex",
-      argv: ["--x-no-confirm", "--x-preset", "c", "hi"],
-      presetCatalog: catalog({
-        c: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
-      }),
+      argv: ["--x-no-confirm", "--x-preset", "codex::gpt-5.5::high", "hi"],
     });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--model")).toEqual(["gpt-5.5"]);
     expect(cmd).toContain('model_reasoning_effort="high"');
   });
 
-  test("pi preset model + thinking feed the resolver default slot", async () => {
+  test("pi triple model + effort feed the thinking slot", async () => {
     const h = makeHarness({
       agent: "pi",
-      argv: ["--x-no-confirm", "--x-preset", "pp", "hi"],
+      argv: ["--x-no-confirm", "--x-preset", "pi::pi-pro::xhigh", "hi"],
       listProfiles: () => ["default"],
-      presetCatalog: catalog({
-        pp: preset({ harness: "pi", model: "pi-pro", thinking: "deep" }),
-      }),
     });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--model")).toEqual(["pi-pro"]);
-    expect(flagValues(cmd, "--thinking")).toEqual(["deep"]);
+    // The triple's keeper effort maps onto pi's thinking band (xhigh → xhigh).
+    expect(flagValues(cmd, "--thinking")).toEqual(["xhigh"]);
   });
 });
 
 describe("harnessless run-preset + harness agreement", () => {
-  test("the harnessless form drives the harness from the preset (codex)", async () => {
+  test("the harnessless form drives the harness from the triple (codex)", async () => {
     const h = makeHarness({
-      argv: ["--x-preset", "c", "--x-no-confirm", "hi"],
+      argv: ["--x-preset", "codex::gpt-5.5::high", "--x-no-confirm", "hi"],
       rawArgv: true,
-      presetCatalog: catalog({
-        c: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
-      }),
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.codexBin);
     expect(flagValues(cmd, "--model")).toEqual(["gpt-5.5"]);
   });
 
-  test("a head agent disagreeing with the preset harness fails loud", async () => {
+  test("a head agent disagreeing with the triple harness fails loud", async () => {
     const h = makeHarness({
-      argv: ["codex", "--x-no-confirm", "--x-preset", "p", "hi"],
+      argv: [
+        "codex",
+        "--x-no-confirm",
+        "--x-preset",
+        "claude::opus::high",
+        "hi",
+      ],
       rawArgv: true,
-      presetCatalog: catalog({
-        p: preset({ harness: "claude", model: "opus" }),
-      }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
@@ -162,13 +133,10 @@ describe("harnessless run-preset + harness agreement", () => {
     expect(h.spawned.length).toBe(0);
   });
 
-  test("a missing preset name fails loud", async () => {
+  test("a malformed harnessless triple fails loud naming the segment", async () => {
     const h = makeHarness({
-      argv: ["claude", "--x-no-confirm", "--x-preset", "ghost"],
+      argv: ["--x-preset", "ghost::opus::high", "--x-no-confirm", "hi"],
       rawArgv: true,
-      presetCatalog: catalog({
-        p: preset({ harness: "claude" }),
-      }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
@@ -177,16 +145,14 @@ describe("harnessless run-preset + harness agreement", () => {
   });
 });
 
-describe("no --x-preset → harness default pointer", () => {
-  test("a fresh launch resolves the catalog claude_default", async () => {
+describe("no --x-preset → harness default triple", () => {
+  test("a fresh launch resolves the catalog claude_default triple", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
       presetCatalog: {
-        presets: {
-          d: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-        },
-        claude_default: "d",
+        presets: {},
+        claude_default: { harness: "claude", model: "opus", effort: "xhigh" },
       },
     });
     const cmd = await runAndCapture(h, main);
@@ -196,17 +162,14 @@ describe("no --x-preset → harness default pointer", () => {
 
   test("only the matching-harness default is resolved for the launch", async () => {
     // A catalog carrying every harness default resolves ONLY the claude one for
-    // a claude launch — the codex/pi pointers never touch it.
+    // a claude launch — the codex/pi triples never touch it.
     const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
       listProfiles: () => ["default"],
       presetCatalog: {
-        presets: {
-          cd: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-          xd: preset({ harness: "codex", model: "gpt", effort: "high" }),
-        },
-        claude_default: "cd",
-        codex_default: "xd",
+        presets: {},
+        claude_default: { harness: "claude", model: "opus", effort: "xhigh" },
+        codex_default: { harness: "codex", model: "gpt", effort: "high" },
       },
     });
     const cmd = await runAndCapture(h, main);

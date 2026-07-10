@@ -115,20 +115,22 @@ describe("splitSubcommand", () => {
     });
   });
 
-  test("leading --x-preset is the harnessless run-preset form", () => {
-    expect(splitSubcommand(["--x-preset", "claude-opus-xhigh", "/p"])).toEqual({
+  test("leading --x-preset is the harnessless run-preset form (the value is a triple)", () => {
+    expect(
+      splitSubcommand(["--x-preset", "claude::opus::xhigh", "/p"]),
+    ).toEqual({
       kind: "run-preset",
-      presetName: "claude-opus-xhigh",
+      presetName: "claude::opus::xhigh",
       // The whole argv stays in rest so parseArgs strips the flag.
-      rest: ["--x-preset", "claude-opus-xhigh", "/p"],
+      rest: ["--x-preset", "claude::opus::xhigh", "/p"],
     });
   });
 
   test("leading --x-preset=joined form classifies as run-preset", () => {
-    expect(splitSubcommand(["--x-preset=codex-gpt55-high"])).toEqual({
+    expect(splitSubcommand(["--x-preset=codex::gpt-5.5::high"])).toEqual({
       kind: "run-preset",
-      presetName: "codex-gpt55-high",
-      rest: ["--x-preset=codex-gpt55-high"],
+      presetName: "codex::gpt-5.5::high",
+      rest: ["--x-preset=codex::gpt-5.5::high"],
     });
   });
 

@@ -43,19 +43,12 @@ function piHarness(
 const DEFAULT_THINKING = ["--thinking", "high"];
 const DEFAULT_MODEL = ["--model", "glm"];
 
-/** A catalog whose pi_default pins the given model + thinking. */
+/** A catalog whose pi_default triple pins the given model + thinking. The triple's
+ *  effort segment carries the keeper effort that maps onto pi's thinking band. */
 function piDefaultCatalog(model: string, thinking: string): PresetCatalog {
   return {
-    presets: {
-      "pi-default": {
-        harness: "pi",
-        model,
-        effort: null,
-        thinking,
-        role: null,
-      },
-    },
-    pi_default: "pi-default",
+    presets: {},
+    pi_default: { harness: "pi", model, effort: thinking },
   };
 }
 
