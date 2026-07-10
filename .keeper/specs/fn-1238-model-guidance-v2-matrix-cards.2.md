@@ -63,5 +63,5 @@ throwing.
 - [ ] The disk-mode test pins the committed tree all-fresh including card parity under the pinned config-dir fixture
 
 ## Done summary
-
+Threaded the model-card contract through model-guidance-check: optional research.<model>.card coercion (loud on partial/malformed/copy-paste), --check hashes every declared card presence+hash only, and the --state lattice requires a present hash-matching card for fresh, emitting card_present/card_hash_parity/reasons per model.
 ## Evidence
