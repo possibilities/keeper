@@ -88,6 +88,10 @@ export interface Harness {
   /** Action logs ensureCodexStateSharingFn was invoked with, in order (call count
    *  = length) — the codex leaf-guard reaches every codex launch, passthrough too. */
   codexStateSharingCalls: string[][];
+  /** Profile lists ensurePiStateSharingFn's `listProfilesFn` arg resolved to, in
+   *  order (call count = length) — the pi leaf-guard reaches every pi launch,
+   *  passthrough included, fed the `() => []` arm on passthrough. */
+  piStateSharingCalls: string[][];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
   /** Every birth record the launcher emitted (draft + child pid), in order. */
@@ -174,6 +178,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const err: string[] = [];
   const bootstrappedProfiles: string[] = [];
   const codexStateSharingCalls: string[][] = [];
+  const piStateSharingCalls: string[][] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
@@ -230,7 +235,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
       bootstrappedProfiles.push(profileName);
       return [profileDir, false];
     },
-    ensurePiStateSharingFn: () => {},
+    ensurePiStateSharingFn: (listProfilesFn: () => string[]) => {
+      piStateSharingCalls.push(listProfilesFn());
+    },
     ensureKeeperAgentPiProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);
       return [profileDir, false];
@@ -280,6 +287,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     err,
     bootstrappedProfiles,
     codexStateSharingCalls,
+    piStateSharingCalls,
     codexSessionNameIndexers,
     birthRecords,
     tmuxCommands,
