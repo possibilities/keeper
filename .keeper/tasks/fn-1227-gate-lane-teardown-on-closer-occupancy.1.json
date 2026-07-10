@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T00:53:35.856000Z",
+  "depends_on": [],
+  "epic": "fn-1227-gate-lane-teardown-on-closer-occupancy",
+  "id": "fn-1227-gate-lane-teardown-on-closer-occupancy.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Gate finalize and recover on closer occupancy",
+  "updated_at": "2026-07-10T00:53:35.856000Z"
+}
