@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Schema linchpin extended identically in two firewalled parsers with clobber/normalize semantics \u2014 a parser-differential correctness invariant and the epic's stop-or-rethink proof point.",
+      "task_id": "fn-1230-launch-triples-over-preset-catalog.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting cascade threading per-model efforts across render fan-out, selection brief, apply validation, and drift gates on a contract-shaped cube where a missed site silently accepts an unrenderable tier.",
+      "task_id": "fn-1230-launch-triples-over-preset-catalog.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "New launch-triple grammar and enumeration/doctor design with LangSec reject-not-best-effort correctness and a cold-start import-graph invariant to preserve.",
+      "task_id": "fn-1230-launch-triples-over-preset-catalog.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Wide launch-config cascade retiring the catalog with byte-identical triple round-trip for detached legs and fail-open-without-throw invariants across dispatch, autopilot, and escalation.",
+      "task_id": "fn-1230-launch-triples-over-preset-catalog.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bounded but carries a subtle correctness invariant: non-injective slugification must never collide two distinct triples on a tmux name or state path, with ordinal-based leg identity.",
+      "task_id": "fn-1230-launch-triples-over-preset-catalog.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mechanical multi-surface prose sweep plus corpus re-vendor following a clear pattern with drift-check backstops \u2014 no intelligence-bound reason, so the default workhorse.",
+      "task_id": "fn-1230-launch-triples-over-preset-catalog.6",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T03:03:29.287000Z",
+  "epic_id": "fn-1230-launch-triples-over-preset-catalog",
+  "input_hash": "c6d4ed75ef46cf3a78502baf3f2d390f9714b501f380120be613003d776eaa4c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3335843189,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1230-launch-triples-over-preset-catalog.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Schema linchpin extended identically in two firewalled parsers with clobber/normalize semantics \u2014 a parser-differential correctness invariant and the epic's stop-or-rethink proof point.\",\"confidence\":0.85},{\"task_id\":\"fn-1230-launch-triples-over-preset-catalog.2\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Cross-cutting cascade threading per-model efforts across render fan-out, selection brief, apply validation, and drift gates on a contract-shaped cube where a missed site silently accepts an unrenderable tier.\",\"confidence\":0.68},{\"task_id\":\"fn-1230-launch-triples-over-preset-catalog.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"New launch-triple grammar and enumeration/doctor design with LangSec reject-not-best-effort correctness and a cold-start import-graph invariant to preserve.\",\"confidence\":0.82},{\"task_id\":\"fn-1230-launch-triples-over-preset-catalog.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Wide launch-config cascade retiring the catalog with byte-identical triple round-trip for detached legs and fail-open-without-throw invariants across dispatch, autopilot, and escalation.\",\"confidence\":0.8},{\"task_id\":\"fn-1230-launch-triples-over-preset-catalog.5\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Bounded but carries a subtle correctness invariant: non-injective slugification must never collide two distinct triples on a tmux name or state path, with ordinal-based leg identity.\",\"confidence\":0.6},{\"task_id\":\"fn-1230-launch-triples-over-preset-catalog.6\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Mechanical multi-surface prose sweep plus corpus re-vendor following a clear pattern with drift-check backstops \u2014 no intelligence-bound reason, so the default workhorse.\",\"confidence\":0.74}]}\n"
+}

@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-10T02:59:59.912000Z",
   "depends_on": [
@@ -10,7 +11,7 @@
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Panel members as triples",
-  "updated_at": "2026-07-10T02:59:59.912000Z"
+  "updated_at": "2026-07-10T03:03:29.287000Z"
 }
