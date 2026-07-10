@@ -7,7 +7,7 @@
     "fn-1234-shared-global-harness-instructions"
   ],
   "id": "fn-1236-cover-pi-passthrough-leaf-guard-wiring",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T09:56:41.816000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T09:56:41.048000Z"
+  "updated_at": "2026-07-10T09:56:41.816000Z"
 }
