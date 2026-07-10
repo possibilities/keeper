@@ -81,5 +81,5 @@ to the prior predicate over the existing fixture corpus.
   suite is green
 
 ## Done summary
-
+drained gains a plan/inflight/board scope axis with plan as the new default: plan/inflight count only keeper-dispatched work (autopilot+escalation provenance) and self-exclude the caller, board keeps the strict byte-identical gate; the predicate now emits a structured holder list and the watch wedge alarm moves to --scope board.
 ## Evidence
