@@ -55,5 +55,5 @@ Fresh-launch argv goldens must not move.
 - [ ] Descriptor completeness tests cover the new capability field for all four harnesses
 
 ## Done summary
-
+Added a resume-launch capability (resumeLaunch.dashGuard) to the harness descriptor registry and resume branches to the launch-config native builder table: claude pins a fresh child session via --session-id/--fork-session, codex leads verb-position resume, pi/hermes shapes were live-probed (pi's dash-prompt case fails loud as unsupported; hermes requires the =-joined oneshot form). Fresh-launch argv is byte-unchanged.
 ## Evidence
