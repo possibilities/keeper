@@ -43,7 +43,15 @@ hand_tuned: |
   long-horizon planning. On a tie, or absent such a reason, choose sonnet — the
   default implementation workhorse. Security- or correctness-critical work is a
   hard opus gate that overrides the sonnet-first default regardless of size.
-  Mechanical or templated work takes sonnet at low or medium effort. Anti-anchor
+  Mechanical or templated work takes sonnet at low or medium effort. Trickle
+  lane: when the candidate cells offer a model beyond the sonnet/opus pair and
+  a task is genuinely bounded mechanical work — a single-surface edit, a
+  straight test addition, or a mechanical refactor with a fully-specified
+  acceptance and a named surface, in the low or medium band — PREFER that
+  trickle model over sonnet for the task (its own guidance block below governs
+  fit); this deliberate routing builds the cohort evidence that can widen its
+  range. Any doubt about boundedness, or anything contract-, security-, or
+  investigation-shaped, stays on sonnet or opus. Anti-anchor
   clause: spec length and difficulty adjectives are not difficulty — a short spec
   can be intelligence-bound and a long spec mechanical. Model and effort are
   independent axes: cranking sonnet's effort is not an opus substitute.
