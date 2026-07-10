@@ -64,5 +64,5 @@ Evidence.
 - [ ] Fast-suite fixtures cover the resume watermark (pre-resume stop excluded) and both discovery branches
 
 ## Done summary
-
+Added --resume to 'keeper agent run' capture path: resolve a partner by name/id (requireHarness=<cli>), refuse-live, launch+capture in the recorded cwd. Codex discovery resolves the pre-existing rollout by uuid; the stop-scan watermark excludes the pre-resume answer; envelope resume_target is the post-resume id (claude child / codex uuid). Fresh runs stay byte-identical (goldens green).
 ## Evidence
