@@ -34,6 +34,8 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import type { AccountObserverWorkerData } from "./account-observer-worker";
+import { resolveAccountRoutingRoot } from "./account-routing-config";
 import {
   type AdoptableCodexRollout,
   findAdoptableCodexRollouts,
@@ -6168,6 +6170,7 @@ export type WorkerName =
   | "statusline"
   | "builds"
   | "usageScraper"
+  | "accountObserver"
   | "deadLetter"
   | "eventsIngest"
   | "birthIngest"
@@ -6197,6 +6200,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "statusline",
   "builds",
   "usageScraper",
+  "accountObserver",
   "deadLetter",
   "eventsIngest",
   "birthIngest",
@@ -8885,6 +8889,46 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (usageScraperWorker)`
+
+  // Spawn the account-observation PRODUCER worker — the optional, bounded probe
+  // over the two installed public CLIs (CodexBar + `cswap list --json`). It
+  // invokes each through an exact-argv runner, validates the payloads, and
+  // atomically publishes ONE PII-free observation sidecar under the routing
+  // root; the per-launch router reads that sidecar off the launch path. SHADOW
+  // MODE: it publishes health + candidate snapshots but nothing consumes them for
+  // launches yet. Like the usage-scraper it posts NO messages to main and holds
+  // NO DB handle — its only output is the on-disk sidecar. NOT a file-watcher
+  // (not in WATCHER_WORKERS). The state dir is resolved on main via
+  // `resolveAccountRoutingRoot()` so the `KEEPER_ACCOUNT_ROUTING_ROOT` sandbox
+  // seam moves the observer + router together.
+  const accountObserverWorker = want("accountObserver")
+    ? new Worker(
+        new URL("./account-observer-worker.ts", import.meta.url).href,
+        {
+          workerData: {
+            stateDir: resolveAccountRoutingRoot(),
+          } satisfies AccountObserverWorkerData,
+        } as WorkerOptions & { workerData: unknown },
+      )
+    : null;
+
+  if (accountObserverWorker) {
+    const aow = accountObserverWorker;
+    // No message minting — the observer's only output is its on-disk sidecar.
+    // Wire only the crash guards: a producer crash is fatal like every other
+    // worker (the `!shuttingDown` gate keeps an orderly teardown quiet).
+    aow.onerror = (err: ErrorEvent): void => {
+      console.error(
+        "[keeperd] account-observer worker error:",
+        err.message ?? err,
+      );
+      if (!shuttingDown) fatalExit();
+    };
+
+    aow.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // end `if (accountObserverWorker)`
 
   // Watches the dead-letters dir and posts a contentless
   // `{kind:"dead-letter-changed"}`. The worker holds NO DB handle — main is the
@@ -12925,6 +12969,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       statuslineWorker,
       buildsWorker,
       usageScraperWorker,
+      accountObserverWorker,
       deadLetterWorker,
       eventsIngestWorker,
       birthIngestWorker,
