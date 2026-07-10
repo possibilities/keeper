@@ -2589,6 +2589,187 @@ export async function runDeconflictHumanNotifySweep(
 }
 
 // ---------------------------------------------------------------------------
+// fn-1240 — daemon work-verb fan-in merge-conflict human-notify sweep
+// ---------------------------------------------------------------------------
+//
+// The active-page half of the WORK-verb fan-in conflict escalation. A completed
+// upstream lane that will not merge cleanly into a downstream task's base lane mints a
+// sticky `work::<taskId>` `worktree-merge-conflict` row (via `provision()`'s pre-merge
+// in autopilot-worker.ts). UNLIKE the close-scoped deconflict notify (stage 3), this
+// sweep goes STRAIGHT to the one botctl page — it is NOT sequenced behind a
+// resolver/deconflict session (nothing stamps `resolver_dispatched_at` /
+// `merge_escalated_at` in this page-only tier, so gating on them would page never). It
+// pages ONCE per conflict identity — the `(work, taskId)` PK — via the
+// `human_notified_at` once-marker, re-arming when `retry_dispatch` drops the row so a
+// genuine re-conflict re-pages.
+
+/** A sticky `work::<taskId>` `worktree-merge-conflict` failure not yet human-paged —
+ *  the work-verb notify sweep's current-state working set, read straight off
+ *  `dispatch_failures` (bounded by the number of concurrently-stuck fan-in conflicts,
+ *  never a history scan). */
+export interface PendingWorkMergeConflict {
+  /** The sticky work-row `dispatch_failures.id` (the task id; verb is always `work`). */
+  id: string;
+  /** The conflict reason — `worktree-merge-conflict: merging <src> into <base> — <stderr>`. */
+  reason: string;
+  /** The work row's `dir` — the dependent task's LANE worktree where the conflict sits. */
+  dir: string | null;
+}
+
+/**
+ * Select every sticky `work::<taskId>` `worktree-merge-conflict` failure not yet
+ * human-paged (`human_notified_at IS NULL`). The SQL twin of {@link
+ * selectPendingHumanNotifications} but on the WORK verb and INDEPENDENT of the resolver
+ * chain — no `merge_escalated_at IS NOT NULL` precondition, since this page-only tier
+ * dispatches no resolver to stamp it (gating on it would page never). The leading-token
+ * filter is identical (exact {@link MERGE_ESCALATION_REASON_TOKEN}), so a
+ * non-merge-conflict work failure (`launch_failed` / `worktree-lane-premerge-*` / …)
+ * never matches. A stamped `human_notified_at` (the terminal `notified` fold) drops the
+ * row out — the page-once guarantee. `retry_dispatch` re-arms by deleting the row.
+ */
+export function selectPendingWorkMergeNotifications(
+  db: Database,
+): PendingWorkMergeConflict[] {
+  return db
+    .query(
+      `SELECT id, reason, dir FROM dispatch_failures
+         WHERE verb = 'work'
+           AND human_notified_at IS NULL
+           AND reason IS NOT NULL
+           AND instr(reason, ':') > 0
+           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
+    )
+    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingWorkMergeConflict[];
+}
+
+/** Cap the conflict reason carried into the page body so a pathological git stderr
+ *  (many conflicting files) can never bloat the botctl arg. The array-form spawn
+ *  already blocks shell interpolation of a hunk; this bounds size. */
+const WORK_MERGE_NOTIFY_REASON_CAP = 600;
+
+/**
+ * Build the ONE structured operator page the work-verb fan-in notify sweep sends over
+ * botctl for a stuck `work::<taskId>` merge conflict. Short by design — the sticky work
+ * row already carries the full context on the board (`keeper status`); this is the
+ * active page that names the task, its lane worktree, the conflicting file set (the git
+ * stderr carried on the reason, size-bounded), and the single unstick command. The
+ * free-text reason rides as a literal botctl argv element via an array-form spawn
+ * (never a shell string, so no hunk interpolates). Pure.
+ */
+export function buildWorkMergeHumanNotifyBody(args: {
+  taskId: string;
+  lane: string | null;
+  reason: string;
+}): string {
+  const lane = args.lane != null && args.lane !== "" ? args.lane : "?";
+  const reason = args.reason.trim();
+  const boundedReason =
+    reason.length > WORK_MERGE_NOTIFY_REASON_CAP
+      ? `${reason.slice(0, WORK_MERGE_NOTIFY_REASON_CAP)} … [truncated]`
+      : reason;
+  return [
+    `🔴 keeper: work::${args.taskId} needs you — a worktree fan-in merge conflict`,
+    `blocks the task and every dependent; it will NOT auto-resolve or auto-retry.`,
+    ``,
+    `Resolve the conflict by hand in the task's base lane (merge BOTH intents,`,
+    `never pick one side), then unstick the board:`,
+    `  keeper autopilot retry work::${args.taskId}`,
+    ``,
+    `Lane: ${lane}`,
+    `Conflict: ${boundedReason}`,
+  ].join("\n");
+}
+
+/** Injectable dependency surface for {@link runWorkMergeHumanNotifySweep} — the
+ *  work-verb fan-in notify sweep. Same fail-open injectable-deps discipline as
+ *  {@link DeconflictHumanNotifySweepDeps}, minus the session-sequencing gate (the
+ *  page-only tier notifies straight away). */
+export interface WorkMergeHumanNotifySweepDeps {
+  /** The current-state pending working set (DELEGATES to
+   *  {@link selectPendingWorkMergeNotifications} in production). */
+  readonly selectPending: () => PendingWorkMergeConflict[];
+  /** Re-read that the `work::<id>` row is STILL present with `human_notified_at IS
+   *  NULL` — checked immediately before the page to narrow the clear-mid-sweep window
+   *  (a `retry_dispatch` between select and notify drops the row). */
+  readonly stillPending: (id: string) => boolean;
+  /** Send the ONE botctl page about the stuck fan-in conflict. Async + fail-open —
+   *  every error degrades to `notify_failed` so the row re-sweeps (the sticky stays
+   *  operator-visible meanwhile), never a wedge or a silent drop. */
+  readonly notifyHuman: (
+    row: PendingWorkMergeConflict,
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  /** Mint a `MergeHumanNotified{verb:"work", outcome}` synthetic event. The fold stamps
+   *  `human_notified_at` on the `(work, id)` row ONLY on the terminal `notified`; it
+   *  NEVER clears the sticky row — only `retry_dispatch` (`DispatchCleared`) does. */
+  readonly mintAttempted: (
+    id: string,
+    outcome: MergeHumanNotifiedOutcome,
+  ) => void;
+  /** Warn sink for non-fatal diagnostics. */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one daemon work-verb fan-in merge-conflict human-notify sweep — the active-page
+ * half of the WORK escalation path. Walk the sticky `work::<taskId>`
+ * `worktree-merge-conflict` rows not yet paged, gate each by {@link
+ * shouldEscalateMergeConflict} (defense-in-depth over the selector's SQL token filter),
+ * re-read that the row is STILL pending, send ONE botctl page, then mint
+ * `MergeHumanNotified{verb:"work", outcome}`.
+ *
+ * PAGES ONCE — the sweep NEVER clears the sticky row; only `retry_dispatch` does. A
+ * TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next sweep's
+ * selector drops the row; a `notify_failed` (botctl absent / failed) leaves the marker
+ * NULL so the row re-sweeps and the page is never lost (the sticky is operator-visible
+ * the whole time). INDEPENDENT of the resolver chain — it waits on NO session verdict
+ * (the page-only tier dispatches none). NEVER throws — every helper edge degrades to a
+ * recorded outcome. The spawn lives ONLY here in the producer, never reachable from
+ * `applyEvent`.
+ */
+export async function runWorkMergeHumanNotifySweep(
+  deps: WorkMergeHumanNotifySweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let pending: PendingWorkMergeConflict[];
+  try {
+    pending = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: work fan-in human-notify sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  if (pending.length === 0) return;
+
+  for (const row of pending) {
+    if (!shouldEscalateMergeConflict(row.reason)) continue;
+    // Re-read immediately before the page: a `retry_dispatch` that cleared the row (or
+    // the fold that stamped the marker) between select and notify means there is
+    // nothing left to page — skip without minting.
+    if (!deps.stillPending(row.id)) continue;
+
+    let result: MergeHumanNotifiedOutcome;
+    try {
+      result = await deps.notifyHuman(row);
+    } catch (err) {
+      // The helper is fail-open by contract; this catch is defense-in-depth so a
+      // surprise throw still records a non-terminal outcome and never aborts the sweep.
+      note(
+        `# warn: work fan-in human-notify threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      result = "notify_failed";
+    }
+    // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
+    // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
+    deps.mintAttempted(row.id, result);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // fn-1088 — daemon resolver-dispatch producer (the merge-resolver worker)
 // ---------------------------------------------------------------------------
 //
@@ -10260,19 +10441,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   /**
    * Mint one synthetic `MergeHumanNotified` event onto the writable connection — the
-   * deconflict human-notify sweep's (stage 3) only write path into the
-   * `dispatch_failures.human_notified_at` once-marker (it never UPDATEs the projection
-   * directly; the reducer fold owns that, stamping the marker ONLY on the terminal
-   * `notified` and NEVER clearing the sticky row). Sibling of
-   * {@link mintMergeEscalationEvent}. The close-row `id` rides the entity-key overload
-   * on `session_id` so a re-fold correlates the row WITHOUT re-parsing `data`; the full
-   * `{ id, outcome }` payload also rides `data` for the strict fold parser. NON-FATAL on
-   * insert failure — the next heartbeat sweep re-attempts (the marker stays NULL on a
+   * only write path into the `dispatch_failures.human_notified_at` once-marker for both
+   * the deconflict human-notify sweep (stage 3, `verb:"close"`) and the work-verb fan-in
+   * page sweep (`verb:"work"`); it never UPDATEs the projection directly (the reducer
+   * fold owns that, stamping the marker ONLY on the terminal `notified` and NEVER
+   * clearing the sticky row). Sibling of {@link mintMergeEscalationEvent}. The row `id`
+   * rides the entity-key overload on `session_id` so a re-fold correlates the row WITHOUT
+   * re-parsing `data`; the full payload also rides `data` for the strict fold parser. The
+   * `verb` defaults to `close` and is OMITTED from the payload in that case, keeping the
+   * close-path event byte-identical to before verb-parameterization. NON-FATAL on insert
+   * failure — the next heartbeat sweep re-attempts (the marker stays NULL on a
    * `notify_failed`).
    */
   function mintMergeHumanNotifiedEvent(
     id: string,
     outcome: MergeHumanNotifiedOutcome,
+    verb: "close" | "work" = "close",
   ): void {
     try {
       stmts.insertEvent.run({
@@ -10288,7 +10472,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data: JSON.stringify({ id, outcome }),
+        $data:
+          verb === "close"
+            ? JSON.stringify({ id, outcome })
+            : JSON.stringify({ id, outcome, verb }),
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,
@@ -10929,6 +11116,89 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         void runDeconflictHumanNotifySweepTick().catch((err) => {
           console.error(
             `[keeperd] deconflict human-notify sweep tick threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
+    : null;
+
+  // Send the ONE botctl page about a stuck `work::<taskId>` fan-in merge conflict. ASYNC
+  // spawn (never `spawnSync` — that would block the main loop), array form so the
+  // free-text body rides as a literal argv element (no shell interpolation of a hunk). A
+  // non-zero exit OR a missing botctl maps to `notify_failed` — NON-terminal, so the
+  // marker stays NULL and the row re-sweeps: the page is never lost, and the sticky work
+  // row stays operator-visible via `keeper status` throughout.
+  async function notifyHumanOfWorkMergeConflict(
+    row: PendingWorkMergeConflict,
+  ): Promise<MergeHumanNotifiedOutcome> {
+    const body = buildWorkMergeHumanNotifyBody({
+      taskId: row.id,
+      lane: row.dir,
+      reason: row.reason,
+    });
+    try {
+      const proc = Bun.spawn(
+        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0 ? "notified" : "notify_failed";
+    } catch (err) {
+      console.error(
+        `[keeperd] work fan-in human-notify spawn threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return "notify_failed";
+    }
+  }
+
+  // Producer-side work-verb fan-in merge-conflict page sweep (fn-1240). Each heartbeat
+  // tick walks the sticky `work::<taskId>` `worktree-merge-conflict` rows not yet paged
+  // and sends ONE botctl page STRAIGHT away — INDEPENDENT of the resolver/deconflict
+  // chain (this page-only tier stamps neither `resolver_dispatched_at` nor
+  // `merge_escalated_at`, so it never waits on a session verdict), then mints
+  // `MergeHumanNotified{verb:"work", outcome}`. A terminal `notified` stamps the
+  // `human_notified_at` once-marker so the human is paged ONCE; a `notify_failed`
+  // re-sweeps. `retry_dispatch` drops the row (re-arming the marker) so a genuine
+  // re-conflict re-pages. Same pause + autopilot-role gating as the sibling sweeps: a
+  // paused board (the human is in control) defers the page until play, and a server-only
+  // boot never arms the timer.
+  async function runWorkMergeHumanNotifySweepTick(): Promise<void> {
+    if (shuttingDown) return;
+    if (autopilotPaused) return;
+    await runWorkMergeHumanNotifySweep({
+      selectPending: () => selectPendingWorkMergeNotifications(db),
+      stillPending: (id) => {
+        try {
+          return (
+            db
+              .query(
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND human_notified_at IS NULL LIMIT 1",
+              )
+              .get(id) != null
+          );
+        } catch {
+          return false;
+        }
+      },
+      notifyHuman: (row) => notifyHumanOfWorkMergeConflict(row),
+      mintAttempted: (id, outcome) =>
+        mintMergeHumanNotifiedEvent(id, outcome, "work"),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const workMergeHumanNotifySweepTimer = want("autopilot")
+    ? setInterval(() => {
+        void runWorkMergeHumanNotifySweepTick().catch((err) => {
+          console.error(
+            `[keeperd] work fan-in human-notify sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -12889,6 +13159,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     if (deconflictHumanNotifySweepTimer !== null) {
       clearInterval(deconflictHumanNotifySweepTimer);
+    }
+    if (workMergeHumanNotifySweepTimer !== null) {
+      clearInterval(workMergeHumanNotifySweepTimer);
     }
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);

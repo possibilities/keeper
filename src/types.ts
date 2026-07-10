@@ -1249,16 +1249,19 @@ export interface ResolverDispatchAttemptedPayload {
 
 /**
  * Pre-flattened `MergeHumanNotified` synthetic event payload — the terminal
- * "human notified" stage of the DECONFLICT escalation path, sibling to
- * `MergeEscalationAttempted` / `ResolverDispatchAttempted` on the same sticky
- * `worktree-merge-conflict` close row. The daemon sweep mints it after it observes
- * the `deconflict::<epic>` escalation session reach a terminal decline/death and
- * sends the one structured botctl notification, stamping the
- * `dispatch_failures.human_notified_at` once-marker so the human is notified
- * exactly once. Keyed by the close-row `id` (verb is always `close`). The TERMINAL
- * `notified` outcome stamps `human_notified_at = event.ts` (gated `IS NULL`); any
- * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
- * leaving the marker NULL so the sweep re-attempts. The fold reads ONLY the
+ * "human notified" stage of a `worktree-merge-conflict` escalation path, sibling to
+ * `MergeEscalationAttempted` / `ResolverDispatchAttempted` on the same sticky row.
+ * The DECONFLICT (`close`) path mints it after it observes the `deconflict::<epic>`
+ * session reach a terminal decline/death; the WORK fan-in path mints it straight
+ * away for a stuck `work::<taskId>` conflict (no session to sequence behind in the
+ * page-only tier). Either way it sends the one structured botctl notification and
+ * stamps the `dispatch_failures.human_notified_at` once-marker so the human is
+ * notified exactly once. `verb` selects WHICH row the marker stamps (`close` or
+ * `work`); it is OPTIONAL on the wire and defaults to `close` when absent, so a
+ * historical close event (minted `{id, outcome}` with no verb) folds byte-identically.
+ * The TERMINAL `notified` outcome stamps `human_notified_at = event.ts` (gated `IS
+ * NULL`); any other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to
+ * a no-op, leaving the marker NULL so the sweep re-attempts. The fold reads ONLY the
  * payload + `event.ts`, so re-fold stays byte-deterministic. The marker NEVER
  * clears the sticky row — only `DispatchCleared` (`retry_dispatch`) does, which
  * re-arms it at NULL. INDEPENDENT of `merge_escalated_at` / `resolver_dispatched_at`:
@@ -1266,10 +1269,12 @@ export interface ResolverDispatchAttemptedPayload {
  * inline forever (never added to the retention shed predicate).
  */
 export interface MergeHumanNotifiedPayload {
-  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
+  /** The sticky row `dispatch_failures.id` (the epic id for `close`, the task id for `work`). */
   id: string;
   /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
+  /** Which `dispatch_failures` verb-row the marker stamps — `close` (default) or `work`. */
+  verb: string;
 }
 
 /**

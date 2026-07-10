@@ -4888,7 +4888,14 @@ function extractMergeHumanNotifiedPayload(
     if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
       return null;
     }
-    return { id: parsed.id, outcome: parsed.outcome };
+    // `verb` is OPTIONAL on the wire: a historical close event (minted `{id, outcome}`)
+    // carries no verb, so a missing/blank/non-string value defaults to `close`, keeping
+    // that fold byte-identical. The WORK fan-in path mints an explicit `verb:"work"`.
+    const verb =
+      typeof parsed.verb === "string" && parsed.verb.length > 0
+        ? parsed.verb
+        : "close";
+    return { id: parsed.id, outcome: parsed.outcome, verb };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse MergeHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4899,20 +4906,23 @@ function extractMergeHumanNotifiedPayload(
 
 /**
  * Fold one synthetic `MergeHumanNotified` event — the terminal "human notified"
- * once-latch of the DECONFLICT path, sibling to {@link foldMergeEscalationAttempted}
- * and {@link foldResolverDispatchAttempted}. For the TERMINAL `notified` outcome
- * (the daemon delivered the one botctl notification about a declined/dead
- * `deconflict::<epic>` session) it stamps `human_notified_at = event.ts` on the
- * sticky `worktree-merge-conflict` close row, gated `human_notified_at IS NULL` so
- * the first observation wins and a re-fold reproduces it byte-identically. Every
- * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
- * leaving the marker NULL so the sweep re-attempts on the next tick. The branch
- * reads ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so
- * re-fold stays byte-deterministic. The UPDATE no-ops on a missing row (the
- * clear-before-mint race) and NEVER clears the row — only `DispatchCleared`
- * (`retry_dispatch`) does, which re-arms the marker at NULL. Independent of
- * `merge_escalated_at` / `resolver_dispatched_at`. Malformed/missing payload →
- * safe no-op.
+ * once-latch of a `worktree-merge-conflict` escalation path, sibling to {@link
+ * foldMergeEscalationAttempted} and {@link foldResolverDispatchAttempted}. For the
+ * TERMINAL `notified` outcome (the daemon delivered the one botctl notification —
+ * about a declined/dead `deconflict::<epic>` session on the close path, or straight
+ * away for a stuck `work::<taskId>` fan-in conflict on the work path) it stamps
+ * `human_notified_at = event.ts` on the sticky row identified by the payload's
+ * verb-parameterized `(verb, id)` key, gated `human_notified_at IS NULL` so the first
+ * observation wins and a re-fold reproduces it byte-identically. The `verb` defaults
+ * to `close` for a legacy verb-less payload, so historical close events fold exactly
+ * as before. Every other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds
+ * to a no-op, leaving the marker NULL so the sweep re-attempts on the next tick. The
+ * branch reads ONLY the payload (`outcome` + `verb`) + `event.ts` (no
+ * wall-clock/fs/liveness), so re-fold stays byte-deterministic. The UPDATE no-ops on a
+ * missing row (the clear-before-mint race) and NEVER clears the row — only
+ * `DispatchCleared` (`retry_dispatch`) does, which re-arms the marker at NULL.
+ * Independent of `merge_escalated_at` / `resolver_dispatched_at`. Malformed/missing
+ * payload → safe no-op.
  */
 function foldMergeHumanNotified(db: Database, event: Event): void {
   const payload = extractMergeHumanNotifiedPayload(event);
@@ -4925,8 +4935,8 @@ function foldMergeHumanNotified(db: Database, event: Event): void {
   db.run(
     `UPDATE dispatch_failures
         SET human_notified_at = ?
-      WHERE verb = 'close' AND id = ? AND human_notified_at IS NULL`,
-    [event.ts, payload.id],
+      WHERE verb = ? AND id = ? AND human_notified_at IS NULL`,
+    [event.ts, payload.verb, payload.id],
   );
 }
 

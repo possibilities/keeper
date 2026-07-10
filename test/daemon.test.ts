@@ -56,6 +56,7 @@ import {
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildSharedDirtyObservation,
+  buildWorkMergeHumanNotifyBody,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   CRASH_LOOP_YOUNG_RUNTIME_MS,
@@ -101,6 +102,7 @@ import {
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
+  type PendingWorkMergeConflict,
   PROBE_LIFE_ADMISSION_CODES,
   PROBE_SETTLE_INITIAL,
   type ProbeSettleEvent,
@@ -144,6 +146,7 @@ import {
   runMergeEscalationSweep,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
+  runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
   SERVE_PROBE_MAX_FAIL_STREAK,
@@ -161,6 +164,7 @@ import {
   selectPendingHumanNotifications,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
+  selectPendingWorkMergeNotifications,
   selectRepairCandidates,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
@@ -170,6 +174,7 @@ import {
   startDaemon,
   WAL_AUTOCHECKPOINT_PAGES,
   type WorkerName,
+  type WorkMergeHumanNotifySweepDeps,
   withBootDrainCheckpointTuning,
   writeRestartLedger,
 } from "../src/daemon";
@@ -8830,6 +8835,226 @@ test("prewarmWatcherAddon: the loud assertion does NOT downgrade a genuine failu
       () => {},
     ),
   ).toThrow("ABI mismatch");
+});
+
+// ---- fn-1240 work-verb fan-in merge-conflict page sweep ----------------------
+// The active-page half of the WORK escalation: a stuck `work::<taskId>`
+// `worktree-merge-conflict` row pages the human ONCE, STRAIGHT away (no resolver/
+// deconflict sequencing — nothing stamps the resolver columns in this page-only tier),
+// re-arming when `retry_dispatch` drops the row.
+
+// ---- selectPendingWorkMergeNotifications (the work-verb working-set read) -----
+
+test("selectPendingWorkMergeNotifications: picks only NOT-yet-paged work rows with the exact merge-conflict token", () => {
+  const { db } = freshMemDb();
+  // A stuck work fan-in conflict, not yet paged → SELECTED.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-1-foo.2",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    dir: "/wt/lane",
+  });
+  // Independent of the resolver chain: a NULL merge_escalated_at work row is STILL
+  // selected (unlike the close stage-3 selector, which requires merge_escalated_at set).
+  // Already paged (human_notified_at set) → dropped (page-once).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-2-paged.1",
+    reason: mergeConflictReason("fn-2-paged.1", "keeper/epic/fn-2-paged"),
+    dir: "/wt/lane2",
+  });
+  db.run(
+    "UPDATE dispatch_failures SET human_notified_at = 333 WHERE verb = 'work' AND id = ?",
+    ["fn-2-paged.1"],
+  );
+  // A non-merge-conflict work failure → dropped (never pages).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-3-launch.1",
+    reason: "launch_failed: worker never bound",
+    dir: "/wt/lane3",
+  });
+  // A `worktree-merge` PREFIX (not the exact token) work row → dropped.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-4-lock.1",
+    reason: "worktree-merge-lock-timeout: could not acquire the lock",
+    dir: "/wt/lane4",
+  });
+  // A CLOSE merge-conflict row → dropped (this selector is work-verb only; the close
+  // deconflict path owns it).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-5-close",
+    reason: mergeConflictReason("fn-5-close.1", "keeper/epic/fn-5-close"),
+    dir: "/repo/root",
+  });
+
+  expect(selectPendingWorkMergeNotifications(db)).toEqual([
+    {
+      id: "fn-1-foo.2",
+      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+      dir: "/wt/lane",
+    },
+  ]);
+  db.close();
+});
+
+test("selectPendingWorkMergeNotifications: empty table returns []", () => {
+  const { db } = freshMemDb();
+  expect(selectPendingWorkMergeNotifications(db)).toEqual([]);
+  db.close();
+});
+
+// ---- buildWorkMergeHumanNotifyBody (pure page body) --------------------------
+
+test("buildWorkMergeHumanNotifyBody: names the task, its lane, the conflict reason, and the unstick command", () => {
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: "/wt/lane",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+  });
+  expect(body).toContain("work::fn-1-foo.2");
+  expect(body).toContain("keeper autopilot retry work::fn-1-foo.2");
+  expect(body).toContain("Lane: /wt/lane");
+  expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
+});
+
+test("buildWorkMergeHumanNotifyBody: a null/empty lane degrades to `?` (never throws)", () => {
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: null,
+    reason: "worktree-merge-conflict: merging a into b — x",
+  });
+  expect(body).toContain("Lane: ?");
+});
+
+test("buildWorkMergeHumanNotifyBody: a pathological reason is size-bounded (no unbounded botctl arg)", () => {
+  const hugeStderr = "CONFLICT ".repeat(500); // ~4.5k chars
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: "/wt/lane",
+    reason: `worktree-merge-conflict: merging a into b — ${hugeStderr}`,
+  });
+  expect(body).toContain("[truncated]");
+  // The whole body stays comfortably bounded despite the pathological stderr.
+  expect(body.length).toBeLessThan(1200);
+});
+
+// ---- runWorkMergeHumanNotifySweep (orchestration core, injected deps) ---------
+
+function fakeWorkMergeSweepDeps(opts: {
+  pending: PendingWorkMergeConflict[];
+  stillPending?: (id: string) => boolean;
+  notify?: (
+    row: PendingWorkMergeConflict,
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  selectThrows?: boolean;
+}): {
+  deps: WorkMergeHumanNotifySweepDeps;
+  mints: HumanNotifyMintCall[];
+  notifies: string[];
+} {
+  const mints: HumanNotifyMintCall[] = [];
+  const notifies: string[] = [];
+  const deps: WorkMergeHumanNotifySweepDeps = {
+    selectPending: () => {
+      if (opts.selectThrows) throw new Error("read boom");
+      return opts.pending;
+    },
+    stillPending: opts.stillPending ?? (() => true),
+    notifyHuman: async (row) => {
+      notifies.push(row.id);
+      return (await opts.notify?.(row)) ?? "notified";
+    },
+    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
+  };
+  return { deps, mints, notifies };
+}
+
+function workMergePending(): PendingWorkMergeConflict[] {
+  return [
+    {
+      id: "fn-1-foo.2",
+      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+      dir: "/wt/lane",
+    },
+  ];
+}
+
+test("runWorkMergeHumanNotifySweep: a stuck fan-in conflict pages the human ONCE and mints notified (no session sequencing)", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual(["fn-1-foo.2"]);
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notified" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: a second cycle over an ALREADY-paged row (selector drops it) sends zero additional pages", async () => {
+  // Page-once is enforced by the selector: once the terminal `notified` stamps the
+  // marker, the row falls out of the working set. An empty pending set is a no-op.
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({ pending: [] });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a failed page leaves the marker unminted-terminal (notify_failed re-sweeps)", async () => {
+  const { deps, mints } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    notify: async () => "notify_failed",
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  // notify_failed mints attempted{notify_failed} — the fold no-ops on it, so the marker
+  // stays NULL and the next sweep retries the page.
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notify_failed" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: a THROWING notifier never aborts the sweep (records notify_failed)", async () => {
+  const { deps, mints } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    notify: async () => {
+      throw new Error("botctl boom");
+    },
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notify_failed" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: a row cleared mid-sweep (stillPending false) is skipped — no page, no mint", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    stillPending: () => false,
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a non-token reason in the pending set is NOT paged (defense-in-depth gate)", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo.2",
+        reason: "worktree-merge-lock-timeout: could not acquire the lock",
+        dir: "/wt/lane",
+      },
+    ],
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: [],
+    selectThrows: true,
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

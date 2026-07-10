@@ -7105,6 +7105,11 @@ export async function loadReconcileSnapshot(
           finalizeFailureIds.add(id);
           break;
         case "work-task":
+        // A work-verb fan-in `worktree-merge-conflict` row is a sticky like its
+        // close-path `merge-escalation` sibling — NEITHER recover- nor finalize-scoped,
+        // so it is never auto-cleared here (only `retry_dispatch` drops it), exactly as
+        // when it routed to `work-task` before the divert.
+        case "work-merge-conflict":
         case "merge-escalation":
         case "close-plain":
         case "unknown":

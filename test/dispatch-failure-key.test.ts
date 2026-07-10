@@ -281,6 +281,60 @@ describe("routeDispatchFailure: representative variant kinds", () => {
     expect(routeDispatchFailure(row("open", "z", "x")).kind).toBe("unknown");
   });
 
+  test("work verb + merge-conflict token → work-merge-conflict (the fan-in divert)", () => {
+    // A completed upstream lane that will not merge into a downstream task's base lane
+    // mints a `work::<taskId>` `worktree-merge-conflict` row — diverted OUT of the dead
+    // work-task arm into its own served escalation arm.
+    expect(
+      routeDispatchFailure(
+        row(
+          "work",
+          "fn-1-foo.2",
+          "worktree-merge-conflict: merging fn-1-foo.1 into keeper/epic/fn-1-foo — CONFLICT",
+        ),
+      ).kind,
+    ).toBe("work-merge-conflict");
+  });
+
+  test("work verb + a worktree-merge PREFIX (not the exact token) still → work-task (exact-leading-token divert)", () => {
+    // The divert is exact-leading-token only: a `worktree-merge-lock-timeout` /
+    // `worktree-merge-local-timeout` work row (a `worktree-merge` PREFIX, NOT the token)
+    // and a `worktree-lane-premerge-*` work row never divert — every non-conflict work
+    // failure stays the retryable work-task, unchanged.
+    for (const reason of [
+      "worktree-merge-lock-timeout: could not acquire the lock",
+      "worktree-merge-local-timeout: a local git op timed out",
+      "worktree-lane-premerge-dirty-base: deferring the fan-in …",
+      "launch_failed: worker never bound",
+      "x",
+    ]) {
+      expect(routeDispatchFailure(row("work", "fn-1-foo.2", reason)).kind).toBe(
+        "work-task",
+      );
+    }
+    // A colon-less bare `worktree-merge-conflict` (no token boundary) is NOT the token
+    // either — `leadingReasonToken` requires a colon, so it stays work-task.
+    expect(
+      routeDispatchFailure(row("work", "fn-1-foo.2", "worktree-merge-conflict"))
+        .kind,
+    ).toBe("work-task");
+  });
+
+  test("the merge-conflict token diverts ONLY the work verb — a CLOSE row still routes merge-escalation", () => {
+    // The two paths are disjoint and independent: the same token on a close row is the
+    // pre-existing merge-escalation arm (untouched); on a work row it is the new arm.
+    const reason =
+      "worktree-merge-conflict: merging fn-1-foo.1 into keeper/epic/fn-1-foo — CONFLICT";
+    expect(routeDispatchFailure(row("work", "fn-1-foo.2", reason)).kind).toBe(
+      "work-merge-conflict",
+    );
+    expect(routeDispatchFailure(row("close", EPIC, reason)).kind).toBe(
+      "merge-escalation",
+    );
+    // `isMergeEscalationReason` (verb-forced close) is unchanged by the work divert.
+    expect(isMergeEscalationReason(reason)).toBe(true);
+  });
+
   test("crash-loop distress key → unknown (never collides with work/close failedKeys)", () => {
     // The synthetic distress verb is deliberately neither work nor close, so it
     // routes as `unknown` — it can never enter the reconciler's failedKeys

@@ -554,10 +554,14 @@ export interface DispatchFailureIdentity {
  * union carrying the raw identity so consumers read whatever field they need.
  * Each `close` arm preserves ONE exact match semantic (see {@link
  * routeDispatchFailure}); `unknown` preserves the raw strings for any other verb.
- * Adding a variant here breaks compilation of every switch that omits it.
+ * A `work` row splits on the merge-conflict leading token: a fan-in conflict is
+ * `work-merge-conflict` (its own served escalation arm), every OTHER work failure
+ * is the retryable `work-task`. Adding a variant here breaks compilation of every
+ * switch that omits it.
  */
 export type DispatchFailureRoute =
   | ({ kind: "work-task" } & DispatchFailureIdentity)
+  | ({ kind: "work-merge-conflict" } & DispatchFailureIdentity)
   | ({ kind: "worktree-finalize" } & DispatchFailureIdentity)
   | ({ kind: "worktree-recover" } & DispatchFailureIdentity)
   | ({ kind: "merge-escalation" } & DispatchFailureIdentity)
@@ -576,14 +580,20 @@ export function leadingReasonToken(reason: string): string {
 }
 
 /**
- * Route a `dispatch_failures` row by its identity. `close`-row precedence, each
- * arm a distinct EXACT match semantic:
+ * Route a `dispatch_failures` row by its identity. A `work` row splits on the
+ * merge-conflict leading token: a fan-in conflict (exact {@link
+ * MERGE_ESCALATION_REASON_TOKEN}) diverts to its own served `work-merge-conflict`
+ * arm — the resolve::/deconflict::/page pipeline — while every OTHER work failure
+ * stays the retryable `work-task`. The divert is exact-leading-token only, so a
+ * `worktree-lane-premerge-*` / `worktree-merge-lock-timeout` work row (a
+ * `worktree-merge` PREFIX, not the token) never diverts. `close`-row precedence,
+ * each arm a distinct EXACT match semantic:
  *   1. `worktree-finalize` — the ID prefix ({@link WORKTREE_FINALIZE_ID_PREFIX},
  *      on the id, NOT the reason).
  *   2. `worktree-recover` — the reason prefix ({@link WORKTREE_RECOVER_REASON_PREFIX}).
  *   3. `merge-escalation` — the exact leading reason token ({@link
  *      MERGE_ESCALATION_REASON_TOKEN}).
- * The three arms are disjoint over every minted row (a finalize-keyed row never
+ * The three close arms are disjoint over every minted row (a finalize-keyed row never
  * carries a recover reason; a recover reason never has the merge-conflict token),
  * so the ordering routes each real row exactly as the three independent legacy
  * predicates did. NEVER throws.
@@ -592,6 +602,9 @@ export function routeDispatchFailure(
   row: DispatchFailureIdentity,
 ): DispatchFailureRoute {
   if (row.verb === "work") {
+    if (leadingReasonToken(row.reason) === MERGE_ESCALATION_REASON_TOKEN) {
+      return { kind: "work-merge-conflict", ...row };
+    }
     return { kind: "work-task", ...row };
   }
   if (row.verb !== "close") {
@@ -653,6 +666,7 @@ export function isMergeEscalationReason(reason: string): boolean {
     case "merge-escalation":
       return true;
     case "work-task":
+    case "work-merge-conflict":
     case "worktree-finalize":
     case "worktree-recover":
     case "close-plain":
