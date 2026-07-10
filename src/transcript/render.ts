@@ -231,7 +231,7 @@ function forceFit(
   };
 }
 
-/** Filter and page entries forward by offset or backward by before cursor. */
+/** Filter and page entries forward by offset or backward by before boundary. */
 export function buildTranscriptPage(
   entries: readonly TranscriptEntry[],
   filter: TranscriptFilter,
@@ -310,9 +310,10 @@ export function buildTranscriptPage(
 
 function entryLabel(
   entry: RenderedTranscriptEntry,
+  pagePosition: number,
   showSource: boolean,
 ): string {
-  const fields = [`#${entry.index}`, entry.timestamp ?? "time-unknown"];
+  const fields = [`#${pagePosition}`, entry.timestamp ?? "time-unknown"];
   if (showSource || entry.source !== "main") {
     fields.push(entry.source);
   }
@@ -336,16 +337,24 @@ function entryLabel(
   return `[${fields.join(" ")}]`;
 }
 
+/**
+ * `startOffset` is the page's filtered start position (`page.offset`, which
+ * already folds in any front-skip from character clipping). Labels are
+ * `startOffset + array position` — array position is read AFTER
+ * buildTranscriptPage's backward-branch reverse, so it already matches
+ * forward reading order.
+ */
 export function renderTranscriptEntriesText(
   entries: readonly RenderedTranscriptEntry[],
   showSource: boolean,
+  startOffset: number,
 ): string {
   if (entries.length === 0) {
     return "(no entries matched)\n";
   }
   return `${entries
-    .map((entry) => {
-      const label = entryLabel(entry, showSource);
+    .map((entry, position) => {
+      const label = entryLabel(entry, startOffset + position, showSource);
       return entry.body.length > 0 ? `${label}\n${entry.body}` : label;
     })
     .join("\n\n")}\n`;

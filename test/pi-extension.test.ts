@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import keeperEvents, {
+  clampTranscriptParams,
   type PiEventBindings,
   type PiObservedEvent,
   type PiTranslateMeta,
@@ -25,6 +26,8 @@ import keeperEvents, {
   resolvePiEventsLogDir,
   serializePiLine,
   transcriptCliArgs,
+  transcriptIdError,
+  transcriptToolResult,
   translatePiEvent,
 } from "../plugins/keeper/pi-extension/keeper-events";
 import { piExtensionArgs, piExtensionPath } from "../src/agent/launch-config";
@@ -259,6 +262,145 @@ describe("pi extension — transcript tool argv", () => {
       "--meta",
       "--thinking",
     ]);
+  });
+});
+
+describe("pi extension — param clamping", () => {
+  test("a list limit clamps to 100 with a recorded clamp", () => {
+    const { params, clamps } = clampTranscriptParams({ limit: 999 });
+    expect(params.limit).toBe(100);
+    expect(clamps).toEqual([{ param: "limit", requested: 999, applied: 100 }]);
+  });
+
+  test("a show limit clamps to 500 (session_id present)", () => {
+    const { params, clamps } = clampTranscriptParams({
+      session_id: "s",
+      limit: 5000,
+    });
+    expect(params.limit).toBe(500);
+    expect(clamps).toEqual([{ param: "limit", requested: 5000, applied: 500 }]);
+  });
+
+  test("max_chars clamps to 60000 in show mode", () => {
+    const { params, clamps } = clampTranscriptParams({
+      session_id: "s",
+      max_chars: 999_999,
+    });
+    expect(params.max_chars).toBe(60_000);
+    expect(clamps).toEqual([
+      { param: "max_chars", requested: 999_999, applied: 60_000 },
+    ]);
+  });
+
+  test("in-bounds values are left untouched, no clamp recorded", () => {
+    const { params, clamps } = clampTranscriptParams({
+      session_id: "s",
+      limit: 50,
+      max_chars: 12_000,
+    });
+    expect(params.limit).toBe(50);
+    expect(params.max_chars).toBe(12_000);
+    expect(clamps).toEqual([]);
+  });
+
+  test("transcriptCliArgs emits the clamped bound in argv", () => {
+    expect(transcriptCliArgs({ limit: 999 })).toEqual([
+      "transcript",
+      "list",
+      "--harness",
+      "claude",
+      "--limit",
+      "100",
+    ]);
+    expect(
+      transcriptCliArgs({ session_id: "s", max_chars: 999_999 }),
+    ).toContain("60000");
+  });
+});
+
+describe("pi extension — id validation before spawn", () => {
+  test("a flag-shaped session_id is rejected", () => {
+    expect(transcriptIdError({ session_id: "--project" })).not.toBeNull();
+    expect(transcriptIdError({ session_id: "-x" })).not.toBeNull();
+  });
+
+  test("a verb/injection-shaped session_id is rejected", () => {
+    expect(transcriptIdError({ session_id: "; rm -rf /" })).not.toBeNull();
+    expect(transcriptIdError({ session_id: "$(whoami)" })).not.toBeNull();
+  });
+
+  test("an over-200-char id is rejected", () => {
+    expect(transcriptIdError({ session_id: "a".repeat(201) })).not.toBeNull();
+  });
+
+  test("a well-formed session_id and subagent pass", () => {
+    expect(transcriptIdError({ session_id: "abc-123_9.session" })).toBeNull();
+    expect(transcriptIdError({ session_id: "s", subagent: "all" })).toBeNull();
+    expect(
+      transcriptIdError({ session_id: "s", subagent: "abc12" }),
+    ).toBeNull();
+  });
+
+  test("a flag-shaped subagent is rejected", () => {
+    expect(
+      transcriptIdError({ session_id: "s", subagent: "--all" }),
+    ).not.toBeNull();
+  });
+
+  test("omitted ids are legal (list mode)", () => {
+    expect(transcriptIdError({})).toBeNull();
+  });
+});
+
+describe("pi extension — transcript tool result shaping", () => {
+  test("a maxBuffer overflow returns truncated content, not a failure", () => {
+    const r = transcriptToolResult(
+      {
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        message: "stdout maxBuffer length exceeded",
+      },
+      "partial transcript body",
+      "",
+      ["transcript", "s"],
+      [],
+    );
+    expect(r.content[0].text).toContain("partial transcript body");
+    expect(r.content[0].text).toContain("truncated - narrow with grep/limit");
+    expect(r.content[0].text).not.toContain("keeper transcript failed");
+    expect(r.details.truncated).toBe(true);
+  });
+
+  test("a non-overflow error still fails with the CLI message", () => {
+    const r = transcriptToolResult(
+      { code: 1, message: "boom" },
+      "",
+      "no such session",
+      ["transcript", "s"],
+      [],
+    );
+    expect(r.content[0].text).toBe("keeper transcript failed: no such session");
+    expect(r.details.exit_code).toBe(1);
+  });
+
+  test("a successful call surfaces applied clamps in details", () => {
+    const r = transcriptToolResult(
+      null,
+      "the transcript",
+      "",
+      ["transcript", "list", "--limit", "100"],
+      [{ param: "limit", requested: 999, applied: 100 }],
+    );
+    expect(r.content[0].text).toBe("the transcript");
+    expect(r.details.exit_code).toBe(0);
+    expect(r.details.clamps).toEqual([
+      { param: "limit", requested: 999, applied: 100 },
+    ]);
+  });
+
+  test("empty stdout on success yields the no-output placeholder", () => {
+    const r = transcriptToolResult(null, "", "", ["transcript", "list"], []);
+    expect(r.content[0].text).toBe("(no transcript output)");
+    expect(r.details.clamps).toBeUndefined();
   });
 });
 

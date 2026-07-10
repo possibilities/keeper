@@ -331,29 +331,35 @@ function appendEventsLogLine(
 const TRANSCRIPT_TOOL_TIMEOUT_MS = 20_000;
 const TRANSCRIPT_TOOL_MAX_BUFFER = 256 * 1024;
 
-function schema(
-  kind: string,
-  value: Record<string, unknown>,
-): Record<string, unknown> {
-  const result = { ...value };
-  Object.defineProperty(result, "~kind", { value: kind, enumerable: false });
-  return result;
-}
-
+/**
+ * Tool parameter schema — DELIBERATELY plain JSON Schema, carrying NO TypeBox
+ * marker.
+ *
+ * Verified against the installed pi (0.80.6, `validateToolArguments` in
+ * `@earendil-works/pi-ai/compat`): pi gates STRICT TypeBox validation on the
+ * SYMBOL `Symbol.for("TypeBox.Kind")` — a symbol property, never a string one.
+ * A tool schema WITHOUT that symbol is treated as plain JSON Schema and routed
+ * through pi's own lenient `coerceWithJsonSchema` + `Compile().Check()`, which
+ * accepts this shape and coerces the string-typed numbers/booleans an LLM
+ * commonly emits ("5" -> 5, "true" -> true). Attaching the real Kind symbol
+ * would flip pi to STRICT mode and REJECT those coercions, so plain JSON is
+ * both the robust choice and the one that keeps this island node:*-only (no
+ * pi/typebox import). Confirmed empirically, not assumed. (A prior string-keyed
+ * "~kind" marker was inert — pi never reads a string key — and is dropped.)
+ */
 function stringSchema(description: string): Record<string, unknown> {
-  return schema("String", { type: "string", description });
+  return { type: "string", description };
 }
 
 function numberSchema(description: string): Record<string, unknown> {
-  return schema("Number", { type: "number", description });
+  return { type: "number", description };
 }
 
 function booleanSchema(description: string): Record<string, unknown> {
-  return schema("Boolean", { type: "boolean", description });
+  return { type: "boolean", description };
 }
 
-/** TypeBox-compatible schema without importing pi's isolated dependency tree. */
-const TRANSCRIPT_TOOL_PARAMETERS = schema("Object", {
+const TRANSCRIPT_TOOL_PARAMETERS: Record<string, unknown> = {
   type: "object",
   properties: {
     session_id: stringSchema(
@@ -379,7 +385,7 @@ const TRANSCRIPT_TOOL_PARAMETERS = schema("Object", {
     ),
     include_thinking: booleanSchema("Include thinking blocks."),
   },
-});
+};
 
 function pushStringFlag(args: string[], flag: string, value: unknown): void {
   if (typeof value === "string" && value.trim().length > 0) {
@@ -393,8 +399,107 @@ function pushNumberFlag(args: string[], flag: string, value: unknown): void {
   }
 }
 
-/** Convert validated tool parameters to an argv-only keeper invocation. */
-export function transcriptCliArgs(params: PiTranscriptParams): string[] {
+/**
+ * Upper bounds on the model-supplied size params. keeper's stdout rides a 256KB
+ * byte {@link TRANSCRIPT_TOOL_MAX_BUFFER}; `maxBuffer` counts BYTES while these
+ * params count UTF-16 chars, so the caps assume a ~4-bytes/char worst case
+ * (60_000 * 4 = 240KB < 256KB) to keep a compliant render inside the buffer.
+ * limit is capped tighter for a session listing than for a transcript show.
+ */
+const TRANSCRIPT_MAX_CHARS_CAP = 60_000;
+const TRANSCRIPT_LIST_LIMIT_CAP = 100;
+const TRANSCRIPT_SHOW_LIMIT_CAP = 500;
+
+/** One recorded clamp of an oversized model param — surfaced in the tool result
+ *  details (never as an error), so the caller sees the applied bound. */
+export interface TranscriptClamp {
+  param: "limit" | "max_chars";
+  requested: number;
+  applied: number;
+}
+
+/**
+ * Clamp the oversized size params down to their caps, returning the bounded
+ * params plus the list of applied clamps. PURE. A clamp is recorded only when a
+ * finite numeric value actually exceeds its cap; `limit`'s cap depends on list
+ * vs show mode, and `max_chars` is bounded only in show mode (list never
+ * forwards it).
+ */
+export function clampTranscriptParams(params: PiTranscriptParams): {
+  params: PiTranscriptParams;
+  clamps: TranscriptClamp[];
+} {
+  const clamps: TranscriptClamp[] = [];
+  const next: PiTranscriptParams = { ...params };
+  const listing = (params.session_id?.trim() ?? "").length === 0;
+  const limitCap = listing
+    ? TRANSCRIPT_LIST_LIMIT_CAP
+    : TRANSCRIPT_SHOW_LIMIT_CAP;
+  if (
+    typeof next.limit === "number" &&
+    Number.isFinite(next.limit) &&
+    next.limit > limitCap
+  ) {
+    clamps.push({ param: "limit", requested: next.limit, applied: limitCap });
+    next.limit = limitCap;
+  }
+  if (
+    !listing &&
+    typeof next.max_chars === "number" &&
+    Number.isFinite(next.max_chars) &&
+    next.max_chars > TRANSCRIPT_MAX_CHARS_CAP
+  ) {
+    clamps.push({
+      param: "max_chars",
+      requested: next.max_chars,
+      applied: TRANSCRIPT_MAX_CHARS_CAP,
+    });
+    next.max_chars = TRANSCRIPT_MAX_CHARS_CAP;
+  }
+  return { params: next, clamps };
+}
+
+/**
+ * The safe-id shape a session_id / subagent must match before it reaches argv.
+ * DELIBERATELY mirrors `isSafeSessionId` in `src/transcript/claude.ts`
+ * (`^[A-Za-z0-9][A-Za-z0-9._-]*$`, length 1..200) — the isolation rule forbids
+ * importing it, so this is a hand-kept copy; drift is accepted and noted. The
+ * leading-alphanumeric anchor is what rejects a flag-like ("--project") or
+ * verb/injection-like ("; rm") value before any subprocess spawns.
+ */
+const TRANSCRIPT_SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function isSafeTranscriptId(value: string): boolean {
+  return (
+    value.length > 0 && value.length <= 200 && TRANSCRIPT_SAFE_ID.test(value)
+  );
+}
+
+/**
+ * Validate the id-shaped params (session_id, subagent) against the safe-id
+ * shape, returning a clean error message for the first offender or `null` when
+ * every present id is safe. PURE — the caller rejects BEFORE argv assembly and
+ * before any subprocess spawns. Empty/absent ids are legal (list mode omits
+ * session_id) and skip validation.
+ */
+export function transcriptIdError(params: PiTranscriptParams): string | null {
+  const fields: Array<["session_id" | "subagent", string | undefined]> = [
+    ["session_id", params.session_id],
+    ["subagent", params.subagent],
+  ];
+  for (const [field, raw] of fields) {
+    const value = typeof raw === "string" ? raw.trim() : "";
+    if (value.length === 0) continue;
+    if (!isSafeTranscriptId(value)) {
+      const shown = value.length > 80 ? `${value.slice(0, 80)}...` : value;
+      return `${field} ${JSON.stringify(shown)} is not a valid id (must start with a letter or digit; only letters, digits, dot, underscore, hyphen; max 200 chars)`;
+    }
+  }
+  return null;
+}
+
+/** Build the argv-only keeper invocation from already-clamped params. */
+function buildTranscriptArgv(params: PiTranscriptParams): string[] {
   const sessionId = params.session_id?.trim() ?? "";
   const listing = sessionId.length === 0;
   const args = ["transcript", ...(listing ? ["list"] : [sessionId])];
@@ -420,19 +525,87 @@ export function transcriptCliArgs(params: PiTranscriptParams): string[] {
   return args;
 }
 
+/** Convert tool parameters to an argv-only keeper invocation, with the oversized
+ *  size params clamped to their caps first. */
+export function transcriptCliArgs(params: PiTranscriptParams): string[] {
+  return buildTranscriptArgv(clampTranscriptParams(params).params);
+}
+
 function boundedToolText(text: string): string {
   if (text.length <= TRANSCRIPT_TOOL_MAX_BUFFER) return text;
   return `${text.slice(0, TRANSCRIPT_TOOL_MAX_BUFFER)}\n[output truncated by pi extension]`;
 }
 
+/** The Node error `code` a `maxBuffer` overflow carries; the truncated stdout
+ *  rides along on the same callback, so it is a partial-success, not a failure. */
+const TRANSCRIPT_MAXBUFFER_CODE = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+
+type TranscriptToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details: Record<string, unknown>;
+};
+
+/**
+ * Shape the keeper CLI outcome into a tool result. PURE (no spawn) so the
+ * success / overflow / failure branches are unit-testable with a synthetic
+ * error object. A `maxBuffer` overflow is re-routed OUT of the failure path:
+ * the truncated stdout is returned as content plus an explicit truncation
+ * notice; every other error keeps failing with the CLI's message. Applied
+ * clamps ride in details, never as an error.
+ */
+export function transcriptToolResult(
+  error: { code?: unknown; message?: string } | null | undefined,
+  stdout: string,
+  stderr: string,
+  args: string[],
+  clamps: TranscriptClamp[],
+): TranscriptToolResult {
+  const out = boundedToolText(stdout);
+  const err = boundedToolText(stderr);
+  const details: Record<string, unknown> = { argv: args };
+  if (clamps.length > 0) details.clamps = clamps;
+  if (error === null || error === undefined) {
+    return {
+      content: [{ type: "text", text: out || "(no transcript output)" }],
+      details: { ...details, exit_code: 0 },
+    };
+  }
+  const code = error.code ?? null;
+  if (code === TRANSCRIPT_MAXBUFFER_CODE) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${out}${out ? "\n" : ""}[transcript truncated - narrow with grep/limit]`,
+        },
+      ],
+      details: { ...details, exit_code: null, truncated: true },
+    };
+  }
+  const message = err.trim() || out.trim() || error.message || "unknown error";
+  return {
+    content: [{ type: "text", text: `keeper transcript failed: ${message}` }],
+    details: { ...details, exit_code: code },
+  };
+}
+
 async function executeTranscriptTool(
   params: PiTranscriptParams,
   signal?: AbortSignal,
-): Promise<{
-  content: Array<{ type: "text"; text: string }>;
-  details: Record<string, unknown>;
-}> {
-  const args = transcriptCliArgs(params);
+): Promise<TranscriptToolResult> {
+  const idError = transcriptIdError(params);
+  if (idError !== null) {
+    // Reject a flag/verb-shaped id BEFORE any subprocess spawns — a clean
+    // tool-error, not a thrown exception.
+    return {
+      content: [
+        { type: "text", text: `keeper transcript rejected: ${idError}` },
+      ],
+      details: { rejected: idError },
+    };
+  }
+  const { params: clamped, clamps } = clampTranscriptParams(params);
+  const args = buildTranscriptArgv(clamped);
   return new Promise((resolve) => {
     const options = {
       encoding: "utf8" as const,
@@ -441,26 +614,7 @@ async function executeTranscriptTool(
       ...(signal === undefined ? {} : { signal }),
     };
     execFile("keeper", args, options, (error, stdout, stderr) => {
-      const out = boundedToolText(stdout);
-      const err = boundedToolText(stderr);
-      if (error === null) {
-        resolve({
-          content: [{ type: "text", text: out || "(no transcript output)" }],
-          details: { argv: args, exit_code: 0 },
-        });
-        return;
-      }
-      const code = (error as { code?: unknown }).code ?? null;
-      const message = err.trim() || out.trim() || error.message;
-      resolve({
-        content: [
-          {
-            type: "text",
-            text: `keeper transcript failed: ${message}`,
-          },
-        ],
-        details: { argv: args, exit_code: code },
-      });
+      resolve(transcriptToolResult(error, stdout, stderr, args, clamps));
     });
   });
 }

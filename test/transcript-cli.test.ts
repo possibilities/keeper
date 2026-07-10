@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -13,7 +14,11 @@ import {
   runTranscriptCli,
   type TranscriptCliDeps,
 } from "../cli/transcript";
-import { encodeClaudeProject } from "../src/transcript/claude";
+import {
+  discoverClaudeProjectsRoots,
+  encodeClaudeProject,
+  listClaudeSessions,
+} from "../src/transcript/claude";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const OTHER_SESSION = "22222222-2222-4222-8222-222222222222";
@@ -53,6 +58,27 @@ function writeSession(
   modified: string,
 ): string {
   const projectDir = join(configDir, "projects", encodeClaudeProject(project));
+  mkdirSync(projectDir, { recursive: true });
+  const path = join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(path, `${body}\n`);
+  const time = new Date(modified);
+  utimesSync(path, time, time);
+  return path;
+}
+
+/**
+ * Writes a session directly into a literal, hard-coded bucket directory name,
+ * bypassing encodeClaudeProject entirely. Regression fixtures for the encoder
+ * must use this helper (never writeSession) so the expected bucket string
+ * cannot silently co-move with a future encoder change.
+ */
+function writeSessionInBucket(
+  bucket: string,
+  sessionId: string,
+  body: string,
+  modified: string,
+): string {
+  const projectDir = join(configDir, "projects", bucket);
   mkdirSync(projectDir, { recursive: true });
   const path = join(projectDir, `${sessionId}.jsonl`);
   writeFileSync(path, `${body}\n`);
@@ -282,6 +308,225 @@ describe("keeper transcript show", () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.error.code).toBe("session_not_found");
   });
+
+  test("human entry labels equal page.offset + array position and round-trip via --offset", () => {
+    const forward = JSON.parse(
+      run([SESSION, "--offset", "0", "--limit", "20", "--json"]).stdout,
+    );
+    const page = forward.data.page;
+    expect(page.offset).toBe(0);
+    const human = run([SESSION, "--offset", "0", "--limit", "20"]);
+    expect(human.stdout).toContain(`[#${page.offset} `);
+
+    const midLabel = page.offset + 2;
+    const viaOffset = JSON.parse(
+      run([SESSION, "--offset", String(midLabel), "--json"]).stdout,
+    );
+    expect(viaOffset.data.page.offset).toBe(midLabel);
+    expect(viaOffset.data.entries[0].sourceIndex).toBe(
+      forward.data.entries[2].sourceIndex,
+    );
+  });
+
+  test("backward-paged human labels equal page.offset even when char-clipping skips entries from the front", () => {
+    const clipped = JSON.parse(
+      run([SESSION, "--max-chars", "700", "--json"]).stdout,
+    );
+    expect(clipped.data.page.clipped_by_chars).toBe(true);
+    const human = run([SESSION, "--max-chars", "700"]);
+    expect(human.stdout).toContain(`[#${clipped.data.page.offset} `);
+  });
+
+  test("human output never exceeds the requested --max-chars", () => {
+    for (const budget of [900, 1000, 1500, 5000]) {
+      const result = run([SESSION, "--max-chars", String(budget)]);
+      expect(result.code).toBe(0);
+      expect(result.stdout.length).toBeLessThanOrEqual(budget);
+    }
+  });
+
+  test("many-subagent session caps the human header with a '+M more' tail; JSON keeps the full list", () => {
+    const manyId = "55555555-5555-4555-8555-555555555555";
+    const mainPath = writeSession(
+      PROJECT,
+      manyId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Many subagents",
+          sessionId: manyId,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T08:00:00.000Z",
+          cwd: PROJECT,
+          sessionId: manyId,
+          message: { role: "user", content: "Build the alpha feature" },
+        }),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+    const subagentDir = join(mainPath.slice(0, -".jsonl".length), "subagents");
+    mkdirSync(subagentDir, { recursive: true });
+    const total = 15;
+    for (let i = 0; i < total; i++) {
+      const id = `sub${String(i).padStart(2, "0")}abcdef`;
+      writeFileSync(
+        join(subagentDir, `agent-${id}.jsonl`),
+        `${line({
+          type: "user",
+          timestamp: "2026-07-09T08:00:03.500Z",
+          cwd: PROJECT,
+          sessionId: manyId,
+          agentId: id,
+          message: { role: "user", content: `Subagent ${i} task` },
+        })}\n`,
+      );
+    }
+
+    const human = run([manyId, "--offset", "0"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain(`+${total - 12} more`);
+    expect(human.stdout.match(/^ {2}sub\d\dabcdef /gm)).toHaveLength(12);
+
+    const json = JSON.parse(run([manyId, "--offset", "0", "--json"]).stdout);
+    expect(json.data.subagents).toHaveLength(total);
+  });
+
+  test("--help documents the total-budget semantics and the label/JSON-index distinction", () => {
+    const help = runTranscriptCli(["show", "--help"], deps);
+    expect(help.stdout).toContain("Total character budget");
+    expect(help.stdout).toContain("page position");
+  });
+});
+
+describe("keeper transcript preview ellipsizing", () => {
+  test("preview call sites each clip to their own exact max, never max+2", () => {
+    const longId = "88888888-8888-4888-8888-888888888888";
+    const longTitle = "T".repeat(1000);
+    const longPrompt = "P".repeat(500);
+    const mainPath = writeSession(
+      PROJECT,
+      longId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: longTitle,
+          sessionId: longId,
+        }),
+        message("user", "2026-07-09T08:00:00.000Z", longPrompt),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+
+    const subagentDir = join(mainPath.slice(0, -".jsonl".length), "subagents");
+    mkdirSync(subagentDir, { recursive: true });
+    const longTask = "S".repeat(500);
+    writeFileSync(
+      join(subagentDir, `agent-${SUBAGENT}.jsonl`),
+      `${line({
+        type: "user",
+        timestamp: "2026-07-09T08:00:01.000Z",
+        cwd: PROJECT,
+        sessionId: longId,
+        agentId: SUBAGENT,
+        message: { role: "user", content: longTask },
+      })}\n`,
+    );
+
+    // firstPrompt is computed once (max 240) and carried verbatim into the
+    // JSON list item — never re-clipped downstream.
+    const listJson = JSON.parse(
+      run(["list", "--project", PROJECT, "--json"]).stdout,
+    );
+    const item = listJson.data.sessions.find(
+      (session: { sessionId: string }) => session.sessionId === longId,
+    );
+    expect(item.firstPrompt).toBe(`${"P".repeat(237)}...`);
+    expect(item.firstPrompt.length).toBe(240);
+
+    // list human rendering clips the title preview to max 180.
+    const listHuman = run(["list", "--project", PROJECT]);
+    expect(listHuman.stdout).toContain(JSON.stringify(`${"T".repeat(177)}...`));
+
+    // show's header clips the (raw, unclipped-at-JSON-layer) title to max 300.
+    const showHuman = run([longId, "--project", PROJECT, "--offset", "0"]);
+    expect(showHuman.stdout).toContain(
+      `title: ${JSON.stringify(`${"T".repeat(297)}...`)}`,
+    );
+
+    // the subagent header line clips its task preview to max 72.
+    expect(showHuman.stdout).toContain(
+      `task=${JSON.stringify(`${"S".repeat(69)}...`)}`,
+    );
+  });
+});
+
+describe("keeper transcript first-prompt slash-command stripping", () => {
+  test("strips slash-command XML wrappers and falls through to the next candidate when empty", () => {
+    const slashId = "99999999-9999-4999-9999-999999999999";
+    writeSession(
+      PROJECT,
+      slashId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Slash session",
+          sessionId: slashId,
+        }),
+        message(
+          "user",
+          "2026-07-09T08:00:00.000Z",
+          "<command-message>Running tests</command-message>" +
+            "<command-name>/test</command-name><command-args></command-args>",
+        ),
+        message(
+          "user",
+          "2026-07-09T08:00:01.000Z",
+          "Actually run the widget tests",
+        ),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+
+    const parsed = JSON.parse(
+      run(["list", "--project", PROJECT, "--json"]).stdout,
+    );
+    const item = parsed.data.sessions.find(
+      (session: { sessionId: string }) => session.sessionId === slashId,
+    );
+    expect(item.firstPrompt).toBe("Actually run the widget tests");
+  });
+
+  test("unwraps command-args content instead of dropping it", () => {
+    const slashId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    writeSession(
+      PROJECT,
+      slashId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Slash args session",
+          sessionId: slashId,
+        }),
+        message(
+          "user",
+          "2026-07-09T08:00:00.000Z",
+          "<command-message>Running</command-message>" +
+            "<command-name>/grep</command-name><command-args>needle</command-args>",
+        ),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+
+    const parsed = JSON.parse(
+      run(["list", "--project", PROJECT, "--json"]).stdout,
+    );
+    const item = parsed.data.sessions.find(
+      (session: { sessionId: string }) => session.sessionId === slashId,
+    );
+    expect(item.firstPrompt).toBe("needle");
+  });
 });
 
 describe("keeper transcript list", () => {
@@ -308,12 +553,226 @@ describe("keeper transcript list", () => {
     expect(conflict.code).toBe(2);
     expect(conflict.stderr).toContain("mutually exclusive");
   });
+
+  test("a file vanishing between scan and parse degrades one row, not the whole list", () => {
+    const roots = discoverClaudeProjectsRoots({ configDirs: [configDir] });
+    const result = listClaudeSessions({
+      roots,
+      project: null,
+      sinceMs: null,
+      untilMs: null,
+      offset: 0,
+      limit: 20,
+      onBeforeInspect: (file) => {
+        if (file.sessionId === SESSION) {
+          unlinkSync(file.path);
+        }
+      },
+    });
+    expect(result.total).toBe(2);
+    expect(result.nextOffset).toBeNull();
+    expect(result.items).toHaveLength(2);
+
+    const vanished = result.items.find((item) => item.sessionId === SESSION);
+    expect(vanished).toBeDefined();
+    expect(vanished?.project).toBeNull();
+    expect(vanished?.title).toBeNull();
+    expect(vanished?.startedAt).toBeNull();
+    expect(vanished?.firstPrompt).toBeNull();
+    expect(vanished?.bytes).toBeGreaterThan(0);
+
+    const survivor = result.items.find(
+      (item) => item.sessionId === OTHER_SESSION,
+    );
+    expect(survivor?.title).toBe("Beta session");
+  });
 });
 
-test("time parser supports relative durations and inclusive date-only until", () => {
+describe("keeper transcript show ambiguous session hint", () => {
+  test("duplicate session id within one config root names --project", () => {
+    const dupSessionId = "66666666-6666-4666-8666-666666666666";
+    writeSession(
+      PROJECT,
+      dupSessionId,
+      line({ type: "custom-title", customTitle: "A", sessionId: dupSessionId }),
+      "2026-07-09T12:00:00.000Z",
+    );
+    writeSession(
+      OTHER_PROJECT,
+      dupSessionId,
+      line({ type: "custom-title", customTitle: "B", sessionId: dupSessionId }),
+      "2026-07-09T12:00:00.000Z",
+    );
+
+    const result = run([dupSessionId]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--project");
+    expect(result.stderr).not.toContain("--config-dir");
+  });
+
+  test("duplicate session id across config roots names --config-dir", () => {
+    const dupSessionId = "77777777-7777-4777-8777-777777777777";
+    writeSession(
+      PROJECT,
+      dupSessionId,
+      line({ type: "custom-title", customTitle: "A", sessionId: dupSessionId }),
+      "2026-07-09T12:00:00.000Z",
+    );
+
+    const configDir2 = join(root, "claude2");
+    const projectDir2 = join(
+      configDir2,
+      "projects",
+      encodeClaudeProject(PROJECT),
+    );
+    mkdirSync(projectDir2, { recursive: true });
+    const path2 = join(projectDir2, `${dupSessionId}.jsonl`);
+    writeFileSync(
+      path2,
+      `${line({ type: "custom-title", customTitle: "C", sessionId: dupSessionId })}\n`,
+    );
+    const modified = new Date("2026-07-09T12:00:00.000Z");
+    utimesSync(path2, modified, modified);
+
+    const result = runTranscriptCli(
+      [dupSessionId, "--config-dir", configDir, "--config-dir", configDir2],
+      deps,
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--config-dir");
+  });
+});
+
+describe("encodeClaudeProject", () => {
+  test("replaces every non-alphanumeric character with a dash, one dash per character", () => {
+    expect(encodeClaudeProject("/work/alpha")).toBe("-work-alpha");
+    expect(encodeClaudeProject("/work/keeper-lane.3")).toBe(
+      "-work-keeper-lane-3",
+    );
+  });
+
+  test("adjacent non-alphanumeric characters yield adjacent dashes (non-collapsing)", () => {
+    expect(encodeClaudeProject("/work/foo_.bar")).toBe("-work-foo--bar");
+  });
+});
+
+describe("keeper transcript dotted/underscored project paths", () => {
+  test("list --project finds sessions for a worktree-lane-like dotted path", () => {
+    const dottedProject = "/work/keeper-qzvs8i.harden-transcript";
+    const dottedBucket = "-work-keeper-qzvs8i-harden-transcript";
+    const dottedSession = "33333333-3333-4333-8333-333333333333";
+    writeSessionInBucket(
+      dottedBucket,
+      dottedSession,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Dotted lane session",
+          sessionId: dottedSession,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T10:00:00.000Z",
+          cwd: dottedProject,
+          sessionId: dottedSession,
+          message: { role: "user", content: "Work in the dotted lane" },
+        }),
+      ].join("\n"),
+      "2026-07-09T10:01:00.000Z",
+    );
+
+    const listResult = run(["list", "--project", dottedProject, "--json"]);
+    expect(listResult.code).toBe(0);
+    const parsed = JSON.parse(listResult.stdout);
+    expect(
+      parsed.data.sessions.map((item: { sessionId: string }) => item.sessionId),
+    ).toEqual([dottedSession]);
+
+    const showResult = run([
+      dottedSession,
+      "--project",
+      dottedProject,
+      "--offset",
+      "0",
+    ]);
+    expect(showResult.code).toBe(0);
+    expect(showResult.stdout).toContain("Work in the dotted lane");
+  });
+
+  test("adjacent non-alphanumeric characters (underscore-dot) resolve to the same literal bucket", () => {
+    const project = "/work/foo_.bar";
+    const bucket = "-work-foo--bar";
+    const sessionId = "44444444-4444-4444-8444-444444444444";
+    writeSessionInBucket(
+      bucket,
+      sessionId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Underscore-dot session",
+          sessionId,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T11:00:00.000Z",
+          cwd: project,
+          sessionId,
+          message: { role: "user", content: "Work in the underscore-dot dir" },
+        }),
+      ].join("\n"),
+      "2026-07-09T11:01:00.000Z",
+    );
+
+    const listResult = run(["list", "--project", project, "--json"]);
+    expect(listResult.code).toBe(0);
+    const parsed = JSON.parse(listResult.stdout);
+    expect(
+      parsed.data.sessions.map((item: { sessionId: string }) => item.sessionId),
+    ).toEqual([sessionId]);
+  });
+});
+
+test("time parser supports relative durations and inclusive local-day until", () => {
   expect(parseTranscriptTime("7d", NOW, "since")).toBe(NOW - 7 * 86_400_000);
+  // Date-only bounds are local calendar days: since is that day's local
+  // midnight (Date's own local-time constructor), until is the next local
+  // midnight minus one ms — independent of the host's timezone.
+  expect(parseTranscriptTime("2026-07-09", NOW, "since")).toBe(
+    new Date(2026, 6, 9, 0, 0, 0, 0).getTime(),
+  );
   expect(parseTranscriptTime("2026-07-09", NOW, "until")).toBe(
-    Date.parse("2026-07-10T00:00:00.000Z") - 1,
+    new Date(2026, 6, 10, 0, 0, 0, 0).getTime() - 1,
   );
   expect(parseTranscriptTime("nonsense", NOW, "since")).toContain("invalid");
+});
+
+test("date-only since/until select local calendar days across DST boundaries", () => {
+  const originalTz = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    // 2026-03-08 is the America/New_York spring-forward transition: local
+    // midnight to next local midnight spans only 23 wall-clock hours.
+    const springSince = parseTranscriptTime("2026-03-08", NOW, "since");
+    const springUntil = parseTranscriptTime("2026-03-08", NOW, "until");
+    expect(springSince).toBe(new Date(2026, 2, 8, 0, 0, 0, 0).getTime());
+    expect(springUntil).toBe(new Date(2026, 2, 9, 0, 0, 0, 0).getTime() - 1);
+    expect((springUntil as number) - (springSince as number)).toBe(
+      23 * 3_600_000 - 1,
+    );
+
+    // 2026-11-01 is the fall-back transition: the local day spans 25 hours.
+    const fallSince = parseTranscriptTime("2026-11-01", NOW, "since");
+    const fallUntil = parseTranscriptTime("2026-11-01", NOW, "until");
+    expect(fallSince).toBe(new Date(2026, 10, 1, 0, 0, 0, 0).getTime());
+    expect(fallUntil).toBe(new Date(2026, 10, 2, 0, 0, 0, 0).getTime() - 1);
+    expect((fallUntil as number) - (fallSince as number)).toBe(
+      25 * 3_600_000 - 1,
+    );
+  } finally {
+    if (originalTz === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTz;
+    }
+  }
 });
