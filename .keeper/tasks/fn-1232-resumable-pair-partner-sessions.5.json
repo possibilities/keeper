@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T03:33:54.055000Z",
+  "depends_on": [
+    "fn-1232-resumable-pair-partner-sessions.3",
+    "fn-1232-resumable-pair-partner-sessions.4"
+  ],
+  "epic": "fn-1232-resumable-pair-partner-sessions",
+  "id": "fn-1232-resumable-pair-partner-sessions.5",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Pair skill resume docs",
+  "updated_at": "2026-07-10T03:33:54.055000Z"
+}
