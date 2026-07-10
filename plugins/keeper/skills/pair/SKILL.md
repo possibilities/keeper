@@ -39,9 +39,10 @@ allowlist + keeper events-shim pre-seeded so it reports live state with no
 interactive hook-approval prompt (degrading to presence-only tracking if the
 seed can't be written).
 
-**Name your partners.** Pass `--name <n>` on every launch (fresh or resumed) so
-the partner is resumable by name later — an unnamed partner is still resumable
-by job id, but a name is far easier to recall and to hand to a follow-up turn.
+**Name your partners.** Pass `--name <n>` on a fresh launch so the partner is
+resumable by name later — an unnamed partner is still resumable by job id, but
+a name is far easier to recall and to hand to a follow-up turn. A `--resume`
+launch ignores `--name`: the resumed partner keeps its original name.
 
 You wait with **blocking Bash calls**, never a Monitor — a blocking call bills
 zero tokens while it blocks (the model is suspended between emitting the tool_use
@@ -84,8 +85,8 @@ keeper agent run codex "$(cat /tmp/ask.md)" --read-only --name codereview-1 --ou
   background and poll `--output`, which appears atomically only once
   complete).
 - To continue an existing partner instead of starting fresh, add `--resume
-  <name-or-id>` in place of `--preset`/`--model`/`--effort`/`--session` (the
-  resumed session keeps its own config) — see *Resuming a partner* below.
+  <name-or-id>` in place of `--preset`/`--model`/`--effort` (the resumed
+  session keeps its own config) — see *Resuming a partner* below.
 
 ## Detached + chunked wait (`agent panel start|wait`)
 
@@ -281,8 +282,8 @@ effort range, then compose the triple from what you found.
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi/hermes member is an arg fault; hermes is model-only, pi takes thinking not effort). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner` (rides the leg as a `--system` block on the panel path; pairs with `--cli`, not with a bare triple). Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
-| `--name <n>` | **`agent run` only.** Names the partner so it is resumable by name later — pass it on every launch. |
-| `--resume <name-or-id>` | **`agent run` only.** Continues a prior partner by current/former name or id instead of launching fresh (see *Resuming a partner*). Rejects `--preset`/`--model`/`--effort`/`--session`. |
+| `--name <n>` | **`agent run` only.** Names the partner so it is resumable by name later — pass it on a fresh launch; a `--resume` launch ignores it and keeps the partner's original name. |
+| `--resume <name-or-id>` | **`agent run` only.** Continues a prior partner by current/former name or id instead of launching fresh (see *Resuming a partner*). Rejects `--preset`/`--model`/`--effort`; `--session`/`--name` are silently dropped — the resumed session keeps its own. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a sensible
 default (a cross-vendor partner, `default` role) and say what you chose — don't
