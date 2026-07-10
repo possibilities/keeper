@@ -7,7 +7,15 @@
 // `keeper prompt`, (3) the post-hook additionalContext plumbing, and (4) the
 // work marker write→read round-trip through the production writer + reader.
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -22,17 +30,38 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { readMarker } from "../plugin/hooks/lib.ts";
-import { effectiveMatrixFromDisk } from "../src/host_matrix.ts";
+import {
+  hostMatrixV2EffortsFor,
+  loadHostMatrixV2,
+} from "../src/host_matrix.ts";
 import { writeWorkMarker } from "../src/session_markers.ts";
+
+/** The pinned claude-only v2 host matrix the generated-cell guard resolves under,
+ * so the expected cell set is host-blind — the operator's live
+ * `~/.config/keeper/matrix.yaml` never leaks in. Its cell set (opus/sonnet × the
+ * five efforts, all native) is the workers/ tree a claude-only render produces. */
+const CLAUDE_ONLY_MATRIX = [
+  "efforts: [low, medium, high, xhigh, max]",
+  "subagent_templates: [template/agents/worker.md.tmpl]",
+  "subagent_models: [opus, sonnet]",
+  "providers:",
+  "  - name: claude",
+  "    models: [opus, sonnet]",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "",
+].join("\n");
 
 const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
 const POST_HOOK = join(REPO, "plugin", "hooks", "post-hook.ts");
 
-// workers/ is gitignored (rendered per-cell from subagents.yaml), so a clean
-// checkout that never ran render-plugin-templates has no cells on disk. The two
-// tests that enumerate real cells skip there instead of failing hard; promote.sh
-// renders before its drift guards, so promotion-time coverage is preserved.
+// workers/ is gitignored (rendered per-cell from the host worker matrix), so a
+// clean checkout that never ran render-plugin-templates has no cells on disk. The
+// two tests that enumerate real cells skip there instead of failing hard;
+// promote.sh renders before its drift guards, so promotion-time coverage is
+// preserved.
 const WORKERS_RENDERED = existsSync(join(REPO, "workers"));
 
 function readHooks(): Record<string, Array<Record<string, unknown>>> {
@@ -119,21 +148,37 @@ describe("hooks.json wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
-// per-cell work plugin set ↔ subagents.yaml matrix (both directions)
+// per-cell work plugin set ↔ required host matrix (both directions)
 // ---------------------------------------------------------------------------
 
-describe("generated work plugins match the subagents.yaml matrix", () => {
+describe("generated work plugins match the host worker matrix", () => {
+  let cfgDir: string;
+  const savedConfigDir = process.env.KEEPER_CONFIG_DIR;
+  beforeAll(() => {
+    cfgDir = realpathSync(mkdtempSync(join(tmpdir(), "planctl-guard-cfg-")));
+    writeFileSync(join(cfgDir, "matrix.yaml"), CLAUDE_ONLY_MATRIX);
+    process.env.KEEPER_CONFIG_DIR = cfgDir;
+  });
+  afterAll(() => {
+    rmSync(cfgDir, { recursive: true, force: true });
+    if (savedConfigDir === undefined) {
+      delete process.env.KEEPER_CONFIG_DIR;
+    } else {
+      process.env.KEEPER_CONFIG_DIR = savedConfigDir;
+    }
+  });
+
   test.skipIf(!WORKERS_RENDERED)(
     "on-disk workers/ cell set equals the ragged {model × effort} product",
     () => {
-      // The renderer fans out over the EFFECTIVE matrix (embedded base overlaid by
-      // a host matrix when present) using each model's OWN effort list, so the gate
-      // computes the ragged product from the same source. With no host matrix every
-      // model shares the flat axis and the product is the rectangular cartesian.
-      const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
+      // The renderer fans out over the v2 host worker matrix using each
+      // capability's OWN effort list, so the gate computes the ragged product from
+      // the same source under a pinned claude-only fixture. A claude-only roster
+      // shares the flat axis, so the product is the rectangular cartesian.
+      const matrix = loadHostMatrixV2();
       const expected = new Set<string>();
       for (const model of matrix.models) {
-        for (const effort of matrix.effortsFor(model)) {
+        for (const effort of hostMatrixV2EffortsFor(matrix, model)) {
           expected.add(`${model}-${effort}`);
         }
       }

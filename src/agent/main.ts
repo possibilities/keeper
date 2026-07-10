@@ -88,13 +88,11 @@ import {
   tmuxTranscriptSessionId,
 } from "./launch-handle";
 import {
-  DEFAULT_MAX_ATTEMPTS,
-  DEFAULT_STOP_TIMEOUT_MS,
   isValidMatrixToken,
   loadMatrix,
   type Matrix,
+  MatrixConfigError,
   matrixConfigPath,
-  presetNameFor,
   providerCheckFindings,
   type ResolveResult,
   resolveModel,
@@ -1961,10 +1959,9 @@ const PROVIDERS_CHECK_FAULT_EXIT = 1;
  * model resolves to the single claude candidate; a wrapped model resolves to its
  * pecking-ordered foreign candidates. An UNROUTABLE wrapped model (no configured
  * provider) exits with the distinct `no_route` code; a bad model/effort token
- * exits 2; a malformed matrix exits 2. An ABSENT matrix is the claude-only world:
- * every model resolves native (byte-identical to today, where no non-claude
- * provider exists), so no_route can only arise once a matrix configures wrapped
- * models.
+ * exits 2; a malformed matrix exits 2. An ABSENT matrix is a typed loud failure
+ * (ADR 0036 — the host matrix is REQUIRED): it exits 2 naming the absent state and
+ * the copy-the-example fix, never a silent claude-native fallback candidate.
  */
 function runProvidersResolve(
   deps: MainDeps,
@@ -1993,19 +1990,22 @@ function runProvidersResolve(
     }
     throw exc;
   }
-  const result: ResolveResult =
-    matrix === null
-      ? {
-          driver: "native",
-          candidates: [
-            {
-              harness: "claude",
-              model_id: model,
-              preset_name: presetNameFor("claude", model),
-            },
-          ],
-        }
-      : resolveModel(matrix, model);
+  if (matrix === null) {
+    // v2 (ADR 0036): the host worker matrix is REQUIRED — an absent (or empty)
+    // matrix is a typed loud failure, never a silent claude-native fallback. The
+    // MatrixConfigError message names the state, where it looked, and the exact fix.
+    deps.writeErr(
+      `Error: ${
+        new MatrixConfigError(
+          "absent",
+          matrixConfigPath(),
+          "no matrix.yaml found",
+        ).message
+      }\n`,
+    );
+    return deps.exit(2);
+  }
+  const result: ResolveResult = resolveModel(matrix, model);
   if (result.driver === "wrapped" && result.candidates.length === 0) {
     deps.writeErr(
       `agent providers resolve: no configured provider serves the wrapped ` +
@@ -2024,10 +2024,7 @@ function runProvidersResolve(
     );
     return deps.exit(PROVIDERS_NO_ROUTE_EXIT);
   }
-  const defaults = matrix?.defaults ?? {
-    stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
-    max_attempts: DEFAULT_MAX_ATTEMPTS,
-  };
+  const defaults = matrix.defaults;
   deps.write(
     `${JSON.stringify({
       schema_version: PROVIDERS_SCHEMA_VERSION,

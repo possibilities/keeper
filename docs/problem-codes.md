@@ -86,20 +86,23 @@ the await-owned range):
 
 ## Agent provider matrix (`keeper agent providers resolve|check`)
 
-The host-matrix doctor verbs read `~/.config/keeper/matrix.yaml` (ADR 0010) — the
-ordered provider roster that grows the worker model axis beyond claude. They emit
-a structured JSON line on stdout (`resolve`'s candidate envelope, `check`'s
-findings) and human diagnostics on stderr; neither rides the shared `cli/envelope.ts`
-shape. An ABSENT matrix is the claude-only world and never faults — every existing
-`keeper agent` behavior stays byte-identical. Reads only; nothing is mutated.
+The host-matrix doctor verbs read the REQUIRED `~/.config/keeper/matrix.yaml` v2
+(ADR 0036) — the ordered provider roster that grows the worker model axis beyond
+claude. They emit a structured JSON line on stdout (`resolve`'s candidate
+envelope, `check`'s findings) and human diagnostics on stderr; neither rides the
+shared `cli/envelope.ts` shape. Reads only; nothing is mutated.
 
 `resolve <model> <effort>` emits `{schema_version, model, effort, driver,
 candidates:[{harness, model_id, preset_name}], defaults}` at exit 0. On the
 unroutable path it emits `{schema_version, error:"no_route", model, effort,
-driver, candidates:[]}`.
+driver, candidates:[]}`. An ABSENT matrix is a typed loud failure (exit 2, ADR
+0036) naming the state and the copy-the-example fix — there is no claude-native
+fallback candidate.
 
-`check` emits `{schema_version, matrix_present, findings:[...]}`. Each finding is a
-`binary-unreachable` (a provider whose harness binary is off PATH), an
+`check` emits `{schema_version, matrix_present, findings:[...]}`; an ABSENT matrix
+reports `matrix_present: false` with an empty finding list at exit 0 — nothing to
+drift-check yet, distinct from `resolve`'s loud absent-matrix failure above. Each
+finding is a `binary-unreachable` (a provider whose harness binary is off PATH), an
 `off-cube-triple` (a well-formed host launch triple — a `<harness>_default`,
 `worker`, `escalation`, or panel member — outside the enumerable cube, tagged with
 its `source`), or a `malformed-triple` (a host triple the grammar rejects, carrying
@@ -127,9 +130,9 @@ The launcher-owned worker-cell seam (`src/worker-cell.ts`) rejects a doomed
 non-zero (exit 1) with the same reason. These are launch-time reason tokens
 (carried in the sticky reason / stderr message), NOT shared-envelope codes.
 
-| code                   | emitted by                    | meaning                                                                                                                | recovery                                                                                                              | retry-safe |
-| ---------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `worker-cell-no-route` | autopilot producer, `dispatch` | A WRAPPED cell (a capability model claude does not serve) that the host matrix routes to zero providers, or a malformed `matrix.yaml` at probe time (degraded, never a daemon exit). | Add a provider serving the model to `~/.config/keeper/matrix.yaml` (or fix the matrix), then `keeper retry-dispatch` (autopilot) / re-run (manual). | yes (fix config first) |
+| code                     | emitted by                     | meaning                                                                                                                | recovery                                                                                                              | retry-safe |
+| ------------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `worker-cell-bad-matrix` | autopilot producer, `dispatch` | The host worker matrix (`~/.config/keeper/matrix.yaml`) failed to load — one of four states the reason NAMES: `absent` (no file), `unparseable` (bad YAML / unreadable), `schema-invalid` (a shape violation — e.g. a retired `route:`/`native:`/`name:`/`subagents:` key), or `valid-but-empty` (an empty file). No cell can compose, so the daemon parks every cell-bearing `work` dispatch behind this sticky and never exits. | Copy `docs/examples/matrix.example.yaml` to `~/.config/keeper/matrix.yaml` and edit it (the message names the exact path + fix), then `keeper retry-dispatch` (autopilot) / re-run (manual). | yes (fix config first) |
 
 Distinct from the run-time `no_route` the `agent providers resolve` verb emits
 (above): that is a read-time doctor verdict, this is a launch-time dispatch

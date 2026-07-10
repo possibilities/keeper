@@ -22,6 +22,7 @@ import {
   parseRootsManifest,
 } from "../scripts/daemon-fingerprint.ts";
 import {
+  parseImports,
   parseWorkerSpecs,
   repoRoot,
   stripComments,
@@ -62,11 +63,14 @@ describe("daemon load-surface boundary", () => {
     expect(closure.workerEdges).toContain("src/autopilot-worker.ts");
   });
 
-  test("attribute-import edges are discovered", () => {
-    // `import embeddedConfig from "../subagents.yaml" with { type: "text" }` is a
-    // real load edge to a non-source asset — recorded, and covered by a file root.
-    expect(closure.assetImports.length).toBeGreaterThan(0);
-    expect(closure.assetImports).toContain("plugins/plan/subagents.yaml");
+  test("attribute-import edges are parsed by the walker (synthetic)", () => {
+    // The daemon loads the host worker matrix producer-side (ADR 0036), never as a
+    // baked-in `... with { type: "text" }` asset — so its real closure carries no
+    // asset imports. The walker's attribute-import parsing stays pinned here
+    // synthetically: the trailing `with { … }` clause does not perturb the spec.
+    expect(
+      parseImports('import cfg from "./sample.yaml" with { type: "text" };'),
+    ).toEqual([{ spec: "./sample.yaml", typeOnly: false }]);
   });
 
   test("every reachable in-repo path falls under a manifest root", () => {
@@ -87,8 +91,7 @@ describe("daemon load-surface boundary", () => {
     );
     // Genuine roots pass, both directory and file forms.
     expect(underRoot("src/daemon.ts")).toBe(true);
-    expect(underRoot("plugins/plan/src/subagents_config.ts")).toBe(true);
-    expect(underRoot("plugins/plan/subagents.yaml")).toBe(true);
+    expect(underRoot("plugins/plan/src/host_matrix.ts")).toBe(true);
     expect(underRoot("package.json")).toBe(true);
   });
 });
@@ -138,7 +141,6 @@ describe("daemon-fingerprint seam (pure core)", () => {
     expect(roots.length).toBeGreaterThan(0);
     expect(roots).toContain("src");
     expect(roots).toContain("plugins/plan/src");
-    expect(roots).toContain("plugins/plan/subagents.yaml");
   });
 
   test("composeRevParseArgs builds an argv array with no shell interpolation", () => {

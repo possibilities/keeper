@@ -22,7 +22,11 @@ import { fileURLToPath } from "node:url";
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import { followupPath } from "../audit_artifacts.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
-import { type EffectiveMatrix, effectiveMatrix } from "../host_matrix.ts";
+import {
+  type EffectiveMatrix,
+  effectiveMatrix,
+  hostMatrixPath,
+} from "../host_matrix.ts";
 import { isEpicId } from "../ids.ts";
 import {
   type ProjectContext,
@@ -30,7 +34,6 @@ import {
   tryResolveOwningProjectForId,
 } from "../project.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
-import { loadSubagentsMatrixFromDisk } from "../subagents_config.ts";
 import { loadYamlInput, parseYamlInput } from "../yaml_input.ts";
 
 export const SELECTION_BRIEF_SCHEMA_VERSION = 1;
@@ -233,42 +236,27 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
   const ctx = resolvePlanStateContext(epicId, project, format);
   const root = planPluginRoot();
   const configPath = join(root, "model-selector.yaml");
-  const subagentsPath = join(root, "subagents.yaml");
   const selectorConfigYaml = readUtf8(configPath, "CONFIG_MISSING", format);
   validateYamlFile(configPath, "CONFIG_MISSING", format);
-  const subagentsYaml = readUtf8(subagentsPath, "MATRIX_MISSING", format);
-  validateYamlFile(subagentsPath, "MATRIX_MISSING", format);
-  // Structurally validate the raw subagents.yaml the brief embeds — the selector
-  // reads it as the axis source, so a malformed embed fails loud here.
-  try {
-    loadSubagentsMatrixFromDisk(subagentsPath);
-  } catch (exc) {
-    emitSelectionBriefError(
-      "MATRIX_MISSING",
-      `configured model/effort matrix is missing or invalid: ${subagentsPath}`,
-      format,
-      {
-        path: subagentsPath,
-        error: exc instanceof Error ? exc.message : String(exc),
-      },
-    );
-  }
 
-  // The effective axes = embedded claude defaults overlaid by the host provider
-  // matrix (matrix.yaml) when present, so wrapped capability models the host
-  // roster lists become selectable with no rebuild. A malformed host matrix is
-  // fail-loud (never a silent fall-back to defaults).
+  // The axes come from the REQUIRED v2 host matrix (matrix.yaml). An absent or
+  // malformed matrix is fail-loud (MATRIX_MISSING) — v2 has no embedded fallback.
   let effective: EffectiveMatrix;
   try {
     effective = effectiveMatrix();
   } catch (exc) {
     emitSelectionBriefError(
       "MATRIX_MISSING",
-      `host provider matrix (matrix.yaml) is invalid: ${exc instanceof Error ? exc.message : String(exc)}`,
+      `host worker matrix (matrix.yaml) is missing or invalid: ${exc instanceof Error ? exc.message : String(exc)}`,
       format,
       { error: exc instanceof Error ? exc.message : String(exc) },
     );
   }
+
+  // The brief embeds the host matrix.yaml verbatim as the selector's axis source.
+  // effectiveMatrix() already loaded + validated it, so the read succeeds here.
+  const matrixPath = hostMatrixPath();
+  const matrixYaml = readUtf8(matrixPath, "MATRIX_MISSING", format);
 
   // Every roster model must carry a model-selector.yaml guidance block. This
   // enforcement lives at the runtime seam — not repo CI's drift gate — because a
@@ -304,7 +292,7 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
 
   const source = args.fromFollowup
     ? collectFollowupSource(epicId, primaryRepo, format)
-    : collectLiveSource(ctx, epicId, format, subagentsYaml);
+    : collectLiveSource(ctx, epicId, format, matrixYaml);
 
   const configHash = sha256(selectorConfigYaml);
   const inputHash = sha256(source.inputForHash);
@@ -322,8 +310,8 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
     selector_config_path: configPath,
     selector_config_hash: configHash,
     selector_config_yaml: selectorConfigYaml,
-    subagents_path: subagentsPath,
-    subagents_yaml: subagentsYaml,
+    matrix_path: matrixPath,
+    matrix_yaml: matrixYaml,
     efforts: effective.efforts,
     models: effective.models,
     input_hash: inputHash,
@@ -366,7 +354,7 @@ function collectLiveSource(
   ctx: ProjectContext,
   epicId: string,
   format: OutputFormat | null,
-  subagentsYaml: string,
+  matrixYaml: string,
 ): BriefSource {
   const epicSpecPath = join(ctx.dataDir, "specs", `${epicId}.md`);
   const epicSpecMd = readUtf8(epicSpecPath, "EPIC_SPEC_MISSING", format);
@@ -406,7 +394,7 @@ function collectLiveSource(
       depends_on: t.depends_on,
       spec_md: t.spec_md,
     })),
-    subagents_yaml: subagentsYaml,
+    matrix_yaml: matrixYaml,
   });
   return {
     briefTasksBase,

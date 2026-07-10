@@ -687,3 +687,448 @@ export function providerCheckFindings(
   }
   return findings;
 }
+
+// ── v2 loader (ADR 0036) ─────────────────────────────────────────────────────
+//
+// The v2 schema drops the embedded-defaults fallback: a provider model entry is
+// the LAUNCH ID verbatim (the string the harness CLI receives), a bare scalar or
+// `{id, efforts}`; the capability token is the basename (the segment after the
+// last `/`, the whole id when slash-free). Worker-cell eligibility is the explicit
+// `subagent_models` list; the cell-template inventory is `subagent_templates`. The
+// `route:`/`native:`/`name:`/`subagents:` keys retire. Absence and malformedness
+// are typed four-state loud errors, never a silent null fallback.
+//
+// ADDITIVE this task: the v1 {@link loadMatrix} + its derivations + every launcher
+// consumer stay on v1 unchanged; the runtime cutover to this loader lands in the
+// daemon-dispatch task. This is the parse layer + fixtures the dependent tasks
+// adopt, pinned against the plan island's twin (host_matrix.ts) by the cross-island
+// parity test.
+
+/** The four discriminated matrix-load failure states — each a distinct named
+ *  error so an operator (and the daemon's parked-dispatch sticky) can tell an
+ *  absent file from a typo from an empty file. Collapsing them is the mistake. */
+export type MatrixConfigState =
+  | "absent"
+  | "unparseable"
+  | "schema-invalid"
+  | "valid-but-empty";
+
+/** The remediation every four-state error carries — the exact copy-the-example
+ *  fix (Terraform-init pattern: what + where-looked + how to fix). */
+export const MATRIX_EXAMPLE_PATH = "docs/examples/matrix.example.yaml";
+
+/** A typed, four-state matrix-load failure — the launcher island's config-error
+ *  sibling. `state` discriminates the four cases and `configPath` names the
+ *  resolved path the message points at. Standalone (extends Error, not
+ *  {@link ConfigError}) because the config→triple→matrix import cycle evaluates
+ *  this module before config.ts initializes `ConfigError`, so a class-level
+ *  `extends ConfigError` would hit the TDZ; the v1 loader only references
+ *  ConfigError lazily inside function bodies for the same reason. */
+export class MatrixConfigError extends Error {
+  readonly state: MatrixConfigState;
+  readonly configPath: string;
+  constructor(state: MatrixConfigState, configPath: string, detail: string) {
+    super(
+      `${detail} (looked at ${configPath}). ` +
+        `Copy ${MATRIX_EXAMPLE_PATH} to ${configPath} and edit it.`,
+    );
+    this.name = "MatrixConfigError";
+    this.state = state;
+    this.configPath = configPath;
+  }
+}
+
+/** One provider roster entry (v2): a harness plus the capability→launch-id map of
+ *  the models it serves (launch id === the verbatim string the harness receives;
+ *  capability === its basename). Map order is declaration order. */
+export interface MatrixV2Provider {
+  name: HarnessName;
+  /** capability token → launch id, in declaration order. */
+  models: Map<string, string>;
+  /** per-provider effort override (normalized ascending), or undefined to inherit. */
+  efforts?: string[];
+  /** per-model effort overrides (normalized), keyed by capability token. */
+  modelEfforts: Map<string, string[]>;
+}
+
+/** One cross-provider dedup shadow: a (provider, capability) whose launch id lost
+ *  to an earlier provider serving the same derived capability. Surfaced so callers
+ *  can log the winner + the shadowed entries (dedup transparency). */
+export interface MatrixShadow {
+  provider: HarnessName;
+  capability: string;
+  launchId: string;
+  /** the roster-first provider that serves this capability and won dispatch. */
+  winner: HarnessName;
+}
+
+/** The parsed v2 host matrix. `providers` order IS the cost-ascending pecking
+ *  order; `subagentModels` IS the worker-cell axis. */
+export interface MatrixV2 {
+  efforts: string[];
+  subagentTemplates: string[];
+  subagentModels: string[];
+  providers: MatrixV2Provider[];
+  wrapper_driver: WrapperDriver;
+  defaults: MatrixDefaults;
+  /** driver per cell capability (native iff claude serves it, else wrapped). */
+  driverByModel: Map<string, Driver>;
+  /** effective effort list per capability ANY provider serves (routed or
+   *  launch-only), resolved at its roster-first (winning) provider. */
+  effortsByModel: Map<string, string[]>;
+  /** cross-provider dedup shadow log, in encounter order. */
+  shadowed: MatrixShadow[];
+}
+
+const ALLOWED_V2_KEYS: ReadonlySet<string> = new Set([
+  "efforts",
+  "subagent_templates",
+  "subagent_models",
+  "providers",
+  "wrapper_driver",
+  "defaults",
+]);
+
+/** The capability token of a launch id: the segment after the LAST `/`, or the
+ *  whole id when slash-free. Safe by construction — the launch id is validated as
+ *  a slash-joined strict-token target, so its last segment is a strict token. */
+export function capabilityOf(launchId: string): string {
+  const slash = launchId.lastIndexOf("/");
+  return slash === -1 ? launchId : launchId.slice(slash + 1);
+}
+
+/** A `subagent_templates` entry: a non-empty RELATIVE path with no `..` segment
+ *  and no NUL — the traversal guard that replaces the retired `render_to:` check,
+ *  since these entries become filesystem paths downstream. */
+export function isValidTemplatePath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+  if (value.includes("\0") || value.startsWith("/")) {
+    return false;
+  }
+  return !value.split("/").includes("..");
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Load + validate the v2 host matrix, or throw a typed four-state
+ * {@link MatrixConfigError}. Absent file → `absent`; unreadable / bad YAML →
+ * `unparseable`; empty/whitespace → `valid-but-empty`; any shape violation →
+ * `schema-invalid` (the message NAMES a retired key). Never returns null — v2 has
+ * no silent fallback.
+ */
+export function loadMatrixV2(
+  configPath: string = matrixConfigPath(),
+): MatrixV2 {
+  if (!fileExists(configPath)) {
+    throw new MatrixConfigError("absent", configPath, "no matrix.yaml found");
+  }
+  let text: string;
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch (err) {
+    throw new MatrixConfigError(
+      "unparseable",
+      configPath,
+      `matrix.yaml could not be read: ${errMessage(err)}`,
+    );
+  }
+  let raw: unknown;
+  try {
+    raw = parseYaml(text);
+  } catch (err) {
+    throw new MatrixConfigError(
+      "unparseable",
+      configPath,
+      `matrix.yaml is not valid YAML: ${errMessage(err)}`,
+    );
+  }
+  if (raw === null) {
+    throw new MatrixConfigError(
+      "valid-but-empty",
+      configPath,
+      "matrix.yaml is empty",
+    );
+  }
+  try {
+    return parseMatrixV2(raw, configPath);
+  } catch (err) {
+    if (err instanceof MatrixConfigError) {
+      throw err;
+    }
+    if (err instanceof ConfigError) {
+      throw new MatrixConfigError("schema-invalid", configPath, err.message);
+    }
+    throw err;
+  }
+}
+
+function parseMatrixV2(raw: unknown, configPath: string): MatrixV2 {
+  if (!isRecord(raw)) {
+    throw new ConfigError("matrix.yaml must be a mapping");
+  }
+  for (const key of Object.keys(raw)) {
+    if (key === "subagents") {
+      throw new ConfigError(
+        "the 'subagents:' key is retired — use 'subagent_templates:' (the cell-template inventory) and 'subagent_models:' (worker-cell eligibility)",
+      );
+    }
+    if (!ALLOWED_V2_KEYS.has(key)) {
+      throw new ConfigError(
+        `unknown top-level key '${key}' (allowed: ${[...ALLOWED_V2_KEYS].join(", ")})`,
+      );
+    }
+  }
+  const efforts = parseEffortList(raw.efforts, "efforts", configPath);
+  const subagentTemplates = parseTemplateList(raw.subagent_templates);
+  const { providers, effortsByModel, servedBy, shadowed } = parseV2Providers(
+    raw.providers,
+    efforts,
+    configPath,
+  );
+  const subagentModels = parseSubagentModels(raw.subagent_models, servedBy);
+  const claude = providers.find((p) => p.name === "claude");
+  const driverByModel = new Map<string, Driver>();
+  for (const cap of subagentModels) {
+    driverByModel.set(
+      cap,
+      claude?.models.has(cap) === true ? "native" : "wrapped",
+    );
+  }
+  return {
+    efforts,
+    subagentTemplates,
+    subagentModels,
+    providers,
+    wrapper_driver: parseWrapperDriver(raw.wrapper_driver, configPath),
+    defaults: parseDefaults(raw.defaults, configPath),
+    driverByModel,
+    effortsByModel,
+    shadowed,
+  };
+}
+
+function parseTemplateList(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ConfigError("subagent_templates must be a non-empty list");
+  }
+  const out: string[] = [];
+  for (const item of value) {
+    if (!isValidTemplatePath(item)) {
+      throw new ConfigError(
+        `subagent_templates entry ${JSON.stringify(item)} must be a non-empty relative path with no '..' segment and no NUL`,
+      );
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+function parseV2Providers(
+  value: unknown,
+  baseEfforts: string[],
+  configPath: string,
+): {
+  providers: MatrixV2Provider[];
+  effortsByModel: Map<string, string[]>;
+  servedBy: Map<string, HarnessName>;
+  shadowed: MatrixShadow[];
+} {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ConfigError("providers must be a non-empty list");
+  }
+  const providers: MatrixV2Provider[] = [];
+  const effortsByModel = new Map<string, string[]>();
+  const servedBy = new Map<string, HarnessName>();
+  const shadowed: MatrixShadow[] = [];
+  const seenProvider = new Set<string>();
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      throw new ConfigError(
+        "each providers entry must be a {name, models} mapping",
+      );
+    }
+    for (const k of Object.keys(entry)) {
+      if (k === "route") {
+        throw new ConfigError(
+          "the 'route:' flag is retired — launch-only enumeration falls out of a capability's absence from 'subagent_models', not a per-provider flag",
+        );
+      }
+      if (k !== "name" && k !== "models" && k !== "efforts") {
+        throw new ConfigError(
+          `unknown provider key '${k}' (allowed: name, models, efforts)`,
+        );
+      }
+    }
+    const name = entry.name;
+    if (typeof name !== "string" || !isHarnessName(name)) {
+      throw new ConfigError(
+        `provider name must be one of ${HARNESS_NAMES.join("|")} (got ${JSON.stringify(name)})`,
+      );
+    }
+    if (seenProvider.has(name)) {
+      throw new ConfigError(`provider '${name}' is listed more than once`);
+    }
+    seenProvider.add(name);
+    const providerEfforts =
+      entry.efforts === undefined
+        ? undefined
+        : parseEffortList(
+            entry.efforts,
+            `provider '${name}' efforts`,
+            configPath,
+          );
+    const { models, modelEfforts } = parseV2ProviderModels(
+      entry.models,
+      name,
+      configPath,
+    );
+    // Effort resolution + dedup are keyed on roster-FIRST appearance of a
+    // capability: the owner wins dispatch and owns the effort list; a later
+    // provider serving the same derived capability is a logged shadow.
+    for (const [cap, launchId] of models) {
+      if (!servedBy.has(cap)) {
+        servedBy.set(cap, name);
+        effortsByModel.set(
+          cap,
+          modelEfforts.get(cap) ?? providerEfforts ?? baseEfforts,
+        );
+      } else {
+        shadowed.push({
+          provider: name,
+          capability: cap,
+          launchId,
+          winner: servedBy.get(cap) as HarnessName,
+        });
+      }
+    }
+    providers.push({ name, models, efforts: providerEfforts, modelEfforts });
+  }
+  return { providers, effortsByModel, servedBy, shadowed };
+}
+
+function parseV2ProviderModels(
+  value: unknown,
+  provider: string,
+  configPath: string,
+): { models: Map<string, string>; modelEfforts: Map<string, string[]> } {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ConfigError(
+      `provider '${provider}' models must be a non-empty list`,
+    );
+  }
+  const models = new Map<string, string>();
+  const modelEfforts = new Map<string, string[]>();
+  for (const item of value) {
+    let launchId: string;
+    let perModelEfforts: string[] | undefined;
+    if (typeof item === "string") {
+      launchId = item;
+    } else if (isRecord(item)) {
+      for (const k of Object.keys(item)) {
+        if (k === "name") {
+          throw new ConfigError(
+            `provider '${provider}' model long form uses the retired 'name:' key — use 'id:' (the launch id; its capability is derived by basename)`,
+          );
+        }
+        if (k === "native") {
+          throw new ConfigError(
+            `provider '${provider}' model long form uses the retired 'native:' key — the model entry IS the launch id verbatim; the capability is the basename`,
+          );
+        }
+        if (k !== "id" && k !== "efforts") {
+          throw new ConfigError(
+            `provider '${provider}' model long form has unknown key '${k}' (allowed: id, efforts)`,
+          );
+        }
+      }
+      if (typeof item.id !== "string") {
+        throw new ConfigError(
+          `provider '${provider}' model long form 'id' must be a string`,
+        );
+      }
+      launchId = item.id;
+      if (item.efforts !== undefined) {
+        perModelEfforts = parseEffortList(
+          item.efforts,
+          `provider '${provider}' model '${launchId}' efforts`,
+          configPath,
+        );
+      }
+    } else {
+      throw new ConfigError(
+        `provider '${provider}' model entry must be a bare launch-id string or the long form {id, efforts?}`,
+      );
+    }
+    if (!isValidMatrixAliasTarget(launchId)) {
+      throw new ConfigError(
+        `provider '${provider}' launch id '${launchId}' must be '/'-joined [a-z0-9._-] segments (no leading dot, no empty segment)`,
+      );
+    }
+    const capability = capabilityOf(launchId);
+    if (!isValidMatrixToken(capability)) {
+      throw new ConfigError(
+        `provider '${provider}' launch id '${launchId}' derives an invalid capability token '${capability}'`,
+      );
+    }
+    if (models.has(capability)) {
+      throw new ConfigError(
+        `provider '${provider}' derives capability '${capability}' from more than one launch id (same-provider duplicate — a typo)`,
+      );
+    }
+    models.set(capability, launchId);
+    if (perModelEfforts !== undefined) {
+      modelEfforts.set(capability, perModelEfforts);
+    }
+  }
+  return { models, modelEfforts };
+}
+
+function parseSubagentModels(
+  value: unknown,
+  servedBy: Map<string, HarnessName>,
+): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ConfigError("subagent_models must be a non-empty list");
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || !isValidMatrixToken(item)) {
+      throw new ConfigError(
+        `subagent_models entries must be tokens matching [a-z0-9._-] with no leading dot (got ${JSON.stringify(item)})`,
+      );
+    }
+    if (seen.has(item)) {
+      throw new ConfigError(`subagent_models lists '${item}' more than once`);
+    }
+    if (!servedBy.has(item)) {
+      throw new ConfigError(
+        `subagent_models entry '${item}' is served by no provider — add a provider whose launch id derives that capability`,
+      );
+    }
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
+/** The effective effort list for a capability under the v2 matrix — the resolved
+ *  per-capability list (owner's model → provider → top-level chain), else the
+ *  top-level axis for a capability no provider serves. */
+export function matrixV2EffortsFor(matrix: MatrixV2, model: string): string[] {
+  return [...(matrix.effortsByModel.get(model) ?? matrix.efforts)];
+}
+
+/** The worker-cell axis: `subagent_models` in declared order, each tagged with its
+ *  driver (native iff claude serves it). */
+export function matrixV2Cells(matrix: MatrixV2): MatrixCell[] {
+  return matrix.subagentModels.map((model) => ({
+    model,
+    driver: matrix.driverByModel.get(model) ?? "wrapped",
+  }));
+}

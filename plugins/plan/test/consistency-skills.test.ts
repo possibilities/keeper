@@ -13,16 +13,15 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { effectiveMatrixFromDisk } from "../src/host_matrix.ts";
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { effectiveMatrix } from "../src/host_matrix.ts";
 import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
 import { runCli } from "./harness.ts";
 
 const REPO = join(import.meta.dir, "..");
 const CWD = mkdtempSync(join(tmpdir(), "planctl-consistency-"));
 
-// workers/ is gitignored (rendered per-cell from subagents.yaml), so a clean
-// checkout that never ran render-plugin-templates has no cells on disk. The
+// workers/ is gitignored (rendered per-cell from the required host matrix), so a
+// clean checkout that never ran render-plugin-templates has no cells on disk. The
 // per-cell enumeration below skips there instead of failing hard; install.sh and
 // promote.sh render before the suite runs, so real-checkout coverage is preserved.
 const WORKERS_RENDERED = existsSync(join(REPO, "workers"));
@@ -516,14 +515,14 @@ describe("close skill blocking-follow-up gate contract", () => {
 
 // ---------------------------------------------------------------------------
 // close-planner: follow-up template stamps both tier and model, with the
-// full configured axes — derived from subagents.yaml so axis drift trips
-// this pin instead of silently rotting the template.
+// full configured axes — derived from the required host matrix so axis drift
+// trips this pin instead of silently rotting the template.
 // ---------------------------------------------------------------------------
 
 const CLOSE_PLANNER = join(REPO, "agents", "close-planner.md");
 
 describe("close-planner follow-up template tier/model shape", () => {
-  const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+  const matrix = effectiveMatrix();
 
   test("template block carries both `tier:` and `model:` lines with the full configured enums", () => {
     const text = readFileSync(CLOSE_PLANNER, "utf-8");
@@ -779,9 +778,10 @@ describe("work.md.tmpl agentId capture regex", () => {
 
 describe("generated work plugins in the plan plugin", () => {
   // The renderer fans out over the EFFECTIVE matrix using each model's own effort
-  // list, so this per-cell existence gate walks the same ragged product. With no
-  // host matrix every model shares the flat axis (rectangular cartesian).
-  const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
+  // list, so this per-cell existence gate walks the same ragged product. The
+  // committed workers/ tree renders from the test suite's pinned claude-only host
+  // matrix (bunfig.toml preload), so effectiveMatrix() here resolves the same axes.
+  const matrix = effectiveMatrix();
   for (const model of matrix.models) {
     for (const effort of matrix.effortsFor(model)) {
       test.skipIf(!WORKERS_RENDERED)(

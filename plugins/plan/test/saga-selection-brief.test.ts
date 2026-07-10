@@ -190,18 +190,44 @@ describe("selection-brief with a host provider matrix", () => {
     return dir;
   }
 
+  /** A tracked EMPTY config dir (no matrix.yaml) — the required-matrix-absent case. */
+  function cfgWithoutMatrix(): string {
+    const dir = mkdtempSync(join(tmpdir(), "selbrief-nomatrix-"));
+    cfgDirs.push(dir);
+    return dir;
+  }
+
+  test("no host matrix present fails loud with MATRIX_MISSING (v2 has no fallback)", () => {
+    const project = getProject();
+    const { epicId } = scaffoldEpic(project, {
+      title: "No matrix",
+      nTasks: 1,
+    });
+    const r = runCli(["selection-brief", epicId, "--project", project.root], {
+      cwd: project.root,
+      home: project.home,
+      env: { KEEPER_CONFIG_DIR: cfgWithoutMatrix() },
+    });
+    expect(r.code).toBe(1);
+    const payload = parseCliOutput(r.output);
+    expect(payload.success).toBe(false);
+    expect((payload.error as Record<string, unknown>).code).toBe(
+      "MATRIX_MISSING",
+    );
+  });
+
   // A guided roster: claude serves opus (native), codex serves the wrapped
   // capability gpt-5.5 (a committed guidance block covers it).
   const GUIDED_MATRIX = [
     "efforts: [medium, high]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus, gpt-5.5]",
     "providers:",
     "  - name: claude",
     "    models: [opus]",
     "  - name: codex",
     "    models:",
-    "      - name: gpt-5.5",
-    "        native: gpt-5.5-codex",
-    "subagents: [work]",
+    "      - gpt-5.5",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
@@ -211,12 +237,13 @@ describe("selection-brief with a host provider matrix", () => {
   // A roster naming a wrapped capability with NO model-selector.yaml block.
   const UNGUIDED_MATRIX = [
     "efforts: [medium, high]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus, mystery-model]",
     "providers:",
     "  - name: claude",
     "    models: [opus]",
     "  - name: codex",
     "    models: [mystery-model]",
-    "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
@@ -266,17 +293,17 @@ describe("selection-brief with a host provider matrix", () => {
   // ragged product (3 cells), not the rectangular {2 models × 2 efforts = 4}.
   const RAGGED_MATRIX = [
     "efforts: [medium, high]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus, gpt-5.5]",
     "providers:",
     "  - name: claude",
     "    models:",
-    "      - name: opus",
+    "      - id: opus",
     "        efforts: [high]",
     "  - name: codex",
     "    models:",
-    "      - name: gpt-5.5",
-    "        native: gpt-5.5-codex",
+    "      - id: gpt-5.5",
     "        efforts: [medium, high]",
-    "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",

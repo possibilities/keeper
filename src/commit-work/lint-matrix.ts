@@ -29,7 +29,7 @@
  * of file type; each is self-contained and sub-second):
  *  - the vendored prompt corpus or a hack/panel skill body staged →
  *    `bun scripts/vendor-corpus.ts --check`
- *  - the plan model-selector config or subagents matrix staged →
+ *  - the plan model-selector config or its research-cache references staged →
  *    `bun plugins/plan/scripts/model-guidance-check.ts --check`
  *  - the plan package's `src/` tree staged → the root
  *    `test/reconcile-core-depgraph.test.ts` import-boundary ratchet (never the
@@ -117,12 +117,11 @@ export function isVendorCorpusPath(path: string): boolean {
   );
 }
 
-/** True when `path` is the plan model-selector config or the subagents matrix
- * it is checked against — the model-guidance drift check's trigger set. */
+/** True when `path` is the plan model-selector config or its research-cache
+ * references tree — the model-guidance drift check's trigger set. */
 export function isModelGuidancePath(path: string): boolean {
   return (
     path === "plugins/plan/model-selector.yaml" ||
-    path === "plugins/plan/subagents.yaml" ||
     path.startsWith("plugins/plan/skills/model-guidance/references/")
   );
 }
@@ -526,7 +525,7 @@ export async function runScopedLint(
   }
 
   // 13 --- model-guidance drift (staged path touches the plan model-selector
-  //        config or the subagents matrix it is checked against). ---
+  //        config or its research-cache references tree). ---
   if (
     !skipDriftGates &&
     stagedFiles.some(isModelGuidancePath) &&

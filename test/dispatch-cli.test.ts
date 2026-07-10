@@ -50,23 +50,38 @@ function writePresets(body: string): void {
   writeFileSync(join(dir, "presets.yaml"), body);
 }
 
-/** Write a host provider matrix into the sandboxed config dir so the CLI's route
- *  probe (`defaultRouteProbe` → `loadMatrix`) classifies a wrapped capability
- *  model — fixture-injected, never the host `~/.config/keeper/matrix.yaml`. */
+/** Write a v2 host matrix into the sandboxed config dir so the CLI's fresh
+ *  `composeWorkerCellDir` → `loadMatrixV2` resolves a cell — fixture-injected,
+ *  never the host `~/.config/keeper/matrix.yaml`. */
 function writeMatrix(body: string): void {
   writeFileSync(join(dir, "matrix.yaml"), body);
 }
 
-/** A fixture roster: claude native (opus/sonnet) + a wrapped `gpt-5.5` served by
- *  codex. Enough to route the wrapped candidate through the seam. */
+/** A minimal valid v2 host matrix (ADR 0036): claude-native opus/sonnet across
+ *  the full effort axis, both worker cells. */
+const CLAUDE_MATRIX = [
+  "efforts: [low, medium, high, xhigh, max]",
+  "subagent_templates: [template/agents/worker.md.tmpl]",
+  "subagent_models: [opus, sonnet]",
+  "providers:",
+  "  - name: claude",
+  "    models: [opus, sonnet]",
+  "wrapper_driver: { model: sonnet, effort: high }",
+  "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
+  "",
+].join("\n");
+
+/** A v2 roster: claude native (opus/sonnet) + a wrapped `gpt-5.5` served by codex,
+ *  all three listed in subagent_models (so gpt-5.5 composes its own cell). */
 const WRAPPED_MATRIX = [
   "efforts: [high]",
+  "subagent_templates: [template/agents/worker.md.tmpl]",
+  "subagent_models: [opus, sonnet, gpt-5.5]",
   "providers:",
   "  - name: claude",
   "    models: [opus, sonnet]",
   "  - name: codex",
   "    models: [gpt-5.5]",
-  "subagents: [work]",
   "wrapper_driver: { model: sonnet, effort: high }",
   "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
   "",
@@ -357,6 +372,7 @@ test("a malformed --preset triple fails loud (exit 2)", async () => {
 // ---------------------------------------------------------------------------
 
 test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the argv", async () => {
+  writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     dirExists: () => true,
@@ -384,6 +400,7 @@ test("plan work: a cell-less task (no model/tier) launches with NO --plugin-dir"
 });
 
 test("plan work: an out-of-matrix cell refuses (exit 1, actionable), launches nothing", async () => {
+  writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({
       epics: epicWith(dir, { model: "opus", tier: "ludicrous" }),
@@ -396,10 +413,10 @@ test("plan work: an out-of-matrix cell refuses (exit 1, actionable), launches no
   expect(r.stderr).toContain("model/tier");
 });
 
-test("plan work: a routed WRAPPED model threads the resolved --plugin-dir into the spec AND the argv", async () => {
-  // CLI parity with the autopilot producer: a task whose capability model the
-  // fixture matrix serves via a wrapped provider resolves its rendered host cell
-  // and launches with it — in the structured spec AND the byte-pinned argv.
+test("plan work: a WRAPPED cell in subagent_models threads the resolved --plugin-dir into the spec AND the argv", async () => {
+  // CLI parity with the autopilot producer: in v2 a wrapped capability model listed
+  // in subagent_models composes its `workers/<model>-<effort>` cell directly (no
+  // route probe) and launches with it — in the structured spec AND the byte-pinned argv.
   writeMatrix(WRAPPED_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({
@@ -418,24 +435,24 @@ test("plan work: a routed WRAPPED model threads the resolved --plugin-dir into t
   expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/gpt-5.5-high");
 });
 
-test("plan work: a WRAPPED model no provider serves refuses (exit 1) with worker-cell-no-route", async () => {
-  // Parity pin: a capability model absent from the embedded axes AND served by
-  // zero matrix providers keeps the byte-identical no-route refusal.
-  writeMatrix(WRAPPED_MATRIX);
+test("plan work: with NO host matrix present, a work dispatch refuses (exit 1) with worker-cell-bad-matrix", async () => {
+  // v2 (ADR 0036): the host matrix is REQUIRED. A manual dispatch loads it FRESH and,
+  // finding none, refuses with the four-state bad-matrix reject NAMING the absent
+  // state (matching the producer's parked-dispatch sticky) — never a silent launch.
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({
-      epics: epicWith(dir, { model: "grok-9", tier: "high" }),
+      epics: epicWith(dir, { model: "opus", tier: "high" }),
     }),
     dirExists: () => true,
   });
   expect(r.code).toBe(1);
   expect(r.spec).toBeUndefined(); // never launched
-  expect(r.stderr).toContain("wrapped model");
-  expect(r.stderr).toContain("worker-cell-no-route");
-  expect(r.stderr).toContain("grok-9");
+  expect(r.stderr).toContain("worker-cell-bad-matrix");
+  expect(r.stderr).toContain("absent");
 });
 
 test("plan work: a missing cell manifest refuses (exit 1) with the regenerate remedy", async () => {
+  writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     // cwd exists; the cell's `.claude-plugin/…` manifest does not.
@@ -448,6 +465,7 @@ test("plan work: a missing cell manifest refuses (exit 1) with the regenerate re
 });
 
 test("plan work: a shadowing work plugin refuses (exit 1) naming the offending manifest", async () => {
+  writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     dirExists: () => true,
@@ -556,6 +574,7 @@ test("plan work: --dry-run reflects the worktree-mode refusal (exit 1, no argv l
 });
 
 test("plan work: --dry-run reflects a cell reject (exit 1) instead of printing argv", async () => {
+  writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--dry-run"], {
     query: makeQuery({
       epics: epicWith(dir, { model: "opus", tier: "ludicrous" }),
@@ -567,6 +586,7 @@ test("plan work: --dry-run reflects a cell reject (exit 1) instead of printing a
 });
 
 test("plan work: --dry-run on an in-matrix cell PRINTS the resolved --plugin-dir argv", async () => {
+  writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force", "--dry-run"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     dirExists: () => true,

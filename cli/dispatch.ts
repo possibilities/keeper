@@ -42,7 +42,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { matrixConfigPath } from "../src/agent/matrix";
 import { parseTriple } from "../src/agent/triple";
 import {
   KEEPER_ROOT,
@@ -70,7 +69,6 @@ import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
 import {
   composeWorkerCellDir,
-  defaultRouteProbe,
   defaultShadowingWorkProbe,
   resolveWorkerCell,
 } from "../src/worker-cell";
@@ -759,14 +757,15 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
 
     // Resolve the task's per-cell worker plugin — `work::` only. Compose the
     // {model, tier} cell fresh from the projection axes `resolvePlanCwd` carried,
-    // then run the SAME resolution seam the autopilot producer uses (fresh
-    // filesystem probes here; the producer injects its per-cycle memoized shadow
-    // closure). A partial/absent cell (either axis null) launches cell-less
-    // exactly like the producer — parity, never a reject. Any reject exits 1 with
-    // a three-part actionable error (what was being launched, which cell/manifest
-    // is wrong, what to do next) instead of spawning a doomed worker. Runs under
-    // `--dry-run` too so it reflects the reject a real run would hit. The switch
-    // is closed by `assertNever` — a new reject kind fails compilation here.
+    // LOADING the host matrix itself at invocation (`composeWorkerCellDir`), then run
+    // the SAME resolution seam the autopilot producer uses (fresh filesystem probes
+    // here; the producer injects its per-cycle memoized shadow closure). A
+    // partial/absent cell (either axis null) launches cell-less exactly like the
+    // producer — parity, never a reject. Any reject exits 1 with a three-part
+    // actionable error (what was being launched, which cell/matrix is wrong, what to
+    // do next) instead of spawning a doomed worker. Runs under `--dry-run` too so it
+    // reflects the reject a real run would hit. The switch is closed by `assertNever`
+    // — a new reject kind fails compilation here.
     if (verb === "work") {
       const cell = resolveWorkerCell(
         composeWorkerCellDir(cwdResult.model ?? null, cwdResult.tier ?? null),
@@ -774,24 +773,21 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
           dirExists: deps.dirExists ?? existsSync,
           probeShadow:
             deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
-          probeRoute: () => defaultRouteProbe(cwdResult.model ?? ""),
         },
       );
       if (!cell.ok) {
         switch (cell.kind) {
+          case "bad-matrix":
+            die(
+              `refusing to launch ${claudeName}: the host worker matrix is ` +
+                `${cell.state} — ${cell.detail} Then retry (worker-cell-bad-matrix)`,
+            );
+            break;
           case "out-of-matrix":
             die(
               `refusing to launch ${claudeName}: its {model, tier} resolves no valid ` +
                 `worker cell — ${cell.message}; fix the task's model/tier in the plan ` +
                 "or regenerate the worker matrix",
-            );
-            break;
-          case "no-route":
-            die(
-              `refusing to launch ${claudeName}: '${cell.model}' is a wrapped model ` +
-                `with no configured provider in ${matrixConfigPath()} — add a ` +
-                "provider serving it to the roster (or correct the task's model), " +
-                "then retry (worker-cell-no-route)",
             );
             break;
           case "missing":

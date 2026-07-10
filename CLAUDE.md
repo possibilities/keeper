@@ -19,8 +19,9 @@ file is imperative guardrails only.
 - **Three peers live under `plugins/`** — `plugins/keeper/` (hooks + `keeper:*` skills) and `plugins/plan/`
   (behind `keeper plan`, `plan:*` skills) are claude-plugins, each with exactly ONE `<plugin>/.claude-plugin/plugin.json`
   (keeper exactly ONE `hooks/hooks.json`); `plugins/prompt/` is the engine behind `keeper prompt` and carries NO
-  `.claude-plugin` manifest. `plugins/plan/` also renders the `subagents.yaml` model × effort matrix as per-cell
-  `work`-plugin manifests under `workers/<model>-<effort>/`, added via `--plugin-dir` ATOP the full plugins.yaml (keeper+plan+arthack) every launch inherits. Never duplicate a manifest or add a
+  `.claude-plugin` manifest. `plugins/plan/` also renders the required host matrix as per-cell `work` manifests
+  under `workers/<model>-<effort>/`, added via `--plugin-dir` ATOP the full plugins.yaml (keeper+plan+arthack)
+  every launch inherits. Never duplicate a manifest or add a
   `~/.claude/plugins/keeper` symlink (double-registers); daemon, `cli/`, `src/`, `keeper` binary stay at repo root.
 - **The Agent Bus inbox watcher is a session Monitor** in `plugins/keeper/monitors.json` — STRICTLY
   separate from `hooks.json`; never fold in.
@@ -95,10 +96,11 @@ file is imperative guardrails only.
 ## Test isolation
 
 - **One fast pure-in-process tier.** `bun test` is the keeper fast suite (only `test:opentui` splits out); `bun run test:full` gates all three suites serially — root, plan, prompt — and `test:full:slow` injects `KEEPER_RUN_SLOW` / `KEEPER_PLAN_RUN_SLOW` to unlock the real-git/subprocess tiers. NO test boots a real daemon / Worker thread / UDS socket / subprocess / git / tmux — git-boundary DECISIONS go through a pure seam, never git's execution. There is no watchdog, so a test must never hang or synchronously spin; production is the safety net.
-- **Sandbox ALL SIX state classes** under the per-test tmpdir for any test on the real state surface:
+- **Sandbox ALL SEVEN state classes** under the per-test tmpdir for any test on the real state surface:
   `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
-  and the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` — never `{ ...process.env, KEEPER_DB }`;
-  build via `sandboxEnv(...)`. Pure unit tests use `freshMemDb()` / `freshDbFile()` over a full `migrate()`.
+  the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK`, and `KEEPER_CONFIG_DIR` — never
+  `{ ...process.env, KEEPER_DB }`; build via `sandboxEnv(...)`. Pure tests use `freshMemDb()` /
+  `freshDbFile()` over a full `migrate()`.
 - **Test runs are lock-free** — `scripts/test-gate.ts` (the `test` script routes through it) caps
   `--parallel` (`KEEPER_TEST_PARALLEL`, default 5) + adds `--no-orphans`. Never add a host-wide lock — a hung holder wedges every runner.
 - **Poll, don't sleep.** Any assertion waiting on async state uses `retryUntil`

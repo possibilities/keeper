@@ -126,8 +126,8 @@ function isDepthBand(value: unknown): value is DepthBand {
 }
 
 /** The plan plugin root (`plugins/plan/`), where the drift-gated config files
- * — model-selector.yaml, subagents.yaml, audit-policy.yaml — sit. Mirrors
- * selection_brief's resolution: three dirs up from `src/verbs/<verb>.ts`. */
+ * — model-selector.yaml, audit-policy.yaml — sit. Mirrors selection_brief's
+ * resolution: three dirs up from `src/verbs/<verb>.ts`. */
 function planPluginRoot(): string {
   return dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 }

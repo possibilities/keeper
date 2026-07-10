@@ -1,0 +1,25 @@
+# Pinned claude-only host worker matrix (v2) for the prompt regression-pin suite
+# and the golden capture. Every render the parity suite drives resolves this dir
+# as its KEEPER_CONFIG_DIR, so the goldens stay host-blind — no operator
+# ~/.config/keeper/matrix.yaml can leak into a compare. Its cell set (opus/sonnet
+# × the five efforts, all native) is what the render-plugin-templates golden
+# tree pins.
+efforts:
+  - low
+  - medium
+  - high
+  - xhigh
+  - max
+subagent_templates:
+  - template/agents/worker.md.tmpl
+subagent_models:
+  - opus
+  - sonnet
+providers:
+  - name: claude
+    models:
+      - opus
+      - sonnet
+wrapper_driver:
+  model: sonnet
+  effort: high

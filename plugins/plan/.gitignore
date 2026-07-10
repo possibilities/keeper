@@ -20,9 +20,9 @@ node_modules/
 agents/practice-scout.md
 
 # Generated per-cell `work` plugins (rendered from template/agents/worker.md.tmpl
-# via render_to into workers/<model>-<effort>/{.claude-plugin/plugin.json,
-# agents/worker.md}, one plugin per cell of the subagents.yaml matrix; each loads
-# as the constant work:worker, selected at launch via --plugin-dir).
+# into workers/<model>-<effort>/{.claude-plugin/plugin.json, agents/worker.md},
+# one plugin per cell of the required host matrix; each loads as the constant
+# work:worker, selected at launch via --plugin-dir).
 workers/
 
 # Generated skills (rendered from template/skills/*.md.tmpl;

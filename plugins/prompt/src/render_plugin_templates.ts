@@ -5,35 +5,46 @@
 // promptctl run_render_plugin_templates.py — byte-for-byte on the rendered tree
 // and every sidecar (the generated-guard's sha256 contract depends on it).
 //
-// The seven preserved behaviors (numbered in the body):
+// The behaviors (numbered in the body):
 //
-//   1. Run build-snippets first (in-process; only when the arthack snippet corpus
-//      is present under the project root).
-//   2. Three template-kinds -> output shapes: template/commands -> commands/<stem>.md,
+//   1. Load + validate the REQUIRED host worker matrix
+//      (`~/.config/keeper/matrix.yaml`, v2) BEFORE any render. An absent /
+//      unparseable / schema-invalid / valid-but-empty matrix aborts with a typed
+//      four-state error and writes no partial tree.
+//   2. Run build-snippets (in-process; only when the arthack snippet corpus is
+//      present under the project root).
+//   3. Three template-kinds -> output shapes: template/commands -> commands/<stem>.md,
 //      template/skills -> skills/<stem>/SKILL.md (variant = directory name),
 //      template/agents -> agents/<stem>.md.
-//   3. Variant fan-out: a `variants:` frontmatter list renders once per variant
+//   4. Variant fan-out: a `variants:` frontmatter list renders once per variant
 //      with `current_variant` bound. The non-variant branch does NOT bind
 //      `current_variant` — strictVariables raises on a stray reference, the
 //      asymmetry that keeps a variant template from rendering as non-variant.
-//   4. Cross-boundary `render_to:` (agents only) is resolved POST-render from the
-//      rendered frontmatter; the output stem follows the rendered `name:` field.
-//   5. Frontmatter stripping: `variants:` everywhere, `render_to:` on agents. The
-//      skill non-variant branch deliberately does NOT strip `variants:` (faithful
-//      asymmetry — do not "fix" it).
-//   6. Orphan cleanup runs on COMMANDS ONLY (variant-aware), collect-then-delete,
+//   5. Worker-cell fan-out (agents only): a template listed in the matrix's
+//      `subagent_templates` inventory fans out over `subagent_models ×
+//      effortsFor(capability)`, one self-contained `work` plugin per cell under
+//      the fixed `workers/<model>-<effort>/` convention (the destination comes
+//      from the plan island's `workerCellDir`, the ONE code home for it). Each
+//      cell carries its driver (native/wrapped) and the wrapper driver so the
+//      composed template branches a wrapped cell onto its foreign harness, and
+//      emits a per-cell `.claude-plugin/plugin.json` whose description is the
+//      required `manifest_description:` frontmatter (a listed template missing
+//      it errors — build-forward, no fallback).
+//   6. Frontmatter stripping: `variants:` everywhere, `manifest_description:` on
+//      agents. The skill non-variant branch deliberately does NOT strip
+//      `variants:` (faithful asymmetry — do not "fix" it).
+//   7. Orphan cleanup runs on COMMANDS ONLY (variant-aware), collect-then-delete,
 //      with a containment escape guard; empty commands/ dirs are rmdir'd.
-//   7. Exit code: 1 iff any render failed, else 0 — never aborts early.
+//   8. Exit code: 1 iff any render failed, else 0 — never aborts early once past
+//      the matrix load.
 //
 // Sidecar serialization is frozen: `json.dumps(sort_keys=True, indent=2,
 // ensure_ascii=False) + "\n"` with `_warning`/`source_template`/`sha256`. The
-// em-dash in `_warning` stays literal (ensure_ascii=False). `render_to:` agents
-// additionally emit a per-tier `plugin.json` manifest (insertion-order JSON, no
-// key sort) plus its own sidecar; a `render_to:` template missing
-// `manifest_description:` raises — build-forward, no fallback.
+// em-dash in `_warning` stays literal (ensure_ascii=False). A worker cell also
+// emits a per-cell `plugin.json` manifest (insertion-order JSON, no key sort)
+// plus its own sidecar.
 //
-// The ONE deliberate diff vs the Python oracle: the sidecar `_warning` and any
-// regenerate cite say `keeper prompt`, not `promptctl`.
+// The sidecar `_warning` and any regenerate cite say `keeper prompt`.
 
 import { createHash } from "node:crypto";
 import {
@@ -50,14 +61,16 @@ import {
 import { dirname, join, relative, resolve, sep } from "node:path";
 import yaml from "js-yaml";
 import {
-  type EffectiveMatrix,
-  effectiveMatrixFromDisk,
+  HostMatrixConfigError,
+  type HostMatrixV2,
+  hostMatrixV2EffortsFor,
+  loadHostMatrixV2,
 } from "../../plan/src/host_matrix.ts";
+import { workerCellDir } from "../../plan/src/worker_cells.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { renderTemplate, sourceRelpath } from "./render_engine.ts";
 
 const VARIANTS_STRIP_RE = /^variants:.*\n/gm;
-const RENDER_TO_STRIP_RE = /^render_to:.*\n/gm;
 const MANIFEST_DESCRIPTION_STRIP_RE = /^manifest_description:.*\n/gm;
 
 const TMPL_SUFFIX = ".md.tmpl";
@@ -122,21 +135,6 @@ function sourceVariants(templatePath: string): string[] {
     return [];
   }
   return variants.map((v) => String(v));
-}
-
-/** The plugin's EFFECTIVE {model × effort} matrix, or null when the plugin ships
- * no `subagents.yaml`. The plugin's committed config is the claude-native base;
- * a host `~/.config/keeper/matrix.yaml`, when present, overrides the model axis
- * (adding wrapped capability cells) and the wrapper driver. Read once per
- * renderAgents pass; a listed agent template fans out over the ragged {model ×
- * effort} product (each model's own effective effort list) instead of the 1-D
- * `variants:` path. A malformed config throws (fail-loud build). */
-function pluginEffectiveMatrix(pluginDir: string): EffectiveMatrix | null {
-  const configPath = join(pluginDir, "subagents.yaml");
-  if (!isFile(configPath)) {
-    return null;
-  }
-  return effectiveMatrixFromDisk(configPath);
 }
 
 /** The sidecar companion path for a rendered output. */
@@ -434,90 +432,87 @@ function renderSkills(pluginDir: string, projectRoot: string): boolean {
   return hadFailures;
 }
 
-/** Resolution result for an agent output (post-render frontmatter). */
-interface AgentOutput {
-  out: string;
-  label: string;
-  manifestPath: string | null;
-  manifestDescription: string | null;
+/** Emit a non-cell agent to `out` (+ sidecar), stripping `variants:` and
+ * `manifest_description:`. */
+function emitAgent(out: string, rendered: string, sourceRel: string): void {
+  const stripped = stripLines(rendered, [
+    VARIANTS_STRIP_RE,
+    MANIFEST_DESCRIPTION_STRIP_RE,
+  ]);
+  if (writeWithSidecar(out, stripped, sourceRel)) {
+    process.stdout.write(`✓ Rendered agents/${baseName(out)}\n`);
+  }
 }
 
-/** Resolve the final agent output path using post-render frontmatter. When
- * `render_to:` is declared, the target dir is `<pluginDir>/<render_to>/agents`
- * (render_to names a sub-plugin WITHIN the owning plugin, so it is resolved
- * against the plugin root, never the project root — the two coincide only when a
- * plugin is rendered as its own project root) and the stem follows the rendered
- * `name:` field; a per-tier plugin.json manifest path + its rendered
- * `manifest_description` are returned alongside. Path-traversal guarded. A
- * `render_to:` template missing `manifest_description:` throws. Mirrors
- * _resolve_agent_output. */
-function resolveAgentOutput(
+/** Emit one worker cell: the rendered agent under
+ * `workers/<model>-<effort>/agents/<stem>.md` plus a per-cell
+ * `.claude-plugin/plugin.json` whose description is the required
+ * `manifest_description:` frontmatter. The destination comes from the plan
+ * island's `workerCellDir` — the ONE code home for the cell-path convention, so
+ * the launcher's `--plugin-dir` selection and this write can't drift. Returns
+ * false when a listed template is missing `manifest_description:` (a cell render
+ * failure), true otherwise. The `<model>`/`<effort>` tokens are matrix-validated
+ * tokens (load-time charset guard), so the destination stays within the plugin
+ * root without a per-write escape check. */
+function emitCell(
   pluginDir: string,
+  projectRoot: string,
   stem: string,
-  defaultOut: string,
+  model: string,
+  effort: string,
   rendered: string,
   sourceRel: string,
-): AgentOutput {
-  const fm = parseFrontmatter(rendered);
-  const renderTo = (fm.render_to as string) || "";
-  const renderName = (fm.name as string) || "";
-  if (!renderTo) {
-    return {
-      out: defaultOut,
-      label: `agents/${baseName(defaultOut)}`,
-      manifestPath: null,
-      manifestDescription: null,
-    };
-  }
-
-  const pluginResolved = resolve(pluginDir);
-  const targetDir = resolve(join(pluginDir, renderTo, "agents"));
-  if (!isRelativeTo(targetDir, pluginResolved)) {
-    throw new ValueErrorLike(
-      `render_to escapes plugin root: '${renderTo}' → ${targetDir}`,
-    );
-  }
-  mkdirSync(targetDir, { recursive: true });
-  const outStem = renderName || stem;
-  const out = join(targetDir, `${outStem}.md`);
-  const label = `${renderTo}/agents/${outStem}.md`;
-
-  const manifestDescription = fm.manifest_description;
+): boolean {
+  const cellDir = workerCellDir(model, effort);
+  const manifestDescription = parseFrontmatter(rendered).manifest_description;
   if (typeof manifestDescription !== "string" || !manifestDescription.trim()) {
-    throw new ValueErrorLike(
-      `render_to template '${sourceRel}' is missing required ` +
+    process.stderr.write(
+      `✗ cell template '${sourceRel}' is missing required ` +
         "'manifest_description:' frontmatter — refusing to emit a " +
-        `.claude-plugin/plugin.json manifest at '${renderTo}' without one`,
+        `.claude-plugin/plugin.json manifest at '${cellDir}' without one\n`,
     );
+    return false;
   }
-  const manifestPath = resolve(
-    join(pluginDir, renderTo, ".claude-plugin", "plugin.json"),
+
+  const out = join(pluginDir, cellDir, "agents", `${stem}.md`);
+  const stripped = stripLines(rendered, [
+    VARIANTS_STRIP_RE,
+    MANIFEST_DESCRIPTION_STRIP_RE,
+  ]);
+  if (writeWithSidecar(out, stripped, sourceRel)) {
+    process.stdout.write(`✓ Rendered ${cellDir}/agents/${stem}.md\n`);
+  }
+
+  const manifestPath = join(
+    pluginDir,
+    cellDir,
+    ".claude-plugin",
+    "plugin.json",
   );
-  if (!isRelativeTo(manifestPath, pluginResolved)) {
-    throw new ValueErrorLike(
-      `render_to manifest escapes plugin root: '${renderTo}' → ${manifestPath}`,
-    );
+  const manifest = manifestContent(manifestDescription.trim());
+  if (writeWithSidecar(manifestPath, manifest, sourceRel)) {
+    const rel = relPosix(resolve(projectRoot), resolve(manifestPath));
+    process.stdout.write(`✓ Rendered ${rel}\n`);
   }
-  return {
-    out,
-    label,
-    manifestPath,
-    manifestDescription: manifestDescription.trim(),
-  };
+  return true;
 }
 
-/** Render template/agents/ -> agents/<stem>.md (variant-aware, render_to-aware).
- * `render_to:` is resolved POST-render. `variants:` and `render_to:` are both
- * stripped on the agent path. Mirrors _render_agents. */
-function renderAgents(pluginDir: string, projectRoot: string): boolean {
+/** Render template/agents/ -> agents/<stem>.md (variant-aware) OR, for a template
+ * listed in the matrix's `subagent_templates` inventory, fan it out over
+ * `subagent_models × effortsFor(capability)` into the fixed
+ * `workers/<model>-<effort>/` cell convention. `variants:` and
+ * `manifest_description:` are stripped on the agent path. */
+function renderAgents(
+  pluginDir: string,
+  projectRoot: string,
+  matrix: HostMatrixV2,
+): boolean {
   const templatesDir = join(pluginDir, "template", "agents");
   if (!isDir(templatesDir)) {
     return false;
   }
   const agentsDir = join(pluginDir, "agents");
   mkdirSync(agentsDir, { recursive: true });
-
-  const matrix = pluginEffectiveMatrix(pluginDir);
 
   let hadFailures = false;
   for (const tmpl of sortedTemplates(templatesDir)) {
@@ -526,82 +521,56 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
     const baseOut = join(agentsDir, `${stem}.md`);
     const variants = sourceVariants(tmpl);
     const tmplRel = relPosix(resolve(pluginDir), resolve(tmpl));
-    const matrixCell = matrix?.subagents.includes(tmplRel) ? matrix : null;
 
-    const emit = (rendered: string, defaultOut: string): void => {
-      let resolved: AgentOutput;
-      try {
-        resolved = resolveAgentOutput(
-          pluginDir,
-          stem,
-          defaultOut,
-          rendered,
-          sourceRel,
-        );
-      } catch (e) {
-        if (e instanceof ValueErrorLike) {
-          hadFailures = true;
-          process.stderr.write(`✗ ${e.message}\n`);
-          return;
-        }
-        throw e;
-      }
-      const stripped = stripLines(rendered, [
-        VARIANTS_STRIP_RE,
-        RENDER_TO_STRIP_RE,
-        MANIFEST_DESCRIPTION_STRIP_RE,
-      ]);
-      if (writeWithSidecar(resolved.out, stripped, sourceRel)) {
-        process.stdout.write(`✓ Rendered ${resolved.label}\n`);
-      }
-      if (
-        resolved.manifestPath !== null &&
-        resolved.manifestDescription !== null
-      ) {
-        const manifest = manifestContent(resolved.manifestDescription);
-        if (writeWithSidecar(resolved.manifestPath, manifest, sourceRel)) {
-          const rel = relPosix(resolve(projectRoot), resolved.manifestPath);
-          process.stdout.write(`✓ Rendered ${rel}\n`);
-        }
-      }
-    };
-
-    if (matrixCell !== null) {
-      // Ragged {model × effort} fan-out: one generated agent per cell, models
-      // sorted and each model's OWN effective effort list sorted for stable output
-      // ordering. With no host matrix every model shares the top-level axis (the
-      // product stays rectangular); a host roster's per-model effort overrides make
-      // the cube ragged, so the effort list is resolved per model, not once. Each
-      // cell carries its driver (native/wrapped) and the wrapper driver, so the
-      // composed template can branch a wrapped cell onto its foreign harness while a
-      // native cell stays byte-identical.
-      const models = [...matrixCell.models].sort();
-      const wrapperModel = matrixCell.wrapper_driver.model;
-      const wrapperEffort = matrixCell.wrapper_driver.effort;
-      for (const model of models) {
-        const efforts = [...matrixCell.effortsFor(model)].sort();
-        for (const effort of efforts) {
-          const defaultOut = join(agentsDir, `${stem}-${model}-${effort}.md`);
+    if (matrix.subagentTemplates.includes(tmplRel)) {
+      // Ragged {model × effort} fan-out: models sorted, and each capability's OWN
+      // effective effort list sorted, for stable output ordering. A per-provider or
+      // per-model effort override makes the cube ragged, so the list is resolved per
+      // model. Each cell carries its driver (native/wrapped) and the wrapper driver,
+      // so the composed template branches a wrapped cell onto its foreign harness
+      // while a native cell keeps its own model/effort.
+      const wrapperModel = matrix.wrapper_driver.model;
+      const wrapperEffort = matrix.wrapper_driver.effort;
+      for (const model of [...matrix.models].sort()) {
+        const driver = matrix.driverByModel.get(model) ?? "wrapped";
+        for (const effort of [
+          ...hostMatrixV2EffortsFor(matrix, model),
+        ].sort()) {
           const [rendered, failed] = renderOne(tmpl, {
             current_model: model,
             current_effort: effort,
-            current_driver: matrixCell.driverFor(model),
+            current_driver: driver,
             wrapper_model: wrapperModel,
             wrapper_effort: wrapperEffort,
           });
           if (failed) {
             hadFailures = true;
             process.stderr.write(
-              `✗ Failed to render agents/${baseName(defaultOut)}\n`,
+              `✗ Failed to render ${workerCellDir(model, effort)}/agents/${stem}.md\n`,
             );
             continue;
           }
-          emit(rendered, defaultOut);
+          if (
+            !emitCell(
+              pluginDir,
+              projectRoot,
+              stem,
+              model,
+              effort,
+              rendered,
+              sourceRel,
+            )
+          ) {
+            hadFailures = true;
+          }
         }
       }
-    } else if (variants.length > 0) {
+      continue;
+    }
+
+    if (variants.length > 0) {
       for (const variant of variants) {
-        const defaultOut = variant
+        const out = variant
           ? join(agentsDir, `${stem}-${variant}.md`)
           : baseOut;
         const [rendered, failed] = renderOne(tmpl, {
@@ -609,12 +578,10 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
         });
         if (failed) {
           hadFailures = true;
-          process.stderr.write(
-            `✗ Failed to render agents/${baseName(defaultOut)}\n`,
-          );
+          process.stderr.write(`✗ Failed to render agents/${baseName(out)}\n`);
           continue;
         }
-        emit(rendered, defaultOut);
+        emitAgent(out, rendered, sourceRel);
       }
     } else {
       const [rendered, failed] = renderOne(tmpl, null);
@@ -625,7 +592,7 @@ function renderAgents(pluginDir: string, projectRoot: string): boolean {
         );
         continue;
       }
-      emit(rendered, baseOut);
+      emitAgent(baseOut, rendered, sourceRel);
     }
   }
   return hadFailures;
@@ -697,7 +664,21 @@ export function runRenderPluginTemplates(
     return 1;
   }
 
-  // 1. Rebuild the snippet index so render-time globals see current state — only
+  // 1. The host worker matrix is REQUIRED — load + validate it BEFORE any write so
+  //    an absent/unparseable/schema-invalid/empty matrix aborts with the typed
+  //    four-state error and leaves no partial tree behind.
+  let matrix: HostMatrixV2;
+  try {
+    matrix = loadHostMatrixV2();
+  } catch (e) {
+    if (e instanceof HostMatrixConfigError) {
+      process.stderr.write(`Error: ${e.message}\n`);
+      return 1;
+    }
+    throw e;
+  }
+
+  // 2. Rebuild the snippet index so render-time globals see current state — only
   //    when the arthack snippet corpus is present under this root.
   const snippetIndexSource = join(
     projectRoot,
@@ -718,7 +699,7 @@ export function runRenderPluginTemplates(
   const pluginDirs = discoverPluginDirs(projectRoot);
   let hadFailures = false;
 
-  // 2-5. Three template kinds → three shapes. Loop ordering mirrors bash: all
+  // 3-6. Three template kinds → three shapes. Loop ordering mirrors bash: all
   // commands across all plugins, then all skills, then all agents.
   for (const pluginDir of pluginDirs) {
     if (renderCommands(pluginDir, projectRoot)) {
@@ -731,27 +712,18 @@ export function runRenderPluginTemplates(
     }
   }
   for (const pluginDir of pluginDirs) {
-    if (renderAgents(pluginDir, projectRoot)) {
+    if (renderAgents(pluginDir, projectRoot, matrix)) {
       hadFailures = true;
     }
   }
 
-  // 6. Orphan cleanup LAST so a freshly-rendered file is never mistaken for one.
+  // 7. Orphan cleanup LAST so a freshly-rendered file is never mistaken for one.
   for (const pluginDir of pluginDirs) {
     pruneCommandOrphans(pluginDir);
   }
 
-  // 7. Exit code: 1 iff any render failed, else 0.
+  // 8. Exit code: 1 iff any render failed, else 0.
   return hadFailures ? 1 : 0;
-}
-
-/** Local error type mirroring Python's caught `ValueError` so the render_to
- * validation failures stay catchable distinctly from unexpected throws. */
-class ValueErrorLike extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ValueErrorLike";
-  }
 }
 
 /** True when `candidate` is `root` or lives beneath it. The separator guard stops

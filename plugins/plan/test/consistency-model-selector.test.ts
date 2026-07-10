@@ -1,13 +1,14 @@
 // Drift gate for the selector policy config (../model-selector.yaml), asserted
 // in the fast tier as pure disk reads — no subprocess, daemon, or git. Pins the
-// on-disk config against the subagents.yaml axes (both directions) and against
-// the model-guidance skill's references/ cache (hash parity), then drives the
-// coverage + research-hash failure modes through the pure check core with
-// hand-built inputs whose expected outcomes are independent of the config under
-// test.
+// on-disk config against the required host matrix axes (both directions) and
+// against the model-guidance skill's references/ cache (hash parity), then
+// drives the coverage + research-hash failure modes through the pure check core
+// with hand-built inputs whose expected outcomes are independent of the config
+// under test.
 
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import {
@@ -22,25 +23,49 @@ import {
   type ModelSelectorConfig,
   unionEfforts,
 } from "../scripts/model-guidance-check.ts";
-import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
+import { effectiveMatrix } from "../src/host_matrix.ts";
 
 const PLAN_ROOT = resolve(import.meta.dir, "..");
+
+// A committed claude-only v2 host matrix seeded into a scratch KEEPER_CONFIG_DIR so
+// `--state` (which reads the required host matrix axes) resolves opus + sonnet
+// without touching the live ~/.config/keeper.
+const CLAUDE_ONLY_MATRIX = readFileSync(
+  join(PLAN_ROOT, "test", "fixtures", "matrix-claude-only.yaml"),
+  "utf-8",
+);
+const stateCfgDirs: string[] = [];
+afterAll(() => {
+  for (const d of stateCfgDirs) rmSync(d, { recursive: true, force: true });
+});
+function withClaudeOnlyMatrix<T>(fn: () => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "mgs-cfg-"));
+  stateCfgDirs.push(dir);
+  writeFileSync(join(dir, "matrix.yaml"), CLAUDE_ONLY_MATRIX);
+  const prev = process.env.KEEPER_CONFIG_DIR;
+  process.env.KEEPER_CONFIG_DIR = dir;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.KEEPER_CONFIG_DIR;
+    else process.env.KEEPER_CONFIG_DIR = prev;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // on-disk config ↔ live axes + references cache
 // ---------------------------------------------------------------------------
 
 describe("on-disk selector config", () => {
-  test("passes the drift gate (coverage both directions + hash parity)", () => {
+  test("passes the host-blind integrity gate (structural + research-hash parity)", () => {
+    // No axis read — the gate is green with no host matrix present.
     const result = checkModelGuidanceFromDisk(PLAN_ROOT);
     expect(result.errors).toEqual([]);
     expect(result.ok).toBe(true);
   });
 
   test("is readable off disk with no compile step and carries selector + usage + a block per axis value", () => {
-    const matrix = loadSubagentsMatrixFromDisk(
-      join(PLAN_ROOT, "subagents.yaml"),
-    );
+    const matrix = effectiveMatrix();
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
@@ -139,21 +164,17 @@ describe("on-disk selector config", () => {
     expect(agentLower).toContain("not difficulty");
   });
 
-  test("subagents.yaml header cross-references model-selector.yaml", () => {
-    const text = readFileSync(join(PLAN_ROOT, "subagents.yaml"), "utf-8");
-    expect(text).toContain("model-selector.yaml");
-  });
-
   test("state mode classifies every model fresh and every effort present", () => {
-    const matrix = loadSubagentsMatrixFromDisk(
-      join(PLAN_ROOT, "subagents.yaml"),
+    // --state reads its axes from the required v2 host matrix; pin a claude-only
+    // roster so the classification is deterministic.
+    const state = withClaudeOnlyMatrix(() =>
+      classifyModelGuidanceFromDisk(PLAN_ROOT),
     );
-    const state = classifyModelGuidanceFromDisk(PLAN_ROOT);
     expect(state.models.opus.state).toBe("fresh");
     expect(state.models.opus.hash_parity).toBe(true);
     expect(state.models.sonnet.state).toBe("fresh");
     expect(state.models.sonnet.hash_parity).toBe(true);
-    for (const effort of matrix.efforts) {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
       expect(state.efforts[effort].state).toBe("present");
     }
   });

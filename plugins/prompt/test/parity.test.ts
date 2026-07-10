@@ -35,9 +35,9 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import {
-  DEFAULT_WRAPPER_EFFORT,
-  DEFAULT_WRAPPER_MODEL,
-  effectiveMatrixFromDisk,
+  HostMatrixConfigError,
+  hostMatrixV2EffortsFor,
+  loadHostMatrixV2,
 } from "../../plan/src/host_matrix.ts";
 import { run as runCheckGenerated } from "../src/check_generated.ts";
 import { run as runRender } from "../src/render.ts";
@@ -78,12 +78,11 @@ const roots: NormalizeRoots = {
   keeperRoot: KEEPER_ROOT,
 };
 
-/** An empty config dir every in-process render resolves as its
- *  `KEEPER_CONFIG_DIR`, so no host `~/.config/keeper/matrix.yaml` leaks into the
- *  golden compares — with no matrix present the render falls back to the embedded
- *  claude-only defaults, keeping the suite host-independent. */
-const SANDBOX_CONFIG_DIR = mkdtempSync(join(tmpdir(), "prompt-parity-cfg-"));
-afterAll(() => rmSync(SANDBOX_CONFIG_DIR, { recursive: true, force: true }));
+/** The committed claude-only v2 host matrix every in-process render resolves as
+ *  its `KEEPER_CONFIG_DIR`, so no operator `~/.config/keeper/matrix.yaml` leaks
+ *  into the golden compares. Its cell set — opus/sonnet × the five efforts, all
+ *  native — is exactly what the render-plugin-templates golden tree pins. */
+const SANDBOX_CONFIG_DIR = join(FIXTURES_DIR, "host-matrix");
 
 interface CandidateRun {
   stdout: Buffer;
@@ -195,7 +194,7 @@ function renderPlanTree(): string {
 
 function copyPlanPluginSkeleton(work: string): void {
   const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
-  for (const entry of [".claude-plugin", "template", "subagents.yaml"]) {
+  for (const entry of [".claude-plugin", "template"]) {
     cpSync(join(livePlanRoot, entry), join(work, entry), { recursive: true });
   }
   writeFileSync(join(work, ".git"), ""); // synthetic project-root marker
@@ -387,35 +386,66 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs golden", ()
 });
 
 // ===========================================================================
-// 3. WRAPPED WORKER CELLS — host provider matrix overlay (ADR 0010)
+// 3. WORKER CELLS — the REQUIRED v2 host worker matrix (ADR 0036)
 //
-// These run the worktree renderer in-process under a sandboxed KEEPER_CONFIG_DIR.
-// An empty dir → embedded claude-only defaults; a dir carrying a fixture
-// matrix.yaml → the wrapped-cell axes it declares.
+// These run the worktree renderer in-process under a pinned KEEPER_CONFIG_DIR.
+// The matrix is required: an absent/unparseable/schema-invalid/empty matrix
+// aborts the render with a typed four-state error and writes no partial tree; a
+// present matrix's `subagent_models × effortsFor(capability)` is the cell set.
 // ===========================================================================
 
-describe("wrapped worker cells: host provider matrix overlay", () => {
-  const LIVE_PLAN_SUBAGENTS = join(
-    KEEPER_ROOT,
-    "plugins",
-    "plan",
-    "subagents.yaml",
-  );
+describe("worker cells: the required v2 host worker matrix", () => {
+  // The pinned committed claude-only matrix (opus/sonnet × five efforts, all
+  // native), byte-for-byte the fixture the golden tree was captured under.
+  const CLAUDE_ONLY_MATRIX = [
+    "efforts: [low, medium, high, xhigh, max]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus, sonnet]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus, sonnet]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
 
-  // claude serves opus (native); codex serves the wrapped capability gpt-5.5 with
-  // a native-id alias; pi also serves gpt-5.5 (pecking-order overlap — allowed).
-  const FIXTURE_MATRIX = [
+  // claude serves opus (native); codex serves the wrapped capability
+  // gpt-5.5 (cost-ascending first among wrapped providers, so it wins); pi's
+  // gpt-5.5 entry is shadowed cross-provider (first provider wins, logged).
+  const MULTI_PROVIDER_MATRIX = [
     "efforts: [medium, high]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus, gpt-5.5]",
     "providers:",
     "  - name: claude",
     "    models: [opus]",
     "  - name: codex",
-    "    models:",
-    "      - name: gpt-5.5",
-    "        native: gpt-5.5-codex",
+    "    models: [gpt-5.5]",
     "  - name: pi",
     "    models: [gpt-5.5]",
-    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: xhigh",
+    "",
+  ].join("\n");
+
+  // A ragged roster: opus renders only [high], gpt-5.5 renders only [medium], so
+  // the {model × effort} cube is non-rectangular. Each capability's own effort
+  // list drives its fan-out.
+  const RAGGED_MATRIX = [
+    "efforts: [medium, high]",
+    "subagent_templates: [template/agents/worker.md.tmpl]",
+    "subagent_models: [opus, gpt-5.5]",
+    "providers:",
+    "  - name: claude",
+    "    models:",
+    "      - id: opus",
+    "        efforts: [high]",
+    "  - name: codex",
+    "    models:",
+    "      - id: gpt-5.5",
+    "        efforts: [medium]",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
@@ -429,9 +459,10 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     }
   });
 
-  /** A tracked temp config dir, optionally carrying a `matrix.yaml`. */
+  /** A tracked temp config dir, optionally carrying a `matrix.yaml`. Absent
+   *  `matrixYaml` yields an EMPTY dir — the absent-matrix state. */
   function tmpConfig(matrixYaml?: string): string {
-    const dir = mkdtempSync(join(tmpdir(), "prompt-wrapped-cfg-"));
+    const dir = mkdtempSync(join(tmpdir(), "prompt-cell-cfg-"));
     trackedCfgDirs.push(dir);
     if (matrixYaml !== undefined) {
       writeFileSync(join(dir, "matrix.yaml"), matrixYaml);
@@ -439,13 +470,12 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     return dir;
   }
 
-  /** `effectiveMatrixFromDisk` over the live plan subagents.yaml, resolved under
-   *  `configDir` (its matrix.yaml, if any, overlays the embedded defaults). */
-  function effectiveUnder(configDir: string) {
+  /** `loadHostMatrixV2` resolved under `configDir` as KEEPER_CONFIG_DIR. */
+  function matrixUnder(configDir: string) {
     const saved = process.env.KEEPER_CONFIG_DIR;
     process.env.KEEPER_CONFIG_DIR = configDir;
     try {
-      return effectiveMatrixFromDisk(LIVE_PLAN_SUBAGENTS);
+      return loadHostMatrixV2();
     } finally {
       if (saved === undefined) {
         delete process.env.KEEPER_CONFIG_DIR;
@@ -461,7 +491,7 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     work: string;
     rc: number;
   } {
-    const work = mkdtempSync(join(tmpdir(), "prompt-wrapped-plan-"));
+    const work = mkdtempSync(join(tmpdir(), "prompt-cell-plan-"));
     copyPlanPluginSkeleton(work);
     const saved = process.env.KEEPER_CONFIG_DIR;
     process.env.KEEPER_CONFIG_DIR = configDir;
@@ -487,62 +517,98 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
       .sort();
   }
 
-  test("no host matrix → embedded claude-only axes, all native, default wrapper", () => {
-    const m = effectiveUnder(tmpConfig());
+  /** True when a render aborted BEFORE writing any output shape into `work`. */
+  function noPartialTree(work: string): boolean {
+    return ["commands", "skills", "agents", "workers"].every(
+      (shape) => !existsSync(join(work, shape)),
+    );
+  }
+
+  test("a claude-only matrix: all-native axes, the wrapper driver from the host", () => {
+    const m = matrixUnder(tmpConfig(CLAUDE_ONLY_MATRIX));
     expect([...m.models].sort()).toEqual(["opus", "sonnet"]);
     expect([...m.efforts]).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    // With no host matrix every model shares the flat axis — the cube stays
-    // rectangular (each model's effortsFor equals the top-level efforts).
+    // Every model shares the flat axis — the cube stays rectangular.
     for (const model of m.models) {
-      expect([...m.effortsFor(model)]).toEqual([...m.efforts]);
+      expect(hostMatrixV2EffortsFor(m, model)).toEqual([...m.efforts]);
     }
-    expect(m.driverFor("opus")).toBe("native");
-    expect(m.driverFor("sonnet")).toBe("native");
-    expect(m.wrapper_driver).toEqual({
-      model: DEFAULT_WRAPPER_MODEL,
-      effort: DEFAULT_WRAPPER_EFFORT,
-    });
+    expect(m.driverByModel.get("opus")).toBe("native");
+    expect(m.driverByModel.get("sonnet")).toBe("native");
+    expect(m.wrapper_driver).toEqual({ model: "sonnet", effort: "high" });
   });
 
-  test("a fixture matrix overrides the axes: wrapped model + driver + wrapper from the host", () => {
-    const m = effectiveUnder(tmpConfig(FIXTURE_MATRIX));
+  test("a multi-provider matrix: wrapped model + driver + wrapper + shadow log from the host", () => {
+    const m = matrixUnder(tmpConfig(MULTI_PROVIDER_MATRIX));
     expect([...m.models].sort()).toEqual(["gpt-5.5", "opus"]);
     expect([...m.efforts]).toEqual(["medium", "high"]);
-    // claude membership → native; a model served only by codex/pi → wrapped.
-    expect(m.driverFor("opus")).toBe("native");
-    expect(m.driverFor("gpt-5.5")).toBe("wrapped");
+    // claude membership → native; a capability served only by codex/pi → wrapped.
+    expect(m.driverByModel.get("opus")).toBe("native");
+    expect(m.driverByModel.get("gpt-5.5")).toBe("wrapped");
     expect(m.wrapper_driver).toEqual({ model: "sonnet", effort: "xhigh" });
+    // pi's gpt-5.5 is shadowed by codex (first provider wins).
+    expect(m.shadowed).toEqual([
+      {
+        provider: "pi",
+        capability: "gpt-5.5",
+        launchId: "gpt-5.5",
+        winner: "codex",
+      },
+    ]);
   });
 
-  test("a malformed matrix fails loud, never a silent fall-back to defaults", () => {
+  test("an absent matrix throws the typed four-state 'absent' error (no silent fallback)", () => {
+    let caught: unknown;
+    try {
+      matrixUnder(tmpConfig());
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(HostMatrixConfigError);
+    expect((caught as HostMatrixConfigError).state).toBe("absent");
+  });
+
+  test("a schema-invalid matrix throws loud, never a silent fall-back to defaults", () => {
     // providers must be a non-empty list — a mapping is malformed.
     const cfg = tmpConfig(
-      "efforts: [high]\nproviders: {}\nsubagents: [work]\nwrapper_driver:\n  model: sonnet\n  effort: high\n",
+      "efforts: [high]\nsubagent_templates: [template/agents/worker.md.tmpl]\nsubagent_models: [opus]\nproviders: {}\nwrapper_driver:\n  model: sonnet\n  effort: high\n",
     );
-    expect(() => effectiveUnder(cfg)).toThrow();
+    let caught: unknown;
+    try {
+      matrixUnder(cfg);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(HostMatrixConfigError);
+    expect((caught as HostMatrixConfigError).state).toBe("schema-invalid");
   });
 
-  test("a model served by claude AND a wrapped provider fails loud (ambiguous driver)", () => {
+  test("an escaping subagent_templates entry is rejected upstream at load time", () => {
     const cfg = tmpConfig(
       [
         "efforts: [high]",
+        "subagent_templates: ['../escape.md.tmpl']",
+        "subagent_models: [opus]",
         "providers:",
         "  - name: claude",
-        "    models: [gpt-5.5]",
-        "  - name: codex",
-        "    models: [gpt-5.5]",
-        "subagents: [work]",
+        "    models: [opus]",
         "wrapper_driver:",
         "  model: sonnet",
         "  effort: high",
         "",
       ].join("\n"),
     );
-    expect(() => effectiveUnder(cfg)).toThrow();
+    let caught: unknown;
+    try {
+      matrixUnder(cfg);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(HostMatrixConfigError);
+    expect((caught as HostMatrixConfigError).state).toBe("schema-invalid");
   });
 
-  test("acceptance 1 — no matrix renders byte-identical to the golden tree (in-process)", () => {
-    const { work, rc } = renderPlanInProcess(tmpConfig());
+  test("acceptance 1 — a claude-only matrix renders byte-identical to the golden tree (in-process)", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig(CLAUDE_ONLY_MATRIX));
     try {
       expect(rc).toBe(0);
       const gotFiles = collectTree(work);
@@ -566,11 +632,11 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     }
   });
 
-  test("acceptance 2 — a fixture matrix fans out one cell per capability model × effort", () => {
-    const { work, rc } = renderPlanInProcess(tmpConfig(FIXTURE_MATRIX));
+  test("acceptance 2 — a multi-provider matrix fans out one cell per capability × effort", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig(MULTI_PROVIDER_MATRIX));
     try {
       expect(rc).toBe(0);
-      // model axis {opus, gpt-5.5} × efforts {medium, high} — one cell each.
+      // cell axis {opus, gpt-5.5} × efforts {medium, high} — one cell each.
       expect(workerCellDirs(work)).toEqual([
         "gpt-5.5-high",
         "gpt-5.5-medium",
@@ -605,34 +671,12 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     }
   });
 
-  // A ragged roster: opus renders only [high], gpt-5.5 renders only [medium], so
-  // the {model × effort} cube is non-rectangular. Each model's own effort list
-  // drives its fan-out.
-  const RAGGED_MATRIX = [
-    "efforts: [medium, high]",
-    "providers:",
-    "  - name: claude",
-    "    models:",
-    "      - name: opus",
-    "        efforts: [high]",
-    "  - name: codex",
-    "    models:",
-    "      - name: gpt-5.5",
-    "        native: gpt-5.5-codex",
-    "        efforts: [medium]",
-    "subagents: [work]",
-    "wrapper_driver:",
-    "  model: sonnet",
-    "  effort: xhigh",
-    "",
-  ].join("\n");
-
   test("acceptance 2 (ragged) — per-model effort overrides fan out a non-rectangular cell set", () => {
-    // effortsFor(opus)=[high], effortsFor(gpt-5.5)=[medium] — the effective matrix
-    // exposes the ragged lists.
-    const m = effectiveUnder(tmpConfig(RAGGED_MATRIX));
-    expect([...m.effortsFor("opus")]).toEqual(["high"]);
-    expect([...m.effortsFor("gpt-5.5")]).toEqual(["medium"]);
+    // effortsFor(opus)=[high], effortsFor(gpt-5.5)=[medium] — the matrix exposes
+    // the ragged lists.
+    const m = matrixUnder(tmpConfig(RAGGED_MATRIX));
+    expect(hostMatrixV2EffortsFor(m, "opus")).toEqual(["high"]);
+    expect(hostMatrixV2EffortsFor(m, "gpt-5.5")).toEqual(["medium"]);
 
     const { work, rc } = renderPlanInProcess(tmpConfig(RAGGED_MATRIX));
     try {
@@ -661,8 +705,64 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
     }
   });
 
+  test("acceptance 2 — an absent matrix aborts the render (rc 1) and writes no partial tree", () => {
+    const { work, rc } = renderPlanInProcess(tmpConfig());
+    try {
+      expect(rc).toBe(1);
+      expect(noPartialTree(work)).toBe(true);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("acceptance 2 — a schema-invalid matrix aborts the render (rc 1) and writes no partial tree", () => {
+    const { work, rc } = renderPlanInProcess(
+      tmpConfig(
+        "efforts: [high]\nsubagent_templates: [template/agents/worker.md.tmpl]\nsubagent_models: [opus]\nproviders: {}\nwrapper_driver:\n  model: sonnet\n  effort: high\n",
+      ),
+    );
+    try {
+      expect(rc).toBe(1);
+      expect(noPartialTree(work)).toBe(true);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("acceptance 5 — an inventory-listed template missing manifest_description errors, writing no cell manifest", () => {
+    const work = mkdtempSync(join(tmpdir(), "prompt-cell-nomanifest-"));
+    const cfg = tmpConfig(CLAUDE_ONLY_MATRIX);
+    const saved = process.env.KEEPER_CONFIG_DIR;
+    try {
+      copyPlanPluginSkeleton(work);
+      // Strip the manifest_description: line from the (copied) cell template so
+      // the listed inventory template lacks the required field.
+      const tmpl = join(work, "template", "agents", "worker.md.tmpl");
+      writeFileSync(
+        tmpl,
+        readFileSync(tmpl, "utf-8").replace(/^manifest_description:.*\n/m, ""),
+      );
+      process.env.KEEPER_CONFIG_DIR = cfg;
+      const rc = runRenderPluginTemplates({ projectRoot: work });
+      expect(rc).toBe(1);
+      // No per-cell plugin.json is emitted for a cell whose template lacked the field.
+      expect(
+        existsSync(
+          join(work, "workers", "opus-high", ".claude-plugin", "plugin.json"),
+        ),
+      ).toBe(false);
+    } finally {
+      if (saved === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = saved;
+      }
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
   test("the composed shell branches the frontmatter on the driver — native keeps the model/effort/maxTurns, wrapped bakes the wrapper driver", () => {
-    const { work, rc } = renderPlanInProcess(tmpConfig(FIXTURE_MATRIX));
+    const { work, rc } = renderPlanInProcess(tmpConfig(MULTI_PROVIDER_MATRIX));
     try {
       expect(rc).toBe(0);
       // A native cell (claude serves opus) keeps its own model + effort at the
@@ -705,7 +805,7 @@ describe("wrapped worker cells: host provider matrix overlay", () => {
   });
 
   test("a wrapped cell body carries the full delegate → adjudicate → normalize → commit contract", () => {
-    const { work, rc } = renderPlanInProcess(tmpConfig(FIXTURE_MATRIX));
+    const { work, rc } = renderPlanInProcess(tmpConfig(MULTI_PROVIDER_MATRIX));
     try {
       expect(rc).toBe(0);
       const wrapped = readFileSync(

@@ -45,7 +45,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { ConfigError, loadPresetCatalog } from "./agent/config";
-import { matrixConfigPath } from "./agent/matrix";
+import { loadMatrixV2, MatrixConfigError } from "./agent/matrix";
 import type { Triple } from "./agent/triple";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
@@ -137,6 +137,7 @@ import {
   epicHasActiveResolver,
   epicHasOccupyingJob,
   FINALIZER_GUARD_S,
+  type HostMatrixSnapshot,
   isFinalizerVerb,
   isStoppedJobLive,
   KEEPER_ROOT,
@@ -166,11 +167,7 @@ import {
 import { isPidAlive, runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
-import {
-  defaultRouteProbe,
-  defaultShadowingWorkProbe,
-  resolveWorkerCell,
-} from "./worker-cell";
+import { defaultShadowingWorkProbe, resolveWorkerCell } from "./worker-cell";
 import {
   ELIGIBLE_REASON,
   memoizedAssessRepo,
@@ -255,6 +252,7 @@ export {
 export type {
   DispatchKey,
   EpicRecoverVerdict,
+  HostMatrixSnapshot,
   LaneMergedEntry,
   PlannedLaunch,
   ReconcileDecision,
@@ -3605,10 +3603,11 @@ export async function runReconcileCycle(
     }
     // Per-cell worker-plugin guards, BEFORE any launch side effect (mirrors the
     // `worktreeReject` / `cwd-missing` per-key skip shape). The shared
-    // `resolveWorkerCell` seam applies the invalid → missing → shadowed
-    // precedence over the pure compose result the launch already carries
-    // (`plan.pluginDir` / `plan.pluginDirReject`); this producer re-composes the
-    // EXACT sticky reason strings from the machine kind, so a doomed launch
+    // `resolveWorkerCell` seam applies the bad-matrix → invalid → missing →
+    // shadowed precedence over the pure compose result the launch already carries
+    // (`plan.pluginDir` / `plan.pluginDirReject` / `plan.matrixReject` — the last
+    // built from the cycle's ONE host-matrix snapshot); this producer re-composes
+    // the EXACT sticky reason strings from the machine kind, so a doomed launch
     // mints a sticky `DispatchFailed` (cleared by `retry_dispatch`) and skips
     // per-key without burning a cold boot, and a sibling launch keeps
     // dispatching. The switch is closed by `assertNever` — a new reject kind
@@ -3621,24 +3620,32 @@ export async function runReconcileCycle(
         ...(plan.pluginDirReject !== undefined
           ? { reject: plan.pluginDirReject }
           : {}),
+        ...(plan.matrixReject !== undefined
+          ? { matrixReject: plan.matrixReject }
+          : {}),
       },
       {
         dirExists,
         probeShadow: probeShadowMemoized,
-        // Bind the route probe to the TASK's capability model (the model the cell
-        // names), NOT the orchestrator session `plan.model` — a wrapped cell's
-        // resolution turns on classifying the model it actually runs.
-        probeRoute: () => defaultRouteProbe(plan.cellModel ?? ""),
       },
     );
     if (!cell.ok) {
       let reason: string;
       switch (cell.kind) {
-        // (1) an out-of-matrix {model, effort} the pure compose flagged.
+        // (1) the cycle's host matrix failed to load — the four-state discriminator
+        //     (ADR 0036). No matrix ⇒ no cell to compose, so this ranks first; the
+        //     reason NAMES the state and carries the copy-the-example remediation
+        //     the MatrixConfigError message already bakes in.
+        case "bad-matrix":
+          reason =
+            `worker-cell-bad-matrix: ${cell.state} — ${cell.detail} ` +
+            "Then 'keeper retry-dispatch'.";
+          break;
+        // (2) an out-of-matrix {model, effort} the pure compose flagged.
         case "out-of-matrix":
           reason = `worker-cell-invalid: ${cell.message}`;
           break;
-        // (2) a cell whose generated plugin manifest is absent — `claude
+        // (3) a cell whose generated plugin manifest is absent — `claude
         //     --plugin-dir` would fall back to the dir basename and `/plan:work`
         //     could not resolve `work:worker`. Remediation: regenerate the tree.
         case "missing":
@@ -3649,7 +3656,7 @@ export async function runReconcileCycle(
             `claude --plugin-dir falls back to the dir basename and '/plan:work' ` +
             `cannot resolve 'work:worker')`;
           break;
-        // (3) a non-cell `work`-named plugin sitting in a claude `plugin_scan_dir`
+        // (4) a non-cell `work`-named plugin sitting in a claude `plugin_scan_dir`
         //     re-claims the `work:worker` constant at launch and silently shadows
         //     the `--plugin-dir`-selected cell (silent wrong-worker spawn).
         case "shadowed":
@@ -3658,14 +3665,6 @@ export async function runReconcileCycle(
             `plugin in a claude plugin_scan_dir would steal 'work:worker' from ` +
             `the '${cell.pluginDir}' cell at launch (silent wrong-worker spawn); ` +
             "remove or rename it, then 'keeper retry-dispatch'";
-          break;
-        // (4) a wrapped capability model the host matrix routes to zero
-        //     configured providers (or a malformed matrix.yaml).
-        case "no-route":
-          reason =
-            `worker-cell-no-route: '${cell.model}' is a wrapped model with no ` +
-            `configured provider in ${matrixConfigPath()} — add a provider serving ` +
-            "it to the roster (or correct the task's model), then 'keeper retry-dispatch'";
           break;
         default:
           assertNever(cell);
@@ -3679,11 +3678,10 @@ export async function runReconcileCycle(
       });
       continue;
     }
-    // The LATE-resolved cell dir. For a native cell it equals `plan.pluginDir`;
-    // for a routed WRAPPED candidate the seam re-derived the host cell path the
-    // pure embedded compose could not (`plan.pluginDir` is null there). Thread
-    // THIS — never the stale `plan.pluginDir` — into both launch shapes below, or
-    // the wrapped worker launches without its cell plugin (the bug, one layer down).
+    // The resolved cell dir off the ok-result — equal to `plan.pluginDir` for any
+    // in-matrix cell (native or wrapped alike compose their dir in the pure core
+    // from the injected axes), and `null` for a cell-less launch. Threaded into both
+    // launch shapes below.
     const resolvedPluginDir = cell.pluginDir;
     // Worktree-mode producer step, BEFORE `confirmRunning` mints the
     // durable Dispatched. `launchCwd` is the cwd `confirmRunning` actually launches
@@ -7252,6 +7250,32 @@ export async function loadReconcileSnapshot(
   const { model: workerModel, effort: workerEffort } =
     resolveWorkerLaunchConfig();
 
+  // Load the host worker matrix (ADR 0036) ONCE per cycle and attach it as a
+  // serializable four-state discriminated field — the parsed cell axes when good,
+  // else the typed failure the pure `reconcile` threads onto every `work` launch as
+  // a distress sticky (dispatch parks, the daemon loop NEVER `fatalExit`s — a
+  // LaunchAgent respawn would crash-loop a bad config). This single read is why one
+  // reconcile cycle sees exactly one matrix verdict: a mid-cycle edit cannot flip
+  // it. A non-typed throw is a real bug (loadMatrixV2 wraps every load failure as a
+  // MatrixConfigError) — let it propagate to `driveCycle`'s backstop, which logs and
+  // re-drives on the next pulse, never launching against an unknown matrix state.
+  let hostMatrix: HostMatrixSnapshot;
+  try {
+    const matrix = loadMatrixV2();
+    hostMatrix = {
+      ok: true,
+      models: matrix.subagentModels,
+      effortsByModel: matrix.effortsByModel,
+      efforts: matrix.efforts,
+    };
+  } catch (err) {
+    if (err instanceof MatrixConfigError) {
+      hostMatrix = { ok: false, state: err.state, detail: err.message };
+    } else {
+      throw err;
+    }
+  }
+
   // Resolve every epic's repos to a single git toplevel for the worktree
   // lane geometry — the ONE git-resolution pass (mirrors `unseededRoots`), gated on
   // `worktreeMode` so an OFF cycle adds ZERO git spawns (empty map). A FRESH
@@ -7369,6 +7393,7 @@ export async function loadReconcileSnapshot(
     unseededRoots,
     workerModel,
     workerEffort,
+    hostMatrix,
     maxConcurrentJobs,
     maxConcurrentPerRoot,
     worktreeMode,
