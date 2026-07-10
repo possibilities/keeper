@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 3,
+        "insertions": 11
+      },
+      "done_summary": "Fixed SKILL.md --resume doc drift (no longer claims --session is rejected or that --name should be passed on a resumed launch) and dropped the bare fn-1232 fn-id from resume-policy.ts and its test doc-comments, keeping the ADR 0034 pointer.",
+      "input_hash": "934bbdfb82832b1befe72561a0fe6d6d89d561a7669ff5fecc200206d9ca49fd",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1915,
+      "spec_md": "## Description\n\nTwo verified text-accuracy fixes on the pair-resume surface (findings F1 and F2).\n\nF1 (doc-vs-code drift) \u2014 `plugins/keeper/skills/pair/SKILL.md` around lines\n284-285 claims `--resume` \"Rejects `--preset`/`--model`/`--effort`/`--session`\"\nand that `--name` should be passed \"on every launch (fresh or resumed)\". But\n`runResumeCaptureSubcommand` in `src/agent/main.ts` (reject check at ~1456-1466\ncovers only model/effort/preset; launch uses `posture: {}` at ~1557) neither\nrejects nor threads `--session`/`--name` \u2014 they are silently dropped. The code\nbehavior is deliberate (the resumed session keeps its own config/name), so fix\nthe DOC: drop `--session` from the `--resume` \"Rejects\" list and qualify the\n`--name` guidance so it does not tell the human/agent to pass `--name` on a\nresume (a resumed partner keeps its original name).\n\nF2 (rule #0 fn-id in comments) \u2014 `src/agent/resume-policy.ts` (line ~2) and\n`test/agent-resume-policy.test.ts` (line ~2) open their doc-comments with\n\"(epic fn-1232, ADR 0034)\". CLAUDE.md rule #0 bans fn-ids in code comments.\nDrop \"epic fn-1232, \" from both openers, keeping the sanctioned \"ADR 0034\"\npointer.\n\nFiles: plugins/keeper/skills/pair/SKILL.md, src/agent/resume-policy.ts,\ntest/agent-resume-policy.test.ts.\n\nNo runtime behavior changes; documentation and comments only.\n\n## Acceptance\n\n- [ ] SKILL.md no longer lists `--session` as rejected by `--resume` and no longer instructs passing `--name` on a resumed launch\n- [ ] Neither resume-policy.ts nor agent-resume-policy.test.ts contains a bare `fn-1232` fn-id in comments; the ADR 0034 pointer remains\n- [ ] `bun test` stays green\n\n## Done summary\nFixed SKILL.md --resume doc drift (no longer claims --session is rejected or that --name should be passed on a resumed launch) and dropped the bare fn-1232 fn-id from resume-policy.ts and its test doc-comments, keeping the ADR 0034 pointer.\n## Evidence\n",
+      "task_id": "fn-1235-correct-pair-resume-docs-and-provenance.1",
+      "tier": "low",
+      "title": "Fix resume doc drift and fn-id comments"
+    }
+  ],
+  "created_at": "2026-07-10T09:30:20.383000Z",
+  "epic_id": "fn-1235-correct-pair-resume-docs-and-provenance",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "selection_input_hash": "934bbdfb82832b1befe72561a0fe6d6d89d561a7669ff5fecc200206d9ca49fd",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
