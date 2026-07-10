@@ -34,6 +34,7 @@ import {
 import { subscribeCollection } from "../src/readiness-client";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import { createViewShell } from "../src/view-shell";
+import { KEEPER_EPIC_BRANCH_PREFIX } from "../src/worktree-git";
 import { buildParseOptions, GIT_FLAGS } from "./descriptor";
 import { parseDuration } from "./duration";
 
@@ -179,13 +180,44 @@ function renderAttributions(
 }
 
 /**
+ * Display shortening for a keeper lane row header. A lane's dir basename
+ * restates its branch (`<repoName>-<repoDirHash>--<branch-with-dashes>`) and a
+ * rib branch carries the epic id twice (`keeper/epic/<epic_id>--<task_id>`), so
+ * the raw pair renders >200 chars of redundancy per header. When `branch` is
+ * under `keeper/epic/`, collapse to `{ name: <repoName>, branch: "lane
+ * <epic_id|task_id>" }`; any other branch (main checkout, foreign worktree)
+ * returns null and the caller renders the row untouched. Display-only — the
+ * full `project_dir` still rides the frame's state JSON sidecar.
+ */
+function laneHeaderParts(
+  name: string,
+  branch: string,
+): { name: string; branch: string } | null {
+  if (!branch.startsWith(KEEPER_EPIC_BRANCH_PREFIX)) return null;
+  const rest = branch.slice(KEEPER_EPIC_BRANCH_PREFIX.length);
+  if (rest.length === 0) return null;
+  const sep = rest.indexOf("--");
+  const tail = sep === -1 ? "" : rest.slice(sep + 2);
+  const id = tail.length > 0 ? tail : rest;
+  // `<repoName>-<repoDirHash>--…` → repoName. The repoDirHash is a base36
+  // uint32 (1-7 chars); a basename off that scheme keeps its full name.
+  let shortName = name;
+  const dashDash = name.indexOf("--");
+  if (dashDash > 0) {
+    const head = name.slice(0, dashDash);
+    const dehashed = head.replace(/-[0-9a-z]{1,7}$/, "");
+    shortName = dehashed.length > 0 ? dehashed : head;
+  }
+  return { name: shortName, branch: `lane ${id}` };
+}
+
+/**
  * Render the `git`-collection rows into the per-frame block list. Each row
  * with non-zero ahead / dirty / orphan counts produces one block; rows
  * with all zeroes are dropped (the empty-row filter matches the
  * pre-refactor behavior). Exported as `string[]` (one entry per kept
  * block) so the live-shell wrapper consumes lines, not a joined string;
- * the script's emit seam still joins with `\n` for stdout / sidecar
- * writes.
+ * the script's emit seam still joins for stdout / sidecar writes.
  *
  * Layout (file-centric, one line per dirty file with source-badged
  * multi-attribution):
@@ -194,6 +226,9 @@ function renderAttributions(
  *     path/to/file.ts [M ] tool@sess-a, bash@sess-b, inferred@sess-c
  *       ↳ renamed from path/to/orig.ts
  *     path/to/other.ts [??] <orphan>
+ *
+ * A keeper lane row collapses its dir/branch redundancy via
+ * {@link laneHeaderParts}: `(repo) [lane <epic_id|task_id>] ...`.
  *
  * `dirty=` carries the project-wide dirty file count (`dirty_count`);
  * `orphan=` is the strict-mystery `orphaned_count` (files with zero
@@ -209,8 +244,12 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
   const blocks: string[] = [];
   for (const row of rows) {
     const dir = seg(row.project_dir);
-    const name = basename(dir) || dir;
-    const branch = row.branch == null ? "detached" : seg(row.branch);
+    const rawName = basename(dir) || dir;
+    const rawBranch = row.branch == null ? "detached" : seg(row.branch);
+    const lane =
+      row.branch == null ? null : laneHeaderParts(rawName, rawBranch);
+    const name = lane === null ? rawName : lane.name;
+    const branch = lane === null ? rawBranch : lane.branch;
     const aheadCount =
       typeof row.ahead === "number" && row.ahead > 0 ? row.ahead : 0;
     const ahead = aheadCount > 0 ? ` +${aheadCount}` : "";
@@ -268,12 +307,13 @@ export function renderRowBlocks(rows: Record<string, unknown>[]): string[] {
  * Top-level renderer — returns the frame body as one element per output
  * line, suitable for `liveShell.pushFrame`. Internally fans out via
  * `renderRowBlocks` (one multi-line block per non-empty worktree row),
- * joins those blocks with `\n`, then splits on `\n` so each individual
- * row becomes its own array element. The caller joins with `\n` for
+ * joins those blocks with a blank separator line so adjacent worktrees
+ * stay visually distinct, then splits on `\n` so each individual row
+ * becomes its own array element. The caller joins with `\n` for
  * stdout / sidecar / byte-compare.
  */
 export function renderRowLines(rows: Record<string, unknown>[]): string[] {
-  const body = renderRowBlocks(rows).join("\n");
+  const body = renderRowBlocks(rows).join("\n\n");
   return body === "" ? ["no changes"] : body.split("\n");
 }
 

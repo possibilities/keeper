@@ -31,7 +31,7 @@
  */
 
 import { expect, test } from "bun:test";
-import { renderRowBlocks } from "../cli/git";
+import { renderRowBlocks, renderRowLines } from "../cli/git";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
 import {
   type ConnectFactory,
@@ -408,6 +408,88 @@ test("renderRowBlocks: ahead-only row shows +N on the project line, no unpushed 
   if (!block) throw new Error("missing block");
   expect(block).toMatch(/^\(ahead\) \[main \+3\]/);
   expect(block).not.toContain("unpushed");
+});
+
+// ---------------------------------------------------------------------------
+// renderRowBlocks: keeper lane header shortening — the dir basename restates
+// the branch and a rib branch restates the epic id, so lane rows collapse to
+// `(repo) [lane <id>]`; non-lane rows render untouched.
+// ---------------------------------------------------------------------------
+
+const LANE_EPIC = "fn-1230-launch-triples-over-preset-catalog";
+
+function laneRow(
+  projectDir: string,
+  branch: string | null,
+): Record<string, unknown> {
+  return {
+    project_dir: projectDir,
+    branch,
+    ahead: 0,
+    behind: 0,
+    dirty_count: 1,
+    orphaned_count: 0,
+    unattributed_to_live_count: 0,
+    dirty_files: [{ xy: ".M", path: "src/foo.ts", attributions: [] }],
+  };
+}
+
+test("renderRowBlocks: epic base lane header collapses to (repo) [lane <epic_id>]", () => {
+  const blocks = renderRowBlocks([
+    laneRow(
+      `/wt/keeper-qzvs8i--keeper-epic-${LANE_EPIC}`,
+      `keeper/epic/${LANE_EPIC}`,
+    ),
+  ]);
+  expect(blocks).toHaveLength(1);
+  expect(blocks[0]).toMatch(
+    /^\(keeper\) \[lane fn-1230-launch-triples-over-preset-catalog\] dirty=1/,
+  );
+});
+
+test("renderRowBlocks: rib lane header collapses to (repo) [lane <task_id>]", () => {
+  const blocks = renderRowBlocks([
+    laneRow(
+      `/wt/keeper-qzvs8i--keeper-epic-${LANE_EPIC}--${LANE_EPIC}.3`,
+      `keeper/epic/${LANE_EPIC}--${LANE_EPIC}.3`,
+    ),
+  ]);
+  expect(blocks).toHaveLength(1);
+  expect(blocks[0]).toMatch(
+    /^\(keeper\) \[lane fn-1230-launch-triples-over-preset-catalog\.3\] dirty=1/,
+  );
+});
+
+test("renderRowBlocks: lane branch with an off-scheme basename keeps the full dir name", () => {
+  const blocks = renderRowBlocks([
+    laneRow("/repo/keeper", `keeper/epic/${LANE_EPIC}`),
+  ]);
+  expect(blocks).toHaveLength(1);
+  expect(blocks[0]).toMatch(/^\(keeper\) \[lane fn-1230-/);
+});
+
+test("renderRowBlocks: non-lane and detached rows render their raw name and branch", () => {
+  const blocks = renderRowBlocks([
+    laneRow("/wt/keeper-baseline--qzvs8i-abc123", null),
+    laneRow("/repo/keeper", "main"),
+  ]);
+  expect(blocks).toHaveLength(2);
+  expect(blocks[0]).toMatch(/^\(keeper-baseline--qzvs8i-abc123\) \[detached\]/);
+  expect(blocks[1]).toMatch(/^\(keeper\) \[main\]/);
+});
+
+test("renderRowLines: adjacent worktree blocks are separated by a blank line", () => {
+  const lines = renderRowLines([
+    laneRow("/repo/a", "main"),
+    laneRow("/repo/b", "main"),
+  ]);
+  expect(lines).toEqual([
+    "(a) [main] dirty=1 orphan=0 unattributed=0",
+    "  src/foo.ts [.M] <orphan>",
+    "",
+    "(b) [main] dirty=1 orphan=0 unattributed=0",
+    "  src/foo.ts [.M] <orphan>",
+  ]);
 });
 
 // ---------------------------------------------------------------------------
