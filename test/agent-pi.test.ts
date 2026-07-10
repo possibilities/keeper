@@ -197,6 +197,18 @@ describe("Pi passthrough commands", () => {
     expect(h.bootstrappedProfiles).toEqual(["work"]);
     expect(h.deps.env.PI_CODING_AGENT_DIR).toBe("/fake-home/.pi-profiles/work");
   });
+
+  test("the canonical AGENTS.md leaf-guard fn runs on a passthrough launch, fed no profiles", async () => {
+    // Pi passthrough launches (package commands like `list`) must still reach
+    // the leaf guard — fed the `() => []` arm, never the real profile list
+    // (non-empty here), so a re-gate behind !shouldPassthrough fails this.
+    const h = piHarness(["list"], {
+      listProfiles: () => ["default", "work"],
+    });
+    await runAndCapture(h, main);
+    expect(h.piStateSharingCalls).toHaveLength(1);
+    expect(h.piStateSharingCalls[0]).toEqual([]);
+  });
 });
 
 let tmpDir: string;
