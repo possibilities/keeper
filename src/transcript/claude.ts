@@ -9,7 +9,7 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type {
   SubagentSummary,
   TranscriptDocument,
@@ -108,7 +108,7 @@ export function discoverClaudeProjectsRoots(
 }
 
 export function encodeClaudeProject(project: string): string {
-  return resolve(project).replaceAll(sep, "-");
+  return resolve(project).replace(/[^A-Za-z0-9]/g, "-");
 }
 
 function isSafeSessionId(sessionId: string): boolean {

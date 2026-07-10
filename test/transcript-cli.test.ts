@@ -61,6 +61,27 @@ function writeSession(
   return path;
 }
 
+/**
+ * Writes a session directly into a literal, hard-coded bucket directory name,
+ * bypassing encodeClaudeProject entirely. Regression fixtures for the encoder
+ * must use this helper (never writeSession) so the expected bucket string
+ * cannot silently co-move with a future encoder change.
+ */
+function writeSessionInBucket(
+  bucket: string,
+  sessionId: string,
+  body: string,
+  modified: string,
+): string {
+  const projectDir = join(configDir, "projects", bucket);
+  mkdirSync(projectDir, { recursive: true });
+  const path = join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(path, `${body}\n`);
+  const time = new Date(modified);
+  utimesSync(path, time, time);
+  return path;
+}
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "keeper-transcript-"));
   configDir = join(root, "claude");
@@ -307,6 +328,95 @@ describe("keeper transcript list", () => {
     const conflict = run(["list", "--global", "--project", PROJECT]);
     expect(conflict.code).toBe(2);
     expect(conflict.stderr).toContain("mutually exclusive");
+  });
+});
+
+describe("encodeClaudeProject", () => {
+  test("replaces every non-alphanumeric character with a dash, one dash per character", () => {
+    expect(encodeClaudeProject("/work/alpha")).toBe("-work-alpha");
+    expect(encodeClaudeProject("/work/keeper-lane.3")).toBe(
+      "-work-keeper-lane-3",
+    );
+  });
+
+  test("adjacent non-alphanumeric characters yield adjacent dashes (non-collapsing)", () => {
+    expect(encodeClaudeProject("/work/foo_.bar")).toBe("-work-foo--bar");
+  });
+});
+
+describe("keeper transcript dotted/underscored project paths", () => {
+  test("list --project finds sessions for a worktree-lane-like dotted path", () => {
+    const dottedProject = "/work/keeper-qzvs8i.harden-transcript";
+    const dottedBucket = "-work-keeper-qzvs8i-harden-transcript";
+    const dottedSession = "33333333-3333-4333-8333-333333333333";
+    writeSessionInBucket(
+      dottedBucket,
+      dottedSession,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Dotted lane session",
+          sessionId: dottedSession,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T10:00:00.000Z",
+          cwd: dottedProject,
+          sessionId: dottedSession,
+          message: { role: "user", content: "Work in the dotted lane" },
+        }),
+      ].join("\n"),
+      "2026-07-09T10:01:00.000Z",
+    );
+
+    const listResult = run(["list", "--project", dottedProject, "--json"]);
+    expect(listResult.code).toBe(0);
+    const parsed = JSON.parse(listResult.stdout);
+    expect(
+      parsed.data.sessions.map((item: { sessionId: string }) => item.sessionId),
+    ).toEqual([dottedSession]);
+
+    const showResult = run([
+      dottedSession,
+      "--project",
+      dottedProject,
+      "--offset",
+      "0",
+    ]);
+    expect(showResult.code).toBe(0);
+    expect(showResult.stdout).toContain("Work in the dotted lane");
+  });
+
+  test("adjacent non-alphanumeric characters (underscore-dot) resolve to the same literal bucket", () => {
+    const project = "/work/foo_.bar";
+    const bucket = "-work-foo--bar";
+    const sessionId = "44444444-4444-4444-8444-444444444444";
+    writeSessionInBucket(
+      bucket,
+      sessionId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Underscore-dot session",
+          sessionId,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T11:00:00.000Z",
+          cwd: project,
+          sessionId,
+          message: { role: "user", content: "Work in the underscore-dot dir" },
+        }),
+      ].join("\n"),
+      "2026-07-09T11:01:00.000Z",
+    );
+
+    const listResult = run(["list", "--project", project, "--json"]);
+    expect(listResult.code).toBe(0);
+    const parsed = JSON.parse(listResult.stdout);
+    expect(
+      parsed.data.sessions.map((item: { sessionId: string }) => item.sessionId),
+    ).toEqual([sessionId]);
   });
 });
 
