@@ -41,5 +41,5 @@ Main-harness table: bare harness launch resolves its default triple to the right
 - [ ] No code path mints, validates, or resolves a named preset
 
 ## Done summary
-
+Switched every launch-config consumer (agent launch/run, dispatch --preset, worker/escalation resolvers, harness defaults) to the launch-triple grammar and retired the named preset catalog: presets.yaml now parses to six optional triple keys, a leftover presets: block fails loud with a migration hint, and the panel-member path keeps the retained Preset shape for task .5.
 ## Evidence
