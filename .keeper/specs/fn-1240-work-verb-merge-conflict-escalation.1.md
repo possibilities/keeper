@@ -64,5 +64,5 @@ No code change; the deliverable is the pinned producer (documented in the ADR) a
 - [ ] The ADR either confirms tasks .2/.3's design assumptions or flags the required reshape.
 
 ## Done summary
-
+Investigation + ADR: pinned the work-verb worktree-merge-conflict producer (provision() fan-in conflict branch in autopilot-worker.ts, via mergeBranchInto); verdict is correct-but-unserved sticky (exact MERGE_ESCALATION_REASON_TOKEN, retryable + sticky, matching the fn-1237 incident), not a lane-premerge mis-token; worktree-lane-wedge does not actively page. ADR 0039 records the four design decisions and confirms tasks .2/.3.
 ## Evidence

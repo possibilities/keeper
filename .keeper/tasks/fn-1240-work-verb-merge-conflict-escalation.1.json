@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Pin fan-in conflict producer and record classification ADR",
-  "updated_at": "2026-07-10T17:35:38.254000Z"
+  "updated_at": "2026-07-10T18:02:31.299000Z",
+  "worker_done_at": "2026-07-10T18:02:31.299000Z"
 }
