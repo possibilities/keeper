@@ -7,7 +7,7 @@
     "fn-1240-work-verb-merge-conflict-escalation"
   ],
   "id": "fn-1246-fix-work-verb-deconflict-brief-loading",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T22:19:46.323000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T22:19:45.350000Z"
+  "updated_at": "2026-07-10T22:19:46.323000Z"
 }
