@@ -1,6 +1,6 @@
 /**
- * Pure in-process tests for `src/agent/resume-policy.ts` (epic fn-1232, ADR
- * 0034) — the resume-by-name policy layer over the bus's `resolveTarget`.
+ * Pure in-process tests for `src/agent/resume-policy.ts` (ADR 0034) — the
+ * resume-by-name policy layer over the bus's `resolveTarget`.
  * Seeds synthetic `jobs` rows into a `freshMemDb` clone (mirroring
  * `test/bus-identity.test.ts`'s `seedJob` shape) plus `harness` /
  * `resume_target` / `cwd`. Every liveness / codex-back-fill probe is injected

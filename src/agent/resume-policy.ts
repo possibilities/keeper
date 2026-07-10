@@ -1,5 +1,5 @@
 /**
- * Resume-by-name policy (epic fn-1232, ADR 0034) — the thin decision layer
+ * Resume-by-name policy (ADR 0034) — the thin decision layer
  * pairing's resume surfaces (`keeper agent resume`, `agent run --resume`) sit
  * on. Resolution itself is NOT reimplemented here: {@link resolveResumeDecision}
  * calls the Agent Bus's `resolveTarget` (`src/bus-identity.ts`) with an EMPTY
