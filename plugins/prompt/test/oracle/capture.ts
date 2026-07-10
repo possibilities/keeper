@@ -98,10 +98,23 @@ interface RunResult {
   code: number;
 }
 
+/** The committed claude-only v2 host matrix the plan-tree capture renders under,
+ *  so the goldens stay host-blind — the render never reads the operator's live
+ *  `~/.config/keeper/matrix.yaml`. */
+const HOST_MATRIX_FIXTURE_DIR = join(FIXTURES_DIR, "host-matrix");
+
 /** Run `keeper prompt <args>` with a fixed cwd, returning raw stdout bytes +
- *  exit code. */
-function runOracle(args: string[], cwd: string): RunResult {
-  const proc = spawnSync("keeper", ["prompt", ...args], { cwd });
+ *  exit code. `envOverride` is merged over the inherited env (the plan render
+ *  pins KEEPER_CONFIG_DIR at the committed fixture). */
+function runOracle(
+  args: string[],
+  cwd: string,
+  envOverride?: Record<string, string>,
+): RunResult {
+  const proc = spawnSync("keeper", ["prompt", ...args], {
+    cwd,
+    env: envOverride ? { ...process.env, ...envOverride } : process.env,
+  });
   return {
     stdout: proc.stdout ?? Buffer.alloc(0),
     stderr: (proc.stderr ?? Buffer.alloc(0)).toString("utf-8"),
@@ -211,6 +224,7 @@ function renderPlanTree(
   const r = runOracle(
     ["render-plugin-templates", "--project-root", work],
     work,
+    { KEEPER_CONFIG_DIR: HOST_MATRIX_FIXTURE_DIR },
   );
   if (r.code !== 0) {
     rmSync(work, { recursive: true, force: true });

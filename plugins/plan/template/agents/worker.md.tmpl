@@ -1,6 +1,5 @@
 ---
 name: worker
-render_to: workers/{{ current_model }}-{{ current_effort }}
 manifest_description: "Plan task-execution worker for the {{ current_model }} model at {{ current_effort }} effort — provides the constant work:worker agent that /plan:work spawns. One work plugin per model×effort cell, selected at launch via --plugin-dir."
 description: Internal task-execution worker — spawned programmatically by `/plan:work` via the emitted `worker_agent` name, never invoked from user requests. Do not invoke directly — use `/plan:work` instead.
 {% if current_driver == "wrapped" -%}
