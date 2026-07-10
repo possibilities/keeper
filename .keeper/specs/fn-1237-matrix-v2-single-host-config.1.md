@@ -77,5 +77,5 @@ green on the rewritten example.
 - [ ] The existing v1 launcher surface (parseRoute, parseProviderModels, nativeIdFor, defaultRouteProbe, `keeper agent` providers resolve) is untouched, and worker-cell.test.ts, dispatch-cli.test.ts, and wrapped-cell-e2e.slow.test.ts stay green exactly as they pass today
 
 ## Done summary
-
+Added v2 host-matrix loaders (loadMatrixV2 / loadHostMatrixV2) beside the unchanged v1 parse layer in both islands: launch-id entries with basename-derived capabilities, subagent_models/subagent_templates, cross-provider dedup with visible shadow log, and typed four-state failures (absent/unparseable/schema-invalid/valid-but-empty) naming the path + example fix; retired route:/native:/name:/subagents: keys rejected by name. Added the fs/os-free worker_cells.ts leaf, rewrote matrix.example.yaml to v2, and pinned both islands with cross-island parity + anti-rot + four-state suites over shared fixtures. Per the coordinator re-scope, the v1 loaders and every consumer stay unchanged (runtime cutover deferred to task .2).
 ## Evidence
