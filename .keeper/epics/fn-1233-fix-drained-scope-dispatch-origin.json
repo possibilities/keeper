@@ -7,7 +7,7 @@
     "fn-1229-agent-friendly-await-scope-and"
   ],
   "id": "fn-1233-fix-drained-scope-dispatch-origin",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T03:46:59.643000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T03:46:58.708000Z"
+  "updated_at": "2026-07-10T03:46:59.643000Z"
 }
