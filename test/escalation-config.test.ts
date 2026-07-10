@@ -1,9 +1,9 @@
 /**
  * Unit tests for `src/escalation-config.ts` — the escalation-session launch-config
  * resolver. Mirrors the `resolveWorkerLaunchConfig` coverage: the `ESCALATION_*`
- * constant fallback, an `escalation` preset override (full + partial), the
- * independence from the `worker` preset, the swallow-to-constants posture on a
- * missing/malformed catalog, and the once-per-value non-claude harness warn.
+ * constant fallback, an `escalation` launch-triple override, the independence from
+ * the `worker` triple, the swallow-to-constants posture on a missing/malformed
+ * catalog, and the once-per-value non-claude harness warn.
  */
 
 import { expect, test } from "bun:test";
@@ -25,14 +25,11 @@ test("resolveEscalationLaunchConfig: no registry file → ESCALATION_* constants
   }
 });
 
-test("resolveEscalationLaunchConfig: an `escalation` preset overrides model/effort", () => {
+test("resolveEscalationLaunchConfig: an `escalation` triple overrides model/effort", () => {
   const dir = mkdtempSync(join(tmpdir(), "kpr-esc-presets-"));
   try {
     const path = join(dir, "presets.yaml");
-    writeFileSync(
-      path,
-      "presets:\n  escalation:\n    harness: claude\n    model: opus\n    effort: max\n",
-    );
+    writeFileSync(path, "escalation: claude::opus::max\n");
     expect(resolveEscalationLaunchConfig(path)).toEqual({
       model: "opus",
       effort: "max",
@@ -42,34 +39,13 @@ test("resolveEscalationLaunchConfig: an `escalation` preset overrides model/effo
   }
 });
 
-test("resolveEscalationLaunchConfig: a partial `escalation` preset layers per-field over the constants", () => {
+test("resolveEscalationLaunchConfig: independent of the `worker` triple (reads ONLY escalation)", () => {
   const dir = mkdtempSync(join(tmpdir(), "kpr-esc-presets-"));
   try {
     const path = join(dir, "presets.yaml");
-    // model-only preset → effort falls back to ESCALATION_EFFORT.
-    writeFileSync(
-      path,
-      "presets:\n  escalation:\n    harness: claude\n    model: opus\n",
-    );
-    expect(resolveEscalationLaunchConfig(path)).toEqual({
-      model: "opus",
-      effort: ESCALATION_EFFORT,
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveEscalationLaunchConfig: independent of the `worker` preset (reads ONLY escalation)", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-esc-presets-"));
-  try {
-    const path = join(dir, "presets.yaml");
-    // A `worker` preset is present but there is NO `escalation` preset — the
+    // A `worker` triple is present but there is NO `escalation` triple — the
     // escalation config must ignore `worker` entirely and fall to the constants.
-    writeFileSync(
-      path,
-      "presets:\n  worker:\n    harness: claude\n    model: opus\n    effort: high\n",
-    );
+    writeFileSync(path, "worker: claude::opus::high\n");
     expect(resolveEscalationLaunchConfig(path)).toEqual({
       model: ESCALATION_MODEL,
       effort: ESCALATION_EFFORT,
@@ -83,7 +59,7 @@ test("resolveEscalationLaunchConfig: a malformed registry FALLS BACK to constant
   const dir = mkdtempSync(join(tmpdir(), "kpr-esc-presets-"));
   try {
     const path = join(dir, "presets.yaml");
-    writeFileSync(path, "presets:\n  - not-a-mapping\n");
+    writeFileSync(path, "escalation: not-a-triple\n");
     expect(resolveEscalationLaunchConfig(path)).toEqual({
       model: ESCALATION_MODEL,
       effort: ESCALATION_EFFORT,
@@ -102,14 +78,11 @@ test("resolveEscalationLaunchConfig: a non-claude escalation harness warns ONCE 
   };
   try {
     const codexPath = join(dir, "codex.yaml");
-    writeFileSync(
-      codexPath,
-      "presets:\n  escalation:\n    harness: codex\n    model: gpt\n    effort: high\n",
-    );
+    writeFileSync(codexPath, "escalation: codex::gpt::high\n");
     // A fresh per-call memo standing in for the dispatch-loop process memo.
     const warned = new Set<string>();
     // The harness is DROPPED, not honored — model/effort still resolve from the
-    // preset so the launch proceeds on claude with the configured knobs.
+    // triple so the launch proceeds on claude with the configured knobs.
     expect(resolveEscalationLaunchConfig(codexPath, warned)).toEqual({
       model: "gpt",
       effort: "high",

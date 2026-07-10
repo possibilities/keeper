@@ -20,6 +20,7 @@ import {
   type GuidanceStateInput,
   loadModelSelectorConfig,
   type ModelSelectorConfig,
+  unionEfforts,
 } from "../scripts/model-guidance-check.ts";
 import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 
@@ -261,6 +262,33 @@ describe("model-guidance check core", () => {
       },
     });
     expect(result).toEqual({ ok: true, errors: [] });
+  });
+
+  test("effort coverage is checked over the union of scopes (no scope's token slips past)", () => {
+    // The guidance gate's effort axis is the UNION across the config's effort
+    // scopes. Feed a multi-scope union and a config missing one scope's token: the
+    // missing token is flagged even though another scope carries it.
+    const input = baseInput();
+    const efforts = unionEfforts([
+      ["medium", "high"],
+      ["high", "xhigh"],
+      ["max"],
+    ]);
+    // First-appearance order, deduped across scopes.
+    expect(efforts).toEqual(["medium", "high", "xhigh", "max"]);
+    const result = checkModelGuidance({
+      ...input,
+      efforts,
+      config: {
+        ...input.config,
+        // A block for every union token EXCEPT `xhigh`.
+        efforts: { medium: "m", high: "h", max: "M" },
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(
+      result.errors.some((e) => e.includes("efforts") && e.includes("xhigh")),
+    ).toBe(true);
   });
 
   test("an extra effort guidance block still fails coverage (efforts stay strict)", () => {

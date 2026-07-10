@@ -62,25 +62,38 @@ gate that drops those scanned third-party plugins from worker launches (interact
 By default the plan worker matrix is claude-only. A host `~/.config/keeper/matrix.yaml`
 ([ADR 0010](./adr/0010-host-provider-matrix-and-wrapped-worker-cells.md)) grows the model axis with
 capability models served by codex or pi: an ordered provider roster (cost-ascending — the pecking
-order), each provider carrying the models it serves (with optional native-id aliases), plus the
-effort axis and the wrapper driver (the fixed claude model/effort that runs wrapped cells). A model
-under the `claude` provider stays **native** (its worker runs that model in-session); any other
-renders as a **wrapped cell** whose claude worker delegates implementation to the cost-preferred
-serving provider at run time. `keeper agent providers check` validates the roster;
-`keeper agent providers resolve <model> <effort>` prints the driver plus the cost-ordered candidate
-harnesses. With no matrix present, rendering, selection, and dispatch stay byte-identical to the
-claude-only default. Standing up the first wrapped task on a host:
+order), each provider carrying the models it serves (with optional native-id aliases) and an optional
+per-provider or per-model effort-list override (clobber, most-specific wins — a per-model override
+beats a per-provider override, which beats the top-level `efforts:` axis), plus the wrapper driver
+(the fixed claude model/effort that runs wrapped cells). A model under the `claude` provider stays
+**native** (its worker runs that model in-session); any other renders as a **wrapped cell** whose
+claude worker delegates implementation to the cost-preferred serving provider at run time. A provider
+carrying `route: false` is **launch-only**: its models stay enumerable as launch triples (pairing,
+panels, `presets list`) but are excluded from the wrapped-cell pecking order and the plan capability
+cell set. `keeper agent providers check` validates the roster and lints the operator's configured host
+launch triples (the four `<harness>_default` triples, `worker`, `escalation`, panel members) against
+the enumerable cube, flagging a well-formed triple outside it as drift; `keeper agent providers resolve
+<model> <effort>` prints the driver plus the cost-ordered candidate harnesses. With no matrix present,
+rendering, selection, and dispatch stay byte-identical to the claude-only default. Standing up the
+first wrapped task on a host:
 
-1. Author `~/.config/keeper/matrix.yaml` — the provider roster (cost-ascending) and the models each
-   serves. [`docs/examples/matrix.example.yaml`](./examples/matrix.example.yaml) is a committed,
-   load-tested reference shape (claude native models, a codex-served capability model, the wrapper
-   driver) to copy from; it is not itself a discovered config path.
+1. Author `~/.config/keeper/matrix.yaml` — the provider roster (cost-ascending), the models each
+   serves, and any effort overrides or `route: false` launch-only providers.
+   [`docs/examples/matrix.example.yaml`](./examples/matrix.example.yaml) is a committed, load-tested
+   reference shape (claude native models, a codex-served capability model with a per-provider effort
+   override, a `route: false` launch-only pi provider, the wrapper driver) to copy from; it is not
+   itself a discovered config path.
 2. For a new model, add its selector guidance with `/plan:model-guidance <model>` (the drift gate fails until every roster model has a block).
 3. Re-render the worker cells: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/`).
-4. Verify routing: `keeper agent providers resolve <model> <effort>`. `keeper agent providers check`
-   fails loud when the roster names a harness whose binary is missing from the host — install the
-   binary or drop the provider, rather than treating the failure as a bug.
-5. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
+4. Discover the enumerable cube and verify routing: `keeper agent presets list --json` lists every
+   `<harness>::<model>::<effort>` launch triple the roster now serves (routed and launch-only alike);
+   `keeper agent providers resolve <model> <effort>` traces one model's cost-ordered candidates.
+   `keeper agent providers check` fails loud when the roster names a harness whose binary is missing
+   from the host, or when a host file (`presets.yaml` defaults/worker/escalation, `panel.yaml`
+   members) names a launch triple outside the enumerable cube — install the missing binary or correct
+   the triple, rather than treating the failure as a bug.
+5. Wire the four `<harness>_default` triples plus `worker`/`escalation` in `~/.config/keeper/presets.yaml`, and any panel members in `~/.config/keeper/panel.yaml`, from the triples `presets list` discovered.
+6. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
 
 ## Shell completions
 

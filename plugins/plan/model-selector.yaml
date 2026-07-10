@@ -168,4 +168,4 @@ research:
   # extra the runtime selection-brief seam gates on the effective matrix.
   gpt-5.3-codex-spark:
     reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
-    sha256: 02243b59cb4220c4b2f860355446b66e97bb5a02f189d9dc7b50117180426f18
+    sha256: fe58cf92782857d47536711f34045dd84923cf84054195e5dd4e10ac73327f09

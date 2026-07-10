@@ -1,8 +1,8 @@
 /**
- * Config adapter pins: the preset catalog (`<harness>_default` pointers +
- * per-preset validation), panel selections, and plugin sources (missing file
- * fail-loud, ~-expansion). Fixture configs only — the live ~/.config is
- * arthack-owned stow state we must not touch.
+ * Config adapter pins: the launch-config catalog (`<harness>_default` +
+ * `worker`/`escalation` launch triples, ADR 0033), panel selections, and plugin
+ * sources (missing file fail-loud, ~-expansion). Fixture configs only — the live
+ * ~/.config is arthack-owned stow state we must not touch.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -32,17 +32,12 @@ import {
   presetsCatalogPath,
   resolvePreset,
 } from "../src/agent/config";
-import { loadMatrix, type Matrix } from "../src/agent/matrix";
 
 let tmpDir: string;
 let savedConfigDir: string | undefined;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-config-"));
-  // Pin the config dir at the (matrix-less) tmpDir so the default `loadMatrix()`
-  // inside `loadPresetCatalog` never reaches the real ~/.config/keeper — test
-  // isolation, and it keeps the un-augmented corpora byte-identical. Tests that
-  // exercise augmentation pass a matrix explicitly.
   savedConfigDir = process.env.KEEPER_CONFIG_DIR;
   process.env.KEEPER_CONFIG_DIR = tmpDir;
 });
@@ -58,35 +53,6 @@ function writeYaml(name: string, body: string): string {
   return p;
 }
 
-/** A catalog with claude (a), codex (b), and pi (z) presets for panel tests. */
-function catalogFixture(): PresetCatalog {
-  return {
-    presets: {
-      a: {
-        harness: "claude",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-      b: {
-        harness: "codex",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-      z: {
-        harness: "pi",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-    },
-  };
-}
-
 describe("loadPresetCatalog", () => {
   test("a missing file is fail-loud (the required-catalog reversal)", () => {
     expect(() => loadPresetCatalog(join(tmpDir, "nope.yaml"))).toThrow(
@@ -100,139 +66,132 @@ describe("loadPresetCatalog", () => {
     codex_default: null,
     pi_default: null,
     hermes_default: null,
+    worker: null,
+    escalation: null,
   };
 
-  test("an empty presets mapping is valid (worker tolerance)", () => {
-    const p = writeYaml("presets.yaml", "presets: {}\n");
-    expect(loadPresetCatalog(p)).toEqual(EMPTY_CATALOG);
-  });
-
-  test("a whitespace-only file parses to an empty catalog", () => {
+  test("an empty file is valid (every key null, presets empty)", () => {
     const p = writeYaml("presets.yaml", "\n");
     expect(loadPresetCatalog(p)).toEqual(EMPTY_CATALOG);
   });
 
-  test("an unknown top-level key is fail-loud (strict reject)", () => {
+  test("a whitespace-only file parses to an empty catalog", () => {
+    const p = writeYaml("presets.yaml", "  \n");
+    expect(loadPresetCatalog(p)).toEqual(EMPTY_CATALOG);
+  });
+
+  test("a leftover `presets:` block is fail-loud with a migration hint", () => {
     const p = writeYaml(
       "presets.yaml",
-      "presets:\n  a:\n    harness: claude\npanels:\n  duo:\n    - a\n",
+      "presets:\n  a:\n    harness: claude\n",
     );
+    expect(() => loadPresetCatalog(p)).toThrow(/retired \(ADR 0033\)/);
+    expect(() => loadPresetCatalog(p)).toThrow(/<harness>::<model>::<effort>/);
+  });
+
+  test("an unknown top-level key is fail-loud (strict reject)", () => {
+    const p = writeYaml("presets.yaml", "panels:\n  duo:\n    - a\n");
     expect(() => loadPresetCatalog(p)).toThrow(
       /Unknown top-level key 'panels'/,
     );
   });
 
   test("malformed YAML is fail-loud", () => {
-    const p = writeYaml("presets.yaml", "presets: [unterminated\n");
+    const p = writeYaml("presets.yaml", "claude_default: [unterminated\n");
     expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
   });
 
-  test("a full preset (claude) is read", () => {
+  test("valid `<harness>_default` triples parse per harness", () => {
     const p = writeYaml(
       "presets.yaml",
       [
-        "presets:",
-        "  claude-opus-xhigh:",
-        "    harness: claude",
-        "    model: opus",
-        "    effort: xhigh",
-        "    role: reviewer",
+        "claude_default: claude::opus::xhigh",
+        "codex_default: codex::gpt-5.5::high",
+        "pi_default: pi::glm::high",
+        "hermes_default: hermes::gpt-5.5::na",
         "",
       ].join("\n"),
     );
     const cat = loadPresetCatalog(p);
-    expect(cat.presets["claude-opus-xhigh"]).toEqual({
+    expect(cat.claude_default).toEqual({
       harness: "claude",
       model: "opus",
       effort: "xhigh",
-      thinking: null,
-      role: "reviewer",
+    });
+    expect(cat.codex_default).toEqual({
+      harness: "codex",
+      model: "gpt-5.5",
+      effort: "high",
+    });
+    expect(cat.pi_default).toEqual({
+      harness: "pi",
+      model: "glm",
+      effort: "high",
+    });
+    expect(cat.hermes_default).toEqual({
+      harness: "hermes",
+      model: "gpt-5.5",
+      effort: "na",
     });
   });
 
-  test("a partial preset leaves omitted fields null", () => {
+  test("no `<harness>_default` keys → all triples null", () => {
+    const p = writeYaml("presets.yaml", "worker: claude::sonnet::max\n");
+    const cat = loadPresetCatalog(p);
+    expect(cat.claude_default).toBeNull();
+    expect(cat.codex_default).toBeNull();
+    expect(cat.pi_default).toBeNull();
+    expect(cat.hermes_default).toBeNull();
+  });
+
+  test("a malformed `<harness>_default` triple is fail-loud naming the segment", () => {
+    const p = writeYaml("presets.yaml", "claude_default: claude::opus\n");
+    expect(() => loadPresetCatalog(p)).toThrow(/claude_default/);
+    expect(() => loadPresetCatalog(p)).toThrow(/three/);
+  });
+
+  test("a `<harness>_default` whose harness mismatches its key is fail-loud", () => {
+    const p = writeYaml("presets.yaml", "claude_default: codex::gpt::high\n");
+    expect(() => loadPresetCatalog(p)).toThrow(
+      /claude_default 'codex::gpt::high' pins harness codex, expected claude/,
+    );
+  });
+
+  test("an empty-string `<harness>_default` is fail-loud", () => {
+    const p = writeYaml("presets.yaml", 'codex_default: ""\n');
+    expect(() => loadPresetCatalog(p)).toThrow(/codex_default must be/);
+  });
+
+  test("worker + escalation triples parse (any harness, harness unchecked)", () => {
     const p = writeYaml(
       "presets.yaml",
-      "presets:\n  m-only:\n    harness: claude\n    model: opus\n",
+      "worker: claude::sonnet::max\nescalation: claude::haiku::high\n",
     );
-    expect(loadPresetCatalog(p).presets["m-only"]).toEqual({
+    const cat = loadPresetCatalog(p);
+    expect(cat.worker).toEqual({
       harness: "claude",
-      model: "opus",
-      effort: null,
-      thinking: null,
-      role: null,
+      model: "sonnet",
+      effort: "max",
+    });
+    expect(cat.escalation).toEqual({
+      harness: "claude",
+      model: "haiku",
+      effort: "high",
     });
   });
 
-  test("invalid harness is fail-loud", () => {
-    const p = writeYaml("presets.yaml", "presets:\n  bad:\n    harness: gpt\n");
-    expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
+  test("a non-claude worker triple parses (the resolver warns-and-ignores)", () => {
+    const p = writeYaml("presets.yaml", "worker: codex::gpt::high\n");
+    expect(loadPresetCatalog(p).worker).toEqual({
+      harness: "codex",
+      model: "gpt",
+      effort: "high",
+    });
   });
 
-  test("effort + thinking on the same preset is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  both:\n    harness: pi\n    effort: high\n    thinking: deep\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
-  });
-
-  test("thinking on a non-pi harness is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  t:\n    harness: claude\n    thinking: deep\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/pi-only/);
-  });
-
-  test("effort on a pi harness is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  e:\n    harness: pi\n    effort: high\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/claude\/codex-only/);
-  });
-
-  test("a reserved preset name is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  default:\n    harness: claude\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/reserved/);
-  });
-
-  test("a YAML-1.1-boolean-looking name is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  yes:\n    harness: claude\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/reserved/);
-  });
-
-  test("a non-matching name (uppercase) is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  Opus:\n    harness: claude\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/\[a-z0-9\._-\]/);
-  });
-
-  test("a dotted preset name validates (widened charset)", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  gpt-5.5:\n    harness: codex\n",
-    );
-    expect(loadPresetCatalog(p, null).presets["gpt-5.5"]?.harness).toBe(
-      "codex",
-    );
-  });
-
-  test("a leading-dot preset name is rejected (never a hidden file)", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  .hidden:\n    harness: claude\n",
-    );
-    expect(() => loadPresetCatalog(p, null)).toThrow(/no leading dot/);
+  test("a malformed worker triple is fail-loud (the resolver swallows the throw)", () => {
+    const p = writeYaml("presets.yaml", "worker: not-a-triple\n");
+    expect(() => loadPresetCatalog(p)).toThrow(/worker/);
   });
 
   test("a missing-file error names the absent path", () => {
@@ -245,242 +204,80 @@ describe("loadPresetCatalog", () => {
     expect(msg).toContain("absent.yaml");
     expect(msg).toContain("missing");
   });
-
-  test("no `<harness>_default` keys → all pointers null", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  a:\n    harness: claude\n",
-    );
-    const cat = loadPresetCatalog(p);
-    expect(cat.claude_default).toBeNull();
-    expect(cat.codex_default).toBeNull();
-    expect(cat.pi_default).toBeNull();
-  });
-
-  test("valid `<harness>_default` pointers name matching presets", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      [
-        "presets:",
-        "  claude-opus:",
-        "    harness: claude",
-        "  codex-gpt:",
-        "    harness: codex",
-        "  pi-gpt:",
-        "    harness: pi",
-        "claude_default: claude-opus",
-        "codex_default: codex-gpt",
-        "pi_default: pi-gpt",
-        "",
-      ].join("\n"),
-    );
-    const cat = loadPresetCatalog(p);
-    expect(cat.claude_default).toBe("claude-opus");
-    expect(cat.codex_default).toBe("codex-gpt");
-    expect(cat.pi_default).toBe("pi-gpt");
-  });
-
-  test("a `<harness>_default` naming no preset is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  a:\n    harness: claude\nclaude_default: ghost\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/claude_default 'ghost'/);
-  });
-
-  test("a `<harness>_default` whose preset harness mismatches is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  a:\n    harness: codex\nclaude_default: a\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(
-      /claude_default 'a' pins harness codex, expected claude/,
-    );
-  });
-
-  test("an empty-string `<harness>_default` is fail-loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      'presets:\n  a:\n    harness: claude\ncodex_default: ""\n',
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(/codex_default must be/);
-  });
-
-  test("the `worker` preset name is unaffected by the pointers", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      [
-        "presets:",
-        "  worker:",
-        "    harness: claude",
-        "    model: sonnet",
-        "  claude-opus:",
-        "    harness: claude",
-        "claude_default: claude-opus",
-        "",
-      ].join("\n"),
-    );
-    const cat = loadPresetCatalog(p);
-    expect(cat.presets.worker?.model).toBe("sonnet");
-    expect(cat.claude_default).toBe("claude-opus");
-  });
-});
-
-describe("loadPresetCatalog host-matrix augmentation", () => {
-  /**
-   * A roster with a native claude pair, a wrapped codex model carrying a
-   * native-id alias, and a wrapped pi model with no alias — every axis the
-   * augmentation reads. Written under tmpDir and loaded so the test drives the
-   * real matrix → catalog path.
-   */
-  function rosterMatrix(): Matrix {
-    const body = [
-      "efforts: [high]",
-      "providers:",
-      "  - name: claude",
-      "    models: [opus]",
-      "  - name: codex",
-      "    models:",
-      "      - gpt-5.5: gpt-5.5-codex",
-      "  - name: pi",
-      "    models: [gpt-5.5]",
-      "subagents: [worker]",
-      "wrapper_driver:",
-      "  model: opus",
-      "  effort: high",
-      "",
-    ].join("\n");
-    const path = join(tmpDir, "matrix.yaml");
-    writeFileSync(path, body);
-    const matrix = loadMatrix(path);
-    if (matrix === null) throw new Error("fixture matrix failed to load");
-    return matrix;
-  }
-
-  test("exposes a resolvable preset for every roster pair", () => {
-    const p = writeYaml("presets.yaml", "presets: {}\n");
-    const cat = loadPresetCatalog(p, rosterMatrix());
-    // Native claude pair.
-    expect(resolvePreset(cat, "claude-opus")).toEqual({
-      harness: "claude",
-      model: "opus",
-      effort: null,
-      thinking: null,
-      role: null,
-    });
-    // Wrapped codex model: the preset model is the provider-native alias target.
-    expect(resolvePreset(cat, "codex-gpt-5.5").model).toBe("gpt-5.5-codex");
-    expect(resolvePreset(cat, "codex-gpt-5.5").harness).toBe("codex");
-    // Wrapped pi model, no alias: native id is the capability token itself.
-    expect(resolvePreset(cat, "pi-gpt-5.5").model).toBe("gpt-5.5");
-    expect(resolvePreset(cat, "pi-gpt-5.5").harness).toBe("pi");
-  });
-
-  test("auto-presets carry no second reasoning axis (effort/thinking null)", () => {
-    const p = writeYaml("presets.yaml", "presets: {}\n");
-    const cat = loadPresetCatalog(p, rosterMatrix());
-    expect(cat.presets["codex-gpt-5.5"]?.effort).toBeNull();
-    expect(cat.presets["pi-gpt-5.5"]?.thinking).toBeNull();
-  });
-
-  test("auto-presets are visible to panel validation", () => {
-    const p = writeYaml("presets.yaml", "presets: {}\n");
-    const cat = loadPresetCatalog(p, rosterMatrix());
-    const panelPath = writeYaml(
-      "panel.yaml",
-      "panels:\n  duo:\n    - claude-opus\n    - codex-gpt-5.5\n",
-    );
-    expect(loadPanelSelections(cat, panelPath).panels.duo).toEqual([
-      "claude-opus",
-      "codex-gpt-5.5",
-    ]);
-  });
-
-  test("a `<harness>_default` may point at an auto-generated preset", () => {
-    const p = writeYaml("presets.yaml", "codex_default: codex-gpt-5.5\n");
-    const cat = loadPresetCatalog(p, rosterMatrix());
-    expect(cat.codex_default).toBe("codex-gpt-5.5");
-  });
-
-  test("a hand-authored preset colliding with an auto name fails loud", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  codex-gpt-5.5:\n    harness: codex\n",
-    );
-    expect(() => loadPresetCatalog(p, rosterMatrix())).toThrow(
-      /collides with a hand-authored preset/,
-    );
-  });
-
-  test("an absent matrix leaves the catalog byte-identical", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  worker:\n    harness: claude\n    model: sonnet\n",
-    );
-    expect(loadPresetCatalog(p, null)).toEqual(loadPresetCatalog(p, null));
-    const cat = loadPresetCatalog(p, null);
-    expect(Object.keys(cat.presets)).toEqual(["worker"]);
-  });
-
-  test("the default matrix arg augments from ~/.config/keeper (matrix-less tmpDir → no-op)", () => {
-    // KEEPER_CONFIG_DIR is pinned at the matrix-less tmpDir, so the default
-    // `loadMatrix()` finds nothing and the catalog stays hand-authored-only.
-    const p = writeYaml(
-      "presets.yaml",
-      "presets:\n  worker:\n    harness: claude\n",
-    );
-    expect(Object.keys(loadPresetCatalog(p).presets)).toEqual(["worker"]);
-  });
 });
 
 describe("loadPanelSelections", () => {
   test("a missing file is fail-loud (the required-panel reversal)", () => {
-    expect(() =>
-      loadPanelSelections(catalogFixture(), join(tmpDir, "nope.yaml")),
-    ).toThrow(ConfigError);
+    expect(() => loadPanelSelections(join(tmpDir, "nope.yaml"))).toThrow(
+      ConfigError,
+    );
   });
 
-  test("a panel of existing presets is read in order", () => {
-    const p = writeYaml("panel.yaml", "panels:\n  duo:\n    - a\n    - b\n");
-    expect(loadPanelSelections(catalogFixture(), p).panels.duo).toEqual([
-      "a",
-      "b",
+  test("a panel of triple members is read in declaration order", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+    );
+    expect(loadPanelSelections(p).panels.duo).toEqual([
+      "claude::opus::high",
+      "codex::gpt-5.3::high",
     ]);
   });
 
-  test("a member referencing no catalog preset is fail-loud", () => {
+  test("a malformed member triple is fail-loud naming the member", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\n    - ghost\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - not-a-triple\n",
     );
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /undefined preset 'ghost'/,
-    );
+    expect(() => loadPanelSelections(p)).toThrow(/not-a-triple/);
+    expect(() => loadPanelSelections(p)).toThrow(/not a valid launch triple/);
   });
 
-  test("a pi member is accepted at load (panel eligibility is the capturable capability)", () => {
-    // Panel eligibility reads a descriptor capability (`capturable`), never a
-    // claude|codex name list — pi is capturable, so a pi panel member is valid.
-    const p = writeYaml("panel.yaml", "panels:\n  mixed:\n    - a\n    - z\n");
-    expect(loadPanelSelections(catalogFixture(), p).panels.mixed).toEqual([
-      "a",
-      "z",
+  test("a pi member is accepted (panel eligibility = capturable + a reasoning axis)", () => {
+    // pi is capturable AND carries a thinking axis, so a pi panel member is valid.
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  mixed:\n    - claude::opus::high\n    - pi::glm::high\n",
+    );
+    expect(loadPanelSelections(p).panels.mixed).toEqual([
+      "claude::opus::high",
+      "pi::glm::high",
+    ]);
+  });
+
+  test("an axisless harness member is fail-loud (not panel-eligible)", () => {
+    // hermes is capturable but exposes no reasoning axis (na) — panels compare an
+    // axis, so it is rejected AT LOAD with the member named.
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - hermes::hermes-m::na\n",
+    );
+    expect(() => loadPanelSelections(p)).toThrow(/hermes::hermes-m::na/);
+    expect(() => loadPanelSelections(p)).toThrow(/not panel-eligible/);
+  });
+
+  test("duplicate identical triples are legal at load (kept in order)", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  dup:\n    - claude::opus::high\n    - claude::opus::high\n",
+    );
+    expect(loadPanelSelections(p).panels.dup).toEqual([
+      "claude::opus::high",
+      "claude::opus::high",
     ]);
   });
 
   test("an empty panel list is fail-loud", () => {
     const p = writeYaml("panel.yaml", "panels:\n  empty: []\n");
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /non-empty list/,
-    );
+    expect(() => loadPanelSelections(p)).toThrow(/non-empty list/);
   });
 
   test("an unknown top-level key is fail-loud (strict reject)", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\npresets:\n  x:\n    harness: claude\n",
+      "panels:\n  duo:\n    - claude::opus::high\npresets:\n  x: y\n",
     );
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+    expect(() => loadPanelSelections(p)).toThrow(
       /Unknown top-level key 'presets'/,
     );
   });
@@ -488,53 +285,35 @@ describe("loadPanelSelections", () => {
   test("the default key names a defined panel", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\n    - b\ndefault: duo\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\ndefault: duo\n",
     );
-    const sel = loadPanelSelections(catalogFixture(), p);
-    expect(sel.default).toBe("duo");
+    expect(loadPanelSelections(p).default).toBe("duo");
   });
 
   test("no default key leaves default null", () => {
-    const p = writeYaml("panel.yaml", "panels:\n  duo:\n    - a\n    - b\n");
-    expect(loadPanelSelections(catalogFixture(), p).default).toBeNull();
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+    );
+    expect(loadPanelSelections(p).default).toBeNull();
   });
 
   test("a default naming an undefined panel is fail-loud", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\n    - b\ndefault: ghost\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\ndefault: ghost\n",
     );
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /default panel 'ghost'/,
-    );
+    expect(() => loadPanelSelections(p)).toThrow(/default panel 'ghost'/);
   });
 
   test("two same-harness-different-model panelists are expressible", () => {
-    const catalog: PresetCatalog = {
-      presets: {
-        opus: {
-          harness: "claude",
-          model: "opus",
-          effort: null,
-          thinking: null,
-          role: null,
-        },
-        sonnet: {
-          harness: "claude",
-          model: "sonnet",
-          effort: null,
-          thinking: null,
-          role: null,
-        },
-      },
-    };
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  claude-duo:\n    - opus\n    - sonnet\n",
+      "panels:\n  claude-duo:\n    - claude::opus::high\n    - claude::sonnet::high\n",
     );
-    expect(loadPanelSelections(catalog, p).panels["claude-duo"]).toEqual([
-      "opus",
-      "sonnet",
+    expect(loadPanelSelections(p).panels["claude-duo"]).toEqual([
+      "claude::opus::high",
+      "claude::sonnet::high",
     ]);
   });
 });

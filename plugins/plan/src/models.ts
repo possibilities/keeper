@@ -171,5 +171,10 @@ export function workerAgentFor(
   model: string | null,
 ): string | null {
   const matrix = effectiveMatrix();
-  return composeWorkerAgent(matrix.efforts, matrix.models, tier, model);
+  return composeWorkerAgent(
+    (m) => matrix.effortsFor(m),
+    matrix.models,
+    tier,
+    model,
+  );
 }

@@ -199,7 +199,8 @@ describe("selection-brief with a host provider matrix", () => {
     "    models: [opus]",
     "  - name: codex",
     "    models:",
-    "      - gpt-5.5: gpt-5.5-codex",
+    "      - name: gpt-5.5",
+    "        native: gpt-5.5-codex",
     "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",
@@ -257,6 +258,68 @@ describe("selection-brief with a host provider matrix", () => {
     expect(tasks.map((t) => t.task_id)).toEqual(taskIds);
     for (const task of tasks) {
       expect(task.candidate_cells).toHaveLength(4);
+    }
+  });
+
+  // A ragged roster: opus renders only [high], gpt-5.5 renders [medium, high].
+  // Both carry committed guidance blocks. The candidate enumeration must be the
+  // ragged product (3 cells), not the rectangular {2 models × 2 efforts = 4}.
+  const RAGGED_MATRIX = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models:",
+    "      - name: opus",
+    "        efforts: [high]",
+    "  - name: codex",
+    "    models:",
+    "      - name: gpt-5.5",
+    "        native: gpt-5.5-codex",
+    "        efforts: [medium, high]",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: xhigh",
+    "",
+  ].join("\n");
+
+  test("candidate cells are the ragged per-model product, not a rectangular cartesian", () => {
+    const project = getProject();
+    const { epicId, taskIds } = scaffoldEpic(project, {
+      title: "Ragged select",
+      nTasks: 1,
+    });
+    const cfg = cfgWithMatrix(RAGGED_MATRIX);
+
+    const r = runCli(["selection-brief", epicId, "--project", project.root], {
+      cwd: project.root,
+      home: project.home,
+      env: { KEEPER_CONFIG_DIR: cfg },
+    });
+    expect(r.code).toBe(0);
+    const payload = parseCliOutput(r.output);
+    expect(payload.success).toBe(true);
+
+    const cells = payload.candidate_cells as Array<{
+      model: string;
+      tier: string;
+    }>;
+    // opus→[high] (1) + gpt-5.5→[medium, high] (2) = 3, NOT the 2×2 rectangle.
+    expect(cells).toHaveLength(3);
+    const pairs = new Set(cells.map((c) => `${c.model}::${c.tier}`));
+    expect(pairs).toEqual(
+      new Set(["opus::high", "gpt-5.5::medium", "gpt-5.5::high"]),
+    );
+    // opus never offers `medium`; gpt-5.5 offers both.
+    expect(pairs.has("opus::medium")).toBe(false);
+
+    const brief = JSON.parse(
+      readFileSync(payload.brief_ref as string, "utf-8"),
+    ) as Record<string, unknown>;
+    const tasks = brief.tasks as Array<Record<string, unknown>>;
+    expect(tasks.map((t) => t.task_id)).toEqual(taskIds);
+    for (const task of tasks) {
+      expect(task.candidate_cells).toHaveLength(3);
     }
   });
 

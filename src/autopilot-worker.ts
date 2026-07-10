@@ -44,8 +44,9 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import { ConfigError, loadPresetCatalog, type Preset } from "./agent/config";
+import { ConfigError, loadPresetCatalog } from "./agent/config";
 import { matrixConfigPath } from "./agent/matrix";
+import type { Triple } from "./agent/triple";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
 import {
@@ -402,25 +403,25 @@ export const ARTHACK_ROOT: string = ((): string => {
 })();
 
 /**
- * Resolve the autopilot worker's `{model, effort}` from the `worker` preset in
- * `presets.yaml`, COALESCING onto the {@link WORKER_MODEL}/{@link WORKER_EFFORT}
- * constants per-field so behavior is byte-identical when no registry/preset
- * exists. Read PRODUCER-SIDE (per dispatch, not a fold input) — the resolved
- * model never enters `events` as a fold key, so re-fold stays byte-identical.
+ * Resolve the autopilot worker's `{model, effort}` from the `worker` launch triple
+ * in `presets.yaml`, COALESCING onto the {@link WORKER_MODEL}/{@link WORKER_EFFORT}
+ * constants so behavior is byte-identical when no registry/triple exists. Read
+ * PRODUCER-SIDE (per dispatch, not a fold input) — the resolved model never enters
+ * `events` as a fold key, so re-fold stays byte-identical.
  *
  * Fail-SAFE — the SOLE fail-open carve-out to the required-catalog posture: a
- * missing OR malformed catalog throws a `ConfigError` that is SWALLOWED-to-
- * constants here, so the daemon never crashes on bad config. Re-resolved per
- * cycle (cheap single-file parse) so a preset edit lands without a daemon bounce;
- * never file-watched.
+ * missing OR malformed catalog (including a malformed `worker` triple) throws a
+ * `ConfigError` that is SWALLOWED-to-constants here, so the daemon never crashes on
+ * bad config. Re-resolved per cycle (cheap single-file parse) so a triple edit
+ * lands without a daemon bounce; never file-watched.
  *
- * A non-claude `preset.harness` is IGNORED (autopilot dispatch is claude-only
- * until harness dispatch lands) but WARNED once per distinct offending value via
- * `warned` — the reconcile cycle re-calls this per tick, so the memo keeps the
- * drop from becoming per-cycle log spam. Never throws on the drop.
+ * A non-claude triple harness is IGNORED (autopilot dispatch is claude-only until
+ * harness dispatch lands) but WARNED once per distinct offending value via `warned`
+ * — the reconcile cycle re-calls this per tick, so the memo keeps the drop from
+ * becoming per-cycle log spam. Never throws on the drop.
  */
 /**
- * Distinct non-claude `worker`-preset harness values already warned about, so
+ * Distinct non-claude `worker`-triple harness values already warned about, so
  * {@link resolveWorkerLaunchConfig} logs the drop ONCE per offending value
  * rather than every reconcile cycle. Producer-side process memo (never a fold
  * input); tests inject a fresh set to observe the once-per-value contract.
@@ -434,12 +435,12 @@ export function resolveWorkerLaunchConfig(
   model: string;
   effort: string;
 } {
-  let preset: Preset | undefined;
+  let triple: Triple | null | undefined;
   try {
     const catalog = loadPresetCatalog(
       ...(configPath === undefined ? [] : ([configPath] as const)),
     );
-    preset = catalog.presets.worker;
+    triple = catalog.worker;
   } catch (err) {
     if (err instanceof ConfigError) {
       console.error(
@@ -451,20 +452,21 @@ export function resolveWorkerLaunchConfig(
     }
   }
   if (
-    preset !== undefined &&
-    preset.harness !== "claude" &&
-    !warned.has(preset.harness)
+    triple !== undefined &&
+    triple !== null &&
+    triple.harness !== "claude" &&
+    !warned.has(triple.harness)
   ) {
-    warned.add(preset.harness);
+    warned.add(triple.harness);
     console.error(
-      `[autopilot-worker] worker preset pins harness '${preset.harness}', but ` +
+      `[autopilot-worker] worker triple pins harness '${triple.harness}', but ` +
         `autopilot dispatch ignores non-claude harness values until harness ` +
         `dispatch lands — launching on claude.`,
     );
   }
   return {
-    model: preset?.model ?? WORKER_MODEL,
-    effort: preset?.effort ?? WORKER_EFFORT,
+    model: triple?.model ?? WORKER_MODEL,
+    effort: triple?.effort ?? WORKER_EFFORT,
   };
 }
 

@@ -128,7 +128,7 @@ Which panel to convene follows the strength rubric below — hack's everyday **P
 
 <!-- BAKE:BEGIN keeper prompt render engineering/panel-strength -->
 
-**The configured panel roster lives in `~/.config/keeper/panel.yaml`.** It defines one or more named panels — each an ordered selection of presets — and an optional top-level `default` pointer naming the panel to convene when none is chosen. Panels may be defined, renamed, or removed at any time, so never hard-code a panel name or assume a particular one exists; read the live roster with `keeper agent presets list` (`--json` for structure) at decision time.
+**The configured panel roster lives in `~/.config/keeper/panel.yaml`.** It defines one or more named panels — each an ordered selection of launch triples (`<harness>::<model>::<effort>`) — and an optional top-level `default` pointer naming the panel to convene when none is chosen. Panels may be defined, renamed, or removed at any time, so never hard-code a panel name or assume a particular one exists; read the live roster with `keeper agent presets list` (`--json` for structure) at decision time.
 
 **A panel's strength is read from its member count and harness diversity.** More members across more distinct harnesses buy more independent cross-checking — at proportional cost, and the panel runs as slow as its slowest member. Reach for a broader panel only when the stakes below justify that cost.
 

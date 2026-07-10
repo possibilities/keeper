@@ -50,9 +50,9 @@ import { join, resolve as resolveAbs } from "node:path";
 
 import { loadEpic } from "../api.ts";
 import { emitFailureEnvelope, emitReadonly } from "../emit.ts";
+import { effectiveMatrix } from "../host_matrix.ts";
 import { isEpicId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
-import { configuredEfforts, configuredModels } from "../models.ts";
 import {
   contextForRoot,
   type ProjectContext,
@@ -284,8 +284,8 @@ export function runApplySelection(args: ApplySelectionArgs): number {
     confidence: c.confidence,
     labelSource: "heuristic-guided",
   }));
-  const efforts = configuredEfforts();
-  const models = configuredModels();
+  const effective = effectiveMatrix();
+  const models = effective.models;
   return landSelectionCells({
     verb: "apply-selection",
     epicId,
@@ -297,7 +297,7 @@ export function runApplySelection(args: ApplySelectionArgs): number {
         verb: "apply-selection",
         todo,
         epicTaskIds,
-        efforts,
+        effortsFor: (m) => effective.effortsFor(m),
         models,
       });
       return cellErrors.length > 0

@@ -13,6 +13,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { effectiveMatrixFromDisk } from "../src/host_matrix.ts";
 import { loadSubagentsMatrixFromDisk } from "../src/subagents_config.ts";
 import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
 import { runCli } from "./harness.ts";
@@ -777,9 +778,12 @@ describe("work.md.tmpl agentId capture regex", () => {
 });
 
 describe("generated work plugins in the plan plugin", () => {
-  const matrix = loadSubagentsMatrixFromDisk(join(REPO, "subagents.yaml"));
+  // The renderer fans out over the EFFECTIVE matrix using each model's own effort
+  // list, so this per-cell existence gate walks the same ragged product. With no
+  // host matrix every model shares the flat axis (rectangular cartesian).
+  const matrix = effectiveMatrixFromDisk(join(REPO, "subagents.yaml"));
   for (const model of matrix.models) {
-    for (const effort of matrix.efforts) {
+    for (const effort of matrix.effortsFor(model)) {
       test.skipIf(!WORKERS_RENDERED)(
         `workers/${model}-${effort} renders a work plugin with the {model × effort} worker`,
         () => {

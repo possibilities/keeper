@@ -22,19 +22,11 @@ const CODEX_WRAPPER_DEFAULTS = [
 const DEFAULT_MODEL = ["--model", "gpt"];
 const DEFAULT_EFFORT = ["-c", 'model_reasoning_effort="high"'];
 
-/** A catalog whose codex_default pins the given model + effort. */
+/** A catalog whose codex_default triple pins the given model + effort. */
 function codexDefaultCatalog(model: string, effort: string): PresetCatalog {
   return {
-    presets: {
-      "codex-default": {
-        harness: "codex",
-        model,
-        effort,
-        thinking: null,
-        role: null,
-      },
-    },
-    codex_default: "codex-default",
+    presets: {},
+    codex_default: { harness: "codex", model, effort },
   };
 }
 

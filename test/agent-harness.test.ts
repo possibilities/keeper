@@ -192,9 +192,9 @@ describe("harness registry — unknown harness fails loud at load", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test("a preset naming an unknown harness is rejected at catalog load", () => {
+  test("a launch triple naming an unknown harness is rejected at catalog load", () => {
     const p = join(tmpDir, "presets.yaml");
-    writeFileSync(p, "presets:\n  x:\n    harness: grok\n");
+    writeFileSync(p, "claude_default: grok::opus::high\n");
     expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
     // The one place the harness roster is enforced — the registry-derived set.
     expect(() => loadPresetCatalog(p)).toThrow(/claude\|codex\|pi\|hermes/);

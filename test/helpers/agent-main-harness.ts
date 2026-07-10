@@ -17,51 +17,36 @@ import type { Matrix } from "../../src/agent/matrix";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
+import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
+
+/** The default host launch triples the harness injects when a test names none: an
+ *  empty set (no defaults, no worker/escalation, no panels). Triple-verb tests
+ *  pass their own {@link HostTriples} fixture. */
+export const DEFAULT_HOST_TRIPLES: HostTriples = {
+  defaults: {},
+  worker: null,
+  escalation: null,
+  panels: {},
+  panelDefault: null,
+};
 
 /**
  * The default preset catalog the harness injects when a test names none: a
- * complete `<harness>_default` per harness so a bare fresh launch resolves a
- * model + effort/thinking (matching the production requirement that a fresh
- * launch pin them) instead of the fresh-launch fail-loud. Bare launches that
+ * complete `<harness>_default` launch triple per harness so a bare fresh launch
+ * resolves a model + effort/thinking (matching the production requirement that a
+ * fresh launch pin them) instead of the fresh-launch fail-loud. Bare launches that
  * don't assert the exact command are unaffected; exact-command tests either see
- * these injected values or pass their own catalog / explicit flags.
+ * these injected values or pass their own catalog / explicit flags. `presets` is
+ * empty (the freeform named catalog is retired); pi's effort segment `high`
+ * translates to its thinking band, hermes carries the axisless `na`.
  */
 export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
-  presets: {
-    "claude-default": {
-      harness: "claude",
-      model: "opus",
-      effort: "high",
-      thinking: null,
-      role: null,
-    },
-    "codex-default": {
-      harness: "codex",
-      model: "gpt",
-      effort: "high",
-      thinking: null,
-      role: null,
-    },
-    "pi-default": {
-      harness: "pi",
-      model: "glm",
-      effort: null,
-      thinking: "high",
-      role: null,
-    },
-    "hermes-default": {
-      harness: "hermes",
-      model: "gpt-5.5",
-      effort: null,
-      thinking: null,
-      role: null,
-    },
-  },
-  claude_default: "claude-default",
-  codex_default: "codex-default",
-  pi_default: "pi-default",
-  hermes_default: "hermes-default",
+  presets: {},
+  claude_default: { harness: "claude", model: "opus", effort: "high" },
+  codex_default: { harness: "codex", model: "gpt", effort: "high" },
+  pi_default: { harness: "pi", model: "glm", effort: "high" },
+  hermes_default: { harness: "hermes", model: "gpt-5.5", effort: "na" },
 };
 
 /** Throwing exit so a test sees the exit code without killing the runner. */
@@ -139,6 +124,9 @@ export interface HarnessOptions {
   presetCatalog?: PresetCatalog;
   /** Panel selections loadPanelSelectionsFn returns (default empty). */
   panelSelections?: PanelSelections;
+  /** Host launch triples loadHostTriplesFn returns (default {@link
+   *  DEFAULT_HOST_TRIPLES} — an empty set). */
+  hostTriples?: HostTriples;
   /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
   findShadowProfileDirs?: () => ShadowProfileFinding[];
   /** Host matrix loadMatrixFn returns (default null → claude-only world). */
@@ -220,6 +208,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,
     loadPanelSelectionsFn: () =>
       opts.panelSelections ?? { panels: {}, default: null },
+    loadHostTriplesFn: () => opts.hostTriples ?? DEFAULT_HOST_TRIPLES,
     ensureClaudeStateSharingFn: () => {},
     ensureKeeperAgentProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);

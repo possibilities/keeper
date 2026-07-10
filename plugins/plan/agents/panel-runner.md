@@ -79,16 +79,17 @@ or your own read of the problem.
 
 ## Step 2 — Launch the panel (start)
 
-`keeper agent panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a named
-preset in the catalog `~/.config/keeper/presets.yaml`), copies the prompt into the run's **durable slug
-dir** (`~/.local/state/keeper/panels/<slug>/`, 0700), launches every member as a **detached read-only
-`keeper agent run` leg** named `panel::<slug>::<preset>` (each writes its own uniform JSON result envelope
+`keeper agent panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a launch
+triple `<harness>::<model>::<effort>`, ADR 0033 — no separate preset catalog names them), copies the
+prompt into the run's **durable slug dir** (`~/.local/state/keeper/panels/<slug>/`, 0700), launches every
+member as a **detached read-only `keeper agent run` leg** named `panel::<slug>::<member>` (a
+disambiguated triple slug plus a 1-based ordinal; each leg writes its own uniform JSON result envelope
 via `--output`), prints a one-line manifest JSON, and exits 0 immediately. The legs run on in their own
 sessions; this call does not block. start is **idempotent by slug** — re-issuing it reconciles the existing
 run rather than blindly re-fanning-out (see *Re-entry*). `--slug` is REQUIRED (each leg's name); the config
 is required too — an absent/empty `--slug`, a
-missing/invalid catalog or `panel.yaml`, or an unknown panel name exits 2 (no fallback); run `keeper agent
-presets list` to see the configured presets + panels.
+missing/invalid `panel.yaml`, or an unknown panel name exits 2 (no fallback); run `keeper agent
+presets list` to see the configured triples + panels.
 
 ```bash
 SLUG="<the Slug: line from your prompt, or a kebab slug you derive from the task>"
@@ -100,7 +101,7 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
 - **`START_RC == 0`** — `MANIFEST` is `{"dir":"…","slug":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
   Capture `DIR`; it is the handle every `wait` call re-reads.
 - **`START_RC != 0`** (exit 2 — an absent/empty `--slug`, or a misconfigured/unknown panel: a missing or
-  invalid catalog / `panel.yaml`, an unknown panel name, zero resolved members, an undefined preset, a
+  invalid `panel.yaml`, an unknown panel name, zero resolved members, a malformed launch triple, a
   non-pairable harness, or an unreadable prompt) — emit the `PANEL_RUN_FAILED` marker (Step 4) with the
   command's stderr as the reason and stop. No legs fanned out.
 

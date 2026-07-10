@@ -1,33 +1,53 @@
-# Example host provider matrix (ADR 0010) — the real activation shape for
-# gpt-5.3-codex-spark, committed for reference only. This file lives OUTSIDE
-# every discovered config path (`~/.config/keeper/matrix.yaml`) so it can
-# never silently activate a foreign provider in repo tooling; it is loaded by
-# explicit path only, in `test/agent-matrix.test.ts`'s anti-rot test.
+# Example host provider matrix — the real activation shape for a wrapped codex
+# model, committed for reference only. This file lives OUTSIDE every discovered
+# config path (`~/.config/keeper/matrix.yaml`) so it can never silently activate a
+# foreign provider in repo tooling; it is loaded by explicit path only, in
+# `test/agent-matrix.test.ts`'s anti-rot test.
 #
-# To activate: copy this file to `~/.config/keeper/matrix.yaml` (or author
-# your own roster from scratch) and follow docs/install.md's "Host provider
-# matrix" walkthrough.
+# To activate: copy this file to `~/.config/keeper/matrix.yaml` (or author your
+# own roster from scratch) and follow docs/install.md's "Host provider matrix"
+# walkthrough.
 
+# The top-level effort axis: the default per-model effort list. Each entry must be
+# in the canonical effort vocabulary [low, medium, high, xhigh, max]; declaration
+# order is irrelevant (the list normalizes to canonical ascending order).
 efforts:
   - medium
   - high
 
 providers:
-  # claude is always the native provider — its models run in-session.
+  # claude is always the native provider — its models run in-session, and always
+  # route (route: false on claude is a load error).
   - name: claude
     models:
       - opus
       - sonnet
-  # codex is cost-ascending first: it serves gpt-5.3-codex-spark as a BARE
-  # capability token (codex accepts bare model ids directly, so this
-  # activation needs no alias).
+  # codex is cost-ascending first among the wrapped providers.
   - name: codex
+    # A per-provider effort override clobbers the top-level axis for codex's cells
+    # (absent inherits, present clobbers; a per-model override is more specific
+    # still). Each override must be a subset of the canonical vocabulary.
+    efforts:
+      - high
+      - xhigh
     models:
+      # A bare capability token: codex accepts bare model ids directly, and it
+      # inherits codex's provider-level effort override above.
       - gpt-5.3-codex-spark
-      # A provider-qualified slashed alias target is the generic form a
-      # harness that rejects bare capability ids requires (pi, for one, at
-      # startup) — carried verbatim to the launch model flag as pass-through:
-      # - gpt-5.3-codex-spark: openai/gpt-5.3-codex-spark
+      # The model long form {name, native?, efforts?} carries a provider-native
+      # alias and/or a per-model effort override that beats the provider override:
+      # - name: gpt-5.3-codex-spark
+      #   native: openai/gpt-5.3-codex-spark
+      #   efforts: [xhigh]
+  # A launch-only provider: route: false keeps pi's models ENUMERABLE for launch
+  # (triples) but excludes them from the wrapped-cell pecking order and the plan
+  # capability cell set. The provider-qualified slashed native id is the generic
+  # long form a harness that rejects bare capability ids requires.
+  - name: pi
+    route: false
+    models:
+      - name: gpt-5.3-spark-preview
+        native: pi/gpt-5.3-spark-preview
 
 subagents:
   - work

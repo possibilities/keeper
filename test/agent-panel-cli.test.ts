@@ -691,7 +691,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     expect(leg[leg.indexOf("--system") + 1]).toBe(roleResult.text);
   });
 
-  test("a configured 2-member panel names each leg panel::<slug>::<its-preset>", async () => {
+  test("a configured 2-member panel names each leg panel::<slug>::<its-member-slug>", async () => {
     const promptFile = join(dir, "ask.md");
     writeFileSync(promptFile, "what is the best answer?");
     const pdir = join(dir, "fanout");
@@ -699,13 +699,11 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     const deps: PanelDeps = {
       ...makeAdHocDeps().deps,
       loadRegistry: () => ({
-        catalog: {
-          presets: {
-            "opus-x": mkPreset("claude"),
-            "codex-x": mkPreset("codex"),
-          },
+        catalog: { presets: {} },
+        selections: {
+          panels: { duo: ["claude::opus::high", "codex::gpt-5.3::high"] },
+          default: null,
         },
-        selections: { panels: { duo: ["opus-x", "codex-x"] }, default: null },
       }),
       spawn: (argv) => {
         spawns.push({ argv });
@@ -723,11 +721,18 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     );
     expect(code).toBe(0);
     expect(spawns.length).toBe(2);
-    // Each leg's --name carries ITS OWN preset, not a shared one.
+    // Each leg's --name carries ITS OWN disambiguated member slug, and --preset the
+    // raw triple.
     const legA = legOf(spawns[0] as AdHocSpawn);
     const legB = legOf(spawns[1] as AdHocSpawn);
-    expect(legA[legA.indexOf("--name") + 1]).toBe("panel::duo-run::opus-x");
-    expect(legB[legB.indexOf("--name") + 1]).toBe("panel::duo-run::codex-x");
+    expect(legA[legA.indexOf("--name") + 1]).toMatch(
+      /^panel::duo-run::claude-opus-high-[0-9a-z]{6}-1$/,
+    );
+    expect(legA[legA.indexOf("--preset") + 1]).toBe("claude::opus::high");
+    expect(legB[legB.indexOf("--name") + 1]).toMatch(
+      /^panel::duo-run::codex-gpt-5-3-high-[0-9a-z]{6}-1$/,
+    );
+    expect(legB[legB.indexOf("--preset") + 1]).toBe("codex::gpt-5.3::high");
     // The manifest records the run slug top-level.
     const manifest: PanelManifest = JSON.parse(
       readFileSync(join(pdir, "manifest.json"), "utf8"),
@@ -837,13 +842,11 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
     const deps: PanelDeps = {
       ...makeAdHocDeps().deps,
       loadRegistry: () => ({
-        catalog: {
-          presets: {
-            "opus-x": mkPreset("claude"),
-            "codex-x": mkPreset("codex"),
-          },
+        catalog: { presets: {} },
+        selections: {
+          panels: { duo: ["claude::opus::high", "codex::gpt-5.3::high"] },
+          default: null,
         },
-        selections: { panels: { duo: ["opus-x", "codex-x"] }, default: null },
       }),
       spawn: () => {
         spawnCount += 1;

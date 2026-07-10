@@ -22,8 +22,9 @@
 //
 // The verb NEVER reads model-selector.yaml — axis validation comes from the
 // effective composed matrix (embedded subagents snapshot plus a host
-// provider matrix.yaml overlay when present), via configuredEfforts /
-// configuredModels. The `selection:` block is captured verbatim into the
+// provider matrix.yaml overlay when present): the model axis plus each model's
+// own effective effort list (ragged under a host roster's per-model overrides).
+// The `selection:` block is captured verbatim into the
 // sidecar; the verb does not police its values beyond shape. The tier-audit
 // stamp + degrade-SOFT policy read live in the shared core.
 
@@ -31,8 +32,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { emitFailureEnvelope } from "../emit.ts";
+import { effectiveMatrix } from "../host_matrix.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
-import { configuredEfforts, configuredModels } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import {
   parseYamlInput,
@@ -250,11 +251,12 @@ export function runAssignCells(args: AssignCellsArgs): number {
 
   // ------------------------------------------------------------------
   // Phase 3+: assert membership/axis/coverage + mutate + commit, through the
-  // shared apply core. The final axis gate reads the LIVE configuredEfforts/Models
-  // (computed once here, before the flock); the core re-reads todo status in-lock.
+  // shared apply core. The final axis gate reads the LIVE effective matrix (the
+  // model axis + each model's ragged effort list, read once here before the
+  // flock); the core re-reads todo status in-lock.
   // ------------------------------------------------------------------
-  const efforts = configuredEfforts();
-  const models = configuredModels();
+  const effective = effectiveMatrix();
+  const models = effective.models;
   const provenance: SelectionCoreProvenance = {
     harness: selHarness,
     model: selModel,
@@ -276,7 +278,7 @@ export function runAssignCells(args: AssignCellsArgs): number {
         verb: "assign-cells",
         todo,
         epicTaskIds,
-        efforts,
+        effortsFor: (m) => effective.effortsFor(m),
         models,
       });
       return cellErrors.length > 0
