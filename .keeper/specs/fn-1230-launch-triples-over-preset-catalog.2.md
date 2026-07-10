@@ -41,5 +41,5 @@ With no host overrides configured the rendered cell set must be byte-identical t
 - [ ] Model-guidance checking covers the union of effort tokens across all scopes
 
 ## Done summary
-
+Moved every plan-island effort consumer onto per-model effective effort lists (EffectiveMatrix.effortsFor): renderer, selection-brief candidates, the cell-write axis gate (naming the model), and workerAgentFor now fan out over the ragged {model × effort} cube; model-guidance effort coverage moved to the union of scopes. Zero behavior change with no host matrix.
 ## Evidence
