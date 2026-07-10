@@ -4,7 +4,7 @@
   "created_at": "2026-07-10T14:49:29.523000Z",
   "depends_on_epics": [],
   "id": "fn-1237-matrix-v2-single-host-config",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T14:54:04.247000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T14:53:46.359000Z"
+  "updated_at": "2026-07-10T14:54:04.247000Z"
 }
