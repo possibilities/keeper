@@ -76,5 +76,5 @@ deadlock); work + close escalations share the cap without starvation. All
 - [ ] Work and close escalations share the global cap without starvation; all resolver/escalation folds re-fold byte-identical.
 
 ## Done summary
-
+Add the tier-2 work-verb fan-in escalation: a resolve::<taskId> autonomous resolver, then a deconflict::<taskId> session sequenced behind its leased terminal verdict, then task .2's page re-gated on merge_escalated_at as the terminal notification — mirroring the close pipeline via the generic sweeps with work-verb selectors and verb-parameterized folds.
 ## Evidence
