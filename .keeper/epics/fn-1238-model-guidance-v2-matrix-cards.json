@@ -6,7 +6,7 @@
     "fn-1237-matrix-v2-single-host-config"
   ],
   "id": "fn-1238-model-guidance-v2-matrix-cards",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T15:15:04.121000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T15:15:03.518000Z"
+  "updated_at": "2026-07-10T15:15:04.121000Z"
 }
