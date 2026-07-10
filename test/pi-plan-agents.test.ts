@@ -58,7 +58,21 @@ describe("Pi plan agent renderer", () => {
     const runnerHeader = runner.slice(0, runner.indexOf("\n---\n", 4));
     const judgeHeader = judge.slice(0, judge.indexOf("\n---\n", 4));
     expect(runnerHeader).not.toContain("Task, Agent");
+    expect(runnerHeader).toContain(
+      `extensions: ${JSON.stringify(
+        join(
+          import.meta.dir,
+          "..",
+          "plugins",
+          "keeper",
+          "pi-extension",
+          "keeper-events.ts",
+        ),
+      )}`,
+    );
+    expect(runnerHeader).toContain('tools: "all, ext:keeper-events/Task"');
     expect(judgeHeader).toContain("Task, Agent");
+    expect(judgeHeader).not.toContain("extensions:");
   });
 
   test("installs every source idempotently and detects drift in check mode", () => {

@@ -9,7 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { parse } from "yaml";
 
 const MANIFEST_NAME = ".keeper-plan-agents.json";
@@ -134,7 +134,8 @@ export function renderPiPlanAgent(path: string): {
   }
   const thinking = thinkingLevel(source.frontmatter.effort, path);
   const denied = translatedDeniedTools(source.frontmatter.disallowedTools);
-  const outputName = `plan:${basename(source.filename, ".md")}.md`;
+  const agentName = basename(source.filename, ".md");
+  const outputName = `plan:${agentName}.md`;
   const lines = [
     "---",
     `description: ${yamlString(description)}`,
@@ -142,6 +143,25 @@ export function renderPiPlanAgent(path: string): {
     `max_turns: ${maxTurnsForThinking(thinking)}`,
     "prompt_mode: replace",
   ];
+  if (agentName === "panel-runner") {
+    const taskExtension = resolve(
+      dirname(path),
+      "..",
+      "..",
+      "keeper",
+      "pi-extension",
+      "keeper-events.ts",
+    );
+    if (!existsSync(taskExtension)) {
+      throw new Error(
+        `${path}: Pi Task extension not found at ${taskExtension}`,
+      );
+    }
+    lines.push(
+      `extensions: ${yamlString(taskExtension)}`,
+      `tools: ${yamlString("all, ext:keeper-events/Task")}`,
+    );
+  }
   if (denied.length > 0) {
     lines.push(`disallowed_tools: ${yamlString(denied.join(", "))}`);
   }

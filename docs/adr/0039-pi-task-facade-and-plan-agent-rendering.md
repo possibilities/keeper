@@ -28,7 +28,7 @@ Keeper renders the planner-side `plugins/plan/agents/*.md` definitions into the 
 - effort maps to Pi thinking;
 - denied Claude tools map to Pi built-ins and both subagent entry tools (`Task` and `Agent`);
 - each agent receives a bounded turn budget;
-- `plan:panel-runner` retains Task access for its judge, while agents that deny nested delegation cannot escape through either tool name.
+- `plan:panel-runner` explicitly loads Keeper's ephemeral Pi extension and exposes only its Task tool for the judge hop, while agents that deny nested delegation cannot escape through either tool name.
 
 Rendered files are Keeper-owned, atomically written, sidecar-marked, and tracked by a manifest so stale outputs are removed without overwriting an unrelated unowned agent. Named Pi profiles share the canonical `agents` directory alongside their existing shared skills and extensions.
 
