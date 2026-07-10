@@ -16,9 +16,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  buildHarnessResumeArgv,
+  buildResumeLaunchPromptTail,
   HARNESS_NAME_SET,
   type HarnessName,
   mapKeeperEffortToAxis,
+  ResumeLaunchUnsupportedError,
 } from "./harness";
 
 // ---------------------------------------------------------------------------
@@ -157,6 +160,24 @@ export interface AgentLaunchOpts {
    *  EVERY harness) and, for claude/pi only, as the harness-native `--name <name>`
    *  (codex has no native name flag). Omitted/empty = no name flag. */
   name?: string;
+  /** Resume-launch target: when set, the native builder composes a RESUME
+   *  argv (the harness's own resume token/target from {@link
+   *  buildHarnessResumeArgv}, any harness-specific extra pins, and the
+   *  dash-guarded `prompt` from {@link buildResumeLaunchPromptTail}) instead
+   *  of a fresh-launch one. The prompt then rides INSIDE the native builder's
+   *  own returned array — {@link buildAgentLaunchArgv} does NOT append it
+   *  again — since where it lands relative to the other resume flags is
+   *  harness-specific (codex needs verb-position LEADING; claude/pi/hermes
+   *  trail their own resume flags). Omitted/empty = fresh launch, byte-
+   *  unchanged. */
+  resumeTarget?: string;
+  /** claude-only: the FRESH CHILD session uuid `--resume` forks into. Minted
+   *  by the CALLER (never generated here — this builder takes it as pure
+   *  input) and required whenever `cli === "claude"` and `resumeTarget` is
+   *  set; a claude resume launch without it throws {@link
+   *  ResumeLaunchUnsupportedError} rather than silently omitting the pin
+   *  (which would break strict transcript discovery). */
+  resumeSessionId?: string;
 }
 
 /** Per-harness native-flag builder table — the descriptor-lookup form of the old
@@ -199,7 +220,14 @@ const NATIVE_ARGS_BUILDERS: Record<
  * also launches as an interactive TUI now, but fires no keeper hooks, so it never
  * becomes a tracked job and omits the carrier (it stays UNTRACKED and is reaped
  * CLI-side). The carrier needs a session to name, so it is added only when
- * `session` is present. Pure — exported for byte-pin tests.
+ * `session` is present.
+ *
+ * A RESUME launch ({@link AgentLaunchOpts.resumeTarget} set) drops the
+ * unconditional trailing `prompt` positional this function otherwise
+ * appends — the native builder's own returned array already carries the
+ * dash-guarded prompt at the harness-correct position, so appending it again
+ * here would double it. A fresh launch (the default) is byte-unchanged.
+ * Pure — exported for byte-pin tests.
  */
 export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
   const wrapperFlags: string[] = [
@@ -226,12 +254,14 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
     wrapperFlags.push("--x-tmux-window-name", opts.name);
   }
   const native = NATIVE_ARGS_BUILDERS[opts.cli](opts);
+  const isResumeLaunch =
+    opts.resumeTarget !== undefined && opts.resumeTarget !== "";
   return [
     ...opts.launcherArgvPrefix,
     opts.cli,
     ...wrapperFlags,
     ...native,
-    opts.prompt,
+    ...(isResumeLaunch ? [] : [opts.prompt]),
   ];
 }
 
@@ -244,7 +274,18 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
  * read-only is carried by the prompt directive alone (no tool strip), so the
  * flags are the same either way — `--permission-mode acceptEdits
  * --dangerously-skip-permissions` so the single-turn partner never stalls on a
- * permission prompt. Pure — exported for tests.
+ * permission prompt.
+ *
+ * RESUME mode ({@link AgentLaunchOpts.resumeTarget} set) appends `--resume
+ * <target> --session-id <resumeSessionId> --fork-session -- <prompt>` —
+ * probe-settled (docs/adr/0034): `--resume <parent>` forks a NEW child
+ * session file, so keeper pins the child id via `--session-id --fork-session`
+ * to keep strict transcript discovery resolving it, and the caller-minted
+ * `resumeSessionId` is REQUIRED (never generated here — a resume launch
+ * missing it throws {@link ResumeLaunchUnsupportedError} rather than silently
+ * omitting the pin). The trailing `--` end-of-options guard is
+ * probe-verified against a live claude binary (a leading-dash prompt
+ * otherwise parses as an unknown option). Pure — exported for tests.
  */
 export function nativeClaudeArgs(opts: AgentLaunchOpts): string[] {
   const args: string[] = [
@@ -259,6 +300,20 @@ export function nativeClaudeArgs(opts: AgentLaunchOpts): string[] {
   // interactive auto-mint on the detached re-exec.
   if (opts.name !== undefined && opts.name !== "") {
     args.push("--name", opts.name);
+  }
+  if (opts.resumeTarget !== undefined && opts.resumeTarget !== "") {
+    if (opts.resumeSessionId === undefined || opts.resumeSessionId === "") {
+      throw new ResumeLaunchUnsupportedError(
+        "claude resume launch requires resumeSessionId — the fresh child uuid `--resume` forks into, minted by the caller",
+      );
+    }
+    args.push(
+      ...buildHarnessResumeArgv("claude", opts.resumeTarget),
+      "--session-id",
+      opts.resumeSessionId,
+      "--fork-session",
+      ...buildResumeLaunchPromptTail("claude", opts.prompt),
+    );
   }
   return args;
 }
@@ -275,11 +330,26 @@ export function nativeClaudeArgs(opts: AgentLaunchOpts): string[] {
  * read-only` would also disable web search), so read-only KEEPS the same flags
  * as write; keeper enforces nothing. The detached interactive window does
  * not hang on codex's directory-trust prompt because the launch pre-seeds the
- * cwd's trust (via `src/codex-trust.ts`, fail-open) before launch. Pure —
- * exported for tests.
+ * cwd's trust (via `src/codex-trust.ts`, fail-open) before launch.
+ *
+ * RESUME mode ({@link AgentLaunchOpts.resumeTarget} set) LEADS the returned
+ * array with the VERB-POSITION `resume <target>` — probe-settled
+ * (docs/adr/0034): `codex resume <uuid>` appends to the SAME rollout file —
+ * and ENDS it with a `--` end-of-options guard ahead of the prompt
+ * (probe-verified against a live codex binary; clap itself suggests `--` on
+ * a rejected dash-led positional). `resume` must lead the forwarded
+ * harness-visible argv ({@link buildAgentLaunchArgv} strips keeper's own
+ * `--x-*` wrapper flags before the native array reaches codex), so unlike
+ * claude/pi/hermes this resume branch cannot simply append at the end. Pure
+ * — exported for tests.
  */
 export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
-  const args = ["--dangerously-bypass-approvals-and-sandbox"];
+  const isResumeLaunch =
+    opts.resumeTarget !== undefined && opts.resumeTarget !== "";
+  const args: string[] = isResumeLaunch
+    ? buildHarnessResumeArgv("codex", opts.resumeTarget as string)
+    : [];
+  args.push("--dangerously-bypass-approvals-and-sandbox");
   if (opts.model !== undefined && opts.model !== "") {
     args.push("-m", opts.model);
   }
@@ -288,6 +358,9 @@ export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
     // codex's reasoning band via the descriptor (keeper `max` → codex `xhigh`).
     const band = mapKeeperEffortToAxis("codex", opts.effort);
     args.push("-c", `model_reasoning_effort="${band}"`);
+  }
+  if (isResumeLaunch) {
+    args.push(...buildResumeLaunchPromptTail("codex", opts.prompt));
   }
   return args;
 }
@@ -305,7 +378,17 @@ export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
  * directive alone (no `--exclude-tools` strip — bash stays leaky, so a strip was
  * never a sandbox), so the flags are the same either way. pi's second axis is
  * `--thinking`; a keeper effort maps onto it via the descriptor (keeper `max` →
- * pi `xhigh`). Pure — exported for tests.
+ * pi `xhigh`).
+ *
+ * RESUME mode ({@link AgentLaunchOpts.resumeTarget} set) appends `--session
+ * <target> <prompt>` — live-probed for this capability (pi has no ADR-settled
+ * fact): a bogus resume target reaches pi's OWN "no session found" runtime
+ * error rather than an argv-parse error, confirming the composition. A
+ * leading-dash prompt, however, is genuinely UNSUPPORTED — probe-verified pi
+ * honors neither a `--` end-of-options guard nor an `=`-joined form for this
+ * bare positional — so {@link buildResumeLaunchPromptTail} throws {@link
+ * ResumeLaunchUnsupportedError} rather than emit a shape pi could misread as
+ * a new flag. Pure — exported for tests.
  */
 export function nativePiArgs(opts: AgentLaunchOpts): string[] {
   // `-na` (--no-approve): ignore project-local `.pi/` resources for this run.
@@ -323,6 +406,12 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
   if (opts.name !== undefined && opts.name !== "") {
     args.push("--name", opts.name);
   }
+  if (opts.resumeTarget !== undefined && opts.resumeTarget !== "") {
+    args.push(
+      ...buildHarnessResumeArgv("pi", opts.resumeTarget),
+      ...buildResumeLaunchPromptTail("pi", opts.prompt),
+    );
+  }
   return args;
 }
 
@@ -338,12 +427,28 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
  * Hermes has no native `--name` flag (like codex), so `opts.name` rides only the
  * tmux window name. Consent for its shell hooks is seeded via the
  * `HERMES_ACCEPT_HOOKS=1` pane env (set by the inner launch), not a flag here.
+ *
+ * RESUME mode ({@link AgentLaunchOpts.resumeTarget} set) appends `--resume
+ * <target> -z=<prompt>` — live-probed for this capability (hermes has no
+ * ADR-settled fact): a bogus resume target still reaches the model rather
+ * than erroring, confirming the composition, and the `=`-joined oneshot form
+ * (never the bare-`-z`-then-separate-token shape the fresh launch uses) is
+ * probe-verified to carry a leading-dash prompt through unmisread — a
+ * separate `-z <dash-prompt>` token argparse reads as a NEW unrecognized
+ * flag.
  * Pure — exported for tests.
  */
 export function nativeHermesArgs(opts: AgentLaunchOpts): string[] {
   const args = ["--yolo"];
   if (opts.model !== undefined && opts.model !== "") {
     args.push("-m", opts.model);
+  }
+  if (opts.resumeTarget !== undefined && opts.resumeTarget !== "") {
+    args.push(
+      ...buildHarnessResumeArgv("hermes", opts.resumeTarget),
+      ...buildResumeLaunchPromptTail("hermes", opts.prompt, "-z"),
+    );
+    return args;
   }
   args.push("-z");
   return args;

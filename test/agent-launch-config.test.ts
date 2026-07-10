@@ -5,7 +5,10 @@
  */
 
 import { expect, test } from "bun:test";
-import { mapKeeperEffortToAxis } from "../src/agent/harness";
+import {
+  mapKeeperEffortToAxis,
+  ResumeLaunchUnsupportedError,
+} from "../src/agent/harness";
 import {
   AGENT_ROLES,
   buildAgentLaunchArgv,
@@ -13,6 +16,7 @@ import {
   loadRolePrompt,
   nativeClaudeArgs,
   nativeCodexArgs,
+  nativeHermesArgs,
   nativePiArgs,
   stripClaudeEnv,
 } from "../src/agent/launch-config";
@@ -90,6 +94,67 @@ test("nativeClaudeArgs: --name appended (claude has a native name flag)", () => 
   expect(args.slice(-2)).toEqual(["--name", "panel::smoke::opus"]);
 });
 
+test("nativeClaudeArgs: resume mode emits resume + pinned child session + fork flags + -- guarded prompt", () => {
+  const args = nativeClaudeArgs({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "follow-up ask",
+    resumeTarget: "parent-uuid",
+    resumeSessionId: "child-uuid",
+  });
+  expect(args).toEqual([
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
+    "--resume",
+    "parent-uuid",
+    "--session-id",
+    "child-uuid",
+    "--fork-session",
+    "--",
+    "follow-up ask",
+  ]);
+});
+
+test("nativeClaudeArgs: resume mode composes after --model/--name (order stays deterministic)", () => {
+  const args = nativeClaudeArgs({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "-dash-ask",
+    model: "opus",
+    name: "pair::sonnet",
+    resumeTarget: "parent-uuid",
+    resumeSessionId: "child-uuid",
+  });
+  expect(args).toEqual([
+    "--permission-mode",
+    "acceptEdits",
+    "--dangerously-skip-permissions",
+    "--model",
+    "opus",
+    "--name",
+    "pair::sonnet",
+    "--resume",
+    "parent-uuid",
+    "--session-id",
+    "child-uuid",
+    "--fork-session",
+    "--",
+    "-dash-ask",
+  ]);
+});
+
+test("nativeClaudeArgs: resume mode without resumeSessionId throws ResumeLaunchUnsupportedError", () => {
+  expect(() =>
+    nativeClaudeArgs({
+      launcherArgvPrefix: LAP,
+      cli: "claude",
+      prompt: "p",
+      resumeTarget: "parent-uuid",
+    }),
+  ).toThrow(ResumeLaunchUnsupportedError);
+});
+
 // ---------------------------------------------------------------------------
 // native flag sets — codex
 // ---------------------------------------------------------------------------
@@ -156,6 +221,44 @@ test("nativeCodexArgs: an already-native band (minimal) passes through unmapped"
   });
   const idx = args.indexOf("-c");
   expect(args[idx + 1]).toBe('model_reasoning_effort="minimal"');
+});
+
+test("nativeCodexArgs: resume mode LEADS with the verb-position resume + target, ends with -- guarded prompt", () => {
+  const args = nativeCodexArgs({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "follow-up ask",
+    resumeTarget: "rollout-uuid",
+  });
+  expect(args).toEqual([
+    "resume",
+    "rollout-uuid",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--",
+    "follow-up ask",
+  ]);
+});
+
+test("nativeCodexArgs: resume mode still composes model/effort flags between target and prompt", () => {
+  const args = nativeCodexArgs({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "-dash-ask",
+    model: "gpt-5.5",
+    effort: "high",
+    resumeTarget: "rollout-uuid",
+  });
+  expect(args).toEqual([
+    "resume",
+    "rollout-uuid",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "-m",
+    "gpt-5.5",
+    "-c",
+    'model_reasoning_effort="high"',
+    "--",
+    "-dash-ask",
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -227,6 +330,75 @@ test("nativePiArgs: keeper effort max caps at pi band xhigh, before --name", () 
   expect(args[idx + 1]).toBe("xhigh");
   // --name stays the final pair so the launcher's native name lands last.
   expect(args.slice(-2)).toEqual(["--name", "panel::smoke::pi"]);
+});
+
+test("nativePiArgs: resume mode appends --session <target> then the prompt as-is", () => {
+  const args = nativePiArgs({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "follow-up ask",
+    resumeTarget: "pi-session-id",
+  });
+  expect(args).toEqual(["-na", "--session", "pi-session-id", "follow-up ask"]);
+});
+
+test("nativePiArgs: resume mode with a leading-dash prompt fails loud instead of silently misrouting it", () => {
+  expect(() =>
+    nativePiArgs({
+      launcherArgvPrefix: LAP,
+      cli: "pi",
+      prompt: "-dash-prompt",
+      resumeTarget: "pi-session-id",
+    }),
+  ).toThrow(ResumeLaunchUnsupportedError);
+});
+
+// ---------------------------------------------------------------------------
+// native flag sets — hermes
+// ---------------------------------------------------------------------------
+
+test("nativeHermesArgs: fresh launch stays -z-then-separate-prompt-token (byte-unchanged)", () => {
+  const args = nativeHermesArgs({
+    launcherArgvPrefix: LAP,
+    cli: "hermes",
+    prompt: "p",
+    model: "some-model",
+  });
+  expect(args).toEqual(["--yolo", "-m", "some-model", "-z"]);
+});
+
+test("nativeHermesArgs: resume mode uses --resume <target> then -z=<prompt> equals-joined (never a bare -z token)", () => {
+  const args = nativeHermesArgs({
+    launcherArgvPrefix: LAP,
+    cli: "hermes",
+    prompt: "follow-up ask",
+    resumeTarget: "hermes-session-id",
+  });
+  expect(args).toEqual([
+    "--yolo",
+    "--resume",
+    "hermes-session-id",
+    "-z=follow-up ask",
+  ]);
+  expect(args).not.toContain("-z");
+});
+
+test("nativeHermesArgs: resume mode with a leading-dash prompt still rides safely joined", () => {
+  const args = nativeHermesArgs({
+    launcherArgvPrefix: LAP,
+    cli: "hermes",
+    prompt: "-dash-ask",
+    model: "some-model",
+    resumeTarget: "hermes-session-id",
+  });
+  expect(args).toEqual([
+    "--yolo",
+    "-m",
+    "some-model",
+    "--resume",
+    "hermes-session-id",
+    "-z=-dash-ask",
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -457,6 +629,58 @@ test("buildAgentLaunchArgv: no name → no window-name flag, no native --name (z
   });
   expect(argv).not.toContain("--x-tmux-window-name");
   expect(argv).not.toContain("--name");
+});
+
+// ---------------------------------------------------------------------------
+// launch argv — resume-launch composition
+// ---------------------------------------------------------------------------
+
+test("buildAgentLaunchArgv: resume launch omits the trailing prompt append — the prompt already rides inside native", () => {
+  const argv = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "codex",
+    prompt: "follow-up ask",
+    resumeTarget: "rollout-uuid",
+  });
+  // The verb-position resume token leads the forwarded (post-wrapper-flag)
+  // codex argv, and the prompt appears EXACTLY once — not double-appended.
+  const idx = argv.indexOf("resume");
+  expect(idx).toBeGreaterThanOrEqual(0);
+  expect(argv[idx + 1]).toBe("rollout-uuid");
+  expect(argv.at(-1)).toBe("follow-up ask");
+  expect(argv.filter((a) => a === "follow-up ask")).toHaveLength(1);
+});
+
+test("buildAgentLaunchArgv: claude resume launch composes the full pinned-child-session shape", () => {
+  const argv = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "follow-up ask",
+    resumeTarget: "parent-uuid",
+    resumeSessionId: "child-uuid",
+  });
+  expect(argv.at(-1)).toBe("follow-up ask");
+  expect(argv).toContain("--resume");
+  expect(argv[argv.indexOf("--resume") + 1]).toBe("parent-uuid");
+  expect(argv).toContain("--session-id");
+  expect(argv[argv.indexOf("--session-id") + 1]).toBe("child-uuid");
+  expect(argv).toContain("--fork-session");
+  expect(argv.filter((a) => a === "follow-up ask")).toHaveLength(1);
+});
+
+test("buildAgentLaunchArgv: fresh launch is unaffected when resumeTarget is absent (byte-unchanged)", () => {
+  for (const cli of ["claude", "codex", "pi", "hermes"] as const) {
+    const argv = buildAgentLaunchArgv({
+      launcherArgvPrefix: LAP,
+      cli,
+      prompt: "P",
+    });
+    expect(argv.at(-1)).toBe("P");
+    expect(argv).not.toContain("--resume");
+    expect(argv).not.toContain("resume");
+    expect(argv).not.toContain("--session-id");
+    expect(argv).not.toContain("--fork-session");
+  }
 });
 
 // ---------------------------------------------------------------------------
