@@ -1098,12 +1098,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           {
             name: "offset",
             type: "string",
-            summary: "Filtered entry offset (default: newest page)",
+            summary:
+              "Filtered entry offset, matches a shown #N label (default: newest page)",
           },
           {
             name: "before",
             type: "string",
-            summary: "Page backward before a filtered entry offset",
+            summary:
+              "Page backward before a filtered entry offset (a shown #N label)",
           },
           {
             name: "limit",
@@ -1113,7 +1115,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           {
             name: "max-chars",
             type: "string",
-            summary: "Rendered character budget (default 32000)",
+            summary: "Total character budget, header + entries (default 32000)",
           },
           {
             name: "max-entry-chars",

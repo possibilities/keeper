@@ -10,6 +10,7 @@ import {
   transcriptHoldingDirectory,
 } from "../src/transcript/claude";
 import type {
+  SubagentSummary,
   TranscriptFilter,
   TranscriptListItem,
   TranscriptRole,
@@ -77,9 +78,19 @@ Options:
 
 const SHOW_HELP = `keeper transcript show <session-id> [options]
 
-Extract a bounded transcript page. Without a cursor, the newest matching page
-is returned. Use --before with older_before to page backward, or --offset with
-newer_offset to page forward.
+Extract a bounded transcript page. Without --offset/--before, the newest
+matching page is returned. Use --before with older_before to page backward,
+or --offset with newer_offset to page forward.
+
+Human output labels each entry #N, where N is its filtered page position
+(matches --offset/--before under the SAME filters) — a round-trippable
+paging handle, not a durable cross-filter id. JSON's entries carry a
+separate "index"/"sourceIndex" (the unfiltered ordinal), unaffected by
+paging or filters.
+
+--max-chars is a TOTAL budget: the rendered header (session info plus a
+capped subagent list) counts against it, and entries get the remainder,
+down to a floor of one force-fitted entry when the budget is tiny.
 
 Options:
   --harness <name>       Harness (currently claude; default claude)
@@ -89,7 +100,7 @@ Options:
   --offset <n>           Filtered entry offset (default newest page)
   --before <n>           Page backward before this filtered entry offset
   --limit <n>            Max entries (default ${DEFAULT_SHOW_LIMIT})
-  --max-chars <n>        Total character budget (default ${DEFAULT_MAX_CHARS})
+  --max-chars <n>        Total character budget, header + entries (default ${DEFAULT_MAX_CHARS})
   --max-entry-chars <n>  Per-entry cap (default ${DEFAULT_MAX_ENTRY_CHARS})
   --tools <level>        none, compact, or full (default compact)
   --role <role>          Repeatable: user|assistant|tool|summary|system
@@ -112,7 +123,10 @@ const AGENT_HELP = `keeper transcript agent workflow
 5. Inspect tool output: --tools full; narrow first with --grep/--role/--since
 
 Defaults are bounded: newest 60 entries, compact tool output, and a
-32000-character budget. Use --format json for a structured envelope.
+32000-character TOTAL budget (header plus entries). Human entry labels are
+filtered page positions, round-trippable via --offset/--before under the
+same filters; use --format json for a structured envelope with a stable
+unfiltered index.
 `;
 
 export interface TranscriptCliResult {
@@ -282,11 +296,46 @@ function renderListText(
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-function renderShowText(
+/** Human-render subagent list bound: past this many, collapse the rest into
+ *  a "+M more" tail. JSON's `subagents` field always carries the complete
+ *  array — this cap is a text-rendering concern only. */
+const SUBAGENT_HEADER_CAP = 12;
+
+function renderSubagentHeaderLines(
+  subagents: readonly SubagentSummary[],
+): string[] {
+  if (subagents.length === 0) {
+    return ["subagents: none"];
+  }
+  const shown = subagents.slice(0, SUBAGENT_HEADER_CAP);
+  const lines = ["subagents:"];
+  for (const subagent of shown) {
+    const task = compactLine(subagent.task, 72);
+    lines.push(
+      `  ${subagent.id} updated=${subagent.updatedAt ?? "unknown"} size=${formatBytes(subagent.bytes)}${task.length > 0 ? ` task=${JSON.stringify(task)}` : ""}`,
+    );
+  }
+  const remaining = subagents.length - shown.length;
+  if (remaining > 0) {
+    lines.push(`  +${remaining} more`);
+  }
+  return lines;
+}
+
+interface ShowHeaderPage {
+  offset: number;
+  endOffset: number;
+  total: number;
+  olderBefore: number | null;
+  newerOffset: number | null;
+  clippedByChars: boolean;
+}
+
+function renderShowHeaderLines(
   session: TranscriptSession,
-  page: ReturnType<typeof buildTranscriptPage>,
   tools: TranscriptToolDetail,
-): string {
+  page: ShowHeaderPage,
+): string[] {
   const metadata = session.main.metadata;
   const lines = [
     "@keeper-transcript v1",
@@ -303,21 +352,50 @@ function renderShowText(
     `char_clipped: ${page.clippedByChars}`,
     `malformed_lines: ${metadata.malformedLines}`,
   ];
-  if (session.subagents.length === 0) {
-    lines.push("subagents: none");
-  } else {
-    lines.push("subagents:");
-    for (const subagent of session.subagents) {
-      const task = compactLine(subagent.task, 72);
-      lines.push(
-        `  ${subagent.id} updated=${subagent.updatedAt ?? "unknown"} size=${formatBytes(subagent.bytes)}${task.length > 0 ? ` task=${JSON.stringify(task)}` : ""}`,
-      );
-    }
-  }
+  lines.push(...renderSubagentHeaderLines(session.subagents));
   lines.push("---");
-  return `${lines.join("\n")}\n${renderTranscriptEntriesText(
+  return lines;
+}
+
+/**
+ * Worst-case length of the rendered header, used to size the --max-chars
+ * entries budget honestly (replaces a prior silent flat reserve). Every
+ * page-summary number (offset/endOffset/total/older_before/newer_offset) is
+ * bounded above by `rawEntryCount`, so an equal-width all-nines placeholder
+ * of every field is always >= the real header text; "false" (5 chars) is
+ * the longer of the two char_clipped spellings. The result is therefore an
+ * upper bound, never an underestimate, of the header this session will
+ * actually print.
+ */
+function worstCaseHeaderBudget(
+  session: TranscriptSession,
+  tools: TranscriptToolDetail,
+  rawEntryCount: number,
+): number {
+  const digits = Math.max(1, String(rawEntryCount).length);
+  const placeholder = Number("9".repeat(digits));
+  const stubPage: ShowHeaderPage = {
+    offset: placeholder,
+    endOffset: placeholder,
+    total: placeholder,
+    olderBefore: placeholder,
+    newerOffset: placeholder,
+    clippedByChars: false,
+  };
+  return `${renderShowHeaderLines(session, tools, stubPage).join("\n")}\n`
+    .length;
+}
+
+function renderShowText(
+  session: TranscriptSession,
+  page: ReturnType<typeof buildTranscriptPage>,
+  tools: TranscriptToolDetail,
+): string {
+  const header = renderShowHeaderLines(session, tools, page).join("\n");
+  return `${header}\n${renderTranscriptEntriesText(
     page.entries,
     session.selectedSource === "all",
+    page.offset,
   )}`;
 }
 
@@ -603,11 +681,16 @@ function parseShow(
     grep: typeof parsed.values.grep === "string" ? parsed.values.grep : null,
     tools: tools.value,
   };
+  const headerBudget = worstCaseHeaderBudget(
+    session,
+    tools.value,
+    session.entries.length,
+  );
   const page = buildTranscriptPage(session.entries, filter, {
     offset,
     before,
     limit,
-    maxChars: Math.max(1_000, maxChars - 4_000),
+    maxChars: Math.max(0, maxChars - headerBudget),
     maxEntryChars,
   });
   const data = {

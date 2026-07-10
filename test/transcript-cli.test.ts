@@ -303,6 +303,96 @@ describe("keeper transcript show", () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.error.code).toBe("session_not_found");
   });
+
+  test("human entry labels equal page.offset + array position and round-trip via --offset", () => {
+    const forward = JSON.parse(
+      run([SESSION, "--offset", "0", "--limit", "20", "--json"]).stdout,
+    );
+    const page = forward.data.page;
+    expect(page.offset).toBe(0);
+    const human = run([SESSION, "--offset", "0", "--limit", "20"]);
+    expect(human.stdout).toContain(`[#${page.offset} `);
+
+    const midLabel = page.offset + 2;
+    const viaOffset = JSON.parse(
+      run([SESSION, "--offset", String(midLabel), "--json"]).stdout,
+    );
+    expect(viaOffset.data.page.offset).toBe(midLabel);
+    expect(viaOffset.data.entries[0].sourceIndex).toBe(
+      forward.data.entries[2].sourceIndex,
+    );
+  });
+
+  test("backward-paged human labels equal page.offset even when char-clipping skips entries from the front", () => {
+    const clipped = JSON.parse(
+      run([SESSION, "--max-chars", "700", "--json"]).stdout,
+    );
+    expect(clipped.data.page.clipped_by_chars).toBe(true);
+    const human = run([SESSION, "--max-chars", "700"]);
+    expect(human.stdout).toContain(`[#${clipped.data.page.offset} `);
+  });
+
+  test("human output never exceeds the requested --max-chars", () => {
+    for (const budget of [900, 1000, 1500, 5000]) {
+      const result = run([SESSION, "--max-chars", String(budget)]);
+      expect(result.code).toBe(0);
+      expect(result.stdout.length).toBeLessThanOrEqual(budget);
+    }
+  });
+
+  test("many-subagent session caps the human header with a '+M more' tail; JSON keeps the full list", () => {
+    const manyId = "55555555-5555-4555-8555-555555555555";
+    const mainPath = writeSession(
+      PROJECT,
+      manyId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Many subagents",
+          sessionId: manyId,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T08:00:00.000Z",
+          cwd: PROJECT,
+          sessionId: manyId,
+          message: { role: "user", content: "Build the alpha feature" },
+        }),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+    const subagentDir = join(mainPath.slice(0, -".jsonl".length), "subagents");
+    mkdirSync(subagentDir, { recursive: true });
+    const total = 15;
+    for (let i = 0; i < total; i++) {
+      const id = `sub${String(i).padStart(2, "0")}abcdef`;
+      writeFileSync(
+        join(subagentDir, `agent-${id}.jsonl`),
+        `${line({
+          type: "user",
+          timestamp: "2026-07-09T08:00:03.500Z",
+          cwd: PROJECT,
+          sessionId: manyId,
+          agentId: id,
+          message: { role: "user", content: `Subagent ${i} task` },
+        })}\n`,
+      );
+    }
+
+    const human = run([manyId, "--offset", "0"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain(`+${total - 12} more`);
+    expect(human.stdout.match(/^ {2}sub\d\dabcdef /gm)).toHaveLength(12);
+
+    const json = JSON.parse(run([manyId, "--offset", "0", "--json"]).stdout);
+    expect(json.data.subagents).toHaveLength(total);
+  });
+
+  test("--help documents the total-budget semantics and the label/JSON-index distinction", () => {
+    const help = runTranscriptCli(["show", "--help"], deps);
+    expect(help.stdout).toContain("Total character budget");
+    expect(help.stdout).toContain("page position");
+  });
 });
 
 describe("keeper transcript list", () => {
