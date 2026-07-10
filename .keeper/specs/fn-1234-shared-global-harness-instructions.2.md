@@ -30,5 +30,5 @@ Write a new ADR recording, in the existing MADR-ish context/decision/consequence
 - [ ] CONTEXT.md has a house-style glossary entry for the shared-instruction-source / canonical-leaf concept.
 
 ## Done summary
-
+Added ADR 0035 recording the shared global-harness-instruction ownership decision (keeper-owned system/shared/AGENTS.md, pi context-file channel, divergence-policy split, AGENTS.md terminology disambiguation), plus a CLAUDE.md disambiguating line and a CONTEXT.md glossary entry for the shared-source-leaf concept.
 ## Evidence
