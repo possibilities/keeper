@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T02:59:59.912000Z",
+  "depends_on": [
+    "fn-1230-launch-triples-over-preset-catalog.1"
+  ],
+  "epic": "fn-1230-launch-triples-over-preset-catalog",
+  "id": "fn-1230-launch-triples-over-preset-catalog.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Thread ragged efforts plan island",
+  "updated_at": "2026-07-10T02:59:59.912000Z"
+}
