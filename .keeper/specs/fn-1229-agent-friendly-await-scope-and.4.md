@@ -59,5 +59,5 @@ bun test); record before/after numbers in Evidence.
   regression-pinned green
 
 ## Done summary
-
+Added an adaptive idle poll interval (nextIdlePollDelayMs) that grows the readiness-client poll delay from 500ms to an 8s cap while idle, resetting to the floor on any in-flight query or fresh inbound frame; pinned by fast-tier pure tests plus integration coverage over the real poll loop. Extended scripts/subscribe-bounce-soak.ts with a steady mode (idle, never-bouncing, reconnect-forever) and a CPU budget gate (process.cpuUsage()) alongside the existing flat-RSS gate; an A/B run (quiet vs. --patch-interval-ms pinning the interval at the floor) measured ~3.6x lower steady-state CPU with the fix, with the steady-poll cadence identified as the dominant contributor by time-coverage (near-100% of a long-lived await vs brief catching-up-backstop windows and near-zero per-frame re-evaluation on a quiet board).
 ## Evidence

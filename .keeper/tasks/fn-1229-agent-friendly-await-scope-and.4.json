@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Measure and fix reconnect loop cost",
-  "updated_at": "2026-07-10T02:00:08.148000Z"
+  "updated_at": "2026-07-10T02:36:54.088000Z",
+  "worker_done_at": "2026-07-10T02:36:54.088000Z"
 }
