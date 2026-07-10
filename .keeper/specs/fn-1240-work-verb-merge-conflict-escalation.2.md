@@ -75,5 +75,5 @@ non-merge-conflict work row is untouched; a failed botctl send leaves
 - [ ] A failed page send does not stamp `human_notified_at` (page is retried); the notify fold re-folds byte-identical.
 
 ## Done summary
-
+Divert a work-verb worktree-merge-conflict row to a new work-merge-conflict route variant and add an independent page-once botctl notify sweep (verb-parameterized human_notified_at latch on the (work,taskId) row, re-armed by retry_dispatch); every other work failure and all close-verb behavior unchanged.
 ## Evidence
