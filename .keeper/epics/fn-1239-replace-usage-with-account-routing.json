@@ -7,7 +7,7 @@
     "fn-1238-model-guidance-v2-matrix-cards"
   ],
   "id": "fn-1239-replace-usage-with-account-routing",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T17:16:37.786000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T17:16:33.111000Z"
+  "updated_at": "2026-07-10T17:16:37.787000Z"
 }
