@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix Claude project bucket encoder",
-  "updated_at": "2026-07-10T01:44:41.440000Z"
+  "updated_at": "2026-07-10T02:12:46.782000Z",
+  "worker_done_at": "2026-07-10T02:12:46.782000Z"
 }

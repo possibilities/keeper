@@ -48,5 +48,5 @@ computed by encodeClaudeProject.
 - [ ] Existing transcript CLI tests stay green
 
 ## Done summary
-
+Fixed encodeClaudeProject to replace every non-alphanumeric character (not just the path separator) with a dash, non-collapsing, so dotted/underscored worktree-lane project paths resolve to the correct on-disk bucket. Added a literal-bucket test helper and regression fixtures pinned to hard-coded bucket strings so a future refactor cannot silently reintroduce the separator-only bug.
 ## Evidence
