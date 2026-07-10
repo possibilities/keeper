@@ -7,7 +7,7 @@
     "fn-1237-matrix-v2-single-host-config"
   ],
   "id": "fn-1241-complete-v2-matrix-cutover-on-operator",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T18:29:50.035000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T18:29:49.053000Z"
+  "updated_at": "2026-07-10T18:29:50.035000Z"
 }
