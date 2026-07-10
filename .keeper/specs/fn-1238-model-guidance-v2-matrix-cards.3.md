@@ -57,5 +57,5 @@ manual read-through: every jq snippet in SKILL.md names fields that exist in the
 - [ ] No touched doc references subagents.yaml as a live axis source
 
 ## Done summary
-
+Rewired model-guidance SKILL.md, model-selector.yaml comments (already landed), CONTEXT.md, and plugins/plan/CLAUDE.md's drift-gate row to the landed v2 card contract (matrix-keyed triggers, byte-aligned --state envelope, research->fetch card->cache->distill->re-hash pass, card-only-gap shortcut, adaptive Fill-new-values label).
 ## Evidence
