@@ -37,6 +37,7 @@ import {
   AUTOCLOSE_HINT_TTL_MS,
   type AuditOrchestratorLiveness,
   AutocloseHintSet,
+  appendRestartLedgerLine,
   auditReadyEscalationDecision,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
@@ -57,9 +58,13 @@ import {
   buildSharedDirtyObservation,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
+  CRASH_LOOP_YOUNG_RUNTIME_MS,
   checkKeeperAgentPresence,
   classifyBaselineForRepair,
   classifyEscalationOutcome,
+  classifyRestartProvenance,
+  collapseRestartLedger,
+  compactRestartLedger,
   countLiveEscalationSessions,
   type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
@@ -77,10 +82,12 @@ import {
   epicHasLiveUnblock,
   escalationCheckoutOccupiedBy,
   escalationSessionLiveFor,
+  foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
   isTransientBusyError,
+  KEEPERD_LAUNCHD_LABEL,
   MAX_LIVE_ESCALATION_SESSIONS,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
@@ -101,11 +108,13 @@ import {
   type ProbeTickOutcome,
   parseBlockedCategory,
   parseRestartLedger,
+  parseRestartLedgerLine,
   prewarmWatcherAddon,
   probeAuditOrchestrator,
   probeReplyProvesLife,
   probeSettleStep,
   pruneRecoveredDeadLetters,
+  qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
   type RepairCandidate,
@@ -116,7 +125,10 @@ import {
   type ResolverDispatchOutcome,
   type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
-  type RestartLedgerEntry,
+  type RestartBoot,
+  type RestartBootLine,
+  type RestartLedgerLine,
+  type RestartProvenance,
   readRestartLedger,
   readTaskBlockedReason,
   recoverOneDeadLetter,
@@ -150,12 +162,12 @@ import {
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
   selectRepairCandidates,
+  serializeRestartLedgerLine,
   serializeSessionTelemetry,
   serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
   startDaemon,
-  updateRestartLedger,
   WAL_AUTOCHECKPOINT_PAGES,
   type WorkerName,
   withBootDrainCheckpointTuning,
@@ -1860,195 +1872,454 @@ test("decideCrashLoop: future-dated garbage is ignored", () => {
   ).toEqual({ crashLoop: false, recentBoots: 0 });
 });
 
-function entriesAt(timestamps: number[]): RestartLedgerEntry[] {
-  return timestamps.map((ts) => ({ ts }));
+function bootLine(
+  bootId: string,
+  ts: number,
+  provenance: RestartProvenance,
+  prevRuntimeMs: number | null,
+): RestartBootLine {
+  return {
+    kind: "boot",
+    boot_id: bootId,
+    ts,
+    provenance,
+    prev_runtime_ms: prevRuntimeMs,
+  };
 }
 
-test("updateRestartLedger: appends this boot, ages out old, sorts ascending", () => {
-  const updated = updateRestartLedger({
-    existing: entriesAt([CL_NOW - CL_WINDOW - 1, CL_NOW - 1_000, CL_NOW - 500]),
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  // The stale entry is dropped; the current boot is appended; result is sorted.
-  expect(updated).toEqual(entriesAt([CL_NOW - 1_000, CL_NOW - 500, CL_NOW]));
-});
+// ── provenance heuristic ─────────────────────────────────────────────────────
 
-test("updateRestartLedger: length cap keeps the most recent entries", () => {
-  // More in-window boots than the cap → keep the newest `cap` (including now).
-  const existing = entriesAt(
-    bootsEndingAt(CL_NOW - 1, RESTART_LEDGER_CAP + 20, 100),
+test("classifyRestartProvenance: the launchd label (and a suffixed sibling) is launchd", () => {
+  expect(classifyRestartProvenance(KEEPERD_LAUNCHD_LABEL)).toBe("launchd");
+  expect(classifyRestartProvenance(`${KEEPERD_LAUNCHD_LABEL}.bus-only`)).toBe(
+    "launchd",
   );
-  const updated = updateRestartLedger({
-    existing,
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  expect(updated.length).toBe(RESTART_LEDGER_CAP);
-  expect(updated[updated.length - 1]).toEqual({ ts: CL_NOW });
-  // Sorted ascending, so the retained slice is the newest window of boots.
-  expect(updated[0].ts).toBeGreaterThan(existing[0].ts);
 });
 
-test("updateRestartLedger: no reason omits the field (matches today's bare boot fold)", () => {
-  const updated = updateRestartLedger({
-    existing: [],
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  expect(updated).toEqual([{ ts: CL_NOW }]);
-  expect(updated[0]).not.toHaveProperty("reason");
+test("classifyRestartProvenance: missing / empty / the '0' sentinel maps to unknown", () => {
+  expect(classifyRestartProvenance(undefined)).toBe("unknown");
+  expect(classifyRestartProvenance(null)).toBe("unknown");
+  expect(classifyRestartProvenance("")).toBe("unknown");
+  expect(classifyRestartProvenance("   ")).toBe("unknown");
+  expect(classifyRestartProvenance("0")).toBe("unknown");
 });
 
-test("updateRestartLedger: a reason lands on the newest entry", () => {
-  const updated = updateRestartLedger({
-    existing: entriesAt([CL_NOW - 1_000]),
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
+test("classifyRestartProvenance: any other service name is a foreign context", () => {
+  expect(classifyRestartProvenance("com.apple.Terminal")).toBe("foreign");
+  expect(classifyRestartProvenance("dev.direnv.thing")).toBe("foreign");
+});
+
+// ── NDJSON line serialize / parse (torn-tail contract) ───────────────────────
+
+test("serializeRestartLedgerLine / parseRestartLedgerLine: a boot line round-trips", () => {
+  const line = bootLine("abc", 1234, "launchd", 90_000);
+  const s = serializeRestartLedgerLine(line);
+  expect(s.endsWith("\n")).toBe(true);
+  expect(parseRestartLedgerLine(s)).toEqual(line);
+});
+
+test("serializeRestartLedgerLine / parseRestartLedgerLine: an enrich line round-trips", () => {
+  const line: RestartLedgerLine = {
+    kind: "enrich",
+    boot_id: "abc",
+    ts: 1300,
     reason: "uncaughtException: boom",
-  });
-  expect(updated).toEqual([
-    { ts: CL_NOW - 1_000 },
-    { ts: CL_NOW, reason: "uncaughtException: boom" },
-  ]);
+  };
+  expect(parseRestartLedgerLine(serializeRestartLedgerLine(line))).toEqual(
+    line,
+  );
 });
 
-test("updateRestartLedger: a second call at the SAME nowMs enriches the entry boot already wrote, not a duplicate", () => {
-  // Models the fatalExit seam: boot-fold wrote a bare entry for this boot;
-  // fatalExit later calls again with the identical nowMs + a reason. The
-  // entry gains the reason IN PLACE — the boot count must not double.
-  const afterBoot = updateRestartLedger({
-    existing: entriesAt([CL_NOW - 5_000]),
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  expect(afterBoot).toEqual([{ ts: CL_NOW - 5_000 }, { ts: CL_NOW }]);
-
-  const afterFatalExit = updateRestartLedger({
-    existing: afterBoot,
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-    reason: "tmux-control-watchdog: control client mute",
-  });
-  expect(afterFatalExit).toEqual([
-    { ts: CL_NOW - 5_000 },
-    { ts: CL_NOW, reason: "tmux-control-watchdog: control client mute" },
-  ]);
-  expect(afterFatalExit.length).toBe(2); // still one entry for this boot, not two
+test("parseRestartLedgerLine: a torn / partial trailing line folds to null (never corrupts)", () => {
+  expect(parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts')).toBeNull();
+  expect(parseRestartLedgerLine("")).toBeNull();
+  expect(parseRestartLedgerLine("   ")).toBeNull();
 });
 
-test("updateRestartLedger: an overlong reason is bounded, never grows the sidecar unbounded", () => {
-  const updated = updateRestartLedger({
-    existing: [],
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
+test("parseRestartLedgerLine: a missing boot_id or non-finite ts folds to null", () => {
+  expect(parseRestartLedgerLine('{"kind":"boot","ts":1}')).toBeNull();
+  expect(
+    parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts":null}'),
+  ).toBeNull();
+  expect(
+    parseRestartLedgerLine('{"kind":"boot","boot_id":"","ts":1}'),
+  ).toBeNull();
+});
+
+test("parseRestartLedgerLine: an unknown kind folds to null", () => {
+  expect(
+    parseRestartLedgerLine('{"kind":"other","boot_id":"a","ts":1}'),
+  ).toBeNull();
+});
+
+test("parseRestartLedgerLine: garbage provenance folds to unknown, a missing gap to null", () => {
+  expect(
+    parseRestartLedgerLine(
+      '{"kind":"boot","boot_id":"a","ts":1,"provenance":"martian"}',
+    ),
+  ).toEqual(bootLine("a", 1, "unknown", null));
+});
+
+test("parseRestartLedgerLine: an enrich line with a non-string reason folds to null", () => {
+  expect(
+    parseRestartLedgerLine('{"kind":"enrich","boot_id":"a","ts":1,"reason":5}'),
+  ).toBeNull();
+});
+
+test("parseRestartLedgerLine: an overlong reason is bounded on read", () => {
+  const line: RestartLedgerLine = {
+    kind: "enrich",
+    boot_id: "a",
+    ts: 1,
     reason: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN + 500),
-  });
-  expect(updated[0].reason?.length).toBe(RESTART_LEDGER_REASON_MAX_LEN);
+  };
+  const parsed = parseRestartLedgerLine(serializeRestartLedgerLine(line)) as {
+    reason: string;
+  };
+  expect(parsed.reason.length).toBe(RESTART_LEDGER_REASON_MAX_LEN);
 });
 
-test("decideCrashLoop: verdict is byte-identical for identical ts sequences with and without reason fields", () => {
-  const bare = entriesAt(bootsEndingAt(CL_NOW, CRASH_LOOP_THRESHOLD, 90_000));
-  const withReasons: RestartLedgerEntry[] = bare.map((e, i) => ({
-    ts: e.ts,
-    reason: i % 2 === 0 ? `watchdog-fire-${i}` : undefined,
-  }));
-  const verdictBare = decideCrashLoop({
-    nowMs: CL_NOW,
-    bootTimestamps: bare.map((e) => e.ts),
-    threshold: CRASH_LOOP_THRESHOLD,
-    windowMs: CL_WINDOW,
-  });
-  const verdictWithReasons = decideCrashLoop({
-    nowMs: CL_NOW,
-    bootTimestamps: withReasons.map((e) => e.ts),
-    threshold: CRASH_LOOP_THRESHOLD,
-    windowMs: CL_WINDOW,
-  });
-  expect(verdictWithReasons).toEqual(verdictBare);
-  expect(verdictBare).toEqual({
-    crashLoop: true,
-    recentBoots: CRASH_LOOP_THRESHOLD,
-  });
+// ── whole-body parse: NDJSON + legacy dual-read ──────────────────────────────
+
+test("parseRestartLedger: NDJSON multi-line round-trips every line", () => {
+  const lines: RestartLedgerLine[] = [
+    bootLine("a", 1, "launchd", null),
+    { kind: "enrich", boot_id: "a", ts: 2, reason: "boom" },
+    bootLine("b", 3, "foreign", 2),
+  ];
+  const raw = lines.map(serializeRestartLedgerLine).join("");
+  expect(parseRestartLedger(raw)).toEqual(lines);
 });
 
-test("parseRestartLedger: valid array of finite numbers (legacy shape) coerces to entries", () => {
-  expect(parseRestartLedger("[1, 2, 3]")).toEqual(entriesAt([1, 2, 3]));
+test("parseRestartLedger: a torn trailing line is dropped, earlier lines survive", () => {
+  const raw =
+    serializeRestartLedgerLine(bootLine("a", 1, "launchd", null)) +
+    '{"kind":"boot","boot_id":"b","ts';
+  expect(parseRestartLedger(raw)).toEqual([bootLine("a", 1, "launchd", null)]);
 });
 
-test("parseRestartLedger: object entries with a reason round-trip", () => {
-  const raw = JSON.stringify([
-    { ts: 1 },
-    { ts: 2, reason: "uncaughtException: boom" },
+test("parseRestartLedger: dual-reads the legacy number array as unknown-provenance boots", () => {
+  expect(parseRestartLedger("[1, 2, 3]")).toEqual([
+    bootLine("legacy:0:1", 1, "unknown", null),
+    bootLine("legacy:1:2", 2, "unknown", null),
+    bootLine("legacy:2:3", 3, "unknown", null),
   ]);
+});
+
+test("parseRestartLedger: dual-reads legacy object entries, a reason becoming an enrich line", () => {
+  const raw = JSON.stringify([{ ts: 1 }, { ts: 2, reason: "boom" }]);
   expect(parseRestartLedger(raw)).toEqual([
-    { ts: 1 },
-    { ts: 2, reason: "uncaughtException: boom" },
+    bootLine("legacy:0:1", 1, "unknown", null),
+    bootLine("legacy:1:2", 2, "unknown", null),
+    { kind: "enrich", boot_id: "legacy:1:2", ts: 2, reason: "boom" },
   ]);
 });
 
-test("parseRestartLedger: a mixed legacy-number + object array coerces uniformly and counts identically", () => {
-  const raw = JSON.stringify([1, { ts: 2 }, { ts: 3, reason: "boom" }, 4]);
-  const parsed = parseRestartLedger(raw);
-  expect(parsed).toEqual([
-    { ts: 1 },
-    { ts: 2 },
-    { ts: 3, reason: "boom" },
-    { ts: 4 },
-  ]);
-  // The crash-loop decision reads ts only, so a mixed-shape ledger counts
-  // exactly like an all-legacy one would.
-  const verdict = decideCrashLoop({
-    nowMs: 4,
-    bootTimestamps: parsed.map((e) => e.ts),
-    threshold: 4,
-    windowMs: CL_WINDOW,
-  });
-  expect(verdict).toEqual({ crashLoop: true, recentBoots: 4 });
-});
-
-test("parseRestartLedger: an object entry with a non-string reason drops the reason but keeps ts", () => {
+test("parseRestartLedger: a legacy non-string reason drops the reason but keeps the boot", () => {
   expect(parseRestartLedger('[{"ts": 5, "reason": 12345}]')).toEqual([
-    { ts: 5 },
+    bootLine("legacy:0:5", 5, "unknown", null),
   ]);
 });
 
-test("parseRestartLedger: corrupt body fails open to empty (never throws, never trips)", () => {
-  // A torn/garbage ledger must become an EMPTY one — never new fatalExit fuel and
-  // never a false crash-loop trip. Non-array, non-JSON, and non-finite/malformed
-  // entries all collapse to [].
+test("parseRestartLedger: corrupt / garbage bodies fail open to empty (never trip)", () => {
   expect(parseRestartLedger("not json at all")).toEqual([]);
   expect(parseRestartLedger('{"not":"an array"}')).toEqual([]);
   expect(parseRestartLedger("")).toEqual([]);
+  // A legacy array with malformed members keeps only the finite-ts entries.
   expect(
-    parseRestartLedger(
-      '[1, "two", null, 3, 1e999, {}, {"ts":"nope"}, {"ts":null}]',
-    ),
-  ).toEqual(entriesAt([1, 3]));
+    parseRestartLedger('[1, "two", null, 3, 1e999, {}, {"ts":"nope"}]'),
+  ).toEqual([
+    bootLine("legacy:0:1", 1, "unknown", null),
+    bootLine("legacy:3:3", 3, "unknown", null),
+  ]);
 });
 
-test("readRestartLedger / writeRestartLedger: round-trip through a real file, atomically", () => {
+test("parseRestartLedger: a legacy rapid-boot array still trips the loop after the format flip", () => {
+  // Acceptance: the count survives the transition. THRESHOLD+1 boots 90s apart
+  // dual-read into forensic boot records; collapse backfills the young gaps.
+  const legacy = bootsEndingAt(CL_NOW, CRASH_LOOP_THRESHOLD + 1, 90_000);
+  const lines = parseRestartLedger(JSON.stringify(legacy));
+  expect(lines.filter((l) => l.kind === "boot").length).toBe(
+    CRASH_LOOP_THRESHOLD + 1,
+  );
+  const qualified = qualifyCrashLoopBootTimestamps(
+    collapseRestartLedger(lines),
+    CRASH_LOOP_YOUNG_RUNTIME_MS,
+  );
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualified,
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: true, recentBoots: CRASH_LOOP_THRESHOLD });
+});
+
+// ── collapse: per-boot_id merge, prev backfill, orphan forensics ─────────────
+
+test("collapseRestartLedger: a boot line and its enrichment collapse to one record", () => {
+  expect(
+    collapseRestartLedger([
+      bootLine("a", 1000, "launchd", null),
+      { kind: "enrich", boot_id: "a", ts: 1500, reason: "boom" },
+    ]),
+  ).toEqual([
+    {
+      boot_id: "a",
+      ts: 1000,
+      provenance: "launchd",
+      prev_runtime_ms: null,
+      reason: "boom",
+      died_at_ms: 1500,
+    },
+  ]);
+});
+
+test("collapseRestartLedger: an orphan enrichment synthesizes a forensic record, never dropped", () => {
+  expect(
+    collapseRestartLedger([
+      { kind: "enrich", boot_id: "orphan", ts: 5000, reason: "late" },
+    ]),
+  ).toEqual([
+    {
+      boot_id: "orphan",
+      ts: 5000,
+      provenance: "unknown",
+      prev_runtime_ms: null,
+      reason: "late",
+      died_at_ms: 5000,
+    },
+  ]);
+});
+
+test("collapseRestartLedger: backfills a missing prev_runtime from the gap, preserves a frozen one", () => {
+  const boots = collapseRestartLedger([
+    bootLine("a", 1000, "launchd", null),
+    bootLine("b", 1000 + 90_000, "launchd", null),
+    bootLine("c", 1000 + 90_000 + 500_000, "launchd", 42),
+  ]);
+  // a: first → null. b: backfilled to the 90s gap. c: frozen 42 preserved.
+  expect(boots.map((b) => b.prev_runtime_ms)).toEqual([null, 90_000, 42]);
+});
+
+// ── fold this boot: gap freeze + overlapping-boot retention ──────────────────
+
+test("foldBootIntoRestartLedger: the first-ever boot has a null predecessor gap", () => {
+  const { lines, bootLine: bl } = foldBootIntoRestartLedger({
+    existing: [],
+    bootId: "first",
+    provenance: "launchd",
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(bl).toEqual(bootLine("first", CL_NOW, "launchd", null));
+  expect(lines).toEqual([bl]);
+});
+
+test("foldBootIntoRestartLedger: freezes the inter-boot gap to the predecessor", () => {
+  const { bootLine: bl } = foldBootIntoRestartLedger({
+    existing: [bootLine("prev", CL_NOW - 90_000, "launchd", null)],
+    bootId: "cur",
+    provenance: "launchd",
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(bl.prev_runtime_ms).toBe(90_000);
+});
+
+test("foldBootIntoRestartLedger: overlapping boots at the same instant each retain their own line", () => {
+  // Fails against a timestamp-keyed ledger, which filtered out any entry whose ts
+  // equalled the booting process's nowMs — erasing the overlapping boot's record.
+  const { lines } = foldBootIntoRestartLedger({
+    existing: [bootLine("a", CL_NOW, "launchd", null)],
+    bootId: "b",
+    provenance: "unknown",
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  const bootIds = lines.filter((l) => l.kind === "boot").map((l) => l.boot_id);
+  expect(bootIds).toEqual(["a", "b"]);
+});
+
+test("collapseRestartLedger: a dying boot's enrichment touches only its own overlapping line", () => {
+  // Two daemons overlap; boot "a" dies and appends an enrich line. Boot "b" is
+  // untouched — the append-only enrich cannot erase the overlapping boot the way
+  // the old ts-keyed read-modify-write did.
+  const boots = collapseRestartLedger([
+    bootLine("a", CL_NOW, "launchd", null),
+    bootLine("b", CL_NOW, "foreign", null),
+    { kind: "enrich", boot_id: "a", ts: CL_NOW + 10, reason: "a-died" },
+  ]);
+  expect(boots.length).toBe(2);
+  expect(boots.find((x) => x.boot_id === "a")?.reason).toBe("a-died");
+  expect(boots.find((x) => x.boot_id === "b")?.reason).toBeUndefined();
+});
+
+// ── compaction: window aging + cap + flatten ─────────────────────────────────
+
+test("compactRestartLedger: ages out an old boot, keeps in-window boots and their enrichment", () => {
+  const out = compactRestartLedger(
+    [
+      bootLine("old", CL_NOW - CL_WINDOW - 1, "launchd", null),
+      bootLine("keep1", CL_NOW - 1_000, "launchd", null),
+      { kind: "enrich", boot_id: "keep1", ts: CL_NOW - 500, reason: "boom" },
+      bootLine("keep2", CL_NOW, "launchd", 1_000),
+    ],
+    { nowMs: CL_NOW, windowMs: CL_WINDOW, cap: RESTART_LEDGER_CAP },
+  );
+  expect(out.filter((l) => l.kind === "boot").map((l) => l.boot_id)).toEqual([
+    "keep1",
+    "keep2",
+  ]);
+  expect(out.filter((l) => l.kind === "enrich").map((l) => l.boot_id)).toEqual([
+    "keep1",
+  ]);
+});
+
+test("compactRestartLedger: the length cap keeps the most recent boots", () => {
+  const many: RestartLedgerLine[] = [];
+  for (let i = 0; i < RESTART_LEDGER_CAP + 5; i++) {
+    many.push(
+      bootLine(
+        `b-${i}`,
+        CL_NOW - (RESTART_LEDGER_CAP + 5 - i) * 100,
+        "launchd",
+        null,
+      ),
+    );
+  }
+  const boots = compactRestartLedger(many, {
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  }).filter((l) => l.kind === "boot");
+  expect(boots.length).toBe(RESTART_LEDGER_CAP);
+  expect(boots[boots.length - 1].boot_id).toBe(`b-${RESTART_LEDGER_CAP + 4}`);
+});
+
+test("compactRestartLedger: a future-dated boot is dropped", () => {
+  const out = compactRestartLedger(
+    [
+      bootLine("now", CL_NOW, "launchd", null),
+      bootLine("future", CL_NOW + 10_000, "launchd", null),
+    ],
+    { nowMs: CL_NOW, windowMs: CL_WINDOW, cap: RESTART_LEDGER_CAP },
+  );
+  expect(out.filter((l) => l.kind === "boot").map((l) => l.boot_id)).toEqual([
+    "now",
+  ]);
+});
+
+// ── runtime-qualified crash-loop counting ────────────────────────────────────
+
+test("qualifyCrashLoopBootTimestamps: young predecessors count, healthy bounce / no-pred / foreign do not", () => {
+  const base = 1_000_000;
+  const boots: RestartBoot[] = collapseRestartLedger([
+    bootLine("h", base, "launchd", null), // no predecessor → excluded
+    bootLine("a", base + 3_600_000, "launchd", 3_600_000), // ran 1h → excluded
+    bootLine("b", base + 3_600_000 + 90_000, "launchd", 90_000), // young → counts
+    bootLine("c", base + 3_600_000 + 180_000, "unknown", 90_000), // unknown young → counts
+    bootLine("f", base + 3_600_000 + 270_000, "foreign", 90_000), // foreign → excluded
+  ]);
+  expect(
+    qualifyCrashLoopBootTimestamps(boots, CRASH_LOOP_YOUNG_RUNTIME_MS),
+  ).toEqual([base + 3_600_000 + 90_000, base + 3_600_000 + 180_000]);
+});
+
+test("qualify + decideCrashLoop: a bounce of a healthy long-running daemon does not trip", () => {
+  const boots = collapseRestartLedger([
+    bootLine("h", CL_NOW - 3_600_000, "launchd", null),
+    bootLine("x", CL_NOW, "launchd", 3_600_000), // bounced after 1h
+  ]);
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        boots,
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: false, recentBoots: 0 });
+});
+
+test("qualify + decideCrashLoop: repeated young deaths trip the loop", () => {
+  const lines: RestartLedgerLine[] = [];
+  // THRESHOLD+1 boots 90s apart: the leading boot has no predecessor (excluded),
+  // the following THRESHOLD each had a young (90s) predecessor → exactly THRESHOLD.
+  for (let i = 0; i <= CRASH_LOOP_THRESHOLD; i++) {
+    lines.push(
+      bootLine(
+        `loop-${i}`,
+        CL_NOW - (CRASH_LOOP_THRESHOLD - i) * 90_000,
+        "launchd",
+        i === 0 ? null : 90_000,
+      ),
+    );
+  }
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        collapseRestartLedger(lines),
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: true, recentBoots: CRASH_LOOP_THRESHOLD });
+});
+
+// ── file round-trip: NDJSON write / read / append ────────────────────────────
+
+test("readRestartLedger / writeRestartLedger: NDJSON round-trip through a real file, no temp left behind", () => {
   const dir = mkdtempSync(join(tmpdir(), "keeper-restart-ledger-"));
   const path = join(dir, "restart-ledger.json");
   try {
-    const entries: RestartLedgerEntry[] = [
-      { ts: 1 },
-      { ts: 2, reason: "serve-liveness-watchdog: probe-stuck" },
+    const lines: RestartLedgerLine[] = [
+      bootLine("a", 1, "launchd", null),
+      {
+        kind: "enrich",
+        boot_id: "a",
+        ts: 2,
+        reason: "serve-liveness-watchdog: probe-stuck",
+      },
+      bootLine("b", 3, "foreign", 2),
     ];
-    writeRestartLedger(path, entries);
-    expect(readRestartLedger(path)).toEqual(entries);
-    // atomicWriteFile never leaves a .tmp.* file behind on success.
+    writeRestartLedger(path, lines);
+    expect(readRestartLedger(path)).toEqual(lines);
     const leftovers = readdirSync(dir).filter(
       (f) => f !== "restart-ledger.json",
     );
     expect(leftovers).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendRestartLedgerLine: appends one line without overwriting existing content", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-restart-ledger-"));
+  const path = join(dir, "restart-ledger.json");
+  try {
+    writeFileSync(
+      path,
+      serializeRestartLedgerLine(bootLine("a", 1, "launchd", null)),
+    );
+    appendRestartLedgerLine(path, {
+      kind: "enrich",
+      boot_id: "a",
+      ts: 2,
+      reason: "boom",
+    });
+    expect(readRestartLedger(path)).toEqual([
+      bootLine("a", 1, "launchd", null),
+      { kind: "enrich", boot_id: "a", ts: 2, reason: "boom" },
+    ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

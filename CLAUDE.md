@@ -72,10 +72,12 @@ file is imperative guardrails only.
   read-only connection. Carve-out: `@parcel/watcher` on EXTERNAL trees + kqueue/pidfd on EXTERNAL fds are fine. A transient `SQLITE_NOTADB` skips the tick via the shared `NotadbTolerance`, never an ad-hoc catch.
 - **No in-process self-heal.** Any unrecoverable error `fatalExit`s (non-zero exit; LaunchAgent
   respawn is sole recovery); never respawn a worker in-process (carve-outs: closing a stale/EPIPE
-  UDS client, the git seed-liveness watchdog's capped MAIN boot-seed re-runs before `fatalExit`, and
-  the serve-liveness watchdog's real-read probes + served-latency self-report that `fatalExit` a
-  wedged serve path, trigger: accept-stall, busy-lag, serve-report-mute, serve-starvation (main clocks
-  arrival; clock-jump guard resets all on suspend/resume)). A crash-loop is loud: main appends each boot to a restart ledger (state-dir sidecar, NOT a fold), minting ONE sticky needs_human distress row cleared once the boot rate recovers.
+  UDS client, the git seed-liveness watchdog's capped boot-seed re-run before `fatalExit`, and the
+  serve-liveness watchdog `fatalExit`ing a wedged serve path on a named trigger: accept-stall,
+  busy-lag, serve-report-mute, serve-starvation; main clocks arrival, clock-jump guard resets on
+  suspend/resume). A crash-loop is loud: main appends each boot to an append-only, boot_id-keyed
+  NDJSON restart ledger (sidecar, NOT a fold; runtime-qualified count), minting ONE sticky
+  distress row cleared once the boot rate recovers.
 - **A `flock` single-instance gate tops `startDaemon()`** before `openDb`/`migrate`; its `FD_CLOEXEC` lock fd never leaves main.
 - **`keeper tabs restore --apply` exits non-zero while autopilot is unpaused** (fail closed, never warn-and-continue) unless `--force`.
 
