@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "A bounded single-surface test addition mirroring an existing codex passthrough test with fully-specified acceptance and a named file, ideal trickle-lane work for the spark model at medium.",
+      "task_id": "fn-1236-cover-pi-passthrough-leaf-guard-wiring.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "created_at": "2026-07-10T09:56:41.446000Z",
+  "epic_id": "fn-1236-cover-pi-passthrough-leaf-guard-wiring",
+  "input_hash": "4f5bfc43a30136401f1faf2a94edbb600c4187e1328d2d6f909d739ad27841bd",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1331428419,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"A bounded single-surface test addition mirroring an existing codex passthrough test with fully-specified acceptance and a named file, ideal trickle-lane work for the spark model at medium.\",\"confidence\":0.8}]}"
+}
