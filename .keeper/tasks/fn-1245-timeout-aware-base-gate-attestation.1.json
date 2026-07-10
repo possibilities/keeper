@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Timeout aware base gate attestation",
-  "updated_at": "2026-07-10T21:50:59.138000Z"
+  "updated_at": "2026-07-10T22:18:49.211000Z",
+  "worker_done_at": "2026-07-10T22:18:49.211000Z"
 }

@@ -47,5 +47,5 @@ load) is a producer/worker-side signal only — it must never enter a fold
 - [ ] Any starvation/timeout signal consulted lives on the producer/worker side; no fold reads wall-clock, CPU time, or host load; fast suite green.
 
 ## Done summary
-
+Made the worker base-gate verdict timeout-aware: a timeout/infra-error baseline verdict is inconclusive (retry with backoff, then TOOLING_FAILURE), never SHARED_BASE_BROKEN — only a confirmed suite-red attests. Native + wrapped partials agree; daemon selectRepairCandidates doc-pinned to trust the category token as the sole discriminator with a regression test.
 ## Evidence
