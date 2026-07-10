@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Gate finalize and recover on closer occupancy",
-  "updated_at": "2026-07-10T00:54:38.775000Z"
+  "updated_at": "2026-07-10T01:16:12.949000Z",
+  "worker_done_at": "2026-07-10T01:16:12.949000Z"
 }

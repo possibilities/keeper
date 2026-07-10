@@ -94,5 +94,5 @@ orphaned one. No real git, no subprocess.
 - [ ] Full fast suite green
 
 ## Done summary
-
+Gated the projection-done finalize arm and recover pass-3 teardown on the shared isOccupyingJob seam so a done epic whose closer still occupies its lane defers merge/teardown until the closer exits (ADR 0031); reuses the occupancy seam only, no cwd matching. Added epicHasOccupyingJob + incident-repro fast-tier tests.
 ## Evidence
