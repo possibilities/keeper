@@ -8,38 +8,38 @@
     {
       "confidence": 0.72,
       "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Cross-cutting architectural seam: the TranscriptReader contract and registry both sibling readers build on, plus a behavior-preserving CLI grammar flip across the largest surface of the epic, is a nameable multi-file cascade warranting opus at the contract-introduction band.",
+      "model": "sonnet",
+      "rationale": "Foundational reader-seam interface plus CLI grammar flip whose abstraction cascades into the two sibling readers, needing Claude API-surface taste and delicate behavior-preserving idiom matching rather than a nameable opus reason.",
       "task_id": "fn-1242-multi-harness-keeper-transcript.1",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.7,
+      "confidence": 0.74,
       "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "Bounded single-file reader implementation against the established task-1 seam with a named reference to re-express and a fully-specified entry mapping, well within sonnet's literal-implementation sweet spot at the model-default band.",
+      "model": "gpt-5.5",
+      "rationale": "Substantial but well-specified single-surface reader with a fully enumerated entry-mapping acceptance, routing GPT-first at the workhorse tier.",
       "task_id": "fn-1242-multi-harness-keeper-transcript.2",
       "tier": "high"
     },
     {
-      "confidence": 0.6,
+      "confidence": 0.68,
       "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "The hardest reader with subtle but fully-specified rules (top-level-timestamp ordering, event_msg dedup, encrypted-reasoning exclusion, meta backfill) is literal execution against a detailed spec, so sonnet at xhigh for the edge-case density rather than escalating the model.",
+      "model": "gpt-5.6-sol",
+      "rationale": "The hardest well-specified reader \u2014 dense correctness edge cases (spine mapping, dedup, timestamp ordering, backfill) against a fixed on-disk contract \u2014 fits the top GPT tier for hard bounded work.",
       "task_id": "fn-1242-multi-harness-keeper-transcript.3",
-      "tier": "xhigh"
+      "tier": "high"
     }
   ],
-  "config_hash": "5a17bddabc7e3f99ac738b07e00cddd2c7b7405003e0373647f2fdb6bbe07dae",
-  "created_at": "2026-07-10T19:24:54.948000Z",
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T21:29:47.061000Z",
   "epic_id": "fn-1242-multi-harness-keeper-transcript",
-  "input_hash": "bdeaa5b733f6301a632200b74f173a046d96f3b49eb35f0c67f2299701e9f16b",
+  "input_hash": "b2c10e23538625853503cf95bb0849c81028cdb202c076b627e8587e23248c44",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 3186271671,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting architectural seam: the TranscriptReader contract and registry both sibling readers build on, plus a behavior-preserving CLI grammar flip across the largest surface of the epic, is a nameable multi-file cascade warranting opus at the contract-introduction band.\",\"confidence\":0.72},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded single-file reader implementation against the established task-1 seam with a named reference to re-express and a fully-specified entry mapping, well within sonnet's literal-implementation sweet spot at the model-default band.\",\"confidence\":0.7},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.3\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"The hardest reader with subtle but fully-specified rules (top-level-timestamp ordering, event_msg dedup, encrypted-reasoning exclusion, meta backfill) is literal execution against a detailed spec, so sonnet at xhigh for the edge-case density rather than escalating the model.\",\"confidence\":0.6}]}\n"
+  "shuffle_seed": 2998996515,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Foundational reader-seam interface plus CLI grammar flip whose abstraction cascades into the two sibling readers, needing Claude API-surface taste and delicate behavior-preserving idiom matching rather than a nameable opus reason.\",\"confidence\":0.72},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Substantial but well-specified single-surface reader with a fully enumerated entry-mapping acceptance, routing GPT-first at the workhorse tier.\",\"confidence\":0.74},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.3\",\"tier\":\"high\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"The hardest well-specified reader \u2014 dense correctness edge cases (spine mapping, dedup, timestamp ordering, backfill) against a fixed on-disk contract \u2014 fits the top GPT tier for hard bounded work.\",\"confidence\":0.68}]}\n"
 }

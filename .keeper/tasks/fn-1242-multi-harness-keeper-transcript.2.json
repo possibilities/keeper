@@ -7,11 +7,11 @@
   ],
   "epic": "fn-1242-multi-harness-keeper-transcript",
   "id": "fn-1242-multi-harness-keeper-transcript.2",
-  "model": "sonnet",
+  "model": "gpt-5.5",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "pi transcript reader",
-  "updated_at": "2026-07-10T19:24:54.948000Z"
+  "updated_at": "2026-07-10T21:29:47.061000Z"
 }
