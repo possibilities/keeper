@@ -14,11 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgsForAgent } from "../src/agent/args";
-import {
-  ConfigError,
-  loadPanelSelections,
-  loadPresetCatalog,
-} from "../src/agent/config";
+import { ConfigError, loadPresetCatalog } from "../src/agent/config";
 import {
   attributeHermesSession,
   hermesLastMessage,
@@ -182,7 +178,7 @@ describe("Hermes detached launch argv (native builder)", () => {
   });
 });
 
-describe("Hermes preset validation", () => {
+describe("Hermes default triple validation", () => {
   let tmpDir: string;
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-hermes-preset-"));
@@ -197,61 +193,30 @@ describe("Hermes preset validation", () => {
     return p;
   }
 
-  test("a model-only hermes preset resolves", () => {
+  test("a hermes_default triple parses (model-only, na effort)", () => {
     const cat = loadPresetCatalog(
-      writePresets("presets:\n  h:\n    harness: hermes\n    model: gpt-5.5\n"),
+      writePresets("hermes_default: hermes::gpt-5.5::na\n"),
     );
-    expect(cat.presets.h).toMatchObject({
+    expect(cat.hermes_default).toEqual({
       harness: "hermes",
       model: "gpt-5.5",
-      effort: null,
-      thinking: null,
+      effort: "na",
     });
   });
 
-  test("a hermes preset carrying effort fails loud", () => {
-    const p = writePresets(
-      "presets:\n  h:\n    harness: hermes\n    model: m\n    effort: high\n",
-    );
+  test("a hermes_default triple carrying a non-na effort fails loud", () => {
+    // Hermes is axisless — the grammar requires the `na` sentinel, rejecting an
+    // effort band.
+    const p = writePresets("hermes_default: hermes::m::high\n");
     expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
-    expect(() => loadPresetCatalog(p)).toThrow(/effort .*not hermes/);
+    expect(() => loadPresetCatalog(p)).toThrow(/must be 'na'/);
   });
 
-  test("a hermes preset carrying thinking fails loud", () => {
-    const p = writePresets(
-      "presets:\n  h:\n    harness: hermes\n    model: m\n    thinking: high\n",
-    );
-    expect(() => loadPresetCatalog(p)).toThrow(ConfigError);
-    expect(() => loadPresetCatalog(p)).toThrow(/thinking .*not hermes/);
-  });
-
-  test("a hermes_default pointer resolves to its preset", () => {
-    const cat = loadPresetCatalog(
-      writePresets(
-        "presets:\n  h:\n    harness: hermes\n    model: m\nhermes_default: h\n",
-      ),
-    );
-    expect(cat.hermes_default).toBe("h");
-  });
-
-  test("a hermes_default pointing at a non-hermes preset is fail-loud", () => {
-    const p = writePresets(
-      "presets:\n  c:\n    harness: claude\n    model: m\n    effort: high\nhermes_default: c\n",
-    );
+  test("a hermes_default naming a non-hermes harness is fail-loud", () => {
+    const p = writePresets("hermes_default: claude::m::high\n");
     expect(() => loadPresetCatalog(p)).toThrow(
-      /hermes_default 'c' pins harness claude, expected hermes/,
+      /hermes_default 'claude::m::high' pins harness claude, expected hermes/,
     );
-  });
-
-  test("a hermes preset is accepted as a panel member (capability-derived)", () => {
-    // Panel eligibility gates on the descriptor `capturable` capability, never a
-    // harness-name allowlist — hermes is capturable, so a hermes member loads.
-    const catalog = loadPresetCatalog(
-      writePresets("presets:\n  h:\n    harness: hermes\n    model: m\n"),
-    );
-    const panelPath = join(tmpDir, "panel.yaml");
-    writeFileSync(panelPath, "panels:\n  solo:\n    - h\n");
-    expect(loadPanelSelections(catalog, panelPath).panels.solo).toEqual(["h"]);
   });
 });
 

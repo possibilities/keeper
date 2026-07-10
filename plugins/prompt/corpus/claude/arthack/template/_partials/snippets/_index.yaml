@@ -302,7 +302,7 @@ snippets:
       - planning
       - executing
     path: _partials/snippets/engineering/panel-strength.md.tmpl
-    token-estimate: 457
+    token-estimate: 467
     used-in: []
   - name: script-shebang-hygiene
     summary: Script hygiene — never zsh shebangs; shebanged scripts need .sh/.py extension and chmod +x.

@@ -13,7 +13,7 @@ description: >-
   RUNNING agent (that is `keeper:bus`), NOT for a multi-model consensus panel
   (that is `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash
-argument-hint: <what to ask> [--preset <name> | --cli claude|codex|pi|hermes] [--role …] [--read-only]
+argument-hint: <what to ask> [--preset <harness::model::effort> | --cli claude|codex|pi|hermes] [--role …] [--read-only]
 ---
 
 # pair
@@ -77,10 +77,11 @@ keeper agent run codex "$(cat /tmp/ask.md)" --read-only --output /tmp/ans.json
 
 `keeper agent panel` launches each partner as a **detached read-only leg** and
 lets you wait for it across bounded blocking calls — the same engine
-`/plan:panel` drives. A single `--cli`/`--preset` member is pairing as a panel of
-one; a named `--panel` fans the ask out to several models at once. Both run
-identically on macOS and Linux — all detachment and polling live in the binary,
-no `setsid`/`timeout`/`gtimeout` on the path.
+`/plan:panel` drives. A single `--cli <harness>` member, or a single launch
+triple passed to `--panel <harness::model::effort>`, is pairing as a panel of
+one; a named `--panel <name>` fans the ask out to several models at once. Both
+run identically on macOS and Linux — all detachment and polling live in the
+binary, no `setsid`/`timeout`/`gtimeout` on the path.
 
 **1. Write the prompt to a file** (a scratch path is fine):
 
@@ -106,18 +107,22 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
 ```
 
 - `--slug` is **required** — a short kebab run id (`[a-z0-9-]`) you auto-derive
-  from the ask (each leg launches as `panel::<slug>::<preset>`, keeping the run
+  from the ask (each leg launches as `panel::<slug>::<member>`, keeping the run
   identifiable in tmux + forensics). Pick a sensible default, don't stall.
 - The manifest is `{"dir":"…","slug":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
   Capture `DIR`; every `wait`/`status` re-reads it — or address the run by `--slug
   <slug>`, the durable form that survives a restart. Each member's `yaml` is that
   leg's answer-envelope path.
-- Pick the member with `--cli <claude|codex|pi|hermes>` (a bare harness, add `--model` /
-  `--effort` / `--role` as needed) or `--preset <name>` (a catalog preset), or
-  fan out with `--panel <name>`. `--panel` and `--preset`/`--cli` are mutually
-  exclusive. An absent/empty `--slug`, a misconfigured/unknown panel, an undefined
-  preset, a non-pairable harness, or an unreadable prompt exits 2 with no leg
-  launched.
+- Pick the member two ways: compose a launch triple directly when you already know
+  harness+model+effort — `--panel <harness::model::effort>` (a single triple is a
+  panel of one) — or give a bare `--cli <claude|codex|pi>` (add `--model` /
+  `--effort` as needed; omit them to fall back to that harness's configured
+  `<harness>_default` triple). Run `keeper agent presets list --json` first to
+  discover native ids and effective effort ranges when you don't already know
+  them. `--role` rides onto a `--cli` member. Fan out several models at once with
+  a named `--panel <name>`. An absent/empty `--slug`, a misconfigured/unknown
+  panel, a malformed triple, a non-pairable harness, or an unreadable prompt exits
+  2 with no leg launched.
 
 **3. Wait token-free (re-issue loop).** Each `wait` call blocks ONE `--chunk`
 window (default 540s = 9 min), then exits: **0** = every leg terminal (verdict
@@ -207,13 +212,18 @@ schema-versioned JSON envelope. The fields:
 
 ## Choosing the partner
 
+Two ways to name a partner: **compose a triple directly** (`<harness>::<model>::<effort>`) when you
+already know the harness, model, and effort you want, or **enumerate then pick** — run
+`keeper agent presets list --json` to discover the configured native ids and each model's effective
+effort range, then compose the triple from what you found.
+
 | Flag | Meaning |
 |---|---|
-| `--preset <name>` | Named launch-config preset from the catalog `~/.config/keeper/presets.yaml` — supplies the harness + model/effort in one token (the recommended interface). Must be a real catalog entry: an unknown name or missing catalog exits 2 (run `keeper agent presets list` to see the configured names). A preset's harness drives the claude/codex/pi orchestration and its optional role; only a `--cli` whose harness disagrees with the preset fails loud. |
-| `--cli claude\|codex\|pi\|hermes` | The partner CLI. **Required unless `--preset` is given.** All four launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded, pi launches with `-na` (ignore project-local `.pi/` resources), and hermes gets its shell-hook allowlist + events-shim pre-seeded — all fail-open, so none stalls on a consent prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
-| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex`/`hermes` `-m`). Omit for the CLI's default; with `--preset` the launcher owns model resolution. |
+| `--preset <triple>` | **`agent run` only** (Quick single-shot). A launch triple `<harness>::<model>::<effort>` — supplies harness + model + effort in one token. The triple's harness must equal the `<cli>` positional, or it's an arg fault. `agent panel start`'s ad-hoc member has no `--preset`; compose the triple with `--panel <triple>` there instead (see *Detached + chunked wait* above). |
+| `--cli claude\|codex\|pi\|hermes` | The partner CLI. **Required unless `--preset`/`--panel` already names a triple.** All four launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded, pi launches with `-na` (ignore project-local `.pi/` resources), and hermes gets its shell-hook allowlist + events-shim pre-seeded — all fail-open, so none stalls on a consent prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
+| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex`/`hermes` `-m`). Omit for the CLI's default; a triple already supplies it unless this overrides. |
 | `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi/hermes member is an arg fault; hermes is model-only, pi takes thinking not effort). |
-| `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner` (rides the leg as a `--system` block on the panel path). Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
+| `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner` (rides the leg as a `--system` block on the panel path; pairs with `--cli`, not with a bare triple). Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
 
 If the user's ask is slug-less or ambiguous about which CLI/role, pick a sensible

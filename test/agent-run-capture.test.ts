@@ -252,11 +252,11 @@ describe("parseRunArgs", () => {
   });
 
   test("--preset / --session / --output parse as value flags (split + = forms)", () => {
-    expect(parseRunArgs(["claude", "p", "--preset", "opus"])).toEqual(
-      okParse({ preset: "opus" }),
-    );
-    expect(parseRunArgs(["codex", "p", "--preset=fast"])).toEqual(
-      okParse({ cli: "codex", preset: "fast" }),
+    expect(
+      parseRunArgs(["claude", "p", "--preset", "claude::opus::high"]),
+    ).toEqual(okParse({ preset: "claude::opus::high" }));
+    expect(parseRunArgs(["codex", "p", "--preset=codex::gpt::high"])).toEqual(
+      okParse({ cli: "codex", preset: "codex::gpt::high" }),
     );
     expect(parseRunArgs(["claude", "p", "--session", "panels"])).toEqual(
       okParse({ session: "panels" }),
@@ -282,7 +282,7 @@ describe("parseRunArgs", () => {
         "claude",
         "p",
         "--preset",
-        "opus",
+        "claude::opus::high",
         "--session",
         "panels",
         "--output",
@@ -291,7 +291,7 @@ describe("parseRunArgs", () => {
       ]),
     ).toEqual(
       okParse({
-        preset: "opus",
+        preset: "claude::opus::high",
         session: "panels",
         output: "/tmp/leg.json",
         readOnly: true,
@@ -314,8 +314,17 @@ describe("parseRunArgs", () => {
     );
     // Compose with a preset (explicit override rides alongside the preset name).
     expect(
-      parseRunArgs(["codex", "p", "--preset", "fast", "--model", "gpt-5"]),
-    ).toEqual(okParse({ cli: "codex", preset: "fast", model: "gpt-5" }));
+      parseRunArgs([
+        "codex",
+        "p",
+        "--preset",
+        "codex::gpt::high",
+        "--model",
+        "gpt-5",
+      ]),
+    ).toEqual(
+      okParse({ cli: "codex", preset: "codex::gpt::high", model: "gpt-5" }),
+    );
   });
 
   test("--system-file + --system together → bad_args (one input, two spellings)", () => {
@@ -876,34 +885,6 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     expect(h.err.join("")).toContain("<cli> must be");
   });
 
-  const PRESET_CATALOG: PresetCatalog = {
-    presets: {
-      opus: {
-        harness: "claude",
-        model: "opus",
-        effort: "high",
-        thinking: null,
-        role: null,
-      },
-      // A matching-harness preset that resolves NEITHER model nor the second
-      // axis — the underspecified case the readiness gate rejects on the run path.
-      "opus-bare": {
-        harness: "claude",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-      fast: {
-        harness: "codex",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-    },
-  };
-
   /** A harness whose faked tmux + on-disk claude transcript let a `claude` run
    *  compose to `completed`. Extra `agent run` flags go before the positionals. */
   function completedRunHarness(
@@ -945,19 +926,19 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     expect(windowNames).toContain("panel::smoke::opus");
   });
 
-  test("--preset with a matching harness validates and composes to completed", async () => {
-    const { h } = completedRunHarness(["--preset", "opus"], PRESET_CATALOG);
+  test("--preset triple with a matching harness validates and composes to completed", async () => {
+    const { h } = completedRunHarness(["--preset", "claude::opus::high"]);
 
     const code = await expectExit(main(h.deps));
 
     expect(code).toBe(0);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "completed" });
-    // A launch actually fired — the preset validation passed, not short-circuited.
+    // A launch actually fired — the triple validation passed, not short-circuited.
     expect(h.tmuxCommands.length).toBeGreaterThan(0);
   });
 
-  test("--preset whose harness disagrees with <cli> is bad_args, no launch", async () => {
-    const { h } = completedRunHarness(["--preset", "fast"], PRESET_CATALOG);
+  test("--preset triple whose harness disagrees with <cli> is bad_args, no launch", async () => {
+    const { h } = completedRunHarness(["--preset", "codex::gpt::high"]);
 
     const code = await expectExit(main(h.deps));
 
@@ -968,60 +949,13 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     expect(h.tmuxCommands.length).toBe(0);
   });
 
-  test("--preset naming an unknown preset is bad_args (ConfigError → exit 2)", async () => {
-    const { h } = completedRunHarness(["--preset", "nope"], PRESET_CATALOG);
+  test("a malformed --preset triple is bad_args (exit 2)", async () => {
+    const { h } = completedRunHarness(["--preset", "nope"]);
 
     const code = await expectExit(main(h.deps));
 
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
-    expect(h.tmuxCommands.length).toBe(0);
-  });
-
-  test("--preset resolving NEITHER model nor second axis is bad_args, not a doomed pane", async () => {
-    // A matching-harness preset that supplies nothing would launch a detached
-    // pane that fails-loud downstream (no_transcript/timed_out). The shared
-    // readiness gate short-circuits it to clean bad_args BEFORE any launch.
-    const { h } = completedRunHarness(
-      ["--preset", "opus-bare"],
-      PRESET_CATALOG,
-    );
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(2);
-    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
-    expect(h.err.join("")).toContain("no model/effort resolved");
-    expect(h.tmuxCommands.length).toBe(0);
-  });
-
-  test("a pi preset with effort but NO thinking is bad_args (pi's second axis is thinking)", async () => {
-    // pi's second axis is `thinking`, not `effort`; the pre-fix model&&effort
-    // check wrongly accepted this. The shared helper reads `thinking` for pi, so
-    // a preset that supplies effort (a claude/codex-only knob) but no thinking
-    // resolves no second axis → bad_args, short-circuiting before any launch.
-    const catalog: PresetCatalog = {
-      presets: {
-        "pi-effort-only": {
-          harness: "pi",
-          model: "glm",
-          effort: "high",
-          thinking: null,
-          role: null,
-        },
-      },
-    };
-    const h = makeHarness({
-      argv: ["run", "--preset", "pi-effort-only", "pi", "say hi"],
-      rawArgv: true,
-      presetCatalog: catalog,
-    });
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(2);
-    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
-    expect(h.err.join("")).toContain("no model/effort resolved");
     expect(h.tmuxCommands.length).toBe(0);
   });
 
@@ -1046,12 +980,14 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
   test("--output writes the result file on a FAIL outcome (bad_args) too", async () => {
     const outDir = tempDir();
     const outPath = join(outDir, "leg.json");
-    // A mismatched --preset is a deterministic fail outcome that still knows the
-    // --output path (write-on-EVERY-outcome, exit-code-independent).
-    const { h } = completedRunHarness(
-      ["--preset", "fast", "--output", outPath],
-      PRESET_CATALOG,
-    );
+    // A mismatched --preset triple is a deterministic fail outcome that still knows
+    // the --output path (write-on-EVERY-outcome, exit-code-independent).
+    const { h } = completedRunHarness([
+      "--preset",
+      "codex::gpt::high",
+      "--output",
+      outPath,
+    ]);
 
     const code = await expectExit(main(h.deps));
 

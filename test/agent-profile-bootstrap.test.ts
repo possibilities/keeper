@@ -723,21 +723,13 @@ describe("main() explicit + env profile precedence", () => {
 // ── model/effort startup overrides through main() ───────────────────────────
 
 describe("main() model override", () => {
-  /** A claude_default preset pinning the given model + effort. */
+  /** A claude_default triple pinning the given model + effort. */
   const claudeDefaultCatalog = (
     model: string,
     effort: string,
   ): PresetCatalog => ({
-    presets: {
-      "claude-default": {
-        harness: "claude",
-        model,
-        effort,
-        thinking: null,
-        role: null,
-      },
-    },
-    claude_default: "claude-default",
+    presets: {},
+    claude_default: { harness: "claude", model, effort },
   });
 
   test("forwards the configured default model for an interactive launch", async () => {

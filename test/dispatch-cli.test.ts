@@ -198,28 +198,27 @@ test("--agent-help names all four plan-form verbs and their scope", async () => 
   expect(r.stdout).toContain("epic-scoped");
 });
 
-test("free-form --preset supplies the spec model/effort", async () => {
-  writePresets(
-    "presets:\n  fast:\n    harness: claude\n    model: haiku\n    effort: low\n",
-  );
-  const r = await runDispatch(["--prompt", "do a thing", "--preset", "fast"]);
-  expect(r.spec?.model).toBe("haiku");
-  expect(r.spec?.effort).toBe("low");
-});
-
-test("explicit --model/--effort override the preset (per field)", async () => {
-  writePresets(
-    "presets:\n  fast:\n    harness: claude\n    model: haiku\n    effort: low\n",
-  );
+test("free-form --preset triple supplies the spec model/effort", async () => {
   const r = await runDispatch([
     "--prompt",
     "do a thing",
     "--preset",
-    "fast",
+    "claude::haiku::low",
+  ]);
+  expect(r.spec?.model).toBe("haiku");
+  expect(r.spec?.effort).toBe("low");
+});
+
+test("explicit --model/--effort override the preset triple (per field)", async () => {
+  const r = await runDispatch([
+    "--prompt",
+    "do a thing",
+    "--preset",
+    "claude::haiku::low",
     "--model",
     "opus",
   ]);
-  // --model wins; the preset's effort still applies.
+  // --model wins; the triple's effort still applies.
   expect(r.spec?.model).toBe("opus");
   expect(r.spec?.effort).toBe("low");
 });
@@ -230,10 +229,8 @@ test("free-form without preset passes no model/effort (zero behavior change)", a
   expect(r.spec?.effort).toBeUndefined();
 });
 
-test("plan form defaults to the worker preset model/effort", async () => {
-  writePresets(
-    "presets:\n  worker:\n    harness: claude\n    model: opus\n    effort: high\n",
-  );
+test("plan form defaults to the worker triple model/effort", async () => {
+  writePresets("worker: claude::opus::high\n");
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",
@@ -250,7 +247,7 @@ test("plan form defaults to the worker preset model/effort", async () => {
   expect(r.spec?.effort).toBe("high");
 });
 
-test("plan form with no worker preset falls back to sonnet/max", async () => {
+test("plan form with no worker triple falls back to sonnet/max", async () => {
   // No catalog file → the worker carve-out swallows the throw → worker defaults.
   const epicRows: Row[] = [
     {
@@ -290,13 +287,10 @@ test("plan form unblock:: defaults to the escalation config (sonnet/high), boots
   expect(r.spec?.pluginDir).toBeUndefined();
 });
 
-test("plan form escalation config is independent of the worker preset", async () => {
-  // Both presets present → an escalation verb resolves the `escalation` preset,
+test("plan form escalation config is independent of the worker triple", async () => {
+  // Both triples present → an escalation verb resolves the `escalation` triple,
   // NEVER the `worker` one.
-  writePresets(
-    "presets:\n  worker:\n    harness: claude\n    model: opus\n    effort: low\n" +
-      "  escalation:\n    harness: claude\n    model: haiku\n    effort: max\n",
-  );
+  writePresets("worker: claude::opus::low\nescalation: claude::haiku::max\n");
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",
@@ -341,18 +335,21 @@ test("plan form unblock:: honors the race guard (parity with work/close)", async
   expect(r.spec).toBeUndefined();
 });
 
-test("a codex preset handed to dispatch fails loud (claude-only, exit 2)", async () => {
-  writePresets("presets:\n  cx:\n    harness: codex\n    model: gpt\n");
-  const r = await runDispatch(["--prompt", "x", "--preset", "cx"]);
+test("a codex --preset triple handed to dispatch fails loud (claude-only, exit 2)", async () => {
+  const r = await runDispatch([
+    "--prompt",
+    "x",
+    "--preset",
+    "codex::gpt::high",
+  ]);
   expect(r.code).toBe(2);
   expect(r.stderr).toContain("claude-only");
 });
 
-test("a missing preset name fails loud (exit 2)", async () => {
-  writePresets("presets:\n  fast:\n    harness: claude\n    model: haiku\n");
+test("a malformed --preset triple fails loud (exit 2)", async () => {
   const r = await runDispatch(["--prompt", "x", "--preset", "nope"]);
   expect(r.code).toBe(2);
-  expect(r.stderr).toContain("not found");
+  expect(r.stderr).toContain("three");
 });
 
 // ---------------------------------------------------------------------------

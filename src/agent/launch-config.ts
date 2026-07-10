@@ -148,9 +148,9 @@ export interface AgentLaunchOpts {
   effort?: string;
   /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
   session?: string;
-  /** A named launch-config preset forwarded as `--x-preset <name>` so the
-   *  launcher owns model/effort resolution — the caller never re-derives them.
-   *  Omitted = no preset flag (model/effort fall to the explicit
+  /** A launch triple (`<harness>::<model>::<effort>`) forwarded as `--x-preset
+   *  <triple>` so the launcher owns model/effort resolution — the caller never
+   *  re-derives them. Omitted = no triple flag (model/effort fall to the explicit
    *  `--model`/`--effort`). */
   preset?: string;
   /** Launch NAME. Rides as `--x-tmux-window-name <name>` (the tmux window name,
@@ -207,9 +207,9 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
     "--x-tmux-detached",
     "--x-no-confirm",
   ];
-  // The named preset rides as a launcher flag so `keeper agent` owns model/effort
-  // resolution (an explicit flag/env still wins over the preset). The caller never
-  // re-derives model/effort from the preset — it only reads the preset's harness.
+  // The launch triple rides as a launcher flag so `keeper agent` owns model/effort
+  // resolution (an explicit flag/env still wins over the triple). The caller never
+  // re-derives model/effort from the triple — it only reads the triple's harness.
   if (opts.preset !== undefined && opts.preset !== "") {
     wrapperFlags.push("--x-preset", opts.preset);
   }

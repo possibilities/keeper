@@ -120,13 +120,13 @@ category to one write-capable session per (repo, fingerprint) instead of the tas
 unblock). All three inherit the identical additive base set plus their target
 `/plan:unblock`, `/plan:deconflict`, or `/plan:repair` skill. What sets them apart is the
 launch config, not the plugin channel: their `{model, effort}` comes from a SEPARATE
-`escalation` preset (`resolveEscalationLaunchConfig`, `src/escalation-config.ts`) — the
-`escalation` key in `presets.yaml` layered per-field over the `ESCALATION_*` constants,
-DELIBERATELY independent of the `worker` preset so an escalation session's tier moves
-without perturbing plan workers. Claude-only; a missing or malformed catalog swallows to
-the built-in escalation defaults, never a launch failure. Every escalation session is
-additionally constrained by the keeper plugin's sixth hook, escalation-guard
-(`PreToolUse(Bash)`), which is role-keyed on the launch-injected
+`escalation` launch triple (`resolveEscalationLaunchConfig`, `src/escalation-config.ts`) —
+the `escalation` key in `presets.yaml` (a `<harness>::<model>::<effort>` triple) coalesced
+over the `ESCALATION_*` constants, DELIBERATELY independent of the `worker` triple so an
+escalation session's tier moves without perturbing plan workers. Claude-only; a missing or
+malformed triple swallows to the built-in escalation defaults, never a launch failure.
+Every escalation session is additionally constrained by the keeper plugin's sixth hook,
+escalation-guard (`PreToolUse(Bash)`), which is role-keyed on the launch-injected
 `KEEPER_ESCALATION_ROLE` marker to a per-role Bash command-family allowlist — unblock and
 resolve stay diagnosis-only, deconflict and repair get write-capable families — failing
 CLOSED for a marked session regardless of `--dangerously-skip-permissions`.

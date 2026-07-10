@@ -42,13 +42,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import {
-  ConfigError,
-  loadPresetCatalog,
-  type Preset,
-  resolvePreset,
-} from "../src/agent/config";
 import { matrixConfigPath } from "../src/agent/matrix";
+import { parseTriple } from "../src/agent/triple";
 import {
   KEEPER_ROOT,
   resolveWorkerLaunchConfig,
@@ -173,13 +168,13 @@ Options:
   --name <n>           claude --name (OPTIONAL pass-through in free form)
   --session <s>        Target tmux session (overrides every fallback)
   --cwd <dir>          Working dir (free form; defaults to process.cwd())
-  --preset <name>      Named launch-config preset from ~/.config/keeper/presets.yaml
-                       (claude-only); supplies --model/--effort. Must be a real
-                       catalog entry (exit 2 otherwise); run \`keeper agent presets
-                       list\` to see the names. Plan form defaults to the same
-                       'worker' preset the autopilot uses.
-  --model <m>          Pass --model to claude (overrides the preset)
-  --effort <e>         Pass --effort to claude (overrides the preset)
+  --preset <triple>    A launch triple <harness::model::effort> (claude-only);
+                       supplies --model/--effort. Must be a well-formed triple
+                       (exit 2 otherwise); run \`keeper agent presets list\` to see
+                       the cube. Plan form defaults to the same 'worker' triple the
+                       autopilot uses.
+  --model <m>          Pass --model to claude (overrides the triple)
+  --effort <e>         Pass --effort to claude (overrides the triple)
   --force              Plan form: skip the race guard
   --no-prefix          Free form: bypass the configured dispatch_prompt_prefix
   --dry-run            Print the resolved launch plan; launch nothing
@@ -625,13 +620,14 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   }
 
   // ---- resolve model/effort (claude-only) ----
-  // Precedence per field: explicit --model/--effort > --preset > worker/escalation
-  // preset (plan form only) > none. Dispatch widens to claude alone for now —
-  // LaunchSpec carries only claude model/effort (codex/pi dispatch is a follow-up).
-  // A `work`/`close` plan default is the SAME `worker` preset the autopilot
-  // resolves (byte-identical to an automated launch); an `unblock`/`deconflict`
-  // escalation default resolves the SEPARATE escalation config (sonnet/high +
-  // `escalation` preset), matching what the daemon's escalation dispatch bakes in.
+  // Precedence per field: explicit --model/--effort > --preset triple >
+  // worker/escalation triple (plan form only) > none. Dispatch widens to claude
+  // alone for now — LaunchSpec carries only claude model/effort (codex/pi dispatch
+  // is a follow-up). A `work`/`close` plan default is the SAME `worker` triple the
+  // autopilot resolves (byte-identical to an automated launch); an
+  // `unblock`/`deconflict` escalation default resolves the SEPARATE escalation
+  // config (sonnet/high + `escalation` triple), matching what the daemon's
+  // escalation dispatch bakes in.
   let baseModel: string | undefined;
   let baseEffort: string | undefined;
   if (hasPlanKey) {
@@ -642,21 +638,21 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     baseEffort = base.effort;
   }
   if (v.preset !== undefined && v.preset !== "") {
-    let preset: Preset;
-    try {
-      preset = resolvePreset(loadPresetCatalog(), v.preset);
-    } catch (err) {
-      argFault(err instanceof ConfigError ? err.message : String(err));
+    const parsed = parseTriple(v.preset);
+    if (!parsed.ok) {
+      argFault(`--preset ${parsed.error}`);
     }
-    if (preset.harness !== "claude") {
+    const triple = parsed.triple;
+    if (triple.harness !== "claude") {
       argFault(
-        `--preset ${v.preset} pins harness ${preset.harness}; dispatch is ` +
+        `--preset ${v.preset} pins harness ${triple.harness}; dispatch is ` +
           "claude-only (codex/pi dispatch is a follow-up)",
       );
     }
-    // A partial preset layers over the worker/plan base per field.
-    if (preset.model !== null) baseModel = preset.model;
-    if (preset.effort !== null) baseEffort = preset.effort;
+    // The triple carries both model and effort; each layers over the worker/plan
+    // base, and the explicit --model/--effort flags below still win per field.
+    baseModel = triple.model;
+    baseEffort = triple.effort;
   }
   // Explicit flags win over any preset/worker default.
   const model = v.model ?? baseModel;
