@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified correctness fix with an exactly-named root cause and file:line evidence spanning two source files plus an end-to-end test \u2014 bounded multi-surface work whose acceptance is prescribed (generalize parseEscalationKey/buildDeconflictIncident to accept task-form refs, keep the close path byte-identical), routing GPT-first per hand_tuned with no nameable intelligence-bound reason for opus; high is the named-root-cause multi-file bug-fix band and gpt-5.5 is the workhorse for substantial well-specified work with a named acceptance and stop condition.",
+      "task_id": "fn-1246-fix-work-verb-deconflict-brief-loading.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T22:19:45.903000Z",
+  "epic_id": "fn-1246-fix-work-verb-deconflict-brief-loading",
+  "input_hash": "d34eb898d748731c7a24456c37d889185b464a3056fbd0793ba758d502836e83",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3545151640,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified correctness fix with an exactly-named root cause and file:line evidence spanning two source files plus an end-to-end test \u2014 bounded multi-surface work whose acceptance is prescribed (generalize parseEscalationKey/buildDeconflictIncident to accept task-form refs, keep the close path byte-identical), routing GPT-first per hand_tuned with no nameable intelligence-bound reason for opus; high is the named-root-cause multi-file bug-fix band and gpt-5.5 is the workhorse for substantial well-specified work with a named acceptance and stop condition.\",\"confidence\":0.78}]}\n"
+}
