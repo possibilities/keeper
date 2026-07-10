@@ -16,6 +16,7 @@ import { main } from "../src/agent/main";
 import {
   cellSet,
   driverFor,
+  effortsFor,
   isValidMatrixAliasTarget,
   isValidMatrixToken,
   loadMatrix,
@@ -56,7 +57,8 @@ const VALID_MATRIX = [
   "      - sonnet",
   "  - name: codex",
   "    models:",
-  "      - gpt-5.5: gpt-5.5-codex",
+  "      - name: gpt-5.5",
+  "        native: gpt-5.5-codex",
   "      - gpt-5-codex",
   "  - name: pi",
   "    models:",
@@ -332,6 +334,342 @@ describe("pure derivations", () => {
   });
 });
 
+describe("model long form + legacy alias retirement", () => {
+  function withCodexModels(...modelLines: string[]): string {
+    return [
+      "efforts:",
+      "  - low",
+      "  - high",
+      "providers:",
+      "  - name: claude",
+      "    models:",
+      "      - opus",
+      "  - name: codex",
+      "    models:",
+      ...modelLines,
+      "subagents:",
+      "  - work",
+      "wrapper_driver:",
+      "  model: sonnet",
+      "  effort: high",
+      "",
+    ].join("\n");
+  }
+
+  test("the long form {name} with no native aliases native id === capability", () => {
+    const m = loadMatrix(
+      writeMatrix(withCodexModels("      - name: gpt-5.5")),
+    ) as Matrix;
+    expect(nativeIdFor(m, "codex", "gpt-5.5")).toBe("gpt-5.5");
+    expect(driverFor(m, "gpt-5.5")).toBe("wrapped");
+  });
+
+  test("the long form {name, native} carries the native id", () => {
+    const m = loadMatrix(
+      writeMatrix(
+        withCodexModels(
+          "      - name: gpt-5.5",
+          "        native: gpt-5.5-codex",
+        ),
+      ),
+    ) as Matrix;
+    expect(nativeIdFor(m, "codex", "gpt-5.5")).toBe("gpt-5.5-codex");
+  });
+
+  test("the retired one-pair alias map is fail-loud, naming the long form", () => {
+    expect(() =>
+      loadMatrix(
+        writeMatrix(withCodexModels("      - gpt-5.5: gpt-5.5-codex")),
+      ),
+    ).toThrow(/alias map is retired/);
+  });
+
+  test("a long-form entry with an unknown key is fail-loud", () => {
+    expect(() =>
+      loadMatrix(
+        writeMatrix(
+          withCodexModels(
+            "      - name: gpt-5.5",
+            "        alias: gpt-5.5-codex",
+          ),
+        ),
+      ),
+    ).toThrow(/unknown key 'alias'/);
+  });
+
+  test("a non-string long-form name is fail-loud (YAML coercion)", () => {
+    // `name: true` parses as a boolean scalar — fails the string guard.
+    expect(() =>
+      loadMatrix(writeMatrix(withCodexModels("      - name: true"))),
+    ).toThrow(/model 'name' must be a string/);
+  });
+});
+
+describe("per-provider / per-model effort overrides", () => {
+  function matrixWith(providerBlock: string[]): Matrix {
+    return loadMatrix(
+      writeMatrix(
+        [
+          "efforts:",
+          "  - low",
+          "  - medium",
+          "  - high",
+          "  - xhigh",
+          "providers:",
+          "  - name: claude",
+          "    models:",
+          "      - opus",
+          ...providerBlock,
+          "subagents:",
+          "  - work",
+          "wrapper_driver:",
+          "  model: sonnet",
+          "  effort: high",
+          "",
+        ].join("\n"),
+      ),
+    ) as Matrix;
+  }
+
+  test("the top-level efforts axis normalizes to canonical ascending order", () => {
+    // Declared out of canonical order → normalized to KEEPER_EFFORTS order.
+    const m = loadMatrix(
+      writeMatrix(
+        [
+          "efforts:",
+          "  - high",
+          "  - low",
+          "  - medium",
+          "providers:",
+          "  - name: claude",
+          "    models:",
+          "      - opus",
+          "subagents:",
+          "  - work",
+          "wrapper_driver:",
+          "  model: sonnet",
+          "  effort: high",
+          "",
+        ].join("\n"),
+      ),
+    ) as Matrix;
+    expect(m.efforts).toEqual(["low", "medium", "high"]);
+  });
+
+  test("a model with no override inherits the top-level axis", () => {
+    const m = matrixWith(["  - name: codex", "    models:", "      - gpt-5.5"]);
+    expect(effortsFor(m, "gpt-5.5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    // An unlisted model also inherits the top-level axis.
+    expect(effortsFor(m, "ghost")).toEqual(["low", "medium", "high", "xhigh"]);
+  });
+
+  test("a provider-level override clobbers the top-level axis and normalizes", () => {
+    const m = matrixWith([
+      "  - name: codex",
+      "    efforts:",
+      "      - high",
+      "      - low",
+      "    models:",
+      "      - gpt-5.5",
+    ]);
+    // Declared [high, low] → canonical [low, high].
+    expect(effortsFor(m, "gpt-5.5")).toEqual(["low", "high"]);
+  });
+
+  test("a model-level override beats the provider-level override", () => {
+    const m = matrixWith([
+      "  - name: codex",
+      "    efforts:",
+      "      - low",
+      "      - high",
+      "    models:",
+      "      - name: gpt-5.5",
+      "        efforts:",
+      "          - xhigh",
+      "      - gpt-5-codex",
+    ]);
+    // gpt-5.5 has a model-level override; gpt-5-codex falls to the provider level.
+    expect(effortsFor(m, "gpt-5.5")).toEqual(["xhigh"]);
+    expect(effortsFor(m, "gpt-5-codex")).toEqual(["low", "high"]);
+  });
+
+  test("a present-but-empty override is fail-loud", () => {
+    expect(() =>
+      matrixWith([
+        "  - name: codex",
+        "    efforts: []",
+        "    models:",
+        "      - gpt-5.5",
+      ]),
+    ).toThrow(/must be a non-empty list/);
+  });
+
+  test("an out-of-subset override token is fail-loud", () => {
+    expect(() =>
+      matrixWith([
+        "  - name: codex",
+        "    models:",
+        "      - name: gpt-5.5",
+        "        efforts:",
+        "          - turbo",
+      ]),
+    ).toThrow(/not in the canonical effort vocabulary/);
+  });
+
+  test("a non-string effort scalar is fail-loud (YAML coercion)", () => {
+    // `true` parses as a boolean scalar — fails the string guard before the
+    // subset check.
+    expect(() =>
+      matrixWith([
+        "  - name: codex",
+        "    efforts:",
+        "      - true",
+        "    models:",
+        "      - gpt-5.5",
+      ]),
+    ).toThrow(/must be strings/);
+  });
+});
+
+describe("route flag (launch-only providers)", () => {
+  function rosterWithPiRoute(route: string): Matrix {
+    return loadMatrix(
+      writeMatrix(
+        [
+          "efforts:",
+          "  - high",
+          "providers:",
+          "  - name: claude",
+          "    models:",
+          "      - opus",
+          "  - name: codex",
+          "    models:",
+          "      - gpt-5.5",
+          "  - name: pi",
+          `    route: ${route}`,
+          "    models:",
+          "      - gpt-5.3-spark",
+          "subagents:",
+          "  - work",
+          "wrapper_driver:",
+          "  model: sonnet",
+          "  effort: high",
+          "",
+        ].join("\n"),
+      ),
+    ) as Matrix;
+  }
+
+  test("route:false excludes a provider's models from the pecking order and cell set", () => {
+    const m = rosterWithPiRoute("false");
+    // pi's spark is launch-only: it routes nowhere and forms no cell.
+    expect(providerOrderFor(m, "gpt-5.3-spark")).toEqual([]);
+    expect(cellSet(m).map((c) => c.model)).toEqual(["opus", "gpt-5.5"]);
+    // But the provider (and its model) stays present in the parsed matrix for
+    // enumeration.
+    const pi = m.providers.find((p) => p.name === "pi");
+    expect(pi?.route).toBe(false);
+    expect(pi?.models.has("gpt-5.3-spark")).toBe(true);
+  });
+
+  test("route:true (the default) keeps the provider routing", () => {
+    const m = rosterWithPiRoute("true");
+    expect(providerOrderFor(m, "gpt-5.3-spark")).toEqual(["pi"]);
+    expect(cellSet(m).map((c) => c.model)).toEqual([
+      "opus",
+      "gpt-5.5",
+      "gpt-5.3-spark",
+    ]);
+  });
+
+  test("a route:false model still resolves an effort list (enumeration)", () => {
+    const m = rosterWithPiRoute("false");
+    expect(effortsFor(m, "gpt-5.3-spark")).toEqual(["high"]);
+  });
+
+  test("route:false on the claude provider is a load error", () => {
+    expect(() =>
+      loadMatrix(
+        writeMatrix(
+          [
+            "efforts:",
+            "  - high",
+            "providers:",
+            "  - name: claude",
+            "    route: false",
+            "    models:",
+            "      - opus",
+            "subagents:",
+            "  - work",
+            "wrapper_driver:",
+            "  model: sonnet",
+            "  effort: high",
+            "",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/claude.*cannot set route: false/);
+  });
+
+  test("a non-boolean route is fail-loud", () => {
+    expect(() =>
+      loadMatrix(
+        writeMatrix(
+          [
+            "efforts:",
+            "  - high",
+            "providers:",
+            "  - name: codex",
+            "    route: sometimes",
+            "    models:",
+            "      - gpt-5.5",
+            "subagents:",
+            "  - work",
+            "wrapper_driver:",
+            "  model: sonnet",
+            "  effort: high",
+            "",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/route must be a boolean/);
+  });
+
+  test("a route:false provider overlapping claude is allowed (overlap check is routed-only)", () => {
+    // pi (route:false) also serves opus (a claude-native model) — no ambiguous-driver
+    // error, because the XOR check applies to routed providers only.
+    const m = loadMatrix(
+      writeMatrix(
+        [
+          "efforts:",
+          "  - high",
+          "providers:",
+          "  - name: claude",
+          "    models:",
+          "      - opus",
+          "  - name: pi",
+          "    route: false",
+          "    models:",
+          "      - opus",
+          "subagents:",
+          "  - work",
+          "wrapper_driver:",
+          "  model: sonnet",
+          "  effort: high",
+          "",
+        ].join("\n"),
+      ),
+    ) as Matrix;
+    expect(driverFor(m, "opus")).toBe("native");
+    expect(cellSet(m).map((c) => c.model)).toEqual(["opus"]);
+  });
+});
+
 describe("alias-target charset (slashed native id)", () => {
   // codex aliases the wrapped capability gpt-5.5 to a provider-qualified slashed
   // native id — the shape pi rejects the bare capability for at startup.
@@ -344,7 +682,8 @@ describe("alias-target charset (slashed native id)", () => {
     "      - opus",
     "  - name: codex",
     "    models:",
-    "      - gpt-5.5: openai/gpt-5.5",
+    "      - name: gpt-5.5",
+    "        native: openai/gpt-5.5",
     "subagents:",
     "  - work",
     "wrapper_driver:",
@@ -390,7 +729,7 @@ describe("alias-target charset (slashed native id)", () => {
     });
   });
 
-  test("a slashed alias KEY (capability) is fail-loud — the strict/relaxed split", () => {
+  test("a slashed alias KEY (long-form name) is fail-loud — the strict/relaxed split", () => {
     expect(() =>
       loadMatrix(
         writeMatrix(
@@ -400,7 +739,8 @@ describe("alias-target charset (slashed native id)", () => {
             "providers:",
             "  - name: codex",
             "    models:",
-            "      - openai/gpt-5.5: gpt-5.5-codex",
+            "      - name: openai/gpt-5.5",
+            "        native: gpt-5.5-codex",
             "subagents:",
             "  - work",
             "wrapper_driver:",
@@ -413,7 +753,7 @@ describe("alias-target charset (slashed native id)", () => {
     ).toThrow(/model token .* must match/);
   });
 
-  test("a slashed effort axis token is fail-loud", () => {
+  test("a slashed effort axis token is fail-loud (out of canonical vocabulary)", () => {
     expect(() =>
       loadMatrix(
         writeMatrix(
@@ -433,7 +773,7 @@ describe("alias-target charset (slashed native id)", () => {
           ].join("\n"),
         ),
       ),
-    ).toThrow(/efforts entries must be tokens/);
+    ).toThrow(/not in the canonical effort vocabulary/);
   });
 
   test("providers resolve carries the slashed model_id through to the launch flag (pass-through)", async () => {
@@ -488,6 +828,30 @@ describe("committed example matrix (anti-rot)", () => {
     const m = loadMatrix(EXAMPLE_PATH) as Matrix;
     expect(driverFor(m, "opus")).toBe("native");
     expect(driverFor(m, "sonnet")).toBe("native");
+  });
+
+  test("the codex provider-level effort override drives the spark effort list", () => {
+    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
+    // spark inherits codex's provider-level override [high, xhigh], not the
+    // top-level axis [medium, high]; opus (claude) inherits the top-level axis.
+    expect(effortsFor(m, "gpt-5.3-codex-spark")).toEqual(["high", "xhigh"]);
+    expect(effortsFor(m, "opus")).toEqual(["medium", "high"]);
+  });
+
+  test("the route:false pi provider is launch-only: enumerable, but no cell and no route", () => {
+    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
+    const preview = "gpt-5.3-spark-preview";
+    // Present in the parsed matrix for enumeration...
+    const pi = m.providers.find((p) => p.name === "pi");
+    expect(pi?.route).toBe(false);
+    expect(pi?.models.get(preview)).toBe("pi/gpt-5.3-spark-preview");
+    // ...but excluded from the capability cell set and the pecking order.
+    expect(cellSet(m).map((c) => c.model)).toEqual([
+      "opus",
+      "sonnet",
+      "gpt-5.3-codex-spark",
+    ]);
+    expect(providerOrderFor(m, preview)).toEqual([]);
   });
 });
 

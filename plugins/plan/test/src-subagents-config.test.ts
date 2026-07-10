@@ -4,7 +4,7 @@
 // snapshot carries today's axes, and that a malformed/absent config fails loud
 // with a typed SubagentsConfigError rather than a soft default.
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   mkdtempSync,
@@ -15,8 +15,15 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadMatrix } from "../../../src/agent/matrix.ts";
-import { loadHostMatrix } from "../src/host_matrix.ts";
+import {
+  cellSet,
+  effortsFor as launcherEffortsFor,
+  loadMatrix,
+} from "../../../src/agent/matrix.ts";
+import {
+  effortsFor as hostEffortsFor,
+  loadHostMatrix,
+} from "../src/host_matrix.ts";
 import {
   configuredEfforts,
   configuredModels,
@@ -259,7 +266,8 @@ describe("loadHostMatrix / loadMatrix cross-island parity", () => {
     "    models: [opus]",
     "  - name: codex",
     "    models:",
-    "      - gpt-5.5: openai/gpt-5.5",
+    "      - name: gpt-5.5",
+    "        native: openai/gpt-5.5",
     "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",
@@ -272,7 +280,8 @@ describe("loadHostMatrix / loadMatrix cross-island parity", () => {
     "providers:",
     "  - name: codex",
     "    models:",
-    "      - openai/gpt-5.5: gpt-5.5-codex",
+    "      - name: openai/gpt-5.5",
+    "        native: gpt-5.5-codex",
     "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",
@@ -339,6 +348,185 @@ describe("loadHostMatrix / loadMatrix cross-island parity", () => {
   });
 });
 
+// Cross-island parity for the schema extensions this task adds: the model long
+// form, per-provider / per-model effort overrides (clobber-inherit-normalize), and
+// the per-provider route flag. Every ACCEPTED and REJECTED roster runs through BOTH
+// firewalled parsers so drift is caught mechanically.
+describe("schema-extension cross-island parity", () => {
+  function write(roster: string): string {
+    const dir = tmp();
+    cleanupDirs.push(dir);
+    const path = join(dir, "matrix.yaml");
+    writeFileSync(path, roster);
+    return path;
+  }
+
+  const cleanupDirs: string[] = [];
+  afterEach(() => {
+    for (const d of cleanupDirs.splice(0)) {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  function bothReject(roster: string): void {
+    const path = write(roster);
+    expect(() => loadHostMatrix(path)).toThrow(SubagentsConfigError);
+    expect(() => loadMatrix(path)).toThrow();
+  }
+
+  // A rich roster exercising every new axis: a provider-level override (codex),
+  // a model-level override that beats it (gpt-5.5), a bare model inheriting the
+  // provider override (gpt-5-codex), a claude-native model inheriting the base
+  // axis (opus), and a launch-only route:false provider (pi/spark).
+  const RICH_ROSTER = [
+    "efforts: [medium, high]",
+    "providers:",
+    "  - name: claude",
+    "    models: [opus]",
+    "  - name: codex",
+    "    efforts: [high, low]",
+    "    models:",
+    "      - name: gpt-5.5",
+    "        native: openai/gpt-5.5",
+    "        efforts: [xhigh]",
+    "      - gpt-5-codex",
+    "  - name: pi",
+    "    route: false",
+    "    models:",
+    "      - spark",
+    "subagents: [work]",
+    "wrapper_driver:",
+    "  model: sonnet",
+    "  effort: high",
+    "",
+  ].join("\n");
+
+  test("both islands agree on the cell set, and route:false is excluded from it", () => {
+    const path = write(RICH_ROSTER);
+    const host = loadHostMatrix(path);
+    const launcher = loadMatrix(path);
+    if (host === null || launcher === null) {
+      throw new Error("fixture matrix failed to load in one island");
+    }
+    // The capability cell set: routed providers only, pecking-order first
+    // appearance — pi's launch-only `spark` is absent from both.
+    const cells = ["opus", "gpt-5.5", "gpt-5-codex"];
+    expect(host.models).toEqual(cells);
+    expect(cellSet(launcher).map((c) => c.model)).toEqual(cells);
+    // Base axis normalizes identically.
+    expect(host.efforts).toEqual(launcher.efforts);
+    expect(host.efforts).toEqual(["medium", "high"]);
+  });
+
+  test("both islands resolve effortsFor identically (clobber-inherit-normalize, route-agnostic)", () => {
+    const path = write(RICH_ROSTER);
+    const host = loadHostMatrix(path);
+    const launcher = loadMatrix(path);
+    if (host === null || launcher === null) {
+      throw new Error("fixture matrix failed to load in one island");
+    }
+    const expected: Record<string, string[]> = {
+      opus: ["medium", "high"], // claude: inherits the base axis
+      "gpt-5.5": ["xhigh"], // model-level override beats provider
+      "gpt-5-codex": ["low", "high"], // provider override, normalized ascending
+      spark: ["medium", "high"], // route:false, still resolves (enumeration)
+      ghost: ["medium", "high"], // unlisted: inherits the base axis
+    };
+    for (const [model, efforts] of Object.entries(expected)) {
+      expect(hostEffortsFor(host, model)).toEqual(efforts);
+      expect(launcherEffortsFor(launcher, model)).toEqual(efforts);
+    }
+  });
+
+  test("both islands reject the retired one-pair alias map", () => {
+    bothReject(
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: codex",
+        "    models:",
+        "      - gpt-5.5: gpt-5.5-codex",
+        "subagents: [work]",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: high",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("both islands reject a present-but-empty effort override", () => {
+    bothReject(
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: codex",
+        "    efforts: []",
+        "    models:",
+        "      - gpt-5.5",
+        "subagents: [work]",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: high",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("both islands reject an out-of-subset effort override token", () => {
+    bothReject(
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: codex",
+        "    models:",
+        "      - name: gpt-5.5",
+        "        efforts: [turbo]",
+        "subagents: [work]",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: high",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("both islands reject route:false on the claude provider", () => {
+    bothReject(
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: claude",
+        "    route: false",
+        "    models: [opus]",
+        "subagents: [work]",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: high",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("both islands reject a non-boolean route", () => {
+    bothReject(
+      [
+        "efforts: [high]",
+        "providers:",
+        "  - name: codex",
+        "    route: 1",
+        "    models:",
+        "      - gpt-5.5",
+        "subagents: [work]",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: high",
+        "",
+      ].join("\n"),
+    );
+  });
+});
+
 // The configured-axes seam (configuredEfforts/configuredModels/workerAgentFor)
 // reads the composed EFFECTIVE matrix: the host provider matrix when present, the
 // embedded snapshot (byte-identical) when absent. A host matrix fixture is injected
@@ -370,7 +558,8 @@ describe("configured-axes effective seam", () => {
     "    models: [opus]",
     "  - name: codex",
     "    models:",
-    "      - gpt-5.5: openai/gpt-5.5",
+    "      - name: gpt-5.5",
+    "        native: openai/gpt-5.5",
     "subagents: [work]",
     "wrapper_driver:",
     "  model: sonnet",

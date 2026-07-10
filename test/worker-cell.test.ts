@@ -54,7 +54,9 @@ function mkMatrix(roster: Array<[HarnessName, string[]]>): Matrix {
     efforts: ["high"],
     providers: roster.map(([name, models]) => ({
       name,
+      route: true,
       models: new Map(models.map((m) => [m, m])),
+      modelEfforts: new Map(),
     })),
     subagents: ["template/agents/worker.md.tmpl"],
     wrapper_driver: { model: "sonnet", effort: "high" },

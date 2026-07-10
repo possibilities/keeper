@@ -26,6 +26,7 @@ import {
   HARNESS_NAMES,
   type HarnessName,
   isHarnessName,
+  KEEPER_EFFORTS,
 } from "./harness";
 
 /** claude is the native provider; every other roster provider is a wrapper. */
@@ -38,6 +39,18 @@ export interface MatrixProvider {
   name: HarnessName;
   /** capability token → provider-native id, in declaration order. */
   models: Map<string, string>;
+  /** `false` declares a LAUNCH-ONLY provider: its models stay enumerable for
+   *  launch (triples) but are excluded from the wrapped-cell pecking order and
+   *  the capability cell set. Defaults to `true` (a routing provider); `false` on
+   *  claude is a load error. */
+  route: boolean;
+  /** A per-provider `efforts` override (normalized, canonical ascending), or
+   *  undefined to inherit the top-level axis. */
+  efforts?: string[];
+  /** Per-model `efforts` overrides (normalized), keyed by capability token — only
+   *  the models that declare one. Most-specific in the model → provider → top-level
+   *  clobber chain. */
+  modelEfforts: Map<string, string[]>;
 }
 
 /** The fixed claude model-and-effort every wrapped cell's wrapper runs at. */
@@ -113,6 +126,56 @@ const ALLOWED_MATRIX_KEYS: ReadonlySet<string> = new Set([
   "defaults",
 ]);
 
+/** The canonical effort vocabulary as a membership set — {@link KEEPER_EFFORTS}
+ *  (harness.ts) is the one source of truth for keeper's five-rung effort axis, the
+ *  subset + normalization anchor every matrix effort list validates against. */
+const CANONICAL_EFFORT_SET: ReadonlySet<string> = new Set(KEEPER_EFFORTS);
+
+/** Reorder a set of accepted effort tokens into canonical ({@link KEEPER_EFFORTS})
+ *  ascending order, so a declared list renders in a stable order regardless of
+ *  declaration order. */
+function normalizeEfforts(present: ReadonlySet<string>): string[] {
+  return KEEPER_EFFORTS.filter((e) => present.has(e));
+}
+
+/**
+ * Parse + validate an effort list — the top-level axis OR a per-provider /
+ * per-model override. A non-empty list of strings, each in the canonical effort
+ * vocabulary, no duplicates, normalized to canonical ascending order. A present-
+ * but-empty list is a fail-loud error; a non-string scalar (a YAML 1.1 coercion
+ * like `off`) fails the string guard; an out-of-vocabulary token fails the subset
+ * check.
+ */
+function parseEffortList(
+  value: unknown,
+  ctx: string,
+  configPath: string,
+): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ConfigError(`${ctx} must be a non-empty list in ${configPath}`);
+  }
+  const present = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      throw new ConfigError(
+        `${ctx} entries must be strings in ${configPath} (got ${JSON.stringify(item)})`,
+      );
+    }
+    if (!CANONICAL_EFFORT_SET.has(item)) {
+      throw new ConfigError(
+        `${ctx} entry '${item}' is not in the canonical effort vocabulary [${KEEPER_EFFORTS.join(", ")}] in ${configPath}`,
+      );
+    }
+    if (present.has(item)) {
+      throw new ConfigError(
+        `${ctx} lists '${item}' more than once in ${configPath}`,
+      );
+    }
+    present.add(item);
+  }
+  return normalizeEfforts(present);
+}
+
 /**
  * Read the host matrix from `matrix.yaml`. An ABSENT or empty/whitespace file
  * returns null (the caller falls back to embedded claude-only defaults); a file
@@ -145,7 +208,7 @@ export function loadMatrix(
   const providers = parseProviders(raw.providers, configPath);
   assertNoClaudeOverlap(providers, configPath);
   return {
-    efforts: parseTokenList(raw.efforts, "efforts", configPath),
+    efforts: parseEffortList(raw.efforts, "efforts", configPath),
     providers,
     subagents: parseTokenList(raw.subagents, "subagents", configPath),
     wrapper_driver: parseWrapperDriver(raw.wrapper_driver, configPath),
@@ -188,9 +251,9 @@ function parseProviders(value: unknown, configPath: string): MatrixProvider[] {
       );
     }
     for (const k of Object.keys(entry)) {
-      if (k !== "name" && k !== "models") {
+      if (k !== "name" && k !== "models" && k !== "efforts" && k !== "route") {
         throw new ConfigError(
-          `unknown provider key '${k}' in ${configPath} (allowed: name, models)`,
+          `unknown provider key '${k}' in ${configPath} (allowed: name, models, efforts, route)`,
         );
       }
     }
@@ -206,49 +269,121 @@ function parseProviders(value: unknown, configPath: string): MatrixProvider[] {
       );
     }
     seen.add(name);
+    const { models, modelEfforts } = parseProviderModels(
+      entry.models,
+      name,
+      configPath,
+    );
     providers.push({
       name,
-      models: parseProviderModels(entry.models, name, configPath),
+      route: parseRoute(entry.route, name, configPath),
+      efforts:
+        entry.efforts === undefined
+          ? undefined
+          : parseEffortList(
+              entry.efforts,
+              `provider '${name}' efforts`,
+              configPath,
+            ),
+      models,
+      modelEfforts,
     });
   }
   return providers;
 }
 
+/**
+ * The per-provider `route` flag: a strict boolean, default `true` when absent.
+ * `route: false` declares a launch-only provider (enumerated for triples, excluded
+ * from the wrapped-cell pecking order and the capability cell set). `route: false`
+ * on the claude provider is a load error — claude is always the native routing
+ * provider.
+ */
+function parseRoute(
+  value: unknown,
+  name: HarnessName,
+  configPath: string,
+): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (typeof value !== "boolean") {
+    throw new ConfigError(
+      `provider '${name}' route must be a boolean in ${configPath} (got ${JSON.stringify(value)})`,
+    );
+  }
+  if (name === "claude" && value === false) {
+    throw new ConfigError(
+      `provider 'claude' cannot set route: false in ${configPath} — claude is always the native routing provider`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Parse a provider's models list into the capability→native-id map plus the
+ * per-model effort overrides. Each entry is a bare capability token (native id ===
+ * capability) or the model long form `{name, native?, efforts?}`, discriminated by
+ * a required `name` key. An object WITHOUT a `name` key is the RETIRED one-pair
+ * `capability: native-id` alias map — fail loud, naming the long form.
+ */
 function parseProviderModels(
   value: unknown,
   provider: string,
   configPath: string,
-): Map<string, string> {
+): { models: Map<string, string>; modelEfforts: Map<string, string[]> } {
   if (!Array.isArray(value) || value.length === 0) {
     throw new ConfigError(
       `provider '${provider}' models must be a non-empty list in ${configPath}`,
     );
   }
   const models = new Map<string, string>();
+  const modelEfforts = new Map<string, string[]>();
   for (const item of value) {
     let capability: string;
     let nativeId: string;
+    let perModelEfforts: string[] | undefined;
     if (typeof item === "string") {
       capability = item;
       nativeId = item;
     } else if (isRecord(item)) {
-      const pairs = Object.entries(item);
-      if (pairs.length !== 1) {
+      if (!("name" in item)) {
         throw new ConfigError(
-          `provider '${provider}' model alias must be a single 'capability: native-id' pair in ${configPath}`,
+          `provider '${provider}' model entry ${JSON.stringify(item)} must be a bare token or the long form {name, native?, efforts?} in ${configPath} (the 'capability: native-id' alias map is retired — use {name: <capability>, native: <native-id>})`,
         );
       }
-      const [cap, nid] = pairs[0] as [string, unknown];
-      capability = cap;
-      if (typeof nid !== "string") {
+      for (const k of Object.keys(item)) {
+        if (k !== "name" && k !== "native" && k !== "efforts") {
+          throw new ConfigError(
+            `provider '${provider}' model long form has unknown key '${k}' in ${configPath} (allowed: name, native, efforts)`,
+          );
+        }
+      }
+      if (typeof item.name !== "string") {
         throw new ConfigError(
-          `provider '${provider}' alias '${cap}' native id must be a string in ${configPath}`,
+          `provider '${provider}' model 'name' must be a string in ${configPath}`,
         );
       }
-      nativeId = nid;
+      capability = item.name;
+      if (item.native === undefined) {
+        nativeId = capability;
+      } else if (typeof item.native !== "string") {
+        throw new ConfigError(
+          `provider '${provider}' model '${capability}' native id must be a string in ${configPath}`,
+        );
+      } else {
+        nativeId = item.native;
+      }
+      if (item.efforts !== undefined) {
+        perModelEfforts = parseEffortList(
+          item.efforts,
+          `provider '${provider}' model '${capability}' efforts`,
+          configPath,
+        );
+      }
     } else {
       throw new ConfigError(
-        `provider '${provider}' model entry must be a token or a one-pair alias map in ${configPath}`,
+        `provider '${provider}' model entry must be a bare token or the long form {name, native?, efforts?} in ${configPath}`,
       );
     }
     if (!isValidMatrixToken(capability)) {
@@ -267,8 +402,11 @@ function parseProviderModels(
       );
     }
     models.set(capability, nativeId);
+    if (perModelEfforts !== undefined) {
+      modelEfforts.set(capability, perModelEfforts);
+    }
   }
-  return models;
+  return { models, modelEfforts };
 }
 
 function parseWrapperDriver(value: unknown, configPath: string): WrapperDriver {
@@ -350,9 +488,11 @@ function parsePositiveInt(
 }
 
 /**
- * A model served by claude AND another provider is an ambiguous driver (native
- * vs wrapped) — fail-loud. Two NON-claude providers sharing a model is allowed
- * and intended: that overlap is exactly what the pecking order arbitrates.
+ * A model served by claude AND another ROUTED provider is an ambiguous driver
+ * (native vs wrapped) — fail-loud. Two NON-claude providers sharing a model is
+ * allowed and intended: that overlap is exactly what the pecking order arbitrates.
+ * The check is scoped to routed providers only — a launch-only (route:false)
+ * provider overlapping claude is enumeration, not a routing conflict.
  */
 function assertNoClaudeOverlap(
   providers: MatrixProvider[],
@@ -363,7 +503,7 @@ function assertNoClaudeOverlap(
     return;
   }
   for (const p of providers) {
-    if (p.name === "claude") {
+    if (p.name === "claude" || !p.route) {
       continue;
     }
     for (const model of p.models.keys()) {
@@ -391,11 +531,36 @@ export function driverFor(matrix: Matrix, model: string): Driver {
 export function providerOrderFor(matrix: Matrix, model: string): HarnessName[] {
   const order: HarnessName[] = [];
   for (const p of matrix.providers) {
-    if (p.name !== "claude" && p.models.has(model)) {
+    if (p.name !== "claude" && p.route && p.models.has(model)) {
       order.push(p.name);
     }
   }
   return order;
+}
+
+/**
+ * The effective effort list for a capability model — the most-specific override
+ * wins (model-level → provider-level → the top-level axis), resolved at the
+ * pecking-order FIRST provider that serves the model, and returned in canonical
+ * ascending order. A model no provider serves inherits the top-level axis. Route-
+ * agnostic: a launch-only (route:false) provider still contributes its efforts to
+ * enumeration.
+ */
+export function effortsFor(matrix: Matrix, model: string): string[] {
+  for (const p of matrix.providers) {
+    if (!p.models.has(model)) {
+      continue;
+    }
+    const perModel = p.modelEfforts.get(model);
+    if (perModel !== undefined) {
+      return [...perModel];
+    }
+    if (p.efforts !== undefined) {
+      return [...p.efforts];
+    }
+    return [...matrix.efforts];
+  }
+  return [...matrix.efforts];
 }
 
 /** The provider-native id for a capability model — the alias target, or the
@@ -419,11 +584,15 @@ export interface MatrixCell {
 
 /** The distinct capability models the matrix defines (the model axis), each
  *  tagged native/wrapped, in pecking-order first appearance. A model served by
- *  several wrapped providers appears exactly once. */
+ *  several wrapped providers appears exactly once. A launch-only (route:false)
+ *  provider is excluded — its models enumerate for launch but form no cell. */
 export function cellSet(matrix: Matrix): MatrixCell[] {
   const seen = new Set<string>();
   const cells: MatrixCell[] = [];
   for (const p of matrix.providers) {
+    if (!p.route) {
+      continue;
+    }
     for (const model of p.models.keys()) {
       if (seen.has(model)) {
         continue;
