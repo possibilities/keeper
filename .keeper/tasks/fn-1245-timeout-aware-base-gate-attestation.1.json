@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T21:50:08.962000Z",
+  "depends_on": [],
+  "epic": "fn-1245-timeout-aware-base-gate-attestation",
+  "id": "fn-1245-timeout-aware-base-gate-attestation.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Timeout aware base gate attestation",
+  "updated_at": "2026-07-10T21:50:08.962000Z"
+}
