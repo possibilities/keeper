@@ -14,10 +14,13 @@ this skill is how it gets authored and kept honest. The `selection-brief` verb a
 *read* the config — nothing regenerates it automatically. That is deliberate: model guidance is
 researched judgment, and a human owns when it is refreshed.
 
-The one section this skill never touches is the top-level `hand_tuned` block. That is human-owned
-routing judgment — the binding sonnet-first burden-of-proof tie-break — hand-tuned directly by a
-human, never authored or refreshed by a research pass. Leave it byte-untouched on every run; the
-`efforts:`/`models:` guidance blocks and the `research:` map are this skill's scope.
+The one section this skill never touches on its own is the top-level `hand_tuned` block. That is
+human-owned routing judgment — the binding model-axis tie-break — never authored or refreshed by a
+research pass. Leave it byte-untouched on every run; the `efforts:`/`models:` guidance blocks and
+the `research:` map are this skill's scope. When the human dictates a `hand_tuned` change through a
+session, transcribing their policy is in-bounds — and reconcile the surfaces that restate the
+family split in the same pass (`usage:`, the `plan:model-selector` agent prompt, and the
+consistency test's pinned phrasing) so no selector brief ships a self-contradiction.
 
 The unit of work is one **axis value**. The `efforts:` axis and the `models:` axis live in the
 required host matrix (`~/.config/keeper/matrix.yaml`'s `efforts:` and `subagent_models:` — the
@@ -124,19 +127,27 @@ For each model in scope on the host matrix's `subagent_models:` axis:
 
 1. **Research** the current capability signal — web (the model's own capability/behavior docs) plus
    in-repo worker experience. Focus on what a worker cares about: strengths, failure modes, and
-   when to pick this tier over another.
+   when to pick this tier over another. With several models in scope, research may fan out (one
+   subagent per vendor family, the notes/card formats pasted into each prompt); distillation stays
+   single-writer in this session so when-to-pick reads fleet-relative.
 2. **Fetch the vendor's own system card.** Record TWO URLs as you go — the durable discovery URL
    (the vendor's stable index/landing page) and the resolved artifact URL actually fetched (vendor
    CDN/PDF paths are content-addressed and rot, so the discovery URL is what a future re-research
    pass re-resolves from). Cards are PDF-first — treat PDF extraction as the primary conversion
-   path, markdown-only in the tree. A card-only gap (a model whose `--state` `reasons` is exactly
+   path, markdown-only in the tree. A bot-gated landing page is normal: record it as the discovery
+   URL anyway, fetch the artifact wherever it actually serves (vendor safety hubs often serve the
+   PDF directly), and fall back to an archived snapshot honestly noted in the card header when
+   nothing serves live. A card-only gap (a model whose `--state` `reasons` is exactly
    `[no-card]`) needs only this step and step 3's card half — its notes are already researched, skip
    straight here.
 3. **Cache both.**
    - The raw research notes as a provenance-headed markdown at `references/<model>.md`. The first
      comment block is the provenance header — `model_id`, `resolves_to`, `researched` date, `status`,
-     `method`, and `sources`. This file is the review point: depth and citations live here, never in
-     the config.
+     `method`, and `sources`. The header must survive the strict YAML loader `--state` parses it
+     with: keep every value a plain scalar — after any `: `, never open with a `"` (a quoted scalar
+     with trailing text kills the whole header) and never add a second `: ` inside one entry; join
+     clauses with an em-dash instead. A header that fails to parse classifies the value `stub`
+     silently. This file is the review point: depth and citations live here, never in the config.
    - The converted card as provenance-headed markdown at `references/cards/<model>.md`, distinct
      from the notes file (the gate rejects a card path equal to its notes reference as a copy-paste
      error). Its header records both URLs from step 2, the converter used, and — optionally, as a
@@ -145,7 +156,11 @@ For each model in scope on the host matrix's `subagent_models:` axis:
      of the full PDF.
 4. **Distill** into `model-selector.yaml`:
    - `models.<model>` — a short behavioral block (strengths, weaknesses, when-to-pick). Prompt-sized;
-     raw research stays in `references/`.
+     raw research stays in `references/`. Write when-to-pick fleet-relative (against the sibling
+     tiers, all in one sitting) and capability-shaped: the fast suite's forbidden-word guard rejects
+     cost/provider/harness words in every skill-authored block (`hand_tuned` alone is exempt).
+     Routing posture — which family or tier is the default — lives in `hand_tuned`; blocks and notes
+     name it, never restate it.
    - `efforts.<effort>` — for each configured effort in scope, concrete worker-facing advice on when
      to route a task to that band (difficulty and blast radius, not line count). When you refresh the
      efforts set, also author its provenance: `efforts_provenance.last_reviewed` (today) and
@@ -190,7 +205,9 @@ only — the gate never parses either file's provenance header. The fast test su
 (`plugins/plan/test/consistency-model-selector.test.ts`) asserts the same check in-process, so a red
 gate is a red suite. Note the gate checks hash parity, not freshness: a `stub`-stamped value with a
 matching hash passes `--check` but reads as a gap in `--state`, and axis coverage against the host
-matrix is a `--state` concern, not `--check`'s.
+matrix is a `--state` concern, not `--check`'s. After a research pass, also re-run `--state` and
+confirm every value in scope classifies `fresh` — researched notes that come back `stub` mean the
+provenance header failed to parse (see the plain-scalar rule above), which `--check` cannot see.
 
 ## Commit the pass
 
