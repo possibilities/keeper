@@ -28,5 +28,5 @@ In-lane: the file is removed (git shows the deletion); `~/.codex/AGENTS.override
 - [ ] The stale `~/.codex/AGENTS.md.pre-stow-20260320` backup is removed (optional cleanup, if present).
 
 ## Done summary
-
+Deleted arthack's competing system/codex/.codex/AGENTS.md source; confirmed no ~/.codex/AGENTS.override.md exists; removed the stale ~/.codex/AGENTS.md.pre-stow-20260320 backup. Self-heals via the fn-1234.1 launch guard once deployed.
 ## Evidence
