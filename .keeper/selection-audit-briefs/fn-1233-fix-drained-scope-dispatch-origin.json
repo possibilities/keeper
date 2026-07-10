@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 25,
+        "files_changed": 4,
+        "insertions": 155
+      },
+      "done_summary": "Served jobs.dispatch_origin on the shared jobs wire (JOBS_DESCRIPTOR) so keeper await drained's plan/inflight scopes gate on keeper-dispatched work instead of reading undefined; extracted projectDrainedRunningJobs and added real-projection integration coverage (runQuery -> CLI projection -> drainedState) asserting provenance sourcing and ownSessionId self-exclusion.",
+      "input_hash": "6bf423b8867dadcebff63660bd3ef5fcd0c1aa3fbdc3b2c764b53798b5f389be",
+      "model": "opus",
+      "spec_chars": 3472,
+      "spec_md": "## Description\n\nFixes F1 (Critical), with merged test-coverage findings F2 and F3.\n\nRoot cause (verified in the epic worktree, HEAD d5e7a3a3): the pure\n`drainedState` predicate (src/await-conditions.ts:1413) correctly filters\nrunning jobs by `isKeeperDispatched(job.dispatchOrigin)`, but the CLI builds\nits `runningJobs` from `snap.jobs.values()` reading `job.dispatch_origin ?? null`\n(cli/await.ts:2022-2026). `snap.jobs` is the wire subscribe\n`makeState(\"jobs\", \u2026, collection:\"jobs\")` (src/readiness-client.ts:1928), and\n`JOBS_DESCRIPTOR.columns` (src/collections.ts:99-190) does NOT include\n`dispatch_origin`. So `job.dispatch_origin` is `undefined` at runtime \u2192 `null`\n\u2192 `isKeeperDispatched(null)` is false for every job. The `Job` TYPE\n(src/types.ts:596) declares the field, so tsc and the `jobRow` fixture\n(test/await.test.ts:291, which injects `dispatch_origin` directly) never catch\nthe type-vs-runtime projection gap.\n\nFix direction is a genuine design choice \u2014 pick one and justify it:\n- Add `\"dispatch_origin\"` to `JOBS_DESCRIPTOR.columns` (simplest, but widens\n  the shared jobs wire shape for every subscriber and conflicts with the\n  explicit \"deliberately omits\" decision documented in\n  src/autoclose-worker.ts:116-123, where the autoclose pulse reads\n  `dispatch_origin` via a direct SELECT rather than the descriptor path); OR\n- Source the drained running-job set through a scope-exempt query that includes\n  `dispatch_origin` (mirrors the autoclose direct-SELECT precedent, narrower\n  blast radius on the wire).\n\nFiles: src/collections.ts, cli/await.ts, src/readiness-client.ts (whichever the\nchosen fix touches), test/await.test.ts.\n\nF2 (merged): re-add integration coverage that composes the jobs frame through\nthe ACTUAL descriptor/wire projection (or asserts `dispatch_origin` is served on\nthe drained path), so a future regression of the strip is caught \u2014 the current\ngreen suite passes only because `jobRow` injects the column.\n\nF3 (merged): in the same real-projection integration test, assert\n`deps.ownSessionId` flows through the CLI drained projection (cli/await.ts:2045)\nto self-exclude the caller's own dispatched job \u2014 self-exclusion is only\nreachable once dispatch discrimination is live.\n\nValue-space is otherwise correct: `dispatch_origin` is only ever\n`autopilot`/`escalation`/`null` (src/reducer.ts), which `isKeeperDispatched`\ncovers exactly; the pure predicate needs no change.\n\n## Acceptance\n\n- [ ] The drained running-job set reads a real `dispatch_origin` sourced through\n      the server projection; `keeper await drained --scope inflight` holds while\n      a working autopilot/escalation job exists and clears when it ends.\n- [ ] `keeper await drained` (plan scope) holds while a live escalation session\n      (dispatch_origin='escalation', plan_verb=NULL) exists despite all plan/\n      close rows completed.\n- [ ] An integration test drives the REAL jobs-wire projection for\n      `dispatch_origin` (not the injected `jobRow` field) and asserts caller\n      self-exclusion via `ownSessionId` through the CLI drained projection.\n\n## Done summary\nServed jobs.dispatch_origin on the shared jobs wire (JOBS_DESCRIPTOR) so keeper await drained's plan/inflight scopes gate on keeper-dispatched work instead of reading undefined; extracted projectDrainedRunningJobs and added real-projection integration coverage (runQuery -> CLI projection -> drainedState) asserting provenance sourcing and ownSessionId self-exclusion.\n## Evidence\n",
+      "task_id": "fn-1233-fix-drained-scope-dispatch-origin.1",
+      "tier": "xhigh",
+      "title": "Source dispatch-origin into drained"
+    }
+  ],
+  "created_at": "2026-07-10T04:11:42.266000Z",
+  "epic_id": "fn-1233-fix-drained-scope-dispatch-origin",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "selection_input_hash": "6bf423b8867dadcebff63660bd3ef5fcd0c1aa3fbdc3b2c764b53798b5f389be",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
