@@ -63,6 +63,9 @@ import {
   changedSignature,
   classifyTargetId,
   completeWatermark,
+  type DrainedHolder,
+  type DrainedJob,
+  type DrainedScope,
   drainedState,
   epicAddedMet,
   epicRemovedMet,
@@ -115,9 +118,18 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      a background monitor in YOUR session is still running.
                      Selector (exact match): cmd:<command>, kind:<monitor|
                      bash-bg|ambient>, or a bare token (= cmd:<token>).
-  drained            the board is fully at rest — no in-flight launch, no
-                     running job, every row completed, not catching up (no id).
-                     --fail-on-stuck → exit 5 on an operator jam sticky
+  drained [--scope S]  no open KEEPER-DISPATCHED work remains (no id). The
+                     --scope axis (default plan):
+                       plan     (default) only autopilot/escalation sessions
+                                count; YOUR own + adopted/external sessions
+                                never hold it; still holds on open plan rows +
+                                pending dispatches. Means "no open plan work"
+                       inflight only running dispatched work + pending
+                                dispatches reach zero (ignores ready rows)
+                       board    STRICT prior gate — the WHOLE board at rest,
+                                every session counts, every row completed
+                     --fail-on-stuck → exit 5 on an operator jam sticky (all
+                     scopes; an external session never masks a real jam)
   epic-added [id]    an epic appears on the board (optionally a specific id).
                      Edge-triggered: never satisfied on first paint
   epic-removed <id>  the named epic leaves the board (done or deleted).
@@ -142,6 +154,8 @@ Flags:
   --connect-timeout <dur>  Bounded reach-server deadline → reason=unreachable
                          exit 1. Default off = reconnect forever
   --fail-on-stuck        Treat stuck verdicts as terminal exit 5 (else wait)
+  --scope <plan|inflight|board>  drained scope (default plan; board = the
+                         strict whole-board gate). Inert for other conditions
   --no-armed-line        Suppress the initial armed line
   --require-transition   A condition true at arm time waits for a real edge
   --json                 Emit armed/terminal lines as JSON
@@ -170,11 +184,21 @@ literal 'and' to wait for ALL. Durations are unit-required (30s, 5m).
   keeper await complete fn-N.M            # task/epic done+approved AND its session idle
   keeper await landed fn-N                # epic's lane merged into LOCAL default (later than complete)
   keeper await git-clean and agents-idle  # cwd's git root quiet + no OTHER working session
-  keeper await drained --fail-on-stuck    # whole board at rest; exit 5 on an operator jam
+  keeper await drained                    # no open keeper-dispatched work (plan scope — the default)
+  keeper await drained --scope board --fail-on-stuck  # STRICT: whole board at rest; exit 5 on a jam
   keeper await server-up                  # keeperd is serving (reconnects forever)
   keeper await needs-human                # ANY needs-human signal present (umbrella)
   keeper await stuck-dispatch since:S     # re-arm anti-spin: fire only on a NEW signal
   keeper await <cond> --timeout 5m --json # own deadline + JSON envelope lines
+
+drained --scope axis (default plan): plan waits on open KEEPER-DISPATCHED work only —
+autopilot + escalation (unblock/deconflict/resolve/repair) sessions, YOUR own session and
+every adopted/external session excluded — plus open plan rows + pending dispatches; this is
+"no open plan work left". inflight waits only for running dispatched work + pending
+dispatches to hit zero (ignores ready-but-undispatched rows — pair it with a paused board).
+board is the STRICT prior gate: the WHOLE board at rest, every session counts. The default
+FLIPPED to plan — a caller that needs the whole-board gate MUST say --scope board (the watch
+wedge alarm does). --fail-on-stuck fires on an operator jam under every scope.
 
 Needs-human signals (level-triggered presence; ANDable): the six per-signal tokens
 dead-letter · block-escalation · parked-question · stuck-dispatch · finalize-non-ff ·
@@ -298,6 +322,12 @@ export interface ParsedArgs {
    */
   connectTimeoutMs: number | null;
   failOnStuck: boolean;
+  /**
+   * The `drained` scope axis (ADR 0032). Bare `drained` defaults to `plan`
+   * (keeper-dispatched work only, caller self-excluded); `board` is the strict
+   * prior gate. Inert for every non-`drained` condition.
+   */
+  scope: DrainedScope;
   noArmedLine: boolean;
   requireTransition: boolean;
   json: boolean;
@@ -768,6 +798,26 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       ? (values.sock as string)
       : resolveSockPath();
 
+  // The `drained` scope axis (ADR 0032). Default `plan`; `board` is the strict
+  // prior gate. Validated here so a typo fails usage rather than silently
+  // reading as `plan`. Inert for every non-`drained` condition.
+  let scope: DrainedScope = "plan";
+  const scopeRaw = values.scope;
+  if (scopeRaw !== undefined) {
+    if (
+      scopeRaw !== "plan" &&
+      scopeRaw !== "inflight" &&
+      scopeRaw !== "board"
+    ) {
+      return {
+        ok: false,
+        message: `--scope must be plan|inflight|board (got '${String(scopeRaw)}')`,
+        exitCode: EXIT_USAGE,
+      };
+    }
+    scope = scopeRaw;
+  }
+
   return {
     ok: true,
     args: {
@@ -775,6 +825,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       timeoutMs,
       connectTimeoutMs,
       failOnStuck: values["fail-on-stuck"] === true,
+      scope,
       noArmedLine: values["no-armed-line"] === true,
       requireTransition: values["require-transition"] === true,
       json: values.json === true,
@@ -1823,18 +1874,35 @@ export async function runAwait(
       slot.baselineCaptured = true;
     }
     if (slot.kind === "drained") {
-      let runningJobs = 0;
+      // Project every working job into a scoped holder input — the pure
+      // predicate applies the scope's provenance + self-exclusion filter (never
+      // here). `dispatch_origin` carries the keeper-dispatch provenance the
+      // plan/inflight scopes key on.
+      const runningJobs: DrainedJob[] = [];
       for (const job of snap.jobs.values()) {
         if (job.state === "working") {
-          runningJobs += 1;
+          runningJobs.push({
+            jobId: job.job_id,
+            dispatchOrigin: job.dispatch_origin ?? null,
+            label: job.title ?? job.job_id,
+          });
         }
       }
+      const pendingDispatches: DrainedHolder[] = snap.pendingDispatches.map(
+        (p) => ({
+          kind: "pending",
+          id: `${p.verb}::${p.id}`,
+          label: `${p.verb}::${p.id}`,
+        }),
+      );
       return drainedState({
+        scope: args.scope,
         perTask: snap.readiness.perTask,
         perCloseRow: snap.readiness.perCloseRow,
         openEpicCount: snap.epics.length,
-        pendingDispatchCount: snap.pendingDispatches.length,
-        runningJobCount: runningJobs,
+        pendingDispatches,
+        runningJobs,
+        ownSessionId: deps.ownSessionId,
         catchingUp: latestCatchingUp,
         ...(latestDispatchFailureReasons === null
           ? {}

@@ -301,19 +301,55 @@ function escalationSoftensStuck(
  * result carries (met and waiting alike) so the command prints it on the met
  * envelope — the anchor a supervisor captures to re-arm with `since:<signature>`.
  * Absent (undefined) on every other predicate.
+ *
+ * `holders` is the structured list of what currently holds a `drained` wait
+ * ({@link DrainedHolder}) — the enrichment {@link drainedState} attaches so the
+ * heartbeat and probe surfaces can NAME the blockers. Additive and drained-only;
+ * never rendered into the byte-stable `detail` string, so existing stdout
+ * listeners are unaffected. Absent on every other predicate.
  */
 export type AwaitState =
-  | { kind: "met"; detail?: string; signature?: string }
-  | { kind: "waiting"; detail?: string; signature?: string }
-  | { kind: "not-found"; detail?: string; signature?: string }
-  | { kind: "deleted"; detail?: string; signature?: string }
-  | { kind: "stuck"; detail?: string; signature?: string }
+  | {
+      kind: "met";
+      detail?: string;
+      signature?: string;
+      holders?: readonly DrainedHolder[];
+    }
+  | {
+      kind: "waiting";
+      detail?: string;
+      signature?: string;
+      holders?: readonly DrainedHolder[];
+    }
+  | {
+      kind: "not-found";
+      detail?: string;
+      signature?: string;
+      holders?: readonly DrainedHolder[];
+    }
+  | {
+      kind: "deleted";
+      detail?: string;
+      signature?: string;
+      holders?: readonly DrainedHolder[];
+    }
+  | {
+      kind: "stuck";
+      detail?: string;
+      signature?: string;
+      holders?: readonly DrainedHolder[];
+    }
   // A bare `fn-N` target that resolves to 2+ live epics — a terminal usage
   // refusal, never a wait: the command cannot know which epic the caller meant,
   // so it exits naming every candidate (fn-1193). `detail` carries the
   // comma-joined candidate ids. Distinct from `not-found` (no match) — this is
   // TOO-MANY matches.
-  | { kind: "ambiguous"; detail?: string; signature?: string };
+  | {
+      kind: "ambiguous";
+      detail?: string;
+      signature?: string;
+      holders?: readonly DrainedHolder[];
+    };
 
 // ---------------------------------------------------------------------------
 // Index lookups
@@ -1260,17 +1296,88 @@ export function isJamReason(reason: string): boolean {
   );
 }
 
+/**
+ * `drained`'s scope axis (ADR 0032). Selects WHICH work has to be at rest:
+ *  - `plan` (the bare-`drained` default): only keeper-DISPATCHED work counts —
+ *    the caller's own session and every adopted/external session are excluded,
+ *    so an unrelated live shell never holds it. Still holds on open plan rows +
+ *    pending dispatches (the natural "no open plan work left" meaning).
+ *  - `inflight`: only currently in-flight dispatched work — running dispatched
+ *    jobs + pending dispatches — must reach zero; ready-but-undispatched rows
+ *    are ignored (the natural pair with a paused board).
+ *  - `board`: the prior strict gate — the WHOLE board at rest, every working
+ *    session counts. The flip's opt-out for a caller that wants strictness.
+ */
+export type DrainedScope = "plan" | "inflight" | "board";
+
+/**
+ * Is this `jobs.dispatch_origin` a keeper-DISPATCHED provenance — an autopilot
+ * `work`/`close` worker (`'autopilot'`) OR an escalation `unblock`/`deconflict`/
+ * `resolve`/`repair` session (`'escalation'`)? The POSITIVE discriminator the
+ * `plan`/`inflight` scopes count on, mirroring the autoclose worker's provenance
+ * buckets. NEVER the `plan_verb` whitelist: that is NULL for the escalation
+ * sessions (resolver/deconflict/repair) and for every adopted/external row, so a
+ * verb-based gate would report drained mid-merge-resolution. NULL (a manual
+ * `keeper dispatch`, a handoff, a pair partner, an adopted/external session) is
+ * not keeper-dispatched.
+ */
+export function isKeeperDispatched(dispatchOrigin: string | null): boolean {
+  return dispatchOrigin === "autopilot" || dispatchOrigin === "escalation";
+}
+
+/**
+ * One `state==='working'` job the {@link drainedState} predicate weighs. The CLI
+ * projects each working `jobs` row into this; the pure predicate applies the
+ * scope's provenance + self-exclusion filter (never the CLI — the scope
+ * semantics live here so the fixture corpus pins them).
+ */
+export interface DrainedJob {
+  /** `jobs.job_id` — matched against `ownSessionId` for self-exclusion. */
+  jobId: string;
+  /**
+   * `jobs.dispatch_origin` — the keeper-dispatch provenance discriminator (see
+   * {@link isKeeperDispatched}). NULL for manual/adopted/external sessions.
+   */
+  dispatchOrigin: string | null;
+  /** Holder display label (the job title, else the id). */
+  label: string;
+}
+
+/**
+ * One thing currently holding `drained` from `met` (ADR 0032). The shape is
+ * fixed here — the heartbeat (task 2) and the probe / terminal explanation
+ * (task 3) both read this one list rather than re-deriving holders. Attacker-
+ * influenced (`label` can be a session title), so a renderer serializes and
+ * size-bounds it. Never rendered into the byte-stable stdout `detail`.
+ */
+export interface DrainedHolder {
+  /** Holder category — lets a renderer group "N jobs, M rows" without parsing. */
+  kind: "job" | "pending" | "task" | "close-row";
+  /** Stable id: the `job_id`, the `verb::id` dispatch key, or the plan row id. */
+  id: string;
+  /** Human display label. */
+  label: string;
+}
+
 export interface DrainedInputs {
+  /** The scope axis (ADR 0032); bare `drained` defaults to `plan`. */
+  scope: DrainedScope;
   /** Per-task readiness verdicts (post-mutex). */
   perTask: ReadonlyMap<string, Verdict>;
   /** Per-close-row readiness verdicts. */
   perCloseRow: ReadonlyMap<string, Verdict>;
   /** Count of OPEN epics on the default-visible board; `0` ⇒ board empty. */
   openEpicCount: number;
-  /** In-flight launch-window occupants (`pending_dispatches`). */
-  pendingDispatchCount: number;
-  /** Jobs in the `working` state. */
-  runningJobCount: number;
+  /** In-flight launch-window occupants (`pending_dispatches`), holder-shaped. */
+  pendingDispatches: readonly DrainedHolder[];
+  /** Every `state==='working'` job; the scope's filter selects which count. */
+  runningJobs: readonly DrainedJob[];
+  /**
+   * The caller's OWN `CLAUDE_CODE_SESSION_ID` — excluded from the `plan`/
+   * `inflight` running set (mirrors {@link agentsIdleState}'s self-exclusion).
+   * `null` when unset (the self-exclusion is then a no-op). Ignored by `board`.
+   */
+  ownSessionId: string | null;
   /** Reducer still draining toward head — NEVER report drained mid-catch-up. */
   catchingUp: boolean;
   /** The live `dispatch_failures.reason` strings (for the jam check). */
@@ -1280,23 +1387,28 @@ export interface DrainedInputs {
 }
 
 /**
- * `drained` predicate (fn-1015). MET when the board is fully at rest:
- * `catching_up===false` AND no in-flight launch AND no running job AND (the
- * open board is empty OR every per-task / per-close-row verdict is
- * `completed`). A deferred-on-upstream-merge epic (a per-(epic, repoDir) entry
- * in the reconciler's `computeDeferredEpicIds` map) always carries a
- * non-`completed` verdict (a ready task / ready close-row held back from cutting
- * its lane), so it reads `waiting` here automatically — the self-resolving
- * carve-out needs no producer-side probe on the client.
+ * `drained` predicate (fn-1015; scope axis ADR 0032). MET when the scope's work
+ * is at rest and the reducer is not catching up.
  *
- * Under `--fail-on-stuck` a jam-reason sticky ({@link isJamReason}) escalates
- * to `stuck` (exit 5): the board will not drain without an operator, so an
- * armed await must bail rather than block forever. Checked right after the
- * catch-up guard — a jam never self-clears, so siblings still in flight don't
- * make it any less terminal.
+ * The scope (see {@link DrainedScope}) governs two things — WHICH working jobs
+ * count as in-flight, and WHETHER open plan rows hold:
+ *  - `board` counts EVERY working job (the prior strict gate, byte-identical);
+ *    `plan`/`inflight` count only keeper-dispatched work ({@link
+ *    isKeeperDispatched}), always excluding the caller's own session.
+ *  - `plan`/`board` additionally hold while the open board carries a
+ *    non-`completed` per-task / per-close-row verdict; `inflight` stops at zero
+ *    in-flight work, ignoring ready-but-undispatched rows.
  *
- * Level-triggered (no baseline): fires `met` immediately if the board is
- * already at rest at first paint.
+ * A deferred-on-upstream-merge epic always carries a non-`completed` verdict, so
+ * `plan`/`board` read `waiting` here automatically — no producer-side probe.
+ *
+ * The `--fail-on-stuck` jam escalation ({@link isJamReason} → `stuck`, exit 5)
+ * is scope-INDEPENDENT: it fires right after the catch-up guard for every scope,
+ * so an external session can never mask a real operator jam.
+ *
+ * Level-triggered (no baseline): fires `met` immediately if already at rest at
+ * first paint. `detail` stays byte-stable across the flip (the enriched holder
+ * list rides the separate `holders` field, never the `detail` string).
  */
 export function drainedState(inputs: DrainedInputs): AwaitState {
   if (inputs.catchingUp) {
@@ -1311,30 +1423,59 @@ export function drainedState(inputs: DrainedInputs): AwaitState {
       };
     }
   }
-  if (inputs.pendingDispatchCount > 0 || inputs.runningJobCount > 0) {
+
+  // Scope's running-job filter: `board` counts every working job; `plan` /
+  // `inflight` count only keeper-dispatched work, always excluding the caller.
+  const runningHolders: DrainedHolder[] = [];
+  for (const job of inputs.runningJobs) {
+    if (inputs.scope !== "board") {
+      if (!isKeeperDispatched(job.dispatchOrigin)) {
+        continue;
+      }
+      if (inputs.ownSessionId !== null && job.jobId === inputs.ownSessionId) {
+        continue;
+      }
+    }
+    runningHolders.push({ kind: "job", id: job.jobId, label: job.label });
+  }
+  const pendingHolders = inputs.pendingDispatches;
+
+  if (runningHolders.length > 0 || pendingHolders.length > 0) {
     return {
       kind: "waiting",
-      detail: `in-flight (pending=${inputs.pendingDispatchCount} running=${inputs.runningJobCount})`,
+      detail: `in-flight (pending=${pendingHolders.length} running=${runningHolders.length})`,
+      holders: [...runningHolders, ...pendingHolders],
     };
   }
+
+  // `inflight` scope stops at zero in-flight dispatched work — ready-but-
+  // undispatched rows never hold it (the natural pair with a paused board).
+  if (inputs.scope === "inflight") {
+    return { kind: "met", detail: "no in-flight dispatched work (drained)" };
+  }
+
   if (inputs.openEpicCount === 0) {
     return { kind: "met", detail: "board empty (drained)" };
   }
-  for (const v of inputs.perTask.values()) {
+  // `plan`/`board`: an open board holds while any row is non-`completed`. The
+  // `detail` names the FIRST holder (prior byte-stable format); `holders`
+  // carries the full list for the heartbeat/probe surfaces.
+  const rowHolders: DrainedHolder[] = [];
+  let firstWaitingDetail: string | null = null;
+  for (const [id, v] of inputs.perTask) {
     if (v.tag !== "completed") {
-      return {
-        kind: "waiting",
-        detail: `task ${verdictPhrase(v)} (not drained)`,
-      };
+      rowHolders.push({ kind: "task", id, label: id });
+      firstWaitingDetail ??= `task ${verdictPhrase(v)} (not drained)`;
     }
   }
-  for (const v of inputs.perCloseRow.values()) {
+  for (const [id, v] of inputs.perCloseRow) {
     if (v.tag !== "completed") {
-      return {
-        kind: "waiting",
-        detail: `close-row ${verdictPhrase(v)} (not drained)`,
-      };
+      rowHolders.push({ kind: "close-row", id, label: id });
+      firstWaitingDetail ??= `close-row ${verdictPhrase(v)} (not drained)`;
     }
+  }
+  if (firstWaitingDetail !== null) {
+    return { kind: "waiting", detail: firstWaitingDetail, holders: rowHolders };
   }
   return { kind: "met", detail: "all rows completed (drained)" };
 }

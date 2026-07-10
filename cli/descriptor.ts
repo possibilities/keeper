@@ -750,6 +750,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         summary: "Exit 5 on a stuck verdict instead of waiting",
       },
       {
+        name: "scope",
+        type: "string",
+        summary: "drained scope: plan (default) | inflight | board (strict)",
+      },
+      {
         name: "no-armed-line",
         type: "boolean",
         summary: "Suppress the periodic armed-state progress line",

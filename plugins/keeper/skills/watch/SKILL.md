@@ -158,10 +158,12 @@ Monitor({
 The umbrella `needs-human` fires on ANY of the six families (its dispatch
 contribution is the operator-jam class only, never the broad sticky count). When
 the intent is specifically *"tell me the moment the board wedges"*, arm instead
-(or additionally) the drain alarm, which exits 5 on an operator-jam sticky:
+(or additionally) the drain alarm, which exits 5 on an operator-jam sticky. Pass
+`--scope board` explicitly — this alarm watches the WHOLE board at rest, not the
+plan-scoped default (which excludes adopted/external sessions):
 
 ```
-Monitor({ command: "keeper await drained --fail-on-stuck", description: "wedge alarm", persistent: true })
+Monitor({ command: "keeper await drained --scope board --fail-on-stuck", description: "wedge alarm", persistent: true })
 ```
 
 **3. The bus inbox** — already armed. The keeper plugin arms `keeper bus watch`

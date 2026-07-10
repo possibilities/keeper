@@ -48,6 +48,17 @@ test("HELP documents complete as done-AND-idle and lists the landed condition", 
   expect(landed.ok).toBe(true);
 });
 
+test("HELP documents the drained --scope axis and the new plan default", () => {
+  // The scope axis + the flipped default must be discoverable in --help.
+  expect(AWAIT_HELP).toContain("--scope");
+  expect(AWAIT_HELP).toContain("plan");
+  expect(AWAIT_HELP).toContain("inflight");
+  expect(AWAIT_HELP).toContain("board");
+  // Agent-help names the axis + the flip too.
+  expect(AWAIT_AGENT_HELP).toContain("--scope");
+  expect(AWAIT_AGENT_HELP).toContain("--scope board");
+});
+
 test("--agent-help routes to the runbook signal before any I/O", () => {
   // Pure routing: the flag is classified into the meta signal `main` prints,
   // never a condition — so no git-root resolve, no socket, no subscribe.
@@ -505,6 +516,7 @@ function singleArgs(
     json: false,
     sock: "/tmp/keeper-mock.sock",
     ...overrides,
+    scope: overrides.scope ?? "plan",
   };
 }
 
@@ -523,6 +535,7 @@ function argsFor(
     json: false,
     sock: "/tmp/keeper-mock.sock",
     ...overrides,
+    scope: overrides.scope ?? "plan",
   };
 }
 
@@ -636,6 +649,27 @@ test("parseAwaitArgs: flags wire through", () => {
 test("parseAwaitArgs: bad condition → usage error", () => {
   const r = parseAwaitArgs(["bogus", "fn-1-foo.1"]);
   expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: drained defaults to plan scope", () => {
+  const r = parseAwaitArgs(["drained"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.scope).toBe("plan");
+});
+
+test("parseAwaitArgs: --scope wires through and validates", () => {
+  for (const s of ["plan", "inflight", "board"] as const) {
+    const r = parseAwaitArgs(["drained", "--scope", s]);
+    if (!r.ok) {
+      throw new Error(`expected ok for scope ${s}, got ${r.message}`);
+    }
+    expect(r.args.scope).toBe(s);
+  }
+  // An unknown scope is a usage error, not a silent read-as-plan.
+  const bad = parseAwaitArgs(["drained", "--scope", "everything"]);
+  expect(bad.ok).toBe(false);
 });
 
 test("parseAwaitArgs: missing positional id for plan → usage error", () => {
@@ -3063,12 +3097,17 @@ test("await drained: empty board → armed + met (exit 0)", async () => {
   expect(h.exitCode).toBe(0);
 });
 
-test("await drained: a working job holds waiting, then drains → met", async () => {
+test("await drained --scope board: a working job holds waiting, then drains → met", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
 
-  await runAndCatch(argsFor([{ condition: "drained" }]), h.deps);
+  // --scope board is the strict gate — ANY working session (even a bare,
+  // non-dispatched one) holds it.
+  await runAndCatch(
+    argsFor([{ condition: "drained" }], { scope: "board" }),
+    h.deps,
+  );
   const sock = socketRef.current;
   if (!sock) {
     throw new Error("mock socket never installed");
@@ -3083,6 +3122,53 @@ test("await drained: a working job holds waiting, then drains → met", async ()
   expect(h.exitCode).toBeNull();
 
   // Job goes away → drained met.
+  sock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [], 2)]);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await drained (plan default): an external working session never holds → met", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  // The reproduced incident, wired end-to-end: a live external session
+  // (dispatch_origin absent) on an otherwise-empty board fires plan-scope met.
+  await runAndCatch(argsFor([{ condition: "drained" }]), h.deps);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [jobRow({ job_id: "external-1", state: "working" })],
+  });
+  expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+  expect(h.exitCode).toBe(0);
+});
+
+test("await drained (plan default): a keeper-dispatched session holds, then drains → met", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "drained" }]), h.deps);
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // An autopilot-dispatched worker holds plan scope.
+  deliverFiveWith(sock, idPrefix, {
+    jobs: [
+      jobRow({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+    ],
+  });
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  expect(h.exitCode).toBeNull();
+
+  // Worker goes away → drained met.
   sock.deliver([resultFrame("jobs", `${idPrefix}-jobs`, [], 2)]);
   expect(h.exitCode).toBe(0);
 });
