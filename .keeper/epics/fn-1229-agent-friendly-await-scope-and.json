@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-10T01:58:36.663000Z",
+  "depends_on_epics": [],
+  "id": "fn-1229-agent-friendly-await-scope-and",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Agent-friendly await scope and legibility",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-10T01:58:36.663000Z"
+}
