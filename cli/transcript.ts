@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { homedir } from "node:os";
+import { dirname } from "node:path";
 import { parseArgs as parseNodeArgs } from "node:util";
 import {
   discoverClaudeProjectsRoots,
@@ -22,6 +23,7 @@ import {
   buildTranscriptPage,
   renderTranscriptEntriesText,
 } from "../src/transcript/render";
+import { ellipsizeInline } from "../src/transcript/text";
 import { parseOptions } from "./descriptor";
 import { errorEnvelope, successEnvelope } from "./envelope";
 
@@ -67,8 +69,10 @@ Options:
   --project <path>       Project path (default cwd)
   --global               Search every project
   --config-dir <dir>     Claude config directory (repeatable)
-  --since <time>         ISO-8601 time/date or relative duration (30m, 8h, 7d)
-  --until <time>         ISO-8601 time/date or relative duration
+  --since <time>         ISO-8601 time/date, relative duration (30m, 8h, 7d),
+                          or YYYY-MM-DD (that local calendar day, from midnight)
+  --until <time>         ISO-8601 time/date, relative duration, or YYYY-MM-DD
+                          (that local calendar day, through the last ms)
   --offset <n>           Result offset (default 0)
   --limit <n>            Max sessions (default ${DEFAULT_LIST_LIMIT})
   --format human|json    Output format (default human)
@@ -104,8 +108,10 @@ Options:
   --max-entry-chars <n>  Per-entry cap (default ${DEFAULT_MAX_ENTRY_CHARS})
   --tools <level>        none, compact, or full (default compact)
   --role <role>          Repeatable: user|assistant|tool|summary|system
-  --since <time>         ISO-8601 time/date or relative duration
-  --until <time>         ISO-8601 time/date or relative duration
+  --since <time>         ISO-8601 time/date, relative duration, or YYYY-MM-DD
+                          (that local calendar day, from midnight)
+  --until <time>         ISO-8601 time/date, relative duration, or YYYY-MM-DD
+                          (that local calendar day, through the last ms)
   --grep <text>          Case-insensitive content filter
   --meta                 Include injected meta and system entries
   --thinking             Include thinking blocks
@@ -185,7 +191,16 @@ function parsePositive(
     : `${name} must be a positive integer (got '${String(raw)}')`;
 }
 
-/** Parse ISO-8601 or a duration relative to now. Date-only until is inclusive. */
+const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Parse ISO-8601, a duration relative to now, or a date-only YYYY-MM-DD.
+ * Date-only bounds are LOCAL calendar days: since is that day's local
+ * midnight, until is the next local midnight minus one ms (inclusive of
+ * the whole day). Computed from Date calendar components rather than a
+ * flat 86_400_000 ms offset so a DST-shortened or -lengthened day is still
+ * bounded correctly.
+ */
 export function parseTranscriptTime(
   raw: string | undefined,
   nowMs: number,
@@ -203,13 +218,32 @@ export function parseTranscriptTime(
     };
     return nowMs - Number(relative[1]) * (units[relative[2] as string] ?? 0);
   }
+  const dateOnly = DATE_ONLY.exec(raw);
+  if (dateOnly !== null) {
+    const year = Number(dateOnly[1]);
+    const month = Number(dateOnly[2]) - 1;
+    const day = Number(dateOnly[3]);
+    const localMidnight = new Date(year, month, day, 0, 0, 0, 0).getTime();
+    if (!Number.isFinite(localMidnight)) {
+      return `invalid --${edge} time '${raw}'; use ISO-8601 or 30m/8h/7d`;
+    }
+    if (edge === "since") return localMidnight;
+    const nextLocalMidnight = new Date(
+      year,
+      month,
+      day + 1,
+      0,
+      0,
+      0,
+      0,
+    ).getTime();
+    return nextLocalMidnight - 1;
+  }
   const parsed = Date.parse(raw);
   if (!Number.isFinite(parsed)) {
     return `invalid --${edge} time '${raw}'; use ISO-8601 or 30m/8h/7d`;
   }
-  return edge === "until" && /^\d{4}-\d{2}-\d{2}$/.test(raw)
-    ? parsed + 86_400_000 - 1
-    : parsed;
+  return parsed;
 }
 
 function resolveOutputFormat(values: {
@@ -252,9 +286,7 @@ function parseRoots(
 }
 
 function compactLine(raw: string | null, max = 180): string {
-  if (raw === null) return "";
-  const line = raw.replace(/\s+/g, " ").trim();
-  return line.length <= max ? line : `${line.slice(0, max - 3)}...`;
+  return raw === null ? "" : ellipsizeInline(raw, max);
 }
 
 function formatBytes(bytes: number): string {
@@ -638,12 +670,22 @@ function parseShow(
       : fail(message, 1);
   }
   if (lookup.kind === "ambiguous") {
-    const owners = lookup.files
-      .map((file) => transcriptHoldingDirectory(file.path))
-      .join(", ");
-    const message = `session '${sessionId}' exists in multiple projects: ${owners}; pass --project`;
+    const owners = lookup.files.map((file) =>
+      transcriptHoldingDirectory(file.path),
+    );
+    // Bucket dirs live directly under a config root's "projects" dir; the
+    // config root disambiguates when duplicates span DIFFERENT roots
+    // (--project alone can't tell those apart), otherwise --project (which
+    // maps to a bucket within one root) is still the right hint.
+    const configRoots = new Set(owners.map((owner) => dirname(owner)));
+    const hintFlag = configRoots.size > 1 ? "--config-dir" : "--project";
+    const message = `session '${sessionId}' exists in multiple projects: ${owners.join(", ")}; pass ${hintFlag}`;
     return format.value === "json"
-      ? jsonFailure("session_ambiguous", message, "pass --project <path>")
+      ? jsonFailure(
+          "session_ambiguous",
+          message,
+          `pass ${hintFlag} <${hintFlag === "--config-dir" ? "dir" : "path"}>`,
+        )
       : fail(message, 1);
   }
   let session: ReturnType<typeof loadClaudeSession>;

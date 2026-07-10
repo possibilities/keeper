@@ -20,6 +20,7 @@ import type {
   TranscriptSource,
   TranscriptTool,
 } from "./model";
+import { ellipsizeInline } from "./text";
 
 const METADATA_SLICE_BYTES = 128 * 1024;
 const SUMMARY_PREVIEW_CHARS = 240;
@@ -46,6 +47,12 @@ export interface ClaudeListOptions {
   untilMs: number | null;
   offset: number;
   limit: number;
+  /**
+   * Extension seam invoked once per selected file, before it is inspected
+   * (parsed). Lets a caller (tests, in practice) provoke a scan-to-parse
+   * race deterministically instead of relying on real filesystem timing.
+   */
+  onBeforeInspect?: (file: ClaudeSessionFile) => void;
 }
 
 export interface ClaudeListResult {
@@ -560,22 +567,38 @@ function inspectClaudeFile(file: ClaudeSessionFile): TranscriptDocument {
   });
 }
 
-function truncateInline(text: string, max = SUMMARY_PREVIEW_CHARS): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}...`;
+const SLASH_COMMAND_WRAPPER_TAGS = [
+  "command-name",
+  "command-message",
+  "local-command-stdout",
+] as const;
+
+/** Strip slash-command XML scaffolding, unwrapping command-args content. */
+function stripSlashCommandWrappers(text: string): string {
+  let result = text;
+  for (const tag of SLASH_COMMAND_WRAPPER_TAGS) {
+    result = result.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "g"), "");
+  }
+  return result.replace(/<command-args>([\s\S]*?)<\/command-args>/g, "$1");
 }
 
 function firstHumanPrompt(document: TranscriptDocument): string | null {
-  const entry = document.entries.find(
-    (candidate) =>
-      candidate.role === "user" &&
-      candidate.kind === "text" &&
-      !candidate.meta &&
-      candidate.text !== null,
-  );
-  return entry?.text === null || entry?.text === undefined
-    ? null
-    : truncateInline(entry.text);
+  for (const candidate of document.entries) {
+    if (
+      candidate.role !== "user" ||
+      candidate.kind !== "text" ||
+      candidate.meta ||
+      candidate.text === null
+    ) {
+      continue;
+    }
+    const stripped = stripSlashCommandWrappers(candidate.text).trim();
+    if (stripped.length === 0) {
+      continue;
+    }
+    return ellipsizeInline(stripped, SUMMARY_PREVIEW_CHARS);
+  }
+  return null;
 }
 
 function countSubagents(mainPath: string): number {
@@ -651,7 +674,29 @@ export function listClaudeSessions(
     options.offset + options.limit,
   );
   const items = selected.map((file): TranscriptListItem => {
-    const document = inspectClaudeFile(file);
+    options.onBeforeInspect?.(file);
+    // Read-and-catch, never existsSync-then-read: the transcript tree
+    // mutates live under the reader (TOCTOU). A file that vanished between
+    // scan and parse degrades this one row instead of failing the page.
+    let document: TranscriptDocument | null;
+    try {
+      document = inspectClaudeFile(file);
+    } catch {
+      document = null;
+    }
+    if (document === null) {
+      return {
+        sessionId: file.sessionId,
+        path: file.path,
+        project: null,
+        title: null,
+        startedAt: null,
+        updatedAt: new Date(file.modifiedMs).toISOString(),
+        bytes: file.bytes,
+        subagentCount: countSubagents(file.path),
+        firstPrompt: null,
+      };
+    }
     return {
       sessionId: file.sessionId,
       path: file.path,

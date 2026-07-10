@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -13,7 +14,11 @@ import {
   runTranscriptCli,
   type TranscriptCliDeps,
 } from "../cli/transcript";
-import { encodeClaudeProject } from "../src/transcript/claude";
+import {
+  discoverClaudeProjectsRoots,
+  encodeClaudeProject,
+  listClaudeSessions,
+} from "../src/transcript/claude";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const OTHER_SESSION = "22222222-2222-4222-8222-222222222222";
@@ -395,6 +400,135 @@ describe("keeper transcript show", () => {
   });
 });
 
+describe("keeper transcript preview ellipsizing", () => {
+  test("preview call sites each clip to their own exact max, never max+2", () => {
+    const longId = "88888888-8888-4888-8888-888888888888";
+    const longTitle = "T".repeat(1000);
+    const longPrompt = "P".repeat(500);
+    const mainPath = writeSession(
+      PROJECT,
+      longId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: longTitle,
+          sessionId: longId,
+        }),
+        message("user", "2026-07-09T08:00:00.000Z", longPrompt),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+
+    const subagentDir = join(mainPath.slice(0, -".jsonl".length), "subagents");
+    mkdirSync(subagentDir, { recursive: true });
+    const longTask = "S".repeat(500);
+    writeFileSync(
+      join(subagentDir, `agent-${SUBAGENT}.jsonl`),
+      `${line({
+        type: "user",
+        timestamp: "2026-07-09T08:00:01.000Z",
+        cwd: PROJECT,
+        sessionId: longId,
+        agentId: SUBAGENT,
+        message: { role: "user", content: longTask },
+      })}\n`,
+    );
+
+    // firstPrompt is computed once (max 240) and carried verbatim into the
+    // JSON list item — never re-clipped downstream.
+    const listJson = JSON.parse(
+      run(["list", "--project", PROJECT, "--json"]).stdout,
+    );
+    const item = listJson.data.sessions.find(
+      (session: { sessionId: string }) => session.sessionId === longId,
+    );
+    expect(item.firstPrompt).toBe(`${"P".repeat(237)}...`);
+    expect(item.firstPrompt.length).toBe(240);
+
+    // list human rendering clips the title preview to max 180.
+    const listHuman = run(["list", "--project", PROJECT]);
+    expect(listHuman.stdout).toContain(JSON.stringify(`${"T".repeat(177)}...`));
+
+    // show's header clips the (raw, unclipped-at-JSON-layer) title to max 300.
+    const showHuman = run([longId, "--project", PROJECT, "--offset", "0"]);
+    expect(showHuman.stdout).toContain(
+      `title: ${JSON.stringify(`${"T".repeat(297)}...`)}`,
+    );
+
+    // the subagent header line clips its task preview to max 72.
+    expect(showHuman.stdout).toContain(
+      `task=${JSON.stringify(`${"S".repeat(69)}...`)}`,
+    );
+  });
+});
+
+describe("keeper transcript first-prompt slash-command stripping", () => {
+  test("strips slash-command XML wrappers and falls through to the next candidate when empty", () => {
+    const slashId = "99999999-9999-4999-9999-999999999999";
+    writeSession(
+      PROJECT,
+      slashId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Slash session",
+          sessionId: slashId,
+        }),
+        message(
+          "user",
+          "2026-07-09T08:00:00.000Z",
+          "<command-message>Running tests</command-message>" +
+            "<command-name>/test</command-name><command-args></command-args>",
+        ),
+        message(
+          "user",
+          "2026-07-09T08:00:01.000Z",
+          "Actually run the widget tests",
+        ),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+
+    const parsed = JSON.parse(
+      run(["list", "--project", PROJECT, "--json"]).stdout,
+    );
+    const item = parsed.data.sessions.find(
+      (session: { sessionId: string }) => session.sessionId === slashId,
+    );
+    expect(item.firstPrompt).toBe("Actually run the widget tests");
+  });
+
+  test("unwraps command-args content instead of dropping it", () => {
+    const slashId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    writeSession(
+      PROJECT,
+      slashId,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Slash args session",
+          sessionId: slashId,
+        }),
+        message(
+          "user",
+          "2026-07-09T08:00:00.000Z",
+          "<command-message>Running</command-message>" +
+            "<command-name>/grep</command-name><command-args>needle</command-args>",
+        ),
+      ].join("\n"),
+      "2026-07-09T08:01:00.000Z",
+    );
+
+    const parsed = JSON.parse(
+      run(["list", "--project", PROJECT, "--json"]).stdout,
+    );
+    const item = parsed.data.sessions.find(
+      (session: { sessionId: string }) => session.sessionId === slashId,
+    );
+    expect(item.firstPrompt).toBe("needle");
+  });
+});
+
 describe("keeper transcript list", () => {
   test("defaults to cwd and --global expands the scope", () => {
     const local = run(["list"]);
@@ -418,6 +552,94 @@ describe("keeper transcript list", () => {
     const conflict = run(["list", "--global", "--project", PROJECT]);
     expect(conflict.code).toBe(2);
     expect(conflict.stderr).toContain("mutually exclusive");
+  });
+
+  test("a file vanishing between scan and parse degrades one row, not the whole list", () => {
+    const roots = discoverClaudeProjectsRoots({ configDirs: [configDir] });
+    const result = listClaudeSessions({
+      roots,
+      project: null,
+      sinceMs: null,
+      untilMs: null,
+      offset: 0,
+      limit: 20,
+      onBeforeInspect: (file) => {
+        if (file.sessionId === SESSION) {
+          unlinkSync(file.path);
+        }
+      },
+    });
+    expect(result.total).toBe(2);
+    expect(result.nextOffset).toBeNull();
+    expect(result.items).toHaveLength(2);
+
+    const vanished = result.items.find((item) => item.sessionId === SESSION);
+    expect(vanished).toBeDefined();
+    expect(vanished?.project).toBeNull();
+    expect(vanished?.title).toBeNull();
+    expect(vanished?.startedAt).toBeNull();
+    expect(vanished?.firstPrompt).toBeNull();
+    expect(vanished?.bytes).toBeGreaterThan(0);
+
+    const survivor = result.items.find(
+      (item) => item.sessionId === OTHER_SESSION,
+    );
+    expect(survivor?.title).toBe("Beta session");
+  });
+});
+
+describe("keeper transcript show ambiguous session hint", () => {
+  test("duplicate session id within one config root names --project", () => {
+    const dupSessionId = "66666666-6666-4666-8666-666666666666";
+    writeSession(
+      PROJECT,
+      dupSessionId,
+      line({ type: "custom-title", customTitle: "A", sessionId: dupSessionId }),
+      "2026-07-09T12:00:00.000Z",
+    );
+    writeSession(
+      OTHER_PROJECT,
+      dupSessionId,
+      line({ type: "custom-title", customTitle: "B", sessionId: dupSessionId }),
+      "2026-07-09T12:00:00.000Z",
+    );
+
+    const result = run([dupSessionId]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--project");
+    expect(result.stderr).not.toContain("--config-dir");
+  });
+
+  test("duplicate session id across config roots names --config-dir", () => {
+    const dupSessionId = "77777777-7777-4777-8777-777777777777";
+    writeSession(
+      PROJECT,
+      dupSessionId,
+      line({ type: "custom-title", customTitle: "A", sessionId: dupSessionId }),
+      "2026-07-09T12:00:00.000Z",
+    );
+
+    const configDir2 = join(root, "claude2");
+    const projectDir2 = join(
+      configDir2,
+      "projects",
+      encodeClaudeProject(PROJECT),
+    );
+    mkdirSync(projectDir2, { recursive: true });
+    const path2 = join(projectDir2, `${dupSessionId}.jsonl`);
+    writeFileSync(
+      path2,
+      `${line({ type: "custom-title", customTitle: "C", sessionId: dupSessionId })}\n`,
+    );
+    const modified = new Date("2026-07-09T12:00:00.000Z");
+    utimesSync(path2, modified, modified);
+
+    const result = runTranscriptCli(
+      [dupSessionId, "--config-dir", configDir, "--config-dir", configDir2],
+      deps,
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--config-dir");
   });
 });
 
@@ -510,10 +732,47 @@ describe("keeper transcript dotted/underscored project paths", () => {
   });
 });
 
-test("time parser supports relative durations and inclusive date-only until", () => {
+test("time parser supports relative durations and inclusive local-day until", () => {
   expect(parseTranscriptTime("7d", NOW, "since")).toBe(NOW - 7 * 86_400_000);
+  // Date-only bounds are local calendar days: since is that day's local
+  // midnight (Date's own local-time constructor), until is the next local
+  // midnight minus one ms — independent of the host's timezone.
+  expect(parseTranscriptTime("2026-07-09", NOW, "since")).toBe(
+    new Date(2026, 6, 9, 0, 0, 0, 0).getTime(),
+  );
   expect(parseTranscriptTime("2026-07-09", NOW, "until")).toBe(
-    Date.parse("2026-07-10T00:00:00.000Z") - 1,
+    new Date(2026, 6, 10, 0, 0, 0, 0).getTime() - 1,
   );
   expect(parseTranscriptTime("nonsense", NOW, "since")).toContain("invalid");
+});
+
+test("date-only since/until select local calendar days across DST boundaries", () => {
+  const originalTz = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    // 2026-03-08 is the America/New_York spring-forward transition: local
+    // midnight to next local midnight spans only 23 wall-clock hours.
+    const springSince = parseTranscriptTime("2026-03-08", NOW, "since");
+    const springUntil = parseTranscriptTime("2026-03-08", NOW, "until");
+    expect(springSince).toBe(new Date(2026, 2, 8, 0, 0, 0, 0).getTime());
+    expect(springUntil).toBe(new Date(2026, 2, 9, 0, 0, 0, 0).getTime() - 1);
+    expect((springUntil as number) - (springSince as number)).toBe(
+      23 * 3_600_000 - 1,
+    );
+
+    // 2026-11-01 is the fall-back transition: the local day spans 25 hours.
+    const fallSince = parseTranscriptTime("2026-11-01", NOW, "since");
+    const fallUntil = parseTranscriptTime("2026-11-01", NOW, "until");
+    expect(fallSince).toBe(new Date(2026, 10, 1, 0, 0, 0, 0).getTime());
+    expect(fallUntil).toBe(new Date(2026, 10, 2, 0, 0, 0, 0).getTime() - 1);
+    expect((fallUntil as number) - (fallSince as number)).toBe(
+      25 * 3_600_000 - 1,
+    );
+  } finally {
+    if (originalTz === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTz;
+    }
+  }
 });
