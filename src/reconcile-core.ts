@@ -1251,6 +1251,33 @@ export function epicHasActiveResolver(
 }
 
 /**
+ * Does `epic` have an OCCUPYING close OR work job — the recover-pass teardown gate
+ * that keeps a lane whose closer (or a mid-task worker) is still LIVE inside it from
+ * being merged/torn out from under the session (ADR 0031: a deleted cwd →
+ * posix_spawn ENOENT → a `working` zombie ghost-holding the slot). A thin
+ * composition of the shared {@link isOccupyingJob} seam (close by epic id, work by
+ * each task id) — no new liveness predicate, no cwd matching — so the reconciler and
+ * board can never drift on what "occupies" means. Distinct from {@link isEpicInFlight}:
+ * NO `liveTabKeys` arm — the recover producer gates on durable + live-pane occupancy
+ * only, never the pre-SessionStart launch window. Returns on first occupant.
+ */
+export function epicHasOccupyingJob(
+  epic: Epic,
+  jobs: Map<string, Job>,
+  livePaneIds: ReadonlySet<string> | null,
+): boolean {
+  if (isOccupyingJob(jobs, "close", epic.epic_id, livePaneIds)) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (isOccupyingJob(jobs, "work", task.task_id, livePaneIds)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * The terminal-outcome verdict of the autonomous `resolve::<epic>` merge-resolver,
  * or the not-yet-terminal signal — the gate the daemon deconflict-dispatch sweep reads
  * so it SEQUENCES the `deconflict::<epic>` session behind the resolver (the resolver,
@@ -1963,26 +1990,50 @@ export function reconcile(
   // paused autopilot must not do. Launches are already suppressed while paused, so
   // the geometry attach has nothing to decorate either.
   if (snapshot.worktreeMode && !state.paused) {
-    // The producer-observable finalize trigger. Collect the epics whose
-    // CLOSER JOB finished (the durable jobs projection, re-fold-safe + restart-safe)
-    // — a BROADER trigger than `completedRowIds` (the close-row's `completed`
-    // verdict, gated on the main `epics` projection folding `done`). `finalizeEpic`
-    // then confirms real completion via the MAIN projection (`isEpicDone`) before
-    // merging — a finished-but-not-done crashed closer is rejected there. Union'd
-    // with `completedRowIds` so the pre-worktree done-on-main path is unchanged.
-    const closerFinishedIds = new Set<string>();
+    // The finalize collection — every epic whose lane should merge-to-default and
+    // tear down THIS cycle. Two arms, BOTH gated on CLOSE occupancy (ADR 0031):
+    //  - projection-done (`completedRowIds`): the epic folded `done`, so its close
+    //    row read `completed` in the ONE readiness pass above.
+    //  - closer-finished (`closerJobFinished`): a `close::<epic>` job row exists AND
+    //    no longer occupies — a BROADER, producer-observable trigger off the durable
+    //    `jobs` projection (fires even before the main `epics` projection folds
+    //    `done`; `finalizeEpic` re-confirms real completion via `isEpicDone` before
+    //    it merges, so a finished-but-not-done crashed closer is rejected there —
+    //    projection-done crash robustness is unchanged).
+    // The CLOSE-OCCUPANCY GATE: an epic whose close job still OCCUPIES its slot
+    // (`working`; `stopped` with a live pane; or a degraded pane probe — the shared
+    // `isOccupyingJob` semantics) is a live closer mid-turn INSIDE its lane.
+    // Collecting it would merge + tear the lane out from under the session, deleting
+    // its cwd (posix_spawn ENOENT → Stop hooks die → a `working` zombie ghost-holds
+    // the slot). Defer to a later cycle: a self-resolving deferral minting no row —
+    // the closer's pane dies (normally via autoclose's reap) and the next cycle
+    // finalizes. The closer-finished arm ALREADY encodes this gate; routing the
+    // projection-done arm through the SAME shared seam keeps the reconciler and board
+    // from drifting on what "occupies" means. A done epic with NO close job
+    // (never-forked / done-before-worktree) never occupies → finalizes as before.
+    // The deferral ends at "no longer occupying," never "process dead" — an idle
+    // closer occupies until its pane dies (ADR 0031). Symmetric with the
+    // closer-finished arm's own long-standing silent defer; the `finalizeEpic`-side
+    // retry-skip / done-guard diagnostics stay the observable defer surface.
+    const finalizeEpicIds = new Set<string>();
     for (const epic of snapshot.epics) {
+      const epicId = epic.epic_id;
       if (
-        closerJobFinished(snapshot.jobs, epic.epic_id, snapshot.livePaneIds)
+        isOccupyingJob(snapshot.jobs, "close", epicId, snapshot.livePaneIds)
       ) {
-        closerFinishedIds.add(epic.epic_id);
+        continue;
+      }
+      if (
+        completedRowIds.has(epicId) ||
+        closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds)
+      ) {
+        finalizeEpicIds.add(epicId);
       }
     }
     attachWorktreeGeometry(
       snapshot.epics,
       launches,
-      completedRowIds,
-      closerFinishedIds,
+      finalizeEpicIds,
       worktreeFinalize,
       worktreeSinkProvision,
       worktreeGeometry.byEpicId,
@@ -2246,12 +2297,12 @@ export function prepareWorktreeGeometry(
  *    the lane order, the primary-parent branch). The close-row launch maps to the
  *    synthetic {@link CLOSE_SINK_ID} sink (pinned to base).
  *  - Collect a {@link WorktreeLaunchInfo} into `worktreeFinalize` for every `ok`
- *    epic that needs finalizing — its close-row id is in `completedRowIds` (the MAIN
- *    projection folded `status:done`) OR `closerFinishedIds` (the closer JOB
- *    finished, the BROADER producer-observable signal off the durable `jobs`
- *    projection). The producer merges that base into the default branch + tears
- *    down, confirming real completion via the MAIN projection (`isEpicDone`) first
- *    (`finalizeEpic`) — the closer writes `done` to the PRIMARY repo, not the lane.
+ *    epic in `finalizeEpicIds` — the CLOSE-OCCUPANCY-GATED finalize set the caller
+ *    assembled (an epic folded `status:done` OR its closer JOB finished, AND no
+ *    close job still occupies its lane; ADR 0031). The producer merges that base
+ *    into the default branch + tears down, re-confirming real completion via the
+ *    MAIN projection (`isEpicDone`) first (`finalizeEpic`) — the closer writes
+ *    `done` to the PRIMARY repo, not the lane.
  *  - `clustered` (multi-repo) → stamp each task launch with ITS group's assignment
  *    (a `serial` group's tasks stay worktree-less on the shared checkout); the
  *    single close launch maps to the PRIMARY group's sink (worktree-less if the
@@ -2260,13 +2311,13 @@ export function prepareWorktreeGeometry(
  *    additionally lands in `worktreeSinkProvision` — no close worker dispatches into
  *    it, so the producer runs its rib→base fan-in before finalize via `provision`.
  *
- * Pure: a total function of the epics + launches + id sets + the resolved geometry.
+ * Pure: a total function of the epics + launches + the finalize set + the resolved
+ * geometry.
  */
 function attachWorktreeGeometry(
   epics: Epic[],
   launches: PlannedLaunch[],
-  completedRowIds: Set<string>,
-  closerFinishedIds: Set<string>,
+  finalizeEpicIds: Set<string>,
   worktreeFinalize: WorktreeLaunchInfo[],
   worktreeSinkProvision: WorktreeLaunchInfo[],
   byEpicId: ReadonlyMap<string, EpicWorktreeGeometry>,
@@ -2285,8 +2336,7 @@ function attachWorktreeGeometry(
   for (const epic of epics) {
     const epicId = epic.epic_id;
     const epicLaunches = launches.filter((l) => epicOf(l) === epicId);
-    const needsFinalize =
-      completedRowIds.has(epicId) || closerFinishedIds.has(epicId);
+    const needsFinalize = finalizeEpicIds.has(epicId);
     if (epicLaunches.length === 0 && !needsFinalize) {
       continue;
     }
