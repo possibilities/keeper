@@ -158,12 +158,23 @@ models:
 # every configured model has an entry AND each recorded hash matches the file on
 # disk — so re-researching a model without re-hashing here fails the fast suite.
 research:
+  # Each entry's optional `card` sub-mapping pins a vendor system-card cache
+  # under skills/model-guidance/references/cards/<model>.md (converted
+  # markdown, provenance-headed) — the raw source the notes file above
+  # distills. The host-blind gate hashes the committed markdown, never
+  # upstream bytes; it never parses the card's provenance header.
   opus:
     reference: skills/model-guidance/references/opus.md
     sha256: 7f4a160d704ae0f05e4543f3c37d61be3d1d6f89e6d76dd044486ac38997a6c4
+    card:
+      reference: skills/model-guidance/references/cards/opus.md
+      sha256: adad39baa99bcba194c4677b96ee42c40341e36caf395486daf60085e7e2e560
   sonnet:
     reference: skills/model-guidance/references/sonnet.md
     sha256: cf88409ab1dafa43569e41b5c73d04bc6b9f18a3c3e52b78a9a3c2df3ad2990e
+    card:
+      reference: skills/model-guidance/references/cards/sonnet.md
+      sha256: 5b7494c21726a3bd74fa10b5aa7d09c78cc903b66da515b7d26c1b73e529292a
   # Host-roster capability model absent from the claude-only default axis. The
   # research entry is tolerated by the host-blind gate, but the reference must
   # exist and hash-match like any other; the guidance block is a pre-provisioned
@@ -171,3 +182,6 @@ research:
   gpt-5.3-codex-spark:
     reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
     sha256: fe58cf92782857d47536711f34045dd84923cf84054195e5dd4e10ac73327f09
+    card:
+      reference: skills/model-guidance/references/cards/gpt-5.3-codex-spark.md
+      sha256: b2d909a0616523cbc0ec4ef47e9bbc6c039bf72fbfc4bcacdcee6c632b4a8f32
