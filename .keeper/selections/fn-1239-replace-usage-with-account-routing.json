@@ -6,72 +6,72 @@
   },
   "cells": [
     {
-      "confidence": 0.97,
+      "confidence": 0.8,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "New routing policy, adversarial parsing, concurrency, privacy, and worker lifecycle create subtle correctness and security invariants across multiple boundaries.",
+      "rationale": "Greenfield routing core with a novel worst-window headroom selector, adversarial subprocess parsers, PII/credential containment, and a concurrency-atomic flock ledger - multiple nameable security and correctness invariants gate opus.",
       "task_id": "fn-1239-replace-usage-with-account-routing.1",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.97,
+      "confidence": 0.66,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Exact argv and environment composition across every launch path is a correctness-critical architectural cascade with ambiguous handoff failure semantics.",
+      "rationale": "Correctness-critical Claude process boundary: byte-exact argv forwarding across the nested -- and every launch channel plus lost-handoff ambiguity that must never double-launch, a cross-cutting cascade warranting opus over a byte-pinned GPT pick.",
       "task_id": "fn-1239-replace-usage-with-account-routing.2",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.98,
+      "confidence": 0.58,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Untrusted hook input, a forward-only schema change, and deterministic event folding form a security- and correctness-critical contract.",
+      "rationale": "Event-sourcing schema step, deterministic fold, and re-fold equivalence over attacker-influenced hook data - schema and migration work is a correctness-critical opus gate even though templated.",
       "task_id": "fn-1239-replace-usage-with-account-routing.3",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.94,
+      "confidence": 0.6,
       "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Removing profile infrastructure without breaking instruction guards, settings seeding, shared history, or credential containment is a cross-cutting architectural refactor.",
+      "model": "sonnet",
+      "rationale": "Delicate surgical separation of intertwined guard and profile-farm machinery that must preserve resume correctness and global-instruction guards - judgment- and idiom-heavy removal whose hazards are dependency-guarded and test-pinned, so sonnet over opus.",
       "task_id": "fn-1239-replace-usage-with-account-routing.4",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.91,
+      "confidence": 0.57,
       "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "The retirement path is fully specified and largely mechanical, but spans public CLI contracts, daemon supervision, workers, modules, and tests.",
+      "model": "gpt-5.6-sol",
+      "rationale": "Wide, well-specified mechanical deletion of the usage stack with an explicit keep-scope and depgraph completeness checks - GPT-first big-working-set navigation at the default band with no deep judgment or propagating abstraction.",
       "task_id": "fn-1239-replace-usage-with-account-routing.5",
-      "tier": "xhigh"
+      "tier": "high"
     },
     {
-      "confidence": 0.98,
+      "confidence": 0.72,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "A destructive forward-only migration that must preserve historical re-fold safety and unrelated projections carries subtle schema correctness invariants.",
+      "rationale": "Destructive schema-singleton migration that must idempotently drop projections, avoid dead-lettering historical events, and preserve deterministic re-fold and live-only rewind boundaries - a clear subtle-correctness opus gate.",
       "task_id": "fn-1239-replace-usage-with-account-routing.6",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.96,
+      "confidence": 0.68,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "This is well-specified multi-file documentation pruning with semantic consistency and lint constraints but no novel design requirement.",
+      "rationale": "User-facing docs pruning under strict house discipline - lean present-tense prose, guardrail-versus-glossary judgment, and precise two-CLI role framing - taste and idiom work that routes to sonnet at the default band.",
       "task_id": "fn-1239-replace-usage-with-account-routing.7",
       "tier": "high"
     }
   ],
-  "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
-  "created_at": "2026-07-10T17:16:32.866000Z",
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T21:37:16.927000Z",
   "epic_id": "fn-1239-replace-usage-with-account-routing",
-  "input_hash": "4445541497cae6e283432560d36246a7ace934180c791e199d7cd530dd667a7a",
+  "input_hash": "60cf42ccfb4a722c6e5f8f2458111fe6e6e35fcc9da7f2f72e341d9604d7fa27",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 1145394196,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1239-replace-usage-with-account-routing.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"New routing policy, adversarial parsing, concurrency, privacy, and worker lifecycle create subtle correctness and security invariants across multiple boundaries.\",\"confidence\":0.97},{\"task_id\":\"fn-1239-replace-usage-with-account-routing.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Exact argv and environment composition across every launch path is a correctness-critical architectural cascade with ambiguous handoff failure semantics.\",\"confidence\":0.97},{\"task_id\":\"fn-1239-replace-usage-with-account-routing.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Untrusted hook input, a forward-only schema change, and deterministic event folding form a security- and correctness-critical contract.\",\"confidence\":0.98},{\"task_id\":\"fn-1239-replace-usage-with-account-routing.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Removing profile infrastructure without breaking instruction guards, settings seeding, shared history, or credential containment is a cross-cutting architectural refactor.\",\"confidence\":0.94},{\"task_id\":\"fn-1239-replace-usage-with-account-routing.5\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"The retirement path is fully specified and largely mechanical, but spans public CLI contracts, daemon supervision, workers, modules, and tests.\",\"confidence\":0.91},{\"task_id\":\"fn-1239-replace-usage-with-account-routing.6\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A destructive forward-only migration that must preserve historical re-fold safety and unrelated projections carries subtle schema correctness invariants.\",\"confidence\":0.98},{\"task_id\":\"fn-1239-replace-usage-with-account-routing.7\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"This is well-specified multi-file documentation pruning with semantic consistency and lint constraints but no novel design requirement.\",\"confidence\":0.96}]}\n"
+  "shuffle_seed": 1624195788,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1239-replace-usage-with-account-routing.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Greenfield routing core with a novel worst-window headroom selector, adversarial subprocess parsers, PII/credential containment, and a concurrency-atomic flock ledger - multiple nameable security and correctness invariants gate opus.\", \"confidence\": 0.8}, {\"task_id\": \"fn-1239-replace-usage-with-account-routing.2\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Correctness-critical Claude process boundary: byte-exact argv forwarding across the nested -- and every launch channel plus lost-handoff ambiguity that must never double-launch, a cross-cutting cascade warranting opus over a byte-pinned GPT pick.\", \"confidence\": 0.66}, {\"task_id\": \"fn-1239-replace-usage-with-account-routing.3\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Event-sourcing schema step, deterministic fold, and re-fold equivalence over attacker-influenced hook data - schema and migration work is a correctness-critical opus gate even though templated.\", \"confidence\": 0.58}, {\"task_id\": \"fn-1239-replace-usage-with-account-routing.4\", \"tier\": \"xhigh\", \"model\": \"sonnet\", \"rationale\": \"Delicate surgical separation of intertwined guard and profile-farm machinery that must preserve resume correctness and global-instruction guards - judgment- and idiom-heavy removal whose hazards are dependency-guarded and test-pinned, so sonnet over opus.\", \"confidence\": 0.6}, {\"task_id\": \"fn-1239-replace-usage-with-account-routing.5\", \"tier\": \"high\", \"model\": \"gpt-5.6-sol\", \"rationale\": \"Wide, well-specified mechanical deletion of the usage stack with an explicit keep-scope and depgraph completeness checks - GPT-first big-working-set navigation at the default band with no deep judgment or propagating abstraction.\", \"confidence\": 0.57}, {\"task_id\": \"fn-1239-replace-usage-with-account-routing.6\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Destructive schema-singleton migration that must idempotently drop projections, avoid dead-lettering historical events, and preserve deterministic re-fold and live-only rewind boundaries - a clear subtle-correctness opus gate.\", \"confidence\": 0.72}, {\"task_id\": \"fn-1239-replace-usage-with-account-routing.7\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"User-facing docs pruning under strict house discipline - lean present-tense prose, guardrail-versus-glossary judgment, and precise two-CLI role framing - taste and idiom work that routes to sonnet at the default band.\", \"confidence\": 0.68}]}\n"
 }
