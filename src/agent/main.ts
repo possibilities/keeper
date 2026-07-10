@@ -332,7 +332,7 @@ export function realDeps(): MainDeps {
     pluginConfigPath: pluginConfigPath(),
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
-    loadPanelSelectionsFn: (catalog) => loadPanelSelections(catalog),
+    loadPanelSelectionsFn: () => loadPanelSelections(),
     ensureClaudeStateSharingFn: (listProfilesFn, actionLog) =>
       ensureClaudeStateSharing(
         listProfilesFn,

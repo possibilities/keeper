@@ -53,35 +53,6 @@ function writeYaml(name: string, body: string): string {
   return p;
 }
 
-/** A catalog with claude (a), codex (b), and pi (z) presets for panel tests. */
-function catalogFixture(): PresetCatalog {
-  return {
-    presets: {
-      a: {
-        harness: "claude",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-      b: {
-        harness: "codex",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-      z: {
-        harness: "pi",
-        model: null,
-        effort: null,
-        thinking: null,
-        role: null,
-      },
-    },
-  };
-}
-
 describe("loadPresetCatalog", () => {
   test("a missing file is fail-loud (the required-catalog reversal)", () => {
     expect(() => loadPresetCatalog(join(tmpDir, "nope.yaml"))).toThrow(
@@ -237,52 +208,76 @@ describe("loadPresetCatalog", () => {
 
 describe("loadPanelSelections", () => {
   test("a missing file is fail-loud (the required-panel reversal)", () => {
-    expect(() =>
-      loadPanelSelections(catalogFixture(), join(tmpDir, "nope.yaml")),
-    ).toThrow(ConfigError);
+    expect(() => loadPanelSelections(join(tmpDir, "nope.yaml"))).toThrow(
+      ConfigError,
+    );
   });
 
-  test("a panel of existing presets is read in order", () => {
-    const p = writeYaml("panel.yaml", "panels:\n  duo:\n    - a\n    - b\n");
-    expect(loadPanelSelections(catalogFixture(), p).panels.duo).toEqual([
-      "a",
-      "b",
+  test("a panel of triple members is read in declaration order", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+    );
+    expect(loadPanelSelections(p).panels.duo).toEqual([
+      "claude::opus::high",
+      "codex::gpt-5.3::high",
     ]);
   });
 
-  test("a member referencing no catalog preset is fail-loud", () => {
+  test("a malformed member triple is fail-loud naming the member", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\n    - ghost\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - not-a-triple\n",
     );
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /undefined preset 'ghost'/,
-    );
+    expect(() => loadPanelSelections(p)).toThrow(/not-a-triple/);
+    expect(() => loadPanelSelections(p)).toThrow(/not a valid launch triple/);
   });
 
-  test("a pi member is accepted at load (panel eligibility is the capturable capability)", () => {
-    // Panel eligibility reads a descriptor capability (`capturable`), never a
-    // claude|codex name list — pi is capturable, so a pi panel member is valid.
-    const p = writeYaml("panel.yaml", "panels:\n  mixed:\n    - a\n    - z\n");
-    expect(loadPanelSelections(catalogFixture(), p).panels.mixed).toEqual([
-      "a",
-      "z",
+  test("a pi member is accepted (panel eligibility = capturable + a reasoning axis)", () => {
+    // pi is capturable AND carries a thinking axis, so a pi panel member is valid.
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  mixed:\n    - claude::opus::high\n    - pi::glm::high\n",
+    );
+    expect(loadPanelSelections(p).panels.mixed).toEqual([
+      "claude::opus::high",
+      "pi::glm::high",
+    ]);
+  });
+
+  test("an axisless harness member is fail-loud (not panel-eligible)", () => {
+    // hermes is capturable but exposes no reasoning axis (na) — panels compare an
+    // axis, so it is rejected AT LOAD with the member named.
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - hermes::hermes-m::na\n",
+    );
+    expect(() => loadPanelSelections(p)).toThrow(/hermes::hermes-m::na/);
+    expect(() => loadPanelSelections(p)).toThrow(/not panel-eligible/);
+  });
+
+  test("duplicate identical triples are legal at load (kept in order)", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  dup:\n    - claude::opus::high\n    - claude::opus::high\n",
+    );
+    expect(loadPanelSelections(p).panels.dup).toEqual([
+      "claude::opus::high",
+      "claude::opus::high",
     ]);
   });
 
   test("an empty panel list is fail-loud", () => {
     const p = writeYaml("panel.yaml", "panels:\n  empty: []\n");
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /non-empty list/,
-    );
+    expect(() => loadPanelSelections(p)).toThrow(/non-empty list/);
   });
 
   test("an unknown top-level key is fail-loud (strict reject)", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\npresets:\n  x:\n    harness: claude\n",
+      "panels:\n  duo:\n    - claude::opus::high\npresets:\n  x: y\n",
     );
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
+    expect(() => loadPanelSelections(p)).toThrow(
       /Unknown top-level key 'presets'/,
     );
   });
@@ -290,53 +285,35 @@ describe("loadPanelSelections", () => {
   test("the default key names a defined panel", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\n    - b\ndefault: duo\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\ndefault: duo\n",
     );
-    const sel = loadPanelSelections(catalogFixture(), p);
-    expect(sel.default).toBe("duo");
+    expect(loadPanelSelections(p).default).toBe("duo");
   });
 
   test("no default key leaves default null", () => {
-    const p = writeYaml("panel.yaml", "panels:\n  duo:\n    - a\n    - b\n");
-    expect(loadPanelSelections(catalogFixture(), p).default).toBeNull();
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+    );
+    expect(loadPanelSelections(p).default).toBeNull();
   });
 
   test("a default naming an undefined panel is fail-loud", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - a\n    - b\ndefault: ghost\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\ndefault: ghost\n",
     );
-    expect(() => loadPanelSelections(catalogFixture(), p)).toThrow(
-      /default panel 'ghost'/,
-    );
+    expect(() => loadPanelSelections(p)).toThrow(/default panel 'ghost'/);
   });
 
   test("two same-harness-different-model panelists are expressible", () => {
-    const catalog: PresetCatalog = {
-      presets: {
-        opus: {
-          harness: "claude",
-          model: "opus",
-          effort: null,
-          thinking: null,
-          role: null,
-        },
-        sonnet: {
-          harness: "claude",
-          model: "sonnet",
-          effort: null,
-          thinking: null,
-          role: null,
-        },
-      },
-    };
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  claude-duo:\n    - opus\n    - sonnet\n",
+      "panels:\n  claude-duo:\n    - claude::opus::high\n    - claude::sonnet::high\n",
     );
-    expect(loadPanelSelections(catalog, p).panels["claude-duo"]).toEqual([
-      "opus",
-      "sonnet",
+    expect(loadPanelSelections(p).panels["claude-duo"]).toEqual([
+      "claude::opus::high",
+      "claude::sonnet::high",
     ]);
   });
 });

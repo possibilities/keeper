@@ -53,6 +53,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   ConfigError,
+  isPanelEligibleHarness,
   loadPanelSelections,
   loadPresetCatalog,
   type PanelSelections,
@@ -65,6 +66,12 @@ import {
   type AgentCli,
   loadRolePrompt,
 } from "../agent/launch-config";
+import {
+  formatTriple,
+  parseTriple,
+  slugifyTriple,
+  type Triple,
+} from "../agent/triple";
 import { parseDuration } from "../duration";
 import { resolveKeeperAgentPathDepFree } from "../keeper-agent-path";
 import { keeperStateDir } from "../keeper-state-dir";
@@ -118,8 +125,13 @@ const PANEL_TRASH_DIR = ".gc";
 // ---------------------------------------------------------------------------
 
 /** A resolved panel member. `harness` is always the `agent run <cli>` positional;
- *  `preset` set → the leg also carries `--preset <preset>`. `name` is the leg
- *  label and the basename of its result file + pidfile.
+ *  `preset` set → the leg also carries `--preset <preset>`. For a configured panel
+ *  member `preset` is the raw launch triple (`<harness>::<model>::<effort>`) and
+ *  `ordinal` its 1-based position among identical triples in the panel — together the
+ *  member's stable identity for attribution and the judge label. `name` is the
+ *  DISPLAY slug (a disambiguated `slugifyTriple` plus ordinal): the leg label and the
+ *  basename of its result file + pidfile, so two members never share a tmux name or
+ *  output path even when their triples slugify identically.
  *
  *  The ad-hoc (panel-of-one) fields are absent for a configured panel member, so
  *  a configured member's leg argv stays byte-identical: `model`/`effort` layer a
@@ -130,6 +142,7 @@ export interface PanelMember {
   name: string;
   harness: AgentCli;
   preset?: string;
+  ordinal?: number;
   model?: string;
   effort?: string;
   system?: string;
@@ -156,7 +169,7 @@ export interface PanelManifestMember {
 }
 
 /** The `start`-persisted, `wait`-re-read manifest. `slug` is the run's
- *  agent-authored identifier (each leg launches as `panel::<slug>::<preset>`),
+ *  agent-authored identifier (each leg launches as `panel::<slug>::<member>`),
  *  persisted top-level for run correlation. `boot_epoch_ms` is the machine's
  *  sleep-proof boot instant (`deps.bootEpochMs`, kernel-derived — see that seam);
  *  a resuming `start`/`wait` compares it against the current boot to detect a
@@ -296,23 +309,75 @@ export type ResolveMembersResult =
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a panel name to its members against the catalog + panel selections.
- * The reserved name `default` is a symbolic pointer to the configured default
- * panel (git-HEAD semantics), dereferenced to `selections.default` before the
- * lookup; a null default fails loud naming what was typed. Otherwise: a PANEL
- * hit → its members (each named by its preset); else a single catalog PRESET hit
- * → a one-member panel; else an unknown name → fail loud (the caller exits 2 —
- * there is no zero-config fallback). A member pinning a harness outside
- * claude|codex|pi fails loud. Pure.
+ * Build resolved {@link PanelMember}s from an ordered list of raw launch-triple
+ * strings (a configured panel's members, or a single `--panel <triple>`). Each is
+ * re-parsed with the shared grammar and re-checked for panel-eligibility
+ * ({@link isPanelEligibleHarness}) — the SAME gates {@link loadPanelSelections}
+ * applies, so a hand-crafted `selections` that bypassed load is still rejected here.
+ * Duplicate identical triples are legal: each gets a 1-based `ordinal` in declaration
+ * order, and `name` is `slugifyTriple(…, disambiguate) + '-' + ordinal` so two
+ * members never collide on a leg name or output path — the hash suffix separates
+ * distinct triples whose slugs coincide, the ordinal separates repeats of one triple.
+ * `preset` carries the raw (canonical) triple, forwarded verbatim as the leg's
+ * `--preset`. Pure.
+ */
+function buildTripleMembers(
+  rawTriples: readonly string[],
+  label: string,
+): ResolveMembersResult {
+  const triples: Triple[] = [];
+  for (const raw of rawTriples) {
+    const parsed = parseTriple(raw);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        error: `${label} member '${raw}' is not a valid launch triple: ${parsed.error}`,
+      };
+    }
+    if (!isPanelEligibleHarness(parsed.triple.harness)) {
+      return {
+        ok: false,
+        error: `${label} member '${raw}' pins harness ${parsed.triple.harness}, which is not panel-eligible (claude|codex|pi only)`,
+      };
+    }
+    triples.push(parsed.triple);
+  }
+  if (triples.length === 0) {
+    return { ok: false, error: `${label} resolved to zero members` };
+  }
+  // 1-based ordinal per identical (canonical) triple, in declaration order, so
+  // repeats of one triple land on distinct slug names + output paths.
+  const seen = new Map<string, number>();
+  const members: PanelMember[] = triples.map((triple) => {
+    const canonical = formatTriple(triple);
+    const ordinal = (seen.get(canonical) ?? 0) + 1;
+    seen.set(canonical, ordinal);
+    return {
+      name: `${slugifyTriple(triple, { disambiguate: true })}-${ordinal}`,
+      harness: triple.harness,
+      preset: canonical,
+      ordinal,
+    };
+  });
+  return { ok: true, members };
+}
+
+/**
+ * Resolve a `--panel` selector to its members against the panel selections. The
+ * reserved name `default` is a symbolic pointer to the configured default panel
+ * (git-HEAD semantics), dereferenced to `selections.default` before the lookup; a
+ * null default fails loud naming what was typed. Otherwise: a configured PANEL hit →
+ * its ordered triple members; else a single launch TRIPLE → a one-member panel; else
+ * an unknown selector → fail loud (the caller exits 2 — there is no zero-config
+ * fallback). Every member is re-parsed and re-checked for panel-eligibility. Pure.
  */
 export function resolvePanelMembers(
-  catalog: PresetCatalog,
   selections: PanelSelections,
   name: string,
 ): ResolveMembersResult {
-  // `default` is load-reserved (never a panel's or preset's own name), so it
-  // aliases the configured default panel — dereferenced here so the explicit
-  // `--panel default` path converges with the no-flag default path.
+  // `default` is load-reserved (never a panel's own name), so it aliases the
+  // configured default panel — dereferenced here so the explicit `--panel default`
+  // path converges with the no-flag default path.
   let lookup = name;
   if (name === "default") {
     if (selections.default === null || selections.default === "") {
@@ -326,50 +391,19 @@ export function resolvePanelMembers(
 
   const panelMembers = selections.panels[lookup];
   if (panelMembers !== undefined) {
-    const members: PanelMember[] = [];
-    for (const memberName of panelMembers) {
-      const preset = catalog.presets[memberName];
-      if (preset === undefined) {
-        return {
-          ok: false,
-          error: `panel '${lookup}' references undefined preset '${memberName}'`,
-        };
-      }
-      if (!AGENT_CLIS.has(preset.harness)) {
-        return {
-          ok: false,
-          error: `panel '${lookup}' member '${memberName}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
-        };
-      }
-      members.push({
-        name: memberName,
-        harness: preset.harness as AgentCli,
-        preset: memberName,
-      });
-    }
-    if (members.length === 0) {
-      return { ok: false, error: `panel '${lookup}' resolved to zero members` };
-    }
-    return { ok: true, members };
+    return buildTripleMembers(panelMembers, `panel '${lookup}'`);
   }
 
-  const preset = catalog.presets[lookup];
-  if (preset !== undefined) {
-    if (!AGENT_CLIS.has(preset.harness)) {
-      return {
-        ok: false,
-        error: `preset '${lookup}' pins harness ${preset.harness}, which is not pair-launchable (claude|codex|pi only)`,
-      };
-    }
-    return {
-      ok: true,
-      members: [
-        { name: lookup, harness: preset.harness as AgentCli, preset: lookup },
-      ],
-    };
+  // Not a configured panel → accept a single launch triple as a panel of one.
+  const single = parseTriple(lookup);
+  if (single.ok) {
+    return buildTripleMembers([lookup], `panel '${lookup}'`);
   }
 
-  return { ok: false, error: `'${lookup}' is not a known panel or preset` };
+  return {
+    ok: false,
+    error: `'${lookup}' is not a known panel, and not a valid launch triple: ${single.error}`,
+  };
 }
 
 /** The ad-hoc single-member selector (pairing = a panel of one). Exactly ONE of
@@ -1081,11 +1115,7 @@ export async function panelStart(
       );
       return 2;
     }
-    resolved = resolvePanelMembers(
-      config.catalog,
-      config.selections,
-      panelName,
-    );
+    resolved = resolvePanelMembers(config.selections, panelName);
   }
   if (!resolved.ok) {
     deps.writeErr(`pair panel start: ${resolved.error}\n`);
@@ -1688,7 +1718,7 @@ export function buildPanelDeps(): PanelDeps {
     cwd: process.cwd(),
     loadRegistry: () => {
       const catalog = loadPresetCatalog();
-      const selections = loadPanelSelections(catalog);
+      const selections = loadPanelSelections();
       return { catalog, selections };
     },
     spawn: (argv, opts) => {
@@ -1727,11 +1757,11 @@ Usage:
   keeper agent panel prune
 
 start  idempotent-by-slug. Resolves the panel members (a panel.yaml panel or a
-       single catalog preset; an absent/empty --slug, or a missing/invalid catalog
+       single launch triple; an absent/empty --slug, or a missing/invalid catalog
        or panel.yaml, is fail-loud exit 2), derives the run's DURABLE dir from the
        slug (~/.local/state/keeper/panels/<slug>/, 0700 — or the --run-dir override),
        and under a per-slug advisory lock either fans out fresh (launch each member
-       as a DETACHED read-only \`keeper agent run\` leg named \`panel::<slug>::<preset>\`
+       as a DETACHED read-only \`keeper agent run\` leg named \`panel::<slug>::<member>\`
        in the 'panels' session) or RECONCILES an existing run — reuse terminal legs
        (completed OR failed; resume is not retry), leave running legs, relaunch only
        no-result legs. Prints the manifest, exits 0. A colliding-slug prompt/member
@@ -1754,9 +1784,9 @@ prune  GC abandoned run dirs under ~/.local/state/keeper/panels/. Reclaims a slu
 
 Options:
   --slug <slug>     start: REQUIRED run id (each leg launches as
-                    panel::<slug>::<preset>). wait/status: resolves the durable
+                    panel::<slug>::<member>). wait/status: resolves the durable
                     slug dir. Slugified to [a-z0-9-]; empties-to-nothing → exit 2.
-  --panel <name>    Panel name, catalog preset (panel of one), or 'default' to
+  --panel <name>    Panel name, a launch triple (panel of one), or 'default' to
                     resolve the configured default panel in panel.yaml
   --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
   --cli <x>         Ad-hoc single member harness: claude|codex|pi
@@ -1878,12 +1908,12 @@ export async function runPanel(argv: string[]): Promise<void> {
     }
 
     // --slug is REQUIRED: it names the run, and each leg launches as
-    // `panel::<slug>::<preset>`. Slugify to `[a-z0-9-]`; absent OR a value that
+    // `panel::<slug>::<member>`. Slugify to `[a-z0-9-]`; absent OR a value that
     // slugifies to nothing (all non-ASCII / punctuation-only) is misuse → exit 2
     // with a panel-scoped message (never the leaf's raw string).
     if (parsed.values.slug === undefined) {
       process.stderr.write(
-        "pair panel start: --slug is required (a human-meaningful run id; each leg launches as panel::<slug>::<preset>)\n",
+        "pair panel start: --slug is required (a human-meaningful run id; each leg launches as panel::<slug>::<member>)\n",
       );
       process.exit(2);
     }

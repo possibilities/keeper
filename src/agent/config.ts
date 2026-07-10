@@ -28,7 +28,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { type HarnessName, isCapturableHarness } from "./harness";
+import { type HarnessName, harnessDescriptor } from "./harness";
 import { parseTriple, type Triple } from "./triple";
 
 /** Raised for fail-loud config errors; main() prints `Error: <msg>` + exit 1. */
@@ -316,11 +316,12 @@ export interface PresetCatalog {
 
 /**
  * The panel selections, parsed from `panel.yaml`: named panels (each an ordered
- * list of catalog preset names) plus an optional `default` naming the panel a
- * bare `keeper agent panel start` (no `--panel`) assembles. Resolved against a
- * {@link PresetCatalog} — every panel member must name a catalog preset whose
- * harness is panel-eligible (its descriptor is `capturable`; claude/codex/pi all
- * qualify, a future non-capturable harness is rejected at load).
+ * list of launch-triple members `<harness>::<model>::<effort>`) plus an optional
+ * `default` naming the panel a bare `keeper agent panel start` (no `--panel`)
+ * assembles. Members are stored as their raw triple strings in declaration order;
+ * every member's harness is panel-eligible ({@link isPanelEligibleHarness}) or the
+ * load fails loud. Duplicate identical triples are legal — the launch path
+ * (`resolvePanelMembers`) disambiguates them by 1-based ordinal.
  */
 export interface PanelSelections {
   panels: Record<string, string[]>;
@@ -509,18 +510,35 @@ function parseMachineTriple(
 }
 
 /**
- * Read the panel selections from `panel.yaml`, resolved against an already-parsed
- * {@link PresetCatalog}. REQUIRED + validated: a missing file is fail-LOUD
- * (ConfigError). Each panel member must name a catalog preset whose harness is
- * panel-eligible — its descriptor is `capturable` (claude/codex/pi all qualify; a
- * future non-capturable harness is rejected AT LOAD). The optional top-level
- * `default` key (a structural key, exempt from `validatePresetName` though
- * `default` is a reserved preset name) must name a defined panel. Fail-loud on
- * malformed YAML, an unknown top-level key, an empty panel list, or any of the
- * above.
+ * True when a harness may serve as a panel member: its final message is capturable
+ * (a panel leg must read a verdict) AND it exposes a second reasoning axis (an
+ * axisless harness has no effort/thinking rung to compare, so it is not a panel
+ * comparand — panels are claude/codex/pi). The SINGLE eligibility predicate both
+ * the load gate ({@link loadPanelSelections}) and the launch gate (panel.ts
+ * `resolvePanelMembers`) read, so panel eligibility can never drift between them.
+ */
+export function isPanelEligibleHarness(name: string): boolean {
+  const d = harnessDescriptor(name);
+  if (d === undefined) {
+    return false;
+  }
+  return d.capturable && d.secondAxis !== "none";
+}
+
+/**
+ * Read the panel selections from `panel.yaml`. REQUIRED + validated: a missing file
+ * is fail-LOUD (ConfigError). Each panel is an ordered list of launch-triple members
+ * (`<harness>::<model>::<effort>`) parsed with the shared grammar — a malformed
+ * triple is fail-loud naming the panel and the offending member. Every member's
+ * harness must be panel-eligible ({@link isPanelEligibleHarness}: capturable AND
+ * carrying a reasoning axis; claude/codex/pi qualify, an axisless harness is rejected
+ * AT LOAD, the same predicate the launch path re-checks). Duplicate identical triples
+ * are legal (the launch path disambiguates by ordinal). The optional top-level
+ * `default` key (a structural key, exempt from `validatePresetName` though `default`
+ * is a reserved preset name) must name a defined panel. Fail-loud on malformed YAML,
+ * an unknown top-level key, an empty panel list, or any of the above.
  */
 export function loadPanelSelections(
-  catalog: PresetCatalog,
   configPath: string = panelConfigPath(),
 ): PanelSelections {
   if (!isFile(configPath)) {
@@ -548,23 +566,19 @@ export function loadPanelSelections(
           `Panel '${name}' members must be non-empty strings in ${configPath}`,
         );
       }
-      const memberName = member.trim();
-      const preset = catalog.presets[memberName];
-      if (preset === undefined) {
+      const triple = member.trim();
+      const parsed = parseTriple(triple);
+      if (!parsed.ok) {
         throw new ConfigError(
-          `Panel '${name}' references undefined preset '${memberName}' in ${configPath}`,
+          `Panel '${name}' member '${triple}' is not a valid launch triple: ${parsed.error} (in ${configPath})`,
         );
       }
-      // Panel eligibility is a descriptor CAPABILITY (`capturable`), never a
-      // harness-name allowlist: a member's final message must be capturable for a
-      // panel leg to read its verdict. pi is capturable, so a pi member is valid;
-      // a future non-capturable harness (hermes before M2) is rejected here.
-      if (!isCapturableHarness(preset.harness)) {
+      if (!isPanelEligibleHarness(parsed.triple.harness)) {
         throw new ConfigError(
-          `Panel '${name}' member '${memberName}' pins harness ${preset.harness}, which is not panel-eligible (its final message is not capturable) in ${configPath}`,
+          `Panel '${name}' member '${triple}' pins harness ${parsed.triple.harness}, which is not panel-eligible (panels compare a reasoning axis — claude/codex/pi only) in ${configPath}`,
         );
       }
-      out.push(memberName);
+      out.push(triple);
     }
     panels[name] = out;
   }

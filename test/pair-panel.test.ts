@@ -23,12 +23,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  ConfigError,
-  type PanelSelections,
-  type Preset,
-  type PresetCatalog,
-} from "../src/agent/config";
+import { ConfigError, type PanelSelections } from "../src/agent/config";
 import {
   buildDetachWrapperArgv,
   buildPanelLegArgv,
@@ -54,17 +49,19 @@ afterEach(() => {
 
 // ---- helpers --------------------------------------------------------------
 
-function preset(harness: Preset["harness"]): Preset {
-  return { harness, model: null, effort: null, thinking: null, role: null };
-}
+/** Panel-eligible launch triples reused across the fixtures. Distinct models so
+ *  their base slugs never collide (the disambiguated slug + ordinal is what the
+ *  resolution tests assert). */
+const T_CLAUDE = "claude::opus::high";
+const T_CODEX = "codex::gpt-5.3::high";
+const T_CLAUDE2 = "claude::sonnet::high";
+const T_CODEX2 = "codex::gpt-5.1::high";
+const T_PI = "pi::glm::high";
 
-/** A two-member `default` panel of opus(claude)+codex(codex) catalog presets —
- *  the stand-in for the removed zero-config fallback in the start/wait tests. */
-const DEFAULT_CATALOG: PresetCatalog = {
-  presets: { opus: preset("claude"), codex: preset("codex") },
-};
+/** A two-member `default` panel of a claude + a codex triple — the stand-in for the
+ *  removed zero-config fallback in the start/wait tests. */
 const DEFAULT_SELECTIONS: PanelSelections = {
-  panels: { default: ["opus", "codex"] },
+  panels: { default: [T_CLAUDE, T_CODEX] },
   default: "default",
 };
 
@@ -84,7 +81,6 @@ interface SpawnCall {
 }
 
 function makeDeps(opts: {
-  catalog?: PresetCatalog;
   selections?: PanelSelections;
   clock?: { ms: number };
   pidAlive?: (pid: number) => boolean;
@@ -110,7 +106,7 @@ function makeDeps(opts: {
     env: { PATH: "/usr/bin" },
     cwd: "/work/repo",
     loadRegistry: () => ({
-      catalog: opts.catalog ?? { presets: {} },
+      catalog: { presets: {} },
       selections: opts.selections ?? { panels: {}, default: null },
     }),
     spawn: (argv, o) => {
@@ -180,96 +176,153 @@ function readManifest(): PanelManifest {
   return JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
 }
 
+/** The resolved member slugs (leg names + result-file basenames), in declaration
+ *  order, read from the persisted manifest. Leg names are disambiguated
+ *  `slugifyTriple`s the resolver mints, so orchestration tests seed + assert by the
+ *  slug the resolver actually produced rather than a hand-guessed hash. */
+function memberSlugs(): string[] {
+  return readManifest().members.map((m) => m.name);
+}
+
 // ---- member resolution ----------------------------------------------------
 
 const EMPTY_SELECTIONS: PanelSelections = { panels: {}, default: null };
 
-test("resolvePanelMembers: panel hit → preset-named members", () => {
-  const catalog: PresetCatalog = {
-    presets: { rA: preset("claude"), rB: preset("codex") },
-  };
+test("resolvePanelMembers: panel hit → triple members with slug names + ordinals", () => {
   const sel: PanelSelections = {
-    panels: { default: ["rA", "rB"] },
+    panels: { default: [T_CLAUDE, T_CODEX] },
     default: "default",
   };
-  const r = resolvePanelMembers(catalog, sel, "default");
+  const r = resolvePanelMembers(sel, "default");
   expect(r.ok).toBe(true);
   if (!r.ok) return;
-  expect(r.members).toEqual([
-    { name: "rA", harness: "claude", preset: "rA" },
-    { name: "rB", harness: "codex", preset: "rB" },
-  ]);
+  expect(r.members).toHaveLength(2);
+  const [a, b] = r.members;
+  expect(a).toMatchObject({ harness: "claude", preset: T_CLAUDE, ordinal: 1 });
+  expect(a?.name).toMatch(/^claude-opus-high-[0-9a-z]{6}-1$/);
+  expect(b).toMatchObject({ harness: "codex", preset: T_CODEX, ordinal: 1 });
+  expect(b?.name).toMatch(/^codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
 });
 
-test("resolvePanelMembers: a single preset → a one-member panel", () => {
-  const catalog: PresetCatalog = { presets: { solo: preset("claude") } };
-  const r = resolvePanelMembers(catalog, EMPTY_SELECTIONS, "solo");
+test("resolvePanelMembers: a single triple → a one-member panel", () => {
+  const r = resolvePanelMembers(EMPTY_SELECTIONS, T_CLAUDE);
   expect(r.ok).toBe(true);
   if (!r.ok) return;
-  expect(r.members).toEqual([
-    { name: "solo", harness: "claude", preset: "solo" },
-  ]);
+  expect(r.members).toHaveLength(1);
+  expect(r.members[0]).toMatchObject({
+    harness: "claude",
+    preset: T_CLAUDE,
+    ordinal: 1,
+  });
+  expect(r.members[0]?.name).toMatch(/^claude-opus-high-[0-9a-z]{6}-1$/);
+});
+
+test("resolvePanelMembers: duplicate identical triples → two ordinal-bearing legs, distinct names", () => {
+  const sel: PanelSelections = {
+    panels: { dup: [T_CLAUDE, T_CLAUDE] },
+    default: null,
+  };
+  const r = resolvePanelMembers(sel, "dup");
+  expect(r.ok).toBe(true);
+  if (!r.ok) return;
+  expect(r.members).toHaveLength(2);
+  // Same raw triple, 1-based ordinals in declaration order …
+  expect(r.members[0]).toMatchObject({ preset: T_CLAUDE, ordinal: 1 });
+  expect(r.members[1]).toMatchObject({ preset: T_CLAUDE, ordinal: 2 });
+  // … and distinct leg names (the ordinal suffix separates the repeats).
+  expect(r.members[0]?.name).not.toBe(r.members[1]?.name);
+  expect(r.members[0]?.name).toMatch(/-1$/);
+  expect(r.members[1]?.name).toMatch(/-2$/);
+});
+
+test("resolvePanelMembers: two distinct triples that slugify identically get distinct names (hash suffix)", () => {
+  // `a.b` and `a-b` both slugify to `a-b`, so the base slug collides; the raw
+  // triple differs, so the disambiguating hash suffix keeps the leg names apart.
+  const t1 = "claude::a.b::high";
+  const t2 = "claude::a-b::high";
+  const sel: PanelSelections = { panels: { coll: [t1, t2] }, default: null };
+  const r = resolvePanelMembers(sel, "coll");
+  expect(r.ok).toBe(true);
+  if (!r.ok) return;
+  expect(r.members[0]?.preset).toBe(t1);
+  expect(r.members[1]?.preset).toBe(t2);
+  // Both share the base slug + ordinal 1, so only the hash keeps them apart.
+  expect(r.members[0]?.name).toMatch(/^claude-a-b-high-[0-9a-z]{6}-1$/);
+  expect(r.members[1]?.name).toMatch(/^claude-a-b-high-[0-9a-z]{6}-1$/);
+  expect(r.members[0]?.name).not.toBe(r.members[1]?.name);
 });
 
 test("resolvePanelMembers: an unknown name is fail-loud (no fallback)", () => {
-  const r = resolvePanelMembers({ presets: {} }, EMPTY_SELECTIONS, "nonesuch");
+  const r = resolvePanelMembers(EMPTY_SELECTIONS, "nonesuch");
   expect(r.ok).toBe(false);
   if (r.ok) return;
   expect(r.error).toContain("nonesuch");
+  expect(r.error).toContain("not a known panel");
+});
+
+test("resolvePanelMembers: a non-panel-eligible (axisless) member is fail-loud", () => {
+  const sel: PanelSelections = {
+    panels: { bad: ["hermes::hermes-m::na"] },
+    default: null,
+  };
+  const r = resolvePanelMembers(sel, "bad");
+  expect(r.ok).toBe(false);
+  if (r.ok) return;
+  expect(r.error).toContain("hermes::hermes-m::na");
+  expect(r.error).toContain("not panel-eligible");
 });
 
 test("resolvePanelMembers: 'default' dereferences the configured default panel", () => {
   // The default pointer names a panel called `reviewers`, not one literally
   // named `default` — proving `default` is a symbolic pointer, not a frozen name.
-  const catalog: PresetCatalog = {
-    presets: { rA: preset("claude"), rB: preset("codex") },
-  };
   const sel: PanelSelections = {
-    panels: { reviewers: ["rA", "rB"] },
+    panels: { reviewers: [T_CLAUDE, T_CODEX] },
     default: "reviewers",
   };
-  const r = resolvePanelMembers(catalog, sel, "default");
+  const r = resolvePanelMembers(sel, "default");
   expect(r.ok).toBe(true);
   if (!r.ok) return;
-  expect(r.members).toEqual([
-    { name: "rA", harness: "claude", preset: "rA" },
-    { name: "rB", harness: "codex", preset: "rB" },
-  ]);
+  expect(r.members.map((m) => m.preset)).toEqual([T_CLAUDE, T_CODEX]);
 });
 
 test("resolvePanelMembers: 'default' with no configured default is fail-loud naming 'default'", () => {
-  const catalog: PresetCatalog = { presets: { rA: preset("claude") } };
-  const sel: PanelSelections = { panels: { reviewers: ["rA"] }, default: null };
-  const r = resolvePanelMembers(catalog, sel, "default");
+  const sel: PanelSelections = {
+    panels: { reviewers: [T_CLAUDE] },
+    default: null,
+  };
+  const r = resolvePanelMembers(sel, "default");
   expect(r.ok).toBe(false);
   if (r.ok) return;
   expect(r.error).toContain("--panel default");
   expect(r.error).toContain("panel.yaml");
 });
 
-test("resolvePanelMembers: a pi single-preset is accepted (pair-launchable)", () => {
-  // pi is capturable, so it is panel-eligible both in panel.yaml (the load gate)
-  // and here as a single pi catalog preset used directly as --panel
-  // (resolvePanelMembers gates on AGENT_CLIS, derived from the harness registry).
-  const catalog: PresetCatalog = { presets: { thinker: preset("pi") } };
-  const r = resolvePanelMembers(catalog, EMPTY_SELECTIONS, "thinker");
+test("resolvePanelMembers: a pi single triple is accepted (panel-eligible)", () => {
+  // pi is capturable AND carries a thinking axis, so a pi triple is panel-eligible
+  // both in panel.yaml (the load gate) and here as a single --panel triple.
+  const r = resolvePanelMembers(EMPTY_SELECTIONS, T_PI);
   expect(r.ok).toBe(true);
   if (!r.ok) return;
-  expect(r.members).toEqual([
-    { name: "thinker", harness: "pi", preset: "thinker" },
-  ]);
+  expect(r.members[0]).toMatchObject({
+    harness: "pi",
+    preset: T_PI,
+    ordinal: 1,
+  });
 });
 
 // ---- argv shape ------------------------------------------------------------
 
-test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; no banned tokens", () => {
+test("buildPanelLegArgv: leg carries the RAW triple as --preset + the slug as --name; presetless leg drops --preset; no banned tokens", () => {
+  // The forwarded `--preset` is the raw triple (identity); only display surfaces
+  // (`--name`, the output basename) take the slug.
+  const slug = "claude-opus-high-abc123-1";
   const presetArgv = buildPanelLegArgv({
     keeperBin: KEEPER_BIN,
     keeperAgentPath: KEEPER_AGENT,
     prompt: "what is the best answer?",
-    member: { name: "rA", harness: "claude", preset: "rA" },
+    member: { name: slug, harness: "claude", preset: T_CLAUDE, ordinal: 1 },
     slug: "my-run",
-    yamlPath: "/d/rA.yaml",
+    yamlPath: `/d/${slug}.yaml`,
     stopTimeoutMs: 1_800_000,
   });
   expect(presetArgv).toEqual([
@@ -280,16 +333,16 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
     "claude",
     "what is the best answer?",
     "--preset",
-    "rA",
+    T_CLAUDE,
     "--read-only",
     "--session",
     "panels",
     "--output",
-    "/d/rA.yaml",
+    `/d/${slug}.yaml`,
     "--stop-timeout",
     "1800000ms",
     "--name",
-    "panel::my-run::rA",
+    `panel::my-run::${slug}`,
   ]);
 
   // A presetless member keeps its harness as the `<cli>` positional and drops the
@@ -340,14 +393,11 @@ test("buildPanelLegArgv: agent run leg with --preset; presetless leg drops it; n
 // ---- start -----------------------------------------------------------------
 
 test("start: persists + prints a manifest, launches every leg detached", async () => {
-  const catalog: PresetCatalog = {
-    presets: { rA: preset("claude"), rB: preset("codex") },
-  };
   const selections: PanelSelections = {
-    panels: { default: ["rA", "rB"] },
+    panels: { default: [T_CLAUDE, T_CODEX] },
     default: "default",
   };
-  const { deps, spawns, stdout } = makeDeps({ catalog, selections });
+  const { deps, spawns, stdout } = makeDeps({ selections });
   const code = await panelStart(
     {
       promptFile: writePrompt(),
@@ -374,9 +424,11 @@ test("start: persists + prints a manifest, launches every leg detached", async (
     expect(leg.slice(0, 4)).toEqual([KEEPER_BIN, KEEPER_AGENT, "agent", "run"]);
     const tIdx = leg.indexOf("--stop-timeout");
     expect(leg[tIdx + 1]).toBe("900000ms");
-    // Each leg is named panel::<slug>::<member> so the run + preset are visible.
+    // Each leg is named panel::<slug>::<member-slug> (a disambiguated slugifyTriple).
     const nameIdx = leg.indexOf("--name");
-    expect(leg[nameIdx + 1]).toMatch(/^panel::my-run::(rA|rB)$/);
+    expect(leg[nameIdx + 1]).toMatch(
+      /^panel::my-run::(claude-opus-high|codex-gpt-5-3-high)-[0-9a-z]{6}-1$/,
+    );
   }
 
   // Manifest persisted AND printed identically.
@@ -385,9 +437,12 @@ test("start: persists + prints a manifest, launches every leg detached", async (
   expect(printed).toEqual(persisted);
   expect(persisted.dir).toBe(dir);
   expect(persisted.slug).toBe("my-run");
-  expect(persisted.members.map((m) => m.name)).toEqual(["rA", "rB"]);
-  expect(persisted.members[0]?.yaml).toBe(join(dir, "rA.yaml"));
-  expect(persisted.members[0]?.pidfile).toBe(join(dir, "rA.pidfile"));
+  const [a, b] = persisted.members;
+  expect(a?.name).toMatch(/^claude-opus-high-[0-9a-z]{6}-1$/);
+  expect(b?.name).toMatch(/^codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
+  // The result-file + pidfile basenames derive from the disambiguated slug.
+  expect(a?.yaml).toBe(join(dir, `${a?.name}.yaml`));
+  expect(a?.pidfile).toBe(join(dir, `${a?.name}.pidfile`));
   // Prompt copied into the scratch dir.
   expect(readFileSync(join(dir, "prompt.md"), "utf8")).toBe(
     "what is the best answer?",
@@ -395,10 +450,7 @@ test("start: persists + prints a manifest, launches every leg detached", async (
 });
 
 test("start: an absent --panel uses the panel.yaml default, launching each via --preset", async () => {
-  const { deps, spawns } = makeDeps({
-    catalog: DEFAULT_CATALOG,
-    selections: DEFAULT_SELECTIONS,
-  });
+  const { deps, spawns } = makeDeps({ selections: DEFAULT_SELECTIONS });
   const code = await panelStart(
     {
       promptFile: writePrompt(),
@@ -413,17 +465,17 @@ test("start: an absent --panel uses the panel.yaml default, launching each via -
   expect(spawns.length).toBe(2);
   const opusLeg = spawns[0]?.argv ?? [];
   const codexLeg = spawns[1]?.argv ?? [];
+  // The forwarded --preset is the raw triple, verbatim.
   expect(opusLeg).toContain("--preset");
-  expect(opusLeg).toContain("opus");
+  expect(opusLeg).toContain(T_CLAUDE);
   expect(opusLeg).not.toContain("--cli");
   expect(codexLeg).toContain("--preset");
-  expect(codexLeg).toContain("codex");
+  expect(codexLeg).toContain(T_CODEX);
 });
 
 test("start: no --panel and no default panel is fail-loud (exit 2)", async () => {
   const { deps, stderr } = makeDeps({
-    catalog: DEFAULT_CATALOG,
-    selections: { panels: { default: ["opus", "codex"] }, default: null },
+    selections: { panels: { default: [T_CLAUDE, T_CODEX] }, default: null },
   });
   const code = await panelStart(
     {
@@ -443,9 +495,8 @@ test("start: an explicit --panel default resolves the configured default panel",
   // The default pointer names `reviewers`, so `--panel default` must dereference
   // it (git-HEAD style) rather than look for a panel literally named `default`.
   const { deps, spawns } = makeDeps({
-    catalog: { presets: { opus: preset("claude"), codex: preset("codex") } },
     selections: {
-      panels: { reviewers: ["opus", "codex"] },
+      panels: { reviewers: [T_CLAUDE, T_CODEX] },
       default: "reviewers",
     },
   });
@@ -461,14 +512,13 @@ test("start: an explicit --panel default resolves the configured default panel",
   );
   expect(code).toBe(0);
   expect(spawns.length).toBe(2);
-  expect(spawns[0]?.argv).toContain("opus");
-  expect(spawns[1]?.argv).toContain("codex");
+  expect(spawns[0]?.argv).toContain(T_CLAUDE);
+  expect(spawns[1]?.argv).toContain(T_CODEX);
 });
 
 test("start: --panel default with no configured default is fail-loud naming what was typed", async () => {
   const { deps, stderr } = makeDeps({
-    catalog: DEFAULT_CATALOG,
-    selections: { panels: { reviewers: ["opus", "codex"] }, default: null },
+    selections: { panels: { reviewers: [T_CLAUDE, T_CODEX] }, default: null },
   });
   const code = await panelStart(
     {
@@ -486,11 +536,10 @@ test("start: --panel default with no configured default is fail-loud naming what
 });
 
 test("start: a per-leg spawn failure records a null pidfile (no crash)", async () => {
-  // opus spawns fine; codex's spawn throws.
+  // The claude leg spawns fine; the codex leg's spawn throws.
   const { deps } = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
-    throwOnSpawn: (argv) => argv.join(" ").includes("--preset codex"),
+    throwOnSpawn: (argv) => argv.join(" ").includes(T_CODEX),
   });
   const code = await panelStart(
     {
@@ -504,8 +553,9 @@ test("start: a per-leg spawn failure records a null pidfile (no crash)", async (
   );
   expect(code).toBe(0);
   const m = readManifest();
-  expect(m.members[0]?.pidfile).toBe(join(dir, "opus.pidfile"));
-  expect(m.members[1]?.name).toBe("codex");
+  expect(m.members[0]?.harness).toBe("claude");
+  expect(typeof m.members[0]?.pidfile).toBe("string");
+  expect(m.members[1]?.harness).toBe("codex");
   expect(m.members[1]?.pidfile).toBeNull();
 });
 
@@ -533,26 +583,14 @@ test("start: a ConfigError from the config load exits 2", async () => {
 const RECONCILE_BOOT = 1_700_000_000_000;
 
 test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg, relaunches a dead no-result leg to g2", async () => {
-  const catalog: PresetCatalog = {
-    presets: {
-      done: preset("claude"),
-      failed: preset("codex"),
-      dead: preset("claude"),
-      live: preset("codex"),
-    },
-  };
   const selections: PanelSelections = {
-    panels: { quad: ["done", "failed", "dead", "live"] },
+    panels: { quad: [T_CLAUDE, T_CODEX, T_CLAUDE2, T_CODEX2] },
     default: "quad",
   };
   const prompt = writePrompt("reconcile me");
 
   // First fan-out (fresh): all four legs launch at generation 1.
-  const first = makeDeps({
-    catalog,
-    selections,
-    bootEpochMs: () => RECONCILE_BOOT,
-  });
+  const first = makeDeps({ selections, bootEpochMs: () => RECONCILE_BOOT });
   expect(
     await panelStart(
       {
@@ -566,18 +604,24 @@ test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg,
     ),
   ).toBe(0);
   expect(first.spawns.length).toBe(4);
+  // The resolved leg slugs, in declaration order (done, failed, dead, live).
+  const [done, failed, dead, live] = memberSlugs() as [
+    string,
+    string,
+    string,
+    string,
+  ];
 
   // Simulate leg outcomes: done→completed, failed→a failed result (both terminal);
   // dead→dead pid + no result; live→live pid + no result.
-  seedResult("done", "completed");
-  seedResult("failed", "timed_out");
-  seedPidfile("dead", 5555);
-  seedPidfile("live", 4242);
+  seedResult(done, "completed");
+  seedResult(failed, "timed_out");
+  seedPidfile(dead, 5555);
+  seedPidfile(live, 4242);
 
   // Re-issue the SAME start: same boot, graceMs 0 (the dead pid is not grace-held),
   // and pidAlive true only for the live pid.
   const second = makeDeps({
-    catalog,
     selections,
     bootEpochMs: () => RECONCILE_BOOT,
     graceMs: 0,
@@ -599,48 +643,41 @@ test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg,
   // Only the dead no-result leg relaunched, to a new-generation result path.
   expect(second.spawns.length).toBe(1);
   const leg = second.spawns[0]?.argv.slice(4) ?? [];
-  expect(leg[leg.indexOf("--name") + 1]).toBe("panel::quad::dead");
-  expect(leg[leg.indexOf("--output") + 1]).toBe(join(dir, "dead.g2.yaml"));
+  expect(leg[leg.indexOf("--name") + 1]).toBe(`panel::quad::${dead}`);
+  expect(leg[leg.indexOf("--output") + 1]).toBe(join(dir, `${dead}.g2.yaml`));
 
   const m = readManifest();
   expect(m.generation).toBe(2);
   const byName = Object.fromEntries(m.members.map((x) => [x.name, x]));
   // Terminal legs kept their generation-1 paths (reused, never relaunched).
-  expect(byName.done?.yaml).toBe(join(dir, "done.yaml"));
-  expect(byName.failed?.yaml).toBe(join(dir, "failed.yaml"));
+  expect(byName[done]?.yaml).toBe(join(dir, `${done}.yaml`));
+  expect(byName[failed]?.yaml).toBe(join(dir, `${failed}.yaml`));
   // The live leg is left untouched (still its gen-1 path).
-  expect(byName.live?.yaml).toBe(join(dir, "live.yaml"));
+  expect(byName[live]?.yaml).toBe(join(dir, `${live}.yaml`));
   // The dead leg repointed to gen 2 (both result + pidfile).
-  expect(byName.dead?.yaml).toBe(join(dir, "dead.g2.yaml"));
-  expect(byName.dead?.pidfile).toBe(join(dir, "dead.g2.pidfile"));
+  expect(byName[dead]?.yaml).toBe(join(dir, `${dead}.g2.yaml`));
+  expect(byName[dead]?.pidfile).toBe(join(dir, `${dead}.g2.pidfile`));
 });
 
 test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live pid); a completed leg is still reused", async () => {
-  const catalog: PresetCatalog = {
-    presets: { done: preset("claude"), running: preset("codex") },
-  };
   const selections: PanelSelections = {
-    panels: { duo: ["done", "running"] },
+    panels: { duo: [T_CLAUDE, T_CODEX] },
     default: "duo",
   };
   const prompt = writePrompt("reboot me");
 
-  const first = makeDeps({
-    catalog,
-    selections,
-    bootEpochMs: () => RECONCILE_BOOT,
-  });
+  const first = makeDeps({ selections, bootEpochMs: () => RECONCILE_BOOT });
   await panelStart(
     { promptFile: prompt, slug: "duo", panel: "duo", dir, timeoutSeconds: 900 },
     first.deps,
   );
-  seedResult("done", "completed");
-  seedPidfile("running", 4242); // a pid that was alive pre-reboot
+  const [done, running] = memberSlugs() as [string, string];
+  seedResult(done, "completed");
+  seedPidfile(running, 4242); // a pid that was alive pre-reboot
 
   // Re-issue after a reboot: the derived boot-epoch jumps an hour beyond tolerance.
   // Even though the pid still reads "alive", a pre-reboot pid can't be trusted.
   const second = makeDeps({
-    catalog,
     selections,
     bootEpochMs: () => RECONCILE_BOOT + 60 * 60_000,
     pidAlive: () => true,
@@ -661,29 +698,25 @@ test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live 
   // Only the non-terminal leg relaunched; the completed leg was reused.
   expect(second.spawns.length).toBe(1);
   const leg = second.spawns[0]?.argv.slice(4) ?? [];
-  expect(leg[leg.indexOf("--name") + 1]).toBe("panel::duo::running");
+  expect(leg[leg.indexOf("--name") + 1]).toBe(`panel::duo::${running}`);
   const m = readManifest();
   expect(m.generation).toBe(2);
   // The boot-epoch is re-stamped to the current boot.
   expect(m.boot_epoch_ms).toBe(RECONCILE_BOOT + 60 * 60_000);
   const byName = Object.fromEntries(m.members.map((x) => [x.name, x]));
-  expect(byName.done?.yaml).toBe(join(dir, "done.yaml")); // reused gen 1
-  expect(byName.running?.yaml).toBe(join(dir, "running.g2.yaml")); // relaunched
+  expect(byName[done]?.yaml).toBe(join(dir, `${done}.yaml`)); // reused gen 1
+  expect(byName[running]?.yaml).toBe(join(dir, `${running}.g2.yaml`)); // relaunched
 });
 
 test("reconcile: a same-boot leg launched within grace is left (not relaunched) despite a dead pid", async () => {
-  const catalog: PresetCatalog = {
-    presets: { fresh: preset("claude") },
-  };
   const selections: PanelSelections = {
-    panels: { solo: ["fresh"] },
+    panels: { solo: [T_CLAUDE] },
     default: "solo",
   };
   const prompt = writePrompt("grace me");
   const clock = { ms: 1000 };
 
   const first = makeDeps({
-    catalog,
     selections,
     clock,
     bootEpochMs: () => RECONCILE_BOOT,
@@ -698,12 +731,12 @@ test("reconcile: a same-boot leg launched within grace is left (not relaunched) 
     },
     first.deps,
   );
-  seedPidfile("fresh", 7777); // pid recorded, but the process reads dead
+  const [fresh] = memberSlugs() as [string];
+  seedPidfile(fresh, 7777); // pid recorded, but the process reads dead
 
   // Re-issue at the same clock (launched_at === now) with a generous grace and a
   // dead pid: the leg is too fresh to trust the dead reading → LEFT, not relaunched.
   const second = makeDeps({
-    catalog,
     selections,
     clock,
     bootEpochMs: () => RECONCILE_BOOT,
@@ -728,7 +761,6 @@ test("reconcile: a same-boot leg launched within grace is left (not relaunched) 
 
 test("reconcile: an all-terminal re-issue is a no-op (no relaunch, generation unchanged)", async () => {
   const first = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
     bootEpochMs: () => RECONCILE_BOOT,
   });
@@ -743,11 +775,11 @@ test("reconcile: an all-terminal re-issue is a no-op (no relaunch, generation un
     },
     first.deps,
   );
-  seedResult("opus", "completed");
-  seedResult("codex", "failed"); // a terminal fail still counts — resume is not retry
+  const [opus, codex] = memberSlugs() as [string, string];
+  seedResult(opus, "completed");
+  seedResult(codex, "failed"); // a terminal fail still counts — resume is not retry
 
   const second = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
     bootEpochMs: () => RECONCILE_BOOT,
   });
@@ -769,7 +801,6 @@ test("reconcile: an all-terminal re-issue is a no-op (no relaunch, generation un
 
 test("reconcile: lock contention fails fast (exit 2), no legs spawned", async () => {
   const { deps, spawns, stderr } = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
     lock: () => null, // another driver already holds the slug
   });
@@ -796,7 +827,6 @@ test("reconcile: the lock is released after a successful start (a fresh handle c
     },
   };
   const { deps } = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
     lock: () => handle,
   });
@@ -817,7 +847,6 @@ test("reconcile: the lock is released after a successful start (a fresh handle c
 
 test("reconcile: a prompt mismatch refuses the resume (exit 2), no relaunch", async () => {
   const first = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
   });
   await panelStart(
@@ -834,7 +863,6 @@ test("reconcile: a prompt mismatch refuses the resume (exit 2), no relaunch", as
   const other = join(dir, "other-prompt.txt");
   writeFileSync(other, "a completely different prompt");
   const second = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
   });
   const code = await panelStart(
@@ -853,23 +881,24 @@ test("reconcile: a prompt mismatch refuses the resume (exit 2), no relaunch", as
 });
 
 test("reconcile: a member-set mismatch refuses the resume (exit 2)", async () => {
-  const catalogA: PresetCatalog = {
-    presets: { a1: preset("claude"), a2: preset("codex") },
+  const selA: PanelSelections = {
+    panels: { p: [T_CLAUDE, T_CODEX] },
+    default: "p",
   };
-  const selA: PanelSelections = { panels: { p: ["a1", "a2"] }, default: "p" };
   const prompt = writePrompt("same prompt");
-  const first = makeDeps({ catalog: catalogA, selections: selA });
+  const first = makeDeps({ selections: selA });
   await panelStart(
     { promptFile: prompt, slug: "run-x", panel: "p", dir, timeoutSeconds: 900 },
     first.deps,
   );
 
-  // Re-issue with the SAME prompt but a DIFFERENT member set (a2 → b2).
-  const catalogB: PresetCatalog = {
-    presets: { a1: preset("claude"), b2: preset("codex") },
+  // Re-issue with the SAME prompt but a DIFFERENT member set (the codex triple
+  // swapped for a second claude triple).
+  const selB: PanelSelections = {
+    panels: { p: [T_CLAUDE, T_CLAUDE2] },
+    default: "p",
   };
-  const selB: PanelSelections = { panels: { p: ["a1", "b2"] }, default: "p" };
-  const second = makeDeps({ catalog: catalogB, selections: selB });
+  const second = makeDeps({ selections: selB });
   const code = await panelStart(
     { promptFile: prompt, slug: "run-x", panel: "p", dir, timeoutSeconds: 900 },
     second.deps,
@@ -881,11 +910,11 @@ test("reconcile: a member-set mismatch refuses the resume (exit 2)", async () =>
 
 // ---- wait ------------------------------------------------------------------
 
-/** Drive start (recording spawn) against the default opus+codex panel, then
- *  return so the caller can simulate leg outcomes for wait. */
-async function startLegacy(): Promise<void> {
+/** Drive start (recording spawn) against the default claude+codex panel, then
+ *  return the two resolved leg slugs `[claude, codex]` so the caller can seed leg
+ *  outcomes for wait by the name the resolver actually minted. */
+async function startLegacy(): Promise<[string, string]> {
   const { deps } = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
   });
   await panelStart(
@@ -898,12 +927,13 @@ async function startLegacy(): Promise<void> {
     },
     deps,
   );
+  return memberSlugs() as [string, string];
 }
 
 test("wait: full-success N-of-N → exit 0, ok:true (manifest round-trip)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedResult("codex", "completed");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedResult(codex, "completed");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -913,35 +943,35 @@ test("wait: full-success N-of-N → exit 0, ok:true (manifest round-trip)", asyn
   expect(v.dir).toBe(dir);
   expect(v.members).toEqual([
     {
-      name: "opus",
+      name: opus,
       harness: "claude",
       status: "ok",
-      yaml: join(dir, "opus.yaml"),
+      yaml: join(dir, `${opus}.yaml`),
       reason: null,
     },
     {
-      name: "codex",
+      name: codex,
       harness: "codex",
       status: "ok",
-      yaml: join(dir, "codex.yaml"),
+      yaml: join(dir, `${codex}.yaml`),
       reason: null,
     },
   ]);
 });
 
 test("wait: mixed verdict (one failed outcome) → exit 0, ok:false, reason=outcome", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedResult("codex", "timed_out");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedResult(codex, "timed_out");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
   expect(code).toBe(0); // all-terminal, NOT all-success
   const v: PanelVerdict = JSON.parse(stdout().trim());
   expect(v.ok).toBe(false);
-  expect(v.members[0]).toMatchObject({ name: "opus", status: "ok" });
+  expect(v.members[0]).toMatchObject({ name: opus, status: "ok" });
   expect(v.members[1]).toMatchObject({
-    name: "codex",
+    name: codex,
     status: "fail",
     yaml: null,
   });
@@ -956,16 +986,16 @@ test("wait: every non-completed outcome maps to fail with reason=outcome", async
     "launch_failed",
     "bad_args",
   ]) {
-    await startLegacy();
-    seedResult("opus", "completed");
-    seedResult("codex", outcome);
+    const [opus, codex] = await startLegacy();
+    seedResult(opus, "completed");
+    seedResult(codex, outcome);
     const { deps, stdout } = makeDeps({});
     const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
     expect(code).toBe(0);
     const v: PanelVerdict = JSON.parse(stdout().trim());
     expect(v.ok).toBe(false);
     expect(v.members[1]).toMatchObject({
-      name: "codex",
+      name: codex,
       status: "fail",
       yaml: null,
       reason: outcome,
@@ -974,10 +1004,10 @@ test("wait: every non-completed outcome maps to fail with reason=outcome", async
 });
 
 test("wait: a present-but-unparseable result file → fail (reason=corrupt-result)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
   // A half-written / non-JSON present file — never throws out of wait.
-  writeFileSync(join(dir, "codex.yaml"), "{not json");
+  writeFileSync(join(dir, `${codex}.yaml`), "{not json");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -985,17 +1015,17 @@ test("wait: a present-but-unparseable result file → fail (reason=corrupt-resul
   const v: PanelVerdict = JSON.parse(stdout().trim());
   expect(v.ok).toBe(false);
   expect(v.members[1]).toMatchObject({
-    name: "codex",
+    name: codex,
     status: "fail",
     reason: "corrupt-result",
   });
 });
 
 test("wait: content-blind — a panelist answer in the result file never reaches the verdict", async () => {
-  await startLegacy();
+  const [opus, codex] = await startLegacy();
   // seedResult stamps the SECRET marker into each completed envelope's `message`.
-  seedResult("opus", "completed");
-  seedResult("codex", "completed");
+  seedResult(opus, "completed");
+  seedResult(codex, "completed");
 
   const { deps, stdout } = makeDeps({});
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -1004,10 +1034,10 @@ test("wait: content-blind — a panelist answer in the result file never reaches
 });
 
 test("wait: a non-terminal leg with a live pid → exit 124 when the chunk elapses", async () => {
-  await startLegacy();
+  const [opus, codex] = await startLegacy();
   // opus is done; codex is still running (pid alive, no result file).
-  seedResult("opus", "completed");
-  writeFileSync(join(dir, "codex.pidfile"), "4242\n");
+  seedResult(opus, "completed");
+  writeFileSync(join(dir, `${codex}.pidfile`), "4242\n");
 
   const { deps } = makeDeps({ pidAlive: (pid) => pid === 4242 });
   const code = await panelWait({ dir, chunkSeconds: 1 }, deps);
@@ -1015,10 +1045,10 @@ test("wait: a non-terminal leg with a live pid → exit 124 when the chunk elaps
 });
 
 test("wait: a dead pid past the startup grace → crash fail (exit 0, ok:false)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
   // codex never wrote a result file; its pid is gone (crash-without-file).
-  writeFileSync(join(dir, "codex.pidfile"), "4242\n");
+  writeFileSync(join(dir, `${codex}.pidfile`), "4242\n");
 
   const { deps, stdout } = makeDeps({ pidAlive: () => false, graceMs: 0 });
   const code = await panelWait({ dir, chunkSeconds: 540 }, deps);
@@ -1101,7 +1131,6 @@ test("parseManifest: rejects a manifest missing a top-level slug", () => {
 
 test("start: each leg carries a startfile path and the detach wrapper receives $STARTFILE", async () => {
   const { deps, spawns } = makeDeps({
-    catalog: DEFAULT_CATALOG,
     selections: DEFAULT_SELECTIONS,
   });
   await panelStart(
@@ -1128,10 +1157,10 @@ test("start: each leg carries a startfile path and the detach wrapper receives $
 // ---- Guard A: pid-recycle identity cross-check -----------------------------
 
 test("wait recycle guard: a live pid whose start-time drifted reads DEAD (not running)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242); // the pid is occupied...
-  seedStartfile("codex", "STORED"); // ...but by a different process now
+  const [opus, codexSlug] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codexSlug, 4242); // the pid is occupied...
+  seedStartfile(codexSlug, "STORED"); // ...but by a different process now
   const { deps, stdout } = makeDeps({
     pidAlive: (pid) => pid === 4242, // kill(pid,0) says alive
     readStartTime: (pid) => (pid === 4242 ? "RECYCLED" : null), // ≠ stored
@@ -1141,16 +1170,16 @@ test("wait recycle guard: a live pid whose start-time drifted reads DEAD (not ru
   expect(code).toBe(0); // terminal, NOT 124 — the recycled pid is treated as dead
   const v: PanelVerdict = JSON.parse(stdout().trim());
   expect(v.ok).toBe(false);
-  const codex = v.members.find((m) => m.name === "codex");
+  const codex = v.members.find((m) => m.name === codexSlug);
   expect(codex?.status).toBe("fail");
   expect(codex?.reason).toContain("exited before producing a result file");
 });
 
 test("wait recycle guard: a MATCHING start-time keeps the leg live (times out 124)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242);
-  seedStartfile("codex", "STORED");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codex, 4242);
+  seedStartfile(codex, "STORED");
   const { deps } = makeDeps({
     pidAlive: (pid) => pid === 4242,
     readStartTime: (pid) => (pid === 4242 ? "STORED" : null), // == stored → same proc
@@ -1161,10 +1190,10 @@ test("wait recycle guard: a MATCHING start-time keeps the leg live (times out 12
 });
 
 test("wait recycle guard: a null live probe fails OPEN (leg stays live)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242);
-  seedStartfile("codex", "STORED");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codex, 4242);
+  seedStartfile(codex, "STORED");
   const { deps } = makeDeps({
     pidAlive: (pid) => pid === 4242,
     readStartTime: () => null, // can't tell → trust bare pid liveness
@@ -1175,9 +1204,9 @@ test("wait recycle guard: a null live probe fails OPEN (leg stays live)", async 
 });
 
 test("wait recycle guard: a missing stored start-time degrades to bare pid liveness (no probe)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242);
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codex, 4242);
   // NO seedStartfile — the wrapper's capture failed / a pre-durable leg.
   const probeCalls: number[] = [];
   const { deps } = makeDeps({
@@ -1194,10 +1223,10 @@ test("wait recycle guard: a missing stored start-time degrades to bare pid liven
 });
 
 test("wait recycle guard: the start-time probe runs at most ONCE per leg across poll ticks (memoized)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242);
-  seedStartfile("codex", "STORED");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codex, 4242);
+  seedStartfile(codex, "STORED");
   let probeCount = 0;
   const { deps } = makeDeps({
     pidAlive: (pid) => pid === 4242,
@@ -1214,21 +1243,20 @@ test("wait recycle guard: the start-time probe runs at most ONCE per leg across 
 });
 
 test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHES (not left)", async () => {
-  const catalog: PresetCatalog = { presets: { solo: preset("claude") } };
   const selections: PanelSelections = {
-    panels: { one: ["solo"] },
+    panels: { one: [T_CLAUDE] },
     default: "one",
   };
   const prompt = writePrompt("recycle me");
-  const first = makeDeps({ catalog, selections });
+  const first = makeDeps({ selections });
   await panelStart(
     { promptFile: prompt, slug: "one", panel: "one", dir, timeoutSeconds: 900 },
     first.deps,
   );
-  seedPidfile("solo", 4242);
-  seedStartfile("solo", "STORED");
+  const [solo] = memberSlugs() as [string];
+  seedPidfile(solo, 4242);
+  seedStartfile(solo, "STORED");
   const second = makeDeps({
-    catalog,
     selections,
     graceMs: 0,
     pidAlive: (pid) => pid === 4242,
@@ -1252,21 +1280,20 @@ test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHE
 });
 
 test("reconcile recycle guard: a MATCHING start-time leaves the live leg untouched", async () => {
-  const catalog: PresetCatalog = { presets: { solo: preset("claude") } };
   const selections: PanelSelections = {
-    panels: { one: ["solo"] },
+    panels: { one: [T_CLAUDE] },
     default: "one",
   };
   const prompt = writePrompt("keep me");
-  const first = makeDeps({ catalog, selections });
+  const first = makeDeps({ selections });
   await panelStart(
     { promptFile: prompt, slug: "one", panel: "one", dir, timeoutSeconds: 900 },
     first.deps,
   );
-  seedPidfile("solo", 4242);
-  seedStartfile("solo", "STORED");
+  const [solo] = memberSlugs() as [string];
+  seedPidfile(solo, 4242);
+  seedStartfile(solo, "STORED");
   const second = makeDeps({
-    catalog,
     selections,
     graceMs: 0,
     pidAlive: (pid) => pid === 4242,
@@ -1291,9 +1318,9 @@ test("reconcile recycle guard: a MATCHING start-time leaves the live leg untouch
 // ---- Guard B: reboot-in-wait ------------------------------------------------
 
 test("wait reboot guard: a boot-epoch mismatch fails non-terminal legs 'machine-rebooted' and returns promptly", async () => {
-  await startLegacy(); // stamps manifest boot_epoch_ms = TEST_BOOT_EPOCH_MS
-  seedResult("opus", "completed"); // a leg that finished pre-reboot
-  seedPidfile("codex", 4242); // a non-terminal leg
+  const [opus, codex] = await startLegacy(); // stamps boot_epoch_ms = TEST_BOOT_EPOCH_MS
+  seedResult(opus, "completed"); // a leg that finished pre-reboot
+  seedPidfile(codex, 4242); // a non-terminal leg
   const clock = { ms: 0 };
   const { deps, stdout } = makeDeps({
     clock,
@@ -1305,11 +1332,11 @@ test("wait reboot guard: a boot-epoch mismatch fails non-terminal legs 'machine-
   expect(clock.ms).toBe(0); // prompt — never slept a poll tick (no spin to 124)
   const v: PanelVerdict = JSON.parse(stdout().trim());
   expect(v.ok).toBe(false);
-  const codex = v.members.find((m) => m.name === "codex");
-  expect(codex?.status).toBe("fail");
-  expect(codex?.reason).toBe("machine-rebooted");
+  const codexMember = v.members.find((m) => m.name === codex);
+  expect(codexMember?.status).toBe("fail");
+  expect(codexMember?.reason).toBe("machine-rebooted");
   // A leg that finished before the reboot keeps its real verdict (reused).
-  expect(v.members.find((m) => m.name === "opus")?.status).toBe("ok");
+  expect(v.members.find((m) => m.name === opus)?.status).toBe("ok");
 });
 
 test("wait reboot guard: an absent boot-epoch (pre-durable manifest) does NOT fire the guard", async () => {
@@ -1337,10 +1364,10 @@ test("wait reboot guard: an absent boot-epoch (pre-durable manifest) does NOT fi
 });
 
 test("wait reboot+recycle: a reboot supersedes the recycle check (Guard B wins, distinct reason)", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242);
-  seedStartfile("codex", "STORED");
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codex, 4242);
+  seedStartfile(codex, "STORED");
   const clock = { ms: 0 };
   const { deps, stdout } = makeDeps({
     clock,
@@ -1353,14 +1380,14 @@ test("wait reboot+recycle: a reboot supersedes the recycle check (Guard B wins, 
   expect(code).toBe(0);
   expect(clock.ms).toBe(0); // prompt
   const v: PanelVerdict = JSON.parse(stdout().trim());
-  const codex = v.members.find((m) => m.name === "codex");
-  expect(codex?.reason).toBe("machine-rebooted"); // not "exited before…"
+  const codexMember = v.members.find((m) => m.name === codex);
+  expect(codexMember?.reason).toBe("machine-rebooted"); // not "exited before…"
 });
 
 test("wait is strictly read-only: a reboot verdict writes nothing to the manifest", async () => {
-  await startLegacy();
-  seedResult("opus", "completed");
-  seedPidfile("codex", 4242);
+  const [opus, codex] = await startLegacy();
+  seedResult(opus, "completed");
+  seedPidfile(codex, 4242);
   const before = readFileSync(join(dir, "manifest.json"), "utf8");
   const { deps } = makeDeps({
     pidAlive: (pid) => pid === 4242,
