@@ -44,6 +44,11 @@ export type Dispatch =
   // `runPanel`; `rest` carries the operation + its flags, which `runPanel` owns
   // (self-emits + owns its code).
   | { kind: "panel"; rest: string[] }
+  // The harness-agnostic resume verb: `resume <name-or-id> [prompt...]`.
+  // `target` is the raw name/former-name/id argument (resolved through the
+  // resume-policy module, never re-parsed here); `rest` is everything after
+  // it — the optional follow-up prompt, joined by the route.
+  | { kind: "resume"; target: string; rest: string[] }
   | { kind: "help" }
   | { kind: "help-wrapper" }
   | { kind: "agent-help" }
@@ -110,6 +115,17 @@ Usage:
                                     a non-blocking per-leg snapshot; prune GCs
                                     abandoned run dirs. Exit 0 all-terminal / 124
                                     chunk-elapsed / 2 absent-slug-or-bad-config.
+  keeper agent resume <name-or-id> [prompt]
+                                    Re-attach a dead partner by current name,
+                                    former name, or session id, launching it as
+                                    a detached interactive TUI in its recorded
+                                    cwd with the prompt delivered. Mints a FRESH
+                                    tracked job carrying the matched row's name
+                                    (never folds onto the resolved row). A live
+                                    target is refused (exit 2, points at
+                                    keeper bus chat send); an ambiguous or
+                                    unknown target also exits 2 without
+                                    launching anything.
   keeper agent --help                  Show this help.
   keeper agent --version               Show the version.
 
@@ -271,6 +287,27 @@ Panel fan-out (start | wait | status | prune):
                                         it), 2 = an absent/empty --slug, a
                                         missing/corrupt manifest, or bad config.
 
+Resume (harness-agnostic re-attach):
+  keeper agent resume <name-or-id> [prompt]
+                                        Resolve <name-or-id> (a current name,
+                                        former name, or session id) to a dead
+                                        partner job and re-attach it as a
+                                        detached interactive TUI in its
+                                        recorded cwd, delivering [prompt] as
+                                        its next turn. Mints a FRESH tracked
+                                        job carrying the matched row's name —
+                                        it never folds onto the resolved row,
+                                        so a later resume by the same name
+                                        chains onto this newer lineage. A LIVE
+                                        target is refused (exit 2, points at
+                                        \`keeper bus chat send\`); an ambiguous
+                                        target exits 2 listing every tied
+                                        candidate; an unknown target or one with
+                                        no resume target exits 2 without
+                                        launching anything. The harness-native
+                                        passthrough flags (--x-* etc.) apply
+                                        identically to a fresh launch.
+
 tmux-mode exit codes (a structured JSON error is emitted on every non-zero exit):
   0  success                        2  bad args
   1  internal/parse failure         3  prerequisite missing (tmux/session not found)
@@ -302,6 +339,8 @@ Launch or drive a partner model CLI from this session.
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>]
   keeper agent panel wait --slug <slug>   # blocks ONE chunk; re-issue on exit 124
   keeper agent presets list         # the names for --preset / --panel
+  keeper agent resume <name-or-id> "<follow-up ask>"
+                                    # re-attach a dead partner by name/id, continuing the chat
 
 Exit codes: 0 terminal answer · 124 panel wait chunk elapsed with no terminal answer
 (a re-issue SIGNAL, not a failure — call wait again) · 2 absent slug / bad config.
@@ -320,7 +359,10 @@ keeper worker on plan work (that is keeper dispatch).
  * `wait-for-stop`/`show-last-message` → the
  * post-launch transcript verbs with the remaining args (the handle); `run`/`wait`
  * → the blocking run-and-capture verbs (launch→wait→show in one process, and
- * wait→show on an existing handle) emitting the uniform envelope; `--x-help`
+ * wait→show on an existing handle) emitting the uniform envelope; `resume
+ * <name-or-id> [prompt...]` → re-attach a dead partner by current/former name
+ * or session id (a bare `resume` with no target is usage — a target is
+ * required); `--x-help`
  * → wrapper help; `--agent-help` → the operator runbook; `-h`/`--help` → short usage;
  * `-v`/`--version` → version; an empty
  * argv or any other leading token → usage (carrying the unknown subcommand name when
@@ -401,6 +443,13 @@ export function splitSubcommand(argv: string[]): Dispatch {
   }
   if (head === "panel") {
     return { kind: "panel", rest: argv.slice(1) };
+  }
+  if (head === "resume") {
+    const target = (argv[1] ?? "").trim();
+    if (target === "") {
+      return { kind: "usage", unknown: "resume" };
+    }
+    return { kind: "resume", target, rest: argv.slice(2) };
   }
   if (head === KEEPER_AGENT_HELP_FLAG) {
     return { kind: "help-wrapper" };

@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   type BirthRecordDraft,
   buildBirthDraft,
@@ -24,6 +25,10 @@ import {
 } from "../birth-record";
 import { ensureCodexDirTrust } from "../codex-trust";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
+import {
+  HERMES_SHIM_EVENTS,
+  HERMES_SHIM_VERSION,
+} from "../hermes-shim-contract";
 import { ensureHermesShimTrust } from "../hermes-trust";
 import {
   buildLauncherArgvPrefix,
@@ -67,14 +72,18 @@ import {
   HARNESS_DESCRIPTORS,
   type HarnessName,
   mapKeeperEffortToAxis,
+  ResumeLaunchUnsupportedError,
 } from "./harness";
 import {
+  buildAgentLaunchArgv,
   FINAL_MESSAGE_DIRECTIVE,
   piExtensionArgs,
   READ_ONLY_DIRECTIVE,
 } from "./launch-config";
 import {
+  hermesShimCommand,
   type LaunchHandleDeps,
+  launchEnvForAgent,
   launchToResolvedHandle,
   tmuxTranscriptSessionId,
 } from "./launch-handle";
@@ -114,6 +123,11 @@ import {
 } from "./passthrough";
 import { makePhaser } from "./phaser";
 import { discoverPlugins, PluginError } from "./plugins";
+// Type-only: resolveResumeDecision itself is NEVER imported here — it
+// transitively pulls src/db.ts (bun:sqlite) via server-worker.ts, a cost this
+// cold-start launcher must never pay. See resume-resolve-cli.ts (spawned as a
+// subprocess by resolveResumeDecisionFn below) for the real call.
+import type { ResumeDecision } from "./resume-policy";
 import {
   type ChildSpawnedFn,
   defaultSpawn,
@@ -287,6 +301,17 @@ export interface MainDeps {
    * `realDeps()` binds it to {@link piExtensionArgs} (fail-open existence check).
    */
   resolvePiExtensionArgsFn: () => string[];
+  /**
+   * Resolve `target` (a current name, former name, session id, id prefix, or
+   * current-title substring) to a {@link ResumeDecision} for the `resume` verb.
+   * Throws on a tool-level failure (db open, a malformed subprocess result) —
+   * a resolved-but-non-"ok" decision (live/ambiguous/unknown/no-target) is a
+   * SUCCESSFUL return, never a throw. `realDeps()` binds it to a SUBPROCESS
+   * spawn of `resume-resolve-cli.ts`, never a direct import of
+   * `resolveResumeDecision` (see the import-site comment for why); a test
+   * injects a pure fake, so the fast suite never touches a real db or spawn.
+   */
+  resolveResumeDecisionFn: (target: string) => ResumeDecision;
 }
 
 /** Parse a host YAML file to its raw body, or null when the file is absent (the
@@ -366,7 +391,66 @@ export function realDeps(): MainDeps {
     runTmuxCommandFn: defaultTmuxCommandRunner,
     resolveStatuslineSettingsPathFn: resolveKeeperPluginStatuslineSettingsPath,
     resolvePiExtensionArgsFn: () => piExtensionArgs(),
+    resolveResumeDecisionFn: (target) =>
+      resolveResumeDecisionViaSubprocess(
+        process.execPath,
+        resumeResolveCliPath(),
+        target,
+      ),
   };
+}
+
+/** Absolute path to `resume-resolve-cli.ts`, resolved relative to THIS module
+ *  (robust across worktrees and a `bun link`ed binary alike). */
+function resumeResolveCliPath(): string {
+  return fileURLToPath(new URL("./resume-resolve-cli.ts", import.meta.url));
+}
+
+/**
+ * Resolve a `resume` target via a SUBPROCESS boundary rather than an import —
+ * `resolveResumeDecision` transitively pulls `src/db.ts` (bun:sqlite) through
+ * its liveness probe, a cost `cli/agent.ts`'s cold-start bundle must never pay
+ * (a dynamic import bundles inline just like a static one; only a real process
+ * boundary isolates it — see the hygiene test pinning the bundle bun:sqlite-free).
+ * Blocking (`spawnSync`): the resume verb is a one-shot CLI invocation, not a
+ * hot loop, so the extra process start is an acceptable cost for keeping the
+ * launcher's own cold start db-free. Throws on a malformed/tool-error result —
+ * a resolved-but-non-"ok" `ResumeDecision` is a normal, non-throwing return.
+ */
+function resolveResumeDecisionViaSubprocess(
+  bunBin: string,
+  scriptPath: string,
+  target: string,
+): ResumeDecision {
+  const result = spawnSync(bunBin, [scriptPath, target], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const stdout = (result.stdout ?? "").trim();
+  let parsed: unknown = null;
+  try {
+    parsed = stdout === "" ? null : JSON.parse(stdout);
+  } catch {
+    parsed = null;
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    typeof (parsed as { kind?: unknown }).kind !== "string"
+  ) {
+    const diagnostic =
+      (result.stderr ?? "").trim() ||
+      stdout ||
+      `exit ${result.status ?? "null"}`;
+    throw new Error(
+      `keeper agent resume: resolver produced no valid decision: ${diagnostic}`,
+    );
+  }
+  const decision = parsed as { kind: string; message?: string };
+  if (decision.kind === "tool-error") {
+    throw new Error(decision.message ?? "resume resolver failed");
+  }
+  return parsed as ResumeDecision;
 }
 
 const CLAUDE_SESSION_ENV_VARS_TO_SCRUB: readonly string[] = [
@@ -1855,6 +1939,188 @@ function runProvidersCheck(deps: MainDeps): never {
   );
 }
 
+/**
+ * `resume <name-or-id> [prompt...]`: the harness-agnostic re-attach verb.
+ * Resolves `target` through the resume-policy module (via the
+ * {@link MainDeps.resolveResumeDecisionFn} subprocess seam), refuses a live
+ * target / reports ambiguity / an unknown target without launching anything,
+ * then relaunches the matched partner as a detached interactive TUI in its
+ * RECORDED cwd — a FRESH tracked job (never folded onto the resolved row),
+ * carrying the matched row's current title as the launch name so a later
+ * resume by the same name chains onto this newer lineage.
+ */
+function runResumeSubcommand(
+  deps: MainDeps,
+  target: string,
+  rest: string[],
+): never {
+  const prompt = rest.join(" ");
+  let decision: ResumeDecision;
+  try {
+    decision = deps.resolveResumeDecisionFn(target);
+  } catch (err) {
+    deps.writeErr(
+      `Error: keeper agent resume: cannot resolve '${target}': ` +
+        `${(err as Error).message}\n`,
+    );
+    return deps.exit(2);
+  }
+
+  if (decision.kind === "unknown") {
+    deps.writeErr(
+      `Error: keeper agent resume: no partner session found matching '${target}'.\n`,
+    );
+    return deps.exit(2);
+  }
+  if (decision.kind === "live") {
+    deps.writeErr(
+      `Error: keeper agent resume: '${target}' resolves to a LIVE ` +
+        `${displayAgent(decision.harness)} session (job ${decision.job_id}` +
+        `${decision.title !== null ? `, "${decision.title}"` : ""}). It is ` +
+        `still running — message it instead: ` +
+        `keeper bus chat send ${decision.job_id} "<msg>"\n`,
+    );
+    return deps.exit(2);
+  }
+  if (decision.kind === "ambiguous") {
+    deps.writeErr(
+      `Error: keeper agent resume: '${target}' is ambiguous among ` +
+        `${decision.candidates.length} equally-recent sessions:\n`,
+    );
+    for (const c of decision.candidates) {
+      deps.writeErr(
+        `  ${c.job_id}  ${c.harness}  ${c.title ?? "(untitled)"}  ` +
+          `updated_at=${c.updated_at}\n`,
+      );
+    }
+    deps.writeErr("Resume by the exact job id to disambiguate.\n");
+    return deps.exit(2);
+  }
+  if (decision.kind === "harness-mismatch") {
+    deps.writeErr(
+      `Error: keeper agent resume: '${target}' did not resolve to a ` +
+        `${decision.require_harness} session (newest match: ` +
+        `${decision.harness} job ${decision.job_id}).\n`,
+    );
+    return deps.exit(2);
+  }
+  if (decision.kind === "no-target") {
+    deps.writeErr(
+      `Error: keeper agent resume: matched ${decision.harness} job ` +
+        `${decision.job_id}${decision.title !== null ? ` ("${decision.title}")` : ""} ` +
+        `has no resume target — it cannot be resumed.\n`,
+    );
+    return deps.exit(2);
+  }
+
+  // decision.kind === "ok"
+  const cwd = decision.cwd;
+  if (cwd === null || cwd === "" || !existsSync(cwd)) {
+    deps.writeErr(
+      `Error: keeper agent resume: the recorded cwd for ${decision.harness} ` +
+        `job ${decision.job_id}${cwd ? ` ('${cwd}')` : ""} no longer exists ` +
+        `— cannot resume there.\n`,
+    );
+    return deps.exit(2);
+  }
+
+  deps.writeErr(
+    `Resuming ${displayAgent(decision.harness)} job ${decision.job_id}` +
+      `${decision.title !== null ? ` ("${decision.title}")` : ""} in ${cwd}\n`,
+  );
+
+  // claude forks a NEW child session file on --resume (docs/adr/0034); the
+  // child uuid is minted HERE (never by the builder) and pinned via
+  // --session-id --fork-session. Other harnesses resume their existing
+  // native session, so they carry no such id.
+  const resumeSessionId =
+    decision.harness === "claude" ? deps.randomUuid() : undefined;
+
+  let launchArgv: string[];
+  try {
+    launchArgv = buildAgentLaunchArgv({
+      launcherArgvPrefix: [],
+      cli: decision.harness,
+      prompt,
+      name: decision.title ?? undefined,
+      resumeTarget: decision.resume_target,
+      resumeSessionId,
+    });
+  } catch (exc) {
+    if (exc instanceof ResumeLaunchUnsupportedError) {
+      deps.writeErr(`Error: keeper agent resume: ${exc.message}\n`);
+      return deps.exit(2);
+    }
+    throw exc;
+  }
+
+  // A resume launch must mint a FRESH job id — never fold onto the matched
+  // row (claude is immune: its --session-id above is explicit argv, not
+  // env-carried). codex/pi/hermes derive identity from KEEPER_JOB_ID, which a
+  // freshly-forked tmux SERVER would otherwise inherit from THIS process's own
+  // ambient env (a resume launch with no explicit --x-tmux-session lands in
+  // the shared 'keeper-agent' session, per tmux-launch.ts's resolveSession
+  // fallback) — force it empty so identity always comes from the fresh mint.
+  const tmuxLaunch = parseKeeperAgentTmuxArgs([
+    ...launchArgv.slice(1),
+    "--x-tmux-env",
+    "KEEPER_JOB_ID=",
+  ]);
+  if (tmuxLaunch.error !== null) {
+    deps.writeErr(`keeper agent resume: ${tmuxLaunch.error}\n`);
+    return deps.exit(2);
+  }
+
+  if (decision.harness === "codex") {
+    ensureCodexDirTrust({ cwd, env: deps.env });
+  }
+  if (decision.harness === "hermes") {
+    ensureHermesShimTrust({
+      env: deps.env,
+      shimCommand: hermesShimCommand(deps.launcherArgvPrefix),
+      events: HERMES_SHIM_EVENTS,
+      version: HERMES_SHIM_VERSION,
+    });
+  }
+
+  try {
+    const result = launchKeeperAgentInTmux({
+      agent: decision.harness,
+      innerArgs: tmuxLaunch.remainingArgs,
+      options: tmuxLaunch.options,
+      env: launchEnvForAgent(decision.harness, deps.env),
+      cwd,
+      transcriptSessionId: null,
+      startedAtMs: deps.now(),
+      stateDir: deps.launcherStateDir,
+      tmuxBin: deps.tmuxBin,
+      launcherArgvPrefix: deps.launcherArgvPrefix,
+      randomUuid: deps.randomUuid,
+      runTmuxCommand: deps.runTmuxCommandFn,
+    });
+    deps.write(
+      `${JSON.stringify({
+        resumed: true,
+        job_id: decision.job_id,
+        harness: decision.harness,
+        title: decision.title,
+        cwd,
+        run_id: result.id,
+        session: result.session,
+        window_id: result.windowId,
+        attach_command: result.attachCommand,
+      })}\n`,
+    );
+    return deps.exit(0);
+  } catch (exc) {
+    if (exc instanceof TmuxLaunchError) {
+      deps.writeErr(`Error: ${exc.message}\n`);
+      return deps.exit(exc.exitCode);
+    }
+    throw exc;
+  }
+}
+
 export async function main(deps: MainDeps): Promise<never> {
   const actionLog: string[] = [];
 
@@ -1924,6 +2190,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "providers-check") {
     return runProvidersCheck(deps);
+  }
+  if (dispatch.kind === "resume") {
+    return runResumeSubcommand(deps, dispatch.target, dispatch.rest);
   }
 
   // Resolve the leading-token harness. `run` carries it directly; the

@@ -237,6 +237,46 @@ describe("splitSubcommand", () => {
     });
   });
 
+  test("resume <target> classifies with an empty rest", () => {
+    expect(splitSubcommand(["resume", "my-partner"])).toEqual({
+      kind: "resume",
+      target: "my-partner",
+      rest: [],
+    });
+  });
+
+  test("resume <target> <prompt> classifies, rest carries the prompt tokens", () => {
+    expect(
+      splitSubcommand(["resume", "my-partner", "follow", "up", "ask"]),
+    ).toEqual({
+      kind: "resume",
+      target: "my-partner",
+      rest: ["follow", "up", "ask"],
+    });
+  });
+
+  test("resume <id> accepts a bare session-id-shaped target", () => {
+    expect(splitSubcommand(["resume", "abc-123-def"])).toEqual({
+      kind: "resume",
+      target: "abc-123-def",
+      rest: [],
+    });
+  });
+
+  test("bare resume (no target) is usage", () => {
+    expect(splitSubcommand(["resume"])).toEqual({
+      kind: "usage",
+      unknown: "resume",
+    });
+  });
+
+  test("resume with a blank target is usage", () => {
+    expect(splitSubcommand(["resume", "  "])).toEqual({
+      kind: "usage",
+      unknown: "resume",
+    });
+  });
+
   test("empty argv is bare usage (no unknown)", () => {
     expect(splitSubcommand([])).toEqual({ kind: "usage" });
   });
@@ -386,6 +426,128 @@ describe("main() dispatch routing", () => {
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.piBin);
     expect(cmd).toContain("--help");
+  });
+});
+
+describe("resume route", () => {
+  test("unknown target: exit 2, no launch, message names the target", async () => {
+    const h = harness(["resume", "ghost"]);
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("no partner session found");
+    expect(h.err.join("")).toContain("ghost");
+    expect(h.tmuxCommands.length).toBe(0);
+    expect(h.spawned.length).toBe(0);
+  });
+
+  test("live target: exit 2, points at the bus, no launch", async () => {
+    const h = makeHarness({
+      argv: ["resume", "codey"],
+      rawArgv: true,
+      resolveResumeDecision: {
+        kind: "live",
+        job_id: "job-live-1",
+        harness: "codex",
+        title: "codey",
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("LIVE");
+    expect(h.err.join("")).toContain("job-live-1");
+    expect(h.err.join("")).toContain("keeper bus chat send job-live-1");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("ambiguous target: exit 2, lists every tied candidate", async () => {
+    const h = makeHarness({
+      argv: ["resume", "twin"],
+      rawArgv: true,
+      resolveResumeDecision: {
+        kind: "ambiguous",
+        candidates: [
+          { job_id: "job-a", harness: "claude", title: "twin", updated_at: 5 },
+          { job_id: "job-b", harness: "pi", title: "twin", updated_at: 5 },
+        ],
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("ambiguous");
+    expect(h.err.join("")).toContain("job-a");
+    expect(h.err.join("")).toContain("job-b");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("no-target: exit 2, names the matched job, no launch", async () => {
+    const h = makeHarness({
+      argv: ["resume", "stale"],
+      rawArgv: true,
+      resolveResumeDecision: {
+        kind: "no-target",
+        job_id: "job-nt",
+        harness: "hermes",
+        title: "stale",
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("no resume target");
+    expect(h.err.join("")).toContain("job-nt");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("harness-mismatch: exit 2, names both the required and matched harness", async () => {
+    const h = makeHarness({
+      argv: ["resume", "wrong-cli"],
+      rawArgv: true,
+      resolveResumeDecision: {
+        kind: "harness-mismatch",
+        job_id: "job-hm",
+        harness: "pi",
+        require_harness: "claude",
+        title: "wrong-cli",
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("claude");
+    expect(h.err.join("")).toContain("job-hm");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("ok decision but the recorded cwd vanished: exit 2, no launch", async () => {
+    const h = makeHarness({
+      argv: ["resume", "gone-dir"],
+      rawArgv: true,
+      resolveResumeDecision: {
+        kind: "ok",
+        job_id: "job-vanished",
+        harness: "claude",
+        resume_target: "parent-session-uuid",
+        cwd: "/nonexistent/definitely/not/on/disk/xyz",
+        title: "gone-dir",
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("no longer exists");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("resolver tool failure: exit 2, no launch", async () => {
+    const h = makeHarness({
+      argv: ["resume", "whoever"],
+      rawArgv: true,
+      resolveResumeDecision: () => {
+        throw new Error("db open failed");
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(2);
+    expect(h.err.join("")).toContain("cannot resolve");
+    expect(h.err.join("")).toContain("db open failed");
+    expect(h.tmuxCommands.length).toBe(0);
   });
 });
 
