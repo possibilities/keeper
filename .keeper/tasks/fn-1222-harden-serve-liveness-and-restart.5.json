@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "NDJSON restart ledger and runtime-qualified counting",
-  "updated_at": "2026-07-09T21:28:15.020000Z"
+  "updated_at": "2026-07-10T00:35:35.812000Z",
+  "worker_done_at": "2026-07-10T00:35:35.812000Z"
 }

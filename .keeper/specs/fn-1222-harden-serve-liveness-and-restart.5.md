@@ -56,5 +56,5 @@ matrix stays byte-identical — the producer changes, not the pure counter.
 - [ ] CLAUDE.md's ledger clause and ADR 0003's supersession pointer are updated; lints stay green
 
 ## Done summary
-
+Rewrote the restart ledger as an append-only, boot_id-keyed NDJSON sidecar: fatalExit enriches its own boot_id line via a single bounded append (never by timestamp), boot lines freeze provenance + the inter-boot gap, compaction is boot-only via temp+fsync+rename with a torn-tail/legacy-array-tolerant reader, and the crash-loop count is runtime-qualified (young-predecessor deaths count, foreign excluded) while decideCrashLoop stays unchanged.
 ## Evidence
