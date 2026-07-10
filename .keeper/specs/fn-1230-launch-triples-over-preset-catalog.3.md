@@ -39,5 +39,5 @@ Table-drive the grammar: valid triples per harness (slashed pi native id, hermes
 - [ ] The launcher island import graph still never reaches the DB layer
 
 ## Done summary
-
+Added src/agent/triple.ts (parseTriple/formatTriple/slugifyTriple, enumerateTriples, host-triple lint) as a dep-free launcher island; reshaped presets list/resolve to the virtual cube + triple grammar and providers check to lint host triples against the cube, retiring the auto-preset collision finding.
 ## Evidence
