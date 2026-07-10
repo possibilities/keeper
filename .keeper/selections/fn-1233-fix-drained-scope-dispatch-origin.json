@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped wire-projection choice (widen shared jobs descriptor vs scope-exempt direct-SELECT) reconciling a documented 'deliberately omits' decision, plus a subtle correctness invariant that the type system and fixtures hid, warrants opus at the contract-touching xhigh band.",
+      "task_id": "fn-1233-fix-drained-scope-dispatch-origin.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T03:46:59.247000Z",
+  "epic_id": "fn-1233-fix-drained-scope-dispatch-origin",
+  "input_hash": "6bf423b8867dadcebff63660bd3ef5fcd0c1aa3fbdc3b2c764b53798b5f389be",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1811162040,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped wire-projection choice (widen shared jobs descriptor vs scope-exempt direct-SELECT) reconciling a documented 'deliberately omits' decision, plus a subtle correctness invariant that the type system and fixtures hid, warrants opus at the contract-touching xhigh band.\",\"confidence\":0.78}]}\n"
+}
