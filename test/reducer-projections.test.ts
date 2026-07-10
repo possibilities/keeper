@@ -1443,6 +1443,151 @@ test("ResolverDispatchAttempted with a malformed payload is a safe no-op (cursor
   expect(getResolverDispatchedAt("close", "fn-rd-mal")).toBeNull();
 });
 
+// fn-1240 — the resolver-dispatch AND merge-escalation folds are VERB-PARAMETERIZED: a
+// `verb:"work"` payload stamps the `(work, taskId)` fan-in conflict row; a verb-less
+// payload still defaults to the CLOSE row (the historical close event, byte-identical).
+// Same dispatch-once + re-arm-on-DispatchCleared discipline as the close path, on its
+// own row.
+
+/** The WORK-verb resolver-dispatch event — mints `{id, outcome, verb:"work"}`. */
+function workResolverDispatchEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "ResolverDispatchAttempted",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome, verb: "work" }),
+  });
+}
+
+/** The WORK-verb merge-escalation (deconflict-dispatch) event — `{id, outcome, verb:"work"}`. */
+function workMergeEscalationEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "MergeEscalationAttempted",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome, verb: "work" }),
+  });
+}
+
+test("ResolverDispatchAttempted{verb:work} stamps resolver_dispatched_at on the WORK row (verb-parameterized fold)", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-wrd-1.2",
+    "worktree-merge-conflict: merging a into b — CONFLICT",
+    "/wt/lane",
+    1700,
+  );
+  drainAll();
+  expect(getResolverDispatchedAt("work", "fn-wrd-1.2")).toBeNull();
+
+  const dispatchedId = workResolverDispatchEvent(
+    "fn-wrd-1.2",
+    "dispatched",
+    1750,
+  );
+  expect(drainAll()).toBe(1);
+  // A pure function of event.ts (never wall-clock) → re-fold-deterministic.
+  expect(getResolverDispatchedAt("work", "fn-wrd-1.2")).toBe(1750);
+  expect(getCursor()).toBe(dispatchedId);
+});
+
+test("MergeEscalationAttempted{verb:work} stamps merge_escalated_at on the WORK row (verb-parameterized fold)", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-wme-1.2",
+    "worktree-merge-conflict: merging a into b — CONFLICT",
+    "/wt/lane",
+    1700,
+  );
+  drainAll();
+  expect(getMergeEscalatedAt("work", "fn-wme-1.2")).toBeNull();
+
+  const dispatchedId = workMergeEscalationEvent(
+    "fn-wme-1.2",
+    "dispatched",
+    1750,
+  );
+  expect(drainAll()).toBe(1);
+  expect(getMergeEscalatedAt("work", "fn-wme-1.2")).toBe(1750);
+  expect(getCursor()).toBe(dispatchedId);
+});
+
+test("a verb-less ResolverDispatchAttempted/MergeEscalationAttempted defaults to CLOSE, never touching a same-id work row", () => {
+  // Both a close AND a work merge-conflict row share the id. A verb-less payload (the
+  // historical close event shape) must stamp ONLY the close row.
+  dispatchFailedEvent(
+    "close",
+    "fn-both.x",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  dispatchFailedEvent(
+    "work",
+    "fn-both.x",
+    "worktree-merge-conflict: merging a into b — CONFLICT",
+    "/wt/lane",
+    1700,
+  );
+  resolverDispatchEvent("fn-both.x", "dispatched", 1750); // verb-less → close default
+  mergeEscalationEvent("fn-both.x", "dispatched", 1750); // verb-less → close default
+  drainAll();
+  expect(getResolverDispatchedAt("close", "fn-both.x")).toBe(1750);
+  expect(getMergeEscalatedAt("close", "fn-both.x")).toBe(1750);
+  expect(getResolverDispatchedAt("work", "fn-both.x")).toBeNull();
+  expect(getMergeEscalatedAt("work", "fn-both.x")).toBeNull();
+
+  // The explicit work events then stamp ONLY the work row (the close markers unchanged).
+  workResolverDispatchEvent("fn-both.x", "dispatched", 1760);
+  workMergeEscalationEvent("fn-both.x", "dispatched", 1760);
+  drainAll();
+  expect(getResolverDispatchedAt("work", "fn-both.x")).toBe(1760);
+  expect(getMergeEscalatedAt("work", "fn-both.x")).toBe(1760);
+  expect(getResolverDispatchedAt("close", "fn-both.x")).toBe(1750);
+});
+
+test("DispatchCleared drops a WORK row's resolver/escalation latches so a fresh conflict re-arms at NULL", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-wclr.3",
+    "worktree-merge-conflict: merging a into b — CONFLICT",
+    "/wt/lane",
+    1700,
+  );
+  workResolverDispatchEvent("fn-wclr.3", "dispatched", 1750);
+  workMergeEscalationEvent("fn-wclr.3", "dispatched", 1760);
+  drainAll();
+  expect(getResolverDispatchedAt("work", "fn-wclr.3")).toBe(1750);
+  expect(getMergeEscalatedAt("work", "fn-wclr.3")).toBe(1760);
+
+  // `keeper autopilot retry work::fn-wclr.3` → DispatchCleared drops the whole row.
+  dispatchClearedEvent("work", "fn-wclr.3");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-wclr.3")).toBeNull();
+
+  // A fresh conflict on the same task re-arms BOTH latches at the column default.
+  dispatchFailedEvent(
+    "work",
+    "fn-wclr.3",
+    "worktree-merge-conflict: merging a into b — CONFLICT",
+    "/wt/lane",
+    1800,
+  );
+  drainAll();
+  expect(getResolverDispatchedAt("work", "fn-wclr.3")).toBeNull();
+  expect(getMergeEscalatedAt("work", "fn-wclr.3")).toBeNull();
+});
+
 test("MergeEscalationAttempted also stamps merge_escalated_at on the terminal dispatched outcome (the deconflict-dispatch marker)", () => {
   // fn-1129.1 repurposes the merge-escalation marker: the sweep now DISPATCHES a
   // deconflict::<epic> session and records `dispatched` (terminal) instead of the
