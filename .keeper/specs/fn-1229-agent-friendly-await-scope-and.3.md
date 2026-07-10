@@ -58,5 +58,5 @@ states.
 - [ ] Fast suite green
 
 ## Done summary
-
+Added --probe to keeper await: one-shot evaluate-and-exit against the first painted snapshot, emitting a probe envelope naming per-slot state and drained-family holders. New additive exit 9 (evaluated-clean-does-not-hold) registered in keeper.ts's EXIT_CODES and mirrored in descriptor.ts, with a lockstep test. Edge-triggered conditions are a usage error under --probe; probe implies a bounded connect deadline (server-up included); existing not-found/ambiguous/stuck codes still take priority over the generic does-not-hold.
 ## Evidence
