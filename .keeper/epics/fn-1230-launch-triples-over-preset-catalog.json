@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-10T07:16:27.235000Z",
   "created_at": "2026-07-10T02:59:59.912000Z",
   "depends_on_epics": [],
   "id": "fn-1230-launch-triples-over-preset-catalog",
   "last_validated_at": "2026-07-10T03:03:37.427000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Launch triples over preset catalog",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T03:03:37.427000Z"
+  "updated_at": "2026-07-10T07:16:27.235000Z"
 }
