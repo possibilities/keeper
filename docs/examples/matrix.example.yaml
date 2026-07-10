@@ -1,56 +1,75 @@
-# Example host provider matrix — the real activation shape for a wrapped codex
-# model, committed for reference only. This file lives OUTSIDE every discovered
-# config path (`~/.config/keeper/matrix.yaml`) so it can never silently activate a
-# foreign provider in repo tooling; it is loaded by explicit path only, in
-# `test/agent-matrix.test.ts`'s anti-rot test.
+# Example host worker matrix (v2) — the REQUIRED single worker-matrix config,
+# committed for reference only. This file lives OUTSIDE every discovered config
+# path (`~/.config/keeper/matrix.yaml`) so it can never silently activate a
+# foreign provider in repo tooling; it is loaded by explicit path only, in the
+# anti-rot test (`test/agent-matrix.test.ts`).
 #
 # To activate: copy this file to `~/.config/keeper/matrix.yaml` (or author your
-# own roster from scratch) and follow docs/install.md's "Host provider matrix"
-# walkthrough.
+# own roster from scratch) and follow docs/install.md's "Host worker matrix"
+# walkthrough. There is no embedded fallback — an absent, empty, unparseable, or
+# schema-invalid matrix is a typed loud failure that parks dispatch behind a
+# distress sticky naming the state and the fix.
 
-# The top-level effort axis: the default per-model effort list. Each entry must be
-# in the canonical effort vocabulary [low, medium, high, xhigh, max]; declaration
+# The top-level effort axis: the default per-model effort list a cell inherits
+# when neither its provider nor its own entry narrows it. Each entry must be in
+# the canonical effort vocabulary [low, medium, high, xhigh, max]; declaration
 # order is irrelevant (the list normalizes to canonical ascending order).
 efforts:
   - medium
   - high
 
+# The cell-template inventory: the templates the renderer fans out over
+# subagent_models × efforts. Each entry is a NON-EMPTY RELATIVE path (no leading
+# `/`, no `..` segment, no NUL) — the traversal guard that replaces the retired
+# `render_to:` frontmatter.
+subagent_templates:
+  - template/agents/worker.md.tmpl
+
+# Worker-cell eligibility: the capability tokens that render and select as worker
+# cells. A capability a provider serves but that is ABSENT here launches as a
+# triple (enumeration) yet never enters the cell set — that is the only "launch
+# only" mechanism; the `route:` flag is retired. Every entry MUST be served by at
+# least one provider below, or the matrix fails loud.
+subagent_models:
+  - opus
+  - sonnet
+  - gpt-5.3-codex-spark
+
 providers:
-  # claude is always the native provider — its models run in-session, and always
-  # route (route: false on claude is a load error).
+  # claude is the native provider — its models run in-session. A capability the
+  # claude provider serves is native; every other capability is wrapped.
   - name: claude
     models:
+      # Bare launch-ids: the string the harness CLI receives verbatim. The
+      # capability token is the basename (here the whole id — it is slash-free).
       - opus
       - sonnet
-  # codex is cost-ascending first among the wrapped providers.
+  # codex is cost-ascending first among the wrapped providers, so it WINS the
+  # gpt-5.3-codex-spark capability and owns its effort list.
   - name: codex
-    # A per-provider effort override clobbers the top-level axis for codex's cells
-    # (absent inherits, present clobbers; a per-model override is more specific
+    # A per-provider effort override clobbers the top-level axis for codex's
+    # cells (absent inherits; a per-model {id, efforts} override is more specific
     # still). Each override must be a subset of the canonical vocabulary.
     efforts:
       - high
       - xhigh
     models:
-      # A bare capability token: codex accepts bare model ids directly, and it
-      # inherits codex's provider-level effort override above.
+      # A bare launch-id — capability = the whole slash-free string.
       - gpt-5.3-codex-spark
-      # The model long form {name, native?, efforts?} carries a provider-native
-      # alias and/or a per-model effort override that beats the provider override:
-      # - name: gpt-5.3-codex-spark
-      #   native: openai/gpt-5.3-codex-spark
-      #   efforts: [xhigh]
-  # A launch-only provider: route: false keeps pi's models ENUMERABLE for launch
-  # (triples) but excludes them from the wrapped-cell pecking order and the plan
-  # capability cell set. The provider-qualified slashed native id is the generic
-  # long form a harness that rejects bare capability ids requires.
+  # pi is later in the roster, so its gpt-5.3-codex-spark entry is SHADOWED by
+  # codex (the derived capability collides cross-provider — first provider wins,
+  # the shadow is logged, not an error).
   - name: pi
-    route: false
     models:
-      - name: gpt-5.3-spark-preview
-        native: pi/gpt-5.3-spark-preview
-
-subagents:
-  - work
+      # A provider-qualified launch-id: the capability is the basename after the
+      # last `/` (gpt-5.3-codex-spark), which codex already owns → shadowed.
+      - id: openai-codex/gpt-5.3-codex-spark
+      # The {id, efforts} long form carries a per-model effort override. Its
+      # capability (gpt-5.3-spark-preview) is absent from subagent_models, so it
+      # is launch-only: enumerable for launch, never a worker cell.
+      - id: gpt-5.3-spark-preview
+        efforts:
+          - medium
 
 # The fixed claude model-and-effort every wrapped cell's wrapper runs at.
 wrapper_driver:

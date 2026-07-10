@@ -14,13 +14,20 @@ import { join } from "node:path";
 import { ConfigError } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import {
+  capabilityOf,
   cellSet,
   driverFor,
   effortsFor,
   isValidMatrixAliasTarget,
   isValidMatrixToken,
+  isValidTemplatePath,
   loadMatrix,
+  loadMatrixV2,
   type Matrix,
+  MatrixConfigError,
+  type MatrixV2,
+  matrixV2Cells,
+  matrixV2EffortsFor,
   nativeIdFor,
   providerCheckFindings,
   providerOrderFor,
@@ -33,6 +40,7 @@ import {
   hostTripleRefs,
   lintHostTriples,
 } from "../src/agent/triple";
+import * as fx from "./fixtures/matrix-v2";
 import { expectExit, makeHarness } from "./helpers/agent-main-harness";
 
 let tmpDir: string;
@@ -44,8 +52,11 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
+let matrixSeq = 0;
 function writeMatrix(body: string): string {
-  const p = join(tmpDir, "matrix.yaml");
+  // A UNIQUE filename per call so a test that writes several fixtures in one
+  // expression gets distinct paths (never one file the last write clobbers).
+  const p = join(tmpDir, `matrix-${matrixSeq++}.yaml`);
   writeFileSync(p, body);
   return p;
 }
@@ -846,11 +857,228 @@ describe("alias-target charset (slashed native id)", () => {
   });
 });
 
-describe("committed example matrix (anti-rot)", () => {
+// ── v2 loader (ADR 0036) ─────────────────────────────────────────────────────
+
+/** The normalized cross-island projection — what both v2 loaders must reduce a
+ *  fixture to. Hand-comparable; the parity suite asserts launcher === plan. */
+function projectLauncher(m: MatrixV2) {
+  return {
+    efforts: m.efforts,
+    subagentTemplates: m.subagentTemplates,
+    subagentModels: m.subagentModels,
+    drivers: Object.fromEntries(
+      m.subagentModels.map((c) => [c, m.driverByModel.get(c)]),
+    ),
+    effortsByModel: Object.fromEntries(m.effortsByModel),
+    shadowed: m.shadowed.map((s) => ({
+      provider: s.provider,
+      capability: s.capability,
+      launchId: s.launchId,
+      winner: s.winner,
+    })),
+  };
+}
+
+describe("v2 loader — capability derivation + parse", () => {
+  test("capabilityOf: basename after the last slash, whole id when slash-free", () => {
+    expect(capabilityOf("opus")).toBe("opus");
+    expect(capabilityOf("openai-codex/gpt-5.3-codex-spark")).toBe(
+      "gpt-5.3-codex-spark",
+    );
+    expect(capabilityOf("a/b/c")).toBe("c");
+  });
+
+  test("isValidTemplatePath: relative, no `..`, no NUL, no leading slash", () => {
+    expect(isValidTemplatePath("template/agents/worker.md.tmpl")).toBe(true);
+    expect(isValidTemplatePath("")).toBe(false);
+    expect(isValidTemplatePath("/etc/passwd")).toBe(false);
+    expect(isValidTemplatePath("../x")).toBe(false);
+    expect(isValidTemplatePath("a/../b")).toBe(false);
+    expect(isValidTemplatePath("a\0b")).toBe(false);
+    expect(isValidTemplatePath(42)).toBe(false);
+  });
+
+  test("a valid multi-provider roster reduces to the hand-computed projection", () => {
+    const m = loadMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    const exp = fx.MULTI_PROVIDER_EXPECTED;
+    expect(m.efforts).toEqual(exp.efforts);
+    expect(m.subagentTemplates).toEqual(exp.subagentTemplates);
+    expect(m.subagentModels).toEqual(exp.subagentModels);
+    expect(projectLauncher(m).drivers).toEqual(exp.drivers);
+    expect(projectLauncher(m).effortsByModel).toEqual(exp.effortsByModel);
+    // The shared fixture types provider/winner as `string`; the launcher narrows
+    // them to HarnessName — same runtime shape, cast for the structural compare.
+    expect(m.shadowed).toEqual(exp.shadowed as typeof m.shadowed);
+    // The bare launch-id keeps its verbatim string; the provider-qualified one too.
+    expect(
+      m.providers
+        .find((p) => p.name === "codex")
+        ?.models.get("gpt-5.3-codex-spark"),
+    ).toBe("gpt-5.3-codex-spark");
+    expect(
+      m.providers
+        .find((p) => p.name === "pi")
+        ?.models.get("gpt-5.3-codex-spark"),
+    ).toBe("openai-codex/gpt-5.3-codex-spark");
+  });
+
+  test("matrixV2Cells: subagent_models in declared order, driver-tagged", () => {
+    const m = loadMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    expect(matrixV2Cells(m)).toEqual([
+      { model: "opus", driver: "native" },
+      { model: "sonnet", driver: "native" },
+      { model: "gpt-5.3-codex-spark", driver: "wrapped" },
+    ]);
+  });
+
+  test("matrixV2EffortsFor: per-capability list, else the top-level axis", () => {
+    const m = loadMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    // spark inherits codex's provider override; opus the top-level axis; an
+    // unserved capability falls to the top-level axis.
+    expect(matrixV2EffortsFor(m, "gpt-5.3-codex-spark")).toEqual([
+      "high",
+      "xhigh",
+    ]);
+    expect(matrixV2EffortsFor(m, "opus")).toEqual(["medium", "high"]);
+    expect(matrixV2EffortsFor(m, "never-served")).toEqual(["medium", "high"]);
+  });
+});
+
+describe("v2 loader — retired keys (each rejection names the key)", () => {
+  test.each(fx.RETIRED_KEY_FIXTURES)(
+    "rejects the retired '$key' key naming it",
+    ({ key, body }) => {
+      let caught: unknown;
+      try {
+        loadMatrixV2(writeMatrix(body));
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(MatrixConfigError);
+      expect((caught as MatrixConfigError).state).toBe("schema-invalid");
+      expect((caught as Error).message).toContain(`'${key}:'`);
+    },
+  );
+});
+
+describe("v2 loader — four-state failure taxonomy", () => {
+  test("absent → typed error naming the path + the copy-the-example fix", () => {
+    const missing = join(tmpDir, "nope.yaml");
+    let caught: unknown;
+    try {
+      loadMatrixV2(missing);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(MatrixConfigError);
+    const err = caught as MatrixConfigError;
+    expect(err.state).toBe("absent");
+    expect(err.configPath).toBe(missing);
+    expect(err.message).toContain(missing);
+    expect(err.message).toContain("docs/examples/matrix.example.yaml");
+  });
+
+  test("unparseable → typed error", () => {
+    expect(() => loadMatrixV2(writeMatrix(fx.UNPARSEABLE))).toThrow(
+      MatrixConfigError,
+    );
+    try {
+      loadMatrixV2(writeMatrix(fx.UNPARSEABLE));
+    } catch (e) {
+      expect((e as MatrixConfigError).state).toBe("unparseable");
+    }
+  });
+
+  test("valid-but-empty → typed error distinct from absent", () => {
+    try {
+      loadMatrixV2(writeMatrix(fx.VALID_BUT_EMPTY));
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MatrixConfigError);
+      expect((e as MatrixConfigError).state).toBe("valid-but-empty");
+    }
+  });
+
+  test("schema-invalid → typed error naming the fix", () => {
+    try {
+      loadMatrixV2(writeMatrix(fx.SCHEMA_INVALID));
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MatrixConfigError);
+      expect((e as MatrixConfigError).state).toBe("schema-invalid");
+      expect((e as Error).message).toContain(
+        "docs/examples/matrix.example.yaml",
+      );
+    }
+  });
+
+  test("the four states are four DISTINCT discriminants", () => {
+    const states = new Set<string>();
+    for (const [path] of [
+      [join(tmpDir, "gone.yaml")],
+      [writeMatrix(fx.UNPARSEABLE)],
+      [writeMatrix(fx.VALID_BUT_EMPTY)],
+      [writeMatrix(fx.SCHEMA_INVALID)],
+    ] as const) {
+      try {
+        loadMatrixV2(path);
+      } catch (e) {
+        states.add((e as MatrixConfigError).state);
+      }
+    }
+    expect(states).toEqual(
+      new Set(["absent", "unparseable", "valid-but-empty", "schema-invalid"]),
+    );
+  });
+});
+
+describe("v2 loader — dedup, shadow, and launch-only enumeration", () => {
+  test("a same-provider basename collision errors at load", () => {
+    expect(() => loadMatrixV2(writeMatrix(fx.SAME_PROVIDER_COLLISION))).toThrow(
+      /same-provider duplicate/,
+    );
+  });
+
+  test("a cross-provider duplicate resolves to the first provider; the loser is shadowed", () => {
+    const m = loadMatrixV2(writeMatrix(fx.CROSS_PROVIDER_DEDUP));
+    // codex (roster-first) owns gpt-5.5's effort list; pi's slashed entry shadows.
+    expect(m.effortsByModel.get("gpt-5.5")).toEqual(["high"]);
+    expect(m.shadowed).toEqual([
+      {
+        provider: "pi",
+        capability: "gpt-5.5",
+        launchId: "openai/gpt-5.5",
+        winner: "codex",
+      },
+    ]);
+  });
+
+  test("a subagent_models entry no provider serves errors at load", () => {
+    expect(() => loadMatrixV2(writeMatrix(fx.SUBAGENT_MODEL_UNSERVED))).toThrow(
+      /served by no provider/,
+    );
+  });
+
+  test("a provider model absent from subagent_models loads as launch-only enumeration", () => {
+    const m = loadMatrixV2(writeMatrix(fx.LAUNCH_ONLY));
+    // gpt-5.5 is a cell; gpt-5.5-preview enumerates (resolves an effort list) but
+    // never forms a cell.
+    expect(m.subagentModels).toEqual(["gpt-5.5"]);
+    expect(m.effortsByModel.has("gpt-5.5-preview")).toBe(true);
+    expect(matrixV2Cells(m).map((c) => c.model)).toEqual(["gpt-5.5"]);
+    expect(
+      m.providers
+        .find((p) => p.name === "codex")
+        ?.models.get("gpt-5.5-preview"),
+    ).toBe("gpt-5.5-preview");
+  });
+});
+
+describe("committed example matrix (anti-rot, v2)", () => {
   // The example lives at docs/examples/matrix.example.yaml — outside every
-  // discovered config path — and is loaded here by explicit path only, through
-  // the SAME real loadMatrix a host `~/.config/keeper/matrix.yaml` would go
-  // through, so a behavior-changing edit to the example fails this test loud.
+  // discovered config path — and is loaded here by explicit path through the SAME
+  // real v2 loaders a host `~/.config/keeper/matrix.yaml` would, so a
+  // behavior-changing edit to the example fails this test loud.
   const EXAMPLE_PATH = join(
     import.meta.dir,
     "..",
@@ -859,50 +1087,40 @@ describe("committed example matrix (anti-rot)", () => {
     "matrix.example.yaml",
   );
 
-  test("parses with the real loader and resolves the codex/spark activation", () => {
-    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
-    expect(m).not.toBeNull();
-    expect(driverFor(m, "gpt-5.3-codex-spark")).toBe("wrapped");
-    expect(resolveModel(m, "gpt-5.3-codex-spark")).toEqual({
-      driver: "wrapped",
-      candidates: [
-        {
-          harness: "codex",
-          model_id: "gpt-5.3-codex-spark",
-          preset_name: "codex-gpt-5.3-codex-spark",
-        },
-      ],
-    });
-  });
-
-  test("claude models stay native", () => {
-    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
-    expect(driverFor(m, "opus")).toBe("native");
-    expect(driverFor(m, "sonnet")).toBe("native");
-  });
-
-  test("the codex provider-level effort override drives the spark effort list", () => {
-    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
-    // spark inherits codex's provider-level override [high, xhigh], not the
-    // top-level axis [medium, high]; opus (claude) inherits the top-level axis.
-    expect(effortsFor(m, "gpt-5.3-codex-spark")).toEqual(["high", "xhigh"]);
-    expect(effortsFor(m, "opus")).toEqual(["medium", "high"]);
-  });
-
-  test("the route:false pi provider is launch-only: enumerable, but no cell and no route", () => {
-    const m = loadMatrix(EXAMPLE_PATH) as Matrix;
-    const preview = "gpt-5.3-spark-preview";
-    // Present in the parsed matrix for enumeration...
-    const pi = m.providers.find((p) => p.name === "pi");
-    expect(pi?.route).toBe(false);
-    expect(pi?.models.get(preview)).toBe("pi/gpt-5.3-spark-preview");
-    // ...but excluded from the capability cell set and the pecking order.
-    expect(cellSet(m).map((c) => c.model)).toEqual([
-      "opus",
-      "sonnet",
-      "gpt-5.3-codex-spark",
+  test("the launcher loader parses the example: bare, {id, efforts}, and provider-qualified forms", () => {
+    const m = loadMatrixV2(EXAMPLE_PATH);
+    // bare launch-id (codex) → capability = the whole id
+    expect(
+      m.providers
+        .find((p) => p.name === "codex")
+        ?.models.get("gpt-5.3-codex-spark"),
+    ).toBe("gpt-5.3-codex-spark");
+    // provider-qualified launch-id (pi) → capability = basename (shadowed by codex)
+    expect(
+      m.providers
+        .find((p) => p.name === "pi")
+        ?.models.get("gpt-5.3-codex-spark"),
+    ).toBe("openai-codex/gpt-5.3-codex-spark");
+    // {id, efforts} band (pi) → launch-only capability with its own effort list
+    expect(m.effortsByModel.get("gpt-5.3-spark-preview")).toEqual(["medium"]);
+    // driver-tagged cell axis
+    expect(matrixV2Cells(m)).toEqual([
+      { model: "opus", driver: "native" },
+      { model: "sonnet", driver: "native" },
+      { model: "gpt-5.3-codex-spark", driver: "wrapped" },
     ]);
-    expect(providerOrderFor(m, preview)).toEqual([]);
+    expect(matrixV2EffortsFor(m, "gpt-5.3-codex-spark")).toEqual([
+      "high",
+      "xhigh",
+    ]);
+    expect(m.shadowed).toEqual([
+      {
+        provider: "pi",
+        capability: "gpt-5.3-codex-spark",
+        launchId: "openai-codex/gpt-5.3-codex-spark",
+        winner: "codex",
+      },
+    ]);
   });
 });
 

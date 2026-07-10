@@ -553,3 +553,436 @@ export function effectiveMatrix(): EffectiveMatrix {
 export function effectiveMatrixFromDisk(path: string): EffectiveMatrix {
   return composeEffective(loadSubagentsMatrixFromDisk(path));
 }
+
+// ── v2 loader (ADR 0036) ─────────────────────────────────────────────────────
+//
+// The plan island's OWN small parser of the v2 matrix.yaml the launcher island
+// owns — extracting only what a plan consumer needs (the effort axis, the cell
+// axis with each cell's driver, the template inventory, the wrapper driver, the
+// per-cell effort lists, the dedup shadow log), pinned byte-for-byte against the
+// launcher island's twin (`src/agent/matrix.ts` `loadMatrixV2`) by the cross-island
+// parity test. A provider model entry is the launch id verbatim; the capability is
+// its basename. Absence/malformedness is a typed four-state loud error.
+//
+// ADDITIVE this task: the v1 `loadHostMatrix` + `composeEffective` base path stay
+// unchanged so the plan verbs and renderer keep working until their cutover tasks.
+
+/** The four discriminated matrix-load failure states — mirrors the launcher
+ *  island's `MatrixConfigState`. */
+export type MatrixConfigState =
+  | "absent"
+  | "unparseable"
+  | "schema-invalid"
+  | "valid-but-empty";
+
+/** The remediation every four-state error carries. */
+export const MATRIX_EXAMPLE_PATH = "docs/examples/matrix.example.yaml";
+
+/** A typed, four-state matrix-load failure. Extends {@link SubagentsConfigError}
+ *  (the plan island's existing typed error) so an `instanceof` catch still
+ *  catches it; `state` discriminates the four cases, `label` names the path. */
+export class HostMatrixConfigError extends SubagentsConfigError {
+  readonly state: MatrixConfigState;
+  constructor(state: MatrixConfigState, path: string, detail: string) {
+    super(
+      `${detail} (looked at ${path}). ` +
+        `Copy ${MATRIX_EXAMPLE_PATH} to ${path} and edit it.`,
+      path,
+    );
+    this.name = "HostMatrixConfigError";
+    this.state = state;
+  }
+}
+
+/** One cross-provider dedup shadow (mirrors the launcher island's `MatrixShadow`). */
+export interface HostMatrixShadow {
+  provider: string;
+  capability: string;
+  launchId: string;
+  winner: string;
+}
+
+/** The v2 subset a plan consumer needs. `models` IS `subagent_models` (the cell
+ *  axis); `effortsByModel` covers EVERY capability any provider serves. */
+export interface HostMatrixV2 {
+  efforts: string[];
+  subagentTemplates: string[];
+  models: string[];
+  wrapper_driver: { model: string; effort: string };
+  driverByModel: Map<string, Driver>;
+  effortsByModel: Map<string, string[]>;
+  shadowed: HostMatrixShadow[];
+}
+
+const ALLOWED_V2_KEYS: ReadonlySet<string> = new Set([
+  "efforts",
+  "subagent_templates",
+  "subagent_models",
+  "providers",
+  "wrapper_driver",
+  "defaults",
+]);
+
+/** The capability token of a launch id: the segment after the LAST `/`, else the
+ *  whole id. Safe by construction (the launch id validates as a slash-joined
+ *  strict-token target, so its last segment is a strict token). */
+export function capabilityOf(launchId: string): string {
+  const slash = launchId.lastIndexOf("/");
+  return slash === -1 ? launchId : launchId.slice(slash + 1);
+}
+
+/** A `subagent_templates` entry: a non-empty RELATIVE path, no `..` segment, no
+ *  NUL — the traversal guard replacing the retired `render_to:` check. */
+export function isValidTemplatePath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+  if (value.includes("\0") || value.startsWith("/")) {
+    return false;
+  }
+  return !value.split("/").includes("..");
+}
+
+/** Load + validate the v2 host matrix, or throw a typed four-state
+ * {@link HostMatrixConfigError}. Never returns null — v2 has no silent fallback.
+ * Mirrors the launcher island's `loadMatrixV2` under the parity test. */
+export function loadHostMatrixV2(
+  path: string = hostMatrixPath(),
+): HostMatrixV2 {
+  try {
+    if (!statSync(path).isFile()) {
+      throw new HostMatrixConfigError("absent", path, "no matrix.yaml found");
+    }
+  } catch (err) {
+    if (err instanceof HostMatrixConfigError) {
+      throw err;
+    }
+    throw new HostMatrixConfigError("absent", path, "no matrix.yaml found");
+  }
+  let raw: Buffer;
+  try {
+    raw = readFileSync(path);
+  } catch (err) {
+    throw new HostMatrixConfigError(
+      "unparseable",
+      path,
+      `matrix.yaml could not be read: ${(err as Error).message}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYamlInput(raw, path);
+  } catch (err) {
+    throw new HostMatrixConfigError(
+      "unparseable",
+      path,
+      `matrix.yaml is not valid YAML: ${(err as Error).message}`,
+    );
+  }
+  if (parsed === null || parsed === undefined) {
+    throw new HostMatrixConfigError(
+      "valid-but-empty",
+      path,
+      "matrix.yaml is empty",
+    );
+  }
+  try {
+    return parseHostMatrixV2(parsed, path);
+  } catch (err) {
+    if (err instanceof HostMatrixConfigError) {
+      throw err;
+    }
+    if (err instanceof SubagentsConfigError) {
+      throw new HostMatrixConfigError("schema-invalid", path, err.message);
+    }
+    throw err;
+  }
+}
+
+function parseHostMatrixV2(parsed: unknown, label: string): HostMatrixV2 {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new SubagentsConfigError("matrix.yaml must be a mapping", label);
+  }
+  const doc = parsed as Record<string, unknown>;
+  for (const key of Object.keys(doc)) {
+    if (key === "subagents") {
+      throw new SubagentsConfigError(
+        "the 'subagents:' key is retired — use 'subagent_templates:' (the cell-template inventory) and 'subagent_models:' (worker-cell eligibility)",
+        label,
+      );
+    }
+    if (!ALLOWED_V2_KEYS.has(key)) {
+      throw new SubagentsConfigError(
+        `unknown top-level key '${key}' (allowed: ${[...ALLOWED_V2_KEYS].join(", ")})`,
+        label,
+      );
+    }
+  }
+  const efforts = coerceEffortList(doc.efforts, "efforts", label);
+  const subagentTemplates = coerceTemplateList(doc.subagent_templates, label);
+  const { effortsByModel, servedBy, claudeServes, shadowed } =
+    coerceV2Providers(doc.providers, efforts, label);
+  const models = coerceSubagentModels(doc.subagent_models, servedBy, label);
+  const driverByModel = new Map<string, Driver>();
+  for (const cap of models) {
+    driverByModel.set(cap, claudeServes.has(cap) ? "native" : "wrapped");
+  }
+  return {
+    efforts,
+    subagentTemplates,
+    models,
+    wrapper_driver: coerceWrapperDriver(doc.wrapper_driver, label),
+    driverByModel,
+    effortsByModel,
+    shadowed,
+  };
+}
+
+function coerceTemplateList(raw: unknown, label: string): string[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new SubagentsConfigError(
+      "host matrix `subagent_templates` must be a non-empty list",
+      label,
+    );
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (!isValidTemplatePath(entry)) {
+      throw new SubagentsConfigError(
+        `host matrix \`subagent_templates\` entry ${JSON.stringify(entry)} must be a non-empty relative path with no '..' segment and no NUL`,
+        label,
+      );
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
+function coerceV2Providers(
+  raw: unknown,
+  baseEfforts: string[],
+  label: string,
+): {
+  effortsByModel: Map<string, string[]>;
+  servedBy: Map<string, string>;
+  claudeServes: Set<string>;
+  shadowed: HostMatrixShadow[];
+} {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new SubagentsConfigError(
+      "host matrix `providers` must be a non-empty list",
+      label,
+    );
+  }
+  const effortsByModel = new Map<string, string[]>();
+  const servedBy = new Map<string, string>();
+  // claudeServes tracks capabilities the claude provider serves → native.
+  const claudeServes = new Set<string>();
+  const shadowed: HostMatrixShadow[] = [];
+  const seenProvider = new Set<string>();
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new SubagentsConfigError(
+        "each host matrix provider must be a {name, models} mapping",
+        label,
+      );
+    }
+    const rec = entry as Record<string, unknown>;
+    for (const k of Object.keys(rec)) {
+      if (k === "route") {
+        throw new SubagentsConfigError(
+          "the 'route:' flag is retired — launch-only enumeration falls out of a capability's absence from 'subagent_models', not a per-provider flag",
+          label,
+        );
+      }
+      if (k !== "name" && k !== "models" && k !== "efforts") {
+        throw new SubagentsConfigError(
+          `host matrix provider has unknown key '${k}' (allowed: name, models, efforts)`,
+          label,
+        );
+      }
+    }
+    if (!isMatrixToken(rec.name)) {
+      throw new SubagentsConfigError(
+        "host matrix provider `name` must be a valid token",
+        label,
+      );
+    }
+    const name = rec.name;
+    if (seenProvider.has(name)) {
+      throw new SubagentsConfigError(
+        `host matrix provider '${name}' is listed more than once`,
+        label,
+      );
+    }
+    seenProvider.add(name);
+    const providerEfforts =
+      rec.efforts === undefined
+        ? undefined
+        : coerceEffortList(rec.efforts, `provider '${name}' efforts`, label);
+    const caps = coerceV2ProviderModels(rec.models, name, label);
+    for (const cap of caps.keys()) {
+      if (name === "claude") {
+        claudeServes.add(cap);
+      }
+      if (!servedBy.has(cap)) {
+        servedBy.set(cap, name);
+        effortsByModel.set(
+          cap,
+          caps.get(cap) ?? providerEfforts ?? baseEfforts,
+        );
+      } else {
+        shadowed.push({
+          provider: name,
+          capability: cap,
+          launchId: caps.launchId(cap),
+          winner: servedBy.get(cap) as string,
+        });
+      }
+    }
+  }
+  return { effortsByModel, servedBy, claudeServes, shadowed };
+}
+
+/** The capabilities one provider serves plus per-model effort overrides and launch
+ *  ids. Returned as an augmented Map with `.get(cap)` = per-model efforts (or
+ *  undefined) and `.launchId(cap)` = the entry's launch id. Each entry is a bare
+ *  launch id or `{id, efforts?}`; the retired `name:`/`native:` keys fail loud. */
+function coerceV2ProviderModels(
+  raw: unknown,
+  provider: string,
+  label: string,
+): Map<string, string[] | undefined> & { launchId(cap: string): string } {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new SubagentsConfigError(
+      `host matrix provider '${provider}' models must be a non-empty list`,
+      label,
+    );
+  }
+  const perModel = new Map<string, string[] | undefined>();
+  const launchIds = new Map<string, string>();
+  for (const item of raw) {
+    let launchId: string;
+    let perModelEfforts: string[] | undefined;
+    if (typeof item === "string") {
+      launchId = item;
+    } else if (
+      item !== null &&
+      typeof item === "object" &&
+      !Array.isArray(item)
+    ) {
+      const rec = item as Record<string, unknown>;
+      for (const k of Object.keys(rec)) {
+        if (k === "name") {
+          throw new SubagentsConfigError(
+            `host matrix provider '${provider}' model long form uses the retired 'name:' key — use 'id:' (the launch id; its capability is derived by basename)`,
+            label,
+          );
+        }
+        if (k === "native") {
+          throw new SubagentsConfigError(
+            `host matrix provider '${provider}' model long form uses the retired 'native:' key — the model entry IS the launch id verbatim; the capability is the basename`,
+            label,
+          );
+        }
+        if (k !== "id" && k !== "efforts") {
+          throw new SubagentsConfigError(
+            `host matrix provider '${provider}' model long form has unknown key '${k}' (allowed: id, efforts)`,
+            label,
+          );
+        }
+      }
+      if (typeof rec.id !== "string") {
+        throw new SubagentsConfigError(
+          `host matrix provider '${provider}' model long form 'id' must be a string`,
+          label,
+        );
+      }
+      launchId = rec.id;
+      if (rec.efforts !== undefined) {
+        perModelEfforts = coerceEffortList(
+          rec.efforts,
+          `provider '${provider}' model '${launchId}' efforts`,
+          label,
+        );
+      }
+    } else {
+      throw new SubagentsConfigError(
+        `host matrix provider '${provider}' model entry must be a bare launch-id string or the long form {id, efforts?}`,
+        label,
+      );
+    }
+    if (!isMatrixAliasTarget(launchId)) {
+      throw new SubagentsConfigError(
+        `host matrix provider '${provider}' launch id '${launchId}' must be '/'-joined [a-z0-9._-] segments (no leading dot, no empty segment)`,
+        label,
+      );
+    }
+    const capability = capabilityOf(launchId);
+    if (!isMatrixToken(capability)) {
+      throw new SubagentsConfigError(
+        `host matrix provider '${provider}' launch id '${launchId}' derives an invalid capability token '${capability}'`,
+        label,
+      );
+    }
+    if (launchIds.has(capability)) {
+      throw new SubagentsConfigError(
+        `host matrix provider '${provider}' derives capability '${capability}' from more than one launch id (same-provider duplicate — a typo)`,
+        label,
+      );
+    }
+    perModel.set(capability, perModelEfforts);
+    launchIds.set(capability, launchId);
+  }
+  return Object.assign(perModel, {
+    launchId: (cap: string): string => launchIds.get(cap) as string,
+  });
+}
+
+function coerceSubagentModels(
+  raw: unknown,
+  servedBy: Map<string, string>,
+  label: string,
+): string[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new SubagentsConfigError(
+      "host matrix `subagent_models` must be a non-empty list",
+      label,
+    );
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!isMatrixToken(item)) {
+      throw new SubagentsConfigError(
+        `host matrix \`subagent_models\` entries must be tokens matching [a-z0-9._-] with no leading dot (got ${JSON.stringify(item)})`,
+        label,
+      );
+    }
+    if (seen.has(item)) {
+      throw new SubagentsConfigError(
+        `host matrix \`subagent_models\` lists '${item}' more than once`,
+        label,
+      );
+    }
+    if (!servedBy.has(item)) {
+      throw new SubagentsConfigError(
+        `host matrix \`subagent_models\` entry '${item}' is served by no provider — add a provider whose launch id derives that capability`,
+        label,
+      );
+    }
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
+/** The effective effort list for a capability under the v2 host matrix — the
+ * resolved per-capability list, else the top-level axis. Mirrors the launcher
+ * island's `matrixV2EffortsFor`. */
+export function hostMatrixV2EffortsFor(
+  host: HostMatrixV2,
+  model: string,
+): string[] {
+  return [...(host.effortsByModel.get(model) ?? host.efforts)];
+}
