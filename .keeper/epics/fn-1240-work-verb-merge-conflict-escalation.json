@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-10T17:34:28.799000Z",
+  "depends_on_epics": [],
+  "id": "fn-1240-work-verb-merge-conflict-escalation",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Work verb merge conflict escalation",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-10T17:34:28.799000Z"
+}

@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-10T17:34:28.799000Z",
+  "depends_on": [
+    "fn-1240-work-verb-merge-conflict-escalation.2"
+  ],
+  "epic": "fn-1240-work-verb-merge-conflict-escalation",
+  "id": "fn-1240-work-verb-merge-conflict-escalation.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Lane-scoped autonomous resolver and deconflict escalation",
+  "updated_at": "2026-07-10T17:34:28.799000Z"
+}
