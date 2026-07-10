@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 21
+      },
+      "done_summary": "Added a main()-level pi passthrough test in test/agent-pi.test.ts asserting ensurePiStateSharingFn runs exactly once, fed the empty-profile-list arm, mirroring codex's symmetric passthrough guard test.",
+      "input_hash": "4f5bfc43a30136401f1faf2a94edbb600c4187e1328d2d6f909d739ad27841bd",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1321,
+      "spec_md": "## Description\n\nFinding F1 (Consider, Axis 1). Evidence path: at ac9f4876,\nsrc/agent/main.ts:2719-2726 wires the pi branch as\nensurePiStateSharingFn(shouldPassthrough ? () => [] : deps.listProfilesFn, actionLog)\nso the canonical pi AGENTS.md leaf materializes on passthrough\nlaunches, fed an empty profile list. The codex sibling has a\nmain()-level passthrough test (test/agent-codex.test.ts:284,\n\"the canonical AGENTS.md leaf-guard fn runs on a passthrough launch\",\nasserting codexStateSharingCalls toHaveLength 1), but\ntest/agent-pi.test.ts has no equivalent \u2014 line 246 only unit-tests\nthe leaf function directly and the passthrough block (154-244) never\nasserts the guard reaches passthrough through main().\n\nFiles:\n- test/agent-pi.test.ts (add the assertion; mirror the codex passthrough test's harness shape)\n\n## Acceptance\n\n- [ ] A test drives a passthrough pi launch through main() and asserts ensurePiStateSharingFn is invoked exactly once\n- [ ] The test asserts the fn is fed an empty profile list on passthrough (the () => [] arm), so a re-gate behind !shouldPassthrough fails it\n\n## Done summary\nAdded a main()-level pi passthrough test in test/agent-pi.test.ts asserting ensurePiStateSharingFn runs exactly once, fed the empty-profile-list arm, mirroring codex's symmetric passthrough guard test.\n## Evidence\n",
+      "task_id": "fn-1236-cover-pi-passthrough-leaf-guard-wiring.1",
+      "tier": "medium",
+      "title": "Test pi passthrough state-sharing"
+    }
+  ],
+  "created_at": "2026-07-10T10:10:04.737000Z",
+  "epic_id": "fn-1236-cover-pi-passthrough-leaf-guard-wiring",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
+  "selection_input_hash": "4f5bfc43a30136401f1faf2a94edbb600c4187e1328d2d6f909d739ad27841bd",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
