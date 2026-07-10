@@ -31,5 +31,5 @@ No runtime behavior changes; documentation and comments only.
 - [ ] `bun test` stays green
 
 ## Done summary
-
+Fixed SKILL.md --resume doc drift (no longer claims --session is rejected or that --name should be passed on a resumed launch) and dropped the bare fn-1232 fn-id from resume-policy.ts and its test doc-comments, keeping the ADR 0034 pointer.
 ## Evidence

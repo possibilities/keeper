@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "low",
   "title": "Fix resume doc drift and fn-id comments",
-  "updated_at": "2026-07-10T09:16:17.968000Z"
+  "updated_at": "2026-07-10T09:27:57.056000Z",
+  "worker_done_at": "2026-07-10T09:27:57.056000Z"
 }
