@@ -47,5 +47,5 @@ documented command once and recording the output in Evidence.
 - [ ] No history narration or plan-id references appear in the doc
 
 ## Done summary
-
+Reworked plugins/keeper/skills/pair/SKILL.md to document both resume shapes (agent resume verb, agent run --resume) with runnable examples verified against the landed CLI, name resolution semantics, and name-your-partners guidance; frontmatter now advertises resume.
 ## Evidence
