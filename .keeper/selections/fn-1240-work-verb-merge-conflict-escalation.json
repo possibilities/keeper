@@ -6,48 +6,24 @@
   },
   "cells": [
     {
-      "confidence": 0.8,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Hard-to-pin producer trace plus the load-bearing classification verdict and design-decision ADR that gates the whole epic is intelligence-bound investigation and design.",
-      "task_id": "fn-1240-work-verb-merge-conflict-escalation.1",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.78,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Contract-touching router divert (new union variant, exhaustiveness, re-fold-deterministic notify fold) with a subtle page-once correctness invariant and an over-broad-divert reclassification risk.",
-      "task_id": "fn-1240-work-verb-merge-conflict-escalation.2",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.77,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "New autonomous resolver chain with subtle concurrency and correctness invariants \u2014 TTL/lease reclaim, human-retry-vs-resolver race, session-dedup collision, green-gating \u2014 where a wrong abstraction propagates.",
-      "task_id": "fn-1240-work-verb-merge-conflict-escalation.3",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.8,
+      "confidence": 0.82,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "Multi-file forward-facing docs reconciliation following the ADR \u2014 needs consolidation judgment to stay lint-green but is well-specified, not intelligence-bound.",
+      "rationale": "Docs/glossary consolidation demands Claude-tuned wording and in-repo idiom matching (prune-not-append, disambiguate glossary entries) across a few files, fitting sonnet at the default high band with no intelligence-bound reason for opus.",
       "task_id": "fn-1240-work-verb-merge-conflict-escalation.4",
       "tier": "high"
     }
   ],
-  "config_hash": "4db070bcc5784045ec7df920039f107b5bccc03482958015fc094087a39fc892",
-  "created_at": "2026-07-10T17:35:38.254000Z",
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T21:31:27.641000Z",
   "epic_id": "fn-1240-work-verb-merge-conflict-escalation",
-  "input_hash": "9b83bee13470130b93b357597ae04ce4a12c637d05d461e2261a9bdcd1e2d682",
+  "input_hash": "8d10c48247cfc30b0c90e5af12ad9bca8d7abbc7c99f929195e1cc67628319b7",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 2609102561,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1240-work-verb-merge-conflict-escalation.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Hard-to-pin producer trace plus the load-bearing classification verdict and design-decision ADR that gates the whole epic is intelligence-bound investigation and design.\",\"confidence\":0.8},{\"task_id\":\"fn-1240-work-verb-merge-conflict-escalation.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-touching router divert (new union variant, exhaustiveness, re-fold-deterministic notify fold) with a subtle page-once correctness invariant and an over-broad-divert reclassification risk.\",\"confidence\":0.78},{\"task_id\":\"fn-1240-work-verb-merge-conflict-escalation.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"New autonomous resolver chain with subtle concurrency and correctness invariants \u2014 TTL/lease reclaim, human-retry-vs-resolver race, session-dedup collision, green-gating \u2014 where a wrong abstraction propagates.\",\"confidence\":0.77},{\"task_id\":\"fn-1240-work-verb-merge-conflict-escalation.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Multi-file forward-facing docs reconciliation following the ADR \u2014 needs consolidation judgment to stay lint-green but is well-specified, not intelligence-bound.\",\"confidence\":0.8}]}\n"
+  "shuffle_seed": 2366686338,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1240-work-verb-merge-conflict-escalation.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Docs/glossary consolidation demands Claude-tuned wording and in-repo idiom matching (prune-not-append, disambiguate glossary entries) across a few files, fitting sonnet at the default high band with no intelligence-bound reason for opus.\",\"confidence\":0.82}]}"
 }
