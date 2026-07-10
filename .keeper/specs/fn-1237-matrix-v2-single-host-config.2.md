@@ -74,5 +74,5 @@ dispatch-cli.test.ts, and wrapped-cell-e2e.slow.test.ts pass against the reshape
 - [ ] keeper agent provider resolution with no matrix present emits the typed loud error instead of a claude-native fallback candidate
 
 ## Done summary
-
+Daemon dispatch cut over to the injected v2 host-matrix snapshot: the autopilot producer loads matrix.yaml once per cycle into a four-state discriminated field, the pure reconcile core composes cells from the injected axes via the fs-free worker_cells leaf (subagents_config dropped, import-closure test green unmodified), a bad matrix parks cell-bearing work dispatches behind a worker-cell-bad-matrix distress sticky (no daemon exit), the route probe + no-route retire, and keeper agent providers-resolve with no matrix emits the typed loud error.
 ## Evidence
