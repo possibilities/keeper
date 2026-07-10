@@ -27,6 +27,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCodexHome } from "../codex-trust";
 
 /** Raised for fail-loud state errors; main() prints `Error: <msg>` + exit 1. */
 export class StateError extends Error {}
@@ -50,6 +51,24 @@ export function defaultClaudeStowDir(): string {
     // Partial checkout: fall back to the unresolved absolute path rather than
     // throwing on a pure path computation. The guard's `!existsSync` fail-open
     // handles the missing-source case at enforce time.
+    return dir;
+  }
+}
+
+/**
+ * Resolve keeper's `system/shared` source dir — the home of the ONE real
+ * `AGENTS.md` every harness's global-instruction leaf links back to. Mirrors
+ * `defaultClaudeStowDir`: derived from this module's own path and symlink-resolved
+ * to a stable absolute target so the guard's relative links never churn across
+ * launches (the doc leaves MUST source from this REAL file, never a symlink, or
+ * `readlink` would drift). Falls back to the unresolved path on a partial checkout.
+ */
+export function defaultSharedStowDir(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dir = resolve(here, "..", "..", "system", "shared");
+  try {
+    return realpathSync(dir);
+  } catch {
     return dir;
   }
 }
@@ -102,7 +121,7 @@ export const DEFAULT_PI_SHARED_PATHS: readonly string[] = [
   "themes",
   "extensions",
   "tools",
-  "SYSTEM.md",
+  "AGENTS.md",
   "APPEND_SYSTEM.md",
   "npm",
   "git",
@@ -524,13 +543,15 @@ export function ensureKeeperAgentPiProfileDir(
   profileName: string,
   actionLog: string[] | null,
   homeDir: string = homedir(),
+  sharedStowDir: string | null = null,
+  env: NodeJS.ProcessEnv = process.env,
 ): [string, boolean] {
   assertProfileDirNameAllowed(profileName);
   const canonicalDir = join(homeDir, ".pi", "agent");
   const profileDir = join(homeDir, ".pi-profiles", profileName);
   let changed = false;
 
-  ensurePiCanonicalRoot(canonicalDir);
+  ensurePiCanonicalRoot(canonicalDir, sharedStowDir, actionLog, env);
 
   if ((pathExists(profileDir) || isSymlink(profileDir)) && !isDir(profileDir)) {
     throw new StateError(`Pi profile path is not a directory: ${profileDir}`);
@@ -549,9 +570,26 @@ export function ensureKeeperAgentPiProfileDir(
   return [profileDir, changed];
 }
 
-function ensurePiCanonicalRoot(canonicalDir: string): void {
+function ensurePiCanonicalRoot(
+  canonicalDir: string,
+  sharedStowDir: string | null,
+  actionLog: string[] | null,
+  env: NodeJS.ProcessEnv,
+): void {
   mkdirSync(canonicalDir, { recursive: true });
   mkdirSync(join(canonicalDir, "sessions"), { recursive: true });
+  // Materialize the canonical AGENTS.md leaf BEFORE any profile loop runs — the
+  // per-profile shared-link loop skips a canonical path that does not yet exist,
+  // so a late materialization would drop AGENTS.md for every profile. Null shared
+  // dir disables it (test-only fail-open); production resolves a real path via
+  // `defaultSharedStowDir()`.
+  if (sharedStowDir !== null) {
+    ensureCanonicalStowLinks(
+      piCanonicalStowLeaves(sharedStowDir, canonicalDir),
+      actionLog,
+      env,
+    );
+  }
 }
 
 function ensurePiProfileSharedLinks(
@@ -615,12 +653,90 @@ function normalizeProfile(profileName: string): string {
   return normalized === "default" ? "" : normalized;
 }
 
+/** How a canonical leaf's regular-file clobber is compared to its stow source:
+ *  `json` is whitespace/key-order-insensitive (settings.json); `bytes` is exact. */
+export type LeafCompare = "json" | "bytes";
+
+/** What the guard does when a leaf's regular-file clobber diverges from its source:
+ *  `error` hard-throws (keeper-owned leaves); `warn` leaves the live file in place
+ *  and logs (human-owned global-instruction leaves — codex/pi). */
+export type LeafDivergence = "error" | "warn";
+
 /**
- * The canonical stow-owned leaves the launch guard re-asserts. HARDCODED — NOT
- * derived from DEFAULT_SHARED_PATHS, which includes the gitignored
- * `settings.local.json` (per-machine overrides the stow package does not own).
+ * One canonical global-instruction leaf the launch guard re-asserts: a symlink at
+ * `linkPath` that must resolve to the real stow `source`. Generalizes the former
+ * claude-only `[settings.json, CLAUDE.md]` pair into a per-harness table so codex's
+ * `AGENTS.md` and pi's canonical `AGENTS.md` re-link to keeper's one shared source
+ * on every launch too. `compare` picks the clobber-equality test; `onDivergence`
+ * picks the hard-error vs warn-and-respect split (a wrong-TARGET symlink is always
+ * repaired regardless — that repair is the codex/pi cutover onto keeper).
  */
-const CANONICAL_STOW_LEAVES: readonly string[] = ["settings.json", "CLAUDE.md"];
+export interface CanonicalStowLeaf {
+  source: string;
+  linkPath: string;
+  compare: LeafCompare;
+  onDivergence: LeafDivergence;
+}
+
+/** The claude leaves: `settings.json` (json-compared, hard-error, sourced from the
+ *  claude stow dir) + `CLAUDE.md` sourced from the ONE shared `AGENTS.md` (byte-
+ *  compared, hard-error). Both keeper-owned, so a divergent clobber is fail-loud. */
+function claudeStowLeaves(
+  claudeStowDir: string,
+  sharedStowDir: string,
+  homeDir: string,
+): CanonicalStowLeaf[] {
+  const claudeDir = join(homeDir, ".claude");
+  return [
+    {
+      source: join(claudeStowDir, "settings.json"),
+      linkPath: join(claudeDir, "settings.json"),
+      compare: "json",
+      onDivergence: "error",
+    },
+    {
+      source: join(sharedStowDir, "AGENTS.md"),
+      linkPath: join(claudeDir, "CLAUDE.md"),
+      compare: "bytes",
+      onDivergence: "error",
+    },
+  ];
+}
+
+/** The codex leaf: `<CODEX_HOME|~/.codex>/AGENTS.md` sourced from the shared file,
+ *  warn-and-respect (a human-edited codex AGENTS.md is never clobbered; only a
+ *  wrong-target symlink is repaired, which cuts codex over onto keeper). */
+function codexStowLeaves(
+  sharedStowDir: string,
+  homeDir: string,
+  env: NodeJS.ProcessEnv,
+): CanonicalStowLeaf[] {
+  return [
+    {
+      source: join(sharedStowDir, "AGENTS.md"),
+      linkPath: join(resolveCodexHome(env, homeDir), "AGENTS.md"),
+      compare: "bytes",
+      onDivergence: "warn",
+    },
+  ];
+}
+
+/** The pi canonical leaf: `<canonicalDir>/AGENTS.md` sourced from the shared file,
+ *  warn-and-respect. Materialized BEFORE the profile loop so per-profile AGENTS.md
+ *  links are not skipped by the canonical-absent guard in the loop. */
+function piCanonicalStowLeaves(
+  sharedStowDir: string,
+  canonicalDir: string,
+): CanonicalStowLeaf[] {
+  return [
+    {
+      source: join(sharedStowDir, "AGENTS.md"),
+      linkPath: join(canonicalDir, "AGENTS.md"),
+      compare: "bytes",
+      onDivergence: "warn",
+    },
+  ];
+}
 
 /** Whitespace-insensitive, key-order-independent JSON equality. */
 function jsonSemanticEqual(a: string, b: string): boolean {
@@ -687,41 +803,59 @@ function divergentClobberMessage(
 }
 
 /**
- * Re-assert the canonical stow-owned `~/.claude/{settings.json,CLAUDE.md}`
- * symlinks on every launch. Claude Code's atomic-rename settings write replaces
- * the relative stow symlink with a regular file; this guard force-restores the
- * relative link, hard-erroring only on a genuinely divergent clobber.
+ * Non-throwing sibling of `divergentClobberMessage` for a warn-and-respect leaf
+ * (codex / pi). Their global-instruction files are human-owned, so keeper never
+ * clobbers a divergent regular file and — critically — never THROWS: main() maps
+ * StateError → exit(1), so a throw here would abort a benign human-edited launch.
+ * A single WARNING line the caller pushes onto the action log.
+ */
+function divergentRespectMessage(linkPath: string, target: string): string {
+  return (
+    `WARNING: ${linkPath} is a regular file whose contents differ from the shared ` +
+    `source ${target}; leaving the live file in place (not re-linking). Remove it ` +
+    `to let keeper re-assert the shared link on the next launch.`
+  );
+}
+
+/**
+ * Re-assert every canonical global-instruction symlink in `leaves` on each launch —
+ * one keeper-owned `system/shared/AGENTS.md` behind claude's `~/.claude/CLAUDE.md`,
+ * codex's `AGENTS.md`, and pi's canonical `AGENTS.md` (plus claude's `settings.json`
+ * off the claude stow dir). An atomic-rename write (Claude Code) or a human edit can
+ * replace a relative symlink with a regular file; this guard force-restores the link.
  *
  * Per leaf (via lstat, so a clobber is never silently dereferenced):
- *   - correct symlink (resolves to the stow target) → no-op
- *   - symlink to the wrong target → repair + loud log
+ *   - correct symlink (resolves to the leaf's source) → no-op
+ *   - symlink to the wrong target → repair + loud log (the codex/pi cutover onto
+ *     keeper's shared source, for EVERY leaf regardless of `onDivergence`)
  *   - regular-file clobber, contents identical to the source → repair + loud log
- *     (settings.json compared key-order-independently; CLAUDE.md byte-compared)
- *   - regular-file clobber, divergent contents → throw StateError with recovery
+ *     (`compare: "json"` key-order-independent; `compare: "bytes"` exact)
+ *   - regular-file clobber, divergent contents → `onDivergence: "error"` throws
+ *     StateError with recovery; `"warn"` leaves the live file + logs a WARNING
  *   - link absent but source present → create the relative link
  *   - source file missing → skip + warn (nothing to enforce against)
  *
  * `KEEPER_AGENT_SKIP_LINK_GUARD` set → skip the whole guard with a loud warning.
- * Throws a typed StateError on divergence; main() owns the exit.
+ * Throws a typed StateError only for an `error` leaf on divergence; main() owns the
+ * exit. Leaves carry absolute `source`/`linkPath` (built by the per-harness leaf
+ * helpers), so this function is HOME-agnostic.
  */
 export function ensureCanonicalStowLinks(
-  claudeStowDir: string,
-  homeDir: string = homedir(),
+  leaves: readonly CanonicalStowLeaf[],
   actionLog: string[] | null = null,
   env: NodeJS.ProcessEnv = process.env,
 ): void {
   if (env.KEEPER_AGENT_SKIP_LINK_GUARD) {
     actionLog?.push(
       "WARNING: KEEPER_AGENT_SKIP_LINK_GUARD set — skipping the canonical stow " +
-        "link guard; ~/.claude/{settings.json,CLAUDE.md} are NOT re-asserted",
+        "link guard; harness global-instruction links are NOT re-asserted",
     );
     return;
   }
 
-  const claudeDir = join(homeDir, ".claude");
-  for (const leaf of CANONICAL_STOW_LEAVES) {
-    const target = join(claudeStowDir, leaf);
-    const linkPath = join(claudeDir, leaf);
+  for (const leaf of leaves) {
+    const target = leaf.source;
+    const { linkPath } = leaf;
     const relTarget = relative(dirname(linkPath), target);
 
     if (!existsSync(target)) {
@@ -750,17 +884,23 @@ export function ensureCanonicalStowLinks(
       continue;
     }
 
-    // Regular-file clobber: Claude replaced the symlink with a real file.
+    // Regular-file clobber: an atomic-rename write or a human edit replaced the
+    // symlink with a real file.
     const live = readFileSync(linkPath, "utf8");
     const source = readFileSync(target, "utf8");
     const identical =
-      leaf === "settings.json"
+      leaf.compare === "json"
         ? jsonSemanticEqual(live, source)
         : live === source;
     if (!identical) {
-      throw new StateError(
-        divergentClobberMessage(linkPath, target, relTarget),
-      );
+      if (leaf.onDivergence === "error") {
+        throw new StateError(
+          divergentClobberMessage(linkPath, target, relTarget),
+        );
+      }
+      // warn-and-respect: leave the human-owned file untouched, never throw.
+      actionLog?.push(divergentRespectMessage(linkPath, target));
+      continue;
     }
     relinkCanonical(linkPath, relTarget);
     actionLog?.push(
@@ -791,15 +931,17 @@ function relinkCanonical(linkPath: string, relTarget: string): void {
  * every configured non-default profile dir, plus the `~/.claude-profiles/
  * default/` silo's session-bearing-path links back to canonical. `listProfilesFn`
  * is injected (agentusage's `listProfiles`) so this stays testable without the
- * real catalog. `claudeStowDir` (keeper's `system/claude/.claude`, derived from
- * the module path) drives the launch-time canonical-link guard; null disables it
- * (test-only fail-open).
+ * real catalog. `claudeStowDir` (keeper's `system/claude/.claude`) drives the
+ * launch-time canonical-link guard and sources `settings.json`; `sharedStowDir`
+ * (keeper's `system/shared`) sources the `CLAUDE.md` leaf from the one shared
+ * `AGENTS.md`. A null `claudeStowDir` disables the guard (test-only fail-open).
  */
 export function ensureClaudeStateSharing(
   listProfilesFn: () => string[],
   actionLog: string[] | null = null,
   homeDir: string = homedir(),
   claudeStowDir: string | null = null,
+  sharedStowDir: string | null = null,
 ): void {
   const profileNames = configuredNonDefaultProfiles(safeList(listProfilesFn));
   const sharedPaths = [...DEFAULT_SHARED_PATHS];
@@ -807,17 +949,22 @@ export function ensureClaudeStateSharing(
   const canonicalDir = join(homeDir, ".claude");
   mkdirSync(canonicalDir, { recursive: true });
 
-  // Keeper's `system/claude/.claude/` owns `~/.claude/{settings.json,CLAUDE.md}`
-  // as relative symlinks into the repo. This guard re-asserts those canonical
-  // links on every launch (Claude's atomic-rename settings write clobbers them
-  // into regular files) BEFORE the profile farm links through them, and
-  // hard-errors on a genuinely divergent clobber. `settings.json`/`CLAUDE.md`
-  // also appear in DEFAULT_SHARED_PATHS, so each profile links them through this
-  // freshly-correct canonical node like every other shared path. A null
-  // `claudeStowDir` disables the guard — test-only fail-open; production always
-  // resolves a real path via `defaultClaudeStowDir()`.
+  // Keeper owns `~/.claude/settings.json` (off `system/claude/.claude`) and
+  // `~/.claude/CLAUDE.md` (off the shared `system/shared/AGENTS.md`) as relative
+  // symlinks into the repo. This guard re-asserts those canonical links on every
+  // launch (Claude's atomic-rename settings write clobbers them into regular
+  // files) BEFORE the profile farm links through them, and hard-errors on a
+  // genuinely divergent clobber. `settings.json`/`CLAUDE.md` also appear in
+  // DEFAULT_SHARED_PATHS, so each profile links them through this freshly-correct
+  // canonical node like every other shared path. A null `claudeStowDir` disables
+  // the guard — test-only fail-open; production resolves real paths via
+  // `defaultClaudeStowDir()` / `defaultSharedStowDir()`.
   if (claudeStowDir !== null) {
-    ensureCanonicalStowLinks(claudeStowDir, homeDir, actionLog);
+    const sharedDir = sharedStowDir ?? defaultSharedStowDir();
+    ensureCanonicalStowLinks(
+      claudeStowLeaves(claudeStowDir, sharedDir, homeDir),
+      actionLog,
+    );
   }
 
   const profilesRoot = join(homeDir, ".claude-profiles");
@@ -879,15 +1026,50 @@ export function ensureClaudeStateSharing(
   }
 }
 
-/** Prepare Pi profile dirs for every configured non-default keeper agent profile. */
+/**
+ * Re-assert codex's canonical global-instruction link on every launch (codex is
+ * almost always a passthrough invocation, so this runs unconditionally to reach
+ * ALL codex launches). codex reads `<CODEX_HOME|~/.codex>/AGENTS.md`; this points
+ * that leaf at keeper's one shared `system/shared/AGENTS.md`. Warn-and-respect: a
+ * human-edited regular file is left in place with a WARNING and NEVER throws (main()
+ * maps StateError → exit 1, so a throw would abort a benign launch) — but a
+ * wrong-TARGET symlink IS repaired, and that repair is the codex cutover onto
+ * keeper. `sharedStowDir` null disables the guard (test-only fail-open); production
+ * resolves a real path via `defaultSharedStowDir()`. keeper only READS CODEX_HOME
+ * (via `resolveCodexHome`) — it never sets or forces it.
+ */
+export function ensureCodexStateSharing(
+  actionLog: string[] | null = null,
+  homeDir: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+  sharedStowDir: string | null = null,
+): void {
+  if (sharedStowDir === null) {
+    return;
+  }
+  ensureCanonicalStowLinks(
+    codexStowLeaves(sharedStowDir, homeDir, env),
+    actionLog,
+    env,
+  );
+}
+
+/** Prepare Pi profile dirs for every configured non-default keeper agent profile.
+ *  Always materializes the canonical `~/.pi/agent/AGENTS.md` leaf first (even with
+ *  no configured profiles — main() calls this with an empty list on a passthrough
+ *  launch so the default-account canonical leaf is covered too); the profile farm
+ *  runs only when profiles are configured. `sharedStowDir` null disables the
+ *  canonical AGENTS.md leaf (test-only fail-open). */
 export function ensurePiStateSharing(
   listProfilesFn: () => string[],
   actionLog: string[] | null = null,
   homeDir: string = homedir(),
+  sharedStowDir: string | null = null,
+  env: NodeJS.ProcessEnv = process.env,
 ): void {
   const profileNames = configuredNonDefaultProfiles(safeList(listProfilesFn));
   const canonicalDir = join(homeDir, ".pi", "agent");
-  ensurePiCanonicalRoot(canonicalDir);
+  ensurePiCanonicalRoot(canonicalDir, sharedStowDir, actionLog, env);
 
   if (profileNames.length === 0) {
     return;

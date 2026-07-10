@@ -99,6 +99,8 @@ describe("Codex command assembly", () => {
     });
     expect(h.deps.env.KEEPER_AGENT_CODEX_PROFILE).toBe("default");
     expect(h.deps.env.KEEPER_AGENT_CLAUDE_PROFILE).toBeUndefined();
+    // The canonical AGENTS.md leaf-guard runs on interactive launches too.
+    expect(h.codexStateSharingCalls).toHaveLength(1);
   });
 
   test("slug-shaped prompts feed the Codex session indexer", async () => {
@@ -277,6 +279,13 @@ describe("Codex passthrough commands", () => {
       "list",
     ]);
     expect(h.codexSessionNameIndexers).toHaveLength(0);
+  });
+
+  test("the canonical AGENTS.md leaf-guard fn runs on a passthrough launch", async () => {
+    // Codex is almost always passthrough, so the guard must reach these launches.
+    const h = codexHarness(["plugin", "list"]);
+    await runAndCapture(h, main);
+    expect(h.codexStateSharingCalls).toHaveLength(1);
   });
 
   test("exec remains a wrapped agent run", async () => {

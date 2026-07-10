@@ -81,8 +81,11 @@ export interface EnsureCodexDirTrustOptions {
 }
 
 /** Resolve CODEX_HOME the same way transcript-watch does: an explicit non-empty
- *  CODEX_HOME wins, else `<home>/.codex`. */
-function resolveCodexHome(
+ *  CODEX_HOME wins, else `<home>/.codex`. keeper only READS this — it never sets
+ *  or forces CODEX_HOME. Exported so the launch-time state-sharing guard finds
+ *  codex's global-instruction leaf (`<CODEX_HOME|~/.codex>/AGENTS.md`) without a
+ *  duplicate resolver. */
+export function resolveCodexHome(
   env: Record<string, string | undefined>,
   home: string,
 ): string {
