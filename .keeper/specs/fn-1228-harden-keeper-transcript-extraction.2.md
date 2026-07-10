@@ -60,5 +60,5 @@ N under identical filters, assert adjacency. Assert human output length <= reque
 - [ ] --help, --agent-help, and descriptor summaries state the total-budget semantics and the label-vs-JSON-index distinction; descriptor purity and conformance tests stay green
 
 ## Done summary
-
+Fixed entry-label paging (now filtered page.offset + array position, round-trips through --offset/--before) and made --max-chars an honest total budget (header, including a capped 12-line subagent list with a +M more tail, counts against it; entries get the remainder). Synced SHOW_HELP/AGENT_HELP/descriptor wording and dropped 'cursor' from help text.
 ## Evidence
