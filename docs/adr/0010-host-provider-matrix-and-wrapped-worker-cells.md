@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted.
+Accepted. Partially superseded by 0036: the embedded-defaults fallback for an
+absent matrix, the `name:`/`native:` capability→native-id alias grammar, and
+the `route:` flag are replaced by the required host matrix v2 (launch-id
+entries with basename-derived capabilities, `subagent_models` eligibility).
+The provider-roster/wrapped-cell architecture below stands.
 
 ## Context
 
