@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting multi-file generalization of a launch-time guard with subtle correctness invariants (a wrongly-thrown StateError would abort benign launches, plus a pi ordering trap and symlink-repair cutover), a contract-shaped new pattern warranting opus at xhigh.",
+      "task_id": "fn-1234-shared-global-harness-instructions.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded docs-only work (one ADR plus a disambiguating CLAUDE.md line and CONTEXT.md glossary entry) with a fully-specified acceptance and no design cascade, a sonnet medium fit.",
+      "task_id": "fn-1234-shared-global-harness-instructions.2",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Genuinely bounded mechanical work \u2014 delete one named file, verify an override is absent, remove a stale backup \u2014 with a fully-specified acceptance, the trickle-lane low-band shape.",
+      "task_id": "fn-1234-shared-global-harness-instructions.3",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "8f824283a4b635641650422ab09d3c415b8d39346c6f09c43f1b72c710c7ba7f",
+  "created_at": "2026-07-10T05:11:00.243000Z",
+  "epic_id": "fn-1234-shared-global-harness-instructions",
+  "input_hash": "fc2c35d1eafca6adf90a2a4d22e156ef5b157c011ba0ac72d4f41fb62797b9e6",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4230755793,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1234-shared-global-harness-instructions.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting multi-file generalization of a launch-time guard with subtle correctness invariants (a wrongly-thrown StateError would abort benign launches, plus a pi ordering trap and symlink-repair cutover), a contract-shaped new pattern warranting opus at xhigh.\",\"confidence\":0.83},{\"task_id\":\"fn-1234-shared-global-harness-instructions.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Bounded docs-only work (one ADR plus a disambiguating CLAUDE.md line and CONTEXT.md glossary entry) with a fully-specified acceptance and no design cascade, a sonnet medium fit.\",\"confidence\":0.8},{\"task_id\":\"fn-1234-shared-global-harness-instructions.3\",\"tier\":\"low\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Genuinely bounded mechanical work \u2014 delete one named file, verify an override is absent, remove a stale backup \u2014 with a fully-specified acceptance, the trickle-lane low-band shape.\",\"confidence\":0.76}]}\n"
+}
