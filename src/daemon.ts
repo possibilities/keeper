@@ -1617,6 +1617,13 @@ function emitRepairCandidateDrop(
  * the shared-base route, and resolve each to (repo_dir, repo_token, fingerprint).
  * Producer-side fs reads (via `readReason`) are legal outside any fold.
  *
+ * The category TOKEN is the sole red-vs-inconclusive discriminator here: an
+ * inconclusive (timed-out / starved) base gate is the WORKER's job to down-categorize
+ * to `TOOLING_FAILURE` (which routes surface-and-stop, minting no repair), so only a
+ * confirmed suite-red arrives as `SHARED_BASE_BROKEN`. This path never re-derives
+ * red-ness from the reason free-text — mirroring {@link classifyBaselineForRepair},
+ * where a timeout or infra-error leaf is never counted as red.
+ *
  * `readReason` is injected (production passes {@link readTaskBlockedReason}) so a test
  * drives the WHOLE pipeline against a real block-written state file with no mocked
  * reason-read. Every candidate-drop gate emits a class-stable diagnostic through

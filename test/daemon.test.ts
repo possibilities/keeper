@@ -6383,6 +6383,36 @@ test("selectRepairCandidates: a non-repair category (SPEC_UNCLEAR) yields NO can
   db.close();
 });
 
+test("selectRepairCandidates: an inconclusive base gate down-categorized to TOOLING_FAILURE yields NO repair candidate (timeout-aware attestation, daemon-side)", () => {
+  // A starved / timed-out base gate is INCONCLUSIVE, not a confirmed base red: the
+  // worker guidance routes it to TOOLING_FAILURE, never SHARED_BASE_BROKEN. The daemon
+  // trusts that category token as the sole red-vs-inconclusive discriminator, so a
+  // TOOLING_FAILURE block mints no repair candidate — a starved gate can never fabricate
+  // a repair::<repo> distress row. A genuine SHARED_BASE_BROKEN still mints (round-trip
+  // case above), so the confirmed-red safety net is unchanged.
+  const { db } = freshMemDb();
+  const proj = join(tmpDir, "proj");
+  writeBlockedStateFile(
+    proj,
+    "fn-1-foo.1",
+    "TOOLING_FAILURE: base gate timed out (starved host); inconclusive, not a confirmed base red",
+  );
+  seedEpicWithTasks(db, "fn-1-foo", proj, [
+    { task_id: "fn-1-foo.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
+
+  const notes: string[] = [];
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason, (l) =>
+    notes.push(l),
+  );
+  expect(candidates).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-candidate-drop task=fn-1-foo.1 class=non_repair_category category=TOOLING_FAILURE",
+  ]);
+  db.close();
+});
+
 test("selectRepairCandidates: every reachable candidate-drop gate emits its class-stable diagnostic", () => {
   const { db } = freshMemDb();
   const proj = join(tmpDir, "proj");
