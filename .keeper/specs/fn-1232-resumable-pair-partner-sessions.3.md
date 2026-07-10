@@ -58,5 +58,5 @@ recorded in Evidence.
 - [ ] The dispatch fast suite covers the new union member and verb split
 
 ## Done summary
-
+Wired keeper agent resume <name-or-id> [prompt]: resolves via resume-policy (refuse-live/ambiguous/unknown/no-target all exit 2 with no launch), then relaunches the matched partner as a detached interactive TUI in its recorded cwd with a fresh tracked job carrying the matched row's name. resolveResumeDecision's db dependency is isolated behind a new subprocess (resume-resolve-cli.ts) to keep cli/agent.ts's cold-start bundle bun:sqlite-free. --help/--x-help/--agent-help document the verb; fresh-launch argv is byte-unchanged.
 ## Evidence
