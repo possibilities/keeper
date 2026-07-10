@@ -65,5 +65,5 @@ daemon/subprocess; pure fast tier.
 - [ ] The module opens the database read-only and the fast suite covers every union branch
 
 ## Done summary
-
+Added src/agent/resume-policy.ts: a pure resume-by-name policy layer over the bus's resolveTarget (empty live-channel set), implementing refuse-live (pid+start-time recycle identity), newest-updated_at collapse with tie ambiguity, a second read-only jobs lookup for harness/resume_target/cwd, and the codex NULL-resume_target rollout back-fill before erroring no-target. Full fast suite covers every union branch (ok/live/ambiguous/unknown/no-target/harness-mismatch).
 ## Evidence
