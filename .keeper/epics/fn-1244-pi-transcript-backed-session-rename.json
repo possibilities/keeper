@@ -6,7 +6,7 @@
     "fn-1242-multi-harness-keeper-transcript"
   ],
   "id": "fn-1244-pi-transcript-backed-session-rename",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-10T20:20:48.572000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-10T20:20:46.292000Z"
+  "updated_at": "2026-07-10T20:20:48.573000Z"
 }
