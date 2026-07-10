@@ -74,6 +74,10 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
   env.KEEPER_RESTART_LEDGER = join(tmpDir, "restart-ledger.json");
+  // Single-instance gate: the daemon's kernel flock file. A host-wide lock would
+  // wedge parallel test runners, so it is sandboxed under tmpDir like every other
+  // state path — an in-process daemon boot never touches the real host lock.
+  env.KEEPER_SINGLE_INSTANCE_LOCK = join(tmpDir, "keeperd.lock");
   // Births tree (fn-1103): non-claude harness launches drop maildir birth
   // records here. Sandboxed so a launcher-spawn test never writes the human's
   // real `~/.local/state/keeper/births/`.

@@ -37,6 +37,7 @@ import {
   AUTOCLOSE_HINT_TTL_MS,
   type AuditOrchestratorLiveness,
   AutocloseHintSet,
+  appendRestartLedgerLine,
   auditReadyEscalationDecision,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
@@ -57,9 +58,13 @@ import {
   buildSharedDirtyObservation,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
+  CRASH_LOOP_YOUNG_RUNTIME_MS,
   checkKeeperAgentPresence,
   classifyBaselineForRepair,
   classifyEscalationOutcome,
+  classifyRestartProvenance,
+  collapseRestartLedger,
+  compactRestartLedger,
   countLiveEscalationSessions,
   type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
@@ -77,10 +82,12 @@ import {
   epicHasLiveUnblock,
   escalationCheckoutOccupiedBy,
   escalationSessionLiveFor,
+  foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
   isTransientBusyError,
+  KEEPERD_LAUNCHD_LABEL,
   MAX_LIVE_ESCALATION_SESSIONS,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
@@ -94,11 +101,20 @@ import {
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
+  PROBE_LIFE_ADMISSION_CODES,
+  PROBE_SETTLE_INITIAL,
+  type ProbeSettleEvent,
+  type ProbeSettleState,
+  type ProbeTickOutcome,
   parseBlockedCategory,
   parseRestartLedger,
+  parseRestartLedgerLine,
   prewarmWatcherAddon,
   probeAuditOrchestrator,
+  probeReplyProvesLife,
+  probeSettleStep,
   pruneRecoveredDeadLetters,
+  qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
   type RepairCandidate,
@@ -109,7 +125,10 @@ import {
   type ResolverDispatchOutcome,
   type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
-  type RestartLedgerEntry,
+  type RestartBoot,
+  type RestartBootLine,
+  type RestartLedgerLine,
+  type RestartProvenance,
   readRestartLedger,
   readTaskBlockedReason,
   recoverOneDeadLetter,
@@ -117,6 +136,7 @@ import {
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolveProbeArming,
   routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
@@ -124,9 +144,15 @@ import {
   runMergeEscalationSweep,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
+  SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
-  SERVE_PROBE_STUCK_THRESHOLD_MS,
+  SERVE_PROBE_MAX_FAIL_STREAK,
+  SERVE_REPORT_MUTE_THRESHOLD_MS,
+  SERVE_STARVATION_MAX_BREACH_STREAK,
   SERVE_WATCHDOG_BOOT_GRACE_MS,
+  SERVE_WATCHDOG_INITIAL_STATE,
+  SERVE_WATCHDOG_INTERVAL_MS,
+  type ServeWatchdogTriggerState,
   SHARED_BASE_BROKEN_CATEGORY,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
@@ -136,12 +162,12 @@ import {
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
   selectRepairCandidates,
+  serializeRestartLedgerLine,
   serializeSessionTelemetry,
   serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
   startDaemon,
-  updateRestartLedger,
   WAL_AUTOCHECKPOINT_PAGES,
   type WorkerName,
   withBootDrainCheckpointTuning,
@@ -178,7 +204,17 @@ import {
   GIT_STATUS_DIRTY_FILES_WIRE_CAP,
 } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
-import { isPidAlive, runQuery } from "../src/server-worker";
+import {
+  type CensusConnView,
+  censusConns,
+  type FanoutCursor,
+  isDaemonSelfConn,
+  isPidAlive,
+  MAX_SUBS_PER_TICK,
+  newFanoutCursor,
+  runQuery,
+  sliceFanout,
+} from "../src/server-worker";
 import type { Event, Job } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { sandboxEnv } from "./helpers/sandbox-env";
@@ -1156,103 +1192,707 @@ test("decideGitSeedWatchdog: alive-but-never-seeding still grows stale from the 
 });
 
 // ---------------------------------------------------------------------------
-// fn-1082 — serve-liveness watchdog pure verdict
+// fn-1082 / fn-1222 — serve-liveness watchdog pure reducer
 // ---------------------------------------------------------------------------
 
-// Boot grace already elapsed; both sockets probed fresh this instant; no lag
-// breaches. The healthy steady state — every case below perturbs one axis.
-const SWD_BASE = {
-  nowMs: 1_000_000,
-  bootGraceUntilMs: 1_000_000 - SERVE_WATCHDOG_BOOT_GRACE_MS,
-  lastServerProbeOkAtMs: 1_000_000,
-  lastBusProbeOkAtMs: 1_000_000,
-  probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
-  consecutiveLagBreaches: 0,
-  maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+// One monotonic tick at NOW; the previous tick was one interval earlier. Threshold
+// inputs are hand-chosen (1s served-latency, floor of 20 samples) so every
+// expectation below is hand-reasoned, never re-derived by the reducer under test.
+const SWD_NOW = 1_000_000;
+const SWD_INTERVAL = SERVE_WATCHDOG_INTERVAL_MS;
+
+// A healthy carried state at the previous tick: every streak clear, the last report
+// just arrived, the prior tick one interval back.
+const SWD_STATE: ServeWatchdogTriggerState = {
+  serverProbeFailStreak: 0,
+  busProbeFailStreak: 0,
+  lagBreachStreak: 0,
+  starvationBreachStreak: 0,
+  reportBaselineMonoMs: SWD_NOW,
+  lastTickMonoMs: SWD_NOW - SWD_INTERVAL,
 };
 
-test("decideServeLivenessWatchdog: healthy — fresh probes, no lag → ok", () => {
-  expect(decideServeLivenessWatchdog({ ...SWD_BASE })).toEqual({ kind: "ok" });
+// Healthy tick inputs: boot grace elapsed, both probes live, no lag, a fresh report,
+// and quiet-but-not-breaching starvation terms. Each case perturbs one axis.
+const SWD_BASE = {
+  nowMonoMs: SWD_NOW,
+  bootGraceUntilMonoMs: SWD_NOW - SERVE_WATCHDOG_BOOT_GRACE_MS,
+  intervalMs: SWD_INTERVAL,
+  clockJumpFactor: SERVE_CLOCK_JUMP_FACTOR,
+  prev: SWD_STATE,
+  serverProbe: "live" as ProbeTickOutcome,
+  busProbe: "live" as ProbeTickOutcome,
+  maxProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+  lagBreached: false,
+  maxLagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  lastReportArrivalMonoMs: SWD_NOW as number | null,
+  reportMuteThresholdMs: SERVE_REPORT_MUTE_THRESHOLD_MS,
+  servedLatencyP99Ms: 5,
+  servedLatencyThresholdMs: 1_000,
+  queueing: false,
+  ourFault: false,
+  sampleCount: 100,
+  sampleFloor: 20,
+  maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
+};
+
+// Run one reducer tick with per-tick + carried-state overrides.
+function swd(
+  over: Partial<Omit<typeof SWD_BASE, "prev">> = {},
+  prevOver: Partial<ServeWatchdogTriggerState> = {},
+) {
+  return decideServeLivenessWatchdog({
+    ...SWD_BASE,
+    ...over,
+    prev: { ...SWD_STATE, ...prevOver },
+  });
+}
+
+// The full first-paint starvation conjunction for one window — every term breaching.
+const SWD_STARVATION_BREACH = {
+  servedLatencyP99Ms: 1_500,
+  queueing: true,
+  lagBreached: true,
+  ourFault: true,
+  sampleCount: 100,
+} as const;
+
+test("decideServeLivenessWatchdog: healthy — live probes, no lag, fresh report → ok", () => {
+  expect(swd().verdict).toEqual({ kind: "ok" });
 });
 
-test("decideServeLivenessWatchdog: within boot grace → ok even with stale probes and a full lag run", () => {
-  // The arm-time baselines are meaningless until workers bind + probe once; the
-  // grace window must suppress a verdict no matter how stale the inputs look.
+test("decideServeLivenessWatchdog: within boot grace → ok with every streak cleared, whatever the inputs look like", () => {
+  // Arm-time baselines are meaningless until workers bind + report once; the grace
+  // window suppresses the verdict AND holds every streak clear regardless of inputs.
+  const r = swd(
+    {
+      nowMonoMs: SWD_BASE.bootGraceUntilMonoMs - 1,
+      serverProbe: "dead",
+      busProbe: "dead",
+      lagBreached: true,
+    },
+    {
+      lastTickMonoMs: null,
+      serverProbeFailStreak: 5,
+      busProbeFailStreak: 5,
+      lagBreachStreak: 5,
+      starvationBreachStreak: 5,
+    },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.serverProbeFailStreak).toBe(0);
+  expect(r.state.busProbeFailStreak).toBe(0);
+  expect(r.state.lagBreachStreak).toBe(0);
+  expect(r.state.starvationBreachStreak).toBe(0);
+});
+
+test("decideServeLivenessWatchdog: accept-stall-server — the fail streak reaches the cap on a dead read", () => {
+  // Consecutive-attempt counting, not wall-clock age: one more dead read tips a
+  // streak already one short of the cap over, and the verdict NAMES the socket.
+  const r = swd(
+    { serverProbe: "dead" },
+    { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  );
+  expect(r.verdict).toEqual({
+    kind: "escalate",
+    trigger: "accept-stall-server",
+  });
+  expect(r.state.serverProbeFailStreak).toBe(SERVE_PROBE_MAX_FAIL_STREAK);
+});
+
+test("decideServeLivenessWatchdog: accept-stall-server one dead read short of the cap → ok", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      nowMs: SWD_BASE.bootGraceUntilMs - 1,
-      lastServerProbeOkAtMs: 0,
-      lastBusProbeOkAtMs: 0,
-      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
-    }),
+    swd(
+      { serverProbe: "dead" },
+      { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 2 },
+    ).verdict,
   ).toEqual({ kind: "ok" });
 });
 
-test("decideServeLivenessWatchdog: keeperd read stalled (low lag) → escalate names accept-stall-server", () => {
-  // The accept-stall mode: reads die, lag stays low. The server probe last
-  // succeeded past the window while the bus probe is fresh — either socket alone
-  // is enough to escalate, and the verdict NAMES which one tripped.
-  expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-    }),
-  ).toEqual({ kind: "escalate", trigger: "accept-stall-server" });
+test("decideServeLivenessWatchdog: a live read resets the accept-stall streak (consecutive, not cumulative)", () => {
+  // One proof-of-life read breaks the run — the streak must count consecutive
+  // failures, so a single answered probe zeroes an almost-tripped streak.
+  const r = swd(
+    { serverProbe: "live" },
+    { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.serverProbeFailStreak).toBe(0);
 });
 
-test("decideServeLivenessWatchdog: bus registry read stalled (low lag) → escalate names accept-stall-bus", () => {
+test("decideServeLivenessWatchdog: an unarmed socket never accumulates a fail streak (cannot false-trip)", () => {
+  // A not-served / not-yet-ready socket fires no probe: its tick outcome is
+  // `unarmed`, which resets rather than advances the streak.
+  const r = swd(
+    { serverProbe: "unarmed" },
+    { serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.serverProbeFailStreak).toBe(0);
+});
+
+test("decideServeLivenessWatchdog: accept-stall-bus — the bus fail streak reaches the cap", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-    }),
+    swd(
+      { busProbe: "dead" },
+      { busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+    ).verdict,
   ).toEqual({ kind: "escalate", trigger: "accept-stall-bus" });
 });
 
 test("decideServeLivenessWatchdog: both sockets stalled → server trigger wins (deterministic)", () => {
-  // When both accept-stalls are live the server socket is checked first, so the
-  // named trigger is stable rather than order-dependent.
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastServerProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS,
-    }),
+    swd(
+      { serverProbe: "dead", busProbe: "dead" },
+      {
+        serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1,
+        busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1,
+      },
+    ).verdict,
   ).toEqual({ kind: "escalate", trigger: "accept-stall-server" });
 });
 
-test("decideServeLivenessWatchdog: probe age just under the window → ok", () => {
-  // One-off blips must not restart: a probe that succeeded moments inside the
-  // window (age === threshold − 1) is still healthy — escalate is `>=` only.
+test("decideServeLivenessWatchdog: busy-lag — lag breached for N consecutive windows → escalate", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      lastServerProbeOkAtMs:
-        SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
-      lastBusProbeOkAtMs: SWD_BASE.nowMs - SERVE_PROBE_STUCK_THRESHOLD_MS + 1,
-    }),
-  ).toEqual({ kind: "ok" });
-});
-
-test("decideServeLivenessWatchdog: busy-wedge — lag breached for N consecutive intervals → escalate names busy-lag", () => {
-  expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
-    }),
+    swd(
+      { lagBreached: true },
+      { lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1 },
+    ).verdict,
   ).toEqual({ kind: "escalate", trigger: "busy-lag" });
 });
 
-test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer than N intervals → ok", () => {
-  // High lag this tick but the run has not reached N — a transient GC pause or a
-  // heavy-but-finite fold must not trip a false restart.
+test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer than N windows → ok", () => {
   expect(
-    decideServeLivenessWatchdog({
-      ...SWD_BASE,
-      consecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 1,
-    }),
+    swd(
+      { lagBreached: true },
+      { lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 2 },
+    ).verdict,
   ).toEqual({ kind: "ok" });
+});
+
+test("decideServeLivenessWatchdog: serve-report-mute — no report within the staleness bound (main's arrival clock)", () => {
+  // The serve loop froze and stopped posting: the newest arrival is exactly the mute
+  // bound old on main's own clock, so mute fires (`>=`).
+  const stale = SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS;
+  expect(
+    swd({ lastReportArrivalMonoMs: stale }, { reportBaselineMonoMs: stale })
+      .verdict,
+  ).toEqual({ kind: "escalate", trigger: "serve-report-mute" });
+});
+
+test("decideServeLivenessWatchdog: report arrival just inside the mute bound → ok", () => {
+  const almost = SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS + 1;
+  expect(
+    swd({ lastReportArrivalMonoMs: almost }, { reportBaselineMonoMs: almost })
+      .verdict,
+  ).toEqual({ kind: "ok" });
+});
+
+test("decideServeLivenessWatchdog: a fresh report advances the baseline and clears an aging mute", () => {
+  // A report arriving this tick re-bases the staleness clock; a stale prior baseline
+  // must not linger once a newer arrival lands.
+  const r = swd(
+    { lastReportArrivalMonoMs: SWD_NOW },
+    { reportBaselineMonoMs: SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state.reportBaselineMonoMs).toBe(SWD_NOW);
+});
+
+test("decideServeLivenessWatchdog: serve-starvation — the full conjunction reaches N consecutive windows → escalate", () => {
+  const r = swd(SWD_STARVATION_BREACH, {
+    starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK - 1,
+  });
+  expect(r.verdict).toEqual({ kind: "escalate", trigger: "serve-starvation" });
+  expect(r.state.starvationBreachStreak).toBe(
+    SERVE_STARVATION_MAX_BREACH_STREAK,
+  );
+});
+
+test("decideServeLivenessWatchdog: serve-starvation one window short of the cap → ok", () => {
+  expect(
+    swd(SWD_STARVATION_BREACH, {
+      starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK - 2,
+    }).verdict,
+  ).toEqual({ kind: "ok" });
+});
+
+// Each starvation term is individually necessary: drop any one and the window is
+// inconclusive — the streak resets to zero and no escalation fires, even one window
+// from the cap.
+for (const [term, override] of [
+  ["served latency below threshold", { servedLatencyP99Ms: 5 }],
+  ["the worker loop is not queueing", { queueing: false }],
+  ["the daemon is not saturated", { lagBreached: false }],
+  ["the daemon is not burning its own cpu", { ourFault: false }],
+  ["the sample count is below the floor", { sampleCount: 5 }],
+] as const) {
+  test(`decideServeLivenessWatchdog: serve-starvation inconclusive when ${term} — streak resets, no escalate`, () => {
+    const r = swd(
+      { ...SWD_STARVATION_BREACH, ...override },
+      { starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK - 1 },
+    );
+    expect(r.verdict).toEqual({ kind: "ok" });
+    expect(r.state.starvationBreachStreak).toBe(0);
+  });
+}
+
+test("decideServeLivenessWatchdog: a clock discontinuity resets EVERY trigger's state and fires nothing across it", () => {
+  // Laptop suspend/resume: the tick gap leaps past the jump factor. Even with every
+  // streak at the cap and inputs that would otherwise escalate, the resume tick
+  // returns ok and zeroes all trigger state + re-bases the arrival clock to now.
+  const r = swd(
+    {
+      // A gap beyond clockJumpFactor× the interval since the prior tick, with every
+      // other input at its escalating value (starvation breach includes lagBreached).
+      serverProbe: "dead",
+      busProbe: "dead",
+      ...SWD_STARVATION_BREACH,
+      lastReportArrivalMonoMs: SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS * 10,
+    },
+    {
+      lastTickMonoMs:
+        SWD_NOW - (SERVE_CLOCK_JUMP_FACTOR * SWD_INTERVAL + SWD_INTERVAL),
+      serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+      busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+      lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+      starvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
+      reportBaselineMonoMs: SWD_NOW - SERVE_REPORT_MUTE_THRESHOLD_MS * 10,
+    },
+  );
+  expect(r.verdict).toEqual({ kind: "ok" });
+  expect(r.state).toEqual({
+    serverProbeFailStreak: 0,
+    busProbeFailStreak: 0,
+    lagBreachStreak: 0,
+    starvationBreachStreak: 0,
+    reportBaselineMonoMs: SWD_NOW,
+    lastTickMonoMs: SWD_NOW,
+  });
+});
+
+test("decideServeLivenessWatchdog: a gap exactly at the jump factor is NOT a discontinuity (normal eval)", () => {
+  // The guard is strictly `>`: a gap of exactly clockJumpFactor× the interval still
+  // evaluates the triggers, so a dead-read streak at the cap still escalates.
+  const r = swd(
+    { serverProbe: "dead" },
+    {
+      lastTickMonoMs: SWD_NOW - SERVE_CLOCK_JUMP_FACTOR * SWD_INTERVAL,
+      serverProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1,
+    },
+  );
+  expect(r.verdict).toEqual({
+    kind: "escalate",
+    trigger: "accept-stall-server",
+  });
+});
+
+test("SERVE_WATCHDOG_INITIAL_STATE is a clean zeroed state", () => {
+  expect(SERVE_WATCHDOG_INITIAL_STATE).toEqual({
+    serverProbeFailStreak: 0,
+    busProbeFailStreak: 0,
+    lagBreachStreak: 0,
+    starvationBreachStreak: 0,
+    reportBaselineMonoMs: null,
+    lastTickMonoMs: null,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1222 — serve-liveness probe hardening: the probe cannot kill the daemon it
+// protects. Pure seams only — the fast tier covers the settle machine, the
+// proof-of-life matcher, the self-exempt census, and per-worker arming with zero
+// real sockets.
+// ---------------------------------------------------------------------------
+
+// -- probeSettleStep: a probe connection is closed on EVERY settle path ---------
+
+test("probeSettleStep: timeout BEFORE open settles false, then the late open closes the orphaned socket", () => {
+  // The exact leak the incident rode: the timeout fires before the connection
+  // opens, so settle has no socket to end — then open hands us a live socket
+  // nobody would otherwise close, orphaning a connection every tick.
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+
+  const t = probeSettleStep(state, { kind: "timeout" });
+  state = t.state;
+  // Settled false; no socket held yet, so no close is directed at settle time.
+  expect(t.actions).toEqual([{ kind: "resolve", ok: false }]);
+  expect(state.settled).toBe(true);
+
+  const o = probeSettleStep(state, { kind: "open" });
+  state = o.state;
+  // The socket that arrived AFTER settling MUST be closed — zero lingering conns.
+  expect(o.actions).toEqual([{ kind: "close-socket" }]);
+  expect(state.haveSocket).toBe(true);
+});
+
+test("probeSettleStep: open then a matched frame settles true and closes the held socket", () => {
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  state = probeSettleStep(state, { kind: "open" }).state;
+  const m = probeSettleStep(state, { kind: "match" });
+  expect(m.actions).toEqual([
+    { kind: "resolve", ok: true },
+    { kind: "close-socket" },
+  ]);
+  expect(m.state.settled).toBe(true);
+});
+
+test("probeSettleStep: open then timeout settles false and closes the held socket", () => {
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  state = probeSettleStep(state, { kind: "open" }).state;
+  expect(probeSettleStep(state, { kind: "timeout" }).actions).toEqual([
+    { kind: "resolve", ok: false },
+    { kind: "close-socket" },
+  ]);
+});
+
+test("probeSettleStep: a close before open settles false, then the late open still closes the socket", () => {
+  const state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  const c = probeSettleStep(state, { kind: "close" });
+  expect(c.actions).toEqual([{ kind: "resolve", ok: false }]);
+  const o = probeSettleStep(c.state, { kind: "open" });
+  expect(o.actions).toEqual([{ kind: "close-socket" }]);
+});
+
+test("probeSettleStep: post-settle events other than the first open are inert (idempotent, no double-close)", () => {
+  let state: ProbeSettleState = PROBE_SETTLE_INITIAL;
+  state = probeSettleStep(state, { kind: "open" }).state; // haveSocket
+  state = probeSettleStep(state, { kind: "match" }).state; // settled, already closed
+  for (const ev of [
+    { kind: "match" },
+    { kind: "close" },
+    { kind: "error" },
+    { kind: "timeout" },
+    { kind: "open" }, // socket already held — no second close
+  ] as ProbeSettleEvent[]) {
+    expect(probeSettleStep(state, ev).actions).toEqual([]);
+  }
+});
+
+// -- probeReplyProvesLife: proof-of-life scoring --------------------------------
+
+test("probeReplyProvesLife: a result frame echoing the correlation id proves life", () => {
+  expect(
+    probeReplyProvesLife(
+      { type: "result", id: "abc-123", rows: [] },
+      "abc-123",
+    ),
+  ).toBe(true);
+});
+
+test("probeReplyProvesLife: an error frame echoing the correlation id proves life", () => {
+  // The worker read the request to echo the id and answered — the accept→read→
+  // write path an accept-stall wedge kills is alive even when the answer errors.
+  expect(
+    probeReplyProvesLife(
+      { type: "error", id: "abc-123", code: "rpc_failed" },
+      "abc-123",
+    ),
+  ).toBe(true);
+});
+
+test("probeReplyProvesLife: a cap rejection proves life even though it cannot carry the id", () => {
+  // Emitted at accept time, before the request line is read — so it cannot echo
+  // the correlation id, yet it proves the accept path answered this connection.
+  // This is the id-less-reject the incident wrongly scored as a death.
+  expect(
+    probeReplyProvesLife(
+      { type: "error", code: "too_many_connections" },
+      "abc-123",
+    ),
+  ).toBe(true);
+  expect(
+    probeReplyProvesLife({ type: "error", code: "max_connections" }, "abc-123"),
+  ).toBe(true);
+});
+
+test("probeReplyProvesLife: a frame for a DIFFERENT correlation id is not life", () => {
+  expect(probeReplyProvesLife({ type: "result", id: "other" }, "abc-123")).toBe(
+    false,
+  );
+});
+
+test("probeReplyProvesLife: an unrelated id-less error is not life", () => {
+  // A bad_frame error that neither echoes the id nor is an admission rejection is
+  // NOT life — an id-carrying answer (proving the read path) is the bar.
+  expect(
+    probeReplyProvesLife({ type: "error", code: "bad_frame" }, "abc-123"),
+  ).toBe(false);
+});
+
+test("probeReplyProvesLife: the bus ack (no rpc id) proves life via extraMatch only", () => {
+  const busMatch = (f: Record<string, unknown>): boolean =>
+    f.type === "ack" && f.op === "list";
+  expect(
+    probeReplyProvesLife({ type: "ack", op: "list" }, null, busMatch),
+  ).toBe(true);
+  expect(
+    probeReplyProvesLife({ type: "ack", op: "other" }, null, busMatch),
+  ).toBe(false);
+});
+
+test("PROBE_LIFE_ADMISSION_CODES holds exactly the two cap-rejection codes", () => {
+  // Independent source of truth: the codes server-worker.ts emits at cap-reject.
+  expect([...PROBE_LIFE_ADMISSION_CODES].sort()).toEqual([
+    "max_connections",
+    "too_many_connections",
+  ]);
+});
+
+// -- isDaemonSelfConn + censusConns: self-exemption + distinct census bucket ----
+
+test("isDaemonSelfConn: an exact pid match only; null / another pid is external", () => {
+  expect(isDaemonSelfConn(4242, 4242)).toBe(true);
+  expect(isDaemonSelfConn(4243, 4242)).toBe(false);
+  expect(isDaemonSelfConn(null, 4242)).toBe(false);
+});
+
+function makeCensusConn(o: {
+  peerPid: number | null;
+  subs?: number;
+  pending?: boolean;
+  everEngaged?: boolean;
+  connectedAt?: number;
+  lastActivityAt?: number;
+}): CensusConnView {
+  const subs = new Map<string | null, unknown>();
+  for (let i = 0; i < (o.subs ?? 0); i++) subs.set(String(i), {});
+  return {
+    data: {
+      peerPid: o.peerPid,
+      pending: o.pending ? { bytes: new Uint8Array(0), offset: 0 } : null,
+      subs: subs as unknown as CensusConnView["data"]["subs"],
+      everEngaged: o.everEngaged ?? false,
+      connectedAt: o.connectedAt ?? 0,
+      // Default fresh (== NOW at the census call sites below), so a conn is
+      // `subAbandoned` only when a test explicitly ages its inbound activity.
+      lastActivityAt: o.lastActivityAt ?? 1_000_000,
+    },
+  };
+}
+
+test("censusConns: the daemon's own conns land in a distinct self bucket, apart from external classification", () => {
+  const SELF = 4242;
+  const NOW = 1_000_000;
+  const TTL = 30_000;
+  const conns: CensusConnView[] = [
+    // Three self-probes (peer pid == daemon pid) — the self bucket, never
+    // double-counted into pending / zero_sub / sub_* even when subscribed or
+    // backpressured.
+    makeCensusConn({ peerPid: SELF }),
+    makeCensusConn({ peerPid: SELF, subs: 2 }),
+    makeCensusConn({ peerPid: SELF, pending: true }),
+    // External clients across the reaper-mirroring buckets (5000 alive, 6000 dead).
+    makeCensusConn({ peerPid: 5000, subs: 1 }), // sub_live
+    makeCensusConn({ peerPid: 6000, subs: 1 }), // sub_dead
+    makeCensusConn({ peerPid: null, subs: 1 }), // sub_unknown
+    makeCensusConn({ peerPid: 5000, connectedAt: NOW, everEngaged: true }), // zero_sub, fresh
+    makeCensusConn({ peerPid: 6000 }), // zero_sub + dead
+    makeCensusConn({ peerPid: 5000, connectedAt: 0, everEngaged: false }), // zero_sub + unengaged
+    makeCensusConn({ peerPid: 5000, subs: 1, pending: true }), // sub_live + pending
+  ];
+  const c = censusConns(conns, {
+    selfPid: SELF,
+    nowMs: NOW,
+    unengagedTtlMs: TTL,
+    subscribedSilenceTtlMs: 45_000,
+    isPidAlive: (pid) => pid === 5000,
+  });
+  // Hand-computed from the fixtures above (independent of the implementation).
+  // Every subscribed fixture defaults `lastActivityAt` to NOW (fresh) → none
+  // abandoned; the dedicated aging test below covers `subAbandoned`.
+  expect(c).toEqual({
+    total: 10,
+    self: 3,
+    pending: 1, // only the external sub_live+pending conn; the self one is exempt
+    zeroSub: 3,
+    zeroSubDead: 1,
+    zeroSubUnengaged: 1,
+    subLive: 2,
+    subDead: 1,
+    subUnknown: 1,
+    subAbandoned: 0,
+  });
+});
+
+test("censusConns: a subscribed conn inbound-silent past the heartbeat ceiling counts as sub_abandoned; a fresh-heartbeat board never does", () => {
+  const SELF = 4242;
+  const NOW = 2_000_000;
+  const SILENCE_TTL = 45_000;
+  const conns: CensusConnView[] = [
+    // Abandoned-but-alive: subscribed, peer alive, inbound-silent 60s > 45s.
+    makeCensusConn({ peerPid: 5000, subs: 1, lastActivityAt: NOW - 60_000 }),
+    // Fresh heartbeat (5s ago < 45s): a legitimately-quiet live board — SAFE,
+    // never reaped, never counted abandoned even though it is silent.
+    makeCensusConn({ peerPid: 5000, subs: 1, lastActivityAt: NOW - 5_000 }),
+    // Exactly at the ceiling counts (>=), independent of peer liveness: a
+    // subscribed conn whose peer probe is unavailable is still abandonable.
+    makeCensusConn({
+      peerPid: null,
+      subs: 2,
+      lastActivityAt: NOW - SILENCE_TTL,
+    }),
+    // Zero-sub silent conn is OUT of scope — the idle/unengaged arms own it, so
+    // an old lastActivityAt here must NOT count as sub_abandoned.
+    makeCensusConn({ peerPid: 5000, subs: 0, lastActivityAt: NOW - 600_000 }),
+    // Self-probe subscribed + silent: exempt (self bucket), never abandoned.
+    makeCensusConn({ peerPid: SELF, subs: 1, lastActivityAt: NOW - 600_000 }),
+  ];
+  const c = censusConns(conns, {
+    selfPid: SELF,
+    nowMs: NOW,
+    unengagedTtlMs: 30_000,
+    subscribedSilenceTtlMs: SILENCE_TTL,
+    isPidAlive: (pid) => pid === 5000,
+  });
+  // Hand-computed: 2 abandoned (the 60s sub_live + the at-ceiling sub_unknown);
+  // the 5s-fresh board, the zero-sub conn, and the self-probe are all excluded.
+  expect(c.subAbandoned).toBe(2);
+  expect(c.subLive).toBe(2); // the 60s + the 5s conns (both peer 5000, subscribed)
+  expect(c.subUnknown).toBe(1); // the null-peer subscribed conn
+  expect(c.zeroSub).toBe(1);
+  expect(c.self).toBe(1);
+  expect(c.total).toBe(5);
+});
+
+// -- sliceFanout: bounded per-tick fan-out + round-robin anti-starvation --------
+
+test("sliceFanout: below-budget set serves every unit and resets the cursor (no-op bound)", () => {
+  const units = [0, 1, 2, 3];
+  const cursor = newFanoutCursor();
+  cursor.value = 3; // even a non-zero cursor is ignored when the budget covers all
+  const slice = sliceFanout(units, cursor, 10);
+  expect(slice.serve).toEqual([0, 1, 2, 3]);
+  expect(slice.deferred).toBe(0);
+  expect(cursor.value).toBe(0);
+});
+
+test("sliceFanout: an empty set serves nothing and resets the cursor", () => {
+  const cursor = newFanoutCursor();
+  cursor.value = 5;
+  const slice = sliceFanout<number>([], cursor, 4);
+  expect(slice.serve).toEqual([]);
+  expect(slice.deferred).toBe(0);
+  expect(cursor.value).toBe(0);
+});
+
+test("sliceFanout: over-budget set serves a bounded window and advances the cursor round-robin", () => {
+  const units = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const cursor = newFanoutCursor();
+  // Tick 1: [0,1,2], cursor → 3.
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([0, 1, 2]);
+  expect(cursor.value).toBe(3);
+  // Tick 2: [3,4,5], cursor → 6.
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([3, 4, 5]);
+  expect(cursor.value).toBe(6);
+  // Tick 3: [6,7,8], cursor → 9.
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([6, 7, 8]);
+  expect(cursor.value).toBe(9);
+  // Tick 4: wraps — [9,0,1], cursor → 2. Every unit served within 4 = ceil(10/3).
+  expect(sliceFanout(units, cursor, 3).serve).toEqual([9, 0, 1]);
+  expect(cursor.value).toBe(2);
+});
+
+test("sliceFanout: every unit is serviced within ceil(N/budget) ticks from ANY starting cursor, and no tick exceeds the budget", () => {
+  // The anti-starvation guarantee, proven over a fake unit set for a spread of
+  // (N, budget) shapes and every starting offset — the property the serve loop
+  // relies on so a deferred subscription can never be starved.
+  for (const n of [7, 10, 16, 33, 64, 100]) {
+    for (const budget of [1, 3, 8, 13, 64]) {
+      if (budget >= n) continue; // the no-op-bound case, covered above
+      const bound = Math.ceil(n / budget);
+      const units = Array.from({ length: n }, (_, i) => i);
+      for (const startOffset of [0, 1, budget, n - 1]) {
+        const cursor = newFanoutCursor();
+        cursor.value = startOffset;
+        // Track, per unit, the last tick it was served; assert no gap exceeds
+        // `bound`. Prime "last served" at -1 so a unit unseen through the first
+        // `bound` ticks trips the gap check.
+        const lastServed = new Array<number>(n).fill(-1);
+        // Run enough ticks to observe steady-state gaps well past one wrap.
+        for (let tick = 0; tick < bound * 3; tick++) {
+          const slice = sliceFanout(units, cursor, budget);
+          expect(slice.serve.length).toBe(budget); // never exceeds the budget
+          expect(slice.deferred).toBe(n - budget);
+          for (const u of slice.serve) lastServed[u] = tick;
+          if (tick >= bound - 1) {
+            // From the first full window onward, every unit must have been seen
+            // within the trailing `bound` ticks.
+            for (let u = 0; u < n; u++) {
+              expect(tick - lastServed[u]).toBeLessThan(bound);
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+test("sliceFanout: a cursor left past a shrunken ring is normalized, not out-of-bounds", () => {
+  // A conn set that shrank between ticks (conns closed) can leave the cursor
+  // pointing past the new length; the slice must wrap it, never index undefined.
+  const units = [0, 1, 2];
+  const cursor: FanoutCursor = { value: 999 };
+  const slice = sliceFanout(units, cursor, 2);
+  expect(slice.serve).toEqual([0, 1]); // 999 % 3 === 0 → start at 0
+  expect(slice.serve.every((u) => u !== undefined)).toBe(true);
+  expect(cursor.value).toBe(2);
+});
+
+test("MAX_SUBS_PER_TICK is a positive bound", () => {
+  // Guards the constant against an accidental 0/negative edit that would make
+  // `sliceFanout` treat the production path as unbounded.
+  expect(MAX_SUBS_PER_TICK).toBeGreaterThan(0);
+});
+
+// -- resolveProbeArming: each socket arms only after its own worker is ready ----
+
+test("resolveProbeArming: an un-armed served socket does not fire and reads fresh (cannot false-trip)", () => {
+  const r = resolveProbeArming({
+    serverServed: true,
+    busServed: true,
+    serverArmed: false, // the server worker has not reported ready yet
+    busArmed: true,
+    nowMs: 2_000,
+    lastServerProbeOkAtMs: 0, // stale, but un-armed → ignored
+    lastBusProbeOkAtMs: 1_500,
+  });
+  expect(r.fireServerProbe).toBe(false);
+  expect(r.verdictServerProbeOkAtMs).toBe(2_000); // fresh = nowMs, never trips
+  expect(r.fireBusProbe).toBe(true);
+  expect(r.verdictBusProbeOkAtMs).toBe(1_500); // armed → real probe anchor
+});
+
+test("resolveProbeArming: an armed served socket fires and uses its real probe anchor", () => {
+  const r = resolveProbeArming({
+    serverServed: true,
+    busServed: false, // bus not served this boot
+    serverArmed: true,
+    busArmed: false,
+    nowMs: 2_000,
+    lastServerProbeOkAtMs: 1_200,
+    lastBusProbeOkAtMs: 0,
+  });
+  expect(r.fireServerProbe).toBe(true);
+  expect(r.verdictServerProbeOkAtMs).toBe(1_200);
+  expect(r.fireBusProbe).toBe(false);
+  expect(r.verdictBusProbeOkAtMs).toBe(2_000); // unserved → fresh
+});
+
+test("resolveProbeArming: a bus-only boot arms its bus probe and leaves the unserved server fresh", () => {
+  const r = resolveProbeArming({
+    serverServed: false,
+    busServed: true,
+    serverArmed: false,
+    busArmed: true,
+    nowMs: 5_000,
+    lastServerProbeOkAtMs: 0,
+    lastBusProbeOkAtMs: 4_900,
+  });
+  expect(r.fireServerProbe).toBe(false);
+  expect(r.verdictServerProbeOkAtMs).toBe(5_000);
+  expect(r.fireBusProbe).toBe(true);
+  expect(r.verdictBusProbeOkAtMs).toBe(4_900);
 });
 
 // ---------------------------------------------------------------------------
@@ -1325,195 +1965,454 @@ test("decideCrashLoop: future-dated garbage is ignored", () => {
   ).toEqual({ crashLoop: false, recentBoots: 0 });
 });
 
-function entriesAt(timestamps: number[]): RestartLedgerEntry[] {
-  return timestamps.map((ts) => ({ ts }));
+function bootLine(
+  bootId: string,
+  ts: number,
+  provenance: RestartProvenance,
+  prevRuntimeMs: number | null,
+): RestartBootLine {
+  return {
+    kind: "boot",
+    boot_id: bootId,
+    ts,
+    provenance,
+    prev_runtime_ms: prevRuntimeMs,
+  };
 }
 
-test("updateRestartLedger: appends this boot, ages out old, sorts ascending", () => {
-  const updated = updateRestartLedger({
-    existing: entriesAt([CL_NOW - CL_WINDOW - 1, CL_NOW - 1_000, CL_NOW - 500]),
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  // The stale entry is dropped; the current boot is appended; result is sorted.
-  expect(updated).toEqual(entriesAt([CL_NOW - 1_000, CL_NOW - 500, CL_NOW]));
-});
+// ── provenance heuristic ─────────────────────────────────────────────────────
 
-test("updateRestartLedger: length cap keeps the most recent entries", () => {
-  // More in-window boots than the cap → keep the newest `cap` (including now).
-  const existing = entriesAt(
-    bootsEndingAt(CL_NOW - 1, RESTART_LEDGER_CAP + 20, 100),
+test("classifyRestartProvenance: the launchd label (and a suffixed sibling) is launchd", () => {
+  expect(classifyRestartProvenance(KEEPERD_LAUNCHD_LABEL)).toBe("launchd");
+  expect(classifyRestartProvenance(`${KEEPERD_LAUNCHD_LABEL}.bus-only`)).toBe(
+    "launchd",
   );
-  const updated = updateRestartLedger({
-    existing,
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  expect(updated.length).toBe(RESTART_LEDGER_CAP);
-  expect(updated[updated.length - 1]).toEqual({ ts: CL_NOW });
-  // Sorted ascending, so the retained slice is the newest window of boots.
-  expect(updated[0].ts).toBeGreaterThan(existing[0].ts);
 });
 
-test("updateRestartLedger: no reason omits the field (matches today's bare boot fold)", () => {
-  const updated = updateRestartLedger({
-    existing: [],
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  expect(updated).toEqual([{ ts: CL_NOW }]);
-  expect(updated[0]).not.toHaveProperty("reason");
+test("classifyRestartProvenance: missing / empty / the '0' sentinel maps to unknown", () => {
+  expect(classifyRestartProvenance(undefined)).toBe("unknown");
+  expect(classifyRestartProvenance(null)).toBe("unknown");
+  expect(classifyRestartProvenance("")).toBe("unknown");
+  expect(classifyRestartProvenance("   ")).toBe("unknown");
+  expect(classifyRestartProvenance("0")).toBe("unknown");
 });
 
-test("updateRestartLedger: a reason lands on the newest entry", () => {
-  const updated = updateRestartLedger({
-    existing: entriesAt([CL_NOW - 1_000]),
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
+test("classifyRestartProvenance: any other service name is a foreign context", () => {
+  expect(classifyRestartProvenance("com.apple.Terminal")).toBe("foreign");
+  expect(classifyRestartProvenance("dev.direnv.thing")).toBe("foreign");
+});
+
+// ── NDJSON line serialize / parse (torn-tail contract) ───────────────────────
+
+test("serializeRestartLedgerLine / parseRestartLedgerLine: a boot line round-trips", () => {
+  const line = bootLine("abc", 1234, "launchd", 90_000);
+  const s = serializeRestartLedgerLine(line);
+  expect(s.endsWith("\n")).toBe(true);
+  expect(parseRestartLedgerLine(s)).toEqual(line);
+});
+
+test("serializeRestartLedgerLine / parseRestartLedgerLine: an enrich line round-trips", () => {
+  const line: RestartLedgerLine = {
+    kind: "enrich",
+    boot_id: "abc",
+    ts: 1300,
     reason: "uncaughtException: boom",
-  });
-  expect(updated).toEqual([
-    { ts: CL_NOW - 1_000 },
-    { ts: CL_NOW, reason: "uncaughtException: boom" },
-  ]);
+  };
+  expect(parseRestartLedgerLine(serializeRestartLedgerLine(line))).toEqual(
+    line,
+  );
 });
 
-test("updateRestartLedger: a second call at the SAME nowMs enriches the entry boot already wrote, not a duplicate", () => {
-  // Models the fatalExit seam: boot-fold wrote a bare entry for this boot;
-  // fatalExit later calls again with the identical nowMs + a reason. The
-  // entry gains the reason IN PLACE — the boot count must not double.
-  const afterBoot = updateRestartLedger({
-    existing: entriesAt([CL_NOW - 5_000]),
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-  });
-  expect(afterBoot).toEqual([{ ts: CL_NOW - 5_000 }, { ts: CL_NOW }]);
-
-  const afterFatalExit = updateRestartLedger({
-    existing: afterBoot,
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
-    reason: "tmux-control-watchdog: control client mute",
-  });
-  expect(afterFatalExit).toEqual([
-    { ts: CL_NOW - 5_000 },
-    { ts: CL_NOW, reason: "tmux-control-watchdog: control client mute" },
-  ]);
-  expect(afterFatalExit.length).toBe(2); // still one entry for this boot, not two
+test("parseRestartLedgerLine: a torn / partial trailing line folds to null (never corrupts)", () => {
+  expect(parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts')).toBeNull();
+  expect(parseRestartLedgerLine("")).toBeNull();
+  expect(parseRestartLedgerLine("   ")).toBeNull();
 });
 
-test("updateRestartLedger: an overlong reason is bounded, never grows the sidecar unbounded", () => {
-  const updated = updateRestartLedger({
-    existing: [],
-    nowMs: CL_NOW,
-    windowMs: CL_WINDOW,
-    cap: RESTART_LEDGER_CAP,
+test("parseRestartLedgerLine: a missing boot_id or non-finite ts folds to null", () => {
+  expect(parseRestartLedgerLine('{"kind":"boot","ts":1}')).toBeNull();
+  expect(
+    parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts":null}'),
+  ).toBeNull();
+  expect(
+    parseRestartLedgerLine('{"kind":"boot","boot_id":"","ts":1}'),
+  ).toBeNull();
+});
+
+test("parseRestartLedgerLine: an unknown kind folds to null", () => {
+  expect(
+    parseRestartLedgerLine('{"kind":"other","boot_id":"a","ts":1}'),
+  ).toBeNull();
+});
+
+test("parseRestartLedgerLine: garbage provenance folds to unknown, a missing gap to null", () => {
+  expect(
+    parseRestartLedgerLine(
+      '{"kind":"boot","boot_id":"a","ts":1,"provenance":"martian"}',
+    ),
+  ).toEqual(bootLine("a", 1, "unknown", null));
+});
+
+test("parseRestartLedgerLine: an enrich line with a non-string reason folds to null", () => {
+  expect(
+    parseRestartLedgerLine('{"kind":"enrich","boot_id":"a","ts":1,"reason":5}'),
+  ).toBeNull();
+});
+
+test("parseRestartLedgerLine: an overlong reason is bounded on read", () => {
+  const line: RestartLedgerLine = {
+    kind: "enrich",
+    boot_id: "a",
+    ts: 1,
     reason: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN + 500),
-  });
-  expect(updated[0].reason?.length).toBe(RESTART_LEDGER_REASON_MAX_LEN);
+  };
+  const parsed = parseRestartLedgerLine(serializeRestartLedgerLine(line)) as {
+    reason: string;
+  };
+  expect(parsed.reason.length).toBe(RESTART_LEDGER_REASON_MAX_LEN);
 });
 
-test("decideCrashLoop: verdict is byte-identical for identical ts sequences with and without reason fields", () => {
-  const bare = entriesAt(bootsEndingAt(CL_NOW, CRASH_LOOP_THRESHOLD, 90_000));
-  const withReasons: RestartLedgerEntry[] = bare.map((e, i) => ({
-    ts: e.ts,
-    reason: i % 2 === 0 ? `watchdog-fire-${i}` : undefined,
-  }));
-  const verdictBare = decideCrashLoop({
-    nowMs: CL_NOW,
-    bootTimestamps: bare.map((e) => e.ts),
-    threshold: CRASH_LOOP_THRESHOLD,
-    windowMs: CL_WINDOW,
-  });
-  const verdictWithReasons = decideCrashLoop({
-    nowMs: CL_NOW,
-    bootTimestamps: withReasons.map((e) => e.ts),
-    threshold: CRASH_LOOP_THRESHOLD,
-    windowMs: CL_WINDOW,
-  });
-  expect(verdictWithReasons).toEqual(verdictBare);
-  expect(verdictBare).toEqual({
-    crashLoop: true,
-    recentBoots: CRASH_LOOP_THRESHOLD,
-  });
+// ── whole-body parse: NDJSON + legacy dual-read ──────────────────────────────
+
+test("parseRestartLedger: NDJSON multi-line round-trips every line", () => {
+  const lines: RestartLedgerLine[] = [
+    bootLine("a", 1, "launchd", null),
+    { kind: "enrich", boot_id: "a", ts: 2, reason: "boom" },
+    bootLine("b", 3, "foreign", 2),
+  ];
+  const raw = lines.map(serializeRestartLedgerLine).join("");
+  expect(parseRestartLedger(raw)).toEqual(lines);
 });
 
-test("parseRestartLedger: valid array of finite numbers (legacy shape) coerces to entries", () => {
-  expect(parseRestartLedger("[1, 2, 3]")).toEqual(entriesAt([1, 2, 3]));
+test("parseRestartLedger: a torn trailing line is dropped, earlier lines survive", () => {
+  const raw =
+    serializeRestartLedgerLine(bootLine("a", 1, "launchd", null)) +
+    '{"kind":"boot","boot_id":"b","ts';
+  expect(parseRestartLedger(raw)).toEqual([bootLine("a", 1, "launchd", null)]);
 });
 
-test("parseRestartLedger: object entries with a reason round-trip", () => {
-  const raw = JSON.stringify([
-    { ts: 1 },
-    { ts: 2, reason: "uncaughtException: boom" },
+test("parseRestartLedger: dual-reads the legacy number array as unknown-provenance boots", () => {
+  expect(parseRestartLedger("[1, 2, 3]")).toEqual([
+    bootLine("legacy:0:1", 1, "unknown", null),
+    bootLine("legacy:1:2", 2, "unknown", null),
+    bootLine("legacy:2:3", 3, "unknown", null),
   ]);
+});
+
+test("parseRestartLedger: dual-reads legacy object entries, a reason becoming an enrich line", () => {
+  const raw = JSON.stringify([{ ts: 1 }, { ts: 2, reason: "boom" }]);
   expect(parseRestartLedger(raw)).toEqual([
-    { ts: 1 },
-    { ts: 2, reason: "uncaughtException: boom" },
+    bootLine("legacy:0:1", 1, "unknown", null),
+    bootLine("legacy:1:2", 2, "unknown", null),
+    { kind: "enrich", boot_id: "legacy:1:2", ts: 2, reason: "boom" },
   ]);
 });
 
-test("parseRestartLedger: a mixed legacy-number + object array coerces uniformly and counts identically", () => {
-  const raw = JSON.stringify([1, { ts: 2 }, { ts: 3, reason: "boom" }, 4]);
-  const parsed = parseRestartLedger(raw);
-  expect(parsed).toEqual([
-    { ts: 1 },
-    { ts: 2 },
-    { ts: 3, reason: "boom" },
-    { ts: 4 },
-  ]);
-  // The crash-loop decision reads ts only, so a mixed-shape ledger counts
-  // exactly like an all-legacy one would.
-  const verdict = decideCrashLoop({
-    nowMs: 4,
-    bootTimestamps: parsed.map((e) => e.ts),
-    threshold: 4,
-    windowMs: CL_WINDOW,
-  });
-  expect(verdict).toEqual({ crashLoop: true, recentBoots: 4 });
-});
-
-test("parseRestartLedger: an object entry with a non-string reason drops the reason but keeps ts", () => {
+test("parseRestartLedger: a legacy non-string reason drops the reason but keeps the boot", () => {
   expect(parseRestartLedger('[{"ts": 5, "reason": 12345}]')).toEqual([
-    { ts: 5 },
+    bootLine("legacy:0:5", 5, "unknown", null),
   ]);
 });
 
-test("parseRestartLedger: corrupt body fails open to empty (never throws, never trips)", () => {
-  // A torn/garbage ledger must become an EMPTY one — never new fatalExit fuel and
-  // never a false crash-loop trip. Non-array, non-JSON, and non-finite/malformed
-  // entries all collapse to [].
+test("parseRestartLedger: corrupt / garbage bodies fail open to empty (never trip)", () => {
   expect(parseRestartLedger("not json at all")).toEqual([]);
   expect(parseRestartLedger('{"not":"an array"}')).toEqual([]);
   expect(parseRestartLedger("")).toEqual([]);
+  // A legacy array with malformed members keeps only the finite-ts entries.
   expect(
-    parseRestartLedger(
-      '[1, "two", null, 3, 1e999, {}, {"ts":"nope"}, {"ts":null}]',
-    ),
-  ).toEqual(entriesAt([1, 3]));
+    parseRestartLedger('[1, "two", null, 3, 1e999, {}, {"ts":"nope"}]'),
+  ).toEqual([
+    bootLine("legacy:0:1", 1, "unknown", null),
+    bootLine("legacy:3:3", 3, "unknown", null),
+  ]);
 });
 
-test("readRestartLedger / writeRestartLedger: round-trip through a real file, atomically", () => {
+test("parseRestartLedger: a legacy rapid-boot array still trips the loop after the format flip", () => {
+  // Acceptance: the count survives the transition. THRESHOLD+1 boots 90s apart
+  // dual-read into forensic boot records; collapse backfills the young gaps.
+  const legacy = bootsEndingAt(CL_NOW, CRASH_LOOP_THRESHOLD + 1, 90_000);
+  const lines = parseRestartLedger(JSON.stringify(legacy));
+  expect(lines.filter((l) => l.kind === "boot").length).toBe(
+    CRASH_LOOP_THRESHOLD + 1,
+  );
+  const qualified = qualifyCrashLoopBootTimestamps(
+    collapseRestartLedger(lines),
+    CRASH_LOOP_YOUNG_RUNTIME_MS,
+  );
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualified,
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: true, recentBoots: CRASH_LOOP_THRESHOLD });
+});
+
+// ── collapse: per-boot_id merge, prev backfill, orphan forensics ─────────────
+
+test("collapseRestartLedger: a boot line and its enrichment collapse to one record", () => {
+  expect(
+    collapseRestartLedger([
+      bootLine("a", 1000, "launchd", null),
+      { kind: "enrich", boot_id: "a", ts: 1500, reason: "boom" },
+    ]),
+  ).toEqual([
+    {
+      boot_id: "a",
+      ts: 1000,
+      provenance: "launchd",
+      prev_runtime_ms: null,
+      reason: "boom",
+      died_at_ms: 1500,
+    },
+  ]);
+});
+
+test("collapseRestartLedger: an orphan enrichment synthesizes a forensic record, never dropped", () => {
+  expect(
+    collapseRestartLedger([
+      { kind: "enrich", boot_id: "orphan", ts: 5000, reason: "late" },
+    ]),
+  ).toEqual([
+    {
+      boot_id: "orphan",
+      ts: 5000,
+      provenance: "unknown",
+      prev_runtime_ms: null,
+      reason: "late",
+      died_at_ms: 5000,
+    },
+  ]);
+});
+
+test("collapseRestartLedger: backfills a missing prev_runtime from the gap, preserves a frozen one", () => {
+  const boots = collapseRestartLedger([
+    bootLine("a", 1000, "launchd", null),
+    bootLine("b", 1000 + 90_000, "launchd", null),
+    bootLine("c", 1000 + 90_000 + 500_000, "launchd", 42),
+  ]);
+  // a: first → null. b: backfilled to the 90s gap. c: frozen 42 preserved.
+  expect(boots.map((b) => b.prev_runtime_ms)).toEqual([null, 90_000, 42]);
+});
+
+// ── fold this boot: gap freeze + overlapping-boot retention ──────────────────
+
+test("foldBootIntoRestartLedger: the first-ever boot has a null predecessor gap", () => {
+  const { lines, bootLine: bl } = foldBootIntoRestartLedger({
+    existing: [],
+    bootId: "first",
+    provenance: "launchd",
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(bl).toEqual(bootLine("first", CL_NOW, "launchd", null));
+  expect(lines).toEqual([bl]);
+});
+
+test("foldBootIntoRestartLedger: freezes the inter-boot gap to the predecessor", () => {
+  const { bootLine: bl } = foldBootIntoRestartLedger({
+    existing: [bootLine("prev", CL_NOW - 90_000, "launchd", null)],
+    bootId: "cur",
+    provenance: "launchd",
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  expect(bl.prev_runtime_ms).toBe(90_000);
+});
+
+test("foldBootIntoRestartLedger: overlapping boots at the same instant each retain their own line", () => {
+  // Fails against a timestamp-keyed ledger, which filtered out any entry whose ts
+  // equalled the booting process's nowMs — erasing the overlapping boot's record.
+  const { lines } = foldBootIntoRestartLedger({
+    existing: [bootLine("a", CL_NOW, "launchd", null)],
+    bootId: "b",
+    provenance: "unknown",
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  });
+  const bootIds = lines.filter((l) => l.kind === "boot").map((l) => l.boot_id);
+  expect(bootIds).toEqual(["a", "b"]);
+});
+
+test("collapseRestartLedger: a dying boot's enrichment touches only its own overlapping line", () => {
+  // Two daemons overlap; boot "a" dies and appends an enrich line. Boot "b" is
+  // untouched — the append-only enrich cannot erase the overlapping boot the way
+  // the old ts-keyed read-modify-write did.
+  const boots = collapseRestartLedger([
+    bootLine("a", CL_NOW, "launchd", null),
+    bootLine("b", CL_NOW, "foreign", null),
+    { kind: "enrich", boot_id: "a", ts: CL_NOW + 10, reason: "a-died" },
+  ]);
+  expect(boots.length).toBe(2);
+  expect(boots.find((x) => x.boot_id === "a")?.reason).toBe("a-died");
+  expect(boots.find((x) => x.boot_id === "b")?.reason).toBeUndefined();
+});
+
+// ── compaction: window aging + cap + flatten ─────────────────────────────────
+
+test("compactRestartLedger: ages out an old boot, keeps in-window boots and their enrichment", () => {
+  const out = compactRestartLedger(
+    [
+      bootLine("old", CL_NOW - CL_WINDOW - 1, "launchd", null),
+      bootLine("keep1", CL_NOW - 1_000, "launchd", null),
+      { kind: "enrich", boot_id: "keep1", ts: CL_NOW - 500, reason: "boom" },
+      bootLine("keep2", CL_NOW, "launchd", 1_000),
+    ],
+    { nowMs: CL_NOW, windowMs: CL_WINDOW, cap: RESTART_LEDGER_CAP },
+  );
+  expect(out.filter((l) => l.kind === "boot").map((l) => l.boot_id)).toEqual([
+    "keep1",
+    "keep2",
+  ]);
+  expect(out.filter((l) => l.kind === "enrich").map((l) => l.boot_id)).toEqual([
+    "keep1",
+  ]);
+});
+
+test("compactRestartLedger: the length cap keeps the most recent boots", () => {
+  const many: RestartLedgerLine[] = [];
+  for (let i = 0; i < RESTART_LEDGER_CAP + 5; i++) {
+    many.push(
+      bootLine(
+        `b-${i}`,
+        CL_NOW - (RESTART_LEDGER_CAP + 5 - i) * 100,
+        "launchd",
+        null,
+      ),
+    );
+  }
+  const boots = compactRestartLedger(many, {
+    nowMs: CL_NOW,
+    windowMs: CL_WINDOW,
+    cap: RESTART_LEDGER_CAP,
+  }).filter((l) => l.kind === "boot");
+  expect(boots.length).toBe(RESTART_LEDGER_CAP);
+  expect(boots[boots.length - 1].boot_id).toBe(`b-${RESTART_LEDGER_CAP + 4}`);
+});
+
+test("compactRestartLedger: a future-dated boot is dropped", () => {
+  const out = compactRestartLedger(
+    [
+      bootLine("now", CL_NOW, "launchd", null),
+      bootLine("future", CL_NOW + 10_000, "launchd", null),
+    ],
+    { nowMs: CL_NOW, windowMs: CL_WINDOW, cap: RESTART_LEDGER_CAP },
+  );
+  expect(out.filter((l) => l.kind === "boot").map((l) => l.boot_id)).toEqual([
+    "now",
+  ]);
+});
+
+// ── runtime-qualified crash-loop counting ────────────────────────────────────
+
+test("qualifyCrashLoopBootTimestamps: young predecessors count, healthy bounce / no-pred / foreign do not", () => {
+  const base = 1_000_000;
+  const boots: RestartBoot[] = collapseRestartLedger([
+    bootLine("h", base, "launchd", null), // no predecessor → excluded
+    bootLine("a", base + 3_600_000, "launchd", 3_600_000), // ran 1h → excluded
+    bootLine("b", base + 3_600_000 + 90_000, "launchd", 90_000), // young → counts
+    bootLine("c", base + 3_600_000 + 180_000, "unknown", 90_000), // unknown young → counts
+    bootLine("f", base + 3_600_000 + 270_000, "foreign", 90_000), // foreign → excluded
+  ]);
+  expect(
+    qualifyCrashLoopBootTimestamps(boots, CRASH_LOOP_YOUNG_RUNTIME_MS),
+  ).toEqual([base + 3_600_000 + 90_000, base + 3_600_000 + 180_000]);
+});
+
+test("qualify + decideCrashLoop: a bounce of a healthy long-running daemon does not trip", () => {
+  const boots = collapseRestartLedger([
+    bootLine("h", CL_NOW - 3_600_000, "launchd", null),
+    bootLine("x", CL_NOW, "launchd", 3_600_000), // bounced after 1h
+  ]);
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        boots,
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: false, recentBoots: 0 });
+});
+
+test("qualify + decideCrashLoop: repeated young deaths trip the loop", () => {
+  const lines: RestartLedgerLine[] = [];
+  // THRESHOLD+1 boots 90s apart: the leading boot has no predecessor (excluded),
+  // the following THRESHOLD each had a young (90s) predecessor → exactly THRESHOLD.
+  for (let i = 0; i <= CRASH_LOOP_THRESHOLD; i++) {
+    lines.push(
+      bootLine(
+        `loop-${i}`,
+        CL_NOW - (CRASH_LOOP_THRESHOLD - i) * 90_000,
+        "launchd",
+        i === 0 ? null : 90_000,
+      ),
+    );
+  }
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        collapseRestartLedger(lines),
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CL_WINDOW,
+    }),
+  ).toEqual({ crashLoop: true, recentBoots: CRASH_LOOP_THRESHOLD });
+});
+
+// ── file round-trip: NDJSON write / read / append ────────────────────────────
+
+test("readRestartLedger / writeRestartLedger: NDJSON round-trip through a real file, no temp left behind", () => {
   const dir = mkdtempSync(join(tmpdir(), "keeper-restart-ledger-"));
   const path = join(dir, "restart-ledger.json");
   try {
-    const entries: RestartLedgerEntry[] = [
-      { ts: 1 },
-      { ts: 2, reason: "serve-liveness-watchdog: probe-stuck" },
+    const lines: RestartLedgerLine[] = [
+      bootLine("a", 1, "launchd", null),
+      {
+        kind: "enrich",
+        boot_id: "a",
+        ts: 2,
+        reason: "serve-liveness-watchdog: probe-stuck",
+      },
+      bootLine("b", 3, "foreign", 2),
     ];
-    writeRestartLedger(path, entries);
-    expect(readRestartLedger(path)).toEqual(entries);
-    // atomicWriteFile never leaves a .tmp.* file behind on success.
+    writeRestartLedger(path, lines);
+    expect(readRestartLedger(path)).toEqual(lines);
     const leftovers = readdirSync(dir).filter(
       (f) => f !== "restart-ledger.json",
     );
     expect(leftovers).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendRestartLedgerLine: appends one line without overwriting existing content", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-restart-ledger-"));
+  const path = join(dir, "restart-ledger.json");
+  try {
+    writeFileSync(
+      path,
+      serializeRestartLedgerLine(bootLine("a", 1, "launchd", null)),
+    );
+    appendRestartLedgerLine(path, {
+      kind: "enrich",
+      boot_id: "a",
+      ts: 2,
+      reason: "boom",
+    });
+    expect(readRestartLedger(path)).toEqual([
+      bootLine("a", 1, "launchd", null),
+      { kind: "enrich", boot_id: "a", ts: 2, reason: "boom" },
+    ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -8031,8 +8930,12 @@ function spawnedWorkerNames(opts?: {
     (globalThis as { Worker: unknown }).Worker = WorkerSpy;
     for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
     // Boot is fully synchronous up to the returned handle (every `new Worker`
-    // fires here, under the spy).
-    handle = startDaemon({ workers: opts?.workers });
+    // fires here, under the spy). Disable the single-instance flock: it runs on
+    // MAIN (not stubbed by WorkerSpy) and would otherwise take the real host lock.
+    handle = startDaemon({
+      workers: opts?.workers,
+      disableSingleInstanceLock: true,
+    });
   } finally {
     (globalThis as { Worker: unknown }).Worker = realWorker;
     for (const k of Object.keys(sandbox)) {

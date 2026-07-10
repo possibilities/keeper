@@ -28,6 +28,13 @@ crash-loop is made loud, not invisible: each boot is appended to a durable resta
 ledger and a single sticky distress row is minted, level-cleared once the boot
 rate recovers.
 
+> **Superseded (ledger mechanism only):** the restart-ledger mechanism referenced
+> here — originally a replace-in-place JSON array — is superseded by
+> [ADR 0030](0030-single-instance-gate-and-restart-provenance.md), which makes the
+> ledger an append-only, `boot_id`-keyed NDJSON sidecar with provenance and
+> runtime-qualified crash-loop counting. The fatalExit-over-self-heal stance in
+> this record is unchanged.
+
 ## Consequences
 
 - Faults surface as crashes with a clean restart, so the running process is always

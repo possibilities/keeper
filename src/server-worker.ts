@@ -1,7 +1,8 @@
 /**
  * Server worker. Runs as keeperd's read-surface Worker thread: a UDS listener
  * speaking the NDJSON protocol from `src/protocol.ts`, its OWN read-only DB
- * connection, and the `<state-dir>/keeperd.lock` ownership lock.
+ * connection, and the `<state-dir>/keeperd.sock.lock` pid-file ownership lock
+ * (distinct from main's `keeperd.lock` single-instance flock).
  *
  * Three beats layer over the one-shot `query → result`: an independent
  * `data_version` poll (`pollLoop`) turns committed changes into per-entity
@@ -44,6 +45,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { createHistogram, monitorEventLoopDelay } from "node:perf_hooks";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import {
@@ -108,6 +110,24 @@ export interface ServerWorkerData {
 /** Message posted to the parent when the listener is bound and serving. */
 export interface ReadyMessage {
   kind: "ready";
+}
+
+/**
+ * Periodic served-latency self-report to main (the serve-liveness watchdog's eyes
+ * on what real clients experience). DURATIONS ONLY — never timestamps: a starved
+ * serve loop's own clock is late by construction, so main stamps arrival on its own
+ * monotonic clock and judges report staleness from that, never from anything here.
+ *   - `dispatchP99Ms`: p99 of per-request dispatch latency over the window.
+ *   - `busyMs`: total time spent dispatching in the window (occupancy).
+ *   - `sampleCount`: dispatches measured — main floors the p99's trust on this.
+ *   - `loopDelayP99Ms`: the worker's OWN event-loop-delay p99 (the queueing signal).
+ */
+export interface ServeHealthMessage {
+  kind: "serve-health";
+  dispatchP99Ms: number;
+  busyMs: number;
+  sampleCount: number;
+  loopDelayP99Ms: number;
 }
 
 /** Message the parent sends to ask the worker to stop. */
@@ -377,8 +397,10 @@ export const MAX_LIMIT = 500;
 /**
  * Hard upper bound on concurrent connections — the global backstop. Diff fan-out
  * scales with SUBSCRIBED conns only (a zero-sub conn carries no subs and never
- * enters a diff), so the real cost driver is `sub_live`, which the reapers keep
- * low; this ceiling guards against a connection STORM (a reconnect-loop client)
+ * enters a diff), so the real cost driver is `sub_live` — kept low by the reapers
+ * (including {@link SUBSCRIBED_SILENCE_TTL_MS} for abandoned-but-alive subs) AND
+ * bounded per tick by {@link MAX_SUBS_PER_TICK} so no accumulation can starve the
+ * loop. This ceiling guards against a connection STORM (a reconnect-loop client)
  * filling the table. At the cap a NEW connection is REJECTED with a
  * `max_connections` frame then closed — reject-new, NOT LRU-evict: the oldest
  * conn is the legit long-lived board. The {@link PER_PID_MAX_CONNECTIONS}
@@ -442,6 +464,26 @@ export const IDLE_CONN_TTL_MS = 5 * 60_000;
  */
 export const UNENGAGED_CONN_TTL_MS = 30_000;
 
+/**
+ * Inbound-silence ceiling (ms) for a SUBSCRIBED connection before it is reaped as
+ * abandoned-but-alive: subscribed, peer process still live, `everEngaged` — the
+ * exact conn the dead-peer / unengaged / idle sweeps all miss (live pid, engaged,
+ * subs > 0). A ghost of this shape (a half-open UDS FIN the kernel never surfaces,
+ * a viewer whose event loop wedged, a non-keeper client that abandons its socket
+ * without closing it) generates no backpressure during a DB-quiet window, so it
+ * sits in `conns` forever while every diff tick pays its fan-out.
+ *
+ * Reaped on POSITIVE abandonment evidence, never on push-side silence: a live
+ * `subscribeReadiness` viewer sends a heartbeat probe refetch every
+ * {@link import("./readiness-client").HEARTBEAT_IDLE_MS} (15s) of inbound idleness,
+ * so a healthy subscribed conn refreshes `lastActivityAt` at least that often even
+ * on a silent board. This ceiling sits at 3x the client heartbeat — comfortably
+ * past heartbeat jitter, backpressure, and round-trip slop — so it fires ONLY on a
+ * conn whose engagement has genuinely ceased, never on a legitimately-quiet board.
+ * Keyed on `lastActivityAt` (inbound), NOT the server's push cadence.
+ */
+export const SUBSCRIBED_SILENCE_TTL_MS = 45_000;
+
 // ---------------------------------------------------------------------------
 // DEBUG: timing instrumentation
 // ---------------------------------------------------------------------------
@@ -466,6 +508,44 @@ const TRACE_FRAME_BYTES = (() => {
 let __nextConnId = 0;
 function srvTs(msg: string): void {
   console.error(`[srv-ts] T=${Date.now()} ${msg}`);
+}
+
+/**
+ * How often the worker posts a `serve-health` self-report to main. Several reports
+ * per watchdog interval, so a couple of dropped reports never reads as a mute; the
+ * mute threshold is multiple watchdog intervals, well above this.
+ */
+export const SERVE_HEALTH_REPORT_INTERVAL_MS = 12_000;
+
+/**
+ * Accumulates per-dispatch served-latency over a report window. The dispatch timing
+ * that feeds `record` runs UNCONDITIONALLY (a ~20ns `performance.now()` pair, no env
+ * gate — only the trace LOGGING stays behind `TRACE`), so the watchdog always has
+ * eyes on what real clients experience. Backed by a native histogram (bounded memory
+ * under a flood, unlike a growing array); busy-ms is summed alongside since a
+ * histogram has percentiles but no sum. `drain()` reads and resets the window.
+ */
+export class ServeLatencyMeter {
+  // Sub-ms dispatches matter for the tail, and the histogram floors at 1, so record
+  // in MICROSECONDS and convert the p99 back to ms on drain.
+  private readonly hist = createHistogram();
+  private busyMs = 0;
+
+  record(durMs: number): void {
+    const safe = durMs > 0 ? durMs : 0;
+    this.hist.record(Math.max(1, Math.round(safe * 1000)));
+    this.busyMs += safe;
+  }
+
+  drain(): { dispatchP99Ms: number; busyMs: number; sampleCount: number } {
+    const sampleCount = Number(this.hist.count);
+    const dispatchP99Ms =
+      sampleCount > 0 ? Number(this.hist.percentile(99)) / 1000 : 0;
+    const busyMs = this.busyMs;
+    this.hist.reset();
+    this.busyMs = 0;
+    return { dispatchP99Ms, busyMs, sampleCount };
+  }
 }
 
 /**
@@ -1102,6 +1182,40 @@ export function unlinkIfExists(path: string): void {
   } catch {
     // best-effort; a leftover file is reclaimed by the next ownership check
   }
+}
+
+/**
+ * Does the ownership lock at `lockPath` still record OUR pid? A dying stray whose
+ * lock a live successor already stole (the successor rewrote the pid) reads false
+ * here and MUST NOT unlink the successor's socket. A missing / unparseable lock
+ * is "not ours" — ownership can only be proven from our own pid.
+ */
+export function lockOwnedByUs(lockPath: string): boolean {
+  try {
+    if (!existsSync(lockPath)) {
+      return false;
+    }
+    const pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid === process.pid;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ownership-checked teardown: unlink the socket AND the lock ONLY while the lock
+ * still records our pid, so a dying stray never unlinks a live successor's socket
+ * (which a stale-reclaiming successor may have already rebound under this path).
+ */
+export function unlinkOwnedSocketAndLock(
+  lockPath: string,
+  sockPath: string,
+): void {
+  if (!lockOwnedByUs(lockPath)) {
+    return;
+  }
+  unlinkIfExists(sockPath);
+  unlinkIfExists(lockPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,6 +2608,41 @@ function reapUnengaged(list: Writable[], conns?: Set<Writable>): void {
 }
 
 /**
+ * Evict a SUBSCRIBED connection whose inbound engagement has ceased past
+ * {@link SUBSCRIBED_SILENCE_TTL_MS} — the abandoned-but-alive ghost the dead-peer,
+ * unengaged, and idle sweeps all miss: it holds live subscriptions (idle sweep
+ * exempts it), its peer process is still alive (dead-peer sweep skips it), and it
+ * long-ago engaged (unengaged sweep skips it). It generates no backpressure in a
+ * DB-quiet window (stuck-pending is inert), so nothing else touches it while every
+ * diff tick pays its fan-out.
+ *
+ * POSITIVE abandonment evidence, never push-side silence: a live `subscribeReadiness`
+ * viewer refreshes `lastActivityAt` via a heartbeat probe at least every 15s (see
+ * {@link SUBSCRIBED_SILENCE_TTL_MS}), so a healthy quiet board is never past this
+ * ceiling. Zero-sub conns are OUT of scope (the idle/unengaged arms own them);
+ * this arm is the subscribed-conn analog keyed on the client's heartbeat contract.
+ * Per-conn try/catch via `evictConn`, exactly as the sibling reapers.
+ */
+function reapAbandonedSubs(list: Writable[], conns?: Set<Writable>): void {
+  const now = Date.now();
+  for (const sock of list) {
+    // Only subscribed conns — zero-sub is the idle/unengaged sweeps' domain.
+    if (sock.data.subs.size === 0) {
+      continue;
+    }
+    if (now - sock.data.lastActivityAt < SUBSCRIBED_SILENCE_TTL_MS) {
+      continue;
+    }
+    console.error(
+      `[server-worker] reaping abandoned-sub conn ${sock.data.id ?? -1} ` +
+        `(subscribed, inbound-silent ${now - sock.data.lastActivityAt}ms > ` +
+        `${SUBSCRIBED_SILENCE_TTL_MS}ms heartbeat ceiling; ${sock.data.subs.size} sub(s))`,
+    );
+    evictConn(sock, conns);
+  }
+}
+
+/**
  * Count live connections sharing a peer pid — the admission-control predicate
  * behind {@link PER_PID_MAX_CONNECTIONS}. Pure read over the conn set.
  */
@@ -2508,54 +2657,156 @@ export function pidConnCount(conns: Iterable<Writable>, pid: number): number {
 }
 
 /**
- * Log a one-line conn-state census on a cap-hit, classifying every live conn so
- * the reason the sweep did or did not recover a slot is attributable from one
- * log line (the diagnostic the 2026-06-12 stall lacked). Buckets mirror the
- * reaper arms: `pending` (backpressured — stuck-pending candidate), `zero_sub`
- * (idle-sweep candidate), `sub_live` (subscribed, peer alive — the protected
- * board), `sub_dead` (subscribed, peer gone — dead-peer candidate), and
- * `sub_unknown` (subscribed, peerPid null — never liveness-reaped). Pure read.
+ * Whether a connection is the daemon's OWN — its peer pid equals this process's
+ * pid. Main's serve-liveness probe connects to a worker thread in the SAME
+ * process, so its peer pid IS the daemon pid; those conns are exempt from the
+ * per-pid cap (a self-probe must never be cap-rejected into a false death) and
+ * censused in a distinct `self` bucket. Precise by design — an exact pid match
+ * only, never a broad exemption that would re-open the cap the reapers rely on.
  */
-function logCapCensus(conns: Set<Writable>): void {
-  const now = Date.now();
-  let pending = 0;
-  let zeroSub = 0;
-  let zeroSubDead = 0;
-  let zeroSubUnengaged = 0;
-  let subLive = 0;
-  let subDead = 0;
-  let subUnknown = 0;
+export function isDaemonSelfConn(
+  peerPid: number | null,
+  selfPid: number,
+): boolean {
+  return peerPid != null && peerPid === selfPid;
+}
+
+/**
+ * A connection's census view — the `socket.data` fields the cap census reads,
+ * narrowed so the pure seam takes plain objects in tests (no real socket).
+ */
+export type CensusConnView = {
+  data: Pick<
+    ConnState,
+    | "peerPid"
+    | "pending"
+    | "subs"
+    | "everEngaged"
+    | "connectedAt"
+    | "lastActivityAt"
+  >;
+};
+
+/** Cap-census bucket counts ({@link censusConns}). */
+export interface ConnCensus {
+  total: number;
+  /**
+   * The daemon's OWN connections (peer pid == daemon pid) — self-probes, exempt
+   * from the per-pid cap and never peer-liveness-reaped. Broken out so a cap
+   * census settles whether the capped peers are our probes or external clients.
+   */
+  self: number;
+  pending: number;
+  zeroSub: number;
+  zeroSubDead: number;
+  zeroSubUnengaged: number;
+  subLive: number;
+  subDead: number;
+  subUnknown: number;
+  /**
+   * Subscribed conns whose inbound engagement has ceased past the heartbeat
+   * ceiling — the abandoned-but-alive ghosts {@link reapAbandonedSubs} evicts. A
+   * NON-EXCLUSIVE sub-count (mirrors `zeroSubDead`): counted IN ADDITION to the
+   * conn's `subLive`/`subDead`/`subUnknown` classification, never into `total`.
+   */
+  subAbandoned: number;
+}
+
+/**
+ * Classify a connection set into the cap-census buckets. Pure — `isPidAlive` and
+ * the clock are injected — so the fast tier covers the bucketing (including the
+ * `self` bucket) without a real socket. {@link logCapCensus} formats the result.
+ * Buckets mirror the reaper arms: `pending` (backpressured — stuck-pending
+ * candidate), `zero_sub` (idle-sweep candidate), `sub_live` (subscribed, peer
+ * alive — the protected board), `sub_dead` (subscribed, peer gone — dead-peer
+ * candidate), `sub_unknown` (subscribed, peerPid null — never liveness-reaped),
+ * `sub_abandoned` (subscribed, inbound-silent past `subscribedSilenceTtlMs` — the
+ * abandoned-but-alive candidate, a non-exclusive sub-count), with `self` pulled
+ * out ahead of all of them.
+ */
+export function censusConns(
+  conns: Iterable<CensusConnView>,
+  opts: {
+    selfPid: number;
+    nowMs: number;
+    unengagedTtlMs: number;
+    subscribedSilenceTtlMs: number;
+    isPidAlive: (pid: number) => boolean;
+  },
+): ConnCensus {
+  const c: ConnCensus = {
+    total: 0,
+    self: 0,
+    pending: 0,
+    zeroSub: 0,
+    zeroSubDead: 0,
+    zeroSubUnengaged: 0,
+    subLive: 0,
+    subDead: 0,
+    subUnknown: 0,
+    subAbandoned: 0,
+  };
   for (const sock of conns) {
-    if (sock.data.pending !== null) {
-      pending++;
-    }
+    c.total++;
     const pid = sock.data.peerPid;
-    const dead = pid != null && !isPidAlive(pid);
+    // The daemon's own conns are exempt from the per-pid cap and never reaped on
+    // peer-liveness — count them apart from external clients and skip the rest.
+    if (isDaemonSelfConn(pid, opts.selfPid)) {
+      c.self++;
+      continue;
+    }
+    if (sock.data.pending !== null) {
+      c.pending++;
+    }
+    const dead = pid != null && !opts.isPidAlive(pid);
     if (sock.data.subs.size === 0) {
-      zeroSub++;
+      c.zeroSub++;
       if (dead) {
-        zeroSubDead++;
+        c.zeroSubDead++;
       } else if (
         !sock.data.everEngaged &&
-        now - sock.data.connectedAt >= UNENGAGED_CONN_TTL_MS
+        opts.nowMs - sock.data.connectedAt >= opts.unengagedTtlMs
       ) {
-        zeroSubUnengaged++;
+        c.zeroSubUnengaged++;
       }
       continue;
     }
     if (pid == null) {
-      subUnknown++;
+      c.subUnknown++;
     } else if (dead) {
-      subDead++;
+      c.subDead++;
     } else {
-      subLive++;
+      c.subLive++;
+    }
+    // Non-exclusive sub-count (mirrors zeroSubDead): a subscribed conn whose
+    // inbound engagement has ceased past the heartbeat ceiling is the
+    // abandoned-but-alive ghost, counted ON TOP of its live/dead/unknown class.
+    if (opts.nowMs - sock.data.lastActivityAt >= opts.subscribedSilenceTtlMs) {
+      c.subAbandoned++;
     }
   }
+  return c;
+}
+
+/**
+ * Log a one-line conn-state census on a cap-hit, classifying every live conn so
+ * the reason the sweep did or did not recover a slot is attributable from one log
+ * line (the diagnostic the 2026-06-12 stall lacked).
+ */
+function logCapCensus(conns: Set<Writable>): void {
+  const c = censusConns(conns, {
+    selfPid: process.pid,
+    nowMs: Date.now(),
+    unengagedTtlMs: UNENGAGED_CONN_TTL_MS,
+    subscribedSilenceTtlMs: SUBSCRIBED_SILENCE_TTL_MS,
+    isPidAlive,
+  });
   console.error(
     `[server-worker] conn-cap census (${conns.size}/${MAX_CONNECTIONS}): ` +
-      `pending=${pending} zero_sub=${zeroSub} (dead=${zeroSubDead} ` +
-      `unengaged=${zeroSubUnengaged}) sub_live=${subLive} sub_dead=${subDead} ` +
-      `sub_unknown=${subUnknown}`,
+      `self=${c.self} pending=${c.pending} zero_sub=${c.zeroSub} ` +
+      `(dead=${c.zeroSubDead} unengaged=${c.zeroSubUnengaged}) ` +
+      `sub_live=${c.subLive} sub_dead=${c.subDead} sub_unknown=${c.subUnknown} ` +
+      `sub_abandoned=${c.subAbandoned}`,
   );
 }
 
@@ -2574,9 +2825,11 @@ function logCapCensus(conns: Set<Writable>): void {
 export function reapConns(list: Writable[], conns?: Set<Writable>): void {
   reapStuckPending(list, conns);
   // Dead-peer + unengaged are the fast storm-clearers (they free a flood of
-  // garbage conns at once); the 5-minute idle sweep is the slow backstop.
+  // garbage conns at once); abandoned-subs clears live-peer ghosts the others
+  // miss; the 5-minute idle sweep is the slow zero-sub backstop.
   reapDeadPeers(list, conns);
   reapUnengaged(list, conns);
+  reapAbandonedSubs(list, conns);
   reapIdleConns(list, conns);
 }
 
@@ -2594,6 +2847,83 @@ function unionWatched(subs: Iterable<SubState>): string[] {
     }
   }
   return [...union];
+}
+
+/**
+ * Per-tick fan-out budget: the maximum number of `(conn, sub)` units one
+ * {@link diffTick} services. The diff's per-tick cost is `subscribed_conns x
+ * watched_ids x collections` — unbounded in board size and conn count, the
+ * re-fold time-bomb discipline transplanted to the serve loop: an accumulation
+ * of subscriptions (ghosts the reapers have not yet cleared, or a genuinely
+ * busy board) would let one tick's synchronous work starve the accept/read
+ * loop. {@link sliceFanout} caps each tick to this many units and round-robins
+ * the remainder across subsequent ticks, so per-tick cost is O(budget), flat in
+ * conn count. At the {@link DEFAULT_POLL_MS} 50ms cadence a deferred sub is
+ * serviced within `ceil(total_subs / MAX_SUBS_PER_TICK)` ticks — generous enough
+ * that a normal board (well under the budget) sees zero added latency, yet a
+ * fully-saturated {@link MAX_CONNECTIONS} table drains within a bounded window.
+ */
+export const MAX_SUBS_PER_TICK = 64;
+
+/**
+ * The round-robin fan-out position, persisted across ticks (owned by the worker
+ * `main` like `conns`, threaded into both {@link pollLoop} and {@link handleKick}
+ * so the SAME rotation advances no matter which path drives the tick). A plain
+ * mutable holder so the pure {@link sliceFanout} can advance it in place.
+ */
+export interface FanoutCursor {
+  value: number;
+}
+
+/** Allocate a fresh fan-out cursor at rotation position 0. */
+export function newFanoutCursor(): FanoutCursor {
+  return { value: 0 };
+}
+
+/** One tick's fan-out slice: the units to service now + how many were deferred. */
+export interface FanoutSlice<T> {
+  serve: T[];
+  deferred: number;
+}
+
+/**
+ * Round-robin scheduler bounding a diff tick's fan-out. Serves at most
+ * `maxPerTick` units starting at `cursor.value`, wrapping the ring, and advances
+ * the cursor to exactly where this slice ended so the NEXT tick continues the
+ * rotation — never a priority-by-recency order (which would starve the ring's
+ * tail; see the task risk). Consecutive slices cover a contiguous arc of length
+ * `k x maxPerTick`, so within `ceil(units.length / maxPerTick)` ticks the arc
+ * wraps the whole ring: EVERY unit is guaranteed serviced within that bound,
+ * regardless of the starting cursor.
+ *
+ * When the budget covers the whole set (`maxPerTick >= units.length`) or is
+ * non-positive (the unbounded caller path), the cursor resets to 0 and every
+ * unit is served — a no-op bound, so a below-budget board behaves exactly as the
+ * un-scheduled fan-out did.
+ */
+export function sliceFanout<T>(
+  units: T[],
+  cursor: FanoutCursor,
+  maxPerTick: number,
+): FanoutSlice<T> {
+  const n = units.length;
+  if (n === 0) {
+    cursor.value = 0;
+    return { serve: [], deferred: 0 };
+  }
+  if (maxPerTick <= 0 || maxPerTick >= n) {
+    cursor.value = 0;
+    return { serve: units, deferred: 0 };
+  }
+  // Normalize the cursor into [0, n) — it may point past the ring after a set
+  // that shrank between ticks (conns closed), so wrap defensively.
+  const start = ((cursor.value % n) + n) % n;
+  const serve: T[] = [];
+  for (let i = 0; i < maxPerTick; i++) {
+    serve.push(units[(start + i) % n]);
+  }
+  cursor.value = (start + maxPerTick) % n;
+  return { serve, deferred: n - maxPerTick };
 }
 
 /**
@@ -2615,31 +2945,50 @@ function unionWatched(subs: Iterable<SubState>): string[] {
  * `events` INSERT but before the fold sees no projection change; the fold is
  * itself a commit that re-bumps `data_version`, so the next poll catches it.
  */
-export function diffTick(db: Database, conns: Iterable<Writable>): void {
+export function diffTick(
+  db: Database,
+  conns: Iterable<Writable>,
+  cursor?: FanoutCursor,
+): void {
   const list = [...conns];
   if (list.length === 0) {
     return;
   }
 
-  // Connection-hygiene reapers run BEFORE the `byCollection.size === 0` early
-  // return so a zero-sub conn is still swept. Also run every poll tick via
-  // `reapConns`; the call here covers the `handleKick` path. Idempotent.
+  // Connection-hygiene reapers run over the FULL conn set (before any fan-out
+  // bound) so every zero-sub AND deferred conn is still swept. Also run every
+  // poll tick via `reapConns`; the call here covers the `handleKick` path.
   reapConns(list);
 
-  // Build the flat list of (sock, subId, sub) triples across all conns and
-  // group by `sub.collection`. A conn with an empty `subs` map (no live
-  // subscription) contributes nothing.
+  // Build the flat list of (sock, subId, sub) triples across ALL conns, then
+  // bound the fan-out to a round-robin slice of {@link MAX_SUBS_PER_TICK} units
+  // so per-tick cost stays flat in conn count (deferred subs ride the cursor to
+  // a later tick — state-based diffing means nothing is lost, only delayed by a
+  // bounded number of ticks). A conn with an empty `subs` map contributes
+  // nothing. When `cursor` is omitted (direct unit callers) the fan-out is
+  // unbounded — every sub served, exactly as before.
   type Triple = { sock: Writable; subId: string | null; sub: SubState };
-  const byCollection = new Map<string, Triple[]>();
+  const units: Triple[] = [];
   for (const sock of list) {
     for (const [subId, sub] of sock.data.subs) {
-      const group = byCollection.get(sub.collection);
-      const triple: Triple = { sock, subId, sub };
-      if (group) {
-        group.push(triple);
-      } else {
-        byCollection.set(sub.collection, [triple]);
-      }
+      units.push({ sock, subId, sub });
+    }
+  }
+  if (units.length === 0) {
+    return;
+  }
+  const served = cursor
+    ? sliceFanout(units, cursor, MAX_SUBS_PER_TICK).serve
+    : units;
+
+  // Group the served slice by `sub.collection` for the patch pass.
+  const byCollection = new Map<string, Triple[]>();
+  for (const triple of served) {
+    const group = byCollection.get(triple.sub.collection);
+    if (group) {
+      group.push(triple);
+    } else {
+      byCollection.set(triple.sub.collection, [triple]);
     }
   }
   if (byCollection.size === 0) {
@@ -2750,10 +3099,13 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   }
   const _tAfterPatch = TRACE ? performance.now() : 0;
 
-  // Second pass: membership-staleness `meta`. Group live `(sock, sub)` pairs by
+  // Second pass: membership-staleness `meta`. Group the SAME served slice by
   // filter signature so pairs sharing a filter share ONE countAndToken; the
   // signature folds in bound params but excludes sort/limit/offset (different
-  // pages of one filter share).
+  // pages of one filter share). Iterating `served` (not `list`) keeps the meta
+  // pass under the same per-tick fan-out bound as the patch pass — a deferred
+  // sub's membership recheck rides the cursor to a later tick, and meta is
+  // throttled to {@link META_MIN_INTERVAL_MS} anyway.
   const byFilter = new Map<
     string,
     {
@@ -2762,24 +3114,22 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       pairs: { sock: Writable; subId: string | null; sub: SubState }[];
     }
   >();
-  for (const sock of list) {
-    for (const [subId, sub] of sock.data.subs) {
-      const descriptor = getCollection(sub.collection);
-      if (!descriptor) {
-        continue;
-      }
-      const sig = JSON.stringify([
-        sub.collection,
-        sub.where.clause,
-        sub.where.params,
-      ]);
-      const group = byFilter.get(sig);
-      const pair = { sock, subId, sub };
-      if (group) {
-        group.pairs.push(pair);
-      } else {
-        byFilter.set(sig, { descriptor, where: sub.where, pairs: [pair] });
-      }
+  for (const { sock, subId, sub } of served) {
+    const descriptor = getCollection(sub.collection);
+    if (!descriptor) {
+      continue;
+    }
+    const sig = JSON.stringify([
+      sub.collection,
+      sub.where.clause,
+      sub.where.params,
+    ]);
+    const group = byFilter.get(sig);
+    const pair = { sock, subId, sub };
+    if (group) {
+      group.pairs.push(pair);
+    } else {
+      byFilter.set(sig, { descriptor, where: sub.where, pairs: [pair] });
     }
   }
 
@@ -2880,7 +3230,10 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
  * `reapConns` still runs every tick regardless, since it has no data_version
  * dependency. `onNotadbSkip` — when given — is invoked with the running
  * consecutive-miss count on every tolerated skip so the caller can post
- * countable backstop telemetry.
+ * countable backstop telemetry. `cursor` — when given — is the persistent
+ * round-robin fan-out position threaded into `diffTick` so a busy board's ticks
+ * stay bounded (shared with `handleKick` by the worker `main`); omit it and the
+ * fan-out is unbounded, the pre-bound behavior direct callers expect.
  */
 export async function pollLoop(
   db: Database,
@@ -2888,6 +3241,7 @@ export async function pollLoop(
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
   onNotadbSkip?: (consecutiveMisses: number) => void,
+  cursor?: FanoutCursor,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
@@ -2935,7 +3289,7 @@ export async function pollLoop(
     if (cur !== null && cur !== last) {
       last = cur;
       const _tickStart = Date.now();
-      diffTick(db, getConns());
+      diffTick(db, getConns(), cursor);
       const _tickDur = Date.now() - _tickStart;
       if (_tickDur >= 20) {
         if (TRACE) srvTs(`poll-loop diffTick duration=${_tickDur}ms`);
@@ -2950,9 +3304,13 @@ export async function pollLoop(
  * The kick does NOT advance `pollLoop`'s `last`, so the next poll re-diffs
  * harmlessly (diffTick is state-based and idempotent).
  */
-export function handleKick(db: Database, conns: Iterable<Writable>): void {
+export function handleKick(
+  db: Database,
+  conns: Iterable<Writable>,
+  cursor?: FanoutCursor,
+): void {
   try {
-    diffTick(db, conns);
+    diffTick(db, conns, cursor);
   } catch (err) {
     // No-self-heal: log + continue. A crashed diffTick must not take down the
     // worker (and with it, the daemon).
@@ -2977,6 +3335,13 @@ export interface RunningServer {
    * compose without a real-socket shim.
    */
   conns: Set<Writable>;
+  /**
+   * Served-latency window the dispatch loop feeds. The worker `main()` drains it
+   * every {@link SERVE_HEALTH_REPORT_INTERVAL_MS} into a `serve-health` report; a
+   * direct unit caller that never drains it just leaves the window growing (bounded
+   * — it is a histogram).
+   */
+  latencyMeter: ServeLatencyMeter;
   stop(): void;
 }
 
@@ -3009,9 +3374,12 @@ export function startServer(
 ): RunningServer {
   acquireLock(lockPath, sockPath);
 
-  // AF_UNIX has no SO_REUSEADDR: a leftover socket file → EADDRINUSE. The lock
-  // is already ours, so unlinking here can't race another instance.
-  unlinkIfExists(sockPath);
+  // AF_UNIX has no SO_REUSEADDR: a leftover socket file → EADDRINUSE. acquireLock
+  // just wrote our pid, so the lock is ours; unlink the stale socket only WHILE we
+  // own the lock, so we never clear a live successor's rebound socket.
+  if (lockOwnedByUs(lockPath)) {
+    unlinkIfExists(sockPath);
+  }
 
   // Live connection registry. The realtime pollLoop iterates this each tick;
   // open() adds, close() removes. Entries are the sockets themselves (typed as
@@ -3022,6 +3390,10 @@ export function startServer(
   // ONE runQuery + ONE serialize. Owned here (not module-global) so a second
   // in-process server instance never cross-contaminates.
   const memo = newResultMemo();
+
+  // Per-server-instance served-latency window (same not-module-global discipline as
+  // `memo`). The dispatch loop feeds it; `main()` drains it into `serve-health`.
+  const latencyMeter = new ServeLatencyMeter();
 
   const listener = Bun.listen<ConnState>({
     unix: sockPath,
@@ -3045,9 +3417,16 @@ export function startServer(
           // client (a runaway `keeper board`) can never monopolize the table and
           // wedge every other client out of the global cap. Sweep first (the
           // loop's own dead / unengaged conns free here), then reject if it holds.
+          // The daemon's OWN conns (the serve-liveness probe from main, same pid)
+          // are EXEMPT — a self-probe cap-rejected into a false death is exactly
+          // the incident this hardening closes. The reject frame is emitted here
+          // at accept time, BEFORE the request line is read, so it cannot echo the
+          // probe's correlation id; the probe's matcher scores the admission code
+          // itself as proof-of-life (see daemon.ts `probeReplyProvesLife`).
           const pid = socket.data.peerPid;
           if (
             pid != null &&
+            !isDaemonSelfConn(pid, process.pid) &&
             pidConnCount(conns, pid) >= PER_PID_MAX_CONNECTIONS
           ) {
             reapConns([...conns], conns);
@@ -3115,7 +3494,16 @@ export function startServer(
         // querying conn is never idle-reaped; a silently-dead probe stops
         // bumping this and ages out.
         socket.data.lastActivityAt = t0;
-        handleData(db, socket, chunk, writerDb, bridge, memo, bootGate);
+        handleData(
+          db,
+          socket,
+          chunk,
+          writerDb,
+          bridge,
+          memo,
+          bootGate,
+          latencyMeter,
+        );
         const dur = Date.now() - t0;
         if (dur >= 5) {
           if (TRACE) srvTs(`conn ${id} handleData duration=${dur}ms`);
@@ -3157,6 +3545,7 @@ export function startServer(
   return {
     listener,
     conns,
+    latencyMeter,
     stop() {
       // Release the socket HERE — it's owned by the process, not the Worker
       // thread; the daemon's worker.terminate() won't release it.
@@ -3165,8 +3554,10 @@ export function startServer(
       } catch {
         // best-effort
       }
-      unlinkIfExists(sockPath);
-      unlinkIfExists(lockPath);
+      // Ownership-checked: a live successor may have stolen the lock (and rebound
+      // the socket) while this instance was dying. Only unlink when the lock still
+      // records our pid, so a dying stray never unlinks a live daemon's socket.
+      unlinkOwnedSocketAndLock(lockPath, sockPath);
     },
   };
 }
@@ -3185,6 +3576,7 @@ function handleData(
   bridge: ReplayBridge | undefined,
   memo: ResultMemo,
   bootGate: BootGate = { ready: true },
+  meter?: ServeLatencyMeter,
 ): void {
   const w = socket as unknown as Writable;
   let lines: string[];
@@ -3232,8 +3624,10 @@ function handleData(
     // engaged the instant its frame lands, before the multi-second reply).
     socket.data.everEngaged = true;
     let frames: (ServerFrame | PreSerialized)[];
-    // DEBUG: time each dispatchLine so we can spot a slow query / RPC.
-    const _dispatchStart = Date.now();
+    // Time every dispatch UNCONDITIONALLY (the ~20ns `performance.now()` pair, no
+    // env gate) so the serve-liveness watchdog always sees served latency; only the
+    // trace LOGGING below stays behind `TRACE`.
+    const _dispatchStart = performance.now();
     let _frameType = "unknown";
     let _collection: string | undefined;
     try {
@@ -3273,13 +3667,15 @@ function handleData(
     // memo path is bypassed during catch-up, so any PreSerialized line here only
     // rides at steady state and stamps nothing).
     stampBootStatus(db, bootGate, frames);
-    const _dispatchDur = Date.now() - _dispatchStart;
+    const _dispatchDur = performance.now() - _dispatchStart;
+    // Feed the served-latency window unconditionally (the watchdog's eyes).
+    meter?.record(_dispatchDur);
     const _id = socket.data.id ?? -1;
     const _collTag = _collection ? ` coll=${_collection}` : "";
     if (_frameType === "query" || _dispatchDur >= 5) {
       if (TRACE)
         srvTs(
-          `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur}ms frames=${frames.length}`,
+          `conn ${_id} dispatch type=${_frameType}${_collTag} duration=${_dispatchDur.toFixed(2)}ms frames=${frames.length}`,
         );
     }
     if (frames.length > 0) {
@@ -3595,6 +3991,11 @@ function main(): void {
   // "did the daemon bounce under me?" signal the client's epoch guard reads.
   const bootGate: BootGate = { ready: false, generation: randomUUID() };
 
+  // Shared round-robin fan-out position. Threaded into BOTH the poll loop and the
+  // post-fold kick handler so one rotation advances no matter which drives the
+  // tick, bounding every diff tick to {@link MAX_SUBS_PER_TICK} units.
+  const fanoutCursor = newFanoutCursor();
+
   let server: RunningServer;
   try {
     server = startServer(db, sockPath, lockPath, writerDb, bridge, bootGate);
@@ -3627,8 +4028,25 @@ function main(): void {
     resolvePollDone = resolve;
   });
 
+  // Worker-side served-latency self-report. `serveLoopDelayHist` measures THIS
+  // worker's own event-loop delay (the queueing signal main cannot see cross-thread)
+  // and pins a libuv handle, so it is released in `shutdown`; the report interval is
+  // cleared there too, and both the `stopping` guard below and that clear guarantee
+  // no `serve-health` is ever posted after stopping.
+  const serveLoopDelayHist = monitorEventLoopDelay({ resolution: 20 });
+  serveLoopDelayHist.enable();
+  let serveHealthReportTimer: ReturnType<typeof setInterval> | null = null;
+
   const shutdown = async (): Promise<void> => {
     stopping = true; // resolves the poll loop on its next iteration check
+    // Stop reporting FIRST (before any await) so no tick can post mid-teardown, and
+    // release the loop-delay monitor's libuv handle.
+    if (serveHealthReportTimer != null) clearInterval(serveHealthReportTimer);
+    try {
+      serveLoopDelayHist.disable();
+    } catch {
+      // best-effort — tearing down either way
+    }
     // Stop accepting + evict conns FIRST so a final diffTick has nothing to fan
     // out to, then WAIT for the poll loop to exit before closing the connection
     // it reads from — without the await, `db.close()` races a resumed pollLoop
@@ -3647,6 +4065,22 @@ function main(): void {
     }
     process.exit(0);
   };
+
+  // Drain the served-latency window + own loop-delay p99 into a periodic report.
+  // DURATIONS ONLY — main stamps arrival on its own clock and judges staleness there.
+  serveHealthReportTimer = setInterval(() => {
+    if (stopping) return; // never post after stopping
+    const { dispatchP99Ms, busyMs, sampleCount } = server.latencyMeter.drain();
+    const loopDelayP99Ms = serveLoopDelayHist.percentile(99) / 1e6;
+    serveLoopDelayHist.reset();
+    parentPort?.postMessage({
+      kind: "serve-health",
+      dispatchP99Ms,
+      busyMs,
+      sampleCount,
+      loopDelayP99Ms,
+    } satisfies ServeHealthMessage);
+  }, SERVE_HEALTH_REPORT_INTERVAL_MS);
 
   parentPort.on(
     "message",
@@ -3675,7 +4109,7 @@ function main(): void {
       if ((msg as KickMessage).type === "kick") {
         // Fast path: main folded + kicked so we diffTick now. The try/catch is in
         // `handleKick` — this handler must never throw (no-self-heal path).
-        handleKick(db, server.conns);
+        handleKick(db, server.conns, fanoutCursor);
         return;
       }
       if ((msg as BootCompleteMessage).type === "boot-complete") {
@@ -3798,6 +4232,7 @@ function main(): void {
         }),
       } satisfies BackstopMessage);
     },
+    fanoutCursor,
   )
     .then(() => {
       // Clean loop exit. Signal `shutdown()` that the poll connection is idle so

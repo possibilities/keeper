@@ -11,16 +11,28 @@
 
 import type { Database } from "bun:sqlite";
 import {
+  appendFileSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
   unlinkSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve as resolvePath, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  join,
+  resolve as resolvePath,
+  sep,
+} from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import {
   type AdoptableCodexRollout,
@@ -100,7 +112,6 @@ import {
   retainColdPayloads,
 } from "./compaction";
 import {
-  atomicWriteFile,
   clearDispatchMintGate,
   evictStaleDispatchMintGate,
   openDb,
@@ -117,6 +128,7 @@ import {
   resolveKeeperAgentPath,
   resolvePlanRoots,
   resolveRestartLedgerPath,
+  resolveSingleInstanceLockPath,
   resolveSockPath,
   resolveStatuslineRoot,
   resolveUsageRoot,
@@ -224,6 +236,7 @@ import type {
   RequestHandoffResultMessage,
   RetryDispatchRequestMessage,
   RetryDispatchResultMessage,
+  ServeHealthMessage,
   ServerWorkerData,
   SetAutopilotConfigRequestMessage,
   SetAutopilotConfigResultMessage,
@@ -252,6 +265,7 @@ import type {
   TranscriptWorkerData,
 } from "./transcript-worker";
 import type { Job, SessionTelemetryMessage } from "./types";
+import { FileLock } from "./usage-flock";
 import type { UsageScraperWorkerData } from "./usage-scraper-worker";
 import type {
   UsageMessage,
@@ -3480,13 +3494,6 @@ export const SERVE_WATCHDOG_INTERVAL_MS = 30_000;
  */
 export const SERVE_PROBE_TIMEOUT_MS = 5_000;
 /**
- * How stale the last SUCCESSFUL real-read on either socket may get before the
- * watchdog escalates. Three intervals' worth: a genuine wedge fails every probe,
- * so the age crosses this after ~3 consecutive dead ticks — enough to rule out a
- * one-off blip, short enough that an operator sees a restart, not a permanent hang.
- */
-export const SERVE_PROBE_STUCK_THRESHOLD_MS = 3 * SERVE_WATCHDOG_INTERVAL_MS;
-/**
  * Main-loop event-loop-delay p99 (ms) that counts as a BUSY-wedge breach for one
  * interval. ~1s of p99 lag means the main loop is starved — legitimate load rarely
  * sustains this. The accept-stall mode shows LOW lag, so this histogram detector is
@@ -3507,70 +3514,446 @@ export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 3;
  * sockets and answers the first probes well inside it.
  */
 export const SERVE_WATCHDOG_BOOT_GRACE_MS = 60_000;
-
 /**
- * Pure verdict for the serve-liveness watchdog (fn-1082). Mirrors
- * {@link decideGitSeedWatchdog} — clock/threshold arithmetic only, no I/O — so the
- * decision is unit-testable with synthetic clock, probe-age, and lag inputs.
- *
- * Two detectors for two wedge modes, both escalating straight to `fatalExit`
- * (LaunchAgent restart — never an in-process respawn):
- *   - ACCEPT-STALL (low lag, zero read throughput): a real-read probe on either
- *     socket last succeeded past `probeStuckThresholdMs`. The caller stamps
- *     `lastServerProbeOkAtMs`/`lastBusProbeOkAtMs` on each successful round-trip; a
- *     wedged read never stamps, so the age grows until it crosses the window.
- *   - BUSY-wedge (main loop starved): the main event-loop-delay p99 breached its
- *     threshold for `maxConsecutiveLagBreaches` consecutive intervals (the caller
- *     accumulates/resets the count per tick).
- *
- * Returns `{ kind: "ok" }` during the boot-grace window (arm-time baselines are not
- * yet meaningful) and whenever both detectors are clear; otherwise `{ kind:
- * "escalate", trigger }` NAMING which detector fired, so the producer's escalation
- * log pins the wedge mode (accept-stall on which socket, or a busy-lag spin) instead
- * of a bare "something wedged". The server socket is checked before the bus so the
- * trigger is deterministic when both stall at once.
+ * Consecutive FAILED real-read attempts (per socket) before accept-stall escalates.
+ * Attempt-counting replaces the old wall-clock age so a laptop suspend/resume gap
+ * cannot balloon a probe's age past the window (the clock-jump guard zeroes the
+ * streak on a detected discontinuity). Three failed reads in a row ≈ the old
+ * three-interval age window: enough to rule out a one-off blip.
  */
+export const SERVE_PROBE_MAX_FAIL_STREAK = 3;
+/**
+ * How long the serve worker may go without posting a `serve-health` report —
+ * judged by MAIN's OWN arrival clock, never the worker's timestamps — before the
+ * `serve-report-mute` trigger fires. A frozen serve loop stops reporting entirely;
+ * three watchdog intervals of silence rules out a dropped report while still
+ * surfacing a restart promptly.
+ */
+export const SERVE_REPORT_MUTE_THRESHOLD_MS = 3 * SERVE_WATCHDOG_INTERVAL_MS;
+/**
+ * Served-dispatch p99 (ms) that counts as a first-paint breach for one starvation
+ * window. ~1s to first paint is the starvation symptom; a healthy-but-loaded
+ * daemon answers a local dispatch well under this.
+ */
+export const SERVE_STARVATION_LATENCY_P99_THRESHOLD_MS = 1_000;
+/**
+ * Worker-loop-delay p99 (ms) that counts as QUEUEING — the serve worker's own
+ * event loop is backed up, so slow first paint is queue depth behind a starved
+ * loop, not a single heavy query. Reported by the worker; judged here.
+ */
+export const SERVE_STARVATION_QUEUEING_P99_THRESHOLD_MS = 250;
+/**
+ * Fraction of one core the daemon PROCESS must burn over the window for a
+ * starvation window to read as ourFault. `process.cpuUsage` is process-wide in Bun
+ * (`threadCpuUsage` is undefined), so this says "the daemon is burning CPU", not
+ * "the serve worker is" — the conjunction with queueing + saturation is what bounds
+ * the false-positive cost of that coarser granularity.
+ */
+export const SERVE_STARVATION_OURFAULT_CPU_FRACTION = 0.5;
+/**
+ * Minimum served-dispatch samples in a window before its p99 is trustworthy. A
+ * quieter window is INCONCLUSIVE — it resets the starvation streak, never counts
+ * as a breach — so an idle-but-slow blip cannot accumulate toward a restart.
+ */
+export const SERVE_STARVATION_SAMPLE_FLOOR = 20;
+/**
+ * Consecutive starvation breach windows before `serve-starvation` escalates.
+ * Requiring N in a row (not one window) keeps a transient load spike from tripping.
+ */
+export const SERVE_STARVATION_MAX_BREACH_STREAK = 3;
+/**
+ * A tick-to-tick gap beyond this multiple of the interval is a clock discontinuity
+ * (laptop suspend/resume, or an NTP step): the loop was frozen or the clock stepped,
+ * so every trigger's accumulated state is reset and the arrival baseline re-based to
+ * now, so the resume tick cannot false-trip any trigger — old or new.
+ */
+export const SERVE_CLOCK_JUMP_FACTOR = 3;
+
 export type ServeLivenessTrigger =
   | "accept-stall-server"
   | "accept-stall-bus"
-  | "busy-lag";
+  | "busy-lag"
+  | "serve-report-mute"
+  | "serve-starvation";
 
 export type ServeLivenessVerdict =
   | { kind: "ok" }
   | { kind: "escalate"; trigger: ServeLivenessTrigger };
 
+/**
+ * This tick's settled outcome for one socket's real-read probe: `"live"` (the
+ * probe proved life), `"dead"` (it timed out / failed), or `"unarmed"` (the socket
+ * is not served, or its worker has not signalled ready — no probe fired, so the
+ * streak stays fresh and cannot false-trip).
+ */
+export type ProbeTickOutcome = "live" | "dead" | "unarmed";
+
+/**
+ * All the accumulated trigger state the serve-liveness watchdog threads from one
+ * tick to the next. Every streak is reset to zero — and the arrival baseline
+ * re-based — whenever {@link decideServeLivenessWatchdog} detects a clock
+ * discontinuity, so a suspend/resume gap cannot false-trip any trigger.
+ */
+export interface ServeWatchdogTriggerState {
+  /** Consecutive failed server-socket probe attempts (accept-stall-server). */
+  serverProbeFailStreak: number;
+  /** Consecutive failed bus-socket probe attempts (accept-stall-bus). */
+  busProbeFailStreak: number;
+  /** Consecutive main-loop lag-breaching windows (busy-lag). */
+  lagBreachStreak: number;
+  /** Consecutive first-paint starvation windows (serve-starvation). */
+  starvationBreachStreak: number;
+  /**
+   * Freshest serve-health arrival stamp on MAIN's monotonic clock, the baseline
+   * the mute age measures from. `null` until the first report (or a reset). A
+   * stale stamp never regresses it, so a pre-reset report cannot re-trip mute.
+   */
+  reportBaselineMonoMs: number | null;
+  /** Main's monotonic clock at the previous tick; `null` on the first tick. */
+  lastTickMonoMs: number | null;
+}
+
+export const SERVE_WATCHDOG_INITIAL_STATE: ServeWatchdogTriggerState = {
+  serverProbeFailStreak: 0,
+  busProbeFailStreak: 0,
+  lagBreachStreak: 0,
+  starvationBreachStreak: 0,
+  reportBaselineMonoMs: null,
+  lastTickMonoMs: null,
+};
+
+/** A probe streak advances on a dead read and resets on a live/unarmed one. */
+function nextProbeFailStreak(prev: number, outcome: ProbeTickOutcome): number {
+  return outcome === "dead" ? prev + 1 : 0;
+}
+
+/**
+ * Pure step for the serve-liveness watchdog. Mirrors {@link decideGitSeedWatchdog}
+ * in spirit — clock/threshold arithmetic only, no I/O — but is a REDUCER: it folds
+ * one tick's signals over the carried {@link ServeWatchdogTriggerState} and returns
+ * both a verdict and the next state, so the whole decision (streak accumulation,
+ * clock-jump reset, arrival-baseline tracking) is unit-testable with a synthetic
+ * clock and zero real sockets.
+ *
+ * Trigger set, escalated straight to `fatalExit` (LaunchAgent restart — never an
+ * in-process respawn), in the deterministic order they are checked:
+ *   - `accept-stall-server` / `accept-stall-bus`: a socket's real-read probe failed
+ *     `maxProbeFailStreak` attempts in a row (send path alive, reads dark).
+ *   - `busy-lag`: MAIN's event-loop-delay p99 breached for `maxLagBreachStreak`
+ *     consecutive windows (a main-thread busy spin the read probes cannot see).
+ *   - `serve-report-mute`: the serve worker stopped posting `serve-health` — the
+ *     newest arrival is older than `reportMuteThresholdMs` on MAIN's arrival clock
+ *     (a frozen serve loop whose own timestamps would be late by construction).
+ *   - `serve-starvation`: `maxStarvationBreachStreak` consecutive windows where
+ *     served-latency p99 breached AND the worker loop was queueing AND the daemon
+ *     was saturated (main-loop lag) AND the daemon was burning its own CPU AND the
+ *     sample count cleared the floor — a quiet or single-axis window is inconclusive
+ *     (resets the streak), never breaching, so first-paint starvation must be
+ *     sustained AND own-caused to trip.
+ *
+ * A clock discontinuity (tick gap > `clockJumpFactor`× the interval) or the boot
+ * grace window returns `ok` with every streak cleared, so neither a suspend/resume
+ * nor a still-binding boot can trip any trigger.
+ */
 export function decideServeLivenessWatchdog(inputs: {
+  nowMonoMs: number;
+  bootGraceUntilMonoMs: number;
+  intervalMs: number;
+  clockJumpFactor: number;
+  prev: ServeWatchdogTriggerState;
+  serverProbe: ProbeTickOutcome;
+  busProbe: ProbeTickOutcome;
+  maxProbeFailStreak: number;
+  lagBreached: boolean;
+  maxLagBreachStreak: number;
+  lastReportArrivalMonoMs: number | null;
+  reportMuteThresholdMs: number;
+  servedLatencyP99Ms: number;
+  servedLatencyThresholdMs: number;
+  queueing: boolean;
+  ourFault: boolean;
+  sampleCount: number;
+  sampleFloor: number;
+  maxStarvationBreachStreak: number;
+}): { verdict: ServeLivenessVerdict; state: ServeWatchdogTriggerState } {
+  const {
+    nowMonoMs,
+    bootGraceUntilMonoMs,
+    intervalMs,
+    clockJumpFactor,
+    prev,
+    serverProbe,
+    busProbe,
+    maxProbeFailStreak,
+    lagBreached,
+    maxLagBreachStreak,
+    lastReportArrivalMonoMs,
+    reportMuteThresholdMs,
+    servedLatencyP99Ms,
+    servedLatencyThresholdMs,
+    queueing,
+    ourFault,
+    sampleCount,
+    sampleFloor,
+    maxStarvationBreachStreak,
+  } = inputs;
+
+  const cleared = (
+    reportBaselineMonoMs: number,
+  ): ServeWatchdogTriggerState => ({
+    serverProbeFailStreak: 0,
+    busProbeFailStreak: 0,
+    lagBreachStreak: 0,
+    starvationBreachStreak: 0,
+    reportBaselineMonoMs,
+    lastTickMonoMs: nowMonoMs,
+  });
+
+  // 1. Clock discontinuity — the loop was frozen (suspend) or the clock stepped:
+  //    reset EVERY trigger's streak and re-base the arrival baseline to now, so the
+  //    resume tick cannot false-trip any trigger, old or new.
+  if (
+    prev.lastTickMonoMs != null &&
+    nowMonoMs - prev.lastTickMonoMs > clockJumpFactor * intervalMs
+  ) {
+    return { verdict: { kind: "ok" }, state: cleared(nowMonoMs) };
+  }
+
+  // 2. Boot grace — arm-time baselines are not yet meaningful; hold every streak
+  //    clear and keep the arrival baseline fresh, verdict ok regardless of inputs.
+  if (nowMonoMs < bootGraceUntilMonoMs) {
+    return {
+      verdict: { kind: "ok" },
+      state: cleared(lastReportArrivalMonoMs ?? nowMonoMs),
+    };
+  }
+
+  // Advance each streak from this tick's signals.
+  const serverProbeFailStreak = nextProbeFailStreak(
+    prev.serverProbeFailStreak,
+    serverProbe,
+  );
+  const busProbeFailStreak = nextProbeFailStreak(
+    prev.busProbeFailStreak,
+    busProbe,
+  );
+  const lagBreachStreak = lagBreached ? prev.lagBreachStreak + 1 : 0;
+
+  // First-paint starvation is a CONJUNCTION: slow served latency, a queueing worker
+  // loop, a saturated (lagging) main loop, the daemon burning its OWN cpu, and
+  // enough samples to trust the p99. Any missing term makes the window inconclusive
+  // — the streak resets, so only sustained, own-caused starvation trips.
+  const starvationBreachWindow =
+    servedLatencyP99Ms >= servedLatencyThresholdMs &&
+    queueing &&
+    lagBreached &&
+    ourFault &&
+    sampleCount >= sampleFloor;
+  const starvationBreachStreak = starvationBreachWindow
+    ? prev.starvationBreachStreak + 1
+    : 0;
+
+  // Arrival baseline advances only to a FRESHER report stamp; a stale stamp (older
+  // than the current baseline, e.g. a pre-reset report) never regresses it.
+  const priorBaseline = prev.reportBaselineMonoMs;
+  const reportBaselineMonoMs =
+    lastReportArrivalMonoMs != null &&
+    (priorBaseline == null || lastReportArrivalMonoMs > priorBaseline)
+      ? lastReportArrivalMonoMs
+      : (priorBaseline ?? nowMonoMs);
+
+  const state: ServeWatchdogTriggerState = {
+    serverProbeFailStreak,
+    busProbeFailStreak,
+    lagBreachStreak,
+    starvationBreachStreak,
+    reportBaselineMonoMs,
+    lastTickMonoMs: nowMonoMs,
+  };
+
+  // Deterministic check order: accept-stall (server before bus), busy-lag, mute,
+  // starvation. The named trigger is stable when several conditions hold at once.
+  if (serverProbeFailStreak >= maxProbeFailStreak) {
+    return {
+      verdict: { kind: "escalate", trigger: "accept-stall-server" },
+      state,
+    };
+  }
+  if (busProbeFailStreak >= maxProbeFailStreak) {
+    return {
+      verdict: { kind: "escalate", trigger: "accept-stall-bus" },
+      state,
+    };
+  }
+  if (lagBreachStreak >= maxLagBreachStreak) {
+    return { verdict: { kind: "escalate", trigger: "busy-lag" }, state };
+  }
+  if (nowMonoMs - reportBaselineMonoMs >= reportMuteThresholdMs) {
+    return {
+      verdict: { kind: "escalate", trigger: "serve-report-mute" },
+      state,
+    };
+  }
+  if (starvationBreachStreak >= maxStarvationBreachStreak) {
+    return {
+      verdict: { kind: "escalate", trigger: "serve-starvation" },
+      state,
+    };
+  }
+  return { verdict: { kind: "ok" }, state };
+}
+
+/**
+ * Per-socket probe arming for the serve-liveness watchdog. A socket's probing
+ * arms only once its OWN worker reports `{kind:"ready"}` (the listener is bound),
+ * so no probe fires before its socket exists and a bus-only boot arms its bus
+ * probing independently. Until armed — or on a socket this daemon does not serve —
+ * the probe is not fired AND its age reads perpetually fresh, so a late-binding
+ * socket can never trip {@link decideServeLivenessWatchdog} before it is ready
+ * (its own boot grace measures from arm time, never shortened by a sibling).
+ * Pure — arithmetic over the arm flags — so the wiring is unit-testable.
+ */
+export interface ProbeArmingInputs {
+  serverServed: boolean;
+  busServed: boolean;
+  serverArmed: boolean;
+  busArmed: boolean;
   nowMs: number;
-  bootGraceUntilMs: number;
   lastServerProbeOkAtMs: number;
   lastBusProbeOkAtMs: number;
-  probeStuckThresholdMs: number;
-  consecutiveLagBreaches: number;
-  maxConsecutiveLagBreaches: number;
-}): ServeLivenessVerdict {
-  const {
-    nowMs,
-    bootGraceUntilMs,
-    lastServerProbeOkAtMs,
-    lastBusProbeOkAtMs,
-    probeStuckThresholdMs,
-    consecutiveLagBreaches,
-    maxConsecutiveLagBreaches,
-  } = inputs;
-  // Never trip mid-boot: workers may still be binding, first probes not yet landed.
-  if (nowMs < bootGraceUntilMs) return { kind: "ok" };
-  // Accept-stall on either socket — a real read has not answered within the window.
-  if (nowMs - lastServerProbeOkAtMs >= probeStuckThresholdMs) {
-    return { kind: "escalate", trigger: "accept-stall-server" };
+}
+
+export interface ProbeArming {
+  fireServerProbe: boolean;
+  fireBusProbe: boolean;
+  /** Ages fed to {@link decideServeLivenessWatchdog}; fresh until armed. */
+  verdictServerProbeOkAtMs: number;
+  verdictBusProbeOkAtMs: number;
+}
+
+export function resolveProbeArming(i: ProbeArmingInputs): ProbeArming {
+  const serverLive = i.serverServed && i.serverArmed;
+  const busLive = i.busServed && i.busArmed;
+  return {
+    fireServerProbe: serverLive,
+    fireBusProbe: busLive,
+    verdictServerProbeOkAtMs: serverLive ? i.lastServerProbeOkAtMs : i.nowMs,
+    verdictBusProbeOkAtMs: busLive ? i.lastBusProbeOkAtMs : i.nowMs,
+  };
+}
+
+/**
+ * Well-formed server admission-control rejection codes a probe scores as
+ * proof-of-life. A cap rejection (`server-worker.ts` `too_many_connections` /
+ * `max_connections`) is emitted from the accept handler BEFORE the request line
+ * is read, so it structurally cannot echo the probe's correlation id — yet it
+ * proves the serve worker's accept→write path answered this connection, so it is
+ * life, never death. This is the exact link the incident's
+ * probe-orphan → per-pid-cap → id-less-reject → false-death chain turned into a
+ * self-inflicted restart. Keep in sync with the reject codes in `server-worker.ts`.
+ */
+export const PROBE_LIFE_ADMISSION_CODES: ReadonlySet<string> = new Set([
+  "too_many_connections",
+  "max_connections",
+]);
+
+/**
+ * Score one parsed probe reply frame as proof-of-life for the serve-liveness
+ * watchdog. A frame proves the serve loop is live when it ANSWERS this probe:
+ *   - it echoes the probe's `correlationId` — a `result`, or ANY well-formed
+ *     error frame (an rpc error, a boot-gate reject) that threads the id: all
+ *     prove the worker read the request to echo its id, the exact accept→read→
+ *     write path an accept-stall wedge kills; OR
+ *   - it is an accept-time admission rejection ({@link PROBE_LIFE_ADMISSION_CODES})
+ *     that precedes the request read and so cannot carry the id; OR
+ *   - the caller's `extraMatch` accepts it (the bus probe's `ack`-shape reply,
+ *     which carries no rpc id).
+ * Pure — no I/O — so the matcher is unit-testable without a real socket.
+ */
+export function probeReplyProvesLife(
+  frame: Record<string, unknown>,
+  correlationId: string | null,
+  extraMatch?: (frame: Record<string, unknown>) => boolean,
+): boolean {
+  if (correlationId != null && frame.id === correlationId) return true;
+  if (
+    frame.type === "error" &&
+    typeof frame.code === "string" &&
+    PROBE_LIFE_ADMISSION_CODES.has(frame.code)
+  ) {
+    return true;
   }
-  if (nowMs - lastBusProbeOkAtMs >= probeStuckThresholdMs) {
-    return { kind: "escalate", trigger: "accept-stall-bus" };
+  if (extraMatch?.(frame)) return true;
+  return false;
+}
+
+/** Immutable state of the probe settle machine ({@link probeSettleStep}). */
+export interface ProbeSettleState {
+  /** True once the promise has resolved; every later event is idempotent. */
+  settled: boolean;
+  /**
+   * True once `open` delivered a socket the caller is holding. The leak class the
+   * machine closes: a `timeout` (or `close`/`error`) settles BEFORE `open`, so
+   * there is no socket to end at settle — then `open` hands the caller a live
+   * connection nobody would otherwise close.
+   */
+  haveSocket: boolean;
+}
+
+/** An event the probe connection lifecycle feeds to {@link probeSettleStep}. */
+export type ProbeSettleEvent =
+  | { kind: "open" }
+  | { kind: "match" }
+  | { kind: "timeout" }
+  | { kind: "close" }
+  | { kind: "error" };
+
+/**
+ * A side effect the caller runs after a {@link probeSettleStep} transition.
+ * `resolve` settles the probe promise; `close-socket` ends the connection the
+ * caller holds (the ONLY way a post-settle `open` frees its orphaned socket).
+ */
+export type ProbeSettleAction =
+  | { kind: "resolve"; ok: boolean }
+  | { kind: "close-socket" };
+
+export const PROBE_SETTLE_INITIAL: ProbeSettleState = {
+  settled: false,
+  haveSocket: false,
+};
+
+/**
+ * Pure transition for the real-read probe's connection lifecycle. Factored out of
+ * `probeSocketRead` so the fast tier covers every settle path — timeout-before-open,
+ * open-after-settled, a matched frame, a bare close/error — with zero real sockets.
+ *
+ * The invariant: a probe connection is closed on EVERY settle path. `close-socket`
+ * is emitted whenever the machine both is (or becomes) settled AND holds a socket,
+ * so a socket arriving after settling (`open` while `settled`) is always ended.
+ */
+export function probeSettleStep(
+  state: ProbeSettleState,
+  event: ProbeSettleEvent,
+): { state: ProbeSettleState; actions: ProbeSettleAction[] } {
+  if (state.settled) {
+    // Already resolved. The only consequential late event is a socket we now hold
+    // for the first time — close it so a timeout-before-open never leaks a conn.
+    if (event.kind === "open" && !state.haveSocket) {
+      return {
+        state: { ...state, haveSocket: true },
+        actions: [{ kind: "close-socket" }],
+      };
+    }
+    return { state, actions: [] };
   }
-  // Busy-wedge — main loop starved for N consecutive intervals.
-  if (consecutiveLagBreaches >= maxConsecutiveLagBreaches) {
-    return { kind: "escalate", trigger: "busy-lag" };
+  if (event.kind === "open") {
+    return { state: { ...state, haveSocket: true }, actions: [] };
   }
-  return { kind: "ok" };
+  const ok = event.kind === "match";
+  const actions: ProbeSettleAction[] = [{ kind: "resolve", ok }];
+  // Close now iff we hold the socket; otherwise a later `open` closes it above.
+  if (state.haveSocket) actions.push({ kind: "close-socket" });
+  return { state: { ...state, settled: true }, actions };
 }
 
 /**
@@ -3595,22 +3978,31 @@ async function probeSocketRead(
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let remainder = "";
-    let settled = false;
+    let state = PROBE_SETTLE_INITIAL;
     let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
 
-    const settle = (ok: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        sock?.end();
-      } catch {
-        // best-effort — we're done with this connection either way
+    // Drive the pure settle machine and run the side effects it directs: resolve
+    // the promise (clearing the timer) and close whatever connection we hold —
+    // INCLUDING one that arrives after we already settled (the timeout-before-open
+    // leak the machine closes on the late `open`).
+    const apply = (event: ProbeSettleEvent): void => {
+      const next = probeSettleStep(state, event);
+      state = next.state;
+      for (const action of next.actions) {
+        if (action.kind === "resolve") {
+          clearTimeout(timer);
+          resolve(action.ok);
+        } else {
+          try {
+            sock?.end();
+          } catch {
+            // best-effort — we're done with this connection either way
+          }
+        }
       }
-      resolve(ok);
     };
 
-    const timer = setTimeout(() => settle(false), timeoutMs);
+    const timer = setTimeout(() => apply({ kind: "timeout" }), timeoutMs);
     timer.unref?.();
 
     Bun.connect({
@@ -3618,10 +4010,14 @@ async function probeSocketRead(
       socket: {
         open(s) {
           sock = s;
+          apply({ kind: "open" });
+          // A timeout that fired before this open already settled us and `apply`
+          // just closed `s` — never write to a socket the machine has retired.
+          if (state.settled) return;
           try {
             s.write(`${JSON.stringify(request)}\n`);
           } catch {
-            settle(false);
+            apply({ kind: "error" });
           }
         },
         data(_s, chunk) {
@@ -3639,7 +4035,7 @@ async function probeSocketRead(
                 continue; // ignore a malformed line, keep reading
               }
               if (isMatch(frame)) {
-                settle(true);
+                apply({ kind: "match" });
                 return;
               }
             }
@@ -3647,13 +4043,13 @@ async function probeSocketRead(
           }
         },
         close() {
-          settle(false);
+          apply({ kind: "close" });
         },
         error() {
-          settle(false);
+          apply({ kind: "error" });
         },
       },
-    }).catch(() => settle(false));
+    }).catch(() => apply({ kind: "error" }));
   });
 }
 
@@ -3684,10 +4080,57 @@ export const RESTART_LEDGER_CAP = 64;
  */
 export const RESTART_LEDGER_REASON_MAX_LEN = 300;
 
-/** One restart-ledger entry: the boot timestamp plus an optional named fatal reason. */
-export interface RestartLedgerEntry {
-  ts: number;
-  reason?: string;
+/**
+ * How long a predecessor daemon must have run before dying for its successor's
+ * boot NOT to count toward the crash-loop threshold. A boot whose predecessor
+ * died YOUNG (ran at most this long) is loop evidence; a bounce of a daemon that
+ * ran longer — a buildbot kick on a green build, an operator restart — is not,
+ * no matter who bounced it. ~2 minutes covers the observed wedge-restart cycle
+ * (~60-120s) while staying well above launchd's 10s `ThrottleInterval`, so a
+ * genuine self-restart storm still qualifies and a healthy bounce never does.
+ * The runtime is read as the inter-boot gap frozen into each boot line (see
+ * {@link foldBootIntoRestartLedger}), so a throttled restart cadence reads it
+ * directly. See docs/adr/0030.
+ */
+export const CRASH_LOOP_YOUNG_RUNTIME_MS = 2 * 60_000;
+
+/**
+ * The keeperd LaunchAgent's job label. When launchd starts the daemon it stamps
+ * this into `XPC_SERVICE_NAME`, which is how {@link classifyRestartProvenance}
+ * tells a launchd-managed boot from a stray one. Kept in sync with
+ * `plist/arthack.keeperd.plist`'s `Label`.
+ */
+export const KEEPERD_LAUNCHD_LABEL = "arthack.keeperd";
+
+/**
+ * Forensic provenance of one daemon boot, a tri-state label — NEVER an
+ * enforcement input (docs/adr/0030). `launchd`: launchd started us (the normal
+ * managed boot). `foreign`: some OTHER launchd/XPC context started us — a stray
+ * daemon (a dev pane, a CI-spawned process) whose deaths must never page the
+ * human. `unknown`: no usable signal — missing/garbage `XPC_SERVICE_NAME`, or a
+ * shell launch; counted toward the loop (fail toward detection).
+ */
+export type RestartProvenance = "launchd" | "unknown" | "foreign";
+
+/**
+ * Classify a boot's provenance from the `XPC_SERVICE_NAME` heuristic. This is a
+ * MUTABLE heuristic (direnv and other tools overwrite the var), so it is a
+ * forensic label only, never gates the boot. A value starting with the keeperd
+ * launchd label ({@link KEEPERD_LAUNCHD_LABEL}) is a launchd-managed boot;
+ * missing / empty / the `"0"` non-service sentinel maps to `unknown`; any other
+ * non-trivial service name is a `foreign` context. Pure; NEVER throws.
+ */
+export function classifyRestartProvenance(
+  xpcServiceName: string | null | undefined,
+): RestartProvenance {
+  const v = (xpcServiceName ?? "").trim();
+  if (v.length === 0 || v === "0") return "unknown";
+  if (v.startsWith(KEEPERD_LAUNCHD_LABEL)) return "launchd";
+  return "foreign";
+}
+
+function normalizeProvenance(v: unknown): RestartProvenance {
+  return v === "launchd" || v === "foreign" || v === "unknown" ? v : "unknown";
 }
 
 function boundRestartReason(reason: string): string {
@@ -3697,78 +4140,325 @@ function boundRestartReason(reason: string): string {
 }
 
 /**
- * Parse a restart-ledger file body into ledger entries. FAIL-OPEN: any
- * malformed body (not JSON, not an array, non-finite/non-object entries)
- * yields `[]` so a corrupt ledger becomes an empty one — never new `fatalExit`
- * fuel, and never a false crash-loop trip. DUAL-READS the on-disk shape: a
- * bare `number` (the legacy shape) coerces to `{ ts }`; an object entry with a
- * finite `ts` (+ optional string `reason`) passes through — so a legacy or
- * mixed ledger parses cleanly and counts identically for the crash-loop
- * decision. The next write overwrites it clean. Pure; NEVER throws.
+ * One append-only NDJSON restart-ledger line (docs/adr/0030). A `boot` line is
+ * written once per daemon boot; an `enrich` line is appended by {@link fatalExit}
+ * carrying the fatal reason, MATCHED to its boot by `boot_id` — never by
+ * timestamp, which is what let the legacy replace-in-place erase overlapping
+ * newer boots. `prev_runtime_ms` is the inter-boot gap to the predecessor boot,
+ * frozen at write time so the runtime qualification survives the predecessor's
+ * line being aged out at a later compaction.
  */
-export function parseRestartLedger(raw: string): RestartLedgerEntry[] {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    const entries: RestartLedgerEntry[] = [];
-    for (const item of parsed) {
-      if (typeof item === "number" && Number.isFinite(item)) {
-        entries.push({ ts: item });
-        continue;
-      }
-      if (item === null || typeof item !== "object" || Array.isArray(item)) {
-        continue;
-      }
-      const ts = (item as { ts?: unknown }).ts;
-      if (typeof ts !== "number" || !Number.isFinite(ts)) {
-        continue;
-      }
-      const reason = (item as { reason?: unknown }).reason;
-      entries.push(
-        typeof reason === "string"
-          ? { ts, reason: boundRestartReason(reason) }
-          : { ts },
-      );
-    }
-    return entries;
-  } catch {
-    return [];
-  }
+export interface RestartBootLine {
+  kind: "boot";
+  boot_id: string;
+  ts: number;
+  provenance: RestartProvenance;
+  prev_runtime_ms: number | null;
+}
+export interface RestartEnrichLine {
+  kind: "enrich";
+  boot_id: string;
+  ts: number;
+  reason: string;
+}
+export type RestartLedgerLine = RestartBootLine | RestartEnrichLine;
+
+/**
+ * One boot collapsed from its `boot` line and any matching `enrich` line —
+ * the unit the crash-loop producer counts over. `prev_runtime_ms` is the frozen
+ * inter-boot gap (or, for a legacy / orphan record with none, backfilled from
+ * the gap to the previous boot in total order by {@link collapseRestartLedger}).
+ */
+export interface RestartBoot {
+  boot_id: string;
+  ts: number;
+  provenance: RestartProvenance;
+  prev_runtime_ms: number | null;
+  reason?: string;
+  died_at_ms?: number;
 }
 
 /**
- * Fold this boot into the ledger: drop entries outside the window (and any
- * future-dated garbage), then append-or-replace the entry for `nowMs` — a
- * second call with the SAME `nowMs` (the {@link fatalExit} seam enriching the
- * entry this same boot already wrote, rather than minting a second one, which
- * would double-count a single boot toward the crash-loop threshold) replaces
- * in place instead of duplicating. Sort ascending, keep only the most recent
- * `cap`. Window-aging makes the ledger self-heal after a loop stops; the cap
- * bounds the file under a same-window burst. Pure; NEVER throws.
+ * Serialize one ledger line to a single NDJSON record terminated by `\n` — the
+ * delimiter the line-by-line {@link parseRestartLedger} reader keys off. Pure:
+ * same input → same output. Mirrors `serializeEventLogRecord`'s discipline.
  */
-export function updateRestartLedger(inputs: {
-  existing: RestartLedgerEntry[];
+export function serializeRestartLedgerLine(line: RestartLedgerLine): string {
+  return `${JSON.stringify(line)}\n`;
+}
+
+/**
+ * Parse one NDJSON line into a {@link RestartLedgerLine}, or `null` if the line
+ * is unparseable / partial / malformed — the strict torn-tail contract from
+ * {@link parseEventLogLine}: a truncated final line from a killed process folds
+ * to nothing rather than corrupting the ledger. `boot_id` must be a non-empty
+ * string and `ts` a finite number; a `boot` line's `provenance` folds to
+ * `unknown` on garbage and a missing `prev_runtime_ms` to `null`; an `enrich`
+ * line requires a string `reason` (bounded). The `\n` terminator is optional on
+ * the input. Pure; NEVER throws.
+ */
+export function parseRestartLedgerLine(line: string): RestartLedgerLine | null {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const o = parsed as Record<string, unknown>;
+  const bootId = o.boot_id;
+  const ts = o.ts;
+  if (typeof bootId !== "string" || bootId.length === 0) return null;
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return null;
+  if (o.kind === "enrich") {
+    if (typeof o.reason !== "string") return null;
+    return {
+      kind: "enrich",
+      boot_id: bootId,
+      ts,
+      reason: boundRestartReason(o.reason),
+    };
+  }
+  if (o.kind === "boot") {
+    const prev = o.prev_runtime_ms;
+    return {
+      kind: "boot",
+      boot_id: bootId,
+      ts,
+      provenance: normalizeProvenance(o.provenance),
+      prev_runtime_ms:
+        typeof prev === "number" && Number.isFinite(prev) ? prev : null,
+    };
+  }
+  return null;
+}
+
+/**
+ * Coerce the LEGACY JSON-array ledger shape (a bare `number` or `{ ts, reason? }`
+ * per entry) into NDJSON lines, so the crash-loop count and the forensic record
+ * both survive the format flip. Each legacy entry becomes a `boot` line with
+ * `unknown` provenance and no frozen `prev_runtime_ms` (collapse backfills it
+ * from the gap); a legacy `reason` becomes a matching `enrich` line. Synthetic
+ * `boot_id`s keep entries distinct. Pure; NEVER throws.
+ */
+function legacyRestartEntriesToLines(items: unknown[]): RestartLedgerLine[] {
+  const out: RestartLedgerLine[] = [];
+  items.forEach((item, i) => {
+    let ts: number | null = null;
+    let reason: string | undefined;
+    if (typeof item === "number" && Number.isFinite(item)) {
+      ts = item;
+    } else if (
+      item !== null &&
+      typeof item === "object" &&
+      !Array.isArray(item)
+    ) {
+      const t = (item as { ts?: unknown }).ts;
+      if (typeof t === "number" && Number.isFinite(t)) {
+        ts = t;
+        const r = (item as { reason?: unknown }).reason;
+        if (typeof r === "string") reason = boundRestartReason(r);
+      }
+    }
+    if (ts === null) return;
+    const bootId = `legacy:${i}:${ts}`;
+    out.push({
+      kind: "boot",
+      boot_id: bootId,
+      ts,
+      provenance: "unknown",
+      prev_runtime_ms: null,
+    });
+    if (reason !== undefined) {
+      out.push({ kind: "enrich", boot_id: bootId, ts, reason });
+    }
+  });
+  return out;
+}
+
+/**
+ * Parse a restart-ledger file body into ledger lines. DUAL-READS the shape: a
+ * body that whole-parses to a JSON array is the LEGACY format (coerced via
+ * {@link legacyRestartEntriesToLines}); anything else is read line-by-line as
+ * NDJSON, tolerating a torn trailing line (a killed process's partial append)
+ * and skipping any unparseable line. FAIL-OPEN throughout: a corrupt body yields
+ * `[]` so a torn ledger becomes an empty one — never new `fatalExit` fuel, never
+ * a false crash-loop trip. Pure; NEVER throws.
+ */
+export function parseRestartLedger(raw: string): RestartLedgerLine[] {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return [];
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed)) return legacyRestartEntriesToLines(parsed);
+    } catch {
+      // Not a whole legacy array — fall through to NDJSON line parsing.
+    }
+  }
+  const out: RestartLedgerLine[] = [];
+  for (const line of raw.split("\n")) {
+    const parsed = parseRestartLedgerLine(line);
+    if (parsed !== null) out.push(parsed);
+  }
+  return out;
+}
+
+/**
+ * Collapse ledger lines into per-`boot_id` boot records, sorted ascending by
+ * `ts`. A `boot` line establishes the record; an `enrich` line attaches its
+ * `reason` + death `ts`; an ORPHAN enrichment (its boot line aged out, or a
+ * crash before the boot line was written) synthesizes a forensic record so no
+ * fatal reason is silently dropped. `prev_runtime_ms` is taken from the frozen
+ * boot-line value; where absent (legacy / orphan) it is backfilled from the gap
+ * to the previous boot in total order. Pure; NEVER throws.
+ */
+export function collapseRestartLedger(
+  lines: RestartLedgerLine[],
+): RestartBoot[] {
+  const boots = new Map<string, RestartBoot>();
+  for (const line of lines) {
+    if (line.kind === "boot") {
+      const existing = boots.get(line.boot_id);
+      boots.set(line.boot_id, {
+        boot_id: line.boot_id,
+        ts: line.ts,
+        provenance: line.provenance,
+        prev_runtime_ms: line.prev_runtime_ms,
+        reason: existing?.reason,
+        died_at_ms: existing?.died_at_ms,
+      });
+    }
+  }
+  for (const line of lines) {
+    if (line.kind === "enrich") {
+      const existing = boots.get(line.boot_id);
+      if (existing) {
+        existing.reason = line.reason;
+        existing.died_at_ms = line.ts;
+      } else {
+        boots.set(line.boot_id, {
+          boot_id: line.boot_id,
+          ts: line.ts,
+          provenance: "unknown",
+          prev_runtime_ms: null,
+          reason: line.reason,
+          died_at_ms: line.ts,
+        });
+      }
+    }
+  }
+  const result = [...boots.values()].sort((a, b) => a.ts - b.ts);
+  for (let i = 1; i < result.length; i++) {
+    if (result[i].prev_runtime_ms === null) {
+      result[i].prev_runtime_ms = result[i].ts - result[i - 1].ts;
+    }
+  }
+  return result;
+}
+
+/**
+ * Compact the ledger: collapse to boot records, drop any outside the window
+ * (and any future-dated garbage), keep only the most recent `cap`, then flatten
+ * back to lines (each boot line followed by its enrichment, if any). Runs ONLY
+ * at boot in the process holding the single-instance lock. A legacy / orphan
+ * record's backfilled `prev_runtime_ms` is frozen into the rewritten boot line,
+ * converting the file to pure NDJSON. Pure; NEVER throws.
+ */
+export function compactRestartLedger(
+  lines: RestartLedgerLine[],
+  opts: { nowMs: number; windowMs: number; cap: number },
+): RestartLedgerLine[] {
+  const { nowMs, windowMs, cap } = opts;
+  const cutoff = nowMs - windowMs;
+  const boots = collapseRestartLedger(lines).filter(
+    (b) => Number.isFinite(b.ts) && b.ts >= cutoff && b.ts <= nowMs,
+  );
+  const capped = boots.length > cap ? boots.slice(boots.length - cap) : boots;
+  const out: RestartLedgerLine[] = [];
+  for (const b of capped) {
+    out.push({
+      kind: "boot",
+      boot_id: b.boot_id,
+      ts: b.ts,
+      provenance: b.provenance,
+      prev_runtime_ms: b.prev_runtime_ms,
+    });
+    if (b.reason !== undefined && b.died_at_ms !== undefined) {
+      out.push({
+        kind: "enrich",
+        boot_id: b.boot_id,
+        ts: b.died_at_ms,
+        reason: b.reason,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Fold THIS boot into the ledger: measure the inter-boot gap to the most recent
+ * prior boot (its predecessor's runtime-before-death, mirroring launchd's
+ * throttle model), freeze it into a new `boot` line, append it, and compact.
+ * `boot_id` matches the enrichment {@link fatalExit} will later append — no two
+ * boots ever share a line, so overlapping boots each retain their own record and
+ * a dying boot enriches only its own. Returns the compacted lines to persist and
+ * the appended boot line. Pure; NEVER throws.
+ */
+export function foldBootIntoRestartLedger(inputs: {
+  existing: RestartLedgerLine[];
+  bootId: string;
+  provenance: RestartProvenance;
   nowMs: number;
   windowMs: number;
   cap: number;
-  reason?: string;
-}): RestartLedgerEntry[] {
-  const { existing, nowMs, windowMs, cap, reason } = inputs;
-  const cutoff = nowMs - windowMs;
-  const kept = existing.filter(
-    (e) =>
-      Number.isFinite(e.ts) &&
-      e.ts >= cutoff &&
-      e.ts <= nowMs &&
-      e.ts !== nowMs,
+}): { lines: RestartLedgerLine[]; bootLine: RestartBootLine } {
+  const { existing, bootId, provenance, nowMs, windowMs, cap } = inputs;
+  const priorBoots = collapseRestartLedger(existing).filter(
+    (b) => b.ts <= nowMs,
   );
-  kept.push(
-    reason !== undefined
-      ? { ts: nowMs, reason: boundRestartReason(reason) }
-      : { ts: nowMs },
-  );
-  kept.sort((a, b) => a.ts - b.ts);
-  return kept.length > cap ? kept.slice(kept.length - cap) : kept;
+  const predecessor =
+    priorBoots.length > 0 ? priorBoots[priorBoots.length - 1] : null;
+  const bootLine: RestartBootLine = {
+    kind: "boot",
+    boot_id: bootId,
+    ts: nowMs,
+    provenance,
+    prev_runtime_ms: predecessor ? nowMs - predecessor.ts : null,
+  };
+  const lines = compactRestartLedger([...existing, bootLine], {
+    nowMs,
+    windowMs,
+    cap,
+  });
+  return { lines, bootLine };
+}
+
+/**
+ * The runtime-qualified crash-loop producer filter (docs/adr/0030): from the
+ * collapsed boots, keep only the timestamps that count toward the distress
+ * threshold — EXCLUDE `foreign` boots entirely (a stray daemon's deaths never
+ * page the human), and count a boot only when its predecessor died YOUNG (its
+ * frozen `prev_runtime_ms` is at most `youngRuntimeMs`). A boot with no
+ * predecessor (`null`) and a bounce after a healthy long run are both excluded;
+ * `unknown` and `launchd` young boots count. Hands {@link decideCrashLoop} bare
+ * timestamps, leaving its pure timestamp-counting contract untouched. NEVER
+ * throws.
+ */
+export function qualifyCrashLoopBootTimestamps(
+  boots: RestartBoot[],
+  youngRuntimeMs: number,
+): number[] {
+  return boots
+    .filter((b) => b.provenance !== "foreign")
+    .filter(
+      (b) => b.prev_runtime_ms !== null && b.prev_runtime_ms <= youngRuntimeMs,
+    )
+    .map((b) => b.ts);
 }
 
 /**
@@ -3798,7 +4488,7 @@ export function decideCrashLoop(inputs: {
  * boot) or any read/parse error yields `[]` — the crash-loop detector must never
  * be the thing that crashes boot. Mirrors {@link parseRestartLedger}'s contract.
  */
-export function readRestartLedger(path: string): RestartLedgerEntry[] {
+export function readRestartLedger(path: string): RestartLedgerLine[] {
   try {
     return parseRestartLedger(readFileSync(path, "utf8"));
   } catch {
@@ -3807,19 +4497,42 @@ export function readRestartLedger(path: string): RestartLedgerEntry[] {
 }
 
 /**
- * Persist the ledger (best-effort, SYNCHRONOUS + ATOMIC via
- * {@link atomicWriteFile}'s temp-file-then-`renameSync`). A write failure
- * (full disk, ENOENT dir) is swallowed: a lost boot record only undercounts a
- * future loop — strictly safer than crashing boot on the write. Both the write
- * and the rename are synchronous, so calling this from the `fatalExit` seam
- * lands durably before `process.exit`. NEVER throws.
+ * Persist the compacted ledger (best-effort) via temp-file + `fsync` + `rename`,
+ * so a crash mid-write never leaves a torn file the next boot reads. Runs ONLY
+ * at boot in the lock-holding process (the enrichment path uses the append-only
+ * {@link appendRestartLedgerLine} instead). A write failure (full disk, ENOENT
+ * dir) is swallowed: a lost compaction only defers aging — strictly safer than
+ * crashing boot on the write. NEVER throws.
  */
 export function writeRestartLedger(
   path: string,
-  entries: RestartLedgerEntry[],
+  lines: RestartLedgerLine[],
 ): void {
   try {
-    atomicWriteFile(path, JSON.stringify(entries));
+    const content = lines.map(serializeRestartLedgerLine).join("");
+    const dir = dirname(path);
+    const tmp = join(
+      dir,
+      `${basename(path)}.tmp.${process.pid}.${crypto.randomUUID()}`,
+    );
+    let fd: number | null = null;
+    try {
+      fd = openSync(tmp, "w");
+      writeSync(fd, content);
+      fsyncSync(fd);
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
+    try {
+      renameSync(tmp, path);
+    } catch (err) {
+      try {
+        if (existsSync(tmp)) unlinkSync(tmp);
+      } catch {
+        // swallow — the rename error is what the caller cares about
+      }
+      throw err;
+    }
   } catch (err) {
     console.error(
       `[keeperd] restart-ledger write threw (non-fatal): ${
@@ -3827,6 +4540,19 @@ export function writeRestartLedger(
       }`,
     );
   }
+}
+
+/**
+ * Append ONE ledger line with a single `appendFileSync` — the enrichment write
+ * {@link fatalExit} makes on the crash path. Bounded (one line) and never
+ * read-modify-writes, so it cannot block or corrupt the ledger under a crashing
+ * process; the caller wraps it so any throw never escapes the exit path.
+ */
+export function appendRestartLedgerLine(
+  path: string,
+  line: RestartLedgerLine,
+): void {
+  appendFileSync(path, serializeRestartLedgerLine(line));
 }
 
 /**
@@ -5605,6 +6331,14 @@ export interface DaemonOptions {
    */
   disableNativeWatcher?: boolean;
   /**
+   * When `true`, {@link startDaemon} skips the single-instance flock gate — an
+   * in-process daemon never touches the host lock. Required for the in-process
+   * test tier: a Bun worker (and a second {@link startDaemon} in one process)
+   * shares main's pid AND the flock's open-file-description, so a real acquire
+   * would self-conflict. Mirrors {@link DaemonOptions.disableNativeWatcher}.
+   */
+  disableSingleInstanceLock?: boolean;
+  /**
    * Worker-set selector. When supplied, {@link startDaemon} spawns ONLY the named
    * workers; every unselected worker stays `null` with no handlers wired. OMITTED
    * (production default) spawns the full {@link ALL_WORKERS} set.
@@ -5695,6 +6429,93 @@ export function checkKeeperAgentPresence(
 }
 
 /**
+ * Outcome of the single-instance gate, split from its I/O so the fast suite
+ * covers the classification with no real daemon: `acquired` carries the held lock
+ * (main pins it in a module-scope singleton for the process lifetime); `refused`
+ * is a LIVE incumbent holding the flock (the caller exits 1 BEFORE the boot-ledger
+ * append, so a refused boot mints no entry); `degraded` is an inconclusive
+ * primitive — the caller logs loud and boots WITHOUT the gate (fail open).
+ */
+export type SingleInstanceGateOutcome =
+  | { kind: "acquired"; lock: FileLock }
+  | { kind: "refused" }
+  | { kind: "degraded"; reason: string };
+
+/**
+ * Pure classification of a single-instance-lock acquire attempt. `tryAcquire`
+ * mirrors {@link FileLock.tryAcquire}: it returns the held lock, `null` on
+ * contention (`EWOULDBLOCK` — a live incumbent), or THROWS on any other errno (an
+ * inconclusive primitive: dlopen/fcntl/flock failure). Contention fails CLOSED
+ * (`refused`); a throw fails OPEN (`degraded`), so a broken lock primitive can
+ * never wedge every boot.
+ */
+export function decideSingleInstanceGate(
+  tryAcquire: (lockPath: string) => FileLock | null,
+  lockPath: string,
+): SingleInstanceGateOutcome {
+  let lock: FileLock | null;
+  try {
+    lock = tryAcquire(lockPath);
+  } catch (err) {
+    return {
+      kind: "degraded",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return lock === null ? { kind: "refused" } : { kind: "acquired", lock };
+}
+
+/**
+ * The single-instance flock, pinned in module scope on MAIN for the whole daemon
+ * lifetime: NEVER released and NEVER handed to a worker — the flock's FD_CLOEXEC
+ * (set inside {@link FileLock.tryAcquire}) keeps a spawned subprocess from
+ * inheriting it, and a Bun worker shares main's open-file-description. A second
+ * {@link startDaemon} in one process self-conflicts on the flock, which is why
+ * the in-process test tier always sets `disableSingleInstanceLock`.
+ */
+let singleInstanceLock: FileLock | null = null;
+
+/**
+ * Acquire the single-instance flock at the very top of {@link startDaemon} —
+ * before `openDb`/`migrate`/any worker spawn AND before the boot-ledger append.
+ * A live incumbent exits 1 (naming the holder path + the launchctl kickstart
+ * recovery line), so a refused boot never opens the DB and mints no ledger entry.
+ * An inconclusive primitive logs loud and returns, booting WITHOUT the gate.
+ */
+function acquireSingleInstanceLock(): void {
+  if (singleInstanceLock !== null) {
+    // Already held in this process — a re-acquire would self-conflict on our own
+    // flock. Idempotent so a second in-process boot never blocks on itself.
+    return;
+  }
+  const lockPath = resolveSingleInstanceLockPath();
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  } catch {
+    // best-effort; a pre-existing state dir is fine — the flock open still runs
+  }
+  const outcome = decideSingleInstanceGate(
+    (p) => FileLock.tryAcquire(p),
+    lockPath,
+  );
+  if (outcome.kind === "degraded") {
+    console.error(
+      `[keeperd] WARNING: single-instance lock primitive inconclusive at ${lockPath} ` +
+        `(${outcome.reason}) — booting WITHOUT the single-instance gate`,
+    );
+    return;
+  }
+  if (outcome.kind === "refused") {
+    console.error(
+      `[keeperd] refusing to start: another keeperd already holds ${lockPath}\n` +
+        `[keeperd] recover with: launchctl kickstart -k gui/$(id -u)/arthack.keeperd`,
+    );
+    process.exit(1);
+  }
+  singleInstanceLock = outcome.lock;
+}
+
+/**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
  * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
  * but returns a handle whose `stop()` tears everything down WITHOUT
@@ -5705,6 +6526,25 @@ export function checkKeeperAgentPresence(
  */
 export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
+  // Single-instance gate (docs/adr/0030): take a kernel flock on a dedicated
+  // keeperd.lock BEFORE openDb/migrate/any worker spawn, so a second concurrent
+  // daemon can never open — let alone migrate — the DB. A live incumbent exits 1
+  // here (before the boot-ledger append below); an inconclusive primitive fails
+  // open. Skipped only by the in-process test opt (a same-process second boot
+  // shares the flock's open-file-description and would self-conflict).
+  if (!opts.disableSingleInstanceLock) {
+    acquireSingleInstanceLock();
+  }
+  // Restart-ledger boot identity, captured at the EARLIEST boot point
+  // (docs/adr/0030). `restartLedgerBootId` keys this boot's append-only NDJSON
+  // ledger lines: the boot-fold below writes a `boot` line under it, and
+  // `fatalExit` later appends its `enrich` line MATCHED on the same id (never on
+  // timestamp). Provenance is frozen once here from the `XPC_SERVICE_NAME`
+  // heuristic — a forensic label only, never an enforcement input.
+  const restartLedgerBootId = crypto.randomUUID();
+  const restartBootProvenance = classifyRestartProvenance(
+    process.env.XPC_SERVICE_NAME,
+  );
   // Worker-set selector; omitted → ALL_WORKERS. `want(name)` gates each
   // `new Worker(...)` site below. The fold REDUCER runs on MAIN regardless.
   const selectedWorkers = new Set<WorkerName>(opts.workers ?? ALL_WORKERS);
@@ -5908,12 +6748,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let draining = false;
   let shuttingDown = false;
 
-  // The restart-ledger timestamp boot-fold wrote for THIS process (set below,
-  // once boot-fold runs). `fatalExit` re-uses it so a named reason enriches
-  // the SAME entry rather than minting a second one for one boot. `null`
-  // until boot-fold runs; a crash before then falls back to `Date.now()`.
-  let restartLedgerBootTsMs: number | null = null;
-
   // fn-921 git seed-liveness watchdog state. `lastGitLivenessAtMs` is stamped on
   // every worker poll-tick pulse (and on every GitSnapshot) — the MUTE-check
   // anchor. `lastGitProgressAtMs` is the STABLE staleness anchor: stamped at
@@ -5935,16 +6769,38 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let lastTmuxControlLivenessAtMs: number | null = null;
   let tmuxControlWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
-  // fn-1082 serve-liveness watchdog state. Each probe stamps its socket's
-  // `last…ProbeOkAtMs` on a successful real read (arm-time baseline until the first
-  // success), so a wedged read simply stops advancing it and the age grows across
-  // ticks. `serveLagConsecutiveBreaches` accumulates the main-loop lag-breach run
-  // (reset on a clean tick). The lag histogram measures MAIN's loop (the belt for a
-  // main-thread busy-spin — a wedged SERVE thread is caught by the read probes).
-  // {@link decideServeLivenessWatchdog} reads these.
+  // Serve-liveness watchdog state ({@link decideServeLivenessWatchdog}). Accept-stall
+  // is now attempt-counted, not age-based: each tick reads the PRIOR probe's settled
+  // outcome from `serverProbeLive`/`busProbeLive` (seeded live on arm, set by each
+  // settled probe), and the pure reducer folds it into a consecutive-fail streak. The
+  // `last…ProbeOkAtMs` stamps survive only for the escalation log. All accumulated
+  // streaks + the report-arrival baseline live in `serveWatchdogState`, so the single
+  // clock-jump guard inside the reducer can reset every trigger at once.
   let lastServerProbeOkAtMs = Date.now();
   let lastBusProbeOkAtMs = Date.now();
-  let serveLagConsecutiveBreaches = 0;
+  let serverProbeLive = true;
+  let busProbeLive = true;
+  // Each served socket's probing arms only after its OWN worker posts
+  // `{kind:"ready"}` (listener bound). Until then the probe never fires and its tick
+  // outcome reads `unarmed` (streak fresh), so a probe can never precede its socket
+  // and a bus-only boot arms its bus probing independently ({@link resolveProbeArming}).
+  let serverProbeArmed = false;
+  let busProbeArmed = false;
+  let serveWatchdogState: ServeWatchdogTriggerState = {
+    ...SERVE_WATCHDOG_INITIAL_STATE,
+  };
+  // Freshest serve-health report from the server worker, stamped with MAIN's OWN
+  // monotonic arrival clock (never the worker's timestamps — a starved worker's
+  // own stamps are late by construction). `null` until the first report lands.
+  let lastServeHealthArrivalMonoMs: number | null = null;
+  let latestServeHealth: {
+    dispatchP99Ms: number;
+    busyMs: number;
+    sampleCount: number;
+    loopDelayP99Ms: number;
+  } | null = null;
+  // Prior-tick process cpu snapshot for the ourFault (own-cpu) starvation term.
+  let prevWatchdogCpuUsage: ReturnType<typeof process.cpuUsage> | null = null;
   let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
@@ -6285,7 +7141,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
     // Server-worker → main bridge. Every inbound message carries a `kind`
     // discriminator so a stale reply for one verb can't wrong-resolve another.
-    // The `{kind:"ready"}` signal is one-way (worker→main) and matches no branch.
+    // The `{kind:"ready"}` signal arms the serve-liveness watchdog's server probe.
     sw.onmessage = (
       ev: MessageEvent<
         | ReplayRequestMessage
@@ -6296,12 +7152,34 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | SetEpicArmedRequestMessage
         | RequestHandoffRequestMessage
         | BackstopMessage
+        | ServeHealthMessage
         | { kind: "ready" }
         | undefined
       >,
     ): void => {
       const msg = ev.data;
       if (!msg) return;
+      if (msg.kind === "ready") {
+        // The server listener is bound — arm its probe and seed it live so a long
+        // boot drain never reads as an instant fail streak.
+        serverProbeArmed = true;
+        serverProbeLive = true;
+        lastServerProbeOkAtMs = Date.now();
+        return;
+      }
+      if (msg.kind === "serve-health") {
+        // Served-latency self-report. Stamp arrival on MAIN's OWN monotonic clock
+        // (the worker's timestamps would be late by construction under starvation)
+        // and keep the freshest sample for the next watchdog tick's verdict.
+        lastServeHealthArrivalMonoMs = performance.now();
+        latestServeHealth = {
+          dispatchP99Ms: msg.dispatchP99Ms,
+          busyMs: msg.busyMs,
+          sampleCount: msg.sampleCount,
+          loopDelayP99Ms: msg.loopDelayP99Ms,
+        };
+        return;
+      }
       // fn-1096.3: a tolerated-NOTADB skip record — route to the sole
       // sidecar writer.
       if (msg.kind === "backstop") {
@@ -6879,30 +7757,33 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Crash-loop distress signal. Fold this boot into the durable restart ledger (a
   // state-dir sidecar — NOT keeper.db, NOT a fold — so it survives the very crash
-  // it measures), then LEVEL-TRIGGER a sticky `needs_human` distress row: a boot
-  // rate at/over the threshold inside the window mints ONE row on the synthetic
-  // crash-loop key (idempotent — the fold UPSERTs, so a persistent loop is one row,
-  // not one per boot); a boot whose rate has fallen back under threshold drops the
-  // row (the recover-row idiom, resolved on the NEXT boot as the window ages out
-  // the old timestamps). A hot ledger inherited by a healthy post-fix boot reports
-  // honestly, then self-clears. FAIL-OPEN throughout — a corrupt ledger folds to
-  // empty, so the crash-loop detector can never itself become new boot-crash fuel.
+  // it measures): append one `boot` line keyed on `restartLedgerBootId` with the
+  // frozen inter-boot gap + provenance, compacting the append-only NDJSON at this
+  // one lock-held boot point. Then LEVEL-TRIGGER a sticky `needs_human` distress
+  // row off a RUNTIME-QUALIFIED count — collapse per boot_id, exclude `foreign`,
+  // count only boots whose predecessor died young — so a persistent loop mints ONE
+  // idempotent row while a healthy-daemon bounce or a CI kick never trips it. A
+  // boot whose rate has fallen back under threshold drops the row (the recover-row
+  // idiom, resolved on the NEXT boot as the window ages the ledger). FAIL-OPEN
+  // throughout — a corrupt/torn ledger folds to empty, never new boot-crash fuel.
   {
     const nowMs = Date.now();
     const ledgerPath = resolveRestartLedgerPath();
-    const ledgerEntries = updateRestartLedger({
+    const { lines: ledgerLines } = foldBootIntoRestartLedger({
       existing: readRestartLedger(ledgerPath),
+      bootId: restartLedgerBootId,
+      provenance: restartBootProvenance,
       nowMs,
       windowMs: CRASH_LOOP_WINDOW_MS,
       cap: RESTART_LEDGER_CAP,
     });
-    writeRestartLedger(ledgerPath, ledgerEntries);
-    // Remember this boot's own entry ts so a later `fatalExit` enriches it
-    // with a reason instead of minting a second entry for the same boot.
-    restartLedgerBootTsMs = nowMs;
+    writeRestartLedger(ledgerPath, ledgerLines);
     const verdict = decideCrashLoop({
       nowMs,
-      bootTimestamps: ledgerEntries.map((e) => e.ts),
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        collapseRestartLedger(ledgerLines),
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
       threshold: CRASH_LOOP_THRESHOLD,
       windowMs: CRASH_LOOP_WINDOW_MS,
     });
@@ -11483,11 +12364,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (busWorker) {
     const bw = busWorker;
-    // NO onmessage handler: the bus is a pure relay actuator — it reads keeper's
-    // jobs projection READ-ONLY and writes ONLY its own bus.db, never keeper.db,
-    // and posts NOTHING to main. Only the lifecycle onerror + close guards
-    // escalate to the single recovery path (a bus boot failure bounces the
+    // The bus is a pure relay actuator — it reads keeper's jobs projection
+    // READ-ONLY and writes ONLY its own bus.db, never keeper.db. It posts main
+    // exactly ONE message: `{kind:"ready"}` when its listener is bound, which arms
+    // the serve-liveness watchdog's bus probe (and baselines its stuck-age from
+    // ready, so a bus-only boot arms correctly). The lifecycle onerror + close
+    // guards escalate to the single recovery path (a bus boot failure bounces the
     // daemon; the documented fallback is the sibling --bus-only LaunchAgent).
+    bw.onmessage = (ev: MessageEvent<{ kind: "ready" } | undefined>): void => {
+      if (ev.data?.kind === "ready") {
+        busProbeArmed = true;
+        busProbeLive = true;
+        lastBusProbeOkAtMs = Date.now();
+      }
+    };
     bw.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] bus worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
@@ -11639,27 +12529,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   /**
    * Crash exit. Reserved for unrecoverable errors so launchd restarts us.
    * `reason` is optional and backward-compatible — every existing bare
-   * `fatalExit()` call site stays valid and records no reason. When given,
-   * the reason is written into the SAME restart-ledger entry boot-fold
-   * already minted for this process ({@link restartLedgerBootTsMs}), via a
-   * synchronous + atomic {@link writeRestartLedger}, so it lands durably
-   * BEFORE `process.exit`. A crash before boot-fold has run (no entry yet to
-   * enrich) falls back to `Date.now()`, minting a fresh entry rather than
-   * dropping the reason. Ledger trouble never blocks the crash exit.
+   * `fatalExit()` call site stays valid and records no reason. When given, the
+   * reason is appended as ONE `enrich` line MATCHED on this boot's
+   * `restartLedgerBootId` to the append-only NDJSON ledger — a single bounded
+   * {@link appendRestartLedgerLine}, never a read-modify-write, so it lands
+   * durably BEFORE `process.exit` without blocking or corrupting the ledger on
+   * the crash path. The whole append is wrapped so ledger trouble can never
+   * throw out of the exit path.
    */
   function fatalExit(reason?: string): void {
     if (reason !== undefined) {
       try {
-        const ledgerPath = resolveRestartLedgerPath();
-        const nowMs = restartLedgerBootTsMs ?? Date.now();
-        const entries = updateRestartLedger({
-          existing: readRestartLedger(ledgerPath),
-          nowMs,
-          windowMs: CRASH_LOOP_WINDOW_MS,
-          cap: RESTART_LEDGER_CAP,
-          reason,
+        appendRestartLedgerLine(resolveRestartLedgerPath(), {
+          kind: "enrich",
+          boot_id: restartLedgerBootId,
+          ts: Date.now(),
+          reason: boundRestartReason(reason),
         });
-        writeRestartLedger(ledgerPath, entries);
       } catch {
         // best-effort; never block the crash exit on ledger trouble
       }
@@ -11777,85 +12663,141 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Gated on actually serving a socket + out of the in-process tier.
   if ((serverWorker || busWorker) && !opts.disableNativeWatcher) {
     const busSockPath = resolveBusSockPath();
-    // Re-stamp the probe baselines at ARM time (the sockets are bound now), so the
-    // stuck-age measures from a fresh anchor, not the early declaration — a long
-    // boot drain must not read as instant staleness. Mirrors the git seed
-    // watchdog's arm-time baseline. Combined with the boot grace below, the first
-    // post-grace tick still measures well under the stuck window even if the
-    // opening probe missed.
-    lastServerProbeOkAtMs = Date.now();
-    lastBusProbeOkAtMs = Date.now();
-    const bootGraceUntilMs = Date.now() + SERVE_WATCHDOG_BOOT_GRACE_MS;
+    // A socket fires + counts toward the verdict only once its worker posts
+    // `{kind:"ready"}` (the arm handlers above); un-armed / un-served sockets read
+    // `unarmed` (streak fresh) and cannot trip. Boot grace is the belt for the
+    // window between arm and the first settled probe. The watchdog runs on MAIN's
+    // MONOTONIC clock throughout (tick spacing, arrival aging, boot grace) so the
+    // one clock-jump guard's reset stays self-consistent under suspend/resume.
+    const bootGraceUntilMonoMs =
+      performance.now() + SERVE_WATCHDOG_BOOT_GRACE_MS;
     serveLagHistogram = monitorEventLoopDelay({ resolution: 20 });
     serveLagHistogram.enable();
     const lagHistogram = serveLagHistogram;
     serveLivenessWatchdogTimer = setInterval(() => {
       if (shuttingDown) return;
-      // Main-loop lag for this interval (ns → ms), then reset the window.
+      const nowMonoMs = performance.now();
+      // Main-loop lag for this window (ns → ms), then reset the window. High lag is
+      // both the busy-lag streak signal AND the SATURATION term of starvation.
       const lagP99Ms = lagHistogram.percentile(99) / 1e6;
       lagHistogram.reset();
-      serveLagConsecutiveBreaches =
-        lagP99Ms >= SERVE_LAG_P99_THRESHOLD_MS
-          ? serveLagConsecutiveBreaches + 1
-          : 0;
+      const lagBreached = lagP99Ms >= SERVE_LAG_P99_THRESHOLD_MS;
 
-      // Fire a real read on each served socket; stamp on success. A wedged read
-      // never resolves `true` inside its timeout, so the age grows across ticks.
-      // The probes are asynchronous — this tick's verdict reads the PRIOR tick's
-      // result (the timeout << interval, so the latest probe has always settled).
-      if (serverWorker) {
+      // ourFault: the daemon PROCESS burned more than the threshold fraction of a
+      // core over the window. `process.cpuUsage` is process-wide in Bun
+      // (`threadCpuUsage` is undefined), so this reads "the daemon is burning cpu",
+      // not "the serve worker is" — the starvation conjunction bounds that coarseness.
+      const cpuNow = process.cpuUsage();
+      const prevTickMonoMs = serveWatchdogState.lastTickMonoMs;
+      let ourFault = false;
+      if (prevWatchdogCpuUsage != null && prevTickMonoMs != null) {
+        const cpuMicros =
+          cpuNow.user -
+          prevWatchdogCpuUsage.user +
+          (cpuNow.system - prevWatchdogCpuUsage.system);
+        const wallMicros = (nowMonoMs - prevTickMonoMs) * 1000;
+        ourFault =
+          wallMicros > 0 &&
+          cpuMicros / wallMicros >= SERVE_STARVATION_OURFAULT_CPU_FRACTION;
+      }
+      prevWatchdogCpuUsage = cpuNow;
+
+      const arming = resolveProbeArming({
+        serverServed: serverWorker != null,
+        busServed: busWorker != null,
+        serverArmed: serverProbeArmed,
+        busArmed: busProbeArmed,
+        nowMs: nowMonoMs,
+        lastServerProbeOkAtMs,
+        lastBusProbeOkAtMs,
+      });
+
+      // This tick's verdict reads the PRIOR tick's settled probe outcome (the timeout
+      // << interval, so the latest probe has always settled), then fires the next.
+      const serverProbe: ProbeTickOutcome = arming.fireServerProbe
+        ? serverProbeLive
+          ? "live"
+          : "dead"
+        : "unarmed";
+      const busProbe: ProbeTickOutcome = arming.fireBusProbe
+        ? busProbeLive
+          ? "live"
+          : "dead"
+        : "unarmed";
+
+      if (arming.fireServerProbe) {
         const id = crypto.randomUUID();
         void probeSocketRead(
           sockPath,
           { type: "query", id, collection: "autopilot_state", limit: 0 },
-          (f) => f.id === id,
+          (f) => probeReplyProvesLife(f, id),
           SERVE_PROBE_TIMEOUT_MS,
         ).then((ok) => {
+          serverProbeLive = ok;
           if (ok) lastServerProbeOkAtMs = Date.now();
         });
       }
-      if (busWorker) {
+      if (arming.fireBusProbe) {
         void probeSocketRead(
           busSockPath,
           { op: "list" },
-          (f) => f.type === "ack" && f.op === "list",
+          (f) =>
+            probeReplyProvesLife(
+              f,
+              null,
+              (fr) => fr.type === "ack" && fr.op === "list",
+            ),
           SERVE_PROBE_TIMEOUT_MS,
         ).then((ok) => {
+          busProbeLive = ok;
           if (ok) lastBusProbeOkAtMs = Date.now();
         });
       }
 
-      const verdictNowMs = Date.now();
-      const verdict = decideServeLivenessWatchdog({
-        nowMs: verdictNowMs,
-        bootGraceUntilMs,
-        // A socket we do not serve never trips: keep its age perpetually fresh.
-        lastServerProbeOkAtMs: serverWorker
-          ? lastServerProbeOkAtMs
-          : verdictNowMs,
-        lastBusProbeOkAtMs: busWorker ? lastBusProbeOkAtMs : verdictNowMs,
-        probeStuckThresholdMs: SERVE_PROBE_STUCK_THRESHOLD_MS,
-        consecutiveLagBreaches: serveLagConsecutiveBreaches,
-        maxConsecutiveLagBreaches: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+      const health = latestServeHealth;
+      const { verdict, state } = decideServeLivenessWatchdog({
+        nowMonoMs,
+        bootGraceUntilMonoMs,
+        intervalMs: SERVE_WATCHDOG_INTERVAL_MS,
+        clockJumpFactor: SERVE_CLOCK_JUMP_FACTOR,
+        prev: serveWatchdogState,
+        serverProbe,
+        busProbe,
+        maxProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK,
+        lagBreached,
+        maxLagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+        lastReportArrivalMonoMs: lastServeHealthArrivalMonoMs,
+        reportMuteThresholdMs: SERVE_REPORT_MUTE_THRESHOLD_MS,
+        servedLatencyP99Ms: health?.dispatchP99Ms ?? 0,
+        servedLatencyThresholdMs: SERVE_STARVATION_LATENCY_P99_THRESHOLD_MS,
+        queueing:
+          (health?.loopDelayP99Ms ?? 0) >=
+          SERVE_STARVATION_QUEUEING_P99_THRESHOLD_MS,
+        ourFault,
+        sampleCount: health?.sampleCount ?? 0,
+        sampleFloor: SERVE_STARVATION_SAMPLE_FLOOR,
+        maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
       });
+      serveWatchdogState = state;
+
       if (verdict.kind === "escalate") {
-        // Name the wedge mode + carry both probe ages and the lag-breach count so
-        // the crash-loop's cause is legible in server.stderr, not a bare "wedged".
-        const serverAgeMs = serverWorker
-          ? verdictNowMs - lastServerProbeOkAtMs
-          : null;
-        const busAgeMs = busWorker ? verdictNowMs - lastBusProbeOkAtMs : null;
+        // Name the trigger + carry every streak and the report age so the
+        // crash-loop's cause is legible in server.stderr, not a bare "wedged".
+        const reportAge =
+          lastServeHealthArrivalMonoMs != null
+            ? `${Math.round(nowMonoMs - lastServeHealthArrivalMonoMs)}ms`
+            : "n/a";
+        const detail =
+          `server-probe-fails=${state.serverProbeFailStreak} ` +
+          `bus-probe-fails=${state.busProbeFailStreak} ` +
+          `lag-breaches=${state.lagBreachStreak}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES} ` +
+          `starvation-windows=${state.starvationBreachStreak}/${SERVE_STARVATION_MAX_BREACH_STREAK} ` +
+          `report-age=${reportAge}`;
         console.error(
-          `[keeperd] serve-liveness watchdog: ${verdict.trigger} — server-probe-age=${
-            serverAgeMs ?? "n/a"
-          }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES} — exiting for LaunchAgent restart`,
+          `[keeperd] serve-liveness watchdog: ${verdict.trigger} — ${detail} — exiting for LaunchAgent restart`,
         );
         if (!shuttingDown)
-          fatalExit(
-            `serve-liveness-watchdog: ${verdict.trigger} server-probe-age=${
-              serverAgeMs ?? "n/a"
-            }ms bus-probe-age=${busAgeMs ?? "n/a"}ms lag-breaches=${serveLagConsecutiveBreaches}/${SERVE_LAG_MAX_CONSECUTIVE_BREACHES}`,
-          );
+          fatalExit(`serve-liveness-watchdog: ${verdict.trigger} ${detail}`);
       }
     }, SERVE_WATCHDOG_INTERVAL_MS);
   }

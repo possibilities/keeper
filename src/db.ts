@@ -4829,6 +4829,21 @@ export function resolveRestartLedgerPath(): string {
 }
 
 /**
+ * `KEEPER_SINGLE_INSTANCE_LOCK` env wins; else `~/.local/state/keeper/keeperd.lock`.
+ * The dedicated file main takes a kernel `flock` on at the top of `startDaemon()`,
+ * making a second concurrent daemon exit before it can open — let alone migrate —
+ * the DB. DISTINCT from the server worker's `keeperd.sock.lock` pid-file lock: a
+ * Bun worker shares main's pid, so reusing that path would self-conflict. Pure.
+ */
+export function resolveSingleInstanceLockPath(): string {
+  const override = process.env.KEEPER_SINGLE_INSTANCE_LOCK;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "keeperd.lock");
+}
+
+/**
  * SQLite `SQLITE_MAX_VARIABLE_NUMBER` — `IN (?,?,...)` binds one variable per
  * id, so callers of `selectByIds` must chunk past this cap or cap their input.
  */
