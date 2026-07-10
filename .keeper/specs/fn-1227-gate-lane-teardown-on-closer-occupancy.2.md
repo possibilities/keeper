@@ -81,5 +81,5 @@ clears; stopped state → excluded.
 - [ ] Full fast suite green
 
 ## Done summary
-
+Added a detect-only cwd-missing clause to the exit-watcher stuck-sentinel: a plan-dispatched working job whose recorded cwd vanished while its recycle-checked pid is alive mints a needs_human 'stuck-sentinel: cwd-missing' sticky after a two-pulse grace, covering close:: jobs and never taking a kill action (ADR 0031).
 ## Evidence

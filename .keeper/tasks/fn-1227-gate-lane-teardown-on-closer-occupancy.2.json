@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Detect-only cwd-missing stuck sentinel",
-  "updated_at": "2026-07-10T00:54:38.775000Z"
+  "updated_at": "2026-07-10T01:22:09.077000Z",
+  "worker_done_at": "2026-07-10T01:22:09.077000Z"
 }
