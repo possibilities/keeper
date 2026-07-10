@@ -47,6 +47,7 @@ import {
   type Preset,
   type PresetCatalog,
   panelConfigPath,
+  parseYaml,
   pluginConfigPath,
   presetsCatalogPath,
   resolvePreset,
@@ -155,6 +156,16 @@ import {
   TmuxLaunchError,
 } from "./tmux-launch";
 import type { TranscriptStop } from "./transcript-watch";
+import {
+  enumerateTriples,
+  extractHostTriples,
+  formatTriple,
+  type HostTripleFinding,
+  type HostTriples,
+  hostTripleRefs,
+  lintHostTriples,
+  parseTriple,
+} from "./triple";
 import { readSingleChar } from "./tty";
 
 export interface MainDeps {
@@ -224,6 +235,15 @@ export interface MainDeps {
    */
   loadMatrixFn: () => Matrix | null;
   /**
+   * Read the operator's launch triples from the host files — the four harness
+   * defaults + worker/escalation from `presets.yaml` and the panel members from
+   * `panel.yaml`, harvested leniently as raw strings (the doctor validates them
+   * against the cube). Powers `presets list`/`presets resolve` and the
+   * `providers check` host-triple lint. Producer-side, re-read per call; injected
+   * so the triple verbs are testable against fixtures without a real `~/.config`.
+   */
+  loadHostTriplesFn: () => HostTriples;
+  /**
    * True when a roster provider's harness binary is reachable on PATH — the
    * `providers check` reachability probe. HOME/PATH-coupled, so a seam;
    * `realDeps()` binds it against the resolved per-harness bins.
@@ -267,6 +287,16 @@ export interface MainDeps {
    * `realDeps()` binds it to {@link piExtensionArgs} (fail-open existence check).
    */
   resolvePiExtensionArgsFn: () => string[];
+}
+
+/** Parse a host YAML file to its raw body, or null when the file is absent (the
+ *  lenient host-triple harvest treats an absent file as no triples). Malformed
+ *  YAML surfaces as a ConfigError from `parseYaml`, propagated to the verb. */
+function readYamlFileIfPresent(path: string): unknown {
+  if (!existsSync(path)) {
+    return null;
+  }
+  return parseYaml(readFileSync(path, "utf8"));
 }
 
 /** Production deps — the real collaborators. */
@@ -318,6 +348,11 @@ export function realDeps(): MainDeps {
     findShadowProfileDirsFn: () =>
       findShadowProfileDirs(listProfiles, homedir()),
     loadMatrixFn: loadMatrix,
+    loadHostTriplesFn: () =>
+      extractHostTriples(
+        readYamlFileIfPresent(presetsCatalogPath()),
+        readYamlFileIfPresent(panelConfigPath()),
+      ),
     providerReachableFn: (harness) => isBinaryReachable(bins[harness]),
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
     emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
@@ -1279,49 +1314,37 @@ async function runWaitCaptureSubcommand(
 }
 
 /**
- * `presets resolve <name>`: emit the resolved launch-config JSON to stdout. A
- * name matching a single preset emits `{kind:"preset", name, harness, model,
- * effort, thinking, role}` (absent fields null); a name matching a panel emits
- * `{kind:"panel", name, members:[{name, harness}, ...]}` in declaration order —
- * every member harness (claude|codex|pi) is pair-launchable. The reserved name
- * `default` dereferences to the configured default panel and reports that
- * panel's real name (a null default is fail-loud naming `default`). A `kind`
- * discriminator pins the contract task 4's panel SKILL parses with jq. A name
- * matching neither is fail-loud (exit 2).
+ * `presets resolve <name>`: emit the resolved launch reference JSON to stdout. A
+ * well-formed launch triple echoes its parse (`{kind:"triple", triple, harness,
+ * model, effort}`); a name matching a panel derefs to its ordered member triples
+ * (`{kind:"panel", name, members:[...]}`) in declaration order. The reserved name
+ * `default` dereferences to the configured default panel and reports that panel's
+ * real name (a null default is fail-loud naming `default`). A `kind` discriminator
+ * pins the contract downstream skills parse with jq. A name that is neither a
+ * well-formed triple nor a known panel is fail-loud (exit 2), the error naming the
+ * offending triple segment and the known panels.
  */
 function runPresetsResolve(deps: MainDeps, name: string): never {
-  let catalog: PresetCatalog;
-  try {
-    catalog = deps.loadPresetCatalogFn();
-  } catch (exc) {
-    if (exc instanceof ConfigError) {
-      deps.writeErr(`Error: ${exc.message}\n`);
-      return deps.exit(2);
-    }
-    throw exc;
-  }
-
-  // A catalog preset wins and needs no `panel.yaml` read; only a non-preset name
-  // falls through to panel resolution (which DOES require `panel.yaml`).
-  const direct = catalog.presets[name];
-  if (direct !== undefined) {
+  const parsed = parseTriple(name);
+  if (parsed.ok) {
     deps.write(
       `${JSON.stringify({
-        kind: "preset",
-        name,
-        harness: direct.harness,
-        model: direct.model,
-        effort: direct.effort,
-        thinking: direct.thinking,
-        role: direct.role,
+        kind: "triple",
+        triple: formatTriple(parsed.triple),
+        harness: parsed.triple.harness,
+        model: parsed.triple.model,
+        effort: parsed.triple.effort,
       })}\n`,
     );
     return deps.exit(0);
   }
 
-  let selections: PanelSelections;
+  // Not a triple → a panel name. Panel members are raw launch-triple strings; the
+  // deref echoes them verbatim (the doctor is the sole validator of their cube
+  // membership), never re-resolving a named catalog preset (retired, ADR 0033).
+  let host: HostTriples;
   try {
-    selections = deps.loadPanelSelectionsFn(catalog);
+    host = deps.loadHostTriplesFn();
   } catch (exc) {
     if (exc instanceof ConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
@@ -1330,55 +1353,51 @@ function runPresetsResolve(deps: MainDeps, name: string): never {
     throw exc;
   }
 
-  // `default` is reserved and can never be a catalog preset (the direct lookup
-  // above misses it), so here it aliases the configured default panel —
-  // dereferenced to its real name so the envelope reports the target panel.
+  // `default` is reserved and can never be a launch triple, so here it aliases the
+  // configured default panel — dereferenced to its real name.
   let lookup = name;
   if (name === "default") {
-    if (selections.default === null || selections.default === "") {
+    if (host.panelDefault === null || host.panelDefault === "") {
       deps.writeErr(
         "Error: 'default' given but no default panel set in panel.yaml.\n",
       );
       return deps.exit(2);
     }
-    lookup = selections.default;
+    lookup = host.panelDefault;
   }
 
-  const panelMembers = selections.panels[lookup];
-  if (panelMembers !== undefined) {
-    // Load-time validation already guarantees each member resolves to a
-    // panel-launchable (claude|codex) catalog preset.
-    const members = panelMembers.map((memberName) => {
-      const preset = catalog.presets[memberName] as Preset;
-      return { name: memberName, harness: preset.harness };
-    });
+  const members = host.panels[lookup];
+  if (members !== undefined) {
     deps.write(`${JSON.stringify({ kind: "panel", name: lookup, members })}\n`);
     return deps.exit(0);
   }
 
-  const presetNames = Object.keys(catalog.presets).sort();
-  const panelNames = Object.keys(selections.panels).sort();
+  const panelNames = Object.keys(host.panels).sort();
   deps.writeErr(
-    `Error: '${name}' is not a known preset or panel. ` +
-      `Presets: ${presetNames.length > 0 ? presetNames.join(", ") : "(none)"}. ` +
+    `Error: '${name}' is neither a well-formed launch triple ` +
+      `(harness::model::effort) nor a known panel. ${parsed.error}. ` +
       `Panels: ${panelNames.length > 0 ? panelNames.join(", ") : "(none)"}.\n`,
   );
   return deps.exit(2);
 }
 
 /**
- * `presets list [--json]`: the discovery surface so an agent passes a real
- * `--preset` name. Enumerates every catalog preset (name + harness/model/effort)
- * and every panel (name + ordered members) from `presets.yaml` + `panel.yaml`.
- * Human-readable by default, `--json` ({kind:"presets-list", presets, panels,
- * default}) for machine consumption. A missing/invalid catalog or panel file is
- * fail-loud (exit 2) carrying task 1's migration hint — `presets list` IS the
- * entry point that surfaces the config gap, never a crash.
+ * `presets list [--json]`: the discovery surface — the virtual launch cube plus
+ * the four harness defaults and the configured panels. Enumerates every triple the
+ * host matrix defines (routed AND launch-only providers, native ids fanned over
+ * effective efforts, an axisless harness emitting `na`) grouped per harness, and
+ * echoes the four `<harness>_default` triples and each panel's ordered members
+ * read from the host files. Human-readable by default, `--json`
+ * ({kind:"presets-list", harnesses, defaults, panels, default}) for machine
+ * consumption. A malformed matrix / host file is fail-loud (exit 2); an ABSENT
+ * matrix is the claude-only world with an empty cube, never a crash.
  */
 function runPresetsList(deps: MainDeps, json: boolean): never {
-  let catalog: PresetCatalog;
+  let matrix: Matrix | null;
+  let host: HostTriples;
   try {
-    catalog = deps.loadPresetCatalogFn();
+    matrix = deps.loadMatrixFn();
+    host = deps.loadHostTriplesFn();
   } catch (exc) {
     if (exc instanceof ConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
@@ -1387,90 +1406,72 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     throw exc;
   }
 
-  let selections: PanelSelections;
-  try {
-    selections = deps.loadPanelSelectionsFn(catalog);
-  } catch (exc) {
-    if (exc instanceof ConfigError) {
-      deps.writeErr(`Error: ${exc.message}\n`);
-      return deps.exit(2);
-    }
-    throw exc;
-  }
-
-  const presetNames = Object.keys(catalog.presets).sort();
-  const panelNames = Object.keys(selections.panels).sort();
+  const harnesses = matrix === null ? [] : enumerateTriples(matrix);
+  const defaults = {
+    claude: host.defaults.claude ?? null,
+    codex: host.defaults.codex ?? null,
+    pi: host.defaults.pi ?? null,
+    hermes: host.defaults.hermes ?? null,
+  };
+  const panelNames = Object.keys(host.panels).sort();
 
   if (json) {
-    const presets = presetNames.map((name) => {
-      const p = catalog.presets[name] as Preset;
-      return {
-        name,
-        harness: p.harness,
-        model: p.model,
-        effort: p.effort,
-        thinking: p.thinking,
-        role: p.role,
-      };
-    });
-    const panels = panelNames.map((name) => ({
-      name,
-      members: (selections.panels[name] as string[]).map((member) => ({
-        name: member,
-        harness: (catalog.presets[member] as Preset).harness,
-      })),
-    }));
     deps.write(
       `${JSON.stringify({
         kind: "presets-list",
-        presets,
-        panels,
-        default: selections.default,
-        defaults: {
-          claude: catalog.claude_default ?? null,
-          codex: catalog.codex_default ?? null,
-          pi: catalog.pi_default ?? null,
-          hermes: catalog.hermes_default ?? null,
-        },
+        harnesses: harnesses.map((group) => ({
+          harness: group.harness,
+          route: group.route,
+          triples: group.triples.map((t) => ({
+            triple: t.triple,
+            capability: t.capability,
+            native_id: t.native_id,
+            effort: t.effort,
+          })),
+        })),
+        defaults,
+        panels: panelNames.map((name) => ({
+          name,
+          members: host.panels[name] ?? [],
+        })),
+        default: host.panelDefault,
       })}\n`,
     );
     return deps.exit(0);
   }
 
-  const lines: string[] = [`Presets (${presetsCatalogPath()}):`];
-  if (presetNames.length === 0) {
-    lines.push("  (none)");
+  const lines: string[] = [`Launch cube (${matrixConfigPath()}):`];
+  if (harnesses.length === 0) {
+    lines.push(
+      "  (no matrix — claude-only embedded defaults, no enumerable triples)",
+    );
   } else {
-    for (const name of presetNames) {
-      const p = catalog.presets[name] as Preset;
-      const parts: string[] = [p.harness];
-      if (p.model !== null) parts.push(`model=${p.model}`);
-      if (p.effort !== null) parts.push(`effort=${p.effort}`);
-      if (p.thinking !== null) parts.push(`thinking=${p.thinking}`);
-      if (p.role !== null) parts.push(`role=${p.role}`);
-      lines.push(`  ${name}  ${parts.join(" ")}`);
+    for (const group of harnesses) {
+      const tag = group.route ? "" : " (launch-only)";
+      lines.push(`  ${group.harness}${tag}:`);
+      if (group.triples.length === 0) {
+        lines.push("    (no models)");
+      } else {
+        for (const t of group.triples) {
+          lines.push(`    ${t.triple}`);
+        }
+      }
     }
+  }
+  lines.push(`Harness defaults (${presetsCatalogPath()}):`);
+  for (const harness of ["claude", "codex", "pi", "hermes"] as const) {
+    lines.push(`  ${harness}_default  ${defaults[harness] ?? "(unset)"}`);
   }
   lines.push(`Panels (${panelConfigPath()}):`);
   if (panelNames.length === 0) {
     lines.push("  (none)");
   } else {
     for (const name of panelNames) {
-      const members = selections.panels[name] as string[];
-      const marker = selections.default === name ? " (default)" : "";
-      lines.push(`  ${name}  [${members.join(", ")}]${marker}`);
+      const marker = host.panelDefault === name ? " (default)" : "";
+      lines.push(
+        `  ${name}  [${(host.panels[name] ?? []).join(", ")}]${marker}`,
+      );
     }
-  }
-  lines.push(
-    "Harness defaults (the preset a bare `keeper agent <harness>` resolves):",
-  );
-  for (const [harness, pointer] of [
-    ["claude", catalog.claude_default],
-    ["codex", catalog.codex_default],
-    ["pi", catalog.pi_default],
-    ["hermes", catalog.hermes_default],
-  ] as const) {
-    lines.push(`  ${harness}_default  ${pointer ?? "(unset)"}`);
   }
   deps.write(`${lines.join("\n")}\n`);
   return deps.exit(0);
@@ -1629,8 +1630,11 @@ function runProfilesCheck(deps: MainDeps, json: boolean): never {
 const PROVIDERS_SCHEMA_VERSION = 1;
 /** `providers resolve`: a wrapped model has no configured provider (no_route). */
 const PROVIDERS_NO_ROUTE_EXIT = 3;
-/** `providers check`: one or more roster/preset/reachability drift findings. */
+/** `providers check`: one or more roster/triple/reachability drift findings. */
 const PROVIDERS_CHECK_DRIFT_EXIT = 9;
+/** `providers check`: a host launch triple the operator wrote is malformed — a
+ *  tool fault (the config is broken), distinct from off-cube drift (exit 9). */
+const PROVIDERS_CHECK_FAULT_EXIT = 1;
 
 /**
  * `providers resolve <model> <effort>`: emit the cost-ordered serving candidates
@@ -1718,12 +1722,43 @@ function runProvidersResolve(
   return deps.exit(0);
 }
 
+/** One rendered `providers check` finding — the structured fields plus a
+ *  human-readable `line` for stderr. */
+type RenderedProviderFinding = { kind: string; line: string } & Record<
+  string,
+  unknown
+>;
+
+/** Render a host launch-triple finding into its envelope + stderr-line form. */
+function renderHostTripleFinding(
+  f: HostTripleFinding,
+): RenderedProviderFinding {
+  if (f.kind === "malformed-triple") {
+    return {
+      kind: f.kind,
+      source: f.source,
+      triple: f.triple,
+      error: f.error,
+      line: `malformed launch triple at ${f.source}: '${f.triple}' — ${f.error}`,
+    };
+  }
+  return {
+    kind: f.kind,
+    source: f.source,
+    triple: f.triple,
+    line: `launch triple at ${f.source}: '${f.triple}' is outside the enumerable cube (drift)`,
+  };
+}
+
 /**
- * `providers check`: the host-matrix doctor. Reports roster-vs-preset-catalog and
- * roster-vs-binary-reachability drift — one line per finding on stderr, the
- * structured findings as a JSON line on stdout. An ABSENT matrix is clean (exit
- * 0, claude-only defaults, nothing to drift); a malformed matrix is a tool error
- * (exit 1); drift findings exit 9. Read-only — never mutates config.
+ * `providers check`: the host-matrix doctor. Reports roster-vs-binary-reachability
+ * drift and lints the operator's host launch triples (the four defaults, worker,
+ * escalation, panel members) against the enumerable cube — one line per finding on
+ * stderr, the structured findings as a JSON line on stdout. An ABSENT matrix is
+ * clean (exit 0, claude-only defaults, nothing to drift). A malformed matrix OR a
+ * malformed host triple is a tool fault (exit 1); a well-formed triple outside the
+ * cube (or an unreachable binary) is drift (exit 9). Read-only — never mutates
+ * config.
  */
 function runProvidersCheck(deps: MainDeps): never {
   let matrix: Matrix | null;
@@ -1732,7 +1767,7 @@ function runProvidersCheck(deps: MainDeps): never {
   } catch (exc) {
     if (exc instanceof ConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
-      return deps.exit(1);
+      return deps.exit(PROVIDERS_CHECK_FAULT_EXIT);
     }
     throw exc;
   }
@@ -1750,39 +1785,35 @@ function runProvidersCheck(deps: MainDeps): never {
     );
     return deps.exit(0);
   }
-  // The hand-authored preset names the auto-generated `<provider>-<model>` set
-  // must not collide with. A missing/invalid catalog is not fatal to the doctor —
-  // treat it as no hand-authored presets (the collision axis is simply empty).
-  let handAuthored: ReadonlySet<string>;
+  // The operator's host launch triples, linted against the cube. A missing/invalid
+  // host file is not fatal to the roster axis — treat it as no host triples (the
+  // triple-drift axis is simply empty).
+  let host: HostTriples;
   try {
-    handAuthored = new Set(Object.keys(deps.loadPresetCatalogFn().presets));
+    host = deps.loadHostTriplesFn();
   } catch (exc) {
     if (exc instanceof ConfigError) {
-      handAuthored = new Set();
+      host = {
+        defaults: {},
+        worker: null,
+        escalation: null,
+        panels: {},
+        panelDefault: null,
+      };
     } else {
       throw exc;
     }
   }
-  const rendered = providerCheckFindings(
-    matrix,
-    handAuthored,
-    deps.providerReachableFn,
-  ).map((f) =>
-    f.kind === "binary-unreachable"
-      ? {
-          kind: f.kind,
-          provider: f.provider,
-          binary: f.binary,
-          line: `provider '${f.provider}' binary '${f.binary}' is not reachable on PATH`,
-        }
-      : {
-          kind: f.kind,
-          preset: f.preset,
-          provider: f.provider,
-          model: f.model,
-          line: `auto-generated preset '${f.preset}' collides with a hand-authored preset`,
-        },
-  );
+  const tripleFindings = lintHostTriples(matrix, hostTripleRefs(host));
+  const rendered: RenderedProviderFinding[] = [
+    ...providerCheckFindings(matrix, deps.providerReachableFn).map((f) => ({
+      kind: f.kind,
+      provider: f.provider,
+      binary: f.binary,
+      line: `provider '${f.provider}' binary '${f.binary}' is not reachable on PATH`,
+    })),
+    ...tripleFindings.map(renderHostTripleFinding),
+  ];
   deps.write(
     `${JSON.stringify({
       schema_version: PROVIDERS_SCHEMA_VERSION,
@@ -1795,12 +1826,17 @@ function runProvidersCheck(deps: MainDeps): never {
   }
   if (rendered.length === 0) {
     deps.writeErr(
-      "providers check: roster, preset catalog, and binaries all consistent.\n",
+      "providers check: roster, binaries, and host launch triples all consistent.\n",
     );
     return deps.exit(0);
   }
+  // A malformed host triple is a tool fault (exit 1); everything else is drift
+  // (exit 9). A fault dominates when both are present.
+  const fault = tripleFindings.some((f) => f.kind === "malformed-triple");
   deps.writeErr(`providers check: ${rendered.length} finding(s).\n`);
-  return deps.exit(PROVIDERS_CHECK_DRIFT_EXIT);
+  return deps.exit(
+    fault ? PROVIDERS_CHECK_FAULT_EXIT : PROVIDERS_CHECK_DRIFT_EXIT,
+  );
 }
 
 export async function main(deps: MainDeps): Promise<never> {

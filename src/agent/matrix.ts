@@ -655,27 +655,24 @@ export function resolveModel(matrix: Matrix, model: string): ResolveResult {
 
 // ── doctor (providers check) ─────────────────────────────────────────────────
 
-/** One `providers check` drift finding. */
-export type ProviderCheckFinding =
-  | { kind: "binary-unreachable"; provider: HarnessName; binary: string }
-  | {
-      kind: "preset-collision";
-      preset: string;
-      provider: HarnessName;
-      model: string;
-    };
+/** One `providers check` roster/binary finding — a provider whose harness binary
+ *  is unreachable on PATH. Host launch-triple drift (off-cube / malformed) is a
+ *  SEPARATE axis the doctor composes from {@link lintHostTriples} in `triple.ts`. */
+export type ProviderCheckFinding = {
+  kind: "binary-unreachable";
+  provider: HarnessName;
+  binary: string;
+};
 
 /**
- * Build the `providers check` drift findings — pure over the matrix, the set of
- * hand-authored preset names, and an injected reachability probe (the fs/PATH
- * coupling lives at the call site). One finding per: a provider whose harness
- * binary is not reachable, and each auto-generated `<provider>-<model>` preset
- * name that collides with a hand-authored preset (the collision the catalog
- * auto-generation would fail-loud on at load).
+ * Build the `providers check` roster findings — pure over the matrix and an
+ * injected reachability probe (the fs/PATH coupling lives at the call site). One
+ * finding per provider whose harness binary is not reachable. The auto-generated
+ * `<provider>-<model>` preset-collision axis retires with the named catalog (ADR
+ * 0033); host launch-triple drift is linted separately.
  */
 export function providerCheckFindings(
   matrix: Matrix,
-  handAuthoredPresets: ReadonlySet<string>,
   isReachable: (harness: HarnessName) => boolean,
 ): ProviderCheckFinding[] {
   const findings: ProviderCheckFinding[] = [];
@@ -686,19 +683,6 @@ export function providerCheckFindings(
         provider: p.name,
         binary: HARNESS_DESCRIPTORS[p.name].binaryName,
       });
-    }
-  }
-  for (const p of matrix.providers) {
-    for (const model of p.models.keys()) {
-      const preset = presetNameFor(p.name, model);
-      if (handAuthoredPresets.has(preset)) {
-        findings.push({
-          kind: "preset-collision",
-          preset,
-          provider: p.name,
-          model,
-        });
-      }
     }
   }
   return findings;

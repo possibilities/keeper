@@ -98,6 +98,14 @@ candidates:[{harness, model_id, preset_name}], defaults}` at exit 0. On the
 unroutable path it emits `{schema_version, error:"no_route", model, effort,
 driver, candidates:[]}`.
 
+`check` emits `{schema_version, matrix_present, findings:[...]}`. Each finding is a
+`binary-unreachable` (a provider whose harness binary is off PATH), an
+`off-cube-triple` (a well-formed host launch triple — a `<harness>_default`,
+`worker`, `escalation`, or panel member — outside the enumerable cube, tagged with
+its `source`), or a `malformed-triple` (a host triple the grammar rejects, carrying
+its `source` + `error`). The auto-generated `<provider>-<model>` preset-collision
+finding retires with the named catalog (ADR 0033).
+
 | code       | verb                        | meaning                                                                                          | recovery                                                                                 | retry-safe |
 | ---------- | --------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- | ---------- |
 | `no_route` | `agent providers resolve`   | A wrapped (non-claude) model has no configured provider in the roster (empty candidate list).     | Add a provider serving the model to `~/.config/keeper/matrix.yaml`, or correct the token. | yes (read-only) |
@@ -108,8 +116,8 @@ Exit codes (distinct from the shared 0/1/2 core, published in `keeper --help --j
 | ---- | ------------------------- | ---------------------------------------------------------------------------------------------------- |
 | 2    | `agent providers resolve` | A model/effort token violates the name charset (lowercase alnum, hyphen, underscore, dot; no leading dot), or the matrix is malformed. |
 | 3    | `agent providers resolve` | `no_route` — a wrapped model has no configured provider in the roster. Add a serving provider or correct the model token. |
-| 1    | `agent providers check`   | Tool error — the matrix is malformed (ConfigError naming the offense on stderr).                     |
-| 9    | `agent providers check`   | One or more roster/preset/reachability drift findings (an unreachable provider binary, or an auto-generated `<provider>-<model>` preset colliding with a hand-authored one); each finding prints one line. |
+| 1    | `agent providers check`   | Tool fault — the matrix is malformed (ConfigError naming the offense on stderr), OR a host launch triple is malformed (the grammar rejects a `<harness>_default` / `worker` / `escalation` / panel member); each malformed triple prints one line. |
+| 9    | `agent providers check`   | One or more roster/host-triple/reachability drift findings (an unreachable provider binary, or a well-formed host launch triple outside the enumerable cube); each finding prints one line. |
 
 ## Worker-cell launch rejects (`keeper dispatch`, autopilot)
 

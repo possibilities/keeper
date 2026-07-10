@@ -1,21 +1,29 @@
 /**
- * Named-preset launch-config wiring (task 1): the `--x-preset` flag and
- * `presets resolve` verb drive harness/model/effort through main()'s resolver
- * default slots at `explicit > env > preset > yaml > native` per field, the
- * harnessless form drives the harness from the preset, a head agent disagreeing
- * with the preset's harness fails loud, and `presets resolve` emits the pinned
- * JSON contract. A cold-start guard proves the launcher import graph never
- * reaches src/db.ts (bun:sqlite).
+ * Launcher config surface: the `--x-preset` flag still drives an in-session
+ * launch's harness/model/effort through main()'s resolver default slots at
+ * `explicit > env > preset > yaml > native` per field (the named-preset launch
+ * path, retired in a later task); the launch-triple grammar (`parseTriple` /
+ * `slugifyTriple`) validates `harness::model::effort` by construction; and the
+ * reshaped `presets resolve` / `presets list` verbs emit the triple + virtual-cube
+ * contracts. A cold-start guard proves the launcher import graph never reaches
+ * src/db.ts (bun:sqlite).
  */
 
 import { describe, expect, test } from "bun:test";
 import {
   ConfigError,
-  type PanelSelections,
   type Preset,
   type PresetCatalog,
 } from "../src/agent/config";
 import { main } from "../src/agent/main";
+import type { Matrix } from "../src/agent/matrix";
+import {
+  formatTriple,
+  parseTriple,
+  slugifyTriple,
+  TRIPLE_SEGMENT_MAX_LEN,
+  tripleHash,
+} from "../src/agent/triple";
 import {
   expectExit,
   flagValues,
@@ -37,13 +45,6 @@ function preset(
 
 function catalog(presets: Record<string, Preset>): PresetCatalog {
   return { presets };
-}
-
-function selections(
-  panels: Record<string, string[]>,
-  def: string | null = null,
-): PanelSelections {
-  return { panels, default: def };
 }
 
 describe("--x-preset precedence (claude)", () => {
@@ -297,76 +298,152 @@ describe("fresh-launch fail-loud", () => {
   });
 });
 
+describe("launch-triple grammar (parseTriple)", () => {
+  test.each([
+    [
+      "claude::opus::high",
+      { harness: "claude", model: "opus", effort: "high" },
+    ],
+    [
+      "codex::gpt-5.5::max",
+      { harness: "codex", model: "gpt-5.5", effort: "max" },
+    ],
+    // pi carries a keeper effort (translated at launch) — na is only for axisless.
+    [
+      "pi::glm-4.6::xhigh",
+      { harness: "pi", model: "glm-4.6", effort: "xhigh" },
+    ],
+    // A slashed provider-qualified native id in the model segment.
+    [
+      "pi::openai/gpt-5.5::low",
+      { harness: "pi", model: "openai/gpt-5.5", effort: "low" },
+    ],
+    // hermes is axisless — na required.
+    [
+      "hermes::gpt-5.5::na",
+      { harness: "hermes", model: "gpt-5.5", effort: "na" },
+    ],
+  ] as const)("parses %s", (raw, triple) => {
+    const result = parseTriple(raw);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.triple).toEqual(triple);
+      // format round-trips the identity.
+      expect(formatTriple(result.triple)).toBe(raw);
+    }
+  });
+
+  test.each([
+    ["claude::opus", "got 2"], // too few segments
+    ["claude::opus::high::extra", "got 4"], // too many segments
+    ["claude::op:us::high", "model segment"], // bare colon inside a segment
+    ["ghost::opus::high", "harness segment"], // unknown harness
+    ["claude::OPUS::high", "model segment"], // uppercase off the charset
+    ["claude::opus::na", "forbidden"], // na on an axisful harness
+    ["hermes::gpt-5.5::high", "must be 'na'"], // non-na on hermes
+    ["claude::opus::turbo", "not a canonical effort"], // bad effort token
+  ] as const)("rejects %s naming the offending segment", (raw, needle) => {
+    const result = parseTriple(raw);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain(needle);
+    }
+  });
+
+  test("an over-length segment is rejected", () => {
+    const long = "a".repeat(TRIPLE_SEGMENT_MAX_LEN + 1);
+    const result = parseTriple(`claude::${long}::high`);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("model segment");
+      expect(result.error).toContain("cap");
+    }
+  });
+});
+
+describe("slugifyTriple (display/file form)", () => {
+  test("collapses the identity to a [a-z0-9-] slug", () => {
+    expect(
+      slugifyTriple({ harness: "pi", model: "openai/gpt-5.5", effort: "high" }),
+    ).toBe("pi-openai-gpt-5-5-high");
+  });
+
+  test("disambiguate appends a stable hash suffix; the raw triple is the identity", () => {
+    const t = { harness: "claude" as const, model: "opus", effort: "high" };
+    const plain = slugifyTriple(t);
+    const disambiguated = slugifyTriple(t, { disambiguate: true });
+    expect(disambiguated).toBe(`${plain}-${tripleHash(t)}`);
+    // Deterministic + stable across calls.
+    expect(slugifyTriple(t, { disambiguate: true })).toBe(disambiguated);
+  });
+});
+
 describe("presets resolve JSON contract", () => {
-  test("a single preset emits the pinned object", async () => {
+  test("a launch triple echoes its parse", async () => {
     const h = makeHarness({
-      argv: ["presets", "resolve", "p"],
+      argv: ["presets", "resolve", "claude::opus::xhigh"],
       rawArgv: true,
-      presetCatalog: catalog({
-        p: preset({
-          harness: "claude",
-          model: "opus",
-          effort: "xhigh",
-          role: "reviewer",
-        }),
-      }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(JSON.parse(h.out.join(""))).toEqual({
-      kind: "preset",
-      name: "p",
+      kind: "triple",
+      triple: "claude::opus::xhigh",
       harness: "claude",
       model: "opus",
       effort: "xhigh",
-      thinking: null,
-      role: "reviewer",
     });
   });
 
-  test("a panel emits an ordered members array (catalog + panel selections)", async () => {
+  test("an axisless (hermes na) triple echoes with na", async () => {
+    const h = makeHarness({
+      argv: ["presets", "resolve", "hermes::gpt-5.5::na"],
+      rawArgv: true,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    expect(JSON.parse(h.out.join("")).effort).toBe("na");
+  });
+
+  test("a panel name derefs to its ordered member triples", async () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "duo"],
       rawArgv: true,
-      presetCatalog: catalog({
-        a: preset({ harness: "claude", model: "opus" }),
-        b: preset({ harness: "codex", model: "gpt-5.5" }),
-      }),
-      panelSelections: selections({ duo: ["a", "b"] }),
+      hostTriples: {
+        defaults: {},
+        worker: null,
+        escalation: null,
+        panels: { duo: ["claude::opus::high", "codex::gpt-5.5::high"] },
+        panelDefault: null,
+      },
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(JSON.parse(h.out.join(""))).toEqual({
       kind: "panel",
       name: "duo",
-      members: [
-        { name: "a", harness: "claude" },
-        { name: "b", harness: "codex" },
-      ],
+      members: ["claude::opus::high", "codex::gpt-5.5::high"],
     });
   });
 
-  test("the reserved name 'default' resolves the configured default panel by its real name", async () => {
-    // The default pointer names `reviewers`; the envelope must report that real
-    // name (pointer dereference), never the literal `default`.
+  test("the reserved name 'default' derefs the configured default panel by its real name", async () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "default"],
       rawArgv: true,
-      presetCatalog: catalog({
-        a: preset({ harness: "claude", model: "opus" }),
-        b: preset({ harness: "codex", model: "gpt-5.5" }),
-      }),
-      panelSelections: selections({ reviewers: ["a", "b"] }, "reviewers"),
+      hostTriples: {
+        defaults: {},
+        worker: null,
+        escalation: null,
+        panels: { reviewers: ["claude::opus::high"] },
+        panelDefault: "reviewers",
+      },
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(JSON.parse(h.out.join(""))).toEqual({
       kind: "panel",
       name: "reviewers",
-      members: [
-        { name: "a", harness: "claude" },
-        { name: "b", harness: "codex" },
-      ],
+      members: ["claude::opus::high"],
     });
   });
 
@@ -374,8 +451,13 @@ describe("presets resolve JSON contract", () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "default"],
       rawArgv: true,
-      presetCatalog: catalog({ a: preset({ harness: "claude" }) }),
-      panelSelections: selections({ reviewers: ["a"] }, null),
+      hostTriples: {
+        defaults: {},
+        worker: null,
+        escalation: null,
+        panels: { reviewers: ["claude::opus::high"] },
+        panelDefault: null,
+      },
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
@@ -383,115 +465,161 @@ describe("presets resolve JSON contract", () => {
     expect(h.err.join("")).toContain("panel.yaml");
   });
 
-  test("a catalog preset resolves without consulting panel.yaml", async () => {
-    // A catalog-preset name wins before panel resolution — the empty default
-    // panel selections (which would fail-loud a panel lookup) is never reached.
-    const h = makeHarness({
-      argv: ["presets", "resolve", "solo"],
-      rawArgv: true,
-      presetCatalog: catalog({ solo: preset({ harness: "claude" }) }),
-    });
-    const code = await expectExit(main(h.deps));
-    expect(code).toBe(0);
-    expect(JSON.parse(h.out.join("")).kind).toBe("preset");
-  });
-
-  test("an unknown name fails loud naming presets and panels", async () => {
+  test("a name that is neither a triple nor a panel fails loud naming the grammar + panels", async () => {
     const h = makeHarness({
       argv: ["presets", "resolve", "ghost"],
       rawArgv: true,
-      presetCatalog: catalog({ p: preset({ harness: "claude" }) }),
-      panelSelections: selections({ duo: ["p"] }),
+      hostTriples: {
+        defaults: {},
+        worker: null,
+        escalation: null,
+        panels: { duo: ["claude::opus::high"] },
+        panelDefault: null,
+      },
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
     expect(h.err.join("")).toContain("ghost");
+    expect(h.err.join("")).toContain("harness::model::effort");
     expect(h.err.join("")).toContain("duo");
   });
 });
 
 describe("presets list discovery surface", () => {
-  test("--json emits catalog presets + panels for machine use", async () => {
+  const listMatrix: Matrix = {
+    efforts: ["low", "high"],
+    providers: [
+      {
+        name: "claude",
+        route: true,
+        models: new Map([["opus", "opus"]]),
+        modelEfforts: new Map(),
+      },
+      {
+        name: "pi",
+        route: false,
+        models: new Map([["spark", "pi/spark"]]),
+        modelEfforts: new Map(),
+      },
+    ],
+    subagents: ["work"],
+    wrapper_driver: { model: "sonnet", effort: "high" },
+    defaults: { stop_timeout_ms: 7200000, max_attempts: 2 },
+  };
+
+  test("--json emits the virtual cube, the four defaults, and panels", async () => {
     const h = makeHarness({
       argv: ["presets", "list", "--json"],
       rawArgv: true,
-      presetCatalog: {
-        ...catalog({
-          a: preset({ harness: "claude", model: "opus", effort: "xhigh" }),
-          b: preset({ harness: "codex", model: "gpt-5.5", effort: "high" }),
-        }),
-        claude_default: "a",
-        codex_default: "b",
+      matrix: listMatrix,
+      hostTriples: {
+        defaults: {
+          claude: "claude::opus::high",
+          codex: "codex::gpt-5.5::high",
+        },
+        worker: null,
+        escalation: null,
+        panels: { duo: ["claude::opus::high", "pi::pi/spark::low"] },
+        panelDefault: "duo",
       },
-      panelSelections: selections({ duo: ["a", "b"] }, "duo"),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     expect(JSON.parse(h.out.join(""))).toEqual({
       kind: "presets-list",
-      presets: [
+      harnesses: [
         {
-          name: "a",
           harness: "claude",
-          model: "opus",
-          effort: "xhigh",
-          thinking: null,
-          role: null,
+          route: true,
+          triples: [
+            {
+              triple: "claude::opus::low",
+              capability: "opus",
+              native_id: "opus",
+              effort: "low",
+            },
+            {
+              triple: "claude::opus::high",
+              capability: "opus",
+              native_id: "opus",
+              effort: "high",
+            },
+          ],
         },
         {
-          name: "b",
-          harness: "codex",
-          model: "gpt-5.5",
-          effort: "high",
-          thinking: null,
-          role: null,
-        },
-      ],
-      panels: [
-        {
-          name: "duo",
-          members: [
-            { name: "a", harness: "claude" },
-            { name: "b", harness: "codex" },
+          harness: "pi",
+          route: false,
+          triples: [
+            {
+              triple: "pi::pi/spark::low",
+              capability: "spark",
+              native_id: "pi/spark",
+              effort: "low",
+            },
+            {
+              triple: "pi::pi/spark::high",
+              capability: "spark",
+              native_id: "pi/spark",
+              effort: "high",
+            },
           ],
         },
       ],
+      defaults: {
+        claude: "claude::opus::high",
+        codex: "codex::gpt-5.5::high",
+        pi: null,
+        hermes: null,
+      },
+      panels: [
+        { name: "duo", members: ["claude::opus::high", "pi::pi/spark::low"] },
+      ],
       default: "duo",
-      defaults: { claude: "a", codex: "b", pi: null, hermes: null },
     });
   });
 
-  test("human-readable default lists names + harnesses", async () => {
+  test("human-readable lists cube triples, defaults, and panels", async () => {
     const h = makeHarness({
       argv: ["presets", "list"],
       rawArgv: true,
-      presetCatalog: {
-        ...catalog({
-          a: preset({ harness: "claude", model: "opus" }),
-        }),
-        claude_default: "a",
+      matrix: listMatrix,
+      hostTriples: {
+        defaults: { claude: "claude::opus::high" },
+        worker: null,
+        escalation: null,
+        panels: { duo: ["claude::opus::high"] },
+        panelDefault: null,
       },
-      panelSelections: selections({ duo: ["a"] }),
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(0);
     const text = h.out.join("");
-    expect(text).toContain("a");
-    expect(text).toContain("claude");
-    expect(text).toContain("model=opus");
+    expect(text).toContain("claude::opus::low");
+    expect(text).toContain("pi (launch-only)");
+    expect(text).toContain("claude_default  claude::opus::high");
+    expect(text).toContain("codex_default  (unset)");
     expect(text).toContain("duo");
-    expect(text).toContain("claude_default  a");
-    expect(text).toContain("pi_default  (unset)");
   });
 
-  test("a missing catalog yields the discovery error (exit 2), not a crash", async () => {
+  test("an absent matrix is the claude-only world: empty cube, exit 0", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list", "--json"],
+      rawArgv: true,
+      matrix: null,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    expect(JSON.parse(h.out.join("")).harnesses).toEqual([]);
+  });
+
+  test("a malformed matrix is fail-loud (exit 2), not a crash", async () => {
     const h = makeHarness({ argv: ["presets", "list"], rawArgv: true });
-    h.deps.loadPresetCatalogFn = () => {
-      throw new ConfigError("Preset catalog missing at /x/presets.yaml.");
+    h.deps.loadMatrixFn = () => {
+      throw new ConfigError("Unknown top-level key 'x' in /x/matrix.yaml.");
     };
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
-    expect(h.err.join("")).toContain("Preset catalog missing");
+    expect(h.err.join("")).toContain("Unknown top-level key");
   });
 });
 
@@ -520,6 +648,12 @@ describe("cold-start import-graph guard", () => {
 
   test("src/agent/config.ts bundle never references bun:sqlite", async () => {
     expect(await bundledText("./src/agent/config.ts")).not.toContain(
+      "bun:sqlite",
+    );
+  });
+
+  test("src/agent/triple.ts bundle never references bun:sqlite", async () => {
+    expect(await bundledText("./src/agent/triple.ts")).not.toContain(
       "bun:sqlite",
     );
   });

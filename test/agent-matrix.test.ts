@@ -26,6 +26,13 @@ import {
   providerOrderFor,
   resolveModel,
 } from "../src/agent/matrix";
+import {
+  enumerateTripleStrings,
+  enumerateTriples,
+  type HostTriples,
+  hostTripleRefs,
+  lintHostTriples,
+} from "../src/agent/triple";
 import { expectExit, makeHarness } from "./helpers/agent-main-harness";
 
 let tmpDir: string;
@@ -77,6 +84,50 @@ const VALID_MATRIX = [
 /** Parse the shared fixture once per assertion group. */
 function validMatrix(): Matrix {
   return loadMatrix(writeMatrix(VALID_MATRIX)) as Matrix;
+}
+
+/** An enumeration roster exercising every cube axis: claude native (top-level
+ *  efforts [low, high]); codex routed with a provider effort override [high,
+ *  xhigh], an aliased model, and a per-model override [low]; pi launch-only
+ *  (route: false) with a slashed native id; hermes launch-only + axisless (na). */
+const CUBE_MATRIX = [
+  "efforts:",
+  "  - low",
+  "  - high",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "      - sonnet",
+  "  - name: codex",
+  "    efforts:",
+  "      - high",
+  "      - xhigh",
+  "    models:",
+  "      - name: gpt-5.5",
+  "        native: gpt-5.5-codex",
+  "      - name: gpt-fast",
+  "        efforts:",
+  "          - low",
+  "  - name: pi",
+  "    route: false",
+  "    models:",
+  "      - name: spark",
+  "        native: pi/spark-preview",
+  "  - name: hermes",
+  "    route: false",
+  "    models:",
+  "      - hermes-m",
+  "subagents:",
+  "  - work",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "",
+].join("\n");
+
+function cubeMatrix(): Matrix {
+  return loadMatrix(writeMatrix(CUBE_MATRIX)) as Matrix;
 }
 
 describe("loadMatrix parsing", () => {
@@ -855,40 +906,129 @@ describe("committed example matrix (anti-rot)", () => {
   });
 });
 
+describe("enumerateTriples (virtual launch cube)", () => {
+  test("fans every provider over native ids and effective efforts", () => {
+    const cube = enumerateTriples(cubeMatrix());
+    // Provider declaration order, each with its route flag.
+    expect(cube.map((g) => [g.harness, g.route])).toEqual([
+      ["claude", true],
+      ["codex", true],
+      ["pi", false],
+      ["hermes", false],
+    ]);
+    const bh = (name: string) =>
+      cube.find((g) => g.harness === name)?.triples.map((t) => t.triple) ?? [];
+    // claude inherits the top-level axis [low, high].
+    expect(bh("claude")).toEqual([
+      "claude::opus::low",
+      "claude::opus::high",
+      "claude::sonnet::low",
+      "claude::sonnet::high",
+    ]);
+    // codex: gpt-5.5 uses the provider override [high, xhigh] against its native
+    // id; gpt-fast uses its own per-model override [low].
+    expect(bh("codex")).toEqual([
+      "codex::gpt-5.5-codex::high",
+      "codex::gpt-5.5-codex::xhigh",
+      "codex::gpt-fast::low",
+    ]);
+    // A launch-only provider still enumerates, carrying the slashed native id.
+    expect(bh("pi")).toEqual([
+      "pi::pi/spark-preview::low",
+      "pi::pi/spark-preview::high",
+    ]);
+    // An axisless harness emits a single `na` triple per model.
+    expect(bh("hermes")).toEqual(["hermes::hermes-m::na"]);
+  });
+
+  test("a triple entry carries the capability + native id + effort", () => {
+    const cube = enumerateTriples(cubeMatrix());
+    const codex = cube.find((g) => g.harness === "codex");
+    expect(codex?.triples[0]).toEqual({
+      triple: "codex::gpt-5.5-codex::high",
+      capability: "gpt-5.5",
+      native_id: "gpt-5.5-codex",
+      effort: "high",
+    });
+  });
+
+  test("route:false models are enumerable here but absent from the pecking order", () => {
+    const m = cubeMatrix();
+    const strings = enumerateTripleStrings(m);
+    // pi's spark enumerates for launch...
+    expect(strings.has("pi::pi/spark-preview::low")).toBe(true);
+    // ...but forms no capability cell and routes nowhere.
+    expect(cellSet(m).map((c) => c.model)).toEqual([
+      "opus",
+      "sonnet",
+      "gpt-5.5",
+      "gpt-fast",
+    ]);
+    expect(providerOrderFor(m, "spark")).toEqual([]);
+  });
+});
+
+describe("lintHostTriples (host-triple drift + fault)", () => {
+  const hostRefs = (host: Partial<HostTriples>): HostTriples => ({
+    defaults: {},
+    worker: null,
+    escalation: null,
+    panels: {},
+    panelDefault: null,
+    ...host,
+  });
+
+  test("a well-formed triple absent from the cube is off-cube drift", () => {
+    const findings = lintHostTriples(
+      cubeMatrix(),
+      // opus only enumerates at low/high — xhigh is off-cube.
+      hostTripleRefs(hostRefs({ defaults: { claude: "claude::opus::xhigh" } })),
+    );
+    expect(findings).toEqual([
+      {
+        kind: "off-cube-triple",
+        source: "claude_default",
+        triple: "claude::opus::xhigh",
+      },
+    ]);
+  });
+
+  test("a malformed triple is a fault carrying the grammar error + source", () => {
+    const findings = lintHostTriples(
+      cubeMatrix(),
+      hostTripleRefs(hostRefs({ worker: "claude::opus::banana" })),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.kind).toBe("malformed-triple");
+    expect(findings[0]?.source).toBe("worker");
+    expect((findings[0] as { error: string }).error).toContain("banana");
+  });
+
+  test("an in-cube triple (incl. a panel member + na) is clean", () => {
+    const findings = lintHostTriples(
+      cubeMatrix(),
+      hostTripleRefs(
+        hostRefs({
+          defaults: { codex: "codex::gpt-5.5-codex::high" },
+          panels: { duo: ["claude::opus::low", "hermes::hermes-m::na"] },
+        }),
+      ),
+    );
+    expect(findings).toEqual([]);
+  });
+});
+
 describe("providerCheckFindings", () => {
   test("an unreachable provider binary is one finding", () => {
     const m = validMatrix();
-    const findings = providerCheckFindings(
-      m,
-      new Set(),
-      (harness) => harness !== "pi",
-    );
+    const findings = providerCheckFindings(m, (harness) => harness !== "pi");
     expect(findings).toEqual([
       { kind: "binary-unreachable", provider: "pi", binary: "pi" },
     ]);
   });
 
-  test("a colliding hand-authored preset is one finding", () => {
-    const m = validMatrix();
-    const findings = providerCheckFindings(
-      m,
-      new Set(["codex-gpt-5.5"]),
-      () => true,
-    );
-    expect(findings).toEqual([
-      {
-        kind: "preset-collision",
-        preset: "codex-gpt-5.5",
-        provider: "codex",
-        model: "gpt-5.5",
-      },
-    ]);
-  });
-
   test("a consistent roster has no findings", () => {
-    expect(providerCheckFindings(validMatrix(), new Set(), () => true)).toEqual(
-      [],
-    );
+    expect(providerCheckFindings(validMatrix(), () => true)).toEqual([]);
   });
 });
 
@@ -992,12 +1132,18 @@ describe("providers resolve verb", () => {
 });
 
 describe("providers check verb", () => {
-  test("a consistent roster is clean (exit 0, no findings)", async () => {
+  test("a consistent roster with in-cube host triples is clean (exit 0)", async () => {
     const h = makeHarness({
       argv: ["providers", "check"],
       rawArgv: true,
-      matrix: validMatrix(),
-      presetCatalog: { presets: {} },
+      matrix: cubeMatrix(),
+      hostTriples: {
+        defaults: { claude: "claude::opus::low" },
+        worker: "claude::sonnet::high",
+        escalation: null,
+        panels: { duo: ["codex::gpt-5.5-codex::high", "hermes::hermes-m::na"] },
+        panelDefault: "duo",
+      },
       providerReachable: () => true,
     });
     const code = await expectExit(main(h.deps));
@@ -1005,21 +1151,18 @@ describe("providers check verb", () => {
     expect(JSON.parse(h.out.join("")).findings).toEqual([]);
   });
 
-  test("drift findings exit 9 with one line each", async () => {
+  test("an unreachable binary + an off-cube host triple are drift (exit 9)", async () => {
     const h = makeHarness({
       argv: ["providers", "check"],
       rawArgv: true,
-      matrix: validMatrix(),
-      presetCatalog: {
-        presets: {
-          "codex-gpt-5.5": {
-            harness: "codex",
-            model: null,
-            effort: null,
-            thinking: null,
-            role: null,
-          },
-        },
+      matrix: cubeMatrix(),
+      // opus enumerates only at low/high — xhigh is a well-formed off-cube triple.
+      hostTriples: {
+        defaults: { claude: "claude::opus::xhigh" },
+        worker: null,
+        escalation: null,
+        panels: {},
+        panelDefault: null,
       },
       providerReachable: (harness) => harness !== "pi",
     });
@@ -1028,7 +1171,48 @@ describe("providers check verb", () => {
     const kinds = JSON.parse(h.out.join("")).findings.map(
       (f: { kind: string }) => f.kind,
     );
-    expect(kinds).toEqual(["binary-unreachable", "preset-collision"]);
+    expect(kinds).toEqual(["binary-unreachable", "off-cube-triple"]);
+  });
+
+  test("a malformed host triple is a tool fault (exit 1), still enveloped", async () => {
+    const h = makeHarness({
+      argv: ["providers", "check"],
+      rawArgv: true,
+      matrix: cubeMatrix(),
+      hostTriples: {
+        defaults: {},
+        // Two segments — the grammar rejects it (fault, not drift).
+        worker: "claude::opus",
+        escalation: null,
+        panels: {},
+        panelDefault: null,
+      },
+      providerReachable: () => true,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(1);
+    const findings = JSON.parse(h.out.join("")).findings;
+    expect(findings.map((f: { kind: string }) => f.kind)).toEqual([
+      "malformed-triple",
+    ]);
+    expect(findings[0].source).toBe("worker");
+  });
+
+  test("no auto-preset collision finding exists anywhere", async () => {
+    // The retired collision axis: a matrix whose auto `<provider>-<model>` name
+    // would once have collided with a hand-authored preset now produces nothing.
+    const h = makeHarness({
+      argv: ["providers", "check"],
+      rawArgv: true,
+      matrix: cubeMatrix(),
+      providerReachable: () => true,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const kinds: string[] = JSON.parse(h.out.join("")).findings.map(
+      (f: { kind: string }) => f.kind,
+    );
+    expect(kinds).not.toContain("preset-collision");
   });
 
   test("an absent matrix is clean (exit 0, matrix_present false)", async () => {

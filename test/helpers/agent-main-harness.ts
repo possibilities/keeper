@@ -17,7 +17,19 @@ import type { Matrix } from "../../src/agent/matrix";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
 import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
+import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
+
+/** The default host launch triples the harness injects when a test names none: an
+ *  empty set (no defaults, no worker/escalation, no panels). Triple-verb tests
+ *  pass their own {@link HostTriples} fixture. */
+export const DEFAULT_HOST_TRIPLES: HostTriples = {
+  defaults: {},
+  worker: null,
+  escalation: null,
+  panels: {},
+  panelDefault: null,
+};
 
 /**
  * The default preset catalog the harness injects when a test names none: a
@@ -139,6 +151,9 @@ export interface HarnessOptions {
   presetCatalog?: PresetCatalog;
   /** Panel selections loadPanelSelectionsFn returns (default empty). */
   panelSelections?: PanelSelections;
+  /** Host launch triples loadHostTriplesFn returns (default {@link
+   *  DEFAULT_HOST_TRIPLES} — an empty set). */
+  hostTriples?: HostTriples;
   /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
   findShadowProfileDirs?: () => ShadowProfileFinding[];
   /** Host matrix loadMatrixFn returns (default null → claude-only world). */
@@ -220,6 +235,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,
     loadPanelSelectionsFn: () =>
       opts.panelSelections ?? { panels: {}, default: null },
+    loadHostTriplesFn: () => opts.hostTriples ?? DEFAULT_HOST_TRIPLES,
     ensureClaudeStateSharingFn: () => {},
     ensureKeeperAgentProfileDirFn: (profileName: string) => {
       bootstrappedProfiles.push(profileName);
