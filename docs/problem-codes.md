@@ -86,20 +86,23 @@ the await-owned range):
 
 ## Agent provider matrix (`keeper agent providers resolve|check`)
 
-The host-matrix doctor verbs read `~/.config/keeper/matrix.yaml` (ADR 0010) — the
-ordered provider roster that grows the worker model axis beyond claude. They emit
-a structured JSON line on stdout (`resolve`'s candidate envelope, `check`'s
-findings) and human diagnostics on stderr; neither rides the shared `cli/envelope.ts`
-shape. An ABSENT matrix is the claude-only world and never faults — every existing
-`keeper agent` behavior stays byte-identical. Reads only; nothing is mutated.
+The host-matrix doctor verbs read the REQUIRED `~/.config/keeper/matrix.yaml` v2
+(ADR 0036) — the ordered provider roster that grows the worker model axis beyond
+claude. They emit a structured JSON line on stdout (`resolve`'s candidate
+envelope, `check`'s findings) and human diagnostics on stderr; neither rides the
+shared `cli/envelope.ts` shape. Reads only; nothing is mutated.
 
 `resolve <model> <effort>` emits `{schema_version, model, effort, driver,
 candidates:[{harness, model_id, preset_name}], defaults}` at exit 0. On the
 unroutable path it emits `{schema_version, error:"no_route", model, effort,
-driver, candidates:[]}`.
+driver, candidates:[]}`. An ABSENT matrix is a typed loud failure (exit 2, ADR
+0036) naming the state and the copy-the-example fix — there is no claude-native
+fallback candidate.
 
-`check` emits `{schema_version, matrix_present, findings:[...]}`. Each finding is a
-`binary-unreachable` (a provider whose harness binary is off PATH), an
+`check` emits `{schema_version, matrix_present, findings:[...]}`; an ABSENT matrix
+reports `matrix_present: false` with an empty finding list at exit 0 — nothing to
+drift-check yet, distinct from `resolve`'s loud absent-matrix failure above. Each
+finding is a `binary-unreachable` (a provider whose harness binary is off PATH), an
 `off-cube-triple` (a well-formed host launch triple — a `<harness>_default`,
 `worker`, `escalation`, or panel member — outside the enumerable cube, tagged with
 its `source`), or a `malformed-triple` (a host triple the grammar rejects, carrying

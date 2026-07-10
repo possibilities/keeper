@@ -75,8 +75,8 @@ decision is identical, so a hand-fired plan worker loads the byte-same cell an
 automated one does. The producer injects a per-cycle memoized shadow probe; dispatch
 injects a fresh scan (it fires one worker).
 
-The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`, rendered from
-`subagents.yaml`) is appended via `--plugin-dir` AFTER `--name`
+The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`, rendered from the host
+`matrix.yaml`'s `subagent_templates × subagent_models`) is appended via `--plugin-dir` AFTER `--name`
 (`exec-backend.ts:968-974`). It is **additive, not isolating**: the worker still
 inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
 worker argv recovers the byte-identical interactive argv — pinned by the additive
@@ -87,10 +87,12 @@ same additive `--plugin-dir <cell>` channel — there is no separate wrapped-cel
 launch path. Its manifest's driver is the fixed claude wrapper (the `wrapper_driver`
 model/effort from the host matrix), and the wrapper delegates implementation to the
 resolved foreign provider before re-owning tests and the close-out commit. The host
-`~/.config/keeper/matrix.yaml` ([ADR 0010](./adr/0010-host-provider-matrix-and-wrapped-worker-cells.md))
-is the composition INPUT that makes wrapped cells render at all: `render-plugin-templates`
-fans the matrix's roster into the per-cell manifests under `plugins/plan/workers/`, and
-with no matrix present only native claude cells exist to compose in.
+`~/.config/keeper/matrix.yaml` ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
+is the composition INPUT that makes any cell render at all — claude-native included, since there
+is no embedded fallback: `render-plugin-templates` fans `subagent_templates` out over
+`subagent_models × efforts` into the per-cell manifests under `plugins/plan/workers/`, and an
+absent, unparseable, schema-invalid, or empty matrix is a typed loud failure rather than a
+claude-only default.
 
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —
@@ -103,8 +105,8 @@ A sibling plan-plugin config surface, `plugins/plan/model-selector.yaml` (the
 post-scaffold model+effort selector's policy config), is read off disk by
 `keeper plan selection-brief` during the select beat — never compiled in, never a
 `--plugin-dir` — so it rides no launch channel and is noted
-here only to keep the plan plugin's config-surface inventory complete alongside
-`subagents.yaml`.
+here only to keep the plan plugin's config-surface inventory complete alongside the
+host `matrix.yaml`.
 
 The daemon's own **merge-resolver dispatch** (`resolve::<epic>`, launched by the
 resolver-dispatch sweep on a stuck worktree fan-in close) rides this SAME
