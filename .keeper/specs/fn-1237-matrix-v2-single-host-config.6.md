@@ -50,5 +50,5 @@ the render source now names the host matrix, and the test-isolation bullet's san
 - [ ] The CLAUDE.md size/style lint passes
 
 ## Done summary
-
+Swept install.md, plugin-composition-map.md, problem-codes.md, CONTEXT.md, and both CLAUDE.md files to describe only the v2 required host matrix.yaml (launch-id entries, subagent_templates/subagent_models, four-state loud failure); retired route:/native:/subagents.yaml as live surfaces and repointed ADR cross-links to 0036.
 ## Evidence
