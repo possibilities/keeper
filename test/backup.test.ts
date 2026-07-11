@@ -126,6 +126,14 @@ test("resolveBackupDir: a sibling `backups/` of the DB", () => {
   expect(resolveBackupDir("/a/b/keeper.db")).toBe("/a/b/backups");
 });
 
+test("BACKUP_INTERVAL_MS: pinned at 48h — a wide cadence bounds backup I/O churn", () => {
+  // A full VACUUM INTO + integrity_check of a large live DB is the dominant
+  // source of backup I/O churn; a wider cadence bounds it with no loss of
+  // restore correctness (verify-on-write is unchanged). Pinned as an explicit
+  // hand-computed constant so a future edit notices the change.
+  expect(BACKUP_INTERVAL_MS).toBe(48 * 60 * 60 * 1000);
+});
+
 // ---------------------------------------------------------------------------
 // fn-753 — boot-time catch-up overdue check
 // ---------------------------------------------------------------------------
@@ -174,7 +182,7 @@ test("isCatchUpDue: OVERDUE snapshot ⇒ due (older than the interval)", () => {
 test("isCatchUpDue: FRESH snapshot ⇒ NOT due (regular timer unchanged)", () => {
   const dir = join(tmpDir, "backups");
   mkdirSync(dir, { recursive: true });
-  const fresh = new Date(Date.now() - 60_000); // 1 min ago, well within 24h
+  const fresh = new Date(Date.now() - 60_000); // 1 min ago, well within the interval
   writeFileSync(join(dir, snapshotName(fresh)), "x");
   expect(isCatchUpDue(dir, Date.now())).toBe(false);
 });

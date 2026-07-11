@@ -4,7 +4,7 @@
  *
  * ## Why this worker exists
  *
- * bun:sqlite calls are SYNCHRONOUS. The daily verified backup (`VACUUM INTO` on a
+ * bun:sqlite calls are SYNCHRONOUS. The rolling verified backup (`VACUUM INTO` on a
  * ~2 GB DB — a multi-second copy) and the 15-min integrity probe
  * (`PRAGMA quick_check` — a bounded structural sweep) both run synchronous
  * bun:sqlite work; when hosted on main's `setInterval` they STALL the event loop
@@ -19,8 +19,8 @@
  * regardless of which connection it uses.
  *
  * Four schedules:
- * - (a) the 24h verified backup interval (`runBackupPass` → `backupDb(dbPath)`),
- *       relocated from main (daemon.ts),
+ * - (a) the verified backup interval (`BACKUP_INTERVAL_MS`; `runBackupPass` →
+ *       `backupDb(dbPath)`), relocated from main (daemon.ts),
  * - (b) the fn-753 boot-time catch-up one-shot (`isCatchUpDue` ⇒ a delayed
  *       single backup pass), evaluated once on worker start, relocated from main,
  * - (c) the 15-min integrity-probe interval (`runIntegrityProbe`), relocated
@@ -280,7 +280,7 @@ function main(): void {
   const post = (msg: MaintenanceMessage): void => port.postMessage(msg);
   const isShuttingDown = (): boolean => shuttingDown;
 
-  // The 24h verified backup interval (relocated from daemon.ts:runBackupPass).
+  // The verified backup interval (relocated from daemon.ts:runBackupPass).
   const backupTimer = setInterval(() => {
     runBackupPass(dbPath, post, isShuttingDown);
   }, BACKUP_INTERVAL_MS);
