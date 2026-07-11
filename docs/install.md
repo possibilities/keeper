@@ -177,3 +177,9 @@ source of truth — via `keeper reclaim --agent-help`, `bun scripts/backup-db.ts
 deterministically from the immutable `events` table, a restored snapshot re-derives byte-identical
 projections. (`keeper tabs` crash-restore of agent windows is a separate surface — it restores tmux
 windows, not the DB.)
+
+**Offline reclaim maintenance window** — `bun scripts/maintenance-window.ts` is the supported
+one-command path for the whole window (pause autopilot, drain, snapshot, stop the daemon, reclaim,
+restart, verify, then hold or restore autopilot). It wraps the same `reclaimInstructions()` steps
+above under one safety-gated command instead of running them by hand; `--hold` leaves autopilot
+paused after a successful run for triage.
