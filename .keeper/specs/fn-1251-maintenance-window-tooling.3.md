@@ -31,5 +31,5 @@ Extend test/backup.test.ts: the rendered runbook contains a concrete `gui/<uid>/
 - [ ] `keeper reclaim --agent-help` renders resolved, copy-pasteable launchctl bootout/bootstrap commands (real label + plist), with a safe fallback if resolution fails.
 
 ## Done summary
-
+reclaimInstructions() now resolves the real gui/<uid>/arthack.keeperd service target and the loaded LaunchAgent plist path (via launchctl print, falling back to the conventional ~/Library/LaunchAgents path, then to the original placeholder) so keeper reclaim --agent-help/--dry-run prints copy-pasteable launchctl bootout/bootstrap commands.
 ## Evidence
