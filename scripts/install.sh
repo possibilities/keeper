@@ -81,6 +81,64 @@ if command -v pi >/dev/null 2>&1; then
   ( cd "${repo_root}" && PI_CODING_AGENT_DIR="${HOME}/.pi/agent" bun scripts/install-pi-plan-agents.ts )
 fi
 
+# 3b. pi-subagents fork sync. pi loads @tintinweb/pi-subagents LIVE from the
+#     local fork checkout (a local-path package source in ~/.pi/agent/settings.json)
+#     because the checkout's fix branch carries the nested-subagent-spawn fix
+#     until it lands upstream. Keep the fork rebased on upstream so drift
+#     surfaces at install time rather than as a live panel failure. ANY sync
+#     error rolls the checkout back to its pre-rebase tip (the last known-good
+#     patched state — never plain upstream, which would silently drop the fix)
+#     and sends a desktop notification that we are out of sync with upstream.
+#     This step never fails the keeper install.
+pi_subagents_fork="${HOME}/src/possibilities--pi-subagents"
+pi_subagents_branch="fix/nested-subagent-spawn-ctx"
+pi_subagents_notify() {
+  echo "install: pi-subagents fork sync: $1" >&2
+  if command -v notifyctl >/dev/null 2>&1; then
+    notifyctl show-message -t "pi-subagents out of sync with upstream" \
+      -m "$1 (${pi_subagents_fork})" >/dev/null 2>&1 || true
+  fi
+}
+if [ -d "${pi_subagents_fork}/.git" ]; then
+  echo "install: syncing pi-subagents fork against upstream"
+  (
+    set -Eeuo pipefail
+    cd "${pi_subagents_fork}"
+    current_branch="$(git branch --show-current)"
+    if [ "${current_branch}" != "${pi_subagents_branch}" ]; then
+      pi_subagents_notify "checkout is on '${current_branch:-<detached>}', expected '${pi_subagents_branch}' — pi is loading whatever is checked out"
+      exit 0
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "install: pi-subagents fork has local changes; skipping upstream sync"
+      exit 0
+    fi
+    safe_tip="$(git rev-parse HEAD)"
+    if ! git fetch upstream --quiet; then
+      pi_subagents_notify "git fetch upstream failed — cannot verify sync"
+      exit 0
+    fi
+    if git merge-base --is-ancestor upstream/master HEAD; then
+      echo "install: pi-subagents fork already contains upstream/master; no rebase"
+      exit 0
+    fi
+    if ! git rebase upstream/master >/dev/null 2>&1; then
+      git rebase --abort >/dev/null 2>&1 || true
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      pi_subagents_notify "rebase onto upstream/master conflicted; rolled back to pre-rebase tip ${safe_tip:0:10}"
+      exit 0
+    fi
+    if [ -x node_modules/.bin/tsc ] && ! node_modules/.bin/tsc --noEmit >/dev/null 2>&1; then
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      pi_subagents_notify "typecheck failed after rebase onto upstream/master; rolled back to pre-rebase tip ${safe_tip:0:10}"
+      exit 0
+    fi
+    echo "install: pi-subagents fork rebased cleanly onto upstream/master"
+  ) || echo "install: pi-subagents fork sync errored (non-fatal); continuing" >&2
+else
+  echo "install: pi-subagents fork not present (${pi_subagents_fork}); skipping sync"
+fi
+
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it
