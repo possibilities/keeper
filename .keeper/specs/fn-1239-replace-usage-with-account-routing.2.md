@@ -69,5 +69,5 @@ Keep destructive cleanup blocked behind this task. The account diagnostic must s
 - [ ] Exact-argv, environment, resume/restore, and failure-ambiguity tests pass using injected seams only.
 
 ## Done summary
-
+Route every unpinned Claude start/resume/restore through the per-launch account router at the spawn boundary: native decisions preserve the built argv byte-for-byte, managed decisions wrap it in cswap run <slot> --share-history -- <argv…>, and the PII-free KEEPER_ACCOUNT_ROUTE carrier rides both paths without CLAUDE_CONFIG_DIR. Adds the read-only accounts check [--json] diagnostic and retires automatic profile selection from the Claude auto path (pi keeps its picker).
 ## Evidence
