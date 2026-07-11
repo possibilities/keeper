@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Backgrounded worker wait discipline",
-  "updated_at": "2026-07-10T22:57:09.297000Z"
+  "updated_at": "2026-07-11T14:48:10.551000Z",
+  "worker_done_at": "2026-07-11T14:48:10.551000Z"
 }

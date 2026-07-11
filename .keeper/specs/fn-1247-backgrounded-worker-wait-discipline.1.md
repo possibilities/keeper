@@ -28,5 +28,5 @@ Wielder sessions improvise a wait after spawning their backgrounded worker subag
 - [ ] The live skill tree re-renders cleanly, the oracle fixture is refreshed via capture-oracle, and both the prompt suite (parity drift gate) and the plan consistency-skills suite pass.
 
 ## Done summary
-
+Taught the rendered /plan:work skill and /plan:close's SKILL.md that work:worker/subagent spawns are backgrounded — waiting means ending the turn, the completion task-notification is the only wake path, ScheduleWakeup/Monitor/sleep are never used to wait on a worker. Reworded the warm-path 'wait for the worker' step to end-turn phrasing; preserved close's transient-API-retry backoff unchanged. Re-rendered the live skill tree and refreshed the oracle fixture.
 ## Evidence
