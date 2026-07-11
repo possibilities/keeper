@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 2,
+        "deletions": 6,
+        "files_changed": 4,
+        "insertions": 10
+      },
+      "done_summary": "Taught the rendered /plan:work skill and /plan:close's SKILL.md that work:worker/subagent spawns are backgrounded \u2014 waiting means ending the turn, the completion task-notification is the only wake path, ScheduleWakeup/Monitor/sleep are never used to wait on a worker. Reworded the warm-path 'wait for the worker' step to end-turn phrasing; preserved close's transient-API-retry backoff unchanged. Re-rendered the live skill tree and refreshed the oracle fixture.",
+      "input_hash": "06cf9281bc77af6ccd72689023217720025025456eaa7f2fc93d0477b07cf145",
+      "model": "sonnet",
+      "spec_chars": 4537,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/template/skills/work.md.tmpl, plugins/plan/skills/close/SKILL.md, plugins/prompt/test/oracle/fixtures/render-plugin-templates.json\n\n### Approach\n\nWielder sessions improvise a wait after spawning their backgrounded worker subagent and call the harness ScheduleWakeup tool malformed (it is loop-only and requires `prompt`), failing with \"`prompt` is required when `stop` is not true\" roughly once per /plan:work session. The skills must state the actual harness contract: subagent spawns are backgrounded, waiting means ending the turn, the worker's completion task-notification is the only wake path, and ScheduleWakeup/Monitor/sleep are never called to wait on a worker. Add that beat to the work skill template's Phase 2a (right after the \"trust the return value\" paragraph, covering initial spawn, warm resume, and cold respawn) and reword warm-path step 3 from \"Wait for the worker to finish, then re-run\u2026\" to end-turn phrasing (\"End the turn; the worker's next task-notification re-invokes you \u2014 then re-run\u2026\"). Apply the same discipline note to /plan:close's hand-authored SKILL.md around its subagent spawns \u2014 while preserving its documented inline 60s\u2192180s\u2192600s transient-API-retry backoff, which is a legitimate retry sleep, not a worker-wait; a blanket \"never sleep\" wording would contradict it. Keep all new prose outside Task(...) code fences and free of fenced `keeper plan` verbs the CLI doesn't have (the consistency guards scan both). The work SKILL.md is generated: edit only the template, then re-render and refresh the oracle fixture via capture-oracle (two separate commands \u2014 render writes the live gitignored skill tree, capture-oracle writes the committed fixture the parity test reads).\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/template/skills/work.md.tmpl:103 \u2014 the \"trust the return value\" paragraph; the new beat anchors right after it (line 105 is the worker_agent_id capture paragraph)\n- plugins/plan/template/skills/work.md.tmpl:147 \u2014 warm-path step 3, exact string \"Wait for the worker to finish, then re-run\" to reword\n- plugins/plan/template/skills/work.md.tmpl:109 \u2014 Phase 2b opener \"After the worker returns\u2026\"; judge whether the new 2a beat makes it read correctly as-is\n- plugins/plan/skills/close/SKILL.md:123 \u2014 \"Wait for the planner to finish\u2026\" plus content-blind Task spawns at :53/:80/:132/:172; the :65 auditor block documents the transient-retry backoff that must survive unchanged in meaning\n- plugins/prompt/src/render_plugin_templates.ts \u2014 the renderer; skills/work/SKILL.md + its .managed-file-dont-edit sidecar are generated, never hand-edited\n- plugins/prompt/test/oracle/capture.ts \u2014 sole fixture generator (`cd plugins/prompt && bun run capture-oracle`); eyeball the fixture diff before committing so a bug is never frozen as golden\n- plugins/prompt/test/parity.test.ts:350 \u2014 the byte-identical drift gate that fails if the template changes without a fixture refresh\n- plugins/plan/test/consistency-skills.test.ts:747-829 \u2014 template-shape guards (spawn shape, agentId capture regex, verb existence, input-shape contract) that must stay green\n\n## Acceptance\n\n- [ ] The rendered /plan:work skill instructs the orchestrator, for every work:worker spawn (initial, warm resume, cold respawn), that the spawn is backgrounded, waiting means ending the turn, the completion task-notification is the only wake path, and ScheduleWakeup/Monitor/sleep are never used to wait on a worker; no \"Wait for the worker to finish\" phrasing remains in the rendered skill.\n- [ ] /plan:close's skill carries the same wait-discipline note for its subagent spawns while its documented inline transient-API-retry backoff survives unchanged in meaning.\n- [ ] The live skill tree re-renders cleanly, the oracle fixture is refreshed via capture-oracle, and both the prompt suite (parity drift gate) and the plan consistency-skills suite pass.\n\n## Done summary\nTaught the rendered /plan:work skill and /plan:close's SKILL.md that work:worker/subagent spawns are backgrounded \u2014 waiting means ending the turn, the completion task-notification is the only wake path, ScheduleWakeup/Monitor/sleep are never used to wait on a worker. Reworded the warm-path 'wait for the worker' step to end-turn phrasing; preserved close's transient-API-retry backoff unchanged. Re-rendered the live skill tree and refreshed the oracle fixture.\n## Evidence\n",
+      "task_id": "fn-1247-backgrounded-worker-wait-discipline.1",
+      "tier": "medium",
+      "title": "Backgrounded worker wait discipline"
+    }
+  ],
+  "created_at": "2026-07-11T14:52:17.138000Z",
+  "epic_id": "fn-1247-backgrounded-worker-wait-discipline",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "06cf9281bc77af6ccd72689023217720025025456eaa7f2fc93d0477b07cf145",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
