@@ -114,8 +114,6 @@ export interface HarnessDescriptor {
   displayName: string;
   /** The executable resolved on PATH for this harness. */
   binaryName: string;
-  /** The env var naming this harness's resolved launch profile. */
-  profileEnvVar: string;
   /** The second reasoning axis this harness accepts (effort|thinking|none). */
   secondAxis: SecondAxis;
   /** Translation of keeper's five efforts onto this harness's native second-axis
@@ -167,7 +165,6 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     name: "claude",
     displayName: "Claude",
     binaryName: "claude",
-    profileEnvVar: "KEEPER_AGENT_CLAUDE_PROFILE",
     secondAxis: "effort",
     // Claude's native `--effort` speaks keeper's efforts directly — no translation.
     effortAxisMap: null,
@@ -184,7 +181,6 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     name: "codex",
     displayName: "Codex",
     binaryName: "codex",
-    profileEnvVar: "KEEPER_AGENT_CODEX_PROFILE",
     secondAxis: "effort",
     effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
     capturable: true,
@@ -206,7 +202,6 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     name: "pi",
     displayName: "Pi",
     binaryName: "pi",
-    profileEnvVar: "KEEPER_AGENT_PI_PROFILE",
     secondAxis: "thinking",
     effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
     capturable: true,
@@ -227,7 +222,6 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     name: "hermes",
     displayName: "Hermes",
     binaryName: "hermes",
-    profileEnvVar: "KEEPER_AGENT_HERMES_PROFILE",
     // Hermes is model-only: it exposes neither an effort nor a thinking axis, so
     // a preset for it may set neither (config.ts fails a preset that does).
     secondAxis: "none",

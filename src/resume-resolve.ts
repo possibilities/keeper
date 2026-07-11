@@ -7,9 +7,11 @@
  * recorded cwd prints "No conversation found" and exits 0), derive the launch
  * cwd from ON-DISK TRUTH: the conversation artifact itself.
  *
- * CLAUDE. Glob `<root>/projects/*<uuid>.jsonl` over the config-dir roots
- * (`CLAUDE_CONFIG_DIR` + `~/.claude`), realpath-deduped because profiles share
- * one `projects/` via symlink. Read the found transcript's TAIL for the newest
+ * CLAUDE. Glob `<root>/projects/*<uuid>.jsonl` over the canonical `~/.claude`
+ * root (plus any test-injected extras), realpath-deduped. claude-swap's
+ * `--share-history` means every account reads/writes the SAME canonical
+ * `~/.claude/projects/` tree, so there is no per-account root to disambiguate.
+ * Read the found transcript's TAIL for the newest
  * COMPLETE (newline-terminated) line carrying a `cwd` field — torn-tail safe —
  * and prefer a tail cwd whose slug matches its holding dir. Fall back to matching
  * the observed-cwd history against the holding-dir slug. The slug is LOSSY (`/`
@@ -199,7 +201,7 @@ export interface ClaudeResolveInput {
   /** The recorded cwd, DEMOTED to a hint (no longer the launch cwd source). */
   recordedCwd: string | null;
   /** Config-dir roots to glob `<root>/projects/*<uuid>.jsonl` over; realpath-
-   *  deduped internally (profiles share one `projects/` via symlink). */
+   *  deduped internally (the canonical root plus any test-injected extras). */
   projectRoots: string[];
   /** Observed cwd history (includes the recorded cwd) for the slug fallback. */
   observedCwds: string[];
@@ -544,7 +546,7 @@ export function makeResumeResolver(
       return resolveClaudeCwd(fs, {
         sessionId,
         recordedCwd: candidate.cwd,
-        projectRoots: claudeProjectRoots(homeDir, env, extra),
+        projectRoots: claudeProjectRoots(homeDir, extra),
         observedCwds:
           candidate.cwd != null && candidate.cwd !== "" ? [candidate.cwd] : [],
       });
@@ -559,19 +561,12 @@ export function makeResumeResolver(
   };
 }
 
-/** The claude project-dir roots, `CLAUDE_CONFIG_DIR` first (when set), then
- *  `~/.claude`, then any test-injected extras — realpath-deduped downstream. */
-function claudeProjectRoots(
-  homeDir: string,
-  env: Record<string, string | undefined>,
-  extra: string[],
-): string[] {
-  const roots: string[] = [];
-  const cfg = (env.CLAUDE_CONFIG_DIR ?? "").trim();
-  if (cfg !== "") {
-    roots.push(cfg);
-  }
-  roots.push(join(homeDir, ".claude"));
+/** The claude project-dir roots: the canonical `~/.claude`, then any
+ *  test-injected extras — realpath-deduped downstream. claude-swap's
+ *  `--share-history` means every account shares this one canonical root, so
+ *  there is no per-account config dir to search. */
+function claudeProjectRoots(homeDir: string, extra: string[]): string[] {
+  const roots: string[] = [join(homeDir, ".claude")];
   for (const r of extra) {
     if (r !== "") {
       roots.push(r);

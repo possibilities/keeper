@@ -38,7 +38,6 @@ describe("--x-preset precedence (claude)", () => {
   test("triple model + effort feed the default slot", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--x-preset", "claude::opus::xhigh", "hi"],
-      listProfiles: () => ["default"],
     });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--model")).toEqual(["opus"]);
@@ -55,7 +54,6 @@ describe("--x-preset precedence (claude)", () => {
         "sonnet",
         "hi",
       ],
-      listProfiles: () => ["default"],
     });
     const cmd = await runAndCapture(h, main);
     // Explicit --model is forwarded verbatim; the wrapper adds no second --model.
@@ -67,7 +65,6 @@ describe("--x-preset precedence (claude)", () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--x-preset", "claude::opus::xhigh", "hi"],
       env: { CLAUDE_CODE_EFFORT_LEVEL: "low" },
-      listProfiles: () => ["default"],
     });
     const cmd = await runAndCapture(h, main);
     // Env wins → the wrapper adds NO --effort; model still from the triple.
@@ -79,7 +76,6 @@ describe("--x-preset precedence (claude)", () => {
     const h = makeHarness({
       // Two segments — the grammar rejects it, naming the offending shape.
       argv: ["--x-no-confirm", "--x-preset", "claude::opus", "hi"],
-      listProfiles: () => ["default"],
     });
     const code = await expectExit(main(h.deps));
     expect(code).toBe(2);
@@ -103,7 +99,6 @@ describe("--x-preset precedence (codex + pi)", () => {
     const h = makeHarness({
       agent: "pi",
       argv: ["--x-no-confirm", "--x-preset", "pi::pi-pro::xhigh", "hi"],
-      listProfiles: () => ["default"],
     });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--model")).toEqual(["pi-pro"]);
@@ -156,7 +151,6 @@ describe("no --x-preset → harness default triple", () => {
   test("a fresh launch resolves the catalog claude_default triple", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
-      listProfiles: () => ["default"],
       presetCatalog: {
         presets: {},
         claude_default: { harness: "claude", model: "opus", effort: "xhigh" },
@@ -172,7 +166,6 @@ describe("no --x-preset → harness default triple", () => {
     // a claude launch — the codex/pi triples never touch it.
     const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
-      listProfiles: () => ["default"],
       presetCatalog: {
         presets: {},
         claude_default: { harness: "claude", model: "opus", effort: "xhigh" },
@@ -190,7 +183,6 @@ describe("fresh-launch fail-loud", () => {
   test("a bare fresh launch with no default is fail-loud (exit 2)", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "hi"],
-      listProfiles: () => ["default"],
       presetCatalog: EMPTY,
     });
     const code = await expectExit(main(h.deps));
@@ -202,7 +194,6 @@ describe("fresh-launch fail-loud", () => {
   test("a lone --model (no effort, no default) is fail-loud (exit 2)", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--model", "opus", "hi"],
-      listProfiles: () => ["default"],
       presetCatalog: EMPTY,
     });
     const code = await expectExit(main(h.deps));
@@ -213,7 +204,6 @@ describe("fresh-launch fail-loud", () => {
   test("both --model and --effort explicit launches (the both-explicit escape)", async () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--model", "opus", "--effort", "xhigh", "hi"],
-      listProfiles: () => ["default"],
       presetCatalog: EMPTY,
     });
     const cmd = await runAndCapture(h, main);
@@ -225,7 +215,6 @@ describe("fresh-launch fail-loud", () => {
     const h = makeHarness({
       argv: ["--x-no-confirm", "--model", "opus", "hi"],
       env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
-      listProfiles: () => ["default"],
       presetCatalog: EMPTY,
     });
     const cmd = await runAndCapture(h, main);
@@ -235,7 +224,6 @@ describe("fresh-launch fail-loud", () => {
   test("--continue (resume) with no default does NOT fail-loud", async () => {
     const h = makeHarness({
       argv: ["--continue"],
-      listProfiles: () => ["default"],
       presetCatalog: EMPTY,
     });
     const cmd = await runAndCapture(h, main);
@@ -258,7 +246,6 @@ describe("fresh-launch fail-loud", () => {
     const h = makeHarness({
       agent: "pi",
       argv: ["--x-no-confirm", "--model", "gpt-5.5:xhigh", "hi"],
-      listProfiles: () => ["default"],
       presetCatalog: EMPTY,
     });
     const cmd = await runAndCapture(h, main);

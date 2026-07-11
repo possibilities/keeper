@@ -27,7 +27,6 @@ const SUMMARY_PREVIEW_CHARS = 240;
 
 export interface ClaudeRootOptions {
   homeDir?: string;
-  env?: NodeJS.ProcessEnv;
   /** Claude config directories. When present, standard discovery is skipped. */
   configDirs?: readonly string[];
 }
@@ -86,19 +85,17 @@ function safeDirectories(path: string): string[] {
   }
 }
 
-/** Resolve every readable Claude projects tree, deduplicated through symlinks. */
+/** Resolve every readable Claude projects tree, deduplicated through symlinks.
+ *  claude-swap's `--share-history` means every account reads/writes the SAME
+ *  canonical `~/.claude/projects/` tree, so default discovery is just the one
+ *  canonical config dir — never a `.claude-profiles` scan. */
 export function discoverClaudeProjectsRoots(
   options: ClaudeRootOptions = {},
 ): string[] {
   const home = options.homeDir ?? homedir();
-  const env = options.env ?? process.env;
   const configDirs = options.configDirs?.length
     ? [...options.configDirs]
-    : [
-        env.CLAUDE_CONFIG_DIR?.trim() || null,
-        join(home, ".claude"),
-        ...safeDirectories(join(home, ".claude-profiles")),
-      ].filter((path): path is string => path !== null);
+    : [join(home, ".claude")];
 
   const roots: string[] = [];
   const seen = new Set<string>();
