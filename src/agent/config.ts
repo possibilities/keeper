@@ -9,13 +9,15 @@
  * file). The launch-config catalog (`presets.yaml`) holds ONLY launch triples
  * (ADR 0033): the four `<harness>_default` keys (`claude_default`/`codex_default`/
  * `pi_default`/`hermes_default`) naming the `<harness>::<model>::<effort>` triple a
- * bare `keeper agent <harness>` launch resolves, plus the `worker`/`escalation`
- * machine-launch triples. The freeform named-preset catalog is retired — a leftover
- * `presets:` block fails loud with a migration hint. The panel selections
- * (`panel.yaml`) name ordered panels; the panel-member resolution path (task .5)
- * still reads a {@link Preset} shape. All files are REQUIRED + validated: a missing
- * file, a malformed triple, or a `<harness>_default` whose harness disagrees with
- * its key fail-loud (`ConfigError`) — the worker/escalation resolvers are the sole
+ * bare `keeper agent <harness>` launch resolves, the `worker`/`escalation`
+ * machine-launch triples, and the nested `dispatch:` per-verb table (ADR 0040,
+ * ADDITIVE alongside `worker`/`escalation` today). The freeform named-preset
+ * catalog is retired — a leftover `presets:` block fails loud with a migration
+ * hint. The panel selections (`panel.yaml`) name ordered panels; the panel-member
+ * resolution path (task .5) still reads a {@link Preset} shape. All files are
+ * REQUIRED + validated: a missing file, a malformed triple, or a
+ * `<harness>_default` whose harness disagrees with its key fail-loud
+ * (`ConfigError`) — the worker/escalation/dispatch resolvers are the sole
  * fail-open consumers (they catch the throw and coalesce to their constants).
  */
 
@@ -312,6 +314,12 @@ export interface PresetCatalog {
   /** Machine escalation-launch triple; independent of `worker`, same non-claude
    *  warn-and-ignore posture. Null/absent = unset. */
   escalation?: Triple | null;
+  /** The `dispatch:` per-verb launch table (ADR 0040); every {@link DispatchVerb}
+   *  key present, null when unset. ADDITIVE alongside `worker`/`escalation` —
+   *  this task keeps both parsing unchanged pending the task-2 cutover.
+   *  Optional in the type (mirroring `worker`/`escalation`) though {@link
+   *  loadPresetCatalog} always populates it. */
+  dispatch?: DispatchTable;
 }
 
 /**
@@ -372,9 +380,11 @@ function validatePresetName(name: string, configPath: string): void {
   }
 }
 
-/** The four `<harness>_default` catalog keys plus the two machine-launch keys —
- *  the ONLY top-level keys `presets.yaml` admits (ADR 0033). Anything else is a
- *  strict-reject; a legacy `presets:` block is caught with a migration hint. */
+/** The four `<harness>_default` catalog keys, the two retired-shape machine-launch
+ *  keys (`worker`/`escalation`, still parsed unchanged pending the task-2
+ *  cutover), and the `dispatch` block — the ONLY top-level keys `presets.yaml`
+ *  admits (ADR 0033, ADR 0040). Anything else is a strict-reject; a legacy
+ *  `presets:` block is caught with a migration hint. */
 const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "claude_default",
   "codex_default",
@@ -382,34 +392,104 @@ const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "hermes_default",
   "worker",
   "escalation",
+  "dispatch",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
 
-/** Reject any unknown top-level key in a config mapping (no silent typos). */
+/** Reject any unknown key in a config mapping (no silent typos). `label` names
+ *  the offending key's kind in the error ("top-level key" for the catalog root,
+ *  "dispatch verb" for the nested `dispatch:` block). */
 function rejectUnknownKeys(
   raw: Record<string, unknown>,
   allowed: ReadonlySet<string>,
   configPath: string,
+  label = "top-level key",
 ): void {
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) {
       throw new ConfigError(
-        `Unknown top-level key '${key}' in ${configPath} (allowed: ${[...allowed].join(", ")})`,
+        `Unknown ${label} '${key}' in ${configPath} (allowed: ${[...allowed].join(", ")})`,
       );
     }
   }
 }
 
 /**
- * Read the launch-config catalog from `presets.yaml` (ADR 0033). REQUIRED +
- * validated: a missing file is fail-LOUD (ConfigError). The file holds ONLY launch
- * triples — the four `<harness>_default` keys and the `worker`/`escalation`
- * machine-launch keys, each an optional `<harness>::<model>::<effort>` string. A
- * leftover freeform `presets:` block fails loud with a migration hint; any other
- * unknown key is a strict-reject; a malformed triple or a `<harness>_default` whose
- * harness disagrees with its key prefix is fail-loud. An empty/whitespace file is a
- * valid empty catalog (every key null). `presets` is always empty — retained for
- * the panel-member path (task .5).
+ * The dispatched verbs a `dispatch:` row may key on (ADR 0040): the daemon's
+ * three retry-wire verbs, the three autonomous escalation verbs, and handoff.
+ * `approve` resolves through the `work` row rather than carrying its own —
+ * there is no eighth key. Declared here (the catalog's own schema) rather than
+ * imported from `src/dispatch-command.ts`'s verb unions, keeping this dep-free
+ * config island's import graph unchanged.
+ */
+export type DispatchVerb =
+  | "work"
+  | "close"
+  | "resolve"
+  | "unblock"
+  | "deconflict"
+  | "repair"
+  | "handoff";
+
+const DISPATCH_VERBS: readonly DispatchVerb[] = [
+  "work",
+  "close",
+  "resolve",
+  "unblock",
+  "deconflict",
+  "repair",
+  "handoff",
+];
+const DISPATCH_VERB_SET: ReadonlySet<string> = new Set(DISPATCH_VERBS);
+
+/** One resolved `dispatch:` triple per verb; an unset verb reads `null`. Every
+ *  verb key is always present (mirrors the always-null-when-unset posture of
+ *  `claude_default`/`worker`/`escalation`). */
+export type DispatchTable = Record<DispatchVerb, Triple | null>;
+
+/**
+ * Parse the nested `dispatch:` block (ADR 0040): an optional mapping keyed by
+ * {@link DispatchVerb}, each value an optional machine-launch triple parsed by
+ * {@link parseMachineTriple} (harness-unchecked, same posture as `worker`/
+ * `escalation`). Strict unknown-key rejection inside the block via the same
+ * {@link rejectUnknownKeys} discipline as the catalog root. An absent/null
+ * `dispatch` key returns every verb null (ADDITIVE alongside `worker`/
+ * `escalation`; the task-2 cutover retires those keys, not this task).
+ */
+function parseDispatchBlock(
+  raw: Record<string, unknown>,
+  configPath: string,
+): DispatchTable {
+  const table = Object.fromEntries(
+    DISPATCH_VERBS.map((verb) => [verb, null]),
+  ) as DispatchTable;
+  const value = raw.dispatch;
+  if (value === null || value === undefined) {
+    return table;
+  }
+  if (!isRecord(value)) {
+    throw new ConfigError(`dispatch must be a mapping in ${configPath}`);
+  }
+  rejectUnknownKeys(value, DISPATCH_VERB_SET, configPath, "dispatch verb");
+  for (const verb of DISPATCH_VERBS) {
+    table[verb] = parseMachineTriple(value, verb, configPath);
+  }
+  return table;
+}
+
+/**
+ * Read the launch-config catalog from `presets.yaml` (ADR 0033, ADR 0040). REQUIRED
+ * + validated: a missing file is fail-LOUD (ConfigError). The file holds ONLY launch
+ * triples — the four `<harness>_default` keys, the `worker`/`escalation`
+ * machine-launch keys, and the nested `dispatch:` per-verb table (each an optional
+ * `<harness>::<model>::<effort>` string). `dispatch` is ADDITIVE alongside
+ * `worker`/`escalation` today — both still parse unchanged; a future cutover
+ * retires the pair with a migration hint. A leftover freeform `presets:` block
+ * fails loud with a migration hint; any other unknown key (including an unknown
+ * `dispatch` verb) is a strict-reject; a malformed triple or a `<harness>_default`
+ * whose harness disagrees with its key prefix is fail-loud. An empty/whitespace
+ * file is a valid empty catalog (every key null). `presets` is always empty —
+ * retained for the panel-member path (task .5).
  */
 export function loadPresetCatalog(
   configPath: string = presetsCatalogPath(),
@@ -436,6 +516,7 @@ export function loadPresetCatalog(
     hermes_default: parseDefaultTriple(raw, "hermes", configPath),
     worker: parseMachineTriple(raw, "worker", configPath),
     escalation: parseMachineTriple(raw, "escalation", configPath),
+    dispatch: parseDispatchBlock(raw, configPath),
   };
 }
 
@@ -487,11 +568,11 @@ function parseDefaultTriple(
 }
 
 /**
- * Parse one machine-launch triple (`worker`/`escalation`). An unset key is null; a
- * present one must be a well-formed triple (fail-loud on malformed — the resolvers
- * swallow the throw to their constants), but its harness is UNCHECKED here: the
- * autopilot / escalation resolvers accept any harness and warn-and-ignore a
- * non-claude one.
+ * Parse one machine-launch triple (`worker`/`escalation`, or a `dispatch:` verb
+ * row). An unset key is null; a present one must be a well-formed triple
+ * (fail-loud on malformed — the resolvers swallow the throw to their constants),
+ * but its harness is UNCHECKED here: the autopilot / escalation / dispatch
+ * resolvers accept any harness and warn-and-ignore a non-claude one.
  */
 function parseMachineTriple(
   raw: Record<string, unknown>,
