@@ -28,5 +28,5 @@ Backup & restore section).
 - [ ] The entry is forward-facing (no fn-ids/dates/provenance) per docs discipline.
 
 ## Done summary
-
+Added a short pointer in docs/install.md's Backup & restore section to bun scripts/maintenance-window.ts as the supported one-command offline reclaim path, alongside the existing reclaimInstructions() detailed runbook.
 ## Evidence
