@@ -20,16 +20,26 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, type PanelSelections } from "../src/agent/config";
+import type { MaintenanceMessage } from "../src/maintenance-worker";
+import { runPanelPrunePass } from "../src/maintenance-worker";
 import {
   buildDetachWrapperArgv,
   buildPanelLegArgv,
   DETACH_SCRIPT,
   type PanelDeps,
   type PanelManifest,
+  type PanelManifestMember,
   type PanelVerdict,
   panelStart,
   panelWait,
@@ -38,12 +48,21 @@ import {
 } from "../src/pair/panel";
 
 let dir: string;
+let savedStateDir: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "pair-panel-test-"));
+  // Every panelStart/panelWait call in this file passes an explicit `dir`
+  // (--run-dir), so `keeperStateDir()` is otherwise unused here — sandboxed
+  // for the runPanelPrunePass tests below, which rely on `panelPrune`'s
+  // hardcoded `<state-dir>/panels/` root.
+  savedStateDir = process.env.KEEPER_STATE_DIR;
+  process.env.KEEPER_STATE_DIR = dir;
 });
 
 afterEach(() => {
+  if (savedStateDir === undefined) delete process.env.KEEPER_STATE_DIR;
+  else process.env.KEEPER_STATE_DIR = savedStateDir;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1397,4 +1416,219 @@ test("wait is strictly read-only: a reboot verdict writes nothing to the manifes
   await panelWait({ dir, chunkSeconds: 540 }, deps);
   const after = readFileSync(join(dir, "manifest.json"), "utf8");
   expect(after).toBe(before); // no relaunch, no re-stamp — wait never writes
+});
+
+// ---------------------------------------------------------------------------
+// runPanelPrunePass (src/maintenance-worker.ts) — the fn-1248 item 5 auto-
+// reaper wiring. panelPrune's own reap gates (lock/pid/TTL/recycle) are
+// already exercised in test/agent-panel-cli.test.ts; these only prove the
+// periodic-pass wrapper invokes it, relays a log ONLY when it reaped
+// something, and preserves live/locked/pid-alive dirs exactly as panelPrune
+// itself does.
+// ---------------------------------------------------------------------------
+
+const PRUNE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/** `runPanelPrunePass` deps: a fixed clock + pid/lock/start-time seams. `spawn`
+ *  and `write` both throw if ever reached — the prune path never calls
+ *  `spawn`, and `runPanelPrunePass` MUST intercept `write` itself (never pass
+ *  a caller-supplied sink through to `panelPrune`, see its doc). */
+function makePruneDeps(opts: {
+  now: number;
+  alive?: (pid: number) => boolean;
+  readStartTime?: PanelDeps["readStartTime"];
+  lock?: PanelDeps["lock"];
+}): PanelDeps {
+  return {
+    keeperBin: KEEPER_BIN,
+    keeperAgentPath: KEEPER_AGENT,
+    env: {},
+    cwd: dir,
+    loadRegistry: () => ({
+      catalog: { presets: {} },
+      selections: { panels: {}, default: null },
+    }),
+    spawn: () => {
+      throw new Error("runPanelPrunePass must never spawn");
+    },
+    now: () => opts.now,
+    sleep: async () => {},
+    pidAlive: opts.alive ?? (() => false),
+    readStartTime: opts.readStartTime ?? (() => null),
+    lock: opts.lock,
+    write: () => {
+      throw new Error("runPanelPrunePass must intercept write, not forward it");
+    },
+    writeErr: () => {},
+  };
+}
+
+/** Seed a panel run dir (manifest + started-at sentinel + optional pidfiles)
+ *  under `root`, mirroring agent-panel-cli.test.ts's `seedRunDir`. */
+function seedPruneDir(
+  root: string,
+  slug: string,
+  members: PanelManifestMember[],
+  opts: { sentinel?: boolean; pids?: Record<string, string> } = {},
+): string {
+  const d = join(root, slug);
+  mkdirSync(d, { recursive: true });
+  if (opts.sentinel !== false) {
+    writeFileSync(join(d, "started-at"), "0\n");
+  }
+  writeFileSync(
+    join(d, "manifest.json"),
+    JSON.stringify({ dir: d, slug, members } satisfies PanelManifest),
+  );
+  for (const [pidfile, pid] of Object.entries(opts.pids ?? {})) {
+    writeFileSync(pidfile, `${pid}\n`);
+  }
+  return d;
+}
+
+test("runPanelPrunePass reaps an aged-out lock-free pid-dead dir and relays a log naming it", () => {
+  const root = join(dir, "panels");
+  const pidfile = join(root, "old-run", "x.pid");
+  const d = seedPruneDir(
+    root,
+    "old-run",
+    [
+      {
+        name: "x",
+        harness: "codex",
+        yaml: join(root, "old-run", "x.yaml"),
+        pidfile,
+      },
+    ],
+    { pids: { [pidfile]: "9999" } },
+  );
+  const deps = makePruneDeps({
+    now: Date.now() + 10 * PRUNE_DAY_MS,
+    alive: () => false,
+  });
+  const msgs: MaintenanceMessage[] = [];
+  runPanelPrunePass(
+    (m) => msgs.push(m),
+    () => false,
+    deps,
+  );
+  expect(existsSync(d)).toBe(false);
+  expect(msgs).toHaveLength(1);
+  const msg = msgs[0];
+  expect(msg.kind).toBe("maintenance-log");
+  if (msg.kind === "maintenance-log") {
+    expect(msg.message).toContain("old-run");
+  }
+});
+
+test("runPanelPrunePass preserves a live-pid dir and relays no log (nothing reaped)", () => {
+  const root = join(dir, "panels");
+  const pidfile = join(root, "live-run", "x.pid");
+  const d = seedPruneDir(
+    root,
+    "live-run",
+    [
+      {
+        name: "x",
+        harness: "codex",
+        yaml: join(root, "live-run", "x.yaml"),
+        pidfile,
+      },
+    ],
+    { pids: { [pidfile]: "111" } },
+  );
+  const deps = makePruneDeps({
+    now: Date.now() + 10 * PRUNE_DAY_MS,
+    alive: (pid) => pid === 111,
+  });
+  const msgs: MaintenanceMessage[] = [];
+  runPanelPrunePass(
+    (m) => msgs.push(m),
+    () => false,
+    deps,
+  );
+  expect(existsSync(d)).toBe(true);
+  expect(msgs).toHaveLength(0);
+});
+
+test("runPanelPrunePass preserves a lock-held dir (start/reconcile mid-flight)", () => {
+  const root = join(dir, "panels");
+  const d = seedPruneDir(root, "locked-run", []);
+  const deps = makePruneDeps({
+    now: Date.now() + 10 * PRUNE_DAY_MS,
+    lock: (lockPath) =>
+      lockPath.includes("locked-run") ? null : { release: (): void => {} },
+  });
+  const msgs: MaintenanceMessage[] = [];
+  runPanelPrunePass(
+    (m) => msgs.push(m),
+    () => false,
+    deps,
+  );
+  expect(existsSync(d)).toBe(true);
+  expect(msgs).toHaveLength(0);
+});
+
+test("runPanelPrunePass preserves a recycle-guarded live dir (matching start-time, not bare pid liveness)", () => {
+  const root = join(dir, "panels");
+  const pidfile = join(root, "id-run", "x.pid");
+  const startfile = join(root, "id-run", "x.starttime");
+  const d = seedPruneDir(
+    root,
+    "id-run",
+    [
+      {
+        name: "x",
+        harness: "codex",
+        yaml: join(root, "id-run", "x.yaml"),
+        pidfile,
+        startfile,
+      },
+    ],
+    { pids: { [pidfile]: "111" } },
+  );
+  writeFileSync(startfile, "SAME\n");
+  const deps = makePruneDeps({
+    now: Date.now() + 10 * PRUNE_DAY_MS,
+    alive: (pid) => pid === 111,
+    readStartTime: (pid) => (pid === 111 ? "SAME" : null),
+  });
+  const msgs: MaintenanceMessage[] = [];
+  runPanelPrunePass(
+    (m) => msgs.push(m),
+    () => false,
+    deps,
+  );
+  expect(existsSync(d)).toBe(true);
+  expect(msgs).toHaveLength(0);
+});
+
+test("runPanelPrunePass is a no-op when shutting down — dir untouched, nothing relayed", () => {
+  const root = join(dir, "panels");
+  const pidfile = join(root, "old-run", "x.pid");
+  const d = seedPruneDir(
+    root,
+    "old-run",
+    [
+      {
+        name: "x",
+        harness: "codex",
+        yaml: join(root, "old-run", "x.yaml"),
+        pidfile,
+      },
+    ],
+    { pids: { [pidfile]: "9999" } },
+  );
+  const deps = makePruneDeps({
+    now: Date.now() + 10 * PRUNE_DAY_MS,
+    alive: () => false,
+  });
+  const msgs: MaintenanceMessage[] = [];
+  runPanelPrunePass(
+    (m) => msgs.push(m),
+    () => true,
+    deps,
+  );
+  expect(existsSync(d)).toBe(true); // would-be-eligible dir never even scanned
+  expect(msgs).toHaveLength(0);
 });
