@@ -52,5 +52,5 @@ Extend `test/restore-set.test.ts` with an injected liveness dep: a recycled-pid 
 - [ ] Null-start_time / probe-failure resolves to one documented fail-direction consistent for both `tabs list` and `--snapshot-current`.
 
 ## Done summary
-
+deriveCurrentSet now gates current-set membership on an injected recycle-safe (pid, start_time) liveness probe (defaulting to the file-local pidAlive + seed-sweep's readOsStartTime), excluding a reboot-recycled pid while keeping a live-pid row with no stored start_time or a probe failure — the documented conservative fail-direction for both tabs list and --snapshot-current. Never throws, even on a throwing injected probe.
 ## Evidence
