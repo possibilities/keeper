@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-11T17:01:53.988000Z",
   "depends_on": [],
@@ -10,5 +11,5 @@
   "target_repo": "/Volumes/Scratch/src/possibilities--pi-subagents",
   "tier": "xhigh",
   "title": "terminal status propagation fixes",
-  "updated_at": "2026-07-11T17:01:53.988000Z"
+  "updated_at": "2026-07-11T17:02:42.864000Z"
 }
