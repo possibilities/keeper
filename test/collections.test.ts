@@ -234,6 +234,17 @@ test("JOBS_DESCRIPTOR serves profile_name for the recent-sessions log (v36)", ()
   expect(JOBS_DESCRIPTOR.jsonColumns.has("profile_name")).toBe(false);
 });
 
+test("JOBS_DESCRIPTOR serves account_route as explicit launch attribution (v119)", () => {
+  // Schema v119 / fn-1239: the PII-free per-launch account route rides the jobs
+  // row so diagnostics can label each job by its explicit route ('default' /
+  // 'claude-swap:<slot>' / NULL) without inspecting config_dir or email.
+  // Display-only — out of sortable / filters / jsonColumns.
+  expect(JOBS_DESCRIPTOR.columns).toContain("account_route");
+  expect(JOBS_DESCRIPTOR.sortable.has("account_route")).toBe(false);
+  expect(JOBS_DESCRIPTOR.filters.account_route).toBeUndefined();
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("account_route")).toBe(false);
+});
+
 test("JOBS_DESCRIPTOR serves monitors for the expanded-row Monitors section (v51)", () => {
   // Schema v51 / fn-682 / fn-685: `monitors` is a JSON-TEXT array projected
   // by the reducer and rendered by `cli/jobs.ts`'s expanded block via

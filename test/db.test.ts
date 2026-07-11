@@ -268,15 +268,16 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted + v113 last_lifecycle_ts + v114 escalation_instance are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1, fn-1164 task .1, fn-1171 task .2)", () => {
+test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted + v113 last_lifecycle_ts + v114 escalation_instance + v119 account_route are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1, fn-1164 task .1, fn-1171 task .2, fn-1239 task .3)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `escalation_instance` (v114) is the
-  // current final appended column, trailing `last_lifecycle_ts` (v113), `adopted`
-  // (v110), `harness`/`resume_target` (v109), `dispatch_origin` (v108),
-  // `kill_reason` (v103), and the v100 telemetry six.
+  // re-fold determinism charter depends on. `account_route` (v119) is the
+  // current final appended column, trailing `escalation_instance` (v114),
+  // `last_lifecycle_ts` (v113), `adopted` (v110), `harness`/`resume_target`
+  // (v109), `dispatch_origin` (v108), `kill_reason` (v103), and the v100
+  // telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -291,6 +292,7 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
     "adopted",
     "last_lifecycle_ts",
     "escalation_instance",
+    "account_route",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -2866,7 +2868,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // (the exact pass-4 unattributed-to-live scalar) — an additive ALTER on the
   // LIVE-ONLY `git_status` table; it does not touch the epics table SHAPE this
   // test pins, fn-1226 task .1.
-  expect(SCHEMA_VERSION).toBe(118);
+  // v119 appends the nullable `events.account_route` + `jobs.account_route`
+  // columns (the PII-free per-launch account route) — additive ALTERs that
+  // widen the events/jobs row shape, not the epics table this test pins, fn-1239
+  // task .3.
+  expect(SCHEMA_VERSION).toBe(119);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

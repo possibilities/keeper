@@ -529,6 +529,7 @@ function insertEvent(overrides: {
   skill_name?: string | null;
   spawn_name?: string | null;
   worktree?: string | null;
+  account_route?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   const data = overrides.data ?? "{}";
@@ -558,8 +559,8 @@ function insertEvent(overrides: {
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
        subagent_agent_id, tool_use_id, agent_id, agent_type, plan_op,
        plan_target, plan_epic_id, plan_subject_present, plan_files, skill_name,
-       spawn_name, mutation_path, worktree
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       spawn_name, mutation_path, worktree, account_route
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? "sess-a",
@@ -582,6 +583,7 @@ function insertEvent(overrides: {
       overrides.spawn_name ?? null,
       mutationPath,
       overrides.worktree ?? null,
+      overrides.account_route ?? null,
     ],
   );
   return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
@@ -1053,6 +1055,50 @@ test("jobs.worktree: a worktree branch and a NULL serial fold deterministically 
 
   // Full from-scratch re-fold — the deterministic `jobs` column must reproduce
   // both the recorded branch and the NULL byte-identically.
+  rewindAndWipeProjections();
+  drainAll();
+  expect(snapshotProjections().jobs).toEqual(liveJobs);
+});
+
+// ---------------------------------------------------------------------------
+// `jobs.account_route` re-fold determinism (fn-1239.3) — the PII-free per-launch
+// account route is a DETERMINISTIC-replayed `jobs` column: a routed SessionStart
+// folds the route, a launcher-supplied-none one folds NULL, a NULL resume
+// preserves and a different-route resume re-stamps, and a from-scratch re-fold
+// reproduces every shape byte-identically (a pre-v119 event has no route → NULL).
+// ---------------------------------------------------------------------------
+
+test("jobs.account_route: routed / NULL / resume-preserve / resume-restamp fold deterministically and re-fold byte-identically", () => {
+  // A managed route on A, no route on B (launcher supplied none) — the two
+  // shapes plus NULL the column carries in production.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: SESS_A,
+    account_route: "claude-swap:4",
+  });
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_B });
+  // A NULL-route resume on A preserves; a different-route resume on B re-stamps.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: SESS_A,
+    account_route: null,
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: SESS_B,
+    account_route: "default",
+  });
+  drainAll();
+
+  const liveJobs = snapshotProjections().jobs as Array<Record<string, unknown>>;
+  const rA = liveJobs.find((j) => j.job_id === SESS_A)?.account_route;
+  const rB = liveJobs.find((j) => j.job_id === SESS_B)?.account_route;
+  expect(rA).toBe("claude-swap:4");
+  expect(rB).toBe("default");
+
+  // Full from-scratch re-fold — the deterministic `jobs` column reproduces the
+  // preserved route and the re-stamped route byte-identically. Historical
+  // attribution is a pure fold of the event column, never fed back into a choice.
   rewindAndWipeProjections();
   drainAll();
   expect(snapshotProjections().jobs).toEqual(liveJobs);

@@ -189,6 +189,40 @@ export function worktreeBranchFromEnv(env: NodeJS.ProcessEnv): string | null {
 }
 
 /**
+ * Capture the PII-free account ROUTE from `KEEPER_ACCOUNT_ROUTE` — the launch
+ * carrier the Claude account router injects on every unpinned start / resume /
+ * restore (`default` for the native ambient account, `claude-swap:<slot>` for a
+ * managed route). SessionStart-gated by the caller, exactly like
+ * {@link configDirFromEnv} / {@link worktreeBranchFromEnv}.
+ *
+ * The value is environment- and hook-sourced, so it is UNTRUSTED: it is size-
+ * and shape-bounded HERE, at capture, never in the fold (the fold copies it
+ * verbatim). Only the two known PII-free shapes survive —
+ * - `default` (the native route id), or
+ * - `claude-swap:<digits>` (a claude-swap slot number, which carries no PII).
+ * Anything else — unset/empty, over-long, or an unrecognized shape — collapses
+ * to `null`, so a malformed or hostile env can never persist an unbounded or
+ * identity-bearing string, and a launcher that supplied no route folds NULL.
+ * Recording only the bounded route id keeps attribution observational and
+ * PII-free, and never claims a durable human identity (a slot is time-local and
+ * reusable). The literals mirror `src/account-routing-config.ts`
+ * (NATIVE_ROUTE_ID / managedRouteId), inlined because a hook may not import the
+ * routing config (dependency-free island).
+ *
+ * Stays pure (`process.env` read only) — no git, no fs, no `bun:sqlite`.
+ */
+export function accountRouteFromEnv(env: NodeJS.ProcessEnv): string | null {
+  const raw = env.KEEPER_ACCOUNT_ROUTE;
+  if (raw == null || raw.length === 0 || raw.length > 64) {
+    return null;
+  }
+  if (raw === "default") {
+    return raw;
+  }
+  return /^claude-swap:\d{1,10}$/.test(raw) ? raw : null;
+}
+
+/**
  * Three-tuple of backend-exec coordinates captured on EVERY hook event
  * (not SessionStart-gated like {@link configDirFromEnv}). Each field is
  * an independent `string | null` so the reducer's COALESCE
@@ -550,6 +584,7 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "harness",
   "resume_target",
   "adopted",
+  "account_route",
 ]);
 
 /**
@@ -736,6 +771,15 @@ export function buildEventBindings(
   // lockstep (a bare-NULL binding, mirroring resume_target).
   const adopted: number | null = null;
 
+  // SessionStart only: capture the PII-free account ROUTE from the launcher-
+  // injected `KEEPER_ACCOUNT_ROUTE` env (mirrors config_dir / worktree). NULL on
+  // every non-SessionStart row and whenever the launcher supplied no route, so
+  // `events.account_route` is set-once per SessionStart and the reducer's
+  // COALESCE arm carries latest-non-NULL-wins per-process attribution across a
+  // resume. `accountRouteFromEnv` size/shape-bounds the untrusted value.
+  const accountRoute =
+    hookEvent === "SessionStart" ? accountRouteFromEnv(env) : null;
+
   // Backend-exec coordinates: captured on EVERY hook event, not SessionStart-
   // gated. A pure synchronous `process.env` read (no fork/fs/PPID-walk), so it
   // stays inside the cold-start budget on every fire. Absent sentinel
@@ -813,6 +857,7 @@ export function buildEventBindings(
     harness,
     resume_target: resumeTarget,
     adopted,
+    account_route: accountRoute,
   };
   return bindings;
 }

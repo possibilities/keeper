@@ -5388,6 +5388,7 @@ export const INGEST_EVENTS_COLUMNS = [
   "harness",
   "resume_target",
   "adopted",
+  "account_route",
 ] as const;
 
 /**

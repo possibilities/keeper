@@ -152,6 +152,10 @@ function insertEvent(
     // so a claude/launcher SessionStart folds jobs.adopted NULL; adoption-fold
     // tests set it (1) via overrides.
     adopted: overrides.adopted ?? null,
+    // Schema v119 / fn-1239: the PII-free per-launch account route. NULL by
+    // default so a launcher-supplied-none / legacy SessionStart folds
+    // jobs.account_route NULL; account-route fold tests set it via overrides.
+    account_route: overrides.account_route ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -163,8 +167,8 @@ function insertEvent(
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id, mutation_path, worktree, harness, resume_target,
-       adopted
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       adopted, account_route
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -203,6 +207,7 @@ function insertEvent(
       row.harness,
       row.resume_target,
       row.adopted,
+      row.account_route,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -5471,6 +5476,131 @@ test("from-scratch re-fold reproduces jobs.profile_name byte-identically (v36)",
   drainAll();
   const after = db
     .query("SELECT job_id, profile_name, config_dir FROM jobs ORDER BY job_id")
+    .all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// Account-route attribution (schema v119 / fn-1239.3)
+// ---------------------------------------------------------------------------
+
+const readRoute = (jobId: string): string | null =>
+  (
+    db.query("SELECT account_route FROM jobs WHERE job_id = ?").get(jobId) as {
+      account_route: string | null;
+    } | null
+  )?.account_route ?? null;
+
+test("SessionStart folds account_route as default / claude-swap:<slot> / NULL, never from a path or email (v119)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-native",
+    account_route: "default",
+    // A config_dir carrying an email-derived basename is present, proving the
+    // route is the EXPLICIT carrier — never derived from config_dir.
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-managed",
+    account_route: "claude-swap:5",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-none",
+    account_route: null,
+  });
+  drainAll();
+  expect(readRoute("sess-route-native")).toBe("default");
+  expect(readRoute("sess-route-managed")).toBe("claude-swap:5");
+  // A launcher that supplied no route folds NULL — the account label is NOT
+  // back-derived from config_dir's basename.
+  expect(readRoute("sess-route-none")).toBeNull();
+});
+
+test("a resumed SessionStart preserves per-process route attribution without conversation affinity (v119)", () => {
+  // First launch on a managed route.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-resume",
+    account_route: "claude-swap:2",
+  });
+  drainAll();
+  expect(readRoute("sess-route-resume")).toBe("claude-swap:2");
+
+  // A resume carrying NO route (launcher supplied none) preserves the prior
+  // process's attribution — latest-NON-NULL-wins, mirroring config_dir/worktree.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-resume",
+    account_route: null,
+  });
+  drainAll();
+  expect(readRoute("sess-route-resume")).toBe("claude-swap:2");
+
+  // A resume on a DIFFERENT route re-stamps this process's route — cross-account
+  // resume is conversation-correct and the choice is per-process, never bound to
+  // the conversation's earlier route.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-resume",
+    account_route: "default",
+  });
+  drainAll();
+  expect(readRoute("sess-route-resume")).toBe("default");
+});
+
+test("a malformed stored account_route folds without throwing and never influences a sibling job (v119)", () => {
+  // The hook bounds the value at capture, but the fold must be null-safe against
+  // any crafted/legacy stored value — it copies verbatim and never throws, and
+  // one job's route never leaks onto another (no cross-job derivation).
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-crafted",
+    account_route: "not-a-valid-route/../etc",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-clean",
+    account_route: "default",
+  });
+  drainAll();
+  expect(readRoute("sess-route-crafted")).toBe("not-a-valid-route/../etc");
+  expect(readRoute("sess-route-clean")).toBe("default");
+});
+
+test("from-scratch re-fold reproduces jobs.account_route byte-identically (v119)", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-a",
+    account_route: "claude-swap:9",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-b",
+    account_route: null,
+  });
+  // A NULL-route resume on A exercises the COALESCE-preserve path on re-fold.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-a",
+    account_route: null,
+  });
+  // A different-route resume on B exercises the re-stamp path on re-fold.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-b",
+    account_route: "default",
+  });
+  drainAll();
+  const before = db
+    .query("SELECT job_id, account_route FROM jobs ORDER BY job_id")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db
+    .query("SELECT job_id, account_route FROM jobs ORDER BY job_id")
     .all();
   expect(after).toEqual(before);
 });

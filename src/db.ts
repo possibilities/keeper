@@ -4143,6 +4143,30 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    version: 119,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v118→v119 (fn-1239 task .3): add the PII-free per-launch account ROUTE —
+      // `events.account_route` (the launcher-injected KEEPER_ACCOUNT_ROUTE the
+      // hook size/shape-bounds at SessionStart) and its `jobs.account_route`
+      // projection (folded latest-non-NULL-wins on the SessionStart COALESCE
+      // arm). Both nullable TEXT, NO default: NULL = the launcher supplied no
+      // route (an explicit-profile override, a legacy row, or a non-Claude job),
+      // the zero-event reading. `default` / `claude-swap:<slot>` are the only
+      // non-NULL shapes. The fold copies the event value verbatim and NEVER
+      // synthesizes one, so a from-scratch re-fold folds a pre-v119 event to a
+      // NULL route byte-identically (deterministic-replayed, NO cursor rewind).
+      // `events.account_route` is declared in the CREATE_EVENTS literal (after
+      // `adopted`) too; `jobs.account_route` is migration-ONLY (NOT in
+      // CREATE_JOBS), appended here as the trailing jobs column so fresh-vs-
+      // migrated PRAGMA table_info stays byte-identical. No wall-clock / env /
+      // fs / external read.
+      addColumnIfMissing(db, "events", "account_route", "TEXT");
+      addColumnIfMissing(db, "jobs", "account_route", "TEXT");
+    },
+  },
 ];
 
 /**
@@ -4163,7 +4187,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v118:a3a252e4d8073355a01198c57cfbbc69a76248ee96b114c3889ffc1e5c03dc55";
+  "v119:bb178dec0dc3c2cff88a333319560ad7d35678e586dc04e6a1532ca75aea19e8";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -4929,7 +4953,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- NULL (launcher-owned by definition); the fold copies the value verbatim and
     -- never synthesizes one. Declared AFTER resume_target so a fresh CREATE and a
     -- migrated ALTER (which appends) keep table_info byte-identical.
-    adopted INTEGER
+    adopted INTEGER,
+    -- v118->v119 (fn-1239.3): the PII-free account ROUTE the launcher injected
+    -- via KEEPER_ACCOUNT_ROUTE at SessionStart — the "default" native-ambient id
+    -- or a "claude-swap:<slot>" managed id, NULL when the launcher supplied none
+    -- or on every non-SessionStart row. The hook size/shape-bounds the untrusted
+    -- env value at capture; the fold copies it verbatim onto jobs.account_route
+    -- (latest-non-NULL-wins per-process attribution) and NEVER synthesizes one,
+    -- so a legacy row folds NULL byte-identically. Part of the FIVE-place events
+    -- lockstep (this literal, KNOWN_EVENT_COLUMNS, the hook insertBindings,
+    -- INGEST_EVENTS_COLUMNS, the insertEvent prepared statement). Declared AFTER
+    -- adopted so a fresh CREATE and a migrated ALTER (which appends) keep
+    -- table_info byte-identical.
+    account_route TEXT
 )
 `;
 
@@ -6916,7 +6952,7 @@ export function prepareStmts(db: Database): Stmts {
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id, mutation_path, worktree, harness, resume_target,
-        adopted
+        adopted, account_route
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -6926,7 +6962,7 @@ export function prepareStmts(db: Database): Stmts {
         $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
         $background_task_id, $mutation_path, $worktree, $harness, $resume_target,
-        $adopted
+        $adopted, $account_route
       )
     `),
     selectWorldRev: db.prepare(

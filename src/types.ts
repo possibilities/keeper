@@ -314,6 +314,19 @@ export interface Event {
    * re-mint preserves the marker). NULL on every non-SessionStart row.
    */
   adopted: number | null;
+  /**
+   * The PII-free account ROUTE this process launched on — `"default"` (native
+   * ambient account) or `"claude-swap:<slot>"` (a managed claude-swap route),
+   * NULL when the launcher supplied none (an explicit-profile override or a
+   * legacy / non-Claude row). An EXPLICIT launch carrier, never derived from a
+   * path or email: the hook size/shape-bounds `KEEPER_ACCOUNT_ROUTE` at
+   * capture, so a malformed value arrives NULL and the fold — which copies it
+   * verbatim onto `jobs.account_route` via the SessionStart COALESCE arm — never
+   * throws. Attribution is observational per-process: it describes only the
+   * process that emitted the event and never binds a conversation or drives a
+   * later route choice. NULL on every non-SessionStart row.
+   */
+  account_route: string | null;
 }
 
 /**
@@ -621,10 +634,13 @@ export interface Job {
    * surfaces render as not-resumable for a non-claude harness.
    */
   resume_target: string | null;
-  // NOTE: the migration-only jobs column `kill_reason` (v103) is DELIBERATELY
-  // absent here — this interface mirrors only the fields Job-typed reads consume
-  // today. The column exists on the row and is read ad-hoc (a scoped SELECT) by
-  // the folds/producers that own it; a later read surface adds it when needed.
+  // NOTE: the migration-only jobs columns `kill_reason` (v103) and
+  // `account_route` (v119, the PII-free per-launch account route folded from
+  // {@link Event.account_route}) are DELIBERATELY absent here — this interface
+  // mirrors only the fields Job-typed reads consume today. Both ride the row and
+  // are read ad-hoc (a scoped SELECT / the raw JOBS_DESCRIPTOR wire) by the
+  // folds / producers / query surfaces that own them; a later typed read surface
+  // adds one when needed.
 }
 
 /**

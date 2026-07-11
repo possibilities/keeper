@@ -187,6 +187,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // can pill an adopted job distinctly. Display-only — never a `sortable` /
     // `filters` / `jsonColumns` key.
     "adopted",
+    // `account_route`: the PII-free per-launch account route (schema v119 /
+    // fn-1239), `'default'` / `'claude-swap:<slot>'` / NULL, folded latest-non-
+    // NULL-wins from the SessionStart `KEEPER_ACCOUNT_ROUTE` carrier. Served as
+    // explicit launch attribution for diagnostics — the account label never
+    // derives from `config_dir` / email. Display-only — never a `sortable` /
+    // `filters` / `jsonColumns` key.
+    "account_route",
     // `dispatch_origin`: the keeper-DISPATCH provenance discriminator —
     // `'autopilot'` for an autopilot work/close worker, `'escalation'` for an
     // unblock/deconflict/resolve/repair session, NULL for a manual/adopted/

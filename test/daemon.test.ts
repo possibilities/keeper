@@ -4563,7 +4563,12 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // stamped onto `jobs.git_unattributed_to_live_count`; an additive ALTER, NO
   // cursor rewind: `git_status` is LIVE-ONLY, so the boot-seed re-derives the
   // value rather than replay).
-  expect(SCHEMA_VERSION).toBe(118);
+  // And to 119 via fn-1239 task .3 (appending the nullable `events.account_route`
+  // + `jobs.account_route` TEXT columns — the PII-free per-launch account route
+  // the hook captures from KEEPER_ACCOUNT_ROUTE at SessionStart; additive ALTERs,
+  // NO cursor rewind: a pre-v119 event carries no route, so a from-scratch
+  // re-fold leaves both NULL byte-identical).
+  expect(SCHEMA_VERSION).toBe(119);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
