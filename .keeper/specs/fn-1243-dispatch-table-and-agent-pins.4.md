@@ -33,5 +33,5 @@ Parse cases in both islands: valid pins, effort outside the axis (loud, names th
 - [ ] The committed example matrix carries the 11 seeded pins and passes its anti-rot test
 
 ## Done summary
-
+Added agent_pins map to both v2 host matrix parsers (launcher + plan islands), validated pin effort against the matrix's efforts axis, and seeded the 11 static-agent pins into the committed example matrix.
 ## Evidence
