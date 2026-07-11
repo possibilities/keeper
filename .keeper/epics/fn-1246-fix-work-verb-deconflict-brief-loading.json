@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "closer_done_at": "2026-07-11T14:52:45.323000Z",
+  "created_at": "2026-07-10T22:19:45.350000Z",
+  "created_by_close_of": "fn-1240-work-verb-merge-conflict-escalation",
+  "depends_on_epics": [
+    "fn-1240-work-verb-merge-conflict-escalation"
+  ],
+  "id": "fn-1246-fix-work-verb-deconflict-brief-loading",
+  "last_validated_at": "2026-07-10T22:19:46.323000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "done",
+  "title": "Fix work-verb deconflict brief loading",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-11T14:52:45.323000Z"
+}

@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-10T21:50:08.962000Z",
+  "depends_on_epics": [],
+  "id": "fn-1245-timeout-aware-base-gate-attestation",
+  "last_validated_at": "2026-07-10T21:51:00.058000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Timeout aware base gate attestation",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-10T21:51:00.058000Z"
+}

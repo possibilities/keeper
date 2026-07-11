@@ -1,0 +1,45 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 25,
+        "files_changed": 3,
+        "insertions": 24
+      },
+      "done_summary": "Reconciled CLAUDE.md/CONTEXT.md/watch SKILL.md so the resolve/deconflict/page escalation pipeline reads verb-agnostic (close::<epic> and work::<taskId>) instead of close-only, disambiguated the merge-conflict vs lane-premerge classification, and pruned CONTEXT.md's pre-existing line-cap overrun.",
+      "input_hash": "8d10c48247cfc30b0c90e5af12ad9bca8d7abbc7c99f929195e1cc67628319b7",
+      "model": "sonnet",
+      "spec_chars": 2720,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** CLAUDE.md, CONTEXT.md, plugins/keeper/skills/watch/SKILL.md\n\nReconcile the forward-facing docs with the new work-verb escalation channel.\nConsolidate, never append.\n\n### Approach\n\nRewrite the CLAUDE.md Autopilot section so the close-vs-work asymmetry is gone\nand the `worktree-merge-conflict` vs `worktree-lane-premerge` classification\n(per task .1's ADR) is stated once; prune redundant clauses, keep\n`bun scripts/lint-claude-md.ts` green (the edit lands in the `AGENTS.md`\nsymlink too \u2014 edit in place). Disambiguate the CONTEXT.md `Resolver` /\n`Deconflict session` / `Lane pre-merge` entries (broaden to \"epic OR\ntask/lane\" per the identity decision), add any new work-verb term and the\nfan-in-vs-premerge distinction with `Avoid:` lists. Update watch SKILL.md\nrung-2 (resolver sequencing now covers `work::<taskId>`) and rung-4 (a work\nconflict is a live escalation channel, not a manual gap), and check the\n`keeper watch --filter` list for a work-verb-merge-escalation surface. No\nfn-ids / dates / past-tense provenance in any forward-facing doc.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified at authoring time; the repo moves.*\n\n**Required** (read before coding):\n- CLAUDE.md \u2014 the Autopilot section paragraph describing the close-scoped `resolve::`/`deconflict::` sequencing and the `worktree-lane-premerge`/`worktree-lane-wedge` path.\n- CONTEXT.md \u2014 `Resolver` / `Deconflict session` / `Lane pre-merge` entries.\n- plugins/keeper/skills/watch/SKILL.md \u2014 rung-2 (close-sweep) and rung-4 (notify) text; the `keeper watch --filter` list.\n- docs/adr/00NN-work-verb-merge-conflict-escalation.md \u2014 task .1's ADR (the source of truth for the reconciled prose).\n\n### Risks\n\n- `lint-claude-md.ts` bans size growth and re-narration \u2014 this must be a net consolidation, not an append.\n\n### Test notes\n\n`bun scripts/lint-claude-md.ts` green. Docs-only; no behavior tier.\n\n## Acceptance\n\n- [ ] CLAUDE.md Autopilot section reconciled (no close-only asymmetry remains); `bun scripts/lint-claude-md.ts` green.\n- [ ] CONTEXT.md disambiguates the two conflict classes and the resolver/deconflict scope; new terms carry `Avoid:` lists.\n- [ ] watch SKILL.md rung-2 / rung-4 reflect the `work::<taskId>` live escalation channel; the `--filter` list is reconciled.\n- [ ] No fn-ids, dates, or past-tense provenance in any forward-facing doc edited.\n\n## Done summary\nReconciled CLAUDE.md/CONTEXT.md/watch SKILL.md so the resolve/deconflict/page escalation pipeline reads verb-agnostic (close::<epic> and work::<taskId>) instead of close-only, disambiguated the merge-conflict vs lane-premerge classification, and pruned CONTEXT.md's pre-existing line-cap overrun.\n## Evidence\n",
+      "task_id": "fn-1240-work-verb-merge-conflict-escalation.4",
+      "tier": "high",
+      "title": "Docs and glossary reconciliation"
+    }
+  ],
+  "created_at": "2026-07-10T22:19:39.377000Z",
+  "epic_id": "fn-1240-work-verb-merge-conflict-escalation",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1240-work-verb-merge-conflict-escalation.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1240-work-verb-merge-conflict-escalation.2"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1240-work-verb-merge-conflict-escalation.3"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "8d10c48247cfc30b0c90e5af12ad9bca8d7abbc7c99f929195e1cc67628319b7",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

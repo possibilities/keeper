@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A subtle correctness invariant in an event-sourced daemon \u2014 must not loosen the SHARED_BASE_BROKEN safety net, must keep starvation probing out of any fold for re-fold determinism, and touches reason-slot contracts \u2014 a nameable correctness gate that overrides the GPT-first default.",
+      "task_id": "fn-1245-timeout-aware-base-gate-attestation.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-10T21:50:59.138000Z",
+  "epic_id": "fn-1245-timeout-aware-base-gate-attestation",
+  "input_hash": "e0ba85feb1157f0ea0e7111ffc55f028cdaaf72e823d809cb03608646a362b0b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3770320382,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1245-timeout-aware-base-gate-attestation.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A subtle correctness invariant in an event-sourced daemon \u2014 must not loosen the SHARED_BASE_BROKEN safety net, must keep starvation probing out of any fold for re-fold determinism, and touches reason-slot contracts \u2014 a nameable correctness gate that overrides the GPT-first default.\",\"confidence\":0.8}]}\n"
+}

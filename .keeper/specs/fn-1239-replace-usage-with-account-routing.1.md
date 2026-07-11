@@ -68,5 +68,5 @@ Land the observer disabled for routing: it may publish health and candidate snap
 - [ ] Adversarial parser, freshness, fallback, concurrency, and worker-lifecycle tests pass without real subprocesses or workers.
 
 ## Done summary
-
+Added the DB-free, PII-free account-routing core in shadow mode: normalized Capacity observation + strict CodexBar/cswap parsers (src/account-observation.ts), a greatest-headroom selector over a flock-guarded TTL-bounded reservation ledger (src/account-router.ts), the optional observer worker publishing one atomic 0600 sidecar wired into daemon supervision, and a generalized flock primitive (src/file-lock.ts). No launch behavior changed; 53 new pure tests pass.
 ## Evidence

@@ -1,15 +1,19 @@
 #!/usr/bin/env bun
 /**
  * `keeper escalation-brief <unblock::fn-N-slug.M | deconflict::fn-N-slug |
- * repair::<repo-token>>` — the read-only context envelope an autopilot
- * escalation session loads at boot, so it resolves the incident without the
- * original creator's session context.
+ * deconflict::fn-N-slug.M | repair::<repo-token>>` — the read-only context
+ * envelope an autopilot escalation session loads at boot, so it resolves the
+ * incident without the original creator's session context. `deconflict::`
+ * accepts EITHER ref shape: an epic-form ref for a close-verb fan-in and a
+ * task-form ref for a work-verb fan-in, keying its sticky row + resolver jobs
+ * on the ref's OWN id (`verb IN ('close','work')`) while still deriving
+ * `epic_id` for the epic-keyed lineage/primary-repo lookup.
  *
  * The payload spans BOTH stores, which is why the verb lives in keeper core:
  *   - keeper.db (`jobs.transcript_path` / `plan_verb` / `plan_ref`,
  *     `epics.job_links` creator edges, the `dispatch_failures` reason row,
- *     the `resolve::<epic>` resolver jobs, and — for `repair` — the FULL
- *     `epics` table scanned by repo token);
+ *     the `resolve::<epic>` / `resolve::<taskId>` resolver jobs, and — for
+ *     `repair` — the FULL `epics` table scanned by repo token);
  *   - the repo's `.keeper` tree (`epics/<id>.json.created_by_close_of` +
  *     `primary_repo`, and the gitignored `state/tasks/<id>.state.json` blocked
  *     overlay). The `.keeper` schema is OWNED by the plan plugin — this verb reads
@@ -63,9 +67,10 @@ task_id, primary_repo, incident, lineage, degraded}. Read-only over keeper.db +
 the .keeper tree — no daemon, no commit, no lock, no writes.
 
 Keys:
-  unblock::<task-id>     A blocked plan task (e.g. unblock::fn-12-add-oauth.3)
-  deconflict::<epic-id>  A sticky worktree-merge-conflict close (e.g. deconflict::fn-12-add-oauth)
-  repair::<repo-token>   A shared-base-broken repo (e.g. repair::keeper-qzvs8i)
+  unblock::<task-id>         A blocked plan task (e.g. unblock::fn-12-add-oauth.3)
+  deconflict::<epic-id>      A sticky worktree-merge-conflict close (e.g. deconflict::fn-12-add-oauth)
+  deconflict::<task-id>      A sticky worktree-merge-conflict work fan-in (e.g. deconflict::fn-12-add-oauth.3)
+  repair::<repo-token>       A shared-base-broken repo (e.g. repair::keeper-qzvs8i)
 
 The incident block is kind-specific (unblock: blocked reason + CATEGORY + other
 blocked siblings; deconflict: the merge-conflict reason with source/target branch
@@ -193,16 +198,20 @@ export type EscalationBriefResult =
 // ── Key parsing ────────────────────────────────────────────────────────────
 
 type ParsedKey =
-  | { kind: "deconflict"; epic_id: string }
+  | { kind: "deconflict"; epic_id: string; task_id?: string }
   | { kind: "unblock"; epic_id: string; task_id: string }
   | { kind: "repair"; repo_token: string };
 
-/** Parse an escalation key into its kind + ids. `deconflict::` requires an
- *  epic-form ref, `unblock::` a task-form ref (a shape mismatch is unparseable).
- *  `repair::` does NOT route through {@link parsePlanRef} at all — it is
- *  repo-scoped, not epic/task-scoped, so its id half is validated against
- *  {@link REPO_TOKEN_RE} (the same repo-token shape `dispatch-command.ts` and
- *  `derivers.ts` share) instead. Returns null for anything not a valid key. */
+/** Parse an escalation key into its kind + ids. `deconflict::` accepts EITHER
+ *  ref shape — an epic-form ref (the close-verb fan-in escalation) or a
+ *  task-form ref (the work-verb fan-in escalation), carrying `task_id` only
+ *  for the latter and always deriving `epic_id` for the epic-keyed
+ *  lineage/primary-repo lookup. `unblock::` requires a task-form ref (a shape
+ *  mismatch is unparseable). `repair::` does NOT route through
+ *  {@link parsePlanRef} at all — it is repo-scoped, not epic/task-scoped, so
+ *  its id half is validated against {@link REPO_TOKEN_RE} (the same
+ *  repo-token shape `dispatch-command.ts` and `derivers.ts` share) instead.
+ *  Returns null for anything not a valid key. */
 export function parseEscalationKey(key: string): ParsedKey | null {
   const m = /^(unblock|deconflict|repair)::(.+)$/.exec(key);
   if (m == null) {
@@ -220,7 +229,7 @@ export function parseEscalationKey(key: string): ParsedKey | null {
   if (m[1] === "deconflict") {
     return ref.kind === "epic"
       ? { kind: "deconflict", epic_id: ref.epic_id }
-      : null;
+      : { kind: "deconflict", epic_id: ref.epic_id, task_id: ref.task_id };
   }
   return ref.kind === "task"
     ? { kind: "unblock", epic_id: ref.epic_id, task_id: ref.task_id }
@@ -434,20 +443,26 @@ function parseMergeConflictReason(
   return { source: m[1], base: m[2], stderr };
 }
 
-/** Assemble the deconflict incident: the sticky `close::<epic>`
- *  worktree-merge-conflict `dispatch_failures` row + the `resolve::<epic>`
- *  resolver jobs. */
+/** Assemble the deconflict incident: the sticky `close::<epic>` (or, for a
+ *  work-verb escalation, `work::<taskId>`) worktree-merge-conflict
+ *  `dispatch_failures` row + the matching `resolve::<epic>` /
+ *  `resolve::<taskId>` resolver jobs — both keyed on the ref's OWN id
+ *  (`taskId` when the ref is task-form, else `epicId`), mirroring how
+ *  `daemon.ts` mints the sticky row and dispatches the resolver for each verb. */
 function buildDeconflictIncident(
   db: Database,
   epicId: string,
+  taskId?: string,
 ): IncidentResult<DeconflictIncident> {
+  const verb = taskId != null ? "work" : "close";
+  const stickyId = taskId ?? epicId;
   const degraded: string[] = [];
   const row = db
     .query(
       `SELECT reason, dir, merge_escalated_at, resolver_dispatched_at
-         FROM dispatch_failures WHERE verb = 'close' AND id = ?`,
+         FROM dispatch_failures WHERE verb = ? AND id = ?`,
     )
-    .get(epicId) as {
+    .get(verb, stickyId) as {
     reason: string;
     dir: string | null;
     merge_escalated_at: number | null;
@@ -477,7 +492,7 @@ function buildDeconflictIncident(
     .query(
       "SELECT job_id, state, transcript_path FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ?",
     )
-    .all(epicId) as Array<{
+    .all(stickyId) as Array<{
     job_id: string;
     state: string | null;
     transcript_path: string | null;
@@ -851,7 +866,7 @@ export function buildEscalationBrief(
   const lineage = resolveLineage(db, keeperRoot, epicId);
   const incident =
     parsed.kind === "deconflict"
-      ? buildDeconflictIncident(db, epicId)
+      ? buildDeconflictIncident(db, epicId, parsed.task_id)
       : buildUnblockIncident(db, keeperRoot, epicId, parsed.task_id);
 
   const degraded = [...lineage.degraded, ...incident.degraded];
@@ -864,7 +879,8 @@ export function buildEscalationBrief(
     brief: {
       kind: parsed.kind,
       epic_id: epicId,
-      task_id: parsed.kind === "unblock" ? parsed.task_id : null,
+      task_id:
+        parsed.kind === "unblock" ? parsed.task_id : (parsed.task_id ?? null),
       primary_repo: primaryRepo,
       incident: incident.data,
       lineage: {

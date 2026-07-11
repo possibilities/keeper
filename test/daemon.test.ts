@@ -56,6 +56,8 @@ import {
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildSharedDirtyObservation,
+  buildWorkMergeHumanNotifyBody,
+  buildWorkResolverBrief,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   CRASH_LOOP_YOUNG_RUNTIME_MS,
@@ -63,6 +65,7 @@ import {
   classifyBaselineForRepair,
   classifyEscalationOutcome,
   classifyRestartProvenance,
+  classifyWorkResolverOutcome,
   collapseRestartLedger,
   compactRestartLedger,
   countLiveEscalationSessions,
@@ -101,6 +104,7 @@ import {
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
+  type PendingWorkMergeConflict,
   PROBE_LIFE_ADMISSION_CODES,
   PROBE_SETTLE_INITIAL,
   type ProbeSettleEvent,
@@ -144,6 +148,7 @@ import {
   runMergeEscalationSweep,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
+  runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
   SERVE_PROBE_MAX_FAIL_STREAK,
@@ -161,6 +166,9 @@ import {
   selectPendingHumanNotifications,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
+  selectPendingWorkMergeEscalations,
+  selectPendingWorkMergeNotifications,
+  selectPendingWorkResolverDispatches,
   selectRepairCandidates,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
@@ -169,8 +177,11 @@ import {
   shouldEscalateMergeConflict,
   startDaemon,
   WAL_AUTOCHECKPOINT_PAGES,
+  WORK_RESOLVER_LEASE_SEC,
   type WorkerName,
+  type WorkMergeHumanNotifySweepDeps,
   withBootDrainCheckpointTuning,
+  workLaneBusyForResolver,
   writeRestartLedger,
 } from "../src/daemon";
 import {
@@ -6383,6 +6394,36 @@ test("selectRepairCandidates: a non-repair category (SPEC_UNCLEAR) yields NO can
   db.close();
 });
 
+test("selectRepairCandidates: an inconclusive base gate down-categorized to TOOLING_FAILURE yields NO repair candidate (timeout-aware attestation, daemon-side)", () => {
+  // A starved / timed-out base gate is INCONCLUSIVE, not a confirmed base red: the
+  // worker guidance routes it to TOOLING_FAILURE, never SHARED_BASE_BROKEN. The daemon
+  // trusts that category token as the sole red-vs-inconclusive discriminator, so a
+  // TOOLING_FAILURE block mints no repair candidate — a starved gate can never fabricate
+  // a repair::<repo> distress row. A genuine SHARED_BASE_BROKEN still mints (round-trip
+  // case above), so the confirmed-red safety net is unchanged.
+  const { db } = freshMemDb();
+  const proj = join(tmpDir, "proj");
+  writeBlockedStateFile(
+    proj,
+    "fn-1-foo.1",
+    "TOOLING_FAILURE: base gate timed out (starved host); inconclusive, not a confirmed base red",
+  );
+  seedEpicWithTasks(db, "fn-1-foo", proj, [
+    { task_id: "fn-1-foo.1", runtime_status: "blocked", target_repo: proj },
+  ]);
+  seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
+
+  const notes: string[] = [];
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason, (l) =>
+    notes.push(l),
+  );
+  expect(candidates).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-candidate-drop task=fn-1-foo.1 class=non_repair_category category=TOOLING_FAILURE",
+  ]);
+  db.close();
+});
+
 test("selectRepairCandidates: every reachable candidate-drop gate emits its class-stable diagnostic", () => {
   const { db } = freshMemDb();
   const proj = join(tmpDir, "proj");
@@ -8027,6 +8068,22 @@ test("countLiveEscalationSessions: counts only TURN-ACTIVE (working) unblock:: +
   expect(countLiveEscalationSessions([])).toBe(0);
 });
 
+test("countLiveEscalationSessions: a work `deconflict::<taskId>` shares the SAME cap as a close `deconflict::<epic>` (no starvation)", () => {
+  // fn-1240: the work-verb deconflict dispatches through the SAME `dispatchEscalationSession`
+  // as the close path, keyed on the `deconflict` verb regardless of whether its id is an
+  // epic id (close) or a task id (work). Both count toward the one global cap, so neither
+  // starves the other — as slots free, whichever sweep runs next dispatches.
+  const jobs: Job[] = [
+    escJob("deconflict", "fn-1-foo", "working"), // close: epic id
+    escJob("deconflict", "fn-2-bar.3", "working"), // work: task id — SAME cap
+    escJob("unblock", "fn-3-baz.1", "working"), // shares the cap too
+  ];
+  expect(countLiveEscalationSessions(jobs)).toBe(3);
+  // The per-key liveness guard distinguishes the two deconflict namespaces exactly.
+  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-2-bar.3")).toBe(true);
+  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-1-foo")).toBe(true);
+});
+
 test("escalationSessionLiveFor: matches a live session for the exact verb+id only", () => {
   const jobs: Job[] = [
     escJob("deconflict", "fn-1-foo", "working"),
@@ -8830,6 +8887,566 @@ test("prewarmWatcherAddon: the loud assertion does NOT downgrade a genuine failu
       () => {},
     ),
   ).toThrow("ABI mismatch");
+});
+
+// ---- fn-1240 work-verb fan-in merge-conflict escalation (tier-2) --------------
+// The full WORK escalation, mirroring the close pipeline: a stuck `work::<taskId>`
+// `worktree-merge-conflict` row → `resolve::<taskId>` resolver (stage 1) → on its terminal
+// decline a `deconflict::<taskId>` session (stage 2, sequenced behind the resolver's leased
+// terminal verdict) → on ITS terminal decline the human is paged ONCE (stage 3). Identity
+// is task-scoped so `resolve::`/`deconflict::<taskId>` never collide with the close path's
+// epic-scoped sessions; `retry_dispatch` drops the row and re-arms the whole chain.
+
+// ---- selectPendingWorkResolverDispatches (stage-1 working-set read) -----------
+
+test("selectPendingWorkResolverDispatches: picks only work rows with the exact token and a NULL resolver latch", () => {
+  const { db } = freshMemDb();
+  // Dispatchable: a sticky work fan-in conflict, no resolver yet.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-1-foo.2",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    dir: "/wt/lane",
+  });
+  // Already resolver-dispatched (latch set) → dropped (dispatch-once).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-2-done.3",
+    reason: mergeConflictReason("fn-2-done.1", "keeper/epic/fn-2-done"),
+    dir: "/wt/lane2",
+    resolverDispatchedAt: 999,
+  });
+  // A non-merge-conflict work failure → dropped.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-3-launch.1",
+    reason: "launch_failed: worker never bound",
+    dir: "/wt/lane3",
+  });
+  // A `worktree-merge` PREFIX (not the exact token) → dropped.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-4-lock.1",
+    reason: "worktree-merge-lock-timeout: could not acquire the lock",
+    dir: "/wt/lane4",
+  });
+  // A CLOSE merge-conflict row → dropped (this selector is work-verb only).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-5-close",
+    reason: mergeConflictReason("fn-5-close.1", "keeper/epic/fn-5-close"),
+    dir: "/repo/root",
+  });
+
+  expect(selectPendingWorkResolverDispatches(db)).toEqual([
+    {
+      id: "fn-1-foo.2",
+      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+      dir: "/wt/lane",
+    },
+  ]);
+  db.close();
+});
+
+// ---- selectPendingWorkMergeEscalations (stage-2 working-set read) -------------
+
+test("selectPendingWorkMergeEscalations: picks work rows with resolver dispatched but deconflict NOT yet dispatched", () => {
+  const { db } = freshMemDb();
+  // Escalatable: resolver dispatched (latch SET), deconflict latch still NULL.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-1-foo.2",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    dir: "/wt/lane",
+    resolverDispatchedAt: 111,
+  });
+  // Resolver NOT yet dispatched → NOT escalatable (the deconflict is sequenced behind it).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-2-nores.1",
+    reason: mergeConflictReason("fn-2-nores.1", "keeper/epic/fn-2-nores"),
+    dir: "/wt/lane2",
+  });
+  // Already escalated (deconflict dispatched) → dropped (escalate-once).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-3-esc.1",
+    reason: mergeConflictReason("fn-3-esc.1", "keeper/epic/fn-3-esc"),
+    dir: "/wt/lane3",
+    resolverDispatchedAt: 111,
+    mergeEscalatedAt: 222,
+  });
+  // A CLOSE row with the same latch shape → dropped (work-verb only).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-4-close",
+    reason: mergeConflictReason("fn-4-close.1", "keeper/epic/fn-4-close"),
+    dir: "/repo/root",
+    resolverDispatchedAt: 111,
+  });
+
+  expect(selectPendingWorkMergeEscalations(db)).toEqual([
+    {
+      id: "fn-1-foo.2",
+      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+      dir: "/wt/lane",
+    },
+  ]);
+  db.close();
+});
+
+// ---- selectPendingWorkMergeNotifications (stage-3 working-set read) -----------
+// Tier-2: the page is now SEQUENCED — gated on `merge_escalated_at IS NOT NULL` (the
+// deconflict was dispatched), NOT firing straight away as in the page-only tier.
+
+test("selectPendingWorkMergeNotifications: picks work rows with deconflict dispatched but human NOT yet paged", () => {
+  const { db } = freshMemDb();
+  // Pageable: deconflict dispatched (merge_escalated_at SET), not yet paged.
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-1-foo.2",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    dir: "/wt/lane",
+    resolverDispatchedAt: 111,
+    mergeEscalatedAt: 222,
+  });
+  // Deconflict NOT yet dispatched (merge_escalated_at NULL) → dropped (the tier-2 page
+  // waits for the deconflict, unlike the old page-only tier which fired straight away).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-2-noesc.1",
+    reason: mergeConflictReason("fn-2-noesc.1", "keeper/epic/fn-2-noesc"),
+    dir: "/wt/lane2",
+    resolverDispatchedAt: 111,
+  });
+  // Already paged (human_notified_at set) → dropped (page-once).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-3-paged.1",
+    reason: mergeConflictReason("fn-3-paged.1", "keeper/epic/fn-3-paged"),
+    dir: "/wt/lane3",
+    resolverDispatchedAt: 111,
+    mergeEscalatedAt: 222,
+  });
+  db.run(
+    "UPDATE dispatch_failures SET human_notified_at = 333 WHERE verb = 'work' AND id = ?",
+    ["fn-3-paged.1"],
+  );
+  // A non-merge-conflict work failure → dropped (never pages).
+  seedResolverFailureRow(db, {
+    verb: "work",
+    id: "fn-4-launch.1",
+    reason: "launch_failed: worker never bound",
+    dir: "/wt/lane4",
+    mergeEscalatedAt: 222,
+  });
+  // A CLOSE merge-conflict row → dropped (this selector is work-verb only).
+  seedResolverFailureRow(db, {
+    verb: "close",
+    id: "fn-5-close",
+    reason: mergeConflictReason("fn-5-close.1", "keeper/epic/fn-5-close"),
+    dir: "/repo/root",
+    resolverDispatchedAt: 111,
+    mergeEscalatedAt: 222,
+  });
+
+  expect(selectPendingWorkMergeNotifications(db)).toEqual([
+    {
+      id: "fn-1-foo.2",
+      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+      dir: "/wt/lane",
+    },
+  ]);
+  db.close();
+});
+
+test("selectPendingWork* selectors: empty table returns []", () => {
+  const { db } = freshMemDb();
+  expect(selectPendingWorkResolverDispatches(db)).toEqual([]);
+  expect(selectPendingWorkMergeEscalations(db)).toEqual([]);
+  expect(selectPendingWorkMergeNotifications(db)).toEqual([]);
+  db.close();
+});
+
+// ---- buildWorkMergeHumanNotifyBody (pure terminal page body) ------------------
+
+test("buildWorkMergeHumanNotifyBody: names the task, verdict, lane, reason, and the unstick command", () => {
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: "/wt/lane",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    verdict: "declined",
+  });
+  expect(body).toContain("work::fn-1-foo.2");
+  // Tier-2 framing: both the resolver AND the deconflict session gave up.
+  expect(body).toContain("the autonomous merge-resolver AND the");
+  expect(body).toContain("DECLINED");
+  expect(body).toContain("keeper autopilot retry work::fn-1-foo.2");
+  expect(body).toContain("Lane: /wt/lane");
+  expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
+});
+
+test("buildWorkMergeHumanNotifyBody: a `died` verdict frames the deconflict session death", () => {
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: "/wt/lane",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    verdict: "died",
+  });
+  expect(body).toContain("DIED");
+});
+
+test("buildWorkMergeHumanNotifyBody: a null/empty lane degrades to `?` (never throws)", () => {
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: null,
+    reason: "worktree-merge-conflict: merging a into b — x",
+    verdict: "declined",
+  });
+  expect(body).toContain("Lane: ?");
+});
+
+test("buildWorkMergeHumanNotifyBody: a pathological reason is size-bounded (no unbounded botctl arg)", () => {
+  const hugeStderr = "CONFLICT ".repeat(500); // ~4.5k chars
+  const body = buildWorkMergeHumanNotifyBody({
+    taskId: "fn-1-foo.2",
+    lane: "/wt/lane",
+    reason: `worktree-merge-conflict: merging a into b — ${hugeStderr}`,
+    verdict: "declined",
+  });
+  expect(body).toContain("[truncated]");
+  // The whole body stays comfortably bounded despite the pathological stderr.
+  expect(body.length).toBeLessThan(1200);
+});
+
+// ---- buildWorkResolverBrief (pure resolver brief) ----------------------------
+
+test("buildWorkResolverBrief: task-scoped framing, the lane cwd DIRECTLY, and the shared guardrail", () => {
+  const brief = buildWorkResolverBrief({
+    taskId: "fn-1-foo.2",
+    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+    laneDir: "/wt/lane",
+  });
+  // Task-scoped framing + unstick command (never the close path's epic/close::).
+  expect(brief).toContain("task fn-1-foo.2");
+  expect(brief).toContain("work::fn-1-foo.2");
+  expect(brief).toContain("keeper autopilot retry work::fn-1-foo.2");
+  expect(brief).not.toContain("close::");
+  // The worker cds to the lane dir DIRECTLY (per the ADR — not a fabricated worktree path)
+  // and re-runs the fan-in merge of the parsed source.
+  expect(brief).toContain("cd /wt/lane");
+  expect(brief).toContain("git merge --no-ff fn-1-foo.1");
+  // The classify-or-BLOCK guardrail is reused VERBATIM from the close resolver brief.
+  expect(brief).toContain(
+    "GUARDRAIL — your authority is narrower than a human's.",
+  );
+  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
+  // Green-gate: passing tests are necessary, not sufficient.
+  expect(brief).toContain("passing tests are");
+});
+
+test("buildWorkResolverBrief: a parse-miss / missing lane degrades to a still-actionable brief (never throws)", () => {
+  const brief = buildWorkResolverBrief({
+    taskId: "fn-1-foo.2",
+    reason: "worktree-merge-conflict: unparseable head",
+    laneDir: null,
+  });
+  expect(brief).toContain("task fn-1-foo.2");
+  expect(brief).toContain("keeper autopilot retry work::fn-1-foo.2");
+  // Still carries the guardrail even on the degraded path.
+  expect(brief).toContain(
+    "GUARDRAIL — your authority is narrower than a human's.",
+  );
+});
+
+// ---- runWorkMergeHumanNotifySweep (orchestration core, injected deps) ---------
+
+function fakeWorkMergeSweepDeps(opts: {
+  pending: PendingWorkMergeConflict[];
+  stillPending?: (id: string) => boolean;
+  deconflictOutcome?: (id: string) => ResolverOutcome;
+  notify?: (
+    row: PendingWorkMergeConflict,
+    verdict: "declined" | "died",
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  selectThrows?: boolean;
+}): {
+  deps: WorkMergeHumanNotifySweepDeps;
+  mints: HumanNotifyMintCall[];
+  notifies: Array<{ id: string; verdict: "declined" | "died" }>;
+} {
+  const mints: HumanNotifyMintCall[] = [];
+  const notifies: Array<{ id: string; verdict: "declined" | "died" }> = [];
+  const deps: WorkMergeHumanNotifySweepDeps = {
+    selectPending: () => {
+      if (opts.selectThrows) throw new Error("read boom");
+      return opts.pending;
+    },
+    stillPending: opts.stillPending ?? (() => true),
+    // Default: the deconflict already declined (terminal), so the page fires.
+    deconflictOutcome:
+      opts.deconflictOutcome ??
+      (() => ({ terminal: true, verdict: "declined" }) as ResolverOutcome),
+    notifyHuman: async (row, verdict) => {
+      notifies.push({ id: row.id, verdict });
+      return (await opts.notify?.(row, verdict)) ?? "notified";
+    },
+    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
+  };
+  return { deps, mints, notifies };
+}
+
+function workMergePending(): PendingWorkMergeConflict[] {
+  return [
+    {
+      id: "fn-1-foo.2",
+      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+      dir: "/wt/lane",
+    },
+  ];
+}
+
+test("runWorkMergeHumanNotifySweep: a declined deconflict pages the human ONCE with the verdict and mints notified", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ id: "fn-1-foo.2", verdict: "declined" }]);
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notified" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: a LIVE (non-terminal) deconflict session defers the page — no page, no mint", async () => {
+  // Sequencing: the human is paged ONLY at the deconflict's terminal decline. While it is
+  // live (or its job has not folded yet) the sweep skips without minting — a successful
+  // deconflict would clear the sticky before this ever fires.
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    deconflictOutcome: () => ({ terminal: false }),
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a died deconflict pages with the `died` verdict", async () => {
+  const { deps, notifies } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    deconflictOutcome: () => ({ terminal: true, verdict: "died" }),
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ id: "fn-1-foo.2", verdict: "died" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: an empty pending set (already-paged row dropped by selector) is a no-op", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({ pending: [] });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a failed page leaves the marker unminted-terminal (notify_failed re-sweeps)", async () => {
+  const { deps, mints } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    notify: async () => "notify_failed",
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  // notify_failed mints attempted{notify_failed} — the fold no-ops on it, so the marker
+  // stays NULL and the next sweep retries the page.
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notify_failed" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: a THROWING notifier never aborts the sweep (records notify_failed)", async () => {
+  const { deps, mints } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    notify: async () => {
+      throw new Error("botctl boom");
+    },
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notify_failed" }]);
+});
+
+test("runWorkMergeHumanNotifySweep: a row cleared mid-sweep (stillPending false) is skipped — no page, no mint", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: workMergePending(),
+    stillPending: () => false,
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a non-token reason in the pending set is NOT paged (defense-in-depth gate)", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo.2",
+        reason: "worktree-merge-lock-timeout: could not acquire the lock",
+        dir: "/wt/lane",
+      },
+    ],
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runWorkMergeHumanNotifySweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
+    pending: [],
+    selectThrows: true,
+  });
+  await runWorkMergeHumanNotifySweep(deps);
+  expect(mints).toEqual([]);
+  expect(notifies).toEqual([]);
+});
+
+// ---- workLaneBusyForResolver (the retry-in-flight resolver exclusion) ---------
+
+test("workLaneBusyForResolver: a live work OR resolve session for the task blocks; a stopped/dead one does not", () => {
+  const taskId = "fn-1-foo.2";
+  // A manual `retry_dispatch` re-dispatched the work lane → a live `work::<taskId>` → busy.
+  expect(
+    workLaneBusyForResolver(
+      [mkResolveJob({ plan_verb: "work", plan_ref: taskId, state: "working" })],
+      taskId,
+    ),
+  ).toBe(true);
+  // A resolver already in flight → live `resolve::<taskId>` → busy (double-dispatch guard).
+  expect(
+    workLaneBusyForResolver(
+      [mkResolveJob({ plan_ref: taskId, state: "working" })],
+      taskId,
+    ),
+  ).toBe(true);
+  // A stopped work/resolve session has yielded its turn → NOT busy.
+  expect(
+    workLaneBusyForResolver(
+      [
+        mkResolveJob({ plan_verb: "work", plan_ref: taskId, state: "stopped" }),
+        mkResolveJob({ plan_ref: taskId, state: "killed" }),
+      ],
+      taskId,
+    ),
+  ).toBe(false);
+  // A DIFFERENT task's live work session never blocks this one.
+  expect(
+    workLaneBusyForResolver(
+      [
+        mkResolveJob({
+          plan_verb: "work",
+          plan_ref: "fn-2-bar.1",
+          state: "working",
+        }),
+      ],
+      taskId,
+    ),
+  ).toBe(false);
+  // Empty jobs → not busy.
+  expect(workLaneBusyForResolver([], taskId)).toBe(false);
+});
+
+// ---- classifyWorkResolverOutcome (the leased resolver-outcome gate) -----------
+
+test("classifyWorkResolverOutcome: a declined/died/live resolver classifies exactly as the base (no lease)", () => {
+  const taskId = "fn-1-foo.2";
+  const now = 10_000;
+  // Stopped resolver, sticky survives → declined.
+  const declined = new Map<string, Job>([
+    ["j", mkResolveJob({ plan_ref: taskId, state: "stopped" })],
+  ]);
+  expect(
+    classifyWorkResolverOutcome(
+      declined,
+      taskId,
+      100,
+      now,
+      WORK_RESOLVER_LEASE_SEC,
+    ),
+  ).toEqual({ terminal: true, verdict: "declined" });
+  // Killed resolver → died.
+  const died = new Map<string, Job>([
+    ["j", mkResolveJob({ plan_ref: taskId, state: "killed" })],
+  ]);
+  expect(
+    classifyWorkResolverOutcome(
+      died,
+      taskId,
+      100,
+      now,
+      WORK_RESOLVER_LEASE_SEC,
+    ),
+  ).toEqual({ terminal: true, verdict: "died" });
+  // Working resolver → NOT terminal, and NEVER leased out even with an ancient latch.
+  const live = new Map<string, Job>([
+    ["j", mkResolveJob({ plan_ref: taskId, state: "working" })],
+  ]);
+  expect(
+    classifyWorkResolverOutcome(live, taskId, 1, now, WORK_RESOLVER_LEASE_SEC),
+  ).toEqual({ terminal: false });
+});
+
+test("classifyWorkResolverOutcome: a never-folded resolver waits within the lease, then reclaims as died (no deadlock)", () => {
+  const taskId = "fn-1-foo.2";
+  const empty = new Map<string, Job>(); // launch reported ok, jobs row never folded
+  const dispatchedAt = 1_000;
+  // Within the lease: still waiting for the row to fold (base non-terminal).
+  expect(
+    classifyWorkResolverOutcome(
+      empty,
+      taskId,
+      dispatchedAt,
+      dispatchedAt + WORK_RESOLVER_LEASE_SEC - 1,
+      WORK_RESOLVER_LEASE_SEC,
+    ),
+  ).toEqual({ terminal: false });
+  // Past the lease with no live resolver → reclaim as died so the deconflict dispatches.
+  expect(
+    classifyWorkResolverOutcome(
+      empty,
+      taskId,
+      dispatchedAt,
+      dispatchedAt + WORK_RESOLVER_LEASE_SEC + 1,
+      WORK_RESOLVER_LEASE_SEC,
+    ),
+  ).toEqual({ terminal: true, verdict: "died" });
+  // A NULL latch (no dispatch recorded) never reclaims — nothing to lease against.
+  expect(
+    classifyWorkResolverOutcome(
+      empty,
+      taskId,
+      null,
+      10_000_000,
+      WORK_RESOLVER_LEASE_SEC,
+    ),
+  ).toEqual({ terminal: false });
+});
+
+test("runMergeEscalationSweep + classifyWorkResolverOutcome: a leased-out crashed resolver dispatches the work deconflict (end-to-end)", async () => {
+  // The stage-2 sweep is the generic `runMergeEscalationSweep`; wired with the work-verb
+  // leased resolver-outcome classifier, a crashed/never-folded resolver past the lease reads
+  // terminal and the deconflict dispatches — the no-deadlock guarantee end-to-end.
+  const empty = new Map<string, Job>();
+  const { deps, mints, dispatches } = fakeMergeSweepDeps({
+    pending: [
+      {
+        id: "fn-1-foo.2",
+        reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
+        dir: "/wt/lane",
+      },
+    ],
+    resolverOutcome: (id) =>
+      classifyWorkResolverOutcome(
+        empty,
+        id,
+        1_000,
+        1_000 + WORK_RESOLVER_LEASE_SEC + 5,
+        WORK_RESOLVER_LEASE_SEC,
+      ),
+  });
+  await runMergeEscalationSweep(deps);
+  expect(dispatches.length).toBe(1);
+  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "dispatched" }]);
 });
 
 // ---------------------------------------------------------------------------
