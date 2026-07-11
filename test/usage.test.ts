@@ -26,13 +26,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   createUsageEmitEngine,
-  formatShadowAdvisory,
   renderRowLines,
   renderSessionLines,
   routeUsage,
   SCRAPE_HELP,
 } from "../cli/usage";
-import type { ShadowProfileFinding } from "../src/agent/shadow-profiles";
 import {
   createFramesEmitter,
   type FramesEmitter,
@@ -2061,74 +2059,6 @@ test("usage snapshot output: composed frame text, then the keeper-meta: line LAS
   expect(parsed.truncated).toBe(false);
 });
 
-// --- shadow-profile advisory banner (formatShadowAdvisory) -----------------
-
-function finding(over: Partial<ShadowProfileFinding>): ShadowProfileFinding {
-  return {
-    agent: "claude",
-    name: "default",
-    hasAuth: false,
-    isReservedShadow: false,
-    tracked: false,
-    ...over,
-  };
-}
-
-test("advisory fires for an auth-bearing reserved (default) shadow", () => {
-  const lines = formatShadowAdvisory([
-    finding({ name: "default", hasAuth: true, isReservedShadow: true }),
-  ]);
-  expect(lines).toHaveLength(1);
-  expect(lines[0]).toContain("keeper agent profiles check");
-  expect(lines[0]).toContain("claude default/");
-});
-
-test("advisory is silent without an auth-bearing reserved shadow", () => {
-  // No findings at all.
-  expect(formatShadowAdvisory([])).toEqual([]);
-  // Reserved shadow but signed out (no auth) — tracked-health territory, not
-  // this banner's job.
-  expect(
-    formatShadowAdvisory([
-      finding({ name: "default", hasAuth: false, isReservedShadow: true }),
-    ]),
-  ).toEqual([]);
-  // Auth-bearing stray that is NOT a reserved shadow — outside the predicate.
-  expect(
-    formatShadowAdvisory([
-      finding({ name: "leftover", hasAuth: true, isReservedShadow: false }),
-    ]),
-  ).toEqual([]);
-});
-
-test("advisory lists every qualifying shadow across agents on one line", () => {
-  const lines = formatShadowAdvisory([
-    finding({
-      agent: "claude",
-      name: "default",
-      hasAuth: true,
-      isReservedShadow: true,
-    }),
-    finding({
-      agent: "pi",
-      name: "auto",
-      hasAuth: true,
-      isReservedShadow: true,
-    }),
-    // Non-qualifying rows are filtered out.
-    finding({
-      agent: "claude",
-      name: "real",
-      hasAuth: true,
-      isReservedShadow: false,
-    }),
-  ]);
-  expect(lines).toHaveLength(1);
-  expect(lines[0]).toContain("claude default/");
-  expect(lines[0]).toContain("pi auto/");
-  expect(lines[0]).not.toContain("real");
-});
-
 // ---------------------------------------------------------------------------
 // `keeper usage scrape` subverb pre-pass. The leading-token router lands ahead
 // of the view's parseArgs: a `scrape` token delegates to the merged scrape CLI
@@ -2272,7 +2202,6 @@ function makeUsageFramesEngine(
   return createUsageEmitEngine({
     mode: "frames",
     accountAliases: {},
-    shadowAdvisory: [],
     framesEmitter: emitter,
     latestCursor: () => "42",
     catchingUp: gate.catchingUp,

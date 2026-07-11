@@ -27,7 +27,6 @@ export type Dispatch =
   | { kind: "run-preset"; presetName: string; rest: string[] }
   | { kind: "presets-resolve"; presetName: string }
   | { kind: "presets-list"; json: boolean }
-  | { kind: "profiles-check"; json: boolean }
   // The host-matrix provider doctor. `providers resolve <model> <effort>` emits
   // the cost-ordered serving candidates; `providers check` reports roster/preset/
   // reachability drift.
@@ -79,8 +78,8 @@ Usage:
                                     Launch the preset's harness (harnessless).
   keeper agent presets resolve <name>  Emit the resolved preset/panel JSON.
   keeper agent presets list [--json]   List configured presets + panels.
-  keeper agent profiles check [--json] Report shadow/stray dirs + a ~/.claude whose
-                                    tier metadata is missing (read-only).
+  keeper agent accounts check [--json] Report account-routing health + the route
+                                    the policy would choose (read-only).
   keeper agent providers resolve <model> <effort>
                                     Emit the cost-ordered serving candidates for a
                                     model from the host matrix (no_route exit 3 for
@@ -172,8 +171,10 @@ Wrapper flags:
   --x-very-verbose          Add per-phase timing and the composed
                                     agent command. Implies --x-verbose.
   --x-no-confirm            Skip the cwd-confirmation prompt.
-  --x-profile <name>        Select a profile ('default' = native
-                                    account; 'auto' picks via the ledger).
+  --x-profile <name>        Codex only: forwarded as its native --profile
+                                    <name> ('default'/'auto' = native config).
+                                    No effect on Claude (account routing chooses
+                                    automatically) or Pi (always native).
   --x-preset <name>         Apply a named launch-config preset from
                                     presets.yaml (harness/model/effort BELOW any
                                     explicit --model/--effort or effort env).
@@ -194,15 +195,11 @@ Preset resolution:
   keeper agent presets list [--json]   List the configured catalog presets
                                     (name + harness/model/effort) and panels.
 
-Profile diagnostics:
-  keeper agent profiles check [--json] List shadow/stray/auth-bearing
-                                    ~/.claude-profiles + ~/.pi-profiles dirs,
-                                    plus a ~/.claude that is authed but whose
-                                    tier metadata is missing (renders ?x in
-                                    usage) — read-only, NEVER moves or deletes.
-                                    Each finding carries a stable id +
-                                    remediation. Exit 0 clean / 9 findings /
-                                    1 tool error.
+Account routing diagnostics:
+  keeper agent accounts check [--json] Report integration health, snapshot age,
+                                    PII-free candidates, and the route the
+                                    policy would choose for the next Claude
+                                    launch — read-only, reserves nothing.
 
 tmux transport flags (any one implies tmux mode):
   --x-tmux                  Open the invocation in a new tmux window.
@@ -400,12 +397,6 @@ export function splitSubcommand(argv: string[]): Dispatch {
       return { kind: "presets-list", json: argv.slice(2).includes("--json") };
     }
     return { kind: "usage", unknown: `presets ${argv[1] ?? ""}`.trim() };
-  }
-  if (head === "profiles") {
-    if (argv[1] === "check") {
-      return { kind: "profiles-check", json: argv.slice(2).includes("--json") };
-    }
-    return { kind: "usage", unknown: `profiles ${argv[1] ?? ""}`.trim() };
   }
   if (head === "accounts") {
     if (argv[1] === "check") {

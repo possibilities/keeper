@@ -1,11 +1,9 @@
 /**
  * Db-free leaf: the Claude plan-tier → multiplier table, the `.claude.json` read
- * cap, and the single tier-resolvable predicate. Shared by the usage-scraper
+ * cap, and the single tier-resolvable predicate. Used by the usage-scraper
  * PRODUCER (`parseTierMultiplier` in `usage-scraper-worker.ts`, which drags in
- * `src/db.ts`) and the read-only profiles-check DETECTOR (`shadow-profiles.ts`, a
- * cold-path leaf that must NOT import the scraper). Both route their tier check
- * through {@link resolveTierMultiplier} so `keeper usage` and
- * `keeper agent profiles check` can never disagree on whether a tier resolves.
+ * `src/db.ts`), routing its tier check through {@link resolveTierMultiplier} so
+ * `keeper usage` never disagrees with itself on whether a tier resolves.
  *
  * No deps beyond the type system — importable on any cold path.
  */

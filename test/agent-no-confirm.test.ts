@@ -22,7 +22,7 @@ let savedEnv: NodeJS.ProcessEnv;
 
 beforeEach(() => {
   // Restore the env OBJECT reference (not just keys) so a stray mutation in
-  // main() (CLAUDE_CONFIG_DIR / KEEPER_AGENT_CLAUDE_PROFILE writes) never leaks.
+  // main() (KEEPER_ACCOUNT_ROUTE / CLAUDE_CODE_DISABLE_AUTO_MEMORY writes) never leaks.
   savedEnv = process.env;
 });
 afterEach(() => {

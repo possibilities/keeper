@@ -205,25 +205,20 @@ describe("route selection is independent per launch", () => {
 });
 
 // ---------------------------------------------------------------------------
-// override + non-claude fallthrough
+// every Claude launch routes; non-claude harnesses are exempt
 // ---------------------------------------------------------------------------
 
-describe("routing is confined to unpinned Claude launches", () => {
-  test("an explicit --x-profile is an operator override, not routed", async () => {
+describe("routing applies to every Claude launch; non-claude harnesses are exempt", () => {
+  test("an explicit --x-profile no longer bypasses the router — there is no profile farm to defer to", async () => {
     const h = makeHarness({
       argv: ["claude", "--x-profile", "multi-claude-1", "hello"],
       rawArgv: true,
-      profileDir: "/fake-home/.claude-profiles/multi-claude-1",
-      selectAccountRoute: () => {
-        throw new Error("router must not run for an explicit profile");
-      },
+      selectAccountRoute: native(),
     });
     const cmd = await runAndCapture(h, main);
-    expect(h.routerCalls()).toBe(0);
+    expect(h.routerCalls()).toBe(1);
     expect(cmd[0]).toBe("/fake-home/.local/bin/claude");
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(
-      "/fake-home/.claude-profiles/multi-claude-1",
-    );
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
   test("a codex launch is never routed", async () => {

@@ -12,7 +12,6 @@ import {
   installPiPlanAgents,
   renderPiPlanAgent,
 } from "../src/agent/pi-plan-agents";
-import { DEFAULT_PI_SHARED_PATHS } from "../src/agent/state-sharing";
 
 const SOURCE_DIR = join(import.meta.dir, "..", "plugins", "plan", "agents");
 
@@ -115,10 +114,6 @@ describe("Pi plan agent renderer", () => {
     expect(() =>
       installPiPlanAgents({ sourceDir: SOURCE_DIR, targetDir }),
     ).toThrow("unmanaged agent");
-  });
-
-  test("named Pi profiles share the canonical agents directory", () => {
-    expect(DEFAULT_PI_SHARED_PATHS).toContain("agents");
   });
 
   test("the installer refreshes the canonical Pi agent registry", () => {

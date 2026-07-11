@@ -1,26 +1,14 @@
 /**
  * Pi launcher pins: `keeper agent pi` maps wrapper features onto Pi-native CLI
- * contracts. Profile routing uses PI_CODING_AGENT_DIR, model/thinking defaults
+ * contracts. There is no Keeper-owned Pi profile farm — model/thinking defaults
  * become `--model`/`--thinking`, session naming uses Pi's `--session-id` and
  * `--name`, and package/metadata commands pass through cleanly.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
 import { parseArgsForAgent } from "../src/agent/args";
 import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
-import { ensureKeeperAgentPiProfileDir } from "../src/agent/state-sharing";
 import {
   flagValues,
   makeHarness,
@@ -83,8 +71,6 @@ describe("Pi command assembly", () => {
     ]);
     expect(cmd).not.toContain("--strict-mcp-config");
     expect(cmd).not.toContain("--teammate-mode");
-    expect(h.deps.env.KEEPER_AGENT_PI_PROFILE).toBe("default");
-    expect(h.deps.env.KEEPER_AGENT_CLAUDE_PROFILE).toBeUndefined();
   });
 
   test("configured model and thinking are injected for Pi", async () => {
@@ -108,17 +94,13 @@ describe("Pi command assembly", () => {
     expect(flagValues(cmd, "--thinking")).toEqual(["low"]);
   });
 
-  test("explicit wrapper profile maps to PI_CODING_AGENT_DIR", async () => {
-    const h = piHarness(["--x-profile", "work", "--print", "hello"], {
-      profileDir: "/fake-home/.pi-profiles/work",
-    });
+  test("an explicit --x-profile has no effect — no Pi profile farm remains", async () => {
+    const h = piHarness(["--x-profile", "work", "--print", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.piBin);
     expect(cmd).toContain("--print");
-    expect(h.bootstrappedProfiles).toEqual(["work"]);
-    expect(h.deps.env.PI_CODING_AGENT_DIR).toBe("/fake-home/.pi-profiles/work");
+    expect(h.deps.env.PI_CODING_AGENT_DIR).toBeUndefined();
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
-    expect(h.deps.env.KEEPER_AGENT_PI_PROFILE).toBe("work");
   });
 
   test("--fork gets a fresh display name but not a wrapper session id", async () => {
@@ -188,94 +170,19 @@ describe("Pi passthrough commands", () => {
     ]);
   });
 
-  test("explicit profile still sets PI_CODING_AGENT_DIR for passthrough", async () => {
-    const h = piHarness(["--x-profile", "work", "list"], {
-      profileDir: "/fake-home/.pi-profiles/work",
-    });
+  test("an explicit --x-profile still has no effect for passthrough", async () => {
+    const h = piHarness(["--x-profile", "work", "list"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.piBin, "list"]);
-    expect(h.bootstrappedProfiles).toEqual(["work"]);
-    expect(h.deps.env.PI_CODING_AGENT_DIR).toBe("/fake-home/.pi-profiles/work");
+    expect(h.deps.env.PI_CODING_AGENT_DIR).toBeUndefined();
   });
 
-  test("the canonical AGENTS.md leaf-guard fn runs on a passthrough launch, fed no profiles", async () => {
+  test("the canonical AGENTS.md leaf-guard fn runs on a passthrough launch", async () => {
     // Pi passthrough launches (package commands like `list`) must still reach
-    // the leaf guard — fed the `() => []` arm, never the real profile list
-    // (non-empty here), so a re-gate behind !shouldPassthrough fails this.
-    const h = piHarness(["list"], {
-      listProfiles: () => ["default", "work"],
-    });
+    // the leaf guard exactly once, matching every other pi launch — there is no
+    // profile farm loop left to gate it behind.
+    const h = piHarness(["list"]);
     await runAndCapture(h, main);
     expect(h.piStateSharingCalls).toHaveLength(1);
-    expect(h.piStateSharingCalls[0]).toEqual([]);
-  });
-});
-
-let tmpDir: string;
-let home: string;
-
-beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "keeper-agent-pi-profile-"));
-  home = join(tmpDir, "home");
-  mkdirSync(home, { recursive: true });
-});
-
-afterEach(() => {
-  rmSync(tmpDir, { recursive: true, force: true });
-});
-
-describe("ensureKeeperAgentPiProfileDir", () => {
-  test("links shared Pi state while leaving auth profile-local", () => {
-    const canonicalDir = join(home, ".pi", "agent");
-    mkdirSync(join(canonicalDir, "sessions"), { recursive: true });
-    writeFileSync(join(canonicalDir, "settings.json"), '{"theme":"dark"}\n');
-    writeFileSync(join(canonicalDir, "auth.json"), '{"native":true}\n');
-
-    const profileDir = join(home, ".pi-profiles", "work");
-    mkdirSync(profileDir, { recursive: true });
-    writeFileSync(join(profileDir, "auth.json"), '{"profile":true}\n');
-
-    const log: string[] = [];
-    const [dir, changed] = ensureKeeperAgentPiProfileDir("work", log, home);
-
-    expect(changed).toBe(true);
-    expect(dir).toBe(profileDir);
-    expect(lstatSync(join(profileDir, "settings.json")).isSymbolicLink()).toBe(
-      true,
-    );
-    expect(realpathSync(join(profileDir, "settings.json"))).toBe(
-      realpathSync(join(canonicalDir, "settings.json")),
-    );
-    expect(lstatSync(join(profileDir, "sessions")).isSymbolicLink()).toBe(true);
-    expect(readFileSync(join(profileDir, "auth.json"), "utf8")).toBe(
-      '{"profile":true}\n',
-    );
-    expect(log.some((line) => line.includes("Linked shared Pi path"))).toBe(
-      true,
-    );
-  });
-
-  test("materializes the canonical AGENTS.md BEFORE the profile loop (named-profile link present)", () => {
-    // The one shared source lives in a temp system/shared dir.
-    const sharedDir = join(tmpDir, "repo", "system", "shared");
-    mkdirSync(sharedDir, { recursive: true });
-    const sharedSrc = join(sharedDir, "AGENTS.md");
-    writeFileSync(sharedSrc, "# shared canonical\n");
-
-    const log: string[] = [];
-    ensureKeeperAgentPiProfileDir("work", log, home, sharedDir);
-
-    // Canonical ~/.pi/agent/AGENTS.md is a symlink onto the ONE shared source.
-    const canonicalAgents = join(home, ".pi", "agent", "AGENTS.md");
-    expect(lstatSync(canonicalAgents).isSymbolicLink()).toBe(true);
-    expect(realpathSync(canonicalAgents)).toBe(realpathSync(sharedSrc));
-
-    // The named-profile AGENTS.md link is present — it is ONLY reached when the
-    // canonical AGENTS.md already exists, so its presence proves the canonical
-    // leaf was materialized before the per-profile link loop ran (the ordering
-    // trap: a late materialization skips AGENTS.md for every profile).
-    const profileAgents = join(home, ".pi-profiles", "work", "AGENTS.md");
-    expect(lstatSync(profileAgents).isSymbolicLink()).toBe(true);
-    expect(realpathSync(profileAgents)).toBe(realpathSync(sharedSrc));
   });
 });

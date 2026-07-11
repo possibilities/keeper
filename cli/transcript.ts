@@ -288,7 +288,6 @@ function parseRoots(
     : undefined;
   return discoverClaudeProjectsRoots({
     homeDir: deps.homeDir,
-    env: deps.env,
     configDirs,
   });
 }

@@ -82,7 +82,6 @@ describe("Hermes command assembly", () => {
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.hermesBin, "--yolo", "-m", DEFAULT_MODEL]);
     expect(h.deps.env.HERMES_ACCEPT_HOOKS).toBe("1");
-    expect(h.deps.env.KEEPER_AGENT_HERMES_PROFILE).toBe("default");
     // No claude/pi state leaks in.
     expect(h.deps.env.PI_CODING_AGENT_DIR).toBeUndefined();
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();

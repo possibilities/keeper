@@ -15,8 +15,6 @@ describe("tmux env strip", () => {
     const h = makeHarness({
       argv: ["--print"],
       env: { TMUX: "/tmp/tmux-1000/default,123,0", TMUX_PANE: "%7" },
-      listProfiles: () => ["default"],
-      pickProfile: () => "default",
     });
     await runAndCapture(h, main);
     expect(h.deps.env.KEEPER_TMUX_PANE).toBe("%7");
@@ -28,8 +26,6 @@ describe("tmux env strip", () => {
     const h = makeHarness({
       argv: ["--print"],
       env: {},
-      listProfiles: () => ["default"],
-      pickProfile: () => "default",
     });
     await runAndCapture(h, main);
     expect(h.deps.env.KEEPER_TMUX_PANE).toBeUndefined();
@@ -39,8 +35,6 @@ describe("tmux env strip", () => {
     const h = makeHarness({
       argv: ["--print"],
       env: { TMUX: "/tmp/tmux-1000/jobsearch,123,0", TMUX_PANE: "%7" },
-      listProfiles: () => ["default"],
-      pickProfile: () => "default",
     });
     await runAndCapture(h, main);
     expect(h.deps.env.KEEPER_TMUX_PANE).toBeUndefined();
@@ -52,8 +46,6 @@ describe("tmux env strip", () => {
     const h = makeHarness({
       argv: ["--print"],
       env: { TMUX: "/tmp/tmux-1000/default,123,0", TMUX_PANE: "" },
-      listProfiles: () => ["default"],
-      pickProfile: () => "default",
     });
     await runAndCapture(h, main);
     expect(h.deps.env.KEEPER_TMUX_PANE).toBeUndefined();
@@ -65,8 +57,6 @@ describe("tmux env strip", () => {
     const h = makeHarness({
       argv: ["--print"],
       env: { TMUX: "/tmp/tmux-1000/default,123,0" },
-      listProfiles: () => ["default"],
-      pickProfile: () => "default",
     });
     await runAndCapture(h, main);
     expect(h.deps.env.KEEPER_TMUX_PANE).toBeUndefined();
