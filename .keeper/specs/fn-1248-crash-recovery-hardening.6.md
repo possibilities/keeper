@@ -53,5 +53,5 @@ Extend `test/backup.test.ts` for any cadence/checkpoint change; assert a backup 
 - [ ] The live `PRAGMA auto_vacuum` mode is recorded, documenting whether online reclamation is even possible.
 
 ## Done summary
-
+Widened BACKUP_INTERVAL_MS from 24h to 48h to halve daily backup VACUUM INTO/integrity_check I/O churn, restore safety unchanged. Confirmed no compensating wal_checkpoint(TRUNCATE) is needed: VACUUM INTO destinations are always journal_mode=DELETE (verified empirically), and the source's WAL is already checkpointed (PASSIVE, by design) by the steady-state retention pass. Recorded evidence: live production keeper.db PRAGMA auto_vacuum reads 2 (INCREMENTAL), so retention's incremental_vacuum is actively reclaiming pages, not a no-op.
 ## Evidence
