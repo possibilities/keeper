@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant \u2014 structurally distinguishing re-stamped copied history from a genuine new turn while keeping claude/codex/hermes capture byte-identical and not reintroducing the stale answer via findLastMessage \u2014 is a nameable opus gate at the xhigh hard-reasoning band.",
+      "task_id": "fn-1250-pi-resume-capture-stale-answer.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T17:04:15.333000Z",
+  "epic_id": "fn-1250-pi-resume-capture-stale-answer",
+  "input_hash": "021549009c5d03aad23b65aa7ba76dd05c2a72d219a738102ce5ea8a41839f27",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 34949376,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1250-pi-resume-capture-stale-answer.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant \u2014 structurally distinguishing re-stamped copied history from a genuine new turn while keeping claude/codex/hermes capture byte-identical and not reintroducing the stale answer via findLastMessage \u2014 is a nameable opus gate at the xhigh hard-reasoning band.\",\"confidence\":0.78}]}\n"
+}
