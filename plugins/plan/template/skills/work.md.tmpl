@@ -102,6 +102,8 @@ Task(
 
 `subagent_type` is the constant string `work:worker` — the launcher loaded exactly one `work` plugin (the tier-matched cell) at launch, so `work:worker` resolves to it directly. Do **not** pass `model=` on the spawn — the cell's agent file owns the model and effort. The worker returns a capped summary (5 template lines plus at most 3 note lines: what was implemented, files changed, tests run). Don't re-read files the worker already touched — trust the return value.
 
+**Every `work:worker` spawn is backgrounded — initial spawn, warm resume, and cold respawn alike.** Waiting for it means ending the turn, never spinning in place. The worker's completion task-notification is the only wake path back into this orchestrator; never call the harness ScheduleWakeup tool, a Monitor, or a shell sleep to wait on a worker — ScheduleWakeup is loop-only and requires a `prompt`, so calling it here fails outright.
+
 **Capture `worker_agent_id` from the Task tool result.** The result string ends with `…agentId: <hex> (use SendMessage with to: '<id>' to continue this agent)`. Extract with the regex `agentId:\s*([a-f0-9]{10,})` (the agent_id has no newline before it — `re.search`, not `re.match`). Pin the captured hex string in working memory as `worker_agent_id` for Phase 2b's warm-resume path. If the regex doesn't match (very rare), set `worker_agent_id = None` and continue — Phase 2b's cold path handles missing-id case.
 
 ### 2b. Reconcile and switch
@@ -144,7 +146,7 @@ keeper plan reconcile <task_id>
 
    SendMessage error envelope `{"success": false, "message": "No agent named '<id>' is currently addressable..."}` means the agent_id is dead/invalid — fall through to the cold path.
 
-3. Wait for the worker to finish, then re-run `keeper plan reconcile <task_id>` and re-switch. On `done` → continue to Phase 3. On `blocked` → BLOCKED short-circuit. If the verdict is still a non-`done` `in_progress_*` / `state_uncommitted` arm, increment the invocation-local attempt counter and loop: re-send a fresh resume directive (warm) as long as `worker_agent_id` is still addressable, falling through to the cold path on a SendMessage error. Only after the **5th** attempt in this invocation drops do you `keeper plan block <task_id> --reason "RESUME_EXHAUSTED: harness dropped through 5 attempts (1 spawn + 4 retries) on Phase 2b resume"` and stop.
+3. End the turn; the worker's next task-notification re-invokes you — then re-run `keeper plan reconcile <task_id>` and re-switch. On `done` → continue to Phase 3. On `blocked` → BLOCKED short-circuit. If the verdict is still a non-`done` `in_progress_*` / `state_uncommitted` arm, increment the invocation-local attempt counter and loop: re-send a fresh resume directive (warm) as long as `worker_agent_id` is still addressable, falling through to the cold path on a SendMessage error. Only after the **5th** attempt in this invocation drops do you `keeper plan block <task_id> --reason "RESUME_EXHAUSTED: harness dropped through 5 attempts (1 spawn + 4 retries) on Phase 2b resume"` and stop.
 
 **Cold path (cross-session, or warm SendMessage error):**
 
