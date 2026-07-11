@@ -5,11 +5,11 @@
   "depends_on": [],
   "epic": "fn-1242-multi-harness-keeper-transcript",
   "id": "fn-1242-multi-harness-keeper-transcript.1",
-  "model": "sonnet",
+  "model": "gpt-5.6-sol",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reader seam and harness-first grammar",
-  "updated_at": "2026-07-10T21:29:47.061000Z"
+  "updated_at": "2026-07-11T17:23:56.724000Z"
 }
