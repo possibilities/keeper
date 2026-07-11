@@ -284,17 +284,16 @@ export interface Preset {
 }
 
 /**
- * The launch-config catalog parsed from `presets.yaml` (ADR 0033) — ONLY launch
- * triples: the four `<harness>_default` keys naming the triple a bare `keeper agent
- * <harness>` launch resolves, plus the `worker`/`escalation` machine-launch
- * triples. Each is an optional `<harness>::<model>::<effort>` value, parsed to a
- * {@link Triple}; a `<harness>_default` whose harness disagrees with its key
- * prefix fails loud, while `worker`/`escalation` accept any harness (the
- * autopilot/escalation resolvers warn-and-ignore a non-claude one). Read ONLY by
- * this dep-free config island — the launcher import graph never reaches
- * `src/db.ts`. `presets` is retained (always empty) for the panel-member
- * resolution path (task .5) that still resolves a {@link Preset}; the freeform
- * `presets:` block is retired and fails loud at load.
+ * The launch-config catalog parsed from `presets.yaml` (ADR 0033, ADR 0040) —
+ * ONLY launch triples: the four `<harness>_default` keys naming the triple a bare
+ * `keeper agent <harness>` launch resolves, plus the nested `dispatch:` per-verb
+ * launch table. Each `<harness>_default` is an optional `<harness>::<model>::<effort>`
+ * value parsed to a {@link Triple}, fail-loud when its harness disagrees with its
+ * key prefix. Read ONLY by this dep-free config island — the launcher import graph
+ * never reaches `src/db.ts`. `presets` is retained (always empty) for the
+ * panel-member resolution path (task .5) that still resolves a {@link Preset}; the
+ * freeform `presets:` block and the retired `worker`/`escalation` machine-launch
+ * keys both fail loud at load with a migration hint.
  */
 export interface PresetCatalog {
   /** Retired freeform named-preset map — always empty from {@link
@@ -308,16 +307,9 @@ export interface PresetCatalog {
   pi_default?: Triple | null;
   /** Triple a bare `keeper agent hermes` resolves; null/absent when unset. */
   hermes_default?: Triple | null;
-  /** Machine worker-launch triple (`work`/`close` dispatch); any harness, the
-   *  autopilot resolver warns-and-ignores a non-claude one. Null/absent = unset. */
-  worker?: Triple | null;
-  /** Machine escalation-launch triple; independent of `worker`, same non-claude
-   *  warn-and-ignore posture. Null/absent = unset. */
-  escalation?: Triple | null;
-  /** The `dispatch:` per-verb launch table (ADR 0040); every {@link DispatchVerb}
-   *  key present, null when unset. ADDITIVE alongside `worker`/`escalation` —
-   *  this task keeps both parsing unchanged pending the task-2 cutover.
-   *  Optional in the type (mirroring `worker`/`escalation`) though {@link
+  /** The `dispatch:` per-verb launch table (ADR 0040) — the SOLE machine-launch
+   *  surface, replacing the retired `worker`/`escalation` keys. Every {@link
+   *  DispatchVerb} key present, null when unset. Optional in the type though {@link
    *  loadPresetCatalog} always populates it. */
   dispatch?: DispatchTable;
 }
@@ -380,18 +372,15 @@ function validatePresetName(name: string, configPath: string): void {
   }
 }
 
-/** The four `<harness>_default` catalog keys, the two retired-shape machine-launch
- *  keys (`worker`/`escalation`, still parsed unchanged pending the task-2
- *  cutover), and the `dispatch` block — the ONLY top-level keys `presets.yaml`
- *  admits (ADR 0033, ADR 0040). Anything else is a strict-reject; a legacy
- *  `presets:` block is caught with a migration hint. */
+/** The four `<harness>_default` catalog keys plus the `dispatch` block — the ONLY
+ *  top-level keys `presets.yaml` admits (ADR 0033, ADR 0040). Anything else is a
+ *  strict-reject; a legacy `presets:` block or a retired `worker`/`escalation`
+ *  key is caught first with a migration hint. */
 const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "claude_default",
   "codex_default",
   "pi_default",
   "hermes_default",
-  "worker",
-  "escalation",
   "dispatch",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
@@ -480,16 +469,14 @@ function parseDispatchBlock(
 /**
  * Read the launch-config catalog from `presets.yaml` (ADR 0033, ADR 0040). REQUIRED
  * + validated: a missing file is fail-LOUD (ConfigError). The file holds ONLY launch
- * triples — the four `<harness>_default` keys, the `worker`/`escalation`
- * machine-launch keys, and the nested `dispatch:` per-verb table (each an optional
- * `<harness>::<model>::<effort>` string). `dispatch` is ADDITIVE alongside
- * `worker`/`escalation` today — both still parse unchanged; a future cutover
- * retires the pair with a migration hint. A leftover freeform `presets:` block
- * fails loud with a migration hint; any other unknown key (including an unknown
- * `dispatch` verb) is a strict-reject; a malformed triple or a `<harness>_default`
- * whose harness disagrees with its key prefix is fail-loud. An empty/whitespace
- * file is a valid empty catalog (every key null). `presets` is always empty —
- * retained for the panel-member path (task .5).
+ * triples — the four `<harness>_default` keys and the nested `dispatch:` per-verb
+ * table (each an optional `<harness>::<model>::<effort>` string). A leftover freeform
+ * `presets:` block OR a retired `worker`/`escalation` machine-launch key fails loud
+ * with a migration hint naming the `dispatch:` block; any other unknown key
+ * (including an unknown `dispatch` verb) is a strict-reject; a malformed triple or a
+ * `<harness>_default` whose harness disagrees with its key prefix is fail-loud. An
+ * empty/whitespace file is a valid empty catalog (every key null). `presets` is
+ * always empty — retained for the panel-member path (task .5).
  */
 export function loadPresetCatalog(
   configPath: string = presetsCatalogPath(),
@@ -502,9 +489,20 @@ export function loadPresetCatalog(
     throw new ConfigError(
       `The freeform 'presets:' catalog is retired (ADR 0033) in ${configPath}. ` +
         `presets.yaml now holds only launch triples: the four <harness>_default ` +
-        `keys plus worker and escalation, each a '<harness>::<model>::<effort>' ` +
-        `string. See 'keeper agent presets list'.`,
+        `keys plus the per-verb 'dispatch:' table, each a ` +
+        `'<harness>::<model>::<effort>' string. See 'keeper agent presets list'.`,
     );
+  }
+  for (const legacyKey of ["worker", "escalation"] as const) {
+    if (legacyKey in raw) {
+      throw new ConfigError(
+        `The '${legacyKey}:' launch key is retired (ADR 0040) in ${configPath}. ` +
+          `Per-verb launch triples now live in the 'dispatch:' block: move the old ` +
+          `'worker' value to dispatch.work / dispatch.close / dispatch.resolve, and ` +
+          `the old 'escalation' value to dispatch.unblock / dispatch.deconflict / ` +
+          `dispatch.repair. See 'keeper agent presets list'.`,
+      );
+    }
   }
   rejectUnknownKeys(raw, ALLOWED_CATALOG_KEYS, configPath);
 
@@ -514,8 +512,6 @@ export function loadPresetCatalog(
     codex_default: parseDefaultTriple(raw, "codex", configPath),
     pi_default: parseDefaultTriple(raw, "pi", configPath),
     hermes_default: parseDefaultTriple(raw, "hermes", configPath),
-    worker: parseMachineTriple(raw, "worker", configPath),
-    escalation: parseMachineTriple(raw, "escalation", configPath),
     dispatch: parseDispatchBlock(raw, configPath),
   };
 }

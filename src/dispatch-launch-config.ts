@@ -1,19 +1,16 @@
 /**
- * Dispatch-table launch-config resolver (ADR 0040) — resolves each dispatched
- * verb's `{harness?, model?, effort?}` from the `dispatch:` table in
- * `presets.yaml`, floored to the compiled-in `WORKER_*`/`ESCALATION_*`
- * constants when a row is absent, unset, or the catalog fails to parse.
- * Mirrors `resolveWorkerLaunchConfig` (`src/autopilot-worker.ts`) and
- * `resolveEscalationLaunchConfig` (`src/escalation-config.ts`) — its own leaf
- * so the daemon's dispatch surface AND the manual `keeper dispatch` CLI both
- * import it without dragging the autopilot worker module (`./db` +
- * `./server-worker`) onto their graphs. Its only value edges are the dep-free
- * config island (`./agent/config`) and the `WORKER_*`/`ESCALATION_*` floor
- * constants (`./reconcile-core`); it never reaches the DB or an exec driver.
- *
- * This task (ADR 0040 task 1) is ADDITIVE: the catalog still parses the
- * retired `worker`/`escalation` keys unchanged, and this module is not yet
- * wired into any consumer — task 2 performs the cutover.
+ * Dispatch-table launch-config resolver (ADR 0040) — the SOLE launch-config
+ * resolver for every dispatched verb, replacing the retired
+ * `resolveWorkerLaunchConfig`/`resolveEscalationLaunchConfig` twins. Resolves each
+ * dispatched verb's `{harness?, model?, effort?}` from the `dispatch:` table in
+ * `presets.yaml`, floored to the compiled-in `WORKER_*`/`ESCALATION_*` constants
+ * when a row is absent, unset, or the catalog fails to parse. Its own leaf so the
+ * daemon's dispatch surface (reconcile snapshot producer, resolver/escalation
+ * dispatches, handoff) AND the manual `keeper dispatch` CLI both import it without
+ * dragging the autopilot worker module (`./db` + `./server-worker`) onto their
+ * graphs. Its only value edges are the dep-free config island (`./agent/config`)
+ * and the `WORKER_*`/`ESCALATION_*` floor constants (`./reconcile-core`); it never
+ * reaches the DB or an exec driver.
  */
 
 import {

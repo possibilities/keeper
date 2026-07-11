@@ -43,10 +43,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { parseTriple } from "../src/agent/triple";
-import {
-  KEEPER_ROOT,
-  resolveWorkerLaunchConfig,
-} from "../src/autopilot-worker";
+import { KEEPER_ROOT } from "../src/autopilot-worker";
 import { GIT_LOCAL_TIMEOUT_MS, gitExec } from "../src/commit-work/git-exec";
 import {
   resolveConfig,
@@ -57,12 +54,11 @@ import {
   buildDispatchLaunchArgv,
   type DispatchableVerb,
   defaultPlanPrompt,
-  isEscalationVerb,
   parseDispatchableKey,
   validatePromptBytes,
 } from "../src/dispatch-command";
 import { assertNever } from "../src/dispatch-failure-key";
-import { resolveEscalationLaunchConfig } from "../src/escalation-config";
+import { resolveDispatchLaunchConfig } from "../src/dispatch-launch-config";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
@@ -619,19 +615,16 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
 
   // ---- resolve model/effort (claude-only) ----
   // Precedence per field: explicit --model/--effort > --preset triple >
-  // worker/escalation triple (plan form only) > none. Dispatch widens to claude
+  // dispatch[verb] triple (plan form only) > floor. Dispatch widens to claude
   // alone for now — LaunchSpec carries only claude model/effort (codex/pi dispatch
-  // is a follow-up). A `work`/`close` plan default is the SAME `worker` triple the
-  // autopilot resolves (byte-identical to an automated launch); an
-  // `unblock`/`deconflict` escalation default resolves the SEPARATE escalation
-  // config (sonnet/high + `escalation` triple), matching what the daemon's
-  // escalation dispatch bakes in.
+  // is a follow-up). The plan default resolves the verb's `dispatch:` row (ADR
+  // 0040), floored to the same WORKER_*/ESCALATION_* constants the daemon path
+  // uses — so a manual `keeper dispatch <verb>::<id>` launches byte-identically to
+  // the autopilot's launch for that verb.
   let baseModel: string | undefined;
   let baseEffort: string | undefined;
   if (hasPlanKey) {
-    const base = isEscalationVerb(planVerb as DispatchableVerb)
-      ? resolveEscalationLaunchConfig()
-      : resolveWorkerLaunchConfig();
+    const base = resolveDispatchLaunchConfig(planVerb as DispatchableVerb);
     baseModel = base.model;
     baseEffort = base.effort;
   }

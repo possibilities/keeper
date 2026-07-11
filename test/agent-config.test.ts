@@ -1,8 +1,8 @@
 /**
- * Config adapter pins: the launch-config catalog (`<harness>_default` +
- * `worker`/`escalation` launch triples, ADR 0033), panel selections, and plugin
- * sources (missing file fail-loud, ~-expansion). Fixture configs only — the live
- * ~/.config is arthack-owned stow state we must not touch.
+ * Config adapter pins: the launch-config catalog (`<harness>_default` triples +
+ * the per-verb `dispatch:` table, ADR 0033 / ADR 0040), panel selections, and
+ * plugin sources (missing file fail-loud, ~-expansion). Fixture configs only — the
+ * live ~/.config is arthack-owned stow state we must not touch.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -76,8 +76,6 @@ describe("loadPresetCatalog", () => {
     codex_default: null,
     pi_default: null,
     hermes_default: null,
-    worker: null,
-    escalation: null,
     dispatch: EMPTY_DISPATCH,
   };
 
@@ -98,6 +96,23 @@ describe("loadPresetCatalog", () => {
     );
     expect(() => loadPresetCatalog(p)).toThrow(/retired \(ADR 0033\)/);
     expect(() => loadPresetCatalog(p)).toThrow(/<harness>::<model>::<effort>/);
+  });
+
+  test("a leftover `worker:` key is fail-loud with a migration hint naming dispatch", () => {
+    const p = writeYaml("presets.yaml", "worker: claude::sonnet::max\n");
+    expect(() => loadPresetCatalog(p)).toThrow(
+      /'worker:' launch key is retired/,
+    );
+    expect(() => loadPresetCatalog(p)).toThrow(/ADR 0040/);
+    expect(() => loadPresetCatalog(p)).toThrow(/dispatch\.work/);
+  });
+
+  test("a leftover `escalation:` key is fail-loud with a migration hint naming dispatch", () => {
+    const p = writeYaml("presets.yaml", "escalation: claude::sonnet::high\n");
+    expect(() => loadPresetCatalog(p)).toThrow(
+      /'escalation:' launch key is retired/,
+    );
+    expect(() => loadPresetCatalog(p)).toThrow(/dispatch\.unblock/);
   });
 
   test("an unknown top-level key is fail-loud (strict reject)", () => {
@@ -147,7 +162,10 @@ describe("loadPresetCatalog", () => {
   });
 
   test("no `<harness>_default` keys → all triples null", () => {
-    const p = writeYaml("presets.yaml", "worker: claude::sonnet::max\n");
+    const p = writeYaml(
+      "presets.yaml",
+      "dispatch:\n  work: claude::sonnet::max\n",
+    );
     const cat = loadPresetCatalog(p);
     expect(cat.claude_default).toBeNull();
     expect(cat.codex_default).toBeNull();
@@ -173,38 +191,6 @@ describe("loadPresetCatalog", () => {
     expect(() => loadPresetCatalog(p)).toThrow(/codex_default must be/);
   });
 
-  test("worker + escalation triples parse (any harness, harness unchecked)", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "worker: claude::sonnet::max\nescalation: claude::haiku::high\n",
-    );
-    const cat = loadPresetCatalog(p);
-    expect(cat.worker).toEqual({
-      harness: "claude",
-      model: "sonnet",
-      effort: "max",
-    });
-    expect(cat.escalation).toEqual({
-      harness: "claude",
-      model: "haiku",
-      effort: "high",
-    });
-  });
-
-  test("a non-claude worker triple parses (the resolver warns-and-ignores)", () => {
-    const p = writeYaml("presets.yaml", "worker: codex::gpt::high\n");
-    expect(loadPresetCatalog(p).worker).toEqual({
-      harness: "codex",
-      model: "gpt",
-      effort: "high",
-    });
-  });
-
-  test("a malformed worker triple is fail-loud (the resolver swallows the throw)", () => {
-    const p = writeYaml("presets.yaml", "worker: not-a-triple\n");
-    expect(() => loadPresetCatalog(p)).toThrow(/worker/);
-  });
-
   test("a missing-file error names the absent path", () => {
     let msg = "";
     try {
@@ -216,9 +202,12 @@ describe("loadPresetCatalog", () => {
     expect(msg).toContain("missing");
   });
 
-  describe("dispatch: block (ADR 0040, additive)", () => {
+  describe("dispatch: block (ADR 0040)", () => {
     test("no `dispatch` key → every verb null", () => {
-      const p = writeYaml("presets.yaml", "worker: claude::sonnet::max\n");
+      const p = writeYaml(
+        "presets.yaml",
+        "claude_default: claude::sonnet::max\n",
+      );
       expect(loadPresetCatalog(p).dispatch).toEqual(EMPTY_DISPATCH);
     });
 
@@ -258,35 +247,6 @@ describe("loadPresetCatalog", () => {
       expect(cat.dispatch).toEqual({
         ...EMPTY_DISPATCH,
         work: { harness: "claude", model: "opus", effort: "high" },
-      });
-    });
-
-    test("worker/escalation keep parsing unchanged alongside dispatch", () => {
-      const p = writeYaml(
-        "presets.yaml",
-        [
-          "worker: claude::sonnet::max",
-          "escalation: claude::sonnet::high",
-          "dispatch:",
-          "  handoff: codex::gpt::high",
-          "",
-        ].join("\n"),
-      );
-      const cat = loadPresetCatalog(p);
-      expect(cat.worker).toEqual({
-        harness: "claude",
-        model: "sonnet",
-        effort: "max",
-      });
-      expect(cat.escalation).toEqual({
-        harness: "claude",
-        model: "sonnet",
-        effort: "high",
-      });
-      expect(cat.dispatch?.handoff).toEqual({
-        harness: "codex",
-        model: "gpt",
-        effort: "high",
       });
     });
 

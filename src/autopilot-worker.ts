@@ -44,9 +44,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import { ConfigError, loadPresetCatalog } from "./agent/config";
 import { loadMatrixV2, MatrixConfigError } from "./agent/matrix";
-import type { Triple } from "./agent/triple";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
 import {
@@ -119,6 +117,7 @@ import {
   WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_LANE_PREMERGE_REASON_PREFIX,
 } from "./dispatch-failure-key";
+import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import {
   createTmuxPaneOps,
   keeperAgentLaunch,
@@ -399,74 +398,6 @@ export const ARTHACK_ROOT: string = ((): string => {
   }
   return v;
 })();
-
-/**
- * Resolve the autopilot worker's `{model, effort}` from the `worker` launch triple
- * in `presets.yaml`, COALESCING onto the {@link WORKER_MODEL}/{@link WORKER_EFFORT}
- * constants so behavior is byte-identical when no registry/triple exists. Read
- * PRODUCER-SIDE (per dispatch, not a fold input) — the resolved model never enters
- * `events` as a fold key, so re-fold stays byte-identical.
- *
- * Fail-SAFE — the SOLE fail-open carve-out to the required-catalog posture: a
- * missing OR malformed catalog (including a malformed `worker` triple) throws a
- * `ConfigError` that is SWALLOWED-to-constants here, so the daemon never crashes on
- * bad config. Re-resolved per cycle (cheap single-file parse) so a triple edit
- * lands without a daemon bounce; never file-watched.
- *
- * A non-claude triple harness is IGNORED (autopilot dispatch is claude-only until
- * harness dispatch lands) but WARNED once per distinct offending value via `warned`
- * — the reconcile cycle re-calls this per tick, so the memo keeps the drop from
- * becoming per-cycle log spam. Never throws on the drop.
- */
-/**
- * Distinct non-claude `worker`-triple harness values already warned about, so
- * {@link resolveWorkerLaunchConfig} logs the drop ONCE per offending value
- * rather than every reconcile cycle. Producer-side process memo (never a fold
- * input); tests inject a fresh set to observe the once-per-value contract.
- */
-const droppedWorkerHarnessWarned = new Set<string>();
-
-export function resolveWorkerLaunchConfig(
-  configPath?: string,
-  warned: Set<string> = droppedWorkerHarnessWarned,
-): {
-  model: string;
-  effort: string;
-} {
-  let triple: Triple | null | undefined;
-  try {
-    const catalog = loadPresetCatalog(
-      ...(configPath === undefined ? [] : ([configPath] as const)),
-    );
-    triple = catalog.worker;
-  } catch (err) {
-    if (err instanceof ConfigError) {
-      console.error(
-        "[autopilot-worker] preset catalog missing or invalid — using worker defaults:",
-        err.message,
-      );
-    } else {
-      throw err;
-    }
-  }
-  if (
-    triple !== undefined &&
-    triple !== null &&
-    triple.harness !== "claude" &&
-    !warned.has(triple.harness)
-  ) {
-    warned.add(triple.harness);
-    console.error(
-      `[autopilot-worker] worker triple pins harness '${triple.harness}', but ` +
-        `autopilot dispatch ignores non-claude harness values until harness ` +
-        `dispatch lands — launching on claude.`,
-    );
-  }
-  return {
-    model: triple?.model ?? WORKER_MODEL,
-    effort: triple?.effort ?? WORKER_EFFORT,
-  };
-}
 
 /**
  * POSITIVE-EVIDENCE auto-clear set: given the OPEN recover-originated dispatch ids
@@ -7250,10 +7181,18 @@ export async function loadReconcileSnapshot(
   // connection — bounded to the `seed_required`-set window, EMPTY while the flag is
   // clear.
 
-  // Resolve the `worker` preset per cycle (cheap single-file parse, fail-safe to
-  // the WORKER_* constants) — producer-side launch config, never a fold input.
-  const { model: workerModel, effort: workerEffort } =
-    resolveWorkerLaunchConfig();
+  // Resolve the `work` and `close` dispatch rows per cycle (cheap single-file
+  // parse, fail-safe to the WORKER_* constants) — producer-side launch config,
+  // never a fold input. `close` is settable INDEPENDENTLY of `work` (ADR 0040):
+  // two separate `dispatch:` rows, resolved here so the pure `reconcile` stays
+  // config-blind. Both floor to WORKER_* when their row is absent/malformed, so a
+  // `dispatch:`-less catalog yields byte-identical launch argv to the prior default.
+  const workLaunch = resolveDispatchLaunchConfig("work");
+  const closeLaunch = resolveDispatchLaunchConfig("close");
+  const workModel = workLaunch.model ?? WORKER_MODEL;
+  const workEffort = workLaunch.effort ?? WORKER_EFFORT;
+  const closeModel = closeLaunch.model ?? WORKER_MODEL;
+  const closeEffort = closeLaunch.effort ?? WORKER_EFFORT;
 
   // Load the host worker matrix (ADR 0036) ONCE per cycle and attach it as a
   // serializable four-state discriminated field — the parsed cell axes when good,
@@ -7396,8 +7335,10 @@ export async function loadReconcileSnapshot(
     mode,
     armedIds,
     unseededRoots,
-    workerModel,
-    workerEffort,
+    workModel,
+    workEffort,
+    closeModel,
+    closeEffort,
     hostMatrix,
     maxConcurrentJobs,
     maxConcurrentPerRoot,
