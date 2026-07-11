@@ -43,5 +43,5 @@ Test the orchestration logic with injected seams for the launchctl/daemon/verify
 - [ ] On any verify failure the pre-reclaim DB is preserved and autopilot is left paused.
 
 ## Done summary
-
+Added scripts/maintenance-window.ts: one command running the full offline-reclaim window (pause, drain-wait via task .1's board_work_jobs signal, snapshot, stop, keeper reclaim, restart, verify, hold/play), fail-safe on every step with 14 orchestration tests.
 ## Evidence
