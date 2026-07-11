@@ -83,15 +83,14 @@ fi
 
 # 3b. pi-subagents fork sync. pi loads @tintinweb/pi-subagents LIVE from the
 #     local fork checkout (a local-path package source in ~/.pi/agent/settings.json)
-#     because the checkout's fix branch carries the nested-subagent-spawn fix
-#     until it lands upstream. Keep the fork rebased on upstream so drift
-#     surfaces at install time rather than as a live panel failure. ANY sync
-#     error rolls the checkout back to its pre-rebase tip (the last known-good
-#     patched state — never plain upstream, which would silently drop the fix)
-#     and sends a desktop notification that we are out of sync with upstream.
-#     This step never fails the keeper install.
+#     so local patches and in-flight upstream PR branches take effect without a
+#     package reinstall. Keep the checkout rebased on upstream so drift surfaces
+#     at install time rather than as a live panel failure. ANY sync error rolls
+#     the checkout back to its pre-rebase tip (the last known-good state) and
+#     sends a desktop notification that we are out of sync with upstream. This
+#     step never fails the keeper install.
 pi_subagents_fork="${HOME}/src/possibilities--pi-subagents"
-pi_subagents_branch="fix/nested-subagent-spawn-ctx"
+pi_subagents_branch="master"
 pi_subagents_notify() {
   echo "install: pi-subagents fork sync: $1" >&2
   if command -v notifyctl >/dev/null 2>&1; then
