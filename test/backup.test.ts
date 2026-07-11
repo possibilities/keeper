@@ -43,7 +43,9 @@ import {
   readSchemaVersion,
   readTableRowCounts,
   reclaimDb,
+  reclaimInstructions,
   resolveBackupDir,
+  resolveKeeperdTarget,
   restoreInstructions,
   snapshotName,
   verifyReclaim,
@@ -366,6 +368,128 @@ test("restoreInstructions: documents the stop → swap → verify → restart st
   expect(text).toContain("-wal");
   expect(text).toContain("integrity_check");
   expect(text).toMatch(/restart/i);
+});
+
+// ---------------------------------------------------------------------------
+// fn-1251.3 — reclaimInstructions renders RESOLVED launchctl commands
+// ---------------------------------------------------------------------------
+
+test("reclaimInstructions: renders resolved gui/<uid>/arthack.keeperd + real plist path when a target is given", () => {
+  const text = reclaimInstructions(
+    "/state/keeper.db.reclaim",
+    "/state/keeper.db",
+    {
+      domain: "gui/501",
+      service: "gui/501/arthack.keeperd",
+      plistPath: "/Users/arthack/Library/LaunchAgents/arthack.keeperd.plist",
+    },
+  );
+  expect(text).toContain(
+    "launchctl bootout gui/501/arthack.keeperd   # or: launchctl stop",
+  );
+  expect(text).toContain(
+    "launchctl bootstrap gui/501 /Users/arthack/Library/LaunchAgents/arthack.keeperd.plist && keeper await server-up",
+  );
+  // Not the unresolved placeholder text.
+  expect(text).not.toContain("<keeperd label>");
+  expect(text).not.toContain("<keeperd domain/label>");
+});
+
+test("reclaimInstructions: falls back to the placeholder text when resolution fails (target null)", () => {
+  const text = reclaimInstructions(
+    "/state/keeper.db.reclaim",
+    "/state/keeper.db",
+    null,
+  );
+  expect(text).toContain(
+    "launchctl bootout <keeperd label>   # or: launchctl stop",
+  );
+  expect(text).toContain(
+    "launchctl bootstrap <keeperd domain/label> && keeper await server-up",
+  );
+});
+
+test("reclaimInstructions: with no target arg, resolves via resolveKeeperdTarget()'s default (never throws)", () => {
+  // No injected deps — exercises the real production default path (darwin
+  // resolves via the actual environment, non-darwin returns null) without
+  // asserting on host-specific output; the point is it renders SOMETHING
+  // consistent and never throws.
+  const text = reclaimInstructions(
+    "/state/keeper.db.reclaim",
+    "/state/keeper.db",
+  );
+  expect(text.length).toBeGreaterThan(0);
+  expect(text).toContain("launchctl bootout");
+  expect(text).toContain("launchctl bootstrap");
+});
+
+test("resolveKeeperdTarget: resolves the loaded plist path from `launchctl print` output", () => {
+  const target = resolveKeeperdTarget({
+    platform: "darwin",
+    getuid: () => 501,
+    launchctlPrint: (service) => {
+      expect(service).toBe("gui/501/arthack.keeperd");
+      return [
+        "gui/501/arthack.keeperd = {",
+        "\tactive count = 1",
+        "\tpath = /Users/arthack/code/keeper/plist/arthack.keeperd.plist",
+        "\tstdout path = /Users/arthack/.local/state/keeper/server.stdout",
+        "\tstderr path = /Users/arthack/.local/state/keeper/server.stderr",
+        "}",
+      ].join("\n");
+    },
+    existsSync: () => {
+      throw new Error(
+        "existsSync must not be consulted when launchctl resolves the path",
+      );
+    },
+  });
+  expect(target).toEqual({
+    domain: "gui/501",
+    service: "gui/501/arthack.keeperd",
+    plistPath: "/Users/arthack/code/keeper/plist/arthack.keeperd.plist",
+  });
+});
+
+test("resolveKeeperdTarget: falls back to the conventional install path when launchd is unreachable", () => {
+  const target = resolveKeeperdTarget({
+    platform: "darwin",
+    getuid: () => 501,
+    launchctlPrint: () => {
+      throw new Error("Could not find service");
+    },
+    existsSync: (p) =>
+      p === "/Users/arthack/Library/LaunchAgents/arthack.keeperd.plist",
+    homedir: () => "/Users/arthack",
+  });
+  expect(target).toEqual({
+    domain: "gui/501",
+    service: "gui/501/arthack.keeperd",
+    plistPath: "/Users/arthack/Library/LaunchAgents/arthack.keeperd.plist",
+  });
+});
+
+test("resolveKeeperdTarget: returns null (safe fallback) when neither launchd nor the conventional path resolve", () => {
+  const target = resolveKeeperdTarget({
+    platform: "darwin",
+    getuid: () => 501,
+    launchctlPrint: () => {
+      throw new Error("Could not find service");
+    },
+    existsSync: () => false,
+    homedir: () => "/Users/arthack",
+  });
+  expect(target).toBeNull();
+});
+
+test("resolveKeeperdTarget: returns null off macOS without touching getuid/launchctl", () => {
+  const target = resolveKeeperdTarget({
+    platform: "linux",
+    getuid: () => {
+      throw new Error("getuid must not be consulted off darwin");
+    },
+  });
+  expect(target).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
