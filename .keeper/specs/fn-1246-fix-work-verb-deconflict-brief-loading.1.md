@@ -32,5 +32,5 @@ Keep the close-verb path byte-identical (the `verb` default stays `close`; legac
 - [ ] A test drives `keeper escalation-brief deconflict::<taskId>` end-to-end and asserts a parseable brief (the daemon-to-skill handoff F5 exercises).
 
 ## Done summary
-
+Extended parseEscalationKey to accept a task-form deconflict:: ref and generalized buildDeconflictIncident to key the sticky-row lookup on verb IN ('close','work'); updated the deconflict skill's framing, worktree lookup, and retry step for both ref shapes; added end-to-end test coverage for the daemon-dispatched deconflict::<taskId> handoff.
 ## Evidence
