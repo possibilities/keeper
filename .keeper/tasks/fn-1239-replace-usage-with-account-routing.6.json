@@ -8,11 +8,11 @@
   ],
   "epic": "fn-1239-replace-usage-with-account-routing",
   "id": "fn-1239-replace-usage-with-account-routing.6",
-  "model": "opus",
+  "model": "gpt-5.6-sol",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Retire usage projection schema",
-  "updated_at": "2026-07-10T21:37:16.927000Z"
+  "updated_at": "2026-07-11T17:23:45.299000Z"
 }

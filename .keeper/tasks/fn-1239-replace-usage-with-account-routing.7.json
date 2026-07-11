@@ -9,11 +9,11 @@
   ],
   "epic": "fn-1239-replace-usage-with-account-routing",
   "id": "fn-1239-replace-usage-with-account-routing.7",
-  "model": "sonnet",
+  "model": "gpt-5.5",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Prune account routing docs",
-  "updated_at": "2026-07-10T21:37:16.927000Z"
+  "updated_at": "2026-07-11T17:23:45.299000Z"
 }
