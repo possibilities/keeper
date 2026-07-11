@@ -11,5 +11,6 @@
   "target_repo": "/Volumes/Scratch/src/possibilities--pi-subagents",
   "tier": "xhigh",
   "title": "terminal status propagation fixes",
-  "updated_at": "2026-07-11T17:02:42.864000Z"
+  "updated_at": "2026-07-11T18:00:39.593000Z",
+  "worker_done_at": "2026-07-11T18:00:39.593000Z"
 }

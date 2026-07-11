@@ -54,5 +54,23 @@ do NOT open the upstream PR; that is the human's call.
       origin with a drafted PR title/body recorded in the Done summary; no PR opened.
 
 ## Done summary
+Three honesty fixes to subagent result plumbing, shipped as one focused branch off master. Commit a8a5143 on branch keeper/epic/fn-1249-pi-subagents-terminal-status-upstream-pr, pushed to origin (possibilities/pi-subagents). All four upstream checks green (lint, typecheck, test, build); the pre-existing subagents-print-mode-e2e failures did not manifest (isolated e2e green; master full-suite baseline showed the suite green apart from the new tests). New tests A/B-verified: 10 new fix-pinning tests fail on unpatched master and pass patched (685->695 passed). PR NOT opened (human's call).
 
+--- DRAFTED PR TITLE ---
+fix: report subagent runs that end without output as failures
+
+--- DRAFTED PR BODY ---
+## Problem
+
+A subagent whose final assistant turn is a provider error, an abort, or an empty length stop is reported as status "completed" with an empty result — the caller sees "No output" and a failed run looks like a silent success. Two issues compound it: the response collector resets on every message_start (which also fires for user and tool-result messages), so a trailing tool-result turn can wipe an already-captured answer; and the output-file streamer indexes session.messages by a running count that compaction invalidates (compaction replaces the array), which halts transcript streaming for the rest of the run.
+
+## Changes
+
+- Terminal-status propagation: a run that produces no usable text now resolves to a terminal failure carrying its stop reason and the provider error message, instead of a completed run with an empty result. Only a non-empty textual result classifies as completed (an earlier turn's answer still completes even if a later turn errors).
+- Collector reset narrowed: collectResponseText resets only on an assistant message_start, so user/tool-result turns no longer discard the collected answer.
+- Compaction-safe output streaming: streamToOutputFile re-anchors its write index on compaction_end, so post-compaction turns keep streaming.
+
+## Testing
+
+npm run lint, typecheck, test, and build all pass. New tests pin both directions and were A/B-verified against unpatched master: test/terminal-status.test.ts (classification + manager status wiring), test/agent-runner.test.ts (collector survives a trailing tool-result turn; runAgent surfaces a terminal failure), test/output-file.test.ts (streaming survives a compaction).
 ## Evidence
