@@ -13,9 +13,8 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Re-fold**: Rebuilding a projection by replaying every event, which stays deterministic only because a fold never reads wall-clock, environment, or the filesystem. Avoid: rebuild, replay-repair, reprocess.
 - **Dead letter**: An event the reducer could not fold, parked for inspection and later replay instead of crashing the fold. Avoid: error queue, poison message, reject.
 - **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a rewind. Avoid: snapshot, ephemeral view, scratch state.
-- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed. Avoid: registry (that word belongs to Usage-model registry), migration list, schema chain.
+- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed; a one-lane-at-a-time singleton resource, so two concurrent schema edits collide at merge rather than compose silently. Avoid: registry (that word belongs to Usage-model registry), migration list, schema chain.
 - **Additive-idempotent step**: A migration ladder step whose `kind` only adds structure and converges safely on repeated application, the one class a merge-time renumber may resolve mechanically without a human. Avoid: safe migration, non-destructive step, idempotent guard.
-- **Schema singleton**: The property that keeper's schema is one lane-at-a-time resource, so two concurrent schema edits are meant to collide at merge rather than compose silently. Avoid: shared resource, lock file, mutex.
 
 ## Plan board
 - **Board**: The read-only plan state — epics, tasks, and their readiness — that an agent orients on before acting. Avoid: backlog, kanban, queue.
@@ -24,11 +23,14 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Plan**: The durable spec-and-dependency graph for an epic, authored interactively and consumed read-only, never mutated by the reducer. Avoid: roadmap, schedule, spec sheet.
 - **Id ledger**: The host-local append-only record of every plan number a project has handed out, consulted at mint alongside the directory scan so destroying a minted file can never free its number. Avoid: high-water mark, watermark, counter.
 - **Brief**: The self-contained context packet a worker receives for its task, carrying the spec and glossary out-of-band instead of inlined prose. Avoid: prompt, ticket body, handoff note.
+- **Edit claim**: One structured write-prediction on a task — an exact path, a bounded glob, or a logical resource token, carrying expected or possible certainty; a task's claims form its write surface (what it mutates, never what it merely reads), and the claim noun is distinct from the claim verb, which takes ownership of a task. Avoid: Files list, touched files, write set.
+- **Overlap gate**: The scaffold-time check that intersects sibling tasks' edit claims and refuses DAG-incomparable tasks whose expected exact claims collide, downgrading softer intersections to warnings. Avoid: conflict gate, serialization check, file lock.
 - **Readiness**: The gate deciding whether a task may dispatch, recomputed each cycle from its dependencies and validation state. Avoid: status, priority, availability.
 - **Arm**: To flip an epic or task from not-ready to dispatchable by stamping it validated. Avoid: enable, approve, unlock.
 - **Ghost**: A not-yet-validated epic or task that renders dashed and blocks dispatch until it is armed. Avoid: draft, stub, placeholder.
 - **Tier**: The capability class assigned to a task that selects which model and worker cell runs it. Avoid: level, rank, weight.
 - **Worker cell**: The one `{model × tier}` `work` plugin a task's launcher selects at launch; a native cell runs its model in-session, a wrapped cell delegates to the model's serving provider. Avoid: variant, flavor, profile.
+- **Cell assignment**: A committed, receipt-backed `{model, tier}` choice covering the exact current todo set; an unassigned task carries null axes and cannot arm or dispatch. Avoid: provisional default, placeholder cell, suggested cell.
 - **Capability model**: The model-axis value a task carries, a capability token derived from a Provider's launch id (the segment after its last `/`, the whole id when slash-free); native when the claude provider serves it, wrapped otherwise. Avoid: harness model, backend model, model alias.
 - **Launch id**: A Provider's model entry, the string a harness CLI receives verbatim — a bare scalar or an `{id, efforts}` form carrying a per-model effort-list override — from which the Capability model derives by basename. Avoid: alias target, model alias, native alias.
 - **Provider**: A harness's entry in the host matrix config, tying it to the launch ids it serves. Avoid: vendor, backend, platform.
@@ -43,6 +45,10 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Audited task**: A task whose selected tier is policy-flagged for review, parking AUDIT_READY instead of stamping done until its audit clears. Avoid: keystone task, gated task, flagged task.
 - **Audit gate**: The block-machinery hold between a worker finishing and its done-stamp, where the task-scoped audit decides resume or escalation. Avoid: review gate, done gate, checkpoint.
 - **Blocking follow-up**: A follow-up epic the close audit requires to complete before its source epic may stamp done; the source stays open, holding every epic that depends on it. Avoid: gating epic, close blocker.
+
+## Personal notes
+- **Note**: A durable user-authored text capture that stays active until one successful external action archives it; archived Notes remain browsable history. Avoid: snippet (that names a prompt-corpus entry), task, handoff.
+- **Disposition**: The successful clipboard copy or fresh-agent launch that processes a Note and moves it to archived history. Avoid: send (only one kind), archive (the resulting state), delivery.
 
 ## Autopilot and dispatch
 - **Autopilot**: The server-side loop that reconciles the board against running work, dispatching ready tasks and closing finished epics without a human. Avoid: scheduler, cron, orchestrator.
