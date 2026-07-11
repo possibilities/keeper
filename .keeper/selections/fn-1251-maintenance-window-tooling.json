@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded read-time signal but the safe-to-stop correctness (excluding the supervising session, staying out of a fold) is delicate in-repo idiom matching that warrants Claude judgment at the default band.",
+      "task_id": "fn-1251-maintenance-window-tooling.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multi-step orchestration of a destructive offline-reclaim window whose fail-safe rollback (never unpause, preserve pre-reclaim DB) is a subtle correctness invariant with data-loss blast radius \u2014 a hard opus gate at the contract-shaped effort band.",
+      "task_id": "fn-1251-maintenance-window-tooling.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified single-surface rendering of resolved launchctl commands with a named fallback and a clear acceptance \u2014 GPT-first everyday work needing no deep judgment.",
+      "task_id": "fn-1251-maintenance-window-tooling.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Short doc entry but it turns on user-facing wording, home placement, and the repo's forward-facing docs-discipline idiom \u2014 Claude-tuned taste over a bounded single surface.",
+      "task_id": "fn-1251-maintenance-window-tooling.4",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T17:05:17.104000Z",
+  "epic_id": "fn-1251-maintenance-window-tooling",
+  "input_hash": "42bb9ac59fcf33086d41131dcb72b3c444df8bd1b848bea8460ae469589f441f",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1119591109,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1251-maintenance-window-tooling.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Bounded read-time signal but the safe-to-stop correctness (excluding the supervising session, staying out of a fold) is delicate in-repo idiom matching that warrants Claude judgment at the default band.\",\"confidence\":0.72},{\"task_id\":\"fn-1251-maintenance-window-tooling.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Multi-step orchestration of a destructive offline-reclaim window whose fail-safe rollback (never unpause, preserve pre-reclaim DB) is a subtle correctness invariant with data-loss blast radius \u2014 a hard opus gate at the contract-shaped effort band.\",\"confidence\":0.7},{\"task_id\":\"fn-1251-maintenance-window-tooling.3\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified single-surface rendering of resolved launchctl commands with a named fallback and a clear acceptance \u2014 GPT-first everyday work needing no deep judgment.\",\"confidence\":0.74},{\"task_id\":\"fn-1251-maintenance-window-tooling.4\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Short doc entry but it turns on user-facing wording, home placement, and the repo's forward-facing docs-discipline idiom \u2014 Claude-tuned taste over a bounded single surface.\",\"confidence\":0.66}]}\n"
+}
