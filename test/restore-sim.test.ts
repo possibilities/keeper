@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { RestoreCandidate } from "../src/restore-set";
 import {
-  type AttachVerdict,
+  type AttachVerifyResult,
   RESTORE_INTENT_SCHEMA_VERSION,
   RESTORE_VERIFY_POLL_MS,
   RESTORE_VERIFY_TIMEOUT_MS,
@@ -417,14 +417,17 @@ test("end-to-end restore transaction: rehomed-transcript resolve, preflight-fail
   async function verify(
     candidate: RestoreCandidate,
     launchStartMs: number,
-  ): Promise<AttachVerdict> {
+  ): Promise<AttachVerifyResult> {
     if (candidate.job_id === REHOMED_UUID) {
-      // Evidence present the instant we check — the happy verified path.
+      // Evidence present the instant we check + the process stays alive across the
+      // dwell — the happy verified path.
       return verifyAttach({
-        hasEvidence: () => true,
+        findEvidence: () => ({ pid: 4242, start_time: "darwin:s" }),
+        identityLiveness: () => "alive",
         paneLiveness: () => "alive",
         now: () => launchStartMs,
         sleep: async () => {},
+        dwellMs: 0,
       });
     }
     // Both timeout scenarios: no evidence ever arrives within the bound —
@@ -432,7 +435,8 @@ test("end-to-end restore transaction: rehomed-transcript resolve, preflight-fail
     // poll loop terminates without any real waiting.
     let elapsed = 0;
     return verifyAttach({
-      hasEvidence: () => false,
+      findEvidence: () => null,
+      identityLiveness: () => "alive",
       paneLiveness: () =>
         candidate.job_id === "pi-alive-timeout" ? "alive" : "dead",
       now: () => launchStartMs + elapsed,

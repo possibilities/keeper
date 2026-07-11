@@ -63,31 +63,37 @@ import {
 import type { GenerationSummary, RestoreCandidate } from "../src/restore-set";
 import { RECENT_GENERATION_BOUND } from "../src/restore-set";
 import {
-  type AttachVerdict,
+  type AttachVerifyResult,
   classifyPaneLiveness,
   claudeAttachEvidence,
   crashLoopHint,
   gcRestoreIntents,
+  identityLiveness,
   listOpenRestoreIntents,
   mayAttemptRestore,
   nonClaudeAttachEvidence,
   type PaneLiveness,
   RESTORE_INTENT_SCHEMA_VERSION,
+  RESTORE_VERIFY_DWELL_MS,
   RESTORE_VERIFY_POLL_MS,
   RESTORE_VERIFY_TIMEOUT_MS,
   type RestoreIntent,
   readRestoreIntent,
   resolveRestoreApplyLockPath,
   resolveRestoreIntentDir,
+  restoreNoOpDecision,
   tryAcquireApplyLock,
   verifyAttach,
   writeRestoreIntent,
 } from "../src/restore-verify";
+import { readOsStartTime } from "../src/seed-sweep";
+import { isPidAlive } from "../src/server-worker";
 import {
   type AttachVerifyFn,
   applyRestoreVerified,
   autopilotGateDecision,
   claudeAttachEvidenceFromDb,
+  commentSafe,
   countOutcomes,
   defaultLauncherPrefix,
   type IntentSink,
@@ -958,21 +964,26 @@ function probeSessionPaneLiveness(session: string): PaneLiveness {
 }
 
 /** The production attach verifier: read on-disk evidence (claude NDJSON / non-claude
- *  birth record) gated on the pre-launch floor, bounded-poll, then disambiguate a
- *  no-evidence timeout by pane liveness. */
+ *  birth record) gated on the pre-launch floor to capture the attaching process's
+ *  recycle-safe identity, DWELL-probe that identity so a pane that dies right after
+ *  attaching is `failed` (not a point-in-time false `verified`), and disambiguate a
+ *  no-evidence timeout by pane liveness. The dwell / no-op liveness probe flows
+ *  through the injected `(pid, start_time)` seam ({@link identityLiveness} over the
+ *  real `isPidAlive` + `readOsStartTime`). */
 function makeAttachVerify(dbPath: string): AttachVerifyFn {
   const eventsDir = resolveEventsLogDir();
   const birthDir = resolveBirthDir(process.env);
-  return (candidate, launchStartMs): Promise<AttachVerdict> => {
+  const probeDeps = { isPidAlive, readStartTime: readOsStartTime };
+  return (candidate, launchStartMs): Promise<AttachVerifyResult> => {
     const harness = harnessOrClaude(candidate.harness);
-    const hasEvidence =
+    const findEvidence =
       harness === "claude"
         ? () =>
             claudeAttachEvidence(
               eventsDir,
               candidate.resume_target,
               launchStartMs,
-            ) ||
+            ) ??
             claudeAttachEvidenceFromDb(
               dbPath,
               candidate.resume_target,
@@ -981,13 +992,16 @@ function makeAttachVerify(dbPath: string): AttachVerifyFn {
         : () =>
             nonClaudeAttachEvidence(birthDir, candidate.job_id, launchStartMs);
     return verifyAttach({
-      hasEvidence,
+      findEvidence,
+      identityLiveness: (identity) =>
+        identityLiveness(identity.pid, identity.start_time, probeDeps),
       paneLiveness: () =>
         probeSessionPaneLiveness(candidate.backend_exec_session_id),
       now: () => Date.now(),
       sleep: (ms) => Bun.sleep(ms),
       timeoutMs: RESTORE_VERIFY_TIMEOUT_MS,
       pollMs: RESTORE_VERIFY_POLL_MS,
+      dwellMs: RESTORE_VERIFY_DWELL_MS,
     });
   };
 }
@@ -1073,12 +1087,31 @@ async function runApply(
       intent,
       makeIntent: (candidate) =>
         buildRestoreIntent(candidate, generationId, intentDir, launcherPrefix),
-      // A prior VERIFIED intent for this exact tab+generation means an earlier
-      // apply already re-attached it — no-op (never double-spawn). A crashed tab
-      // has no verified intent this generation, so it is never false-skipped.
-      isLive: (candidate) =>
-        readRestoreIntent(intentDir, intentKey(candidate, generationId))
-          ?.state === "verified",
+      // The live-UUID no-op gate: a prior VERIFIED intent whose stored
+      // (pid, start_time) handle a REAL current probe still finds alive means an
+      // earlier apply re-attached it and it is STILL up — no-op (never a
+      // double-spawn). A verified-then-died tab probes dead → not skipped → the
+      // relaunch re-observes it (no permanent mask). An inconclusive probe (starved
+      // start-time read, or a pre-handle intent) skips to avoid a double-spawn but
+      // is surfaced — never a SILENT masked death.
+      isLive: (candidate) => {
+        const prior = readRestoreIntent(
+          intentDir,
+          intentKey(candidate, generationId),
+        );
+        const decision = restoreNoOpDecision(prior, {
+          isPidAlive,
+          readStartTime: readOsStartTime,
+        });
+        if (decision.skip && decision.inconclusive) {
+          process.stderr.write(
+            `keeper tabs: [live?] ${commentSafe(candidate.label)}: ` +
+              "verified-tab liveness probe inconclusive — skipping relaunch " +
+              "(no double-spawn); rerun restore --apply to re-check.\n",
+          );
+        }
+        return decision.skip;
+      },
     });
     process.stdout.write(renderOutcomes(outcomes, true, 0));
     const { failed } = countOutcomes(outcomes);

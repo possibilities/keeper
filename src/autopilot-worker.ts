@@ -2281,6 +2281,52 @@ export function buildWorktreeStatusEntries(
   return out;
 }
 
+/** Coalesce window for {@link logMergeGateDeferral}: within it, a repeat for the
+ * same key increments a suppressed count instead of logging; the first call past
+ * it flushes the message with a "+N suppressed" suffix and re-arms. */
+const MERGE_GATE_DEFER_LOG_COALESCE_MS = 60_000;
+
+interface MergeGateDeferLogEntry {
+  loggedAt: number;
+  suppressed: number;
+}
+
+/** Per-key coalesce state for {@link logMergeGateDeferral}, module-scoped so it
+ * persists across the per-cycle `computeDeferredEpicIds` calls a fresh reconcile
+ * cycle would otherwise reset. */
+const mergeGateDeferLogState = new Map<string, MergeGateDeferLogEntry>();
+
+/**
+ * Per-key coalesced `console.error` for a merge-gate deferral: a key's first call
+ * logs immediately; a repeat within {@link MERGE_GATE_DEFER_LOG_COALESCE_MS}
+ * increments a suppressed count instead of logging; the next call past the window
+ * flushes the message with a "+N suppressed" suffix and re-arms. A steadily-
+ * deferred pair re-fires every reconcile cycle, so this bounds boot-log volume
+ * without ever permanently dropping the diagnostic — the pair stays visible at
+ * the coalesce cadence for as long as it stays deferred.
+ */
+export function logMergeGateDeferral(
+  key: string,
+  message: string,
+  now: number = Date.now(),
+  state: Map<string, MergeGateDeferLogEntry> = mergeGateDeferLogState,
+): void {
+  const prior = state.get(key);
+  if (
+    prior === undefined ||
+    now - prior.loggedAt >= MERGE_GATE_DEFER_LOG_COALESCE_MS
+  ) {
+    const suffix =
+      prior !== undefined && prior.suppressed > 0
+        ? ` (+${prior.suppressed} suppressed)`
+        : "";
+    console.error(`${message}${suffix}`);
+    state.set(key, { loggedAt: now, suppressed: 0 });
+  } else {
+    prior.suppressed++;
+  }
+}
+
 /**
  * Compute the EPHEMERAL cross-epic merge-gate defer map, keyed PER (epic, repoDir):
  * epic id → the set of its lane repos whose lane MUST NOT be cut this cycle because a
@@ -2430,7 +2476,8 @@ export async function computeDeferredEpicIds(
               blockedUpstreamRes !== undefined &&
               hasWorktreeLaneInRepo(blockedUpstreamRes, repoR)
             ) {
-              console.error(
+              logMergeGateDeferral(
+                `${epic.epic_id}@${repoR}#blocked-incomplete`,
                 `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — upstream ${blockedUpstreamId} still open (blocked-incomplete lane not yet merged into LOCAL default)`,
               );
               markDeferred(epic.epic_id, repoR);
@@ -2464,7 +2511,8 @@ export async function computeDeferredEpicIds(
           // satisfied without an ancestry probe.
           const lanes = await enumerateLanes(repoR);
           if (!lanes.ok) {
-            console.error(
+            logMergeGateDeferral(
+              `${epic.epic_id}@${repoR}#enum-inconclusive`,
               `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — could not enumerate ${repoR} lane branches (probe inconclusive)`,
             );
             markDeferred(epic.epic_id, repoR);
@@ -2480,14 +2528,16 @@ export async function computeDeferredEpicIds(
           // not-ancestor and inconclusive both defer; only exit 0 proceeds).
           const localDefault = await resolveLocalDefault(repoR);
           if (localDefault === null) {
-            console.error(
+            logMergeGateDeferral(
+              `${epic.epic_id}@${repoR}#default-branch-inconclusive`,
               `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — could not resolve ${repoR} default branch (probe inconclusive)`,
             );
             markDeferred(epic.epic_id, repoR);
             break;
           }
           if (!(await gitIsAncestorOf(repoR, laneBranch, localDefault, run))) {
-            console.error(
+            logMergeGateDeferral(
+              `${epic.epic_id}@${repoR}#not-ancestor`,
               `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — upstream ${upstreamId} (${laneBranch}) not yet merged into ${localDefault}`,
             );
             markDeferred(epic.epic_id, repoR);
@@ -2498,9 +2548,9 @@ export async function computeDeferredEpicIds(
         // A git probe threw — DEFER this (epic, repo) group conservatively (an
         // inconclusive probe must never proceed: a stale fork is permanent). The
         // snapshot build never sees the throw.
-        console.error(
-          `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — probe threw:`,
-          err,
+        logMergeGateDeferral(
+          `${epic.epic_id}@${repoR}#probe-threw`,
+          `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — probe threw: ${errMsg(err)}`,
         );
         markDeferred(epic.epic_id, repoR);
       }

@@ -68,6 +68,7 @@ import { harnessOrClaude } from "./agent/harness";
 import { type CloseKind, parseGenerationId } from "./exec-backend";
 import { extractTmuxTopologySnapshot } from "./reducer";
 import { resumeTarget } from "./resume-descriptor";
+import { readOsStartTime } from "./seed-sweep";
 
 /**
  * Idle cutoff (seconds): a killed row whose last activity is older than this is
@@ -1661,9 +1662,62 @@ function derivePostTerminalCurrentSet(
 }
 
 /**
+ * Pure recycle-safe liveness predicate shared by `deriveCurrentSet`'s row
+ * gate. Mirrors `selectDeadReprobeCandidates`'s (`exit-watcher.ts`)
+ * conservatism exactly, just phrased as an inclusion test instead of a reap
+ * selector:
+ * - no stored `pid` → can't probe at all (pre-pid-tracking rows, or a harness
+ *   that never recorded one) → KEEP (unchanged from the prior no-check
+ *   behavior).
+ * - `isAlive(pid)` false → the process is verifiably gone → DROP.
+ * - `pid` alive, no stored `start_time` → can't prove recycle from a bare pid
+ *   (the pid space is small and reused) → KEEP (the fail-direction called out
+ *   in the task spec: a live-pid row with no stored start-time must not be
+ *   silently dropped from the `--snapshot-current` revive script, nor
+ *   flagged a phantom in `tabs list`).
+ * - `pid` alive, stored start_time present, `readStartTime` returns `null`
+ *   (probe failed — `ps`/`/proc` glitch) → KEEP (same conservative "can't
+ *   tell" stance).
+ * - `pid` alive, both start times present but DIFFER → the OS reused the pid
+ *   for an unrelated process since this row was stamped → DROP.
+ * - `pid` alive, start times match → the same process is still running → KEEP.
+ *
+ * A throwing injected probe (a real-world `ps`/`process.kill` glitch) is
+ * caught and treated the same as a failed probe — KEEP, never propagate —
+ * preserving `deriveCurrentSet`'s never-throws contract without pushing the
+ * try/catch onto every caller.
+ */
+function isRecycleSafeLive(
+  pid: number | null,
+  storedStartTime: string | null,
+  isAlive: (pid: number) => boolean,
+  readStartTime: (pid: number) => string | null,
+): boolean {
+  if (pid == null) {
+    return true;
+  }
+  try {
+    if (!isAlive(pid)) {
+      return false;
+    }
+    if (storedStartTime == null) {
+      return true;
+    }
+    const osStart = readStartTime(pid);
+    if (osStart == null) {
+      return true;
+    }
+    return osStart === storedStartTime;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Derive the CURRENT live set — every `state ∈ {working, stopped}` job that
- * holds backend coords — as restore candidates, ordered by visual window order.
- * A terminal row also qualifies when later backend-exec evidence from the same
+ * holds backend coords AND passes a recycle-safe `(pid, start_time)`
+ * liveness probe — as restore candidates, ordered by visual window order. A
+ * terminal row also qualifies when later backend-exec evidence from the same
  * still-live pid proves the process remains attached; that read-time guard keeps
  * the current snapshot process-scoped without mutating the projection.
  *
@@ -1676,14 +1730,28 @@ function derivePostTerminalCurrentSet(
  * script resumes each session EXACTLY; the display `label` keeps the latest name
  * (`title`, `job_id` fallback). Read-only; empty input returns `[]`, never
  * throws.
+ *
+ * The liveness probe is INJECTED (`opts.isAlive` / `opts.readStartTime`,
+ * defaulting to the file-local `pidAlive` + `readOsStartTime`) so fast tests
+ * never fork a real process — see the epic's `(pid, start_time)` recycle
+ * identity references; this reuses that seam rather than adding a 6th
+ * `pidAlive` variant.
  */
-export function deriveCurrentSet(db: Database): RestoreCandidate[] {
+export function deriveCurrentSet(
+  db: Database,
+  opts: {
+    isAlive?: (pid: number) => boolean;
+    readStartTime?: (pid: number) => string | null;
+  } = {},
+): RestoreCandidate[] {
+  const isAlive = opts.isAlive ?? pidAlive;
+  const readStartTime = opts.readStartTime ?? readOsStartTime;
   const rows = db
     .query(
       `SELECT job_id, created_at, title, window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                 AS backend_exec_session_id,
-              harness, resume_target
+              harness, resume_target, pid, start_time
          FROM jobs
         WHERE state IN ('working', 'stopped')
           AND COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
@@ -1700,6 +1768,8 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     backend_exec_session_id: string;
     harness: string | null;
     resume_target: string | null;
+    pid: number | null;
+    start_time: string | null;
   }[];
 
   const candidates: RestoreCandidate[] = [];
@@ -1710,6 +1780,9 @@ export function deriveCurrentSet(db: Database): RestoreCandidate[] {
     }
     const backendSession = seg(row.backend_exec_session_id);
     if (backendSession === "") {
+      continue;
+    }
+    if (!isRecycleSafeLive(row.pid, row.start_time, isAlive, readStartTime)) {
       continue;
     }
     const label = row.title != null && row.title !== "" ? row.title : jobId;

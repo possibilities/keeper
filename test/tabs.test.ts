@@ -46,6 +46,7 @@ import type {
   RestoreCandidate,
 } from "../src/restore-set";
 import {
+  type AttachVerifyResult,
   RESTORE_INTENT_SCHEMA_VERSION,
   type RestoreIntent,
 } from "../src/restore-verify";
@@ -223,22 +224,24 @@ function seedAutopilotPaused(db: Database, paused: number): void {
   );
 }
 
-test("claudeAttachEvidenceFromDb reads ingested SessionStart evidence with recency gate", () => {
+test("claudeAttachEvidenceFromDb reads ingested SessionStart identity with recency gate", () => {
   kdb.db.run(
-    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
-       VALUES (?, 'wanted', 'SessionStart', 'session_start', '{}')`,
+    `INSERT INTO events (ts, session_id, pid, start_time, hook_event, event_type, data)
+       VALUES (?, 'wanted', 6161, 'darwin:db', 'SessionStart', 'session_start', '{}')`,
     [RECENT],
   );
 
+  // A fresh-enough match returns the row's (pid, start_time) identity.
   expect(
     claudeAttachEvidenceFromDb(dbPath, "wanted", (RECENT - 1) * 1000),
-  ).toBe(true);
+  ).toEqual({ pid: 6161, start_time: "darwin:db" });
+  // Too-new a floor rejects the stale record; a different id never matches.
   expect(
     claudeAttachEvidenceFromDb(dbPath, "wanted", (RECENT + 1) * 1000),
-  ).toBe(false);
-  expect(claudeAttachEvidenceFromDb(dbPath, "other", (RECENT - 1) * 1000)).toBe(
-    false,
-  );
+  ).toBeNull();
+  expect(
+    claudeAttachEvidenceFromDb(dbPath, "other", (RECENT - 1) * 1000),
+  ).toBeNull();
 });
 
 function fakeCandidate(opts: {
@@ -838,19 +841,25 @@ function baseIntentFor(candidate: RestoreCandidate): RestoreIntent {
   };
 }
 
-test("applyRestoreVerified: a verified verdict → verified outcome + a verified intent", async () => {
+test("applyRestoreVerified: a verified verdict → verified outcome + a verified intent carrying the identity", async () => {
   const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
   const { writes, sink } = recordingIntent();
   const out = await applyRestoreVerified(plan, {
     ensureLaunched: async () => ({ ok: true }),
-    verify: async () => "verified",
+    verify: async () => ({
+      verdict: "verified",
+      identity: { pid: 5150, start_time: "darwin:v" },
+    }),
     intent: sink,
     makeIntent: baseIntentFor,
     sleep: async () => {},
   });
   expect(out.map((o) => o.kind)).toEqual(["verified"]);
-  // Write-before-launch then a terminal verified write.
+  // Write-before-launch then a terminal verified write, and the verified write
+  // stamps the captured (pid, start_time) handle for the later no-op gate.
   expect(writes.map((w) => w.state)).toEqual(["launched", "verified"]);
+  expect(writes.at(-1)?.verified_pid).toBe(5150);
+  expect(writes.at(-1)?.verified_start_time).toBe("darwin:v");
 });
 
 test("applyRestoreVerified: later launches do not wait for an earlier verification timeout", async () => {
@@ -863,8 +872,8 @@ test("applyRestoreVerified: later launches do not wait for an earlier verificati
   );
   const { sink } = recordingIntent();
   const launched: string[] = [];
-  let releaseFirst: ((verdict: "launched-unverified") => void) | undefined;
-  const firstVerdict = new Promise<"launched-unverified">((resolve) => {
+  let releaseFirst: ((verdict: AttachVerifyResult) => void) | undefined;
+  const firstVerdict = new Promise<AttachVerifyResult>((resolve) => {
     releaseFirst = resolve;
   });
   let markSecondLaunched: (() => void) | undefined;
@@ -881,7 +890,9 @@ test("applyRestoreVerified: later launches do not wait for an earlier verificati
       return { ok: true };
     },
     verify: async (candidate) =>
-      candidate.job_id === "a" ? await firstVerdict : "verified",
+      candidate.job_id === "a"
+        ? await firstVerdict
+        : { verdict: "verified", identity: null },
     intent: sink,
     makeIntent: baseIntentFor,
     sleep: async () => {},
@@ -891,7 +902,7 @@ test("applyRestoreVerified: later launches do not wait for an earlier verificati
     secondLaunched.then(() => true),
     Bun.sleep(50).then(() => false),
   ]);
-  releaseFirst?.("launched-unverified");
+  releaseFirst?.({ verdict: "launched-unverified", identity: null });
   const out = await applying;
 
   expect(launchedBeforeFirstSettled).toBe(true);
@@ -907,7 +918,7 @@ test("applyRestoreVerified: a launch failure → failed outcome, verify never ru
     ensureLaunched: async () => ({ ok: false, error: "exit 3 NOOP" }),
     verify: async () => {
       verifyCalled = true;
-      return "verified";
+      return { verdict: "verified", identity: null };
     },
     intent: sink,
     makeIntent: baseIntentFor,
@@ -925,7 +936,7 @@ test("applyRestoreVerified: died resume (verify failed) → failed + resurfacing
   const { writes, sink } = recordingIntent();
   const out = await applyRestoreVerified(plan, {
     ensureLaunched: async () => ({ ok: true }),
-    verify: async () => "failed",
+    verify: async () => ({ verdict: "failed", identity: null }),
     intent: sink,
     makeIntent: baseIntentFor,
     sleep: async () => {},
@@ -940,7 +951,7 @@ test("applyRestoreVerified: no evidence + live pane → launched-unverified warn
   const { writes, sink } = recordingIntent();
   const out = await applyRestoreVerified(plan, {
     ensureLaunched: async () => ({ ok: true }),
-    verify: async () => "launched-unverified",
+    verify: async () => ({ verdict: "launched-unverified", identity: null }),
     intent: sink,
     makeIntent: baseIntentFor,
     sleep: async () => {},
@@ -959,7 +970,7 @@ test("applyRestoreVerified: an already-live session no-ops (never launches)", as
       launched = true;
       return { ok: true };
     },
-    verify: async () => "failed",
+    verify: async () => ({ verdict: "failed", identity: null }),
     intent: sink,
     makeIntent: baseIntentFor,
     isLive: () => true,
@@ -969,6 +980,31 @@ test("applyRestoreVerified: an already-live session no-ops (never launches)", as
   // No launch, no intent churn — the existing verified marker is left untouched.
   expect(launched).toBe(false);
   expect(writes).toEqual([]);
+});
+
+test("applyRestoreVerified: isLive false re-attempts the tab (verified-then-died is never a permanent no-op)", async () => {
+  // The re-run counterpart to the no-op test: a stored-verified tab whose identity
+  // now probes dead (isLive false) is relaunched and re-verified, not masked.
+  const plan = planRestore([fakeCandidate({ job_id: "a" })], null);
+  const { writes, sink } = recordingIntent();
+  let launched = false;
+  const out = await applyRestoreVerified(plan, {
+    ensureLaunched: async () => {
+      launched = true;
+      return { ok: true };
+    },
+    verify: async () => ({
+      verdict: "verified",
+      identity: { pid: 321, start_time: "darwin:new" },
+    }),
+    intent: sink,
+    makeIntent: baseIntentFor,
+    isLive: () => false,
+    sleep: async () => {},
+  });
+  expect(launched).toBe(true);
+  expect(out.map((o) => o.kind)).toEqual(["verified"]);
+  expect(writes.map((w) => w.state)).toEqual(["launched", "verified"]);
 });
 
 test("applyRestoreVerified: hands verify the pre-launch floor + carries the launch id", async () => {
@@ -986,7 +1022,7 @@ test("applyRestoreVerified: hands verify the pre-launch floor + carries the laun
     },
     verify: async (_candidate, launchStartMs) => {
       floors.push(launchStartMs);
-      return "verified";
+      return { verdict: "verified", identity: null };
     },
     intent: sink,
     makeIntent: baseIntentFor,

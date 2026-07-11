@@ -41,12 +41,27 @@ import type { RestoreCandidate } from "../src/restore-set";
 import {
   classifyPaneLiveness,
   claudeAttachEvidence,
+  identityLiveness,
   type PaneLiveness,
   RESTORE_INTENT_SCHEMA_VERSION,
   type RestoreIntent,
   verifyAttach,
 } from "../src/restore-verify";
+import { readOsStartTime } from "../src/seed-sweep";
+import { isPidAlive } from "../src/server-worker";
 import { applyRestoreVerified, type IntentSink } from "../src/tabs-core";
+
+/** The real recycle-safe liveness probe the e2e instrument drives — the same
+ *  (pid, start_time) seam production wires. The OK harness writes its live pid into
+ *  the SessionStart evidence (no start_time → the bare-pid alive path). */
+const realIdentityLiveness = (id: {
+  pid: number | null;
+  start_time: string | null;
+}) =>
+  identityLiveness(id.pid, id.start_time, {
+    isPidAlive,
+    readStartTime: readOsStartTime,
+  });
 
 const SLOW_ENABLED = process.env.KEEPER_RUN_SLOW !== undefined;
 const TMUX_BIN = Bun.which("tmux");
@@ -119,7 +134,9 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         "#!/usr/bin/env bash",
         'session_id="$1"',
         'events_dir="$2"',
-        'line="{\\"bindings\\":{\\"session_id\\":\\"$session_id\\",\\"hook_event\\":\\"SessionStart\\",\\"ts\\":$(date +%s)}}"',
+        // Carry the harness's own pid (which `exec sleep` inherits, keeping it
+        // live) so the evidence yields a real, probe-able recycle-safe identity.
+        'line="{\\"bindings\\":{\\"session_id\\":\\"$session_id\\",\\"hook_event\\":\\"SessionStart\\",\\"ts\\":$(date +%s),\\"pid\\":$$}}"',
         'printf "%s\\n" "$line" >> "$events_dir/$$.ndjson"',
         // A plain large-seconds sleep, not GNU-only "sleep infinity" — BSD/macOS
         // sleep rejects the "infinity" keyword (numeric-only), and this must
@@ -207,7 +224,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         },
         verify: async (c, launchStartMs) =>
           verifyAttach({
-            hasEvidence: () =>
+            findEvidence: () =>
               claudeAttachEvidence(
                 eventsDir,
                 c.resume_target,
@@ -216,11 +233,13 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
                 // write is never mistaken for stale.
                 Math.floor(launchStartMs / 1000) * 1000,
               ),
+            identityLiveness: realIdentityLiveness,
             paneLiveness: () => probeLiveness(session),
             now: Date.now,
             sleep: sleepMs,
             timeoutMs: 5_000,
             pollMs: 100,
+            dwellMs: 300,
           }),
         intent,
         makeIntent,
@@ -241,7 +260,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
           launches++;
           return { ok: true };
         },
-        verify: async () => "verified",
+        verify: async () => ({ verdict: "verified", identity: null }),
         intent,
         makeIntent,
         isLive: () => live,
@@ -309,7 +328,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         },
         verify: async (c, launchStartMs) =>
           verifyAttach({
-            hasEvidence: () =>
+            findEvidence: () =>
               claudeAttachEvidence(
                 eventsDir,
                 c.resume_target,
@@ -318,6 +337,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
                 // write is never mistaken for stale.
                 Math.floor(launchStartMs / 1000) * 1000,
               ),
+            identityLiveness: realIdentityLiveness,
             paneLiveness: () => probeLiveness(session),
             now: Date.now,
             sleep: sleepMs,

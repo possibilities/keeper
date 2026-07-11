@@ -92,7 +92,11 @@ import {
   type RestoreCandidate,
   selectGenerationFromEnriched,
 } from "./restore-set";
-import type { AttachVerdict, RestoreIntent } from "./restore-verify";
+import type {
+  AttachIdentity,
+  AttachVerifyResult,
+  RestoreIntent,
+} from "./restore-verify";
 import { probeServerGeneration } from "./restore-worker";
 import { buildResumeCommand } from "./resume-descriptor";
 import {
@@ -302,13 +306,15 @@ export async function applyRestore(
 
 /** Verify one launched candidate against on-disk attach evidence — the injected
  *  seam production wires to {@link import("./restore-verify").verifyAttach} and
- *  tests fake with a fixed verdict. `launchStartMs` is the wall-clock captured
+ *  tests fake with a fixed result. `launchStartMs` is the wall-clock captured
  *  BEFORE the launch, so the real verify gates evidence on records at/after it
- *  (rejecting a stale pre-crash SessionStart for the same session id). */
+ *  (rejecting a stale pre-crash SessionStart for the same session id). Returns the
+ *  verdict PLUS the recycle-safe identity captured from evidence, which the durable
+ *  `verified` intent stores for the later no-op gate. */
 export type AttachVerifyFn = (
   candidate: RestoreCandidate,
   launchStartMs: number,
-) => Promise<AttachVerdict>;
+) => Promise<AttachVerifyResult>;
 
 /** The durable intent side of the transaction: persist the intent (write-before-
  *  launch, overwrite on each state transition). A `verified` write drops the tab
@@ -415,9 +421,15 @@ export async function applyRestoreVerified(
       out.push(
         (async (): Promise<AgentOutcome> => {
           try {
-            const verdict = await deps.verify(candidate, launchStartMs);
+            const { verdict, identity } = await deps.verify(
+              candidate,
+              launchStartMs,
+            );
             if (verdict === "verified") {
-              deps.intent.write(touchIntent(base, "verified", ""));
+              // Stamp the verified process's recycle-safe (pid, start_time) handle
+              // into the durable intent — the later no-op gate probes THIS, not the
+              // bare marker, so a verified-then-died tab is re-observed dead.
+              deps.intent.write(touchIntent(base, "verified", "", identity));
               return { kind: "verified", candidate };
             }
             if (verdict === "failed") {
@@ -459,13 +471,23 @@ export async function applyRestoreVerified(
 }
 
 /** Transition an intent to a new state/reason, stamping `updated_at` (a side-file
- *  wall-clock, never a fold input). Pure over its inputs. */
+ *  wall-clock, never a fold input). A `verified` transition carries the captured
+ *  `(pid, start_time)` handle; every other transition clears it to null (a
+ *  non-verified tab has no live process to probe). Pure over its inputs. */
 function touchIntent(
   base: RestoreIntent,
   state: RestoreIntent["state"],
   reason: string,
+  identity: AttachIdentity | null = null,
 ): RestoreIntent {
-  return { ...base, state, reason, updated_at: new Date().toISOString() };
+  return {
+    ...base,
+    state,
+    reason,
+    verified_pid: identity?.pid ?? null,
+    verified_start_time: identity?.start_time ?? null,
+    updated_at: new Date().toISOString(),
+  };
 }
 
 /** Count each outcome kind in one pass. Exported so the consumer picks the
@@ -1110,44 +1132,58 @@ export function loadCurrentSetForDump(
 // ---------------------------------------------------------------------------
 
 /**
- * True iff the ingested `events` table carries a `SessionStart` for the exact
- * Claude session id at or after the launch floor. Restore verification first
- * reads raw events-log NDJSON; this fallback covers the normal daemon race where
- * keeperd has already ingested and cleaned up the per-pid hook file. Read-only,
- * daemon-down-safe, and fail-closed to `false` on any open/read error.
+ * The re-attached claude process's identity iff the ingested `events` table
+ * carries a `SessionStart` for the exact Claude session id at or after the launch
+ * floor, else `null`. Restore verification first reads raw events-log NDJSON; this
+ * fallback covers the normal daemon race where keeperd has already ingested and
+ * cleaned up the per-pid hook file. Returns the NEWEST matching SessionStart's
+ * `(pid, start_time)` so the dwell + no-op gate probe a real process. Read-only,
+ * daemon-down-safe, and fail-closed to `null` on any open/read error.
  */
 export function claudeAttachEvidenceFromDb(
   dbPath: string,
   sessionId: string,
   sinceMs = 0,
-): boolean {
+): AttachIdentity | null {
   if (sessionId === "") {
-    return false;
+    return null;
   }
   try {
     const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
     try {
-      if (Number.isFinite(sinceMs) && sinceMs > 0) {
-        const row = db
-          .query(
-            `SELECT 1 AS found FROM events
-              WHERE hook_event = 'SessionStart'
-                AND session_id = ?
-                AND ts >= ?
-              LIMIT 1`,
-          )
-          .get(sessionId, sinceMs / 1000) as { found: number } | null;
-        return row !== null;
+      const gated = Number.isFinite(sinceMs) && sinceMs > 0;
+      const row = (
+        gated
+          ? db
+              .query(
+                `SELECT pid, start_time FROM events
+                  WHERE hook_event = 'SessionStart'
+                    AND session_id = ?
+                    AND ts >= ?
+                  ORDER BY id DESC
+                  LIMIT 1`,
+              )
+              .get(sessionId, sinceMs / 1000)
+          : db
+              .query(
+                `SELECT pid, start_time FROM events
+                  WHERE hook_event = 'SessionStart'
+                    AND session_id = ?
+                  ORDER BY id DESC
+                  LIMIT 1`,
+              )
+              .get(sessionId)
+      ) as { pid: number | null; start_time: string | null } | null;
+      if (row === null) {
+        return null;
       }
-      const row = db
-        .query(
-          `SELECT 1 AS found FROM events
-            WHERE hook_event = 'SessionStart'
-              AND session_id = ?
-            LIMIT 1`,
-        )
-        .get(sessionId) as { found: number } | null;
-      return row !== null;
+      return {
+        pid:
+          typeof row.pid === "number" && Number.isInteger(row.pid)
+            ? row.pid
+            : null,
+        start_time: typeof row.start_time === "string" ? row.start_time : null,
+      };
     } finally {
       try {
         db.close();
@@ -1156,7 +1192,7 @@ export function claudeAttachEvidenceFromDb(
       }
     }
   } catch {
-    return false;
+    return null;
   }
 }
 

@@ -20,11 +20,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type ApplyLockIdentity,
+  type AttachIdentity,
   classifyPaneLiveness,
   claudeAttachEvidence,
   completeLines,
   crashLoopHint,
   gcRestoreIntents,
+  identityLiveness,
   listOpenRestoreIntents,
   listRestoreIntents,
   mayAttemptRestore,
@@ -35,6 +37,8 @@ import {
   type RestoreIntent,
   type RestoreIntentState,
   readRestoreIntent,
+  restoreNoOpDecision,
+  type StartTimeProbeDeps,
   tryAcquireApplyLock,
   verifyAttach,
   writeRestoreIntent,
@@ -60,32 +64,50 @@ function intent(over: Partial<RestoreIntent> = {}): RestoreIntent {
     attempt: 1,
     state: "planned",
     reason: "",
+    verified_pid: null,
+    verified_start_time: null,
     created_at: "2026-07-07T00:00:00.000Z",
     updated_at: "2026-07-07T00:00:00.000Z",
     ...over,
   };
 }
 
-/** One events-log NDJSON line for a SessionStart on `sessionId` at `tsSecs`. */
-function sessionStartLine(sessionId: string, tsSecs: number): string {
+/** One events-log NDJSON line for a SessionStart on `sessionId` at `tsSecs`. The
+ *  `pid` / `start_time` recycle-safe identity the hook stamps on SessionStart is
+ *  carried so the evidence reader can lift it (defaults mirror a real record). */
+function sessionStartLine(
+  sessionId: string,
+  tsSecs: number,
+  identity: { pid?: number | null; start_time?: string | null } = {},
+): string {
+  const pid = "pid" in identity ? identity.pid : 7777;
+  const startTime =
+    "start_time" in identity ? identity.start_time : "darwin:start-7777";
   return `${JSON.stringify({
     bindings: {
       ts: tsSecs,
       session_id: sessionId,
       hook_event: "SessionStart",
       event_type: "session_start",
+      pid,
+      start_time: startTime,
     },
   })}\n`;
 }
 
-/** One birth-record file body carrying `sessionId` (== keeper job id). */
-function birthBody(sessionId: string, launchIso: string): string {
+/** One birth-record file body carrying `sessionId` (== keeper job id), with the
+ *  recycle-safe `(pid, start_time)` the launcher stamps. */
+function birthBody(
+  sessionId: string,
+  launchIso: string,
+  identity: { pid?: number; start_time?: string | null } = {},
+): string {
   return `${JSON.stringify({
     schema_version: 1,
     session_id: sessionId,
     harness: "pi",
-    pid: 4242,
-    start_time: null,
+    pid: identity.pid ?? 4242,
+    start_time: "start_time" in identity ? identity.start_time : "linux:990099",
     cwd: "/repo",
     spawn_name: null,
     config_dir: null,
@@ -113,6 +135,44 @@ describe("restore intent artifact", () => {
       job_id: i.job_id,
     });
     expect(back).toEqual(i);
+  });
+
+  test("round-trips a verified intent's (pid, start_time) handle", () => {
+    const dir = tmp("rv-intent-");
+    const i = intent({
+      state: "verified",
+      verified_pid: 9090,
+      verified_start_time: "darwin:handle",
+    });
+    writeRestoreIntent(dir, i);
+    const back = readRestoreIntent(dir, {
+      generation_id: i.generation_id,
+      session_uuid: i.session_uuid,
+      job_id: i.job_id,
+    });
+    expect(back?.verified_pid).toBe(9090);
+    expect(back?.verified_start_time).toBe("darwin:handle");
+  });
+
+  test("parseRestoreIntent accepts a pre-handle intent, defaulting the handle to null", () => {
+    // Backward-compat: an intent written before the (pid, start_time) handle
+    // existed omits the fields entirely — it must still parse (never a rejected
+    // record forcing a rewind), reading as an unprobeable handle.
+    const { verified_pid, verified_start_time, ...legacy } = intent({
+      state: "verified",
+    });
+    void verified_pid;
+    void verified_start_time;
+    expect("verified_pid" in legacy).toBe(false);
+    const parsed = parseRestoreIntent(JSON.stringify(legacy));
+    expect(parsed).not.toBeNull();
+    expect(parsed?.verified_pid).toBeNull();
+    expect(parsed?.verified_start_time).toBeNull();
+  });
+
+  test("parseRestoreIntent rejects a present-but-mistyped handle", () => {
+    const bad = JSON.stringify({ ...intent(), verified_pid: "not-a-number" });
+    expect(parseRestoreIntent(bad)).toBeNull();
   });
 
   test("parseRestoreIntent rejects a wrong schema_version", () => {
@@ -201,19 +261,38 @@ describe("completeLines", () => {
 // ---------------------------------------------------------------------------
 
 describe("claudeAttachEvidence", () => {
-  test("true for a SessionStart matching the exact session id", () => {
+  test("returns the SessionStart's (pid, start_time) for the exact session id", () => {
     const dir = tmp("rv-events-");
-    writeFileSync(join(dir, "111.ndjson"), sessionStartLine("wanted", 1000));
-    expect(claudeAttachEvidence(dir, "wanted")).toBe(true);
+    writeFileSync(
+      join(dir, "111.ndjson"),
+      sessionStartLine("wanted", 1000, { pid: 5150, start_time: "darwin:x" }),
+    );
+    expect(claudeAttachEvidence(dir, "wanted")).toEqual({
+      pid: 5150,
+      start_time: "darwin:x",
+    });
   });
 
-  test("false for a SessionStart of a DIFFERENT session id", () => {
+  test("a matched record missing pid/start_time yields a null-handle identity", () => {
+    const dir = tmp("rv-events-");
+    writeFileSync(
+      join(dir, "111.ndjson"),
+      sessionStartLine("wanted", 1000, { pid: null, start_time: null }),
+    );
+    // Evidence WAS seen (attach proven) but the identity is unprobeable.
+    expect(claudeAttachEvidence(dir, "wanted")).toEqual({
+      pid: null,
+      start_time: null,
+    });
+  });
+
+  test("null for a SessionStart of a DIFFERENT session id", () => {
     const dir = tmp("rv-events-");
     writeFileSync(join(dir, "111.ndjson"), sessionStartLine("other", 1000));
-    expect(claudeAttachEvidence(dir, "wanted")).toBe(false);
+    expect(claudeAttachEvidence(dir, "wanted")).toBeNull();
   });
 
-  test("false for a non-SessionStart event on the same id", () => {
+  test("null for a non-SessionStart event on the same id", () => {
     const dir = tmp("rv-events-");
     writeFileSync(
       join(dir, "111.ndjson"),
@@ -221,7 +300,7 @@ describe("claudeAttachEvidence", () => {
         bindings: { ts: 1000, session_id: "wanted", hook_event: "Stop" },
       })}\n`,
     );
-    expect(claudeAttachEvidence(dir, "wanted")).toBe(false);
+    expect(claudeAttachEvidence(dir, "wanted")).toBeNull();
   });
 
   test("a torn final line is never consumed as evidence", () => {
@@ -229,23 +308,32 @@ describe("claudeAttachEvidence", () => {
     // The matching SessionStart is the trailing PARTIAL (no newline) → not read.
     const partial = sessionStartLine("wanted", 1000).replace(/\n$/, "");
     writeFileSync(join(dir, "111.ndjson"), `noise\n${partial}`);
-    expect(claudeAttachEvidence(dir, "wanted")).toBe(false);
+    expect(claudeAttachEvidence(dir, "wanted")).toBeNull();
   });
 
   test("recency gate rejects a STALE pre-crash SessionStart", () => {
     const dir = tmp("rv-events-");
     // Event at t=1000s (1_000_000 ms); floor at 2_000_000 ms → rejected.
     writeFileSync(join(dir, "111.ndjson"), sessionStartLine("wanted", 1000));
-    expect(claudeAttachEvidence(dir, "wanted", 2_000_000)).toBe(false);
+    expect(claudeAttachEvidence(dir, "wanted", 2_000_000)).toBeNull();
     // A fresh event at t=3000s (3_000_000 ms) clears the same floor.
-    writeFileSync(join(dir, "222.ndjson"), sessionStartLine("wanted", 3000));
-    expect(claudeAttachEvidence(dir, "wanted", 2_000_000)).toBe(true);
+    writeFileSync(
+      join(dir, "222.ndjson"),
+      sessionStartLine("wanted", 3000, {
+        pid: 3003,
+        start_time: "darwin:fresh",
+      }),
+    );
+    expect(claudeAttachEvidence(dir, "wanted", 2_000_000)).toEqual({
+      pid: 3003,
+      start_time: "darwin:fresh",
+    });
   });
 
   test("empty session id and absent dir are both no-evidence", () => {
     const dir = tmp("rv-events-");
-    expect(claudeAttachEvidence(dir, "")).toBe(false);
-    expect(claudeAttachEvidence(join(dir, "nope"), "wanted")).toBe(false);
+    expect(claudeAttachEvidence(dir, "")).toBeNull();
+    expect(claudeAttachEvidence(join(dir, "nope"), "wanted")).toBeNull();
   });
 });
 
@@ -254,15 +342,21 @@ describe("claudeAttachEvidence", () => {
 // ---------------------------------------------------------------------------
 
 describe("nonClaudeAttachEvidence", () => {
-  test("true for a birth record carrying the job id", () => {
+  test("returns the birth record's (pid, start_time) for the job id", () => {
     const dir = tmp("rv-birth-");
     mkdirSync(join(dir, "new"), { recursive: true });
     writeFileSync(
       join(dir, "new", "4242.rec.json"),
-      birthBody("job-x", "2026-07-07T01:00:00.000Z"),
+      birthBody("job-x", "2026-07-07T01:00:00.000Z", {
+        pid: 8080,
+        start_time: "linux:424242",
+      }),
     );
-    expect(nonClaudeAttachEvidence(dir, "job-x")).toBe(true);
-    expect(nonClaudeAttachEvidence(dir, "job-other")).toBe(false);
+    expect(nonClaudeAttachEvidence(dir, "job-x")).toEqual({
+      pid: 8080,
+      start_time: "linux:424242",
+    });
+    expect(nonClaudeAttachEvidence(dir, "job-other")).toBeNull();
   });
 
   test("recency gate rejects a stale birth record", () => {
@@ -273,7 +367,7 @@ describe("nonClaudeAttachEvidence", () => {
       birthBody("job-x", "2026-07-07T00:00:00.000Z"),
     );
     const floor = Date.parse("2026-07-07T02:00:00.000Z");
-    expect(nonClaudeAttachEvidence(dir, "job-x", floor)).toBe(false);
+    expect(nonClaudeAttachEvidence(dir, "job-x", floor)).toBeNull();
   });
 });
 
@@ -302,42 +396,85 @@ describe("classifyPaneLiveness", () => {
 });
 
 // ---------------------------------------------------------------------------
-// verifyAttach — the bounded state matrix
+// verifyAttach — the evidence window + dwell state matrix
 // ---------------------------------------------------------------------------
 
-describe("verifyAttach", () => {
-  const fixedClock = { now: () => 0, sleep: async () => {} };
+const ID: AttachIdentity = { pid: 4242, start_time: "darwin:s" };
+/** A fixed clock + no-op sleep. The dwell is POLL-COUNT bounded, so a stopped
+ *  clock cannot spin it. */
+const fixedClock = { now: () => 0, sleep: async () => {} };
 
-  test("evidence present immediately → verified (never touches the pane)", async () => {
+describe("verifyAttach", () => {
+  test("evidence present + process stays alive across the dwell → verified", async () => {
     let paneProbed = false;
-    const verdict = await verifyAttach({
-      hasEvidence: () => true,
+    const result = await verifyAttach({
+      findEvidence: () => ID,
+      identityLiveness: () => "alive",
       paneLiveness: () => {
         paneProbed = true;
         return "dead";
       },
+      dwellMs: 1000,
+      pollMs: 500,
       ...fixedClock,
     });
-    expect(verdict).toBe("verified");
+    // The verdict carries the captured identity for the durable intent, and the
+    // no-evidence pane path is never touched when evidence is present.
+    expect(result).toEqual({ verdict: "verified", identity: ID });
     expect(paneProbed).toBe(false);
   });
 
   test("evidence appears on a later poll → verified", async () => {
     let calls = 0;
-    const verdict = await verifyAttach({
-      hasEvidence: () => ++calls >= 3,
+    const result = await verifyAttach({
+      findEvidence: () => (++calls >= 3 ? ID : null),
+      identityLiveness: () => "alive",
       paneLiveness: () => "dead",
+      dwellMs: 0,
       now: () => 0,
       sleep: async () => {},
     });
-    expect(verdict).toBe("verified");
+    expect(result.verdict).toBe("verified");
     expect(calls).toBe(3);
   });
 
-  test("no-evidence timeout + DEAD pane → failed", async () => {
+  test("evidence then the process DIES inside the dwell → failed (die-after-verify)", async () => {
+    // The exact mask this closes: a candidate verifies (evidence seen) then the
+    // 17-way boot memory crunch kills the pane. A dwell probe re-observes the
+    // death → failed, never a point-in-time false verified.
+    let probes = 0;
+    const result = await verifyAttach({
+      findEvidence: () => ID,
+      identityLiveness: () => (++probes >= 2 ? "dead" : "alive"),
+      paneLiveness: () => "alive",
+      dwellMs: 1500,
+      pollMs: 500,
+      ...fixedClock,
+    });
+    expect(result).toEqual({ verdict: "failed", identity: ID });
+    expect(probes).toBe(2);
+  });
+
+  test("evidence but the dwell probe is only-ever inconclusive → launched-unverified", async () => {
+    // Documented probe-failure fail-direction: a starved start-time read (unknown)
+    // never asserts up (no false verified) nor down (no relaunch this apply) — it
+    // resurfaces as a warn.
+    const result = await verifyAttach({
+      findEvidence: () => ID,
+      identityLiveness: () => "unknown",
+      paneLiveness: () => "alive",
+      dwellMs: 1500,
+      pollMs: 500,
+      ...fixedClock,
+    });
+    expect(result).toEqual({ verdict: "launched-unverified", identity: ID });
+  });
+
+  test("no-evidence timeout + DEAD pane → failed (identity null)", async () => {
     let t = 0;
-    const verdict = await verifyAttach({
-      hasEvidence: () => false,
+    const result = await verifyAttach({
+      findEvidence: () => null,
+      identityLiveness: () => "alive",
       paneLiveness: () => "dead",
       now: () => t,
       sleep: async (ms) => {
@@ -346,13 +483,14 @@ describe("verifyAttach", () => {
       timeoutMs: 1000,
       pollMs: 100,
     });
-    expect(verdict).toBe("failed");
+    expect(result).toEqual({ verdict: "failed", identity: null });
   });
 
   test("no-evidence timeout + ALIVE pane → launched-unverified", async () => {
     let t = 0;
-    const verdict = await verifyAttach({
-      hasEvidence: () => false,
+    const result = await verifyAttach({
+      findEvidence: () => null,
+      identityLiveness: () => "alive",
       paneLiveness: () => "alive",
       now: () => t,
       sleep: async (ms) => {
@@ -361,13 +499,14 @@ describe("verifyAttach", () => {
       timeoutMs: 1000,
       pollMs: 100,
     });
-    expect(verdict).toBe("launched-unverified");
+    expect(result.verdict).toBe("launched-unverified");
   });
 
   test("no-evidence timeout + UNKNOWN pane → launched-unverified (never a false failed)", async () => {
     let t = 0;
-    const verdict = await verifyAttach({
-      hasEvidence: () => false,
+    const result = await verifyAttach({
+      findEvidence: () => null,
+      identityLiveness: () => "alive",
       paneLiveness: () => "unknown",
       now: () => t,
       sleep: async (ms) => {
@@ -376,7 +515,143 @@ describe("verifyAttach", () => {
       timeoutMs: 1000,
       pollMs: 100,
     });
-    expect(verdict).toBe("launched-unverified");
+    expect(result.verdict).toBe("launched-unverified");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// identityLiveness — the recycle-safe (pid, start_time) probe
+// ---------------------------------------------------------------------------
+
+describe("identityLiveness", () => {
+  /** Build probe deps from a fixed liveness map + a start-time reader. */
+  function deps(over: Partial<StartTimeProbeDeps> = {}): StartTimeProbeDeps {
+    return {
+      isPidAlive: () => true,
+      readStartTime: () => "darwin:s",
+      ...over,
+    };
+  }
+
+  test("live pid whose start_time matches → alive", () => {
+    expect(identityLiveness(100, "darwin:s", deps())).toBe("alive");
+  });
+
+  test("a gone pid → dead (never probes start_time)", () => {
+    let readCalled = false;
+    const live = identityLiveness(100, "darwin:s", {
+      isPidAlive: () => false,
+      readStartTime: () => {
+        readCalled = true;
+        return "darwin:s";
+      },
+    });
+    expect(live).toBe("dead");
+    expect(readCalled).toBe(false);
+  });
+
+  test("live pid whose start_time DIFFERS → dead (recycled pid, our process gone)", () => {
+    expect(
+      identityLiveness(
+        100,
+        "darwin:OLD",
+        deps({ readStartTime: () => "darwin:NEW" }),
+      ),
+    ).toBe("dead");
+  });
+
+  test("live pid whose start_time can't be read → unknown (inconclusive)", () => {
+    expect(
+      identityLiveness(100, "darwin:s", deps({ readStartTime: () => null })),
+    ).toBe("unknown");
+  });
+
+  test("live pid with NO stored start_time → bare-pid alive", () => {
+    expect(identityLiveness(100, null, deps())).toBe("alive");
+    expect(identityLiveness(100, "", deps())).toBe("alive");
+  });
+
+  test("no captured pid → unknown (nothing to probe)", () => {
+    const noProbe = deps({
+      isPidAlive: () => {
+        throw new Error("must not probe a null pid");
+      },
+    });
+    expect(identityLiveness(null, "darwin:s", noProbe)).toBe("unknown");
+    expect(identityLiveness(0, "darwin:s", noProbe)).toBe("unknown");
+    expect(identityLiveness(-1, "darwin:s", noProbe)).toBe("unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreNoOpDecision — the live-UUID no-op gate over a stored verified intent
+// ---------------------------------------------------------------------------
+
+describe("restoreNoOpDecision", () => {
+  const aliveDeps: StartTimeProbeDeps = {
+    isPidAlive: () => true,
+    readStartTime: () => "darwin:s",
+  };
+  const deadDeps: StartTimeProbeDeps = {
+    isPidAlive: () => false,
+    readStartTime: () => null,
+  };
+  const starvedDeps: StartTimeProbeDeps = {
+    isPidAlive: () => true,
+    readStartTime: () => null,
+  };
+  const verified = (over: Partial<RestoreIntent> = {}): RestoreIntent =>
+    intent({
+      state: "verified",
+      verified_pid: 4242,
+      verified_start_time: "darwin:s",
+      ...over,
+    });
+
+  test("verified + stored identity still alive → skip (idempotent no-op)", () => {
+    expect(restoreNoOpDecision(verified(), aliveDeps)).toEqual({
+      skip: true,
+      inconclusive: false,
+    });
+  });
+
+  test("verified but the stored identity is DEAD → re-attempt (never a permanent no-op)", () => {
+    // The mask this closes: a verified-then-died tab must relaunch, not skip.
+    expect(restoreNoOpDecision(verified(), deadDeps)).toEqual({
+      skip: false,
+      inconclusive: false,
+    });
+  });
+
+  test("verified but the probe is inconclusive → skip WITH the inconclusive flag", () => {
+    // Fail-direction: don't double-spawn a possibly-live session, but flag the skip
+    // so the caller never masks a death silently.
+    expect(restoreNoOpDecision(verified(), starvedDeps)).toEqual({
+      skip: true,
+      inconclusive: true,
+    });
+  });
+
+  test("a verified intent with NO stored handle skips inconclusively (backward-compat)", () => {
+    const preHandle = intent({
+      state: "verified",
+      verified_pid: null,
+      verified_start_time: null,
+    });
+    expect(restoreNoOpDecision(preHandle, aliveDeps)).toEqual({
+      skip: true,
+      inconclusive: true,
+    });
+  });
+
+  test("a non-verified prior (or null) is never a no-op", () => {
+    expect(restoreNoOpDecision(null, aliveDeps).skip).toBe(false);
+    expect(
+      restoreNoOpDecision(intent({ state: "failed" }), aliveDeps).skip,
+    ).toBe(false);
+    expect(
+      restoreNoOpDecision(intent({ state: "launched" }), aliveDeps).skip,
+    ).toBe(false);
   });
 });
 

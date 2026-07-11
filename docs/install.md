@@ -158,8 +158,9 @@ rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ## Backup & restore
 
 `keeper.db` is the source of truth, so the daemon guards it with a periodic `PRAGMA quick_check`
-integrity probe and a daily verified `VACUUM INTO` snapshot (kept only if the full `integrity_check`
-passes). The backup, restore, and offline size-reclaim runbooks are rendered from code — the single
+integrity probe and a rolling verified `VACUUM INTO` snapshot (kept only if the full `integrity_check`
+passes; see `BACKUP_INTERVAL_MS` in `src/backup.ts` for the current cadence). The backup, restore,
+and offline size-reclaim runbooks are rendered from code — the single
 source of truth — via `keeper reclaim --agent-help`, `bun scripts/backup-db.ts`, and
 `reclaimInstructions()` / `restoreInstructions()` in `src/backup.ts`. Because projections fold
 deterministically from the immutable `events` table, a restored snapshot re-derives byte-identical

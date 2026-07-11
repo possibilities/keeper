@@ -111,6 +111,11 @@ const PANEL_SESSION = "panels";
  *  abandoned). Measured off the run's write-once `started-at` sentinel mtime, NOT
  *  the dir mtime (a leg's result write bumps that). */
 export const PANEL_PRUNE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+/** Cadence for the maintenance-worker's automatic `panelPrune` caller (see
+ *  src/maintenance-worker.ts) — well inside {@link PANEL_PRUNE_TTL_MS} so a
+ *  reclaimable dir is swept promptly, matching the sibling backup interval
+ *  (`BACKUP_INTERVAL_MS`, src/backup.ts). */
+export const PANEL_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** The run-birth sentinel basename — written once at fresh start, never on a
  *  reconcile, so its mtime anchors `panel prune`'s age check to the run's original
  *  start instant. */

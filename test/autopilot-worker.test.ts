@@ -107,6 +107,7 @@ import {
   laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
   loadReconcileSnapshot,
+  logMergeGateDeferral,
   type MergeSuiteProbe,
   type MergeSuiteVerdict,
   mergeLaneBaseIntoDefault,
@@ -13560,6 +13561,99 @@ test("fn-1034 reconcile: a CLUSTERED epic defers ONLY the flagged group's work r
   ).toBe(true);
   // A pure `continue` — reconcile mints no sticky / dispatch_failures.
   expect(decision.worktreeFinalize).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// logMergeGateDeferral — per-key coalesced console.error for a merge-gate
+// deferral: a key's first call logs immediately, a repeat within the coalesce
+// window is suppressed (counted, not logged), and the first call past the
+// window flushes a "+N suppressed" summary and re-arms.
+// ---------------------------------------------------------------------------
+
+test("logMergeGateDeferral: first call for a key logs immediately, verbatim", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const state = new Map<string, { loggedAt: number; suppressed: number }>();
+    logMergeGateDeferral("a@/repo", "hello world", 1_000, state);
+    expect(errs).toEqual(["hello world"]);
+  } finally {
+    console.error = origError;
+  }
+});
+
+test("logMergeGateDeferral: a repeat within the coalesce window is suppressed, not logged", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const state = new Map<string, { loggedAt: number; suppressed: number }>();
+    logMergeGateDeferral("a@/repo", "hello world", 1_000, state);
+    logMergeGateDeferral("a@/repo", "hello world", 1_500, state);
+    logMergeGateDeferral("a@/repo", "hello world", 2_000, state);
+    expect(errs).toEqual(["hello world"]);
+    expect(state.get("a@/repo")?.suppressed).toBe(2);
+  } finally {
+    console.error = origError;
+  }
+});
+
+test("logMergeGateDeferral: the first call past the coalesce window flushes a '+N suppressed' summary and re-arms", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const state = new Map<string, { loggedAt: number; suppressed: number }>();
+    logMergeGateDeferral("a@/repo", "hello world", 0, state);
+    logMergeGateDeferral("a@/repo", "hello world", 10_000, state); // suppressed
+    logMergeGateDeferral("a@/repo", "hello world", 20_000, state); // suppressed
+    logMergeGateDeferral("a@/repo", "hello world", 61_000, state); // past the 60s window
+    expect(errs).toEqual(["hello world", "hello world (+2 suppressed)"]);
+    // Re-armed: the flush resets the window start and the suppressed count.
+    expect(state.get("a@/repo")).toEqual({ loggedAt: 61_000, suppressed: 0 });
+  } finally {
+    console.error = origError;
+  }
+});
+
+test("logMergeGateDeferral: independent keys never suppress each other", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const state = new Map<string, { loggedAt: number; suppressed: number }>();
+    logMergeGateDeferral("a@/repo", "message a", 0, state);
+    logMergeGateDeferral("b@/repo", "message b", 0, state);
+    logMergeGateDeferral("a@/repo", "message a", 1_000, state); // suppressed, key a
+    logMergeGateDeferral("b@/repo", "message b", 1_000, state); // suppressed, key b
+    expect(errs).toEqual(["message a", "message b"]);
+  } finally {
+    console.error = origError;
+  }
+});
+
+test("logMergeGateDeferral: an unseen key always logs on first call, even against the default shared state", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const key = `unique-key-${Date.now()}-${Math.random()}`;
+    logMergeGateDeferral(key, "unseen key logs");
+    expect(errs).toEqual(["unseen key logs"]);
+  } finally {
+    console.error = origError;
+  }
 });
 
 // ---------------------------------------------------------------------------
