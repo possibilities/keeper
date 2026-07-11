@@ -48,5 +48,5 @@ Update every fixture that asserts the flag; add a test that the emitted claude r
 - [ ] All display-surface fixtures asserting the old flag are updated and green.
 
 ## Done summary
-
+Dropped the --x-no-confirm launcher-alias flag from buildResumeCommand's claude arm so the pasted resume string runs in any shell; updated all pinned fixtures in test/resume-descriptor.test.ts and added a no-launcher-flag assertion.
 ## Evidence
