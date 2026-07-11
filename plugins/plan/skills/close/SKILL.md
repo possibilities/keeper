@@ -49,6 +49,8 @@ Capture the `[instructions]` tail (anything after the epic id in `$ARGUMENTS`) v
 
 Spawn the quality-auditor with a config-only prompt — `EPIC_ID`, `PRIMARY_REPO`, `BRIEF_REF`, and `DEPTH_BAND`, nothing else. The auditor reads the brief itself (commit groups, done summaries) and persists its report via `audit submit --project "$PRIMARY_REPO"` (the submit auto-routes state to the epic's primary repo through the central resolver; `--project` is an explicit belt-and-suspenders pin, not the mechanism); the closer never inlines audit prose. `DEPTH_BAND` sizes the pass — the auditor's report meta echoes it back, so a mismatch against the brief's own `depth.band` is visible to the close-planner at vet time.
 
+**Every subagent spawn in this skill is backgrounded — the auditor, the close-planner, and the model-selector alike.** Waiting for one means ending the turn, never spinning in place; the subagent's completion task-notification is the only wake path back into this closer. Never call the harness ScheduleWakeup tool, a Monitor, or a shell sleep to wait on a spawned subagent — ScheduleWakeup is loop-only and requires a `prompt`, so calling it here fails outright. This is distinct from the transient-failure retry below: that backoff sleeps between re-*spawn* attempts after a dropped Task call returns no body, which is a legitimate retry sleep, never a wait on a live subagent.
+
 ```
 Task(
     subagent_type="plan:quality-auditor",
@@ -120,7 +122,7 @@ keeper plan epic-question <epic_id> --clear
 SendMessage(to=planner_agent_id, message="ANSWER: <human's answer>")
 ```
 
-Wait for the planner to finish, then re-parse its one-line return (fatal / non-fatal / a fresh QUESTION — which re-parks via the Surface-and-pin step above) and continue. A SendMessage error envelope `{"success": false, "message": "No agent named '<id>' is currently addressable..."}` means the agent is dead — fall through to the cold path.
+End the turn; the planner's next task-notification re-invokes you — then re-parse its one-line return (fatal / non-fatal / a fresh QUESTION — which re-parks via the Surface-and-pin step above) and continue. A SendMessage error envelope `{"success": false, "message": "No agent named '<id>' is currently addressable..."}` means the agent is dead — fall through to the cold path.
 
 **Cold fallback (SendMessage error, or a fresh session with no pinned id):** clear the parked epic-question, then re-spawn the close-planner against the persisted artifacts, folding the answer into the prompt. The report and (any) prior verdict still live at their refs under `audits/<epic_id>/`, so the planner re-reads them by path:
 
