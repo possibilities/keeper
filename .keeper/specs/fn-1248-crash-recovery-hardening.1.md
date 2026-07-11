@@ -60,5 +60,5 @@ Extend `test/tabs.test.ts` (snapshot-script tests assert byte-aligned argv — s
 - [ ] A probe failure resolves to a documented fail-direction that neither masks a death nor double-spawns.
 
 ## Done summary
-
+Gated the restore live-UUID no-op and the verify verdict on a REAL current (pid, start_time) probe instead of a past-attach marker: persisted the verified process's recycle-safe handle into the intent (backward-compatible, no schema bump), so a verified-then-died tab re-observes dead and relaunches; replaced the point-in-time verdict with a dwell/startup-window check; all liveness reads flow through injected seams (fast tier subprocess-free).
 ## Evidence
