@@ -39,5 +39,5 @@ reintroduce the stale answer on the resumed-timeout path.
       byte-identical to today (existing suites stay green).
 
 ## Done summary
-
+Anchor resumed-pi capture on a structural stop-count watermark: waitForTranscriptStop samples the prior-stop count when the wait begins and returns only a strictly-newer stop, so a re-stamped copied prior answer is never captured; findLastMessage cuts the timed-out partial read to this turn's own prompt. Fresh pi and claude/codex/hermes byte-unchanged.
 ## Evidence
