@@ -31,8 +31,8 @@
  *
  * Anti-spoof: the server resolves the connecting peer's pid via `peerPidForFd`
  * (authoritative LOCAL_PEERPID), walks its ancestry to the nearest pid keeper
- * tracks (the Claude harness — the peer is the `keeper bus watch` subprocess two
- * hops below it), enriches THAT pid from keeper.db `jobs`, and OVERWRITES the
+ * tracks (the harness — the peer is a `keeper bus watch` descendant), enriches
+ * THAT pid from keeper.db `jobs`, and OVERWRITES the
  * sender-claimed `from` with the harness-resolved identity. Because the walk
  * roots at the server-resolved peer pid, a client cannot forge an identity it is
  * not descended from.
@@ -621,7 +621,7 @@ export const HARNESS_WALK_MAX_DEPTH = 40;
 
 /** Resolved harness identity: the ancestor pid keeper tracks + its job row. */
 export interface HarnessIdentity {
-  /** The ancestor pid that has a keeper `jobs` row — the Claude harness. */
+  /** The ancestor pid that has a keeper `jobs` row — the tracked harness. */
   pid: number;
   /** That ancestor's keeper-resolved identity. */
   identity: JobIdentity;
@@ -629,11 +629,10 @@ export interface HarnessIdentity {
 
 /**
  * Walk a connecting peer's pid up its ancestry and return the NEAREST ancestor
- * (the peer pid itself counts) that has a keeper.db `jobs` row — keeper only
- * tracks Claude HARNESS pids, so the nearest ancestor keeper knows IS the
- * harness. The `keeper bus watch` client is two hops below its harness (harness
- * → zsh → watch), so enriching the bare peer pid always missed; this lifts the
- * identity to the real session.
+ * (the peer pid itself counts) that has a keeper.db `jobs` row — keeper tracks
+ * harness pids, so the nearest ancestor keeper knows IS the harness. A `keeper
+ * bus watch` client runs below its harness, so enriching the bare peer pid always
+ * missed; this lifts the identity to the real session.
  *
  * ANTI-SPOOF: the walk roots at the SERVER-resolved peer pid (never a
  * client-supplied pid), so a client can only resolve to an ancestor it is
@@ -978,7 +977,7 @@ export function startBusServer(
     // Anti-spoof: the pid is the PEER pid, never the client-claimed one. The
     // peer is the `keeper bus watch` subprocess (harness → zsh → watch), so we
     // resolve the channel's IDENTITY from the nearest ancestor keeper tracks —
-    // the Claude harness — rooting the walk at the server-resolved peer pid so a
+    // the harness — rooting the walk at the server-resolved peer pid so a
     // client cannot forge an identity it is not descended from.
     const peerPid = conn.peerPid ?? op.pid ?? 0;
     // The walk awaits `ps` off the serve loop — BOTH the per-hop ppid probe

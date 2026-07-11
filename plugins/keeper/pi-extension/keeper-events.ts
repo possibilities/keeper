@@ -6,8 +6,8 @@
  * AgentHarness lifecycle. The keeper launcher arms THIS file on every tracked pi
  * launch (interactive or detached); it translates pi's events into keeper's
  * events-log NDJSON contract so a pi session shows the same working/stopped churn
- * on the board that a claude session does, and registers a read-only transcript
- * tool backed by the keeper CLI.
+ * on the board that a claude session does, holds a session-scoped Agent Bus inbox,
+ * and registers a read-only transcript tool backed by the keeper CLI.
  *
  * EPHEMERAL, NEVER a persistent `pi install`: a global install would fire on the
  * human's own non-keeper pi sessions. The `-e` per-launch arming plus the
@@ -22,9 +22,10 @@
  *
  * SELF-CONTAINED ISLAND: pi loads this file in ISOLATION via jiti, outside the
  * keeper build — it can import nothing from keeper's `src/` tree and the pi
- * package is not on keeper's module path either. So it imports ONLY `node:*` and
- * carries its own minimal structural types for the pi events it reads and its own
- * copy of the events-log contract (the byte-identical NDJSON shape + dir
+ * package is not on keeper's module path either. Its local helpers import only
+ * `node:*`; this entry point carries minimal structural types for the pi events
+ * it reads and its own copy of the events-log contract (the byte-identical NDJSON
+ * shape + dir
  * resolver). The matching comments on both sides are the drift guard.
  *
  * FAIL-OPEN IS LOAD-BEARING, NOT OPTIONAL: pi ABORTS the launch when an extension
@@ -50,6 +51,12 @@ import { execFile } from "node:child_process";
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  type AmbientBusWatchTask,
+  claimBusInboxOwnership,
+  PiBusInboxController,
+  releaseBusInboxOwnership,
+} from "./bus-inbox.ts";
 import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
 
 // ---------------------------------------------------------------------------
@@ -78,9 +85,24 @@ export interface PiObservedEvent {
 /** The minimal surface of pi's `ExtensionAPI` this extension calls. Structural so
  *  the file needs no import from the pi package; pi passes an object with `.on`. */
 export interface PiExtensionApi {
-  on(event: string, handler: (event: PiObservedEvent) => void): void;
+  on(
+    event: string,
+    handler: (event: PiObservedEvent) => void | Promise<void>,
+  ): void;
   events?: PiTaskEventBus;
   registerTool?(tool: PiToolDefinition<unknown>): void;
+  sendMessage?(
+    message: {
+      customType: string;
+      content: string;
+      display: boolean;
+      details?: Record<string, unknown>;
+    },
+    options?: {
+      triggerTurn?: boolean;
+      deliverAs?: "steer" | "followUp" | "nextTurn";
+    },
+  ): void;
 }
 
 export interface PiTranscriptParams {
@@ -133,6 +155,8 @@ export interface PiTranslateMeta {
   /** Event timestamp in Unix SECONDS (the live fire instant — this is a live
    *  channel, not a replay tail, so wall-clock at emit is authoritative). */
   tsSec: number;
+  /** Harness-armed background resources reflected on Stop as ambient monitors. */
+  backgroundTasks?: AmbientBusWatchTask[];
 }
 
 /** One bare-column `events` binding map — the payload of an events-log line.
@@ -207,7 +231,12 @@ export function piEventBindings(
     case "agent_end":
       return {
         ...base("Stop", "stop"),
-        data: boundedData("Stop", { hook_event_name: "Stop" }),
+        data: boundedData("Stop", {
+          hook_event_name: "Stop",
+          ...(meta.backgroundTasks === undefined
+            ? {}
+            : { background_tasks: meta.backgroundTasks }),
+        }),
       };
     case "tool_call": {
       const toolName =
@@ -653,6 +682,26 @@ const TRANSCRIPT_TOOL: PiToolDefinition<PiTranscriptParams> = {
 };
 
 // ---------------------------------------------------------------------------
+// Agent Bus delivery
+// ---------------------------------------------------------------------------
+
+/** Inject one peer message with Monitor-like wake semantics. Never throws. */
+export function sendPiBusMessage(pi: PiExtensionApi, line: string): void {
+  try {
+    pi.sendMessage?.(
+      {
+        customType: "keeper-agent-bus",
+        content: line,
+        display: true,
+      },
+      { deliverAs: "steer", triggerTurn: true },
+    );
+  } catch {
+    // A session replacement invalidates the old extension API.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // extension factory (pi's default-export entry point)
 // ---------------------------------------------------------------------------
 
@@ -678,6 +727,14 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     }
     const pid = process.pid;
     const cwd = process.cwd();
+    const busInbox =
+      typeof pi.sendMessage === "function"
+        ? new PiBusInboxController({
+            deliver: (line) => sendPiBusMessage(pi, line),
+          })
+        : null;
+    const busOwnerToken = {};
+    let ownsBusInbox = false;
 
     const emit = (event: PiObservedEvent): void => {
       try {
@@ -686,6 +743,13 @@ export default function keeperEvents(pi: PiExtensionApi): void {
           pid,
           cwd,
           tsSec: Date.now() / 1000,
+          ...(event.type === "agent_end" && busInbox !== null
+            ? {
+                backgroundTasks: [busInbox.ambientTask()].filter(
+                  (task): task is AmbientBusWatchTask => task !== null,
+                ),
+              }
+            : {}),
         });
         if (line !== null) {
           appendEventsLogLine(process.env, pid, line);
@@ -707,6 +771,27 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     ]) {
       pi.on(kind, emit);
     }
+    pi.on("session_start", () => {
+      try {
+        if (busInbox !== null && claimBusInboxOwnership(busOwnerToken)) {
+          ownsBusInbox = true;
+          busInbox.start();
+        }
+      } catch {
+        // Presence-only degradation: a bus child must never break Pi startup.
+      }
+    });
+    pi.on("session_shutdown", async () => {
+      if (!ownsBusInbox) return;
+      ownsBusInbox = false;
+      try {
+        await busInbox?.stop();
+      } catch {
+        // Session teardown must remain fail-open for every shutdown reason.
+      } finally {
+        releaseBusInboxOwnership(busOwnerToken);
+      }
+    });
     if (typeof pi.registerTool === "function") {
       pi.registerTool(TRANSCRIPT_TOOL);
       if (pi.events !== undefined) {

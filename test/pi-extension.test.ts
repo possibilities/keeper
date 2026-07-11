@@ -24,6 +24,7 @@ import keeperEvents, {
   type PiTranslateMeta,
   piEventBindings,
   resolvePiEventsLogDir,
+  sendPiBusMessage,
   serializePiLine,
   transcriptCliArgs,
   transcriptIdError,
@@ -60,6 +61,31 @@ describe("pi extension — pure translation", () => {
     expect(b?.event_type).toBe("stop");
     expect(b?.session_id).toBe("job-1111-2222");
     expect(b?.data).toBe('{"hook_event_name":"Stop"}');
+  });
+
+  test("agent_end carries the harness-armed bus watcher as an ambient task", () => {
+    const b = piEventBindings(
+      { type: "agent_end" },
+      {
+        ...META,
+        backgroundTasks: [
+          {
+            id: "pi-bus-42",
+            type: "shell",
+            command: "keeper bus watch --json --lifetime-stdin",
+            description: "keeper agent bus",
+          },
+        ],
+      },
+    );
+    expect(JSON.parse(b?.data as string).background_tasks).toEqual([
+      {
+        id: "pi-bus-42",
+        type: "shell",
+        command: "keeper bus watch --json --lifetime-stdin",
+        description: "keeper agent bus",
+      },
+    ]);
   });
 
   test("tool_call folds to PreToolUse carrying the tool name + input", () => {
@@ -473,7 +499,7 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(existsSync(join(logDir, `${process.pid}.ndjson`))).toBe(false);
   });
 
-  test("with KEEPER_JOB_ID → registers the five lifecycle observers", () => {
+  test("with KEEPER_JOB_ID → registers lifecycle and bus observers", () => {
     process.env.KEEPER_JOB_ID = "job-abc";
     const pi = fakePi();
     keeperEvents(pi);
@@ -481,6 +507,7 @@ describe("pi extension — factory arming + fail-open", () => {
       "agent_end",
       "agent_start",
       "session_shutdown",
+      "session_start",
       "tool_call",
       "tool_result",
     ]);
@@ -517,6 +544,40 @@ describe("pi extension — factory arming + fail-open", () => {
     keeperEvents(pi);
     // The deliberately-failing write must be swallowed — no throw escapes.
     expect(() => pi.fire("agent_start", { type: "agent_start" })).not.toThrow();
+  });
+
+  test("bus delivery uses steer + idle wake and swallows a stale Pi API", () => {
+    const calls: unknown[] = [];
+    sendPiBusMessage(
+      {
+        on() {},
+        sendMessage(message, options) {
+          calls.push({ message, options });
+        },
+      },
+      "Agent Bus message from alice: ship it",
+    );
+    expect(calls).toEqual([
+      {
+        message: {
+          customType: "keeper-agent-bus",
+          content: "Agent Bus message from alice: ship it",
+          display: true,
+        },
+        options: { deliverAs: "steer", triggerTurn: true },
+      },
+    ]);
+    expect(() =>
+      sendPiBusMessage(
+        {
+          on() {},
+          sendMessage() {
+            throw new Error("stale extension");
+          },
+        },
+        "late",
+      ),
+    ).not.toThrow();
   });
 
   test("the factory never throws even when pi.on itself throws", () => {
