@@ -23,6 +23,10 @@ You receive, in your prompt:
   two panelists launched from the same identical triple. Each is a `keeper agent run` JSON result envelope
   whose `message` field is that panelist's final answer (JSON is valid YAML, so reading the `.yaml` still
   surfaces `message`). Optionally a scratch dir for Track A.
+- Optionally a **failed-legs block** — member names + content-blind failure reasons for panelists that
+  produced no viable answer. The runner sends it when the panel judged on a quorum rather than the full
+  roster: fuse only the answer files you were given, and your audit MUST disclose the reduced composition
+  (which legs failed and that coverage is narrower than the configured panel).
 
 Read every answer file in full, in your own context, before judging. If reading any panelist file trips `stop_reason: model_context_window_exceeded`, say so explicitly in your output, read what you can in chunks, and mark any section you could not fully ground as **partial / unverified** rather than guessing.
 

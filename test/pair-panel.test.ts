@@ -343,6 +343,7 @@ test("buildPanelLegArgv: leg carries the RAW triple as --preset + the slug as --
     "1800000ms",
     "--name",
     `panel::my-run::${slug}`,
+    "--reap-window-on-terminal",
   ]);
 
   // A presetless member keeps its harness as the `<cli>` positional and drops the

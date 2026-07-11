@@ -1214,6 +1214,7 @@ function emitRunCapture(
   deps: MainDeps,
   result: RunCaptureResult,
   outputPath: string | null = null,
+  reap?: () => void,
 ): never {
   if (outputPath !== null) {
     try {
@@ -1227,8 +1228,45 @@ function emitRunCapture(
       return deps.exit(bad.exitCode);
     }
   }
+  // Reap AFTER the result file landed and BEFORE the exit: the answer's
+  // durability never depends on the teardown, and a reap failure downgrades to
+  // a stderr note — it must never rewrite a captured result as a failed leg.
+  if (reap !== undefined) {
+    try {
+      reap();
+    } catch (err) {
+      deps.writeErr(
+        `agent: reap-window-on-terminal failed (window left resident): ${(err as Error).message}\n`,
+      );
+    }
+  }
   deps.write(`${JSON.stringify(result.envelope)}\n`);
   return deps.exit(result.exitCode);
+}
+
+/**
+ * The reap-on-terminal teardown for {@link emitRunCapture}: kills exactly the
+ * tmux window this run launched, via the socket-correct argv the launch
+ * returned. Undefined (no teardown) unless the posture was requested AND the
+ * launch actually opened a window — so a plain `agent run` stays resident and
+ * resumable, and only an explicitly one-shot leg tears itself down.
+ */
+function reapThunk(
+  deps: MainDeps,
+  requested: boolean,
+  killWindowCommand: string[] | null,
+): (() => void) | undefined {
+  if (!requested || killWindowCommand === null) {
+    return undefined;
+  }
+  return () => {
+    const result = deps.runTmuxCommandFn(killWindowCommand);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `tmux kill-window exited ${result.exitCode}: ${result.stderr.trim()}`,
+      );
+    }
+  };
 }
 
 /**
@@ -1373,11 +1411,12 @@ async function runRunCaptureSubcommand(
     );
   }
   const prompt = composed.prompt;
+  let killWindowCommand: string[] | null = null;
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),
-      launch: () =>
-        launchToResolvedHandle({
+      launch: () => {
+        const launched = launchToResolvedHandle({
           deps: launchHandleDeps(deps),
           agent,
           prompt,
@@ -1389,12 +1428,22 @@ async function runRunCaptureSubcommand(
             name: parsed.name ?? undefined,
           },
           stopTimeoutMs: parsed.stopTimeoutMs,
-        }),
+        });
+        if (launched.ok) {
+          killWindowCommand = launched.killWindowCommand ?? null;
+        }
+        return launched;
+      },
     },
     verbDeps,
     agent,
   );
-  return emitRunCapture(deps, result, parsed.output);
+  return emitRunCapture(
+    deps,
+    result,
+    parsed.output,
+    reapThunk(deps, parsed.reapWindowOnTerminal, killWindowCommand),
+  );
 }
 
 /** A successfully-parsed `agent run` argv (the `ok:true` arm of parseRunArgs). */
@@ -1575,11 +1624,12 @@ async function runResumeCaptureSubcommand(
         ? null
         : decision.resume_target;
 
+  let killWindowCommand: string[] | null = null;
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),
-      launch: () =>
-        launchToResolvedHandle({
+      launch: () => {
+        const launched = launchToResolvedHandle({
           deps: { ...launchHandleDeps(deps), cwd: resumeCwd },
           agent,
           prompt: composed.prompt,
@@ -1591,12 +1641,22 @@ async function runResumeCaptureSubcommand(
             childSessionId,
             sessionId: discoverySessionId,
           },
-        }),
+        });
+        if (launched.ok) {
+          killWindowCommand = launched.killWindowCommand ?? null;
+        }
+        return launched;
+      },
     },
     verbDeps,
     agent,
   );
-  return emitRunCapture(deps, result, parsed.output);
+  return emitRunCapture(
+    deps,
+    result,
+    parsed.output,
+    reapThunk(deps, parsed.reapWindowOnTerminal, killWindowCommand),
+  );
 }
 
 /**

@@ -569,6 +569,10 @@ export function buildPanelLegArgv(opts: {
     `${opts.stopTimeoutMs}ms`,
     "--name",
     `panel::${opts.slug}::${m.name}`,
+    // Panel legs are one-shot by design (the judge reads answer FILES, never a
+    // live leg), so every leg tears its own window down once its result lands —
+    // a panel never accumulates resident harness processes.
+    "--reap-window-on-terminal",
   ];
 }
 
@@ -632,10 +636,21 @@ function readResultOutcome(yamlPath: string): string {
     return "corrupt-result";
   }
   try {
-    const parsed = JSON.parse(text) as { outcome?: unknown };
-    return typeof parsed.outcome === "string"
-      ? parsed.outcome
-      : "corrupt-result";
+    const parsed = JSON.parse(text) as { outcome?: unknown; message?: unknown };
+    if (typeof parsed.outcome !== "string") {
+      return "corrupt-result";
+    }
+    // Shape-only viability check (never reads the answer semantically): a
+    // `completed` envelope must carry a non-empty string message — the judge
+    // cannot synthesize from an empty answer, so an answerless leg fails here
+    // rather than poisoning the fan-in.
+    if (
+      parsed.outcome === "completed" &&
+      (typeof parsed.message !== "string" || parsed.message.trim() === "")
+    ) {
+      return "empty_message";
+    }
+    return parsed.outcome;
   } catch {
     return "corrupt-result";
   }

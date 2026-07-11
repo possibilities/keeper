@@ -192,6 +192,7 @@ function okParse(
     prompt: "p",
     stopTimeoutMs: null,
     readOnly: false,
+    reapWindowOnTerminal: false,
     systemFile: null,
     system: null,
     preset: null,
@@ -209,6 +210,12 @@ describe("parseRunArgs", () => {
   test("<cli> <prompt> parses, stop-timeout absent → null, read-only false", () => {
     expect(parseRunArgs(["claude", "say hi"])).toEqual(
       okParse({ prompt: "say hi" }),
+    );
+  });
+
+  test("--reap-window-on-terminal parses to the one-shot posture", () => {
+    expect(parseRunArgs(["claude", "p", "--reap-window-on-terminal"])).toEqual(
+      okParse({ reapWindowOnTerminal: true }),
     );
   });
 
@@ -492,12 +499,39 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("stop seen + found-but-empty message → no_message, never completed", async () => {
+    const { envelope, exitCode } = await captureFromHandle(
+      seams({
+        wait: {
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          stop: { ...STOP, message: null },
+        },
+        show: {
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: null,
+          found: true,
+        },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-2", agent: "codex", startMs: 0 },
+    );
+    expect(envelope).toMatchObject({
+      outcome: "no_message",
+      message: null,
+      message_found: true,
+    });
+    expect(exitCode).toBe(0);
+  });
+
   test("wait times out but transcript resolves → timed_out + partial (exit 4)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       seams({
         wait: {
           ok: false,
           error: "timed out waiting for transcript stop after 50ms (caller)",
+          transcriptPath: "/t.jsonl",
         },
         show: {
           ok: true,
@@ -627,7 +661,11 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
   test("codex resume_target is discovered on a timed_out partial", async () => {
     const { envelope } = await captureFromHandle(
       seams({
-        wait: { ok: false, error: "timed out waiting for transcript stop" },
+        wait: {
+          ok: false,
+          error: "timed out waiting for transcript stop",
+          transcriptPath: "/rollout.jsonl",
+        },
         show: {
           ok: true,
           transcriptPath: "/rollout.jsonl",

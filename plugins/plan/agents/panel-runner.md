@@ -117,7 +117,7 @@ every non-terminal leg). A prompt- or member-set mismatch against the stored run
 not a resume) — so the prompt must reproduce exactly.
 
 Then wait as in Step 3. If you still hold `$DIR` from this session, `wait --run-dir "$DIR"` works; after a
-restart you have only the slug, so wait by it — `keeper agent panel wait --slug "$SLUG" --chunk 540` is the
+restart you have only the slug, so wait by it — `keeper agent panel wait --slug "$SLUG" --chunk 540s` is the
 simple re-entry form (`keeper agent panel status --slug "$SLUG"` gives a one-shot non-blocking snapshot).
 Both resolve the same durable dir. A reboot mid-`wait` is detected in-band: the verdict returns promptly with
 a `machine-rebooted` reason on the non-terminal legs (not a 124 spin) — treat it exactly as re-entry, re-issue
@@ -133,13 +133,13 @@ dead legs) then `wait` again.
 **Each `wait` is its own Bash tool call carrying the explicit `timeout: 600000` tool parameter.** That
 parameter is the Bash tool's per-call ceiling (600000ms = 10 min). The tool's *default* foreground window
 is only 120000ms (120s), and any call that outruns the window in force is silently **auto-backgrounded** —
-so a `--chunk 540` wait (9 min) blows straight past the 120s default and would vanish into the background
+so a `--chunk 540s` wait (9 min) blows straight past the 120s default and would vanish into the background
 unless `timeout: 600000` is set. With the ceiling set, chunk 540 blocks in the foreground and still leaves
 ~60s of return-latency headroom under the 600000ms cap.
 
 ```bash
 # ONE Bash tool call — set the tool parameter timeout: 600000
-keeper agent panel wait --run-dir "$DIR" --chunk 540
+keeper agent panel wait --run-dir "$DIR" --chunk 540s
 ```
 
 `timeout: 600000` is the **Bash tool parameter**, not a shelled `timeout`/`gtimeout` binary — those do not
@@ -155,7 +155,7 @@ manifest; shell state does **not** survive across Bash calls, so pass its captur
 Bound the re-issues with a **backstop of 6** chunks (~54 min of 9-min chunks — comfortably past the 30-min
 per-leg timeout; a leg still running this late is wedged). **Hold the count in your own reasoning, never a
 shell variable** — because shell state does not cross Bash calls, you cannot wrap the chunks in one `while`
-loop: a single Bash call carrying `timeout: 600000` has room for exactly one `--chunk 540` wait, and a
+loop: a single Bash call carrying `timeout: 600000` has room for exactly one `--chunk 540s` wait, and a
 second loop iteration would run past the 10-min ceiling and be auto-backgrounded. Issue one wait, read its
 exit code, re-issue only on 124, and increment your mental count each time. When you exhaust the backstop
 of 6 with no exit-0 verdict, the run is wedged — emit `PANEL_RUN_FAILED` (Step 4) and never loop past it.
@@ -175,29 +175,40 @@ event. A final message emitted while legs are still running drops the panel; the
 never arrives to resume you. While legs are in flight your only moves are the next blocking `wait`, the
 judge spawn (Step 5), or the failure return (Step 4) — never a bare stop.
 
-## Step 4 — Verdict (parse + tally)
+## Step 4 — Verdict (parse + tally against quorum)
 
 On exit 0, `VERDICT` is `{"dir":"…","ok":<bool>,"members":[{"name","harness","status":"ok|fail","yaml","reason"},…]}`.
-The subcommand has already tallied every leg — `ok` is true iff **every** member wrote a `completed` result
-file (the atomic rename guarantees a present result file is whole; any other outcome is a fail). You key off
-`ok`:
-
-- **`ok == true`** — every leg succeeded. Proceed to Step 5 with the per-member `.yaml` paths.
-- **`ok == false`, OR `wait` ended on a non-zero terminal** (exit 2, or `BACKSTOP` exhausted with no
-  verdict) — at least one leg failed, timed out, or never produced output. Emit the `PANEL_RUN_FAILED`
-  marker below and do **NOT** spawn the judge.
+The subcommand has already tallied every leg (`ok` is true iff **every** member wrote a viable `completed`
+result file — the atomic rename guarantees a present result file is whole; any other outcome, including a
+completed-but-answerless `empty_message` leg, is a fail). A panel degrades gracefully: you key off the
+**ok-member count against quorum**, not all-or-nothing `ok` — re-convening a whole panel because one leg
+timed out is exactly the retry storm this contract exists to prevent.
 
 ```bash
-OK=$(echo "$VERDICT" | jq -r '.ok')
-if [ "$OK" != "true" ]; then
+N=$(echo "$VERDICT" | jq '.members | length')
+OKS=$(echo "$VERDICT" | jq '[.members[] | select(.status == "ok")] | length')
+QUORUM=$(( N / 2 + N % 2 )); [ "$QUORUM" -lt 2 ] && QUORUM=2   # max(2, ceil(N/2))
+```
+
+- **`OKS == N`** — every leg succeeded. Proceed to Step 5 with all per-member `.yaml` paths.
+- **`QUORUM <= OKS < N`** — a degraded but judgeable panel. Proceed to Step 5 with ONLY the ok members'
+  `.yaml` paths, and carry the failed members' `name` + `reason` lines into the judge prompt's failed-legs
+  block so the audit discloses the reduced composition.
+- **`OKS < QUORUM`, OR `wait` ended on a non-zero terminal** (exit 2, or `BACKSTOP` exhausted with no
+  verdict) — too few independent answers to fuse. Emit the `PANEL_RUN_FAILED` marker below and do **NOT**
+  spawn the judge. Never lower the bar to a single answer: one answer is not a panel, and never re-convene
+  under a fresh slug to chase the missing legs.
+
+```bash
+if [ "$OKS" -lt "$QUORUM" ]; then
   LEGS=$(echo "$VERDICT" | jq -r '.members[] | "  - \(.name): \(.status)\(if .reason then " — " + .reason else "" end)"')
   # …emit PANEL_RUN_FAILED with $LEGS and $DIR (template below)…
 fi
 ```
 
 The verdict's `reason` fields are the leg's own terminal `outcome` (`timed_out`, `no_message`,
-`launch_failed`, `bad_args`, …), a `corrupt-result` note, or a crashed-leg note — never a panelist's answer
-content — so quoting them stays content-blind. Your final message on any hard-fail path:
+`empty_message`, `launch_failed`, `bad_args`, …), a `corrupt-result` note, or a crashed-leg note — never a
+panelist's answer content — so quoting them stays content-blind. Your final message on any hard-fail path:
 
 ```
 PANEL_RUN_FAILED
@@ -210,14 +221,14 @@ The judge was NOT spawned; no panel answer was produced.
 `PANEL_RUN_FAILED` is the sentinel your caller (`/plan:panel`) keys on to surface a panel failure rather
 than presenting it as an answer. Emit it verbatim on every hard-fail path.
 
-## Step 5 — Spawn the judge (full success only)
+## Step 5 — Spawn the judge (quorum met)
 
-When `ok == true`, collect the output **PATHS only** — never read their content — and spawn the judge with
-the question verbatim plus the labeled paths. Label each path by its member `name` straight from the
-verdict:
+With quorum met, collect the ok members' output **PATHS only** — never read their content — and spawn the
+judge with the question verbatim plus the labeled paths. Label each path by its member `name` straight from
+the verdict:
 
 ```bash
-echo "$VERDICT" | jq -r '.members[] | "- \(.name) → \(.yaml)"'
+echo "$VERDICT" | jq -r '.members[] | select(.status == "ok") | "- \(.name) → \(.yaml)"'
 ```
 
 ```
@@ -229,9 +240,15 @@ Task(
 Answer files (read each in full in your own context):
 - <member-1> → <DIR>/<member-1>.yaml
 - <member-2> → <DIR>/<member-2>.yaml
+
+Failed legs (no answer file — your audit MUST disclose the reduced composition):
+- <member-3>: <reason>
 """
 )
 ```
+
+Omit the failed-legs block entirely on a full-success run. It carries only member names and content-blind
+`reason` outcomes — never answer content, never a substitute answer.
 
 Pass **no `model=` kwarg** — the judge frontmatter already pins its model. The judge reads every answer
 file in its own context, classifies the deliverable (artifact → merge & verify; research →
@@ -239,8 +256,12 @@ five-section synthesis), and returns the fused answer plus its audit.
 
 ## Step 6 — Return
 
-Return a **positively marked** success: your final message is `PANEL_ANSWER` on its **first line**, then the
-judge's fused answer **verbatim** from the next line down — nothing before the marker, nothing between it
+First validate the judge's result: a Task return that is empty, whitespace-only, or a bare error is NOT an
+answer — emit `PANEL_RUN_FAILED` with the judge failure as the reason (never `PANEL_ANSWER` with an empty
+body, and never retry the judge more than once).
+
+Then return a **positively marked** success: your final message is `PANEL_ANSWER` on its **first line**, then
+the judge's fused answer **verbatim** from the next line down — nothing before the marker, nothing between it
 and the answer.
 
 ```

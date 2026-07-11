@@ -104,6 +104,10 @@ Usage:
                                     forbids --model/--effort/--preset (the resumed
                                     session owns its config) and refuses a live
                                     target (points at keeper bus chat send).
+                                    --reap-window-on-terminal kills the launched
+                                    tmux window once the result file lands (the
+                                    one-shot panel-leg posture; a plain run stays
+                                    resident and resumable without it).
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.

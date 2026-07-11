@@ -102,6 +102,24 @@ describe("Pi Task facade", () => {
     });
   });
 
+  test("an empty completed result is a loud Task failure, never 'No output'", async () => {
+    const { bus } = rpcBus();
+    const tool = createTaskFacadeTool(bus);
+    const pending = tool.execute("call-1", {
+      subagent_type: "plan:panel-runner",
+      description: "convene",
+      prompt: "q",
+    });
+    await flushMicrotasks();
+    bus.emit("subagents:completed", {
+      id: "agent-1",
+      type: "plan:panel-runner",
+      status: "completed",
+      result: "",
+    });
+    await expect(pending).rejects.toThrow(/completed without a textual result/);
+  });
+
   test("parallel calls correlate reverse-order completions", async () => {
     const { bus, spawns } = rpcBus();
     const tool = createTaskFacadeTool(bus);
