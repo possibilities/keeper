@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Merge-gate log-spam repro and fix",
-  "updated_at": "2026-07-11T16:07:10.097000Z"
+  "updated_at": "2026-07-11T17:54:43.109000Z",
+  "worker_done_at": "2026-07-11T17:54:43.109000Z"
 }

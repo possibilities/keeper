@@ -48,5 +48,5 @@ Add a unit test around the coalescing/rate-limit helper (first emitted, subseque
 - [ ] No genuinely diagnostic error edge is silently dropped.
 
 ## Done summary
-
+Found the real ~39k-lines/boot emitter: computeDeferredEpicIds in src/autopilot-worker.ts (not reconcile-core.ts, which the task spec suspected but genuinely has zero console calls — confirmed by reproduction against the live daemon log, where 45539/113766 lines were this one message). Added a per-key coalescing helper (logMergeGateDeferral): first occurrence logs immediately, repeats within 60s are suppressed and counted, next call past the window flushes a '+N suppressed' summary and re-arms — no diagnostic edge is silently dropped.
 ## Evidence
