@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-11T16:04:59.443000Z",
+  "depends_on": [],
+  "epic": "fn-1248-crash-recovery-hardening",
+  "id": "fn-1248-crash-recovery-hardening.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Resume descriptor alias-safe",
+  "updated_at": "2026-07-11T16:04:59.443000Z"
+}
