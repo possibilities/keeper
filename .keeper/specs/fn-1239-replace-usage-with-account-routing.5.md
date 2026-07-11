@@ -65,5 +65,5 @@ Task 1's observer and task 2's launcher are already proven before this deletion 
 - [ ] Surviving frame-stream and unrelated worker tests remain green with no references to deleted modules.
 
 ## Done summary
-
+Retired the human-facing usage command, usage frame view, dashboard pane, daemon usage watcher/scraper workers, terminal-scrape implementation, usage registry/picker, and their dedicated test suites/fixtures, leaving account routing's Capacity observer as the sole quota-related runtime.
 ## Evidence
