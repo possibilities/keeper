@@ -9,8 +9,7 @@
  * never writes the DB — it opens a READ-ONLY connection (for the restart-seed)
  * and only posts messages, keeping main the sole writer.
  *
- * Differs from the file-watcher archetype (`src/usage-worker.ts`) in its driver,
- * not its contract:
+ * Its polling driver follows the standard worker contract:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert; the pure
  *   {@link BuildsScanner} core + the response-parsers are exported and drivable
  *   with no Worker or network.
@@ -272,11 +271,8 @@ export function parseLatestBuild(
 
 /**
  * Pure, exported change-gate + disappearance tracker — the deterministic core,
- * drivable in tests with no Worker or network. Mirrors the discipline in
- * {@link import("./usage-worker").UsageScanner} (a change-gate keyed by entity
- * name holding the last-emitted serialized snapshot, seeded from the projection
- * so a restart does not re-emit), with a disappearance diff in place of the
- * file-deletion path.
+ * drivable in tests with no Worker or network. The gate is keyed by entity name
+ * and seeded from the projection so a restart does not re-emit unchanged rows.
  */
 export class BuildsScanner {
   /** builder name → last-emitted gate key (the change-gate). */

@@ -28,7 +28,7 @@
  *
  * The foreign harness is a deterministic STUB on the launch PATH — this suite pins
  * keeper's launch/anchor/envelope plumbing, never a real model call (mirroring the
- * repo's other slow-tier stubs, e.g. usage-scrape-runner's `/usr/bin/false`). So
+ * repo's other slow-tier stubs. So
  * the genuine external dependency the skip guards is `tmux` (the detached-pane
  * substrate): absent tmux, the run leg cannot execute and a green pass would be a
  * false negative — the gate skips LOUD instead.

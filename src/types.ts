@@ -650,7 +650,7 @@ export interface Job {
  * blob via {@link import("./daemon").serializeSessionTelemetry}. `kind` (the
  * discriminator) and `id` (the correlation key — a claude `session_id` that
  * equals the hook-sourced `jobs.job_id`) are NOT serialized: `id` rides in
- * `events.session_id`, mirroring the {@link UsageSnapshotMessage} pipeline. Any
+ * `events.session_id`. Any
  * field the statusLine payload omits arrives as `null` and folds latest-wins
  * without nulling the other columns (COALESCE merge in the reducer arm).
  */
@@ -674,7 +674,7 @@ export interface SessionTelemetryMessage {
 
 /**
  * Decoded fold-side shape of a `SessionTelemetry` event's `data` blob (fn-1024),
- * mirroring the {@link UsageSnapshotMessage}→payload split. Produced by
+ * Produced by
  * {@link import("./reducer").extractSessionTelemetry} with every field a
  * null-fallback (a guarded parse that NEVER throws — unknown/absent → null), so
  * a malformed or partial blob folds to a safe value. The six fields land on the

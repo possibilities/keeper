@@ -292,7 +292,7 @@ export const FRAMES_FLAGS = [
     type: "string",
     default: "board",
     summary:
-      "Viewer to stream: board|jobs|git|autopilot|builds|usage (default board)",
+      "Viewer to stream: board|jobs|git|autopilot|builds (default board)",
   },
   {
     name: "for",
@@ -495,45 +495,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: true,
     requires_tty: false,
     flags: GIT_FLAGS,
-  },
-  {
-    name: "usage",
-    summary: "Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: true,
-    requires_tty: false,
-    flags: VIEWER_FLAGS,
-    verbs: [
-      {
-        name: "scrape",
-        summary: "One-shot TUI usage scrape → schema-1 JSON contract",
-        visibility: "public",
-        mutates: false,
-        requires_daemon: false,
-        requires_tty: false,
-        flags: [
-          {
-            name: "target",
-            type: "string",
-            summary: "Agent to scrape (claude|codex)",
-          },
-          {
-            name: "profile",
-            type: "string",
-            summary: "Account profile ('default' = native ~/.claude)",
-          },
-          {
-            name: "command",
-            type: "string",
-            summary: "Override the agent binary path",
-          },
-          { name: "rows", type: "string", summary: "PTY row count" },
-          { name: "cols", type: "string", summary: "PTY column count" },
-          FLAG_HELP,
-        ],
-      },
-    ],
   },
   {
     name: "autopilot",

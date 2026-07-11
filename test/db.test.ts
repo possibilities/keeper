@@ -4041,7 +4041,7 @@ test("fresh openDb has the schema-v23 usage table for the agentusage read surfac
   expect(byName.get("updated_at")?.dflt_value).toBe("0");
   // FRESHNESS-EXCLUSION TRIPWIRE — schema half. The four freshness fields
   // from the source envelope MUST NOT appear here. Pair test:
-  // test/usage-worker.test.ts asserts the producer side.
+  // Reducer lifecycle tests assert the projection side.
   for (const f of [
     "fetched_at",
     "next_fetch_at",

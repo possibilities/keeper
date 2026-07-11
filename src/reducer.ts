@@ -83,7 +83,6 @@ import type {
   SubagentDisposition,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
-import { asAccountState } from "./usage-scrape-runner";
 
 // Re-export the `WorktreeRepoStatus` / `LaneMerged` fold row contracts (now defined
 // on the pure verdict side) so existing `from "./reducer"` importers keep resolving.
@@ -99,6 +98,10 @@ export type { LaneMergedEntry, WorktreeRepoStatusEntry };
  * determinism (the batch size is not an input to any projection write).
  */
 export const DEFAULT_BATCH_SIZE = 50;
+
+function asAccountState(v: unknown): "signed_out" | "no_subscription" | null {
+  return v === "signed_out" || v === "no_subscription" ? v : null;
+}
 
 /**
  * Test-only seam. When set, {@link applyEvent} invokes this AFTER the jobs
@@ -3013,8 +3016,8 @@ function clearEmbeddedMonitorFactOnTerminal(
 }
 
 /**
- * Pre-flattened agentusage usage snapshot. The usage-worker carries every
- * projection-meaningful field in the synthetic `UsageSnapshot` event's `data`
+ * Pre-flattened usage snapshot. The synthetic `UsageSnapshot` event carries every
+ * projection-meaningful field in its `data`
  * blob; the reducer never re-reads the on-disk file. Freshness fields
  * (`fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
  * `last_skipped_fetch_at`) are filtered at the producer — including any here
@@ -3055,8 +3058,7 @@ interface UsageSnapshotPayload {
    * Stable failure classification (one of the keeper-side `UsageErrorKind`
    * values: `format_changed` / `panel_missing` / `scrape_failed` /
    * `upstream_limited` / `runner_failed`). Stored opaque as TEXT; the producer
-   * (usage-worker) validates it before minting the event, so a malformed blob
-   * here folds to null. Older events that predate the field fold to null safely.
+   * A malformed value folds to null so old or malformed events remain safe.
    */
   error_kind: string | null;
   /**
@@ -3325,7 +3327,7 @@ function projectUsageRow(db: Database, event: Event): void {
   );
   // Reverse fan-out: pull the current rate-limit annotation from the matching
   // `profiles` row and stamp it onto the just-UPSERTed usage row. The join key
-  // `profileNameForUsageId(usage.id)` translates agentusage's `"default"` id to
+  // `profileNameForUsageId(usage.id)` translates the `"default"` id to
   // keeper's `''` default-profile sentinel. NULL-safe: a missing profile row
   // leaves the columns NULL (the zero-event shape); a later `RateLimited`
   // populates them via the forward fan-out. Pure function of the fold inputs +
@@ -3354,9 +3356,8 @@ function projectUsageRow(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `UsageDeleted` tombstone. The usage-worker posts this when
- * an `<id>.json` file disappears; without it, {@link projectUsageRow}'s
- * UPSERT-only path would leak the final pre-delete snapshot row forever.
+ * Fold one synthetic `UsageDeleted` tombstone. Without it,
+ * {@link projectUsageRow}'s UPSERT-only path retains the final snapshot row.
  *
  * The primary key (`id`) rides in `event.session_id`. An empty / missing pk is a
  * safe no-op — fold must never throw. DELETE is idempotent.
@@ -9103,10 +9104,10 @@ function projectJobsRow(db: Database, event: Event): void {
           // Forward fan-out: colocate the rate-limit annotation on the matching
           // `usage` row (join key `usage.id = profiles.profile_name`). Pure
           // UPDATE, never UPSERT — a rate_limit must not mint a phantom `usage`
-          // row for a profile agentusage isn't tracking; a missing row matches
+          // row for an untracked profile; a missing row matches
           // zero, and a later `UsageSnapshot` pulls the annotation back via the
           // reverse fan-out. `usageIdForProfileName` maps the `''` sentinel to
-          // agentusage's `"default"` id so a default-account rate limit colocates
+          // the `"default"` id so a default-account rate limit colocates
           // on `usage.default`. The `last_event_id` bump is load-bearing (it
           // drives the wire diff). Pure function of the fold inputs.
           //

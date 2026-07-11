@@ -12,6 +12,7 @@ import {
   buildSetMainPaneWidthArgs,
   buildTabsRestoreArgv,
   buildWorkNewSessionArgs,
+  DASH_SUB_PANES,
   dashPaneArgv,
   dashTmux,
   type GuardFs,
@@ -78,7 +79,13 @@ describe("dash pane argv triple", () => {
       "keeper board; exec $SHELL",
     ]);
     // Three elements: shell, flag, script — not one string.
-    expect(dashPaneArgv("usage")).toHaveLength(3);
+    expect(dashPaneArgv("builds")).toHaveLength(3);
+  });
+
+  test("the dashboard has no usage pane", () => {
+    expect(DASH_SUB_PANES).toEqual(["autopilot", "jobs", "git", "builds"]);
+    expect(DASH_SUB_PANES).not.toContain("usage" as never);
+    expect(HELP).not.toContain("builds/usage");
   });
 });
 

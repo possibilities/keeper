@@ -310,9 +310,9 @@ keys currently tripped by the instant-death breaker. `>= 2` (multiple keys dying
 instantly in a window) is the likely **account session/quota wall** — repeated
 instant worker deaths, not a flaky task; the per-key breakers already stopped each
 key's burn (no silent churn loop), so the board never auto-pauses on it. Resume
-each key with `keeper autopilot retry <verb>::<id>` AFTER the session limit resets
-(check `keeper usage` for the reset time); retrying before the reset just re-arms
-the breaker.
+each key with `keeper autopilot retry <verb>::<id>` only after account capacity
+recovers; use `keeper agent accounts check` for routing diagnostics. Retrying
+before capacity recovers just re-arms the breaker.
 
 ### Take over for a bit, then put it back
 

@@ -464,9 +464,8 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `usage` descriptor — one row per agentusage profile, a current-state
- * snapshot of one `~/.local/state/agentusage/<id>.json` envelope, produced by
- * synthetic `UsageSnapshot` / `UsageDeleted` events.
+ * The `usage` descriptor — one row per profile, folded from synthetic
+ * `UsageSnapshot` / `UsageDeleted` events.
  *
  * The source envelope's freshness fields (`fetched_at`, `next_fetch_at`, …) are
  * read-and-discarded by the worker and absent from the projection. `error_at`

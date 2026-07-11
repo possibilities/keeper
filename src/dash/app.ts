@@ -690,8 +690,8 @@ export async function createDashApp(
   });
 
   // ── catching-up gate (fn-1180) ──────────────────────────────────────────
-  // dash rides ONE `subscribeReadiness` connection (unlike usage's two
-  // streams), so the gate is a direct read of its per-connection latch — no
+  // dash rides one `subscribeReadiness` connection, so the gate is a direct read
+  // of its per-connection latch — no
   // latest-wins merge needed.
   let catchingUp = false;
   let freshestBoot: BootStatus | undefined;

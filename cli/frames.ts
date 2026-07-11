@@ -24,14 +24,8 @@ import { resolveSockPath } from "../src/db";
 import { buildParseOptions, FRAMES_FLAGS } from "./descriptor";
 import { parseDuration } from "./duration";
 
-/** The six viewers `keeper frames` can stream, one process each. */
-export type FramesView =
-  | "board"
-  | "jobs"
-  | "git"
-  | "autopilot"
-  | "builds"
-  | "usage";
+/** The five viewers `keeper frames` can stream, one process each. */
+export type FramesView = "board" | "jobs" | "git" | "autopilot" | "builds";
 
 /** The view set, in the canonical viewer order (`--view` allowlist + default). */
 export const FRAMES_VIEWS: readonly FramesView[] = [
@@ -40,7 +34,6 @@ export const FRAMES_VIEWS: readonly FramesView[] = [
   "git",
   "autopilot",
   "builds",
-  "usage",
 ] as const;
 
 /**
@@ -89,7 +82,7 @@ JSON envelope per rendered-frame change, then an always-parseable trailer. For
 multi-view supervision run one process per view.
 
 Options:
-  --view <viewer>      board | jobs | git | autopilot | builds | usage
+  --view <viewer>      board | jobs | git | autopilot | builds
                        (default board)
   --for <dur>          Stream a bounded chunk for this long, then a trailer +
                        exit (unit required, e.g. 10s, 2m). Default ~30s when
@@ -151,9 +144,8 @@ CHUNKED-CONSUMPTION LOOP (bounded foreground commands or a polled background)
      baseline is a net diff — you resume where you left off.
 
 ONE PROCESS PER VIEW
-  One invocation streams ONE --view. The usage viewer cannot share a process
-  with the shared-shell viewers, so per-view processes are the only uniform
-  contract. Supervise multiple views with multiple concurrent invocations.
+  One invocation streams ONE --view. Supervise multiple views with multiple
+  concurrent invocations.
 
 COVERAGE IS HONEST BY CONSTRUCTION
   'continuous' is provable ONLY within one invocation. Across invocations, or
@@ -164,8 +156,7 @@ COVERAGE IS HONEST BY CONSTRUCTION
 
 /** Prod dispatch table — each viewer's `run<View>Frames` entry, lazy-imported so
  *  a `frames` invocation never pays to load a viewer it will not stream (mirrors
- *  the lazy handler map in `cli/keeper.ts`). The usage entry drives the viewer's
- *  open-coded dual-stream shell in frames mode over the SAME wire contract. */
+ *  the lazy handler map in `cli/keeper.ts`). */
 export function defaultFramesEntries(): Record<FramesView, FramesEntry> {
   return {
     board: async (c) => (await import("./board")).runBoardFrames(c),
@@ -173,7 +164,6 @@ export function defaultFramesEntries(): Record<FramesView, FramesEntry> {
     git: async (c) => (await import("./git")).runGitFrames(c),
     autopilot: async (c) => (await import("./autopilot")).runAutopilotFrames(c),
     builds: async (c) => (await import("./builds")).runBuildsFrames(c),
-    usage: async (c) => (await import("./usage")).runUsageFrames(c),
   };
 }
 
