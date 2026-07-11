@@ -1,15 +1,16 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-11T22:43:55.921000Z",
   "depends_on": [],
   "epic": "fn-1255-described-panel-roster-ladder",
   "id": "fn-1255-described-panel-roster-ladder.3",
-  "model": null,
+  "model": "gpt-5.4-mini",
   "priority": null,
-  "selection_input_hash": null,
+  "selection_input_hash": "8301d735f67313a83b67ef6c0128cf79a1d9c3fc4827c4966fc307f37b1a5c4b",
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": null,
+  "tier": "medium",
   "title": "Re-vendor corpus and re-bake",
-  "updated_at": "2026-07-11T22:43:55.921000Z"
+  "updated_at": "2026-07-11T22:46:01.645000Z"
 }

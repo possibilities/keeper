@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified schema cutover across two reader seams with named refs, but contract-shaped (PanelSelections schema) so the frontier GPT workhorse at xhigh fits the propagation risk without a nameable opus reason.",
+      "task_id": "fn-1255-described-panel-roster-ladder.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Substantial but fully-specified work: land a byte-verbatim roster and mirror an existing structural-gate precedent with enumerated failure classes, so a strong GPT at the default band suffices.",
+      "task_id": "fn-1255-described-panel-roster-ladder.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.4-mini",
+      "rationale": "Small, scripted vendor-sync pipeline with a precondition check and golden re-record; bounded mechanical work with light judgment routes to the strong GPT light tier at medium.",
+      "task_id": "fn-1255-described-panel-roster-ladder.3",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Authoring slash-only skill prose with description discipline, near-uniform wording, and honest caveats is judgment- and taste-heavy Claude-tuned work, bounded by a clear model-guidance precedent.",
+      "task_id": "fn-1255-described-panel-roster-ladder.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Broad forward-facing docs and glossary sweep with prune-first CLAUDE.md discipline and in-repo idiom matching is user-facing wording work that favors the sonnet workhorse across many surfaces.",
+      "task_id": "fn-1255-described-panel-roster-ladder.5",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T22:46:01.645000Z",
+  "epic_id": "fn-1255-described-panel-roster-ladder",
+  "input_hash": "8301d735f67313a83b67ef6c0128cf79a1d9c3fc4827c4966fc307f37b1a5c4b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2197935925,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1255-described-panel-roster-ladder.1\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified schema cutover across two reader seams with named refs, but contract-shaped (PanelSelections schema) so the frontier GPT workhorse at xhigh fits the propagation risk without a nameable opus reason.\",\"confidence\":0.74},{\"task_id\":\"fn-1255-described-panel-roster-ladder.2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Substantial but fully-specified work: land a byte-verbatim roster and mirror an existing structural-gate precedent with enumerated failure classes, so a strong GPT at the default band suffices.\",\"confidence\":0.78},{\"task_id\":\"fn-1255-described-panel-roster-ladder.3\",\"tier\":\"medium\",\"model\":\"gpt-5.4-mini\",\"rationale\":\"Small, scripted vendor-sync pipeline with a precondition check and golden re-record; bounded mechanical work with light judgment routes to the strong GPT light tier at medium.\",\"confidence\":0.76},{\"task_id\":\"fn-1255-described-panel-roster-ladder.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Authoring slash-only skill prose with description discipline, near-uniform wording, and honest caveats is judgment- and taste-heavy Claude-tuned work, bounded by a clear model-guidance precedent.\",\"confidence\":0.72},{\"task_id\":\"fn-1255-described-panel-roster-ladder.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Broad forward-facing docs and glossary sweep with prune-first CLAUDE.md discipline and in-repo idiom matching is user-facing wording work that favors the sonnet workhorse across many surfaces.\",\"confidence\":0.7}]}\n"
+}
