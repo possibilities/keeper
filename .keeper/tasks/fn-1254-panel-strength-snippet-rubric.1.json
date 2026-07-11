@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-11T22:41:44.748000Z",
+  "depends_on": [],
+  "epic": "fn-1254-panel-strength-snippet-rubric",
+  "id": "fn-1254-panel-strength-snippet-rubric.1",
+  "model": null,
+  "priority": null,
+  "selection_input_hash": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": null,
+  "title": "Rewrite panel-strength snippet source",
+  "updated_at": "2026-07-11T22:41:44.748000Z"
+}
