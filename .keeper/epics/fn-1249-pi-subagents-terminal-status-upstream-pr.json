@@ -4,7 +4,7 @@
   "created_at": "2026-07-11T17:01:53.988000Z",
   "depends_on_epics": [],
   "id": "fn-1249-pi-subagents-terminal-status-upstream-pr",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-11T17:02:43.854000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Volumes/Scratch/src/possibilities--pi-subagents"
   ],
-  "updated_at": "2026-07-11T17:02:42.993000Z"
+  "updated_at": "2026-07-11T17:02:43.854000Z"
 }
