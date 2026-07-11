@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 22,
+        "files_changed": 5,
+        "insertions": 59
+      },
+      "done_summary": "Made the worker base-gate verdict timeout-aware: a timeout/infra-error baseline verdict is inconclusive (retry with backoff, then TOOLING_FAILURE), never SHARED_BASE_BROKEN \u2014 only a confirmed suite-red attests. Native + wrapped partials agree; daemon selectRepairCandidates doc-pinned to trust the category token as the sole discriminator with a regression test.",
+      "input_hash": "e0ba85feb1157f0ea0e7111ffc55f028cdaaf72e823d809cb03608646a362b0b",
+      "model": "opus",
+      "spec_chars": 3550,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/template/_partials/worker-implement-native.md, plugins/plan/template/_partials/worker-implement-wrapped.md, src/daemon.ts, test/daemon.test.ts\n\n### Approach\n\nMake the worker-side base-gate verdict timeout-aware. `keeper baseline`\nalready hands the worker a discriminated verdict (green / suite-red /\ninfra-error / timeout) \u2014 the worker guidance simply never acts on the\ndistinction. Teach both worker partials (native and wrapped \u2014 they must\nstay consistent; the work SKILL.md copy is generated, edit the\ntemplate/partials only) that a `timeout` or `infra-error` verdict is\nINCONCLUSIVE: retry with backoff / escalate as tooling trouble, never\nstamp `SHARED_BASE_BROKEN`; only a confirmed suite-red attests, mirroring\nthe daemon-side `classifyBaselineForRepair` precedent (\"an infra-error or\ntimeout leaf is NEVER red for this purpose\"). Evaluate a belt-and-braces\ndaemon-side guard in the worker-stamped candidate path\n(`selectRepairCandidates` folds the free-text reason verbatim today) \u2014 if\na machine-readable timeout hint in the reason is needed, check the\n`parseBlockedCategory` and `fingerprintFailure` reason-slot contracts\nbefore widening them. Any starvation probing (wall-clock-vs-cpu, host\nload) is a producer/worker-side signal only \u2014 it must never enter a fold\n(re-fold determinism). The confirmed-red attestation path must not loosen.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts:1626-1682 \u2014 `selectRepairCandidates`: the worker-stamped candidate source that trusts the SHARED_BASE_BROKEN reason verbatim (the gap).\n- src/daemon.ts:1706-1730 \u2014 `classifyBaselineForRepair` / `baselineRedIsConfirmed`: the timeout-never-red precedent to mirror, not reinvent.\n- plugins/plan/template/_partials/worker-implement-native.md:38 \u2014 the worker base-gate guidance (primary edit surface); sibling worker-implement-wrapped.md:45 must stay consistent.\n- cli/baseline.ts \u2014 the verdict surface the worker consults (timeout already distinct from suite-red).\n\n**Optional** (reference as needed):\n- src/baseline-store.ts:289 \u2014 `BaselineOutcome` discriminated union (the shape that cannot mis-classify).\n- src/failure-fingerprint.ts:74 \u2014 `fingerprintFailure` (reuse; never a second fingerprint scheme).\n- test/daemon.test.ts \u2014 `selectRepairCandidates` cases; a starved-attestation-defers test slots beside them.\n- docs/adr/0017-trunk-repair-escalation-and-role-keyed-guard.md \u2014 the attestation/repair rationale home for any ADR note.\n\n## Acceptance\n\n- [ ] A worker whose base gate returns a timeout or infra-error verdict does not attest SHARED_BASE_BROKEN \u2014 the guidance routes it to retry-with-backoff or a tooling escalation instead.\n- [ ] A confirmed suite-red base gate still attests SHARED_BASE_BROKEN exactly as before (no loosening of the safety net).\n- [ ] Native and wrapped worker guidance agree on the new verdict handling.\n- [ ] Any starvation/timeout signal consulted lives on the producer/worker side; no fold reads wall-clock, CPU time, or host load; fast suite green.\n\n## Done summary\nMade the worker base-gate verdict timeout-aware: a timeout/infra-error baseline verdict is inconclusive (retry with backoff, then TOOLING_FAILURE), never SHARED_BASE_BROKEN \u2014 only a confirmed suite-red attests. Native + wrapped partials agree; daemon selectRepairCandidates doc-pinned to trust the category token as the sole discriminator with a regression test.\n## Evidence\n",
+      "task_id": "fn-1245-timeout-aware-base-gate-attestation.1",
+      "tier": "xhigh",
+      "title": "Timeout aware base gate attestation"
+    }
+  ],
+  "created_at": "2026-07-11T15:16:51.400000Z",
+  "epic_id": "fn-1245-timeout-aware-base-gate-attestation",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "e0ba85feb1157f0ea0e7111ffc55f028cdaaf72e823d809cb03608646a362b0b",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
