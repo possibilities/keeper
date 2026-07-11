@@ -41,5 +41,5 @@ Golden-argv tests: for each verb, a dispatch:-less catalog yields today's exact 
 - [ ] Setting resolve: in the table changes the resolver session's launch flags (the named behavior change is live)
 
 ## Done summary
-
+Cut every dispatch site (reconcile snapshot work/close pairs, both resolve:: dispatches, the verb-parameterized escalation dispatch, and pinnable handoff) plus cli/dispatch precedence to resolveDispatchLaunchConfig(verb); deleted resolveWorkerLaunchConfig + src/escalation-config.ts and made a leftover worker:/escalation: catalog key fail loud with a dispatch:-block migration hint. A dispatch:-less catalog yields byte-identical launch argv for every verb.
 ## Evidence
