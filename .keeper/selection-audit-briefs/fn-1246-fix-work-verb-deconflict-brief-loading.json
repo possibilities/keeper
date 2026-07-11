@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 53,
+        "files_changed": 3,
+        "insertions": 199
+      },
+      "done_summary": "Extended parseEscalationKey to accept a task-form deconflict:: ref and generalized buildDeconflictIncident to key the sticky-row lookup on verb IN ('close','work'); updated the deconflict skill's framing, worktree lookup, and retry step for both ref shapes; added end-to-end test coverage for the daemon-dispatched deconflict::<taskId> handoff.",
+      "input_hash": "d34eb898d748731c7a24456c37d889185b464a3056fbd0793ba758d502836e83",
+      "model": "gpt-5.5",
+      "spec_chars": 2399,
+      "spec_md": "## Description\n\nFixes finding F1 (merges F4 + F5). Evidence path, confirmed at commit a9ac5814:\n\n- `src/daemon.ts:11610` `dispatchWorkDeconflict` launches `/plan:deconflict <taskId>`\n  (row.id is a task id) for a stuck work fan-in conflict.\n- `cli/escalation-brief.ts:220-223` `parseEscalationKey` requires `ref.kind === \"epic\"`\n  for `deconflict::`, so a task-form ref returns `null` \u2192 `unparseable_key`.\n- `cli/escalation-brief.ts:447-448` `buildDeconflictIncident` hard-filters\n  `dispatch_failures WHERE verb = 'close'`, so a work row is never found.\n- The fn-1240 commit set never touched `cli/escalation-brief.ts` nor the deconflict skill.\n\nFiles:\n- `cli/escalation-brief.ts` \u2014 extend `parseEscalationKey` to accept a task-form ref for\n  `deconflict::` (carry the task_id and derive the epic_id from it for the epic-keyed\n  lineage/primary-repo lookup), and generalize `buildDeconflictIncident` to look up the\n  sticky row by `verb IN ('close','work')` keyed on the ref's own id.\n- `plugins/plan/skills/deconflict/SKILL.md` \u2014 generalize the epic-only framing so the\n  skill reads correctly on either a `deconflict::<epic>` or a `deconflict::<taskId>` ref,\n  including its retry step (`keeper autopilot retry close::<epic>` vs `work::<taskId>`)\n  and the \"never write in another task's lane\" guard for the work-lane case.\n- `test/escalation-brief.test.ts` \u2014 add the end-to-end coverage.\n\nKeep the close-verb path byte-identical (the `verb` default stays `close`; legacy\n`deconflict::<epic>` refs and their brief output are unchanged).\n\n## Acceptance\n\n- [ ] `keeper escalation-brief deconflict::<taskId>` returns `ok` with a parseable incident for a sticky work-verb merge-conflict row.\n- [ ] `deconflict::<epic>` output and the close path are unchanged (byte-identical brief).\n- [ ] The `deconflict` skill's guidance and retry step read correctly for a task-form ref.\n- [ ] A test drives `keeper escalation-brief deconflict::<taskId>` end-to-end and asserts a parseable brief (the daemon-to-skill handoff F5 exercises).\n\n## Done summary\nExtended parseEscalationKey to accept a task-form deconflict:: ref and generalized buildDeconflictIncident to key the sticky-row lookup on verb IN ('close','work'); updated the deconflict skill's framing, worktree lookup, and retry step for both ref shapes; added end-to-end test coverage for the daemon-dispatched deconflict::<taskId> handoff.\n## Evidence\n",
+      "task_id": "fn-1246-fix-work-verb-deconflict-brief-loading.1",
+      "tier": "high",
+      "title": "Load work deconflict brief"
+    }
+  ],
+  "created_at": "2026-07-11T14:52:41.241000Z",
+  "epic_id": "fn-1246-fix-work-verb-deconflict-brief-loading",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "d34eb898d748731c7a24456c37d889185b464a3056fbd0793ba758d502836e83",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
