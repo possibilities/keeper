@@ -123,7 +123,6 @@ import {
   recoverWorktrees,
   refreshSuppressionForOpenPending,
   reposForRecovery,
-  resolveWorkerLaunchConfig,
   runMergeSuiteGate,
   runPackageSuiteGate,
   runReconcileCycle,
@@ -339,12 +338,15 @@ function makeSnapshot(
     // so every pre-fn-905 test sees the normal dispatch behavior; the
     // unseeded-gate tests override it with the roots to gate.
     unseededRoots: new Set<string>(),
-    // fn-937: the worker `--model`/`--effort` resolved producer-side from the
-    // `worker` preset, COALESCING onto the WORKER_* constants. Default to the
-    // constants so every pre-fn-937 test sees byte-for-byte identical dispatch;
-    // the preset-override tests set these explicitly.
-    workerModel: WORKER_MODEL,
-    workerEffort: WORKER_EFFORT,
+    // fn-937 / ADR 0040: the `work`- and `close`-row `--model`/`--effort` resolved
+    // producer-side from the `dispatch:` table, COALESCING onto the WORKER_*
+    // constants. `close` is settable independently of `work`. Default both pairs to
+    // the constants so every pre-existing test sees byte-for-byte identical dispatch;
+    // the dispatch-override tests set these explicitly.
+    workModel: WORKER_MODEL,
+    workEffort: WORKER_EFFORT,
+    closeModel: WORKER_MODEL,
+    closeEffort: WORKER_EFFORT,
     // The cycle's host-matrix snapshot. Default to a valid claude-only axis set
     // (opus/sonnet × the five-rung effort axis) so every pre-existing dispatch test
     // composes the same `workers/<model>-<effort>` cells; the bad-matrix and ragged
@@ -1400,14 +1402,14 @@ test("reconcile: ready task → planned `work` launch with correct argv shape", 
   );
 });
 
-test("fn-937: a snapshot's resolved worker preset flows into the launch's command AND the launch model/effort", () => {
+test("fn-937: a snapshot's resolved work dispatch row flows into the launch's command AND the launch model/effort", () => {
   const epic = makeEpic({
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
   });
   const snap = makeSnapshot({
     epics: [epic],
-    workerModel: "opus",
-    workerEffort: "high",
+    workModel: "opus",
+    workEffort: "high",
   });
   const decision = reconcile(snap, makeState(), 0);
   const plan = decision.launches[0];
@@ -1418,6 +1420,46 @@ test("fn-937: a snapshot's resolved worker preset flows into the launch's comman
   // buildPlannedLaunchSpec identically (drift-guard parity).
   expect(plan?.model).toBe("opus");
   expect(plan?.effort).toBe("high");
+});
+
+test("ADR 0040: the close dispatch row is settable INDEPENDENTLY of the work row", () => {
+  // One cycle with a work-driving epic (a ready todo task) AND a close-driving epic
+  // (all tasks complete), plus divergent work/close pairs, proves each launch reads
+  // its OWN resolved pair — a close row never tracks the work row's model.
+  const workEpic = makeEpic({
+    epic_id: "fn-1-work",
+    epic_number: 1,
+    project_dir: "/repo-work",
+    tasks: [makeTask({ task_id: "fn-1-work.1", epic_id: "fn-1-work" })],
+  });
+  const closeEpic = makeEpic({
+    epic_id: "fn-2-close",
+    epic_number: 2,
+    project_dir: "/repo-close",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-close.1",
+        epic_id: "fn-2-close",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [workEpic, closeEpic],
+    workModel: "opus",
+    workEffort: "high",
+    closeModel: "haiku",
+    closeEffort: "low",
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workLaunch = decision.launches.find((l) => l.verb === "work");
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  expect(workLaunch?.model).toBe("opus");
+  expect(workLaunch?.effort).toBe("high");
+  // The close launch reads the SEPARATE close pair, never the work one.
+  expect(closeLaunch?.model).toBe("haiku");
+  expect(closeLaunch?.effort).toBe("low");
 });
 
 test("fn-905: reconcile dispatches NOTHING into an unseeded root", () => {
@@ -4142,88 +4184,6 @@ test("buildWorkerCommand / buildPlannedLaunchSpec: omitted model/effort default 
     model: WORKER_MODEL,
     effort: WORKER_EFFORT,
   });
-});
-
-test("resolveWorkerLaunchConfig: no registry file → WORKER_* constants", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
-  try {
-    const cfg = resolveWorkerLaunchConfig(join(dir, "presets.yaml"));
-    expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveWorkerLaunchConfig: a `worker` triple overrides model/effort", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
-  try {
-    const path = join(dir, "presets.yaml");
-    writeFileSync(path, "worker: claude::opus::high\n");
-    const cfg = resolveWorkerLaunchConfig(path);
-    expect(cfg).toEqual({ model: "opus", effort: "high" });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveWorkerLaunchConfig: no `worker` key in a present registry → constants", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
-  try {
-    const path = join(dir, "presets.yaml");
-    // A catalog with an escalation triple but no worker → worker falls to constants.
-    writeFileSync(path, "escalation: claude::haiku::high\n");
-    const cfg = resolveWorkerLaunchConfig(path);
-    expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveWorkerLaunchConfig: a malformed registry FALLS BACK to constants without throwing", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
-  try {
-    const path = join(dir, "presets.yaml");
-    // A malformed worker triple → ConfigError, must be swallowed to constants.
-    writeFileSync(path, "worker: not-a-triple\n");
-    const cfg = resolveWorkerLaunchConfig(path);
-    expect(cfg).toEqual({ model: WORKER_MODEL, effort: WORKER_EFFORT });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("resolveWorkerLaunchConfig: a non-claude worker harness warns ONCE per value and still launches on claude", () => {
-  const dir = mkdtempSync(join(tmpdir(), "kpr-presets-"));
-  const errs: string[] = [];
-  const origError = console.error;
-  console.error = (...args: unknown[]) => {
-    errs.push(args.map(String).join(" "));
-  };
-  try {
-    const codexPath = join(dir, "codex.yaml");
-    writeFileSync(codexPath, "worker: codex::gpt::high\n");
-    // A fresh per-call memo standing in for the reconcile cycle's process memo.
-    const warned = new Set<string>();
-    // The harness is DROPPED, not honored — model/effort still resolve from the
-    // triple so the launch proceeds on claude with the configured knobs.
-    const first = resolveWorkerLaunchConfig(codexPath, warned);
-    expect(first).toEqual({ model: "gpt", effort: "high" });
-    // A second reconcile cycle re-resolves the SAME offending value: no new warn.
-    resolveWorkerLaunchConfig(codexPath, warned);
-    const codexWarns = errs.filter((e) => e.includes("pins harness 'codex'"));
-    expect(codexWarns.length).toBe(1);
-
-    // A DISTINCT offending value (pi) warns once more against the same memo.
-    const piPath = join(dir, "pi.yaml");
-    writeFileSync(piPath, "worker: pi::glm::high\n");
-    resolveWorkerLaunchConfig(piPath, warned);
-    resolveWorkerLaunchConfig(piPath, warned);
-    const piWarns = errs.filter((e) => e.includes("pins harness 'pi'"));
-    expect(piWarns.length).toBe(1);
-  } finally {
-    console.error = origError;
-    rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 test("buildLaunchArgv wraps the worker command in [shell, -l, -i, -c, body]", () => {

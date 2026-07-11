@@ -239,6 +239,14 @@ export interface HostMatrixShadow {
   winner: string;
 }
 
+/** A static plan subagent's `{model, effort}` pin (a pair, never a triple —
+ *  frontmatter carries no harness axis), baked into the agent's rendered
+ *  frontmatter at render time. Mirrors the launcher island's `AgentPin`. */
+export interface AgentPin {
+  model: string;
+  effort: string;
+}
+
 /** The v2 subset a plan consumer needs. `models` IS `subagent_models` (the cell
  *  axis); `effortsByModel` covers EVERY capability any provider serves. */
 export interface HostMatrixV2 {
@@ -249,6 +257,9 @@ export interface HostMatrixV2 {
   driverByModel: Map<string, Driver>;
   effortsByModel: Map<string, string[]>;
   shadowed: HostMatrixShadow[];
+  /** the `agent_pins:` map (static subagent name → its `{model, effort}` pin),
+   *  in declaration order. Empty when the block is absent. */
+  agentPins: Map<string, AgentPin>;
 }
 
 const ALLOWED_V2_KEYS: ReadonlySet<string> = new Set([
@@ -258,6 +269,7 @@ const ALLOWED_V2_KEYS: ReadonlySet<string> = new Set([
   "providers",
   "wrapper_driver",
   "defaults",
+  "agent_pins",
 ]);
 
 /** The capability token of a launch id: the segment after the LAST `/`, else the
@@ -364,6 +376,7 @@ function parseHostMatrixV2(parsed: unknown, label: string): HostMatrixV2 {
   for (const cap of models) {
     driverByModel.set(cap, claudeServes.has(cap) ? "native" : "wrapped");
   }
+  const agentPins = coerceAgentPins(doc.agent_pins, efforts, label);
   return {
     efforts,
     subagentTemplates,
@@ -372,6 +385,7 @@ function parseHostMatrixV2(parsed: unknown, label: string): HostMatrixV2 {
     driverByModel,
     effortsByModel,
     shadowed,
+    agentPins,
   };
 }
 
@@ -612,6 +626,62 @@ function coerceSubagentModels(
     out.push(item);
   }
   return out;
+}
+
+/** Parse + validate the `agent_pins:` map — agent name → `{model, effort}`. An
+ * absent block parses as an empty map (a pins-less v2 file stays valid for
+ * launch/dispatch surfaces; render-time strictness for a missing/extra pin is
+ * the renderer's job — task 5). Effort must be a member of the matrix's
+ * top-level efforts axis; model is an opaque non-empty strict-charset token
+ * (not cross-checked against `subagent_models` — frontmatter has no harness
+ * axis to resolve through). Mirrors the launcher island's `parseAgentPins`. */
+function coerceAgentPins(
+  raw: unknown,
+  efforts: string[],
+  label: string,
+): Map<string, AgentPin> {
+  const pins = new Map<string, AgentPin>();
+  if (raw === undefined) {
+    return pins;
+  }
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new SubagentsConfigError(
+      "host matrix `agent_pins` must be a mapping of agent name to {model, effort}",
+      label,
+    );
+  }
+  const effortSet = new Set(efforts);
+  for (const [name, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new SubagentsConfigError(
+        `host matrix \`agent_pins['${name}']\` must be a {model, effort} mapping`,
+        label,
+      );
+    }
+    const rec = entry as Record<string, unknown>;
+    for (const k of Object.keys(rec)) {
+      if (k !== "model" && k !== "effort") {
+        throw new SubagentsConfigError(
+          `host matrix \`agent_pins['${name}']\` has unknown key '${k}' (allowed: model, effort)`,
+          label,
+        );
+      }
+    }
+    if (!isMatrixToken(rec.model)) {
+      throw new SubagentsConfigError(
+        `host matrix \`agent_pins['${name}'].model\` must be a valid token`,
+        label,
+      );
+    }
+    if (typeof rec.effort !== "string" || !effortSet.has(rec.effort)) {
+      throw new SubagentsConfigError(
+        `host matrix \`agent_pins['${name}'].effort\` '${rec.effort}' is not in the matrix effort axis [${efforts.join(", ")}]`,
+        label,
+      );
+    }
+    pins.set(name, { model: rec.model, effort: rec.effort });
+  }
+  return pins;
 }
 
 /** The effective effort list for a capability under the v2 host matrix — the

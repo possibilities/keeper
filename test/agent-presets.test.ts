@@ -381,8 +381,7 @@ describe("presets resolve JSON contract", () => {
       rawArgv: true,
       hostTriples: {
         defaults: {},
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: { duo: ["claude::opus::high", "codex::gpt-5.5::high"] },
         panelDefault: null,
       },
@@ -402,8 +401,7 @@ describe("presets resolve JSON contract", () => {
       rawArgv: true,
       hostTriples: {
         defaults: {},
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: { reviewers: ["claude::opus::high"] },
         panelDefault: "reviewers",
       },
@@ -423,8 +421,7 @@ describe("presets resolve JSON contract", () => {
       rawArgv: true,
       hostTriples: {
         defaults: {},
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: { reviewers: ["claude::opus::high"] },
         panelDefault: null,
       },
@@ -441,8 +438,7 @@ describe("presets resolve JSON contract", () => {
       rawArgv: true,
       hostTriples: {
         defaults: {},
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: { duo: ["claude::opus::high"] },
         panelDefault: null,
       },
@@ -500,8 +496,7 @@ describe("presets list discovery surface", () => {
           claude: "claude::opus::high",
           codex: "codex::gpt-5.5::high",
         },
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: { duo: ["claude::opus::high", "pi::pi/spark::low"] },
         panelDefault: "duo",
       },
@@ -556,11 +551,81 @@ describe("presets list discovery surface", () => {
         pi: null,
         hermes: null,
       },
+      // No presetCatalog fixture passed → DEFAULT_PRESET_CATALOG carries no
+      // `dispatch` block, so every verb floors to its compiled default.
+      dispatch: [
+        { verb: "work", triple: "claude::sonnet::max", floored: true },
+        { verb: "close", triple: "claude::sonnet::max", floored: true },
+        { verb: "resolve", triple: "claude::sonnet::max", floored: true },
+        { verb: "unblock", triple: "claude::sonnet::high", floored: true },
+        { verb: "deconflict", triple: "claude::sonnet::high", floored: true },
+        { verb: "repair", triple: "claude::sonnet::high", floored: true },
+        { verb: "handoff", triple: null, floored: true },
+      ],
       panels: [
         { name: "duo", members: ["claude::opus::high", "pi::pi/spark::low"] },
       ],
       default: "duo",
     });
+  });
+
+  test("--json marks a configured dispatch verb unfloored, mixed with floored rows", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list", "--json"],
+      rawArgv: true,
+      matrix: writeAndLoad(LIST_MATRIX_BODY),
+      presetCatalog: {
+        presets: {},
+        dispatch: {
+          work: { harness: "claude", model: "opus", effort: "low" },
+          close: null,
+          resolve: null,
+          unblock: null,
+          deconflict: null,
+          repair: null,
+          handoff: null,
+        },
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const dispatch = JSON.parse(h.out.join("")).dispatch;
+    expect(dispatch).toEqual([
+      { verb: "work", triple: "claude::opus::low", floored: false },
+      { verb: "close", triple: "claude::sonnet::max", floored: true },
+      { verb: "resolve", triple: "claude::sonnet::max", floored: true },
+      { verb: "unblock", triple: "claude::sonnet::high", floored: true },
+      { verb: "deconflict", triple: "claude::sonnet::high", floored: true },
+      { verb: "repair", triple: "claude::sonnet::high", floored: true },
+      { verb: "handoff", triple: null, floored: true },
+    ]);
+  });
+
+  test("human-readable marks a floored dispatch row and leaves a configured one bare", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list"],
+      rawArgv: true,
+      matrix: writeAndLoad(LIST_MATRIX_BODY),
+      presetCatalog: {
+        presets: {},
+        dispatch: {
+          work: { harness: "claude", model: "opus", effort: "low" },
+          close: null,
+          resolve: null,
+          unblock: null,
+          deconflict: null,
+          repair: null,
+          handoff: null,
+        },
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const text = h.out.join("");
+    expect(text).toContain("work  claude::opus::low");
+    expect(text).not.toContain("work  claude::opus::low (floored)");
+    expect(text).toContain("close  claude::sonnet::max (floored)");
+    expect(text).toContain("handoff  (none) (floored)");
   });
 
   test("human-readable lists cube triples, defaults, and panels", async () => {
@@ -570,8 +635,7 @@ describe("presets list discovery surface", () => {
       matrix: writeAndLoad(LIST_MATRIX_BODY),
       hostTriples: {
         defaults: { claude: "claude::opus::high" },
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: { duo: ["claude::opus::high"] },
         panelDefault: null,
       },
@@ -646,6 +710,45 @@ describe("presets list discovery surface", () => {
     ).toEqual([
       ["codex::gpt-5.3-codex-spark::high", true],
       ["codex::gpt-5.3-codex-spark::xhigh", true],
+    ]);
+  });
+
+  test("dispatch table against the committed v2 example matrix: configured + floored rows", async () => {
+    const EXAMPLE_PATH = join(
+      import.meta.dir,
+      "..",
+      "docs",
+      "examples",
+      "matrix.example.yaml",
+    );
+    const h = makeHarness({
+      argv: ["presets", "list", "--json"],
+      rawArgv: true,
+      matrix: loadMatrixV2(EXAMPLE_PATH),
+      presetCatalog: {
+        presets: {},
+        dispatch: {
+          work: { harness: "claude", model: "sonnet", effort: "medium" },
+          close: null,
+          resolve: null,
+          unblock: null,
+          deconflict: null,
+          repair: null,
+          handoff: null,
+        },
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const dispatch = JSON.parse(h.out.join("")).dispatch;
+    expect(dispatch).toEqual([
+      { verb: "work", triple: "claude::sonnet::medium", floored: false },
+      { verb: "close", triple: "claude::sonnet::max", floored: true },
+      { verb: "resolve", triple: "claude::sonnet::max", floored: true },
+      { verb: "unblock", triple: "claude::sonnet::high", floored: true },
+      { verb: "deconflict", triple: "claude::sonnet::high", floored: true },
+      { verb: "repair", triple: "claude::sonnet::high", floored: true },
+      { verb: "handoff", triple: null, floored: true },
     ]);
   });
 });

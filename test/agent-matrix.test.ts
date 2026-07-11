@@ -898,6 +898,7 @@ function projectLauncher(m: MatrixV2) {
       launchId: s.launchId,
       winner: s.winner,
     })),
+    agentPins: Object.fromEntries(m.agentPins),
   };
 }
 
@@ -963,6 +964,33 @@ describe("v2 loader — capability derivation + parse", () => {
     ]);
     expect(matrixV2EffortsFor(m, "opus")).toEqual(["medium", "high"]);
     expect(matrixV2EffortsFor(m, "never-served")).toEqual(["medium", "high"]);
+  });
+});
+
+describe("v2 loader — agent_pins", () => {
+  test("a valid agent_pins block parses to a {model, effort} map", () => {
+    const m = loadMatrixV2(writeMatrix(fx.AGENT_PINS_VALID));
+    expect(Object.fromEntries(m.agentPins)).toEqual({
+      "repo-scout": { model: "opus", effort: "high" },
+      "practice-scout": { model: "opus", effort: "medium" },
+    });
+  });
+
+  test("an absent agent_pins block parses as an empty map", () => {
+    const m = loadMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    expect(m.agentPins.size).toBe(0);
+  });
+
+  test("a pin effort outside the matrix's top-level efforts axis is fail-loud, naming the pin", () => {
+    expect(() =>
+      loadMatrixV2(writeMatrix(fx.AGENT_PINS_EFFORT_OUTSIDE_AXIS)),
+    ).toThrow(/agent_pins\['gap-analyst'\].effort/);
+  });
+
+  test("a malformed pin pair shape (missing effort) is fail-loud", () => {
+    expect(() => loadMatrixV2(writeMatrix(fx.AGENT_PINS_MALFORMED))).toThrow(
+      /agent_pins\['epic-scout'\].effort/,
+    );
   });
 });
 
@@ -1144,6 +1172,23 @@ describe("committed example matrix (anti-rot, v2)", () => {
       },
     ]);
   });
+
+  test("the example carries the 11 seeded agent_pins", () => {
+    const m = loadMatrixV2(EXAMPLE_PATH);
+    expect(Object.fromEntries(m.agentPins)).toEqual({
+      "close-planner": { model: "opus", effort: "high" },
+      "docs-gap-scout": { model: "opus", effort: "medium" },
+      "epic-scout": { model: "opus", effort: "medium" },
+      "gap-analyst": { model: "opus", effort: "xhigh" },
+      "model-selector": { model: "opus", effort: "high" },
+      "panel-judge": { model: "opus", effort: "xhigh" },
+      "panel-runner": { model: "opus", effort: "xhigh" },
+      "practice-scout": { model: "opus", effort: "medium" },
+      "quality-auditor": { model: "opus", effort: "high" },
+      "repo-scout": { model: "opus", effort: "high" },
+      "selection-auditor": { model: "opus", effort: "high" },
+    });
+  });
 });
 
 describe("enumerateTriples (virtual launch cube)", () => {
@@ -1211,8 +1256,7 @@ describe("enumerateTriples (virtual launch cube)", () => {
 describe("lintHostTriples (host-triple drift + fault)", () => {
   const hostRefs = (host: Partial<HostTriples>): HostTriples => ({
     defaults: {},
-    worker: null,
-    escalation: null,
+    dispatch: {},
     panels: {},
     panelDefault: null,
     ...host,
@@ -1236,11 +1280,11 @@ describe("lintHostTriples (host-triple drift + fault)", () => {
   test("a malformed triple is a fault carrying the grammar error + source", () => {
     const findings = lintHostTriples(
       cubeMatrix(),
-      hostTripleRefs(hostRefs({ worker: "claude::opus::banana" })),
+      hostTripleRefs(hostRefs({ dispatch: { work: "claude::opus::banana" } })),
     );
     expect(findings).toHaveLength(1);
     expect(findings[0]?.kind).toBe("malformed-triple");
-    expect(findings[0]?.source).toBe("worker");
+    expect(findings[0]?.source).toBe("dispatch.work");
     expect((findings[0] as { error: string }).error).toContain("banana");
   });
 
@@ -1488,8 +1532,7 @@ describe("providers check verb", () => {
       matrix: cubeMatrixV2(),
       hostTriples: {
         defaults: { claude: "claude::opus::low" },
-        worker: "claude::sonnet::high",
-        escalation: null,
+        dispatch: { work: "claude::sonnet::high" },
         panels: { duo: ["codex::gpt-5.5-codex::high", "hermes::hermes-m::na"] },
         panelDefault: "duo",
       },
@@ -1508,8 +1551,7 @@ describe("providers check verb", () => {
       // opus enumerates only at low/high — xhigh is a well-formed off-cube triple.
       hostTriples: {
         defaults: { claude: "claude::opus::xhigh" },
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: {},
         panelDefault: null,
       },
@@ -1531,8 +1573,7 @@ describe("providers check verb", () => {
       hostTriples: {
         defaults: {},
         // Two segments — the grammar rejects it (fault, not drift).
-        worker: "claude::opus",
-        escalation: null,
+        dispatch: { unblock: "claude::opus" },
         panels: {},
         panelDefault: null,
       },
@@ -1544,7 +1585,34 @@ describe("providers check verb", () => {
     expect(findings.map((f: { kind: string }) => f.kind)).toEqual([
       "malformed-triple",
     ]);
-    expect(findings[0].source).toBe("worker");
+    expect(findings[0].source).toBe("dispatch.unblock");
+  });
+
+  test("a well-formed off-cube dispatch triple is drift naming the verb key (exit 9)", async () => {
+    const h = makeHarness({
+      argv: ["providers", "check"],
+      rawArgv: true,
+      matrix: cubeMatrixV2(),
+      // sonnet only enumerates at low/high — xhigh is off-cube.
+      hostTriples: {
+        defaults: {},
+        dispatch: { unblock: "claude::sonnet::xhigh" },
+        panels: {},
+        panelDefault: null,
+      },
+      providerReachable: () => true,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(9);
+    const findings = JSON.parse(h.out.join("")).findings;
+    expect(findings).toEqual([
+      {
+        kind: "off-cube-triple",
+        source: "dispatch.unblock",
+        triple: "claude::sonnet::xhigh",
+        line: expect.stringContaining("dispatch.unblock"),
+      },
+    ]);
   });
 
   test("no auto-preset collision finding exists anywhere", async () => {
@@ -1610,5 +1678,43 @@ describe("providers check verb", () => {
     const parsed = JSON.parse(h.out.join(""));
     expect(parsed.matrix_present).toBe(true);
     expect(parsed.findings).toEqual([]);
+  });
+
+  test("dispatch table against the committed v2 example matrix: in-cube clean, off-cube drift", async () => {
+    const EXAMPLE_PATH = join(
+      import.meta.dir,
+      "..",
+      "docs",
+      "examples",
+      "matrix.example.yaml",
+    );
+    const h = makeHarness({
+      argv: ["providers", "check"],
+      rawArgv: true,
+      matrix: loadMatrixV2(EXAMPLE_PATH),
+      hostTriples: {
+        defaults: {},
+        dispatch: {
+          // in-cube: claude/sonnet enumerates at the top-level [medium, high].
+          work: "claude::sonnet::medium",
+          // off-cube: opus never enumerates at low (only medium/high).
+          repair: "claude::opus::low",
+        },
+        panels: {},
+        panelDefault: null,
+      },
+      providerReachable: () => true,
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(9);
+    const findings = JSON.parse(h.out.join("")).findings;
+    expect(findings).toEqual([
+      {
+        kind: "off-cube-triple",
+        source: "dispatch.repair",
+        triple: "claude::opus::low",
+        line: expect.stringContaining("dispatch.repair"),
+      },
+    ]);
   });
 });

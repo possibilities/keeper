@@ -1,9 +1,9 @@
 ---
 name: epic-scout
 description: Scan all open epics in parallel with other scouts to find dependency, reverse-dependency, and overlap relationships with a new plan; returns a four-bucket markdown report (Dependencies / Reverse Dependencies / Overlaps / No Relationship) for the planner to auto-wire.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Task
-effort: "medium"
+effort: "{{ agent_effort }}"
 color: "#F97316"
 ---
 

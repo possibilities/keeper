@@ -178,6 +178,9 @@ function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
       rec.failed.push(p);
     },
     buildPrompt: (doc) => `/hack ${doc}`,
+    // Default: no `dispatch.handoff` pin → flagless launch (the prior default).
+    // Pin-carrying tests override this.
+    resolveDispatchConfig: () => ({}),
     ...over,
   };
   return { deps, rec };
@@ -218,6 +221,37 @@ test("dispatchOneHandoff launches into the row's target_session", async () => {
     deps,
   );
   expect(rec.launches[0]?.session).toBe("my-session");
+});
+
+test("dispatchOneHandoff launches flagless when the dispatch.handoff pin is absent (ADR 0040)", async () => {
+  const { deps, rec } = makeDeps({
+    // The default `resolveDispatchConfig` returns {} (no pin).
+  });
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-noflag", target_session: "s" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  // No compiled default for handoff — an absent row means NO --model/--effort flags
+  // (byte-identical to the prior flagless launch).
+  expect(rec.launches[0]?.spec.model).toBeUndefined();
+  expect(rec.launches[0]?.spec.effort).toBeUndefined();
+});
+
+test("dispatchOneHandoff carries the dispatch.handoff pin's model/effort onto the spec (ADR 0040)", async () => {
+  const { deps, rec } = makeDeps({
+    resolveDispatchConfig: () => ({ model: "opus", effort: "high" }),
+  });
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-pinned", target_session: "s" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  // A present row makes handoff pinnable — the resolved pair flows onto the spec.
+  expect(rec.launches[0]?.spec.model).toBe("opus");
+  expect(rec.launches[0]?.spec.effort).toBe("high");
 });
 
 test("dispatchOneHandoff uses the row's target_dir as the launch cwd (per-row wins over the global)", async () => {

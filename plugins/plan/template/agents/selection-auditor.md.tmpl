@@ -1,9 +1,9 @@
 ---
 name: selection-auditor
 description: Grade each executed worker cell underpowered / right-sized / overpowered from a committed selection-audit brief and return a raw JSON verdict.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Task
-effort: "high"
+effort: "{{ agent_effort }}"
 color: "#F59E0B"
 ---
 

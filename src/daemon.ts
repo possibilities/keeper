@@ -164,7 +164,7 @@ import {
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
 } from "./dispatch-failure-key";
-import { resolveEscalationLaunchConfig } from "./escalation-config";
+import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
@@ -212,7 +212,11 @@ import type {
   PlanWorkerOutbound,
   RecheckPendingMessage,
 } from "./plan-worker";
-import { isStoppedJobLive } from "./reconcile-core";
+import {
+  ESCALATION_EFFORT,
+  ESCALATION_MODEL,
+  isStoppedJobLive,
+} from "./reconcile-core";
 import {
   DEFAULT_BATCH_SIZE,
   type DrainOptions,
@@ -3630,9 +3634,14 @@ export interface EscalationDispatchDeps {
     id: string,
     cwd: string,
   ) => boolean;
-  /** Resolve the escalation session's `{model, effort}` (DELEGATES to
-   *  {@link resolveEscalationLaunchConfig} in production). */
-  readonly resolveConfig: () => { model: string; effort: string };
+  /** Resolve the `<verb>` escalation session's `{model, effort}` from the
+   *  `dispatch:` table (DELEGATES to {@link resolveDispatchLaunchConfig}, floored to
+   *  the `ESCALATION_*` constants, in production). Verb-parameterized (ADR 0040) so
+   *  each escalation verb's row is honored independently. */
+  readonly resolveConfig: (verb: EscalationVerb) => {
+    model: string;
+    effort: string;
+  };
   /** Launch ONE `<verb>::<id>` session with the built {@link LaunchSpec} + cwd; returns
    *  `{ ok }`. Async + fail-open (a throw is caught and mapped to `dispatch_failed`). */
   readonly launch: (args: {
@@ -3687,7 +3696,7 @@ export async function dispatchEscalationSession(
     );
     return "at_cap";
   }
-  const { model, effort } = deps.resolveConfig();
+  const { model, effort } = deps.resolveConfig(args.verb);
   const spec: LaunchSpec = {
     prompt: args.prompt,
     claudeName: label,
@@ -11191,7 +11200,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // checkout-gated (the resolver's own path is gated in `dispatchResolver` directly).
     isCheckoutOccupied: (verb, id, cwd) =>
       verb === "deconflict" && escalationCheckoutOccupied(verb, id, cwd),
-    resolveConfig: () => resolveEscalationLaunchConfig(),
+    resolveConfig: (verb) => {
+      const cfg = resolveDispatchLaunchConfig(verb);
+      return {
+        model: cfg.model ?? ESCALATION_MODEL,
+        effort: cfg.effort ?? ESCALATION_EFFORT,
+      };
+    },
     launch: async ({ spec, cwd, label }) => {
       const result = await keeperAgentLaunch({
         noteLine: (line) => console.error(`[keeperd] ${line}`),
@@ -11709,6 +11724,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       );
       return "checkout_busy";
     }
+    // The `resolve` dispatch honors the operator's `dispatch.resolve` row (ADR
+    // 0040), floored to the WORKER_* constants when unset — so a `dispatch:`-less
+    // catalog launches byte-identically to the prior inline default.
+    const resolveLaunch = resolveDispatchLaunchConfig("resolve");
     const spec: LaunchSpec = {
       prompt: buildWorkResolverBrief({
         taskId: row.id,
@@ -11716,8 +11735,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         laneDir: row.dir,
       }),
       claudeName: `resolve::${row.id}`,
-      model: WORKER_MODEL,
-      effort: WORKER_EFFORT,
+      model: resolveLaunch.model ?? WORKER_MODEL,
+      effort: resolveLaunch.effort ?? WORKER_EFFORT,
     };
     const result = await keeperAgentLaunch({
       noteLine: (line) => console.error(`[keeperd] ${line}`),
@@ -12410,6 +12429,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       );
       return "checkout_busy";
     }
+    // The `resolve` dispatch honors the operator's `dispatch.resolve` row (ADR
+    // 0040), floored to the WORKER_* constants when unset — so a `dispatch:`-less
+    // catalog launches byte-identically to the prior inline default.
+    const resolveLaunch = resolveDispatchLaunchConfig("resolve");
     const spec: LaunchSpec = {
       prompt: buildResolverBrief({
         epicId: row.id,
@@ -12417,8 +12440,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         repoDir: row.dir,
       }),
       claudeName: `resolve::${row.id}`,
-      model: WORKER_MODEL,
-      effort: WORKER_EFFORT,
+      model: resolveLaunch.model ?? WORKER_MODEL,
+      effort: resolveLaunch.effort ?? WORKER_EFFORT,
     };
     const result = await keeperAgentLaunch({
       noteLine: (line) => console.error(`[keeperd] ${line}`),

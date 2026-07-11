@@ -1,9 +1,9 @@
 ---
 name: panel-runner
 description: Convene a full panel in one isolated subagent — resolve the panel, fan the panelists out as detached read-only `keeper agent run` legs, wait token-free with chunked blocking Bash, then spawn `plan:panel-judge` and return the fused answer; spawned by `/plan:panel` and by programmatic callers, with panelist content never entering the caller's context.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Monitor
-effort: "xhigh"
+effort: "{{ agent_effort }}"
 color: "#0EA5E9"
 ---
 

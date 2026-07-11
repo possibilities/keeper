@@ -1,9 +1,9 @@
 ---
 name: close-planner
 description: Vet a quality audit, decide kept/culled/merged per finding, cluster survivors into one follow-up epic, and submit the verdict + follow-up plan. Internal to /plan:close — never invoked from user requests.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Task
-effort: "high"
+effort: "{{ agent_effort }}"
 color: "#6366F1"
 ---
 

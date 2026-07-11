@@ -223,6 +223,7 @@ describe.skipIf(!SLOW_ENABLED || TMUX_BIN === null)(
         driverByModel: new Map(),
         effortsByModel: new Map(),
         shadowed: [],
+        agentPins: new Map(),
       });
       const probe = { dirExists: () => true, probeShadow: () => null };
 

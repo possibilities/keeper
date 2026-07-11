@@ -162,9 +162,14 @@ describe("on-disk work-plugin cells are well-formed", () => {
   );
 
   test("no stale plan:worker-*.md agents linger in agents/", () => {
-    const stale = readdirSync(join(REPO, "agents")).filter(
-      (n) => n.startsWith("worker-") && n.endsWith(".md"),
-    );
+    // agents/ is gitignored (rendered), so a clean checkout has none — an absent
+    // dir trivially carries no stale worker agents.
+    const agentsDir = join(REPO, "agents");
+    const stale = existsSync(agentsDir)
+      ? readdirSync(agentsDir).filter(
+          (n) => n.startsWith("worker-") && n.endsWith(".md"),
+        )
+      : [];
     expect(stale).toEqual([]);
   });
 });

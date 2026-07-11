@@ -92,7 +92,16 @@ is the composition INPUT that makes any cell render at all — claude-native inc
 is no embedded fallback: `render-plugin-templates` fans `subagent_templates` out over
 `subagent_models × efforts` into the per-cell manifests under `plugins/plan/workers/`, and an
 absent, unparseable, schema-invalid, or empty matrix is a typed loud failure rather than a
-claude-only default.
+claude-only default. The same render also stamps the 11 static plan agents
+(`plugins/plan/agents/*.md` — close-planner, docs-gap-scout, epic-scout, gap-analyst,
+model-selector, panel-judge, panel-runner, practice-scout, quality-auditor, repo-scout,
+selection-auditor): every plain-render agent template (every `template/agents/*.md.tmpl` NOT
+in `subagent_templates`) draws its frontmatter `model`/`effort` from the matrix's
+`agent_pins:` map, keyed by agent name. A template with no matching pin fails the render
+loud, naming the agent. Every plain-render template ↔ `agent_pins` entry is meant to be a
+total, disjoint partition — a host-blind test suite gate (`plugins/prompt/test/`) renders
+into a temp dir and compares frontmatter against the pin, catching a template with no pin,
+a pin with no template, or a hand-edited rendered file diverging from its pin.
 
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —
@@ -121,17 +130,22 @@ merge-escalation sweep, sequenced behind the tier-1 `resolve::` resolver), and
 category to one write-capable session per (repo, fingerprint) instead of the task's own
 unblock). All three inherit the identical additive base set plus their target
 `/plan:unblock`, `/plan:deconflict`, or `/plan:repair` skill. What sets them apart is the
-launch config, not the plugin channel: their `{model, effort}` comes from a SEPARATE
-`escalation` launch triple (`resolveEscalationLaunchConfig`, `src/escalation-config.ts`) —
-the `escalation` key in `presets.yaml` (a `<harness>::<model>::<effort>` triple) coalesced
-over the `ESCALATION_*` constants, DELIBERATELY independent of the `worker` triple so an
-escalation session's tier moves without perturbing plan workers. Claude-only; a missing or
-malformed triple swallows to the built-in escalation defaults, never a launch failure.
-Every escalation session is additionally constrained by the keeper plugin's sixth hook,
-escalation-guard (`PreToolUse(Bash)`), which is role-keyed on the launch-injected
-`KEEPER_ESCALATION_ROLE` marker to a per-role Bash command-family allowlist — unblock and
-resolve stay diagnosis-only, deconflict and repair get write-capable families — failing
-CLOSED for a marked session regardless of `--dangerously-skip-permissions`.
+launch config, not the plugin channel: every dispatched verb — `work`, `close`, `resolve`,
+`unblock`, `deconflict`, `repair`, `handoff` — resolves its `{model, effort}` through the
+ONE `resolveDispatchLaunchConfig` leaf (`src/dispatch-launch-config.ts`) reading the
+per-verb `dispatch:` table in `presets.yaml` (a `<harness>::<model>::<effort>` triple per
+row), floored to the compiled-in reconcile-core constants when a row is absent or the
+catalog fails to parse: `work`/`close`/`resolve` float to the worker constants,
+`unblock`/`deconflict`/`repair` to the escalation constants, `handoff` to the harness's own
+default. The escalation rows stay independently tunable from the work/close/resolve rows —
+retuning one verb's tier is one `dispatch:` line, never a perturbation of the others.
+Claude-only; a non-claude triple resolves its model/effort but warns once per (verb,
+harness) rather than launching a foreign harness. Every escalation session is additionally
+constrained by the keeper plugin's sixth hook, escalation-guard (`PreToolUse(Bash)`), which
+is role-keyed on the launch-injected `KEEPER_ESCALATION_ROLE` marker to a per-role Bash
+command-family allowlist — unblock and resolve stay diagnosis-only, deconflict and repair
+get write-capable families — failing CLOSED for a marked session regardless of
+`--dangerously-skip-permissions`.
 
 ## The worker isolation gate (config-flagged, default OFF)
 

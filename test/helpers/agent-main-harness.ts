@@ -26,12 +26,11 @@ import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
 
 /** The default host launch triples the harness injects when a test names none: an
- *  empty set (no defaults, no worker/escalation, no panels). Triple-verb tests
+ *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
  *  pass their own {@link HostTriples} fixture. */
 export const DEFAULT_HOST_TRIPLES: HostTriples = {
   defaults: {},
-  worker: null,
-  escalation: null,
+  dispatch: {},
   panels: {},
   panelDefault: null,
 };

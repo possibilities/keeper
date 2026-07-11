@@ -44,6 +44,7 @@
 import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
+import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import {
   keeperAgentLaunch,
   type LaunchResult,
@@ -207,6 +208,11 @@ export interface HandoffDispatchDeps {
   emitLaunchFailed(payload: HandoffLaunchFailedPayload): void;
   /** The launch prompt = `handoffPromptPrefix` + the framing + the inline brief. */
   buildPrompt(doc: string): string;
+  /** Resolve the `dispatch.handoff` launch pin (ADR 0040). Returns `{}` when the
+   *  row is absent — handoff carries NO compiled default, so an absent row yields a
+   *  flagless launch (byte-identical to the prior behavior); a present row makes
+   *  handoff pinnable. Production: {@link resolveDispatchLaunchConfig}("handoff"). */
+  resolveDispatchConfig(): { model?: string; effort?: string };
 }
 
 /** Outcome of {@link dispatchOneHandoff}, for the cycle log + tests. */
@@ -270,9 +276,19 @@ export async function dispatchOneHandoff(
   // Launch — ONLY after the durable `HandoffDispatching` ack. keeper agent owns the
   // tmux window; the prompt boots the handoff-ee into the prefix skill with the
   // brief inline (the framing + `row.doc`), no `keeper handoff show` round-trip.
+  // Handoff becomes pinnable (ADR 0040): a present `dispatch.handoff` row adds
+  // --model/--effort to the spec; an absent row resolves to `{}` and the launch
+  // stays flagless (the prior default — LaunchSpec omits the flags when undefined).
+  const handoffLaunch = deps.resolveDispatchConfig();
   const spec: LaunchSpec = {
     prompt: deps.buildPrompt(row.doc),
     claudeName: `handoff::${row.handoff_id}`,
+    ...(handoffLaunch.model !== undefined
+      ? { model: handoffLaunch.model }
+      : {}),
+    ...(handoffLaunch.effort !== undefined
+      ? { effort: handoffLaunch.effort }
+      : {}),
   };
   // PER-ROW launch cwd: the handoff's resolved `--cwd` (an absolute path the CLI
   // validated) wins; a NULL/empty value coalesces to the worker-global `cwd`
@@ -545,6 +561,7 @@ function main(): void {
       } satisfies HandoffLaunchFailedMessage);
     },
     buildPrompt: (doc) => buildHandoffPrompt(doc, promptPrefix),
+    resolveDispatchConfig: () => resolveDispatchLaunchConfig("handoff"),
   };
 
   // Single-flight cycle drive — coalesce a wake burst into one trailing re-run.

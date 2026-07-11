@@ -613,16 +613,20 @@ export interface ReconcileSnapshot {
    */
   unseededRoots: Set<string>;
   /**
-   * The autopilot worker `--model` / `--effort`, resolved producer-side per
-   * cycle from the `worker` preset in `presets.yaml` (COALESCING onto
-   * {@link WORKER_MODEL}/{@link WORKER_EFFORT} when absent/malformed). Assembled
-   * read-time in {@link loadReconcileSnapshot} so the pure `reconcile` stays
-   * fs-free; threaded onto each {@link PlannedLaunch} so both worker-command
-   * builders read the SAME resolved values. NEVER a fold input — re-fold stays
-   * byte-identical regardless of which model runs.
+   * The `work`- and `close`-row `--model` / `--effort`, resolved producer-side
+   * per cycle from the `dispatch:` table in `presets.yaml` (each verb COALESCING
+   * onto {@link WORKER_MODEL}/{@link WORKER_EFFORT} when its row is
+   * absent/malformed, ADR 0040). `close` is settable INDEPENDENTLY of `work` —
+   * two separate `dispatch:` rows — so a close row may run a different model than
+   * a work row. Assembled read-time in {@link loadReconcileSnapshot} so the pure
+   * `reconcile` stays config-blind; threaded onto each {@link PlannedLaunch} so
+   * both worker-command builders read the SAME resolved values. NEVER a fold input
+   * — re-fold stays byte-identical regardless of which model runs.
    */
-  workerModel: string;
-  workerEffort: string;
+  workModel: string;
+  workEffort: string;
+  closeModel: string;
+  closeEffort: string;
   /**
    * The host worker matrix (`~/.config/keeper/matrix.yaml`, ADR 0036), loaded ONCE
    * per cycle in {@link loadReconcileSnapshot} and attached as a serializable
@@ -1956,12 +1960,12 @@ export function reconcile(
           verb,
           taskId,
           cwd,
-          snapshot.workerModel,
-          snapshot.workerEffort,
+          snapshot.workModel,
+          snapshot.workEffort,
           pluginDir,
         ),
-        model: snapshot.workerModel,
-        effort: snapshot.workerEffort,
+        model: snapshot.workModel,
+        effort: snapshot.workEffort,
         tier: verb === "work" ? task.tier : null,
         cellModel: verb === "work" ? (task.model ?? null) : null,
         pluginDir,
@@ -2035,11 +2039,11 @@ export function reconcile(
             closeVerb,
             epicId,
             projectDir,
-            snapshot.workerModel,
-            snapshot.workerEffort,
+            snapshot.closeModel,
+            snapshot.closeEffort,
           ),
-          model: snapshot.workerModel,
-          effort: snapshot.workerEffort,
+          model: snapshot.closeModel,
+          effort: snapshot.closeEffort,
           tier: null,
           // A `close` row is cell-less — it loads no per-cell worker plugin, and
           // names no capability model.
