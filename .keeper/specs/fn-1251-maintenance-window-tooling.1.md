@@ -35,5 +35,5 @@ Unit-test the new count/condition: an interactive `working` session does NOT cou
 - [ ] The derivation is read-time (not inside a fold).
 
 ## Done summary
-
+Added isBoardWorkJob/boardWorkIdleState in src/await-conditions.ts and an additive keeper status in_flight.board_work_jobs field, both excluding interactive/supervising sessions from plan-worker activity counts.
 ## Evidence
