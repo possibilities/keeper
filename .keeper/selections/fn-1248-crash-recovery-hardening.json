@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Load-bearing early-proof task with a subtle TOCTOU liveness invariant, a backward-compatible intent-schema change, and a new dwell/startup-window design that sets the approach for the sibling task, so it clears the opus correctness-invariant gate at the contract-touching xhigh band.",
+      "task_id": "fn-1248-crash-recovery-hardening.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified with an in-repo sibling deriver to mirror, but the fail-direction reconciliation across two consumers plus the never-throws and re-fold-determinism invariants are delicate keeper idiom that sonnet matches best at the known-pattern high band.",
+      "task_id": "fn-1248-crash-recovery-hardening.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Near-mechanical display-only string change with a fully-nameable acceptance whose only care is grepping and updating all pinned fixtures, routing GPT-first at the do-exactly-this medium band.",
+      "task_id": "fn-1248-crash-recovery-hardening.3",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Mirrors an existing periodic-timer template but must honor keeper's sacred worker-contract, sole-writer, and no-self-heal invariants plus bound the .gc trash, which is delicate in-repo idiom matching favoring sonnet at the known-pattern high band.",
+      "task_id": "fn-1248-crash-recovery-hardening.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Under-specified investigation whose named candidate emitter is explicitly ruled out, so success hinges on a log-grep diagnostic hunt with no confirmed hypothesis before a mechanical coalescing fix, routing to sonnet for the open-ended judgment at a high investigation band.",
+      "task_id": "fn-1248-crash-recovery-hardening.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.63,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified backup cadence/checkpoint tuning with explicit guardrails (no events table, no SCHEMA_STEPS) and a clear restore-safety bar plus standard SQLite pragma reasoning, fitting the GPT workhorse at the multi-consideration high band.",
+      "task_id": "fn-1248-crash-recovery-hardening.6",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T16:07:10.097000Z",
+  "epic_id": "fn-1248-crash-recovery-hardening",
+  "input_hash": "5db3bb5937d79a70f13d65def02313ad4a67f69798a19132812eb0277d14a168",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1572059993,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1248-crash-recovery-hardening.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Load-bearing early-proof task with a subtle TOCTOU liveness invariant, a backward-compatible intent-schema change, and a new dwell/startup-window design that sets the approach for the sibling task, so it clears the opus correctness-invariant gate at the contract-touching xhigh band.\",\"confidence\":0.78},{\"task_id\":\"fn-1248-crash-recovery-hardening.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Well-specified with an in-repo sibling deriver to mirror, but the fail-direction reconciliation across two consumers plus the never-throws and re-fold-determinism invariants are delicate keeper idiom that sonnet matches best at the known-pattern high band.\",\"confidence\":0.66},{\"task_id\":\"fn-1248-crash-recovery-hardening.3\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Near-mechanical display-only string change with a fully-nameable acceptance whose only care is grepping and updating all pinned fixtures, routing GPT-first at the do-exactly-this medium band.\",\"confidence\":0.8},{\"task_id\":\"fn-1248-crash-recovery-hardening.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Mirrors an existing periodic-timer template but must honor keeper's sacred worker-contract, sole-writer, and no-self-heal invariants plus bound the .gc trash, which is delicate in-repo idiom matching favoring sonnet at the known-pattern high band.\",\"confidence\":0.62},{\"task_id\":\"fn-1248-crash-recovery-hardening.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Under-specified investigation whose named candidate emitter is explicitly ruled out, so success hinges on a log-grep diagnostic hunt with no confirmed hypothesis before a mechanical coalescing fix, routing to sonnet for the open-ended judgment at a high investigation band.\",\"confidence\":0.6},{\"task_id\":\"fn-1248-crash-recovery-hardening.6\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified backup cadence/checkpoint tuning with explicit guardrails (no events table, no SCHEMA_STEPS) and a clear restore-safety bar plus standard SQLite pragma reasoning, fitting the GPT workhorse at the multi-consideration high band.\",\"confidence\":0.63}]}\n"
+}
