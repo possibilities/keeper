@@ -52,9 +52,12 @@ export interface DispatchLaunchConfig {
  * escalation defaults); `handoff` floors to fully-absent (no flags → the
  * harness's own default — handoff carries no compiled default today).
  * `Record<DispatchVerb, ...>` types this exhaustively so a new verb cannot
- * ship unmapped without a compile error (compile-time totality).
+ * ship unmapped without a compile error (compile-time totality). Exported so
+ * the operator-legibility surface (`keeper agent presets list`) can render
+ * the same floors it displays for an unconfigured verb without re-deriving
+ * them — the single source of truth for "what does verb X float to".
  */
-const DISPATCH_FLOORS: Record<DispatchVerb, DispatchLaunchConfig> = {
+export const DISPATCH_FLOORS: Record<DispatchVerb, DispatchLaunchConfig> = {
   work: { model: WORKER_MODEL, effort: WORKER_EFFORT },
   close: { model: WORKER_MODEL, effort: WORKER_EFFORT },
   resolve: { model: WORKER_MODEL, effort: WORKER_EFFORT },
