@@ -9,6 +9,10 @@
  * not used — the HOME-coupled config readers and state collaborators are stubs.
  */
 
+import type {
+  RouteSelection,
+  RoutingInspection,
+} from "../../src/account-router";
 import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
@@ -104,6 +108,8 @@ export interface Harness {
   tmuxCommands: string[][];
   /** Call count for the injected picker. */
   pickerCalls: () => number;
+  /** Call count for the injected account router (claude routing). */
+  routerCalls: () => number;
 }
 
 export interface HarnessOptions {
@@ -170,6 +176,17 @@ export interface HarnessOptions {
   resolveResumeDecision?:
     | ResumeDecision
     | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
+  /**
+   * Account route the router seam returns for an unpinned claude launch. Default:
+   * the native default (no cswap wrap), so byte-pins stay native and the seam
+   * touches no fs. Pass a managed selection to exercise the claude-swap wrap.
+   */
+  selectAccountRoute?: () => RouteSelection;
+  /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
+   *  a disabled `no-observation` snapshot. */
+  inspectRouting?: () => RoutingInspection;
+  /** claude-swap executable a managed route wraps through (default fake path). */
+  cswapBin?: string;
 }
 
 /**
@@ -188,6 +205,16 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
   let pickerCalls = 0;
+  let routerCalls = 0;
+
+  const selectAccountRoute =
+    opts.selectAccountRoute ??
+    (() => ({
+      id: "default",
+      kind: "native" as const,
+      slot: null,
+      reason: "harness-native",
+    }));
 
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
@@ -292,6 +319,27 @@ export function makeHarness(opts: HarnessOptions): Harness {
       }
       return decision ?? { kind: "unknown", target };
     },
+    selectAccountRouteFn: () => {
+      routerCalls += 1;
+      return selectAccountRoute();
+    },
+    inspectRoutingFn:
+      opts.inspectRouting ??
+      (() => ({
+        health: "no-observation",
+        observed_at_ms: null,
+        age_ms: null,
+        fresh: false,
+        enabled: false,
+        would_choose: {
+          id: "default",
+          kind: "native",
+          slot: null,
+          reason: "no-observation",
+        },
+        candidates: [],
+      })),
+    cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",
   };
 
   return {
@@ -306,6 +354,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     birthRecords,
     tmuxCommands,
     pickerCalls: () => pickerCalls,
+    routerCalls: () => routerCalls,
   };
 }
 

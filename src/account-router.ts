@@ -42,6 +42,7 @@ import {
 import {
   isObservationFresh,
   type NormalizedWindow,
+  type ObservationHealth,
   type Route,
   type RouteKind,
   readObservationSidecar,
@@ -140,6 +141,138 @@ function doSelectRoute(deps: SelectRouteDeps): RouteSelection {
   } finally {
     lock.release();
   }
+}
+
+// ---------- read-only diagnostic --------------------------------------------
+
+/** One candidate route as the read-only diagnostic reports it — PII-free. */
+export interface RoutingCandidateView {
+  id: string;
+  kind: RouteKind;
+  slot: number | null;
+  /** Worst-window effective utilization (base + live reservation pressure). */
+  worst_utilization: number;
+}
+
+/**
+ * The read-only account-routing snapshot behind `keeper agent accounts check`.
+ * A pure PII-free view of what {@link selectRoute} WOULD do right now — health,
+ * observation age, candidates, and the route the policy would pick — computed
+ * WITHOUT acquiring the ledger lock or recording a reservation.
+ */
+export interface RoutingInspection {
+  /** CodexBar health, or `"no-observation"` when no sidecar exists yet. */
+  health: ObservationHealth | "no-observation";
+  /** The sidecar's measurement instant (epoch ms), or null when absent. */
+  observed_at_ms: number | null;
+  /** Age of the observation at inspection time (ms), or null when absent. */
+  age_ms: number | null;
+  /** Whether the observation is within the freshness ceiling. */
+  fresh: boolean;
+  /** Whether automatic balancing is enabled (health ok + fresh + candidates). */
+  enabled: boolean;
+  /** The route the policy would choose now — native default on any disabled path. */
+  would_choose: RouteSelection;
+  /** PII-free candidate views (empty whenever balancing is disabled). */
+  candidates: RoutingCandidateView[];
+}
+
+/**
+ * Inspect the routing decision WITHOUT reserving — the machine diagnostic for
+ * `keeper agent accounts check`. Reuses the exact selection scoring so the
+ * reported `would_choose` matches what {@link selectRoute} would pick, but it
+ * only READS the sidecar and ledger (no lock, no write), so it can never record
+ * a reservation or perturb a concurrent launch. Never throws.
+ */
+export function inspectRouting(deps: SelectRouteDeps = {}): RoutingInspection {
+  try {
+    return doInspectRouting(deps);
+  } catch {
+    return {
+      health: "no-observation",
+      observed_at_ms: null,
+      age_ms: null,
+      fresh: false,
+      enabled: false,
+      would_choose: nativeSelection("error"),
+      candidates: [],
+    };
+  }
+}
+
+function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
+  const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
+  const nowMs = deps.nowMs ?? Date.now();
+
+  const obs = readObservationSidecar(observationSidecarPath(stateDir));
+  if (obs === null) {
+    return {
+      health: "no-observation",
+      observed_at_ms: null,
+      age_ms: null,
+      fresh: false,
+      enabled: false,
+      would_choose: nativeSelection("no-observation"),
+      candidates: [],
+    };
+  }
+  const fresh = isObservationFresh(obs, nowMs);
+  const base = {
+    health: obs.health,
+    observed_at_ms: obs.observed_at_ms,
+    age_ms: nowMs - obs.observed_at_ms,
+    fresh,
+  };
+  if (!fresh) {
+    return {
+      ...base,
+      enabled: false,
+      would_choose: nativeSelection("stale-observation"),
+      candidates: [],
+    };
+  }
+  if (obs.health !== "ok") {
+    return {
+      ...base,
+      enabled: false,
+      would_choose: nativeSelection(`disabled-${obs.health}`),
+      candidates: [],
+    };
+  }
+  const routeable = obs.routes.filter((r) => r.windows.length > 0);
+  if (routeable.length === 0) {
+    return {
+      ...base,
+      enabled: false,
+      would_choose: nativeSelection("native-fallback"),
+      candidates: [],
+    };
+  }
+  // Read the ledger WITHOUT the lock and WITHOUT writing — a diagnostic never
+  // reserves. Pruning is in-memory only, so no ledger file is created or touched.
+  const ledger = pruneLedger(loadLedger(stateDir), nowMs);
+  const candidates: RoutingCandidateView[] = routeable.map((r) => {
+    const entry = ledger.routes[r.id];
+    const pending = entry ? entry.reservations.length : 0;
+    return {
+      id: r.id,
+      kind: r.kind,
+      slot: r.slot,
+      worst_utilization: worstEffectiveUtilization(r.windows, pending, nowMs),
+    };
+  });
+  const chosen = scoreAndPick(routeable, ledger, nowMs);
+  return {
+    ...base,
+    enabled: true,
+    would_choose: {
+      id: chosen.id,
+      kind: chosen.kind,
+      slot: chosen.slot,
+      reason: routeable.length === 1 ? "sole-candidate" : "selected",
+    },
+    candidates,
+  };
 }
 
 // ---------- scoring ---------------------------------------------------------

@@ -19,6 +19,16 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  inspectRouting,
+  type RouteSelection,
+  type RoutingInspection,
+  selectRoute,
+} from "../account-router";
+import {
+  KEEPER_ACCOUNT_ROUTE_ENV,
+  resolveCswapCommand,
+} from "../account-routing-config";
+import {
   type BirthRecordDraft,
   buildBirthDraft,
   emitBirthRecord,
@@ -76,6 +86,7 @@ import {
 } from "./harness";
 import {
   buildAgentLaunchArgv,
+  composeManagedClaudeArgv,
   FINAL_MESSAGE_DIRECTIVE,
   piExtensionArgs,
   READ_ONLY_DIRECTIVE,
@@ -329,6 +340,30 @@ export interface MainDeps {
     target: string,
     requireHarness?: HarnessName,
   ) => ResumeDecision;
+  /**
+   * Resolve the account route for one Claude launch (fresh / resume / restore) —
+   * the single Claude process-boundary decision. Reads the latest validated
+   * observation, records a short-lived launch reservation, and fails open to the
+   * native default on every uncertain path. Selection is INDEPENDENT per launch:
+   * no prior attribution or conversation identity participates. Injected so the
+   * launch path is testable without touching the real observation sidecar /
+   * ledger; `realDeps()` binds {@link selectRoute}.
+   */
+  selectAccountRouteFn: () => RouteSelection;
+  /**
+   * Read-only account-routing diagnostic behind `accounts check` — reports
+   * integration health, snapshot age, PII-free candidates, and the route policy
+   * would choose WITHOUT recording a reservation. `realDeps()` binds
+   * {@link inspectRouting}.
+   */
+  inspectRoutingFn: () => RoutingInspection;
+  /**
+   * The claude-swap executable a MANAGED route wraps the launch through
+   * (`cswap run <slot> --share-history -- <Claude argv…>`). `realDeps()` resolves
+   * it via `KEEPER_CSWAP_BIN` / PATH; a seam keeps the managed byte-pins path-
+   * independent.
+   */
+  cswapBin: string;
 }
 
 /** Parse a host YAML file to its raw body, or null when the file is absent (the
@@ -435,6 +470,9 @@ export function realDeps(): MainDeps {
         target,
         requireHarness,
       ),
+    selectAccountRouteFn: () => selectRoute(),
+    inspectRoutingFn: () => inspectRouting(),
+    cswapBin: resolveCswapCommand(),
   };
 }
 
@@ -2163,6 +2201,36 @@ function runProvidersCheck(deps: MainDeps): never {
 }
 
 /**
+ * `accounts check [--json]`: the read-only account-routing diagnostic. Reports
+ * integration health, observation age, PII-free candidates, and the route the
+ * per-launch policy WOULD pick — WITHOUT recording a reservation or launching
+ * anything. A machine diagnostic (the `--json` snapshot the operator/tests
+ * consume), not a replacement usage viewer. Always exits 0: a disabled or absent
+ * integration is a reported state, not an error.
+ */
+function runAccountsCheck(deps: MainDeps, json: boolean): never {
+  const inspection = deps.inspectRoutingFn();
+  if (json) {
+    deps.write(`${JSON.stringify(inspection)}\n`);
+    return deps.exit(0);
+  }
+  deps.write(
+    `account routing: health=${inspection.health} ` +
+      `fresh=${inspection.fresh} enabled=${inspection.enabled}\n`,
+  );
+  deps.write(
+    `would choose: ${inspection.would_choose.id} ` +
+      `(${inspection.would_choose.reason})\n`,
+  );
+  for (const c of inspection.candidates) {
+    deps.write(
+      `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)}\n`,
+    );
+  }
+  return deps.exit(0);
+}
+
+/**
  * `resume <name-or-id> [prompt...]`: the harness-agnostic re-attach verb.
  * Resolves `target` through the resume-policy module (via the
  * {@link MainDeps.resolveResumeDecisionFn} subprocess seam), refuses a live
@@ -2413,6 +2481,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "providers-check") {
     return runProvidersCheck(deps);
+  }
+  if (dispatch.kind === "accounts-check") {
+    return runAccountsCheck(deps, dispatch.json);
   }
   if (dispatch.kind === "resume") {
     return runResumeSubcommand(deps, dispatch.target, dispatch.rest);
@@ -2995,7 +3066,26 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  if (launcherProfile === "auto" && configuredProfiles.length === 1) {
+  // The account router supersedes the profile farm for Claude: an UNPINNED (auto)
+  // Claude launch takes NO keeper-owned profile dir — its account route is
+  // resolved at the spawn boundary below (native default, or a claude-swap wrap).
+  // pi keeps automatic profile selection unchanged; an EXPLICIT Claude --x-profile
+  // / KEEPER_AGENT_PROFILE stays an operator override (removed with the farm in a
+  // later task). `claudeAutoRoute` gates the spawn-time route resolution so an
+  // explicit `default` (native, no router) is NOT re-routed.
+  const claudeAutoRoute = agent === "claude" && launcherProfile === "auto";
+  if (claudeAutoRoute) {
+    launcherProfile = "";
+    actionLog.push(
+      "Account router owns this Claude launch (automatic profile selection retired)",
+    );
+  }
+
+  if (
+    agent !== "claude" &&
+    launcherProfile === "auto" &&
+    configuredProfiles.length === 1
+  ) {
     const forced = configuredProfiles[0] as string;
     const normalizedForced = normalizeKeeperAgentProfileArg(forced);
     launcherProfile = normalizedForced;
@@ -3007,7 +3097,7 @@ export async function main(deps: MainDeps): Promise<never> {
     );
   }
 
-  if (launcherProfile === "auto") {
+  if (agent !== "claude" && launcherProfile === "auto") {
     const selected = phase(`auto-select ${agentLabel} profile`, () => {
       try {
         return deps.pickProfileFn();
@@ -3063,7 +3153,7 @@ export async function main(deps: MainDeps): Promise<never> {
   note(`profile: ${launcherProfile || "default"}`);
 
   // Build agent command.
-  const runCmd = [bin, ...remainingArgs];
+  let runCmd = [bin, ...remainingArgs];
   actionLog.push(`Built base ${agentLabel} command`);
 
   if (agent === "claude") {
@@ -3273,6 +3363,34 @@ export async function main(deps: MainDeps): Promise<never> {
 
   if (agent === "claude") {
     scrubInheritedClaudeSessionEnv(deps.env, actionLog);
+  }
+
+  // ── Claude account routing — the single Claude process-boundary decision ──
+  // Every UNPINNED Claude start/resume/restore resolves an account route from the
+  // latest validated observation. Selection is INDEPENDENT per launch: no prior
+  // attribution or conversation identity participates (cross-account resume stays
+  // conversation-correct via claude-swap's --share-history). The router fails open
+  // to the native default whenever an integration is unavailable or balancing is
+  // disabled, so a native decision preserves the launch byte-for-byte. A managed
+  // decision wraps the already-built Claude argv in the public
+  // `cswap run <slot> --share-history -- <argv…>` contract, letting claude-swap
+  // own account isolation and the exec handoff. The PII-free route id rides
+  // KEEPER_ACCOUNT_ROUTE on BOTH paths — it survives claude-swap's same-account
+  // fast path, so route identity never depends on CLAUDE_CONFIG_DIR. An explicit
+  // profile (claudeAutoRoute false) is an operator override and is not routed.
+  if (claudeAutoRoute) {
+    const route = deps.selectAccountRouteFn();
+    deps.env[KEEPER_ACCOUNT_ROUTE_ENV] = route.id;
+    actionLog.push(`Resolved account route: ${route.id} (${route.reason})`);
+    note(`route: ${route.id}`);
+    if (route.kind === "managed" && route.slot !== null) {
+      runCmd = composeManagedClaudeArgv({
+        cswapBin: deps.cswapBin,
+        slot: route.slot,
+        nativeClaudeArgv: runCmd,
+      });
+      actionLog.push(`Routed through claude-swap slot ${route.slot}`);
+    }
   }
 
   if (launcherVeryVerbose) {

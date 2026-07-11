@@ -56,6 +56,16 @@ export function managedRouteId(slot: number): string {
   return `claude-swap:${slot}`;
 }
 
+/**
+ * The launch-carrier env var that names the account route a Claude process was
+ * launched on. Set on EVERY routed Claude launch (native or managed) to the
+ * PII-free route id, so launch attribution can record which route was used. It
+ * survives the claude-swap same-account fast path (claude-swap scrubs only
+ * auth-override vars and execs with the inherited environment), so route
+ * identity is carried WITHOUT relying on `CLAUDE_CONFIG_DIR`.
+ */
+export const KEEPER_ACCOUNT_ROUTE_ENV = "KEEPER_ACCOUNT_ROUTE";
+
 // ---------- bounded-execution knobs ----------------------------------------
 
 /**

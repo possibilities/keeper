@@ -524,107 +524,95 @@ describe("main() passthrough commands", () => {
   });
 });
 
-describe("main() auto profile routing", () => {
-  test("defaults to auto routing and exports the resolved profile", async () => {
+// The Claude auto (unpinned) path no longer touches the keeper-owned profile
+// farm — the account router owns the launch (see test/agent-account-routing for
+// the native/managed routing detail). These pins hold the RETIREMENT: an
+// unpinned Claude launch consults the router seam, never the profile picker, and
+// bootstraps no CLAUDE_CONFIG_DIR. pi keeps automatic profile selection.
+describe("main() Claude auto path retires the profile farm", () => {
+  test("an unpinned Claude launch routes via the account router, not the picker", async () => {
     const h = makeHarness({
       argv: ["--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
-      pickProfile: () => "default",
+      pickProfile: () => {
+        throw new Error(
+          "profile picker must not run for an auto Claude launch",
+        );
+      },
     });
     expect((await runAndCapture(h, main)).length).toBeGreaterThan(0);
-    expect(h.pickerCalls()).toBe(1);
-    // "default" normalizes to the native account internally, but the env var
-    // surfaces "default" via the wrapper's default-account handling.
+    expect(h.routerCalls()).toBe(1);
+    expect(h.pickerCalls()).toBe(0);
+    // Native default route → the profile env surfaces "default", no config dir.
     expect(profileEnv(h)).toBe("default");
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
-  test("an explicit --x-profile auto still invokes the router", async () => {
+  test("--x-profile auto routes via the account router", async () => {
     const h = makeHarness({
       argv: ["--x-profile", "auto", "--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
-      pickProfile: () => "default",
+      pickProfile: () => {
+        throw new Error("profile picker must not run for --x-profile auto");
+      },
     });
     await runAndCapture(h, main);
-    expect(h.pickerCalls()).toBe(1);
+    expect(h.routerCalls()).toBe(1);
+    expect(h.pickerCalls()).toBe(0);
   });
 
-  test("the router's named profile is exported", async () => {
-    const h = makeHarness({
-      argv: ["--print"],
-      env: {},
-      listProfiles: () => ["multi-claude-1", "multi-claude-2"],
-      pickProfile: () => "multi-claude-2",
-      profileDir: join(home, ".claude-profiles", "multi-claude-2"),
-    });
-    await runAndCapture(h, main);
-    expect(profileEnv(h)).toBe("multi-claude-2");
-  });
-
-  test("a single-profile list forces that profile without calling the picker", async () => {
+  test("a configured profile list never forces a Claude profile dir", async () => {
     const h = makeHarness({
       argv: ["--print"],
       env: {},
       listProfiles: () => ["multi-claude-2"],
       pickProfile: () => {
         throw new Error(
-          "single-profile list should force, not call the picker",
+          "profile picker must not run for an auto Claude launch",
         );
       },
-      profileDir: join(home, ".claude-profiles", "multi-claude-2"),
     });
     await runAndCapture(h, main);
     expect(h.pickerCalls()).toBe(0);
-    expect(profileEnv(h)).toBe("multi-claude-2");
-  });
-
-  test("a list fail-open (listProfiles throws) still routes via the picker", async () => {
-    const h = makeHarness({
-      argv: ["--print"],
-      env: {},
-      listProfiles: () => {
-        throw new Error("simulated catalog failure");
-      },
-      pickProfile: () => "default",
-    });
-    await runAndCapture(h, main);
-    expect(h.pickerCalls()).toBe(1);
+    expect(h.bootstrappedProfiles).toEqual([]);
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
     expect(profileEnv(h)).toBe("default");
   });
 
-  test("--resume uses the auto router after shared-state setup", async () => {
+  test("--resume routes via the account router after shared-state setup", async () => {
     const sessionId = "d64ccaef-beac-4647-933b-db0d6b81704d";
     const h = makeHarness({
       argv: ["--resume", sessionId, "--print"],
       env: {},
       listProfiles: () => ["default", "multi-claude-1"],
-      pickProfile: () => "multi-claude-1",
-      profileDir: join(home, ".claude-profiles", "multi-claude-1"),
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(h.pickerCalls()).toBe(1);
-    // Resume carries its own session posture — the harness default pointer never
-    // injects a model onto it (fresh-only), so no wrapper --model is added.
-    expect(cmd).not.toContain("--model");
-    expect(profileEnv(h)).toBe("multi-claude-1");
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(
-      join(home, ".claude-profiles", "multi-claude-1"),
-    );
-  });
-
-  test("a picker failure falls back to the native default account", async () => {
-    const h = makeHarness({
-      argv: ["--x-profile", "auto", "--print"],
-      env: {},
-      listProfiles: () => ["default", "multi-claude-1"],
       pickProfile: () => {
-        throw new Error("agentusage exploded");
+        throw new Error("profile picker must not run for a resume launch");
       },
     });
-    await runAndCapture(h, main);
+    const cmd = await runAndCapture(h, main);
+    expect(h.routerCalls()).toBe(1);
+    expect(h.pickerCalls()).toBe(0);
+    // Resume carries its own session posture — no wrapper --model injected.
+    expect(cmd).not.toContain("--model");
     expect(profileEnv(h)).toBe("default");
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
+  test("pi keeps automatic profile selection (router never consulted)", async () => {
+    const h = makeHarness({
+      argv: ["--print"],
+      agent: "pi",
+      env: {},
+      listProfiles: () => ["multi-pi-1", "multi-pi-2"],
+      pickProfile: () => "multi-pi-2",
+      profileDir: join(home, ".pi-profiles", "multi-pi-2"),
+    });
+    await runAndCapture(h, main);
+    expect(h.routerCalls()).toBe(0);
+    expect(h.pickerCalls()).toBe(1);
+    expect(h.deps.env.KEEPER_AGENT_PI_PROFILE).toBe("multi-pi-2");
   });
 });
 
@@ -690,17 +678,22 @@ describe("main() explicit + env profile precedence", () => {
     expect(profileEnv(h)).toBe("multi-claude-1");
   });
 
-  test("KEEPER_AGENT_PROFILE=auto keeps the router", async () => {
+  test("KEEPER_AGENT_PROFILE=auto routes via the account router", async () => {
     const h = makeHarness({
       argv: ["--print"],
       env: { KEEPER_AGENT_PROFILE: "auto" },
       listProfiles: () => ["default", "multi-claude-1"],
-      pickProfile: () => "multi-claude-1",
-      profileDir: join(home, ".claude-profiles", "multi-claude-1"),
+      pickProfile: () => {
+        throw new Error(
+          "profile picker must not run for KEEPER_AGENT_PROFILE=auto",
+        );
+      },
     });
     await runAndCapture(h, main);
-    expect(h.pickerCalls()).toBe(1);
-    expect(profileEnv(h)).toBe("multi-claude-1");
+    expect(h.routerCalls()).toBe(1);
+    expect(h.pickerCalls()).toBe(0);
+    expect(profileEnv(h)).toBe("default");
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
   test("KEEPER_AGENT_PROFILE=default uses the native account (no router, no config dir)", async () => {

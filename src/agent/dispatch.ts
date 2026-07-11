@@ -33,6 +33,10 @@ export type Dispatch =
   // reachability drift.
   | { kind: "providers-resolve"; model: string; effort: string }
   | { kind: "providers-check" }
+  // The read-only account-routing diagnostic: `accounts check [--json]` reports
+  // integration health, snapshot age, PII-free candidates, and the route policy
+  // would choose — WITHOUT reserving a route.
+  | { kind: "accounts-check"; json: boolean }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   // The blocking run-and-capture verbs. `run-capture` composes launch→wait→show
   // in one process; `wait-capture` runs wait→show on an already-launched handle.
@@ -402,6 +406,12 @@ export function splitSubcommand(argv: string[]): Dispatch {
       return { kind: "profiles-check", json: argv.slice(2).includes("--json") };
     }
     return { kind: "usage", unknown: `profiles ${argv[1] ?? ""}`.trim() };
+  }
+  if (head === "accounts") {
+    if (argv[1] === "check") {
+      return { kind: "accounts-check", json: argv.slice(2).includes("--json") };
+    }
+    return { kind: "usage", unknown: `accounts ${argv[1] ?? ""}`.trim() };
   }
   if (head === "providers") {
     if (argv[1] === "resolve") {
