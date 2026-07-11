@@ -18,11 +18,23 @@
  * move is exactly that bun:sqlite is synchronous and blocks main's loop
  * regardless of which connection it uses.
  *
- * Three schedules, all relocated here from main (daemon.ts):
+ * Four schedules:
  * - (a) the 24h verified backup interval (`runBackupPass` → `backupDb(dbPath)`),
+ *       relocated from main (daemon.ts),
  * - (b) the fn-753 boot-time catch-up one-shot (`isCatchUpDue` ⇒ a delayed
- *       single backup pass), evaluated once on worker start,
- * - (c) the 15-min integrity-probe interval (`runIntegrityProbe`).
+ *       single backup pass), evaluated once on worker start, relocated from main,
+ * - (c) the 15-min integrity-probe interval (`runIntegrityProbe`), relocated
+ *       from main,
+ * - (d) the 24h panel-dir GC interval (`runPanelPrunePass` →
+ *       `panelPrune`, src/pair/panel.ts) — fn-1248 item 5. `panelPrune` had
+ *       exactly one caller before this, the `keeper agent panel prune` CLI verb,
+ *       so an abandoned panel run dir was only ever reaped when a human ran it by
+ *       hand; this gives it the same automatic cadence as backup/integrity. The
+ *       reap itself is already GC-safe (lock-free AND pid-dead — via the
+ *       recycle-safe `(pid, start_time)` check — AND past-TTL); this only wires
+ *       it onto a schedule. Its own leftover-trash sweep (`.gc/`, cleared at the
+ *       top of every `panelPrune` call) now also runs automatically, so the trash
+ *       stays bounded instead of only clearing on the next manual `prune`.
  *
  * ## Side effects stay main-side (the relay)
  *
@@ -37,6 +49,9 @@
  *   corruption-throw classification are UNCHANGED and run worker-side (only the
  *   blocking `quickCheck` it drives is what we moved off main); its side effects
  *   route through main so the existing logging/alarm behavior is byte-identical.
+ * - `{kind:"maintenance-log", message}` for the panel-prune pass, ONLY when it
+ *   actually reaped a dir — a no-op tick relays nothing (log-spam mitigation:
+ *   steady-state chatter stays silent, mirroring the probe's healthy-DB silence).
  *
  * ## Producer-side, never a fold
  *
@@ -62,8 +77,9 @@
  *   the sole terminator; on `onerror`/`close` main `fatalExit`s (LaunchAgent
  *   restart — never an in-process respawn).
  *
- * The pass bodies (`runBackupPass`, `runProbePass`) are exported so the test
- * suite drives the relay shape directly without spawning a real Worker.
+ * The pass bodies (`runBackupPass`, `runProbePass`, `runPanelPrunePass`) are
+ * exported so the test suite drives the relay shape directly without spawning a
+ * real Worker.
  */
 
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -81,6 +97,13 @@ import {
   liveQuickCheck,
   runIntegrityProbe,
 } from "./integrity-probe";
+import {
+  buildPanelDeps,
+  PANEL_PRUNE_INTERVAL_MS,
+  type PanelDeps,
+  type PanelPruneResult,
+  panelPrune,
+} from "./pair/panel";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only the DB path
@@ -182,10 +205,58 @@ export function runProbePass(
 }
 
 /**
+ * Run one panel-dir GC pass and relay a log line to main ONLY when it actually
+ * reaped something (a no-op tick stays silent — log-spam mitigation, mirroring
+ * `runProbePass`'s silence on a healthy DB). `panelPrune` (src/pair/panel.ts) is
+ * already GC-safe throughout — lock-free AND pid-dead (via the recycle-safe
+ * `legIdentityHolds` `(pid, start_time)` check, not bare `kill(pid,0)`) AND
+ * past-TTL — and fail-open (never force-deletes a dir it can't positively prove
+ * abandoned), so this only wires it onto the periodic schedule; it does not
+ * duplicate any of `panelPrune`'s own reaping logic. `deps` defaults to the real
+ * production {@link PanelDeps} ({@link buildPanelDeps}); its `write` is
+ * intercepted to capture the printed {@link PanelPruneResult} instead of writing
+ * this worker's stdout, since side effects route through main (see file header).
+ *
+ * Exported so tests drive the relay shape directly without spawning a real
+ * Worker.
+ */
+export function runPanelPrunePass(
+  post: (msg: MaintenanceMessage) => void,
+  isShuttingDown: () => boolean,
+  deps: PanelDeps = buildPanelDeps(),
+): void {
+  if (isShuttingDown()) return;
+  let captured = "";
+  panelPrune(
+    {},
+    {
+      ...deps,
+      write: (s) => {
+        captured += s;
+      },
+    },
+  );
+  let result: PanelPruneResult;
+  try {
+    result = JSON.parse(captured) as PanelPruneResult;
+  } catch {
+    // Malformed capture — non-fatal; the next interval retries.
+    return;
+  }
+  if (result.pruned.length > 0) {
+    post({
+      kind: "maintenance-log",
+      message: `[panel-prune] reaped ${result.pruned.length} abandoned panel dir(s): ${result.pruned.join(", ")}`,
+    });
+  }
+}
+
+/**
  * Worker entrypoint. Wires the shutdown message, schedules the backup +
- * integrity-probe intervals, evaluates the fn-753 boot catch-up one-shot once on
- * start, and posts pass outcomes to main. Owns no long-lived resource beyond the
- * timers, which the shutdown handler clears before exiting clean.
+ * integrity-probe + panel-prune intervals, evaluates the fn-753 boot catch-up
+ * one-shot once on start, and posts pass outcomes to main. Owns no long-lived
+ * resource beyond the timers, which the shutdown handler clears before exiting
+ * clean.
  */
 function main(): void {
   if (!parentPort) {
@@ -219,6 +290,12 @@ function main(): void {
     runProbePass(dbPath, post, isShuttingDown);
   }, INTEGRITY_PROBE_INTERVAL_MS);
 
+  // The 24h panel-dir GC interval (fn-1248 item 5) — the automatic caller
+  // `panelPrune` never had; see the file header + runPanelPrunePass doc.
+  const panelPruneTimer = setInterval(() => {
+    runPanelPrunePass(post, isShuttingDown);
+  }, PANEL_PRUNE_INTERVAL_MS);
+
   // fn-753 boot-time catch-up: the regular interval resets on every daemon boot,
   // so a keeperd that restarts more often than BACKUP_INTERVAL_MS would never
   // reach its first fire. If the newest snapshot is overdue (or none exists),
@@ -242,6 +319,7 @@ function main(): void {
       // close here.
       clearInterval(backupTimer);
       clearInterval(probeTimer);
+      clearInterval(panelPruneTimer);
       if (backupCatchUpTimer !== null) {
         clearTimeout(backupCatchUpTimer);
         backupCatchUpTimer = null;
