@@ -65,5 +65,5 @@ Land attribution before dropping profile/usage projections so every new routed j
 - [ ] Schema fingerprint, zero-to-head migration, upgrade migration, and re-fold-equivalence tests pass.
 
 ## Done summary
-
+Added PII-free per-launch account-route attribution: the hook bounds KEEPER_ACCOUNT_ROUTE at SessionStart, the event stream carries it, and it folds latest-non-NULL-wins into jobs.account_route (schema v119). Statusline + jobs descriptor now use the explicit route instead of inspecting CLAUDE_CONFIG_DIR.
 ## Evidence
