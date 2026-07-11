@@ -67,11 +67,13 @@ describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
     expect(runnerHeader).not.toContain("Task, Agent");
     // pi-subagents must LOAD in the runner's child session (extensions: is the
     // sole loading authority — an allowlist omitting it leaves only factory
-    // side effects, and the judge spawn dies with "No active session"), while
-    // the ext: allowlist keeps its own spawn tools hidden.
+    // side effects, and the judge spawn dies with "No active session"). It
+    // cannot be allowlisted by name (its `./src/index.ts` entry canonicalizes
+    // to "src"), so the wildcard keeps all defaults loaded while the ext:
+    // allowlist keeps their tools hidden.
     expect(runnerHeader).toContain(
       `extensions: ${JSON.stringify(
-        `pi-subagents, ${join(
+        `*, ${join(
           import.meta.dir,
           "..",
           "plugins",
