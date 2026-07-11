@@ -1,0 +1,18 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-11T20:46:34.380000Z",
+  "depends_on": [
+    "fn-1252-edit-claims-conflict-prevention.5",
+    "fn-1252-edit-claims-conflict-prevention.6"
+  ],
+  "epic": "fn-1252-edit-claims-conflict-prevention",
+  "id": "fn-1252-edit-claims-conflict-prevention.7",
+  "model": "opus",
+  "priority": null,
+  "selection_input_hash": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Claims calibration report",
+  "updated_at": "2026-07-11T20:46:34.380000Z"
+}
