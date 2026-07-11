@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Dispatch table parse and verb resolver",
-  "updated_at": "2026-07-10T21:29:10.981000Z"
+  "updated_at": "2026-07-11T14:50:27.896000Z",
+  "worker_done_at": "2026-07-11T14:50:27.896000Z"
 }

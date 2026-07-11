@@ -38,5 +38,5 @@ Unit-test the resolver floors per verb (absent file, malformed file, absent row,
 - [ ] The new module imports only within the config island (no db.ts, no autopilot-worker graph)
 
 ## Done summary
-
+Added the additive dispatch: per-verb launch table parse to presets.yaml (work/close/resolve/unblock/deconflict/repair/handoff, strict key rejection) alongside unchanged worker/escalation keys, plus a new dep-free src/dispatch-launch-config.ts exporting resolveDispatchLaunchConfig(verb) with compile-time-total per-verb-class floors, whole-file-to-floor on parse failure, warn-once non-claude harness handling, and approve resolving through work.
 ## Evidence
