@@ -395,6 +395,43 @@ describe("render-plugin-templates: byte-identical tree + sidecars vs golden", ()
 // ===========================================================================
 
 describe("worker cells: the required v2 host worker matrix", () => {
+  // Every full-tree render needs an agent_pins entry per static plan agent or the
+  // render aborts loud. CLAUDE_ONLY mirrors the committed fixture matrix (its
+  // render is asserted byte-identical to the golden), so it carries the fixture's
+  // real per-agent efforts; the constrained-axis ([medium, high]) matrices below
+  // only exercise worker cells, so a uniform in-axis pin suffices.
+  const STATIC_AGENTS = [
+    "close-planner",
+    "docs-gap-scout",
+    "epic-scout",
+    "gap-analyst",
+    "model-selector",
+    "panel-judge",
+    "panel-runner",
+    "practice-scout",
+    "quality-auditor",
+    "repo-scout",
+    "selection-auditor",
+  ];
+  const REAL_AGENT_PINS = [
+    "agent_pins:",
+    "  close-planner: {model: opus, effort: high}",
+    "  docs-gap-scout: {model: opus, effort: medium}",
+    "  epic-scout: {model: opus, effort: medium}",
+    "  gap-analyst: {model: opus, effort: xhigh}",
+    "  model-selector: {model: opus, effort: high}",
+    "  panel-judge: {model: opus, effort: xhigh}",
+    "  panel-runner: {model: opus, effort: xhigh}",
+    "  practice-scout: {model: opus, effort: medium}",
+    "  quality-auditor: {model: opus, effort: high}",
+    "  repo-scout: {model: opus, effort: high}",
+    "  selection-auditor: {model: opus, effort: high}",
+  ];
+  const UNIFORM_AGENT_PINS = [
+    "agent_pins:",
+    ...STATIC_AGENTS.map((n) => `  ${n}: {model: opus, effort: high}`),
+  ];
+
   // The pinned committed claude-only matrix (opus/sonnet × five efforts, all
   // native), byte-for-byte the fixture the golden tree was captured under.
   const CLAUDE_ONLY_MATRIX = [
@@ -407,6 +444,7 @@ describe("worker cells: the required v2 host worker matrix", () => {
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: high",
+    ...REAL_AGENT_PINS,
     "",
   ].join("\n");
 
@@ -427,6 +465,7 @@ describe("worker cells: the required v2 host worker matrix", () => {
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
+    ...UNIFORM_AGENT_PINS,
     "",
   ].join("\n");
 
@@ -449,6 +488,7 @@ describe("worker cells: the required v2 host worker matrix", () => {
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
+    ...UNIFORM_AGENT_PINS,
     "",
   ].join("\n");
 
@@ -757,6 +797,58 @@ describe("worker cells: the required v2 host worker matrix", () => {
       } else {
         process.env.KEEPER_CONFIG_DIR = saved;
       }
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("a plain-render agent template with no agent_pins entry fails the render loud, naming the agent", () => {
+    // Every pin present EXCEPT gap-analyst: the static-agent render must abort
+    // loud and NAME the un-pinned agent; the worker cell fan-out is unaffected.
+    const missingOnePin = [
+      "efforts: [low, medium, high, xhigh, max]",
+      "subagent_templates: [template/agents/worker.md.tmpl]",
+      "subagent_models: [opus, sonnet]",
+      "providers:",
+      "  - name: claude",
+      "    models: [opus, sonnet]",
+      "wrapper_driver:",
+      "  model: sonnet",
+      "  effort: high",
+      ...REAL_AGENT_PINS.filter((l) => !l.includes("gap-analyst:")),
+      "",
+    ].join("\n");
+    const work = mkdtempSync(join(tmpdir(), "prompt-cell-nopin-"));
+    copyPlanPluginSkeleton(work);
+    const cfg = tmpConfig(missingOnePin);
+    const saved = process.env.KEEPER_CONFIG_DIR;
+    const priorStdout = process.stdout.write;
+    const priorStderr = process.stderr.write;
+    const stderrChunks: Buffer[] = [];
+    process.stdout.write = captureWrite([]);
+    process.stderr.write = captureWrite(stderrChunks);
+    process.env.KEEPER_CONFIG_DIR = cfg;
+    let rc: number;
+    try {
+      rc = runRenderPluginTemplates({ projectRoot: work });
+    } finally {
+      process.stdout.write = priorStdout;
+      process.stderr.write = priorStderr;
+      if (saved === undefined) {
+        delete process.env.KEEPER_CONFIG_DIR;
+      } else {
+        process.env.KEEPER_CONFIG_DIR = saved;
+      }
+    }
+    const stderr = Buffer.concat(stderrChunks).toString("utf-8");
+    try {
+      expect(rc).toBe(1);
+      expect(stderr).toContain("gap-analyst");
+      expect(stderr).toContain("agent_pins");
+      // The un-pinned agent is not emitted; the pinned agents + worker cells are.
+      expect(existsSync(join(work, "agents", "gap-analyst.md"))).toBe(false);
+      expect(existsSync(join(work, "agents", "close-planner.md"))).toBe(true);
+      expect(existsSync(join(work, "workers", "opus-high"))).toBe(true);
+    } finally {
       rmSync(work, { recursive: true, force: true });
     }
   });

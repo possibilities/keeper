@@ -108,7 +108,7 @@ count|src/db.ts|183
 forbid|plugins/plan/.claude-plugin/plugin.json|planctl
 forbid|plugins/plan/hooks/hooks.json|planctl
 forbid|.keeper/CLAUDE.md|planctl
-forbid|plugins/plan/agents/epic-scout.md|planctl
+forbid|plugins/plan/template/agents/epic-scout.md.tmpl|planctl
 forbid|scripts/commands.ts|planctl
 forbid|scripts/resume.ts|planctl
 

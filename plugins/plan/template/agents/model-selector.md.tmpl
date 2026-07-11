@@ -1,9 +1,9 @@
 ---
 name: model-selector
 description: Select each todo task's model/effort cell from a content-blind selector brief and return a raw JSON verdict.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Bash, Task
-effort: "high"
+effort: "{{ agent_effort }}"
 color: "#A855F7"
 ---
 

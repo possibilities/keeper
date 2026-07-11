@@ -898,6 +898,7 @@ function projectLauncher(m: MatrixV2) {
       launchId: s.launchId,
       winner: s.winner,
     })),
+    agentPins: Object.fromEntries(m.agentPins),
   };
 }
 
@@ -963,6 +964,33 @@ describe("v2 loader — capability derivation + parse", () => {
     ]);
     expect(matrixV2EffortsFor(m, "opus")).toEqual(["medium", "high"]);
     expect(matrixV2EffortsFor(m, "never-served")).toEqual(["medium", "high"]);
+  });
+});
+
+describe("v2 loader — agent_pins", () => {
+  test("a valid agent_pins block parses to a {model, effort} map", () => {
+    const m = loadMatrixV2(writeMatrix(fx.AGENT_PINS_VALID));
+    expect(Object.fromEntries(m.agentPins)).toEqual({
+      "repo-scout": { model: "opus", effort: "high" },
+      "practice-scout": { model: "opus", effort: "medium" },
+    });
+  });
+
+  test("an absent agent_pins block parses as an empty map", () => {
+    const m = loadMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    expect(m.agentPins.size).toBe(0);
+  });
+
+  test("a pin effort outside the matrix's top-level efforts axis is fail-loud, naming the pin", () => {
+    expect(() =>
+      loadMatrixV2(writeMatrix(fx.AGENT_PINS_EFFORT_OUTSIDE_AXIS)),
+    ).toThrow(/agent_pins\['gap-analyst'\].effort/);
+  });
+
+  test("a malformed pin pair shape (missing effort) is fail-loud", () => {
+    expect(() => loadMatrixV2(writeMatrix(fx.AGENT_PINS_MALFORMED))).toThrow(
+      /agent_pins\['epic-scout'\].effort/,
+    );
   });
 });
 
@@ -1143,6 +1171,23 @@ describe("committed example matrix (anti-rot, v2)", () => {
         winner: "codex",
       },
     ]);
+  });
+
+  test("the example carries the 11 seeded agent_pins", () => {
+    const m = loadMatrixV2(EXAMPLE_PATH);
+    expect(Object.fromEntries(m.agentPins)).toEqual({
+      "close-planner": { model: "opus", effort: "high" },
+      "docs-gap-scout": { model: "opus", effort: "medium" },
+      "epic-scout": { model: "opus", effort: "medium" },
+      "gap-analyst": { model: "opus", effort: "xhigh" },
+      "model-selector": { model: "opus", effort: "high" },
+      "panel-judge": { model: "opus", effort: "xhigh" },
+      "panel-runner": { model: "opus", effort: "xhigh" },
+      "practice-scout": { model: "opus", effort: "medium" },
+      "quality-auditor": { model: "opus", effort: "high" },
+      "repo-scout": { model: "opus", effort: "high" },
+      "selection-auditor": { model: "opus", effort: "high" },
+    });
   });
 });
 

@@ -224,6 +224,7 @@ function projectLauncher(m: MatrixV2) {
       launchId: s.launchId,
       winner: s.winner,
     })),
+    agentPins: Object.fromEntries(m.agentPins),
   };
 }
 
@@ -242,6 +243,7 @@ function projectPlan(h: HostMatrixV2) {
       launchId: s.launchId,
       winner: s.winner,
     })),
+    agentPins: Object.fromEntries(h.agentPins),
   };
 }
 
