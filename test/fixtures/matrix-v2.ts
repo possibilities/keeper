@@ -185,6 +185,80 @@ export const SUBAGENT_MODEL_UNSERVED = [
   "",
 ].join("\n");
 
+/** A valid roster carrying an `agent_pins:` block — two static subagents pinned
+ *  to `{model, effort}` pairs drawn from the top-level efforts axis. */
+export const AGENT_PINS_VALID = [
+  "efforts:",
+  "  - medium",
+  "  - high",
+  "subagent_templates:",
+  "  - template/agents/worker.md.tmpl",
+  "subagent_models:",
+  "  - opus",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "agent_pins:",
+  "  repo-scout:",
+  "    model: opus",
+  "    effort: high",
+  "  practice-scout:",
+  "    model: opus",
+  "    effort: medium",
+  "",
+].join("\n");
+
+/** An `agent_pins` entry whose effort ('xhigh') is outside the matrix's
+ *  top-level efforts axis (['medium', 'high']) — schema-invalid, naming the pin. */
+export const AGENT_PINS_EFFORT_OUTSIDE_AXIS = [
+  "efforts:",
+  "  - medium",
+  "  - high",
+  "subagent_templates:",
+  "  - template/agents/worker.md.tmpl",
+  "subagent_models:",
+  "  - opus",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "agent_pins:",
+  "  gap-analyst:",
+  "    model: opus",
+  "    effort: xhigh",
+  "",
+].join("\n");
+
+/** An `agent_pins` entry with a malformed pair shape (missing `effort`) —
+ *  schema-invalid. */
+export const AGENT_PINS_MALFORMED = [
+  "efforts:",
+  "  - medium",
+  "  - high",
+  "subagent_templates:",
+  "  - template/agents/worker.md.tmpl",
+  "subagent_models:",
+  "  - opus",
+  "providers:",
+  "  - name: claude",
+  "    models:",
+  "      - opus",
+  "wrapper_driver:",
+  "  model: sonnet",
+  "  effort: high",
+  "agent_pins:",
+  "  epic-scout:",
+  "    model: opus",
+  "",
+].join("\n");
+
 /** Build a claude-only body carrying the given extra provider/model lines — the
  *  frame the retired-key fixtures reuse. */
 function claudeBase(extra: string[]): string {
@@ -327,6 +401,7 @@ export const VALID_FIXTURES: { name: string; body: string }[] = [
   { name: "multi-provider", body: MULTI_PROVIDER },
   { name: "cross-provider-dedup", body: CROSS_PROVIDER_DEDUP },
   { name: "launch-only", body: LAUNCH_ONLY },
+  { name: "agent-pins-valid", body: AGENT_PINS_VALID },
 ];
 
 /** Every SCHEMA-INVALID fixture body → both islands must reject each with a
@@ -337,6 +412,8 @@ export const SCHEMA_INVALID_FIXTURES: { name: string; body: string }[] = [
   { name: "subagent-model-unserved", body: SUBAGENT_MODEL_UNSERVED },
   { name: "bad-template-absolute", body: BAD_TEMPLATE_ABSOLUTE },
   { name: "bad-template-traversal", body: BAD_TEMPLATE_TRAVERSAL },
+  { name: "agent-pins-effort-outside-axis", body: AGENT_PINS_EFFORT_OUTSIDE_AXIS },
+  { name: "agent-pins-malformed", body: AGENT_PINS_MALFORMED },
   ...RETIRED_KEY_FIXTURES.map((f) => ({
     name: `retired-${f.key}`,
     body: f.body,

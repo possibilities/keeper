@@ -13,10 +13,12 @@
 # The top-level effort axis: the default per-model effort list a cell inherits
 # when neither its provider nor its own entry narrows it. Each entry must be in
 # the canonical effort vocabulary [low, medium, high, xhigh, max]; declaration
-# order is irrelevant (the list normalizes to canonical ascending order).
+# order is irrelevant (the list normalizes to canonical ascending order). Also
+# the axis every `agent_pins:` entry's effort validates against below.
 efforts:
   - medium
   - high
+  - xhigh
 
 # The cell-template inventory: the templates the renderer fans out over
 # subagent_models × efforts. Each entry is a NON-EMPTY RELATIVE path (no leading
@@ -79,3 +81,42 @@ wrapper_driver:
 defaults:
   stop_timeout_ms: 7200000
   max_attempts: 2
+
+# Every static plan subagent's {model, effort} pin — baked into its rendered
+# frontmatter at render time. A pair, not a triple: frontmatter carries no
+# harness axis. Effort must be a member of the `efforts:` axis above; model is
+# an opaque token, not cross-checked against subagent_models/providers.
+agent_pins:
+  close-planner:
+    model: opus
+    effort: high
+  docs-gap-scout:
+    model: opus
+    effort: medium
+  epic-scout:
+    model: opus
+    effort: medium
+  gap-analyst:
+    model: opus
+    effort: xhigh
+  model-selector:
+    model: opus
+    effort: high
+  panel-judge:
+    model: opus
+    effort: xhigh
+  panel-runner:
+    model: opus
+    effort: xhigh
+  practice-scout:
+    model: opus
+    effort: medium
+  quality-auditor:
+    model: opus
+    effort: high
+  repo-scout:
+    model: opus
+    effort: high
+  selection-auditor:
+    model: opus
+    effort: high
