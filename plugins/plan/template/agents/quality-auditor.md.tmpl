@@ -1,9 +1,9 @@
 ---
 name: quality-auditor
 description: Review recent changes for correctness, simplicity, security, and test coverage.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Task
-effort: "high"
+effort: "{{ agent_effort }}"
 color: "#EC4899"
 ---
 

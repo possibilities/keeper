@@ -61,7 +61,7 @@ describe("render engine — byte-identical vs the promptctl oracle goldens", () 
   }> = [
     {
       template: join(PLAN_TEMPLATES, "agents", "practice-scout.md.tmpl"),
-      vars: null,
+      vars: { agent_model: "opus", agent_effort: "medium" },
       golden: "agents/practice-scout.md",
     },
     {

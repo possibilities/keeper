@@ -1,9 +1,9 @@
 ---
 name: repo-scout
 description: Scan the current repo to find existing patterns, conventions, reusable code, and gotchas relevant to a requested change. Returns a fixed-heading markdown report for a planner to fold into task specs.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Task
-effort: "high"
+effort: "{{ agent_effort }}"
 color: "#22C55E"
 ---
 

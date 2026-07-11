@@ -412,7 +412,10 @@ export const SCHEMA_INVALID_FIXTURES: { name: string; body: string }[] = [
   { name: "subagent-model-unserved", body: SUBAGENT_MODEL_UNSERVED },
   { name: "bad-template-absolute", body: BAD_TEMPLATE_ABSOLUTE },
   { name: "bad-template-traversal", body: BAD_TEMPLATE_TRAVERSAL },
-  { name: "agent-pins-effort-outside-axis", body: AGENT_PINS_EFFORT_OUTSIDE_AXIS },
+  {
+    name: "agent-pins-effort-outside-axis",
+    body: AGENT_PINS_EFFORT_OUTSIDE_AXIS,
+  },
   { name: "agent-pins-malformed", body: AGENT_PINS_MALFORMED },
   ...RETIRED_KEY_FIXTURES.map((f) => ({
     name: `retired-${f.key}`,
