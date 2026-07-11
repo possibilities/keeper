@@ -63,7 +63,8 @@ this step, and a byte-for-byte-identical prompt is what lets the same slug recon
 
 ```bash
 PANEL=default   # or the panel name your caller gave you
-PROMPT=$(mktemp /tmp/panel-runner.XXXXXX.md)
+SLUG="<the Slug: line from your prompt, or a kebab slug you derive from the task>"
+PROMPT="/tmp/panel-runner-${SLUG}.md"   # deterministic — never mktemp: re-entry rewrites the same bytes
 cat > "$PROMPT" <<'PROMPT'
 <the caller's task, VERBATIM — do not summarize, reframe, or pre-digest it>
 
@@ -73,6 +74,9 @@ answers, and they will not see yours. Research it cold with web search and bash,
 self-contained answer to the question above. Do not hedge about being on a panel — just answer.
 PROMPT
 ```
+
+`cat >` overwrites, so re-running this step is always safe — a random temp name (mktemp) would break the
+byte-identical re-entry contract and can spuriously fail on template collisions.
 
 The `<<'PROMPT'` quoting keeps the task literal — no shell expansion. Pass it verbatim; never add a stance
 or your own read of the problem.
@@ -92,7 +96,6 @@ missing/invalid `panel.yaml`, or an unknown panel name exits 2 (no fallback); ru
 presets list` to see the configured triples + panels.
 
 ```bash
-SLUG="<the Slug: line from your prompt, or a kebab slug you derive from the task>"
 MANIFEST=$(keeper agent panel start "$PROMPT" --slug "$SLUG" --panel "$PANEL")
 START_RC=$?
 DIR=$(echo "$MANIFEST" | jq -r '.dir')
