@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "User-facing methodology prose that bakes byte-verbatim into skill bodies needs Claude-tuned wording, register, and idiom taste, so sonnet over a GPT tier; single-file, well-enumerated acceptance with no contract or cross-module reasoning keeps it at the medium band.",
+      "task_id": "fn-1254-panel-strength-snippet-rubric.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T22:44:57.915000Z",
+  "epic_id": "fn-1254-panel-strength-snippet-rubric",
+  "input_hash": "47fbdd2def105c90163b4c31feb9ab0af0162d4d94b00c77f0c1ce749f1e9279",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1207688493,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1254-panel-strength-snippet-rubric.1\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"User-facing methodology prose that bakes byte-verbatim into skill bodies needs Claude-tuned wording, register, and idiom taste, so sonnet over a GPT tier; single-file, well-enumerated acceptance with no contract or cross-module reasoning keeps it at the medium band.\",\"confidence\":0.8}]}\n"
+}
