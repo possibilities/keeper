@@ -70,5 +70,7 @@ Merge only after managed/default launch and cross-account resume tests pass. Lea
 - [ ] No credential migration, legacy launcher, or runtime archive reader remains.
 
 ## Done summary
-
+Removed Keeper's Claude/Pi profile-farm machinery: deleted shadow-profiles.ts, ensureKeeperAgentProfileDir/PiProfileDir, the profiles-check command, CLAUDE_CONFIG_DIR/PI_CODING_AGENT_DIR construction, KEEPER_AGENT_*_PROFILE env vars, and .claude-profiles/.pi-profiles scanning in resume/transcript discovery. Preserved the global-instruction guard (CLAUDE.md/AGENTS.md symlinks) for claude/codex/pi, splitting Claude settings.json into an install-time-only seed (create-if-absent, never drift-compared or repaired afterward). Claude account routing now runs unconditionally for every launch; Pi runs natively with no profile selection.
 ## Evidence
+- Commits: c115f665
+- Tests: bun run typecheck: clean, bun run lint: clean, bun run test (fast suite): 8410 pass / 0 fail, bun run test:full (root+plan+prompt): all green
