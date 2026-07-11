@@ -45,5 +45,5 @@ Extend `test/pair-panel.test.ts`: assert the auto-reaper invokes prune on its in
 - [ ] The `.gc` trash is bounded (reaped or hard-deleted), so the leak is fixed, not relocated.
 
 ## Done summary
-
+Wired panelPrune onto a 24h auto-reaper in the maintenance-worker (alongside backup/integrity), reusing its existing recycle-safe (pid, start_time) liveness gate; the .gc trash sweep now runs automatically too, bounding it instead of relocating the leak. Added test/pair-panel.test.ts coverage for the wiring (reaps + relays only on an actual reap, preserves live/locked/recycle-guarded dirs, no-op while shutting down).
 ## Evidence

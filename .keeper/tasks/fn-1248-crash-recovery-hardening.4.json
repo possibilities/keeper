@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Panel GC auto-reap",
-  "updated_at": "2026-07-11T16:07:10.097000Z"
+  "updated_at": "2026-07-11T17:42:25.385000Z",
+  "worker_done_at": "2026-07-11T17:42:25.385000Z"
 }
