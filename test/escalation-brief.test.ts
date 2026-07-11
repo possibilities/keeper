@@ -87,7 +87,10 @@ function seedJob(
 function seedMergeConflict(
   db: Database,
   opts: {
-    epic_id: string;
+    /** The sticky row's `id` — an epic id for the (default) close verb, a
+     *  task id for the work verb. */
+    id: string;
+    verb?: "close" | "work";
     reason: string;
     dir?: string | null;
     resolver_dispatched_at?: number | null;
@@ -98,9 +101,10 @@ function seedMergeConflict(
     `INSERT INTO dispatch_failures
        (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
         resolver_dispatched_at, merge_escalated_at)
-     VALUES ('close', ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
+     VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
   ).run(
-    opts.epic_id,
+    opts.verb ?? "close",
+    opts.id,
     opts.reason,
     opts.dir ?? null,
     opts.resolver_dispatched_at ?? null,
@@ -157,9 +161,15 @@ test("parseEscalationKey accepts all three key shapes", () => {
   });
 });
 
+test("parseEscalationKey accepts a task-form deconflict ref (the work-verb fan-in escalation)", () => {
+  expect(parseEscalationKey("deconflict::fn-12-add-oauth.3")).toEqual({
+    kind: "deconflict",
+    epic_id: "fn-12-add-oauth",
+    task_id: "fn-12-add-oauth.3",
+  });
+});
+
 test("parseEscalationKey rejects shape mismatches and garbage", () => {
-  // deconflict wants an epic ref; a task ref is a mismatch.
-  expect(parseEscalationKey("deconflict::fn-12-add-oauth.3")).toBeNull();
   // unblock wants a task ref; an epic ref is a mismatch.
   expect(parseEscalationKey("unblock::fn-12-add-oauth")).toBeNull();
   expect(parseEscalationKey("resolve::fn-12-add-oauth")).toBeNull();
@@ -234,7 +244,7 @@ test("a closer creator resolves through created_by_close_of to the original crea
   });
   writeEpicFile(tmp, "fn-50-parent", { primary_repo: "/repo" });
   seedMergeConflict(db, {
-    epic_id: "fn-100-child",
+    id: "fn-100-child",
     reason:
       "worktree-merge-conflict: merging keeper/epic/fn-100-child into main — CONFLICT (content): foo.ts",
     dir: "/repo",
@@ -747,7 +757,7 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
   });
   writeEpicFile(tmp, "fn-821-byte", { primary_repo: "/repo" });
   seedMergeConflict(db, {
-    epic_id: "fn-821-byte",
+    id: "fn-821-byte",
     reason:
       "worktree-merge-conflict: merging keeper/epic/fn-821-byte into main — CONFLICT (content): foo.ts",
     dir: "/repo",
@@ -813,6 +823,78 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
     },
     degraded: ["incident_resolver_job_missing"],
   });
+  db.close();
+});
+
+// ── Deconflict: work-verb task-form ref (fn-1246 F1) ───────────────────────
+
+test("a task-form deconflict ref resolves the work-verb sticky row, keying the sticky lookup and resolver jobs on the task id while deriving epic_id for lineage", () => {
+  const { db } = freshMemDb();
+  seedEpic(db, {
+    epic_id: "fn-900-work",
+    project_dir: tmp,
+    job_links: [{ kind: "creator", job_id: "work-sess" }],
+  });
+  seedJob(db, {
+    job_id: "work-sess",
+    plan_verb: null,
+    transcript_path: "/t/work.jsonl",
+  });
+  writeEpicFile(tmp, "fn-900-work", { primary_repo: "/repo" });
+  seedMergeConflict(db, {
+    verb: "work",
+    id: "fn-900-work.2",
+    reason:
+      "worktree-merge-conflict: merging keeper/epic/fn-900-work--fn-900-work.2 into keeper/epic/fn-900-work — CONFLICT (content): bar.ts",
+    dir: "/repo/lanes/fn-900-work.2",
+    resolver_dispatched_at: 42,
+  });
+  seedJob(db, {
+    job_id: "resolve-work-sess",
+    plan_verb: "resolve",
+    plan_ref: "fn-900-work.2",
+    transcript_path: "/t/resolve-work.jsonl",
+    state: "ended",
+  });
+  // An epic-scoped resolver job that must NOT leak into this task's resolver_jobs —
+  // the sticky lookup + resolver-job query are both keyed on the task id, never
+  // the epic id, for a work-verb ref.
+  seedJob(db, {
+    job_id: "resolve-epic-sess",
+    plan_verb: "resolve",
+    plan_ref: "fn-900-work",
+    transcript_path: "/t/resolve-epic.jsonl",
+    state: "ended",
+  });
+
+  const r = buildEscalationBrief(db, "deconflict::fn-900-work.2", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const b = r.brief;
+  expect(b.kind).toBe("deconflict");
+  expect(b.epic_id).toBe("fn-900-work");
+  expect(b.task_id).toBe("fn-900-work.2");
+  expect(b.primary_repo).toBe("/repo");
+  const inc = b.incident as {
+    conflict: {
+      source_branch: string | null;
+      base_branch: string | null;
+      repo_dir: string | null;
+    } | null;
+    resolver_jobs: Array<{ session_id: string }>;
+  };
+  expect(inc.conflict?.source_branch).toBe(
+    "keeper/epic/fn-900-work--fn-900-work.2",
+  );
+  expect(inc.conflict?.base_branch).toBe("keeper/epic/fn-900-work");
+  expect(inc.conflict?.repo_dir).toBe("/repo/lanes/fn-900-work.2");
+  expect(inc.resolver_jobs.map((j) => j.session_id)).toEqual([
+    "resolve-work-sess",
+  ]);
+  expect(b.degraded).toEqual([]);
   db.close();
 });
 
@@ -900,4 +982,48 @@ test("main() emits a single ok:false root at exit 1 for an unparseable key", () 
   const parsed = JSON.parse(out);
   expect(parsed.ok).toBe(false);
   expect(parsed.error.code).toBe("unparseable_key");
+});
+
+test("main() drives the daemon-dispatched deconflict::<taskId> handoff end-to-end and returns a parseable brief", () => {
+  // The exact key `dispatchWorkDeconflict` launches (`verb: "deconflict", id:
+  // row.id` where `row.id` is a task id) — this is F1/F4/F5's seam: before
+  // this fix, `parseEscalationKey` rejected the task-form ref outright.
+  const dbPath = join(tmp, "keeper.db");
+  const { db } = freshDbFile(dbPath);
+  seedEpic(db, {
+    epic_id: "fn-901-work",
+    project_dir: tmp,
+    job_links: [{ kind: "creator", job_id: "e2e-sess" }],
+  });
+  seedJob(db, {
+    job_id: "e2e-sess",
+    plan_verb: null,
+    transcript_path: "/t/e2e.jsonl",
+  });
+  seedMergeConflict(db, {
+    verb: "work",
+    id: "fn-901-work.1",
+    reason:
+      "worktree-merge-conflict: merging keeper/epic/fn-901-work--fn-901-work.1 into keeper/epic/fn-901-work — CONFLICT (content): baz.ts",
+    dir: "/repo/lanes/fn-901-work.1",
+    resolver_dispatched_at: 7,
+  });
+  db.close();
+  writeEpicFile(tmp, "fn-901-work", { primary_repo: "/repo" });
+
+  const { out, code } = runMain(dbPath, ["deconflict::fn-901-work.1"]);
+  expect(code).toBe(0);
+  // Exactly one JSON root: a second document makes JSON.parse throw "Extra data".
+  const parsed = JSON.parse(out);
+  expect(parsed.ok).toBe(true);
+  expect(parsed.schema_version).toBe(1);
+  expect(parsed.kind).toBe("deconflict");
+  expect(parsed.epic_id).toBe("fn-901-work");
+  expect(parsed.task_id).toBe("fn-901-work.1");
+  expect(parsed.primary_repo).toBe("/repo");
+  expect(parsed.incident.conflict.repo_dir).toBe("/repo/lanes/fn-901-work.1");
+  expect(parsed.incident.conflict.source_branch).toBe(
+    "keeper/epic/fn-901-work--fn-901-work.1",
+  );
+  expect(parsed.lineage.creator.session_id).toBe("e2e-sess");
 });
