@@ -104,14 +104,12 @@ test("resumeTarget: an explicit claude harness still resolves to job_id", () => 
 test("buildResumeCommand emits cd + claude --resume with a quoted UUID target", () => {
   const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
   const cmd = buildResumeCommand("/Users/mike/code/keeper", uuid, null);
-  expect(cmd).toBe(
-    `cd /Users/mike/code/keeper && claude --resume "${uuid}" --x-no-confirm`,
-  );
+  expect(cmd).toBe(`cd /Users/mike/code/keeper && claude --resume "${uuid}"`);
 });
 
 test("buildResumeCommand drops cd prefix on an empty cwd", () => {
   const cmd = buildResumeCommand("", "sess-abc", null);
-  expect(cmd).toBe('claude --resume "sess-abc" --x-no-confirm');
+  expect(cmd).toBe('claude --resume "sess-abc"');
 });
 
 test("buildResumeCommand never inserts --plugin-dir, even for a non-null tier (fn-10)", () => {
@@ -121,14 +119,14 @@ test("buildResumeCommand never inserts --plugin-dir, even for a non-null tier (f
   // threaded through the signature (board/projection read) but never shapes
   // the argv.
   const cmd = buildResumeCommand("/repo", "fn-1.1", "mint");
-  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1" --x-no-confirm');
+  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1"');
   expect(cmd).not.toContain("--plugin-dir");
   expect(cmd).not.toContain("work-plugins");
 });
 
 test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {
   const cmd = buildResumeCommand("/repo", "fn-1.1", "");
-  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1" --x-no-confirm');
+  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1"');
 });
 
 test("buildResumeCommand: codex renders the native `codex resume` subcommand form", () => {
@@ -148,14 +146,22 @@ test("buildResumeCommand: hermes renders `hermes --resume`", () => {
   );
 });
 
-test("buildResumeCommand: a NULL/absent harness stays the claude alias form", () => {
+test("buildResumeCommand: a NULL/absent harness defaults to the claude form", () => {
   // ABSENT ⇒ claude — a legacy candidate (no harness tag) renders byte-identically.
   expect(buildResumeCommand("/repo", "u", null)).toBe(
-    'cd /repo && claude --resume "u" --x-no-confirm',
+    'cd /repo && claude --resume "u"',
   );
   expect(buildResumeCommand("/repo", "u", null, null)).toBe(
-    'cd /repo && claude --resume "u" --x-no-confirm',
+    'cd /repo && claude --resume "u"',
   );
+});
+
+test("buildResumeCommand: the claude arm carries no --x- launcher-alias flag", () => {
+  // A human pastes this into whatever shell they have open — no `claude →
+  // keeper agent claude` alias guaranteed. A `--x-*` flag here would reach the
+  // real claude binary verbatim and be rejected as an unknown option.
+  const cmd = buildResumeCommand("/repo", "sess-1", null);
+  expect(cmd).not.toMatch(/--x-/);
 });
 
 test("tierForJobFromEpics resolves the tier for a work job whose epic is in the map", () => {
