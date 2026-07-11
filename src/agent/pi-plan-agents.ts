@@ -158,7 +158,14 @@ export function renderPiPlanAgent(path: string): {
       );
     }
     lines.push(
-      `extensions: ${yamlString(taskExtension)}`,
+      // `extensions:` is pi's sole loading authority, and an allowlist that
+      // omits pi-subagents leaves only its factory side effects in the child
+      // session — RPC handlers with no lifecycle-wired ctx — so the runner's
+      // judge spawn dies with "No active session". Loading it retains the
+      // child activation with the child's own ctx, while the `ext:` allowlist
+      // below still hides its Agent/steer tools: the runner's only spawn
+      // surface stays the keeper Task facade.
+      `extensions: ${yamlString(`pi-subagents, ${taskExtension}`)}`,
       `tools: ${yamlString("all, ext:keeper-events/Task")}`,
     );
   }

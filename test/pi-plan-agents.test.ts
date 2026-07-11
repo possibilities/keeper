@@ -65,16 +65,20 @@ describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
     const runnerHeader = runner.slice(0, runner.indexOf("\n---\n", 4));
     const judgeHeader = judge.slice(0, judge.indexOf("\n---\n", 4));
     expect(runnerHeader).not.toContain("Task, Agent");
+    // pi-subagents must LOAD in the runner's child session (extensions: is the
+    // sole loading authority — an allowlist omitting it leaves only factory
+    // side effects, and the judge spawn dies with "No active session"), while
+    // the ext: allowlist keeps its own spawn tools hidden.
     expect(runnerHeader).toContain(
       `extensions: ${JSON.stringify(
-        join(
+        `pi-subagents, ${join(
           import.meta.dir,
           "..",
           "plugins",
           "keeper",
           "pi-extension",
           "keeper-events.ts",
-        ),
+        )}`,
       )}`,
     );
     expect(runnerHeader).toContain('tools: "all, ext:keeper-events/Task"');
