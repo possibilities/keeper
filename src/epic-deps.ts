@@ -56,20 +56,6 @@ export function projectBasename(dir: string | null): string {
 }
 
 /**
- * Pure directional mapping between keeper's empty default-profile sentinel and
- * the usage projection's `default` row id. It lets rate-limit fan-out join the
- * same account in both directions without reading DB, clock, or environment.
- */
-export function usageIdForProfileName(profileName: string): string {
-  return profileName === "" ? "default" : profileName;
-}
-
-/** See {@link usageIdForProfileName}. Reverse mapping: `'default' → ''`. */
-export function profileNameForUsageId(usageId: string): string {
-  return usageId === "default" ? "" : usageId;
-}
-
-/**
  * Resolver-side dep-satisfaction predicate — STATUS-ONLY by the
  * folds-never-probe-liveness invariant. A resolved upstream whose status is
  * `"done"` satisfies the dependency for the reducer's `resolved_epic_deps`

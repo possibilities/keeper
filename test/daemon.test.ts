@@ -4280,7 +4280,14 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // the hook captures from KEEPER_ACCOUNT_ROUTE at SessionStart; additive ALTERs,
   // NO cursor rewind: a pre-v119 event carries no route, so a from-scratch
   // re-fold leaves both NULL byte-identical).
-  expect(SCHEMA_VERSION).toBe(119);
+  // And to 120 via fn-1239 task .6 (unconditionally DROPping the retired `usage`
+  // / `profiles` tables — the account-routing boundary supersedes the
+  // Keeper-owned usage/profile projections; mirrors the `event_blobs` v74 tail
+  // DROP. The `UsageSnapshot` / `UsageDeleted` fold arms become explicit
+  // no-ops and the `RateLimited`/`ApiError` profile-level fan-out is deleted,
+  // so NO cursor rewind: neither retired table is ever read again and a
+  // from-scratch re-fold never touches them).
+  expect(SCHEMA_VERSION).toBe(120);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

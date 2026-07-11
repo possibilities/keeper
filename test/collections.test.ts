@@ -34,12 +34,10 @@ import {
   liveKeyExpr,
   liveKeyOf,
   PENDING_DISPATCHES_DESCRIPTOR,
-  PROFILES_DESCRIPTOR,
   SCHEDULED_TASKS_DESCRIPTOR,
   selectByIdsChunked,
   selectVersionsByIds,
   selectVersionsByIdsChunked,
-  USAGE_DESCRIPTOR,
 } from "../src/collections";
 import { MAX_IN_PARAMS, openDb } from "../src/db";
 import {
@@ -174,54 +172,9 @@ test("getCollection resolves the git status collection", () => {
   expect(GIT_DESCRIPTOR.jsonColumns.has("jobs")).toBe(true);
 });
 
-test("getCollection resolves the usage collection (fn-615)", () => {
-  expect(getCollection("usage")).toBe(USAGE_DESCRIPTOR);
-  expect(USAGE_DESCRIPTOR.table).toBe("usage");
-  expect(USAGE_DESCRIPTOR.pk).toBe("id");
-  expect(USAGE_DESCRIPTOR.version).toBe("last_event_id");
-  // Filters: pk + the natural per-target filter.
-  expect(USAGE_DESCRIPTOR.filters.id).toBe("id");
-  expect(USAGE_DESCRIPTOR.filters.target).toBe("target");
-  // Default sort is stable by pk.
-  expect(USAGE_DESCRIPTOR.defaultSort).toEqual({ column: "id", dir: "asc" });
-  // No JSON-decoded columns (all scalars).
-  expect(USAGE_DESCRIPTOR.jsonColumns.size).toBe(0);
-  // Columns include every persisted field.
-  for (const col of [
-    "id",
-    "target",
-    "multiplier",
-    "session_percent",
-    "session_resets_at",
-    "week_percent",
-    "week_resets_at",
-    "sonnet_week_percent",
-    "sonnet_week_resets_at",
-    "codex_spark_session_percent",
-    "codex_spark_session_resets_at",
-    "codex_spark_week_percent",
-    "codex_spark_week_resets_at",
-    // Schema v35 (fn-642): colocated rate-limit columns.
-    "last_rate_limit_at",
-    "last_rate_limit_session_id",
-    "account_state",
-    // Schema v41 (fn-651): rate-limit lift instant + last-successful-fold
-    // freshness stamp on the usage wire.
-    "rate_limit_lifts_at",
-    "last_usage_fold_at",
-    "last_event_id",
-    "updated_at",
-  ]) {
-    expect(USAGE_DESCRIPTOR.columns).toContain(col);
-  }
-  // Sortable allowlist covers the human-relevant columns.
-  expect(USAGE_DESCRIPTOR.sortable.has("id")).toBe(true);
-  expect(USAGE_DESCRIPTOR.sortable.has("target")).toBe(true);
-  expect(USAGE_DESCRIPTOR.sortable.has("last_event_id")).toBe(true);
-  expect(USAGE_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
-  // No defaultFilter / defaultClause — every row is interesting by default.
-  expect(USAGE_DESCRIPTOR.defaultFilter).toBeUndefined();
-  expect(USAGE_DESCRIPTOR.defaultClause).toBeUndefined();
+test("usage and profiles are retired (fn-1239 task .6) — no collection resolves either name", () => {
+  expect(getCollection("usage")).toBeUndefined();
+  expect(getCollection("profiles")).toBeUndefined();
 });
 
 test("JOBS_DESCRIPTOR serves profile_name for the recent-sessions log (v36)", () => {
@@ -402,44 +355,6 @@ test("drained CLI projection: dispatch_origin sourced through runQuery gates pla
   expect(planHeld.kind).toBe("waiting");
   expect((planHeld.holders ?? []).map((h) => h.id)).toEqual(["sib"]);
   db.close();
-});
-
-test("getCollection resolves the profiles collection (fn-639)", () => {
-  expect(getCollection("profiles")).toBe(PROFILES_DESCRIPTOR);
-  expect(PROFILES_DESCRIPTOR.table).toBe("profiles");
-  expect(PROFILES_DESCRIPTOR.pk).toBe("config_dir");
-  expect(PROFILES_DESCRIPTOR.version).toBe("last_event_id");
-  // Filter: pk only — the per-profile read narrows on the profile dir.
-  expect(PROFILES_DESCRIPTOR.filters.config_dir).toBe("config_dir");
-  // Default sort is stable by pk.
-  expect(PROFILES_DESCRIPTOR.defaultSort).toEqual({
-    column: "config_dir",
-    dir: "asc",
-  });
-  // No JSON-decoded columns — every persisted field is a scalar.
-  expect(PROFILES_DESCRIPTOR.jsonColumns.size).toBe(0);
-  // Columns include every persisted field.
-  for (const col of [
-    "config_dir",
-    // Schema v35 (fn-642): derived basename, the join key against usage.id.
-    "profile_name",
-    "last_rate_limit_at",
-    "last_rate_limit_session_id",
-    "last_event_id",
-    "updated_at",
-  ]) {
-    expect(PROFILES_DESCRIPTOR.columns).toContain(col);
-  }
-  // Sortable allowlist covers config_dir, last_rate_limit_at (time-ordered
-  // browse for "most-recently-rate-limited first"), last_event_id, updated_at.
-  expect(PROFILES_DESCRIPTOR.sortable.has("config_dir")).toBe(true);
-  expect(PROFILES_DESCRIPTOR.sortable.has("last_rate_limit_at")).toBe(true);
-  expect(PROFILES_DESCRIPTOR.sortable.has("last_event_id")).toBe(true);
-  expect(PROFILES_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
-  // No defaultFilter / defaultClause — every row is interesting by default
-  // (a quiet seed-only profile is still surface-worthy).
-  expect(PROFILES_DESCRIPTOR.defaultFilter).toBeUndefined();
-  expect(PROFILES_DESCRIPTOR.defaultClause).toBeUndefined();
 });
 
 test("getCollection resolves the pending_dispatches collection (schema v50, fn-678)", () => {

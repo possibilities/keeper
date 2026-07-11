@@ -4149,6 +4149,32 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(db, "jobs", "account_route", "TEXT");
     },
   },
+  {
+    version: 120,
+    kind: "drop",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v119→v120 (fn-1239 task .6): retire the Keeper-owned `usage` /
+      // `profiles` projections — superseded by the account-routing boundary
+      // (`docs/adr/0038`). DROP UNCONDITIONALLY at the tail — the `event_blobs`
+      // precedent (v74): both tables are (re)created above via the steady-state
+      // `CREATE_USAGE` / `CREATE_PROFILES` (`IF NOT EXISTS`, which must stay —
+      // every historical ADD-column step from v23/v33 onward still runs against
+      // them during a fresh 0→head walk), so a version-guarded DROP would let
+      // them resurrect empty on a post-shed restart. An unconditional
+      // `DROP TABLE IF EXISTS` converges cleanly on every path: a fresh walk
+      // drops the freshly-created empty tables, a pre-v120 upgrade drops the
+      // real populated tables, and a v120+ restart drops the empty resurrected
+      // tables. NO rewind-and-redrain: unlike a column drop that reshapes a
+      // projection other folds still read, retiring these two tables removes
+      // their fold arms entirely (`UsageSnapshot` / `UsageDeleted` become
+      // explicit no-ops in `applyEvent`, and the `RateLimited`/`ApiError`
+      // profile-level fan-out is deleted), so a from-scratch re-fold never
+      // touches either table and needs no cursor reset.
+      db.run("DROP TABLE IF EXISTS usage");
+      db.run("DROP TABLE IF EXISTS profiles");
+    },
+  },
 ];
 
 /**
@@ -4169,7 +4195,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v119:bb178dec0dc3c2cff88a333319560ad7d35678e586dc04e6a1532ca75aea19e8";
+  "v120:fb7f05f0e2289b8108f7d63b418a03b6a61fdb36f84e553381682ce39365792a";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5258,21 +5284,13 @@ CREATE TABLE IF NOT EXISTS git_status (
 `;
 
 /**
- * `usage` projection table — one row per profile, folded from
- * `UsageSnapshot` / `UsageDeleted` events via a single-row UPSERT.
- *
- * Freshness fields (`fetched_at` etc.) are intentionally absent: this
- * projection ignores them so a fetch-only refresh
- * produces zero churn. Do NOT add a freshness column without re-reading the
- * snapshot freshness-exclusion discipline.
- *
- * `last_rate_limit_at` / `last_rate_limit_session_id` are populated server-side
- * from `profiles` (joined on `profile_name = projectBasename(config_dir)`) and
- * are CARVED OUT of `projectUsageRow`'s ON CONFLICT clause so a `UsageSnapshot`
- * re-fold can't clobber a `RateLimited` fan-out. Symmetrically,
- * `rate_limit_lifts_at` / `last_usage_fold_at` ride the percentage path and are
- * carved out of the rate-limit fan-out's UPDATE. `last_usage_fold_at` is set
- * from the event `ts` (never `Date.now()`) only on successful-usage snapshots.
+ * `usage` projection table — RETIRED at schema v120 (fn-1239 task .6; DROPped
+ * unconditionally by the tail step, mirroring `event_blobs`) in favor of the
+ * account-routing boundary (`docs/adr/0038`). Kept here ONLY so the
+ * steady-state `CREATE TABLE IF NOT EXISTS` still gives every historical
+ * ADD-column step (v23 onward) a table to run against during a fresh 0→head
+ * migration walk; nothing at head folds into or reads it. Do NOT add a new
+ * column or wire it into a live query/collection/fold.
  */
 const CREATE_USAGE = `
 CREATE TABLE IF NOT EXISTS usage (
@@ -5306,15 +5324,13 @@ CREATE TABLE IF NOT EXISTS usage (
 `;
 
 /**
- * `profiles` projection table — one row per Claude profile directory, keyed by
- * `config_dir`. The `''` sentinel collapses NULL `config_dir` → default
- * `~/.claude`; the PK is NOT NULL because SQLite treats multiple NULL PKs as
- * distinct (a nullable PK + `INSERT OR IGNORE` would not dedupe). Maintained by
- * the SessionStart seed fan-out and the `RateLimited`/`ApiError` fan-out, both
- * using `COALESCE(config_dir,'')` so a NULL-config rate limit lands on its seeded
- * row. `profile_name` is the `projectBasename(config_dir)` join key against
- * `usage.id` (the `!= ''` guard keeps sentinel rows out of the join). Both
- * fan-outs read only event payload + in-transaction `jobs.config_dir`.
+ * `profiles` projection table — RETIRED at schema v120 (fn-1239 task .6;
+ * DROPped unconditionally by the tail step alongside `usage`; see its comment
+ * above). Kept here ONLY so the steady-state `CREATE TABLE IF NOT EXISTS`
+ * still gives every historical ADD-column step (v33 onward) a table to run
+ * against during a fresh 0→head migration walk; nothing at head folds into or
+ * reads it. Do NOT add a new column or wire it into a live query/collection/
+ * fold.
  */
 const CREATE_PROFILES = `
 CREATE TABLE IF NOT EXISTS profiles (

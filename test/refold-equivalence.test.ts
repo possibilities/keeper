@@ -790,7 +790,6 @@ function snapshotProjections() {
         "SELECT * FROM subagent_invocations ORDER BY job_id, agent_id, turn_seq",
       )
       .all(),
-    usage: db.query("SELECT * FROM usage ORDER BY rowid").all(),
     commit_trailer_facts: db
       .query("SELECT * FROM commit_trailer_facts ORDER BY event_id")
       .all(),
@@ -832,7 +831,6 @@ function rewindAndWipeProjections(): void {
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
   db.run("DELETE FROM subagent_invocations");
-  db.run("DELETE FROM usage");
   db.run("DELETE FROM commit_trailer_facts");
   db.run("DELETE FROM autopilot_state");
   // Reset the LIVE-ONLY git skip-floor to 0 alongside the cursor rewind. In
