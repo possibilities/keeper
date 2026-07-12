@@ -7,7 +7,7 @@
     "fn-1257-fix-state-read-guard-audit-severe"
   ],
   "id": "fn-1258-narrow-state-read-guard-shell-chain-scan",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-12T03:01:57.504000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-12T03:01:56.269000Z"
+  "updated_at": "2026-07-12T03:01:57.504000Z"
 }
