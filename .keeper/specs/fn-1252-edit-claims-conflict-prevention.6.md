@@ -42,5 +42,5 @@ Faked git: a conflicting merge returns `conflictedFiles`; the fold stores them f
 - [ ] The schema change is one forward-only `SCHEMA_STEPS` entry with `SCHEMA_FINGERPRINT` re-pinned.
 
 ## Done summary
-
+mergeBranchInto captures the conflicted-file set (git diff --diff-filter=U for fan-in, merge-tree plumbing for finalize) before its internal abort; threaded through WorktreeDriver into a new nullable dispatch_failures.conflicted_files column via one forward-only v120 SCHEMA_STEPS entry, populated only from the DispatchFailed event payload for deterministic re-fold.
 ## Evidence
