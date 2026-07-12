@@ -483,12 +483,15 @@ export const SUBAGENT_INVOCATIONS_RECENCY_SEC = 86_400;
  * tool invocations and their `SubagentStart` / `SubagentStop` lifecycle.
  * Composite pk `(job_id, agent_id, turn_seq)` in the table, but `pk` expects a
  * single column, so `job_id` carries the wire identity (every subscribe filters
- * by it) and the other two ride in `columns` for display.
+ * by it). The server diff keys by all three `liveKeyColumns`, preventing sibling
+ * invocations from collapsing into one watched/version/patch slot. The client
+ * MUST still read `state.rows` (not `byId`) because client `byId` keys on the
+ * single wire pk and collapses invocations to one row per job.
  *
  * `recencyBound` scopes every non-pk query to `ts >= now - 1d`. The membership
  * token, the page SELECT, and `COUNT(*)` all read through ONE `ResolvedFilter`,
  * so the bound applies to all three consistently — render's count/stuck and the
- * byId diff stay in agreement (the constraint the column-narrowing comment below
+ * live-key diff stay in agreement (the constraint the column-narrowing comment below
  * preserves, now also across the recency floor). It is NOT a `LIMIT` page (which
  * would trim the page but not the count and break that agreement); it is a WHERE
  * floor, so count/token/page agree by construction. A pk (`job_id`) detail
@@ -504,9 +507,10 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
   // (`isOpenTurnRow`) — without it the readiness index + the render collapse
   // can't tell a backgrounded `ok` sub (in flight, NULL `duration_ms`) from a
   // finished one. NOT a row-filter or page (those break render's count/stuck +
-  // the byId diff).
+  // the live-key diff).
   columns: [
     "job_id",
+    "agent_id",
     "subagent_type",
     "turn_seq",
     "ts",
@@ -516,6 +520,7 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
   ],
   pk: "job_id",
+  liveKeyColumns: ["job_id", "agent_id", "turn_seq"],
   version: "last_event_id",
   sortable: new Set(["ts", "turn_seq", "duration_ms"]),
   defaultSort: { column: "ts", dir: "asc" },
@@ -530,9 +535,10 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
  *
  * Composite SQL key `(job_id, cron_id)`, but `pk` expects a single column, so
  * `job_id` carries the wire identity (every subscribe filters by it) and
- * `cron_id` rides in `columns` for display. The composite-key/single-pk split
- * means the client MUST read `state.rows` (not `byId`) — `byId` collapses to
- * one row per `job_id` and crons would silently collapse to one per job.
+ * `cron_id` rides in `columns` for display. The server diff keys by both
+ * `liveKeyColumns`, preventing sibling crons from collapsing into one watched /
+ * version / patch slot. The client MUST still read `state.rows` (not `byId`) —
+ * client `byId` keys on the single wire pk and collapses crons to one per job.
  */
 export const SCHEDULED_TASKS_DESCRIPTOR: CollectionDescriptor = {
   name: "scheduled_tasks",
@@ -550,6 +556,7 @@ export const SCHEDULED_TASKS_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
   ],
   pk: "job_id",
+  liveKeyColumns: ["job_id", "cron_id"],
   version: "last_event_id",
   sortable: new Set(["ts", "cron_id"]),
   defaultSort: { column: "ts", dir: "asc" },
@@ -725,13 +732,17 @@ export const ARMED_EPICS_DESCRIPTOR: CollectionDescriptor = {
  * discharged (SessionStart bind, `DispatchFailed`, or the TTL sweep's
  * `DispatchExpired`). The dedup source of truth the reconciler reads in its
  * readiness pass; a reducer projection. Composite pk `(verb, id)` → `verb`
- * carries the wire identity, `id` rides in `columns` / `filters`.
+ * carries the wire identity, `id` rides in `columns` / `filters`, and the server
+ * diff keys by both `liveKeyColumns` so same-verb rows keep independent watched /
+ * version / patch slots. Clients MUST still read `state.rows` (not `byId`)
+ * because client `byId` keys on the single wire pk.
  */
 export const PENDING_DISPATCHES_DESCRIPTOR: CollectionDescriptor = {
   name: "pending_dispatches",
   table: "pending_dispatches",
   columns: ["verb", "id", "dir", "dispatched_at", "last_event_id"],
   pk: "verb",
+  liveKeyColumns: ["verb", "id"],
   version: "last_event_id",
   sortable: new Set(["verb", "id", "dispatched_at", "last_event_id"]),
   defaultSort: { column: "dispatched_at", dir: "desc" },
@@ -1214,8 +1225,8 @@ export interface CountAndToken {
  * the count can never drift from the page.
  *
  * The token is `group_concat` over the matching rows' live-key identities
- * ({@link liveKeyExpr} — the composite `(verb, id)` for `dispatch_failures`, the
- * bare `pk` otherwise). The inner `ORDER BY` on that same key is REQUIRED:
+ * ({@link liveKeyExpr} — every descriptor's composite `liveKeyColumns` when
+ * declared, otherwise its bare `pk`). The inner `ORDER BY` on that same key is REQUIRED:
  * `group_concat` order is otherwise plan-dependent, and an unstable token fires
  * phantom `meta` frames every tick. Ordering by the identity (not the display
  * sort) keeps it a pure membership fingerprint. Zero rows → `NULL`, normalized
