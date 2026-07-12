@@ -61,5 +61,5 @@ Structured references are self-describing to upgraded watchers. Their `text` fal
 - [ ] Fast tests prove that old watcher rendering of the fallback text still gives a usable read instruction without carrying message content.
 
 ## Done summary
-
+keeper bus chat send now writes a private artifact and publishes a typed reference (with safe legacy-visible read-path text) instead of inline body content; the watcher validates references and renders bounded read-path notifications with no preview, keeps legacy inline rendering, fails loud on malformed/unsupported/missing/corrupt references, and preserves artifacts on ambiguous outcomes while removing them on known non-delivery.
 ## Evidence
