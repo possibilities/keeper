@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted for the session-scoped watcher lifecycle. The message-body transport portion is superseded by ADR 0048.
 
 ## Context
 

@@ -104,6 +104,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 
 ## Bus, presence, and session surface
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
+- **Bus message artifact**: The private immutable file carrying one Agent Bus message's content while the bus carries only its confined reference; it remains readable through ordinary message retention and any queued-for-wake lifetime. Avoid: spill file, attachment, inline payload.
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
 - **Tmux session**: The terminal-multiplexer container workers, viewers, and panels launch into; an unqualified "session" in a launch or dispatch context means this one. Avoid: workspace, window group, terminal.
 - **Harness session**: One persisted agent conversation with its own transcript and immutable harness-native id; jobs and forensics key on it, while its display title is never identity. Avoid: job, chat, conversation.
