@@ -46,16 +46,16 @@ Which panel to name, and when a broader one earns its cost, follows the strength
 
 <!-- BAKE:BEGIN keeper prompt render engineering/panel-strength -->
 
-**The configured panel roster lives in `~/.config/keeper/panel.yaml`.** It defines one or more named panels — each an ordered selection of launch triples (`<harness>::<model>::<effort>`) — and an optional top-level `default` pointer naming the panel to convene when none is chosen. Panels may be defined, renamed, or removed at any time, so never hard-code a panel name or assume a particular one exists; read the live roster with `keeper agent presets list` (`--json` for structure) at decision time.
+**The configured panel roster lives in `~/.config/keeper/panel.yaml`, authored by the `/plan:panel-guidance` skill.** Each panel carries an authored strength band (`weak|light|standard|strong|max`) and a rich description of the work it fits. Panels may be defined, renamed, or removed at any time, so never hard-code a panel name or assume a particular one exists; read the live roster with `keeper agent presets list` (`--json` for structure) at decision time.
 
-**A panel's strength is read from its member count and harness diversity.** More members across more distinct harnesses buy more independent cross-checking — at proportional cost, and the panel runs as slow as its slowest member. Reach for a broader panel only when the stakes below justify that cost.
+**Choosing is two-stage: restate the task's stakes in a phrase, then pick the weakest panel whose description covers it.** Escalate a rung only on an observable trigger — genuine ambiguity, blast radius, irreversibility, or a security surface — never on felt confidence.
 
 Pick where a panel-worthy question lands:
 
-- **The human named a panel** — pass that name through as the panel argument, verbatim. Their choice stands; don't second-guess it against the roster.
-- **An ordinary panel-worthy question** — convene the configured default: omit the panel argument and let the `default` pointer resolve. This is the common path.
-- **The answer anchors above-inline work, or being confidently wrong is expensive** — run `keeper agent presets list` (`--json` for structure), read the roster, and pass a broader configured panel for the extra cross-checking.
-- **Ambiguous which way it leans** — take the configured default. A redundant fan-out is cheaper than an under-checked answer, and the default is the calibrated middle.
+- **The human names a panel** — pass that name through as the panel argument, verbatim. Their choice stands; don't second-guess it against the roster.
+- **An ordinary panel-worthy question** — convene the configured default: omit the panel argument and let the `default` pointer resolve.
+- **A weak rung is a cheap sanity duo** — when one direct answer would do, skip the panel entirely rather than reaching for the floor.
+- **A shorter description is not a weaker fit, and a stronger band is not a tiebreaker** — read what each panel actually covers; band order breaks a tie only once a named trigger fires.
 
 **When roster discovery fails, or no default is configured** — skip the panel: answer the question directly without one, and tell the human about the config gap so they can fix `panel.yaml`. A missing roster or default is a configuration problem to surface, never a reason to stall or to invent a panel name.
 
