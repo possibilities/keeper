@@ -274,6 +274,32 @@ already know the harness, model, and effort you want, or **enumerate then pick**
 `keeper agent presets list --json` to discover the configured native ids and each model's effective
 effort range, then compose the triple from what you found.
 
+**Right-size the partner — the same difficulty-and-diversity philosophy the
+model guidance and panel roster use, applied to one leg:**
+
+- **Human-named axes win — select only the rest.** Any harness, model, or effort
+  the human states is fixed and overrides the rubric; the selection fills ONLY
+  the axes they left open. "Ask codex" fixes the harness but still picks model +
+  effort; "use gpt-5.5" fixes the model but still picks its effort; a full
+  `<harness>::<model>::<effort>` triple defers nothing.
+- **Diversity first — default to a DIFFERENT family than yourself.** A second
+  opinion earns its keep on another family's blind spots, so bias to a different
+  vendor than the calling session unless the human named one or the ask turns on
+  one family's own idiom (Claude-tuned taste/wording → a claude partner is fair;
+  a correctness/algorithmic cross-check → go cross-family).
+- **Size effort to the ask's difficulty and blast radius, not its length.** A
+  quick sanity check or mechanical review → a light tier; a hard correctness,
+  security, or design cross-check → a frontier tier at high/xhigh. A long prompt
+  is not a hard question — match the model to the reasoning, not the word count.
+- **Ground the pick in the model guidance.** Read the per-model capability blocks
+  in `plugins/plan/model-selector.yaml` (`models:` / `efforts:`) for the
+  strengths, weaknesses, and when-to-pick behind each tier, and
+  `keeper agent presets list --json` for the available per-harness triples and
+  which are cells; choose the model + effort from those, not from memory.
+- **Ambiguous ask → pick and say so, never stall.** Choose a sensible cross-family
+  partner at an effort matched to the stakes and `default` role, and state what
+  you chose in one line so the human can redirect.
+
 | Flag | Meaning |
 |---|---|
 | `--preset <triple>` | **`agent run` only** (Quick single-shot). A launch triple `<harness>::<model>::<effort>` — supplies harness + model + effort in one token. The triple's harness must equal the `<cli>` positional, or it's an arg fault. `agent panel start`'s ad-hoc member has no `--preset`; compose the triple with `--panel <triple>` there instead (see *Detached + chunked wait* above). |
@@ -284,10 +310,6 @@ effort range, then compose the triple from what you found.
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
 | `--name <n>` | **`agent run` only.** Names the partner so it is resumable by name later — pass it on a fresh launch; a `--resume` launch ignores it and keeps the partner's original name. |
 | `--resume <name-or-id>` | **`agent run` only.** Continues a prior partner by current/former name or id instead of launching fresh (see *Resuming a partner*). Rejects `--preset`/`--model`/`--effort`; `--session`/`--name` are silently dropped — the resumed session keeps its own. |
-
-If the user's ask is slug-less or ambiguous about which CLI/role, pick a sensible
-default (a cross-vendor partner, `default` role) and say what you chose — don't
-stall.
 
 ## Read-only posture (prompting-only)
 
