@@ -79,5 +79,5 @@ live daemon, no real DB beyond the sandboxed fixtures already in use there.
 - [ ] Fast suite green.
 
 ## Done summary
-
+Added repair to RetryDispatchVerb/RETRY_DISPATCH_VERBS so keeper autopilot retry repair::<token> re-arms a stranded repair latch; updated the validator error string, autopilot retry help text, and rewrote the now-stale disjointness commentary in dispatch-command.ts, daemon.ts, and dispatch-failure-key.ts. unblock/deconflict remain retry-wire-excluded. No reducer or db.ts changes.
 ## Evidence

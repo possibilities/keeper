@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "retry dispatch accepts repair verb",
-  "updated_at": "2026-07-12T14:36:32.474000Z"
+  "updated_at": "2026-07-12T15:12:30.169000Z",
+  "worker_done_at": "2026-07-12T15:12:30.169000Z"
 }
