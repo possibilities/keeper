@@ -29,6 +29,12 @@ export interface PiTaskToolDefinition {
   ): Promise<PiTaskToolResult>;
 }
 
+/** The minimal Pi extension surface needed to expose the Task facade. */
+export interface PiTaskExtensionApi {
+  events?: PiTaskEventBus;
+  registerTool?(tool: PiTaskToolDefinition): void;
+}
+
 interface RpcSuccess {
   success: true;
   data?: unknown;
@@ -321,4 +327,19 @@ export function createTaskFacadeTool(
       }
     },
   };
+}
+
+/**
+ * Minimal Pi extension entry point for a nested AgentSession that needs Task.
+ * It deliberately owns no lifecycle, title, telemetry, bus, or status surface;
+ * those remain scoped to the tracked top-level session extension.
+ */
+export default function taskFacadeExtension(pi: PiTaskExtensionApi): void {
+  try {
+    if ((process.env.KEEPER_JOB_ID ?? "").trim() === "") return;
+    if (pi.events === undefined || typeof pi.registerTool !== "function") return;
+    pi.registerTool(createTaskFacadeTool(pi.events));
+  } catch {
+    // A Task-facade load failure must never prevent the child session starting.
+  }
 }

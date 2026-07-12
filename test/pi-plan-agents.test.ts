@@ -78,11 +78,12 @@ describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
           "plugins",
           "keeper",
           "pi-extension",
-          "keeper-events.ts",
+          "task-facade.ts",
         )}`,
       )}`,
     );
-    expect(runnerHeader).toContain('tools: "all, ext:keeper-events/Task"');
+    expect(runnerHeader).toContain('tools: "all, ext:task-facade/Task"');
+    expect(runnerHeader).not.toContain("keeper-events.ts");
     expect(judgeHeader).toContain("Task, Agent");
     expect(judgeHeader).not.toContain("extensions:");
   });
