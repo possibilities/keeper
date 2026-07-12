@@ -158,7 +158,16 @@ export function renderPiPlanAgent(path: string): {
       );
     }
     lines.push(
-      `extensions: ${yamlString(taskExtension)}`,
+      // `extensions:` is pi's sole loading authority, and an allowlist that
+      // omits pi-subagents leaves only its factory side effects in the child
+      // session — RPC handlers with no lifecycle-wired ctx — so the runner's
+      // judge spawn dies with "No active session". The wildcard keeps every
+      // default extension loaded (pi-subagents cannot be named: a package
+      // entry of `./src/index.ts` canonicalizes to "src", not its package
+      // name) while the `ext:` allowlist below still hides every extension
+      // tool except the keeper Task facade — the runner's only spawn surface
+      // for the judge hop.
+      `extensions: ${yamlString(`*, ${taskExtension}`)}`,
       `tools: ${yamlString("all, ext:keeper-events/Task")}`,
     );
   }

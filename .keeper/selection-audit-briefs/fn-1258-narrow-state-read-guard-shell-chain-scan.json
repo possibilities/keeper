@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 8,
+        "files_changed": 2,
+        "insertions": 91
+      },
+      "done_summary": "Narrowed the state-read guard's keeper plan seam chain scan to strip the quoted --reason value before scanning chain/redirect metachars, so a legit AUDIT_SEVERE finding summary with a shell-inert metachar is exempt while command substitution and real out-of-quote chains still deny. Added classifier + subprocess-ladder regression tests.",
+      "input_hash": "6e66aa18bb3788df6e64bd29c882fcc51ee2f19eefd866957212e1939138dc4d",
+      "model": "opus",
+      "spec_chars": 2055,
+      "spec_md": "## Description\n\nFinding F2 (with merged F3): `plugins/plan/plugin/hooks/state-read-guard.ts:66`.\n`SHELL_CHAIN = /[;&|`+\"`\"+`\\n]|\\$\\(|[<>]/` is tested against the whole\n`command` in `commandTouchesStateTree`, including the quoted `--reason`\npayload. Per `plugins/plan/skills/work/SKILL.md:212` the AUDIT_SEVERE\nreason is a free-form one-line finding summary, so a legitimate\nescalation whose prose contains a shell-inert metachar inside the quoted\nreason (e.g. `--reason \"AUDIT_SEVERE: timeout > 5s regresses\"`) forfeits\nthe exemption and is denied \u2014 the very case the parent fix set out to\nallow.\n\nNarrow the chain check so it inspects the command OUTSIDE the quoted\n`--reason` value (metachars that are shell-inert inside double quotes must\nnot forfeit the exemption), while a chain that lands OUTSIDE the quotes\n(`keeper plan \u2026 && cat <audits-path>`) still forfeits and denies. Preserve\nthe fail-closed default and the `KEEPER_PLAN_GUARD_BYPASS=1` recovery.\nAdd the regression test F3 names (a `keeper plan block` whose `--reason`\nprose holds a bare `>`/`<`/`&`/`|`/`;`) at both the classifier and\nsubprocess-ladder layers, mirroring the existing exempt/chained cases.\n\nFiles:\n- plugins/plan/plugin/hooks/state-read-guard.ts\n- plugins/plan/test/state-read-guard.test.ts\n\n## Acceptance\n\n- [ ] `commandTouchesStateTree` returns false for a `keeper plan block --reason \"AUDIT_SEVERE: \u2026\"` whose quoted reason contains a shell-inert metachar.\n- [ ] `commandTouchesStateTree` still returns true for a real chained tree read (`keeper plan \u2026 && cat .keeper/state/audits/\u2026`).\n- [ ] Classifier + subprocess-ladder regression tests cover the metachar-in-reason case and pin the intended behavior.\n\n## Done summary\nNarrowed the state-read guard's keeper plan seam chain scan to strip the quoted --reason value before scanning chain/redirect metachars, so a legit AUDIT_SEVERE finding summary with a shell-inert metachar is exempt while command substitution and real out-of-quote chains still deny. Added classifier + subprocess-ladder regression tests.\n## Evidence\n",
+      "task_id": "fn-1258-narrow-state-read-guard-shell-chain-scan.1",
+      "tier": "xhigh",
+      "title": "Scope chain scan off --reason"
+    }
+  ],
+  "created_at": "2026-07-12T03:54:12.858000Z",
+  "epic_id": "fn-1258-narrow-state-read-guard-shell-chain-scan",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "6e66aa18bb3788df6e64bd29c882fcc51ee2f19eefd866957212e1939138dc4d",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

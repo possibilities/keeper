@@ -762,6 +762,14 @@ export interface MatrixShadow {
   winner: HarnessName;
 }
 
+/** A static plan subagent's `{model, effort}` pin (a pair, never a triple —
+ *  frontmatter carries no harness axis), baked into the agent's rendered
+ *  frontmatter at render time. */
+export interface AgentPin {
+  model: string;
+  effort: string;
+}
+
 /** The parsed v2 host matrix. `providers` order IS the cost-ascending pecking
  *  order; `subagentModels` IS the worker-cell axis. */
 export interface MatrixV2 {
@@ -778,6 +786,11 @@ export interface MatrixV2 {
   effortsByModel: Map<string, string[]>;
   /** cross-provider dedup shadow log, in encounter order. */
   shadowed: MatrixShadow[];
+  /** the `agent_pins:` map (static subagent name → its `{model, effort}` pin),
+   *  in declaration order. Empty when the block is absent — render-time
+   *  strictness (a missing/extra pin failing loud) is the renderer's job, not
+   *  the parser's. */
+  agentPins: Map<string, AgentPin>;
 }
 
 const ALLOWED_V2_KEYS: ReadonlySet<string> = new Set([
@@ -787,6 +800,7 @@ const ALLOWED_V2_KEYS: ReadonlySet<string> = new Set([
   "providers",
   "wrapper_driver",
   "defaults",
+  "agent_pins",
 ]);
 
 /** The capability token of a launch id: the segment after the LAST `/`, or the
@@ -899,6 +913,7 @@ function parseMatrixV2(raw: unknown, configPath: string): MatrixV2 {
       claude?.models.has(cap) === true ? "native" : "wrapped",
     );
   }
+  const agentPins = parseAgentPins(raw.agent_pins, efforts, configPath);
   return {
     efforts,
     subagentTemplates,
@@ -909,6 +924,7 @@ function parseMatrixV2(raw: unknown, configPath: string): MatrixV2 {
     driverByModel,
     effortsByModel,
     shadowed,
+    agentPins,
   };
 }
 
@@ -1115,6 +1131,56 @@ function parseSubagentModels(
     out.push(item);
   }
   return out;
+}
+
+/** Parse + validate the `agent_pins:` map — agent name → `{model, effort}`. An
+ *  absent block parses as an empty map (a pins-less v2 file stays valid for
+ *  launch/dispatch surfaces; render-time strictness for a missing/extra pin is
+ *  the renderer's job). Effort must be a member of the matrix's top-level
+ *  efforts axis; model is an opaque non-empty strict-charset token (not
+ *  cross-checked against `subagent_models` — frontmatter has no harness axis to
+ *  resolve through). */
+function parseAgentPins(
+  value: unknown,
+  efforts: string[],
+  configPath: string,
+): Map<string, AgentPin> {
+  const pins = new Map<string, AgentPin>();
+  if (value === undefined) {
+    return pins;
+  }
+  if (!isRecord(value)) {
+    throw new ConfigError(
+      `agent_pins must be a mapping of agent name to {model, effort} in ${configPath}`,
+    );
+  }
+  const effortSet = new Set(efforts);
+  for (const [name, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) {
+      throw new ConfigError(
+        `agent_pins['${name}'] must be a {model, effort} mapping in ${configPath}`,
+      );
+    }
+    for (const k of Object.keys(entry)) {
+      if (k !== "model" && k !== "effort") {
+        throw new ConfigError(
+          `agent_pins['${name}'] has unknown key '${k}' in ${configPath} (allowed: model, effort)`,
+        );
+      }
+    }
+    if (typeof entry.model !== "string" || !isValidMatrixToken(entry.model)) {
+      throw new ConfigError(
+        `agent_pins['${name}'].model must be a valid token in ${configPath}`,
+      );
+    }
+    if (typeof entry.effort !== "string" || !effortSet.has(entry.effort)) {
+      throw new ConfigError(
+        `agent_pins['${name}'].effort '${entry.effort}' is not in the matrix effort axis [${efforts.join(", ")}] in ${configPath}`,
+      );
+    }
+    pins.set(name, { model: entry.model, effort: entry.effort });
+  }
+  return pins;
 }
 
 /** The effective effort list for a capability under the v2 matrix — the resolved

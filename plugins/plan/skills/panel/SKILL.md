@@ -86,9 +86,10 @@ failure:
 - **`PANEL_ANSWER`** on the first line — success. Strip that marker line and absorb the fused answer that
   follows (see *Absorb, then answer*).
 - **`PANEL_RUN_FAILED`** on the first line — failure. It carries a `reason:` line and the per-leg status; the
-  runner emits it when any leg fails, times out, or never produces its output, or when the panel resolves to
-  zero members. Tell the human that **the panel failed** and why; do **not** present the failure text as an
-  answer. No judge ran, so there is no panel answer to render.
+  runner emits it when too few legs produce viable answers to meet quorum (`max(2, ceil(N/2))` of the roster),
+  when the wait wedges, or when the panel resolves to zero members. A panel with SOME failed legs but quorum
+  met still judges — its audit discloses the reduced composition. Tell the human that **the panel failed** and
+  why; do **not** present the failure text as an answer. No judge ran, so there is no panel answer to render.
 
 Anything else is a **malformed return** — status narration, "waiting" prose, a promise of future work, or an
 empty or error-shaped Task return. Never absorb a malformed return as an answer, and never let one end your

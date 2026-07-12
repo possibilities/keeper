@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Two fully-diagnosed bug fixes in one file plus its test with named root causes and prescribed remedies \u2014 well-specified correctness work with no design judgment, so GPT-first at terra, and high because execution spans source plus test seams across two independent paths with race-window reasoning to get right.",
+      "task_id": "fn-1260-harden-maintenance-window-drain-and.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-12T06:03:39.713000Z",
+  "epic_id": "fn-1260-harden-maintenance-window-drain-and",
+  "input_hash": "d97292abfae431f96f9bc50b46f2fa73bf161cad52b1a3c2063b6a7df019032d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3648164523,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Two fully-diagnosed bug fixes in one file plus its test with named root causes and prescribed remedies \u2014 well-specified correctness work with no design judgment, so GPT-first at terra, and high because execution spans source plus test seams across two independent paths with race-window reasoning to get right.\",\"confidence\":0.79}]}"
+}

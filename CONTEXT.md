@@ -13,9 +13,8 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Re-fold**: Rebuilding a projection by replaying every event, which stays deterministic only because a fold never reads wall-clock, environment, or the filesystem. Avoid: rebuild, replay-repair, reprocess.
 - **Dead letter**: An event the reducer could not fold, parked for inspection and later replay instead of crashing the fold. Avoid: error queue, poison message, reject.
 - **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a rewind. Avoid: snapshot, ephemeral view, scratch state.
-- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed. Avoid: registry, migration list, schema chain.
+- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed; a one-lane-at-a-time singleton resource, so two concurrent schema edits collide at merge rather than compose silently. Avoid: registry (that word belongs to Usage-model registry), migration list, schema chain.
 - **Additive-idempotent step**: A migration ladder step whose `kind` only adds structure and converges safely on repeated application, the one class a merge-time renumber may resolve mechanically without a human. Avoid: safe migration, non-destructive step, idempotent guard.
-- **Schema singleton**: The property that keeper's schema is one lane-at-a-time resource, so two concurrent schema edits are meant to collide at merge rather than compose silently. Avoid: shared resource, lock file, mutex.
 
 ## Plan board
 - **Board**: The read-only plan state — epics, tasks, and their readiness — that an agent orients on before acting. Avoid: backlog, kanban, queue.
@@ -24,11 +23,15 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Plan**: The durable spec-and-dependency graph for an epic, authored interactively and consumed read-only, never mutated by the reducer. Avoid: roadmap, schedule, spec sheet.
 - **Id ledger**: The host-local append-only record of every plan number a project has handed out, consulted at mint alongside the directory scan so destroying a minted file can never free its number. Avoid: high-water mark, watermark, counter.
 - **Brief**: The self-contained context packet a worker receives for its task, carrying the spec and glossary out-of-band instead of inlined prose. Avoid: prompt, ticket body, handoff note.
+- **Edit claim**: One structured write-prediction on a task — an exact path, a bounded glob, or a logical resource token, carrying expected or possible certainty; a task's claims form its write surface (what it mutates, never what it merely reads), and the claim noun is distinct from the claim verb, which takes ownership of a task. Avoid: Files list, touched files, write set.
+- **Overlap gate**: The scaffold-time check that intersects sibling tasks' edit claims and refuses DAG-incomparable tasks whose expected exact claims collide, downgrading softer intersections to warnings. Avoid: conflict gate, serialization check, file lock.
 - **Readiness**: The gate deciding whether a task may dispatch, recomputed each cycle from its dependencies and validation state. Avoid: status, priority, availability.
 - **Arm**: To flip an epic or task from not-ready to dispatchable by stamping it validated. Avoid: enable, approve, unlock.
 - **Ghost**: A not-yet-validated epic or task that renders dashed and blocks dispatch until it is armed. Avoid: draft, stub, placeholder.
 - **Tier**: The capability class assigned to a task that selects which model and worker cell runs it. Avoid: level, rank, weight.
 - **Worker cell**: The one `{model × tier}` `work` plugin a task's launcher selects at launch; a native cell runs its model in-session, a wrapped cell delegates to the model's serving provider. Avoid: variant, flavor, profile.
+- **Cell assignment**: A committed, receipt-backed `{model, tier}` choice covering the exact current todo set; an unassigned task carries null axes and cannot arm or dispatch. Avoid: provisional default, placeholder cell, suggested cell.
+- **Dispatched cell**: The worker cell a work dispatch actually launched when a Worker provider translated the task's Cell assignment, recorded on the task at claim and cleared when a later attempt runs unconstrained; absent means the assigned cell ran. Avoid: effective cell, executed cell, override cell.
 - **Capability model**: The model-axis value a task carries, a capability token derived from a Provider's launch id (the segment after its last `/`, the whole id when slash-free); native when the claude provider serves it, wrapped otherwise. Avoid: harness model, backend model, model alias.
 - **Launch id**: A Provider's model entry, the string a harness CLI receives verbatim — a bare scalar or an `{id, efforts}` form carrying a per-model effort-list override — from which the Capability model derives by basename. Avoid: alias target, model alias, native alias.
 - **Provider**: A harness's entry in the host matrix config, tying it to the launch ids it serves. Avoid: vendor, backend, platform.
@@ -44,11 +47,19 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Audit gate**: The block-machinery hold between a worker finishing and its done-stamp, where the task-scoped audit decides resume or escalation. Avoid: review gate, done gate, checkpoint.
 - **Blocking follow-up**: A follow-up epic the close audit requires to complete before its source epic may stamp done; the source stays open, holding every epic that depends on it. Avoid: gating epic, close blocker.
 
+## Personal notes
+- **Note**: A durable user-authored text capture that stays active until one successful external action archives it; archived Notes remain browsable history. Avoid: snippet (that names a prompt-corpus entry), task, handoff.
+- **Disposition**: The successful clipboard copy or fresh-agent launch that processes a Note and moves it to archived history. Avoid: send (only one kind), archive (the resulting state), delivery.
+
 ## Autopilot and dispatch
 - **Autopilot**: The server-side loop that reconciles the board against running work, dispatching ready tasks and closing finished epics without a human. Avoid: scheduler, cron, orchestrator.
+- **Autopilot arm**: The durable selection of an epic for dispatch under autopilot's armed mode, distinct from the Plan validation Arm. Avoid: validation marker, approval, readiness.
+- **Armed dependency closure**: The dispatch-eligible epic set in armed mode: every explicitly autopilot-armed epic plus its transitive upstream Epic dependencies. It governs new work and closer dispatch; existing sessions remain occupancy signals, not eligibility. Avoid: armed set (explicit members only), in-flight set, readiness closure.
 - **Reconciler**: The level-triggered core of autopilot that re-derives what should be running from current state each cycle. Avoid: dispatcher, poller, event loop.
 - **Dispatch**: To fire one worker at a task or a close, whether by autopilot or by hand. Avoid: launch, spawn, enqueue.
 - **Dispatch table**: The launch catalog's per-verb `dispatch:` map assigning each dispatched session's launch triple, floored to the compiled-in constants when a row is absent or the catalog is unreadable. Avoid: role key, worker preset, escalation preset.
+- **Equivalence map**: The committed directional mapping naming, for every dispatchable worker cell of one provider family, its most-equivalent cell in the other; the two directions are authored independently and are never inverses. Avoid: alias map, translation table, model crosswalk.
+- **Worker provider**: The durable autopilot setting constraining every work dispatch to one provider family by translating each task's Cell assignment through the Equivalence map at launch; a cell it cannot translate refuses to dispatch rather than falling back. Avoid: provider pin, model pin, provider affinity.
 - **Reaper**: A background sweep that reclaims stuck, stale, or dead work so the board keeps moving. Avoid: cleanup job, garbage collector, timeout.
 - **Phantom-working**: A job row stuck reading working after its session has gone permanently idle, so autoclose, readiness, and dependent dispatches all consume the wrong state. Avoid: zombie job, ghost worker, stale running.
 - **Drain**: Folding a backlog of pending events to completion in bounded batches. Avoid: flush, catch-up, backfill.
@@ -59,7 +70,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Operator jam**: A dispatch failure whose reason class cannot self-clear, leaving the board wedged until an operator acts; alarm surfaces fire on the jam class, while the broad sticky count stays a status display. Avoid: stuck row, hard failure, blockage.
 - **Parked question**: A question a worker left on its epic awaiting a human answer, surfaced as a needs-human signal until it is answered. Avoid: blocker, prompt, open ask.
 - **Pinned epic**: The full epic block a live close/work dispatch failure keeps rendered on the board after the epic closes — display-only, its lifetime exactly the failure row's. Avoid: sticky epic, ghost epic, zombie row.
-- **Selection review**: The committed, per-epic dataset of out-of-band verdicts grading whether each executed worker cell was underpowered, right-sized, or overpowered; a human-invoked skill assembles and grades it after the epic closes, and it is advisory input to model-selector policy, never a live board signal. Avoid: selection score, rating, quality audit.
+- **Selection review**: The committed, per-epic dataset of out-of-band verdicts grading whether the cell each task actually ran — its Dispatched cell when recorded, else its Cell assignment — was underpowered, right-sized, or overpowered; a human-invoked skill assembles and grades it after the epic closes, and it is advisory input to model-selector policy, never a live board signal. Avoid: selection score, rating, quality audit.
 - **Selector verdict**: The raw JSON cell-set a model-selector subagent returns as its final message — untrusted input the calling skill pipes verbatim to the trusted apply seam, which stages it as the ordinal-keyed verdict document under gitignored selection state for close-finalize to consume. Avoid: assignment, selection (alone), verdict file.
 - **Model card**: The cached, provenance-headed, sha256-pinned vendor system-card markdown for one model-selector research entry, converted from the vendor's own capability doc and required for that model to classify `fresh`; distinct from the research notes `reference`, which is the skill-authored distilled behavioral cache the card's raw signal feeds. Avoid: reference (that names the notes file), spec sheet, datasheet.
 - **Instant-death wall**: The needs-human threshold reached when enough dispatch keys trip the instant-death breaker at once that the failures read as an account or quota wall rather than isolated crashes. Avoid: crash wall, breaker count, death spiral.
@@ -83,14 +94,17 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
 - **Lane pre-merge**: The guard that vets a dependent task's base lane BEFORE its fan-in merges the completed siblings in — restoring a provably-redundant leak to the base's HEAD, deferring a base it cannot safely settle to a self-clearing row, and escalating a persistent wedge to a needs-human distress; distinct from the fan-in conflict itself, which a Resolver settles rather than self-clearing. Avoid: clean, cleanup, premerge fixup, fan-in conflict.
 
-## Account routing
+## Account routing and usage scraping
 - **Capacity observation**: A freshness-bounded report from optional external tools that may inform selection for one new agent process, but is never durable truth. Avoid: usage projection, account state, balance record.
 - **Account route**: The account execution path selected independently for one new agent process, including a process resuming or restoring an existing conversation; it never binds that conversation to the account for a later launch. Avoid: profile, pin, affinity, session account.
 - **Launch attribution**: The immutable fact of which Account route one process used, retained for explanation and forensics but never consumed to route a later process. Avoid: account affinity, profile name, pin.
 - **Launch reservation**: Short-lived, non-exclusive pressure applied during concurrent account selection so new processes do not stampede one route; it conveys no durable ownership. Avoid: lease, lock, affinity.
+- **Usage-model registry**: The `usage_models` keeper-config map declaring which claude profiles and codex the usage scraper produces envelopes for, keyed by envelope id with an optional display alias per entry; an absent or malformed map idles the producer rather than erroring. Avoid: profile catalog, account list, scrape targets.
+- **agentusage**: The frozen on-disk namespace the usage scraper writes and reads — the envelope root, the tmux socket, and the path-filter token that share this name — pinned as a fixed wire/on-disk contract independent of any project directory. Avoid: the agentusage project, external scraper.
 
 ## Bus, presence, and session surface
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
+- **Bus message artifact**: The private immutable file carrying one Agent Bus message's content while the bus carries only its confined reference; it remains readable through ordinary message retention and any queued-for-wake lifetime. Avoid: spill file, attachment, inline payload.
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
 - **Tmux session**: The terminal-multiplexer container workers, viewers, and panels launch into; an unqualified "session" in a launch or dispatch context means this one. Avoid: workspace, window group, terminal.
 - **Harness session**: One persisted agent conversation with its own transcript and immutable harness-native id; jobs and forensics key on it, while its display title is never identity. Avoid: job, chat, conversation.

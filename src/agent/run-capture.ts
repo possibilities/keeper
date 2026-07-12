@@ -133,6 +133,11 @@ export type ParseRunArgsResult =
       prompt: string;
       stopTimeoutMs: number | null;
       readOnly: boolean;
+      /** `--reap-window-on-terminal` — a one-shot leg posture: after the terminal
+       *  envelope is written, the handler best-effort kills the tmux window the
+       *  launch opened. Panel legs always pass it; pair/debug launches stay
+       *  resident (resumable) without it. */
+      reapWindowOnTerminal: boolean;
       /** Raw `--system-file` path (unread — the pure parser never touches the
        *  filesystem); the handler resolves it to text. Null when unset. */
       systemFile: string | null;
@@ -171,9 +176,10 @@ export type ParseRunArgsResult =
   | { ok: false; error: string };
 
 /**
- * Parse `agent run <cli> <prompt> [--read-only] [--stop-timeout <dur>]`. Two
+ * Parse `agent run <cli> <prompt> [--read-only] [--reap-window-on-terminal]
+ * [--stop-timeout <dur>]`. Two
  * positionals — the partner CLI (claude|codex|pi) and the prompt — plus the
- * optional read-only posture and stop-wait override. A malformed/missing
+ * optional read-only posture, the one-shot reap posture, and stop-wait override. A malformed/missing
  * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
  * `--read-only` is prompting-only: it prepends the read-only directive to the
  * prompt and relies on the model following it (keeper enforces nothing).
@@ -194,6 +200,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
   let stopTimeoutMs: number | null = null;
   let readOnly = false;
+  let reapWindowOnTerminal = false;
   let systemFile: string | null = null;
   let system: string | null = null;
   let preset: string | null = null;
@@ -208,6 +215,10 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     const arg = rest[i] as string;
     if (arg === "--read-only") {
       readOnly = true;
+      continue;
+    }
+    if (arg === "--reap-window-on-terminal") {
+      reapWindowOnTerminal = true;
       continue;
     }
     if (arg === "--stop-timeout") {
@@ -387,6 +398,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     prompt,
     stopTimeoutMs,
     readOnly,
+    reapWindowOnTerminal,
     systemFile,
     system,
     preset,
@@ -430,7 +442,15 @@ export interface RunCaptureDeps {
  * the public handle echoed into the envelope.
  */
 export type RunLaunchResult =
-  | { ok: true; handle: ResolvedHandle; runId: string }
+  | {
+      ok: true;
+      handle: ResolvedHandle;
+      runId: string;
+      /** The socket-correct `tmux kill-window` argv for the window this launch
+       *  opened — the handler runs it on the reap-on-terminal posture, AFTER the
+       *  result file lands. Absent when the launch path exposes no window. */
+      killWindowCommand?: string[];
+    }
   | { ok: false; error: string };
 
 /** Inputs to {@link captureFromHandle}. */
@@ -482,12 +502,30 @@ export async function captureFromHandle(
 
   const wait = await deps.waitForStop(handle, verbDeps);
   if (!wait.ok) {
-    // The wait did not reach a stop. Probe the transcript: if it resolves, the
-    // stop simply never came before the deadline (timed_out, partial captured);
-    // if it does not, either a concurrent same-cwd session made attribution
-    // ambiguous (transcript_ambiguous — refuse to guess a foreign answer) or the
-    // path never appeared (no_transcript).
-    const show = await deps.showLastMessage(handle, verbDeps);
+    // The wait did not reach a stop. When the transcript path DID resolve and
+    // only the stop wait timed out, read that known path once for a partial
+    // capture (timed_out) — never re-run path discovery on a second budget. A
+    // path-stage failure is already terminal: the whole budget was spent
+    // looking, so re-probing would just spend another one (no_transcript, or
+    // transcript_ambiguous when attribution collided). hermes has no
+    // path-discovery phase — its show keeps the original handle.
+    const knownPath = wait.transcriptPath ?? null;
+    if (knownPath === null && agent !== "hermes") {
+      return buildRunCaptureEnvelope({
+        outcome:
+          wait.reason === "ambiguous"
+            ? "transcript_ambiguous"
+            : "no_transcript",
+        agent,
+        handle: handleId,
+        resumeTarget: baseResume,
+        elapsedSeconds: elapsed(),
+      });
+    }
+    const show = await deps.showLastMessage(
+      knownPath === null ? handle : { ...handle, transcriptPath: knownPath },
+      verbDeps,
+    );
     if (!show.ok) {
       const ambiguous =
         show.reason === "ambiguous" || wait.reason === "ambiguous";
@@ -533,8 +571,12 @@ export async function captureFromHandle(
     message = wait.stop.message;
     messageFound = wait.stop.message !== null;
   }
+  // `completed` promises a non-empty deliverable: a found-but-textless final
+  // turn (tool-only / refusal / empty text) is `no_message`, so a panel or
+  // pair caller never treats an answerless leg as a usable answer.
+  const deliverable = messageFound && message !== null && message.trim() !== "";
   return buildRunCaptureEnvelope({
-    outcome: messageFound ? "completed" : "no_message",
+    outcome: deliverable ? "completed" : "no_message",
     agent,
     handle: handleId,
     transcriptPath,

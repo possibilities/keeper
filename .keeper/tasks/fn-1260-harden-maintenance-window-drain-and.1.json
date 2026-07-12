@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T06:03:38.860000Z",
+  "depends_on": [],
+  "epic": "fn-1260-harden-maintenance-window-drain-and",
+  "id": "fn-1260-harden-maintenance-window-drain-and.1",
+  "model": "gpt-5.6-terra",
+  "priority": null,
+  "selection_input_hash": "d97292abfae431f96f9bc50b46f2fa73bf161cad52b1a3c2063b6a7df019032d",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Harden drain gate and verify probe",
+  "updated_at": "2026-07-12T06:24:51.051000Z",
+  "worker_done_at": "2026-07-12T06:24:51.051000Z"
+}

@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-sol",
+      "rationale": "Well-specified contract-shaped work (new typed verbs, wire envelope, server-side hash-parity idempotency with a prescribed shared derivation helper) routes GPT-first at the contract-touching xhigh band rather than opus.",
+      "task_id": "fn-1253-restore-orchestrator-content-blindness.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Agent-spec authoring with delicate two-mode discrimination, depth-band self-read wording, and a silent-degrade coupling between template and skill needs Claude-tuned prompt judgment and in-repo idiom at the high band.",
+      "task_id": "fn-1253-restore-orchestrator-content-blindness.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Rewriting the orchestrator audit gate to switch purely on typed envelopes, with crash-resume semantics and ref-based block reasons, is judgment-heavy skill authoring tightly coupled to the worker/verb contracts, favoring sonnet at high.",
+      "task_id": "fn-1253-restore-orchestrator-content-blindness.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.63,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "An advisory fail-open PreToolUse guard closely copying the commit-guard deny-dispatcher pattern is well-specified pattern-following (explicitly not a security boundary), fitting a GPT tier at high for the path/Bash-vector and blast-radius care.",
+      "task_id": "fn-1253-restore-orchestrator-content-blindness.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Doc alignment plus an ADR under this repo's terse prune-in-place, forward-facing, glossary-genre discipline is wording-and-idiom-sensitive taste work best served by sonnet at the bounded medium band.",
+      "task_id": "fn-1253-restore-orchestrator-content-blindness.5",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T22:42:17.118000Z",
+  "epic_id": "fn-1253-restore-orchestrator-content-blindness",
+  "input_hash": "f7b7d5d0c1758504b05195757ff0173bc5f85fd283fcb1cf84d8c3210a27146c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4156020176,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1253-restore-orchestrator-content-blindness.1\",\"tier\":\"xhigh\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Well-specified contract-shaped work (new typed verbs, wire envelope, server-side hash-parity idempotency with a prescribed shared derivation helper) routes GPT-first at the contract-touching xhigh band rather than opus.\",\"confidence\":0.72},{\"task_id\":\"fn-1253-restore-orchestrator-content-blindness.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Agent-spec authoring with delicate two-mode discrimination, depth-band self-read wording, and a silent-degrade coupling between template and skill needs Claude-tuned prompt judgment and in-repo idiom at the high band.\",\"confidence\":0.68},{\"task_id\":\"fn-1253-restore-orchestrator-content-blindness.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Rewriting the orchestrator audit gate to switch purely on typed envelopes, with crash-resume semantics and ref-based block reasons, is judgment-heavy skill authoring tightly coupled to the worker/verb contracts, favoring sonnet at high.\",\"confidence\":0.66},{\"task_id\":\"fn-1253-restore-orchestrator-content-blindness.4\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"An advisory fail-open PreToolUse guard closely copying the commit-guard deny-dispatcher pattern is well-specified pattern-following (explicitly not a security boundary), fitting a GPT tier at high for the path/Bash-vector and blast-radius care.\",\"confidence\":0.63},{\"task_id\":\"fn-1253-restore-orchestrator-content-blindness.5\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Doc alignment plus an ADR under this repo's terse prune-in-place, forward-facing, glossary-genre discipline is wording-and-idiom-sensitive taste work best served by sonnet at the bounded medium band.\",\"confidence\":0.6}]}\n"
+}

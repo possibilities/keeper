@@ -106,7 +106,7 @@ export function findShadowingWorkManifest(
  * Default {@link WorkerCellProbeDeps.probeShadow} impl: read the launcher plugin
  * config and scan its real `plugin_scan_dirs` for a shadowing non-cell `work`
  * manifest. Fail-safe on a missing/invalid config (mirrors
- * `resolveWorkerLaunchConfig`'s swallow-to-constants posture) — no scan dirs
+ * `resolveDispatchLaunchConfig`'s swallow-to-floor posture) — no scan dirs
  * means nothing to shadow. Producer-only.
  */
 export function defaultShadowingWorkProbe(): string | null {

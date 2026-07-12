@@ -415,21 +415,25 @@ export function lintHostTriplesV2(
 
 /**
  * The operator's launch triples read from the host files — the four harness
- * defaults, the worker/escalation machine-launch triples, and every panel's
- * ordered members. Extracted leniently as RAW strings ({@link extractHostTriples})
- * so the doctor is the sole validator; a present value is a candidate triple, an
- * absent one simply contributes no ref.
+ * defaults, the nested `dispatch:` per-verb machine-launch triples (ADR 0040;
+ * the retired `worker`/`escalation` keys are no longer harvested), and every
+ * panel's ordered members. Extracted leniently as RAW strings ({@link
+ * extractHostTriples}) so the doctor is the sole validator; a present value is
+ * a candidate triple, an absent one simply contributes no ref.
  */
 export interface HostTriples {
   defaults: Partial<Record<HarnessName, string>>;
-  worker: string | null;
-  escalation: string | null;
+  /** Raw `dispatch:` verb → triple string, keyed by whatever verb name the
+   *  operator wrote (lenient — not narrowed to the known {@link DispatchVerb}
+   *  set, so an unknown/future verb still lints rather than vanishing). */
+  dispatch: Record<string, string>;
   panels: Record<string, string[]>;
   panelDefault: string | null;
 }
 
 /** Flatten {@link HostTriples} into the labeled refs the doctor lints — defaults,
- *  worker, escalation, then every panel member in declaration order. */
+ *  every `dispatch:` verb (labeled `dispatch.<verb>`), then every panel member,
+ *  in declaration order. */
 export function hostTripleRefs(host: HostTriples): HostTripleRef[] {
   const refs: HostTripleRef[] = [];
   for (const harness of HARNESS_NAMES) {
@@ -438,11 +442,8 @@ export function hostTripleRefs(host: HostTriples): HostTripleRef[] {
       refs.push({ source: `${harness}_default`, raw: value });
     }
   }
-  if (host.worker !== null) {
-    refs.push({ source: "worker", raw: host.worker });
-  }
-  if (host.escalation !== null) {
-    refs.push({ source: "escalation", raw: host.escalation });
+  for (const [verb, raw] of Object.entries(host.dispatch)) {
+    refs.push({ source: `dispatch.${verb}`, raw });
   }
   for (const [panel, members] of Object.entries(host.panels)) {
     members.forEach((member, i) => {
@@ -465,17 +466,17 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 /**
  * Extract the host launch triples from the parsed `presets.yaml` + `panel.yaml`
  * bodies — LENIENT string harvesting only (the four `<harness>_default` pointers,
- * `worker`, `escalation`, the `panels` map, and its `default`), never a validating
- * parse. The doctor validates the harvested strings against the cube; anything
- * that is not a plain string is simply dropped here. Pure over the parsed bodies.
+ * the nested `dispatch:` verb map, the `panels` map, and its `default`), never a
+ * validating parse. The doctor validates the harvested strings against the cube;
+ * anything that is not a plain string is simply dropped here. Pure over the
+ * parsed bodies.
  */
 export function extractHostTriples(
   presetsRaw: unknown,
   panelRaw: unknown,
 ): HostTriples {
   const defaults: Partial<Record<HarnessName, string>> = {};
-  let worker: string | null = null;
-  let escalation: string | null = null;
+  const dispatch: Record<string, string> = {};
   const presets = asRecord(presetsRaw);
   if (presets !== null) {
     for (const harness of HARNESS_NAMES) {
@@ -484,8 +485,15 @@ export function extractHostTriples(
         defaults[harness] = value;
       }
     }
-    worker = asNonEmptyString(presets.worker);
-    escalation = asNonEmptyString(presets.escalation);
+    const dispatchRaw = asRecord(presets.dispatch);
+    if (dispatchRaw !== null) {
+      for (const [verb, value] of Object.entries(dispatchRaw)) {
+        const str = asNonEmptyString(value);
+        if (str !== null) {
+          dispatch[verb] = str;
+        }
+      }
+    }
   }
   const panels: Record<string, string[]> = {};
   let panelDefault: string | null = null;
@@ -503,5 +511,5 @@ export function extractHostTriples(
     }
     panelDefault = asNonEmptyString(panel.default);
   }
-  return { defaults, worker, escalation, panels, panelDefault };
+  return { defaults, dispatch, panels, panelDefault };
 }

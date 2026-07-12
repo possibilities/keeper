@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-sol",
+      "rationale": "Well-specified strict-parser + totality gate mirroring named precedents (panel-guidance-check, dual matrix parser); one clever but fully-designed cross-direction proxy invariant routes GPT-first to the top tier for hard bounded work.",
+      "task_id": "fn-1256-provider-equivalence-worker-pin.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Small doc revision that must fold equivalence into an existing SKILL.md's scope/idiom cleanly (not bolt on) with consistency-test-pinned phrasing \u2014 delicate in-repo prose is sonnet's judgment lane.",
+      "task_id": "fn-1256-provider-equivalence-worker-pin.2",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Contract-touching schema+RPC+reducer-fold change but a well-trodden codex_adoption recipe with explicit file:line refs; GPT-first multi-step agentic implementation at the contract-shaped xhigh band.",
+      "task_id": "fn-1256-provider-equivalence-worker-pin.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting multi-file dispatch cascade whose three-resolution-point agreement is a subtle silent-un-translate correctness invariant with fail-closed behavior \u2014 a nameable intelligence-bound opus gate.",
+      "task_id": "fn-1256-provider-equivalence-worker-pin.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Bounded single-surface claim-verb runtime capture with a fully-named contract; GPT-first everyday tier at high to handle the one normalize/mergeTaskState round-trip nuance the spec flags.",
+      "task_id": "fn-1256-provider-equivalence-worker-pin.5",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Judgment-heavy audit-methodology design \u2014 cohort exclusion of constrained runs, preserved blinding, and a new constrained-runs report section alongside a schema bump \u2014 is sonnet's under-specified-judgment workhorse lane.",
+      "task_id": "fn-1256-provider-equivalence-worker-pin.6",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-12T01:33:13.099000Z",
+  "epic_id": "fn-1256-provider-equivalence-worker-pin",
+  "input_hash": "582d9cff4f0425c92d28dd222f0b2afc18646eefd6fe4c45ce145e74e95e000a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1479384319,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1256-provider-equivalence-worker-pin.1\",\"tier\":\"high\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Well-specified strict-parser + totality gate mirroring named precedents (panel-guidance-check, dual matrix parser); one clever but fully-designed cross-direction proxy invariant routes GPT-first to the top tier for hard bounded work.\",\"confidence\":0.66},{\"task_id\":\"fn-1256-provider-equivalence-worker-pin.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Small doc revision that must fold equivalence into an existing SKILL.md's scope/idiom cleanly (not bolt on) with consistency-test-pinned phrasing \u2014 delicate in-repo prose is sonnet's judgment lane.\",\"confidence\":0.68},{\"task_id\":\"fn-1256-provider-equivalence-worker-pin.3\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"Contract-touching schema+RPC+reducer-fold change but a well-trodden codex_adoption recipe with explicit file:line refs; GPT-first multi-step agentic implementation at the contract-shaped xhigh band.\",\"confidence\":0.68},{\"task_id\":\"fn-1256-provider-equivalence-worker-pin.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting multi-file dispatch cascade whose three-resolution-point agreement is a subtle silent-un-translate correctness invariant with fail-closed behavior \u2014 a nameable intelligence-bound opus gate.\",\"confidence\":0.8},{\"task_id\":\"fn-1256-provider-equivalence-worker-pin.5\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Bounded single-surface claim-verb runtime capture with a fully-named contract; GPT-first everyday tier at high to handle the one normalize/mergeTaskState round-trip nuance the spec flags.\",\"confidence\":0.62},{\"task_id\":\"fn-1256-provider-equivalence-worker-pin.6\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy audit-methodology design \u2014 cohort exclusion of constrained runs, preserved blinding, and a new constrained-runs report section alongside a schema bump \u2014 is sonnet's under-specified-judgment workhorse lane.\",\"confidence\":0.66}]}\n"
+}

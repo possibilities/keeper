@@ -34,6 +34,7 @@ import {
   emitBirthRecord,
 } from "../birth-record";
 import { ensureCodexDirTrust } from "../codex-trust";
+import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import {
   HERMES_SHIM_EVENTS,
@@ -1216,6 +1217,7 @@ function emitRunCapture(
   deps: MainDeps,
   result: RunCaptureResult,
   outputPath: string | null = null,
+  reap?: () => void,
 ): never {
   if (outputPath !== null) {
     try {
@@ -1229,8 +1231,45 @@ function emitRunCapture(
       return deps.exit(bad.exitCode);
     }
   }
+  // Reap AFTER the result file landed and BEFORE the exit: the answer's
+  // durability never depends on the teardown, and a reap failure downgrades to
+  // a stderr note — it must never rewrite a captured result as a failed leg.
+  if (reap !== undefined) {
+    try {
+      reap();
+    } catch (err) {
+      deps.writeErr(
+        `agent: reap-window-on-terminal failed (window left resident): ${(err as Error).message}\n`,
+      );
+    }
+  }
   deps.write(`${JSON.stringify(result.envelope)}\n`);
   return deps.exit(result.exitCode);
+}
+
+/**
+ * The reap-on-terminal teardown for {@link emitRunCapture}: kills exactly the
+ * tmux window this run launched, via the socket-correct argv the launch
+ * returned. Undefined (no teardown) unless the posture was requested AND the
+ * launch actually opened a window — so a plain `agent run` stays resident and
+ * resumable, and only an explicitly one-shot leg tears itself down.
+ */
+function reapThunk(
+  deps: MainDeps,
+  requested: boolean,
+  killWindowCommand: string[] | null,
+): (() => void) | undefined {
+  if (!requested || killWindowCommand === null) {
+    return undefined;
+  }
+  return () => {
+    const result = deps.runTmuxCommandFn(killWindowCommand);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `tmux kill-window exited ${result.exitCode}: ${result.stderr.trim()}`,
+      );
+    }
+  };
 }
 
 /**
@@ -1375,11 +1414,12 @@ async function runRunCaptureSubcommand(
     );
   }
   const prompt = composed.prompt;
+  let killWindowCommand: string[] | null = null;
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),
-      launch: () =>
-        launchToResolvedHandle({
+      launch: () => {
+        const launched = launchToResolvedHandle({
           deps: launchHandleDeps(deps),
           agent,
           prompt,
@@ -1391,12 +1431,22 @@ async function runRunCaptureSubcommand(
             name: parsed.name ?? undefined,
           },
           stopTimeoutMs: parsed.stopTimeoutMs,
-        }),
+        });
+        if (launched.ok) {
+          killWindowCommand = launched.killWindowCommand ?? null;
+        }
+        return launched;
+      },
     },
     verbDeps,
     agent,
   );
-  return emitRunCapture(deps, result, parsed.output);
+  return emitRunCapture(
+    deps,
+    result,
+    parsed.output,
+    reapThunk(deps, parsed.reapWindowOnTerminal, killWindowCommand),
+  );
 }
 
 /** A successfully-parsed `agent run` argv (the `ok:true` arm of parseRunArgs). */
@@ -1577,11 +1627,12 @@ async function runResumeCaptureSubcommand(
         ? null
         : decision.resume_target;
 
+  let killWindowCommand: string[] | null = null;
   const result = await composeRunCapture(
     {
       ...runCaptureSeams(deps),
-      launch: () =>
-        launchToResolvedHandle({
+      launch: () => {
+        const launched = launchToResolvedHandle({
           deps: { ...launchHandleDeps(deps), cwd: resumeCwd },
           agent,
           prompt: composed.prompt,
@@ -1593,12 +1644,22 @@ async function runResumeCaptureSubcommand(
             childSessionId,
             sessionId: discoverySessionId,
           },
-        }),
+        });
+        if (launched.ok) {
+          killWindowCommand = launched.killWindowCommand ?? null;
+        }
+        return launched;
+      },
     },
     verbDeps,
     agent,
   );
-  return emitRunCapture(deps, result, parsed.output);
+  return emitRunCapture(
+    deps,
+    result,
+    parsed.output,
+    reapThunk(deps, parsed.reapWindowOnTerminal, killWindowCommand),
+  );
 }
 
 /**
@@ -1720,23 +1781,72 @@ function loadMatrixOrNull(deps: MainDeps): MatrixV2 | null {
   }
 }
 
+/** One resolved row of the `dispatch:` per-verb table `presets list` renders:
+ *  the operator-configured triple when the catalog's `dispatch.<verb>` row is
+ *  set, else the compiled floor rendered as its `claude::<model>::<effort>`
+ *  triple (the floor's implicit harness — dispatch is claude-only until
+ *  harness dispatch lands, ADR 0040); `handoff`'s fully-absent floor renders
+ *  `triple: null`. `floored` marks a row that fell through to the compiled
+ *  default rather than an operator-configured value. */
+interface DispatchListRow {
+  verb: DispatchVerb;
+  triple: string | null;
+  floored: boolean;
+}
+
+/**
+ * Build the per-verb `dispatch:` table for `presets list`: every {@link
+ * DispatchVerb} in {@link DISPATCH_FLOORS}' declared (canonical) order,
+ * resolved from the catalog's configured triple or the compiled floor — the
+ * SAME floor `resolveDispatchLaunchConfig` (`src/dispatch-launch-config.ts`)
+ * applies at dispatch time, so a floored row here is never a display-only lie
+ * about what actually launches. Pure over the catalog.
+ */
+function buildDispatchListRows(catalog: PresetCatalog): DispatchListRow[] {
+  const verbs = Object.keys(DISPATCH_FLOORS) as DispatchVerb[];
+  return verbs.map((verb) => {
+    const configured = catalog.dispatch?.[verb] ?? null;
+    if (configured !== null) {
+      return { verb, triple: formatTriple(configured), floored: false };
+    }
+    const floor = DISPATCH_FLOORS[verb];
+    if (floor.model === undefined || floor.effort === undefined) {
+      return { verb, triple: null, floored: true };
+    }
+    return {
+      verb,
+      triple: formatTriple({
+        harness: "claude",
+        model: floor.model,
+        effort: floor.effort,
+      }),
+      floored: true,
+    };
+  });
+}
+
 /**
  * `presets list [--json]`: the discovery surface — the virtual launch cube plus
- * the four harness defaults and the configured panels. Enumerates every triple the
- * host matrix defines (cell AND launch-only capabilities, launch ids fanned over
- * effective efforts, an axisless harness emitting `na`) grouped per harness, and
- * echoes the four `<harness>_default` triples and each panel's ordered members
- * read from the host files. Human-readable by default, `--json`
- * ({kind:"presets-list", harnesses, defaults, panels, default}) for machine
- * consumption. A malformed matrix / host file is fail-loud (exit 2); an ABSENT
- * matrix is the claude-only world with an empty cube, never a crash.
+ * the four harness defaults, the resolved `dispatch:` per-verb table, and the
+ * configured panels. Enumerates every triple the host matrix defines (cell AND
+ * launch-only capabilities, launch ids fanned over effective efforts, an
+ * axisless harness emitting `na`) grouped per harness, echoes the four
+ * `<harness>_default` triples and each panel's ordered members read from the
+ * host files, and resolves every dispatch verb to its configured triple or
+ * compiled floor ({@link buildDispatchListRows}), flagging a floored row.
+ * Human-readable by default, `--json` ({kind:"presets-list", harnesses,
+ * defaults, dispatch, panels, default}) for machine consumption. A malformed
+ * matrix / host file / preset catalog is fail-loud (exit 2); an ABSENT matrix
+ * is the claude-only world with an empty cube, never a crash.
  */
 function runPresetsList(deps: MainDeps, json: boolean): never {
   let matrix: MatrixV2 | null;
   let host: HostTriples;
+  let catalog: PresetCatalog;
   try {
     matrix = loadMatrixOrNull(deps);
     host = deps.loadHostTriplesFn();
+    catalog = deps.loadPresetCatalogFn();
   } catch (exc) {
     if (exc instanceof MatrixConfigError || exc instanceof ConfigError) {
       deps.writeErr(`Error: ${exc.message}\n`);
@@ -1753,6 +1863,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     hermes: host.defaults.hermes ?? null,
   };
   const panelNames = Object.keys(host.panels).sort();
+  const dispatchRows = buildDispatchListRows(catalog);
 
   if (json) {
     deps.write(
@@ -1769,6 +1880,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
           })),
         })),
         defaults,
+        dispatch: dispatchRows,
         panels: panelNames.map((name) => ({
           name,
           members: host.panels[name] ?? [],
@@ -1800,6 +1912,11 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
   lines.push(`Harness defaults (${presetsCatalogPath()}):`);
   for (const harness of ["claude", "codex", "pi", "hermes"] as const) {
     lines.push(`  ${harness}_default  ${defaults[harness] ?? "(unset)"}`);
+  }
+  lines.push(`Dispatch table (${presetsCatalogPath()}):`);
+  for (const row of dispatchRows) {
+    const tag = row.floored ? " (floored)" : "";
+    lines.push(`  ${row.verb}  ${row.triple ?? "(none)"}${tag}`);
   }
   lines.push(`Panels (${panelConfigPath()}):`);
   if (panelNames.length === 0) {
@@ -1928,13 +2045,13 @@ function renderHostTripleFinding(
 
 /**
  * `providers check`: the host-matrix doctor. Reports roster-vs-binary-reachability
- * drift and lints the operator's host launch triples (the four defaults, worker,
- * escalation, panel members) against the enumerable cube — one line per finding on
- * stderr, the structured findings as a JSON line on stdout. An ABSENT matrix is
- * clean (exit 0, claude-only defaults, nothing to drift). A malformed matrix OR a
- * malformed host triple is a tool fault (exit 1); a well-formed triple outside the
- * cube (or an unreachable binary) is drift (exit 9). Read-only — never mutates
- * config.
+ * drift and lints the operator's host launch triples (the four defaults, every
+ * `dispatch:` verb, panel members) against the enumerable cube — one line per
+ * finding on stderr, the structured findings as a JSON line on stdout. An ABSENT
+ * matrix is clean (exit 0, claude-only defaults, nothing to drift). A malformed
+ * matrix OR a malformed host triple is a tool fault (exit 1); a well-formed triple
+ * outside the cube (or an unreachable binary) is drift (exit 9). Read-only — never
+ * mutates config.
  */
 function runProvidersCheck(deps: MainDeps): never {
   let matrix: MatrixV2 | null;
@@ -1971,8 +2088,7 @@ function runProvidersCheck(deps: MainDeps): never {
     if (exc instanceof ConfigError) {
       host = {
         defaults: {},
-        worker: null,
-        escalation: null,
+        dispatch: {},
         panels: {},
         panelDefault: null,
       };

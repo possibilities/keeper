@@ -76,6 +76,8 @@ interface SeedJob {
   plan_verb?: string | null;
   last_event_id?: number | null;
   pid?: number | null;
+  /** The stored `(pid, start_time)` recycle-identity companion to `pid`. */
+  start_time?: string | null;
   /** Backend coords the topology deriver's projection-join fallback keys on
    *  (`(backend_exec_generation_id, backend_exec_pane_id)`). */
   backend_exec_type?: string | null;
@@ -96,9 +98,9 @@ function seedJob(db: Database, j: SeedJob): void {
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, close_kind, window_index,
        cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
-       last_event_id, pid, backend_exec_type, backend_exec_pane_id,
+       last_event_id, pid, start_time, backend_exec_type, backend_exec_pane_id,
        backend_exec_generation_id, harness, resume_target, adopted
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -117,6 +119,7 @@ function seedJob(db: Database, j: SeedJob): void {
       j.plan_verb ?? null,
       j.last_event_id ?? null,
       j.pid ?? null,
+      j.start_time ?? null,
       j.backend_exec_type ?? null,
       j.backend_exec_pane_id ?? null,
       j.backend_exec_generation_id ?? null,
@@ -913,6 +916,138 @@ test("deriveCurrentSet: resume_target is always the job_id; a never-named sessio
   // to the same job_id.
   expect(cur[0].resume_target).toBe("unnamed-uuid");
   expect(cur[0].label).toBe("unnamed-uuid");
+});
+
+// ---------------------------------------------------------------------------
+// deriveCurrentSet — recycle-safe `(pid, start_time)` liveness gate
+// ---------------------------------------------------------------------------
+
+test("deriveCurrentSet: a recycled pid (OS start_time differs from stored) is excluded, not surfaced as current", () => {
+  seedJob(kdb.db, {
+    job_id: "recycled",
+    state: "working",
+    title: "reboot-orphan",
+    backend_exec_session_id: "work",
+    pid: 4242,
+    start_time: "darwin:stored-boot-time",
+  });
+  // The probe reports the pid is alive (some OTHER process now owns it) but
+  // its start_time no longer matches what was stamped for this job — the
+  // reboot-recycled-pid scenario from the epic (fn-816/fn-1164 → Apple daemon).
+  const cur = deriveCurrentSet(kdb.db, {
+    isAlive: () => true,
+    readStartTime: () => "darwin:different-boot-time",
+  });
+  expect(cur.map((c) => c.job_id)).not.toContain("recycled");
+});
+
+test("deriveCurrentSet: a live (pid, start_time)-matched row is kept", () => {
+  seedJob(kdb.db, {
+    job_id: "still-live",
+    state: "working",
+    title: "genuinely-live",
+    backend_exec_session_id: "work",
+    pid: 4343,
+    start_time: "darwin:same-boot-time",
+  });
+  const cur = deriveCurrentSet(kdb.db, {
+    isAlive: () => true,
+    readStartTime: () => "darwin:same-boot-time",
+  });
+  expect(cur.map((c) => c.job_id)).toEqual(["still-live"]);
+});
+
+test("deriveCurrentSet: a verifiably dead pid (isAlive false) is excluded regardless of start_time", () => {
+  seedJob(kdb.db, {
+    job_id: "verified-dead",
+    state: "working",
+    title: "dead-process",
+    backend_exec_session_id: "work",
+    pid: 4444,
+    start_time: "darwin:stored-boot-time",
+  });
+  const cur = deriveCurrentSet(kdb.db, {
+    isAlive: () => false,
+    readStartTime: () => "darwin:stored-boot-time",
+  });
+  expect(cur.map((c) => c.job_id)).not.toContain("verified-dead");
+});
+
+test("deriveCurrentSet: null stored start_time on an alive pid resolves to KEEP (documented fail-direction) — not dropped, not treated as a phantom", () => {
+  seedJob(kdb.db, {
+    job_id: "no-start-time",
+    state: "working",
+    title: "pre-tracking-row",
+    backend_exec_session_id: "work",
+    pid: 4545,
+    start_time: null,
+  });
+  let readStartTimeCalled = false;
+  const cur = deriveCurrentSet(kdb.db, {
+    isAlive: () => true,
+    readStartTime: () => {
+      readStartTimeCalled = true;
+      return "darwin:whatever";
+    },
+  });
+  expect(cur.map((c) => c.job_id)).toEqual(["no-start-time"]);
+  // No stored start_time to compare against — the probe is never consulted.
+  expect(readStartTimeCalled).toBe(false);
+});
+
+test("deriveCurrentSet: a probe failure (readStartTime returns null) on an alive pid resolves to KEEP, the same conservative can't-tell stance", () => {
+  seedJob(kdb.db, {
+    job_id: "probe-failed",
+    state: "working",
+    title: "ps-glitch",
+    backend_exec_session_id: "work",
+    pid: 4646,
+    start_time: "darwin:stored-boot-time",
+  });
+  const cur = deriveCurrentSet(kdb.db, {
+    isAlive: () => true,
+    readStartTime: () => null,
+  });
+  expect(cur.map((c) => c.job_id)).toEqual(["probe-failed"]);
+});
+
+test("deriveCurrentSet: a NULL pid (never tracked) is kept unconditionally — the probe is never consulted", () => {
+  seedJob(kdb.db, {
+    job_id: "no-pid",
+    state: "working",
+    title: "harness-without-pid",
+    backend_exec_session_id: "work",
+    pid: null,
+  });
+  let isAliveCalled = false;
+  const cur = deriveCurrentSet(kdb.db, {
+    isAlive: () => {
+      isAliveCalled = true;
+      return false;
+    },
+  });
+  expect(cur.map((c) => c.job_id)).toEqual(["no-pid"]);
+  expect(isAliveCalled).toBe(false);
+});
+
+test("deriveCurrentSet: never throws when an injected probe itself throws — caught and treated as KEEP", () => {
+  seedJob(kdb.db, {
+    job_id: "throwy",
+    state: "working",
+    title: "bad-probe",
+    backend_exec_session_id: "work",
+    pid: 4747,
+    start_time: "darwin:stored-boot-time",
+  });
+  let cur: RestoreCandidate[] = [];
+  expect(() => {
+    cur = deriveCurrentSet(kdb.db, {
+      isAlive: () => {
+        throw new Error("boom");
+      },
+    });
+  }).not.toThrow();
+  expect(cur.map((c) => c.job_id)).toEqual(["throwy"]);
 });
 
 test("deriveCurrentSet: terminal row with later live-pid backend evidence is current", () => {

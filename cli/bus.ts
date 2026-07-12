@@ -8,7 +8,8 @@
  *   - `chat send <target> <msg|->` — message one agent (current OR historical name,
  *                                    or the role address `planner@<epic_id>`);
  *                                    synchronous, prints the result, exit 1 on a miss.
- *   - `watch`                      — long-lived inbox subscriber (the Monitor command).
+ *   - `watch`                      — long-lived inbox subscriber (Claude Monitor or
+ *                                    tracked-Pi extension child).
  *
  * `chat` is a reserved SUB-NAMESPACE token so a future `bus pair …` tenant slots in
  * without a routing change; the wire envelope already carries the `namespace` axis.
@@ -91,11 +92,14 @@ Usage:
   keeper bus chat send <target> <msg|->   Message one agent (current or former name)
   keeper bus wake <planner@epic>          Resume an offline epic-creator session so a
                                           queued escalation is redelivered (client-side)
-  keeper bus watch                        Long-lived inbox subscriber (Monitor command)
+  keeper bus watch                        Long-lived inbox subscriber
+  keeper bus watch --json --lifetime-stdin  Pi extension transport (machine-framed,
+                                            parent-lifetime-bound)
 
 Your inbox is already open:
-  The keeper plugin arms 'keeper bus watch' as a session Monitor before your
-  first prompt. NEVER start a watcher/listener, NEVER run 'keeper bus watch'
+  Keeper arms 'keeper bus watch' before your first prompt: as a plugin Monitor
+  in Claude and as a session-scoped extension child in tracked Pi. NEVER start a
+  watcher/listener, NEVER run 'keeper bus watch'
   yourself, NEVER check whether you're connected — just WAIT for events.
   'Wait' means yield, not spin: keep doing other work or hand back, don't poll.
   When a human says you'll get a message from someone, you are already
@@ -162,9 +166,9 @@ Flags:
 /** Terse operator runbook (agent-facing), distinct from the full `--help`. */
 export const AGENT_HELP = `keeper bus — operator runbook (agent-facing)
 
-Local inter-agent message bus. Your inbox is ALREADY open (the keeper plugin arms
-'keeper bus watch' as a session Monitor) — never start a watcher, never pre-check
-'list' before a send, just send and yield.
+Local inter-agent message bus. Your inbox is ALREADY open (a plugin Monitor in
+Claude; a session-scoped extension child in tracked Pi) — never start a watcher,
+never pre-check 'list' before a send, just send and yield.
 
   keeper bus chat send <target> "<msg>"   # <target>: current/former name, session/channel id, or planner@<epic>
   keeper bus chat send <target> -         # read the message body from stdin
@@ -189,7 +193,7 @@ export type BusCommand =
   | { kind: "agent-help" }
   | { kind: "usage"; error: string }
   | { kind: "list" }
-  | { kind: "watch" }
+  | { kind: "watch"; json?: true; lifetimeStdin?: true }
   | { kind: "send"; target: string; message: string }
   | { kind: "wake"; target: string };
 
@@ -214,8 +218,24 @@ export function parseBusArgv(argv: string[]): BusCommand {
   switch (verb) {
     case "list":
       return { kind: "list" };
-    case "watch":
-      return { kind: "watch" };
+    case "watch": {
+      const flags = argv.slice(1);
+      const allowed = new Set(["--json", "--lifetime-stdin"]);
+      const unknown = flags.find((flag) => !allowed.has(flag));
+      if (unknown !== undefined) {
+        return { kind: "usage", error: `unknown watch flag '${unknown}'` };
+      }
+      if (new Set(flags).size !== flags.length) {
+        return { kind: "usage", error: "duplicate watch flag" };
+      }
+      return {
+        kind: "watch",
+        ...(flags.includes("--json") ? { json: true as const } : {}),
+        ...(flags.includes("--lifetime-stdin")
+          ? { lifetimeStdin: true as const }
+          : {}),
+      };
+    }
     case "wake": {
       const target = argv[1];
       if (target === undefined || target.length === 0) {
@@ -364,7 +384,12 @@ export function spillPointerLine(
   fullChars: number,
   path: string,
 ): string {
-  return `${head}${preview}… ⟦full +${fullChars} chars → ${path}⟧`;
+  const suffix = `… ⟦full +${fullChars} chars → ${path}⟧`;
+  const previewBudget = Math.max(
+    0,
+    NOTIFY_LINE_BUDGET - head.length - suffix.length,
+  );
+  return `${head}${preview.slice(0, previewBudget).trimEnd()}${suffix}`;
 }
 
 /**
@@ -380,7 +405,9 @@ export function spillFileName(tsMs: number, from: string): string {
           .replace(/[-:]/g, "")
           .replace(/\.\d+Z$/, "Z")
       : "msg";
-  const token = (from || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
+  const token = (from || "unknown")
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .slice(0, 64);
   return `${stamp}-${token}.md`;
 }
 
@@ -780,13 +807,18 @@ async function busRoundTrip<T>(
  *  WITHOUT joining the registry or taking over the agent's live `watch` channel
  *  (which shares the same `(pid, start_time)` identity). A `watch` registers
  *  with `sendOnly:false` so it owns a durable, subscribable channel. */
-function registerFrame(sendOnly = false): object {
+export function registerFrame(
+  sendOnly = false,
+  env: NodeJS.ProcessEnv = process.env,
+): object {
+  const sessionId = (env.KEEPER_JOB_ID ?? "").trim();
   return {
     op: "register",
     namespace: CHAT_NAMESPACE,
     namespaces: [CHAT_NAMESPACE],
     pid: process.pid,
     send_only: sendOnly,
+    ...(sessionId === "" ? {} : { session_id: sessionId }),
   };
 }
 
@@ -919,20 +951,78 @@ export function pruneInbox(dir: string, nowMs: number = Date.now()): void {
  * spilled to a file with a compact pointer line otherwise. Spill failure falls back
  * to the (harness-clipped) inline line: a clipped message beats a dropped one.
  */
-export function emitMessage(msg: InboundMessage, inboxDir: string): void {
+export function renderMessageNotification(
+  msg: InboundMessage,
+  inboxDir: string,
+): string {
   const decision = renderDecision(msg);
   if (decision.kind === "inline") {
-    process.stdout.write(`${decision.line}\n`);
-    return;
+    return decision.line;
   }
   const path = spillBody(inboxDir, msg, decision.head, decision.body);
   if (path === null) {
-    process.stdout.write(`${decision.head}${decision.body}\n`);
-    return;
+    const suffix = "… ⟦full message unavailable⟧";
+    const previewBudget = Math.max(
+      0,
+      NOTIFY_LINE_BUDGET - decision.head.length - suffix.length,
+    );
+    return `${decision.head}${decision.preview
+      .slice(0, previewBudget)
+      .trimEnd()}${suffix}`;
   }
-  process.stdout.write(
-    `${spillPointerLine(decision.head, decision.preview, decision.body.length, path)}\n`,
+  const homePrefix = `${homedir()}/`;
+  const displayPath = path.startsWith(homePrefix)
+    ? `~/${path.slice(homePrefix.length)}`
+    : path;
+  return spillPointerLine(
+    decision.head,
+    decision.preview,
+    decision.body.length,
+    displayPath,
   );
+}
+
+export function emitMessage(msg: InboundMessage, inboxDir: string): void {
+  process.stdout.write(`${renderMessageNotification(msg, inboxDir)}\n`);
+}
+
+/** Pi's extension consumes one escaped notification per physical stdout line. */
+export function emitJsonMessage(msg: InboundMessage, inboxDir: string): void {
+  process.stdout.write(
+    `${JSON.stringify({
+      type: "agent_bus_message",
+      line: renderMessageNotification(msg, inboxDir),
+    })}\n`,
+  );
+}
+
+interface LifetimeInput {
+  once(
+    event: "end" | "close" | "error",
+    listener: () => void,
+  ): unknown;
+  resume(): unknown;
+}
+
+/**
+ * Bind a watch process to its parent's stdin pipe. EOF is a kernel-owned parent
+ * death signal, so an abruptly killed Pi cannot leave an orphan subscriber that
+ * remains falsely present on the Agent Bus.
+ */
+export function armLifetimeStdin(
+  input: LifetimeInput = process.stdin,
+  exit: (code: number) => void = (code) => process.exit(code),
+): void {
+  let exited = false;
+  const finish = (): void => {
+    if (exited) return;
+    exited = true;
+    exit(0);
+  };
+  input.once("end", finish);
+  input.once("close", finish);
+  input.once("error", finish);
+  input.resume();
 }
 
 /** Persist a full message body under the inbox; return its path or null. */
@@ -965,15 +1055,16 @@ function spillBody(
  * {@link emitMessage}. On disconnect it reconnects with a bounded backoff — a watch
  * must survive a daemon bounce. Never returns (the Monitor command runs forever).
  */
-async function runWatch(sockPath: string): Promise<never> {
+async function runWatch(sockPath: string, json = false): Promise<never> {
   const inboxDir = resolveInboxDir();
   pruneInbox(inboxDir);
+  const emit = json ? emitJsonMessage : emitMessage;
 
   // Reconnect forever — a watch outlives daemon bounces. Bounded backoff.
   let backoffMs = 250;
   for (;;) {
     try {
-      await watchOnce(sockPath, inboxDir);
+      await watchOnce(sockPath, inboxDir, emit);
       backoffMs = 250; // a clean session resets the backoff
     } catch {
       // connect/transport fault — fall through to backoff + retry.
@@ -991,7 +1082,11 @@ type FrameWriter = { write: (data: string) => number };
  * connection stays open with no heartbeat traffic — the server keys liveness on
  * socket-close, so a silent live watcher is never reaped.
  */
-function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
+function watchOnce(
+  sockPath: string,
+  inboxDir: string,
+  emit: (msg: InboundMessage, inboxDir: string) => void,
+): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let remainder = "";
     let settled = false;
@@ -1022,7 +1117,7 @@ function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
             } catch {
               continue;
             }
-            handleWatchFrame(s, f, inboxDir);
+            handleWatchFrame(s, f, inboxDir, emit);
           }
         },
         close() {
@@ -1041,6 +1136,7 @@ export function handleWatchFrame(
   s: FrameWriter,
   f: Record<string, unknown>,
   inboxDir: string,
+  emit: (msg: InboundMessage, inboxDir: string) => void = emitMessage,
 ): void {
   if (f.type === "ack" && f.op === "register") {
     s.write(`${JSON.stringify({ op: "subscribe" })}\n`);
@@ -1049,7 +1145,7 @@ export function handleWatchFrame(
   // A delivered event envelope (server → subscriber). Control-namespace lifecycle
   // events (join/part/reap/takeover) are not inter-agent messages — skip them.
   if (f.event === "message" && f.namespace !== "bus" && isInbound(f)) {
-    emitMessage(toInbound(f), inboxDir);
+    emit(toInbound(f), inboxDir);
   }
 }
 
@@ -1146,7 +1242,8 @@ export async function main(argv: string[]): Promise<void> {
       return process.exit(exitCode);
     }
     case "watch": {
-      await runWatch(sockPath);
+      if (cmd.lifetimeStdin === true) armLifetimeStdin();
+      await runWatch(sockPath, cmd.json === true);
       break; // unreachable — runWatch never returns
     }
   }

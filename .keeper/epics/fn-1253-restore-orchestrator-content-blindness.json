@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "closer_done_at": "2026-07-12T02:42:58.659000Z",
+  "created_at": "2026-07-11T22:39:20.658000Z",
+  "depends_on_epics": [],
+  "id": "fn-1253-restore-orchestrator-content-blindness",
+  "last_validated_at": "2026-07-11T22:42:28.018000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "done",
+  "title": "Restore orchestrator content blindness",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-12T02:42:58.659000Z"
+}

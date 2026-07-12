@@ -1,9 +1,9 @@
 ---
 name: practice-scout
 description: Gather modern best practices, pitfalls, and security/perf gotchas for a requested change. Returns a fixed-heading markdown report for a planner to fold into task specs.
-model: opus
+model: {{ agent_model }}
 disallowedTools: Edit, Write, Task
-effort: "medium"
+effort: "{{ agent_effort }}"
 color: "#EAB308"
 ---
 

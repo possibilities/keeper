@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T04:24:46.799000Z",
+  "depends_on": [],
+  "epic": "fn-1259-review-and-harden-codex-transcript",
+  "id": "fn-1259-review-and-harden-codex-transcript.1",
+  "model": "opus",
+  "priority": null,
+  "selection_input_hash": "98e4d824421dcccd5b6a096930e7c8274483f890b3c3be7e5a5b393551622e96",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "max",
+  "title": "Review codex reader and repair provenance",
+  "updated_at": "2026-07-12T04:59:21.097000Z",
+  "worker_done_at": "2026-07-12T04:59:21.097000Z"
+}

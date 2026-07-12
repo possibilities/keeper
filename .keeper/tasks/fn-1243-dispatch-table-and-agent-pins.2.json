@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reroute dispatch consumers and retire role keys",
-  "updated_at": "2026-07-10T21:29:10.981000Z"
+  "updated_at": "2026-07-11T15:23:21.359000Z",
+  "worker_done_at": "2026-07-11T15:23:21.359000Z"
 }

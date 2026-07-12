@@ -33,5 +33,5 @@ Cases: a configured dispatch table renders fully in list output; a floored verb 
 - [ ] Both verbs pass against the committed v2 example matrix under fixture config
 
 ## Done summary
-
+extractHostTriples/hostTripleRefs now harvest the dispatch: block as dispatch.<verb> refs (worker/escalation retired); providers check lints every dispatch triple against the enumerable cube; presets list resolves each verb to its configured triple or compiled floor, flagging floored rows, in human and JSON output.
 ## Evidence

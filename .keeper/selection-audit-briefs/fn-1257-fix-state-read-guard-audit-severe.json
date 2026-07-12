@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 2,
+        "insertions": 75
+      },
+      "done_summary": "Exempted the sanctioned keeper plan seam from the state-read guard's Bash vector so a marked orchestrator's own AUDIT_SEVERE block (finding_ref audits path in --reason) is allowed, while genuine tree reads \u2014 including a read chained behind a plan invocation \u2014 stay denied. Added guard regression tests (classifier + subprocess ladder).",
+      "input_hash": "e9ef5232ae88ba149902867590e70a85d1727083c9a543c04355132ae9c6d445",
+      "model": "opus",
+      "spec_chars": 1755,
+      "spec_md": "## Description\n\nFixes F1 (with F5's regression test folded in). The state-read guard's\nBash vector `commandTouchesStateTree` (`plugins/plan/plugin/hooks/state-read-guard.ts:56`,\n`STATE_TREE_TOKEN = /\\.keeper[\\\\/]state[\\\\/](?:briefs|audits)\\b/`) tests the\nwhole command string, so the work gate's own escalation at\n`plugins/plan/template/skills/work.md.tmpl:232` \u2014\n`keeper plan block <task_id> --reason \"AUDIT_SEVERE: finding_ref=<path>\"`,\nwhere `<path>` is `taskFindingPath` = `audits/<epic>/tasks/<task>.json`\n(`plugins/plan/src/audit_artifacts.ts:204`) \u2014 is denied in a work/close-marked\nmain context. Exempt the sanctioned typed seam: skip the token scan when\nthe command is a `keeper plan \u2026` invocation (those verbs ARE the\ncontent-blind seam and never cat/grep the tree). Keep the deny in force\nfor genuine tree reads.\n\nFiles:\n- plugins/plan/plugin/hooks/state-read-guard.ts (commandTouchesStateTree / STATE_TREE_TOKEN)\n- plugins/plan/test/state-read-guard.test.ts (add the regression test \u2014 F5)\n\n## Acceptance\n\n- [ ] `commandTouchesStateTree` returns false for a `keeper plan block --reason \"AUDIT_SEVERE: finding_ref=<audits-path>\"` command (the sanctioned seam is allowed).\n- [ ] `commandTouchesStateTree` still returns true for a bare `cat <audits-path>` / `grep \u2026 <briefs-path>` command from a marked orchestrator.\n- [ ] A new state-read-guard test asserts both directions above.\n\n## Done summary\nExempted the sanctioned keeper plan seam from the state-read guard's Bash vector so a marked orchestrator's own AUDIT_SEVERE block (finding_ref audits path in --reason) is allowed, while genuine tree reads \u2014 including a read chained behind a plan invocation \u2014 stay denied. Added guard regression tests (classifier + subprocess ladder).\n## Evidence\n",
+      "task_id": "fn-1257-fix-state-read-guard-audit-severe.1",
+      "tier": "xhigh",
+      "title": "Exempt plan-block from guard"
+    }
+  ],
+  "created_at": "2026-07-12T03:01:47.835000Z",
+  "epic_id": "fn-1257-fix-state-read-guard-audit-severe",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "e9ef5232ae88ba149902867590e70a85d1727083c9a543c04355132ae9c6d445",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

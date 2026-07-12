@@ -159,7 +159,7 @@ a wedged leg never loops forever:
 
 ```bash
 # Issue as its own Bash call, timeout: 600000:
-VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540)
+VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540s)
 WAIT_RC=$?
 # exit 0   → every leg terminal; $VERDICT is the verdict JSON
 # exit 124 → chunk elapsed; issue the SAME command again as a NEW Bash call

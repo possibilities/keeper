@@ -227,6 +227,29 @@ function seedTerminalPanel(): string {
   );
   writeFileSync(
     join(pdir, "codex.yaml"),
+    `${JSON.stringify({ schema_version: 1, outcome: "completed", message: "codex answer body" })}\n`,
+  );
+  return pdir;
+}
+
+/** Seed a scratch panel dir whose single leg "completed" with no answer text. */
+function seedEmptyMessagePanel(): string {
+  const pdir = mkdtempSync(join(dir, "panel-"));
+  const manifest: PanelManifest = {
+    dir: pdir,
+    slug: "empty-run",
+    members: [
+      {
+        name: "codex",
+        harness: "codex",
+        yaml: join(pdir, "codex.yaml"),
+        pidfile: join(pdir, "codex.pidfile"),
+      },
+    ],
+  };
+  writeFileSync(join(pdir, "manifest.json"), JSON.stringify(manifest));
+  writeFileSync(
+    join(pdir, "codex.yaml"),
     `${JSON.stringify({ schema_version: 1, outcome: "completed", message: null })}\n`,
   );
   return pdir;
@@ -249,6 +272,23 @@ test("agent panel wait: terminal panel → exit 0 + verdict JSON (content-blind)
   expect(v.members.map((m) => m.name)).toEqual(["opus", "codex"]);
   // The verdict never leaks a panelist's answer.
   expect(r.stdout).not.toContain("SECRET_ANSWER_DO_NOT_LEAK");
+});
+
+test("agent panel wait: completed leg with empty message → fail (empty_message)", async () => {
+  const pdir = seedEmptyMessagePanel();
+  const r = await runAgent([
+    "panel",
+    "wait",
+    "--run-dir",
+    pdir,
+    "--chunk",
+    "540s",
+  ]);
+  expect(r.code).toBe(0);
+  const v: PanelVerdict = JSON.parse(r.stdout.trim());
+  expect(v.ok).toBe(false);
+  expect(v.members[0]?.status).toBe("fail");
+  expect(v.members[0]?.reason).toBe("empty_message");
 });
 
 test("agent panel wait: missing manifest → exit 2", async () => {
@@ -1306,7 +1346,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
     );
     writeFileSync(
       join(pdir, "done.yaml"),
-      JSON.stringify({ outcome: "completed" }),
+      JSON.stringify({ outcome: "completed", message: "done answer" }),
     );
     writeFileSync(
       join(pdir, "bad.yaml"),
@@ -1357,7 +1397,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
     ]);
     writeFileSync(
       join(pdir, "x.yaml"),
-      JSON.stringify({ outcome: "completed" }),
+      JSON.stringify({ outcome: "completed", message: "x answer" }),
     );
     const { deps, out } = makeProbeDeps({ now: 0 });
     expect(panelStatus({ dir: pdir }, deps)).toBe(0);
@@ -1433,7 +1473,7 @@ function seedDurableTerminal(slug: string): string {
   );
   writeFileSync(
     join(panelDir, "opus.yaml"),
-    JSON.stringify({ outcome: "completed" }),
+    JSON.stringify({ outcome: "completed", message: "opus answer" }),
   );
   return panelDir;
 }

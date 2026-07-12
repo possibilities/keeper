@@ -34,5 +34,5 @@ The gate must fail on: an 11th template with no pin, a 12th pin with no template
 - [ ] plugin-composition-map.md and problem-codes.md describe the per-verb table, pin injection, and the new lint findings as current behavior
 
 ## Done summary
-
+Added a host-blind drift-gate test asserting the template↔agent_pins partition (total, disjoint, frontmatter-equals-pin) and swept install.md/plugin-composition-map.md/problem-codes.md to describe the dispatch: table + agent_pins as current behavior, including the worker/escalation migration hint.
 ## Evidence

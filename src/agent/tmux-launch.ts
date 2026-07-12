@@ -173,6 +173,9 @@ export interface TmuxLaunchResult {
   /** Path to launch.sh; null when `--no-artifacts` inlined the launch command. */
   launchScript: string | null;
   attachCommand: string[] | null;
+  /** Socket-correct argv that kills exactly the window this launch opened —
+   *  the reap-on-terminal posture's teardown handle. */
+  killWindowCommand: string[] | null;
   message: string | null;
 }
 
@@ -576,6 +579,7 @@ export function launchKeeperAgentInTmux(
       paneId: target.paneId,
       launchScript,
       attachCommand: [...tmuxBase, "attach-session", "-t", target.session],
+      killWindowCommand: [...tmuxBase, "kill-window", "-t", target.windowId],
       message: startedMessage(target.session, target.windowId, tmuxBase),
     };
   }
@@ -607,6 +611,7 @@ export function launchKeeperAgentInTmux(
       paneId: target.paneId,
       launchScript,
       attachCommand: [...tmuxBase, "attach-session", "-t", target.session],
+      killWindowCommand: [...tmuxBase, "kill-window", "-t", target.windowId],
       message: null,
     };
   }
@@ -620,6 +625,7 @@ export function launchKeeperAgentInTmux(
       paneId: target.paneId,
       launchScript,
       attachCommand: [...tmuxBase, "attach-session", "-t", target.session],
+      killWindowCommand: [...tmuxBase, "kill-window", "-t", target.windowId],
       message: startedMessage(target.session, target.windowId, tmuxBase),
     };
   }
@@ -642,6 +648,7 @@ export function launchKeeperAgentInTmux(
     paneId: target.paneId,
     launchScript,
     attachCommand: [...tmuxBase, "attach-session", "-t", target.session],
+    killWindowCommand: [...tmuxBase, "kill-window", "-t", target.windowId],
     message: null,
   };
 }

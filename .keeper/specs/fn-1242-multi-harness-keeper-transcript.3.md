@@ -40,5 +40,5 @@ Synthetic day-dir fixtures under a tmpdir codex home injected via env. Cover: wi
 - [ ] `bun test` green including the new codex suite.
 
 ## Done summary
-
+Added the codex TranscriptReader (src/transcript/codex.ts) behind the harness registry: cwd-scoped day-dir listing with mtime pre-filter and bounded head-slice reads, filename-uuid find, and a full response_item/event_msg spine mapping including agent_reasoning-to-thinking, developer-to-system, encrypted-reasoning skip, and event_msg-duplicate suppression with firstPrompt preference. Covered by test/transcript-codex.test.ts (20 tests).
 ## Evidence

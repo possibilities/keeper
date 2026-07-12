@@ -52,5 +52,5 @@ Extend the fake Pi API with command registration, session manager identity/leaf 
 - [ ] `bun test test/pi-extension.test.ts` and the full fast suite are green without real model, process, daemon, worker, socket, git, or tmux activity.
 
 ## Done summary
-
+Registered /rename inside the KEEPER_JOB_ID arming boundary: consumes the branch-aware keeper transcript pi turn contract, resolves openai-codex/gpt-5.3-codex-spark through Pi's OAuth-aware model registry with a bounded direct completion, and revalidates session/leaf/title before calling pi.setSessionName() exactly once. Every non-empty session_info_changed title mints a lifecycle-neutral TranscriptTitle event for Keeper's existing title projection/renamer; session_start replays the current title to self-heal a missed write.
 ## Evidence

@@ -26,6 +26,13 @@ const CWD = mkdtempSync(join(tmpdir(), "planctl-consistency-"));
 // promote.sh render before the suite runs, so real-checkout coverage is preserved.
 const WORKERS_RENDERED = existsSync(join(REPO, "workers"));
 
+// agents/ is likewise gitignored — the static plan agents render from
+// template/agents/*.md.tmpl with their model/effort injected from the host
+// matrix agent_pins. A clean checkout has none until render-plugin-templates
+// runs (install.sh / promote.sh render first), so the frontmatter/body checks
+// below gate on the rendered artifact's presence rather than failing hard.
+const AGENTS_RENDERED = existsSync(join(REPO, "agents", "model-selector.md"));
+
 // Multi-word verb prefixes the CLI exposes as nested groups. When a `keeper plan
 // <words…>` reference starts with one of these, both words form the verb path.
 const MULTIWORD_PREFIXES = new Set([
@@ -285,8 +292,8 @@ describe("cell-review skill consistency", () => {
   });
 });
 
-describe("model-selector agent frontmatter", () => {
-  test("exists as a tracked agent named model-selector", () => {
+describe.skipIf(!AGENTS_RENDERED)("model-selector agent frontmatter", () => {
+  test("exists as a rendered agent named model-selector", () => {
     expect(existsSync(MODEL_SELECTOR_AGENT)).toBe(true);
     const fm = parseFrontmatter(frontmatterBlock(MODEL_SELECTOR_AGENT));
     expect(fm.name).toBe("model-selector");
@@ -521,49 +528,55 @@ describe("close skill blocking-follow-up gate contract", () => {
 
 const CLOSE_PLANNER = join(REPO, "agents", "close-planner.md");
 
-describe("close-planner follow-up template tier/model shape", () => {
-  const matrix = effectiveMatrix();
+describe.skipIf(!AGENTS_RENDERED)(
+  "close-planner follow-up template tier/model shape",
+  () => {
+    const matrix = effectiveMatrix();
 
-  test("template block carries both `tier:` and `model:` lines with the full configured enums", () => {
-    const text = readFileSync(CLOSE_PLANNER, "utf-8");
-    const tierLine = new RegExp(
-      `tier: <${matrix.efforts.join("\\|")}>\\s+# REQUIRED`,
-    );
-    const modelLine = new RegExp(
-      `model: <${matrix.models.join("\\|")}>\\s+# REQUIRED`,
-    );
-    expect(text).toMatch(tierLine);
-    expect(text).toMatch(modelLine);
-  });
+    test("template block carries both `tier:` and `model:` lines with the full configured enums", () => {
+      const text = readFileSync(CLOSE_PLANNER, "utf-8");
+      const tierLine = new RegExp(
+        `tier: <${matrix.efforts.join("\\|")}>\\s+# REQUIRED`,
+      );
+      const modelLine = new RegExp(
+        `model: <${matrix.models.join("\\|")}>\\s+# REQUIRED`,
+      );
+      expect(text).toMatch(tierLine);
+      expect(text).toMatch(modelLine);
+    });
 
-  test("task-spec rules prose requires both tier and model", () => {
-    const text = readFileSync(CLOSE_PLANNER, "utf-8");
-    expect(text).toContain("`tier` and `model` are both required per task");
-  });
-});
+    test("task-spec rules prose requires both tier and model", () => {
+      const text = readFileSync(CLOSE_PLANNER, "utf-8");
+      expect(text).toContain("`tier` and `model` are both required per task");
+    });
+  },
+);
 
-describe("close-planner blocking-decision contract", () => {
-  const body = () => readFileSync(CLOSE_PLANNER, "utf-8");
+describe.skipIf(!AGENTS_RENDERED)(
+  "close-planner blocking-decision contract",
+  () => {
+    const body = () => readFileSync(CLOSE_PLANNER, "utf-8");
 
-  test("verdict shape carries the blocks_closing / blocks_closing_reason pair", () => {
-    const text = body();
-    expect(text).toContain('"blocks_closing"');
-    expect(text).toContain('"blocks_closing_reason"');
-  });
+    test("verdict shape carries the blocks_closing / blocks_closing_reason pair", () => {
+      const text = body();
+      expect(text).toContain('"blocks_closing"');
+      expect(text).toContain('"blocks_closing_reason"');
+    });
 
-  test("the rubric is consumer-observable with a default-to-not-block", () => {
-    const text = body();
-    expect(text).toContain("consumer-observable");
-    expect(text).toContain("When torn, do not block");
-  });
+    test("the rubric is consumer-observable with a default-to-not-block", () => {
+      const text = body();
+      expect(text).toContain("consumer-observable");
+      expect(text).toContain("When torn, do not block");
+    });
 
-  test("the blocking case drops the source dep and adds an Overview provenance line", () => {
-    const text = body();
-    // The blocking follow-up omits the source-link the finalize verb substitutes.
-    expect(text).toMatch(/omit.*depends_on_epics/i);
-    expect(text).toContain("blocks the close of");
-  });
-});
+    test("the blocking case drops the source dep and adds an Overview provenance line", () => {
+      const text = body();
+      // The blocking follow-up omits the source-link the finalize verb substitutes.
+      expect(text).toMatch(/omit.*depends_on_epics/i);
+      expect(text).toContain("blocks the close of");
+    });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // panel skill — thin shim spawns plan:panel-runner; the runner agent's
@@ -574,8 +587,8 @@ const PANEL_RUNNER = join(REPO, "agents", "panel-runner.md");
 const PANEL_SKILL = join(REPO, "skills", "panel", "SKILL.md");
 const PANEL_REFERENCE = join(REPO, "skills", "panel", "references", "panel.md");
 
-describe("panel-runner agent frontmatter", () => {
-  test("exists as a tracked agent named panel-runner", () => {
+describe.skipIf(!AGENTS_RENDERED)("panel-runner agent frontmatter", () => {
+  test("exists as a rendered agent named panel-runner", () => {
     expect(existsSync(PANEL_RUNNER)).toBe(true);
     const fm = parseFrontmatter(frontmatterBlock(PANEL_RUNNER));
     expect(fm.name).toBe("panel-runner");
@@ -593,43 +606,46 @@ describe("panel-runner agent frontmatter", () => {
   });
 });
 
-describe("panel-runner wait discipline is drop-hardened", () => {
-  const body = () => readFileSync(PANEL_RUNNER, "utf-8");
+describe.skipIf(!AGENTS_RENDERED)(
+  "panel-runner wait discipline is drop-hardened",
+  () => {
+    const body = () => readFileSync(PANEL_RUNNER, "utf-8");
 
-  test("the wait example carries the explicit Bash tool timeout parameter at its 10-min ceiling", () => {
-    expect(body()).toContain("timeout: 600000");
-  });
+    test("the wait example carries the explicit Bash tool timeout parameter at its 10-min ceiling", () => {
+      expect(body()).toContain("timeout: 600000");
+    });
 
-  test("states the verified harness defaults (120s default window, 600000ms ceiling)", () => {
-    const text = body();
-    expect(text).toContain("120000ms");
-    expect(text).toContain("600000ms");
-  });
+    test("states the verified harness defaults (120s default window, 600000ms ceiling)", () => {
+      const text = body();
+      expect(text).toContain("120000ms");
+      expect(text).toContain("600000ms");
+    });
 
-  test("documents the auto-background envelope as a tripwire", () => {
-    const text = body();
-    expect(text).toContain("tripwire");
-    expect(text).toContain("Command running in background");
-  });
+    test("documents the auto-background envelope as a tripwire", () => {
+      const text = body();
+      expect(text).toContain("tripwire");
+      expect(text).toContain("Command running in background");
+    });
 
-  test("bounds all re-issues with a stated backstop terminating in PANEL_RUN_FAILED", () => {
-    const text = body();
-    expect(text).toContain("backstop");
-    expect(text).toContain("PANEL_RUN_FAILED");
-  });
+    test("bounds all re-issues with a stated backstop terminating in PANEL_RUN_FAILED", () => {
+      const text = body();
+      expect(text).toContain("backstop");
+      expect(text).toContain("PANEL_RUN_FAILED");
+    });
 
-  test("forbids ending the turn while legs are non-terminal (house wording)", () => {
-    expect(body()).toContain("never end a turn text-only to wait");
-  });
+    test("forbids ending the turn while legs are non-terminal (house wording)", () => {
+      expect(body()).toContain("never end a turn text-only to wait");
+    });
 
-  test("Step 6 return is positively marked with a first-line PANEL_ANSWER", () => {
-    expect(body()).toContain("PANEL_ANSWER");
-  });
+    test("Step 6 return is positively marked with a first-line PANEL_ANSWER", () => {
+      expect(body()).toContain("PANEL_ANSWER");
+    });
 
-  test("drops the false claim that a chunk is safe without the explicit timeout parameter", () => {
-    expect(body()).not.toContain("safely under Bash's hard 10-min");
-  });
-});
+    test("drops the false claim that a chunk is safe without the explicit timeout parameter", () => {
+      expect(body()).not.toContain("safely under Bash's hard 10-min");
+    });
+  },
+);
 
 describe("panel skill shim", () => {
   test("spawns plan:panel-runner with no model= kwarg", () => {

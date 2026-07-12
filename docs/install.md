@@ -119,7 +119,9 @@ REQUIRED worker-matrix config — there is no embedded fallback, so a fresh host
 select, or dispatch worker cells (claude-native included) until it exists. Top level: the default
 `efforts` axis, `subagent_templates` (the cell-template inventory the renderer fans out),
 `subagent_models` (the explicit capability tokens eligible to render and select as worker cells),
-`wrapper_driver` (the fixed claude model/effort every wrapped cell's wrapper runs at), and
+`wrapper_driver` (the fixed claude model/effort every wrapped cell's wrapper runs at),
+`agent_pins` (every static plan subagent's `{model, effort}` pin, baked into its rendered
+frontmatter — a pair, never a triple, since frontmatter carries no harness axis), and
 `providers` — an ordered roster (cost-ascending — the pecking order), each carrying the launch ids
 it serves. A provider model entry is the launch id verbatim (the string the harness CLI receives)
 as a bare scalar or `{id, efforts}` for a per-model effort-list override (most-specific wins — a
@@ -145,18 +147,31 @@ distress sticky until the file is fixed. Standing up a host:
 1. Copy [`docs/examples/matrix.example.yaml`](./examples/matrix.example.yaml) — a committed,
    load-tested reference shape (claude native models, a codex-served capability model with a
    per-provider effort override, a launch-only pi entry absent from `subagent_models`, the wrapper
-   driver) — to `~/.config/keeper/matrix.yaml`, or author your own roster from scratch. It is not
-   itself a discovered config path.
+   driver, the 11 seeded `agent_pins`) — to `~/.config/keeper/matrix.yaml`, or author your own
+   roster from scratch. It is not itself a discovered config path. Authoring from scratch still
+   needs an `agent_pins:` entry per static plan agent — copy the example's block as a starting
+   point, since it names all 11 by their current agent id.
 2. For a new model, add its selector guidance with `/plan:model-guidance <model>` (the drift gate fails until every roster model has a block).
-3. Re-render the worker cells: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/`).
+3. Re-render the worker cells AND the static agents: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/` and `ls plugins/plan/agents/`). A static agent template with no matching `agent_pins` entry fails the render loud, naming the agent.
 4. Discover the enumerable cube and verify routing: `keeper agent presets list --json` lists every
    `<harness>::<model>::<effort>` launch triple the roster now serves (cell-bearing and launch-only
-   alike); `keeper agent providers resolve <model> <effort>` traces one model's cost-ordered
-   candidates. `keeper agent providers check` fails loud when the roster names a harness whose binary
-   is missing from the host, or when a host file (`presets.yaml` defaults/worker/escalation,
-   `panel.yaml` members) names a launch triple outside the enumerable cube — install the missing
-   binary or correct the triple, rather than treating the failure as a bug.
-5. Wire the four `<harness>_default` triples plus `worker`/`escalation` in `~/.config/keeper/presets.yaml`, and any panel members in `~/.config/keeper/panel.yaml`, from the triples `presets list` discovered.
+   alike) plus the resolved per-verb `dispatch:` table; `keeper agent providers resolve <model>
+   <effort>` traces one model's cost-ordered candidates. `keeper agent providers check` fails loud
+   when the roster names a harness whose binary is missing from the host, or when a host file
+   (`presets.yaml` defaults/`dispatch:`, `panel.yaml` members) names a launch triple outside the
+   enumerable cube — install the missing binary or correct the triple, rather than treating the
+   failure as a bug.
+5. Wire the four `<harness>_default` triples plus the per-verb `dispatch:` table
+   (`work`/`close`/`resolve`/`unblock`/`deconflict`/`repair`/`handoff`) in
+   `~/.config/keeper/presets.yaml`, and any panel members in `~/.config/keeper/panel.yaml`, from
+   the triples `presets list` discovered. Migrating from a `worker:`/`escalation:` host: move the
+   old `worker` triple to `dispatch.work` / `dispatch.close` / `dispatch.resolve`, and the old
+   `escalation` triple to `dispatch.unblock` / `dispatch.deconflict` / `dispatch.repair` — a
+   leftover `worker:`/`escalation:` key fails `presets.yaml` to load loud, naming the retired key
+   and the `dispatch:` block to move it into; an unset verb floors to the compiled-in default
+   (`work`/`close`/`resolve` float to the reconcile-core worker constants, `unblock`/`deconflict`/
+   `repair` to the escalation constants, `handoff` to the harness's own default), so the board keeps
+   moving on defaults while you migrate.
 6. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
 
 ## Shell completions
@@ -197,8 +212,9 @@ rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ## Backup & restore
 
 `keeper.db` is the source of truth, so the daemon guards it with a periodic `PRAGMA quick_check`
-integrity probe and a daily verified `VACUUM INTO` snapshot (kept only if the full `integrity_check`
-passes). The backup, restore, and offline size-reclaim runbooks are rendered from code — the single
+integrity probe and a rolling verified `VACUUM INTO` snapshot (kept only if the full `integrity_check`
+passes; see `BACKUP_INTERVAL_MS` in `src/backup.ts` for the current cadence). The backup, restore,
+and offline size-reclaim runbooks are rendered from code — the single
 source of truth — via `keeper reclaim --agent-help`, `bun scripts/backup-db.ts`, and
 `reclaimInstructions()` / `restoreInstructions()` in `src/backup.ts`. Because projections fold
 deterministically from the immutable `events` table, a restored snapshot re-derives byte-identical

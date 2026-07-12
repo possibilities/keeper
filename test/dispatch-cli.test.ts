@@ -3,8 +3,8 @@
  * model/effort resolution path (fn-937 task 3). The pure builders live in
  * `src/dispatch-command.ts` (unit-tested in `test/dispatch-command.test.ts`); this
  * file covers the thin entry's PRECEDENCE — explicit --model/--effort > --preset >
- * the `worker` preset default (plan form only) — by capturing the `LaunchSpec` the
- * injected `launch` seam receives, never a real tmux/daemon.
+ * the verb's `dispatch:` row (plan form only) > floor — by capturing the
+ * `LaunchSpec` the injected `launch` seam receives, never a real tmux/daemon.
  *
  * The preset catalog dir is sandboxed via KEEPER_CONFIG_DIR (os.homedir()
  * ignores $HOME on macOS). `main()` calls process.exit() directly on failures, so
@@ -244,8 +244,8 @@ test("free-form without preset passes no model/effort (zero behavior change)", a
   expect(r.spec?.effort).toBeUndefined();
 });
 
-test("plan form defaults to the worker triple model/effort", async () => {
-  writePresets("worker: claude::opus::high\n");
+test("plan form defaults to the dispatch.work row model/effort", async () => {
+  writePresets("dispatch:\n  work: claude::opus::high\n");
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",
@@ -262,8 +262,8 @@ test("plan form defaults to the worker triple model/effort", async () => {
   expect(r.spec?.effort).toBe("high");
 });
 
-test("plan form with no worker triple falls back to sonnet/max", async () => {
-  // No catalog file → the worker carve-out swallows the throw → worker defaults.
+test("plan form with no dispatch.work row falls back to sonnet/max", async () => {
+  // No catalog file → the resolver floors to the WORKER_* constants (sonnet/max).
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",
@@ -279,9 +279,9 @@ test("plan form with no worker triple falls back to sonnet/max", async () => {
   expect(r.spec?.effort).toBe("max");
 });
 
-test("plan form unblock:: defaults to the escalation config (sonnet/high), boots /plan:unblock", async () => {
-  // No presets.yaml → the escalation carve-out swallows the throw → escalation
-  // defaults. unblock is task-scoped, so it resolves the blocked task's repo.
+test("plan form unblock:: defaults to the escalation floor (sonnet/high), boots /plan:unblock", async () => {
+  // No presets.yaml → the resolver floors unblock to the ESCALATION_* constants
+  // (sonnet/high). unblock is task-scoped, so it resolves the blocked task's repo.
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",
@@ -302,10 +302,12 @@ test("plan form unblock:: defaults to the escalation config (sonnet/high), boots
   expect(r.spec?.pluginDir).toBeUndefined();
 });
 
-test("plan form escalation config is independent of the worker triple", async () => {
-  // Both triples present → an escalation verb resolves the `escalation` triple,
-  // NEVER the `worker` one.
-  writePresets("worker: claude::opus::low\nescalation: claude::haiku::max\n");
+test("plan form escalation verb resolves its own dispatch row, independent of work", async () => {
+  // Both rows present → an escalation verb resolves its OWN dispatch row
+  // (dispatch.unblock), NEVER the dispatch.work one.
+  writePresets(
+    "dispatch:\n  work: claude::opus::low\n  unblock: claude::haiku::max\n",
+  );
   const epicRows: Row[] = [
     {
       epic_id: "fn-1-x",

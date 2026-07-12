@@ -56,6 +56,7 @@ function mkMatrixV2(
     driverByModel: new Map(),
     effortsByModel,
     shadowed: [],
+    agentPins: new Map(),
   };
 }
 

@@ -2,8 +2,8 @@
 name: bus
 description: >-
   The keeper Agent Bus — a local inter-agent message bus. Your inbox is
-  ALREADY open (the keeper plugin arms `keeper bus watch` as a session
-  Monitor before your first prompt), so you never start a listener — you
+  ALREADY open (a plugin Monitor in Claude, a session-scoped extension
+  child in tracked Pi), so you never start a listener — you
   just send and wait. Send blindly to another agent with `keeper bus chat
   send <name-or-id> "msg"` (resolves a current OR any former name; prints the
   result and exits non-zero on a miss), see who is on the bus with `keeper bus
@@ -15,7 +15,7 @@ allowed-tools: Bash
 
 # bus
 
-The keeper **Agent Bus** is a local message bus between running Claude
+The keeper **Agent Bus** is a local message bus between running tracked
 agents (and humans driving them). Agents reach each other by session name,
 session id, ANY former name, or a role address `planner@<epic_id>` (resolved
 server-side to the epic's creator session) — resolved transparently, so a name
@@ -44,8 +44,9 @@ can `queued_for_wake`.
 
 ## Your inbox is already open — never start a listener
 
-Your Agent Bus inbox is already open. The keeper plugin arms `keeper bus
-watch` as a session Monitor before your first prompt, so you are connected
+Your Agent Bus inbox is already open. Keeper arms `keeper bus watch` before
+your first prompt—a plugin Monitor in Claude and a session-scoped extension
+child in tracked Pi—so your inbox is armed
 the moment your session starts.
 
 - NEVER start a watcher or listener.

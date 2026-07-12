@@ -15,9 +15,12 @@ node_modules/
 # (carry {_warning, source_template, sha256} for the check-generated guard).
 **/*.managed-file-dont-edit
 
-# Generated agents (rendered from template/agents/*.md.tmpl via
-# keeper prompt render-plugin-templates; carries _promptctl_path marker).
-agents/practice-scout.md
+# Generated static agents (all rendered from template/agents/*.md.tmpl via
+# keeper prompt render-plugin-templates, frontmatter model/effort injected from
+# the host matrix agent_pins; each carries a _promptctl_path marker sidecar).
+# Leading slash anchors this to plugins/plan/agents/ ONLY — never the sibling
+# template/agents/ source tree.
+/agents/
 
 # Generated per-cell `work` plugins (rendered from template/agents/worker.md.tmpl
 # into workers/<model>-<effort>/{.claude-plugin/plugin.json, agents/worker.md},

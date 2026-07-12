@@ -1,0 +1,18 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-11T16:04:59.443000Z",
+  "depends_on": [
+    "fn-1248-crash-recovery-hardening.4"
+  ],
+  "epic": "fn-1248-crash-recovery-hardening",
+  "id": "fn-1248-crash-recovery-hardening.6",
+  "model": "gpt-5.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Backup churn reduction",
+  "updated_at": "2026-07-11T18:21:45.412000Z",
+  "worker_done_at": "2026-07-11T18:21:45.412000Z"
+}

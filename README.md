@@ -13,8 +13,8 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **History forensics** — `keeper transcript` extracts bounded main/subagent
   conversations; `keeper search-history`, `keeper find-file-history`, and
   `keeper session events` answer who/when/what across sessions
-- **Crash restore** — `keeper tabs restore` re-opens managed agent windows; daily
-  verified DB snapshots guard the log
+- **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling
+  cadence of verified DB snapshots guards the log
 
 Install & uninstall: [docs/install.md](./docs/install.md) · Guardrails:
 [CLAUDE.md](./CLAUDE.md) · Vocabulary: [CONTEXT.md](./CONTEXT.md) · Decisions:

@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T03:01:56.269000Z",
+  "depends_on": [],
+  "epic": "fn-1258-narrow-state-read-guard-shell-chain-scan",
+  "id": "fn-1258-narrow-state-read-guard-shell-chain-scan.1",
+  "model": "opus",
+  "priority": null,
+  "selection_input_hash": "6e66aa18bb3788df6e64bd29c882fcc51ee2f19eefd866957212e1939138dc4d",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Scope chain scan off --reason",
+  "updated_at": "2026-07-12T03:48:47.769000Z",
+  "worker_done_at": "2026-07-12T03:48:47.769000Z"
+}

@@ -1,0 +1,20 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-11T22:39:20.658000Z",
+  "depends_on": [
+    "fn-1253-restore-orchestrator-content-blindness.2",
+    "fn-1253-restore-orchestrator-content-blindness.3"
+  ],
+  "epic": "fn-1253-restore-orchestrator-content-blindness",
+  "id": "fn-1253-restore-orchestrator-content-blindness.4",
+  "model": "gpt-5.6-terra",
+  "priority": null,
+  "selection_input_hash": "f7b7d5d0c1758504b05195757ff0173bc5f85fd283fcb1cf84d8c3210a27146c",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Add orchestrator state-read guard",
+  "updated_at": "2026-07-12T02:21:50.869000Z",
+  "worker_done_at": "2026-07-12T02:21:50.869000Z"
+}

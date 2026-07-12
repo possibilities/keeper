@@ -46,5 +46,5 @@ Re-spell the existing suite by prepending the claude token to every runTranscrip
 - [ ] `bun test` green.
 
 ## Done summary
-
+Introduced the TranscriptReader seam (reader.ts/registry.ts/parse-common.ts) and flipped keeper transcript to the harness-first grammar (keeper transcript <harness> list|show|<session-id>); claude.ts implements the interface behind its preserved exports, --harness is gone, unregistered harnesses fail naming the registry keys, and the pi-extension + test suite are re-spelled for the new grammar.
 ## Evidence

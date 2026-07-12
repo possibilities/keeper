@@ -48,6 +48,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseBirthRecord } from "./birth-record";
+import type { DeadLetterBindings } from "./dead-letter";
 import { parseEventLogLine } from "./dead-letter";
 import { FileLock } from "./usage-flock";
 
@@ -111,6 +112,17 @@ export interface RestoreIntent {
   state: RestoreIntentState;
   /** Failure / unverified diagnosis; "" when none. */
   reason: string;
+  /**
+   * The re-attached process's recycle-safe (pid, start_time) identity, captured
+   * from the attach evidence that proved the re-attach. The live-UUID no-op gate
+   * on a LATER apply probes THIS handle, so a tab that verifies then dies is
+   * re-observed dead instead of masked as a permanent no-op. Absent/null on a
+   * non-`verified` state, on an un-probeable attach (evidence carried no pid), or
+   * on an intent written before the handle existed — the gate treats a handle-less
+   * verified intent as an unprobeable skip, preserving the prior behavior.
+   */
+  verified_pid?: number | null;
+  verified_start_time?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -190,6 +202,17 @@ export function parseRestoreIntent(text: string): RestoreIntent | null {
     !Number.isInteger(o.attempt) ||
     !isValidState(o.state) ||
     !isStr(o.reason) ||
+    // The (pid, start_time) handle is OPTIONAL for backward-compat (a pre-handle
+    // intent omits it), but a PRESENT value must be well-typed — a garbage handle
+    // is a torn record, not a silent null.
+    (o.verified_pid !== undefined &&
+      o.verified_pid !== null &&
+      !(
+        typeof o.verified_pid === "number" && Number.isInteger(o.verified_pid)
+      )) ||
+    (o.verified_start_time !== undefined &&
+      o.verified_start_time !== null &&
+      typeof o.verified_start_time !== "string") ||
     !isStr(o.created_at) ||
     !isStr(o.updated_at)
   ) {
@@ -209,6 +232,9 @@ export function parseRestoreIntent(text: string): RestoreIntent | null {
     attempt: o.attempt,
     state: o.state,
     reason: o.reason,
+    verified_pid: typeof o.verified_pid === "number" ? o.verified_pid : null,
+    verified_start_time:
+      typeof o.verified_start_time === "string" ? o.verified_start_time : null,
     created_at: o.created_at,
     updated_at: o.updated_at,
   };
@@ -378,6 +404,100 @@ export function crashLoopHint(intent: {
 }
 
 // ---------------------------------------------------------------------------
+// Recycle-safe process identity — the (pid, start_time) liveness probe
+// ---------------------------------------------------------------------------
+
+/**
+ * The re-attached harness process's recycle-safe identity, lifted from the attach
+ * evidence: a claude SessionStart carries `pid` (the claude process — `process.ppid`
+ * of the hook) plus its `start_time`; a non-claude birth record carries both. `pid`
+ * is null when the evidence carried none (un-probeable); `start_time` is the
+ * platform-tagged token the writer probed at attach (the format `readOsStartTime`
+ * emits), so a later probe is a verbatim string compare.
+ */
+export interface AttachIdentity {
+  pid: number | null;
+  start_time: string | null;
+}
+
+/**
+ * A stored identity's CURRENT liveness. `unknown` is the inconclusive verdict —
+ * the pid is alive but its start_time can't be read (the memory-crunch fault this
+ * bug class lives in), or no pid was captured. It never asserts up (no false
+ * `verified`) nor down (no masked death); the caller picks the fail-direction.
+ */
+export type IdentityLiveness = "alive" | "dead" | "unknown";
+
+/**
+ * The injected probes the recycle-safe liveness check runs on — the production
+ * call site defaults them to the real `isPidAlive` + `readOsStartTime`, the fast
+ * tier fakes them so no subprocess ever runs.
+ */
+export interface StartTimeProbeDeps {
+  isPidAlive: (pid: number) => boolean;
+  readStartTime: (pid: number) => string | null;
+}
+
+/**
+ * Classify a stored `(pid, start_time)` handle's current liveness — the recycle-
+ * safe check `bus-worker` / `resume-policy` already run, never a bare-pid test. A
+ * gone pid is `dead`; a live pid whose start_time still matches is `alive`; a live
+ * pid whose start_time DIFFERS is a recycled pid (our process is gone) → `dead`.
+ * Two reads resolve `unknown` (inconclusive): no captured pid, or a live pid whose
+ * start_time can't be read. A live pid with NO stored start_time to compare
+ * degrades to bare-pid `alive` (the best a handle-less legacy intent allows). Pure
+ * over the injected probes.
+ */
+export function identityLiveness(
+  pid: number | null | undefined,
+  startTime: string | null | undefined,
+  deps: StartTimeProbeDeps,
+): IdentityLiveness {
+  if (pid == null || !Number.isInteger(pid) || pid <= 0) {
+    return "unknown";
+  }
+  if (!deps.isPidAlive(pid)) {
+    return "dead";
+  }
+  if (startTime == null || startTime === "") {
+    return "alive";
+  }
+  const current = deps.readStartTime(pid);
+  if (current == null) {
+    return "unknown";
+  }
+  return current === startTime ? "alive" : "dead";
+}
+
+/**
+ * The live-UUID no-op decision for a re-apply: may this tab SKIP relaunch (an
+ * idempotent no-op), or must it be re-attempted? Only a `verified` intent whose
+ * stored identity a real current probe still finds alive (or inconclusively alive)
+ * is a safe skip; a verified-then-died tab probes `dead` and is re-attempted (never
+ * a permanent no-op — the mask this closes). `inconclusive` flags a skip taken on
+ * an unprobeable / starved handle so the caller can surface it (never a SILENT
+ * masked death) while never double-spawning a possibly-live session. Pure over the
+ * injected probes.
+ */
+export function restoreNoOpDecision(
+  prior: RestoreIntent | null,
+  deps: StartTimeProbeDeps,
+): { skip: boolean; inconclusive: boolean } {
+  if (prior == null || prior.state !== "verified") {
+    return { skip: false, inconclusive: false };
+  }
+  const live = identityLiveness(
+    prior.verified_pid,
+    prior.verified_start_time,
+    deps,
+  );
+  if (live === "dead") {
+    return { skip: false, inconclusive: false };
+  }
+  return { skip: true, inconclusive: live === "unknown" };
+}
+
+// ---------------------------------------------------------------------------
 // Attach evidence — daemon-down, on-disk only
 // ---------------------------------------------------------------------------
 
@@ -405,30 +525,43 @@ function tsSatisfies(tsMs: number, sinceMs: number): boolean {
   return Number.isFinite(tsMs) && tsMs >= sinceMs;
 }
 
+/** Lift the recycle-safe (pid, start_time) identity from a claude event's binding
+ *  map — `pid` is `process.ppid` (the claude process itself, not the transient
+ *  hook subprocess) and `start_time` the SessionStart-only probe. A missing /
+ *  mistyped field degrades to null (an unprobeable identity). Pure. */
+function bindingsIdentity(b: DeadLetterBindings): AttachIdentity {
+  return {
+    pid: typeof b.pid === "number" && Number.isInteger(b.pid) ? b.pid : null,
+    start_time: typeof b.start_time === "string" ? b.start_time : null,
+  };
+}
+
 /**
- * True iff the per-pid events-log NDJSON carries a `SessionStart` for the EXACT
- * requested claude session id AT OR AFTER `sinceMs` — the sole claude attach
- * proof. Reads every `<pid>.ndjson` in `dir`, parses only complete lines via the
- * shared {@link parseEventLogLine}, and matches on `bindings.session_id` +
- * `bindings.hook_event === "SessionStart"`. The `sinceMs` gate (a wall-clock ms,
- * default 0 = ungated) is load-bearing: a resume re-fires SessionStart under the
- * SAME id, so a post-launch verify passes `sinceMs = launchStart` to reject the
- * stale pre-crash record; a live-check passes `now - recency`. Directory-absent /
- * unreadable → false. Pure over the fs read.
+ * The re-attached claude process's identity iff the per-pid events-log NDJSON
+ * carries a `SessionStart` for the EXACT requested session id AT OR AFTER
+ * `sinceMs` — the sole claude attach proof — else `null`. Reads every
+ * `<pid>.ndjson` in `dir`, parses only complete lines via the shared
+ * {@link parseEventLogLine}, and matches on `bindings.session_id` +
+ * `bindings.hook_event === "SessionStart"`, returning that record's
+ * `(pid, start_time)` so the caller can dwell-probe and later no-op-gate a REAL
+ * process. The `sinceMs` gate (a wall-clock ms, default 0 = ungated) is
+ * load-bearing: a resume re-fires SessionStart under the SAME id, so a post-launch
+ * verify passes `sinceMs = launchStart` to reject the stale pre-crash record.
+ * Directory-absent / unreadable → null. Pure over the fs read.
  */
 export function claudeAttachEvidence(
   dir: string,
   sessionId: string,
   sinceMs = 0,
-): boolean {
+): AttachIdentity | null {
   if (sessionId === "") {
-    return false;
+    return null;
   }
   let names: string[];
   try {
     names = readdirSync(dir);
   } catch {
-    return false;
+    return null;
   }
   for (const name of names) {
     if (!name.endsWith(".ndjson")) {
@@ -449,36 +582,38 @@ export function claudeAttachEvidence(
       if (b.session_id === sessionId && b.hook_event === "SessionStart") {
         const tsMs = typeof b.ts === "number" ? b.ts * 1000 : Number.NaN;
         if (tsSatisfies(tsMs, sinceMs)) {
-          return true;
+          return bindingsIdentity(b);
         }
       }
     }
   }
-  return false;
+  return null;
 }
 
 /**
- * True iff a birth record in the births `new/` tree carries the resumed job id
- * with a `launch_ts` AT OR AFTER `sinceMs` — the non-claude attach proof
- * (codex/pi/hermes fire no SessionStart hook). Reads every `*.json`, parses via
- * the shared {@link parseBirthRecord}, matches on `session_id`. The `sinceMs` gate
- * (default 0 = ungated) rejects a stale pre-crash birth the daemon-down restore
- * never retired. Directory-absent → false.
+ * The re-attached non-claude harness's identity iff a birth record in the births
+ * `new/` tree carries the resumed job id with a `launch_ts` AT OR AFTER `sinceMs`
+ * — the non-claude attach proof (codex/pi/hermes fire no SessionStart hook) — else
+ * `null`. Reads every `*.json`, parses via the shared {@link parseBirthRecord},
+ * matches on `session_id`, and returns the record's `(pid, start_time)` for the
+ * dwell probe + later no-op gate. The `sinceMs` gate (default 0 = ungated) rejects
+ * a stale pre-crash birth the daemon-down restore never retired. Directory-absent
+ * → null.
  */
 export function nonClaudeAttachEvidence(
   birthDir: string,
   jobId: string,
   sinceMs = 0,
-): boolean {
+): AttachIdentity | null {
   if (jobId === "") {
-    return false;
+    return null;
   }
   const newDir = join(birthDir, "new");
   let names: string[];
   try {
     names = readdirSync(newDir);
   } catch {
-    return false;
+    return null;
   }
   for (const name of names) {
     if (!name.endsWith(".json")) {
@@ -494,11 +629,11 @@ export function nonClaudeAttachEvidence(
     if (record !== null && record.session_id === jobId) {
       const tsMs = Date.parse(record.launch_ts);
       if (tsSatisfies(tsMs, sinceMs)) {
-        return true;
+        return { pid: record.pid, start_time: record.start_time };
       }
     }
   }
-  return false;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -553,15 +688,36 @@ export function classifyPaneLiveness(
 /** The terminal attach verdict. */
 export type AttachVerdict = "verified" | "failed" | "launched-unverified";
 
-/** Default bounded wait for attach evidence (~20s) and the poll interval. */
+/** The verify outcome plus the recycle-safe identity captured from the attach
+ *  evidence (null when none was observed). The identity rides into the durable
+ *  `verified` intent so a later apply's no-op gate probes a REAL process, never
+ *  the bare marker alone. */
+export interface AttachVerifyResult {
+  verdict: AttachVerdict;
+  identity: AttachIdentity | null;
+}
+
+/** Default bounded wait for attach evidence (~20s), the poll interval, and the
+ *  post-evidence dwell (~1.5s) a process must stay alive across before it is
+ *  declared up. The dwell is short so 17 overlapping restores — whose verifies run
+ *  concurrently — never blow past the sequential {@link INTER_WINDOW_PAUSE_MS}
+ *  pacing budget. */
 export const RESTORE_VERIFY_TIMEOUT_MS = 20_000;
 export const RESTORE_VERIFY_POLL_MS = 500;
+export const RESTORE_VERIFY_DWELL_MS = 1_500;
 
 /** Injected seams for {@link verifyAttach} — every non-pure dependency, so the
  *  full state matrix is unit-tested with zero fs / tmux / real clock. */
 export interface VerifyAttachDeps {
-  /** Reads on-disk attach evidence (claude NDJSON or non-claude birth record). */
-  hasEvidence: () => boolean;
+  /** Reads on-disk attach evidence (claude NDJSON or non-claude birth record),
+   *  returning the attaching process's recycle-safe identity when present, else
+   *  null. The identity is what the dwell probes and the later no-op gate re-checks
+   *  — a bare "yes/no" can't tell a still-live attach from a died one. */
+  findEvidence: () => AttachIdentity | null;
+  /** The recycle-safe (pid, start_time) liveness probe, consulted across the DWELL
+   *  after evidence: a process that dies inside the dwell is a die-after-verify
+   *  `failed`, not the point-in-time false `verified` this closes. */
+  identityLiveness: (identity: AttachIdentity) => IdentityLiveness;
   /** Probes the pane's harness liveness — consulted ONLY on the no-evidence
    *  timeout, to split `failed` (dead) from `launched-unverified` (alive/unknown). */
   paneLiveness: () => PaneLiveness;
@@ -571,31 +727,69 @@ export interface VerifyAttachDeps {
   sleep: (ms: number) => Promise<void>;
   timeoutMs?: number;
   pollMs?: number;
+  /** Minimum dwell (ms) the attached process must stay alive AFTER evidence before
+   *  `verified` — the startup-window that closes the point-in-time TOCTOU. Bounded
+   *  by poll COUNT (not the clock) so a stopped-clock caller can't spin. */
+  dwellMs?: number;
 }
 
 /**
- * Poll for attach evidence up to the bound, then disambiguate. `verified` the
- * instant evidence is observed. On a no-evidence timeout: a DEAD pane is `failed`
- * (the resume died), a live/unknown pane is `launched-unverified` (a warn — never
- * a false `verified`, and a launch exit code alone never reaches here). The clock
- * and sleep are injected so tests drive the timeout deterministically.
+ * Poll for attach evidence up to the window, then DWELL: a proven attach only
+ * `verified`s after the process STAYS alive across a minimum dwell — a single
+ * point-in-time "evidence seen" verdict is exactly the TOCTOU that masks a pane
+ * that dies right after verifying (the 17-way boot memory crunch). On a no-evidence
+ * timeout the pane liveness disambiguates (a DEAD pane is a died resume `failed`, a
+ * live/unknown pane a `launched-unverified` warn — never a false `verified`). A
+ * death observed INSIDE the dwell is `failed`; a dwell of only-inconclusive probes
+ * (starved start-time read, or a handle-less attach) is `launched-unverified` (a
+ * warn that resurfaces) — the documented probe-failure fail-direction that neither
+ * masks a death nor double-spawns. The captured identity rides out for the durable
+ * intent. Clock + sleep injected so tests drive it deterministically.
  */
 export async function verifyAttach(
   deps: VerifyAttachDeps,
-): Promise<AttachVerdict> {
+): Promise<AttachVerifyResult> {
   const timeoutMs = deps.timeoutMs ?? RESTORE_VERIFY_TIMEOUT_MS;
   const pollMs = deps.pollMs ?? RESTORE_VERIFY_POLL_MS;
+  const dwellMs = deps.dwellMs ?? RESTORE_VERIFY_DWELL_MS;
   const start = deps.now();
-  if (deps.hasEvidence()) {
-    return "verified";
-  }
-  while (deps.now() - start < timeoutMs) {
+  // Phase 1 — wait for the attach evidence within the max window.
+  let identity = deps.findEvidence();
+  while (identity === null && deps.now() - start < timeoutMs) {
     await deps.sleep(pollMs);
-    if (deps.hasEvidence()) {
-      return "verified";
+    identity = deps.findEvidence();
+  }
+  if (identity === null) {
+    const verdict: AttachVerdict =
+      deps.paneLiveness() === "dead" ? "failed" : "launched-unverified";
+    return { verdict, identity: null };
+  }
+  // Phase 2 — DWELL. Evidence proves an attach HAPPENED; it does not prove the
+  // process is still up. Require it to STAY alive across the dwell before
+  // `verified`. Poll-count bounded (not clock-bounded) so a fixed-clock caller
+  // can't spin.
+  const dwellPolls = Math.max(1, Math.ceil(dwellMs / Math.max(1, pollMs)));
+  let sawAlive = false;
+  for (let i = 0; i < dwellPolls; i++) {
+    const live = deps.identityLiveness(identity);
+    if (live === "dead") {
+      // Died inside the dwell — a die-after-verify, the mask this closes.
+      return { verdict: "failed", identity };
+    }
+    if (live === "alive") {
+      sawAlive = true;
+    }
+    if (i < dwellPolls - 1) {
+      await deps.sleep(pollMs);
     }
   }
-  return deps.paneLiveness() === "dead" ? "failed" : "launched-unverified";
+  // No death across the dwell. A sustained-alive process verifies; an only-ever-
+  // inconclusive dwell cannot assert up → `launched-unverified` (never a false
+  // verified, never a relaunch this apply).
+  return {
+    verdict: sawAlive ? "verified" : "launched-unverified",
+    identity,
+  };
 }
 
 // ---------------------------------------------------------------------------

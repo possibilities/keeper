@@ -273,8 +273,18 @@ async function executeTask(
           `Task ${params.subagent_type} failed: ${event.error ?? event.status ?? "unknown failure"}`,
         );
       }
+      // A completed subagent with no textual result is a protocol violation,
+      // not an answer: the provider errored or the turn ended textless and the
+      // subagent runner misreported it as success. Fail loudly so the caller
+      // sees a Task error instead of silently consuming "No output".
+      const resultText = typeof event.result === "string" ? event.result : "";
+      if (resultText.trim() === "") {
+        throw new Error(
+          `Task ${params.subagent_type} completed without a textual result (empty subagent answer)`,
+        );
+      }
       return {
-        content: [{ type: "text", text: event.result ?? "" }],
+        content: [{ type: "text", text: resultText }],
         details: {
           agent_id: event.id,
           subagent_type: event.type ?? params.subagent_type,

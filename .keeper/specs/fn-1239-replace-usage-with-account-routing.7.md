@@ -62,5 +62,5 @@ Publish these docs with the retiring code, then perform the archive as an explic
 - [ ] Domain-doc, CLAUDE.md, retired-name, CLI descriptor, fast, and full-suite gates pass.
 
 ## Done summary
-
+Pruned retired usage/profile guidance from README, CLAUDE.md, CONTEXT.md, docs/install.md, and docs/plan-name-retirement.md, and documented the surviving CodexBar+claude-swap account-routing system (keeper agent accounts check, independent per-launch selection, settings seeding, and the private clean-break archive procedure). ADR 0038 remains the sole rationale record. Note: plugins/prompt's parity golden-file test (panel-strength) fails pre-existing and unrelated to this task's files.
 ## Evidence

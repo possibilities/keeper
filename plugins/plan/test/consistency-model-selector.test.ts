@@ -132,8 +132,11 @@ describe("on-disk selector config", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
+    // The rendered agent is gitignored; its body is byte-verbatim from this
+    // template (only the frontmatter model/effort inject from agent_pins), so the
+    // prose checks read the template — the source — and run without a render.
     const agentPrompt = readFileSync(
-      join(PLAN_ROOT, "agents/model-selector.md"),
+      join(PLAN_ROOT, "template/agents/model-selector.md.tmpl"),
       "utf-8",
     );
     // Grep-level: the inverted policy leaves no default-up escape hatch in either

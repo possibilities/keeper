@@ -6,40 +6,40 @@
   },
   "cells": [
     {
-      "confidence": 0.72,
-      "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "Foundational reader-seam interface plus CLI grammar flip whose abstraction cascades into the two sibling readers, needing Claude API-surface taste and delicate behavior-preserving idiom matching rather than a nameable opus reason.",
+      "confidence": 0.8,
+      "label_source": "human-directed",
+      "model": "gpt-5.6-sol",
+      "rationale": "Behavior-preserving refactor with the interface fully designed in the spec, exhaustive line refs, and a mechanical test re-spell as the proof \u2014 a textbook hard-but-well-specified multi-file change with an explicit acceptance and named stop conditions. Human-directed GPT-first reassignment.",
       "task_id": "fn-1242-multi-harness-keeper-transcript.1",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.74,
-      "label_source": "heuristic-guided",
+      "confidence": 0.75,
+      "label_source": "human-directed",
       "model": "gpt-5.5",
-      "rationale": "Substantial but well-specified single-surface reader with a fully enumerated entry-mapping acceptance, routing GPT-first at the workhorse tier.",
+      "rationale": "Unchanged from the prior selection; re-asserted for the full-todo-set coverage contract.",
       "task_id": "fn-1242-multi-harness-keeper-transcript.2",
       "tier": "high"
     },
     {
-      "confidence": 0.68,
-      "label_source": "heuristic-guided",
+      "confidence": 0.75,
+      "label_source": "human-directed",
       "model": "gpt-5.6-sol",
-      "rationale": "The hardest well-specified reader \u2014 dense correctness edge cases (spine mapping, dedup, timestamp ordering, backfill) against a fixed on-disk contract \u2014 fits the top GPT tier for hard bounded work.",
+      "rationale": "Unchanged from the prior selection; re-asserted for the full-todo-set coverage contract.",
       "task_id": "fn-1242-multi-harness-keeper-transcript.3",
       "tier": "high"
     }
   ],
   "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
-  "created_at": "2026-07-10T21:29:47.061000Z",
+  "created_at": "2026-07-11T17:23:56.724000Z",
   "epic_id": "fn-1242-multi-harness-keeper-transcript",
-  "input_hash": "b2c10e23538625853503cf95bb0849c81028cdb202c076b627e8587e23248c44",
+  "input_hash": "unavailable",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
-    "harness": "subagent",
-    "model": "plan:model-selector"
+    "harness": "claude",
+    "model": "claude-fable-5"
   },
-  "shuffle_seed": 2998996515,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Foundational reader-seam interface plus CLI grammar flip whose abstraction cascades into the two sibling readers, needing Claude API-surface taste and delicate behavior-preserving idiom matching rather than a nameable opus reason.\",\"confidence\":0.72},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Substantial but well-specified single-surface reader with a fully enumerated entry-mapping acceptance, routing GPT-first at the workhorse tier.\",\"confidence\":0.74},{\"task_id\":\"fn-1242-multi-harness-keeper-transcript.3\",\"tier\":\"high\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"The hardest well-specified reader \u2014 dense correctness edge cases (spine mapping, dedup, timestamp ordering, backfill) against a fixed on-disk contract \u2014 fits the top GPT tier for hard bounded work.\",\"confidence\":0.68}]}\n"
+  "shuffle_seed": null,
+  "verdict_raw": null
 }

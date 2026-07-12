@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "closer_done_at": "2026-07-11T18:37:08.176000Z",
+  "created_at": "2026-07-11T16:04:59.443000Z",
+  "depends_on_epics": [],
+  "id": "fn-1248-crash-recovery-hardening",
+  "last_validated_at": "2026-07-11T16:07:15.311000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "done",
+  "title": "Crash recovery hardening",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-11T18:37:08.176000Z"
+}

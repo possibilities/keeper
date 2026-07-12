@@ -70,5 +70,5 @@ Merge after runtime producers and consumers are gone, so no deployed code writes
 - [ ] Schema fingerprint, migration, collection, reducer, and re-fold tests pass.
 
 ## Done summary
-
+Retire the usage/profiles projections at schema v120: DROP both tables unconditionally at the tail (event_blobs precedent), remove their query descriptors/collection registry/allowlist entries, delete the UsageSnapshot/UsageDeleted/profile fan-out fold arms (replaced with explicit no-ops), and prune the now-dead usageIdForProfileName/profileNameForUsageId helpers. Preserved: jobs.config_dir/profile_name as inert historical facts, account_route attribution, and RateLimited/ApiError's last_api_error_at/kind stamp.
 ## Evidence

@@ -38,5 +38,5 @@ Synthetic fixtures under a tmpdir pi root injected via env. Cover: bucket-scoped
 - [ ] `bun test` green including the new pi suite.
 
 ## Done summary
-
+Added the pi TranscriptReader (list/find/load) behind the src/transcript registry, mapping pi session JSONL (session/session_info/model_change/message/compaction) onto the harness-neutral model with bounded reads, TOCTOU-safe listing, and a no-subagents load path.
 ## Evidence

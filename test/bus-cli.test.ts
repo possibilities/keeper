@@ -23,8 +23,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AGENT_HELP as BUS_AGENT_HELP,
+  armLifetimeStdin,
   buildPublishFrame,
   CHAT_NAMESPACE,
+  emitJsonMessage,
   emitMessage,
   handleWatchFrame,
   hms,
@@ -34,6 +36,7 @@ import {
   NOTIFY_LINE_BUDGET,
   parseBusArgv,
   pruneInbox,
+  registerFrame,
   renderDecision,
   SPILL_MAX_AGE_MS,
   senderLabel,
@@ -52,6 +55,16 @@ describe("parseBusArgv routing", () => {
 
   test("watch", () => {
     expect(parseBusArgv(["watch"])).toEqual({ kind: "watch" });
+  });
+
+  test("watch accepts only its machine transport flags", () => {
+    expect(
+      parseBusArgv(["watch", "--json", "--lifetime-stdin"]),
+    ).toEqual({ kind: "watch", json: true, lifetimeStdin: true });
+    expect(parseBusArgv(["watch", "--bogus"]).kind).toBe("usage");
+    expect(parseBusArgv(["watch", "--json", "--json"]).kind).toBe(
+      "usage",
+    );
   });
 
   test("resolve is gone → unknown verb usage", () => {
@@ -174,6 +187,19 @@ describe("wakeResultLine (outcome → message + exit code)", () => {
     expect(line).toContain("launched");
     expect(line).toContain("planner@fn-1");
     expect(line).toContain("resumed s1");
+  });
+});
+
+describe("registerFrame", () => {
+  test("carries the keeper job id as the pre-fold identity floor", () => {
+    expect(
+      registerFrame(false, { KEEPER_JOB_ID: " pi-session-1 " }),
+    ).toMatchObject({
+      op: "register",
+      send_only: false,
+      session_id: "pi-session-1",
+    });
+    expect(registerFrame(false, {})).not.toHaveProperty("session_id");
   });
 });
 
@@ -383,6 +409,47 @@ describe("emitMessage (filesystem, sandboxed)", () => {
     }
   });
 
+  test("json mode keeps a multiline body in one physical record", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bus-emit-"));
+    try {
+      const msg: InboundMessage = {
+        namespace: "chat",
+        event: "message",
+        from: { name: "alice", channel_id: "ch-1" },
+        ts: 0,
+        payload: { text: "line one\nline two" },
+      };
+      const out = captureStdout(() => emitJsonMessage(msg, dir));
+      expect(out.trim().split("\n")).toHaveLength(1);
+      expect(JSON.parse(out)).toEqual({
+        type: "agent_bus_message",
+        line: "Agent Bus message from alice: line one\nline two",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("spill failure remains bounded and says the full body is unavailable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bus-emit-"));
+    try {
+      const blocker = join(dir, "file");
+      writeFileSync(blocker, "not a directory");
+      const msg: InboundMessage = {
+        namespace: "chat",
+        event: "message",
+        from: { name: "alice", channel_id: "ch-1" },
+        ts: 0,
+        payload: { text: "x".repeat(NOTIFY_LINE_BUDGET * 4) },
+      };
+      const out = captureStdout(() => emitMessage(msg, blocker));
+      expect(out).toContain("full message unavailable");
+      expect(out.trimEnd().length).toBeLessThanOrEqual(NOTIFY_LINE_BUDGET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a second over-budget message from the same sender/ts gets a unique file", () => {
     const dir = mkdtempSync(join(tmpdir(), "bus-emit-"));
     try {
@@ -403,6 +470,29 @@ describe("emitMessage (filesystem, sandboxed)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("watch stdin lifetime", () => {
+  test("EOF exits once and arms the input stream", () => {
+    const listeners = new Map<string, () => void>();
+    let resumed = false;
+    const exits: number[] = [];
+    armLifetimeStdin(
+      {
+        once(event, listener) {
+          listeners.set(event, listener);
+        },
+        resume() {
+          resumed = true;
+        },
+      },
+      (code) => exits.push(code),
+    );
+    expect(resumed).toBe(true);
+    listeners.get("end")?.();
+    listeners.get("close")?.();
+    expect(exits).toEqual([0]);
   });
 });
 

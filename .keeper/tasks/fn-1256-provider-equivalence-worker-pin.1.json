@@ -1,0 +1,17 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-12T01:30:46.904000Z",
+  "depends_on": [],
+  "epic": "fn-1256-provider-equivalence-worker-pin",
+  "id": "fn-1256-provider-equivalence-worker-pin.1",
+  "model": "gpt-5.6-sol",
+  "priority": null,
+  "selection_input_hash": "582d9cff4f0425c92d28dd222f0b2afc18646eefd6fe4c45ce145e74e95e000a",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Equivalence map artifact and gate",
+  "updated_at": "2026-07-12T02:56:27.763000Z",
+  "worker_done_at": "2026-07-12T02:56:27.763000Z"
+}

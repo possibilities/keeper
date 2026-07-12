@@ -36,5 +36,5 @@ Render against a fixture matrix with pins: all 11 agents render with pinned fron
 - [ ] The render parity suite passes with re-captured goldens under fixture config
 
 ## Done summary
-
+Converted the 10 hand-authored plan agents plus practice-scout to pin-driven templates (model/effort injected as agent_model/agent_effort from the host matrix agent_pins, bodies byte-verbatim); renderAgents' plain-render branch fails loud naming any un-pinned agent, rendered agents are gitignored, and the parity/consistency suites + oracle goldens were updated/re-captured.
 ## Evidence

@@ -26,6 +26,7 @@ import {
 } from "./hermes-capture";
 import {
   DEFAULT_STOP_TIMEOUT_MS,
+  defaultTranscriptPathTimeoutMs,
   findLastMessage,
   type TranscriptStop,
   type WaitForPathOutcome,
@@ -241,12 +242,28 @@ function sleep(ms: number): Promise<void> {
 
 export type WaitForStopResult =
   | { ok: true; transcriptPath: string; stop: TranscriptStop }
-  | { ok: false; error: string; reason?: "timeout" | "ambiguous" };
+  | {
+      ok: false;
+      error: string;
+      reason?: "timeout" | "ambiguous";
+      /** Set when the transcript path DID resolve and only the stop wait timed
+       *  out — the caller reads that known path once instead of re-running
+       *  path discovery on a second budget. */
+      transcriptPath?: string;
+    };
 
 /**
  * Block until the handle's transcript shows the next per-backend stop event,
  * resolving the transcript path first when the handle is a run id. Returns the
  * stop record (carrying the final message text when the backend exposes it).
+ *
+ * Path discovery and the stop wait share ONE absolute deadline derived from the
+ * handle's stop budget: pi creates its session file only at the first assistant
+ * message, so a healthy slow leg can legitimately spend most of the budget
+ * before any file exists — path discovery may consume the whole remainder for
+ * pi, while the fast-writing harnesses keep their small discovery window. The
+ * stop wait then gets exactly what is left, so total wall time obeys the one
+ * budget instead of stacking a fresh stop budget on top of the path window.
  */
 export async function runWaitForStop(
   handle: ResolvedHandle,
@@ -255,7 +272,17 @@ export async function runWaitForStop(
   if (handle.agent === "hermes") {
     return hermesWaitForStop(handle, deps);
   }
-  const resolved = await resolveTranscriptPath(handle, deps);
+  const totalMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+  const deadlineMs = Date.now() + totalMs;
+  const remainingForPath = Math.max(1, deadlineMs - Date.now());
+  const pathTimeoutMs =
+    handle.agent === "pi"
+      ? remainingForPath
+      : Math.min(
+          defaultTranscriptPathTimeoutMs(handle.agent),
+          remainingForPath,
+        );
+  const resolved = await resolveTranscriptPath(handle, deps, pathTimeoutMs);
   if (!resolved.ok) {
     return transcriptPathFailure(resolved.reason);
   }
@@ -269,19 +296,19 @@ export async function runWaitForStop(
     sessionId: handle.sessionId,
     isResume: handle.isResume,
     transcriptPath,
-    stopTimeoutMs: handle.stopTimeoutMs ?? undefined,
+    stopTimeoutMs: Math.max(1, deadlineMs - Date.now()),
   });
   // A bounded timeout maps to the caller's RETRYABLE (exit 4) path, mirroring the
   // transcript-path timeout above — a retryable transient, not a wrong answer.
   // The error self-reports the effective deadline and its source so the next
   // failure tells us whether the caller's --stop-timeout or the default bit.
   if (!outcome.ok) {
-    const effectiveMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     const source = handle.stopTimeoutMs !== null ? "caller" : "default";
     return {
       ok: false,
       reason: "timeout",
-      error: `timed out waiting for transcript stop after ${effectiveMs}ms (${source})`,
+      transcriptPath,
+      error: `timed out waiting for transcript stop after ${totalMs}ms (${source})`,
     };
   }
   return { ok: true, transcriptPath, stop: outcome.stop };
@@ -329,6 +356,7 @@ export async function runShowLastMessage(
 async function resolveTranscriptPath(
   handle: ResolvedHandle,
   deps: VerbDeps,
+  pathTimeoutMs?: number,
 ): Promise<WaitForPathOutcome> {
   if (handle.transcriptPath !== null) {
     return { ok: true, path: handle.transcriptPath };
@@ -341,6 +369,7 @@ async function resolveTranscriptPath(
     startedAtMs: handle.startedAtMs,
     sessionId: handle.sessionId,
     isResume: handle.isResume,
+    pathTimeoutMs,
   });
 }
 

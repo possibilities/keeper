@@ -6,32 +6,32 @@
   },
   "cells": [
     {
-      "confidence": 0.72,
-      "label_source": "heuristic-guided",
+      "confidence": 0.75,
+      "label_source": "human-directed",
       "model": "gpt-5.6-sol",
-      "rationale": "Well-specified new transcript-turn JSON contract with a branch-walking reducer whose edge cases are fully enumerated in acceptance, so GPT-first at the contract-shaped xhigh band on the strongest well-specified tier.",
+      "rationale": "Unchanged from the prior selection; re-asserted for the full-todo-set coverage contract.",
       "task_id": "fn-1244-pi-transcript-backed-session-rename.1",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.78,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Clears the opus burden via a subtle concurrency/staleness correctness invariant, a fail-open OAuth/no-secret-logging security boundary, and delicate pi-extension isolation idiom matching across a cross-cutting registration-to-renamer path.",
+      "confidence": 0.68,
+      "label_source": "human-directed",
+      "model": "gpt-5.6-sol",
+      "rationale": "The staleness/exactly-once/generation-token design is fully authored in the spec with every failure mode enumerated in the acceptance; what remains is careful implementation plus bounded host-API adaptation behind injected seams \u2014 hardest-well-specified tier work, not novel design. Human-directed GPT-first reassignment.",
       "task_id": "fn-1244-pi-transcript-backed-session-rename.2",
       "tier": "xhigh"
     }
   ],
   "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
-  "created_at": "2026-07-10T21:31:19.724000Z",
+  "created_at": "2026-07-11T17:24:12.190000Z",
   "epic_id": "fn-1244-pi-transcript-backed-session-rename",
-  "input_hash": "d83cbc867658e5ac1c3dee6fe27031913055cb77d3cbaa73123c28baa962da08",
+  "input_hash": "unavailable",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
-    "harness": "subagent",
-    "model": "plan:model-selector"
+    "harness": "claude",
+    "model": "claude-fable-5"
   },
-  "shuffle_seed": 3627859078,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1244-pi-transcript-backed-session-rename.1\",\"tier\":\"xhigh\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Well-specified new transcript-turn JSON contract with a branch-walking reducer whose edge cases are fully enumerated in acceptance, so GPT-first at the contract-shaped xhigh band on the strongest well-specified tier.\",\"confidence\":0.72},{\"task_id\":\"fn-1244-pi-transcript-backed-session-rename.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Clears the opus burden via a subtle concurrency/staleness correctness invariant, a fail-open OAuth/no-secret-logging security boundary, and delicate pi-extension isolation idiom matching across a cross-cutting registration-to-renamer path.\",\"confidence\":0.78}]}\n"
+  "shuffle_seed": null,
+  "verdict_raw": null
 }

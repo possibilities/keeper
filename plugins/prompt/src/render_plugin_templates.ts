@@ -568,12 +568,26 @@ function renderAgents(
       continue;
     }
 
+    // A plain-render static agent draws its frontmatter model+effort from the
+    // matrix `agent_pins`; a missing pin fails the render loud, naming the agent.
+    const pin = matrix.agentPins.get(stem);
+    if (pin === undefined) {
+      hadFailures = true;
+      process.stderr.write(
+        `✗ no agent_pins entry for '${stem}' in the host matrix — ` +
+          "every static plan agent needs a {model, effort} pin\n",
+      );
+      continue;
+    }
+    const pinVars = { agent_model: pin.model, agent_effort: pin.effort };
+
     if (variants.length > 0) {
       for (const variant of variants) {
         const out = variant
           ? join(agentsDir, `${stem}-${variant}.md`)
           : baseOut;
         const [rendered, failed] = renderOne(tmpl, {
+          ...pinVars,
           current_variant: variant,
         });
         if (failed) {
@@ -584,7 +598,7 @@ function renderAgents(
         emitAgent(out, rendered, sourceRel);
       }
     } else {
-      const [rendered, failed] = renderOne(tmpl, null);
+      const [rendered, failed] = renderOne(tmpl, pinVars);
       if (failed) {
         hadFailures = true;
         process.stderr.write(

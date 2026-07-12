@@ -63,15 +63,29 @@ import { dirname, join } from "node:path";
 export const INTEGRITY_CHECK_OK = "ok";
 
 /**
- * Daemon backup cadence (ms). 24h — a backup is a recovery floor, not a
+ * Daemon backup cadence (ms). 48h — a backup is a recovery floor, not a
  * point-in-time guarantee (the event log is the source of truth and is already
- * proactively integrity-probed every 15 min), so a daily verified snapshot is
- * the right rolling recovery window without churning the disk on a 2 GB copy.
+ * proactively integrity-probed every 15 min), so a rolling verified snapshot
+ * is the right recovery window without churning the disk on a full-DB copy.
  * Far slacker than the 15 min integrity probe / 30 s checkpoint heartbeats by
  * design: backup is a heavy producer-side op (a full `VACUUM INTO` copy +
  * `integrity_check`), so it runs rarely and off the hot path.
+ *
+ * On a multi-GB live DB, a full `VACUUM INTO` + `integrity_check` pass is the
+ * dominant source of backup I/O churn, so this cadence is deliberately wide:
+ * halving the frequency halves that churn with no loss of restore correctness
+ * — verify-on-write is unchanged, and the two faster safety nets this backup
+ * layers on top of (the immutable event log + the 15 min integrity probe)
+ * already catch corruption well inside the window. No compensating
+ * `wal_checkpoint(TRUNCATE)` is needed alongside this cadence: a `VACUUM INTO`
+ * destination is always written in `journal_mode=DELETE` regardless of the
+ * source's mode (verified empirically), so the snapshot carries no WAL to
+ * checkpoint; the source DB's own WAL is checkpointed by the steady-state
+ * retention pass (`src/compaction.ts` via daemon.ts), which already runs
+ * `PRAGMA wal_checkpoint(PASSIVE)` after every batch that moved bytes —
+ * deliberately PASSIVE, not TRUNCATE, so it never starves a concurrent writer.
  */
-export const BACKUP_INTERVAL_MS = 86_400_000;
+export const BACKUP_INTERVAL_MS = 172_800_000;
 
 /** The Telegram topic every keeper page routes to (matches the integrity probe). */
 export const KEEPER_TOPIC = "Keeper";
@@ -123,8 +137,9 @@ export function snapshotName(now: Date): string {
 
 /**
  * Default startup delay (ms) before a boot-time catch-up backup fires (fn-753).
- * Short enough that a keeperd that restarts more often than the 24h interval
- * (the LaunchAgent crash-recovery scenario, where a plain `setInterval` would
+ * Short enough that a keeperd that restarts more often than the backup
+ * interval ({@link BACKUP_INTERVAL_MS}) — the LaunchAgent crash-recovery
+ * scenario, where a plain `setInterval` would
  * silently never reach its first fire) still lands a snapshot promptly, but
  * long enough to stay off the boot-drain critical path — the catch-up is a
  * heavy `VACUUM INTO`, so it waits for the daemon to settle first.
@@ -775,7 +790,7 @@ export function reclaimInstructions(
     "       launchctl bootout <keeperd label>   # or: launchctl stop",
     "",
     "  4. Keep a pre-reclaim snapshot as the rollback (verified VACUUM INTO copy):",
-    "       bun scripts/backup-db.ts   # or the existing daily snapshot",
+    "       bun scripts/backup-db.ts   # or the existing rolling snapshot",
     "",
     "  5. Checkpoint the WAL fully into the main DB, then reclaim into a new file",
     "     with auto_vacuum=INCREMENTAL baked + quick_check gate:",

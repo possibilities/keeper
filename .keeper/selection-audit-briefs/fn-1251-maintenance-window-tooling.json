@@ -1,0 +1,58 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 2,
+        "insertions": 1097
+      },
+      "done_summary": "Added scripts/maintenance-window.ts: one command running the full offline-reclaim window (pause, drain-wait via task .1's board_work_jobs signal, snapshot, stop, keeper reclaim, restart, verify, hold/play), fail-safe on every step with 14 orchestration tests.",
+      "input_hash": "unavailable",
+      "model": "gpt-5.5",
+      "spec_chars": 2536,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** scripts/maintenance-window.ts (new), src/backup.ts (reference), test/ (new)\n\n### Approach\n\nProvide ONE supported command that runs the full offline-reclaim window with the\nexisting safety gates, replacing the ~8 manual steps. Sequence: capture autopilot\nstate \u2192 pause autopilot \u2192 await the plan-worker drain signal from task .1 \u2192\npre-reclaim snapshot \u2192 stop the daemon (launchctl bootout, resolved label) \u2192\n`keeper reclaim` (which already snapshots + checkpoints + VACUUM INTOs + self-verifies\n+ atomically swaps) \u2192 restart (launchctl bootstrap, resolved plist) \u2192 `keeper await\nserver-up` \u2192 verify (`auto_vacuum=2`, size, a `search-history` forensics probe) \u2192\nthen either `--hold` (leave autopilot paused) or restore/`play`. Must fail safe: on\nany verify mismatch, leave the pre-reclaim DB in place and autopilot paused for\ntriage (mirror `keeper reclaim`'s own rollback discipline). Honor the no-in-process-\nself-heal + sole-writer invariants; the wrapper orchestrates supported verbs, it does\nnot write keeper.db itself.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- src/backup.ts \u2014 `reclaimDb` / `reclaimInstructions` (the sequence to orchestrate); `keeper reclaim` is the offline step\n- src/maintenance-worker.ts:212 \u2014 the existing backup timer / worker pattern\n- task .1's drain signal \u2014 the safe-to-stop gate\n\n### Risks\n\n- Stopping/restarting the daemon via launchctl is external to keeper; the wrapper must resolve the correct label/plist (see task .3) and verify the daemon actually stopped before reclaim (reclaim refuses if the lock is held).\n- Must not unpause on failure \u2014 leave paused for triage.\n\n### Test notes\n\nTest the orchestration logic with injected seams for the launchctl/daemon/verify steps (no real daemon in the fast tier); assert the failure path leaves autopilot paused and the pre-reclaim DB untouched.\n\n## Acceptance\n\n- [ ] One command runs pause \u2192 drain-wait \u2192 snapshot \u2192 stop \u2192 reclaim \u2192 restart \u2192 verify \u2192 hold/play with the existing safety gates.\n- [ ] A `--hold` mode leaves autopilot paused; the default/`--play` restores the captured state.\n- [ ] On any verify failure the pre-reclaim DB is preserved and autopilot is left paused.\n\n## Done summary\nAdded scripts/maintenance-window.ts: one command running the full offline-reclaim window (pause, drain-wait via task .1's board_work_jobs signal, snapshot, stop, keeper reclaim, restart, verify, hold/play), fail-safe on every step with 14 orchestration tests.\n## Evidence\n",
+      "task_id": "fn-1251-maintenance-window-tooling.2",
+      "tier": "xhigh",
+      "title": "Maintenance window wrapper"
+    },
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 1,
+        "insertions": 6
+      },
+      "done_summary": "Added a short pointer in docs/install.md's Backup & restore section to bun scripts/maintenance-window.ts as the supported one-command offline reclaim path, alongside the existing reclaimInstructions() detailed runbook.",
+      "input_hash": "unavailable",
+      "model": "gpt-5.6-luna",
+      "spec_chars": 1418,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** CONTEXT.md or docs/install.md (whichever is the right home)\n\n### Approach\n\nAdd a short, discoverable runbook entry \u2014 \"Offline DB reclaim maintenance window\" \u2014\nthat points at the one-command wrapper from task .2 as the supported path, so a\nfuture agent finds it in one doc read instead of grepping src/backup.ts. Forward-\nfacing only (no fn-ids/dates/provenance per docs discipline); keep the code-rendered\nrunbook (`reclaimInstructions`) as the detailed source of truth and have the doc\npoint at it + the wrapper. Choose the right home (CONTEXT.md glossary vs docs/install.md\nBackup & restore section).\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- docs/install.md \u2014 existing \"Backup & restore\" section (candidate home)\n- CONTEXT.md \u2014 glossary (candidate home if a term is warranted)\n- task .2's wrapper command name \u2014 what the doc points at\n\n## Acceptance\n\n- [ ] A short runbook entry names the supported one-command maintenance-window path and where its detailed runbook lives, discoverable in one read.\n- [ ] The entry is forward-facing (no fn-ids/dates/provenance) per docs discipline.\n\n## Done summary\nAdded a short pointer in docs/install.md's Backup & restore section to bun scripts/maintenance-window.ts as the supported one-command offline reclaim path, alongside the existing reclaimInstructions() detailed runbook.\n## Evidence\n",
+      "task_id": "fn-1251-maintenance-window-tooling.4",
+      "tier": "medium",
+      "title": "Offline reclaim runbook doc"
+    }
+  ],
+  "created_at": "2026-07-12T06:03:34.399000Z",
+  "epic_id": "fn-1251-maintenance-window-tooling",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1251-maintenance-window-tooling.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1251-maintenance-window-tooling.3"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "unavailable",
+  "selector": {
+    "harness": "claude",
+    "model": "claude-fable-5"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.68,
+      "label_source": "human-directed",
+      "model": "gpt-5.5",
+      "rationale": "Orchestrates existing supported verbs with the sequence and fail-safe policy enumerated step-by-step in the spec; the wrapper never writes keeper.db and keeper reclaim carries its own rollback discipline, so the data-loss blast radius sits behind gates the wrapper only invokes. Substantial well-specified implementation, not an opus-gated invariant. Human-directed GPT-first reassignment.",
+      "task_id": "fn-1251-maintenance-window-tooling.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "human-directed",
+      "model": "gpt-5.6-luna",
+      "rationale": "Single-file S-sized runbook pointer with a named existing pattern to follow and the placement choice bounded to two spec-named candidates \u2014 tiny fully-specified mechanical work. Human-directed GPT-first reassignment.",
+      "task_id": "fn-1251-maintenance-window-tooling.4",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-11T17:24:28.926000Z",
+  "epic_id": "fn-1251-maintenance-window-tooling",
+  "input_hash": "unavailable",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "claude",
+    "model": "claude-fable-5"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}

@@ -317,7 +317,12 @@ export function launchToResolvedHandle(
       stopTimeoutMs,
       isResume: resume !== undefined,
     };
-    return { ok: true, handle, runId: result.id };
+    return {
+      ok: true,
+      handle,
+      runId: result.id,
+      killWindowCommand: result.killWindowCommand ?? undefined,
+    };
   } catch (exc) {
     if (exc instanceof TmuxLaunchError) {
       deps.writeErr(`Error: ${exc.message}\n`);

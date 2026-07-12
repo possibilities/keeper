@@ -1,0 +1,16 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-11T22:43:55.921000Z",
+  "depends_on": [],
+  "epic": "fn-1255-described-panel-roster-ladder",
+  "id": "fn-1255-described-panel-roster-ladder.1",
+  "model": "gpt-5.5",
+  "priority": null,
+  "selection_input_hash": "8301d735f67313a83b67ef6c0128cf79a1d9c3fc4827c4966fc307f37b1a5c4b",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Panel schema object cutover",
+  "updated_at": "2026-07-11T22:46:01.645000Z"
+}

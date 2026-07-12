@@ -1,0 +1,20 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-12T01:30:46.904000Z",
+  "depends_on": [
+    "fn-1256-provider-equivalence-worker-pin.2",
+    "fn-1256-provider-equivalence-worker-pin.5"
+  ],
+  "epic": "fn-1256-provider-equivalence-worker-pin",
+  "id": "fn-1256-provider-equivalence-worker-pin.6",
+  "model": "sonnet",
+  "priority": null,
+  "selection_input_hash": "582d9cff4f0425c92d28dd222f0b2afc18646eefd6fe4c45ce145e74e95e000a",
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Audit brief dispatched attribution",
+  "updated_at": "2026-07-12T03:12:54.965000Z",
+  "worker_done_at": "2026-07-12T03:12:54.965000Z"
+}
