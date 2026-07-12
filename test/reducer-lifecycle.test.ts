@@ -152,6 +152,10 @@ function insertEvent(
     // so a claude/launcher SessionStart folds jobs.adopted NULL; adoption-fold
     // tests set it (1) via overrides.
     adopted: overrides.adopted ?? null,
+    // Schema v119 / fn-1239: the PII-free per-launch account route. NULL by
+    // default so a launcher-supplied-none / legacy SessionStart folds
+    // jobs.account_route NULL; account-route fold tests set it via overrides.
+    account_route: overrides.account_route ?? null,
   };
   db.run(
     `INSERT INTO events (
@@ -163,8 +167,8 @@ function insertEvent(
        bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id, mutation_path, worktree, harness, resume_target,
-       adopted
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       adopted, account_route
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -203,6 +207,7 @@ function insertEvent(
       row.harness,
       row.resume_target,
       row.adopted,
+      row.account_route,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -5089,10 +5094,13 @@ test("Commit fold runs in the SAME transaction as cursor advance (atomicity)", (
 });
 
 // ---------------------------------------------------------------------------
-// UsageSnapshot / UsageDeleted reducer arms — fn-615-add-agentusage-usage-collection
+// UsageSnapshot / UsageDeleted / rate-limit profile fan-out — retired at
+// schema v120 (fn-1239 task .6). `usage` and `profiles` are gone at head;
+// these hook events remain in historical logs forever, so the fold must
+// advance the cursor safely without resurrecting either table.
 // ---------------------------------------------------------------------------
 
-test("UsageSnapshot folds into the usage projection and advances the cursor", () => {
+test("UsageSnapshot folds as a safe no-op — advances the cursor without resurrecting the retired usage table", () => {
   const id = insertEvent({
     hook_event: "UsageSnapshot",
     session_id: "claude-default",
@@ -5100,268 +5108,28 @@ test("UsageSnapshot folds into the usage projection and advances the cursor", ()
       target: "claude",
       multiplier: 5,
       session_percent: 12.0,
-      session_resets_at: "2026-05-26T18:30:00-04:00",
-      week_percent: 8.0,
-      week_resets_at: "2026-06-01T20:00:00-04:00",
     }),
   });
-
-  expect(drainAll()).toBe(1);
-  const row = db
-    .query("SELECT * FROM usage WHERE id = ?")
-    .get("claude-default") as {
-    id: string;
-    target: string;
-    multiplier: number;
-    session_percent: number;
-    session_resets_at: string;
-    week_percent: number;
-    week_resets_at: string;
-    last_event_id: number;
-    updated_at: number;
-  } | null;
-
-  expect(row).not.toBeNull();
-  expect(row?.target).toBe("claude");
-  expect(row?.multiplier).toBe(5);
-  expect(row?.session_percent).toBe(12.0);
-  expect(row?.session_resets_at).toBe("2026-05-26T18:30:00-04:00");
-  expect(row?.week_percent).toBe(8.0);
-  expect(row?.week_resets_at).toBe("2026-06-01T20:00:00-04:00");
-  expect(row?.last_event_id).toBe(id);
+  expect(() => drainAll()).not.toThrow();
   expect(getCursor()).toBe(id);
-});
-
-test("UsageSnapshot upserts on conflict and bumps last_event_id every write", () => {
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 12.0,
-      session_resets_at: "T1",
-      week_percent: 8.0,
-      week_resets_at: "T2",
-    }),
-  });
-  const secondId = insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 30.0,
-      session_resets_at: "T1",
-      week_percent: 8.0,
-      week_resets_at: "T2",
-    }),
-  });
-  expect(drainAll()).toBe(2);
-  const row = db
-    .query("SELECT session_percent, last_event_id FROM usage WHERE id = ?")
-    .get("claude-default") as {
-    session_percent: number;
-    last_event_id: number;
-  };
-  expect(row.session_percent).toBe(30.0);
-  expect(row.last_event_id).toBe(secondId);
-});
-
-test("UsageSnapshot folds missing session/week to NULL (safe-value invariant)", () => {
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "x",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      // session/week fields omitted → fold to NULL.
-    }),
-  });
-  drainAll();
-  const row = db
+  const hasUsage = db
     .query(
-      "SELECT session_percent, session_resets_at, week_percent, week_resets_at FROM usage WHERE id = ?",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
     )
-    .get("x") as {
-    session_percent: number | null;
-    session_resets_at: string | null;
-    week_percent: number | null;
-    week_resets_at: string | null;
-  };
-  expect(row.session_percent).toBeNull();
-  expect(row.session_resets_at).toBeNull();
-  expect(row.week_percent).toBeNull();
-  expect(row.week_resets_at).toBeNull();
+    .get();
+  expect(hasUsage ?? null).toBeNull();
 });
 
-test("UsageSnapshot folds account_state through the UPSERT; malformed/absent → NULL (fn-1007)", () => {
-  // A valid account_state persists through the UPSERT...
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "signed-out",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      status: "active",
-      account_state: "signed_out",
-    }),
-  });
-  // ...a malformed account_state folds to NULL (never throws — cursor advances)...
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "garbage",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      account_state: "not_a_state",
-    }),
-  });
-  // ...and a pre-v97 (field-absent) event folds to NULL.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "legacy",
-    data: JSON.stringify({ target: "claude", multiplier: 5 }),
-  });
-  expect(drainAll()).toBe(3);
-  const rows = db
-    .query(
-      "SELECT id, account_state FROM usage WHERE id IN ('signed-out','garbage','legacy')",
-    )
-    .all() as { id: string; account_state: string | null }[];
-  const byId = Object.fromEntries(rows.map((r) => [r.id, r.account_state]));
-  expect(byId["signed-out"]).toBe("signed_out");
-  expect(byId.garbage).toBeNull();
-  expect(byId.legacy).toBeNull();
-});
-
-test("UsageSnapshot with empty pk (session_id) is a safe no-op", () => {
+test("UsageDeleted folds as a safe no-op — advances the cursor without throwing", () => {
   const id = insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "",
-    data: JSON.stringify({ target: "x" }),
+    hook_event: "UsageDeleted",
+    session_id: "claude-default",
   });
-  expect(drainAll()).toBe(1);
-  const count = (
-    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
-  ).n;
-  expect(count).toBe(0);
+  expect(() => drainAll()).not.toThrow();
   expect(getCursor()).toBe(id);
 });
 
-test("UsageSnapshot with malformed data blob is a safe no-op (cursor still advances)", () => {
-  const id = insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: "{ not json",
-  });
-  expect(drainAll()).toBe(1);
-  const count = (
-    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
-  ).n;
-  expect(count).toBe(0);
-  expect(getCursor()).toBe(id);
-});
-
-test("UsageDeleted DELETEs the usage row and advances the cursor", () => {
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 12.0,
-      session_resets_at: "T",
-      week_percent: 8.0,
-      week_resets_at: "T",
-    }),
-  });
-  const dropId = insertEvent({
-    hook_event: "UsageDeleted",
-    session_id: "claude-default",
-    data: "",
-  });
-  expect(drainAll()).toBe(2);
-  const row = db
-    .query("SELECT * FROM usage WHERE id = ?")
-    .get("claude-default");
-  expect(row).toBeNull();
-  expect(getCursor()).toBe(dropId);
-});
-
-test("UsageDeleted on an unknown id is a safe no-op (cursor still advances)", () => {
-  const id = insertEvent({
-    hook_event: "UsageDeleted",
-    session_id: "ghost",
-    data: "",
-  });
-  expect(drainAll()).toBe(1);
-  expect(getCursor()).toBe(id);
-});
-
-test("from-scratch re-fold reproduces the usage projection byte-identically", () => {
-  // Seed a sequence: snapshot, snapshot (upsert), delete, snapshot of another id.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 12.0,
-      session_resets_at: "T1",
-      week_percent: 8.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 30.0,
-      session_resets_at: "T1",
-      week_percent: 8.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "UsageDeleted",
-    session_id: "claude-default",
-    data: "",
-  });
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "codex",
-    data: JSON.stringify({
-      target: "codex",
-      multiplier: 1,
-      session_percent: 1.0,
-      session_resets_at: "T3",
-      week_percent: 71.0,
-      week_resets_at: "T4",
-    }),
-  });
-  drainAll();
-  const before = db.query("SELECT * FROM usage ORDER BY id").all();
-  // Rewind + wipe + re-drain. Re-fold determinism: the post-rewind rows
-  // must equal byte-for-byte the pre-rewind rows.
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM usage");
-  drainAll();
-  const after = db.query("SELECT * FROM usage ORDER BY id").all();
-  expect(after).toEqual(before);
-});
-
-// ---------------------------------------------------------------------------
-// Schema v35 (fn-642) — bidirectional rate-limit fan-out between `usage` and
-// `profiles`. `usage.id` joins against `profiles.profile_name` (the derived
-// `projectBasename(config_dir)`); the `''` sentinel never participates.
-// ---------------------------------------------------------------------------
-
-test("forward fan-out: RateLimited stamps the matching usage row's last_rate_limit_* and bumps last_event_id (fn-642)", () => {
-  // Profile dir `/Users/x/.claude-profiles/multi-claude-3` → basename
-  // `multi-claude-3` → matching usage row id `multi-claude-3`.
+test("historical UsageSnapshot / UsageDeleted / rate_limit RateLimited events re-fold from scratch without dead letters or resurrecting usage/profiles", () => {
   insertEvent({
     hook_event: "UsageSnapshot",
     session_id: "multi-claude-3",
@@ -5369,9 +5137,6 @@ test("forward fan-out: RateLimited stamps the matching usage row's last_rate_lim
       target: "claude",
       multiplier: 20,
       session_percent: 5.0,
-      session_resets_at: "T1",
-      week_percent: 10.0,
-      week_resets_at: "T2",
     }),
   });
   insertEvent({
@@ -5380,24 +5145,27 @@ test("forward fan-out: RateLimited stamps the matching usage row's last_rate_lim
     config_dir: "/Users/x/.claude-profiles/multi-claude-3",
   });
   insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
-  const rlId = insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-rl",
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-rl" });
+  const lastId = insertEvent({
+    hook_event: "UsageDeleted",
+    session_id: "multi-claude-3",
   });
   drainAll();
-  const usageRow = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id, last_event_id FROM usage WHERE id = 'multi-claude-3'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-    last_event_id: number;
-  };
-  expect(usageRow.last_rate_limit_at).not.toBeNull();
-  expect(usageRow.last_rate_limit_session_id).toBe("sess-rl");
-  // last_event_id bumped to the rate-limit event id so the wire diff fires.
-  expect(usageRow.last_event_id).toBe(rlId);
+  expect(getCursor()).toBe(lastId);
+  // The preserved (last_api_error_at, last_api_error_kind) stamp is covered
+  // by the dedicated ApiError/RateLimited tests elsewhere; this proves only
+  // that the retired profile-level fan-out no longer runs, and that a
+  // from-scratch re-fold over the same historical stream converges without
+  // throwing or resurrecting either retired table.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  for (const table of ["usage", "profiles"]) {
+    const has = db
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table);
+    expect(has ?? null).toBeNull();
+  }
 });
 
 test("SessionStart stamps jobs.profile_name from config_dir; a NULL-config resume preserves it (v36)", () => {
@@ -5475,784 +5243,128 @@ test("from-scratch re-fold reproduces jobs.profile_name byte-identically (v36)",
   expect(after).toEqual(before);
 });
 
-test("forward fan-out: a rate_limit on an untracked profile is a no-op — no phantom usage row minted (fn-642)", () => {
-  // SessionStart on profile-A but agentusage never observed profile-A in
-  // ~/.local/state/agentusage — there's no `usage` row to fan into. The
-  // forward UPDATE must match zero rows and we must NOT mint a phantom.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-untracked",
-    config_dir: "/Users/x/.claude-profiles/untracked-profile",
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-untracked",
-  });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-untracked" });
-  drainAll();
-  // The profiles row was seeded + rate-limit stamped (existing fn-639
-  // behavior); but `usage` was never touched.
-  const usageCount = (
-    db.query("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
-  ).n;
-  expect(usageCount).toBe(0);
-});
-
-test("reverse fan-out: UsageSnapshot pulls the current rate-limit from the matching profiles row (fn-642)", () => {
-  // Rate limit lands FIRST (with no usage row yet), then the UsageSnapshot
-  // arrives. The reverse fan-out's post-UPSERT SELECT must pull the
-  // profile's rate-limit annotation onto the new usage row.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-A",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-1",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-A" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-A" });
-  // Now the UsageSnapshot arrives.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-1",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 20.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'multi-claude-1'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  };
-  expect(row.last_rate_limit_at).not.toBeNull();
-  expect(row.last_rate_limit_session_id).toBe("sess-A");
-});
-
-test("reverse fan-out is NULL-safe: a UsageSnapshot with no matching profiles row leaves rate-limit columns NULL (fn-642)", () => {
-  // No SessionStart for the profile this usage corresponds to. The
-  // UsageSnapshot UPSERTs the row; the reverse fan-out's SELECT returns
-  // null; both columns stay NULL.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "lone-profile",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 1.0,
-      session_resets_at: "T1",
-      week_percent: 1.0,
-      week_resets_at: "T2",
-    }),
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'lone-profile'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  };
-  expect(row.last_rate_limit_at).toBeNull();
-  expect(row.last_rate_limit_session_id).toBeNull();
-});
-
-test("ON CONFLICT carve-out: a re-UsageSnapshot does NOT clobber a prior rate-limit fan-out (fn-642)", () => {
-  // A rate-limit lands BEFORE the second UsageSnapshot. The UPSERT must
-  // NOT include last_rate_limit_* in its ON CONFLICT DO UPDATE SET clause —
-  // otherwise the snapshot's NULL bindings would clobber the stamped value.
-  // The reverse fan-out's post-UPSERT SELECT re-reads the profile row and
-  // re-applies it (which keeps the value), so net effect is preservation.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-2",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 5.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-B",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-2",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-B" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-B" });
-  // The usage row now carries the rate-limit. A second UsageSnapshot lands —
-  // the carve-out must preserve last_rate_limit_*.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-2",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 30.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT session_percent, last_rate_limit_session_id FROM usage WHERE id = 'multi-claude-2'",
-    )
-    .get() as {
-    session_percent: number;
-    last_rate_limit_session_id: string | null;
-  };
-  // Quota numbers DO update on a re-snapshot.
-  expect(row.session_percent).toBe(30.0);
-  // Rate-limit annotation is preserved through the snapshot churn.
-  expect(row.last_rate_limit_session_id).toBe("sess-B");
-});
-
-test("literal usage.id='' stays non-joinable — directional mapping is one-way (fn-662)", () => {
-  // The v42 (fn-662) `''↔'default'` mapping is DIRECTIONAL — the helper
-  // translates `''` → `'default'` (forward, profile→usage) and
-  // `'default'` → `''` (reverse, usage→profile), but NEVER `''` → `''`. So a
-  // pathological literal `usage.id=''` cannot join the `''` profile row.
-  //
-  // In steady state this is moot — `projectUsageRow`'s early empty-string
-  // guard rejects any event whose session_id is empty, so no usage row
-  // with id='' ever exists. This test asserts the early-guard's no-mint
-  // behavior is preserved (the concrete invariant from the pre-v42 test
-  // it replaces) AND that the `''` profile row's rate-limit annotation
-  // colocates onto `usage.default` via the forward fan-out's mapping.
-  // Seed `usage.default` first so the forward UPDATE has a row to land on.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 2.0,
-      session_resets_at: "T1",
-      week_percent: 2.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default",
-    config_dir: null,
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
-  // A pathological UsageSnapshot with session_id='' — agentusage cannot mint
-  // this in practice (`<id>.json` with empty basename is impossible on
-  // disk), but the early guard must reject it regardless.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 1.0,
-      session_resets_at: "T1",
-      week_percent: 1.0,
-      week_resets_at: "T2",
-    }),
-  });
-  drainAll();
-  // Sanity: no `usage.id=''` row was minted (empty session_id rejected by
-  // projectUsageRow's early guard).
-  const emptyIdRow = db.query("SELECT id FROM usage WHERE id = ''").get() as {
-    id: string;
-  } | null;
-  expect(emptyIdRow).toBeNull();
-  // The `''` profile row was stamped with the rate-limit (existing v33
-  // behavior). The v42 forward mapping additionally colocates it onto
-  // `usage.default`.
-  const profileRow = db
-    .query(
-      "SELECT profile_name, last_rate_limit_session_id FROM profiles WHERE config_dir = ''",
-    )
-    .get() as {
-    profile_name: string;
-    last_rate_limit_session_id: string | null;
-  };
-  expect(profileRow.profile_name).toBe("");
-  expect(profileRow.last_rate_limit_session_id).toBe("sess-default");
-  // The seeded `usage.default` row carries the colocated annotation —
-  // v42's whole point.
-  const defaultRow = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'default'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  };
-  expect(defaultRow.last_rate_limit_at).not.toBeNull();
-  expect(defaultRow.last_rate_limit_session_id).toBe("sess-default");
-});
-
-test("forward fan-out: NULL-config RateLimited colocates onto usage.default via '' → 'default' mapping (fn-662)", () => {
-  // The early-proof-point test for v42 (fn-662). A default-`~/.claude`
-  // session (NULL config_dir → `''` sentinel) hits a rate limit; the
-  // v42 forward mapping translates `''` → `"default"` so the existing
-  // `usage.default` row picks up `last_rate_limit_at`.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 15.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default-fwd",
-    config_dir: null,
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-default-fwd",
-  });
-  const rlId = insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-default-fwd",
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id, last_event_id FROM usage WHERE id = 'default'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-    last_event_id: number;
-  };
-  expect(row.last_rate_limit_at).not.toBeNull();
-  expect(row.last_rate_limit_session_id).toBe("sess-default-fwd");
-  // last_event_id bumped to the rate-limit event id (descriptor diff fires).
-  expect(row.last_event_id).toBe(rlId);
-});
-
-test("reverse fan-out: 'default' UsageSnapshot pulls the '' profiles annotation via 'default' → '' mapping (fn-662)", () => {
-  // The mirror direction. A NULL-config rate limit stamps the `''` profile
-  // row's annotation FIRST (no usage.default row yet); then a `default`
-  // UsageSnapshot lands and the reverse fan-out's post-UPSERT SELECT
-  // translates `'default'` → `''` to pull the annotation onto `usage.default`.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default-rev",
-    config_dir: null,
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-default-rev",
-  });
-  insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-default-rev",
-  });
-  // Now the UsageSnapshot for the default account lands.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 25.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM usage WHERE id = 'default'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  };
-  expect(row.last_rate_limit_at).not.toBeNull();
-  expect(row.last_rate_limit_session_id).toBe("sess-default-rev");
-});
-
-test("from-scratch re-fold reproduces v42 default-mapped usage + profiles byte-identically (fn-662)", () => {
-  // Re-fold determinism across the v42 mapping. Mix default-profile and
-  // named-profile events in both forward and reverse orderings, then
-  // rewind + wipe + re-drain and assert byte-identical projections.
-  // (a) forward: usage.default exists, NULL-config SessionStart, RateLimited.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 7.0,
-      session_resets_at: "T1",
-      week_percent: 3.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default-fwd-rf",
-    config_dir: null,
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-default-fwd-rf",
-  });
-  insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-default-fwd-rf",
-  });
-  // (b) reverse: default RateLimited lands BEFORE a default UsageSnapshot.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default-rev-rf",
-    config_dir: null,
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-default-rev-rf",
-  });
-  insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-default-rev-rf",
-  });
-  // (c) named profile mixed in — assert the mapping is one-way and named
-  // profiles still route to their own usage row, not to default.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-3",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 20,
-      session_percent: 12.0,
-      session_resets_at: "T1",
-      week_percent: 4.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-named",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-named" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-named" });
-  drainAll();
-  const beforeUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
-  const beforeProfiles = db
-    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
-    .all();
-  // Sanity: default-account annotation actually landed on usage.default,
-  // not on usage with id='' (a pre-v42 regression check).
-  const defaultRow = db
-    .query("SELECT last_rate_limit_session_id FROM usage WHERE id = 'default'")
-    .get() as { last_rate_limit_session_id: string | null };
-  expect(defaultRow.last_rate_limit_session_id).not.toBeNull();
-  // Rewind + wipe + re-drain.
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM usage");
-  db.run("DELETE FROM profiles");
-  drainAll();
-  const afterUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
-  const afterProfiles = db
-    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
-    .all();
-  expect(afterUsage).toEqual(beforeUsage);
-  expect(afterProfiles).toEqual(beforeProfiles);
-});
-
-test("from-scratch re-fold reproduces usage + profiles projections byte-identically (fn-642)", () => {
-  // Cover both fan-out directions and event ordering:
-  // (a) UsageSnapshot BEFORE SessionStart BEFORE RateLimited (forward path);
-  // (b) RateLimited BEFORE UsageSnapshot (reverse path);
-  // (c) untracked rate-limit (no usage row) mints nothing on usage;
-  // (d) '' sentinel never cross-contaminates.
-  // (a) forward: usage row exists, then SessionStart, then rate-limit fans in.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-3",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 20,
-      session_percent: 15.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-fwd",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-fwd" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-fwd" });
-  // (b) reverse: rate-limit first under a profile whose usage row has not
-  // yet been snapshotted; then the UsageSnapshot lands and pulls it in.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-rev",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-1",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rev" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-rev" });
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-1",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 25.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-    }),
-  });
-  // (c) untracked: rate-limit on a profile agentusage doesn't track.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-untracked",
-    config_dir: "/Users/x/.claude-profiles/untracked",
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-untracked",
-  });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-untracked" });
-  // (d) '' sentinel rate-limit (default ~/.claude).
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default",
-    config_dir: null,
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
-  drainAll();
-  const beforeUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
-  const beforeProfiles = db
-    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
-    .all();
-  // Rewind + wipe + re-drain.
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM usage");
-  db.run("DELETE FROM profiles");
-  drainAll();
-  const afterUsage = db.query("SELECT * FROM usage ORDER BY id ASC").all();
-  const afterProfiles = db
-    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
-    .all();
-  expect(afterUsage).toEqual(beforeUsage);
-  expect(afterProfiles).toEqual(beforeProfiles);
-});
-
 // ---------------------------------------------------------------------------
-// Schema v41 (fn-651) — UsageSnapshot ingests `lift_at` + stamps
-// `last_usage_fold_at` only on a successful usage fold; rate-limit fan-out
-// MUST NOT touch either column (carve-out symmetric to v35).
+// Account-route attribution (schema v119 / fn-1239.3)
 // ---------------------------------------------------------------------------
 
-test("UsageSnapshot ingests top-level lift_at into usage.rate_limit_lifts_at (fn-651)", () => {
+const readRoute = (jobId: string): string | null =>
+  (
+    db.query("SELECT account_route FROM jobs WHERE job_id = ?").get(jobId) as {
+      account_route: string | null;
+    } | null
+  )?.account_route ?? null;
+
+test("SessionStart folds account_route as default / claude-swap:<slot> / NULL, never from a path or email (v119)", () => {
   insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-mc1",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 100.0,
-      session_resets_at: "2026-05-30T20:30:00-04:00",
-      week_percent: 50.0,
-      week_resets_at: "2026-06-01T20:00:00-04:00",
-      status: "active",
-      // agentusage's derived unblock instant — soonest resets_at among >=100%
-      // windows. Folds into usage.rate_limit_lifts_at on the percentage path.
-      lift_at: "2026-05-30T20:30:00-04:00",
-    }),
+    hook_event: "SessionStart",
+    session_id: "sess-route-native",
+    account_route: "default",
+    // A config_dir carrying an email-derived basename is present, proving the
+    // route is the EXPLICIT carrier — never derived from config_dir.
+    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-managed",
+    account_route: "claude-swap:5",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-none",
+    account_route: null,
   });
   drainAll();
-  const row = db
-    .query(
-      "SELECT rate_limit_lifts_at, last_usage_fold_at FROM usage WHERE id = ?",
-    )
-    .get("claude-mc1") as {
-    rate_limit_lifts_at: string | null;
-    last_usage_fold_at: number | null;
-  };
-  expect(row.rate_limit_lifts_at).toBe("2026-05-30T20:30:00-04:00");
-  // Status active → successful fold → freshness stamped (non-null).
-  expect(row.last_usage_fold_at).not.toBeNull();
+  expect(readRoute("sess-route-native")).toBe("default");
+  expect(readRoute("sess-route-managed")).toBe("claude-swap:5");
+  // A launcher that supplied no route folds NULL — the account label is NOT
+  // back-derived from config_dir's basename.
+  expect(readRoute("sess-route-none")).toBeNull();
 });
 
-test("UsageSnapshot stamps last_usage_fold_at from the event ts on a successful fold (fn-651)", () => {
-  const id = insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 12.0,
-      session_resets_at: "T1",
-      week_percent: 8.0,
-      week_resets_at: "T2",
-      status: "active",
-    }),
+test("a resumed SessionStart preserves per-process route attribution without conversation affinity (v119)", () => {
+  // First launch on a managed route.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-resume",
+    account_route: "claude-swap:2",
   });
   drainAll();
-  // The event was inserted via the test helper at the synthetic ts — read it
-  // back and assert the stamp equals it (the determinism boundary: never
-  // Date.now()).
-  const eventTs = (
-    db.query("SELECT ts FROM events WHERE id = ?").get(id) as {
-      ts: number;
-    }
-  ).ts;
-  const row = db
-    .query("SELECT last_usage_fold_at FROM usage WHERE id = ?")
-    .get("claude-default") as { last_usage_fold_at: number | null };
-  expect(row.last_usage_fold_at).toBe(eventTs);
+  expect(readRoute("sess-route-resume")).toBe("claude-swap:2");
+
+  // A resume carrying NO route (launcher supplied none) preserves the prior
+  // process's attribution — latest-NON-NULL-wins, mirroring config_dir/worktree.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-resume",
+    account_route: null,
+  });
+  drainAll();
+  expect(readRoute("sess-route-resume")).toBe("claude-swap:2");
+
+  // A resume on a DIFFERENT route re-stamps this process's route — cross-account
+  // resume is conversation-correct and the choice is per-process, never bound to
+  // the conversation's earlier route.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-resume",
+    account_route: "default",
+  });
+  drainAll();
+  expect(readRoute("sess-route-resume")).toBe("default");
 });
 
-test("UsageSnapshot does NOT bump last_usage_fold_at on an idle/stale fold (fn-651)", () => {
-  // First write — a SUCCESSFUL fold stamps the freshness column. Read it
-  // back so we can assert it survives a subsequent idle/stale write.
-  const firstId = insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 12.0,
-      session_resets_at: "T1",
-      week_percent: 8.0,
-      week_resets_at: "T2",
-      status: "active",
-    }),
-  });
-  drainAll();
-  const firstTs = (
-    db.query("SELECT ts FROM events WHERE id = ?").get(firstId) as {
-      ts: number;
-    }
-  ).ts;
-
-  // Second write — STALE envelope with NO usage percents. The
-  // `isSuccessfulFold` gate evaluates false (status != "active", all
-  // percents null) → excluded.last_usage_fold_at is NULL → the UPSERT's
-  // COALESCE preserves the prior successful stamp.
+test("a malformed stored account_route folds without throwing and never influences a sibling job (v119)", () => {
+  // The hook bounds the value at capture, but the fold must be null-safe against
+  // any crafted/legacy stored value — it copies verbatim and never throws, and
+  // one job's route never leaks onto another (no cross-job derivation).
   insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-default",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      // All percents null — a stale snapshot's typical shape.
-      status: "stale",
-    }),
+    hook_event: "SessionStart",
+    session_id: "sess-route-crafted",
+    account_route: "not-a-valid-route/../etc",
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-route-clean",
+    account_route: "default",
   });
   drainAll();
-  const row = db
-    .query("SELECT status, last_usage_fold_at FROM usage WHERE id = ?")
-    .get("claude-default") as {
-    status: string | null;
-    last_usage_fold_at: number | null;
-  };
-  // Status updated to stale on the re-snapshot.
-  expect(row.status).toBe("stale");
-  // But the freshness stamp survived (carve-out preserves it via COALESCE).
-  expect(row.last_usage_fold_at).toBe(firstTs);
+  expect(readRoute("sess-route-crafted")).toBe("not-a-valid-route/../etc");
+  expect(readRoute("sess-route-clean")).toBe("default");
 });
 
-test("UsageSnapshot stamps last_usage_fold_at when any per-window percent is non-null (fn-651)", () => {
-  // The "successful fold" gate is `status === "active" OR any percent
-  // non-null`. A row with only `session_percent` (no status field at all)
-  // still qualifies — agentusage's `active` status is a sufficient signal but
-  // not a necessary one.
+test("from-scratch re-fold reproduces jobs.account_route byte-identically (v119)", () => {
   insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "codex-default",
-    data: JSON.stringify({
-      target: "codex",
-      multiplier: 1,
-      session_percent: 5.0,
-      session_resets_at: "T1",
-      // status field omitted; week_percent omitted.
-    }),
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-a",
+    account_route: "claude-swap:9",
   });
-  drainAll();
-  const row = db
-    .query("SELECT last_usage_fold_at FROM usage WHERE id = ?")
-    .get("codex-default") as { last_usage_fold_at: number | null };
-  expect(row.last_usage_fold_at).not.toBeNull();
-});
-
-test("RateLimited fan-out does NOT clobber rate_limit_lifts_at or last_usage_fold_at (v41 carve-out)", () => {
-  // The schema-v41 carve-out is symmetric to v35: the rate-limit fan-out's
-  // forward UPDATE writes ONLY `last_rate_limit_*` + descriptor bookkeeping
-  // and MUST NOT touch the two v41 columns. A percentage-path fold sets
-  // both; a subsequent RateLimited fold against the same profile must
-  // preserve them.
   insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "multi-claude-1",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 100.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-      status: "active",
-      lift_at: "2026-05-30T20:30:00-04:00",
-    }),
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-b",
+    account_route: null,
+  });
+  // A NULL-route resume on A exercises the COALESCE-preserve path on re-fold.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-a",
+    account_route: null,
+  });
+  // A different-route resume on B exercises the re-stamp path on re-fold.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-route-b",
+    account_route: "default",
   });
   drainAll();
   const before = db
-    .query(
-      "SELECT rate_limit_lifts_at, last_usage_fold_at FROM usage WHERE id = ?",
-    )
-    .get("multi-claude-1") as {
-    rate_limit_lifts_at: string | null;
-    last_usage_fold_at: number | null;
-  };
-  expect(before.rate_limit_lifts_at).toBe("2026-05-30T20:30:00-04:00");
-  expect(before.last_usage_fold_at).not.toBeNull();
-
-  // Now fire a RateLimited fold against the same profile. The forward
-  // UPDATE writes only the rate-limit columns; the carve-out keeps the
-  // lift instant + freshness stamp intact.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-rl-carveout",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-1",
-  });
-  insertEvent({
-    hook_event: "UserPromptSubmit",
-    session_id: "sess-rl-carveout",
-  });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-rl-carveout" });
+    .query("SELECT job_id, account_route FROM jobs ORDER BY job_id")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
   drainAll();
   const after = db
-    .query(
-      "SELECT rate_limit_lifts_at, last_usage_fold_at, last_rate_limit_session_id FROM usage WHERE id = ?",
-    )
-    .get("multi-claude-1") as {
-    rate_limit_lifts_at: string | null;
-    last_usage_fold_at: number | null;
-    last_rate_limit_session_id: string | null;
-  };
-  // Rate-limit fan-out DID stamp the rate-limit column (sanity check that
-  // the fan-out fired at all).
-  expect(after.last_rate_limit_session_id).toBe("sess-rl-carveout");
-  // Lift instant + freshness stamp preserved through the rate-limit fold.
-  expect(after.rate_limit_lifts_at).toBe(before.rate_limit_lifts_at);
-  expect(after.last_usage_fold_at).toBe(before.last_usage_fold_at);
-});
-
-test("UsageSnapshot re-snapshot does NOT clobber a prior successful last_usage_fold_at via NULL excluded (fn-651)", () => {
-  // ON CONFLICT carve-out check: even when a re-UsageSnapshot's gate
-  // evaluates false (idle/stale), COALESCE(excluded.last_usage_fold_at,
-  // usage.last_usage_fold_at) preserves the prior stamp. Companion to the
-  // "idle/stale does not bump" test above — this one specifically asserts
-  // the UPSERT's COALESCE preservation path.
-  const firstId = insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-coalesce",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-      session_percent: 10.0,
-      session_resets_at: "T1",
-      week_percent: 10.0,
-      week_resets_at: "T2",
-      status: "active",
-    }),
-  });
-  drainAll();
-  const firstTs = (
-    db.query("SELECT ts FROM events WHERE id = ?").get(firstId) as {
-      ts: number;
-    }
-  ).ts;
-  // Idle envelope — empty usage block, no status field, no percents.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "claude-coalesce",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 5,
-    }),
-  });
-  drainAll();
-  const row = db
-    .query("SELECT last_usage_fold_at FROM usage WHERE id = ?")
-    .get("claude-coalesce") as { last_usage_fold_at: number | null };
-  expect(row.last_usage_fold_at).toBe(firstTs);
-});
-
-test("from-scratch re-fold reproduces usage.rate_limit_lifts_at + last_usage_fold_at byte-identically (fn-651)", () => {
-  // Cover all three branches of the freshness gate + the lift_at field:
-  // (a) successful fold with lift_at — both columns stamped;
-  // (b) successful fold without lift_at — only freshness stamped;
-  // (c) idle/stale fold against an existing row — preservation via COALESCE.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "rf-a",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 100.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-      status: "active",
-      lift_at: "2026-05-30T20:30:00-04:00",
-    }),
-  });
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "rf-b",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      session_percent: 5.0,
-      session_resets_at: "T1",
-      week_percent: 5.0,
-      week_resets_at: "T2",
-      status: "active",
-    }),
-  });
-  // Idle re-snapshot on rf-b — must preserve the freshness stamp on re-fold.
-  insertEvent({
-    hook_event: "UsageSnapshot",
-    session_id: "rf-b",
-    data: JSON.stringify({
-      target: "claude",
-      multiplier: 1,
-      status: "stale",
-    }),
-  });
-  drainAll();
-  const before = db.query("SELECT * FROM usage ORDER BY id ASC").all();
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM usage");
-  drainAll();
-  const after = db.query("SELECT * FROM usage ORDER BY id ASC").all();
+    .query("SELECT job_id, account_route FROM jobs ORDER BY job_id")
+    .all();
   expect(after).toEqual(before);
 });
 

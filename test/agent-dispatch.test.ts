@@ -32,8 +32,6 @@ function harness(argv: string[]) {
   return makeHarness({
     argv,
     rawArgv: true,
-    listProfiles: () => ["default"],
-    pickProfile: () => "default",
   });
 }
 
@@ -176,24 +174,20 @@ describe("splitSubcommand", () => {
     });
   });
 
-  test("profiles check classifies (bare → human-readable)", () => {
+  // The profile-check command is retired (no Keeper-owned profile farm to
+  // diagnose) — `profiles` is now an ordinary unrecognized leading token,
+  // classified identically regardless of what follows it.
+  test("profiles check is no longer a recognized subcommand", () => {
     expect(splitSubcommand(["profiles", "check"])).toEqual({
-      kind: "profiles-check",
-      json: false,
-    });
-  });
-
-  test("profiles check --json classifies", () => {
-    expect(splitSubcommand(["profiles", "check", "--json"])).toEqual({
-      kind: "profiles-check",
-      json: true,
-    });
-  });
-
-  test("profiles with an unknown verb is usage", () => {
-    expect(splitSubcommand(["profiles", "frobnicate"])).toEqual({
       kind: "usage",
-      unknown: "profiles frobnicate",
+      unknown: "profiles",
+    });
+  });
+
+  test("profiles check --json is no longer a recognized subcommand", () => {
+    expect(splitSubcommand(["profiles", "check", "--json"])).toEqual({
+      kind: "usage",
+      unknown: "profiles",
     });
   });
 

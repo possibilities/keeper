@@ -6,7 +6,7 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 
 - **Session tracking** — every prompt, tool call, and file mutation across claude, codex,
   pi, and hermes sessions lands in one queryable log
-- **Live board** — plan epics/tasks, jobs, git state, and usage served as live-updating
+- **Live board** — plan epics/tasks, jobs, and git state served as live-updating
   collections (`keeper status`, `keeper board`, `keeper query`)
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation

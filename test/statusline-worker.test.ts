@@ -1,5 +1,5 @@
 /**
- * Statusline-worker tests (fn-1024), mirroring the usage-worker.test.ts layout:
+ * Statusline-worker tests:
  *
  * (a) DETERMINISM unit tests against the PURE `StatuslineScanner` core — no
  *     Worker, no watcher, just leaf files + `onChange` / `onDelete`. Cover the

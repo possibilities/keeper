@@ -268,15 +268,16 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted + v113 last_lifecycle_ts + v114 escalation_instance are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1, fn-1164 task .1, fn-1171 task .2)", () => {
+test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted + v113 last_lifecycle_ts + v114 escalation_instance + v119 account_route are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1, fn-1164 task .1, fn-1171 task .2, fn-1239 task .3)", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
   // path and a migrated-from-old path — the fresh-vs-migrated PRAGMA parity the
-  // re-fold determinism charter depends on. `escalation_instance` (v114) is the
-  // current final appended column, trailing `last_lifecycle_ts` (v113), `adopted`
-  // (v110), `harness`/`resume_target` (v109), `dispatch_origin` (v108),
-  // `kill_reason` (v103), and the v100 telemetry six.
+  // re-fold determinism charter depends on. `account_route` (v119) is the
+  // current final appended column, trailing `escalation_instance` (v114),
+  // `last_lifecycle_ts` (v113), `adopted` (v110), `harness`/`resume_target`
+  // (v109), `dispatch_origin` (v108), `kill_reason` (v103), and the v100
+  // telemetry six.
   const expectedTail = [
     "current_model_id",
     "current_model_display",
@@ -291,6 +292,7 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
     "adopted",
     "last_lifecycle_ts",
     "escalation_instance",
+    "account_route",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -429,6 +431,77 @@ test("every SCHEMA_STEPS entry carries a machine-readable kind discriminant", ()
     expect(typeof step.kind).toBe("string");
     expect(validKinds.has(step.kind)).toBe(true);
   }
+});
+
+test("v120: a pre-retirement DB with real usage/profiles rows drops both tables idempotently and reopens cleanly (fn-1239 task .6)", () => {
+  // Simulate a genuine pre-v120 upgrade: hand-seed POPULATED `usage` /
+  // `profiles` tables (real rows, not an empty transient fixture) with NO
+  // `meta` row (no version stamp), so `migrate()` reads it as v0 and walks
+  // the FULL ladder — the same fresh-0→head path every other "fresh" test in
+  // this file exercises, just with two tables (and their data) already
+  // present before the steady-state `CREATE TABLE IF NOT EXISTS` block runs
+  // (which leaves them untouched). Every historical step still runs against
+  // them (some ADD columns, some wipe rows on a rewind-and-redrain, exactly
+  // as a real historical upgrade would), and the v120 tail step must DROP
+  // both tables unconditionally without throwing; a second openDb must be a
+  // no-op (`DROP TABLE IF EXISTS` on an absent table).
+  const pre = new Database(dbPath, { create: true });
+  pre.run(
+    `CREATE TABLE usage (
+       id TEXT PRIMARY KEY,
+       target TEXT,
+       last_event_id INTEGER,
+       updated_at REAL NOT NULL DEFAULT 0
+     )`,
+  );
+  pre.run(
+    "INSERT INTO usage (id, target, last_event_id, updated_at) VALUES ('claude-default', 'claude', 100, 1)",
+  );
+  pre.run(
+    `CREATE TABLE profiles (
+       config_dir TEXT NOT NULL PRIMARY KEY,
+       profile_name TEXT,
+       last_event_id INTEGER,
+       updated_at REAL NOT NULL DEFAULT 0
+     )`,
+  );
+  pre.run(
+    "INSERT INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES ('', NULL, 100, 1)",
+  );
+  pre.close();
+
+  expect(() => openDb(dbPath)).not.toThrow();
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
+  for (const table of ["usage", "profiles"]) {
+    const has = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(table);
+    expect(has ?? null).toBeNull();
+  }
+  db.close();
+
+  // Idempotent re-open: still absent, no throw.
+  expect(() => openDb(dbPath)).not.toThrow();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe(String(SCHEMA_VERSION));
+  for (const table of ["usage", "profiles"]) {
+    const has = db2
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(table);
+    expect(has ?? null).toBeNull();
+  }
+  db2.close();
 });
 
 test("openDb adds nullable escalation_instance to jobs + instance_event_id to dispatch_failures, no DEFAULT (fn-1171 task .2)", () => {
@@ -2866,7 +2939,14 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // (the exact pass-4 unattributed-to-live scalar) — an additive ALTER on the
   // LIVE-ONLY `git_status` table; it does not touch the epics table SHAPE this
   // test pins, fn-1226 task .1.
-  expect(SCHEMA_VERSION).toBe(118);
+  // v119 appends the nullable `events.account_route` + `jobs.account_route`
+  // columns (the PII-free per-launch account route) — additive ALTERs that
+  // widen the events/jobs row shape, not the epics table this test pins, fn-1239
+  // task .3.
+  // v120 unconditionally DROPs the retired `usage` / `profiles` tables (the
+  // `event_blobs` precedent) — it does not touch the epics table SHAPE this
+  // test pins, fn-1239 task .6.
+  expect(SCHEMA_VERSION).toBe(120);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -4003,48 +4083,19 @@ test("fresh openDb has git_status table for the git read surface", () => {
   db.close();
 });
 
-test("fresh openDb has the schema-v23 usage table for the agentusage read surface (fn-615)", () => {
+test("fresh openDb (0→head): usage is absent at head — retired v120 (fn-1239 task .6, formerly fn-615)", () => {
+  // `usage` served the retired agentusage read surface from schema v23
+  // through v119; the tail v120 step DROPs it unconditionally (the
+  // `event_blobs` precedent). A fresh 0→head walk still exercises the
+  // steady-state `CREATE_USAGE` + every historical ADD-column step against a
+  // transient table, but nothing survives the final DROP.
   const { db } = openDb(":memory:");
-  // Table exists, table_info shape matches the CREATE_USAGE literal.
-  const cols = db.prepare("PRAGMA table_info(usage)").all() as {
-    name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
-    pk: number;
-  }[];
-  expect(cols.length).toBeGreaterThan(0);
-  const byName = new Map(cols.map((c) => [c.name, c]));
-  expect(byName.get("id")?.type).toBe("TEXT");
-  expect(byName.get("id")?.pk).toBe(1);
-  expect(byName.get("target")?.type).toBe("TEXT");
-  expect(byName.get("multiplier")?.type).toBe("INTEGER");
-  expect(byName.get("session_percent")?.type).toBe("REAL");
-  expect(byName.get("session_resets_at")?.type).toBe("TEXT");
-  expect(byName.get("week_percent")?.type).toBe("REAL");
-  expect(byName.get("week_resets_at")?.type).toBe("TEXT");
-  expect(byName.get("sonnet_week_percent")?.type).toBe("REAL");
-  expect(byName.get("sonnet_week_resets_at")?.type).toBe("TEXT");
-  expect(byName.get("codex_spark_session_percent")?.type).toBe("REAL");
-  expect(byName.get("codex_spark_session_resets_at")?.type).toBe("TEXT");
-  expect(byName.get("codex_spark_week_percent")?.type).toBe("REAL");
-  expect(byName.get("codex_spark_week_resets_at")?.type).toBe("TEXT");
-  expect(byName.get("last_event_id")?.type).toBe("INTEGER");
-  expect(byName.get("updated_at")?.type).toBe("REAL");
-  expect(byName.get("updated_at")?.notnull).toBe(1);
-  expect(byName.get("updated_at")?.dflt_value).toBe("0");
-  // FRESHNESS-EXCLUSION TRIPWIRE — schema half. The four freshness fields
-  // from the source envelope MUST NOT appear here. Pair test:
-  // test/usage-worker.test.ts asserts the producer side.
-  for (const f of [
-    "fetched_at",
-    "next_fetch_at",
-    "last_successful_fetch_at",
-    "last_skipped_fetch_at",
-  ]) {
-    expect(byName.has(f)).toBe(false);
-  }
-  // Schema version stamped to 23.
+  const hasUsage = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
+    )
+    .get();
+  expect(hasUsage ?? null).toBeNull();
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
@@ -4052,11 +4103,12 @@ test("fresh openDb has the schema-v23 usage table for the agentusage read surfac
   db.close();
 });
 
-test("v22 DB migrates to v23: usage table created via migrate() path, byte-identical PRAGMA table_info vs fresh CREATE", () => {
+test("v22 DB migrates to head: the transient v22→v23 usage CREATE still runs (no throw); usage is absent at head", () => {
   // Build a v22-shaped DB by hand: events + jobs (with config_dir) but no
   // `usage` table. Schema version stamped '22'. Reopen via openDb to drive
-  // the v22→v23 migrate() path, then assert the migrate-path `usage` table
-  // matches the fresh-CREATE shape byte-for-byte.
+  // the full v22→head migrate() path — the v22→v23 hop still creates `usage`
+  // transiently (every later historical ADD-column step runs against it
+  // without throwing) — and assert it converges to ABSENT at head (v120).
   const v22 = new Database(dbPath, { create: true });
   v22.run(`
     CREATE TABLE events (
@@ -4125,49 +4177,35 @@ test("v22 DB migrates to v23: usage table created via migrate() path, byte-ident
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
-  const migrated = db.prepare("PRAGMA table_info(usage)").all() as {
-    name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
-    pk: number;
-  }[];
+  // usage is absent at head on the migrate-path DB — the tail v120 DROP
+  // converges the v22→head walk to the same shape as a fresh open.
+  const hasUsageMigrated = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
+    )
+    .get();
+  expect(hasUsageMigrated ?? null).toBeNull();
   db.close();
 
-  // Build a fresh-CREATE DB at a sibling path to compare against.
+  // Build a fresh-CREATE DB at a sibling path to compare against — same
+  // convergence (both walks drop `usage` at the tail).
   const freshPath = join(tmpDir, "keeper-fresh.db");
   const { db: freshDb } = openDb(freshPath);
-  const fresh = freshDb.prepare("PRAGMA table_info(usage)").all() as {
-    name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
-    pk: number;
-  }[];
+  const hasUsageFresh = freshDb
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
+    )
+    .get();
+  expect(hasUsageFresh ?? null).toBeNull();
   freshDb.close();
-
-  // Convergence assertion: migrate-path and fresh-CREATE produce
-  // byte-identical PRAGMA table_info rows (column name, type, notnull,
-  // default, pk-ordinal). cid is excluded — it's the column index and
-  // identical for both paths, but stripping it makes any divergence in
-  // a non-cid field show up clearly.
-  const normalize = (rows: typeof fresh) =>
-    rows.map((r) => ({
-      name: r.name,
-      type: r.type,
-      notnull: r.notnull,
-      dflt_value: r.dflt_value,
-      pk: r.pk,
-    }));
-  expect(normalize(migrated)).toEqual(normalize(fresh));
 });
 
-test("v22→v23 migration is idempotent on re-open", () => {
-  // First openDb runs the v22→v23 step (creates usage table) AND the
-  // v23→v24 step (last_api_error_at/_kind ADD + rate_limited_at DROP +
-  // rewind-and-redrain); second openDb must be a no-op (CREATE TABLE
-  // IF NOT EXISTS skips; addColumnIfMissing skips; dropColumnIfPresent
-  // skips; the v23→v24 rewind is version-guarded; meta stays at 24).
+test("v22→head migration is idempotent on re-open; usage stays absent", () => {
+  // First openDb runs the full v22→head walk (the transient v22→v23 usage
+  // CREATE, every historical ADD-column step, the v23→v24 rewind-and-redrain,
+  // and the v120 tail DROP); second openDb must be a no-op (every step is
+  // idempotent or version-guarded; meta stays at SCHEMA_VERSION; usage stays
+  // absent — DROP TABLE IF EXISTS on an already-absent table is a no-op).
   const { db } = openDb(dbPath);
   db.close();
   const { db: db2 } = openDb(dbPath);
@@ -4175,10 +4213,12 @@ test("v22→v23 migration is idempotent on re-open", () => {
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
-  const cols = db2.prepare("PRAGMA table_info(usage)").all() as {
-    name: string;
-  }[];
-  expect(cols.map((c) => c.name)).toContain("id");
+  const hasUsage = db2
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
+    )
+    .get();
+  expect(hasUsage ?? null).toBeNull();
   db2.close();
 });
 
@@ -7407,67 +7447,21 @@ test("v31 DB migrates to v32: epics.default_visible added as VIRTUAL generated c
   rmSync(otherTmp, { recursive: true, force: true });
 });
 
-test("fresh v33 DB has profiles table with config_dir NOT NULL PRIMARY KEY + paired rate_limit columns (fn-639)", () => {
-  // Presence + shape gate on the schema-v33 `profiles` projection table.
-  // Built by `CREATE_PROFILES` in `src/db.ts`; populated by the reducer's
-  // SessionStart `INSERT OR IGNORE` seed + the dual-case `RateLimited`/
-  // `ApiError(kind="rate_limit")` UPSERT inside the existing BEGIN
-  // IMMEDIATE transaction. NOT NULL on the PK is load-bearing — SQLite
-  // treats multiple NULL PK rows as distinct, so a nullable PK +
-  // `INSERT OR IGNORE` would NOT dedupe; the `''` sentinel collapses the
-  // default `~/.claude` profile (NULL `events.config_dir`) into a single
-  // bucket.
+test("fresh openDb (0→head): profiles is absent at head — retired v120 (fn-1239 task .6, formerly fn-639)", () => {
+  // `profiles` served the retired agentusage rate-limit correlation surface
+  // from schema v33 through v119; the tail v120 step DROPs it unconditionally
+  // alongside `usage` (see the sibling `usage`-absence test above).
   const { db } = openDb(":memory:");
-  const cols = db.prepare("PRAGMA table_info(profiles)").all() as {
-    name: string;
-    type: string;
-    notnull: number;
-    pk: number;
-    dflt_value: string | null;
-  }[];
-  const names = cols.map((c) => c.name);
-  expect(names).toEqual([
-    "config_dir",
-    // Schema v35 (fn-642): derived basename, the join key against usage.id.
-    "profile_name",
-    "last_rate_limit_at",
-    "last_rate_limit_session_id",
-    "last_event_id",
-    "updated_at",
-  ]);
-  // Build a per-name lookup so each per-column assertion below stays
-  // total-correct without leaning on a non-null assertion (the names list
-  // above already pinned the column set; a missing entry is a hard
-  // toEqual failure long before these lookups run).
-  const byName = new Map(cols.map((c) => [c.name, c] as const));
-  const cfg = byName.get("config_dir");
-  expect(cfg?.type).toBe("TEXT");
-  expect(cfg?.notnull).toBe(1);
-  expect(cfg?.pk).toBe(1);
-  const pname = byName.get("profile_name");
-  expect(pname?.type).toBe("TEXT");
-  expect(pname?.notnull).toBe(0);
-  const lrAt = byName.get("last_rate_limit_at");
-  expect(lrAt?.type).toBe("REAL");
-  expect(lrAt?.notnull).toBe(0);
-  const lrSess = byName.get("last_rate_limit_session_id");
-  expect(lrSess?.type).toBe("TEXT");
-  expect(lrSess?.notnull).toBe(0);
-  const lei = byName.get("last_event_id");
-  expect(lei?.type).toBe("INTEGER");
-  expect(lei?.notnull).toBe(0);
-  const upd = byName.get("updated_at");
-  expect(upd?.type).toBe("REAL");
-  expect(upd?.notnull).toBe(1);
-  // Zero-event projection: empty table.
-  const n = (
-    db.prepare("SELECT COUNT(*) AS n FROM profiles").get() as { n: number }
-  ).n;
-  expect(n).toBe(0);
+  const hasProfiles = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'profiles'",
+    )
+    .get();
+  expect(hasProfiles ?? null).toBeNull();
   db.close();
 });
 
-test("v32 DB migrates to v33: profiles table added; pre-existing projections wiped by v38→v39 rewind (fn-639, fn-648)", () => {
+test("v32 DB migrates to head: the transient v32→v33 profiles CREATE still runs (no throw); profiles is absent at head; pre-existing projections wiped by v38→v39 rewind (fn-1239 task .6, formerly fn-639/fn-648)", () => {
   // Build a v32-shape DB by hand (epics + jobs + reducer_state + meta only —
   // no profiles), then reopen via openDb() → migrate() to verify: (a) the
   // version stamp bumps through v33 to the current SCHEMA_VERSION, (b) the
@@ -7554,20 +7548,14 @@ test("v32 DB migrates to v33: profiles table added; pre-existing projections wip
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
-  // (b) profiles table exists with the right column shape.
-  const cols = reopened.prepare("PRAGMA table_info(profiles)").all() as {
-    name: string;
-  }[];
-  const names = cols.map((c) => c.name);
-  expect(names).toEqual([
-    "config_dir",
-    // Schema v35 (fn-642): derived basename, the join key against usage.id.
-    "profile_name",
-    "last_rate_limit_at",
-    "last_rate_limit_session_id",
-    "last_event_id",
-    "updated_at",
-  ]);
+  // (b) profiles is absent at head — the transient v32→v33 CREATE converges
+  // to the v120 tail DROP, same as the fresh-open path.
+  const hasProfiles = reopened
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'profiles'",
+    )
+    .get();
+  expect(hasProfiles ?? null).toBeNull();
   // (c) Pre-existing epics row is wiped by the fn-648 v38→v39 rewind in
   // the same migrate transaction. v32→v33 itself has no rewind, but the
   // later v38→v39 step inside the same `migrate()` call clears the
@@ -8348,43 +8336,16 @@ test("v39 DB migrates to v40: jobs.name_history added; existing rows backfilled 
 
 // ---------------------------------------------------------------------------
 // Schema v41 (fn-651) — usage.rate_limit_lifts_at + usage.last_usage_fold_at
+// (retired v120 alongside the rest of `usage`; fn-1239 task .6)
 // ---------------------------------------------------------------------------
 
-test("fresh v41 DB has usage.rate_limit_lifts_at TEXT and usage.last_usage_fold_at REAL (fn-651)", () => {
-  // Schema-shape gate: the two new columns land in the CREATE_USAGE literal
-  // so a fresh-DB path and a migrated-DB path converge on identical schema
-  // (the addColumnIfMissing/literal lockstep convention). Both nullable
-  // (no NOT NULL); no DEFAULT — null on existing rows after migrate.
-  const { db } = openDb(":memory:");
-  const cols = db.prepare("PRAGMA table_info(usage)").all() as {
-    name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
-  }[];
-  const lifts = cols.find((c) => c.name === "rate_limit_lifts_at");
-  expect(lifts).toBeDefined();
-  expect(lifts?.type).toBe("TEXT");
-  expect(lifts?.notnull).toBe(0);
-  expect(lifts?.dflt_value).toBeNull();
-  const fold = cols.find((c) => c.name === "last_usage_fold_at");
-  expect(fold).toBeDefined();
-  expect(fold?.type).toBe("REAL");
-  expect(fold?.notnull).toBe(0);
-  expect(fold?.dflt_value).toBeNull();
-  db.close();
-});
-
-test("v40 DB migrates to current: usage.rate_limit_lifts_at + usage.last_usage_fold_at added; pre-existing rows wiped by v41→v42 rewind; idempotent re-open (fn-651, fn-662)", () => {
-  // Build a v40-shape DB by hand: a usage table WITHOUT the two new columns,
-  // two pre-existing rows, schema_version '40'. The v40→v41 step ADDs the
-  // two nullable columns via addColumnIfMissing (no backfill — old events
-  // predate `lift_at`; old folds predate "successful usage" semantics).
-  // The fn-662 v41→v42 rewind that follows in the same migrate transaction
-  // wipes the `usage` table (along with jobs/epics/profiles/etc.), so the
-  // pre-existing rows are gone post-migrate. The boot drain (not run here)
-  // would re-fold them from `UsageSnapshot` events; this fixture has no
-  // events, so `usage` reads empty after migrate.
+test("v40 DB migrates to head: the transient v40→v41 usage ADD-column step still runs (no throw); usage is absent at head (fn-1239 task .6, formerly fn-651/fn-662)", () => {
+  // Build a v40-shape DB by hand: a usage table WITHOUT the two v41 columns,
+  // two pre-existing rows, schema_version '40'. The v40→v41 step still ADDs
+  // the two nullable columns via addColumnIfMissing against the transient
+  // table (no throw), the fn-662 v41→v42 rewind still wipes it, and the v120
+  // tail DROP converges it to absent at head — proving the whole historical
+  // walk survives even though nothing downstream reads `usage` anymore.
   const v40 = new Database(dbPath, { create: true });
   v40.run(`
     CREATE TABLE usage (
@@ -8436,48 +8397,32 @@ test("v40 DB migrates to current: usage.rate_limit_lifts_at + usage.last_usage_f
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
 
-  // (a) Columns landed via addColumnIfMissing.
-  const usageCols = (
-    db.prepare("PRAGMA table_info(usage)").all() as { name: string }[]
-  ).map((c) => c.name);
-  expect(usageCols).toContain("rate_limit_lifts_at");
-  expect(usageCols).toContain("last_usage_fold_at");
-
-  // (b) The fn-662 v41→v42 rewind wiped the pre-existing usage rows in the
-  // same migrate transaction. Post-migrate `usage` reads empty.
-  const usageCount = (
-    db.prepare("SELECT COUNT(*) AS n FROM usage").get() as { n: number }
-  ).n;
-  expect(usageCount).toBe(0);
+  // usage is absent at head — the transient v40→v41 ADD-column step and the
+  // v41→v42 rewind both ran against it without throwing, and the v120 tail
+  // DROP converges the walk to the same shape as a fresh open.
+  const hasUsage = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
+    )
+    .get();
+  expect(hasUsage ?? null).toBeNull();
   db.close();
 
-  // (c) Idempotent re-open: a second openDb is a no-op (addColumnIfMissing
-  // guards on presence; no backfill block to re-run; the v41→v42 rewind
-  // skips at stored ≥ 42). Hand-seed a usage row to prove the second open
-  // does NOT re-rewind.
+  // Idempotent re-open: a second openDb is a no-op (every historical step is
+  // idempotent or version-guarded; the v120 tail DROP TABLE IF EXISTS on an
+  // already-absent table is a no-op); usage stays absent.
   const { db: db2 } = openDb(dbPath);
-  db2.run(
-    `INSERT INTO usage (id, target, multiplier, rate_limit_lifts_at, last_usage_fold_at, last_event_id, updated_at)
-       VALUES ('claude-survive', 'claude', 5, ?, ?, 200, 3)`,
-    ["2026-05-30T20:30:00-04:00", 999.0],
-  );
-  db2.close();
-  const { db: db3 } = openDb(dbPath);
-  const persisted = db3
-    .prepare(
-      "SELECT rate_limit_lifts_at, last_usage_fold_at FROM usage WHERE id = 'claude-survive'",
-    )
-    .get() as {
-    rate_limit_lifts_at: string | null;
-    last_usage_fold_at: number | null;
-  } | null;
-  expect(persisted?.rate_limit_lifts_at).toBe("2026-05-30T20:30:00-04:00");
-  expect(persisted?.last_usage_fold_at).toBe(999.0);
-  const ver3 = db3
+  const ver2 = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
-  expect(ver3.value).toBe(String(SCHEMA_VERSION));
-  db3.close();
+  expect(ver2.value).toBe(String(SCHEMA_VERSION));
+  const hasUsage2 = db2
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage'",
+    )
+    .get();
+  expect(hasUsage2 ?? null).toBeNull();
+  db2.close();
 });
 
 // ---------------------------------------------------------------------------

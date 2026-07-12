@@ -75,76 +75,21 @@ test("KeeperConfig no longer carries maxConcurrentJobs (config-file support remo
   expect(cfg.keeperAgentPath).toBe("/opt/bin/keeper.ts");
 });
 
-// ---------------------------------------------------------------------------
-// usage_models — the single <envelope-id>: <alias|null> registry declaring the
-// scraped model set + the usage-TUI aliases. Fail-open + id-validated; the deep
-// parse contract lives in usage-models.test.ts, these pin the resolveConfig
-// integration + the retired-key tolerance.
-// ---------------------------------------------------------------------------
-
-test("usageModels defaults to {} when the file is absent", () => {
-  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().usageModels).toEqual({});
-});
-
-test("usageModels defaults to {} when the key is absent", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().usageModels).toEqual({});
-});
-
-test("usage_models parses a <envelope-id>: <alias|null> registry", () => {
-  writeConfig(
-    "usage_models:\n" +
-      "  default: claude-0\n" +
-      "  multi-claude-1:\n" +
-      "  codex: gpt\n",
-  );
-  expect(resolveConfig().usageModels).toEqual({
-    default: "claude-0",
-    "multi-claude-1": null,
-    codex: "gpt",
-  });
-});
-
-test("usage_models drops ids failing the [a-z0-9-]+ shape", () => {
-  writeConfig(
-    "usage_models:\n" +
-      "  default: claude-0\n" +
-      "  Bad_Id: nope\n" +
-      "  UPPER: nope\n",
-  );
-  expect(resolveConfig().usageModels).toEqual({ default: "claude-0" });
-});
-
-test("a non-object usage_models falls back to {}", () => {
-  writeConfig("usage_models: not-a-map\n");
-  expect(resolveConfig().usageModels).toEqual({});
-});
-
-test("an array usage_models falls back to {} (a map is required)", () => {
-  writeConfig("usage_models:\n  - default\n  - codex\n");
-  expect(resolveConfig().usageModels).toEqual({});
-});
-
-test("usage_models resolves independently of a malformed sibling key", () => {
-  writeConfig("roots: not-a-list\nusage_models:\n  default: claude-0\n");
-  const cfg = resolveConfig();
-  expect(cfg.usageModels).toEqual({ default: "claude-0" });
-  expect(cfg.roots.length).toBeGreaterThan(0);
-});
-
-test("a lingering account_aliases key is silently ignored (no field, no error)", () => {
-  // The retired alias key is no longer parsed; a deployed config keeping it must
-  // still boot clean, with usage_models resolving from its own key.
+test("retired quota registry keys are silently ignored", () => {
   writeConfig(
     "account_aliases:\n" +
       "  default: claude-0\n" +
       "usage_models:\n" +
-      "  default: claude-real\n",
+      "  default: claude-real\n" +
+      "agentusage_root: ~/.local/state/agentusage\n" +
+      "roots:\n" +
+      "  - ~/code\n",
   );
   const cfg = resolveConfig();
   expect(cfg).not.toHaveProperty("accountAliases");
-  expect(cfg.usageModels).toEqual({ default: "claude-real" });
+  expect(cfg).not.toHaveProperty("usageModels");
+  expect(cfg).not.toHaveProperty("agentusageRoot");
+  expect(cfg.roots).toEqual(["~/code"]);
 });
 
 // ---------------------------------------------------------------------------

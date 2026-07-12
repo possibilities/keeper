@@ -1,6 +1,5 @@
 /**
- * Statusline telemetry producer worker. keeperd's SIXTH file-watcher producer
- * (after transcript, plan, git, usage) — watches the keeper-managed statusLine
+ * Statusline telemetry producer worker. Watches the keeper-managed statusLine
  * leaf dir (`~/.local/state/keeper/statusline/`, one `<token>.json` per session,
  * written by `keeper statusline`). It reads each leaf on change,
  * builds a typed `{kind:"session-telemetry", ...}` message keyed on the RAW
@@ -11,9 +10,8 @@
  * connection (restart-seed + GC census) and only posts messages, keeping main
  * the sole writer.
  *
- * Clones the {@link import("./usage-worker").UsageScanner} producer archetype
- * (external producer → coalesce → mint → fold) with the behaviors telemetry does
- * NOT need STRIPPED OUT:
+ * Uses the external producer → coalesce → mint → fold pattern with the behaviors
+ * telemetry needs:
  *   - **No liveness heartbeat.** A statusLine snapshot is display data, not a
  *     freshness beacon; a stable session's leaf should never re-emit just to
  *     re-stamp a fold. Pure content-gate suppression only.
@@ -41,7 +39,7 @@
  * columns so a daemon restart's boot scan does not re-emit a session already
  * folded.
  *
- * Discipline mirrors usage-worker: `isMainThread`-guarded body (a plain import
+ * Worker discipline: `isMainThread`-guarded body (a plain import
  * is inert; the pure {@link StatuslineScanner} is exported and drivable with no
  * Worker/watcher), own read-only `openDb`, typed `{kind}`/`{type}` messages, the
  * `disableNativeWatcher` seam (skip the `@parcel/watcher` dlopen for the
@@ -155,8 +153,7 @@ function stringifyErr(err: unknown): string {
  *
  * **Slot order is load-bearing** — the change-gate compares `JSON.stringify`
  * output byte-for-byte, and {@link seedFromDb}'s reconstruction must produce
- * identical key order, or every session re-emits on every daemon boot. Mirrors
- * the same discipline in {@link import("./usage-worker").buildUsageMessage}.
+ * identical key order, or every session re-emits on every daemon boot.
  */
 export function buildTelemetryMessage(
   raw: RawLeaf,
@@ -199,8 +196,7 @@ export function statuslineGateKey(msg: SessionTelemetryMessage): string {
 
 /**
  * Pure, exported leaf scanner — the deterministic core, drivable in tests with
- * no Worker or watcher. Mirrors {@link import("./usage-worker").UsageScanner},
- * STRIPPED of the heartbeat + tombstone paths telemetry does not use:
+ * no Worker or watcher. It omits heartbeat and tombstone emission:
  *
  * - `onChange(path)` filters the basename ({@link isStatuslineFilename}),
  *   `stat`s + bounds + reads + safe-parses the CURRENT leaf, builds the message

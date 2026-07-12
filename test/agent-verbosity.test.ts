@@ -1,7 +1,7 @@
 /**
  * The startup verbosity ladder (src/main.ts): level 0 (default) is silent before
  * claude is exec'd; level 1 (--x-verbose) prints one line per startup
- * section plus milestone markers (profile, prompts, session); level 2
+ * section plus milestone markers (account route, session); level 2
  * (--x-very-verbose, implying level 1) adds the full action log + composed
  * command dump. All three still spawn claude; assertions read the captured
  * stdout sink. `--x-no-confirm` keeps the interactive path while skipping
@@ -15,8 +15,6 @@ import { makeHarness, runAndCapture } from "./helpers/agent-main-harness";
 function harness(argv: string[]) {
   return makeHarness({
     argv,
-    listProfiles: () => ["default"],
-    pickProfile: () => "default",
   });
 }
 
@@ -33,7 +31,7 @@ describe("startup verbosity", () => {
     const out = h.out.join("");
     expect(out).toContain("~ ensure shared Claude state\n");
     expect(out).toContain("~ discover plugin dirs\n");
-    expect(out).toContain("~ profile: default\n");
+    expect(out).toContain("~ route: default\n");
     expect(out).toContain("~ session: ");
     expect(out).toContain("~ launching claude\n");
     expect(out).not.toContain("Actions:");

@@ -2,7 +2,7 @@
  * Restore-snapshot worker (epic fn-677 task .3; freeze machinery RETIRED in
  * fn-817 T4). keeperd's tenth Bun Worker thread, joining the producer / consumer
  * fleet (`wake-worker`, `server-worker`, `transcript-worker`, `plan-worker`,
- * `exit-watcher`, `git-worker`, `usage-worker`, `dead-letter-worker`,
+ * `exit-watcher`, `git-worker`, `statusline-worker`, `dead-letter-worker`,
  * `autopilot-worker`).
  *
  * On every `PRAGMA data_version` change (the same change-detection primitive

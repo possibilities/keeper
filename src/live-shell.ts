@@ -1,6 +1,5 @@
 /**
- * `createLiveShell` — TUI primitives shared by the four keeper TUIs
- * (`keeper board`, `keeper git`, `keeper usage`, `keeper autopilot`).
+ * `createLiveShell` — shared TUI primitives for keeper viewers.
  * Owns the OpenTUI renderer lifecycle: alt-screen enter/exit (via
  * `screenMode: "alternate-screen"`), raw-mode + cursor handling
  * (driven by OpenTUI's `setupTerminal()`), per-key dispatch via the

@@ -42,7 +42,6 @@ import {
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import type { Epic, ResolvedEpicDep } from "./types";
-import { parseUsageModels, type UsageModels } from "./usage-models";
 
 /**
  * The forward-only schema migration ladder: one ordered entry per historical
@@ -1421,9 +1420,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "additive",
     apply: (ctx) => {
       const { db } = ctx;
-      // v37→v38: project the agentusage envelope's status/subscription/error axes
-      // onto `usage`. `error_at` is projected but EXCLUDED from the worker
-      // change-gate (it advances on every failed scrape, ~90s).
+      // The usage projection carries status, subscription, and error axes.
       addColumnIfMissing(db, "usage", "status", "TEXT");
       addColumnIfMissing(db, "usage", "subscription_active", "INTEGER");
       addColumnIfMissing(db, "usage", "error_type", "TEXT");
@@ -1588,7 +1585,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "rewind",
     apply: (ctx) => {
       const { db, preMigrateStoredVersion } = ctx;
-      // v41→v42: translate keeper's `''` default-profile sentinel ↔ agentusage's
+      // Translate keeper's `''` default-profile sentinel ↔ the usage projection's
       // `"default"` usage id at the join boundary so a default-account rate limit
       // colocates onto `usage.default`. No schema-shape change — the bump gates
       // the rewind that heals the stranded annotations (the fold output changed).
@@ -3440,13 +3437,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "additive",
     apply: (ctx) => {
       const { db } = ctx;
-      // v92→v93: add the nullable codex-spark quota bucket columns to `usage`.
-      // Codex `/status` can render a second GPT-5.3-Codex-Spark limit section
-      // with its own 5h + weekly windows. The agentusage envelope carries them
-      // as `usage.codex_spark_session` / `usage.codex_spark_week`, the worker
-      // flattens them here, and `keeper usage` renders them as additional body
-      // rows. APPEND-via-ALTER keeps existing rows NULL (zero-event shape) and
-      // a fresh scrape re-emits one UsageSnapshot to populate the columns; no
+      // Nullable codex-spark quota bucket columns preserve the zero-event shape.
       addColumnIfMissing(db, "usage", "codex_spark_session_percent", "REAL");
       addColumnIfMissing(db, "usage", "codex_spark_session_resets_at", "TEXT");
       addColumnIfMissing(db, "usage", "codex_spark_week_percent", "REAL");
@@ -3476,12 +3467,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "additive",
     apply: (ctx) => {
       const { db } = ctx;
-      // v94→v95 (fn-1000.1): add the nullable `usage.error_kind` classification
-      // column. The usage-scraper worker now stamps a stable failure kind
-      // (`format_changed` / `panel_missing` / `scrape_failed` /
-      // `upstream_limited` / `runner_failed`) on a stale envelope's `error.kind`;
-      // the consumer folds it onto this column so `keeper usage` can label WHAT
-      // kind of failure is blocking freshness. APPEND-via-ALTER keeps existing
+      // The nullable `usage.error_kind` classification preserves existing
       // rows NULL (the zero-event shape) and is re-fold-safe: a pre-v95 event
       // carries no `error_kind`, so a from-scratch re-fold leaves the column NULL
       // byte-identically. NO cursor rewind — do NOT add to the rewind-and-redrain
@@ -3511,12 +3497,8 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "additive",
     apply: (ctx) => {
       const { db } = ctx;
-      // v96→v97 (fn-1007.1): add the nullable `usage.account_state` axis. The
-      // usage-scraper worker now derives an orthogonal account-state reason
-      // (`signed_out` / `no_subscription`) onto the envelope; the consumer folds
-      // it onto this column so `keeper usage` can tell apart a logged-out profile
-      // from a confirmed no-subscription one (both distinct from a scrape error).
-      // APPEND-via-ALTER keeps existing rows NULL (the zero-event shape) and is
+      // The nullable `usage.account_state` axis distinguishes signed-out and
+      // no-subscription snapshots from scrape errors. Existing rows stay NULL and remain
       // re-fold-safe: a pre-v97 event carries no `account_state`, so a
       // from-scratch re-fold leaves the column NULL byte-identically. NO cursor
       // rewind — do NOT add to the rewind-and-redrain DELETE list (mirrors the
@@ -4143,6 +4125,56 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    version: 119,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v118→v119 (fn-1239 task .3): add the PII-free per-launch account ROUTE —
+      // `events.account_route` (the launcher-injected KEEPER_ACCOUNT_ROUTE the
+      // hook size/shape-bounds at SessionStart) and its `jobs.account_route`
+      // projection (folded latest-non-NULL-wins on the SessionStart COALESCE
+      // arm). Both nullable TEXT, NO default: NULL = the launcher supplied no
+      // route (an explicit-profile override, a legacy row, or a non-Claude job),
+      // the zero-event reading. `default` / `claude-swap:<slot>` are the only
+      // non-NULL shapes. The fold copies the event value verbatim and NEVER
+      // synthesizes one, so a from-scratch re-fold folds a pre-v119 event to a
+      // NULL route byte-identically (deterministic-replayed, NO cursor rewind).
+      // `events.account_route` is declared in the CREATE_EVENTS literal (after
+      // `adopted`) too; `jobs.account_route` is migration-ONLY (NOT in
+      // CREATE_JOBS), appended here as the trailing jobs column so fresh-vs-
+      // migrated PRAGMA table_info stays byte-identical. No wall-clock / env /
+      // fs / external read.
+      addColumnIfMissing(db, "events", "account_route", "TEXT");
+      addColumnIfMissing(db, "jobs", "account_route", "TEXT");
+    },
+  },
+  {
+    version: 120,
+    kind: "drop",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v119→v120 (fn-1239 task .6): retire the Keeper-owned `usage` /
+      // `profiles` projections — superseded by the account-routing boundary
+      // (`docs/adr/0038`). DROP UNCONDITIONALLY at the tail — the `event_blobs`
+      // precedent (v74): both tables are (re)created above via the steady-state
+      // `CREATE_USAGE` / `CREATE_PROFILES` (`IF NOT EXISTS`, which must stay —
+      // every historical ADD-column step from v23/v33 onward still runs against
+      // them during a fresh 0→head walk), so a version-guarded DROP would let
+      // them resurrect empty on a post-shed restart. An unconditional
+      // `DROP TABLE IF EXISTS` converges cleanly on every path: a fresh walk
+      // drops the freshly-created empty tables, a pre-v120 upgrade drops the
+      // real populated tables, and a v120+ restart drops the empty resurrected
+      // tables. NO rewind-and-redrain: unlike a column drop that reshapes a
+      // projection other folds still read, retiring these two tables removes
+      // their fold arms entirely (`UsageSnapshot` / `UsageDeleted` become
+      // explicit no-ops in `applyEvent`, and the `RateLimited`/`ApiError`
+      // profile-level fan-out is deleted), so a from-scratch re-fold never
+      // touches either table and needs no cursor reset.
+      db.run("DROP TABLE IF EXISTS usage");
+      db.run("DROP TABLE IF EXISTS profiles");
+    },
+  },
 ];
 
 /**
@@ -4163,7 +4195,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v118:a3a252e4d8073355a01198c57cfbbc69a76248ee96b114c3889ffc1e5c03dc55";
+  "v120:fb7f05f0e2289b8108f7d63b418a03b6a61fdb36f84e553381682ce39365792a";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -4274,8 +4306,6 @@ export const DEFAULT_REPO_FORK_ROOT = "~/src";
 
 const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
-const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
-
 /**
  * Parsed keeper daemon config. Keys are INDEPENDENT — a malformed/missing one
  * never disturbs the others. Unknown keys are ignored.
@@ -4289,7 +4319,6 @@ export interface KeeperConfig {
   repoCloneRoot: string;
   repoForkRoot: string;
   claudeProjectsRoot?: string;
-  agentusageRoot?: string;
   // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
@@ -4326,11 +4355,6 @@ export interface KeeperConfig {
   // (absent / non-number / NaN / <= 0 / Infinity) → 30. Re-read on every
   // `resolveConfig` call.
   autocloseGraceSeconds: number;
-  // The `usage_models` registry — the single declaration of which models the
-  // usage scraper produces envelopes for (keys) and their cosmetic TUI aliases
-  // (values). Parsed fail-open + id-validated via {@link parseUsageModels}; never
-  // folded, never changes a row's identity. Empty map ≡ no declared models.
-  usageModels: UsageModels;
 }
 
 /** Default for {@link KeeperConfig.autocloseEnabled} — the feature ships ON. */
@@ -4444,7 +4468,6 @@ export function resolveConfig(): KeeperConfig {
   let repoCloneRoot = DEFAULT_REPO_CLONE_ROOT;
   let repoForkRoot = DEFAULT_REPO_FORK_ROOT;
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
-  let agentusageRoot: string = DEFAULT_AGENTUSAGE_ROOT;
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
   // never spawns.
   let buildbotUrl: string | undefined;
@@ -4461,7 +4484,6 @@ export function resolveConfig(): KeeperConfig {
   // either falls back through the pure resolvers below.
   let autocloseEnabled: boolean = DEFAULT_AUTOCLOSE_ENABLED;
   let autocloseGraceSeconds: number = DEFAULT_AUTOCLOSE_GRACE_SECONDS;
-  let usageModels: UsageModels = {};
   try {
     if (!existsSync(path)) {
       return {
@@ -4470,10 +4492,8 @@ export function resolveConfig(): KeeperConfig {
         repoCloneRoot,
         repoForkRoot,
         claudeProjectsRoot,
-        agentusageRoot,
         autocloseEnabled,
         autocloseGraceSeconds,
-        usageModels,
       };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
@@ -4502,10 +4522,6 @@ export function resolveConfig(): KeeperConfig {
         .claude_projects_root;
       if (typeof cpr === "string" && cpr.length > 0) {
         claudeProjectsRoot = cpr;
-      }
-      const aur = (raw as { agentusage_root?: unknown }).agentusage_root;
-      if (typeof aur === "string" && aur.length > 0) {
-        agentusageRoot = aur;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `buildbotUrl` undefined and the builds worker un-spawned.
@@ -4546,12 +4562,6 @@ export function resolveConfig(): KeeperConfig {
       autocloseGraceSeconds = resolveAutocloseGraceSeconds(
         (raw as { autoclose_grace_seconds?: unknown }).autoclose_grace_seconds,
       );
-      // The `usage_models` registry — fail-open + id-validated in one place so
-      // the SQLite-side config and the dep-free picker never diverge. The retired
-      // `account_aliases` key is no longer parsed; a lingering copy is ignored.
-      usageModels = parseUsageModels(
-        (raw as { usage_models?: unknown }).usage_models,
-      );
     }
   } catch (err) {
     console.error(
@@ -4564,10 +4574,8 @@ export function resolveConfig(): KeeperConfig {
       repoCloneRoot: DEFAULT_REPO_CLONE_ROOT,
       repoForkRoot: DEFAULT_REPO_FORK_ROOT,
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
-      agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       autocloseEnabled: DEFAULT_AUTOCLOSE_ENABLED,
       autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
-      usageModels: {},
     };
   }
   return {
@@ -4576,14 +4584,12 @@ export function resolveConfig(): KeeperConfig {
     repoCloneRoot,
     repoForkRoot,
     claudeProjectsRoot,
-    agentusageRoot,
     buildbotUrl,
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
     autocloseEnabled,
     autocloseGraceSeconds,
-    usageModels,
   };
 }
 
@@ -4731,25 +4737,6 @@ export function resolveClaudeProjectsRoot(): string {
     return join(home, entry.slice(2));
   }
   return entry;
-}
-
-/**
- * Resolve the agentusage state root to an absolute path. `KEEPER_AGENTUSAGE_ROOT`
- * env wins (the test-isolation seam — sandboxes the state dir + picker ledger so
- * a scrape/spawn test never touches the real `~/.local/state/agentusage/`); else
- * the `agentusage_root` config key; else the default. Tilde-expand only, NO
- * existence-filter (the usage-worker + scraper tolerate absence). Both the
- * consumer (usage-worker watch root) and the producer (scraper write dir + the
- * vendored picker's `setStateDir`) resolve through here so one override moves the
- * whole tree.
- */
-export function resolveUsageRoot(): string {
-  const override = process.env.KEEPER_AGENTUSAGE_ROOT;
-  const entry =
-    override && override.length > 0
-      ? override
-      : (resolveConfig().agentusageRoot ?? DEFAULT_AGENTUSAGE_ROOT);
-  return expandTilde(entry);
 }
 
 /**
@@ -4929,7 +4916,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- NULL (launcher-owned by definition); the fold copies the value verbatim and
     -- never synthesizes one. Declared AFTER resume_target so a fresh CREATE and a
     -- migrated ALTER (which appends) keep table_info byte-identical.
-    adopted INTEGER
+    adopted INTEGER,
+    -- v118->v119 (fn-1239.3): the PII-free account ROUTE the launcher injected
+    -- via KEEPER_ACCOUNT_ROUTE at SessionStart — the "default" native-ambient id
+    -- or a "claude-swap:<slot>" managed id, NULL when the launcher supplied none
+    -- or on every non-SessionStart row. The hook size/shape-bounds the untrusted
+    -- env value at capture; the fold copies it verbatim onto jobs.account_route
+    -- (latest-non-NULL-wins per-process attribution) and NEVER synthesizes one,
+    -- so a legacy row folds NULL byte-identically. Part of the FIVE-place events
+    -- lockstep (this literal, KNOWN_EVENT_COLUMNS, the hook insertBindings,
+    -- INGEST_EVENTS_COLUMNS, the insertEvent prepared statement). Declared AFTER
+    -- adopted so a fresh CREATE and a migrated ALTER (which appends) keep
+    -- table_info byte-identical.
+    account_route TEXT
 )
 `;
 
@@ -5285,21 +5284,13 @@ CREATE TABLE IF NOT EXISTS git_status (
 `;
 
 /**
- * `usage` projection table — one row per agentusage profile, folded from
- * `UsageSnapshot` / `UsageDeleted` events via a single-row UPSERT.
- *
- * Freshness fields (`fetched_at` etc.) are intentionally absent: both this
- * projection and the worker's change-gate ignore them so a fetch-only refresh
- * produces zero churn. Do NOT add a freshness column without re-reading the
- * freshness-exclusion discipline in `src/usage-worker.ts`.
- *
- * `last_rate_limit_at` / `last_rate_limit_session_id` are populated server-side
- * from `profiles` (joined on `profile_name = projectBasename(config_dir)`) and
- * are CARVED OUT of `projectUsageRow`'s ON CONFLICT clause so a `UsageSnapshot`
- * re-fold can't clobber a `RateLimited` fan-out. Symmetrically,
- * `rate_limit_lifts_at` / `last_usage_fold_at` ride the percentage path and are
- * carved out of the rate-limit fan-out's UPDATE. `last_usage_fold_at` is set
- * from the event `ts` (never `Date.now()`) only on successful-usage snapshots.
+ * `usage` projection table — RETIRED at schema v120 (fn-1239 task .6; DROPped
+ * unconditionally by the tail step, mirroring `event_blobs`) in favor of the
+ * account-routing boundary (`docs/adr/0038`). Kept here ONLY so the
+ * steady-state `CREATE TABLE IF NOT EXISTS` still gives every historical
+ * ADD-column step (v23 onward) a table to run against during a fresh 0→head
+ * migration walk; nothing at head folds into or reads it. Do NOT add a new
+ * column or wire it into a live query/collection/fold.
  */
 const CREATE_USAGE = `
 CREATE TABLE IF NOT EXISTS usage (
@@ -5333,15 +5324,13 @@ CREATE TABLE IF NOT EXISTS usage (
 `;
 
 /**
- * `profiles` projection table — one row per Claude profile directory, keyed by
- * `config_dir`. The `''` sentinel collapses NULL `config_dir` → default
- * `~/.claude`; the PK is NOT NULL because SQLite treats multiple NULL PKs as
- * distinct (a nullable PK + `INSERT OR IGNORE` would not dedupe). Maintained by
- * the SessionStart seed fan-out and the `RateLimited`/`ApiError` fan-out, both
- * using `COALESCE(config_dir,'')` so a NULL-config rate limit lands on its seeded
- * row. `profile_name` is the `projectBasename(config_dir)` join key against
- * `usage.id` (the `!= ''` guard keeps sentinel rows out of the join). Both
- * fan-outs read only event payload + in-transaction `jobs.config_dir`.
+ * `profiles` projection table — RETIRED at schema v120 (fn-1239 task .6;
+ * DROPped unconditionally by the tail step alongside `usage`; see its comment
+ * above). Kept here ONLY so the steady-state `CREATE TABLE IF NOT EXISTS`
+ * still gives every historical ADD-column step (v33 onward) a table to run
+ * against during a fresh 0→head migration walk; nothing at head folds into or
+ * reads it. Do NOT add a new column or wire it into a live query/collection/
+ * fold.
  */
 const CREATE_PROFILES = `
 CREATE TABLE IF NOT EXISTS profiles (
@@ -6916,7 +6905,7 @@ export function prepareStmts(db: Database): Stmts {
         bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id, mutation_path, worktree, harness, resume_target,
-        adopted
+        adopted, account_route
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -6926,7 +6915,7 @@ export function prepareStmts(db: Database): Stmts {
         $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
         $background_task_id, $mutation_path, $worktree, $harness, $resume_target,
-        $adopted
+        $adopted, $account_route
       )
     `),
     selectWorldRev: db.prepare(

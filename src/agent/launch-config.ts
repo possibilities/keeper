@@ -455,6 +455,43 @@ export function nativeHermesArgs(opts: AgentLaunchOpts): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Managed account route — the claude-swap wrapper composition
+// ---------------------------------------------------------------------------
+
+/**
+ * Compose the managed claude-swap wrapper argv around an already-built native
+ * Claude command. The account router's MANAGED decision routes a launch through
+ * claude-swap's public `run` contract:
+ *
+ *   `<cswap> run <slot> --share-history -- <native Claude args…>`
+ *
+ * The native Claude EXECUTABLE (`nativeClaudeArgv[0]`) is DROPPED: `cswap run`
+ * resolves `claude` from PATH itself and execs it with everything after `--`, so
+ * only the ARGUMENTS carry through — byte-for-byte, in order. `run` MUST be the
+ * first cswap token, and `--` is the end-of-options guard ahead of the forwarded
+ * Claude args. `--share-history` gives every account one unified conversation
+ * history, which is what makes the per-launch account choice orthogonal to a
+ * resume/restore (cross-account resume stays conversation-correct). The wrapper
+ * neither re-derives nor reorders the native argv — model, effort, session id,
+ * resume/fork pins, permissions, plugins, MCP, statusline, and a leading-dash
+ * prompt all pass through transparently. Pure — exported for byte-pin tests.
+ */
+export function composeManagedClaudeArgv(opts: {
+  cswapBin: string;
+  slot: number;
+  nativeClaudeArgv: readonly string[];
+}): string[] {
+  return [
+    opts.cswapBin,
+    "run",
+    String(opts.slot),
+    "--share-history",
+    "--",
+    ...opts.nativeClaudeArgv.slice(1),
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Env strip — CLAUDE* removal before the partner pane
 // ---------------------------------------------------------------------------
 

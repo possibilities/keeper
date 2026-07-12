@@ -9,6 +9,10 @@
  * not used — the HOME-coupled config readers and state collaborators are stubs.
  */
 
+import type {
+  RouteSelection,
+  RoutingInspection,
+} from "../../src/account-router";
 import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
@@ -20,7 +24,6 @@ import {
 } from "../../src/agent/matrix";
 import type { ResumeDecision } from "../../src/agent/resume-policy";
 import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
-import type { ShadowProfileFinding } from "../../src/agent/shadow-profiles";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
@@ -86,14 +89,12 @@ export interface Harness {
   out: string[];
   /** stderr sink. */
   err: string[];
-  /** Profile names ensureKeeperAgentProfileDirFn was called with, in order. */
-  bootstrappedProfiles: string[];
   /** Action logs ensureCodexStateSharingFn was invoked with, in order (call count
    *  = length) — the codex leaf-guard reaches every codex launch, passthrough too. */
   codexStateSharingCalls: string[][];
-  /** Profile lists ensurePiStateSharingFn's `listProfilesFn` arg resolved to, in
-   *  order (call count = length) — the pi leaf-guard reaches every pi launch,
-   *  passthrough included, fed the `() => []` arm on passthrough. */
+  /** Action logs ensurePiStateSharingFn was invoked with, in order (call count =
+   *  length) — the pi leaf-guard reaches every pi launch, passthrough included;
+   *  there is no Keeper-owned Pi profile farm to gate it behind. */
   piStateSharingCalls: string[][];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
@@ -101,8 +102,8 @@ export interface Harness {
   birthRecords: { draft: BirthRecordDraft; pid: number }[];
   /** Every tmux command handed to the tmux seam, in order. */
   tmuxCommands: string[][];
-  /** Call count for the injected picker. */
-  pickerCalls: () => number;
+  /** Call count for the injected account router (claude routing). */
+  routerCalls: () => number;
 }
 
 export interface HarnessOptions {
@@ -121,10 +122,6 @@ export interface HarnessOptions {
   codexBin?: string;
   piBin?: string;
   hermesBin?: string;
-  pickProfile?: () => string;
-  listProfiles?: () => string[];
-  /** Profile dir ensureKeeperAgentProfileDirFn returns (default deterministic). */
-  profileDir?: string;
   /**
    * Preset catalog loadPresetCatalogFn returns. Default: {@link
    * DEFAULT_PRESET_CATALOG} — a `<harness>_default` for each harness so a bare
@@ -138,8 +135,6 @@ export interface HarnessOptions {
   /** Host launch triples loadHostTriplesFn returns (default {@link
    *  DEFAULT_HOST_TRIPLES} — an empty set). */
   hostTriples?: HostTriples;
-  /** Shadow/stray findings findShadowProfileDirsFn returns (default empty). */
-  findShadowProfileDirs?: () => ShadowProfileFinding[];
   /** Host matrix loadMatrixFn returns (default null → absent, so loadMatrixFn
    *  throws the typed `absent` {@link MatrixConfigError}, matching production). */
   matrix?: MatrixV2 | null;
@@ -169,32 +164,48 @@ export interface HarnessOptions {
   resolveResumeDecision?:
     | ResumeDecision
     | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
+  /**
+   * Account route the router seam returns for an unpinned claude launch. Default:
+   * the native default (no cswap wrap), so byte-pins stay native and the seam
+   * touches no fs. Pass a managed selection to exercise the claude-swap wrap.
+   */
+  selectAccountRoute?: () => RouteSelection;
+  /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
+   *  a disabled `no-observation` snapshot. */
+  inspectRouting?: () => RoutingInspection;
+  /** claude-swap executable a managed route wraps through (default fake path). */
+  cswapBin?: string;
 }
 
 /**
  * Build a Harness with sensible inert defaults. State sharing is a no-op;
- * profile bootstrap returns (profileDir, false); config readers return a fixed
- * shared-settings path and empty plugin sources; the spawn seam records.
+ * config readers return a fixed shared-settings path and empty plugin
+ * sources; the spawn seam records.
  */
 export function makeHarness(opts: HarnessOptions): Harness {
   const spawned: string[][] = [];
   const out: string[] = [];
   const err: string[] = [];
-  const bootstrappedProfiles: string[] = [];
   const codexStateSharingCalls: string[][] = [];
   const piStateSharingCalls: string[][] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
-  let pickerCalls = 0;
+  let routerCalls = 0;
+
+  const selectAccountRoute =
+    opts.selectAccountRoute ??
+    (() => ({
+      id: "default",
+      kind: "native" as const,
+      slot: null,
+      reason: "harness-native",
+    }));
 
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
   const hermesBin = opts.hermesBin ?? "/fake-home/.local/bin/hermes";
-  const profileDir = opts.profileDir ?? "/fake-home/.claude-profiles/stub";
-
-  const pickProfile = opts.pickProfile ?? (() => "default");
 
   const spawn: SpawnFn =
     opts.spawn ??
@@ -209,11 +220,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
     cwd: opts.cwd ?? "/fake-home/code/proj",
     spawn,
     readChar: () => "n",
-    listProfilesFn: opts.listProfiles ?? (() => []),
-    pickProfileFn: () => {
-      pickerCalls += 1;
-      return pickProfile();
-    },
     nextCwdOrdinalFn: opts.nextCwdOrdinal ?? (() => 1),
     randomUuid:
       opts.randomUuid ?? (() => "00000000-0000-0000-0000-000000000000"),
@@ -235,18 +241,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
     ensureCodexStateSharingFn: (actionLog: string[]) => {
       codexStateSharingCalls.push(actionLog);
     },
-    ensureKeeperAgentProfileDirFn: (profileName: string) => {
-      bootstrappedProfiles.push(profileName);
-      return [profileDir, false];
+    ensurePiStateSharingFn: (actionLog: string[]) => {
+      piStateSharingCalls.push(actionLog);
     },
-    ensurePiStateSharingFn: (listProfilesFn: () => string[]) => {
-      piStateSharingCalls.push(listProfilesFn());
-    },
-    ensureKeeperAgentPiProfileDirFn: (profileName: string) => {
-      bootstrappedProfiles.push(profileName);
-      return [profileDir, false];
-    },
-    findShadowProfileDirsFn: opts.findShadowProfileDirs ?? (() => []),
     loadMatrixFn: () => {
       if (opts.matrix === undefined || opts.matrix === null) {
         throw new MatrixConfigError(
@@ -291,6 +288,27 @@ export function makeHarness(opts: HarnessOptions): Harness {
       }
       return decision ?? { kind: "unknown", target };
     },
+    selectAccountRouteFn: () => {
+      routerCalls += 1;
+      return selectAccountRoute();
+    },
+    inspectRoutingFn:
+      opts.inspectRouting ??
+      (() => ({
+        health: "no-observation",
+        observed_at_ms: null,
+        age_ms: null,
+        fresh: false,
+        enabled: false,
+        would_choose: {
+          id: "default",
+          kind: "native",
+          slot: null,
+          reason: "no-observation",
+        },
+        candidates: [],
+      })),
+    cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",
   };
 
   return {
@@ -298,13 +316,12 @@ export function makeHarness(opts: HarnessOptions): Harness {
     spawned,
     out,
     err,
-    bootstrappedProfiles,
     codexStateSharingCalls,
     piStateSharingCalls,
     codexSessionNameIndexers,
     birthRecords,
     tmuxCommands,
-    pickerCalls: () => pickerCalls,
+    routerCalls: () => routerCalls,
   };
 }
 
