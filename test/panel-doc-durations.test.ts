@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -10,8 +10,13 @@ import { join } from "node:path";
  * pins the doc surfaces to unit forms (`540s`), catching contract/CLI drift at
  * test time instead of in a live panel.
  */
+// plugins/plan/agents/* is gitignored (rendered from template/agents/*.md.tmpl),
+// so a pristine checkout — a `keeper baseline` worktree — has no panel-runner.md.
+// Gate that one surface on presence, like consistency-skills' AGENTS_RENDERED;
+// the committed surfaces below are always checked.
+const RENDERED_DOC_SURFACES = ["plugins/plan/agents/panel-runner.md"];
+
 const DOC_SURFACES = [
-  "plugins/plan/agents/panel-runner.md",
   "plugins/keeper/skills/pair/SKILL.md",
   "plugins/plan/skills/panel/SKILL.md",
   "plugins/plan/skills/panel/references/panel.md",
@@ -24,7 +29,11 @@ const BARE_DURATION = /--(chunk|timeout|stop-timeout)[= ](\d+)(?![\dsmh])/g;
 test("panel/pair doc surfaces never teach a bare (unit-less) duration flag", () => {
   const repoRoot = join(import.meta.dir, "..");
   const offenders: string[] = [];
-  for (const rel of DOC_SURFACES) {
+  const surfaces = [
+    ...DOC_SURFACES,
+    ...RENDERED_DOC_SURFACES.filter((rel) => existsSync(join(repoRoot, rel))),
+  ];
+  for (const rel of surfaces) {
     const text = readFileSync(join(repoRoot, rel), "utf8");
     for (const line of text.split("\n")) {
       BARE_DURATION.lastIndex = 0;
