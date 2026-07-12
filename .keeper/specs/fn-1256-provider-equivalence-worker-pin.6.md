@@ -49,5 +49,5 @@ the plan suite.
 - [ ] Plan fast suite green
 
 ## Done summary
-
+selection-audit-brief now emits assigned + dispatched cells + constraint (schema v2, fallback dispatched==assigned); cell-review skill grades the dispatched cell and excludes constrained runs from cohort aggregation, routing them to a constrained-runs section for /model-guidance; README documents the distinction.
 ## Evidence
