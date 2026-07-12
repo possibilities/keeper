@@ -4995,6 +4995,7 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   worktree_mode: "worktree_mode",
   worktree_multi_repo: "worktree_multi_repo",
   codex_adoption: "codex_adoption",
+  worker_provider: "worker_provider",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -5039,6 +5040,17 @@ interface AutopilotConfigSetPayload {
    *  resolves to a concrete 0/1. No fold reads it — the codex adoption producer
    *  resolves an absent column `?? OFF` at read time. */
   codex_adoption?: number;
+  /** The durable worker-provider dispatch pin (docs/adr/0047), stored as TEXT —
+   *  the FIRST non-numeric config column. `"claude"` / `"codex"` pin every work
+   *  dispatch to that provider family; `null` clears the pin (unconstrained,
+   *  the byte-identical default). Present iff the patch touches it AND the raw
+   *  wire value is one of the three recognized members — an unrecognized value
+   *  (a typo, a stale enum member) drops the field entirely, preserving the
+   *  existing column, rather than coercing to a sentinel (unlike the numeric
+   *  fields above, silently clearing a dispatch pin is not the safe direction).
+   *  The RPC validator rejects a bad value loud before it ever reaches here;
+   *  this is a defensive backstop, never a throw. */
+  worker_provider?: "claude" | "codex" | null;
 }
 
 /**
@@ -5108,6 +5120,18 @@ function extractAutopilotConfigSetPayload(
       // producer resolves an absent column `?? OFF` at read time.
       patch.codex_adoption = raw === true ? 1 : 0;
     }
+    if ("worker_provider" in parsed) {
+      const raw = parsed.worker_provider;
+      // STRING ENUM, the first non-numeric config column: accept exactly
+      // `"claude"` / `"codex"` / `null`. Anything else (a typo, a number, a
+      // stale enum member) is NOT coerced to a sentinel — it drops the field
+      // entirely so the existing column survives untouched, matching the
+      // strict-mode discipline of `extractAutopilotModePayload` rather than the
+      // coerce-to-null tolerance the numeric fields above use.
+      if (raw === "claude" || raw === "codex" || raw === null) {
+        patch.worker_provider = raw;
+      }
+    }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;
   } catch (err) {
@@ -5148,7 +5172,13 @@ function foldAutopilotConfigSet(db: Database, event: Event): void {
     "created_at",
     "updated_at",
   ];
-  const insertVals: (number | null)[] = [1, 1, event.id, event.ts, event.ts];
+  const insertVals: (number | string | null)[] = [
+    1,
+    1,
+    event.id,
+    event.ts,
+    event.ts,
+  ];
   const setClauses: string[] = ["last_event_id = excluded.last_event_id"];
   for (const field of Object.keys(payload) as AutopilotConfigField[]) {
     const column = AUTOPILOT_CONFIG_COLUMNS[field];
