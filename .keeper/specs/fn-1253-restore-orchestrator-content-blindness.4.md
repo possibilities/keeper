@@ -35,5 +35,5 @@ Payload-driven tests: orchestrator Read of a briefs path denies; agent_id presen
 - [ ] The guard joins the plugin hook manifest alongside the existing guards; guard tests, lint, and typecheck are green.
 
 ## Done summary
-
+Added the state-read-guard PreToolUse dispatcher (Read/Write/Edit + best-effort Bash) that denies a marker-active work/close orchestrator session's access to the briefs/audits state trees, fail-open; wired into hooks.json alongside the existing guards.
 ## Evidence
