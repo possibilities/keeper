@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Worker provider durable setting",
-  "updated_at": "2026-07-12T01:33:13.099000Z"
+  "updated_at": "2026-07-12T03:00:15.902000Z",
+  "worker_done_at": "2026-07-12T03:00:15.902000Z"
 }

@@ -55,5 +55,5 @@ envelope snapshot updates.
 - [ ] Fast suite green
 
 ## Done summary
-
+Adds the durable autopilot_state.worker_provider TEXT-enum dispatch pin (NULL|claude|codex) through the generic set_autopilot_config path: reducer's first non-numeric config parse branch, RPC string-enum validator, CLI config subcommand + show envelope (scope note + claude tier-collapse note), and autopilot skill docs. Dispatch translation deferred to task .4.
 ## Evidence
