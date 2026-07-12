@@ -11,10 +11,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runTranscriptCli, type TranscriptCliDeps } from "../cli/transcript";
 import { TRANSCRIPT_LINE_BYTE_CAP } from "../src/transcript/parse-common";
-import { encodePiCwd, listPiSessions } from "../src/transcript/pi";
+import {
+  encodePiCwd,
+  listPiSessions,
+  TURN_TEXT_CAP,
+} from "../src/transcript/pi";
 
 const SESSION = "019eeca0-fcbb-715d-9bd0-4a756390883a";
 const OTHER_SESSION = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+const TURN_SESSION = "77777777-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PROJECT = "/work/alpha";
 const OTHER_PROJECT = "/work/beta";
 const NOW = Date.parse("2026-07-09T12:00:00.000Z");
@@ -472,5 +477,246 @@ describe("keeper transcript pi harness grammar", () => {
     );
     expect(listResult.code).toBe(0);
     expect(listResult.stdout).toContain("harness: pi");
+  });
+});
+
+describe("keeper transcript pi turn", () => {
+  function assistantMsg(
+    id: string,
+    parentId: string,
+    stopReason: string,
+    content: unknown[],
+  ): string {
+    return line({
+      type: "message",
+      id,
+      parentId,
+      timestamp: "2026-07-09T10:00:00.000Z",
+      message: { role: "assistant", content, stopReason, timestamp: 0 },
+    });
+  }
+
+  function userMsg(id: string, parentId: string, content: unknown[]): string {
+    return line({
+      type: "message",
+      id,
+      parentId,
+      timestamp: "2026-07-09T10:00:00.000Z",
+      message: { role: "user", content, timestamp: 0 },
+    });
+  }
+
+  function toolResultMsg(id: string, parentId: string): string {
+    return line({
+      type: "message",
+      id,
+      parentId,
+      timestamp: "2026-07-09T10:00:00.000Z",
+      message: {
+        role: "toolResult",
+        toolCallId: "call1",
+        toolName: "bash",
+        content: [{ type: "text", text: "file1" }],
+        isError: false,
+        timestamp: 0,
+      },
+    });
+  }
+
+  const OVERSIZED = "y".repeat(TURN_TEXT_CAP + 100);
+
+  beforeEach(() => {
+    const turnLines = [
+      sessionHeader(TURN_SESSION, PROJECT, "2026-07-09T10:00:00.000Z"),
+      line({
+        type: "session_info",
+        id: "si1",
+        parentId: null,
+        timestamp: "2026-07-09T10:00:00.100Z",
+        name: "Turn test",
+      }),
+      // u1 -> a1 (toolUse, has its own text too) -> t1 -> a2 (stop): a
+      // multi-message tool-use response, terminated by a successful stop.
+      userMsg("u1", "si1", [{ type: "text", text: "Build the alpha feature" }]),
+      assistantMsg("a1", "u1", "toolUse", [
+        { type: "thinking", thinking: "private" },
+        { type: "text", text: "Let me check." },
+        {
+          type: "toolCall",
+          id: "call1",
+          name: "bash",
+          arguments: { command: "ls" },
+        },
+      ]),
+      toolResultMsg("t1", "a1"),
+      assistantMsg("a2", "t1", "stop", [{ type: "text", text: "Done." }]),
+      // u2 straight off a2: a prompt with nothing following yet.
+      userMsg("u2", "a2", [{ type: "text", text: "Please finish it" }]),
+      // Siblings off u2: mid tool-use, and each terminal-failure stopReason —
+      // every one must reduce to response: null despite carrying partial text.
+      assistantMsg("a_toolonly", "u2", "toolUse", [
+        { type: "toolCall", id: "call2", name: "bash", arguments: {} },
+      ]),
+      assistantMsg("a_err", "u2", "error", [
+        { type: "text", text: "partial before error" },
+      ]),
+      assistantMsg("a_abort", "u2", "aborted", [
+        { type: "text", text: "partial before abort" },
+      ]),
+      assistantMsg("a_len", "u2", "length", [
+        { type: "text", text: "partial before length cut" },
+      ]),
+      // An image-only user entry off a2 carries no text: the reducer falls
+      // through to the last NON-empty user text (u1), not a null prompt.
+      userMsg("u_img", "a2", [
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ]),
+      // A branch with no non-empty user text anywhere on its path at all.
+      userMsg("only_img", "si1", [
+        { type: "image", data: "BBBB", mimeType: "image/png" },
+      ]),
+      // Oversized prompt/response text, each independently capped.
+      userMsg("u_big", "si1", [{ type: "text", text: OVERSIZED }]),
+      assistantMsg("a_big", "u_big", "stop", [
+        { type: "text", text: OVERSIZED },
+      ]),
+      // A dangling parent link: never resolvable, regardless of file order.
+      userMsg("dangling", "does-not-exist", [
+        { type: "text", text: "Dangling" },
+      ]),
+      // An abandoned branch off u1, written LAST in physical file order —
+      // proves file position never leaks into a different leaf's result.
+      assistantMsg("ab1", "u1", "stop", [
+        { type: "text", text: "Abandoned answer" },
+      ]),
+    ];
+    writePiSession(
+      PROJECT,
+      TURN_SESSION,
+      Date.parse("2026-07-09T10:00:00.000Z"),
+      turnLines,
+      "2026-07-09T10:01:00.000Z",
+    );
+  });
+
+  function runTurn(leaf: string, extra: string[] = []) {
+    return runTranscriptCli(
+      [
+        "pi",
+        "turn",
+        TURN_SESSION,
+        "--leaf",
+        leaf,
+        "--format",
+        "json",
+        ...extra,
+      ],
+      deps,
+    );
+  }
+
+  test("a prompt-and-response turn aggregates multi-message tool-use text in order, only past a terminal stop", () => {
+    const result = runTurn("a2");
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.data.harness).toBe("pi");
+    expect(parsed.data.selected_leaf).toBe("a2");
+    expect(parsed.data.turn).toEqual({
+      prompt: "Build the alpha feature",
+      promptTruncated: false,
+      response: "Let me check.\nDone.",
+      responseTruncated: false,
+    });
+  });
+
+  test("a prompt with nothing following yet is prompt-only (response: null)", () => {
+    const parsed = JSON.parse(runTurn("u2").stdout);
+    expect(parsed.data.turn).toEqual({
+      prompt: "Please finish it",
+      promptTruncated: false,
+      response: null,
+      responseTruncated: false,
+    });
+  });
+
+  test("mid tool-use (no terminal stop yet) is prompt-only", () => {
+    const parsed = JSON.parse(runTurn("a_toolonly").stdout);
+    expect(parsed.data.turn.response).toBeNull();
+  });
+
+  test("error, aborted, and length stopReasons all discard partial text (response: null)", () => {
+    for (const leaf of ["a_err", "a_abort", "a_len"]) {
+      const parsed = JSON.parse(runTurn(leaf).stdout);
+      expect(parsed.data.turn.response).toBeNull();
+      expect(parsed.data.turn.prompt).toBe("Please finish it");
+    }
+  });
+
+  test("an image-only leaf falls through to the last non-empty user text", () => {
+    const parsed = JSON.parse(runTurn("u_img").stdout);
+    expect(parsed.data.turn).toEqual({
+      prompt: "Build the alpha feature",
+      promptTruncated: false,
+      response: "Let me check.\nDone.",
+      responseTruncated: false,
+    });
+  });
+
+  test("a branch with no non-empty user text anywhere is an explicit empty turn", () => {
+    const parsed = JSON.parse(runTurn("only_img").stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.data.turn).toBeNull();
+  });
+
+  test("root explicitly selects the empty branch", () => {
+    const parsed = JSON.parse(runTurn("root").stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.data.selected_leaf).toBe("root");
+    expect(parsed.data.turn).toBeNull();
+  });
+
+  test("prompt and response are independently capped with truncation flags", () => {
+    const parsed = JSON.parse(runTurn("a_big").stdout);
+    expect(parsed.data.turn.prompt.length).toBe(TURN_TEXT_CAP);
+    expect(parsed.data.turn.promptTruncated).toBe(true);
+    expect(parsed.data.turn.response.length).toBe(TURN_TEXT_CAP);
+    expect(parsed.data.turn.responseTruncated).toBe(true);
+  });
+
+  test("an abandoned branch written later in the file never influences an earlier leaf's result", () => {
+    const parsed = JSON.parse(runTurn("a2").stdout);
+    expect(JSON.stringify(parsed.data.turn)).not.toContain("Abandoned");
+
+    // Selecting the abandoned branch's own leaf resolves it in isolation.
+    const abandoned = JSON.parse(runTurn("ab1").stdout);
+    expect(abandoned.data.turn.response).toBe("Abandoned answer");
+  });
+
+  test("an unknown leaf is a structured error, never a null turn", () => {
+    const result = runTurn("nonexistent-leaf-id");
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.code).toBe("leaf_not_found");
+  });
+
+  test("a dangling parent link is a structured malformed error, never a null turn", () => {
+    const result = runTurn("dangling");
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.code).toBe("leaf_malformed");
+  });
+
+  test("an unknown session id is a structured not-found error", () => {
+    const result = runTranscriptCli(
+      ["pi", "turn", "missing-session", "--leaf", "root", "--format", "json"],
+      deps,
+    );
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.code).toBe("session_not_found");
   });
 });

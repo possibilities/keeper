@@ -803,6 +803,36 @@ describe("keeper transcript harness-first grammar", () => {
     expect(bareIdResult.code).toBe(0);
     expect(bareIdResult.stdout).toBe(showResult.stdout);
   });
+
+  test("turn is pi-only: any other harness fails naming pi", () => {
+    const result = runTranscriptCli(
+      ["claude", "turn", SESSION, "--leaf", "root", "--format", "json"],
+      deps,
+    );
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("pi");
+  });
+
+  test("turn --help is harness-independent (prints help even for claude)", () => {
+    const result = runTranscriptCli(["claude", "turn", "--help"], deps);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("keeper transcript pi turn");
+  });
+
+  test("turn requires --leaf", () => {
+    const result = runTranscriptCli(["pi", "turn", SESSION], deps);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("--leaf");
+  });
+
+  test("turn rejects a non-json --format", () => {
+    const result = runTranscriptCli(
+      ["pi", "turn", SESSION, "--leaf", "root", "--format", "human"],
+      deps,
+    );
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("json");
+  });
 });
 
 test("time parser supports relative durations and inclusive local-day until", () => {
