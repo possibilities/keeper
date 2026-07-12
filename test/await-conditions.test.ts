@@ -30,6 +30,7 @@ import {
   type AwaitState,
   advanceCompleteStability,
   agentsIdleState,
+  boardWorkIdleState,
   COMPLETE_DWELL_MS,
   changedSignature,
   classifyTargetId,
@@ -44,6 +45,7 @@ import {
   findEpicByIdOrBare,
   gitCleanState,
   initCompleteStability,
+  isBoardWorkJob,
   isJamReason,
   isKeeperDispatched,
   landedState,
@@ -2018,6 +2020,117 @@ test("isKeeperDispatched: autopilot + escalation yes; null / plan-verb no", () =
   // verb-based gate is exactly the wrong discriminator (misses escalation).
   expect(isKeeperDispatched("work")).toBe(false);
   expect(isKeeperDispatched("resolve")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// isBoardWorkJob / board-work-idle — the maintenance-window "safe to stop"
+// signal, distinct from a raw "every working job" count.
+// ---------------------------------------------------------------------------
+
+test("isBoardWorkJob: working + autopilot/escalation, not own session → true", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "w-1", state: "working", dispatch_origin: "autopilot" },
+      "me",
+    ),
+  ).toBe(true);
+  expect(
+    isBoardWorkJob(
+      { job_id: "e-1", state: "working", dispatch_origin: "escalation" },
+      "me",
+    ),
+  ).toBe(true);
+});
+
+test("isBoardWorkJob: interactive session (null dispatch_origin) → false", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "interactive-1", state: "working", dispatch_origin: null },
+      "me",
+    ),
+  ).toBe(false);
+});
+
+test("isBoardWorkJob: not state=working → false even if keeper-dispatched", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "w-1", state: "stopped", dispatch_origin: "autopilot" },
+      "me",
+    ),
+  ).toBe(false);
+});
+
+test("isBoardWorkJob: own session excluded even when dispatch_origin=autopilot", () => {
+  // The reproduced case: the session asking the question can itself be a
+  // dispatch_origin='autopilot' work:: job — provenance alone can't exclude
+  // it, only the explicit self-exclusion does.
+  expect(
+    isBoardWorkJob(
+      { job_id: "me", state: "working", dispatch_origin: "autopilot" },
+      "me",
+    ),
+  ).toBe(false);
+});
+
+test("isBoardWorkJob: ownSessionId null → no self-exclusion (own job counts)", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "me", state: "working", dispatch_origin: "autopilot" },
+      null,
+    ),
+  ).toBe(true);
+});
+
+test("board-work-idle: zero jobs → met", () => {
+  expect(boardWorkIdleState([], null).kind).toBe("met");
+});
+
+test("board-work-idle: only an interactive working session → met (excluded)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "interactive-1",
+      state: "working",
+      dispatch_origin: null,
+    }),
+  ];
+  expect(boardWorkIdleState(jobs, "interactive-1").kind).toBe("met");
+});
+
+test("board-work-idle: an active autopilot work/close dispatch → waiting", () => {
+  const jobs = [
+    makeJob({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+  ];
+  expect(boardWorkIdleState(jobs, "me").kind).toBe("waiting");
+});
+
+test("board-work-idle: an active escalation session → waiting", () => {
+  const jobs = [
+    makeJob({
+      job_id: "e-1",
+      state: "working",
+      dispatch_origin: "escalation",
+    }),
+  ];
+  expect(boardWorkIdleState(jobs, "me").kind).toBe("waiting");
+});
+
+test("board-work-idle: excludes the caller's own board-work session → met", () => {
+  const jobs = [
+    makeJob({ job_id: "me", state: "working", dispatch_origin: "autopilot" }),
+  ];
+  expect(boardWorkIdleState(jobs, "me").kind).toBe("met");
+});
+
+test("board-work-idle: mixed board — interactive + a live dispatch → waiting", () => {
+  const jobs = [
+    makeJob({
+      job_id: "interactive-1",
+      state: "working",
+      dispatch_origin: null,
+    }),
+    makeJob({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+  ];
+  expect(boardWorkIdleState(jobs, "interactive-1").kind).toBe("waiting");
 });
 
 test("drained: empty open board → met", () => {
