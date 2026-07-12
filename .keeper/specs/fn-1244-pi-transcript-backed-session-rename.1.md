@@ -44,5 +44,5 @@ Use synthetic Pi trees containing abandoned later-file branches, metadata leaves
 - [ ] `bun test test/transcript-pi.test.ts test/transcript-cli.test.ts` and the full fast suite are green.
 
 ## Done summary
-
+Added keeper transcript pi turn: a branch-aware (leaf-to-root parentId walk) Latest-turn JSON contract aggregating assistant text across tool-use messages, gated on a successful terminal stop, with independently capped+truncation-flagged prompt/response and explicit empty/prompt-only/complete states distinct from read/leaf failures.
 ## Evidence
