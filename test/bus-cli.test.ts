@@ -22,8 +22,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AGENT_HELP as BUS_AGENT_HELP,
   armLifetimeStdin,
+  AGENT_HELP as BUS_AGENT_HELP,
   buildPublishFrame,
   CHAT_NAMESPACE,
   emitJsonMessage,
@@ -58,13 +58,13 @@ describe("parseBusArgv routing", () => {
   });
 
   test("watch accepts only its machine transport flags", () => {
-    expect(
-      parseBusArgv(["watch", "--json", "--lifetime-stdin"]),
-    ).toEqual({ kind: "watch", json: true, lifetimeStdin: true });
+    expect(parseBusArgv(["watch", "--json", "--lifetime-stdin"])).toEqual({
+      kind: "watch",
+      json: true,
+      lifetimeStdin: true,
+    });
     expect(parseBusArgv(["watch", "--bogus"]).kind).toBe("usage");
-    expect(parseBusArgv(["watch", "--json", "--json"]).kind).toBe(
-      "usage",
-    );
+    expect(parseBusArgv(["watch", "--json", "--json"]).kind).toBe("usage");
   });
 
   test("resolve is gone → unknown verb usage", () => {
