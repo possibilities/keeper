@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import type {
+  LatestTurn,
   TranscriptDocument,
   TranscriptEntry,
   TranscriptListItem,
@@ -635,3 +636,253 @@ export const piTranscriptReader: TranscriptReader = {
   find: piFind,
   load: piLoad,
 };
+
+// --- Latest turn (branch-aware, id/parentId walk) --------------------------
+
+/** Independent prompt/response cap for the Latest turn contract. */
+export const TURN_TEXT_CAP = 8192;
+/** The only stopReason that marks an assistant response as complete; every
+ *  other value (toolUse, error, aborted, length, or absent) means the
+ *  response the caller sees must stay null. */
+const TURN_TERMINAL_STOP_REASON = "stop";
+
+interface PiTurnEntry {
+  id: string;
+  parentId: string | null;
+  type: string;
+  raw: Record<string, unknown>;
+}
+
+function boundTurnText(text: string): { text: string; truncated: boolean } {
+  return text.length <= TURN_TEXT_CAP
+    ? { text, truncated: false }
+    : { text: text.slice(0, TURN_TEXT_CAP), truncated: true };
+}
+
+/** Extract only `type: "text"` blocks (string content is returned whole);
+ *  thinking, toolCall, and image blocks contribute no text — an image-only
+ *  user message or a thinking-only assistant message reduces to "". */
+function turnText(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  const parts: string[] = [];
+  for (const block of content) {
+    const obj = recordOf(block);
+    if (obj === null || stringOrNull(obj.type) !== "text") {
+      continue;
+    }
+    const text = stringOrNull(obj.text);
+    if (text !== null) {
+      parts.push(text);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Parse every id-bearing JSONL line into its raw tree node, keyed by id.
+ *  The session header carries no id and can never be a leaf or a link
+ *  target; a malformed or oversized line simply produces no node (nothing
+ *  can walk to or through it). */
+function parsePiEntriesForTurn(text: string): Map<string, PiTurnEntry> {
+  const entries = new Map<string, PiTurnEntry>();
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !withinTranscriptLineByteCap(line)) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const obj = recordOf(parsed);
+    if (obj === null) {
+      continue;
+    }
+    const id = stringOrNull(obj.id);
+    if (id === null) {
+      continue;
+    }
+    entries.set(id, {
+      id,
+      parentId: typeof obj.parentId === "string" ? obj.parentId : null,
+      type: stringOrNull(obj.type) ?? "",
+      raw: obj,
+    });
+  }
+  return entries;
+}
+
+type PiTurnWalkResult =
+  | { kind: "ok"; path: PiTurnEntry[] }
+  | { kind: "not_found" }
+  | { kind: "malformed"; message: string };
+
+/** Walk strictly from the requested leaf to the root via parentId, never via
+ *  file position — an entry physically later in the JSONL but outside this
+ *  chain (an abandoned branch) can never influence the result. Bounded by
+ *  `seen` so a cyclical or self-referencing parent link fails loud instead
+ *  of looping. */
+function walkPiPath(
+  entries: ReadonlyMap<string, PiTurnEntry>,
+  leafId: string,
+): PiTurnWalkResult {
+  const start = entries.get(leafId);
+  if (start === undefined) {
+    return { kind: "not_found" };
+  }
+  const chain: PiTurnEntry[] = [];
+  const seen = new Set<string>();
+  let current: PiTurnEntry | undefined = start;
+  while (current !== undefined) {
+    if (seen.has(current.id)) {
+      return {
+        kind: "malformed",
+        message: `cycle detected in parent chain at entry '${current.id}'`,
+      };
+    }
+    seen.add(current.id);
+    chain.push(current);
+    if (current.parentId === null) {
+      break;
+    }
+    const parent = entries.get(current.parentId);
+    if (parent === undefined) {
+      return {
+        kind: "malformed",
+        message: `dangling parent link: entry '${current.id}' -> '${current.parentId}'`,
+      };
+    }
+    current = parent;
+  }
+  chain.reverse();
+  return { kind: "ok", path: chain };
+}
+
+/** Reduce a root-to-leaf path to the Latest turn: the last non-empty user
+ *  text on the path, then every assistant text block that follows it, kept
+ *  only when the LAST assistant message in that window terminates with a
+ *  successful stop. Thinking, tool calls/results, images, custom entries,
+ *  and compaction summaries never reach either field — they are simply not
+ *  `type: "message"` (or not a `"text"` content block) and fall through. */
+function reducePiTurn(path: readonly PiTurnEntry[]): LatestTurn | null {
+  let latestUserIndex = -1;
+  let latestUserText = "";
+  for (let i = 0; i < path.length; i++) {
+    const entry = path[i] as PiTurnEntry;
+    if (entry.type !== "message") {
+      continue;
+    }
+    const message = recordOf(entry.raw.message);
+    if (message === null || stringOrNull(message.role) !== "user") {
+      continue;
+    }
+    const text = turnText(message.content).trim();
+    if (text.length === 0) {
+      continue;
+    }
+    latestUserIndex = i;
+    latestUserText = text;
+  }
+  if (latestUserIndex === -1) {
+    return null;
+  }
+
+  const responseParts: string[] = [];
+  let sawAssistant = false;
+  let lastStopReason: string | null = null;
+  for (let i = latestUserIndex + 1; i < path.length; i++) {
+    const entry = path[i] as PiTurnEntry;
+    if (entry.type !== "message") {
+      continue;
+    }
+    const message = recordOf(entry.raw.message);
+    if (message === null || stringOrNull(message.role) !== "assistant") {
+      continue;
+    }
+    sawAssistant = true;
+    const text = turnText(message.content);
+    if (text.length > 0) {
+      responseParts.push(text);
+    }
+    lastStopReason = stringOrNull(message.stopReason);
+  }
+
+  const prompt = boundTurnText(latestUserText);
+  if (!sawAssistant || lastStopReason !== TURN_TERMINAL_STOP_REASON) {
+    return {
+      prompt: prompt.text,
+      promptTruncated: prompt.truncated,
+      response: null,
+      responseTruncated: false,
+    };
+  }
+  const response = boundTurnText(responseParts.join("\n"));
+  return {
+    prompt: prompt.text,
+    promptTruncated: prompt.truncated,
+    response: response.text,
+    responseTruncated: response.truncated,
+  };
+}
+
+export interface PiTurnQuery {
+  root: TranscriptRootInputs;
+  sessionId: string;
+  project: string | null;
+  /** An entry id, or the literal "root" — the empty branch before any entry. */
+  leaf: string;
+}
+
+export type PiTurnOutcome =
+  | { kind: "no_roots"; message: string }
+  | { kind: "not_found" }
+  | { kind: "ambiguous"; owners: string[]; hint: string }
+  | { kind: "leaf_not_found" }
+  | { kind: "leaf_malformed"; message: string }
+  | { kind: "read_failed"; message: string }
+  | { kind: "ok"; selectedLeaf: string; turn: LatestTurn | null };
+
+/** Resolve the Latest turn for one pi session's requested leaf. Session
+ *  resolution (no_roots/not_found/ambiguous) reuses `piFind` verbatim; only
+ *  the leaf-to-root walk and turn reduction are new. */
+export function resolvePiTurn(query: PiTurnQuery): PiTurnOutcome {
+  const found = piFind({
+    root: query.root,
+    sessionId: query.sessionId,
+    project: query.project,
+  });
+  if (found.kind !== "found") {
+    return found;
+  }
+  if (query.leaf === "root") {
+    return { kind: "ok", selectedLeaf: "root", turn: null };
+  }
+  let text: string;
+  try {
+    text = readFileSync(found.handle.path, "utf8");
+  } catch (error) {
+    return {
+      kind: "read_failed",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const entries = parsePiEntriesForTurn(text);
+  const walked = walkPiPath(entries, query.leaf);
+  if (walked.kind === "not_found") {
+    return { kind: "leaf_not_found" };
+  }
+  if (walked.kind === "malformed") {
+    return { kind: "leaf_malformed", message: walked.message };
+  }
+  return {
+    kind: "ok",
+    selectedLeaf: query.leaf,
+    turn: reducePiTurn(walked.path),
+  };
+}

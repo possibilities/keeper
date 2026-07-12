@@ -11,6 +11,7 @@ import type {
   TranscriptToolDetail,
 } from "../src/transcript/model";
 import { TRANSCRIPT_ROLES } from "../src/transcript/model";
+import { resolvePiTurn } from "../src/transcript/pi";
 import type {
   TranscriptReader,
   TranscriptRootInputs,
@@ -47,6 +48,7 @@ Harnesses: ${transcriptHarnessNames().join(", ")}
 Commands:
   list                   List sessions (current project by default)
   show <session-id>      Extract one session ("show" may be omitted)
+  turn <session-id>      Extract the selected branch's Latest turn (pi only)
 
 Global options:
   --config-dir <dir>     Claude config directory (repeatable; claude only)
@@ -115,6 +117,29 @@ Options:
   --meta                 Include injected meta and system entries
   --thinking             Include thinking blocks
   --format human|json    Output format (default human)
+  --json                 Alias of --format json
+  --help, -h             Show this help
+`;
+
+const TURN_HELP = `keeper transcript pi turn <session-id> --leaf <entry-id|root> [options]
+
+Extract the requested branch's Latest turn: the most recent non-empty user
+text, plus subsequent assistant text ONLY once that response reaches a
+successful terminal stop. Branch walking follows strictly the leaf's own
+parent chain to the root — an entry physically later in the file but
+outside that chain (an abandoned branch) never influences the result.
+"root" explicitly selects the empty branch, before any entry.
+
+JSON only, one of three shapes: "turn": null (a valid branch with no
+non-empty user text yet), {prompt, response: null} (no complete response
+yet — pending, mid tool-use, or aborted/errored/length-cut), or
+{prompt, response} (both complete). A read/leaf failure is a JSON error
+envelope, never a null turn.
+
+Options:
+  --leaf <entry-id|root> Required. The tree leaf to resolve the turn from.
+  --project <path>       Disambiguate a duplicated session id by project
+  --format json          Output format (default and only mode: json)
   --json                 Alias of --format json
   --help, -h             Show this help
 `;
@@ -748,6 +773,121 @@ function parseShow(
 }
 
 /**
+ * `turn` is pi-only (the only reader implementing branch-aware walking) and
+ * JSON-only (a machine contract, no human render). Every failure — session
+ * resolution, leaf resolution, and read failures alike — surfaces as a JSON
+ * error envelope so a caller never has to special-case a plain-text path.
+ */
+function parseTurn(
+  reader: TranscriptReader,
+  argv: string[],
+  deps: TranscriptCliDeps,
+): TranscriptCliResult {
+  let parsed: ReturnType<typeof parseNodeArgs>;
+  try {
+    parsed = parseNodeArgs({
+      args: argv,
+      options: parseOptions("transcript", "turn"),
+      allowPositionals: true,
+      strict: true,
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  // --help short-circuits before the harness check: every two-level verb's
+  // help is a pure, harness-independent path (help-purity.test.ts probes
+  // every verb through the claude token).
+  if (parsed.values.help === true) return ok(TURN_HELP);
+  if (reader.harness !== "pi") {
+    return fail(
+      `turn is only supported for pi sessions (got '${reader.harness}')`,
+    );
+  }
+  if (parsed.positionals.length !== 1) {
+    return fail(
+      parsed.positionals.length === 0
+        ? "turn: <session-id> is required"
+        : `turn: unexpected argument '${parsed.positionals[1]}'`,
+    );
+  }
+  const sessionId = parsed.positionals[0] as string;
+  const format = resolveOutputFormat(parsed.values);
+  if (!format.ok) return fail(format.error);
+  // json is the only mode turn ever renders, so it is also the silent
+  // default — unlike list/show, an absent --format never falls back to
+  // human here.
+  const formatIsJson =
+    format.value === "json" ||
+    (parsed.values.format === undefined && parsed.values.json !== true);
+  if (!formatIsJson) {
+    return fail("turn: --format must be json (the only supported mode)");
+  }
+  const leaf = parsed.values.leaf;
+  if (typeof leaf !== "string" || leaf.length === 0) {
+    return fail("turn: --leaf <entry-id|root> is required");
+  }
+  const project =
+    typeof parsed.values.project === "string" ? parsed.values.project : null;
+  const outcome = resolvePiTurn({
+    root: buildRootInputs(parsed.values, deps),
+    sessionId,
+    project,
+    leaf,
+  });
+  if (outcome.kind === "no_roots") {
+    return jsonFailure(
+      "no_roots",
+      outcome.message,
+      "check the pi sessions directory and retry",
+    );
+  }
+  if (outcome.kind === "not_found") {
+    const message = `session '${sessionId}' not found${project === null ? "" : ` in project ${project}`}`;
+    return jsonFailure(
+      "session_not_found",
+      message,
+      "run `keeper transcript pi list --global` to discover session ids",
+    );
+  }
+  if (outcome.kind === "ambiguous") {
+    const message = `session '${sessionId}' exists in multiple projects: ${outcome.owners.join(", ")}; pass ${outcome.hint}`;
+    return jsonFailure(
+      "session_ambiguous",
+      message,
+      `pass ${outcome.hint} <path>`,
+    );
+  }
+  if (outcome.kind === "leaf_not_found") {
+    return jsonFailure(
+      "leaf_not_found",
+      `leaf '${leaf}' not found in session '${sessionId}'`,
+      "pass an entry id present in this session, or 'root'",
+    );
+  }
+  if (outcome.kind === "leaf_malformed") {
+    return jsonFailure(
+      "leaf_malformed",
+      outcome.message,
+      "the session's parent chain is broken; re-inspect the transcript file",
+    );
+  }
+  if (outcome.kind === "read_failed") {
+    return jsonFailure(
+      "read_failed",
+      outcome.message,
+      "check the transcript file and retry",
+    );
+  }
+  const data = {
+    harness: reader.harness,
+    session_id: sessionId,
+    selected_leaf: outcome.selectedLeaf,
+    turn: outcome.turn,
+  };
+  return ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)));
+}
+
+/**
  * Peel the leading harness token exactly as `keeper agent`'s splitSubcommand
  * peels its own leading agent token (`src/agent/dispatch.ts`), then route the
  * remainder through the existing list/show/bare-id router. Bare `keeper
@@ -774,6 +914,7 @@ export function runTranscriptCli(
   if (rest.length === 0) return ok(HELP);
   if (rest[0] === "list") return parseList(reader, rest.slice(1), deps);
   if (rest[0] === "show") return parseShow(reader, rest.slice(1), deps);
+  if (rest[0] === "turn") return parseTurn(reader, rest.slice(1), deps);
   return parseShow(reader, rest, deps);
 }
 

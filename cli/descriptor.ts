@@ -1159,6 +1159,31 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           FLAG_JSON_ALIAS,
         ],
       },
+      {
+        name: "turn",
+        summary:
+          "Extract the selected branch's Latest turn as a bounded JSON contract (pi only)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "leaf",
+            type: "string",
+            summary: "Entry id, or root — the tree leaf to resolve from",
+          },
+          {
+            name: "project",
+            type: "string",
+            summary: "Project path used to disambiguate the session",
+          },
+          FLAG_FORMAT,
+          FLAG_JSON_ALIAS,
+        ],
+      },
     ],
   },
   {
