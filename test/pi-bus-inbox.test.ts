@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import {
   BUS_WATCH_COMMAND,
-  claimBusInboxOwnership,
-  parseBusWatchRecord,
-  PiBusInboxController,
-  releaseBusInboxOwnership,
   type BusWatchChild,
+  claimBusInboxOwnership,
+  PiBusInboxController,
+  parseBusWatchRecord,
+  releaseBusInboxOwnership,
 } from "../plugins/keeper/pi-extension/bus-inbox";
 
 class FakeReadable extends EventEmitter {
