@@ -22,7 +22,9 @@ import {
 } from "./subgroup.ts";
 import { runApplySelection } from "./verbs/apply_selection.ts";
 import { runAssignCells } from "./verbs/assign_cells.ts";
+import { runAuditGateCheck } from "./verbs/audit_gate_check.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
+import { runAuditSubmitTask } from "./verbs/audit_submit_task.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runCat } from "./verbs/cat.ts";
 import { runClaim } from "./verbs/claim.ts";
@@ -407,11 +409,26 @@ const WORKER_GROUP: GroupSpec = {
 // (or the typed error envelope + exit 1) as a single JSON value. All three are
 // runtime-state-only — zero .keeper/ commits.
 const AUDIT_RISK_CHOICES = ["Low", "Medium", "High"];
+const AUDIT_FINDING_STATUS_CHOICES = ["clean", "mild", "severe"];
 
 const AUDIT_GROUP: GroupSpec = {
   name: "audit",
   description: "Close-phase audit-artifact submit verbs.",
   commands: [
+    {
+      name: "gate-check",
+      shortHelp:
+        "Read-only per-task audit-gate check: does a finding cover the task's current commits?",
+      run: (rest, format) => {
+        const valueTaking = new Set(["--project"]);
+        const [taskId] = leafPositionals(rest, valueTaking);
+        runAuditGateCheck({
+          taskId: taskId ?? "",
+          project: leafOption(rest, "--project"),
+          format,
+        });
+      },
+    },
     {
       name: "submit",
       shortHelp: "Persist the quality-auditor's report markdown (commit-free).",
@@ -458,6 +475,52 @@ const AUDIT_GROUP: GroupSpec = {
           file: fileArg,
           findings: findingsRaw === null ? 0 : Number.parseInt(findingsRaw, 10),
           risk: riskArg,
+          project: leafOption(rest, "--project"),
+          format,
+        });
+      },
+    },
+    {
+      name: "submit-task",
+      shortHelp:
+        "Persist the per-task audit-gate finding artifact (commit-free).",
+      run: (rest, format) => {
+        const valueTaking = new Set(["--file", "--status", "--project"]);
+        const [taskId] = leafPositionals(rest, valueTaking);
+        // --file / --status are click `required=True`; --status is a
+        // click.Choice. click validates these at PARSE time (exit 2), before
+        // the verb body.
+        const fileArg = leafOption(rest, "--file");
+        if (fileArg === null) {
+          leafUsageError(
+            "audit",
+            "submit-task",
+            "TASK_ID",
+            "Missing option '--file'.",
+          );
+        }
+        const statusArg = leafOption(rest, "--status");
+        if (statusArg === null) {
+          leafUsageError(
+            "audit",
+            "submit-task",
+            "TASK_ID",
+            "Missing option '--status'. Choose from:\n\tclean,\n\tmild,\n\tsevere",
+          );
+        }
+        if (!AUDIT_FINDING_STATUS_CHOICES.includes(statusArg)) {
+          leafUsageError(
+            "audit",
+            "submit-task",
+            "TASK_ID",
+            `Invalid value for '--status': '${statusArg}' is not one of ` +
+              "'clean', 'mild', 'severe'.",
+          );
+        }
+        runAuditSubmitTask({
+          taskId: taskId ?? "",
+          file: fileArg,
+          status: statusArg,
           project: leafOption(rest, "--project"),
           format,
         });
