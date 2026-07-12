@@ -110,12 +110,14 @@ wrong-topology. The refusal names both recoveries (let autopilot dispatch it, or
 `--force` to launch in the shared checkout deliberately) and fails OPEN when the
 daemon is unreachable; `close::` / resume / free-form launches are untouched.
 
-A sibling plan-plugin config surface, `plugins/plan/model-selector.yaml` (the
-post-scaffold model+effort selector's policy config), is read off disk by
-`keeper plan selection-brief` during the select beat — never compiled in, never a
-`--plugin-dir` — so it rides no launch channel and is noted
-here only to keep the plan plugin's config-surface inventory complete alongside the
-host `matrix.yaml`.
+Sibling plan-plugin config surfaces ride no launch channel:
+`plugins/plan/model-selector.yaml` is the post-scaffold model+effort selector policy read
+by `keeper plan selection-brief`, while `plugins/plan/panel-selector.yaml` is the
+committed described panel roster owned and structurally gated by `/plan:panel-guidance`
+(`bun plugins/plan/scripts/panel-guidance-check.ts --check`). The skill installs that
+roster byte-for-byte as `~/.config/keeper/panel.yaml`; `keeper agent presets list --json`
+exposes each panel's members, authored strength, and description. Neither file is compiled
+or a `--plugin-dir`; this inventory keeps both alongside the host `matrix.yaml`.
 
 The daemon's own **merge-resolver dispatch** (`resolve::<epic>`, launched by the
 resolver-dispatch sweep on a stuck worktree fan-in close) rides this SAME

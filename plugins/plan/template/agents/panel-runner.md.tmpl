@@ -83,9 +83,10 @@ or your own read of the problem.
 
 ## Step 2 — Launch the panel (start)
 
-`keeper agent panel start` resolves the panel members from `~/.config/keeper/panel.yaml` (each a launch
-triple `<harness>::<model>::<effort>`, ADR 0033 — no separate preset catalog names them), copies the
-prompt into the run's **durable slug dir** (`~/.local/state/keeper/panels/<slug>/`, 0700), launches every
+`keeper agent panel start` resolves the named panel object from `~/.config/keeper/panel.yaml` and uses
+its ordered `members` launch triples (`<harness>::<model>::<effort>`, ADR 0033; the object also carries
+an authored `strength` and `description`), copies the prompt into the run's **durable slug dir**
+(`~/.local/state/keeper/panels/<slug>/`, 0700), launches every
 member as a **detached read-only `keeper agent run` leg** named `panel::<slug>::<member>` (a
 disambiguated triple slug plus a 1-based ordinal; each leg writes its own uniform JSON result envelope
 via `--output`), prints a one-line manifest JSON, and exits 0 immediately. The legs run on in their own

@@ -99,26 +99,21 @@ distress sticky until the file is fixed. Standing up a host:
    point, since it names all 11 by their current agent id.
 2. For a new model, add its selector guidance with `/plan:model-guidance <model>` (the drift gate fails until every roster model has a block).
 3. Re-render the worker cells AND the static agents: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/` and `ls plugins/plan/agents/`). A static agent template with no matching `agent_pins` entry fails the render loud, naming the agent.
-4. Discover the enumerable cube and verify routing: `keeper agent presets list --json` lists every
+4. Compose and install the described panel roster with `/plan:panel-guidance`. It authors the committed `plugins/plan/panel-selector.yaml` as ten named panel objects, each with `strength`, `members`, and `description`; its structural gate verifies the roster before the skill copies that exact file to `~/.config/keeper/panel.yaml`.
+5. Discover the enumerable cube and verify routing: `keeper agent presets list --json` lists every
    `<harness>::<model>::<effort>` launch triple the roster now serves (cell-bearing and launch-only
-   alike) plus the resolved per-verb `dispatch:` table; `keeper agent providers resolve <model>
-   <effort>` traces one model's cost-ordered candidates. `keeper agent providers check` fails loud
-   when the roster names a harness whose binary is missing from the host, or when a host file
-   (`presets.yaml` defaults/`dispatch:`, `panel.yaml` members) names a launch triple outside the
-   enumerable cube — install the missing binary or correct the triple, rather than treating the
-   failure as a bug.
-5. Wire the four `<harness>_default` triples plus the per-verb `dispatch:` table
+   alike), the resolved per-verb `dispatch:` table, and each configured panel's ordered members,
+   authored strength, and description; `keeper agent providers resolve <model> <effort>` traces one
+   model's cost-ordered candidates. `keeper agent providers check` fails loud when the roster names
+   a harness whose binary is missing from the host, or when a host file (`presets.yaml`
+   defaults/`dispatch:`, `panel.yaml` `members`) names a launch triple outside the enumerable cube —
+   install the missing binary or correct the triple, rather than treating the failure as a bug.
+6. Wire the four `<harness>_default` triples plus the per-verb `dispatch:` table
    (`work`/`close`/`resolve`/`unblock`/`deconflict`/`repair`/`handoff`) in
-   `~/.config/keeper/presets.yaml`, and any panel members in `~/.config/keeper/panel.yaml`, from
-   the triples `presets list` discovered. Migrating from a `worker:`/`escalation:` host: move the
-   old `worker` triple to `dispatch.work` / `dispatch.close` / `dispatch.resolve`, and the old
-   `escalation` triple to `dispatch.unblock` / `dispatch.deconflict` / `dispatch.repair` — a
-   leftover `worker:`/`escalation:` key fails `presets.yaml` to load loud, naming the retired key
-   and the `dispatch:` block to move it into; an unset verb floors to the compiled-in default
-   (`work`/`close`/`resolve` float to the reconcile-core worker constants, `unblock`/`deconflict`/
-   `repair` to the escalation constants, `handoff` to the harness's own default), so the board keeps
-   moving on defaults while you migrate.
-6. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
+   `~/.config/keeper/presets.yaml` from the triples `presets list` discovered. The panel roster is
+   installed only through `/plan:panel-guidance`; its `default` pointer and described panel objects
+   travel together in the committed copy.
+7. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
 
 ## Shell completions
 
