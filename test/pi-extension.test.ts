@@ -241,9 +241,8 @@ describe("pi extension — transcript tool argv", () => {
       }),
     ).toEqual([
       "transcript",
-      "list",
-      "--harness",
       "claude",
+      "list",
       "--offset",
       "20",
       "--limit",
@@ -270,9 +269,8 @@ describe("pi extension — transcript tool argv", () => {
       }),
     ).toEqual([
       "transcript",
-      "session-1",
-      "--harness",
       "claude",
+      "session-1",
       "--project",
       "/work/repo",
       "--subagent",
@@ -332,9 +330,8 @@ describe("pi extension — param clamping", () => {
   test("transcriptCliArgs emits the clamped bound in argv", () => {
     expect(transcriptCliArgs({ limit: 999 })).toEqual([
       "transcript",
-      "list",
-      "--harness",
       "claude",
+      "list",
       "--limit",
       "100",
     ]);
