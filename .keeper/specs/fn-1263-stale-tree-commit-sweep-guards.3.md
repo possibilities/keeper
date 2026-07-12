@@ -125,5 +125,5 @@ short-history degrade, and `--allow-mass-reversion`. No real git.
 - [ ] Fast suite green; no real git or unsandboxed DB in any test.
 
 ## Done summary
-
+Added three repo-state pre-commit gates to keeper commit-work: an always-on in-progress merge/sequencer refusal, a --override-jam shared-checkout dirty/desync jam refusal (fail-open keeper.db probe), and a --allow-mass-reversion post-stage ancestor-blob tripwire; new src/commit-work/repo-state.ts driven through the GitRunner seam, with every commit-work envelope registered in docs/problem-codes.md.
 ## Evidence
