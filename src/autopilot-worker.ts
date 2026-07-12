@@ -140,6 +140,7 @@ import {
   type HostMatrixSnapshot,
   isFinalizerVerb,
   isStoppedJobLive,
+  isWrappedCell,
   KEEPER_ROOT,
   type LaneMergedEntry,
   type PlannedLaunch,
@@ -163,6 +164,7 @@ import {
   type WorktreeRepoResolution,
   type WorktreeRepoStatusEntry,
   worktreeRecoverDispatchId,
+  wrappedEnvelopePath,
 } from "./reconcile-core";
 import { isPidAlive, runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
@@ -2344,6 +2346,97 @@ export function logMergeGateDeferral(
   } else {
     prior.suppressed++;
   }
+}
+
+/** One DONE wrapped-cell task whose provider-leg result envelope never appeared —
+ *  advisory evidence the wrapper implemented natively instead of delegating
+ *  (task .1 mints the marker at launch, this is its backstop). */
+export interface WrappedDelegationSkip {
+  taskId: string;
+  envelopePath: string;
+}
+
+/**
+ * Producer probe (not a fold): scan every DONE task whose EFFECTIVE cell is
+ * wrapped and flag the ones whose provider-leg result envelope ({@link
+ * wrappedEnvelopePath}) is absent on disk. Models the `stuck-sentinel:
+ * cwd-missing` precedent — the fs stat lives HERE in the producer, never inside
+ * a fold, so re-fold determinism is untouched (this reads nothing the
+ * readiness/reconcile fold consumes). DETECT-ONLY: the caller only logs: it
+ * never blocks a dispatch and mints no `dispatch_failures` row (no operator
+ * jam). A thrown `envelopeExists` probe is treated as INCONCLUSIVE, never a
+ * false flag — mirrors the shared-checkout desync probe's error handling. An
+ * unloadable host matrix can't classify wrappedness either, so it yields no
+ * flags rather than a guess. Pure over its injected probe; `envelopeExists`
+ * defaults to a real `existsSync` stat.
+ */
+export function findWrappedDelegationSkips(
+  snapshot: Pick<ReconcileSnapshot, "epics" | "hostMatrix">,
+  envelopeExists: (path: string) => boolean = existsSync,
+): WrappedDelegationSkip[] {
+  if (!snapshot.hostMatrix.ok) {
+    return [];
+  }
+  const hostMatrix = snapshot.hostMatrix;
+  const out: WrappedDelegationSkip[] = [];
+  for (const epic of snapshot.epics) {
+    const projectDir = epic.project_dir ?? "";
+    for (const task of epic.tasks) {
+      if (task.runtime_status !== "done") {
+        continue;
+      }
+      if (task.model == null || task.tier == null) {
+        continue;
+      }
+      if (!isWrappedCell(hostMatrix, task.model)) {
+        continue;
+      }
+      const cwd =
+        task.target_repo != null && task.target_repo !== ""
+          ? task.target_repo
+          : projectDir;
+      if (cwd === "") {
+        continue;
+      }
+      const envelopePath = wrappedEnvelopePath(cwd, task.task_id);
+      let exists: boolean;
+      try {
+        exists = envelopeExists(envelopePath);
+      } catch {
+        continue; // probe error -> inconclusive, never a false flag
+      }
+      if (!exists) {
+        out.push({ taskId: task.task_id, envelopePath });
+      }
+    }
+  }
+  return out;
+}
+
+/** Per-task coalesce state for {@link logWrappedDelegationSkip}, module-scoped
+ *  so it persists across reconcile cycles (mirrors {@link mergeGateDeferLogState}). */
+const wrappedDelegationSkipLogState = new Map<string, MergeGateDeferLogEntry>();
+
+/**
+ * Per-task coalesced advisory `console.error` for {@link findWrappedDelegationSkips}
+ * — reuses {@link logMergeGateDeferral}'s coalescing engine on its own state map so a
+ * steadily-flagged task re-fires at the same bounded cadence without ever permanently
+ * dropping the diagnostic. Clears itself the cycle the envelope appears (or the task
+ * stops matching) simply by no longer being called — no sticky row to retry-clear.
+ */
+export function logWrappedDelegationSkip(
+  skip: WrappedDelegationSkip,
+  now: number = Date.now(),
+  state: Map<string, MergeGateDeferLogEntry> = wrappedDelegationSkipLogState,
+): void {
+  logMergeGateDeferral(
+    skip.taskId,
+    `[autopilot-worker] wrapped-delegation-skipped: ${skip.taskId} done-stamped ` +
+      `with no provider-leg result envelope at ${skip.envelopePath} — advisory, ` +
+      `evidence the wrapper implemented natively instead of delegating`,
+    now,
+    state,
+  );
 }
 
 /**
@@ -8458,6 +8551,22 @@ function main(): void {
               err,
             );
           }
+        }
+        // Wrapped-delegation advisory (task .4): a producer-side, fs-touching
+        // probe — never a fold — flagging a DONE wrapped-cell task whose
+        // provider-leg result envelope never appeared. DETECT-ONLY: logs a
+        // coalesced advisory line, mints no sticky / dispatch_failures row, and
+        // never blocks a dispatch. Runs every cycle regardless of paused — it
+        // reads, never writes.
+        try {
+          for (const skip of findWrappedDelegationSkips(snapshot)) {
+            logWrappedDelegationSkip(skip);
+          }
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] wrapped-delegation-skip probe threw (non-fatal):",
+            err,
+          );
         }
         const decision = reconcile(snapshot, state, deps.now());
         await runReconcileCycle(

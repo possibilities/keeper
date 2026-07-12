@@ -83,6 +83,7 @@ import {
   FINALIZER_GUARD_S,
   type FoundJob,
   findShadowingWorkManifest,
+  findWrappedDelegationSkips,
   gateWedgedLanesByLiveness,
   gatherTipObservations,
   isBareShellCommand,
@@ -109,6 +110,7 @@ import {
   laneWedgeDistressId,
   loadReconcileSnapshot,
   logMergeGateDeferral,
+  logWrappedDelegationSkip,
   type MergeSuiteProbe,
   type MergeSuiteVerdict,
   mergeLaneBaseIntoDefault,
@@ -165,6 +167,7 @@ import {
   type WorktreeRecoveryFailure,
   type WorktreeRecoveryResolution,
   type WorktreeRepoResolution,
+  type WrappedDelegationSkip,
   worktreeFinalizeDispatchId,
   worktreeRecoverDispatchId,
   worktreeRecoverEpicDispatchId,
@@ -1717,6 +1720,144 @@ test("isWrappedCell: driver-keyed — wrapped for a codex model (even with a nul
   expect(isWrappedCell(PROVIDER_MATRIX, "sonnet")).toBe(false);
   // An unknown model reads as wrapped, mirroring the renderer's `?? "wrapped"`.
   expect(isWrappedCell(PROVIDER_MATRIX, "mystery-model")).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// findWrappedDelegationSkips (task .4) — the advisory, producer-probed
+// DETECT-ONLY backstop: a DONE wrapped-cell task whose provider-leg result
+// envelope never appeared. Never blocks a dispatch, never mints a
+// dispatch_failures row — pure over an injected `envelopeExists` probe.
+// ---------------------------------------------------------------------------
+
+test("findWrappedDelegationSkips: a done wrapped task with its envelope PRESENT is not flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => true);
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: a done wrapped task with its envelope ABSENT is flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([
+    {
+      taskId: "fn-1-foo.1",
+      envelopePath: "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+    },
+  ]);
+});
+
+test("findWrappedDelegationSkips: a probe THROW is inconclusive, never a flag", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => {
+    throw new Error("stat exploded");
+  });
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: a done NATIVE task is never flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "opus",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: a NOT-done wrapped task is never flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "in_progress",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: an unloadable host matrix can't classify wrappedness — no flags", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: { ok: false, state: "absent", detail: "no matrix.yaml" },
+  });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([]);
+});
+
+test("logWrappedDelegationSkip: coalesces per-task like logMergeGateDeferral, on its own state map", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const state = new Map<string, { loggedAt: number; suppressed: number }>();
+    const skip: WrappedDelegationSkip = {
+      taskId: "fn-1-foo.1",
+      envelopePath: "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+    };
+    logWrappedDelegationSkip(skip, 0, state);
+    logWrappedDelegationSkip(skip, 1_000, state); // suppressed
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("fn-1-foo.1");
+    expect(errs[0]).toContain(
+      "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+    );
+    expect(state.get("fn-1-foo.1")?.suppressed).toBe(1);
+  } finally {
+    console.error = origError;
+  }
 });
 
 test("reconcile: no-map-entry refuses fail-closed (no pluginDir, no fallback)", () => {
