@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified multi-file work that mirrors an existing bounded-prune function with a named acceptance and investigation targets \u2014 the GPT workhorse fits and no nameable intelligence-bound reason gates opus; high is the known-pattern sweet spot spanning DB layer, worker wiring, a possible forward-only index, and tests.",
+      "task_id": "fn-1265-bounded-bus-control-row-retention.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-12T16:42:16.911000Z",
+  "epic_id": "fn-1265-bounded-bus-control-row-retention",
+  "input_hash": "7318d3833516378b21ba79c29fcf683b46a05165d8647364d2b56e488bb5170d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1931006851,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1265-bounded-bus-control-row-retention.1\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified multi-file work that mirrors an existing bounded-prune function with a named acceptance and investigation targets \u2014 the GPT workhorse fits and no nameable intelligence-bound reason gates opus; high is the known-pattern sweet spot spanning DB layer, worker wiring, a possible forward-only index, and tests.\",\"confidence\":0.72}]}\n"
+}
