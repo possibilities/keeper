@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-12T03:01:56.269000Z",
+  "created_by_close_of": "fn-1257-fix-state-read-guard-audit-severe",
+  "depends_on_epics": [
+    "fn-1257-fix-state-read-guard-audit-severe"
+  ],
+  "id": "fn-1258-narrow-state-read-guard-shell-chain-scan",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Narrow state-read guard shell-chain scan",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-12T03:01:56.269000Z"
+}
