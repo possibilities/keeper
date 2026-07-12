@@ -174,6 +174,149 @@ else
   echo "install: pi-subagents fork unavailable; pi keeps its current package source"
 fi
 
+# 3c. CodexBar fork: rebase the fork checkout onto upstream, package the rebased
+#     source, and install that bundle in place of Homebrew's cask. The existing
+#     app remains untouched unless fetch, rebase, and packaging all succeed. Any
+#     failure after rebase restores the checkout's last known-good tip; an app
+#     replacement failure also restores the previous bundle. This step never
+#     fails the keeper install.
+codexbar_fork="${HOME}/src/possibilities--CodexBar"
+codexbar_branch="main"
+codexbar_origin="https://github.com/possibilities/CodexBar.git"
+codexbar_upstream="https://github.com/steipete/CodexBar.git"
+codexbar_app="/Applications/CodexBar.app"
+codexbar_notify() {
+  echo "install: CodexBar fork install: $1" >&2
+  if command -v notifyctl >/dev/null 2>&1; then
+    notifyctl show-message -t "CodexBar fork install failed" \
+      -m "$1 (${codexbar_fork})" >/dev/null 2>&1 || true
+  fi
+}
+if [ ! -d "${codexbar_fork}/.git" ]; then
+  echo "install: CodexBar fork not present; cloning ${codexbar_origin}"
+  mkdir -p "$(dirname "${codexbar_fork}")"
+  git clone --quiet "${codexbar_origin}" "${codexbar_fork}" 2>/dev/null || \
+    codexbar_notify "clone failed — fork not installed (network/auth?)"
+fi
+if [ -d "${codexbar_fork}/.git" ]; then
+  echo "install: syncing and installing CodexBar fork"
+  (
+    set -Eeuo pipefail
+    cd "${codexbar_fork}"
+    git remote get-url upstream >/dev/null 2>&1 || \
+      git remote add upstream "${codexbar_upstream}"
+    current_branch="$(git branch --show-current)"
+    if [ "${current_branch}" != "${codexbar_branch}" ]; then
+      codexbar_notify "checkout is on '${current_branch:-<detached>}', expected '${codexbar_branch}' — leaving the installed app unchanged"
+      exit 0
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+      codexbar_notify "checkout has local changes — leaving the installed app unchanged"
+      exit 0
+    fi
+    safe_tip="$(git rev-parse HEAD)"
+    install_tmp=""
+    previous_app=""
+    had_previous=0
+    was_running=0
+    app_mutated=0
+    install_complete=0
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2329
+    codexbar_cleanup() {
+      cleanup_status=$?
+      if [ "${cleanup_status}" -ne 0 ] && [ "${install_complete}" -ne 1 ]; then
+        if [ "${app_mutated}" -eq 1 ]; then
+          rm -rf "${codexbar_app}" || true
+          if [ "${had_previous}" -eq 1 ] && [ -d "${previous_app}" ]; then
+            ditto "${previous_app}" "${codexbar_app}" >/dev/null 2>&1 || true
+          fi
+        fi
+        git rebase --abort >/dev/null 2>&1 || true
+        git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+        codexbar_notify "unexpected error; restored the previous bundle and pre-rebase tip ${safe_tip:0:10}"
+        if [ "${was_running}" -eq 1 ] && [ -d "${codexbar_app}" ]; then
+          open -n "${codexbar_app}" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ -n "${install_tmp}" ]; then
+        rm -rf "${install_tmp}"
+      fi
+    }
+    trap codexbar_cleanup EXIT
+    if ! git fetch upstream --quiet; then
+      codexbar_notify "git fetch upstream failed — leaving the installed app unchanged"
+      exit 0
+    fi
+    if ! git rebase upstream/main >/dev/null 2>&1; then
+      git rebase --abort >/dev/null 2>&1 || true
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      codexbar_notify "rebase onto upstream/main conflicted; restored pre-rebase tip ${safe_tip:0:10}"
+      exit 0
+    fi
+    if ! ./Scripts/package_app.sh release >/dev/null 2>&1; then
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      codexbar_notify "package build failed after rebase; restored pre-rebase tip ${safe_tip:0:10}"
+      exit 0
+    fi
+
+    install_tmp="$(mktemp -d "${TMPDIR:-/tmp}/keeper-codexbar.XXXXXX")"
+    staged_app="${install_tmp}/CodexBar.app"
+    previous_app="${install_tmp}/previous-CodexBar.app"
+    if ! ditto "${codexbar_fork}/CodexBar.app" "${staged_app}"; then
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      codexbar_notify "could not stage the packaged app; restored pre-rebase tip ${safe_tip:0:10}"
+      exit 0
+    fi
+    if [ -d "${codexbar_app}" ]; then
+      if ! ditto "${codexbar_app}" "${previous_app}"; then
+        git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+        codexbar_notify "could not back up the installed app; restored pre-rebase tip ${safe_tip:0:10}"
+        exit 0
+      fi
+      had_previous=1
+    fi
+    if pgrep -x CodexBar >/dev/null 2>&1; then
+      was_running=1
+    fi
+    pkill -x CodexBar >/dev/null 2>&1 || pkill -f CodexBar.app >/dev/null 2>&1 || true
+
+    install_failed=0
+    app_mutated=1
+    if command -v brew >/dev/null 2>&1 && brew list --cask codexbar >/dev/null 2>&1; then
+      echo "install: removing Homebrew-managed CodexBar"
+      brew uninstall --cask --force codexbar >/dev/null 2>&1 || install_failed=1
+    fi
+    if [ "${install_failed}" -eq 0 ]; then
+      rm -rf "${codexbar_app}"
+      ditto "${staged_app}" "${codexbar_app}" || install_failed=1
+    fi
+    if [ "${install_failed}" -ne 0 ]; then
+      rm -rf "${codexbar_app}"
+      if [ "${had_previous}" -eq 1 ]; then
+        ditto "${previous_app}" "${codexbar_app}" >/dev/null 2>&1 || true
+      fi
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      codexbar_notify "app replacement failed; restored the previous bundle and pre-rebase tip ${safe_tip:0:10}"
+      if [ "${was_running}" -eq 1 ] && [ -d "${codexbar_app}" ]; then
+        open -n "${codexbar_app}" >/dev/null 2>&1 || true
+      fi
+      exit 0
+    fi
+
+    mkdir -p "${HOME}/.local/bin"
+    ln -sfn "${codexbar_app}/Contents/Helpers/CodexBarCLI" "${HOME}/.local/bin/codexbar"
+    install_complete=1
+    if [ "${was_running}" -eq 1 ]; then
+      open -n "${codexbar_app}" >/dev/null 2>&1 || \
+        codexbar_notify "the fork installed successfully but could not be relaunched"
+    fi
+    echo "install: CodexBar fork rebased, packaged, and installed"
+  ) || codexbar_notify "fork install errored; leaving keeper installation running"
+else
+  echo "install: CodexBar fork unavailable; leaving the installed app unchanged"
+fi
+
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it
