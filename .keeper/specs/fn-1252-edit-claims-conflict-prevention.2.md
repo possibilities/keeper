@@ -45,5 +45,5 @@ Per-(epic,repo) keying must mirror existing distress keying for `worktree_multi_
 - [ ] The pure reconcile core reads the data without importing git/fs; the dep-pin test stays green.
 
 ## Done summary
-
+Added a worktree-gated computeBaseDriftEntries producer probe (autopilot-worker.ts) that measures per-lane base drift via measureBaseDrift and thresholds, threading plain baseDriftEntries snapshot data through the pure reconcile core with no git/fs imports there; OFF worktreeMode is zero-git-spawn, inconclusive/vacuous-ancestor lanes defer rather than false-positive.
 ## Evidence
