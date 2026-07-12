@@ -109,6 +109,14 @@ export interface StaleBaseLaneEntry {
   repo_dir: string;
 }
 
+/** One worktree lane whose base has drifted beyond the producer thresholds. */
+export interface BaseDriftEntry {
+  epic_id: string;
+  repo_dir: string;
+  behind_count: number;
+  merge_base_age_seconds: number;
+}
+
 /**
  * The two `keeper plan` verbs the reconciler dispatches: `work` for a `ready` task
  * row, `close` for a `ready` close row. The argv shape's single source of truth
@@ -925,6 +933,13 @@ export interface ReconcileSnapshot {
    */
   staleBaseLaneEntries?: readonly StaleBaseLaneEntry[];
   /**
+   * The worktree lanes whose bases exceed the producer's behind-count and
+   * merge-base-age thresholds. This is producer-probed plain data only; the pure
+   * core carries it forward for the refresh producer and never probes git itself.
+   * Empty whenever worktree mode is OFF. Optional for call-site back-compat.
+   */
+  baseDriftEntries?: readonly BaseDriftEntry[];
+  /**
    * The `dispatch_failures.id`s that currently have an OPEN per-(epic,repo)
    * stale-base-lane distress row (synthetic `daemon::stale-base-lane:<epicId>-
    * <repoHash>`, collected off the row's `id`). PRODUCER-ONLY: read by the stale-base
@@ -1325,6 +1340,8 @@ export interface WorktreeReject {
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
   completedRowIds: Set<string>;
+  /** Plain producer-probed base-drift data, carried without any git/clock reads. */
+  baseDriftEntries: readonly BaseDriftEntry[];
   /**
    * The per-epic worktree-finalize requests for this cycle: one entry
    * per epic whose close-row verdict is `{tag:"completed"}` AND worktree mode is
@@ -1920,6 +1937,7 @@ const EMPTY_DEFERRED_EPIC_IDS: ReadonlyMap<
   string,
   ReadonlySet<string>
 > = new Map<string, ReadonlySet<string>>();
+const EMPTY_BASE_DRIFT_ENTRIES: readonly BaseDriftEntry[] = [];
 
 /**
  * The pure reconcile decision. Walks every epic / task / close-row, computes the
@@ -1946,6 +1964,10 @@ export function reconcile(
     string,
     ReadonlySet<string>
   > = snapshot.deferredEpicIds ?? EMPTY_DEFERRED_EPIC_IDS;
+  // Producer data only: the refresh producer consumes this on a later pass; the
+  // verdict core carries it without deriving anything from git or a clock.
+  const baseDriftEntries =
+    snapshot.baseDriftEntries ?? EMPTY_BASE_DRIFT_ENTRIES;
 
   // The armed-mode eligibility set: in `armed` mode `work` is dispatched ONLY
   // for armed epics PLUS their transitive upstream dep-closure. Computed ONCE
@@ -2445,6 +2467,7 @@ export function reconcile(
   return {
     launches,
     completedRowIds,
+    baseDriftEntries,
     worktreeFinalize,
     worktreeSinkProvision,
     finalizeFailureIds: snapshot.finalizeFailureIds,

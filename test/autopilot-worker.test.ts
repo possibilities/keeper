@@ -52,6 +52,7 @@ import {
   classifyResolverOutcome,
   classifyWorktreeRepos,
   closerJobFinished,
+  computeBaseDriftEntries,
   computeDeferredEpicIds,
   computeDuplicateEpicNumberGroups,
   computeMergedLaneEntries,
@@ -14716,6 +14717,100 @@ test("fn-1141 computeLandedEpicIds: worktree mode OFF ignores the lane projectio
   expect(
     computeLandedEpicIds(false, ["fn-1-foo", "fn-2-bar"], [open, done]),
   ).toEqual(["fn-2-bar"]);
+});
+
+// ---------------------------------------------------------------------------
+// Base-drift producer probe. Expected magnitudes are hand-computed from the fake
+// git output; this suite never derives them through the implementation.
+// ---------------------------------------------------------------------------
+
+function baseDriftGit(opts: {
+  behind?: string;
+  mergeBase?: string;
+  mergeBaseEpoch?: string;
+  revListExitCode?: number;
+}): ReturnType<typeof fakeAsyncGit> {
+  return fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "symbolic-ref"),
+      result: { stdout: "origin/main\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result:
+        opts.revListExitCode === undefined
+          ? { stdout: opts.behind ?? "0\t16\n" }
+          : { exitCode: opts.revListExitCode },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base"),
+      result: { stdout: opts.mergeBase ?? "base-sha\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "show", "-s", "--format=%ct"),
+      result: { stdout: opts.mergeBaseEpoch ?? "100000\n" },
+    },
+  ]);
+}
+
+test("computeBaseDriftEntries: drifted lanes emit hand-computed magnitude and share one default-branch probe per repo", async () => {
+  const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
+  const b = makeEpic({ epic_id: "fn-2-b", project_dir: "/repo" });
+  const epics = [a, b];
+  const { run, calls } = baseDriftGit({
+    behind: "3\t16\n",
+    mergeBaseEpoch: "100000\n",
+  });
+
+  expect(
+    await computeBaseDriftEntries(epics, classifyIdentity(epics), run, {
+      nowSeconds: 200000,
+    }),
+  ).toEqual([
+    {
+      epic_id: "fn-1-a",
+      repo_dir: "/repo",
+      behind_count: 16,
+      merge_base_age_seconds: 100000,
+    },
+    {
+      epic_id: "fn-2-b",
+      repo_dir: "/repo",
+      behind_count: 16,
+      merge_base_age_seconds: 100000,
+    },
+  ]);
+  expect(
+    calls.filter((c) => argvStartsWith(c.args, "symbolic-ref")),
+  ).toHaveLength(1);
+});
+
+test("computeBaseDriftEntries: a fresh lane has no behind commits, so an old merge-base alone never flags it", async () => {
+  const epic = makeEpic({ epic_id: "fn-1-fresh", project_dir: "/repo" });
+  const { run } = baseDriftGit({
+    behind: "0\t0\n",
+    mergeBaseEpoch: "1\n",
+  });
+
+  expect(
+    await computeBaseDriftEntries([epic], classifyIdentity([epic]), run, {
+      nowSeconds: 200000,
+    }),
+  ).toEqual([]);
+});
+
+test("computeBaseDriftEntries: an inconclusive measurement defers with no entry", async () => {
+  const epic = makeEpic({ epic_id: "fn-1-defer", project_dir: "/repo" });
+  const { run, calls } = baseDriftGit({
+    revListExitCode: GIT_SPAWN_TIMEOUT_CODE,
+  });
+
+  expect(
+    await computeBaseDriftEntries([epic], classifyIdentity([epic]), run, {
+      nowSeconds: 200000,
+    }),
+  ).toEqual([]);
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

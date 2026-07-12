@@ -129,6 +129,7 @@ import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
 import { loadReadinessInputs } from "./readiness-inputs";
 import {
+  type BaseDriftEntry,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   type DispatchKey,
@@ -197,6 +198,7 @@ import {
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
   losslessPremergeClean as gitLosslessPremergeClean,
+  measureBaseDrift as gitMeasureBaseDrift,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
@@ -256,6 +258,7 @@ export {
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
 export type {
+  BaseDriftEntry,
   DispatchKey,
   EpicRecoverVerdict,
   HostMatrixSnapshot,
@@ -2910,6 +2913,117 @@ export async function computeMergedLaneEntries(
     }
   }
   out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
+  return out;
+}
+
+/** Defaults until durable autopilot config supplies these producer inputs. */
+export const DEFAULT_BASE_DRIFT_THRESHOLDS = {
+  behindCount: 15,
+  mergeBaseAgeSeconds: 24 * 60 * 60,
+} as const;
+
+export interface BaseDriftThresholds {
+  behindCount: number;
+  mergeBaseAgeSeconds: number;
+}
+
+/** Injectable producer inputs so durable config can replace only the values. */
+export interface BaseDriftProbeOptions {
+  thresholds?: Readonly<BaseDriftThresholds>;
+  nowSeconds?: number;
+}
+
+/**
+ * Compute the bases that have genuinely drifted from their local default branch.
+ * A lane must be both sufficiently behind and old enough: a fresh/empty lane at
+ * its fork point has zero behind commits, so the ancestry-vacuity case cannot
+ * manufacture a drift entry. Any inconclusive measurement defers to no entry.
+ */
+export async function computeBaseDriftEntries(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+  options: BaseDriftProbeOptions = {},
+): Promise<BaseDriftEntry[]> {
+  const supplied = options.thresholds;
+  const thresholds: BaseDriftThresholds = {
+    behindCount:
+      supplied !== undefined &&
+      Number.isFinite(supplied.behindCount) &&
+      supplied.behindCount >= 0
+        ? supplied.behindCount
+        : DEFAULT_BASE_DRIFT_THRESHOLDS.behindCount,
+    mergeBaseAgeSeconds:
+      supplied !== undefined &&
+      Number.isFinite(supplied.mergeBaseAgeSeconds) &&
+      supplied.mergeBaseAgeSeconds >= 0
+        ? supplied.mergeBaseAgeSeconds
+        : DEFAULT_BASE_DRIFT_THRESHOLDS.mergeBaseAgeSeconds,
+  };
+  const nowSeconds =
+    options.nowSeconds !== undefined && Number.isFinite(options.nowSeconds)
+      ? options.nowSeconds
+      : Math.floor(Date.now() / 1000);
+
+  // Every lane in one repo shares its local default; resolve it at most once.
+  const defaultBranchByRepo = new Map<string, string | null>();
+  const resolveLocalDefault = async (
+    repoDir: string,
+  ): Promise<string | null> => {
+    const hit = defaultBranchByRepo.get(repoDir);
+    if (hit !== undefined) return hit;
+    let branch: string | null;
+    try {
+      branch = await gitResolveDefaultBranch(repoDir, run);
+    } catch {
+      branch = null;
+    }
+    defaultBranchByRepo.set(repoDir, branch);
+    return branch;
+  };
+
+  const out: BaseDriftEntry[] = [];
+  for (const epic of epics) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution === undefined) continue;
+    const laneRepos = worktreeLaneRepoDirs(resolution);
+    const base = baseBranchFor(epic.epic_id);
+    for (const repoDir of laneRepos) {
+      try {
+        const defaultBranch = await resolveLocalDefault(repoDir);
+        if (defaultBranch === null) continue;
+        const measurement = await gitMeasureBaseDrift(
+          repoDir,
+          base,
+          defaultBranch,
+          run,
+        );
+        if (measurement.kind !== "measured") continue;
+        const mergeBaseAgeSeconds = Math.max(
+          0,
+          nowSeconds - measurement.mergeBaseEpochSeconds,
+        );
+        if (
+          measurement.behindCount >= thresholds.behindCount &&
+          mergeBaseAgeSeconds >= thresholds.mergeBaseAgeSeconds
+        ) {
+          out.push({
+            epic_id: epic.epic_id,
+            repo_dir: repoDir,
+            behind_count: measurement.behindCount,
+            merge_base_age_seconds: mergeBaseAgeSeconds,
+          });
+        }
+      } catch {
+        // A producer probe is advisory; defer this lane rather than fail a cycle.
+      }
+    }
+  }
+  out.sort((a, b) =>
+    a.epic_id === b.epic_id
+      ? a.repo_dir.localeCompare(b.repo_dir)
+      : a.epic_id.localeCompare(b.epic_id),
+  );
   return out;
 }
 
@@ -7510,6 +7624,13 @@ export async function loadReconcileSnapshot(
     ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
     : [];
 
+  // Base drift is a separate producer observation. It reuses the resolved lane
+  // repos, resolves each local default once, and remains inert (including all git
+  // reads) while worktree mode is OFF.
+  const baseDriftEntries = worktreeMode
+    ? await computeBaseDriftEntries(epics, worktreeRepoByEpicId)
+    : [];
+
   // The STALE-BASE lane set (fn-1127) — every already-cut lane forked off a base
   // missing a landed same-repo upstream's work. A SIBLING probe to the merge-gate /
   // merge-landed passes (never modifying them), reusing `worktreeRepoByEpicId`'s
@@ -7577,6 +7698,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     landedLaneEntries,
+    baseDriftEntries,
     staleBaseLaneEntries,
     liveAttributedDirtyByWorktree,
     worktreesRoot,
