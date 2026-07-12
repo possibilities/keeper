@@ -433,6 +433,48 @@ describe("keeper transcript codex show", () => {
   });
 });
 
+describe("keeper transcript codex find guards", () => {
+  test("refuses a session id that is not a bare uuid, never resolving it to a path", () => {
+    // The find guard (basename identity + strict uuid shape) must reject any
+    // id carrying a separator or traversal segment before a single day-dir is
+    // scanned — the id is never joined onto a filesystem path.
+    const traversals = [
+      "../../../etc/passwd",
+      "foo/bar",
+      "019eeca0-fcbb-715d-9bd0-4a756390883a/../../secrets",
+      "not-a-uuid",
+    ];
+    for (const evil of traversals) {
+      const result = run([evil, "--json"]);
+      expect(result.code).toBe(1);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error.code).toBe("session_not_found");
+    }
+  });
+
+  test("reports an ambiguous session when one uuid appears in two day-dirs", () => {
+    const dup = "12121212-3434-4565-8787-909090909090";
+    writeRollout(
+      dup,
+      Date.parse("2026-07-05T12:00:00.000Z"),
+      [sessionMeta(dup, PROJECT, "2026-07-05T12:00:00.000Z")],
+      "2026-07-05T12:00:00.000Z",
+    );
+    writeRollout(
+      dup,
+      Date.parse("2026-07-08T12:00:00.000Z"),
+      [sessionMeta(dup, PROJECT, "2026-07-08T12:00:00.000Z")],
+      "2026-07-08T12:00:00.000Z",
+    );
+    const result = run([dup, "--json"]);
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error.code).toBe("session_ambiguous");
+  });
+});
+
 describe("keeper transcript codex list", () => {
   test("defaults to the cwd scope and --global expands it", () => {
     const local = run(["list"]);
