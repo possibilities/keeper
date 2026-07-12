@@ -4,12 +4,12 @@
   "depends_on": [],
   "epic": "fn-1257-fix-state-read-guard-audit-severe",
   "id": "fn-1257-fix-state-read-guard-audit-severe.1",
-  "model": null,
+  "model": "opus",
   "priority": null,
-  "selection_input_hash": null,
+  "selection_input_hash": "e9ef5232ae88ba149902867590e70a85d1727083c9a543c04355132ae9c6d445",
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": null,
+  "tier": "xhigh",
   "title": "Exempt plan-block from guard",
-  "updated_at": "2026-07-12T02:42:58.370000Z"
+  "updated_at": "2026-07-12T02:42:58.655000Z"
 }
