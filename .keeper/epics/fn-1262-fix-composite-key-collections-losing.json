@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-12T14:06:34.358000Z",
+  "depends_on_epics": [],
+  "id": "fn-1262-fix-composite-key-collections-losing",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix composite-key collections losing live updates",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-12T14:06:34.358000Z"
+}

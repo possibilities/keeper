@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T14:06:34.358000Z",
+  "depends_on": [
+    "fn-1262-fix-composite-key-collections-losing.1"
+  ],
+  "epic": "fn-1262-fix-composite-key-collections-losing",
+  "id": "fn-1262-fix-composite-key-collections-losing.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Stabilize subscribe page tie-break via composite key",
+  "updated_at": "2026-07-12T14:06:34.358000Z"
+}
