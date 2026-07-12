@@ -909,7 +909,16 @@ describe("worker cells: the required v2 host worker matrix", () => {
       expect(wrapped).toContain(
         "keeper agent providers resolve gpt-5.5 medium",
       );
-      expect(wrapped).toContain("wrapped::<task-id>");
+      expect(wrapped).toContain(
+        "--session wrapped --name wrapped::<task-id>",
+      );
+      expect(wrapped).not.toContain("--session wrapped::<task-id>");
+      expect(wrapped).toContain(
+        "that window closes when its agent process exits",
+      );
+      expect(wrapped).toContain(
+        "tmux closes the shared session after its last window exits",
+      );
       expect(wrapped).toContain("nohup");
       expect(wrapped).toContain("keeper agent wait");
       // Failure map: launch-fail falls through the pecking order, timeout retries

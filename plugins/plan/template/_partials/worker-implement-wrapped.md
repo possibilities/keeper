@@ -19,13 +19,13 @@ It emits one JSON line `{driver, candidates: [{harness, model_id, preset_name}, 
 - Make NO commits. Create or switch NO branches. Run NO `git` mutation and NO `keeper` commands whatsoever.
 - Return STRICT JSON and nothing else: `{status, summary, files_changed, tests, commit_message}`.
 
-**Launch the first candidate DETACHED — never one blocking call.** A real implementation outlasts the Bash tool's ten-minute cap, so a foreground `keeper agent run` would be killed mid-flight. Launch the leg panel-style: a short POSIX shell double-forks it under `nohup` so it reparents to init the instant the launch returns, recording the real backgrounded pid to a pidfile and severing stdin from `/dev/null`. Give it the deterministic name `wrapped::<task-id>` and an `--output` envelope path (a system-file result sink the run writes on every outcome):
+**Launch the first candidate DETACHED — never one blocking call.** A real implementation outlasts the Bash tool's ten-minute cap, so a foreground `keeper agent run` would be killed mid-flight. Launch the leg panel-style: a short POSIX shell double-forks it under `nohup` so it reparents to init the instant the launch returns, recording the real backgrounded pid to a pidfile and severing stdin from `/dev/null`. Group every provider leg in the shared `wrapped` tmux session, give its window the deterministic name `wrapped::<task-id>`, and provide an `--output` envelope path (a system-file result sink the run writes on every outcome). Each leg still owns one tmux window: that window closes when its agent process exits, and tmux closes the shared session after its last window exits.
 
 ```bash
 sh -c 'nohup "$@" </dev/null >"$LOG" 2>&1 & echo $! > "$PIDFILE"' -- \
   keeper agent run <harness> "<delegate prompt>" \
     --model <model_id> --system-file <contract-path> \
-    --session wrapped::<task-id> --name wrapped::<task-id> \
+    --session wrapped --name wrapped::<task-id> \
     --output <envelope-path> --stop-timeout <stop_timeout_ms>ms
 ```
 
