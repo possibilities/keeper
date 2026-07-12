@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "commit-work purity gate and pathspec commit",
-  "updated_at": "2026-07-12T14:36:32.474000Z"
+  "updated_at": "2026-07-12T15:01:32.883000Z",
+  "worker_done_at": "2026-07-12T15:01:32.883000Z"
 }

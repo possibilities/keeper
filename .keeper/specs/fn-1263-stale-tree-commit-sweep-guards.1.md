@@ -104,5 +104,5 @@ recording).
   suite is green with no real git spawned.
 
 ## Done summary
-
+commit-work now fails loud on staged content outside the session-attributed set (stale_index_carryover; --allow-stale-unstage opt-in) and scopes the commit itself to the attributed set via git --only + GIT_LITERAL_PATHSPECS=1 with --no-renames, so a poisoned/stale index cannot leak into the tree. Adds nothing_to_commit + partial-commit refusal envelopes and full fake-git test coverage.
 ## Evidence
