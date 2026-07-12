@@ -49,7 +49,7 @@ Capture the `[instructions]` tail (anything after the epic id in `$ARGUMENTS`) v
 
 Spawn the quality-auditor with a config-only prompt — `EPIC_ID`, `PRIMARY_REPO`, `BRIEF_REF`, and `DEPTH_BAND`, nothing else. The auditor reads the brief itself (commit groups, done summaries) and persists its report via `audit submit --project "$PRIMARY_REPO"` (the submit auto-routes state to the epic's primary repo through the central resolver; `--project` is an explicit belt-and-suspenders pin, not the mechanism); the closer never inlines audit prose. `DEPTH_BAND` sizes the pass — the auditor's report meta echoes it back, so a mismatch against the brief's own `depth.band` is visible to the close-planner at vet time.
 
-**Every subagent spawn in this skill is backgrounded — the auditor, the close-planner, and the model-selector alike.** Waiting for one means ending the turn, never spinning in place; the subagent's completion task-notification is the only wake path back into this closer. Never call the harness ScheduleWakeup tool, a Monitor, or a shell sleep to wait on a spawned subagent — ScheduleWakeup is loop-only and requires a `prompt`, so calling it here fails outright. This is distinct from the transient-failure retry below: that backoff sleeps between re-*spawn* attempts after a dropped Task call returns no body, which is a legitimate retry sleep, never a wait on a live subagent.
+**Every subagent spawn in this skill is backgrounded — the auditor, the close-planner, and the model-selector alike.** Waiting for one means ending the turn, never spinning in place; the subagent's completion task-notification is the only wake path back into this closer. **Never pass a `name=` kwarg to any of these spawns** — a named spawn becomes a generic addressable teammate and silently REPLACES the typed agent definition, so the child runs without its system prompt and never learns its submit contract (an auditor that analyzes but never persists a report). `subagent_type` + `description` + `prompt` are the only kwargs a spawn in this skill carries. Never call the harness ScheduleWakeup tool, a Monitor, or a shell sleep to wait on a spawned subagent — ScheduleWakeup is loop-only and requires a `prompt`, so calling it here fails outright. This is distinct from the transient-failure retry below: that backoff sleeps between re-*spawn* attempts after a dropped Task call returns no body, which is a legitimate retry sleep, never a wait on a live subagent.
 
 ```
 Task(
@@ -62,7 +62,7 @@ DEPTH_BAND: <depth_band>"""
 )
 ```
 
-No `model=` kwarg — the agent file owns the model and effort.
+No `model=` kwarg (the agent file owns the model and effort) and no `name=` kwarg (a named spawn drops the typed agent definition).
 
 **Transient-failure retry (backoff, not once-then-stop).** The auditor is the expensive, overload-prone step, and the audit runs INLINE — a dropped spawn blocks the whole close, so a "retry once" policy hands a transient API blip back to the human as a dead close. When the Task call fails with no body returned (harness drop, model unavailable, `API Error: 529 Overloaded`), retry with increasing backoff: re-spawn immediately once, then on continued failure sleep `60s → 180s → 600s` between attempts (up to ~5 attempts total). Surface a one-line status to the human before each backoff sleep (*"auditor hit a transient 529; backing off Ns before retry M of 5"*) so a long outage is visible, not silent. Stop only after the backoff budget is exhausted — *"BLOCKED: TOOLING_FAILURE — quality-auditor unreachable after 5 attempts over ~15 min (last error: <verbatim>). Re-run `/plan:close <epic_id>` once the API recovers; `close-finalize` is idempotent so re-run is safe."* A non-transient Task failure (a returned error body that is not an overload/availability blip) stops immediately — backoff is for transient unavailability only.
 
@@ -90,7 +90,7 @@ BRIEF_REF: <brief_ref>
 )
 ```
 
-No `model=` kwarg — the agent file owns the model and effort.
+No `model=` kwarg (the agent file owns the model and effort) and no `name=` kwarg (a named spawn drops the typed agent definition).
 
 **Capture the planner's agentId** from the Task tool result string. It ends with `…agentId: <hex> (use SendMessage with to: '<id>' to continue this agent)`. Extract with `agentId:\s*([a-f0-9]{10,})` (the hex has no newline before it — `re.search`, not `re.match`). Pin it as `planner_agent_id` for the warm-resume path below.
 
@@ -168,7 +168,7 @@ On **any** failure (`FOLLOWUP_MISSING`, `FOLLOWUP_INVALID`, missing config/matri
 
 ### 3.5b — Spawn the selector blind
 
-Spawn `plan:model-selector` with a config-only prompt — `EPIC_ID` (the source epic), `PRIMARY_REPO`, `BRIEF_REF`, nothing else. No `model=` kwarg — the agent file owns the model and effort. The selector reads `BRIEF_REF` itself and returns exactly one raw JSON verdict; the closer never inlines the follow-up specs as selector prompt prose.
+Spawn `plan:model-selector` with a config-only prompt — `EPIC_ID` (the source epic), `PRIMARY_REPO`, `BRIEF_REF`, nothing else. No `model=` kwarg (the agent file owns the model and effort) and no `name=` kwarg (a named spawn drops the typed agent definition). The selector reads `BRIEF_REF` itself and returns exactly one raw JSON verdict; the closer never inlines the follow-up specs as selector prompt prose.
 
 ```
 Task(
