@@ -136,6 +136,35 @@ describe("commandTouchesStateTree", () => {
       ),
     ).toBe(true);
   });
+
+  test("an AUDIT_SEVERE block whose reason prose holds a shell-inert metachar stays exempt", () => {
+    for (const ch of [">", "<", "&", "|", ";"]) {
+      expect(
+        commandTouchesStateTree(
+          `keeper plan block fn-1.2 --reason "AUDIT_SEVERE: timeout ${ch} 5s regresses (finding_ref=.keeper/state/audits/fn-1/tasks/fn-1.2.json)"`,
+        ),
+      ).toBe(false);
+    }
+  });
+
+  test("a real chain after the closed reason quote still forfeits the exemption", () => {
+    expect(
+      commandTouchesStateTree(
+        'keeper plan block fn-1.2 --reason "AUDIT_SEVERE: prose" && cat .keeper/state/audits/fn-1/tasks/fn-1.2.json',
+      ),
+    ).toBe(true);
+  });
+
+  test("a command substitution inside the reason value still forfeits the exemption", () => {
+    for (const sub of [
+      '"$(cat .keeper/state/audits/fn-1/tasks/fn-1.2.json)"',
+      '"`cat .keeper/state/audits/fn-1/tasks/fn-1.2.json`"',
+    ]) {
+      expect(
+        commandTouchesStateTree(`keeper plan block fn-1.2 --reason ${sub}`),
+      ).toBe(true);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -329,6 +358,40 @@ describe("state-read-guard ladder", () => {
       tool_input: {
         command:
           "keeper plan reconcile fn-1-x.2 && cat .keeper/state/audits/fn-1-x/tasks/fn-1-x.2.json",
+      },
+    });
+    expect(code).toBe(0);
+    expect(
+      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+  });
+
+  test("a Bash AUDIT_SEVERE block whose reason prose holds a shell-inert metachar allows", async () => {
+    writeMarker("work", { task_id: "fn-1-x.2" });
+    const { stdout, code } = await run({
+      hook_event_name: "PreToolUse",
+      session_id: SESSION,
+      tool_name: "Bash",
+      cwd: project,
+      tool_input: {
+        command:
+          'keeper plan block fn-1-x.2 --reason "AUDIT_SEVERE: timeout > 5s regresses; see .keeper/state/audits/fn-1-x/tasks/fn-1-x.2.json"',
+      },
+    });
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+  });
+
+  test("a Bash keeper plan seam with a real chain after the closed reason quote denies", async () => {
+    writeMarker("work", { task_id: "fn-1-x.2" });
+    const { stdout, code } = await run({
+      hook_event_name: "PreToolUse",
+      session_id: SESSION,
+      tool_name: "Bash",
+      cwd: project,
+      tool_input: {
+        command:
+          'keeper plan block fn-1-x.2 --reason "AUDIT_SEVERE: prose" && cat .keeper/state/audits/fn-1-x/tasks/fn-1-x.2.json',
       },
     });
     expect(code).toBe(0);
