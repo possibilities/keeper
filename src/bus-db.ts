@@ -31,13 +31,14 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { BusArtifactRef } from "./bus-artifact";
 import { applyPragmas } from "./db";
 
 /**
  * Current bus.db schema version — INDEPENDENT of keeper's `SCHEMA_VERSION`.
  * Forward-only: bump only when adding a step to {@link migrateBusDb}.
  */
-export const BUS_SCHEMA_VERSION = 1;
+export const BUS_SCHEMA_VERSION = 2;
 
 /**
  * WAL truncation floor (bytes). `journal_size_limit` truncates (not just zeroes)
@@ -120,8 +121,16 @@ export function migrateBusDb(db: Database): void {
     for (const ddl of CREATE_CHANNELS_INDEXES) db.run(ddl);
     db.run(CREATE_MESSAGES);
     for (const ddl of CREATE_MESSAGES_INDEXES) db.run(ddl);
-    // Stamp unconditionally — forward-only, never regresses (the > guard above
-    // already refused a newer DB).
+    if (stored < 2) {
+      db.run("ALTER TABLE messages ADD COLUMN payload_media_type TEXT");
+      db.run("ALTER TABLE messages ADD COLUMN artifact_id TEXT");
+      db.run("ALTER TABLE messages ADD COLUMN artifact_len INTEGER");
+      db.run("ALTER TABLE messages ADD COLUMN artifact_sha256 TEXT");
+      db.run("ALTER TABLE messages ADD COLUMN delivered_at REAL");
+      db.run(
+        "CREATE INDEX IF NOT EXISTS idx_messages_artifact_id ON messages(artifact_id)",
+      );
+    }
     db.run(`PRAGMA user_version = ${BUS_SCHEMA_VERSION}`);
   })();
 }
@@ -286,6 +295,9 @@ export interface MessageInput {
   resolved_channel_id?: string | null;
   resolved_session_id?: string | null;
   body?: string | null;
+  payload_media_type?: string | null;
+  artifact_ref?: BusArtifactRef | null;
+  delivered_at?: number | null;
   status?: string | null;
   reply_to?: number | null;
 }
@@ -304,6 +316,9 @@ export interface MessageRow {
   resolved_session_id: string | null;
   body: string | null;
   body_size: number;
+  payload_media_type: string | null;
+  artifact_ref: BusArtifactRef | null;
+  delivered_at: number | null;
   status: string | null;
   reply_to: number | null;
 }
@@ -325,6 +340,19 @@ function rowToMessage(row: Record<string, unknown>): MessageRow {
       row.resolved_session_id == null ? null : String(row.resolved_session_id),
     body: row.body == null ? null : String(row.body),
     body_size: Number(row.body_size),
+    payload_media_type:
+      row.payload_media_type == null ? null : String(row.payload_media_type),
+    artifact_ref:
+      row.artifact_id == null ||
+      row.artifact_len == null ||
+      row.artifact_sha256 == null
+        ? null
+        : {
+            id: String(row.artifact_id),
+            len: Number(row.artifact_len),
+            sha256: String(row.artifact_sha256),
+          },
+    delivered_at: row.delivered_at == null ? null : Number(row.delivered_at),
     status: row.status == null ? null : String(row.status),
     reply_to: row.reply_to == null ? null : Number(row.reply_to),
   };
@@ -332,21 +360,33 @@ function rowToMessage(row: Record<string, unknown>): MessageRow {
 
 /**
  * Append one message; returns its assigned monotonic `id` (the replay cursor).
- * `body_size` is derived from the byte length of `body` (forensic sizing of the
- * spill threshold). `ts` defaults to wall-clock at append — this is a PRODUCER,
+ * `body_size` is the inline UTF-8 byte length or the artifact's declared byte
+ * length. `ts` defaults to wall-clock at append — this is a PRODUCER,
  * not a fold, so reading the clock here is correct.
  */
 export function appendMessage(db: Database, msg: MessageInput): number {
-  const body = msg.body ?? null;
-  const bodySize = body == null ? 0 : Buffer.byteLength(body, "utf8");
+  const ref = msg.artifact_ref ?? null;
+  if (ref !== null && msg.body != null) {
+    throw new TypeError(
+      "a bus message cannot contain both a body and an artifact reference",
+    );
+  }
+  const body = ref === null ? (msg.body ?? null) : null;
+  const bodySize =
+    ref === null
+      ? body == null
+        ? 0
+        : Buffer.byteLength(body, "utf8")
+      : ref.len;
   const ts = msg.ts ?? Date.now();
   const info = db
     .prepare(
       `INSERT INTO messages
          (ts, namespace, event, from_channel_id, from_pid, from_name,
           to_target, resolved_channel_id, resolved_session_id, body, body_size,
-          status, reply_to)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          payload_media_type, artifact_id, artifact_len, artifact_sha256,
+          delivered_at, status, reply_to)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       ts,
@@ -360,6 +400,11 @@ export function appendMessage(db: Database, msg: MessageInput): number {
       msg.resolved_session_id ?? null,
       body,
       bodySize,
+      msg.payload_media_type ?? null,
+      ref?.id ?? null,
+      ref?.len ?? null,
+      ref?.sha256 ?? null,
+      msg.delivered_at ?? null,
       msg.status ?? null,
       msg.reply_to ?? null,
     );
@@ -410,8 +455,9 @@ export function selectQueuedForWake(
 
 /**
  * Age-horizon message retention: delete up to `batchSize` of the OLDEST messages
- * whose `ts` is strictly before `cutoffTs`, PRESERVING every undelivered
- * `queued_for_wake` row regardless of age. Returns the count deleted.
+ * whose delivery time (falling back to `ts`) is strictly before `cutoffTs`,
+ * PRESERVING every undelivered `queued_for_wake` row regardless of age. Returns
+ * artifact ids that became unreferenced after the row-first transaction.
  *
  * Bounded by construction — it reads exactly the front `batchSize` rows by `id`
  * (id-ascending IS oldest-first: {@link appendMessage} assigns `id` and `ts`
@@ -424,26 +470,62 @@ export function selectQueuedForWake(
  * ({@link replayFromCursor}) is NOT a live consumer — the `keeper bus watch`
  * client subscribes with NO `after_id` (`cli/bus.ts`) — so retention deliberately
  * protects no replay window; a delivered escalation has already flipped off
- * `queued_for_wake` and ages out like any other row.
+ * `queued_for_wake` and ages from its terminal delivery timestamp.
  */
 export function pruneMessagesOlderThan(
   db: Database,
   cutoffTs: number,
   batchSize: number,
-): number {
+): string[] {
   const front = db
-    .prepare("SELECT id, ts, status FROM messages ORDER BY id ASC LIMIT ?")
-    .all(batchSize) as { id: number; ts: number; status: string | null }[];
-  const prunable = front
-    .filter((r) => r.ts < cutoffTs && r.status !== QUEUED_FOR_WAKE)
-    .map((r) => r.id);
-  if (prunable.length === 0) return 0;
+    .prepare(
+      `SELECT id, ts, delivered_at, status, artifact_id
+         FROM messages ORDER BY id ASC LIMIT ?`,
+    )
+    .all(batchSize) as {
+    id: number;
+    ts: number;
+    delivered_at: number | null;
+    status: string | null;
+    artifact_id: string | null;
+  }[];
+  const prunable = front.filter(
+    (r) => (r.delivered_at ?? r.ts) < cutoffTs && r.status !== QUEUED_FOR_WAKE,
+  );
+  if (prunable.length === 0) return [];
+  let artifactIds: string[] = [];
   db.transaction(() => {
     db.prepare(
       "DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?))",
-    ).run(JSON.stringify(prunable));
+    ).run(JSON.stringify(prunable.map((r) => r.id)));
+    artifactIds = [
+      ...new Set(
+        prunable.flatMap((r) =>
+          r.artifact_id === null ? [] : [r.artifact_id],
+        ),
+      ),
+    ].filter((id) => !artifactRowExists(db, id));
   }).immediate();
-  return prunable.length;
+  return artifactIds;
+}
+
+export function artifactRowExists(db: Database, artifactId: string): boolean {
+  return (
+    db
+      .prepare("SELECT 1 FROM messages WHERE artifact_id = ? LIMIT 1")
+      .get(artifactId) !== null
+  );
+}
+
+export function markMessageDelivered(
+  db: Database,
+  id: number,
+  status: string,
+  deliveredAt: number,
+): void {
+  db.prepare(
+    "UPDATE messages SET status = ?, delivered_at = ? WHERE id = ?",
+  ).run(status, deliveredAt, id);
 }
 
 /**
