@@ -36,5 +36,5 @@ Re-render via keeper prompt render-plugin-templates; bun test consistency suites
 - [ ] The rendered agent file matches its template and all consistency suites are green.
 
 ## Done summary
-
+Moved the close audit's depth band from a closer-carried DEPTH_BAND spawn value to a quality-auditor self-read of the brief's depth.band field (lean-floor clamp), with the resolved band still echoed in report meta. Documented the auditor's task-scoped mode (TASK_ID discriminant) persisting via audit submit-task, and stripped the close SKILL.md's brief-Read pin step and DEPTH_BAND spawn line entirely.
 ## Evidence
