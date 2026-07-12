@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 2,
+        "deletions": 9,
+        "files_changed": 2,
+        "insertions": 9
+      },
+      "done_summary": "Rewrote the panel-strength snippet from the retired member-count/harness-diversity heuristic to the described-roster rubric: live roster read via presets list, two-stage weakest-covering selection, observable escalation triggers, anti-bias lines, and weak-band skip semantics. Regenerated the snippet index.",
+      "input_hash": "47fbdd2def105c90163b4c31feb9ab0af0162d4d94b00c77f0c1ce749f1e9279",
+      "model": "sonnet",
+      "spec_chars": 3760,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** claude/arthack/template/_partials/snippets/engineering/panel-strength.md.tmpl\n\n### Approach\n\nRewrite the snippet \u2014 the `{#- \u2026 -#}` header (name/summary/tags stay, summary text updates)\nand the whole body \u2014 from the retired count/diversity heuristic to the described-roster\nrubric. The snippet is methodology only: it teaches HOW to choose, and must never name a\nconcrete panel or embed a panel description, because the roster is regenerated independently\nand a name here would couple every roster edit to a cross-repo re-bake. Keep the register and\nlength close to the current body (a bold-led paragraph or two plus a short bullet rubric) \u2014\nit bakes byte-verbatim into two keeper skill bodies. All prose present-tense; no reference to\nwhat the guidance previously said.\n\nRequired content points (each must appear, wording yours):\n- The configured roster lives in `~/.config/keeper/panel.yaml`, authored by the\n  `/plan:panel-guidance` skill; each panel carries an authored strength band\n  (weak|light|standard|strong|max) and a rich description. Read it live at decision time via\n  `keeper agent presets list --json` \u2014 panel names are never hard-coded.\n- Two-stage selection: first restate the task's stakes in a phrase, then pick the WEAKEST\n  panel whose description covers it.\n- Escalate a rung only on an observable trigger \u2014 genuine ambiguity, blast radius,\n  irreversibility, or a security surface \u2014 never on felt confidence.\n- Anti-bias lines: a shorter description is not a weaker fit, and a stronger band is not a\n  tiebreaker unless a named trigger fires.\n- Weak-band semantics: the weak rungs are cheap sanity duos; when one direct answer would do,\n  skip the panel entirely.\n- A human-named panel passes through verbatim; an ordinary panel-worthy question takes the\n  roster's `default` pointer.\n- When roster discovery fails or no default is configured: skip the panel, answer directly,\n  and surface the config gap.\n\n### Investigation targets\n\n*Verify before relying \u2014 these refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- claude/arthack/template/_partials/snippets/engineering/panel-strength.md.tmpl:1 \u2014 the header and body being replaced\n\n**Optional** (reference as needed):\n- /Users/mike/code/keeper/plugins/prompt/corpus/claude/arthack/template/_partials/snippets/engineering/panel-strength.md.tmpl \u2014 the vendored copy keeper currently bakes (register and length reference; the two files have drifted, and this arthack source is the one to rewrite)\n\n### Risks\n\n- Prose that names concrete panels or bands-with-descriptions couples roster edits to\n  cross-repo re-bakes \u2014 keep methodology-only.\n\n### Test notes\n\nNo arthack-side test surface; the keeper epic's re-vendor task verifies the bake gate and\nprompt suite. Sanity: the file parses as a snippet template (header block intact).\n\n## Acceptance\n\n- [ ] The snippet source teaches the described-roster rubric with every required content point present: live roster read via presets list, two-stage weakest-covering selection, observable escalation triggers, both anti-bias lines, weak-band skip semantics, verbatim human-named panels, default-pointer path, and the missing-roster fallback.\n- [ ] No panel name or per-panel description appears anywhere in the snippet.\n- [ ] The embedded summary header describes the new rubric and all prose is present-tense.\n\n## Done summary\nRewrote the panel-strength snippet from the retired member-count/harness-diversity heuristic to the described-roster rubric: live roster read via presets list, two-stage weakest-covering selection, observable escalation triggers, anti-bias lines, and weak-band skip semantics. Regenerated the snippet index.\n## Evidence\n",
+      "task_id": "fn-1254-panel-strength-snippet-rubric.1",
+      "tier": "medium",
+      "title": "Rewrite panel-strength snippet source"
+    }
+  ],
+  "created_at": "2026-07-12T01:42:55.060000Z",
+  "epic_id": "fn-1254-panel-strength-snippet-rubric",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "47fbdd2def105c90163b4c31feb9ab0af0162d4d94b00c77f0c1ce749f1e9279",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
