@@ -84,6 +84,8 @@
 import type { MonitorEntry } from "./derivers";
 import {
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_DESYNC_DISTRESS_REASON,
+  SHARED_DIRTY_DISTRESS_REASON,
   WORKTREE_FINALIZE_NON_FF_REASON,
   WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
@@ -1273,17 +1275,27 @@ export function monitorRunningState(
 // ---------------------------------------------------------------------------
 
 /**
- * Is this `dispatch_failures.reason` an operator jam (an open-board sticky that
- * will NOT self-resolve)? The jam allowlist for `await drained --fail-on-stuck`:
- * `worktree-finalize-non-fast-forward` (an origin-ahead non-ff needing an operator
+ * Is this `dispatch_failures.reason` an operator jam — an open-board sticky whose clear
+ * requires an operator to act (whether the clear itself is `retry_dispatch` or a
+ * producer level-trigger that fires only once the operator has repaired the world)? The
+ * jam allowlist for `await drained --fail-on-stuck` and the shared needs-human alarm
+ * class: `worktree-finalize-non-fast-forward` (an origin-ahead non-ff needing an operator
  * to reconcile origin), `worktree-finalize-suite-red` (the prospective merge result's
- * fast suite failed — a semantic merge conflict an operator must reconcile), and a
- * `worktree-merge-conflict` close-sink content conflict. The `worktree-recover*`
- * auto-clear prefix is excluded FIRST — a recover row self-clears level-triggered once
- * its git resolves, so a `worktree-recover-conflict` never counts despite sharing the
- * `worktree-` namespace. Tokens come from the dep-free `dispatch-failure-key` leaf (the
- * single dispatch-failure vocabulary), so this leaf module adopts them with no drift
- * risk. Exported for the `drained` jam check + its test.
+ * fast suite failed — a semantic merge conflict an operator must reconcile), a
+ * `worktree-merge-conflict` close-sink content conflict, and the two shared-checkout
+ * hygiene distress families — `shared-checkout-dirty` / `shared-checkout-desync` (a
+ * shared MAIN checkout left dirty or trailing landed history; a commit made from it can
+ * mass-revert landed work, so an operator must reconcile the checkout). The minted dirty
+ * / desync reasons are long sentences BEGINNING with those tokens, so they match on
+ * `startsWith`, never exact equality. The `worktree-recover*` auto-clear prefix is
+ * excluded FIRST — a recover row self-clears level-triggered once its git resolves, so a
+ * `worktree-recover-conflict` never counts despite sharing the `worktree-` namespace;
+ * the shared-checkout tokens are prefix-disjoint from it. Tokens come from the dep-free
+ * `dispatch-failure-key` leaf (the single dispatch-failure vocabulary), so this leaf
+ * module adopts them with no drift risk. The dirty/desync families clear EXCLUSIVELY via
+ * their producer level-trigger, NEVER `retry_dispatch` — the jam class only SURFACES
+ * them (needs-human + the `--fail-on-stuck` escalation); it drives no dispatch, cap, or
+ * readiness decision. Exported for the `drained` jam check + its test.
  */
 export function isJamReason(reason: string): boolean {
   if (reason.startsWith(WORKTREE_RECOVER_REASON_PREFIX)) {
@@ -1292,7 +1304,9 @@ export function isJamReason(reason: string): boolean {
   return (
     reason === WORKTREE_FINALIZE_NON_FF_REASON ||
     reason === WORKTREE_FINALIZE_SUITE_RED_REASON ||
-    reason.startsWith(MERGE_ESCALATION_REASON_TOKEN)
+    reason.startsWith(MERGE_ESCALATION_REASON_TOKEN) ||
+    reason.startsWith(SHARED_DIRTY_DISTRESS_REASON) ||
+    reason.startsWith(SHARED_DESYNC_DISTRESS_REASON)
   );
 }
 
@@ -1323,6 +1337,57 @@ export type DrainedScope = "plan" | "inflight" | "board";
  */
 export function isKeeperDispatched(dispatchOrigin: string | null): boolean {
   return dispatchOrigin === "autopilot" || dispatchOrigin === "escalation";
+}
+
+/**
+ * Is `job` a currently-active Board-work session — an autopilot `work`/`close`
+ * dispatch or an escalation `unblock`/`deconflict`/`resolve`/`repair` session
+ * (see {@link isKeeperDispatched}) — other than the caller's own? A supervising
+ * session is not reliably excluded by provenance alone: it can itself be a
+ * `dispatch_origin==='autopilot'` row (e.g. a worker whose OWN task happens to
+ * be driving some other check), so `ownSessionId` is a required exclusion, not
+ * a defensive extra — mirrors {@link agentsIdleState}'s self-exclusion.
+ */
+export function isBoardWorkJob(
+  job: Pick<Job, "job_id" | "state" | "dispatch_origin">,
+  ownSessionId: string | null,
+): boolean {
+  if (job.state !== "working") {
+    return false;
+  }
+  if (!isKeeperDispatched(job.dispatch_origin)) {
+    return false;
+  }
+  return ownSessionId === null || job.job_id !== ownSessionId;
+}
+
+/**
+ * `board-work-idle` predicate — is any Board-work session (excluding the
+ * caller's own) currently `state==='working'`? MET when none are — the signal
+ * a maintenance-window operator needs to know the board is safe to stop,
+ * distinct from a raw "every working job" count (which an interactive
+ * session, including the one asking, would always hold open). Reads the whole
+ * `jobs` collection with no cwd containment — unlike {@link agentsIdleState},
+ * a maintenance window pauses the daemon as a whole, not one repo. Pure: no
+ * I/O, no `Date.now()`.
+ */
+export function boardWorkIdleState(
+  jobsRows: Iterable<Job>,
+  ownSessionId: string | null,
+): AwaitState {
+  let active = 0;
+  for (const job of jobsRows) {
+    if (isBoardWorkJob(job, ownSessionId)) {
+      active += 1;
+    }
+  }
+  if (active === 0) {
+    return { kind: "met", detail: "no board-work session active" };
+  }
+  return {
+    kind: "waiting",
+    detail: `${active} board-work session(s) active`,
+  };
 }
 
 /**

@@ -58,5 +58,5 @@ This task adds inert primitives only. No sender emits references until task 2, a
 - [ ] Orphan enumeration and deletion primitives are explicitly bounded and fast tests cover their page boundaries and failure-soft behavior.
 
 ## Done summary
-
+Added src/bus-artifact.ts: the versioned, typed Bus message artifact claim-check contract (pure encode/decode/validation plus confined publish/resolve/remove/list filesystem ops) with exhaustive fast tests in test/bus-artifact.test.ts covering round-trip, confinement, integrity, and bounded orphan enumeration. Inert primitives only.
 ## Evidence

@@ -905,13 +905,31 @@ describe("worker cells: the required v2 host worker matrix", () => {
         "utf-8",
       );
       // Delegate: resolve providers for the BAKED capability + effort, then launch
-      // the first candidate DETACHED (never one blocking call) with chunked waits.
+      // the first candidate via a single native-detach `keeper agent run` call
+      // (never a hand-rolled nohup/pidfile fork) with chunked waits.
       expect(wrapped).toContain(
         "keeper agent providers resolve gpt-5.5 medium",
       );
-      expect(wrapped).toContain("wrapped::<task-id>");
-      expect(wrapped).toContain("nohup");
+      expect(wrapped).toContain("--session wrapped --name wrapped::<task-id>");
+      expect(wrapped).not.toContain("--session wrapped::<task-id>");
+      expect(wrapped).toContain(
+        "that window closes when its agent process exits",
+      );
+      expect(wrapped).toContain(
+        "tmux closes the shared session after its last window exits",
+      );
+      expect(wrapped).toContain("keeper agent run");
+      expect(wrapped).not.toContain("sh -c 'nohup");
+      expect(wrapped).not.toContain("PIDFILE");
       expect(wrapped).toContain("keeper agent wait");
+      // The leg's --output targets the injected env carrier literally, so it
+      // resolves to exactly the path the producer set (task 4's detection surface).
+      expect(wrapped).toContain('--output "$KEEPER_WRAPPED_ENVELOPE"');
+      // Dumb courier: every fix (impl, test, lint) is re-delegated to the leg via
+      // `--resume`, never patched by the wrapper directly.
+      expect(wrapped).toContain("--resume wrapped::<task-id>");
+      expect(wrapped).toContain("lint_failed");
+      expect(wrapped).not.toContain("read the named files, fix per the stderr");
       // Failure map: launch-fail falls through the pecking order, timeout retries
       // to max_attempts then blocks, no_route / bad args are typed blocks.
       expect(wrapped).toContain("Failure map");

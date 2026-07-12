@@ -17,6 +17,7 @@
     ],
     "defaultMode": "default"
   },
+  "model": "opus[1m]",
   "enabledPlugins": {
     "swift-lsp@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
@@ -29,12 +30,12 @@
   "skipDangerousModePermissionPrompt": true,
   "theme": "auto",
   "preferredNotifChannel": "notifications_disabled",
+  "autoCompactEnabled": false,
   "autoScrollEnabled": true,
   "terminalProgressBarEnabled": true,
   "teammateMode": "in-process",
   "remoteControlAtStartup": false,
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
-  "voiceEnabled": true,
-  "autoCompactEnabled": false
+  "voiceEnabled": true
 }

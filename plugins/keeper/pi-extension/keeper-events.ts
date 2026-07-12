@@ -6,8 +6,9 @@
  * AgentHarness lifecycle. The keeper launcher arms THIS file on every tracked pi
  * launch (interactive or detached); it translates pi's events into keeper's
  * events-log NDJSON contract so a pi session shows the same working/stopped churn
- * on the board that a claude session does, holds a session-scoped Agent Bus inbox,
- * and registers a read-only transcript tool backed by the keeper CLI.
+ * on the board that a claude session does, installs keeper's status footer and
+ * telemetry sink, holds a session-scoped Agent Bus inbox, and registers a
+ * read-only transcript tool backed by the keeper CLI.
  *
  * EPHEMERAL, NEVER a persistent `pi install`: a global install would fire on the
  * human's own non-keeper pi sessions. The `-e` per-launch arming plus the
@@ -57,7 +58,13 @@ import {
   PiBusInboxController,
   releaseBusInboxOwnership,
 } from "./bus-inbox.ts";
+import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
 import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
+import {
+  installPiStatusFooter,
+  type PiFooterApi,
+  type PiFooterContext,
+} from "./status-footer.ts";
 
 // ---------------------------------------------------------------------------
 // pi event shapes (minimal structural subset)
@@ -87,10 +94,21 @@ export interface PiObservedEvent {
 export interface PiExtensionApi {
   on(
     event: string,
-    handler: (event: PiObservedEvent) => void | Promise<void>,
+    handler: (
+      event: PiObservedEvent,
+      context?: PiFooterContext,
+    ) => void | Promise<void>,
   ): void;
   events?: PiTaskEventBus;
+  getThinkingLevel?(): string;
   registerTool?(tool: PiToolDefinition<unknown>): void;
+  /** Presence-gated: `/rename` registers only when both this and
+   *  `setSessionName` exist (see the `registerRenameCommand` call site). The
+   *  real options/handler shape lives in `rename-command.ts`'s `PiRenameApi`
+   *  — kept `unknown` here so this file needs no import from it beyond the
+   *  registration call itself. */
+  registerCommand?(name: string, options: unknown): void;
+  setSessionName?(name: string): void;
   sendMessage?(
     message: {
       customType: string;
@@ -284,6 +302,30 @@ export function piEventBindings(
       // translation forward-compatible with pi vocabulary additions.
       return null;
   }
+}
+
+/**
+ * Translate a Pi session title into the same lifecycle-neutral `TranscriptTitle`
+ * shape the daemon's transcript worker mints synthetically for claude
+ * (`src/daemon.ts`'s `transcript-title` handler): `hook_event:
+ * "TranscriptTitle"` folds at the reducer's priority-3 `'transcript'` title
+ * source (`src/reducer.ts`'s `titleSourceForEvent`) regardless of whether the
+ * rename came from `/rename`, `/name`, or RPC — `session_info_changed` fires
+ * for all three. PURE.
+ */
+export function titleEventBindings(
+  title: string,
+  meta: PiTranslateMeta,
+): PiEventBindings {
+  return {
+    ts: meta.tsSec,
+    session_id: meta.jobId,
+    pid: meta.pid,
+    hook_event: "TranscriptTitle",
+    event_type: "transcript_title",
+    cwd: meta.cwd,
+    data: boundedData("TranscriptTitle", { session_title: title }),
+  };
 }
 
 /**
@@ -530,12 +572,13 @@ export function transcriptIdError(params: PiTranscriptParams): string | null {
   return null;
 }
 
-/** Build the argv-only keeper invocation from already-clamped params. */
+/** Build the argv-only keeper invocation from already-clamped params. The
+ *  extension stays claude-only, but the CLI grammar requires the harness
+ *  positional up front regardless. */
 function buildTranscriptArgv(params: PiTranscriptParams): string[] {
   const sessionId = params.session_id?.trim() ?? "";
   const listing = sessionId.length === 0;
-  const args = ["transcript", ...(listing ? ["list"] : [sessionId])];
-  args.push("--harness", "claude");
+  const args = ["transcript", "claude", ...(listing ? ["list"] : [sessionId])];
   pushStringFlag(args, "--project", params.project);
   pushNumberFlag(args, "--offset", params.offset);
   pushNumberFlag(args, "--limit", params.limit);
@@ -735,6 +778,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
         : null;
     const busOwnerToken = {};
     let ownsBusInbox = false;
+    let refreshStatusFooter = (): void => {};
 
     const emit = (event: PiObservedEvent): void => {
       try {
@@ -771,7 +815,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     ]) {
       pi.on(kind, emit);
     }
-    pi.on("session_start", () => {
+    pi.on("session_start", (_event, context) => {
       try {
         if (busInbox !== null && claimBusInboxOwnership(busOwnerToken)) {
           ownsBusInbox = true;
@@ -780,7 +824,27 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       } catch {
         // Presence-only degradation: a bus child must never break Pi startup.
       }
+      try {
+        if (context !== undefined) {
+          refreshStatusFooter = installPiStatusFooter(
+            pi as PiExtensionApi & PiFooterApi,
+            context,
+            jobId,
+          );
+        }
+      } catch {
+        // A cosmetic footer failure must never break Pi startup.
+      }
     });
+    for (const kind of ["turn_end", "model_select", "thinking_level_select"]) {
+      pi.on(kind, () => {
+        try {
+          refreshStatusFooter();
+        } catch {
+          // Rendering and telemetry are advisory.
+        }
+      });
+    }
     pi.on("session_shutdown", async () => {
       if (!ownsBusInbox) return;
       ownsBusInbox = false;
@@ -797,6 +861,36 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       if (pi.events !== undefined) {
         pi.registerTool(createTaskFacadeTool(pi.events));
       }
+    }
+    if (
+      typeof pi.registerCommand === "function" &&
+      typeof pi.setSessionName === "function"
+    ) {
+      // Cast to the real structural contract `rename-command.ts` needs
+      // (`registerCommand`'s options shape, typed `on` overloads for
+      // `session_info_changed`/`session_start`) — same runtime object, a
+      // narrower view than this file's own minimal `PiExtensionApi`.
+      registerRenameCommand(pi as unknown as PiRenameApi, {
+        onTitleChange: (title) => {
+          try {
+            appendEventsLogLine(
+              process.env,
+              pid,
+              serializePiLine(
+                titleEventBindings(title, {
+                  jobId,
+                  pid,
+                  cwd,
+                  tsSec: Date.now() / 1000,
+                }),
+              ),
+            );
+          } catch {
+            // Fail-open: an events-log write failure must never surface to
+            // Pi — a missed write heals on the next session_start replay.
+          }
+        },
+      });
     }
   } catch {
     // Top-level fail-open: a load-time throw would ABORT pi's launch. Swallow so

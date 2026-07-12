@@ -102,3 +102,21 @@ export function projectWorktreeMultiRepo(
   }
   return rows[0]?.worktree_multi_repo === 1;
 }
+
+/**
+ * Coerce a singleton `autopilot_state` wire row's `worker_provider` column
+ * (NULLABLE TEXT: `"claude"` | `"gpt"` | NULL — the durable work-dispatch
+ * provider pin, docs/adr/0047) to its enum value. An empty row set, an absent
+ * column, or any value outside the two recognized members ALL resolve to
+ * `null` (unconstrained, the byte-identical default); only an exact
+ * `"claude"`/`"gpt"` string passes through. Pure — exported for tests.
+ */
+export function projectWorkerProvider(
+  rows: Record<string, unknown>[],
+): "claude" | "gpt" | null {
+  if (rows.length === 0) {
+    return null;
+  }
+  const raw = rows[0]?.worker_provider;
+  return raw === "claude" || raw === "gpt" ? raw : null;
+}

@@ -6,7 +6,7 @@
  *
  * Proven here: the frames flag grammar (view allowlist + default, the
  * --follow ⨯ bound conflict, bad duration / count / prev-frame → exit 2), the
- * dispatch table reaching all six views with the right config, the
+ * dispatch table reaching all five views with the right config, the
  * bounded-by-default duration + the --follow null-bounds path, help / agent-help
  * rendering, the descriptor's presence in the machine help index, and the
  * shell-owned exit-code mapping (trailer-emitted → 0, never-reachable → 1) via
@@ -97,7 +97,7 @@ async function run(h: Harness, argv: string[]): Promise<number | null> {
 }
 
 // ---------------------------------------------------------------------------
-// View resolution + dispatch table (all six views)
+// View resolution + dispatch table (all five views)
 // ---------------------------------------------------------------------------
 
 test("default --view is board; a bare invocation dispatches to the board entry", async () => {
@@ -107,7 +107,7 @@ test("default --view is board; a bare invocation dispatches to the board entry",
   expect(h.calls[0]?.view).toBe("board");
 });
 
-test("the dispatch table reaches all six views by name", async () => {
+test("the dispatch table reaches all five views by name", async () => {
   for (const view of FRAMES_VIEWS) {
     const h = makeHarness();
     await run(h, ["--view", view, "--max-frames", "1"]);
@@ -122,6 +122,18 @@ test("an unknown --view is a usage fault (exit 2), never a silent default", asyn
   expect(code).toBe(2);
   expect(h.calls).toHaveLength(0);
   expect(h.stderr.join("")).toContain("--view must be one of");
+});
+
+test("the retired usage frame view is rejected and absent from help", async () => {
+  const h = makeHarness();
+  const code = await run(h, ["--view", "usage"]);
+  expect(code).toBe(2);
+  expect(h.calls).toHaveLength(0);
+  expect(FRAMES_VIEWS).not.toContain("usage" as FramesView);
+
+  const help = makeHarness();
+  await run(help, ["--help"]);
+  expect(help.stdout.join("")).not.toContain("builds | usage");
 });
 
 // ---------------------------------------------------------------------------

@@ -144,10 +144,37 @@ non-zero (exit 1) with the same reason. These are launch-time reason tokens
 | code                     | emitted by                     | meaning                                                                                                                | recovery                                                                                                              | retry-safe |
 | ------------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `worker-cell-bad-matrix` | autopilot producer, `dispatch` | The host worker matrix (`~/.config/keeper/matrix.yaml`) failed to load — one of four states the reason NAMES: `absent` (no file), `unparseable` (bad YAML / unreadable), `schema-invalid` (a shape violation — e.g. a retired `route:`/`native:`/`name:`/`subagents:` key), or `valid-but-empty` (an empty file). No cell can compose, so the daemon parks every cell-bearing `work` dispatch behind this sticky and never exits. | Copy `docs/examples/matrix.example.yaml` to `~/.config/keeper/matrix.yaml` and edit it (the message names the exact path + fix), then `keeper retry-dispatch` (autopilot) / re-run (manual). | yes (fix config first) |
+| `worker-provider-no-map-entry` | autopilot producer, `dispatch` | The `worker_provider` pin (ADR 0047) must translate this cell's assigned cell into the pinned family, but the cross-provider equivalence map has NO entry for it in the required direction. The reason NAMES the assigned cell + direction. Fail-closed — the pin NEVER falls back to the assigned provider. | Add the mapping to `plugins/plan/provider-equivalence.yaml` (re-run `bun plugins/plan/scripts/model-guidance-check.ts --check`), then `keeper retry-dispatch` (autopilot) / re-run (manual) — OR clear the pin (`keeper autopilot config worker_provider none`). | yes (fix map or clear pin) |
+| `worker-provider-target-not-on-host` | autopilot producer, `dispatch` | The map's entry translated the assigned cell to a target cell that is NOT a dispatchable cell on the live host matrix (target model or its effort absent). The reason NAMES the assigned + mapped cell + direction. Fail-closed — no fallback. | Fix the map target (or add the target cell to `matrix.yaml`'s `subagent_models`/efforts), then `keeper retry-dispatch` / re-run — OR clear the pin. | yes (fix map/matrix or clear pin) |
+| `worker-provider-map-malformed` | autopilot producer, `dispatch` | The `worker_provider` pin is set but `provider-equivalence.yaml` failed to load/parse at dispatch (the drift gate is offline). The reason NAMES the assigned cell + direction + the parse detail. Fail-closed PER CELL — a stale map parks dispatch, never crashes the cycle. | Fix `plugins/plan/provider-equivalence.yaml` (re-run the `--check` drift gate), then `keeper retry-dispatch` / re-run — OR clear the pin. | yes (fix map or clear pin) |
 
 Distinct from the run-time `no_route` the `agent providers resolve` verb emits
 (above): that is a read-time doctor verdict, this is a launch-time dispatch
 reject that parks the task.
+
+The three `worker-provider-*` rejects surface ONLY while `autopilot_state.worker_provider`
+is pinned (`claude`/`codex`), the durable work-dispatch provider pin that translates each
+task's assigned worker cell through the committed equivalence map at launch. They are the
+override's observability contract: an untranslatable cell spikes a visible sticky rather
+than silently starving the board or falling back to the wrong provider family.
+
+## Wrapped-delegation advisory (autopilot producer)
+
+A wrapped-cell `work` dispatch (its effective model not served natively by
+claude) carries the `KEEPER_WRAPPED_ENVELOPE` marker naming where its provider
+leg must write a result envelope. Every reconcile cycle the producer stats that
+path for each DONE wrapped-cell task and, when it's absent, logs a coalesced
+advisory line — evidence the wrapper implemented natively instead of
+delegating. DETECT-ONLY: it never blocks a dispatch and mints no
+`dispatch_failures` sticky, so there is nothing to `retry_dispatch`.
+
+| code                          | emitted by          | meaning                                                                                                        | recovery                                                                                                   | retry-safe |
+| ------------------------------ | -------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------- |
+| `wrapped-delegation-skipped`  | autopilot producer  | A wrapped-cell task done-stamped with no provider-leg result envelope at its `KEEPER_WRAPPED_ENVELOPE` path — advisory evidence the wrapper skipped delegation and implemented with claude tokens directly. | Advisory only — inspect the task's commit; no dispatch to retry. Clears itself once a later task's envelope lands, or the line simply stops recurring once the coalesce window lapses. | n/a (advisory, no sticky) |
+
+The line prints on the daemon's stderr (`~/.local/state/keeper/server.stderr`
+by default, per the LaunchAgent plist) — `grep 'wrapped-delegation-skipped'`
+there to find flagged tasks.
 
 ## Plan family (`keeper plan` accumulate-all failures)
 
@@ -205,3 +232,49 @@ re-close idempotence path.
 | `BRIEF_MISSING`   | `selection-review-submit`                       | No selection-audit brief exists yet for this epic.                                                                                                            | Run `keeper plan selection-audit-brief <epic_id>` first, then resubmit the verdict.               |
 | `BRIEF_CORRUPT`   | `selection-review-submit`                       | The audit brief is unreadable, or its `schema_version` is newer than this `keeper plan` build understands.                                                    | Re-run `selection-audit-brief` to regenerate it, or upgrade `keeper plan`.                        |
 | `SIDECAR_MISSING` | `selection-audit-brief`                         | The epic never ran through the post-scaffold cell selector (`assign-cells`), so there are no graded `{tier, model}` cells to audit.                            | Run cell selection for the epic before auditing; an epic with no selection sidecar has nothing to grade. |
+
+### Per-task audit-gate verbs (`audit gate-check`, `audit submit-task`)
+
+The content-blind seam `/plan:work`'s per-task audit gate polls between a flagged worker's
+commit and its done-stamp. Both reject with the same converged `{code, message, details}`
+error sub-object on first-found fault, and neither emits a `recovery` key — `gate-check` is
+read-only (a git failure fails closed rather than fabricating a not-covering reading);
+`submit-task` writes only the gitignored per-task finding artifact, never a `.keeper/`
+commit.
+
+| code             | emitted by                    | meaning                                                                                          | recovery                                                                 |
+| ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `GIT_UNAVAILABLE`| `gate-check`, `submit-task`    | Deriving the task's current commit set failed (the shared repo scan hit a git subprocess error).   | Confirm the target/state repos are healthy git checkouts, then retry.      |
+| `BAD_STATUS`     | `submit-task`                  | `--status` is missing or not one of `clean`, `mild`, `severe`.                                     | Pass a valid `--status` value and re-run.                                  |
+| `BAD_JSON`       | `submit-task`                  | The `--file` payload is not valid JSON.                                                            | Fix the finding payload's JSON and re-run.                                 |
+| `BAD_PAYLOAD`    | `submit-task`                  | The `--file` payload parsed but is not a JSON object.                                              | Pass a JSON object payload and re-run.                                     |
+
+Both verbs also share `BAD_TASK_ID | NOT_A_PROJECT | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID`
+with the other task-scoped read verbs (`reconcile`, `resolve-task`, `find-task-commit`) —
+see their `README.md` entries for that shared vocabulary's meaning and recovery.
+
+## keeper commit-work
+
+`cli/commit-work.ts` stages the session-attributed dirty set, runs the lint matrix,
+commits pathspec-limited, and pushes. Every failure is a compact single-line
+`{"success": false, "error": "<code>", …}` envelope at exit 1 (an arg fault is exit 2).
+Three repo-state gates plus the index-purity gate guard the commit; each names the ONE
+sanctioned exception — plain-git-with-explicit-paths — as the deliberate mixed-commit path
+it exists to make visible (`git add <explicit paths>` — never `-A` / `.` — then `git commit`
+/ `git push`). That escape hatch, the `--allow-stale-unstage` / `--override-jam` /
+`--allow-mass-reversion` overrides, and this table tell ONE recovery story; the commit stays
+pathspec-limited even when a gate is overridden, so a poisoned index never enters the tree.
+
+| code                     | meaning                                                                                                                                                                                                 | recovery                                                                                                                                                                            | retry-safe |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `operation_in_progress`  | Gate 1 (pre-lock, NO override). The repo is mid-merge / -cherry-pick / -revert / -rebase / -bisect (probed worktree-portably via `rev-parse`); `operation` names it. A full commit here silently makes a two-parent merge commit — the shape that spread the incident's stale blobs through an auto-merge. Nothing was staged or committed. | Conclude the operation (finish it, or `git bisect reset`) or abort it (`git <op> --abort`), then re-run unchanged. No override — a mid-operation partial commit is never correct. | yes (after the op concludes / aborts) |
+| `shared_checkout_jam`    | Gate 2 (pre-lock, `--override-jam`). A live `dispatch_failures` shared-checkout **dirty** / **desync** distress row (`shared-checkout-{dirty,desync}:<hash>`) matches this repo under a normalized dir compare — the working tree may trail landed history, so a commit risks sweeping stale content. FAIL-OPEN: a repo with no keeper.db (or an unreadable one) commits normally. | Let the daemon's repair/desync recovery clear the row (inspect via `keeper query dispatch_failures`); or, if the staged set is certainly correct and current, re-run with `--override-jam`. | yes (once the jam clears, or with `--override-jam`) |
+| `mass_reversion`         | Gate 3 (in-lock, `--allow-mass-reversion`). The staged set mass-matches ANCESTOR blobs while differing from HEAD (≥ 5 paths AND ≥ 30% of the staged set, excluding gitlinks + regenerated surfaces) — the desynced-checkout bulk-revert signature green suites cannot catch (the tests revert in the same sweep). `count` / `staged` / `sample` name the flagged paths. Nothing was committed. | Inspect the flagged paths against landed history (`git log -p -- <path>`). For a genuine intended bulk revert, re-run with `--allow-mass-reversion`; otherwise the checkout is stale — reconcile it with landed history first. | yes (with `--allow-mass-reversion`, or after reconciling the checkout) |
+| `unmerged_paths`         | Gate 3. The index carries unmerged (stage 1/2/3) paths — committing now would record a half-resolved conflict. `sample` names them. Nothing was committed. | Resolve the conflicted paths (`git add` each once fixed) or abort the in-progress operation, then re-run. | yes (once the conflict is resolved) |
+| `stale_index_carryover`  | Index-purity gate (in-lock, `--allow-stale-unstage`). Staged content sits OUTSIDE the session-attributed set — a dead worker's residue, a shared checkout trailing landed history, or a git-apply / codegen / script write the attribution hooks never saw. `sample` lists the offending paths. The default refuses (never a silent unstage); the commit is always pathspec-limited so the extras cannot leak. | If the extra paths are genuinely yours, commit the mixed set with plain git + explicit paths; otherwise re-run with `--allow-stale-unstage` to unstage the extras and commit only the attributed set. | yes (with either recovery path) |
+| `nothing_to_commit`      | The session-attributed files were discovered + staged but carry no actual index change (already committed, or their edits were reverted) — an empty-tree commit was skipped. | Nothing to do; if you expected a change, confirm the files still differ from HEAD. | yes (read-only outcome) |
+
+The lint (`lint_failed`), coverage (`file_list_too_large`), session (`no_session_id`), and
+message (`forbidden trailer pattern`) envelopes are documented inline in the verb's `--help`
+/ `--agent-help`; `lint_failed`'s only recovery loops back through `commit-work` (fix →
+`git add` → re-invoke the SAME message), never a bare-git bypass.

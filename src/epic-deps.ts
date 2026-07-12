@@ -56,57 +56,6 @@ export function projectBasename(dir: string | null): string {
 }
 
 /**
- * Schema v42 (fn-662): the shared, pure, directional mapping between
- * keeper's `''` default-profile sentinel and agentusage's `"default"` usage id.
- * Both name the SAME entity — a user running Claude Code with no
- * `CLAUDE_CONFIG_DIR` set (the default `~/.claude` profile). keeper writes
- * the SessionStart-seeded profile row under `profile_name=''` (basename of
- * `null`/`''`); agentusage writes the matching usage record under
- * `usage.id='default'` (it has no notion of `CLAUDE_CONFIG_DIR` to project
- * a basename from). The v35/fn-642 bidirectional rate-limit fan-out joined
- * `usage.id = profiles.profile_name` with both arms guarding
- * `profile_name != ''`, so the `''` profile row's rate-limit annotation
- * never reached `usage.default` — a real default-account rate limit
- * never rendered. v42 closes that exactly by translating the sentinel at
- * the join boundary.
- *
- * The mapping is directional:
- * - {@link usageIdForProfileName} — forward: profile-row side → usage-row id.
- *   The RateLimited / ApiError(kind='rate_limit') fan-out arm calls this on
- *   the derived `profile_name` BEFORE binding it to the `UPDATE usage WHERE
- *   id = ?` clause, so a NULL-config session's rate limit colocates on
- *   `usage.default`.
- * - {@link profileNameForUsageId} — reverse: usage-row id → profile-row side.
- *   `projectUsageRow`'s post-UPSERT SELECT against `profiles` calls this on
- *   the just-UPSERTed `usage.id`, so a `default` usage snapshot reads the
- *   `''` profile row's annotation.
- *
- * The reverse direction NEVER makes a literal `usage.id=''` join the `''`
- * profile row (an empty `usage.id` is rejected by `projectUsageRow`'s
- * early empty-string guard up the call stack — and even if it slipped
- * through, this helper would leave it as `''`, preserving the
- * cross-contamination guard the v35 `!= ''` filter originally enforced).
- *
- * Pure function (string → string). No DB / clock / env reads. Re-fold
- * determinism preserved: the migration backfill is a cursor reset + DELETE,
- * not a wall-clock read, and the mapping derives from existing column
- * values only.
- *
- * Accepted edge: a profile literally basenamed `default` (i.e.
- * `CLAUDE_CONFIG_DIR=/some/where/default`) collides with the agentusage
- * default account on `usage.id='default'` and last-write-wins with the
- * `''` sentinel. Documented, not handled — vanishingly unlikely in practice.
- */
-export function usageIdForProfileName(profileName: string): string {
-  return profileName === "" ? "default" : profileName;
-}
-
-/** See {@link usageIdForProfileName}. Reverse mapping: `'default' → ''`. */
-export function profileNameForUsageId(usageId: string): string {
-  return usageId === "default" ? "" : usageId;
-}
-
-/**
  * Resolver-side dep-satisfaction predicate — STATUS-ONLY by the
  * folds-never-probe-liveness invariant. A resolved upstream whose status is
  * `"done"` satisfies the dependency for the reducer's `resolved_epic_deps`

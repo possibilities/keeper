@@ -207,6 +207,7 @@ function autopilotStubBridge(opts: {
       worktree_mode?: boolean;
       worktree_multi_repo?: boolean;
       codex_adoption?: boolean;
+      worker_provider?: "claude" | "gpt" | null;
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
@@ -561,6 +562,53 @@ test("set_autopilot_config rejects a non-boolean codex_adoption (fn-1131)", asyn
   ]) {
     expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config forwards a worker_provider enum patch incl. null clear, normalizing the deprecated codex alias to gpt (fn-1256)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const claude = await setAutopilotConfigHandler(
+    { worker_provider: "claude" },
+    bridge,
+  );
+  expect(claude).toEqual({ ok: true, patch: { worker_provider: "claude" } });
+  const gpt = await setAutopilotConfigHandler(
+    { worker_provider: "gpt" },
+    bridge,
+  );
+  expect(gpt).toEqual({ ok: true, patch: { worker_provider: "gpt" } });
+  // The deprecated `codex` input alias normalizes to the canonical `gpt` so
+  // every new event carries only `gpt`.
+  const codex = await setAutopilotConfigHandler(
+    { worker_provider: "codex" },
+    bridge,
+  );
+  expect(codex).toEqual({ ok: true, patch: { worker_provider: "gpt" } });
+  const cleared = await setAutopilotConfigHandler(
+    { worker_provider: null },
+    bridge,
+  );
+  expect(cleared).toEqual({ ok: true, patch: { worker_provider: null } });
+  expect(state.setConfigCalls).toEqual([
+    { worker_provider: "claude" },
+    { worker_provider: "gpt" },
+    { worker_provider: "gpt" },
+    { worker_provider: null },
+  ]);
+});
+
+test("set_autopilot_config rejects a worker_provider value outside claude|gpt|null (codex accepted as an alias), naming the allowed set (fn-1256)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { worker_provider: "sonnet" },
+    { worker_provider: 1 },
+    { worker_provider: true },
+    { worker_provider: "" },
+  ]) {
+    await expect(setAutopilotConfigHandler(bad, bridge)).rejects.toThrow(
+      /worker_provider.*claude.*gpt/,
     );
   }
   expect(state.setConfigCalls).toEqual([]);
@@ -939,6 +987,20 @@ test("retry_dispatch accepts an `approve::id` clear and forwards it to the bridg
   );
   expect(result).toEqual({ ok: true, verb: "approve", id: "fn-870-clear.1" });
   expect(state.retryCalls).toEqual([{ verb: "approve", id: "fn-870-clear.1" }]);
+});
+
+test("retry_dispatch accepts a `repair::<token>` re-arm and forwards it to the bridge", async () => {
+  // The operator re-arm path for a stranded `repair::<repo-token>` sticky —
+  // `bridge.retryDispatch` mints the `DispatchCleared` event the reducer folds
+  // to DELETE the repair row's latches, letting the repair-escalation sweep
+  // re-dispatch on any persisting candidate.
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await retryDispatchHandler(
+    { id: "repair::keeper-qzvs8i" },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, verb: "repair", id: "keeper-qzvs8i" });
+  expect(state.retryCalls).toEqual([{ verb: "repair", id: "keeper-qzvs8i" }]);
 });
 
 test("retry_dispatch rejects params with extra keys (no command/param injection)", async () => {

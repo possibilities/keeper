@@ -1,0 +1,27 @@
+# A minimal well-formed provider-equivalence map (one model per direction,
+# total over the five canonical efforts) — the positive disk-mode fixture
+# proving a clean map coerces and passes the host-blind check.
+schema_version: 1
+mappings:
+  claude_to_gpt:
+    - source: { model: opus, effort: low }
+      target: { model: gpt-5.6-sol, effort: low }
+    - source: { model: opus, effort: medium }
+      target: { model: gpt-5.6-sol, effort: medium }
+    - source: { model: opus, effort: high }
+      target: { model: gpt-5.6-sol, effort: high }
+    - source: { model: opus, effort: xhigh }
+      target: { model: gpt-5.6-sol, effort: xhigh }
+    - source: { model: opus, effort: max }
+      target: { model: gpt-5.6-sol, effort: max }
+  gpt_to_claude:
+    - source: { model: gpt-5.6-sol, effort: low }
+      target: { model: opus, effort: low }
+    - source: { model: gpt-5.6-sol, effort: medium }
+      target: { model: opus, effort: medium }
+    - source: { model: gpt-5.6-sol, effort: high }
+      target: { model: opus, effort: high }
+    - source: { model: gpt-5.6-sol, effort: xhigh }
+      target: { model: opus, effort: xhigh }
+    - source: { model: gpt-5.6-sol, effort: max }
+      target: { model: opus, effort: max }

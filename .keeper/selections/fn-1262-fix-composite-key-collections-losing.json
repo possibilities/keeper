@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle live-subscription correctness invariant where NULL/type-affinity phantom add+delete silently drops version transitions across the diff-path and a schema-derived contract test guards it \u2014 a nameable correctness-invariant opus gate on contract-shaped serve-layer work.",
+      "task_id": "fn-1262-fix-composite-key-collections-losing.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified single-surface ORDER BY tie-break swap to liveKeyExpr with a named acceptance (display-order only, explicitly no dropped-update semantics), only needing snapshot-test reconciliation \u2014 bounded GPT-first mechanical work.",
+      "task_id": "fn-1262-fix-composite-key-collections-losing.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-12T14:07:24.224000Z",
+  "epic_id": "fn-1262-fix-composite-key-collections-losing",
+  "input_hash": "d32c38f130f53b7b96b00677d7bbe78b0ebd2038f9bb7f17b27d01506fd54dff",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3542890737,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1262-fix-composite-key-collections-losing.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle live-subscription correctness invariant where NULL/type-affinity phantom add+delete silently drops version transitions across the diff-path and a schema-derived contract test guards it \u2014 a nameable correctness-invariant opus gate on contract-shaped serve-layer work.\",\"confidence\":0.78},{\"task_id\":\"fn-1262-fix-composite-key-collections-losing.2\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified single-surface ORDER BY tie-break swap to liveKeyExpr with a named acceptance (display-order only, explicitly no dropped-update semantics), only needing snapshot-test reconciliation \u2014 bounded GPT-first mechanical work.\",\"confidence\":0.74}]}\n"
+}

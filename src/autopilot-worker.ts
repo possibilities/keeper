@@ -126,6 +126,7 @@ import {
   type PaneInfo,
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
+import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
 import { loadReadinessInputs } from "./readiness-inputs";
 import {
   buildPlannedLaunchSpec,
@@ -139,6 +140,7 @@ import {
   type HostMatrixSnapshot,
   isFinalizerVerb,
   isStoppedJobLive,
+  isWrappedCell,
   KEEPER_ROOT,
   type LaneMergedEntry,
   type PlannedLaunch,
@@ -162,11 +164,16 @@ import {
   type WorktreeRepoResolution,
   type WorktreeRepoStatusEntry,
   worktreeRecoverDispatchId,
+  wrappedEnvelopePath,
 } from "./reconcile-core";
 import { isPidAlive, runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
-import { defaultShadowingWorkProbe, resolveWorkerCell } from "./worker-cell";
+import {
+  defaultShadowingWorkProbe,
+  providerRejectReason,
+  resolveWorkerCell,
+} from "./worker-cell";
 import {
   ELIGIBLE_REASON,
   memoizedAssessRepo,
@@ -293,6 +300,7 @@ export {
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
+  isWrappedCell,
   KEEPER_ROOT,
   prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
@@ -1758,7 +1766,7 @@ export interface DuplicateEpicNumberGroup {
 export function computeDuplicateEpicNumberGroups(
   epics: readonly Epic[],
 ): DuplicateEpicNumberGroup[] {
-  // (projectDir   number) → the colliding epic ids. The NUL joiner never appears in a
+  // (projectDir \0 number) → the colliding epic ids. The NUL joiner never appears in a
   // path or a number, so the composite key is unambiguous.
   const byKey = new Map<
     string,
@@ -1772,7 +1780,7 @@ export function computeDuplicateEpicNumberGroups(
     if (projectDir === "") {
       continue;
     }
-    const key = `${projectDir} ${e.epic_number}`;
+    const key = `${projectDir}\0${e.epic_number}`;
     let group = byKey.get(key);
     if (group === undefined) {
       group = { projectDir, epicNumber: e.epic_number, epicIds: [] };
@@ -2077,6 +2085,19 @@ export interface DispatchedPayload {
   id: string;
   dir: string | null;
   ts: number;
+  /**
+   * The dispatched-cell translation forensics (ADR 0047), present ONLY for a
+   * cell-bearing `work` launch: the ASSIGNED cell, the EFFECTIVE cell that
+   * launched (equal to assigned when the `worker_provider` pin did not translate),
+   * and the CONSTRAINT (the pin that forced translation, else null). Recorded on
+   * the event `data` blob for event-log forensics; the reducer fold reads only
+   * `(verb, id, dir, ts)` and ignores this, so re-fold stays byte-identical.
+   */
+  cell?: {
+    assigned: { model: string; tier: string };
+    effective: { model: string; tier: string };
+    constraint: string | null;
+  };
 }
 
 /**
@@ -2325,6 +2346,97 @@ export function logMergeGateDeferral(
   } else {
     prior.suppressed++;
   }
+}
+
+/** One DONE wrapped-cell task whose provider-leg result envelope never appeared —
+ *  advisory evidence the wrapper implemented natively instead of delegating
+ *  (task .1 mints the marker at launch, this is its backstop). */
+export interface WrappedDelegationSkip {
+  taskId: string;
+  envelopePath: string;
+}
+
+/**
+ * Producer probe (not a fold): scan every DONE task whose EFFECTIVE cell is
+ * wrapped and flag the ones whose provider-leg result envelope ({@link
+ * wrappedEnvelopePath}) is absent on disk. Models the `stuck-sentinel:
+ * cwd-missing` precedent — the fs stat lives HERE in the producer, never inside
+ * a fold, so re-fold determinism is untouched (this reads nothing the
+ * readiness/reconcile fold consumes). DETECT-ONLY: the caller only logs: it
+ * never blocks a dispatch and mints no `dispatch_failures` row (no operator
+ * jam). A thrown `envelopeExists` probe is treated as INCONCLUSIVE, never a
+ * false flag — mirrors the shared-checkout desync probe's error handling. An
+ * unloadable host matrix can't classify wrappedness either, so it yields no
+ * flags rather than a guess. Pure over its injected probe; `envelopeExists`
+ * defaults to a real `existsSync` stat.
+ */
+export function findWrappedDelegationSkips(
+  snapshot: Pick<ReconcileSnapshot, "epics" | "hostMatrix">,
+  envelopeExists: (path: string) => boolean = existsSync,
+): WrappedDelegationSkip[] {
+  if (!snapshot.hostMatrix.ok) {
+    return [];
+  }
+  const hostMatrix = snapshot.hostMatrix;
+  const out: WrappedDelegationSkip[] = [];
+  for (const epic of snapshot.epics) {
+    const projectDir = epic.project_dir ?? "";
+    for (const task of epic.tasks) {
+      if (task.runtime_status !== "done") {
+        continue;
+      }
+      if (task.model == null || task.tier == null) {
+        continue;
+      }
+      if (!isWrappedCell(hostMatrix, task.model)) {
+        continue;
+      }
+      const cwd =
+        task.target_repo != null && task.target_repo !== ""
+          ? task.target_repo
+          : projectDir;
+      if (cwd === "") {
+        continue;
+      }
+      const envelopePath = wrappedEnvelopePath(cwd, task.task_id);
+      let exists: boolean;
+      try {
+        exists = envelopeExists(envelopePath);
+      } catch {
+        continue; // probe error -> inconclusive, never a false flag
+      }
+      if (!exists) {
+        out.push({ taskId: task.task_id, envelopePath });
+      }
+    }
+  }
+  return out;
+}
+
+/** Per-task coalesce state for {@link logWrappedDelegationSkip}, module-scoped
+ *  so it persists across reconcile cycles (mirrors {@link mergeGateDeferLogState}). */
+const wrappedDelegationSkipLogState = new Map<string, MergeGateDeferLogEntry>();
+
+/**
+ * Per-task coalesced advisory `console.error` for {@link findWrappedDelegationSkips}
+ * — reuses {@link logMergeGateDeferral}'s coalescing engine on its own state map so a
+ * steadily-flagged task re-fires at the same bounded cadence without ever permanently
+ * dropping the diagnostic. Clears itself the cycle the envelope appears (or the task
+ * stops matching) simply by no longer being called — no sticky row to retry-clear.
+ */
+export function logWrappedDelegationSkip(
+  skip: WrappedDelegationSkip,
+  now: number = Date.now(),
+  state: Map<string, MergeGateDeferLogEntry> = wrappedDelegationSkipLogState,
+): void {
+  logMergeGateDeferral(
+    skip.taskId,
+    `[autopilot-worker] wrapped-delegation-skipped: ${skip.taskId} done-stamped ` +
+      `with no provider-leg result envelope at ${skip.envelopePath} — advisory, ` +
+      `evidence the wrapper implemented natively instead of delegating`,
+    now,
+    state,
+  );
 }
 
 /**
@@ -3218,6 +3330,10 @@ export async function confirmRunning(
   spec: LaunchSpec,
   signal: AbortSignal,
   deps: ConfirmRunningDeps,
+  // The dispatched-cell translation forensics (ADR 0047) recorded on the
+  // pre-launch `Dispatched` event data — present only for a cell-bearing `work`
+  // launch. Optional trailing arg so existing call sites are unaffected.
+  launchCell?: DispatchedPayload["cell"],
 ): Promise<ConfirmOutcome> {
   const key = dispatchKey(verb, id);
   // Watermark BEFORE launch: a re-open of a stale terminal row carries
@@ -3238,6 +3354,7 @@ export async function confirmRunning(
       id,
       dir: cwd === "" ? null : cwd,
       ts: deps.now(),
+      ...(launchCell !== undefined ? { cell: launchCell } : {}),
     });
   } catch {
     // Ack-wait rejected (timeout or shutdown). Abort without launching.
@@ -3596,13 +3713,19 @@ export async function runReconcileCycle(
     const cell = resolveWorkerCell(
       {
         pluginDir: plan.pluginDir,
-        model: plan.cellModel,
-        tier: plan.tier,
+        // The EFFECTIVE cell (the `worker_provider`-translated one when the pin
+        // fired, else the assigned cell) so a missing/invalid reject names the cell
+        // that actually launches — `plan.pluginDir` already composes over it.
+        model: plan.dispatchedCellModel ?? plan.cellModel,
+        tier: plan.dispatchedCellTier ?? plan.tier,
         ...(plan.pluginDirReject !== undefined
           ? { reject: plan.pluginDirReject }
           : {}),
         ...(plan.matrixReject !== undefined
           ? { matrixReject: plan.matrixReject }
+          : {}),
+        ...(plan.providerReject !== undefined
+          ? { providerReject: plan.providerReject }
           : {}),
       },
       {
@@ -3621,6 +3744,13 @@ export async function runReconcileCycle(
           reason =
             `worker-cell-bad-matrix: ${cell.state} — ${cell.detail} ` +
             "Then 'keeper retry-dispatch'.";
+          break;
+        // (1b) the `worker_provider` pin could not translate the assigned cell
+        //      into the pinned family (ADR 0047) — fail-closed, NEVER a fallback to
+        //      the assigned provider. Distinct reason per the three totality gaps a
+        //      stale map leaves at runtime; each names the cells + direction.
+        case "provider-reject":
+          reason = providerRejectReason(cell);
           break;
         // (2) an out-of-matrix {model, effort} the pure compose flagged.
         case "out-of-matrix":
@@ -3761,7 +3891,33 @@ export async function runReconcileCycle(
       worktreeLane,
       worktreeBranch,
       resolvedPluginDir,
+      // The `worker_provider`-translated dispatched cell + the pin (ADR 0047),
+      // null when unconstrained — the always-emitted KEEPER_PLAN_DISPATCHED_* env
+      // carriers ride the spec (empty on a byte-identical unconstrained launch).
+      plan.dispatchedCellModel ?? null,
+      plan.dispatchedCellTier ?? null,
+      plan.dispatchConstraint ?? null,
+      // The wrapped-cell guard marker (task .1) — present only for a wrapped
+      // effective cell, so the KEEPER_WRAPPED_* carriers ride the spec (empty on a
+      // native launch, overwriting any stale session-env marker).
+      plan.wrappedCell ?? null,
+      plan.wrappedEnvelope ?? null,
     );
+    // The dispatched-cell forensics recorded on the `Dispatched` event (ADR
+    // 0047) — {assigned, effective, constraint} for a cell-bearing `work` launch,
+    // effective === assigned when the pin did not translate. Cell-less launches
+    // (a `close` row, a task with no cell) carry none.
+    const launchCell: DispatchedPayload["cell"] =
+      plan.verb === "work" && plan.cellModel != null && plan.tier != null
+        ? {
+            assigned: { model: plan.cellModel, tier: plan.tier },
+            effective: {
+              model: plan.dispatchedCellModel ?? plan.cellModel,
+              tier: plan.dispatchedCellTier ?? plan.tier,
+            },
+            constraint: plan.dispatchConstraint ?? null,
+          }
+        : undefined;
     try {
       const outcome = await confirmRunning(
         plan.verb,
@@ -3771,6 +3927,7 @@ export async function runReconcileCycle(
         spec,
         signal,
         deps,
+        launchCell,
       );
       // CLEAR the cooldown only when nothing actually launched: a definitive
       // launch failure (`"failed"`) or a pre-launch abort
@@ -3867,7 +4024,7 @@ export async function runReconcileCycle(
       // `provisionFailed` below so this group's finalize is skipped either way (its
       // base is not assembled). Only a GENUINE block mints the sticky `close::<epic>`.
       if (!provisioned.ok) {
-        provisionFailed.add(`${closeKeyEpicId(sink)} ${sink.repoDir}`);
+        provisionFailed.add(`${closeKeyEpicId(sink)}\0${sink.repoDir}`);
         if (provisioned.retry === true) {
           // A transient not-ready base lane — retry-skip: mint NO sticky
           // `close::<epic>` row; the next cycle retries once the base settles.
@@ -3902,7 +4059,7 @@ export async function runReconcileCycle(
       }
       // A group whose fan-in provision failed above must NOT finalize — its base is
       // not assembled, so merging it would push incomplete work to default.
-      if (provisionFailed.has(`${closeKeyEpicId(info)} ${info.repoDir}`)) {
+      if (provisionFailed.has(`${closeKeyEpicId(info)}\0${info.repoDir}`)) {
         continue;
       }
       const finalizeKey = worktreeFinalizeDispatchId(
@@ -7161,6 +7318,26 @@ export async function loadReconcileSnapshot(
   )?.worktree_multi_repo;
   const worktreeMultiRepo: boolean = worktreeMultiRepoRaw === 1;
 
+  // The durable work-dispatch provider pin (`worker_provider`, ADR 0047) rides the
+  // SAME singleton row — NULL/absent (unconstrained, the byte-identical default) or
+  // a family (`"claude"`/`"gpt"`) every cell-bearing `work` launch is translated
+  // into. Projection-pull only so a runtime `set_autopilot_config` lands the next
+  // cycle. Mirrors `projectWorkerProvider`'s coercion (only the two exact members
+  // pass; anything else is unconstrained). The equivalence map is loaded + reduced
+  // ONCE per cycle ONLY when a pin is active — an unconstrained cycle reads no map
+  // (zero fs) and never consults the fail-closed snapshot below. Fail-closed: a
+  // stale/broken map becomes a per-cell `map-malformed` launch reject, NEVER a
+  // thrown cycle crash.
+  const workerProviderRaw = (
+    autopilotRows[0] as { worker_provider?: unknown } | undefined
+  )?.worker_provider;
+  const workerProvider: "claude" | "gpt" | null =
+    workerProviderRaw === "claude" || workerProviderRaw === "gpt"
+      ? workerProviderRaw
+      : null;
+  const providerEquivalence =
+    workerProvider !== null ? loadProviderEquivalenceSnapshot() : undefined;
+
   const armedIds = new Set<string>();
   for (const row of read("armed_epics")) {
     const epicId = (row as { epic_id?: unknown }).epic_id;
@@ -7261,6 +7438,7 @@ export async function loadReconcileSnapshot(
       models: matrix.subagentModels,
       effortsByModel: matrix.effortsByModel,
       efforts: matrix.efforts,
+      driverByModel: matrix.driverByModel,
     };
   } catch (err) {
     if (err instanceof MatrixConfigError) {
@@ -7390,6 +7568,8 @@ export async function loadReconcileSnapshot(
     closeModel,
     closeEffort,
     hostMatrix,
+    workerProvider,
+    ...(providerEquivalence !== undefined ? { providerEquivalence } : {}),
     maxConcurrentJobs,
     maxConcurrentPerRoot,
     worktreeMode,
@@ -8371,6 +8551,22 @@ function main(): void {
               err,
             );
           }
+        }
+        // Wrapped-delegation advisory (task .4): a producer-side, fs-touching
+        // probe — never a fold — flagging a DONE wrapped-cell task whose
+        // provider-leg result envelope never appeared. DETECT-ONLY: logs a
+        // coalesced advisory line, mints no sticky / dispatch_failures row, and
+        // never blocks a dispatch. Runs every cycle regardless of paused — it
+        // reads, never writes.
+        try {
+          for (const skip of findWrappedDelegationSkips(snapshot)) {
+            logWrappedDelegationSkip(skip);
+          }
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] wrapped-delegation-skip probe threw (non-fatal):",
+            err,
+          );
         }
         const decision = reconcile(snapshot, state, deps.now());
         await runReconcileCycle(

@@ -314,6 +314,19 @@ export interface Event {
    * re-mint preserves the marker). NULL on every non-SessionStart row.
    */
   adopted: number | null;
+  /**
+   * The PII-free account ROUTE this process launched on — `"default"` (native
+   * ambient account) or `"claude-swap:<slot>"` (a managed claude-swap route),
+   * NULL when the launcher supplied none (an explicit-profile override or a
+   * legacy / non-Claude row). An EXPLICIT launch carrier, never derived from a
+   * path or email: the hook size/shape-bounds `KEEPER_ACCOUNT_ROUTE` at
+   * capture, so a malformed value arrives NULL and the fold — which copies it
+   * verbatim onto `jobs.account_route` via the SessionStart COALESCE arm — never
+   * throws. Attribution is observational per-process: it describes only the
+   * process that emitted the event and never binds a conversation or drives a
+   * later route choice. NULL on every non-SessionStart row.
+   */
+  account_route: string | null;
 }
 
 /**
@@ -621,10 +634,13 @@ export interface Job {
    * surfaces render as not-resumable for a non-claude harness.
    */
   resume_target: string | null;
-  // NOTE: the migration-only jobs column `kill_reason` (v103) is DELIBERATELY
-  // absent here — this interface mirrors only the fields Job-typed reads consume
-  // today. The column exists on the row and is read ad-hoc (a scoped SELECT) by
-  // the folds/producers that own it; a later read surface adds it when needed.
+  // NOTE: the migration-only jobs columns `kill_reason` (v103) and
+  // `account_route` (v119, the PII-free per-launch account route folded from
+  // {@link Event.account_route}) are DELIBERATELY absent here — this interface
+  // mirrors only the fields Job-typed reads consume today. Both ride the row and
+  // are read ad-hoc (a scoped SELECT / the raw JOBS_DESCRIPTOR wire) by the
+  // folds / producers / query surfaces that own them; a later typed read surface
+  // adds one when needed.
 }
 
 /**
@@ -634,7 +650,7 @@ export interface Job {
  * blob via {@link import("./daemon").serializeSessionTelemetry}. `kind` (the
  * discriminator) and `id` (the correlation key — a claude `session_id` that
  * equals the hook-sourced `jobs.job_id`) are NOT serialized: `id` rides in
- * `events.session_id`, mirroring the {@link UsageSnapshotMessage} pipeline. Any
+ * `events.session_id`. Any
  * field the statusLine payload omits arrives as `null` and folds latest-wins
  * without nulling the other columns (COALESCE merge in the reducer arm).
  */
@@ -658,7 +674,7 @@ export interface SessionTelemetryMessage {
 
 /**
  * Decoded fold-side shape of a `SessionTelemetry` event's `data` blob (fn-1024),
- * mirroring the {@link UsageSnapshotMessage}→payload split. Produced by
+ * Produced by
  * {@link import("./reducer").extractSessionTelemetry} with every field a
  * null-fallback (a guarded parse that NEVER throws — unknown/absent → null), so
  * a malformed or partial blob folds to a safe value. The six fields land on the
@@ -1329,5 +1345,30 @@ export interface RepairHumanNotifiedPayload {
   /** The sticky repair-row `dispatch_failures.id` (the repo token; verb is `repair`). */
   id: string;
   /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
+  outcome: string;
+}
+
+/**
+ * Pre-flattened `SharedCheckoutHumanNotified` synthetic event payload — the terminal
+ * "human paged" stage of the shared-checkout hygiene page-once sweep, sibling to
+ * `RepairHumanNotified` but on a `shared-checkout-{dirty,desync}:<repoHash>` distress
+ * row (the daemon distress verb). The daemon page-once sweep mints it after it pages the
+ * human about a live dirty/desync distress row, stamping the
+ * `dispatch_failures.human_notified_at` once-marker so the operator is paged exactly once
+ * per row instance. Keyed by the distress-row `id` (the family prefix + repo hash; verb
+ * is the shared daemon distress verb). The TERMINAL `notified` outcome stamps
+ * `human_notified_at = event.ts` (gated `IS NULL`); any other outcome (`notify_failed` /
+ * unknown) is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts next heartbeat. The fold reads ONLY the payload + `event.ts`, so re-fold
+ * stays byte-deterministic. The marker NEVER clears the sticky row — only the producer
+ * level-clear (`DispatchCleared`) does, which re-arms it at NULL so a cleared-then-reminted
+ * row (a fresh incident episode past a new grace) pages anew. KEEP-SET inline forever
+ * (never added to the retention shed predicate).
+ */
+export interface SharedCheckoutHumanNotifiedPayload {
+  /** The distress-row `dispatch_failures.id` (`shared-checkout-{dirty,desync}:<hash>`;
+   *  verb is the daemon distress verb). */
+  id: string;
+  /** Producer-recorded page outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
 }

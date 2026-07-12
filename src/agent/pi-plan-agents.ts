@@ -150,7 +150,7 @@ export function renderPiPlanAgent(path: string): {
       "..",
       "keeper",
       "pi-extension",
-      "keeper-events.ts",
+      "task-facade.ts",
     );
     if (!existsSync(taskExtension)) {
       throw new Error(
@@ -166,9 +166,10 @@ export function renderPiPlanAgent(path: string): {
       // entry of `./src/index.ts` canonicalizes to "src", not its package
       // name) while the `ext:` allowlist below still hides every extension
       // tool except the keeper Task facade — the runner's only spawn surface
-      // for the judge hop.
+      // for the judge hop. The facade-only extension owns no parent-session
+      // lifecycle, title, telemetry, bus, or status side effects.
       `extensions: ${yamlString(`*, ${taskExtension}`)}`,
-      `tools: ${yamlString("all, ext:keeper-events/Task")}`,
+      `tools: ${yamlString("all, ext:task-facade/Task")}`,
     );
   }
   if (denied.length > 0) {

@@ -1,8 +1,8 @@
 /**
  * `~/.local/state/keeper/` — keeper's durable per-user STATE root, the sibling of
  * `keeperConfigDir()`'s `~/.config/keeper/` (src/agent/config.ts). Deliberately
- * NON-XDG: it matches the usage-picker convention (`src/usage-picker.ts`), NOT
- * the XDG-honoring `defaultKeeperAgentStateDir` / `keeper-agent` dir the tmux
+ * NON-XDG: it is distinct from the XDG-honoring
+ * `defaultKeeperAgentStateDir` / `keeper-agent` dir the tmux
  * launcher uses.
  *
  * `KEEPER_STATE_DIR` overrides it — the single env seam (the test-isolation lever,

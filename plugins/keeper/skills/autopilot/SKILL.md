@@ -66,6 +66,7 @@ flags." Every control op below is a bare one-shot Bash call:
 | Worktree mode on/off | "worktree mode on/off", "run lanes in worktrees" — durable toggle, rejected mid-epic (`--force` to override) | `keeper autopilot worktree on` / `keeper autopilot worktree off` |
 | Set a concurrency cap | "limit to N workers", "cap concurrency at N", "at most N per repo" — runtime config; per-root is legal to set any time (stores intent, effective floors to 1 while worktree mode is off) | `keeper autopilot config max_concurrent_jobs <N>` (or `unlimited`) / `keeper autopilot config max_concurrent_per_root <N>` |
 | Multi-repo worktree grouping | "cluster a multi-repo epic into per-repo lanes", "multi-repo worktree mode" — durable rollout flag, default OFF, only meaningful with worktree mode on | `keeper autopilot config worktree_multi_repo <on\|off>` |
+| Pin work dispatch to a provider | "pin work to claude/codex", "only dispatch claude cells", "stop using codex for work" — durable work-cells-only dispatch pin (docs/adr/0047); `none` clears it | `keeper autopilot config worker_provider <claude\|codex\|none>` |
 | Retry a stuck dispatch | A sticky failure key `<verb>::<id>`, verb one of `work\|close\|approve` | `keeper autopilot retry work::fn-N-slug.3` |
 | Clear / approve a phantom | "approve fn-X" — clears a resurrected/phantom approve pending (the reconciler never dispatches `approve` itself) | `keeper autopilot retry approve::fn-N-slug` |
 | Show me what it's doing | "what's autopilot doing", "show me the autopilot", "is it paused" | `keeper status --json \| jq .data.autopilot` (read) |
@@ -107,7 +108,14 @@ escalations, parked questions, and stuck dispatches, with finalize-non-ff,
 instant-death-wall, and blocked-work as named non-double-counted subsets of
 stuck dispatches) cover what it's CURRENTLY doing — so one read covers both
 the config and the activity. Exit 0 on any board state; exit 1 only on
-transport/usage. For the full orient step run `keeper prompt render
+transport/usage.
+
+`keeper autopilot show` additionally carries `worker_provider` (the
+work-cells-only dispatch pin, `null | "claude" | "codex"`) plus its
+`worker_provider_scope` ("work cells only…") and `worker_provider_note` (the
+many-to-one GPT-tier collapse, present only when pinned to `claude`) —
+`keeper status` does NOT surface these three; read/capture them via
+`keeper autopilot show` specifically. For the full orient step run `keeper prompt render
 engineering/orient`. (The dispatch-log TUI `keeper autopilot --snapshot` still
 exists for a human-readable frame; for a machine read prefer the status envelope,
 and NEVER `--watch` — it hangs.)
@@ -144,6 +152,12 @@ the fields your take-over touches produces a wrong GLOBAL state on restore.
 Pin them; do not re-derive from memory later. (`keeper autopilot show` returns
 the same eight fields as its own envelope; restore `worktree_multi_repo` via
 `keeper autopilot config worktree_multi_repo on|off`.)
+
+**If the take-over touches the work-dispatch provider pin, capture
+`worker_provider` too** — it is NOT one of the `keeper status` eight fields, so
+read it separately via `keeper autopilot show` (`.data.worker_provider`,
+`null | "claude" | "codex"`) and restore it via `keeper autopilot config
+worker_provider <claude|codex|none>` (`none` writes the captured `null`).
 
 **Per-root cap: capture and restore the STORED field, never the effective
 one.** `max_concurrent_per_root` in the envelope is the derived EFFECTIVE cap
@@ -287,7 +301,9 @@ live past a daemon bounce is running blind.
    per-row jam read, `.data.board.epics[].tasks[].dispatch_failure` and
    `.data.board.epics[].close.dispatch_failure` name the block KIND on the exact
    wedged row: the operator-action jams (multi-repo / merge-conflict / dirty-tree /
-   non-ff, cleared by `retry`), the self-clearing occupancy signals
+   non-ff / repair, cleared by `retry`; plus the shared-checkout dirty/desync hygiene
+   jams, which PAGE the operator once but clear ONLY when their producer observes the
+   checkout reconciled — never `retry`), the self-clearing occupancy signals
    `slot-occupied` (a stopped session holds the slot — visibility only) and
    `slot-reclaimed` (a provably-dead session's pane was auto-killed to free it),
    and `instant-death` (a key whose workers bound then died within a minute K
@@ -310,9 +326,9 @@ keys currently tripped by the instant-death breaker. `>= 2` (multiple keys dying
 instantly in a window) is the likely **account session/quota wall** — repeated
 instant worker deaths, not a flaky task; the per-key breakers already stopped each
 key's burn (no silent churn loop), so the board never auto-pauses on it. Resume
-each key with `keeper autopilot retry <verb>::<id>` AFTER the session limit resets
-(check `keeper usage` for the reset time); retrying before the reset just re-arms
-the breaker.
+each key with `keeper autopilot retry <verb>::<id>` only after account capacity
+recovers; use `keeper agent accounts check` for routing diagnostics. Retrying
+before capacity recovers just re-arms the breaker.
 
 ### Take over for a bit, then put it back
 

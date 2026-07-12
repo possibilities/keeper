@@ -271,6 +271,13 @@ const TASK_SUBCOMMANDS: readonly PlanCommand[] = [
 
 const AUDIT_SUBCOMMANDS: readonly PlanCommand[] = [
   {
+    name: "gate-check",
+    summary:
+      "Read-only per-task audit-gate check: does a finding cover the task's current commits?",
+    args: [{ name: "TASK_ID" }],
+    options: [OPT_PROJECT],
+  },
+  {
     name: "submit",
     summary: "Persist the quality-auditor's report markdown (commit-free).",
     args: [{ name: "EPIC_ID" }],
@@ -285,6 +292,24 @@ const AUDIT_SUBCOMMANDS: readonly PlanCommand[] = [
         name: "--risk",
         takesValue: true,
         summary: "Risk level: Low|Medium|High (required)",
+      },
+      OPT_PROJECT,
+    ],
+  },
+  {
+    name: "submit-task",
+    summary: "Persist the per-task audit-gate finding artifact (commit-free).",
+    args: [{ name: "TASK_ID" }],
+    options: [
+      {
+        name: "--file",
+        takesValue: true,
+        summary: "Findings JSON path (required)",
+      },
+      {
+        name: "--status",
+        takesValue: true,
+        summary: "Top-level status: clean|mild|severe (required)",
       },
       OPT_PROJECT,
     ],

@@ -7,7 +7,7 @@ description: >-
   says "work", "/work", or invokes the plan work workflow on an existing
   `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(keeper plan:*), Read, Write, Glob, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Glob, Task, SendMessage
 disable-model-invocation: true
 ---
 
@@ -120,7 +120,7 @@ keeper plan reconcile <task_id>
 
 **On success**, read the envelope `{verdict, task_id, epic_id, status, source_commits, state_head_visible, dirty_session_files, epic_progress, assessed_at, blocked_reason}` and switch on `verdict`. The switch is total over all seven verdicts. `dirty_session_files` is the close-out gate's observable — a count of undischarged files in the worker's lane, or `null` when git was unreadable (a fail-open marker); the stop-guard family reads it, the orchestrator switch does not.
 
-**Every non-`done` verdict is a resume directive, never a work order.** A dirty tree, failing lint, or a missing commit is the worker's to fix in the worker's context — you route the nudge back into the worker and never touch the tree yourself. The global commit-by-default convention does not apply to this skill: it never edits, so it never commits. The switch arms:
+**Every non-`done` verdict is a resume directive, never a work order.** A dirty tree, failing lint, or a missing commit is the worker's to fix in the worker's context — you route the nudge back into the worker and never touch the tree yourself. The global commit-by-default convention does not apply to this skill: it never edits, so it never commits. The nudges below are driver-agnostic — this skill never knows or cares whether the resumed worker is native or a wrapped courier; "finish implementation" is the worker's own contract to honor, whether that means editing directly or resuming its provider leg. The switch arms:
 
 - **`done`** → the source commit and the `.keeper/` state commit both landed. Continue to Phase 3 (report).
 - **`in_progress_committed`** → the worker's source commit landed but `keeper plan done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `keeper plan done <task_id> --summary "..."` now."*
@@ -187,32 +187,52 @@ Format the reason with the worker's `BLOCKED: <category>` category as the prefix
 
 ### 2d. Audit gate (AUDIT_READY blocks only)
 
-An audit-flagged worker commits its source, then parks itself `blocked` with an `AUDIT_READY: <sha> …` reason instead of stamping done (its worker spec's Phase 4.5). The gate holds the done-latch through the existing block machinery, so dependents never dispatch against unreviewed drift. You run the audit CONTENT-BLIND: you pass commit shas and relay a returned envelope by path — you never open the diff, the report, or the findings prose. You NEVER edit code, run `keeper plan done`, or resume on your own outside this gate.
+An audit-flagged worker commits its source, then parks itself `blocked` with an `AUDIT_READY: <sha> …` reason instead of stamping done (its worker spec's Phase 4.5). The gate holds the done-latch through the existing block machinery, so dependents never dispatch against unreviewed drift. You run the audit CONTENT-BLIND: the gate-check verb and the auditor's own one-line return are the only things you read — you never open the finding artifact, the diff, or any findings prose. You NEVER edit code, run `keeper plan done`, or resume on your own outside this gate.
 
-**Step 1 — idempotency short-circuit.** Read the per-task finding artifact at `<primary_repo>/.keeper/state/audits/<epic_id>/tasks/<task_id>.json` (its layout + schema are owned by the audit-artifacts helpers). If it exists AND its recorded `commits` match reconcile's `source_commits` for this task, a prior run already audited this exact commit set (a crashed-and-resumed orchestrator) — skip Steps 2–3 and route on the persisted top-level `status` (Step 4). Absent, or a commit-set mismatch (a new commit landed since) → run the audit.
+**Step 1 — idempotency short-circuit via `gate-check`.** Run:
 
-**Step 2 — spawn the quality-auditor, task-scoped + content-blind.** Spawn `plan:quality-auditor` against ONLY this task's commit set — reconcile's `source_commits` (a list of `{repo, sha}`) — with a config-only prompt: `TASK_ID`, `EPIC_ID`, `PRIMARY_REPO`, the commit shas, and the per-task finding path. Direct it to review just those commits and RETURN a compact findings envelope — its top-level `status` (`clean` / `mild` / `severe`) plus fingerprinted findings (each a `category:file` fingerprint with a one-line summary) — and NOT to run the epic-scoped `audit submit` (that would clobber a sibling lane's report). No `model=` kwarg — the agent file owns the model + effort.
+```bash
+keeper plan audit gate-check <task_id>
+```
 
-**Step 3 — persist findings.** Write the auditor's returned envelope to the per-task finding artifact (Write tool, the path from Step 1), carrying the audited `commits`, the top-level `status`, and each finding stamped `status: accumulated-open`. This is a mechanical relay of a returned envelope to a gitignored file — the same content-blind write `/plan:close` does — never a read-and-reason over findings prose. The artifact is the durable record the close audit later fingerprint-links against.
+Read the envelope `{exists, covers_current_commits, status, finding_ref}` — `gate-check` derives the task's current commit set itself (the same seam `submit-task` uses) and compares it against the persisted finding's stamped hash server-side; you never compute or reason over the hash. Switch on it:
 
-**Step 4 — route on the verdict.**
+- **`covers_current_commits: true`** → a prior run already audited this exact commit set (a crashed-and-resumed orchestrator). Route directly on the persisted `status`, using `finding_ref` from THIS envelope:
+  - `clean` / `mild` → skip Step 2 (no re-audit needed) and go straight to **Step 4**.
+  - `severe` → skip Steps 2–3 (no second refute — a persisted verdict can't re-derive a refute-once budget across a crash) and go straight to **Step 5**.
+- **`covers_current_commits: false`** → either no finding yet, or a new commit landed since the last one. Before spawning the auditor, check reconcile's `source_commits` for this task (the same list Phase 2b's switch already read): an empty list mirrors the worker's own empty-diff exception — nothing to audit, skip straight to **Step 4** (unblock-resume). A non-empty list → run the audit (**Step 2**).
 
-- **`clean` / `mild`** → the drift is acceptable to ship. Unblock, then cold-resume the worker so it stamps its OWN done (you NEVER run `keeper plan done`):
+**Step 2 — spawn the quality-auditor, task mode.** Spawn `plan:quality-auditor` in TASK MODE — `TASK_ID` present in its config — against ONLY this task's commit set (reconcile's `source_commits`, a list of `{repo, sha}`), with a config-only prompt: `TASK_ID`, `EPIC_ID`, `PRIMARY_REPO`, the commit shas. No `model=` kwarg — the agent file owns the model + effort. Task mode persists its own findings via `keeper plan audit submit-task` and returns exactly one line — nothing else:
 
-  ```bash
-  keeper plan unblock <task_id>
-  keeper plan worker resume <task_id>
-  ```
+```
+finding_ref=<path> status=<clean|mild|severe> findings=<N>
+```
 
-  Spawn the resumed worker per **Phase 2b's cold path**, with a resume nudge that states *the audit PASSED — finish commit-then-done, do not re-park*. Re-run `keeper plan reconcile <task_id>` after it returns and re-switch: `done` → **Phase 3**; a non-`done` `in_progress_*` / `state_uncommitted` arm → the ordinary resume machinery.
+Parse it mechanically (`status=(\w+)`, `finding_ref=(\S+)`) — never open `finding_ref` yourself; the findings content lives on disk, and this gate reads only the line. **Unparseable return** (no `status=` match, harness drop, garbled line) → fail-safe to severe: go straight to **Step 5** treating the return as unconfirmed-but-unsafe-to-ship, never silently unblock on a line you couldn't parse.
 
-- **`severe`** → do NOT unblock. Run ONE refute pass: re-spawn `plan:quality-auditor` on the same commit set with a refute directive (argue the finding is NOT real / not gating). A refute that **overturns** it → treat as `mild` (downgrade the persisted finding to `accumulated-open`, then the clean/mild path above). A refute that **confirms** it → rewrite the block reason to `AUDIT_SEVERE` and hand off to the existing escalation:
+**Step 3 — route on the fresh verdict.**
 
-  ```bash
-  keeper plan block <task_id> --reason "AUDIT_SEVERE: <one-line finding summary>"
-  ```
+- `clean` / `mild` → **Step 4**.
+- `severe` → run ONE refute pass: re-spawn `plan:quality-auditor` in task mode on the SAME commit set, with a refute directive (argue the finding at `finding_ref` is NOT real / not gating) plus `finding_ref` for it to re-read on its own — no finding prose ever crosses into you. Parse its returned one-liner the same way as Step 2.
+  - Overturned (`status=clean` or `status=mild`) → **Step 4**.
+  - Confirmed (`status=severe`) → **Step 5**. The refute pass runs at most ONCE; the gate never loops past it.
 
-  Re-blocking an already-blocked task just rewrites its reason. Surface the finding summary and STOP — the daemon's block-escalation path pages from there, exactly like any semantic block. The refute pass runs at most ONCE; the gate never loops.
+**Step 4 — clean/mild (or nothing to audit): unblock and resume.** Unblock, then cold-resume the worker so it stamps its OWN done (you NEVER run `keeper plan done`):
+
+```bash
+keeper plan unblock <task_id>
+keeper plan worker resume <task_id>
+```
+
+Spawn the resumed worker per **Phase 2b's cold path**, with a resume nudge that states *the audit PASSED — finish commit-then-done, do not re-park*. Re-run `keeper plan reconcile <task_id>` after it returns and re-switch: `done` → **Phase 3**; a non-`done` `in_progress_*` / `state_uncommitted` arm → the ordinary resume machinery.
+
+**Step 5 — severe: block with a ref-based reason.** Do NOT unblock.
+
+```bash
+keeper plan block <task_id> --reason "AUDIT_SEVERE: finding_ref=<path>"
+```
+
+The reason carries only the category token plus the ref — the daemon's escalation producer parses the `AUDIT_SEVERE:` category prefix and nothing after it. Re-blocking an already-blocked task just rewrites its reason. Surface the reason and STOP — the daemon's block-escalation path pages from there, exactly like any semantic block.
 
 ---
 

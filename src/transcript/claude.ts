@@ -20,6 +20,27 @@ import type {
   TranscriptSource,
   TranscriptTool,
 } from "./model";
+import {
+  backfillToolNames,
+  contentText,
+  finalizeTimestamps,
+  markMalformedLine,
+  type ParseState,
+  parseTimestamp,
+  pushEntry,
+  recordOf,
+  stringOrNull,
+  trackTimestamp,
+  withinTranscriptLineByteCap,
+} from "./parse-common";
+import type {
+  TranscriptFindOutcome,
+  TranscriptFindQuery,
+  TranscriptListOutcome,
+  TranscriptListQuery,
+  TranscriptReader,
+  TranscriptSessionHandle,
+} from "./reader";
 import { ellipsizeInline } from "./text";
 
 const METADATA_SLICE_BYTES = 128 * 1024;
@@ -27,7 +48,6 @@ const SUMMARY_PREVIEW_CHARS = 240;
 
 export interface ClaudeRootOptions {
   homeDir?: string;
-  env?: NodeJS.ProcessEnv;
   /** Claude config directories. When present, standard discovery is skipped. */
   configDirs?: readonly string[];
 }
@@ -86,19 +106,17 @@ function safeDirectories(path: string): string[] {
   }
 }
 
-/** Resolve every readable Claude projects tree, deduplicated through symlinks. */
+/** Resolve every readable Claude projects tree, deduplicated through symlinks.
+ *  claude-swap's `--share-history` means every account reads/writes the SAME
+ *  canonical `~/.claude/projects/` tree, so default discovery is just the one
+ *  canonical config dir — never a `.claude-profiles` scan. */
 export function discoverClaudeProjectsRoots(
   options: ClaudeRootOptions = {},
 ): string[] {
   const home = options.homeDir ?? homedir();
-  const env = options.env ?? process.env;
   const configDirs = options.configDirs?.length
     ? [...options.configDirs]
-    : [
-        env.CLAUDE_CONFIG_DIR?.trim() || null,
-        join(home, ".claude"),
-        ...safeDirectories(join(home, ".claude-profiles")),
-      ].filter((path): path is string => path !== null);
+    : [join(home, ".claude")];
 
   const roots: string[] = [];
   const seen = new Set<string>();
@@ -190,84 +208,8 @@ export function findClaudeSession(
   return { kind: "found", file: found[0] as ClaudeSessionFile };
 }
 
-function parseTimestamp(raw: unknown): { text: string; ms: number } | null {
-  if (typeof raw !== "string") {
-    return null;
-  }
-  const ms = Date.parse(raw);
-  return Number.isFinite(ms) ? { text: raw, ms } : null;
-}
-
-function stringOrNull(raw: unknown): string | null {
-  return typeof raw === "string" && raw.length > 0 ? raw : null;
-}
-
-function recordOf(raw: unknown): Record<string, unknown> | null {
-  return raw !== null && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>)
-    : null;
-}
-
-function contentText(raw: unknown): string {
-  if (typeof raw === "string") {
-    return raw;
-  }
-  if (!Array.isArray(raw)) {
-    return raw === null || raw === undefined ? "" : JSON.stringify(raw);
-  }
-  const parts: string[] = [];
-  for (const block of raw) {
-    if (typeof block === "string") {
-      parts.push(block);
-      continue;
-    }
-    const obj = recordOf(block);
-    if (obj === null) {
-      continue;
-    }
-    if (typeof obj.text === "string") {
-      parts.push(obj.text);
-    } else if (typeof obj.content === "string") {
-      parts.push(obj.content);
-    } else {
-      parts.push(JSON.stringify(obj));
-    }
-  }
-  return parts.join("\n");
-}
-
-interface ParseState {
-  source: TranscriptSource;
-  entries: TranscriptEntry[];
-  toolNames: Map<string, string>;
-  metadata: TranscriptMetadata;
-  minTimestamp: { text: string; ms: number } | null;
-  maxTimestamp: { text: string; ms: number } | null;
-}
-
-function pushEntry(
-  state: ParseState,
-  entry: Omit<TranscriptEntry, "sourceOrdinal" | "ordinal" | "source">,
-): void {
-  const sourceOrdinal = state.entries.length;
-  state.entries.push({
-    ...entry,
-    source: state.source,
-    sourceOrdinal,
-    ordinal: sourceOrdinal,
-  });
-}
-
 function updateMetadata(state: ParseState, obj: Record<string, unknown>): void {
-  const timestamp = parseTimestamp(obj.timestamp);
-  if (timestamp !== null) {
-    if (state.minTimestamp === null || timestamp.ms < state.minTimestamp.ms) {
-      state.minTimestamp = timestamp;
-    }
-    if (state.maxTimestamp === null || timestamp.ms > state.maxTimestamp.ms) {
-      state.maxTimestamp = timestamp;
-    }
-  }
+  trackTimestamp(state, parseTimestamp(obj.timestamp));
   state.metadata.project = stringOrNull(obj.cwd) ?? state.metadata.project;
   state.metadata.version = stringOrNull(obj.version) ?? state.metadata.version;
   state.metadata.gitBranch =
@@ -413,11 +355,15 @@ function parseContentBlock(
 }
 
 function parseLine(state: ParseState, line: string): void {
+  if (!withinTranscriptLineByteCap(line)) {
+    markMalformedLine(state);
+    return;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
   } catch {
-    state.metadata.malformedLines++;
+    markMalformedLine(state);
     return;
   }
   const obj = recordOf(parsed);
@@ -506,20 +452,8 @@ export function parseClaudeTranscriptText(
       parseLine(state, line);
     }
   }
-  metadata.startedAt = state.minTimestamp?.text ?? null;
-  metadata.updatedAt = state.maxTimestamp?.text ?? null;
-
-  // Tool results can precede the selected page. Resolve names after the full file
-  // is parsed so every result gets the call name when the id is available.
-  for (const entry of state.entries) {
-    if (
-      entry.kind === "tool_result" &&
-      entry.tool?.name === null &&
-      entry.tool.useId !== null
-    ) {
-      entry.tool.name = state.toolNames.get(entry.tool.useId) ?? null;
-    }
-  }
+  finalizeTimestamps(state);
+  backfillToolNames(state);
   return { metadata, source: state.source, entries: state.entries };
 }
 
@@ -853,3 +787,83 @@ export function loadClaudeSession(
 export function transcriptHoldingDirectory(path: string): string {
   return dirname(path);
 }
+
+const NO_ROOTS_MESSAGE = "no readable Claude projects directories found";
+
+function claudeList(query: TranscriptListQuery): TranscriptListOutcome {
+  const roots = discoverClaudeProjectsRoots({
+    homeDir: query.root.homeDir,
+    configDirs: query.root.configDirs,
+  });
+  if (roots.length === 0) {
+    return { kind: "no_roots", message: NO_ROOTS_MESSAGE };
+  }
+  try {
+    const result = listClaudeSessions({
+      roots,
+      project: query.project,
+      sinceMs: query.sinceMs,
+      untilMs: query.untilMs,
+      offset: query.offset,
+      limit: query.limit,
+    });
+    return {
+      kind: "ok",
+      items: result.items,
+      total: result.total,
+      offset: result.offset,
+      nextOffset: result.nextOffset,
+    };
+  } catch (error) {
+    return {
+      kind: "error",
+      message: error instanceof Error ? error.message : String(error),
+      recovery: "check the Claude transcript directories and retry",
+    };
+  }
+}
+
+function claudeFind(query: TranscriptFindQuery): TranscriptFindOutcome {
+  const roots = discoverClaudeProjectsRoots({
+    homeDir: query.root.homeDir,
+    configDirs: query.root.configDirs,
+  });
+  if (roots.length === 0) {
+    return { kind: "no_roots", message: NO_ROOTS_MESSAGE };
+  }
+  const lookup = findClaudeSession(roots, query.sessionId, query.project);
+  if (lookup.kind === "not_found") {
+    return { kind: "not_found" };
+  }
+  if (lookup.kind === "ambiguous") {
+    const owners = lookup.files.map((file) =>
+      transcriptHoldingDirectory(file.path),
+    );
+    // Bucket dirs live directly under a config root's "projects" dir; the
+    // config root disambiguates when duplicates span DIFFERENT roots
+    // (--project alone can't tell those apart), otherwise --project (which
+    // maps to a bucket within one root) is still the right hint.
+    const configRoots = new Set(owners.map((owner) => dirname(owner)));
+    const hint = configRoots.size > 1 ? "--config-dir" : "--project";
+    return { kind: "ambiguous", owners, hint };
+  }
+  return {
+    kind: "found",
+    handle: { sessionId: lookup.file.sessionId, path: lookup.file.path },
+  };
+}
+
+function claudeLoad(
+  handle: TranscriptSessionHandle,
+  subagent: string,
+): TranscriptSession | { error: string } {
+  return loadClaudeSession(handle.path, handle.sessionId, subagent);
+}
+
+export const claudeTranscriptReader: TranscriptReader = {
+  harness: "claude",
+  supportsSubagents: true,
+  list: claudeList,
+  find: claudeFind,
+  load: claudeLoad,
+};

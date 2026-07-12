@@ -12,7 +12,6 @@ import {
   installPiPlanAgents,
   renderPiPlanAgent,
 } from "../src/agent/pi-plan-agents";
-import { DEFAULT_PI_SHARED_PATHS } from "../src/agent/state-sharing";
 
 const SOURCE_DIR = join(import.meta.dir, "..", "plugins", "plan", "agents");
 
@@ -79,11 +78,12 @@ describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
           "plugins",
           "keeper",
           "pi-extension",
-          "keeper-events.ts",
+          "task-facade.ts",
         )}`,
       )}`,
     );
-    expect(runnerHeader).toContain('tools: "all, ext:keeper-events/Task"');
+    expect(runnerHeader).toContain('tools: "all, ext:task-facade/Task"');
+    expect(runnerHeader).not.toContain("keeper-events.ts");
     expect(judgeHeader).toContain("Task, Agent");
     expect(judgeHeader).not.toContain("extensions:");
   });
@@ -122,10 +122,6 @@ describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
     expect(() =>
       installPiPlanAgents({ sourceDir: SOURCE_DIR, targetDir }),
     ).toThrow("unmanaged agent");
-  });
-
-  test("named Pi profiles share the canonical agents directory", () => {
-    expect(DEFAULT_PI_SHARED_PATHS).toContain("agents");
   });
 
   test("the installer refreshes the canonical Pi agent registry", () => {

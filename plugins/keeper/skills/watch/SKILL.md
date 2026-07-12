@@ -140,8 +140,11 @@ Monitor({
 Each delta names its family, key, and op (`appeared` / `cleared`): `dead-letter`,
 `block-escalation`, `parked-question`, `stuck-dispatch`, `finalize-non-ff`,
 `instant-death-wall`. They fire on the OPERATOR-JAM class only — a self-clearing
-occupancy sticky never emits. The `baseline` line lands once at arm; that is the
-sole steady-state wake.
+occupancy sticky never emits. `stuck-dispatch` now also covers the shared-checkout
+dirty/desync hygiene rows (a shared checkout left dirty or trailing landed history):
+the daemon pages the operator once per row, but these clear ONLY when their producer
+observes the checkout reconciled — never `keeper autopilot retry`. The `baseline`
+line lands once at arm; that is the sole steady-state wake.
 
 **2. The jam alarm** — the coarse "the board needs a human NOW" alarm. Unlike the
 tail, a `keeper await` alarm EXITS on `met`, so it is the one wake source you

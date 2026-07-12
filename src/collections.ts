@@ -187,6 +187,13 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // can pill an adopted job distinctly. Display-only — never a `sortable` /
     // `filters` / `jsonColumns` key.
     "adopted",
+    // `account_route`: the PII-free per-launch account route (schema v119 /
+    // fn-1239), `'default'` / `'claude-swap:<slot>'` / NULL, folded latest-non-
+    // NULL-wins from the SessionStart `KEEPER_ACCOUNT_ROUTE` carrier. Served as
+    // explicit launch attribution for diagnostics — the account label never
+    // derives from `config_dir` / email. Display-only — never a `sortable` /
+    // `filters` / `jsonColumns` key.
+    "account_route",
     // `dispatch_origin`: the keeper-DISPATCH provenance discriminator —
     // `'autopilot'` for an autopilot work/close worker, `'escalation'` for an
     // unblock/deconflict/resolve/repair session, NULL for a manual/adopted/
@@ -457,89 +464,6 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `usage` descriptor — one row per agentusage profile, a current-state
- * snapshot of one `~/.local/state/agentusage/<id>.json` envelope, produced by
- * synthetic `UsageSnapshot` / `UsageDeleted` events.
- *
- * The source envelope's freshness fields (`fetched_at`, `next_fetch_at`, …) are
- * read-and-discarded by the worker and absent from the projection. `error_at`
- * IS projected for "stale since" display but excluded from the worker
- * change-gate so a re-failed scrape with the same error produces zero events.
- * `error_kind` (the stable failure classification) IS gated, so a kind flip
- * emits a fresh snapshot.
- */
-export const USAGE_DESCRIPTOR: CollectionDescriptor = {
-  name: "usage",
-  table: "usage",
-  columns: [
-    "id",
-    "target",
-    "multiplier",
-    "session_percent",
-    "session_resets_at",
-    "week_percent",
-    "week_resets_at",
-    "sonnet_week_percent",
-    "sonnet_week_resets_at",
-    "codex_spark_session_percent",
-    "codex_spark_session_resets_at",
-    "codex_spark_week_percent",
-    "codex_spark_week_resets_at",
-    "last_rate_limit_at",
-    "last_rate_limit_session_id",
-    "status",
-    "subscription_active",
-    "account_state",
-    "error_type",
-    "error_message",
-    "error_at",
-    "error_kind",
-    // Rate-limit lift instant + last-successful-fold freshness stamp, carved out
-    // of the rate-limit fan-out so a RateLimited event cannot clobber them.
-    "rate_limit_lifts_at",
-    "last_usage_fold_at",
-    "last_event_id",
-    "updated_at",
-  ],
-  pk: "id",
-  version: "last_event_id",
-  sortable: new Set(["id", "target", "last_event_id", "updated_at"]),
-  defaultSort: { column: "id", dir: "asc" },
-  filters: { id: "id", target: "target" },
-  jsonColumns: new Set(),
-};
-
-/**
- * The `profiles` descriptor — one row per Claude profile directory keyed by
- * `config_dir`, correlating the last `rate_limit` ApiError with each profile.
- * The `''` sentinel collapses the default `~/.claude` profile so a single PK
- * groups every NULL-`config_dir` session.
- */
-export const PROFILES_DESCRIPTOR: CollectionDescriptor = {
-  name: "profiles",
-  table: "profiles",
-  columns: [
-    "config_dir",
-    "profile_name",
-    "last_rate_limit_at",
-    "last_rate_limit_session_id",
-    "last_event_id",
-    "updated_at",
-  ],
-  pk: "config_dir",
-  version: "last_event_id",
-  sortable: new Set([
-    "config_dir",
-    "last_rate_limit_at",
-    "last_event_id",
-    "updated_at",
-  ]),
-  defaultSort: { column: "config_dir", dir: "asc" },
-  filters: { config_dir: "config_dir" },
-  jsonColumns: new Set(),
-};
-
-/**
  * Recency window (seconds) bounding the `subagent_invocations` membership token,
  * page, and `COUNT(*)` to invocations whose `ts` (start time, Unix epoch sec)
  * falls within the last day. The table is never compacted, so its history grows
@@ -759,6 +683,10 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // OFF), served so `keeper query autopilot_state` reflects the real durable
     // state. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
     "codex_adoption",
+    // Durable worker-provider dispatch pin (TEXT, NULL | 'claude' | 'codex' —
+    // docs/adr/0047), served so `keeper query autopilot_state` reflects the
+    // real durable pin. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
+    "worker_provider",
   ],
   pk: "id",
   version: "last_event_id",
@@ -1024,8 +952,6 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [SCHEDULED_TASKS_DESCRIPTOR.name, SCHEDULED_TASKS_DESCRIPTOR],
-  [USAGE_DESCRIPTOR.name, USAGE_DESCRIPTOR],
-  [PROFILES_DESCRIPTOR.name, PROFILES_DESCRIPTOR],
   [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],
   [DISPATCH_FAILURES_DESCRIPTOR.name, DISPATCH_FAILURES_DESCRIPTOR],
   [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
@@ -1071,8 +997,6 @@ export const QUERY_READ_ALLOWLIST: ReadonlySet<string> = new Set([
   "tmux_client_focus",
   "worktree_repo_status",
   "lane_merged",
-  "profiles",
-  "usage",
 ]);
 
 /** Whether `name` is on the {@link QUERY_READ_ALLOWLIST} for `keeper query`. */

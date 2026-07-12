@@ -83,6 +83,7 @@ import {
   FINALIZER_GUARD_S,
   type FoundJob,
   findShadowingWorkManifest,
+  findWrappedDelegationSkips,
   gateWedgedLanesByLiveness,
   gatherTipObservations,
   isBareShellCommand,
@@ -96,6 +97,7 @@ import {
   isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
+  isWrappedCell,
   LANE_OWNER_STALL_GRACE_SEC,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
@@ -108,6 +110,7 @@ import {
   laneWedgeDistressId,
   loadReconcileSnapshot,
   logMergeGateDeferral,
+  logWrappedDelegationSkip,
   type MergeSuiteProbe,
   type MergeSuiteVerdict,
   mergeLaneBaseIntoDefault,
@@ -164,6 +167,7 @@ import {
   type WorktreeRecoveryFailure,
   type WorktreeRecoveryResolution,
   type WorktreeRepoResolution,
+  type WrappedDelegationSkip,
   worktreeFinalizeDispatchId,
   worktreeRecoverDispatchId,
   worktreeRecoverEpicDispatchId,
@@ -187,6 +191,10 @@ import {
   parseDispatchKey,
 } from "../src/dispatch-command";
 import type { LaunchSpec, PaneInfo } from "../src/exec-backend";
+import {
+  buildProviderEquivalenceMap,
+  type ProviderEquivalenceConfig,
+} from "../src/provider-equivalence";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -357,6 +365,10 @@ function makeSnapshot(
       models: ["opus", "sonnet"],
       effortsByModel: new Map(),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+      ]),
     },
     // fn-953: the runtime-settable cap, resolved snapshot-time `column ?? DEFAULT`.
     // Default unlimited (`null`) so a snapshot-driven reconcile sees the same
@@ -1589,6 +1601,332 @@ test("reconcile: an out-of-matrix (model, tier) fails at compose — a reject, n
   expect(plan?.pluginDirReject).toBeDefined();
   expect(plan?.pluginDirReject).toContain("unknown tier");
   expect(plan?.workerCommand).not.toContain("--plugin-dir");
+});
+
+// ---------------------------------------------------------------------------
+// reconcile — worker_provider pin translation (ADR 0047)
+// ---------------------------------------------------------------------------
+
+// A matrix carrying opus/sonnet (claude) + gpt-5.6-sol (gpt) at the five efforts.
+const PROVIDER_MATRIX = {
+  ok: true as const,
+  models: ["opus", "sonnet", "gpt-5.6-sol"],
+  effortsByModel: new Map<string, string[]>(),
+  efforts: ["low", "medium", "high", "xhigh", "max"],
+  driverByModel: new Map<string, "native" | "wrapped">([
+    ["opus", "native"],
+    ["sonnet", "native"],
+    ["gpt-5.6-sol", "wrapped"],
+  ]),
+};
+// opus/max ↔ gpt-5.6-sol/max both directions; only `max`, so opus/high is a gap.
+const PROVIDER_CONFIG: ProviderEquivalenceConfig = {
+  schema_version: 1,
+  mappings: {
+    claude_to_gpt: [
+      {
+        source: { model: "opus", effort: "max" },
+        target: { model: "gpt-5.6-sol", effort: "max" },
+      },
+    ],
+    gpt_to_claude: [
+      {
+        source: { model: "gpt-5.6-sol", effort: "max" },
+        target: { model: "opus", effort: "max" },
+      },
+    ],
+  },
+};
+const PROVIDER_MAP_OK = {
+  ok: true as const,
+  map: buildProviderEquivalenceMap(PROVIDER_CONFIG),
+};
+
+test("reconcile: pin=gpt TRANSLATES a claude cell to its mapped gpt --plugin-dir + non-empty carriers", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: PROVIDER_MATRIX,
+    workerProvider: "gpt",
+    providerEquivalence: PROVIDER_MAP_OK,
+  });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  // The launched cell is the TRANSLATED gpt cell, not the assigned opus cell.
+  expect(plan?.pluginDir).toContain("plugins/plan/workers/gpt-5.6-sol-max");
+  expect(plan?.workerCommand).toContain(`--plugin-dir ${plan?.pluginDir}`);
+  // The dispatched-cell carriers are populated; the ASSIGNED cell is untouched.
+  expect(plan?.dispatchedCellModel).toBe("gpt-5.6-sol");
+  expect(plan?.dispatchedCellTier).toBe("max");
+  expect(plan?.dispatchConstraint).toBe("gpt");
+  expect(plan?.cellModel).toBe("opus");
+  expect(plan?.tier).toBe("max");
+  expect(plan?.providerReject).toBeUndefined();
+  // The wrapped-cell marker keys on the EFFECTIVE (translated) cell — an opus cell
+  // translated INTO a wrapped gpt cell IS marked (keyed on driver, not the pin).
+  expect(plan?.wrappedCell).toBe("gpt-5.6-sol::max");
+  expect(plan?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+  );
+});
+
+test("reconcile: NULL pin is byte-identical to today (assigned cell, empty carriers)", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  expect(plan?.pluginDir).toContain("plugins/plan/workers/opus-max");
+  expect(plan?.dispatchedCellModel).toBeNull();
+  expect(plan?.dispatchedCellTier).toBeNull();
+  expect(plan?.dispatchConstraint).toBeNull();
+  // A native opus cell carries NO wrapped-cell marker (empty carriers).
+  expect(plan?.wrappedCell).toBeUndefined();
+  expect(plan?.wrappedEnvelope).toBeUndefined();
+});
+
+test("reconcile: a SAME-family cell under a pin is UNCHANGED (empty carriers)", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "gpt-5.6-sol" }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: PROVIDER_MATRIX,
+    workerProvider: "gpt",
+    providerEquivalence: PROVIDER_MAP_OK,
+  });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  expect(plan?.pluginDir).toContain("plugins/plan/workers/gpt-5.6-sol-max");
+  expect(plan?.dispatchedCellModel).toBeNull();
+  expect(plan?.dispatchConstraint).toBeNull();
+  expect(plan?.providerReject).toBeUndefined();
+  // A pre-assigned wrapped cell is STILL marked even though the pin did not
+  // translate it (dispatchConstraint null) — the marker keys on the cell driver,
+  // never the pin, so keying off the constraint would silently miss this cell.
+  expect(plan?.wrappedCell).toBe("gpt-5.6-sol::max");
+  expect(plan?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+  );
+});
+
+test("isWrappedCell: driver-keyed — wrapped for a gpt model (even with a null constraint), native for claude, wrapped for an unknown", () => {
+  // The shared predicate the autopilot producer + the manual dispatch path both key
+  // the marker on. A pre-assigned gpt cell is wrapped regardless of any pin.
+  expect(isWrappedCell(PROVIDER_MATRIX, "gpt-5.6-sol")).toBe(true);
+  expect(isWrappedCell(PROVIDER_MATRIX, "opus")).toBe(false);
+  expect(isWrappedCell(PROVIDER_MATRIX, "sonnet")).toBe(false);
+  // An unknown model reads as wrapped, mirroring the renderer's `?? "wrapped"`.
+  expect(isWrappedCell(PROVIDER_MATRIX, "mystery-model")).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// findWrappedDelegationSkips (task .4) — the advisory, producer-probed
+// DETECT-ONLY backstop: a DONE wrapped-cell task whose provider-leg result
+// envelope never appeared. Never blocks a dispatch, never mints a
+// dispatch_failures row — pure over an injected `envelopeExists` probe.
+// ---------------------------------------------------------------------------
+
+test("findWrappedDelegationSkips: a done wrapped task with its envelope PRESENT is not flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => true);
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: a done wrapped task with its envelope ABSENT is flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([
+    {
+      taskId: "fn-1-foo.1",
+      envelopePath: "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+    },
+  ]);
+});
+
+test("findWrappedDelegationSkips: a probe THROW is inconclusive, never a flag", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => {
+    throw new Error("stat exploded");
+  });
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: a done NATIVE task is never flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "opus",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: a NOT-done wrapped task is never flagged", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "in_progress",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], hostMatrix: PROVIDER_MATRIX });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([]);
+});
+
+test("findWrappedDelegationSkips: an unloadable host matrix can't classify wrappedness — no flags", () => {
+  const epic = makeEpic({
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        tier: "max",
+        model: "gpt-5.6-sol",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: { ok: false, state: "absent", detail: "no matrix.yaml" },
+  });
+  const skips = findWrappedDelegationSkips(snap, () => false);
+  expect(skips).toEqual([]);
+});
+
+test("logWrappedDelegationSkip: coalesces per-task like logMergeGateDeferral, on its own state map", () => {
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errs.push(args.map(String).join(" "));
+  };
+  try {
+    const state = new Map<string, { loggedAt: number; suppressed: number }>();
+    const skip: WrappedDelegationSkip = {
+      taskId: "fn-1-foo.1",
+      envelopePath: "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+    };
+    logWrappedDelegationSkip(skip, 0, state);
+    logWrappedDelegationSkip(skip, 1_000, state); // suppressed
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("fn-1-foo.1");
+    expect(errs[0]).toContain(
+      "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+    );
+    expect(state.get("fn-1-foo.1")?.suppressed).toBe(1);
+  } finally {
+    console.error = origError;
+  }
+});
+
+test("reconcile: no-map-entry refuses fail-closed (no pluginDir, no fallback)", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "high", model: "opus" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: PROVIDER_MATRIX,
+    workerProvider: "gpt",
+    providerEquivalence: PROVIDER_MAP_OK,
+  });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  expect(plan?.pluginDir).toBeNull();
+  expect(plan?.providerReject?.reason).toBe("no-map-entry");
+  expect(plan?.providerReject?.direction).toBe("claude_to_gpt");
+  expect(plan?.workerCommand).not.toContain("--plugin-dir");
+});
+
+test("reconcile: target-not-on-host refuses when the mapped cell is absent", () => {
+  // Map opus/max → a gpt model NOT on the host matrix.
+  const config: ProviderEquivalenceConfig = {
+    schema_version: 1,
+    mappings: {
+      claude_to_gpt: [
+        {
+          source: { model: "opus", effort: "max" },
+          target: { model: "gpt-absent", effort: "max" },
+        },
+      ],
+      gpt_to_claude: [
+        {
+          source: { model: "gpt-absent", effort: "max" },
+          target: { model: "opus", effort: "max" },
+        },
+      ],
+    },
+  };
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: PROVIDER_MATRIX,
+    workerProvider: "gpt",
+    providerEquivalence: { ok: true, map: buildProviderEquivalenceMap(config) },
+  });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  expect(plan?.pluginDir).toBeNull();
+  expect(plan?.providerReject?.reason).toBe("target-not-on-host");
+  expect(plan?.providerReject?.target).toEqual({
+    model: "gpt-absent",
+    effort: "max",
+  });
+});
+
+test("reconcile: a malformed map refuses per-cell (map-malformed, never a crash)", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: PROVIDER_MATRIX,
+    workerProvider: "gpt",
+    providerEquivalence: { ok: false, detail: "stale map" },
+  });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  expect(plan?.pluginDir).toBeNull();
+  expect(plan?.providerReject?.reason).toBe("map-malformed");
 });
 
 // ---------------------------------------------------------------------------
@@ -3838,6 +4176,11 @@ test("runReconcileCycle: a WRAPPED-model work row composes + dispatches its cell
       models: ["opus", "sonnet", "gpt-5.5"],
       effortsByModel: new Map([["gpt-5.5", ["high"]]]),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+        ["gpt-5.5", "wrapped"],
+      ]),
     },
   });
   const state = makeState();
@@ -3851,6 +4194,13 @@ test("runReconcileCycle: a WRAPPED-model work row composes + dispatches its cell
   expect(decision.launches[0]?.pluginDirReject).toBeUndefined();
   expect(decision.launches[0]?.matrixReject).toBeUndefined();
   expect(decision.launches[0]?.cellModel).toBe("gpt-5.5");
+  // The wrapped-cell guard marker rides the launch (task .1) — a wrapped effective
+  // cell, so the effective `<model>::<effort>` + the per-task envelope path (cwd
+  // falls to the epic's project_dir here) are present.
+  expect(decision.launches[0]?.wrappedCell).toBe("gpt-5.5::high");
+  expect(decision.launches[0]?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+  );
 
   await runReconcileCycle(
     decision,
@@ -3865,9 +4215,13 @@ test("runReconcileCycle: a WRAPPED-model work row composes + dispatches its cell
   expect(log.emissions).toEqual([]);
   expect(log.launches.length).toBe(1);
   const launch = log.launches[0];
-  // The structured spec carries the resolved cell dir…
+  // The structured spec carries the resolved cell dir + the wrapped-cell marker…
   expect(launch?.spec?.pluginDir).toContain(
     "plugins/plan/workers/gpt-5.5-high",
+  );
+  expect(launch?.spec?.wrappedCell).toBe("gpt-5.5::high");
+  expect(launch?.spec?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
   );
   // …and so does the byte-pinned argv: `--plugin-dir <dir>` right after `--name`.
   const argvStr = (launch?.argv ?? []).join(" ");
@@ -3890,6 +4244,11 @@ test("reconcile: a ragged host roster rejects a tier the model's narrowed effort
       models: ["opus", "sonnet", "gpt-5.5"],
       effortsByModel: new Map([["gpt-5.5", ["high"]]]),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+        ["gpt-5.5", "wrapped"],
+      ]),
     },
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];

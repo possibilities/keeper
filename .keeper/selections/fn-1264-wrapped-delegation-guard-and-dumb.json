@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting marker injection across three launch sites plus byte-pinned argv goldens is a subtle multi-file correctness surface.",
+      "task_id": "fn-1264-wrapped-delegation-guard-and-dumb.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical shell-command allowlist with a documented bypass corpus is a subtle security invariant.",
+      "task_id": "fn-1264-wrapped-delegation-guard-and-dumb.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract prose rewrite plus mechanical re-render and parity recapture is judgment-heavy but not opus-warranting.",
+      "task_id": "fn-1264-wrapped-delegation-guard-and-dumb.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Small producer-probe detection modeled on an existing sentinel precedent.",
+      "task_id": "fn-1264-wrapped-delegation-guard-and-dumb.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded docs, glossary, and ADR write modeled on existing precedents.",
+      "task_id": "fn-1264-wrapped-delegation-guard-and-dumb.5",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-12T16:19:32.230000Z",
+  "epic_id": "fn-1264-wrapped-delegation-guard-and-dumb",
+  "input_hash": "8bd503d39fda6c8a74c89d0c4f04cb21466f2029da9295959407d929fbb83be5",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2345993171,
+  "verdict_raw": "{\n  \"cells\": [\n    {\"task_id\": \"fn-1264-wrapped-delegation-guard-and-dumb.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Cross-cutting marker injection across three launch sites plus byte-pinned argv goldens is a subtle multi-file correctness surface.\", \"confidence\": 0.8},\n    {\"task_id\": \"fn-1264-wrapped-delegation-guard-and-dumb.2\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Security-critical shell-command allowlist with a documented bypass corpus is a subtle security invariant.\", \"confidence\": 0.85},\n    {\"task_id\": \"fn-1264-wrapped-delegation-guard-and-dumb.3\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"Contract prose rewrite plus mechanical re-render and parity recapture is judgment-heavy but not opus-warranting.\", \"confidence\": 0.8},\n    {\"task_id\": \"fn-1264-wrapped-delegation-guard-and-dumb.4\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"Small producer-probe detection modeled on an existing sentinel precedent.\", \"confidence\": 0.82},\n    {\"task_id\": \"fn-1264-wrapped-delegation-guard-and-dumb.5\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"Bounded docs, glossary, and ADR write modeled on existing precedents.\", \"confidence\": 0.85}\n  ]\n}\n"
+}

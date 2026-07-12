@@ -435,6 +435,12 @@ test("plan work: a WRAPPED cell in subagent_models threads the resolved --plugin
   expect(argv[nameIdx + 1]).toBe("work::fn-1-x.1");
   expect(argv[nameIdx + 2]).toBe("--plugin-dir");
   expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/gpt-5.5-high");
+  // …and the wrapped-cell guard marker rides the spec (task .1): the effective
+  // `<model>::<effort>` + the per-task envelope path under the launch repo.
+  expect(r.spec?.wrappedCell).toBe("gpt-5.5::high");
+  expect(r.spec?.wrappedEnvelope).toBe(
+    join(dir, ".keeper", "state", "wrapped-envelopes", "fn-1-x.1.json"),
+  );
 });
 
 test("plan work: with NO host matrix present, a work dispatch refuses (exit 1) with worker-cell-bad-matrix", async () => {
@@ -478,6 +484,92 @@ test("plan work: a shadowing work plugin refuses (exit 1) naming the offending m
   expect(r.spec).toBeUndefined();
   expect(r.stderr).toContain("work:worker");
   expect(r.stderr).toContain("/scan/arthack-work/.claude-plugin/plugin.json");
+});
+
+// ---------------------------------------------------------------------------
+// worker_provider pin translation (ADR 0047) — the manual dispatch applies the
+// SAME `applyProviderConstraint` seam the autopilot producer does.
+// ---------------------------------------------------------------------------
+
+/** A v2 roster: claude native (opus/sonnet) + the codex harness serving
+ *  gpt-5.6-sol (the committed map's opus→gpt target), all in subagent_models. */
+const SOL_MATRIX = [
+  "efforts: [low, medium, high, xhigh, max]",
+  "subagent_templates: [template/agents/worker.md.tmpl]",
+  "subagent_models: [opus, sonnet, gpt-5.6-sol]",
+  "providers:",
+  "  - name: claude",
+  "    models: [opus, sonnet]",
+  "  - name: codex",
+  "    models: [gpt-5.6-sol]",
+  "wrapper_driver: { model: sonnet, effort: high }",
+  "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
+  "",
+].join("\n");
+
+test("plan work: worker_provider=gpt TRANSLATES an opus cell to its mapped gpt cell + carries the dispatched-cell spec fields", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [
+        { id: 1, paused: 1, worker_provider: "gpt" } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBeUndefined(); // launched
+  // The launched cell is the TRANSLATED gpt cell, not the assigned opus cell.
+  expect(r.spec?.pluginDir).toContain("plugins/plan/workers/gpt-5.6-sol-max");
+  expect(r.spec?.dispatchedModel).toBe("gpt-5.6-sol");
+  expect(r.spec?.dispatchedTier).toBe("max");
+  expect(r.spec?.dispatchConstraint).toBe("gpt");
+  // The wrapped-cell marker keys on the EFFECTIVE (translated) cell, not the
+  // assigned opus — the pin translated an opus cell INTO a wrapped gpt cell.
+  expect(r.spec?.wrappedCell).toBe("gpt-5.6-sol::max");
+  expect(r.spec?.wrappedEnvelope).toBe(
+    join(dir, ".keeper", "state", "wrapped-envelopes", "fn-1-x.1.json"),
+  );
+});
+
+test("plan work: worker_provider=gpt with the mapped target OFF the host matrix refuses (fail-closed, exit 1)", async () => {
+  // CLAUDE_MATRIX has no gpt-5.6-sol, so translating opus/max resolves a target
+  // that is not a dispatchable cell — refuse, never fall back to opus.
+  writeMatrix(CLAUDE_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [
+        { id: 1, paused: 1, worker_provider: "gpt" } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched — no fallback to opus
+  expect(r.stderr).toContain("worker-provider-target-not-on-host");
+  expect(r.stderr).toContain("opus/max");
+});
+
+test("plan work: a NULL worker_provider pin is byte-identical to today (assigned cell, no dispatched fields)", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [{ id: 1, paused: 1 } as unknown as Row],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBeUndefined();
+  expect(r.spec?.pluginDir).toContain("plugins/plan/workers/opus-max");
+  expect(r.spec?.dispatchedModel).toBeUndefined();
+  expect(r.spec?.dispatchConstraint).toBeUndefined();
+  // A native opus cell carries NO wrapped-cell marker — the guard stays inert.
+  expect(r.spec?.wrappedCell).toBeUndefined();
+  expect(r.spec?.wrappedEnvelope).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------

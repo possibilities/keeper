@@ -236,8 +236,7 @@ export interface Band {
  * The dash readiness gate's loading state — present while the daemon is down
  * or catching up, absent once ready. `line` is pre-formatted by the app shell
  * off the freshest boot-status header (re-fold percentage, a generic
- * git-seed wait, or a plain catching-up label — no per-root list, mirroring
- * `keeper usage`'s generic gate); the view-model stays free of any
+ * git-seed wait, or a plain catching-up label — no per-root list); the view-model stays free of any
  * wire-protocol dependency.
  */
 export interface DashLoadingState {

@@ -1,58 +1,45 @@
 ## Overview
 
-Plan-time conflict prevention becomes structured and mechanical: tasks declare their
-predicted write surface as edit claims, the scaffold overlap gate refuses near-certain
-collisions between unordered tasks, a pre-arm sweep catches cross-epic collisions
-(including same-session siblings), inter-epic overlap wiring is risk-tiered instead of
-uniformly serializing, and an out-of-band calibration report scores predictions against
-landed Commit ground truth. The escalation backend (resolver → deconflict) remains the
-safety net for the residual; this epic makes the frontend stop over-serializing what
-would merge clean and stop missing what won't. Design record: ADR 0042.
+Merge-conflict prevention re-scoped to the DOMINANT cause: base-drift. A diagnostic
+over 35 historical conflicts found base-drift (a lane's base falling behind the moving
+default) is 66% of conflicts vs file-overlap 29%. This epic adds a PRODUCER-side
+base-freshness gate to autopilot's worktree mode: detect per-lane drift (behind-count +
+merge-base age), and when a lane is quiescent and drift exceeds a tunable threshold,
+refresh its base by merging the local default INTO the lane's own worktree — catching
+drift conflicts early, on the isolated delta, at a quiescent point, instead of at
+finalize. Gate defaults OFF (opt-in, like worktree_mode), tunable via set_autopilot_config.
+All git-touching logic is producer-only (never a fold; re-fold determinism).
 
 ## Quick commands
 
-- `cd plugins/plan && bun test` — fast suite including the new claims/gate/sweep tests
-- Scaffold two unordered tasks claiming the same expected path → expect `write_overlap_unordered` naming the pair; re-run with `--allow-overlap` → warns and commits
-- `keeper plan overlap-sweep <epic>` — JSON envelope of hard/soft cross-epic claim hits
-- `keeper plan claims-report <epic>` — per-tier predicted-vs-actual precision/recall for a landed epic
+- `bun test autopilot-worker worktree-git reconcile-core-depgraph` — probe + primitives + pure-core dep guard
+- `keeper autopilot config drift_behind_threshold 15` — enable/tune the gate (OFF by default)
 
 ## Acceptance
 
-- [ ] Every newly scaffolded task carries structured edit claims (present, possibly empty) and its spec's Files: line is derived from them, never hand-authored
-- [ ] Scaffold refuses DAG-incomparable same-repo tasks with colliding expected exact claims unless --allow-overlap; softer intersections warn without blocking
-- [ ] A pre-arm sweep reports cross-epic claim collisions including same-session siblings; hard hits wire depends_on_epics through the existing add-deps verb
-- [ ] Inter-epic overlap guidance is risk-tiered in lockstep across the plan skill, epic-scout, and gap-analyst — no surface still states the uniform overlap-to-edge rule
-- [ ] Worktree merge conflicts record the conflicted file set structurally; the escalation brief consumes it without stderr regex when present
-- [ ] A calibration verb scores claims against landed Commit files per certainty tier (precision AND recall, never accuracy) and lists unclaimed tasks
-- [ ] The diagnostic spike's verdict is recorded; a not-dominant verdict paused the epic at the check-in instead of building
+- [ ] A producer probe computes per-(epic,repo) base-drift (behind-count + merge-base age) as plain snapshot data, worktreeMode-gated, defer-on-inconclusive, never in a fold.
+- [ ] When enabled and a lane is quiescent + past threshold, a producer pass merges the local default INTO the lane's base worktree (default→base), rate-limited, reusing mergeBranchInto; refresh conflicts route to the existing worktree-merge-conflict→resolver→deconflict chain.
+- [ ] Thresholds are durable autopilot_state config via set_autopilot_config (no new RPC); the gate defaults OFF.
+- [ ] Merge conflicts (fan-in, finalize, refresh) record a structured conflicted-file set on dispatch_failures.
+- [ ] ADR 0042 is revised in place to the base-drift design; the edit_claims/overlap-gate glossary terms are removed and base-drift/base-freshness terms added.
 
 ## Early proof point
 
-Task that proves the approach: ordinal 1 (the conflict-cause diagnostic spike). If it
-fails or returns a not-dominant verdict: the epic pauses at the designed check-in and is
-refined toward the dominant conflict class (base-drift → rebase-cadence work) instead of
-building the claims machinery.
+Task `.2` (the drift probe) proves detection is cheap + deterministic producer-side. If
+drift can't be measured reliably, the refresh gate has nothing to trigger on — surface
+before building `.4`.
 
 ## References
 
-- ADR 0042 (edit claims + risk-tiered overlap wiring); ADR 0018 (out-of-band review precedent); ADR 0020 (merge-time schema renumber)
-- `fn-1239` (overlap) — its in-flight task edits src/reducer.ts and appends a SCHEMA_STEPS entry + SCHEMA_FINGERPRINT re-pin; this epic's conflict-files column is a sibling ladder bump on the singleton migration ladder, serialized via the wired epic dep
-- Named follow-up (calibration-gated, OUT of scope): dispatch-time overlap defer — an ephemeral producer probe twin of computeDeferredEpicIds applied at the reconciler's per-row work gate before the losing lane is cut; build only if the calibration report shows a non-trivial residual after this epic lands
-- Named follow-up: a dedicated post-decomposition edit-surface scout — promote from planner-inline claim seeding if calibration recall stays low
-- Future enhancement: counterfactual replay (offline pairwise merge dry-run of hard-serialized pairs' landed diffs) to de-bias the selective-labels gap in calibration
-- Known holes (accepted): rename collisions are invisible to path claims (git rename detection is content-based); semantic conflicts are invisible to file claims — the resolver pipeline remains the backstop
-- Working-tree coordination: worker-implement partials and the render-plugin-templates fixture were dirty from prior epic work at plan time — a worker regenerating templates must verify current state first
+- ADR 0016 (stale-aware shared-checkout catch-up), ADR 0008 (why merges avoid the shared checkout), ADR 0042 (revised in place to base-drift).
+- Prior art / reuse: `computeStaleBaseLaneEntries` (autopilot-worker.ts:2863), `computeDeferredEpicIds` (:2403), `loadReconcileSnapshot` hook (:7399-7423), `mergeBranchInto`/`mergeReadiness` (worktree-git.ts:1554/:767), provision fork-source (:4118).
+- Diagnostic verdict (task .1, complete): base-drift 66% (23/35) vs file-overlap 29% (10/35) across 35 keeper.db conflict incidents — the input driving this re-scope.
+- Merge-queue guidance: refresh at the gate not continuously; MERGE default→base (never rebase a base dependent lanes build on); combined behind-count-OR-age trigger, tunable, defer on inconclusive git.
+- NOTE (tooling): task titles `.2`-`.5`/`.7` retain their pre-rescope edit-claims wording — the plan tooling cannot rename tasks; each task's SPEC is the authoritative base-drift work.
 
 ## Docs gaps
 
-- **docs/problem-codes.md**: add `claims_invalid` and `write_overlap_unordered` rows in the same change each code lands (the file's own contract)
-- **plugins/plan/README.md**: document the edit_claims task field, the overlap gate + --allow-overlap, and the two new verbs; prune the prose-Files framing
-- **plugins/plan/CLAUDE.md**: one-line guardrail — edit claims are the write-surface source of truth; never hand-author the Files: line
-
-## Best practices
-
-- **Certainty-tiered gating:** only ~7–20% of concurrent same-file edits conflict textually — reject only near-certain collisions, let the rest race into the resolver [merge-conflict mining studies]
-- **Selective-labels bias:** hard-serialized pairs never race; never read their absence of conflicts as gate precision — keep one evaluation path uninfluenced by the gate's own decisions
-- **Per-tier precision AND recall, never accuracy:** a 10–20% base rate makes accuracy meaningless; false positive = silent lost parallelism, false negative = one resolver invocation — asymmetric costs, tracked separately
-- **Glob discipline:** pin semantics explicitly (`*` never crosses `/`), reject invalid patterns (`..`, absolute, backslash) loudly, bound complexity — claims are agent-authored input
-- **Rename blindness:** path claims cannot see rename collisions — a documented recall hole, not a bug to fix in globs
+- **docs/adr/0042**: revise in place toward base-freshness/rebase-cadence; keep decision #4 (conflicted-file capture) + #5 (measurement); do NOT move to superseded/ (never landed).
+- **CONTEXT.md**: remove Edit claim / Overlap gate; add base-drift / base-freshness / lane-base terms (relate to Merge-gate).
+- **CLAUDE.md**: one-line producer-only base-freshness guardrail on the merge-gate line.
+- **docs/problem-codes.md**: add a row only if a new distress code is minted (else reuse worktree-merge-conflict).

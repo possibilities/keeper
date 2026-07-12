@@ -68,3 +68,12 @@ across families.
   classifies the gap and affected dispatches fail closed in the interim.
 - The equivalence-map loader respects the two-island import boundary (plan island vs launcher
   island), mirroring the dual `matrix.yaml` parsers rather than adding a cross-island edge.
+
+## Amendment — family label `codex` → `gpt`
+
+The non-claude provider-family label was renamed `codex` → harness-neutral `gpt`, decoupling the
+dispatch label from the codex *harness* serving the GPT tiers. `worker_provider` is now
+`NULL | claude | gpt`; map directions `claude_to_gpt` / `gpt_to_claude`. `codex` stays a deprecated
+input alias on every write seam (CLI, RPC, reducer fold) normalized to `gpt` — an existing pin
+survives; reads are strict (a stray `codex` reads unset); the fold normalization is load-bearing for
+re-fold determinism (historical events carry `codex`). A `v122` backfill rewrites the durable column value. The codex *harness* is a separate concern, unchanged; the bodies above keep the old spelling as history.

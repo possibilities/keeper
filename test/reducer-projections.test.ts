@@ -357,319 +357,30 @@ function planEvent(args: {
 }
 
 // ---------------------------------------------------------------------------
-// Profiles projection (schema v33, fn-639) — `config_dir`-keyed correlation
-// of the last `rate_limit` ApiError with each Claude profile.
+// Profiles projection — retired at schema v120 (fn-1239 task .6). The
+// SessionStart seed + RateLimited/ApiError fan-out into `profiles` is gone;
+// see test/reducer-lifecycle.test.ts for the paired UsageSnapshot/UsageDeleted
+// no-op coverage and the historical re-fold safety test.
 // ---------------------------------------------------------------------------
 
-test("SessionStart seeds a profiles row keyed on config_dir; NULL config_dir collapses to the '' sentinel (fn-639)", () => {
-  // Three SessionStarts on three distinct config dirs (including NULL).
-  // Each seeds its own row; the NULL bucket collapses to '' via the
-  // COALESCE in the seed UPSERT. Quiet profiles (no rate_limit) carry
-  // NULL last_rate_limit_at — the seed only stamps last_event_id +
-  // updated_at.
+test("SessionStart no longer seeds a profiles row — the retired table is absent at head (fn-1239 task .6, formerly fn-639)", () => {
   insertEvent({
     hook_event: "SessionStart",
-    session_id: "sess-a",
+    session_id: "sess-pn-retired",
     config_dir: "/Users/x/.claude-profiles/multi-claude-1",
   });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-b",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-2",
-  });
-  // NULL → '' sentinel.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default",
-    config_dir: null,
-  });
-  drainAll();
-  const rows = db
-    .query(
-      "SELECT config_dir, last_rate_limit_at, last_rate_limit_session_id FROM profiles ORDER BY config_dir ASC",
-    )
-    .all() as {
-    config_dir: string;
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  }[];
-  expect(rows).toEqual([
-    {
-      config_dir: "",
-      last_rate_limit_at: null,
-      last_rate_limit_session_id: null,
-    },
-    {
-      config_dir: "/Users/x/.claude-profiles/multi-claude-1",
-      last_rate_limit_at: null,
-      last_rate_limit_session_id: null,
-    },
-    {
-      config_dir: "/Users/x/.claude-profiles/multi-claude-2",
-      last_rate_limit_at: null,
-      last_rate_limit_session_id: null,
-    },
-  ]);
-});
-
-test("SessionStart seed is INSERT OR IGNORE: a duplicate SessionStart on the same config_dir does not re-stamp last_event_id (fn-639)", () => {
-  // First SessionStart seeds the row. A second SessionStart on the SAME
-  // config_dir (resume, or a different session under the same profile)
-  // must NOT overwrite — INSERT OR IGNORE keeps the first seed's
-  // (last_event_id, updated_at).
-  const id1 = insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-a",
-    config_dir: "/p/A",
-  });
-  drainAll();
-  const after1 = db
-    .query(
-      "SELECT last_event_id, updated_at FROM profiles WHERE config_dir = '/p/A'",
-    )
-    .get() as { last_event_id: number; updated_at: number };
-  expect(after1.last_event_id).toBe(id1);
-
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-b",
-    config_dir: "/p/A",
-  });
-  drainAll();
-  const after2 = db
-    .query(
-      "SELECT last_event_id, updated_at FROM profiles WHERE config_dir = '/p/A'",
-    )
-    .get() as { last_event_id: number; updated_at: number };
-  // Unchanged — the first seed's last_event_id stuck.
-  expect(after2.last_event_id).toBe(id1);
-  expect(after2.updated_at).toBe(after1.updated_at);
-});
-
-test("RateLimited UPSERTs last_rate_limit_at + last_rate_limit_session_id keyed on the session's config_dir (fn-639)", () => {
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-rl",
-    config_dir: "/Users/x/.claude-profiles/multi-claude-3",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl" });
-  const rlId = insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-rl",
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT config_dir, last_rate_limit_at, last_rate_limit_session_id, last_event_id FROM profiles WHERE config_dir = ?",
-    )
-    .get("/Users/x/.claude-profiles/multi-claude-3") as {
-    config_dir: string;
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-    last_event_id: number;
-  };
-  expect(row.last_rate_limit_at).not.toBeNull();
-  expect(row.last_rate_limit_session_id).toBe("sess-rl");
-  expect(row.last_event_id).toBe(rlId);
-});
-
-test("ApiError(kind='rate_limit') folds to byte-identical profiles row as a sibling RateLimited (fn-639)", () => {
-  // Dual-case parity: the legacy RateLimited synthetic and the v24 ApiError
-  // with data.kind='rate_limit' MUST land identical (last_rate_limit_session_id,
-  // config_dir) on the profile row. Two parallel sessions under TWO distinct
-  // config dirs — one fires RateLimited, the other fires ApiError(rate_limit) —
-  // then assert both profiles carry the matching last_rate_limit_session_id.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-legacy",
-    config_dir: "/p/legacy",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-legacy" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-legacy" });
-
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-new",
-    config_dir: "/p/new",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-new" });
-  insertEvent({
-    hook_event: "ApiError",
-    session_id: "sess-new",
-    data: JSON.stringify({ kind: "rate_limit" }),
-  });
-  drainAll();
-  const legacy = db
-    .query(
-      "SELECT last_rate_limit_session_id FROM profiles WHERE config_dir = '/p/legacy'",
-    )
-    .get() as { last_rate_limit_session_id: string };
-  expect(legacy.last_rate_limit_session_id).toBe("sess-legacy");
-  const fresh = db
-    .query(
-      "SELECT last_rate_limit_session_id FROM profiles WHERE config_dir = '/p/new'",
-    )
-    .get() as { last_rate_limit_session_id: string };
-  expect(fresh.last_rate_limit_session_id).toBe("sess-new");
-});
-
-test("Non-rate_limit ApiError kinds do NOT touch the profiles row (fn-639)", () => {
-  // Profiles is the rate_limit-only correlation surface; the five non-
-  // rate_limit ApiErrorKind values must not stamp the rate-limit columns
-  // (the seed row stays NULL on last_rate_limit_*).
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-auth",
-    config_dir: "/p/auth",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-auth" });
-  insertEvent({
-    hook_event: "ApiError",
-    session_id: "sess-auth",
-    data: JSON.stringify({ kind: "authentication_failed" }),
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT last_rate_limit_at, last_rate_limit_session_id FROM profiles WHERE config_dir = '/p/auth'",
-    )
-    .get() as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  };
-  expect(row.last_rate_limit_at).toBeNull();
-  expect(row.last_rate_limit_session_id).toBeNull();
-});
-
-test("Last-write-wins: a second rate_limit on the same profile overwrites the first (fn-639)", () => {
-  // Two RateLimited events under the same config_dir from two distinct
-  // sessions. Events fold in id order, so the SECOND (higher id) lands on
-  // the row.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-first",
-    config_dir: "/p/shared",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-first" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-first" });
-
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-second",
-    config_dir: "/p/shared",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-second" });
-  const secondRlId = insertEvent({
-    hook_event: "RateLimited",
-    session_id: "sess-second",
-  });
-  drainAll();
-  const row = db
-    .query(
-      "SELECT last_rate_limit_session_id, last_event_id FROM profiles WHERE config_dir = '/p/shared'",
-    )
-    .get() as { last_rate_limit_session_id: string; last_event_id: number };
-  expect(row.last_rate_limit_session_id).toBe("sess-second");
-  expect(row.last_event_id).toBe(secondRlId);
-});
-
-test("NULL-config rate_limit lands on the '' sentinel row that the seed seeded (fn-639)", () => {
-  // Identical COALESCE expression in seed + UPSERT — a NULL-config session's
-  // rate_limit must land on the exact '' row the seed minted (no orphaned
-  // duplicate bucket).
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default",
-    config_dir: null,
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
-  drainAll();
-  const rows = db
-    .query("SELECT config_dir, last_rate_limit_session_id FROM profiles")
-    .all() as {
-    config_dir: string;
-    last_rate_limit_session_id: string | null;
-  }[];
-  expect(rows).toHaveLength(1);
-  expect(rows[0]?.config_dir).toBe("");
-  expect(rows[0]?.last_rate_limit_session_id).toBe("sess-default");
-});
-
-test("rate_limit before SessionStart is null-guarded (no jobs row → skip; cursor still advances) (fn-639)", () => {
-  // The rate_limit fan-out reads jobs.config_dir; if the jobs row is
-  // absent (rate_limit landing before SessionStart on a brand-new
-  // session) the read returns null and the UPSERT is skipped — the
-  // cursor still advances per the "never throw inside fold" invariant.
   const id = insertEvent({
     hook_event: "RateLimited",
-    session_id: "ghost-session",
+    session_id: "sess-pn-retired",
   });
-  drainAll();
+  expect(() => drainAll()).not.toThrow();
   expect(getCursor()).toBe(id);
-  // No profile row was stamped — the jobs row was missing.
-  const n = (
-    db.query("SELECT COUNT(*) AS n FROM profiles").get() as { n: number }
-  ).n;
-  expect(n).toBe(0);
-});
-
-test("from-scratch re-fold reproduces the profiles projection byte-identically (fn-639)", () => {
-  // Mirrors the usage re-fold determinism test (~:2450-2502). Seed a
-  // sequence covering: (a) two distinct profiles, (b) a NULL-config
-  // session collapsing to '', (c) a rate_limit, (d) a second rate_limit
-  // on the same profile from a different session (last-write-wins), and
-  // (e) an unrelated ApiError(authentication_failed) that must NOT stamp
-  // the profile rate-limit fields.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-A",
-    config_dir: "/p/A",
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-B",
-    config_dir: "/p/B",
-  });
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-default",
-    config_dir: null,
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-A" });
-  insertEvent({ hook_event: "RateLimited", session_id: "sess-A" });
-  // Second session under same profile A — last write wins.
-  insertEvent({
-    hook_event: "SessionStart",
-    session_id: "sess-A2",
-    config_dir: "/p/A",
-  });
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-A2" });
-  insertEvent({
-    hook_event: "ApiError",
-    session_id: "sess-A2",
-    data: JSON.stringify({ kind: "rate_limit" }),
-  });
-  // Unrelated kind under profile B — must not touch last_rate_limit_*.
-  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-B" });
-  insertEvent({
-    hook_event: "ApiError",
-    session_id: "sess-B",
-    data: JSON.stringify({ kind: "authentication_failed" }),
-  });
-  drainAll();
-  const before = db
-    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
-    .all();
-  // Rewind + wipe + re-drain. Re-fold determinism: the post-rewind rows
-  // must equal byte-for-byte the pre-rewind rows.
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM profiles");
-  drainAll();
-  const after = db
-    .query("SELECT * FROM profiles ORDER BY config_dir ASC")
-    .all();
-  expect(after).toEqual(before);
+  const hasProfiles = db
+    .query(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'profiles'",
+    )
+    .get();
+  expect(hasProfiles ?? null).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -1952,6 +1663,233 @@ test("a DispatchFailed re-UPSERT of an uncleared WORK row preserves human_notifi
   );
   drainAll();
   expect(getHumanNotifiedAt("work", "fn-wk-pres.1")).toBe(1750);
+});
+
+// ---------------------------------------------------------------------------
+// `SharedCheckoutHumanNotified` folds the terminal page-once marker
+// `dispatch_failures.human_notified_at` on a `shared-checkout-{dirty,desync}:<hash>`
+// distress row (the daemon distress verb). A TERMINAL `notified` stamps
+// `human_notified_at = event.ts` (gated IS NULL); a `notify_failed` / unknown outcome
+// leaves it NULL (re-sweepable). The marker PERSISTS across a `DispatchFailed` re-UPSERT
+// (reason churn) of an uncleared row and is dropped with the row on its producer
+// level-clear (`DispatchCleared`), re-arming a re-minted row at NULL so it pages anew.
+// Pure fold (event.ts + persisted row only) → re-fold reproduces the stamp.
+// ---------------------------------------------------------------------------
+
+const SHARED_DIRTY_ROW_ID = "shared-checkout-dirty:abc123";
+const SHARED_DESYNC_ROW_ID = "shared-checkout-desync:def456";
+// The shared daemon distress verb both families ride (mirrors
+// SHARED_DIRTY_DISTRESS_VERB / SHARED_DESYNC_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB).
+const SHARED_DISTRESS_VERB = "daemon";
+
+function sharedCheckoutHumanNotifiedEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "SharedCheckoutHumanNotified",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome }),
+  });
+}
+
+function seedSharedCheckoutRow(id: string, reason: string, ts: number): void {
+  dispatchFailedEvent(SHARED_DISTRESS_VERB, id, reason, "/repo", ts);
+}
+
+test("SharedCheckoutHumanNotified stamps human_notified_at = event.ts on the terminal notified outcome (dirty + desync families)", () => {
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: /repo has stayed dirty past grace",
+    1700,
+  );
+  seedSharedCheckoutRow(
+    SHARED_DESYNC_ROW_ID,
+    "shared-checkout-desync: /repo has stayed DESYNCED past grace",
+    1700,
+  );
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID),
+  ).toBeNull();
+
+  const dirtyId = sharedCheckoutHumanNotifiedEvent(
+    SHARED_DIRTY_ROW_ID,
+    "notified",
+    1750,
+  );
+  sharedCheckoutHumanNotifiedEvent(SHARED_DESYNC_ROW_ID, "notified", 1760);
+  expect(drainAll()).toBe(2);
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID)).toBe(
+    1760,
+  );
+  expect(getCursor()).toBeGreaterThanOrEqual(dirtyId);
+});
+
+test("SharedCheckoutHumanNotified with a notify_failed / unknown outcome leaves human_notified_at NULL (re-sweepable)", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notify_failed", 1750);
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+
+  // An unknown outcome is non-terminal too (terminal is a strict allow-list).
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "weird_outcome", 1760);
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+
+  // A later terminal retry over the same still-uncleared row stamps it.
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1770);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1770,
+  );
+});
+
+test("SharedCheckoutHumanNotified is idempotent — a second notified event no-ops (first observation wins)", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+
+  // A second terminal notify (later ts) must NOT move the marker — gated IS NULL.
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1900);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+});
+
+test("SharedCheckoutHumanNotified marker survives a DispatchFailed re-UPSERT (reason churn preserves page-once)", () => {
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: /repo has stayed dirty past grace",
+    1700,
+  );
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+
+  // The producer re-mints the SAME uncleared row with a churned reason sentence
+  // (a fresh dirty-count / recover verdict). The UPSERT must PRESERVE the marker —
+  // else the page-once sweep would re-page every heartbeat.
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: /repo has stayed dirty past grace (12 paths)",
+    1850,
+  );
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+});
+
+test("SharedCheckoutHumanNotified: DispatchCleared drops the marker with the row so a re-minted row pages anew (re-arm at NULL)", () => {
+  seedSharedCheckoutRow(
+    SHARED_DESYNC_ROW_ID,
+    "shared-checkout-desync: x",
+    1700,
+  );
+  sharedCheckoutHumanNotifiedEvent(SHARED_DESYNC_ROW_ID, "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID)).toBe(
+    1750,
+  );
+
+  // The producer's observed-clean level-trigger DELETEs the row.
+  dispatchClearedEvent(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID);
+  drainAll();
+  expect(
+    getDispatchFailure(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID),
+  ).toBeNull();
+
+  // A fresh incident episode re-mints the row — the marker re-arms at NULL, so the
+  // next page-once sweep pages anew.
+  seedSharedCheckoutRow(
+    SHARED_DESYNC_ROW_ID,
+    "shared-checkout-desync: x",
+    1900,
+  );
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID),
+  ).toBeNull();
+});
+
+test("SharedCheckoutHumanNotified on a missing row is a safe no-op (cursor advances)", () => {
+  const id = sharedCheckoutHumanNotifiedEvent(
+    "shared-checkout-dirty:gone",
+    "notified",
+    1750,
+  );
+  expect(drainAll()).toBe(1);
+  expect(
+    getDispatchFailure(SHARED_DISTRESS_VERB, "shared-checkout-dirty:gone"),
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("SharedCheckoutHumanNotified with a malformed payload is a safe no-op (cursor advances, marker untouched)", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  drainAll();
+  const malformed = [
+    "{ not json",
+    JSON.stringify({ outcome: "notified" }), // missing id
+    JSON.stringify({ id: "", outcome: "notified" }), // empty id
+    JSON.stringify({ id: SHARED_DIRTY_ROW_ID }), // missing outcome
+    JSON.stringify({ id: SHARED_DIRTY_ROW_ID, outcome: "" }), // empty outcome
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "SharedCheckoutHumanNotified",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+});
+
+test("from-scratch re-fold reproduces the SharedCheckoutHumanNotified stamp byte-identically", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notify_failed", 1740);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1750);
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: churn",
+    1800,
+  );
+  drainAll();
+  const before = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  expect(after).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------
@@ -3993,6 +3931,7 @@ function autopilotConfigSetEvent(
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
     codex_adoption?: boolean;
+    worker_provider?: "claude" | "gpt" | "codex" | null;
   },
   sessionId = "autopilot",
 ): number {
@@ -4016,6 +3955,7 @@ function getAutopilotStateConfig() {
     worktree_mode: number | null;
     worktree_multi_repo: number | null;
     codex_adoption: number | null;
+    worker_provider: string | null;
   } | null;
 }
 
@@ -4526,6 +4466,134 @@ test("AutopilotConfigSet present-but-non-boolean codex_adoption coerces to 0 (OF
     autopilotConfigSetEvent({ codex_adoption: true });
     drainAll();
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-1256 task .3 — `worker_provider` is the durable work-dispatch provider
+// pin (docs/adr/0047), riding the same generic `AutopilotConfigSet` fold as
+// `codex_adoption` but the FIRST non-numeric config column: a STRICT string
+// enum (`"claude"` | `"gpt"` | `null`, with the deprecated `"codex"` folded to
+// `"gpt"` for re-fold determinism), never coerced to a sentinel.
+// ---------------------------------------------------------------------------
+
+test("AutopilotConfigSet {worker_provider:'claude'} sets the column and advances the cursor (fn-1256)", () => {
+  const eventId = autopilotConfigSetEvent({ worker_provider: "claude" });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row?.worker_provider).toBe("claude");
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+  // INSERT path still materializes the boots-paused / yolo defaults.
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotConfigSet {worker_provider:'gpt'} sets the column (fn-1256)", () => {
+  autopilotConfigSetEvent({ worker_provider: "gpt" });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("gpt");
+});
+
+test("AutopilotConfigSet {worker_provider:'codex'} folds the deprecated alias to 'gpt' (re-fold determinism; docs/adr/0047)", () => {
+  autopilotConfigSetEvent({ worker_provider: "codex" });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("gpt");
+});
+
+test("AutopilotConfigSet {worker_provider:null} explicitly clears the pin to SQL NULL (fn-1256)", () => {
+  autopilotConfigSetEvent({ worker_provider: "claude" });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
+  autopilotConfigSetEvent({ worker_provider: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBeNull();
+});
+
+test("AutopilotConfigSet {worker_provider} PRESERVES paused, mode, worktree flags, and both concurrency columns (fn-1256)", () => {
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 4,
+    max_concurrent_per_root: 3,
+    worktree_mode: true,
+    worktree_multi_repo: true,
+  });
+  drainAll();
+  autopilotConfigSetEvent({ worker_provider: "gpt" });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.worker_provider).toBe("gpt"); // landed
+  expect(row?.worktree_mode).toBe(1); // worktree_mode PRESERVED
+  expect(row?.worktree_multi_repo).toBe(1); // worktree_multi_repo PRESERVED
+  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
+  expect(row?.max_concurrent_per_root).toBe(3); // per-root PRESERVED
+  expect(row?.paused).toBe(0); // play PRESERVED
+  expect(row?.mode).toBe("armed"); // mode PRESERVED
+});
+
+test("a codex_adoption patch and a pause toggle PRESERVE worker_provider (fn-1256)", () => {
+  autopilotConfigSetEvent({ worker_provider: "claude" });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
+  autopilotConfigSetEvent({ codex_adoption: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude"); // preserved
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude"); // preserved
+});
+
+test("AutopilotConfigSet present-but-unrecognized worker_provider DROPS the field — never throws, never coerces (fn-1256)", () => {
+  // Unlike the numeric fields (which coerce a bad value to a sentinel), an
+  // unrecognized worker_provider value is dropped from the patch entirely —
+  // the existing column survives untouched. The RPC validator rejects a bad
+  // value loud before it ever reaches the fold; this is a defensive backstop.
+  autopilotConfigSetEvent({ worker_provider: "claude" });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
+  for (const bad of ["sonnet", 1, true, ""]) {
+    insertEvent({
+      hook_event: "AutopilotConfigSet",
+      session_id: "autopilot",
+      data: JSON.stringify({ worker_provider: bad }),
+    });
+    drainAll();
+    // Untouched — the malformed field never reached the column.
+    expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
+  }
+});
+
+test("AutopilotConfigSet malformed JSON payload for worker_provider folds to a safe no-op, never throws (fn-1256)", () => {
+  insertEvent({
+    hook_event: "AutopilotConfigSet",
+    session_id: "autopilot",
+    data: "not json",
+  });
+  expect(() => drainAll()).not.toThrow();
+  expect(getAutopilotStateConfig()).toBeNull();
+});
+
+test("from-scratch re-fold reproduces autopilot_state byte-identically with a worker_provider column (fn-1256)", () => {
+  autopilotConfigSetEvent({ worker_provider: "claude" });
+  autopilotPausedEvent(false);
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 9,
+    worker_provider: "gpt",
+  });
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({ worker_provider: null });
+  drainAll();
+  const before = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  expect(getAutopilotStateConfig()?.worker_provider).toBeNull();
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  expect(getAutopilotStateConfig()?.mode).toBe("armed");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
+  expect(after).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------

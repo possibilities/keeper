@@ -1,7 +1,7 @@
 /**
  * Dead-letter watcher worker (fn-643 task .3). keeperd's SEVENTH Bun Worker
  * thread, joining the producer-worker fleet (`plan-worker`, `transcript-worker`,
- * `usage-worker`, `git-worker`, `exit-watcher`, `server-worker`, `wake-worker`).
+ * `statusline-worker`, `git-worker`, `exit-watcher`, `server-worker`, `wake-worker`).
  *
  * The hook writes per-pid NDJSON files to `~/.local/state/keeper/dead-letters/`
  * when its `events` INSERT exhausts its retry budget (see fn-643 task .2 in

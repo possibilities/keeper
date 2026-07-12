@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import {
+import taskFacadeExtension, {
   createTaskFacadeTool,
   type PiTaskEventBus,
+  type PiTaskToolDefinition,
 } from "../plugins/keeper/pi-extension/task-facade";
 
 class FakeBus implements PiTaskEventBus {
@@ -21,6 +22,18 @@ class FakeBus implements PiTaskEventBus {
 
 const flushMicrotasks = (): Promise<void> =>
   new Promise((resolve) => queueMicrotask(resolve));
+
+function withKeeperJobId(value: string | undefined, run: () => void): void {
+  const saved = process.env.KEEPER_JOB_ID;
+  try {
+    if (value === undefined) delete process.env.KEEPER_JOB_ID;
+    else process.env.KEEPER_JOB_ID = value;
+    run();
+  } finally {
+    if (saved === undefined) delete process.env.KEEPER_JOB_ID;
+    else process.env.KEEPER_JOB_ID = saved;
+  }
+}
 
 interface SpawnRequest {
   requestId: string;
@@ -64,6 +77,44 @@ function rpcBus(version = 2): {
   });
   return { bus, spawns, stops };
 }
+
+describe("Pi Task facade extension", () => {
+  test("an armed child registers only Task", () => {
+    withKeeperJobId("job-parent", () => {
+      const tools: PiTaskToolDefinition[] = [];
+      taskFacadeExtension({
+        events: new FakeBus(),
+        registerTool: (tool) => tools.push(tool),
+      });
+      expect(tools.map((tool) => tool.name)).toEqual(["Task"]);
+    });
+  });
+
+  test("an untracked child registers nothing", () => {
+    withKeeperJobId(undefined, () => {
+      const tools: PiTaskToolDefinition[] = [];
+      taskFacadeExtension({
+        events: new FakeBus(),
+        registerTool: (tool) => tools.push(tool),
+      });
+      expect(tools).toEqual([]);
+    });
+  });
+
+  test("a missing or throwing Pi surface fails open", () => {
+    withKeeperJobId("job-parent", () => {
+      expect(() => taskFacadeExtension({})).not.toThrow();
+      expect(() =>
+        taskFacadeExtension({
+          events: new FakeBus(),
+          registerTool: () => {
+            throw new Error("registration failed");
+          },
+        }),
+      ).not.toThrow();
+    });
+  });
+});
 
 describe("Pi Task facade", () => {
   test("returns only the terminal result body and keeps metadata in details", async () => {

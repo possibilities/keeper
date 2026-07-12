@@ -174,6 +174,73 @@ else
   echo "install: pi-subagents fork unavailable; pi keeps its current package source"
 fi
 
+# 3c. CodexBar CLI: install the latest signed upstream release directly into
+#     ~/.local/bin. Keeper owns this install surface; remove Homebrew's GUI cask
+#     only after the replacement CLI is downloaded and checksum-verified.
+codexbar_cli_install() {
+  local arch tag version asset release_url install_tmp expected_sha actual_sha cli_dir
+  cli_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/keeper/codexbar"
+  case "$(uname -m)" in
+    arm64) arch="arm64" ;;
+    x86_64) arch="x86_64" ;;
+    *)
+      echo "install: unsupported CodexBar CLI architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+
+  tag="$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+    https://github.com/steipete/CodexBar/releases/latest)"
+  tag="${tag##*/}"
+  if [[ ! "${tag}" =~ ^v[0-9] ]]; then
+    echo "install: could not resolve the latest CodexBar release tag" >&2
+    return 1
+  fi
+  version="${tag#v}"
+  asset="CodexBarCLI-v${version}-macos-${arch}.tar.gz"
+  release_url="https://github.com/steipete/CodexBar/releases/download/${tag}"
+
+  if [ -x "${cli_dir}/CodexBarCLI" ] \
+    && [ "$(cat "${cli_dir}/VERSION" 2>/dev/null || true)" = "${version}" ]; then
+    echo "install: CodexBar CLI ${version} already installed"
+  else
+    install_tmp="$(mktemp -d "${TMPDIR:-/tmp}/keeper-codexbar-cli.XXXXXX")"
+    if ! (
+      set -Eeuo pipefail
+      trap 'rm -rf "${install_tmp}"' EXIT
+      curl -fsSL --retry 3 -o "${install_tmp}/${asset}" "${release_url}/${asset}"
+      curl -fsSL --retry 3 -o "${install_tmp}/${asset}.sha256" \
+        "${release_url}/${asset}.sha256"
+      expected_sha="$(awk 'NR == 1 { print $1 }' "${install_tmp}/${asset}.sha256")"
+      actual_sha="$(shasum -a 256 "${install_tmp}/${asset}" | awk '{ print $1 }')"
+      if [ -z "${expected_sha}" ] || [ "${actual_sha}" != "${expected_sha}" ]; then
+        echo "install: CodexBar CLI checksum verification failed" >&2
+        exit 1
+      fi
+      tar -xzf "${install_tmp}/${asset}" -C "${install_tmp}"
+      mkdir -p "${HOME}/.local/bin" "${cli_dir}"
+      install -m 755 "${install_tmp}/CodexBarCLI" "${cli_dir}/.CodexBarCLI.new"
+      install -m 644 "${install_tmp}/VERSION" "${cli_dir}/.VERSION.new"
+      mv -f "${cli_dir}/.CodexBarCLI.new" "${cli_dir}/CodexBarCLI"
+      mv -f "${cli_dir}/.VERSION.new" "${cli_dir}/VERSION"
+      ln -sfn "${cli_dir}/CodexBarCLI" "${HOME}/.local/bin/codexbar"
+      rm -f "${HOME}/.local/bin/CodexBarCLI"
+    ); then
+      echo "install: CodexBar CLI release installation failed" >&2
+      return 1
+    fi
+    echo "install: installed CodexBar CLI ${version} from upstream release"
+  fi
+
+  if command -v brew >/dev/null 2>&1 && brew list --cask codexbar >/dev/null 2>&1; then
+    echo "install: removing Homebrew CodexBar cask; keeper owns the CLI"
+    brew uninstall --cask --force codexbar >/dev/null
+  fi
+}
+if ! codexbar_cli_install; then
+  echo "install: CodexBar CLI step failed (non-fatal); continuing" >&2
+fi
+
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it

@@ -140,7 +140,7 @@ describe("selection-audit-brief assembly", () => {
     expect(gitLogCount(proj.root)).toBe(before + 1);
 
     const brief = loadBrief(proj.root, epicId);
-    expect(brief.schema_version).toBe(1);
+    expect(brief.schema_version).toBe(2);
     expect(brief.epic_id).toBe(epicId);
     expect(brief.selection_config_hash).toBe("cfg-hash-abc");
     expect(brief.selection_input_hash).toBe("in-hash-xyz");
@@ -148,8 +148,13 @@ describe("selection-audit-brief assembly", () => {
     expect(auditable).toHaveLength(1);
     const a0 = auditable[0] as Record<string, unknown>;
     expect(a0.task_id).toBe(t0);
+    // No dispatched_* runtime keys were seeded, so the documented fallback
+    // applies: the dispatched cell equals the assigned cell, no constraint.
     expect(a0.tier).toBe("high");
     expect(a0.model).toBe("opus");
+    expect(a0.assigned_tier).toBe("high");
+    expect(a0.assigned_model).toBe("opus");
+    expect(a0.constraint).toBeNull();
     // The blinded brief never carries the selector's rationale/confidence/
     // label_source — those stay in the selection sidecar for calibration only.
     expect(a0.rationale).toBeUndefined();
@@ -252,6 +257,55 @@ describe("selection-audit-brief assembly", () => {
       insertions: 0,
       deletions: 0,
     });
+  });
+
+  test("constrained task emits both cells + constraint; unconstrained task falls back to dispatched == assigned", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(proj, { nTasks: 2 });
+    const [t0, t1] = taskIds as [string, string];
+    writeSidecar(proj.root, epicId, [
+      { task_id: t0, tier: "high", model: "opus" },
+      { task_id: t1, tier: "medium", model: "opus" },
+    ]);
+    // t0: a worker-provider constraint translated the assigned cell at claim,
+    // so the runtime carries the dispatched cell that actually ran, distinct
+    // from the sidecar's assigned cell.
+    seedRuntime(proj.root, t0, {
+      status: "done",
+      claimed_at: "2026-06-06T00:00:00.000000Z",
+      assignee: "worker@x",
+      dispatched_model: "sonnet",
+      dispatched_tier: "low",
+      dispatch_constraint: "worker_provider=claude",
+    });
+    // t1: an ordinary unconstrained done task — no dispatched_* runtime keys.
+    // Needs execution evidence (a source commit) to be auditable at all.
+    doneTask(proj, t1);
+    seedCommit(proj.root, t1, [{ path: "c.ts", insertions: 1, deletions: 0 }]);
+
+    const r = runCli(
+      ["selection-audit-brief", epicId, "--project", proj.root],
+      { cwd: proj.root, home: proj.home },
+    );
+    expect(r.code).toBe(0);
+    const brief = loadBrief(proj.root, epicId);
+    expect(brief.schema_version).toBe(2);
+    const auditable = brief.auditable_tasks as Array<Record<string, unknown>>;
+    const byId = new Map(auditable.map((a) => [a.task_id, a]));
+
+    const a0 = byId.get(t0) as Record<string, unknown>;
+    expect(a0.assigned_tier).toBe("high");
+    expect(a0.assigned_model).toBe("opus");
+    expect(a0.tier).toBe("low");
+    expect(a0.model).toBe("sonnet");
+    expect(a0.constraint).toBe("worker_provider=claude");
+
+    const a1 = byId.get(t1) as Record<string, unknown>;
+    expect(a1.assigned_tier).toBe("medium");
+    expect(a1.assigned_model).toBe("opus");
+    expect(a1.tier).toBe("medium");
+    expect(a1.model).toBe("opus");
+    expect(a1.constraint).toBeNull();
   });
 });
 

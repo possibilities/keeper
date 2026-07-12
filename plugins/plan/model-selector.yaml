@@ -133,18 +133,20 @@ models:
     user-facing wording, delicate idiom matching; well-specified bounded work
     routes GPT-first instead.
   gpt-5.6-sol: |
-    The GPT flagship tier — the highest GPT-side reasoning ceiling, built for
-    complex reasoning over large codebases and demanding long-horizon agentic
-    work, with a very large (1M-token) context and the best complex-edit safety
-    of its family. Strengths: hard multi-file changes with an explicit
-    acceptance, big-working-set navigation, long tool-heavy trajectories.
-    Weaknesses: documented over-persistence — can push past stated intent
-    (scope-exceeding cleanups, over-claimed results), strongest at the top
-    reasoning efforts; give it explicit stop conditions and an allowed
-    change-scope, and keep it off unsupervised destructive scope. When to pick:
-    the top gpt-side choice for the hardest well-specified work that needs no
-    deep design judgment or taste; opus still owns nameable intelligence-bound
-    reasons.
+    The GPT flagship tier and a reserve pick, not a default — the highest
+    GPT-side reasoning ceiling and best complex-edit safety of its family, with
+    a very large (1M-token) context, but over-powered for most work: its ceiling
+    is wasted on well-specified tasks the mid tiers clear cleanly. Strengths: the
+    genuinely hardest bounded GPT-side work — hard multi-file changes with an
+    explicit acceptance, big-working-set navigation, long tool-heavy trajectories
+    where the top reasoning ceiling is the deciding factor. Weaknesses: documented
+    over-persistence — can push past stated intent (scope-exceeding cleanups,
+    over-claimed results), strongest at the top reasoning efforts; give it
+    explicit stop conditions and an allowed change-scope, and keep it off
+    unsupervised destructive scope. When to pick: rarely — send ordinary
+    well-specified work to gpt-5.6-terra and substantial multi-file work to
+    gpt-5.5, reserving sol for the hardest well-specified tail where the mid tiers
+    genuinely fall short; opus still owns nameable intelligence-bound reasons.
   gpt-5.5: |
     A frontier-class GPT tier a half-step below the 5.6 flagship; its vendor
     sweet spot is multi-step agentic coding — plan, navigate, edit across
@@ -260,7 +262,7 @@ research:
       sha256: bbf8887d08564ffe7d58d28b2bd771a8892828a05b6f489de126654b1baa11f0
   gpt-5.6-sol:
     reference: skills/model-guidance/references/gpt-5.6-sol.md
-    sha256: 1e4cdaa25a71c9d23c4aa4e45f8c1bfc0815402928b675235558633849aa0e52
+    sha256: f8c203137e4f592a1b470b54707968cf1b2184e4ba6da288b46c863e5747c8ae
     card:
       reference: skills/model-guidance/references/cards/gpt-5.6-sol.md
       sha256: 135bd1927d665e481718e1639b5a512c8bb777a3016b0e4c070feefe554175ed

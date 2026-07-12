@@ -1,15 +1,7 @@
 #!/usr/bin/env bun
 
 import { homedir } from "node:os";
-import { dirname } from "node:path";
 import { parseArgs as parseNodeArgs } from "node:util";
-import {
-  discoverClaudeProjectsRoots,
-  findClaudeSession,
-  listClaudeSessions,
-  loadClaudeSession,
-  transcriptHoldingDirectory,
-} from "../src/transcript/claude";
 import type {
   SubagentSummary,
   TranscriptFilter,
@@ -19,6 +11,15 @@ import type {
   TranscriptToolDetail,
 } from "../src/transcript/model";
 import { TRANSCRIPT_ROLES } from "../src/transcript/model";
+import { resolvePiTurn } from "../src/transcript/pi";
+import type {
+  TranscriptReader,
+  TranscriptRootInputs,
+} from "../src/transcript/reader";
+import {
+  transcriptHarnessNames,
+  transcriptReader,
+} from "../src/transcript/registry";
 import {
   buildTranscriptPage,
   renderTranscriptEntriesText,
@@ -33,42 +34,43 @@ const DEFAULT_SHOW_LIMIT = 60;
 const DEFAULT_MAX_CHARS = 32_000;
 const DEFAULT_MAX_ENTRY_CHARS = 6_000;
 
-const HELP = `keeper transcript <session-id> [options]
-keeper transcript show <session-id> [options]
-keeper transcript list [options]
+const HELP = `keeper transcript <harness> <session-id> [options]
+keeper transcript <harness> show <session-id> [options]
+keeper transcript <harness> list [options]
 
-Discover Claude Code sessions and extract compact, bounded text for another
-agent. The shorthand form is identical to "show". Show defaults to the newest
-page; pass --offset 0 to read from the beginning. Main-session headers list
+Discover agent sessions and extract compact, bounded text for another agent.
+The shorthand form is identical to "show". Show defaults to the newest page;
+pass --offset 0 to read from the beginning. Main-session headers list
 available subagents, selected by id/prefix or interleaved with --subagent all.
+
+Harnesses: ${transcriptHarnessNames().join(", ")}
 
 Commands:
   list                   List sessions (current project by default)
   show <session-id>      Extract one session ("show" may be omitted)
+  turn <session-id>      Extract the selected branch's Latest turn (pi only)
 
 Global options:
-  --harness claude       Transcript harness (default claude)
-  --config-dir <dir>     Claude config directory (repeatable)
+  --config-dir <dir>     Claude config directory (repeatable; claude only)
   --format human|json    Output format (default human)
   --json                 Alias of --format json
   --agent-help           Show the terse agent workflow
   --help, -h             Show this help
 
-Run "keeper transcript list --help" or "keeper transcript show --help" for
-filter and pagination options.
+Run "keeper transcript <harness> list --help" or
+"keeper transcript <harness> show --help" for filter and pagination options.
 `;
 
-const LIST_HELP = `keeper transcript list [options]
+const LIST_HELP = `keeper transcript <harness> list [options]
 
-List Claude transcript sessions, newest first. The current working directory is
+List transcript sessions, newest first. The current working directory is
 the default project scope; --global searches every project. Date filters apply
 to the session update time.
 
 Options:
-  --harness <name>       Harness (currently claude; default claude)
   --project <path>       Project path (default cwd)
   --global               Search every project
-  --config-dir <dir>     Claude config directory (repeatable)
+  --config-dir <dir>     Claude config directory (repeatable; claude only)
   --since <time>         ISO-8601 time/date, relative duration (30m, 8h, 7d),
                           or YYYY-MM-DD (that local calendar day, from midnight)
   --until <time>         ISO-8601 time/date, relative duration, or YYYY-MM-DD
@@ -80,7 +82,7 @@ Options:
   --help, -h             Show this help
 `;
 
-const SHOW_HELP = `keeper transcript show <session-id> [options]
+const SHOW_HELP = `keeper transcript <harness> show <session-id> [options]
 
 Extract a bounded transcript page. Without --offset/--before, the newest
 matching page is returned. Use --before with older_before to page backward,
@@ -97,9 +99,8 @@ capped subagent list) counts against it, and entries get the remainder,
 down to a floor of one force-fitted entry when the budget is tiny.
 
 Options:
-  --harness <name>       Harness (currently claude; default claude)
   --project <path>       Disambiguate a duplicated session id by project
-  --config-dir <dir>     Claude config directory (repeatable)
+  --config-dir <dir>     Claude config directory (repeatable; claude only)
   --subagent <id|all>    Select one subagent (prefix accepted), or all
   --offset <n>           Filtered entry offset (default newest page)
   --before <n>           Page backward before this filtered entry offset
@@ -120,10 +121,33 @@ Options:
   --help, -h             Show this help
 `;
 
+const TURN_HELP = `keeper transcript pi turn <session-id> --leaf <entry-id|root> [options]
+
+Extract the requested branch's Latest turn: the most recent non-empty user
+text, plus subsequent assistant text ONLY once that response reaches a
+successful terminal stop. Branch walking follows strictly the leaf's own
+parent chain to the root — an entry physically later in the file but
+outside that chain (an abandoned branch) never influences the result.
+"root" explicitly selects the empty branch, before any entry.
+
+JSON only, one of three shapes: "turn": null (a valid branch with no
+non-empty user text yet), {prompt, response: null} (no complete response
+yet — pending, mid tool-use, or aborted/errored/length-cut), or
+{prompt, response} (both complete). A read/leaf failure is a JSON error
+envelope, never a null turn.
+
+Options:
+  --leaf <entry-id|root> Required. The tree leaf to resolve the turn from.
+  --project <path>       Disambiguate a duplicated session id by project
+  --format json          Output format (default and only mode: json)
+  --json                 Alias of --format json
+  --help, -h             Show this help
+`;
+
 const AGENT_HELP = `keeper transcript agent workflow
 
-1. Discover: keeper transcript list --global --since 7d
-2. Orient:   keeper transcript <session-id>
+1. Discover: keeper transcript claude list --global --since 7d
+2. Orient:   keeper transcript claude <session-id>
 3. Go older: re-run with the emitted older_before as --before
 4. Inspect a worker: --subagent <id> (ids are listed in the header)
 5. Inspect tool output: --tools full; narrow first with --grep/--role/--since
@@ -271,26 +295,15 @@ function resolveOutputFormat(values: {
       };
 }
 
-function validateHarness(raw: unknown): string | null {
-  const harness = typeof raw === "string" ? raw : "claude";
-  return harness === "claude"
-    ? null
-    : `unsupported harness '${harness}'; currently supported: claude`;
-}
-
-function parseRoots(
+function buildRootInputs(
   values: Record<string, unknown>,
   deps: TranscriptCliDeps,
-): string[] {
+): TranscriptRootInputs {
   const configured = values["config-dir"];
   const configDirs = Array.isArray(configured)
     ? configured.filter((value): value is string => typeof value === "string")
     : undefined;
-  return discoverClaudeProjectsRoots({
-    homeDir: deps.homeDir,
-    env: deps.env,
-    configDirs,
-  });
+  return { homeDir: deps.homeDir, env: deps.env, configDirs };
 }
 
 function compactLine(raw: string | null, max = 180): string {
@@ -304,6 +317,7 @@ function formatBytes(bytes: number): string {
 }
 
 function renderListText(
+  harness: string,
   items: readonly TranscriptListItem[],
   metadata: {
     project: string | null;
@@ -314,7 +328,7 @@ function renderListText(
 ): string {
   const lines = [
     "@keeper-transcripts v1",
-    "harness: claude",
+    `harness: ${harness}`,
     `scope: ${metadata.project ?? "global"}`,
     `range: [${metadata.offset}, ${metadata.offset + items.length}) of ${metadata.total}`,
     `next_offset: ${metadata.nextOffset ?? "none"}`,
@@ -372,6 +386,7 @@ interface ShowHeaderPage {
 }
 
 function renderShowHeaderLines(
+  harness: string,
   session: TranscriptSession,
   tools: TranscriptToolDetail,
   page: ShowHeaderPage,
@@ -379,7 +394,7 @@ function renderShowHeaderLines(
   const metadata = session.main.metadata;
   const lines = [
     "@keeper-transcript v1",
-    "harness: claude",
+    `harness: ${harness}`,
     `session: ${metadata.sessionId}`,
     `project: ${metadata.project ?? "unknown"}`,
     `title: ${metadata.title === null ? "none" : JSON.stringify(compactLine(metadata.title, 300))}`,
@@ -408,6 +423,7 @@ function renderShowHeaderLines(
  * actually print.
  */
 function worstCaseHeaderBudget(
+  harness: string,
   session: TranscriptSession,
   tools: TranscriptToolDetail,
   rawEntryCount: number,
@@ -422,16 +438,19 @@ function worstCaseHeaderBudget(
     newerOffset: placeholder,
     clippedByChars: false,
   };
-  return `${renderShowHeaderLines(session, tools, stubPage).join("\n")}\n`
+  return `${renderShowHeaderLines(harness, session, tools, stubPage).join("\n")}\n`
     .length;
 }
 
 function renderShowText(
+  harness: string,
   session: TranscriptSession,
   page: ReturnType<typeof buildTranscriptPage>,
   tools: TranscriptToolDetail,
 ): string {
-  const header = renderShowHeaderLines(session, tools, page).join("\n");
+  const header = renderShowHeaderLines(harness, session, tools, page).join(
+    "\n",
+  );
   return `${header}\n${renderTranscriptEntriesText(
     page.entries,
     session.selectedSource === "all",
@@ -440,6 +459,7 @@ function renderShowText(
 }
 
 function parseList(
+  reader: TranscriptReader,
   argv: string[],
   deps: TranscriptCliDeps,
 ): TranscriptCliResult {
@@ -458,8 +478,6 @@ function parseList(
   if (parsed.positionals.length > 0) {
     return fail(`list: unexpected argument '${parsed.positionals[0]}'`);
   }
-  const harnessError = validateHarness(parsed.values.harness);
-  if (harnessError !== null) return fail(harnessError);
   const format = resolveOutputFormat(parsed.values);
   if (!format.ok) return fail(format.error);
   if (parsed.values.global === true && parsed.values.project !== undefined) {
@@ -488,60 +506,57 @@ function parseList(
   if (sinceMs !== null && untilMs !== null && sinceMs > untilMs) {
     return fail("--since must not be later than --until");
   }
-  const roots = parseRoots(parsed.values, deps);
-  if (roots.length === 0) {
-    return fail("no readable Claude projects directories found", 1);
-  }
   const project =
     parsed.values.global === true
       ? null
       : String(parsed.values.project ?? deps.cwd);
-  try {
-    const result = listClaudeSessions({
-      roots,
-      project,
-      sinceMs,
-      untilMs,
-      offset,
-      limit,
-    });
-    const data = {
-      harness: "claude",
-      scope: project,
-      page: {
-        offset: result.offset,
-        end_offset: result.offset + result.items.length,
-        total: result.total,
-        next_offset: result.nextOffset,
-      },
-      sessions: result.items,
-    };
-    return format.value === "json"
-      ? ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)))
-      : ok(
-          renderListText(result.items, {
-            project,
-            offset: result.offset,
-            total: result.total,
-            nextOffset: result.nextOffset,
-          }),
-        );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+  const outcome = reader.list({
+    root: buildRootInputs(parsed.values, deps),
+    project,
+    sinceMs,
+    untilMs,
+    offset,
+    limit,
+  });
+  if (outcome.kind === "no_roots") {
+    return fail(outcome.message, 1);
+  }
+  if (outcome.kind === "error") {
     return format.value === "json"
       ? {
           code: 1,
           stdout: jsonText(
             errorEnvelope(TRANSCRIPT_SCHEMA_VERSION, {
               code: "read_failed",
-              message,
-              recovery: "check the Claude transcript directories and retry",
+              message: outcome.message,
+              recovery: outcome.recovery,
             }),
           ),
           stderr: "",
         }
-      : fail(`list: ${message}`, 1);
+      : fail(`list: ${outcome.message}`, 1);
   }
+  const data = {
+    harness: reader.harness,
+    scope: project,
+    page: {
+      offset: outcome.offset,
+      end_offset: outcome.offset + outcome.items.length,
+      total: outcome.total,
+      next_offset: outcome.nextOffset,
+    },
+    sessions: outcome.items,
+  };
+  return format.value === "json"
+    ? ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)))
+    : ok(
+        renderListText(reader.harness, outcome.items, {
+          project,
+          offset: outcome.offset,
+          total: outcome.total,
+          nextOffset: outcome.nextOffset,
+        }),
+      );
 }
 
 function parseRoles(raw: unknown): ReadonlySet<TranscriptRole> | null | string {
@@ -583,6 +598,7 @@ function jsonFailure(
 }
 
 function parseShow(
+  reader: TranscriptReader,
   argv: string[],
   deps: TranscriptCliDeps,
 ): TranscriptCliResult {
@@ -606,8 +622,6 @@ function parseShow(
     );
   }
   const sessionId = parsed.positionals[0] as string;
-  const harnessError = validateHarness(parsed.values.harness);
-  if (harnessError !== null) return fail(harnessError);
   const format = resolveOutputFormat(parsed.values);
   if (!format.ok) return fail(format.error);
   const offset =
@@ -660,47 +674,40 @@ function parseShow(
   if (sinceMs !== null && untilMs !== null && sinceMs > untilMs) {
     return fail("--since must not be later than --until");
   }
-  const roots = parseRoots(parsed.values, deps);
-  if (roots.length === 0) {
-    return fail("no readable Claude projects directories found", 1);
-  }
   const project =
     typeof parsed.values.project === "string" ? parsed.values.project : null;
-  const lookup = findClaudeSession(roots, sessionId, project);
-  if (lookup.kind === "not_found") {
+  const outcome = reader.find({
+    root: buildRootInputs(parsed.values, deps),
+    sessionId,
+    project,
+  });
+  if (outcome.kind === "no_roots") {
+    return fail(outcome.message, 1);
+  }
+  if (outcome.kind === "not_found") {
     const message = `session '${sessionId}' not found${project === null ? "" : ` in project ${project}`}`;
     return format.value === "json"
       ? jsonFailure(
           "session_not_found",
           message,
-          "run `keeper transcript list --global` to discover session ids",
+          `run \`keeper transcript ${reader.harness} list --global\` to discover session ids`,
         )
       : fail(message, 1);
   }
-  if (lookup.kind === "ambiguous") {
-    const owners = lookup.files.map((file) =>
-      transcriptHoldingDirectory(file.path),
-    );
-    // Bucket dirs live directly under a config root's "projects" dir; the
-    // config root disambiguates when duplicates span DIFFERENT roots
-    // (--project alone can't tell those apart), otherwise --project (which
-    // maps to a bucket within one root) is still the right hint.
-    const configRoots = new Set(owners.map((owner) => dirname(owner)));
-    const hintFlag = configRoots.size > 1 ? "--config-dir" : "--project";
-    const message = `session '${sessionId}' exists in multiple projects: ${owners.join(", ")}; pass ${hintFlag}`;
+  if (outcome.kind === "ambiguous") {
+    const message = `session '${sessionId}' exists in multiple projects: ${outcome.owners.join(", ")}; pass ${outcome.hint}`;
     return format.value === "json"
       ? jsonFailure(
           "session_ambiguous",
           message,
-          `pass ${hintFlag} <${hintFlag === "--config-dir" ? "dir" : "path"}>`,
+          `pass ${outcome.hint} <${outcome.hint === "--config-dir" ? "dir" : "path"}>`,
         )
       : fail(message, 1);
   }
-  let session: ReturnType<typeof loadClaudeSession>;
+  let session: TranscriptSession | { error: string };
   try {
-    session = loadClaudeSession(
-      lookup.file.path,
-      sessionId,
+    session = reader.load(
+      outcome.handle,
       String(parsed.values.subagent ?? "main"),
     );
   } catch (error) {
@@ -732,6 +739,7 @@ function parseShow(
     tools: tools.value,
   };
   const headerBudget = worstCaseHeaderBudget(
+    reader.harness,
     session,
     tools.value,
     session.entries.length,
@@ -744,7 +752,7 @@ function parseShow(
     maxEntryChars,
   });
   const data = {
-    harness: "claude",
+    harness: reader.harness,
     session: session.main.metadata,
     selected_source: session.selectedSource,
     subagents: session.subagents,
@@ -761,9 +769,132 @@ function parseShow(
   };
   return format.value === "json"
     ? ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)))
-    : ok(renderShowText(session, page, tools.value));
+    : ok(renderShowText(reader.harness, session, page, tools.value));
 }
 
+/**
+ * `turn` is pi-only (the only reader implementing branch-aware walking) and
+ * JSON-only (a machine contract, no human render). Every failure — session
+ * resolution, leaf resolution, and read failures alike — surfaces as a JSON
+ * error envelope so a caller never has to special-case a plain-text path.
+ */
+function parseTurn(
+  reader: TranscriptReader,
+  argv: string[],
+  deps: TranscriptCliDeps,
+): TranscriptCliResult {
+  let parsed: ReturnType<typeof parseNodeArgs>;
+  try {
+    parsed = parseNodeArgs({
+      args: argv,
+      options: parseOptions("transcript", "turn"),
+      allowPositionals: true,
+      strict: true,
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  // --help short-circuits before the harness check: every two-level verb's
+  // help is a pure, harness-independent path (help-purity.test.ts probes
+  // every verb through the claude token).
+  if (parsed.values.help === true) return ok(TURN_HELP);
+  if (reader.harness !== "pi") {
+    return fail(
+      `turn is only supported for pi sessions (got '${reader.harness}')`,
+    );
+  }
+  if (parsed.positionals.length !== 1) {
+    return fail(
+      parsed.positionals.length === 0
+        ? "turn: <session-id> is required"
+        : `turn: unexpected argument '${parsed.positionals[1]}'`,
+    );
+  }
+  const sessionId = parsed.positionals[0] as string;
+  const format = resolveOutputFormat(parsed.values);
+  if (!format.ok) return fail(format.error);
+  // json is the only mode turn ever renders, so it is also the silent
+  // default — unlike list/show, an absent --format never falls back to
+  // human here.
+  const formatIsJson =
+    format.value === "json" ||
+    (parsed.values.format === undefined && parsed.values.json !== true);
+  if (!formatIsJson) {
+    return fail("turn: --format must be json (the only supported mode)");
+  }
+  const leaf = parsed.values.leaf;
+  if (typeof leaf !== "string" || leaf.length === 0) {
+    return fail("turn: --leaf <entry-id|root> is required");
+  }
+  const project =
+    typeof parsed.values.project === "string" ? parsed.values.project : null;
+  const outcome = resolvePiTurn({
+    root: buildRootInputs(parsed.values, deps),
+    sessionId,
+    project,
+    leaf,
+  });
+  if (outcome.kind === "no_roots") {
+    return jsonFailure(
+      "no_roots",
+      outcome.message,
+      "check the pi sessions directory and retry",
+    );
+  }
+  if (outcome.kind === "not_found") {
+    const message = `session '${sessionId}' not found${project === null ? "" : ` in project ${project}`}`;
+    return jsonFailure(
+      "session_not_found",
+      message,
+      "run `keeper transcript pi list --global` to discover session ids",
+    );
+  }
+  if (outcome.kind === "ambiguous") {
+    const message = `session '${sessionId}' exists in multiple projects: ${outcome.owners.join(", ")}; pass ${outcome.hint}`;
+    return jsonFailure(
+      "session_ambiguous",
+      message,
+      `pass ${outcome.hint} <path>`,
+    );
+  }
+  if (outcome.kind === "leaf_not_found") {
+    return jsonFailure(
+      "leaf_not_found",
+      `leaf '${leaf}' not found in session '${sessionId}'`,
+      "pass an entry id present in this session, or 'root'",
+    );
+  }
+  if (outcome.kind === "leaf_malformed") {
+    return jsonFailure(
+      "leaf_malformed",
+      outcome.message,
+      "the session's parent chain is broken; re-inspect the transcript file",
+    );
+  }
+  if (outcome.kind === "read_failed") {
+    return jsonFailure(
+      "read_failed",
+      outcome.message,
+      "check the transcript file and retry",
+    );
+  }
+  const data = {
+    harness: reader.harness,
+    session_id: sessionId,
+    selected_leaf: outcome.selectedLeaf,
+    turn: outcome.turn,
+  };
+  return ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)));
+}
+
+/**
+ * Peel the leading harness token exactly as `keeper agent`'s splitSubcommand
+ * peels its own leading agent token (`src/agent/dispatch.ts`), then route the
+ * remainder through the existing list/show/bare-id router. Bare `keeper
+ * transcript`, `-h`/`--help`, `--agent-help`, and a harness token with an
+ * empty remainder all print help; an unrecognized harness token (hermes
+ * included) fails naming the registry's supported set.
+ */
 export function runTranscriptCli(
   argv: string[],
   deps: TranscriptCliDeps = defaultDeps(),
@@ -772,9 +903,19 @@ export function runTranscriptCli(
     return ok(HELP);
   }
   if (argv[0] === "--agent-help") return ok(AGENT_HELP);
-  if (argv[0] === "list") return parseList(argv.slice(1), deps);
-  if (argv[0] === "show") return parseShow(argv.slice(1), deps);
-  return parseShow(argv, deps);
+  const harness = argv[0] as string;
+  const reader = transcriptReader(harness);
+  if (reader === undefined) {
+    return fail(
+      `unsupported harness '${harness}'; supported: ${transcriptHarnessNames().join(", ")}`,
+    );
+  }
+  const rest = argv.slice(1);
+  if (rest.length === 0) return ok(HELP);
+  if (rest[0] === "list") return parseList(reader, rest.slice(1), deps);
+  if (rest[0] === "show") return parseShow(reader, rest.slice(1), deps);
+  if (rest[0] === "turn") return parseTurn(reader, rest.slice(1), deps);
+  return parseShow(reader, rest, deps);
 }
 
 export function main(argv: string[]): void {

@@ -198,7 +198,7 @@ afterEach(() => {
 });
 
 function run(args: string[]) {
-  return runTranscriptCli([...args, "--config-dir", configDir], deps);
+  return runTranscriptCli(["claude", ...args, "--config-dir", configDir], deps);
 }
 
 describe("keeper transcript show", () => {
@@ -394,7 +394,7 @@ describe("keeper transcript show", () => {
   });
 
   test("--help documents the total-budget semantics and the label/JSON-index distinction", () => {
-    const help = runTranscriptCli(["show", "--help"], deps);
+    const help = runTranscriptCli(["claude", "show", "--help"], deps);
     expect(help.stdout).toContain("Total character budget");
     expect(help.stdout).toContain("page position");
   });
@@ -635,7 +635,14 @@ describe("keeper transcript show ambiguous session hint", () => {
     utimesSync(path2, modified, modified);
 
     const result = runTranscriptCli(
-      [dupSessionId, "--config-dir", configDir, "--config-dir", configDir2],
+      [
+        "claude",
+        dupSessionId,
+        "--config-dir",
+        configDir,
+        "--config-dir",
+        configDir2,
+      ],
       deps,
     );
     expect(result.code).toBe(1);
@@ -729,6 +736,102 @@ describe("keeper transcript dotted/underscored project paths", () => {
     expect(
       parsed.data.sessions.map((item: { sessionId: string }) => item.sessionId),
     ).toEqual([sessionId]);
+  });
+});
+
+describe("keeper transcript harness-first grammar", () => {
+  test("bare invocation, --help/-h, and --agent-help print help without a harness token", () => {
+    expect(runTranscriptCli([], deps).stdout).toContain("keeper transcript");
+    expect(runTranscriptCli(["--help"], deps).stdout).toContain(
+      "keeper transcript",
+    );
+    expect(runTranscriptCli(["-h"], deps).stdout).toContain(
+      "keeper transcript",
+    );
+    expect(runTranscriptCli(["--agent-help"], deps).stdout).toContain(
+      "agent workflow",
+    );
+  });
+
+  test("a harness token with an empty rest prints help", () => {
+    const result = runTranscriptCli(["claude"], deps);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("keeper transcript <harness>");
+  });
+
+  test("an unregistered harness token exits non-zero naming the registry keys", () => {
+    const result = runTranscriptCli(["hermes", "list"], deps);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("hermes");
+    expect(result.stderr).toContain("claude");
+  });
+
+  test("an unknown position-0 token exits non-zero the same way", () => {
+    const result = runTranscriptCli(["bogus", "list"], deps);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("bogus");
+    expect(result.stderr).toContain("claude");
+  });
+
+  test("--harness no longer parses anywhere", () => {
+    const listResult = run(["list", "--harness", "claude"]);
+    expect(listResult.code).toBe(2);
+    const showResult = run([SESSION, "--harness", "claude"]);
+    expect(showResult.code).toBe(2);
+  });
+
+  test("the claude positional list/show/bare-id forms work end to end", () => {
+    const listResult = runTranscriptCli(
+      ["claude", "list", "--project", PROJECT, "--config-dir", configDir],
+      deps,
+    );
+    expect(listResult.code).toBe(0);
+    expect(listResult.stdout).toContain("harness: claude");
+    expect(listResult.stdout).toContain(SESSION);
+
+    const showResult = runTranscriptCli(
+      ["claude", "show", SESSION, "--offset", "0", "--config-dir", configDir],
+      deps,
+    );
+    expect(showResult.code).toBe(0);
+    expect(showResult.stdout).toContain("harness: claude");
+
+    const bareIdResult = runTranscriptCli(
+      ["claude", SESSION, "--offset", "0", "--config-dir", configDir],
+      deps,
+    );
+    expect(bareIdResult.code).toBe(0);
+    expect(bareIdResult.stdout).toBe(showResult.stdout);
+  });
+
+  test("turn is pi-only: any other harness fails naming pi", () => {
+    const result = runTranscriptCli(
+      ["claude", "turn", SESSION, "--leaf", "root", "--format", "json"],
+      deps,
+    );
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("pi");
+  });
+
+  test("turn --help is harness-independent (prints help even for claude)", () => {
+    const result = runTranscriptCli(["claude", "turn", "--help"], deps);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("keeper transcript pi turn");
+  });
+
+  test("turn requires --leaf", () => {
+    const result = runTranscriptCli(["pi", "turn", SESSION], deps);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("--leaf");
+  });
+
+  test("turn rejects a non-json --format", () => {
+    const result = runTranscriptCli(
+      ["pi", "turn", SESSION, "--leaf", "root", "--format", "human"],
+      deps,
+    );
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("json");
   });
 });
 

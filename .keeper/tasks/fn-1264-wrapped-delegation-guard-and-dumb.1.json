@@ -1,0 +1,16 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-12T16:18:14.268000Z",
+  "depends_on": [],
+  "epic": "fn-1264-wrapped-delegation-guard-and-dumb",
+  "id": "fn-1264-wrapped-delegation-guard-and-dumb.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "producer wrapped-cell marker injection",
+  "updated_at": "2026-07-12T16:59:36.783000Z",
+  "worker_done_at": "2026-07-12T16:59:36.783000Z"
+}

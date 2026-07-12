@@ -30,6 +30,7 @@ import {
   type AwaitState,
   advanceCompleteStability,
   agentsIdleState,
+  boardWorkIdleState,
   COMPLETE_DWELL_MS,
   changedSignature,
   classifyTargetId,
@@ -44,6 +45,7 @@ import {
   findEpicByIdOrBare,
   gitCleanState,
   initCompleteStability,
+  isBoardWorkJob,
   isJamReason,
   isKeeperDispatched,
   landedState,
@@ -57,6 +59,8 @@ import {
 import {
   INSTANT_DEATH_BREAKER_REASON,
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_DESYNC_DISTRESS_REASON,
+  SHARED_DIRTY_DISTRESS_REASON,
   WORKTREE_FINALIZE_NON_FF_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "../src/dispatch-failure-key";
@@ -1974,6 +1978,28 @@ test("isJamReason: finalize-non-ff + merge-conflict are jams; recover* is NOT", 
   expect(isJamReason("worktree-merge-local-timeout")).toBe(false);
 });
 
+test("isJamReason: shared-checkout dirty/desync distress rows are operator jams (startsWith the long minted sentence)", () => {
+  // The producers mint LONG sentences beginning with the family token — exact-match
+  // cannot work, so the jam check matches on the leading token via startsWith.
+  const dirtyMinted =
+    `${SHARED_DIRTY_DISTRESS_REASON}: /repo has stayed dirty past the grace ` +
+    `window — reconcile the shared checkout (commit, stash, or discard the changes). ` +
+    `Last recover verdict: repair::repo-abc cannot launch a write-capable session`;
+  const desyncMinted =
+    `${SHARED_DESYNC_DISTRESS_REASON}: /repo has stayed DESYNCED past the grace ` +
+    `window — the ref advanced but the working tree never caught up`;
+  expect(isJamReason(dirtyMinted)).toBe(true);
+  expect(isJamReason(desyncMinted)).toBe(true);
+  // The bare tokens count too (startsWith is reflexive).
+  expect(isJamReason(SHARED_DIRTY_DISTRESS_REASON)).toBe(true);
+  expect(isJamReason(SHARED_DESYNC_DISTRESS_REASON)).toBe(true);
+  // The recover-prefix exclusion is untouched: a recover row that happens to name a
+  // shared checkout in its free text still self-clears and never counts as a jam.
+  expect(
+    isJamReason("worktree-recover-conflict: shared-checkout-desync mentioned"),
+  ).toBe(false);
+});
+
 // Drained scope-axis fixtures (ADR 0032). Base inputs default to the shipped
 // `plan` scope; each test overrides only what it exercises.
 function drainedInputs(over: Partial<DrainedInputs> = {}): DrainedInputs {
@@ -2018,6 +2044,117 @@ test("isKeeperDispatched: autopilot + escalation yes; null / plan-verb no", () =
   // verb-based gate is exactly the wrong discriminator (misses escalation).
   expect(isKeeperDispatched("work")).toBe(false);
   expect(isKeeperDispatched("resolve")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// isBoardWorkJob / board-work-idle — the maintenance-window "safe to stop"
+// signal, distinct from a raw "every working job" count.
+// ---------------------------------------------------------------------------
+
+test("isBoardWorkJob: working + autopilot/escalation, not own session → true", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "w-1", state: "working", dispatch_origin: "autopilot" },
+      "me",
+    ),
+  ).toBe(true);
+  expect(
+    isBoardWorkJob(
+      { job_id: "e-1", state: "working", dispatch_origin: "escalation" },
+      "me",
+    ),
+  ).toBe(true);
+});
+
+test("isBoardWorkJob: interactive session (null dispatch_origin) → false", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "interactive-1", state: "working", dispatch_origin: null },
+      "me",
+    ),
+  ).toBe(false);
+});
+
+test("isBoardWorkJob: not state=working → false even if keeper-dispatched", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "w-1", state: "stopped", dispatch_origin: "autopilot" },
+      "me",
+    ),
+  ).toBe(false);
+});
+
+test("isBoardWorkJob: own session excluded even when dispatch_origin=autopilot", () => {
+  // The reproduced case: the session asking the question can itself be a
+  // dispatch_origin='autopilot' work:: job — provenance alone can't exclude
+  // it, only the explicit self-exclusion does.
+  expect(
+    isBoardWorkJob(
+      { job_id: "me", state: "working", dispatch_origin: "autopilot" },
+      "me",
+    ),
+  ).toBe(false);
+});
+
+test("isBoardWorkJob: ownSessionId null → no self-exclusion (own job counts)", () => {
+  expect(
+    isBoardWorkJob(
+      { job_id: "me", state: "working", dispatch_origin: "autopilot" },
+      null,
+    ),
+  ).toBe(true);
+});
+
+test("board-work-idle: zero jobs → met", () => {
+  expect(boardWorkIdleState([], null).kind).toBe("met");
+});
+
+test("board-work-idle: only an interactive working session → met (excluded)", () => {
+  const jobs = [
+    makeJob({
+      job_id: "interactive-1",
+      state: "working",
+      dispatch_origin: null,
+    }),
+  ];
+  expect(boardWorkIdleState(jobs, "interactive-1").kind).toBe("met");
+});
+
+test("board-work-idle: an active autopilot work/close dispatch → waiting", () => {
+  const jobs = [
+    makeJob({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+  ];
+  expect(boardWorkIdleState(jobs, "me").kind).toBe("waiting");
+});
+
+test("board-work-idle: an active escalation session → waiting", () => {
+  const jobs = [
+    makeJob({
+      job_id: "e-1",
+      state: "working",
+      dispatch_origin: "escalation",
+    }),
+  ];
+  expect(boardWorkIdleState(jobs, "me").kind).toBe("waiting");
+});
+
+test("board-work-idle: excludes the caller's own board-work session → met", () => {
+  const jobs = [
+    makeJob({ job_id: "me", state: "working", dispatch_origin: "autopilot" }),
+  ];
+  expect(boardWorkIdleState(jobs, "me").kind).toBe("met");
+});
+
+test("board-work-idle: mixed board — interactive + a live dispatch → waiting", () => {
+  const jobs = [
+    makeJob({
+      job_id: "interactive-1",
+      state: "working",
+      dispatch_origin: null,
+    }),
+    makeJob({ job_id: "w-1", state: "working", dispatch_origin: "autopilot" }),
+  ];
+  expect(boardWorkIdleState(jobs, "interactive-1").kind).toBe("waiting");
 });
 
 test("drained: empty open board → met", () => {

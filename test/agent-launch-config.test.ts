@@ -12,6 +12,7 @@ import {
 import {
   AGENT_ROLES,
   buildAgentLaunchArgv,
+  composeManagedClaudeArgv,
   isAgentRole,
   loadRolePrompt,
   nativeClaudeArgs,
@@ -24,6 +25,76 @@ import {
 // The folded-launcher argv prefix the launch path spawns: `[bun, cli/keeper.ts,
 // "agent"]`. Supersedes the standalone `keeper agent` binary path.
 const LAP = ["/abs/bun", "/abs/cli/keeper.ts", "agent"] as const;
+
+// ---------------------------------------------------------------------------
+// composeManagedClaudeArgv — the claude-swap managed wrapper
+// ---------------------------------------------------------------------------
+
+test("composeManagedClaudeArgv: wraps native args after `run <slot> --share-history --`", () => {
+  const native = [
+    "/home/.local/bin/claude",
+    "--model",
+    "opus",
+    "--session-id",
+    "abc",
+    "hello",
+  ];
+  expect(
+    composeManagedClaudeArgv({
+      cswapBin: "cswap",
+      slot: 4,
+      nativeClaudeArgv: native,
+    }),
+  ).toEqual([
+    "cswap",
+    "run",
+    "4",
+    "--share-history",
+    "--",
+    "--model",
+    "opus",
+    "--session-id",
+    "abc",
+    "hello",
+  ]);
+});
+
+test("composeManagedClaudeArgv: drops the native executable (cswap resolves claude from PATH)", () => {
+  const native = ["/abs/claude", "--continue"];
+  const wrapped = composeManagedClaudeArgv({
+    cswapBin: "/abs/cswap",
+    slot: 0,
+    nativeClaudeArgv: native,
+  });
+  // slot 0 is valid; the executable is dropped, only args forwarded.
+  expect(wrapped).toEqual([
+    "/abs/cswap",
+    "run",
+    "0",
+    "--share-history",
+    "--",
+    "--continue",
+  ]);
+  expect(wrapped.slice(5)).toEqual(native.slice(1));
+});
+
+test("composeManagedClaudeArgv: forwards a leading-dash prompt verbatim after --", () => {
+  const native = ["/abs/claude", "--", "-leading-dash-prompt"];
+  const wrapped = composeManagedClaudeArgv({
+    cswapBin: "cswap",
+    slot: 9,
+    nativeClaudeArgv: native,
+  });
+  expect(wrapped).toEqual([
+    "cswap",
+    "run",
+    "9",
+    "--share-history",
+    "--",
+    "--",
+    "-leading-dash-prompt",
+  ]);
+});
 
 // ---------------------------------------------------------------------------
 // roles

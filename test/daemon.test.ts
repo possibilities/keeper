@@ -55,6 +55,7 @@ import {
   buildDeconflictHumanNotifyBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
+  buildSharedCheckoutPageBody,
   buildSharedDirtyObservation,
   buildWorkMergeHumanNotifyBody,
   buildWorkResolverBrief,
@@ -148,6 +149,7 @@ import {
   runMergeEscalationSweep,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
+  runSharedCheckoutPageSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -159,6 +161,9 @@ import {
   SERVE_WATCHDOG_INTERVAL_MS,
   type ServeWatchdogTriggerState,
   SHARED_BASE_BROKEN_CATEGORY,
+  type SharedCheckoutNotifiedOutcome,
+  type SharedCheckoutPageRow,
+  type SharedCheckoutPageSweepDeps,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
@@ -172,7 +177,6 @@ import {
   selectRepairCandidates,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
-  serializeUsageSnapshot,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
   startDaemon,
@@ -3940,81 +3944,6 @@ test("archive eligibility: --apply moves a fully-confirmed file to the archive/ 
   expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(true);
 });
 
-// ---------------------------------------------------------------------------
-// fn-651 task .1 — UsageSnapshot serializer (the worker→event wire shape)
-// ---------------------------------------------------------------------------
-//
-// Pre-fix the inline `JSON.stringify({...})` in the `usage-snapshot` worker
-// handler dropped the fn-645 freshness fields (`status`,
-// `subscription_active`, `error_type`, `error_message`, `error_at`), so the
-// reducer's UPSERT folded them to NULL forever — `mc1` (no subscription)
-// never got redacted and the status chip never rendered. These tests pin
-// the extracted serializer's wire shape so the leak can't recur, then
-// run a full round-trip through the reducer to prove the columns
-// actually populate end-to-end.
-
-test("fn-651: serializeUsageSnapshot forwards every projection-meaningful field", () => {
-  const wire = JSON.parse(
-    serializeUsageSnapshot({
-      kind: "usage-snapshot",
-      id: "claude-mc1",
-      target: "claude",
-      multiplier: 5,
-      session_percent: 42.5,
-      session_resets_at: "2026-05-30T18:30:00-04:00",
-      week_percent: 17.0,
-      week_resets_at: "2026-06-01T20:00:00-04:00",
-      sonnet_week_percent: 9.0,
-      sonnet_week_resets_at: "2026-06-01T20:00:00-04:00",
-      codex_spark_session_percent: 27.0,
-      codex_spark_session_resets_at: "2026-05-30T23:59:00-04:00",
-      codex_spark_week_percent: 48.0,
-      codex_spark_week_resets_at: "2026-06-01T21:00:00-04:00",
-      status: "stale",
-      subscription_active: false,
-      account_state: null,
-      error_type: "ClaudeUsageParseError",
-      error_message: "cli output unparseable",
-      error_at: "2026-05-30T12:00:00-04:00",
-      error_kind: "format_changed",
-      // fn-651 task .4: rate-limit lift instant. The companion
-      // `last_usage_fold_at` is NOT a serialized field — the reducer
-      // derives it from the event ts on a successful fold.
-      lift_at: "2026-05-30T20:30:00-04:00",
-    }),
-  );
-  // Every fn-645 + earlier projection field present and round-trippable.
-  expect(wire).toEqual({
-    target: "claude",
-    multiplier: 5,
-    session_percent: 42.5,
-    session_resets_at: "2026-05-30T18:30:00-04:00",
-    week_percent: 17.0,
-    week_resets_at: "2026-06-01T20:00:00-04:00",
-    sonnet_week_percent: 9.0,
-    sonnet_week_resets_at: "2026-06-01T20:00:00-04:00",
-    codex_spark_session_percent: 27.0,
-    codex_spark_session_resets_at: "2026-05-30T23:59:00-04:00",
-    codex_spark_week_percent: 48.0,
-    codex_spark_week_resets_at: "2026-06-01T21:00:00-04:00",
-    status: "stale",
-    subscription_active: false,
-    account_state: null,
-    error_type: "ClaudeUsageParseError",
-    error_message: "cli output unparseable",
-    error_at: "2026-05-30T12:00:00-04:00",
-    error_kind: "format_changed",
-    // fn-651 task .4: top-level envelope field, projected onto
-    // `usage.rate_limit_lifts_at` by parseUsageSnapshot.
-    lift_at: "2026-05-30T20:30:00-04:00",
-  });
-  // `kind` / `id` are NOT projection fields — the discriminator is event
-  // metadata and `id` rides in `events.session_id` via the synthetic-event
-  // pipeline's generic entity-key overload.
-  expect(wire.kind).toBeUndefined();
-  expect(wire.id).toBeUndefined();
-});
-
 test("fn-1024: serializeSessionTelemetry forwards the six telemetry fields and drops kind/id", () => {
   const wire = JSON.parse(
     serializeSessionTelemetry({
@@ -4068,218 +3997,6 @@ test("fn-1024: serializeSessionTelemetry ↔ extractSessionTelemetry round-trips
     input_tokens: 14500,
     window_size: 1000000,
   });
-});
-
-test("fn-651: serialized snapshot folds end-to-end — status / subscription_active / error_* are non-NULL after drain", () => {
-  const { db } = freshMemDb();
-  // Seed the events row exactly the way main's `usage-snapshot` handler
-  // would: session_id = profile pk, data = serialized payload.
-  db.run(
-    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
-       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
-    [
-      1000,
-      "claude-mc1",
-      serializeUsageSnapshot({
-        kind: "usage-snapshot",
-        id: "claude-mc1",
-        target: "claude",
-        multiplier: 5,
-        session_percent: 0,
-        session_resets_at: null,
-        week_percent: 0,
-        week_resets_at: null,
-        sonnet_week_percent: null,
-        sonnet_week_resets_at: null,
-        codex_spark_session_percent: null,
-        codex_spark_session_resets_at: null,
-        codex_spark_week_percent: null,
-        codex_spark_week_resets_at: null,
-        status: "stale",
-        subscription_active: false,
-        account_state: null,
-        error_type: "ClaudeUsageParseError",
-        error_message: "boom",
-        error_at: "2026-05-30T12:00:00-04:00",
-        error_kind: "format_changed",
-        lift_at: null,
-      }),
-    ],
-  );
-  drainToCompletion(db);
-  const row = db
-    .query(
-      `SELECT status, subscription_active, error_type, error_message, error_at,
-              error_kind, sonnet_week_resets_at
-         FROM usage WHERE id = ?`,
-    )
-    .get("claude-mc1") as {
-    status: string | null;
-    subscription_active: number | null;
-    error_type: string | null;
-    error_message: string | null;
-    error_at: string | null;
-    error_kind: string | null;
-    sonnet_week_resets_at: string | null;
-  };
-  expect(row.status).toBe("stale");
-  // The reducer coerces boolean false → integer 0 on the column.
-  expect(row.subscription_active).toBe(0);
-  expect(row.error_type).toBe("ClaudeUsageParseError");
-  expect(row.error_message).toBe("boom");
-  expect(row.error_at).toBe("2026-05-30T12:00:00-04:00");
-  // fn-1000: the classification folds from the UsageSnapshot onto the column.
-  expect(row.error_kind).toBe("format_changed");
-  // sonnet_week_resets_at was null in the message; folds to NULL safely.
-  expect(row.sonnet_week_resets_at).toBeNull();
-  db.close();
-});
-
-test("usage snapshot folds codex-spark quota columns end-to-end", () => {
-  const { db } = freshMemDb();
-  db.run(
-    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
-       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
-    [
-      1500,
-      "codex",
-      serializeUsageSnapshot({
-        kind: "usage-snapshot",
-        id: "codex",
-        target: "codex",
-        multiplier: 1,
-        session_percent: 33,
-        session_resets_at: "2026-06-26T22:57:00-04:00",
-        week_percent: 28,
-        week_resets_at: "2026-06-28T19:20:00-04:00",
-        sonnet_week_percent: null,
-        sonnet_week_resets_at: null,
-        codex_spark_session_percent: 27,
-        codex_spark_session_resets_at: "2026-06-26T23:59:00-04:00",
-        codex_spark_week_percent: 48,
-        codex_spark_week_resets_at: "2026-06-28T21:00:00-04:00",
-        status: "active",
-        subscription_active: null,
-        account_state: null,
-        error_type: null,
-        error_message: null,
-        error_at: null,
-        error_kind: null,
-        lift_at: null,
-      }),
-    ],
-  );
-  drainToCompletion(db);
-  const row = db
-    .query(
-      `SELECT codex_spark_session_percent, codex_spark_session_resets_at,
-              codex_spark_week_percent, codex_spark_week_resets_at
-         FROM usage WHERE id = ?`,
-    )
-    .get("codex") as {
-    codex_spark_session_percent: number | null;
-    codex_spark_session_resets_at: string | null;
-    codex_spark_week_percent: number | null;
-    codex_spark_week_resets_at: string | null;
-  };
-  expect(row.codex_spark_session_percent).toBe(27);
-  expect(row.codex_spark_session_resets_at).toBe("2026-06-26T23:59:00-04:00");
-  expect(row.codex_spark_week_percent).toBe(48);
-  expect(row.codex_spark_week_resets_at).toBe("2026-06-28T21:00:00-04:00");
-  db.close();
-});
-
-test("fn-651: a no-subscription envelope folds subscription_active = 0 so the renderer redacts it", () => {
-  // The `mc1` case from the epic spec: subscription_active=false on the
-  // wire becomes 0 in the column, which is what `cli/usage.ts`'s
-  // `subscription_active !== 0` filter checks to redact the row.
-  const { db } = freshMemDb();
-  db.run(
-    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
-       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
-    [
-      2000,
-      "claude-mc1",
-      serializeUsageSnapshot({
-        kind: "usage-snapshot",
-        id: "claude-mc1",
-        target: "claude",
-        multiplier: 1,
-        session_percent: null,
-        session_resets_at: null,
-        week_percent: null,
-        week_resets_at: null,
-        sonnet_week_percent: null,
-        sonnet_week_resets_at: null,
-        codex_spark_session_percent: null,
-        codex_spark_session_resets_at: null,
-        codex_spark_week_percent: null,
-        codex_spark_week_resets_at: null,
-        status: "active",
-        subscription_active: false,
-        account_state: null,
-        error_type: null,
-        error_message: null,
-        error_at: null,
-        error_kind: null,
-        lift_at: null,
-      }),
-    ],
-  );
-  drainToCompletion(db);
-  const row = db
-    .query(`SELECT subscription_active, status FROM usage WHERE id = ?`)
-    .get("claude-mc1") as {
-    subscription_active: number | null;
-    status: string | null;
-  };
-  expect(row.subscription_active).toBe(0);
-  expect(row.status).toBe("active");
-  db.close();
-});
-
-test("fn-651: an old event missing the fn-645 fields folds them to NULL without error (backwards-compat)", () => {
-  // Pre-fix events on disk have the data blob WITHOUT status /
-  // subscription_active / error_*. The reducer must keep folding them
-  // safely; only NEW events carry the fields. This pins the
-  // backwards-compat contract spelled in the task spec.
-  const { db } = freshMemDb();
-  db.run(
-    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
-       VALUES (?, ?, NULL, 'UsageSnapshot', 'usage_snapshot', ?)`,
-    [
-      3000,
-      "claude-legacy",
-      JSON.stringify({
-        target: "claude",
-        multiplier: 5,
-        session_percent: 1.0,
-        session_resets_at: "T1",
-        week_percent: 1.0,
-        week_resets_at: "T2",
-        // fn-645 fields deliberately omitted — pre-fix shape.
-      }),
-    ],
-  );
-  drainToCompletion(db);
-  const row = db
-    .query(
-      `SELECT status, subscription_active, error_type, error_message, error_at
-         FROM usage WHERE id = ?`,
-    )
-    .get("claude-legacy") as {
-    status: string | null;
-    subscription_active: number | null;
-    error_type: string | null;
-    error_message: string | null;
-    error_at: string | null;
-  };
-  expect(row.status).toBeNull();
-  expect(row.subscription_active).toBeNull();
-  expect(row.error_type).toBeNull();
-  expect(row.error_message).toBeNull();
-  expect(row.error_at).toBeNull();
-  db.close();
 });
 
 // ---------------------------------------------------------------------------
@@ -4563,7 +4280,30 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // stamped onto `jobs.git_unattributed_to_live_count`; an additive ALTER, NO
   // cursor rewind: `git_status` is LIVE-ONLY, so the boot-seed re-derives the
   // value rather than replay).
-  expect(SCHEMA_VERSION).toBe(118);
+  // And to 119 via fn-1239 task .3 (appending the nullable `events.account_route`
+  // + `jobs.account_route` TEXT columns — the PII-free per-launch account route
+  // the hook captures from KEEPER_ACCOUNT_ROUTE at SessionStart; additive ALTERs,
+  // NO cursor rewind: a pre-v119 event carries no route, so a from-scratch
+  // re-fold leaves both NULL byte-identical).
+  // And to 120 via fn-1239 task .6 (unconditionally DROPping the retired `usage`
+  // / `profiles` tables — the account-routing boundary supersedes the
+  // Keeper-owned usage/profile projections; mirrors the `event_blobs` v74 tail
+  // DROP. The `UsageSnapshot` / `UsageDeleted` fold arms become explicit
+  // no-ops and the `RateLimited`/`ApiError` profile-level fan-out is deleted,
+  // so NO cursor rewind: neither retired table is ever read again and a
+  // from-scratch re-fold never touches them).
+  // And to 121 re-appending the nullable `autopilot_state.worker_provider`
+  // TEXT enum column — the durable work-dispatch provider pin, docs/adr/0047;
+  // fn-1256 task .3's original ladder entry was lost to the b39fab28
+  // stale-tree sweep while fn-1239's v119/v120 landed in its place, so it
+  // returns as a NEW tail step (an idempotent additive ALTER, NO cursor
+  // rewind: a stream with no worker_provider patch folds the column NULL
+  // byte-identically).
+  // And to 122 backfilling the `autopilot_state.worker_provider` family-label
+  // value 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE, NO
+  // cursor rewind: the reducer fold normalizes the same alias so a from-scratch
+  // re-fold reaches 'gpt' byte-identically.
+  expect(SCHEMA_VERSION).toBe(122);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -6242,6 +5982,206 @@ test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op (f
   await runRepairEscalationSweep(deps);
   expect(mints).toEqual([]);
   expect(dispatches).toEqual([]);
+});
+
+// ---- runSharedCheckoutPageSweep (dirty/desync distress page-once, injected deps) --
+
+interface SharedCheckoutPageMint {
+  id: string;
+  outcome: SharedCheckoutNotifiedOutcome;
+}
+
+function sharedCheckoutRow(
+  id: string,
+  overrides: Partial<SharedCheckoutPageRow> = {},
+): SharedCheckoutPageRow {
+  return {
+    id,
+    dir: "/repo",
+    reason: `${id}: /repo has stayed live past the grace window`,
+    ...overrides,
+  };
+}
+
+/**
+ * Fake-deps fixture for the pure page-once sweep. The `live` map models the OPEN,
+ * not-yet-paged working set the daemon reader returns; a terminal `notified` mint
+ * models the fold stamping `human_notified_at` (the row drops out of `IS NULL`
+ * selection), while a `notify_failed` mint is a no-op (the row stays live and
+ * re-sweeps). No real daemon / botctl / DB.
+ */
+function fakeSharedCheckoutPageDeps(opts: {
+  rows?: SharedCheckoutPageRow[];
+  notify?: (
+    row: SharedCheckoutPageRow,
+  ) => Promise<SharedCheckoutNotifiedOutcome>;
+  rowsThrow?: boolean;
+}): {
+  deps: SharedCheckoutPageSweepDeps;
+  mints: SharedCheckoutPageMint[];
+  pages: string[];
+  notes: string[];
+  live: Map<string, SharedCheckoutPageRow>;
+} {
+  const mints: SharedCheckoutPageMint[] = [];
+  const pages: string[] = [];
+  const notes: string[] = [];
+  const live = new Map((opts.rows ?? []).map((r) => [r.id, r] as const));
+  const deps: SharedCheckoutPageSweepDeps = {
+    noteLine: (line) => notes.push(line),
+    selectUnpaged: () => {
+      if (opts.rowsThrow) throw new Error("row read boom");
+      return [...live.values()];
+    },
+    notifyHuman: async (row) => {
+      pages.push(row.id);
+      return (await opts.notify?.(row)) ?? "notified";
+    },
+    mintNotified: (id, outcome) => {
+      mints.push({ id, outcome });
+      // Fold-sim: the terminal `notified` stamps human_notified_at → the row drops
+      // out of the unpaged set; a `notify_failed` is a no-op (stays live, re-sweeps).
+      if (outcome === "notified") live.delete(id);
+    },
+  };
+  return { deps, mints, pages, notes, live };
+}
+
+test("runSharedCheckoutPageSweep: pages each OPEN dirty/desync row ONCE, then a stamped row never re-pages", async () => {
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({
+    rows: [
+      sharedCheckoutRow("shared-checkout-dirty:abc"),
+      sharedCheckoutRow("shared-checkout-desync:def"),
+    ],
+  });
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([
+    "shared-checkout-dirty:abc",
+    "shared-checkout-desync:def",
+  ]);
+  expect(mints).toEqual([
+    { id: "shared-checkout-dirty:abc", outcome: "notified" },
+    { id: "shared-checkout-desync:def", outcome: "notified" },
+  ]);
+  // A second heartbeat: both rows now carry human_notified_at (dropped from the
+  // unpaged set) → no re-page, page-once per row instance honored.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toHaveLength(2);
+  expect(mints).toHaveLength(2);
+});
+
+test("runSharedCheckoutPageSweep: a notify_failed leaves the row unpaged (re-sweeps and pages again next heartbeat)", async () => {
+  let attempt = 0;
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
+    notify: async () => (++attempt === 1 ? "notify_failed" : "notified"),
+  });
+  // Tick 1: the botctl send FAILS → non-terminal, marker stays NULL.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual(["shared-checkout-dirty:abc"]);
+  expect(mints).toEqual([
+    { id: "shared-checkout-dirty:abc", outcome: "notify_failed" },
+  ]);
+  // Tick 2: the row is STILL unpaged → pages again, succeeds this time.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([
+    "shared-checkout-dirty:abc",
+    "shared-checkout-dirty:abc",
+  ]);
+  expect(mints[1]).toEqual({
+    id: "shared-checkout-dirty:abc",
+    outcome: "notified",
+  });
+  // Tick 3: now stamped → silent.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toHaveLength(2);
+});
+
+test("runSharedCheckoutPageSweep: a cleared-then-reminted row pages ANEW (fresh incident episode)", async () => {
+  const { deps, mints, pages, live } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow("shared-checkout-desync:def")],
+  });
+  await runSharedCheckoutPageSweep(deps); // pages + stamps → drops out
+  expect(pages).toEqual(["shared-checkout-desync:def"]);
+  await runSharedCheckoutPageSweep(deps); // stamped → silent
+  expect(pages).toHaveLength(1);
+  // The producer's observed-clean level-clear DELETEs the row; after a fresh grace it
+  // re-mints at human_notified_at NULL (the DispatchCleared re-arm) — modeled by
+  // re-inserting into the live working set.
+  live.set(
+    "shared-checkout-desync:def",
+    sharedCheckoutRow("shared-checkout-desync:def"),
+  );
+  await runSharedCheckoutPageSweep(deps); // re-minted → pages anew
+  expect(pages).toEqual([
+    "shared-checkout-desync:def",
+    "shared-checkout-desync:def",
+  ]);
+  expect(mints.filter((m) => m.outcome === "notified")).toHaveLength(2);
+});
+
+test("runSharedCheckoutPageSweep: a throwing notify degrades to notify_failed (fail-open, re-sweepable)", async () => {
+  const { deps, mints, notes } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
+    notify: async () => {
+      throw new Error("botctl spawn boom");
+    },
+  });
+  await runSharedCheckoutPageSweep(deps);
+  expect(mints).toEqual([
+    { id: "shared-checkout-dirty:abc", outcome: "notify_failed" },
+  ]);
+  expect(notes.some((n) => n.includes("shared-checkout page threw"))).toBe(
+    true,
+  );
+});
+
+test("runSharedCheckoutPageSweep: a throwing row read degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({
+    rowsThrow: true,
+    rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
+  });
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runSharedCheckoutPageSweep: an empty working set pages nobody (the shape a paused/clean board presents past the inherited heartbeat gate)", async () => {
+  // Pause + boot-catch-up suppression is the repair-escalation TICK's inherited
+  // early-return (`if (autopilotPaused) return`), upstream of this sweep — a paused
+  // board never even calls it. The pure sweep's own contract: page exactly the OPEN
+  // unpaged rows, so an empty set is a no-op.
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({ rows: [] });
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("buildSharedCheckoutPageBody: names the repo and picks dirty-vs-desync wording by id prefix", () => {
+  const dirty = buildSharedCheckoutPageBody({
+    id: "shared-checkout-dirty:abc",
+    dir: "/repo",
+    reason: "x",
+  });
+  expect(dirty).toContain("/repo");
+  expect(dirty).toContain("DIRTY");
+  expect(dirty).not.toContain("DESYNCED");
+
+  const desync = buildSharedCheckoutPageBody({
+    id: "shared-checkout-desync:def",
+    dir: "/repo",
+    reason: "x",
+  });
+  expect(desync).toContain("DESYNCED");
+
+  // A null dir renders a placeholder, never the literal "null".
+  const noDir = buildSharedCheckoutPageBody({
+    id: "shared-checkout-dirty:abc",
+    dir: null,
+    reason: "x",
+  });
+  expect(noDir).toContain("repo ?");
+  expect(noDir).not.toContain("null");
 });
 
 test("repairReasonFor: the mint-side reason matches escalation-brief's REPAIR_REASON_RE", () => {
@@ -9461,10 +9401,9 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "plan-worker.ts": "plan",
   "exit-watcher.ts": "exit",
   "git-worker.ts": "git",
-  "usage-worker.ts": "usage",
   "statusline-worker.ts": "statusline",
   "builds-worker.ts": "builds",
-  "usage-scraper-worker.ts": "usageScraper",
+  "account-observer-worker.ts": "accountObserver",
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
   "birth-ingest-worker.ts": "birthIngest",
@@ -9525,8 +9464,7 @@ function spawnedWorkerNames(opts?: {
   // `~/.config/keeper/config.yaml` — `builds` is in ALL_WORKERS and must spawn.
   const configPath = join(tmpDir, "keeper-config.yaml");
   // `builds` is gated on a configured `buildbot_url`; pin it so that worker
-  // spawns deterministically. `usageScraper` spawns unconditionally on the plain
-  // selector (no runtime gate), so it needs no config pinning.
+  // spawns deterministically.
   writeFileSync(configPath, "buildbot_url: http://localhost:8010\n");
   const sandbox: Record<string, string> = {
     KEEPER_DB: dbPath,
@@ -9565,35 +9503,12 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-two workers", () => {
-  // The headline regression guard: a wrong default would silently drop a worker
-  // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
-  // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
-  // added `builds` (the first outbound-HTTP worker, gated on a configured
-  // `buildbot_url` — `spawnedWorkerNames` pins one so the boot is deterministic);
-  // fn-801 added `renamer` (the tmux window-namer; no watcher, no message minter);
-  // fn-875 added `bus` (the Agent Bus UDS relay; no watcher, no message minter —
-  // owns its own bus.db + bus.sock, reads keeper.db read-only); fn-930 added
-  // `usageScraper` (the in-process agentusage producer; spawns unconditionally on
-  // the plain selector — no watcher, no message minter — writes only on-disk
-  // envelopes the `usage` consumer folds); fn-946
-  // added `handoff` (the `keeper handoff` dispatch worker; no watcher, mints
-  // HandoffDispatching/HandoffLaunchFailed, reads keeper.db read-only); fn-952
-  // added `tmuxControl` (the persistent `tmux -C` control-focus worker; gated on
-  // `!disableNativeWatcher` — it attaches a REAL tmux client, so it spawns under
-  // the spy boot's default `disableNativeWatcher:false` but never in-process).
-  // fn-1024 added `statusline` (the sixth file-watcher producer; watches the
-  // statusLine leaf dir and mints `SessionTelemetry`, reads keeper.db read-only).
-  // fn-1107 added `autoclose` (the done-window reaper; no watcher, posts a
-  // pre-kill intent hint to main but writes keeper.db NOTHING). fn-1103 added
-  // `birthIngest` (the seventh file-watcher; watches the births maildir the
-  // `keeper agent` launcher drops non-claude birth records into and mints a
-  // synthetic SessionStart per record — the twin of `eventsIngest`, no DB
-  // handle). fn-1122 added `baseline` (the suite-Baseline runner; no watcher, no
-  // message minter — sole writer of the on-disk result leafs, no DB handle).
+test("the production boot spawns the complete worker set", () => {
+  // A boot with no selector must spawn exactly ALL_WORKERS, in order. The
+  // configured buildbot URL makes the optional builds worker deterministic.
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(22);
+  expect(spawned).toHaveLength(21);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -9603,10 +9518,9 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twenty-two 
     "plan",
     "exit",
     "git",
-    "usage",
     "statusline",
     "builds",
-    "usageScraper",
+    "accountObserver",
     "deadLetter",
     "eventsIngest",
     "birthIngest",
@@ -9802,8 +9716,7 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
   for (const w of [
     "transcript",
     "plan",
-    "git",
-    "usage",
+    "statusline",
     "deadLetter",
     "eventsIngest",
     "birthIngest",

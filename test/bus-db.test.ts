@@ -22,6 +22,7 @@ import {
   maxMessageId,
   migrateBusDb,
   openBusDb,
+  pruneControlMessagesOlderThan,
   pruneMessagesOlderThan,
   QUEUED_FOR_WAKE,
   replayFromCursor,
@@ -363,6 +364,17 @@ function idsOf(db: ReturnType<typeof openBusDb>): number[] {
   ).map((r) => r.id);
 }
 
+function idsOfNamespace(
+  db: ReturnType<typeof openBusDb>,
+  namespace: string,
+): number[] {
+  return (
+    db
+      .prepare("SELECT id FROM messages WHERE namespace = ? ORDER BY id ASC")
+      .all(namespace) as { id: number }[]
+  ).map((r) => r.id);
+}
+
 test("pruneMessagesOlderThan deletes rows older than the cutoff and keeps recent ones", () => {
   const db = openBusDb(":memory:");
   appendMessage(db, {
@@ -457,6 +469,135 @@ test("pruneMessagesOlderThan is a no-op when nothing is older than the cutoff", 
   });
   expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(0);
   expect(idsOf(db)).toHaveLength(1);
+  db.close();
+});
+
+test("pruneControlMessagesOlderThan deletes only rows in the target namespace", () => {
+  const db = openBusDb(":memory:");
+  const controlOld1 = appendMessage(db, {
+    namespace: "bus",
+    event: "join",
+    body: "control old 1",
+    ts: 1000,
+  });
+  const chatOld1 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "chat old 1",
+    ts: 1000,
+  });
+  const controlOld2 = appendMessage(db, {
+    namespace: "bus",
+    event: "takeover",
+    body: "control old 2",
+    ts: 1000,
+  });
+  const chatOld2 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "chat old 2",
+    ts: 1000,
+  });
+  const controlRecent = appendMessage(db, {
+    namespace: "bus",
+    event: "part",
+    body: "control recent",
+    ts: 9000,
+  });
+
+  expect(pruneControlMessagesOlderThan(db, "bus", 5000, 100)).toBe(2);
+  expect(idsOfNamespace(db, "bus")).toEqual([controlRecent]);
+  expect(idsOfNamespace(db, "chat")).toEqual([chatOld1, chatOld2]);
+  expect(idsOf(db)).toEqual([chatOld1, chatOld2, controlRecent]);
+  expect(idsOf(db)).not.toContain(controlOld1);
+  expect(idsOf(db)).not.toContain(controlOld2);
+  db.close();
+});
+
+test("pruneControlMessagesOlderThan preserves a queued_for_wake row regardless of age", () => {
+  const db = openBusDb(":memory:");
+  const qfw = appendMessage(db, {
+    namespace: "bus",
+    event: "send",
+    resolved_session_id: "job-1",
+    body: "control wake",
+    ts: 100,
+    status: QUEUED_FOR_WAKE,
+  });
+  appendMessage(db, {
+    namespace: "bus",
+    event: "join",
+    body: "old control",
+    ts: 100,
+  });
+
+  expect(pruneControlMessagesOlderThan(db, "bus", 5000, 100)).toBe(1);
+  expect(idsOfNamespace(db, "bus")).toEqual([qfw]);
+  db.close();
+});
+
+test("pruneControlMessagesOlderThan honors the batch bound across a large backlog", () => {
+  const db = openBusDb(":memory:");
+  const controlIds: number[] = [];
+  const chatIds: number[] = [];
+  for (let i = 0; i < 53; i++) {
+    controlIds.push(
+      appendMessage(db, {
+        namespace: "bus",
+        event: "takeover",
+        body: `control ${i}`,
+        ts: 1000 + i,
+      }),
+    );
+    if (i % 10 === 0) {
+      chatIds.push(
+        appendMessage(db, {
+          namespace: "chat",
+          event: "message",
+          body: `chat ${i}`,
+          ts: 1000 + i,
+        }),
+      );
+    }
+  }
+
+  expect(pruneControlMessagesOlderThan(db, "bus", 100_000, 10)).toBe(10);
+  expect(idsOfNamespace(db, "bus")).toEqual(controlIds.slice(10));
+  expect(idsOfNamespace(db, "chat")).toEqual(chatIds);
+  expect(pruneControlMessagesOlderThan(db, "bus", 100_000, 10)).toBe(10);
+  expect(idsOfNamespace(db, "bus")).toEqual(controlIds.slice(20));
+
+  expect(pruneControlMessagesOlderThan(db, "bus", 100_000, 10)).toBe(10);
+  expect(idsOfNamespace(db, "bus")).toEqual(controlIds.slice(30));
+  expect(pruneControlMessagesOlderThan(db, "bus", 100_000, 10)).toBe(10);
+  expect(idsOfNamespace(db, "bus")).toEqual(controlIds.slice(40));
+  expect(pruneControlMessagesOlderThan(db, "bus", 100_000, 10)).toBe(10);
+  expect(idsOfNamespace(db, "bus")).toEqual(controlIds.slice(50));
+  expect(pruneControlMessagesOlderThan(db, "bus", 100_000, 10)).toBe(3);
+  expect(idsOfNamespace(db, "bus")).toEqual([]);
+  expect(idsOfNamespace(db, "chat")).toEqual(chatIds);
+  db.close();
+});
+
+test("pruneControlMessagesOlderThan is a no-op when nothing in the namespace is older than the cutoff", () => {
+  const db = openBusDb(":memory:");
+  const controlRecent = appendMessage(db, {
+    namespace: "bus",
+    event: "join",
+    body: "recent control",
+    ts: 9000,
+  });
+  const chatOld = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "old chat",
+    ts: 100,
+  });
+
+  expect(pruneControlMessagesOlderThan(db, "bus", 5000, 100)).toBe(0);
+  expect(idsOfNamespace(db, "bus")).toEqual([controlRecent]);
+  expect(idsOfNamespace(db, "chat")).toEqual([chatOld]);
+  expect(idsOf(db)).toEqual([controlRecent, chatOld]);
   db.close();
 });
 

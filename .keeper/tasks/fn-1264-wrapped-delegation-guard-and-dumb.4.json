@@ -1,0 +1,18 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-12T16:18:14.268000Z",
+  "depends_on": [
+    "fn-1264-wrapped-delegation-guard-and-dumb.1"
+  ],
+  "epic": "fn-1264-wrapped-delegation-guard-and-dumb",
+  "id": "fn-1264-wrapped-delegation-guard-and-dumb.4",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "advisory delegation-skipped detection",
+  "updated_at": "2026-07-12T17:20:13.504000Z",
+  "worker_done_at": "2026-07-12T17:20:13.504000Z"
+}

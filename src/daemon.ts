@@ -34,6 +34,8 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import type { AccountObserverWorkerData } from "./account-observer-worker";
+import { resolveAccountRoutingRoot } from "./account-routing-config";
 import {
   type AdoptableCodexRollout,
   findAdoptableCodexRollouts,
@@ -131,7 +133,6 @@ import {
   resolveSingleInstanceLockPath,
   resolveSockPath,
   resolveStatuslineRoot,
-  resolveUsageRoot,
   runDispatchMintGate,
   truncateEphemeralProjections,
 } from "./db";
@@ -157,6 +158,7 @@ import {
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_VERB,
@@ -270,12 +272,6 @@ import type {
 } from "./transcript-worker";
 import type { Job, SessionTelemetryMessage } from "./types";
 import { FileLock } from "./usage-flock";
-import type { UsageScraperWorkerData } from "./usage-scraper-worker";
-import type {
-  UsageMessage,
-  UsageSnapshotMessage,
-  UsageWorkerData,
-} from "./usage-worker";
 import type {
   ShutdownMessage,
   WakeWorkerData,
@@ -395,13 +391,20 @@ export function drainToCompletion(
  * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
  * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
- * isSharedDesyncDistressKey}) distress key, AND the per-repo shared-base repair latch
- * (`repair::<repo-token>`): each is un-retryable by the wire validator BY DESIGN (an
- * operator never clears them through the retry wire), and a level-trigger (main's boot
- * recovery / the recover pass observing the lane clean / the stale-base probe observing
- * the lane re-based or torn down / the desync content probe observing the checkout carry
- * the default tip / the repair sweep observing the base green) owns dropping them — so
- * the orphan sweep must never reap a self-managed row out from under its signal.
+ * isSharedDesyncDistressKey}) distress key: each is un-retryable by the wire validator
+ * BY DESIGN (an operator never clears them through the retry wire), and a level-trigger
+ * (main's boot recovery / the recover pass observing the lane clean / the stale-base
+ * probe observing the lane re-based or torn down / the desync content probe observing
+ * the checkout carry the default tip) owns dropping them — so the orphan sweep must
+ * never reap a self-managed row out from under its signal. The per-repo shared-base
+ * repair latch (`repair::<repo-token>`) is exempt for a DIFFERENT reason: its verb IS
+ * retryable via the wire (`keeper autopilot retry repair::<token>` re-arms a stranded
+ * row after a declined/dead repair session), so a well-formed row never reaches this
+ * check at all — {@link isRetryableDispatchKey} already `continue`s above. The explicit
+ * `row.verb === "repair"` guard below stays as a defensive belt for a malformed/pre-slug
+ * repair id that somehow fails the wire's id-shape check despite the verb match: the
+ * repair sweep's own level-trigger (re-minting from live evidence, clearing on the base
+ * observed green) owns that row too, so the orphan sweep must not reap it either.
  *
  * The per-repo shared-checkout-WEDGE (mid-merge) distress row is DELIBERATELY NOT exempt:
  * a mid-merge shared checkout no longer blocks the working-tree-free base merge, so that
@@ -470,10 +473,13 @@ export function gcUnretryableDispatchFailures(
     // And the per-repo shared-base repair latch (`repair::<repo-token>`) — a LIVE
     // producer owns it (the SHARED_BASE_BROKEN sweep re-mints it while the base is broken
     // and CLEARS it on positive evidence — base green + zero remaining candidates). Its
-    // `repair` verb is un-retryable by the wire validator BY DESIGN (the retry-wire stays
-    // narrow, per `parseDispatchKey`), so the orphan sweep must not reap it — reaping
-    // would drop its once-page / once-dispatch markers and re-page + re-dispatch a
-    // declined repair after every daemon restart.
+    // `repair` verb IS retryable via the wire (`parseDispatchKey` accepts it, per
+    // `RETRY_DISPATCH_VERBS`), so a well-formed row is already skipped by the
+    // `isRetryableDispatchKey` check above — this guard is a defensive belt for a
+    // malformed/pre-slug repair id that fails the wire's id-shape check despite the verb
+    // matching: reaping it would drop its once-page / once-dispatch markers and re-page +
+    // re-dispatch a declined repair after every daemon restart, the same as reaping the
+    // well-formed case would.
     if (row.verb === "repair") {
       continue;
     }
@@ -1389,6 +1395,36 @@ export function buildRepairHumanNotifyBody(args: {
   ].join("\n");
 }
 
+/**
+ * Build the ONE structured operator page the shared-checkout page-once sweep sends over
+ * botctl when a `shared-checkout-{dirty,desync}:<repoHash>` distress row has stayed live
+ * past its producer's grace watermark. Short by design — the sticky distress row carries
+ * the full context on the board; this is the courtesy page that names the repo, the
+ * hazard, and how the row clears. The `id` prefix picks dirty-vs-desync wording. Pure —
+ * no clock/fs/spawn. The dirty/desync rows clear EXCLUSIVELY via their producer
+ * level-trigger (never `keeper autopilot retry`), so the page names no re-arm command.
+ */
+export function buildSharedCheckoutPageBody(row: {
+  id: string;
+  dir: string | null;
+  reason: string;
+}): string {
+  const repo = row.dir != null && row.dir !== "" ? row.dir : "?";
+  const isDesync = row.id.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX);
+  const hazard = isDesync
+    ? `DESYNCED — its ref advanced but the working tree never caught up, so it`
+    : `DIRTY — it carries uncommitted content, so it`;
+  return [
+    `🔴 keeper: ${row.id} needs you — the shared checkout for repo ${repo} is`,
+    `${hazard} trails landed history. Everything served off it (selector policy,`,
+    `skills, worker templates, daemon source) is stale, and a commit made from it`,
+    `can sweep landed work back to stale content.`,
+    ``,
+    `Reconcile the shared checkout by hand (commit or discard local changes, then`,
+    `resync it to the default tip). The row clears itself once it is observed clean.`,
+  ].join("\n");
+}
+
 /** Injectable dependency surface for {@link runBlockHumanNotifySweep} — the stage-3
  *  unblock human-notify sweep. Same fail-open injectable-deps discipline as
  *  {@link DeconflictHumanNotifySweepDeps}. */
@@ -2100,6 +2136,104 @@ export async function runRepairEscalationSweep(
     if (groups.has(row.id)) continue; // still broken → owned by the dispatch/notify pass
     if (!deps.isBaseGreen(row.dir ?? "")) continue; // retained on no report / red base
     deps.clearRow(row.id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared-checkout hygiene page-once sweep (dirty/desync distress promotion)
+// ---------------------------------------------------------------------------
+
+/**
+ * One OPEN shared-checkout hygiene distress row the page-once sweep weighs — a daemon-verb
+ * `shared-checkout-{dirty,desync}:<repoHash>` sticky read with `human_notified_at IS NULL`
+ * (not yet paged). Its live producers (the repair-defer dirt tracker / the merge desync
+ * probe) own the mint-after-grace and the observed-clean level-clear; this sweep only
+ * pages a row that has already crossed grace and stayed open.
+ */
+export interface SharedCheckoutPageRow {
+  /** The distress-row `dispatch_failures.id` (`shared-checkout-{dirty,desync}:<hash>`). */
+  id: string;
+  /** The affected shared-checkout dir, for the page body; may be null / "". */
+  dir: string | null;
+  /** The full distress reason sentence — its family prefix picks the page wording. */
+  reason: string;
+}
+
+/** The page outcome the shared-checkout page-once sweep records. Only the terminal
+ *  `notified` stamps `human_notified_at`; `notify_failed` is NON-terminal (re-sweeps). */
+export type SharedCheckoutNotifiedOutcome = "notified" | "notify_failed";
+
+/**
+ * Injectable dependency surface for {@link runSharedCheckoutPageSweep}. Same fail-open
+ * injectable-deps discipline as {@link RepairEscalationSweepDeps} — every seam is a pure
+ * function so a fixture pins the page-once contract with no real daemon / botctl / DB.
+ */
+export interface SharedCheckoutPageSweepDeps {
+  /** The OPEN daemon-verb `shared-checkout-{dirty,desync}` rows not yet paged
+   *  (`human_notified_at IS NULL`) — the current-state working set. */
+  readonly selectUnpaged: () => SharedCheckoutPageRow[];
+  /** Send the ONE botctl page about a live dirty/desync distress row. Async + fail-open —
+   *  every error degrades to `notify_failed` so the row re-sweeps (it stays
+   *  operator-visible meanwhile), never a wedge or a silent drop. */
+  readonly notifyHuman: (
+    row: SharedCheckoutPageRow,
+  ) => Promise<SharedCheckoutNotifiedOutcome>;
+  /** Mint a `SharedCheckoutHumanNotified{outcome}` synthetic event. The fold stamps
+   *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the row — only
+   *  the producer level-clear (`DispatchCleared`) does, re-arming the marker at NULL so a
+   *  cleared-then-reminted row pages anew. */
+  readonly mintNotified: (
+    id: string,
+    outcome: SharedCheckoutNotifiedOutcome,
+  ) => void;
+  /** Optional greppable trace sink (a page failure). */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one shared-checkout hygiene page-once sweep — the promotion that pages the human
+ * about a live `shared-checkout-dirty` / `shared-checkout-desync` distress row so it can
+ * never sit advisory-and-ignored again. Rides the repair-escalation heartbeat and its
+ * gating (autopilot wanted, not paused) rather than a timer of its own, so a paused board
+ * defers the page until play. For each OPEN, not-yet-paged row it sends ONE botctl page
+ * and mints `SharedCheckoutHumanNotified{outcome}`; the fold stamps `human_notified_at`
+ * ONLY on the terminal `notified`, so a `notify_failed` leaves the marker NULL and the row
+ * re-sweeps next heartbeat (the page is never lost). It pages on ROW PRESENCE past the
+ * producer's grace — the desync-propagation risk exists whether or not a finalize is
+ * currently starving. The producer's observed-clean level-clear DELETEs the row, resetting
+ * the once-marker: a re-minted row after a fresh grace pages again (a new incident episode;
+ * the sustained grace bounds flapping). NEVER throws — a read edge degrades to a skipped
+ * tick; the spawn lives only in the injected `notifyHuman`, never reachable from
+ * `applyEvent`, so a re-fold never re-pages.
+ */
+export async function runSharedCheckoutPageSweep(
+  deps: SharedCheckoutPageSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let rows: SharedCheckoutPageRow[];
+  try {
+    rows = deps.selectUnpaged();
+  } catch (err) {
+    note(
+      `# warn: shared-checkout page sweep row read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  for (const row of rows) {
+    let outcome: SharedCheckoutNotifiedOutcome;
+    try {
+      outcome = await deps.notifyHuman(row);
+    } catch (err) {
+      note(
+        `# warn: shared-checkout page threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      outcome = "notify_failed";
+    }
+    deps.mintNotified(row.id, outcome);
   }
 }
 
@@ -3770,52 +3904,12 @@ export function withBootDrainCheckpointTuning(
 const MAX_DEAD_LETTER_FILE_BYTES = 16 * 1024 * 1024;
 
 /**
- * Serialize a `UsageSnapshotMessage` into the JSON string that rides in the
- * synthetic `UsageSnapshot` event's `data` blob. The reducer
- * (`extractUsageSnapshot`) decodes the same shape; every projection-meaningful
- * field MUST appear here or the corresponding `usage` column folds to NULL
- * forever. NOT serialized: `kind` (event-tag discriminator) and `id` (rides in
- * `events.session_id`, not the data blob). Slot order here is shape-tolerant;
- * the load-bearing order lives in `usage-worker.ts` `buildUsageMessage`.
- */
-export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
-  return JSON.stringify({
-    target: msg.target,
-    multiplier: msg.multiplier,
-    session_percent: msg.session_percent,
-    session_resets_at: msg.session_resets_at,
-    week_percent: msg.week_percent,
-    week_resets_at: msg.week_resets_at,
-    sonnet_week_percent: msg.sonnet_week_percent,
-    sonnet_week_resets_at: msg.sonnet_week_resets_at,
-    codex_spark_session_percent: msg.codex_spark_session_percent,
-    codex_spark_session_resets_at: msg.codex_spark_session_resets_at,
-    codex_spark_week_percent: msg.codex_spark_week_percent,
-    codex_spark_week_resets_at: msg.codex_spark_week_resets_at,
-    // Envelope freshness / plan / stale-error axes — forwarded so the
-    // reducer's UPSERT populates the columns instead of folding NULL.
-    status: msg.status,
-    subscription_active: msg.subscription_active,
-    account_state: msg.account_state,
-    error_type: msg.error_type,
-    error_message: msg.error_message,
-    error_at: msg.error_at,
-    error_kind: msg.error_kind,
-    // Rate-limit lift instant — folded into `usage.rate_limit_lifts_at`. The
-    // companion `last_usage_fold_at` freshness stamp is NOT serialized; the
-    // reducer derives it from the event `ts` (never a wall-clock read in a fold).
-    lift_at: msg.lift_at,
-  });
-}
-
-/**
  * Serialize a `SessionTelemetryMessage` into the JSON string that rides in the
  * synthetic `SessionTelemetry` event's `data` blob (fn-1024). The reducer
  * (`extractSessionTelemetry`) decodes the same shape; every projection-meaningful
  * field MUST appear here or the corresponding `jobs` column folds to NULL. NOT
  * serialized: `kind` (the event-tag discriminator) and `id` (rides in
- * `events.session_id`, not the data blob) — mirroring {@link
- * serializeUsageSnapshot}. A `null` field stays `null` on the wire so the fold's
+ * `events.session_id`, not the data blob). A `null` field stays `null` on the wire so the fold's
  * COALESCE merge preserves whatever a prior snapshot wrote.
  */
 export function serializeSessionTelemetry(
@@ -5395,6 +5489,7 @@ export const INGEST_EVENTS_COLUMNS = [
   "harness",
   "resume_target",
   "adopted",
+  "account_route",
 ] as const;
 
 /**
@@ -6653,10 +6748,9 @@ export type WorkerName =
   | "plan"
   | "exit"
   | "git"
-  | "usage"
   | "statusline"
   | "builds"
-  | "usageScraper"
+  | "accountObserver"
   | "deadLetter"
   | "eventsIngest"
   | "birthIngest"
@@ -6682,10 +6776,9 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "plan",
   "exit",
   "git",
-  "usage",
   "statusline",
   "builds",
-  "usageScraper",
+  "accountObserver",
   "deadLetter",
   "eventsIngest",
   "birthIngest",
@@ -6710,7 +6803,6 @@ export const ALL_WORKERS: readonly WorkerName[] = [
 const WATCHER_WORKERS: readonly WorkerName[] = [
   "transcript",
   "plan",
-  "usage",
   "statusline",
   "deadLetter",
   "eventsIngest",
@@ -7344,34 +7436,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint one synthetic usage `events` row, surviving a transient writer-lock
-   * starvation instead of crashing the daemon.
-   *
-   * The usage producer churns `<id>.json` create/delete events whenever the
-   * agentusage daemon rotates a profile, so its mint is the one most likely to
-   * land mid-checkpoint while a multi-GB WAL writer holds the lock past the
-   * connection `busy_timeout`. `insertEvent.run` is synchronous, so on that
-   * miss it throws `SQLITE_BUSY` straight up through `uw.onmessage` (no awaits,
-   * no catch) to `process.on("uncaughtException")` → `fatalExit` — turning a
-   * recoverable lock-contention blip into a full restart into the unpaused-boot
-   * dispatch window. The 2026-06-10 incident took 39 such restarts.
-   *
-   * A DROPPED usage mint is recoverable BY DESIGN, which is what makes
-   * drop-don't-crash safe HERE specifically (the other producer mints have no
-   * such re-emit and must NOT adopt this without their own recoverability
-   * argument): a snapshot re-emits on the file's next change-gated write, and a
-   * tombstone is re-retracted by the next boot scan's {@link UsageScanner.sweep}
-   * (it diffs the live projection against the on-disk census). So a transient
-   * `SQLITE_BUSY` is logged loudly and dropped; the daemon stays up.
-   *
-   * Every OTHER error — notably `SQLITE_CORRUPT` (the malformed-image / fn-746
-   * class) — still rethrows so the loud-and-`fatalExit`-and-relaunch contract
-   * holds for genuine corruption. This narrows the fatal surface to real faults
-   * without widening any write path.
-   *
-   * @returns `true` if the row landed, `false` if a transient busy dropped it.
+   * Mint a recoverable producer snapshot while tolerating transient writer-lock
+   * starvation. Callers must have a level-triggered re-emit or boot-scan path;
+   * every other error remains fatal.
    */
-  function mintUsageEventTolerant(
+  function mintRecoverableSnapshotEvent(
     params: Parameters<typeof stmts.insertEvent.run>[0],
   ): boolean {
     try {
@@ -7380,8 +7449,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch (err) {
       if (isTransientBusyError(err)) {
         console.error(
-          "[keeperd] usage mint dropped a synthetic event on transient writer-lock " +
-            "contention (recoverable via re-emit / boot sweep); daemon stays up:",
+          "[keeperd] recoverable snapshot mint dropped on transient writer-lock " +
+            "contention; daemon stays up:",
           err,
         );
         return false;
@@ -9052,105 +9121,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (gitWorker)`
 
-  // Spawn the usage worker in the SAME post-migration window. It watches the
-  // agentusage daemon's flat leaf state dir (`~/.local/state/agentusage/`) and
-  // posts `{kind: "usage-snapshot" | "usage-deleted", ...}` messages — the
-  // fifth file-watcher producer-worker instance. Main turns each into a
-  // synthetic `UsageSnapshot`/`UsageDeleted` events row on its writable
-  // connection. The watch root is resolved on main via `resolveUsageRoot()`
-  // and tolerates absence (agentusage may not have run yet).
-  // Gated on the selector — `null` when unselected.
-  const usageWorker = want("usage")
-    ? new Worker(new URL("./usage-worker.ts", import.meta.url).href, {
-        workerData: {
-          dbPath,
-          root: resolveUsageRoot(),
-          disableNativeWatcher: opts.disableNativeWatcher,
-        } satisfies UsageWorkerData,
-      } as WorkerOptions & { workerData: unknown })
-    : null;
-
-  if (usageWorker) {
-    const uw = usageWorker;
-    // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
-    // becomes a synthetic events row on the WRITABLE connection, then a wake pump
-    // folds it. The agentusage profile id rides in `session_id`; the flattened
-    // snapshot in `data` (empty for tombstones). Everything else is NULL.
-    uw.onmessage = (ev: MessageEvent<UsageMessage | undefined>): void => {
-      const msg = ev.data;
-      if (!msg) return;
-      let hookEvent: string;
-      let data: string;
-      if (msg.kind === "usage-snapshot") {
-        hookEvent = "UsageSnapshot";
-        // Pre-flattened payload — the reducer never re-reads the on-disk file.
-        // Forwarded via the exported `serializeUsageSnapshot` so the wire shape
-        // is pinned by a direct test.
-        data = serializeUsageSnapshot(msg);
-      } else if (msg.kind === "usage-deleted") {
-        // Tombstone: the reducer DELETEs the `usage` row whose primary key is
-        // `id`. No payload beyond the pk in `session_id` — matches the
-        // GitRootDropped / EpicDeleted shape so re-fold reproduces the deletion.
-        hookEvent = "UsageDeleted";
-        data = "";
-      } else {
-        return;
-      }
-      // Tolerant mint: a transient writer-lock miss is logged-and-dropped
-      // (recoverable via change-gated re-emit / boot sweep) instead of crashing
-      // the daemon into the unpaused-boot dispatch window; real corruption still
-      // throws on through to `fatalExit`. See {@link mintUsageEventTolerant}.
-      const minted = mintUsageEventTolerant({
-        $ts: Date.now() / 1000,
-        $session_id: msg.id, // the entity pk: agentusage profile id
-        $pid: null,
-        $hook_event: hookEvent,
-        $event_type: "usage_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: data,
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      // Nothing landed on a dropped mint — skip the wake so we don't spin a
-      // no-op drain pass; the next re-emit / boot sweep carries the row.
-      if (minted) {
-        wakePending = true;
-        pumpWakes();
-      }
-    };
-
-    uw.onerror = (err: ErrorEvent): void => {
-      console.error("[keeperd] usage worker error:", err.message ?? err);
-      if (!shuttingDown) fatalExit();
-    };
-
-    uw.addEventListener("close", () => {
-      if (!shuttingDown) fatalExit();
-    });
-  } // end `if (usageWorker)`
-
   // Spawn the statusline worker in the SAME post-migration window (fn-1024). It
   // watches the keeper-managed statusLine leaf dir (`~/.local/state/keeper/
   // statusline/`, one `<token>.json` per session written by `keeper
@@ -9183,11 +9153,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     ): void => {
       const msg = ev.data;
       if (!msg || msg.kind !== "session-telemetry") return;
-      // Tolerant mint (shared with usage): a transient writer-lock miss is
+      // A transient writer-lock miss is
       // logged-and-dropped (recoverable via change-gated re-emit / boot scan)
       // instead of crashing the daemon; real corruption still throws through to
       // `fatalExit`.
-      const minted = mintUsageEventTolerant({
+      const minted = mintRecoverableSnapshotEvent({
         $ts: Date.now() / 1000,
         $session_id: msg.id, // RAW claude session_id === jobs.job_id
         $pid: null,
@@ -9243,8 +9213,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // It polls the local buildbot master's REST API on a fixed cadence and posts
   // `{kind: "build-snapshot" | "build-deleted", ...}` messages — main turns each
   // into a synthetic `BuildSnapshot`/`BuildDeleted` events row on its writable
-  // connection. Gated on the selector AND a configured `buildbot_url` (the spawn
-  // mirrors the usage spawn, but the config key has no default — an unconfigured
+  // connection. Gated on the selector AND a configured `buildbot_url` (the
+  // config key has no default — an unconfigured
   // buildbot leaves the worker un-spawned and the daemon boots normally).
   const buildbotUrl = resolveBuildbotUrl();
   const buildsWorker =
@@ -9286,7 +9256,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // Tolerant mint: a transient writer-lock miss is logged-and-dropped
       // (recoverable via change-gated re-emit on the next poll) instead of
       // crashing the daemon; real corruption still throws through to fatalExit.
-      const minted = mintUsageEventTolerant({
+      const minted = mintRecoverableSnapshotEvent({
         $ts: Date.now() / 1000,
         $session_id: msg.project, // the entity pk: builder name
         $pid: null,
@@ -9335,45 +9305,45 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (buildsWorker)`
 
-  // Spawn the usage-scraper PRODUCER worker — the in-process port of the retired
-  // agentusage daemon. It runs N per-account scrape loops and writes ONLY the
-  // on-disk `<id>.json` / `.error.json` / `events.jsonl` envelopes under the
-  // agentusage state root; the existing `usage` CONSUMER worker watches that same
-  // dir and mints the events, so the scraper posts NO messages to main and needs
-  // no `onmessage` minting. NOT a file-watcher (not in WATCHER_WORKERS). Gated on
-  // the plain worker selector — the scrape entry is first-class keeper source
-  // (always present), and the scraped model SET is governed by config declaring
-  // models (resolved inside the worker), so there is no runtime-resolution gate.
-  // The state dir is resolved on main via `resolveUsageRoot()` so the
-  // `KEEPER_AGENTUSAGE_ROOT` sandbox seam moves the producer + the consumer
-  // together.
-  const usageScraperWorker = want("usageScraper")
-    ? new Worker(new URL("./usage-scraper-worker.ts", import.meta.url).href, {
-        workerData: {
-          dbPath,
-          stateDir: resolveUsageRoot(),
-        } satisfies UsageScraperWorkerData,
-      } as WorkerOptions & { workerData: unknown })
+  // Spawn the account-observation PRODUCER worker — the optional, bounded probe
+  // over the two installed public CLIs (CodexBar + `cswap list --json`). It
+  // invokes each through an exact-argv runner, validates the payloads, and
+  // atomically publishes ONE PII-free observation sidecar under the routing
+  // root; the per-launch router reads that sidecar off the launch path. SHADOW
+  // MODE: it publishes health + candidate snapshots but nothing consumes them for
+  // launches yet. It posts NO messages to main and holds
+  // NO DB handle — its only output is the on-disk sidecar. NOT a file-watcher
+  // (not in WATCHER_WORKERS). The state dir is resolved on main via
+  // `resolveAccountRoutingRoot()` so the `KEEPER_ACCOUNT_ROUTING_ROOT` sandbox
+  // seam moves the observer + router together.
+  const accountObserverWorker = want("accountObserver")
+    ? new Worker(
+        new URL("./account-observer-worker.ts", import.meta.url).href,
+        {
+          workerData: {
+            stateDir: resolveAccountRoutingRoot(),
+          } satisfies AccountObserverWorkerData,
+        } as WorkerOptions & { workerData: unknown },
+      )
     : null;
 
-  if (usageScraperWorker) {
-    const usw = usageScraperWorker;
-    // No message minting — the producer's only output is its on-disk envelopes
-    // (the consumer worker turns those into events). Wire only the crash guards:
-    // a producer crash is fatal like every other worker (the `!shuttingDown`
-    // gate keeps an orderly teardown quiet).
-    usw.onerror = (err: ErrorEvent): void => {
+  if (accountObserverWorker) {
+    const aow = accountObserverWorker;
+    // No message minting — the observer's only output is its on-disk sidecar.
+    // Wire only the crash guards: a producer crash is fatal like every other
+    // worker (the `!shuttingDown` gate keeps an orderly teardown quiet).
+    aow.onerror = (err: ErrorEvent): void => {
       console.error(
-        "[keeperd] usage-scraper worker error:",
+        "[keeperd] account-observer worker error:",
         err.message ?? err,
       );
       if (!shuttingDown) fatalExit();
     };
 
-    usw.addEventListener("close", () => {
+    aow.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // end `if (usageScraperWorker)`
+  } // end `if (accountObserverWorker)`
 
   // Watches the dead-letters dir and posts a contentless
   // `{kind:"dead-letter-changed"}`. The worker holds NO DB handle — main is the
@@ -11009,6 +10979,65 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  /**
+   * Mint one synthetic `SharedCheckoutHumanNotified` event onto the writable connection —
+   * the shared-checkout page-once sweep's only write path into the
+   * `dispatch_failures.human_notified_at` once-marker on a
+   * `shared-checkout-{dirty,desync}:<repoHash>` distress row (the reducer fold owns the
+   * UPDATE, stamping ONLY on the terminal `notified` and NEVER clearing the row). Sibling
+   * of {@link mintRepairHumanNotifiedEvent}; the distress-row `id` rides the entity-key
+   * overload on `session_id`. NON-FATAL on insert failure — the next heartbeat sweep
+   * re-attempts (the marker stays NULL on a `notify_failed`).
+   */
+  function mintSharedCheckoutHumanNotifiedEvent(
+    id: string,
+    outcome: SharedCheckoutNotifiedOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: id,
+        $pid: null,
+        $hook_event: "SharedCheckoutHumanNotified",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ id, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] SharedCheckoutHumanNotified mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -12162,6 +12191,60 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // The OPEN, not-yet-paged shared-checkout hygiene distress rows — daemon-verb
+  // `shared-checkout-{dirty,desync}:<repoHash>` stickies with `human_notified_at IS NULL`
+  // — the page-once sweep's current-state working set. Both families share the daemon
+  // distress verb; the two id prefixes are disjoint. A read failure degrades to an empty
+  // set (the next tick re-reads).
+  function selectUnpagedSharedCheckoutRows(): SharedCheckoutPageRow[] {
+    try {
+      return db
+        .query(
+          `SELECT id, dir, reason FROM dispatch_failures
+             WHERE verb = ? AND (id LIKE ? OR id LIKE ?)
+               AND human_notified_at IS NULL`,
+        )
+        .all(
+          SHARED_DIRTY_DISTRESS_VERB,
+          `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
+          `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
+        ) as SharedCheckoutPageRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Send the ONE botctl page about a live shared-checkout dirty/desync distress row.
+  // Sibling of `notifyHumanOfRepair`: ASYNC spawn, array form so the body rides as a
+  // literal argv element. A non-zero exit OR a missing botctl maps to `notify_failed` —
+  // NON-terminal, so the marker stays NULL and the row re-sweeps: the page is never lost,
+  // and the distress row stays operator-visible on the board throughout.
+  async function notifyHumanOfSharedCheckout(
+    row: SharedCheckoutPageRow,
+  ): Promise<SharedCheckoutNotifiedOutcome> {
+    const body = buildSharedCheckoutPageBody(row);
+    try {
+      const proc = Bun.spawn(
+        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0 ? "notified" : "notify_failed";
+    } catch (err) {
+      console.error(
+        `[keeperd] shared-checkout human-page spawn threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return "notify_failed";
+    }
+  }
+
   // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
   // checkout (the repo dir itself — NOT the lane-or-project resolution unblock uses),
   // where the base branch lives and `keeper commit-work` lands a trunk commit; the prompt
@@ -12371,6 +12454,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     for (const c of decision.clear) {
       mintDispatchClearedEvent(SHARED_DIRTY_DISTRESS_VERB, c.id);
     }
+
+    // Page-once step — the shared-checkout hygiene distress promotion. Runs AFTER the
+    // dirt mint/clear above so a dirty row minted THIS tick is eligible to page (it is
+    // already open by the time this reads), while a row cleared this tick has already
+    // dropped out of `human_notified_at IS NULL` selection. Inherits this tick's
+    // not-paused / not-shutting-down gating; a paused board defers the page until play.
+    await runSharedCheckoutPageSweep({
+      selectUnpaged: () => selectUnpagedSharedCheckoutRows(),
+      notifyHuman: (row) => notifyHumanOfSharedCheckout(row),
+      mintNotified: (id, outcome) =>
+        mintSharedCheckoutHumanNotifiedEvent(id, outcome),
+      noteLine: note,
+    });
   }
   // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
   // launcher is reachable. Rides the same 60s heartbeat as the block-escalation sweep.
@@ -13666,7 +13762,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Spawn the Baseline runner PRODUCER worker (docs/adr/0005). It consumes the
   // CLI-written request spool, computes the fast-gate suite result once per key in
   // a detached scratch worktree, and is the SOLE writer of the per-key result
-  // leafs — a pure on-disk producer, so like the usage-scraper it posts NO message
+  // leafs — a pure on-disk producer, so it posts NO message
   // to main (no synthetic event, no keeper.db write). It boot-prunes orphaned
   // scratch worktrees itself.
   const baselineWorker = want("baseline")
@@ -13791,10 +13887,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       planWorker,
       exitWorker,
       gitWorker,
-      usageWorker,
       statuslineWorker,
       buildsWorker,
-      usageScraperWorker,
+      accountObserverWorker,
       deadLetterWorker,
       eventsIngestWorker,
       birthIngestWorker,

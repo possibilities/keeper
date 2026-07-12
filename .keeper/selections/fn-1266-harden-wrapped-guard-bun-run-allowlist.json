@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Closing a bypass hole in a security guard's total-edit-denial invariant is a nameable security-critical reason (hard opus gate); xhigh fits the contract-touching allowlist-parsing work where a wrong abstraction reopens the hole, with the root cause already named so max is unwarranted.",
+      "task_id": "fn-1266-harden-wrapped-guard-bun-run-allowlist.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-12T18:10:51.699000Z",
+  "epic_id": "fn-1266-harden-wrapped-guard-bun-run-allowlist",
+  "input_hash": "11ec6fa18a0d72ff58c6a59e6ebb4f057783239be775dea35c60fd6f8a385256",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 300707745,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Closing a bypass hole in a security guard's total-edit-denial invariant is a nameable security-critical reason (hard opus gate); xhigh fits the contract-touching allowlist-parsing work where a wrong abstraction reopens the hole, with the root cause already named so max is unwarranted.\",\"confidence\":0.83}]}\n"
+}

@@ -47,9 +47,11 @@ export interface TranscriptWatchOptions {
    * fresh-launch created-at floor that would reject a rollout whose session-start
    * predates this launch — codex appends to the SAME rollout on resume. claude/pi
    * are already strict-pinned by their session id, so their discovery is
-   * unchanged. The stop-scan anchors at {@link startedAtMs} for every harness
-   * regardless, so a pre-resume terminal stop already in the file is never
-   * captured as the answer. Omitted/false = fresh launch, byte-unchanged.
+   * unchanged. codex/claude anchor the stop-scan at {@link startedAtMs} so a
+   * pre-resume stop is skipped; pi re-stamps its copied history with resume-time
+   * timestamps, defeating that window, so a resumed pi wait anchors on a
+   * structural stop-count watermark instead (see {@link waitForTranscriptStop}).
+   * Omitted/false = fresh launch, byte-unchanged.
    */
   isResume?: boolean;
 }
@@ -132,12 +134,23 @@ export async function waitForTranscriptStop(
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const deadline = Date.now() + (opts.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
 
+  // Resumed pi copies the whole prior conversation into the new session file and
+  // RE-STAMPS every entry with resume-time timestamps, so the started-at window
+  // can't exclude the copied stops (codex keeps original timestamps and stays
+  // handled by that filter). Anchor on a structural watermark instead: the count
+  // of stops already present when the wait begins. Only a STRICTLY newer stop is
+  // the resumed turn's — sampled ONCE here so a stop the turn appends later is
+  // the first past this floor.
+  const resumeStopFloor =
+    opts.isResume === true && opts.agent === "pi"
+      ? countTranscriptStops(opts.agent, opts.transcriptPath)
+      : null;
+
   while (true) {
-    const stop = findTranscriptStop(
-      opts.agent,
-      opts.transcriptPath,
-      opts.startedAtMs,
-    );
+    const stop =
+      resumeStopFloor === null
+        ? findTranscriptStop(opts.agent, opts.transcriptPath, opts.startedAtMs)
+        : findStopPastFloor(opts.agent, opts.transcriptPath, resumeStopFloor);
     if (stop !== null) {
       return { ok: true, stop };
     }
@@ -160,15 +173,32 @@ export async function waitForTranscriptStop(
  * so neither `sawStop` nor `sawAssistant` flips. `text:null` with `found:true`
  * means a turn was observed but carried no readable text (e.g. a codex refusal
  * whose stop event still registered).
+ *
+ * `opts.isResume` cuts the scan for pi: a resumed pi session file copies the
+ * whole prior conversation with resume-time timestamps, so a whole-file scan
+ * would surface the PRIOR turn's answer as "latest" on the timed-out partial
+ * path. The cut starts at the resumed turn's own prompt (the last user-role
+ * entry) so only this turn's output is read. Fresh pi and every other harness
+ * scan the whole file, byte-unchanged.
  */
-export function findLastMessage(agent: AgentKind, path: string): LastMessage {
+export function findLastMessage(
+  agent: AgentKind,
+  path: string,
+  opts?: { isResume?: boolean },
+): LastMessage {
+  const lines = readLines(path);
+  const start =
+    opts?.isResume === true && agent === "pi"
+      ? lastPiUserPromptIndex(lines)
+      : 0;
+
   let latestStopText: string | null = null;
   let sawStop = false;
   let latestAssistantText: string | null = null;
   let sawAssistant = false;
 
-  for (const line of readLines(path)) {
-    const parsed = parseJsonObject(line);
+  for (let i = start; i < lines.length; i++) {
+    const parsed = parseJsonObject(lines[i] as string);
     if (parsed === null) {
       continue;
     }
@@ -191,6 +221,30 @@ export function findLastMessage(agent: AgentKind, path: string): LastMessage {
     return { agent, text: latestAssistantText, found: true };
   }
   return { agent, text: null, found: false };
+}
+
+/**
+ * The index of the resumed pi turn's own prompt — the LAST user-role message
+ * entry (`type:"message"`, `message.role:"user"`). Everything after it is this
+ * turn's output; everything before is the re-stamped copied history. 0 when no
+ * user entry is found, so the scan falls back to the whole file (nothing to cut).
+ */
+function lastPiUserPromptIndex(lines: string[]): number {
+  let idx = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const parsed = parseJsonObject(lines[i] as string);
+    if (parsed !== null && isPiUserPrompt(parsed)) {
+      idx = i;
+    }
+  }
+  return idx;
+}
+
+function isPiUserPrompt(obj: Record<string, unknown>): boolean {
+  if (stringValue(obj.type) !== "message") {
+    return false;
+  }
+  return stringValue(objectValue(obj.message)?.role) === "user";
 }
 
 /**
@@ -372,6 +426,52 @@ function findPiTranscriptInFiles(
   const fresh = freshFiles(files, opts.startedAtMs);
   const cwdMatches = fresh.filter((path) => readPiMeta(path).cwd === opts.cwd);
   return newestFile(cwdMatches) ?? newestFile(fresh);
+}
+
+/**
+ * The count of per-backend stop markers already in a transcript — the resumed-pi
+ * watermark's floor, sampled ONCE as the wait begins. See {@link
+ * waitForTranscriptStop}.
+ */
+function countTranscriptStops(agent: AgentKind, path: string): number {
+  let count = 0;
+  for (const line of readLines(path)) {
+    const parsed = parseJsonObject(line);
+    if (parsed !== null && stopFromObject(agent, parsed) !== null) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * The first stop strictly past `floor` prior stops in file order — the resumed
+ * turn's own stop, anchored past the re-stamped copied history structurally
+ * rather than by a timestamp window pi's re-stamping defeats. Null until the turn
+ * appends stop number `floor + 1`.
+ */
+function findStopPastFloor(
+  agent: AgentKind,
+  path: string,
+  floor: number,
+): TranscriptStop | null {
+  let seen = 0;
+  for (const line of readLines(path)) {
+    const parsed = parseJsonObject(line);
+    if (parsed === null) {
+      continue;
+    }
+    const stop = stopFromObject(agent, parsed);
+    if (stop === null) {
+      continue;
+    }
+    if (seen < floor) {
+      seen++;
+      continue;
+    }
+    return stop;
+  }
+  return null;
 }
 
 function findTranscriptStop(

@@ -65,9 +65,9 @@ pinned. The end state is a repo-wide grep for "planctl" returning only that surf
 ## agentwrap
 
 The "agentwrap" name (the former launcher) is retired to **zero**. The live
-surfaces are `keeper agent` (the command), `KEEPER_AGENT_*` (the env-var family,
-e.g. `KEEPER_AGENT_PATH` / `KEEPER_AGENT_CLAUDE_PROFILE`), `~/.config/keeper/` (the
-launcher config dir), and `~/.local/state/keeper-agent/` (the runtime state dir).
+surfaces are `keeper agent` (the command), `KEEPER_AGENT_*` entries such as
+`KEEPER_AGENT_PATH`, `~/.config/keeper/` (the launcher config dir), and
+`~/.local/state/keeper-agent/` (the runtime state dir).
 
 ### What was retired
 
@@ -75,7 +75,7 @@ launcher config dir), and `~/.local/state/keeper-agent/` (the runtime state dir)
   in-process launcher.
 - **The env-var family.** `AGENTWRAP_*` → `KEEPER_AGENT_*` across producer,
   consumer, and the pane-forward filter (`KEEPER_AGENT_PATH` is excluded from the
-  forward filter). arthack's statusline reads `KEEPER_AGENT_CLAUDE_PROFILE`.
+  forward filter).
 - **The config dir.** `~/.config/agentwrap/` → `~/.config/keeper/`, split into the
   per-harness `{claude,codex,pi,plugins}.yaml` defaults + `{presets,panel}.yaml`
   launch-config. The transitional read-old fallback and its `legacyAgentwrap*`
