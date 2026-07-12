@@ -54,5 +54,5 @@ Documentation lands after both producer/consumer and lifecycle behavior so examp
 - [ ] Forward-facing docs use the canonical Bus message artifact term and contain no stale receiver-spill guidance.
 
 ## Done summary
-
+Replaced size-dependent inline/spill receive guidance in the bus skill with the explicit confined-path artifact-read contract, and added a concise README discoverability entry, using the canonical Bus message artifact term throughout.
 ## Evidence

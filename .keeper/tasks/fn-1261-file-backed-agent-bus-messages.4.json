@@ -15,5 +15,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Document file-backed bus workflow",
-  "updated_at": "2026-07-12T06:27:31.200000Z"
+  "updated_at": "2026-07-12T22:20:22.922000Z",
+  "worker_done_at": "2026-07-12T22:20:22.922000Z"
 }
