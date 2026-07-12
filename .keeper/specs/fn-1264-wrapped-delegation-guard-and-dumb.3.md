@@ -60,5 +60,5 @@ green after re-capture. Confirm a rendered wrapped worker cell contains the `$KE
 - [ ] The parent `/plan:work` resume/iteration contract is consistent with the courier wrapper (no wrapper-side content edits assumed).
 
 ## Done summary
-
+Rewrote the wrapped worker contract as a dumb courier: iteration (impl/test/lint) delegates to the leg via keeper agent run --resume, the wrapper owns only delegation/adjudication/close-out, launch drops the sh -c nohup/pidfile fork for a single native-detach keeper agent run call, and the parity oracle + tests are re-captured/updated.
 ## Evidence
