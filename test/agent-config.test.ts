@@ -294,18 +294,19 @@ describe("loadPanelSelections", () => {
   test("a panel of triple members is read in declaration order", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+      "panels:\n  duo:\n    strength: standard\n    description: a pair.\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\n",
     );
-    expect(loadPanelSelections(p).panels.duo).toEqual([
-      "claude::opus::high",
-      "codex::gpt-5.3::high",
-    ]);
+    expect(loadPanelSelections(p).panels.duo).toEqual({
+      strength: "standard",
+      description: "a pair.",
+      members: ["claude::opus::high", "codex::gpt-5.3::high"],
+    });
   });
 
   test("a malformed member triple is fail-loud naming the member", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - not-a-triple\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - not-a-triple\n",
     );
     expect(() => loadPanelSelections(p)).toThrow(/not-a-triple/);
     expect(() => loadPanelSelections(p)).toThrow(/not a valid launch triple/);
@@ -315,9 +316,9 @@ describe("loadPanelSelections", () => {
     // pi is capturable AND carries a thinking axis, so a pi panel member is valid.
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  mixed:\n    - claude::opus::high\n    - pi::glm::high\n",
+      "panels:\n  mixed:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - pi::glm::high\n",
     );
-    expect(loadPanelSelections(p).panels.mixed).toEqual([
+    expect(loadPanelSelections(p).panels.mixed.members).toEqual([
       "claude::opus::high",
       "pi::glm::high",
     ]);
@@ -328,7 +329,7 @@ describe("loadPanelSelections", () => {
     // axis, so it is rejected AT LOAD with the member named.
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - hermes::hermes-m::na\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - hermes::hermes-m::na\n",
     );
     expect(() => loadPanelSelections(p)).toThrow(/hermes::hermes-m::na/);
     expect(() => loadPanelSelections(p)).toThrow(/not panel-eligible/);
@@ -337,23 +338,73 @@ describe("loadPanelSelections", () => {
   test("duplicate identical triples are legal at load (kept in order)", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  dup:\n    - claude::opus::high\n    - claude::opus::high\n",
+      "panels:\n  dup:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - claude::opus::high\n",
     );
-    expect(loadPanelSelections(p).panels.dup).toEqual([
+    expect(loadPanelSelections(p).panels.dup.members).toEqual([
       "claude::opus::high",
       "claude::opus::high",
     ]);
   });
 
-  test("an empty panel list is fail-loud", () => {
-    const p = writeYaml("panel.yaml", "panels:\n  empty: []\n");
+  test("an empty members list is fail-loud", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  empty:\n    strength: standard\n    description: d\n    members: []\n",
+    );
     expect(() => loadPanelSelections(p)).toThrow(/non-empty list/);
+  });
+
+  test("a legacy list-form panel value is fail-loud, naming the panel and /plan:panel-guidance", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+    );
+    expect(() => loadPanelSelections(p)).toThrow(/'duo'/);
+    expect(() => loadPanelSelections(p)).toThrow(/legacy list form/);
+    expect(() => loadPanelSelections(p)).toThrow(/\/plan:panel-guidance/);
+  });
+
+  test("a panel value that is neither an object nor a list is fail-loud", () => {
+    const p = writeYaml("panel.yaml", "panels:\n  duo: not-a-mapping\n");
+    expect(() => loadPanelSelections(p)).toThrow(
+      /must be an object \{strength, members, description\}/,
+    );
+  });
+
+  test("an unknown panel-entry key is fail-loud (strict reject)", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n    extra: nope\n",
+    );
+    expect(() => loadPanelSelections(p)).toThrow(
+      /Unknown panel 'duo' key 'extra'/,
+    );
+  });
+
+  test("a blank strength is fail-loud", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    strength: '  '\n    description: d\n    members:\n      - claude::opus::high\n",
+    );
+    expect(() => loadPanelSelections(p)).toThrow(
+      /strength must be a non-empty string/,
+    );
+  });
+
+  test("a missing description is fail-loud", () => {
+    const p = writeYaml(
+      "panel.yaml",
+      "panels:\n  duo:\n    strength: standard\n    members:\n      - claude::opus::high\n",
+    );
+    expect(() => loadPanelSelections(p)).toThrow(
+      /description must be a non-empty string/,
+    );
   });
 
   test("an unknown top-level key is fail-loud (strict reject)", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\npresets:\n  x: y\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\npresets:\n  x: y\n",
     );
     expect(() => loadPanelSelections(p)).toThrow(
       /Unknown top-level key 'presets'/,
@@ -363,7 +414,7 @@ describe("loadPanelSelections", () => {
   test("the default key names a defined panel", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\ndefault: duo\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\ndefault: duo\n",
     );
     expect(loadPanelSelections(p).default).toBe("duo");
   });
@@ -371,7 +422,7 @@ describe("loadPanelSelections", () => {
   test("no default key leaves default null", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\n",
     );
     expect(loadPanelSelections(p).default).toBeNull();
   });
@@ -379,7 +430,7 @@ describe("loadPanelSelections", () => {
   test("a default naming an undefined panel is fail-loud", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\ndefault: ghost\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\ndefault: ghost\n",
     );
     expect(() => loadPanelSelections(p)).toThrow(/default panel 'ghost'/);
   });
@@ -387,9 +438,9 @@ describe("loadPanelSelections", () => {
   test("two same-harness-different-model panelists are expressible", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  claude-duo:\n    - claude::opus::high\n    - claude::sonnet::high\n",
+      "panels:\n  claude-duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - claude::sonnet::high\n",
     );
-    expect(loadPanelSelections(p).panels["claude-duo"]).toEqual([
+    expect(loadPanelSelections(p).panels["claude-duo"]?.members).toEqual([
       "claude::opus::high",
       "claude::sonnet::high",
     ]);
