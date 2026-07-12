@@ -20,13 +20,25 @@
 
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import type { ChannelRow } from "../src/bus-db";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { encodeBusArtifactRef, publishBusArtifact } from "../src/bus-artifact";
+import {
+  appendMessage,
+  artifactRowExists,
+  type ChannelRow,
+  openBusDb,
+  QUEUED_FOR_WAKE,
+  replayFromCursor,
+} from "../src/bus-db";
 import type { BusResolveResult, ResolvedIdentity } from "../src/bus-identity";
 import {
   authoritativeFrom,
   backpressureDecision,
   type ChannelLiveness,
   channelPruneDecision,
+  cleanupBusArtifacts,
   closeOwnsBinding,
   enrichPeerFromJobs,
   HARNESS_WALK_MAX_DEPTH,
@@ -34,6 +46,7 @@ import {
   liveChannelsAtBoot,
   MAX_CLIENT_QUEUE,
   offlineSendPersist,
+  payloadFromMessage,
   publishOutcome,
   type RegistryEntry,
   requeueTail,
@@ -41,6 +54,7 @@ import {
   selectFanoutTargets,
   takeoverVictim,
   toLiveChannel,
+  validateChatPayload,
 } from "../src/bus-worker";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -800,6 +814,120 @@ test("offlineSendPersist never queues a role send whose creator identity is unkn
   );
   expect(resolvedSessionId).toBeNull();
   expect(status).toBe("not_connected");
+});
+
+test("reference payload validation rejects inline and malformed/missing references", () => {
+  const base = mkdtempSync(join(tmpdir(), "bus-worker-ref-"));
+  const root = join(base, "artifacts");
+  try {
+    expect(
+      validateChatPayload({ media_type: "text/plain", text: "inline" }, root),
+    ).toEqual({ ok: false, code: "inline_not_allowed" });
+    expect(
+      validateChatPayload(
+        {
+          media_type: "application/json",
+          text: JSON.stringify({ t: "bus-artifact-ref", v: 1, id: "bad" }),
+        },
+        root,
+      ),
+    ).toEqual({ ok: false, code: "invalid_reference" });
+    const published = publishBusArtifact(root, "héllo");
+    expect(
+      validateChatPayload(
+        {
+          media_type: "application/vnd.keeper.bus-ref+json",
+          text: encodeBusArtifactRef(published.ref),
+        },
+        root,
+      ),
+    ).toEqual({ ok: true, ref: published.ref });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("queued replay reconstructs reference payload identity and retains legacy inline text", () => {
+  const db = openBusDb(":memory:");
+  const ref = {
+    id: "4".repeat(32),
+    len: 6,
+    sha256: "5".repeat(64),
+  };
+  appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    artifact_ref: ref,
+    payload_media_type: "application/vnd.keeper.bus-ref+json",
+    status: QUEUED_FOR_WAKE,
+  });
+  appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    body: "legacy inline",
+    status: QUEUED_FOR_WAKE,
+  });
+  const [reference, legacy] = replayFromCursor(db, 0);
+  expect(payloadFromMessage(reference)).toEqual({
+    media_type: "application/vnd.keeper.bus-ref+json",
+    text: '{"t":"bus-artifact-ref","v":1,"id":"44444444444444444444444444444444","len":6,"sha256":"5555555555555555555555555555555555555555555555555555555555555555"}',
+  });
+  expect(payloadFromMessage(legacy)).toEqual({
+    media_type: "text/plain",
+    text: "legacy inline",
+  });
+  db.close();
+});
+
+test("artifact cleanup deletes rows first, is bounded, and retains on delete/check failure", () => {
+  const db = openBusDb(":memory:");
+  const id = "6".repeat(32);
+  appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    ts: 1,
+    artifact_ref: { id, len: 1, sha256: "7".repeat(64) },
+  });
+  const removed: string[] = [];
+  let listedLimit = 0;
+  const result = cleanupBusArtifacts(db, "/unused", 10_000, 5_000, 1, 100, 3, {
+    referenced: artifactRowExists,
+    remove(_root, candidate) {
+      expect(artifactRowExists(db, candidate)).toBe(false);
+      removed.push(candidate);
+      return false;
+    },
+    list(_root, limit) {
+      listedLimit = limit;
+      return { ids: ["8".repeat(32)], complete: true };
+    },
+    mtime() {
+      return 1;
+    },
+  });
+  expect(result).toEqual({ rowArtifacts: 0, orphanArtifacts: 0 });
+  expect(removed).toEqual([id, "8".repeat(32)]);
+  expect(listedLimit).toBe(3);
+  expect(replayFromCursor(db, 0)).toHaveLength(0);
+
+  let deleteAttempted = false;
+  cleanupBusArtifacts(db, "/unused", 10_000, 5_000, 1, 100, 2, {
+    referenced() {
+      throw new Error("database busy");
+    },
+    remove() {
+      deleteAttempted = true;
+      return true;
+    },
+    list() {
+      return { ids: ["9".repeat(32)], complete: true };
+    },
+    mtime() {
+      return 1;
+    },
+  });
+  expect(deleteAttempted).toBe(false);
+  db.close();
 });
 
 test("offlineSendPersist carries the honest miss outcome for unknown / ambiguous targets", () => {

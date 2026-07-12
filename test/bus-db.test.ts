@@ -11,6 +11,8 @@
 
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import type { BusArtifactRef } from "../src/bus-artifact";
 import {
   appendMessage,
   BUS_SCHEMA_VERSION,
@@ -19,6 +21,7 @@ import {
   deleteChannel,
   loadChannels,
   loadOldestChannels,
+  markMessageDelivered,
   maxMessageId,
   migrateBusDb,
   openBusDb,
@@ -28,6 +31,14 @@ import {
   selectQueuedForWake,
   upsertChannel,
 } from "../src/bus-db";
+
+function artifactRef(id = "a".repeat(32), body = "héllo"): BusArtifactRef {
+  return {
+    id,
+    len: Buffer.byteLength(body, "utf8"),
+    sha256: createHash("sha256").update(body, "utf8").digest("hex"),
+  };
+}
 
 function makeChannel(overrides: Partial<ChannelRow> = {}): ChannelRow {
   return {
@@ -63,6 +74,33 @@ test("openBusDb stamps the bus user_version and creates both tables", () => {
   ).map((r) => r.name);
   expect(tables).toContain("channels");
   expect(tables).toContain("messages");
+  db.close();
+});
+
+test("migrateBusDb upgrades a v1 messages table without changing legacy rows", () => {
+  const db = new Database(":memory:");
+  db.run(`CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, namespace TEXT NOT NULL,
+    event TEXT NOT NULL, from_channel_id TEXT, from_pid INTEGER, from_name TEXT,
+    to_target TEXT, resolved_channel_id TEXT, resolved_session_id TEXT, body TEXT,
+    body_size INTEGER NOT NULL DEFAULT 0, status TEXT, reply_to INTEGER
+  )`);
+  db.run(
+    "INSERT INTO messages (ts, namespace, event, body, body_size) VALUES (1, 'chat', 'send', 'legacy', 6)",
+  );
+  db.run("PRAGMA user_version = 1");
+  migrateBusDb(db);
+  const row = db.prepare("SELECT * FROM messages").get() as Record<
+    string,
+    unknown
+  >;
+  expect(row.body).toBe("legacy");
+  expect(row.artifact_id).toBeNull();
+  expect(row.delivered_at).toBeNull();
+  expect(
+    (db.prepare("PRAGMA user_version").get() as { user_version: number })
+      .user_version,
+  ).toBe(2);
   db.close();
 });
 
@@ -182,6 +220,27 @@ test("appendMessage assigns a strictly increasing monotonic id cursor", () => {
 test("maxMessageId is 0 on an empty log", () => {
   const db = openBusDb(":memory:");
   expect(maxMessageId(db)).toBe(0);
+  db.close();
+});
+
+test("appendMessage stores typed references without a body and uses declared byte size", () => {
+  const db = openBusDb(":memory:");
+  const ref = artifactRef();
+  const id = appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    artifact_ref: ref,
+    payload_media_type: "application/vnd.keeper.bus-ref+json",
+  });
+  const raw = db
+    .prepare("SELECT * FROM messages WHERE id = ?")
+    .get(id) as Record<string, unknown>;
+  expect(raw.body).toBeNull();
+  expect(raw.body_size).toBe(6);
+  expect(raw.artifact_id).toBe("a".repeat(32));
+  const [row] = replayFromCursor(db, 0);
+  expect(row.artifact_ref).toEqual(ref);
+  expect(row.payload_media_type).toBe("application/vnd.keeper.bus-ref+json");
   db.close();
 });
 
@@ -383,7 +442,7 @@ test("pruneMessagesOlderThan deletes rows older than the cutoff and keeps recent
     body: "recent",
     ts: 9000,
   });
-  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(2);
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toEqual([]);
   expect(idsOf(db)).toEqual([recent]);
   db.close();
 });
@@ -406,7 +465,7 @@ test("pruneMessagesOlderThan preserves an undelivered queued_for_wake row regard
   });
   // Both are far older than the cutoff, but only the plain row is pruned; the
   // undelivered wake queue survives unconditionally.
-  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(1);
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toEqual([]);
   expect(idsOf(db)).toEqual([qfw]);
   db.close();
 });
@@ -421,7 +480,7 @@ test("pruneMessagesOlderThan ages out a delivered_after_wake row (only the undel
     ts: 100,
     status: DELIVERED_AFTER_WAKE,
   });
-  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(1);
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toEqual([]);
   expect(idsOf(db)).toEqual([]);
   db.close();
 });
@@ -440,9 +499,9 @@ test("pruneMessagesOlderThan honors the batch bound, draining oldest-first acros
     );
   }
   // Everything is older than the cutoff; a batch of 2 removes the 2 oldest only.
-  expect(pruneMessagesOlderThan(db, 100_000, 2)).toBe(2);
+  expect(pruneMessagesOlderThan(db, 100_000, 2)).toEqual([]);
   expect(idsOf(db)).toEqual(ids.slice(2));
-  expect(pruneMessagesOlderThan(db, 100_000, 2)).toBe(2);
+  expect(pruneMessagesOlderThan(db, 100_000, 2)).toEqual([]);
   expect(idsOf(db)).toEqual(ids.slice(4));
   db.close();
 });
@@ -455,8 +514,38 @@ test("pruneMessagesOlderThan is a no-op when nothing is older than the cutoff", 
     body: "recent",
     ts: 9000,
   });
-  expect(pruneMessagesOlderThan(db, 5000, 100)).toBe(0);
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toEqual([]);
   expect(idsOf(db)).toHaveLength(1);
+  db.close();
+});
+
+test("reference retention uses delivery time, preserves queued rows, and returns exact removable ids", () => {
+  const db = openBusDb(":memory:");
+  const oldDelivered = appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    ts: 100,
+    artifact_ref: artifactRef("1".repeat(32), "old"),
+    status: "pending",
+  });
+  markMessageDelivered(db, oldDelivered, "delivered", 200);
+  const newlyDelivered = appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    ts: 100,
+    artifact_ref: artifactRef("2".repeat(32), "new"),
+    status: "pending",
+  });
+  markMessageDelivered(db, newlyDelivered, "delivered", 9_000);
+  const queued = appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    ts: 100,
+    artifact_ref: artifactRef("3".repeat(32), "queue"),
+    status: QUEUED_FOR_WAKE,
+  });
+  expect(pruneMessagesOlderThan(db, 5_000, 100)).toEqual(["1".repeat(32)]);
+  expect(idsOf(db)).toEqual([newlyDelivered, queued]);
   db.close();
 });
 

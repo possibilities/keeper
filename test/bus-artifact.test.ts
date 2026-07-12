@@ -7,6 +7,7 @@
  * temp roots. No daemon, Worker, UDS socket, or subprocess.
  */
 
+import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -20,7 +21,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { describe, expect, test } from "bun:test";
 import {
   BUS_ARTIFACT_MAX_BYTES,
   BUS_ARTIFACT_REF_TAG,

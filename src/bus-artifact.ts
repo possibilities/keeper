@@ -180,7 +180,9 @@ function isWellFormedRef(ref: BusArtifactRef): boolean {
  */
 export function encodeBusArtifactRef(ref: BusArtifactRef): string {
   if (!isWellFormedRef(ref)) {
-    throw new TypeError("refusing to encode a malformed bus artifact reference");
+    throw new TypeError(
+      "refusing to encode a malformed bus artifact reference",
+    );
   }
   return JSON.stringify({
     t: BUS_ARTIFACT_REF_TAG,
