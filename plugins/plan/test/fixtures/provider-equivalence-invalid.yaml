@@ -1,0 +1,26 @@
+# Deliberately-invalid provider-equivalence map — the break-it-first proof
+# fixture. Bundles three independent defect classes so the gate's rejection is
+# proven on more than one axis:
+#   1. `extra_top_level_key` — an unknown top-level key (structural, coercion
+#      rejects the whole document before any semantic check runs).
+#   2. opus (claude_to_codex) is missing `high`/`xhigh`/`max` — a host-blind
+#      totality gap (semantic; would surface via checkProviderEquivalence were
+#      the structural rejection above ever loosened).
+#   3. codex_to_claude maps gpt-5.6-terra -> gpt-5.6-sol, a SAME-FAMILY target
+#      (gpt-5.6-sol is itself a source model of codex_to_claude) — likewise
+#      semantic, likewise would surface via checkProviderEquivalence.
+schema_version: 1
+extra_top_level_key: "this key is not in the allowed schema"
+mappings:
+  claude_to_codex:
+    - source: { model: opus, effort: low }
+      target: { model: gpt-5.6-sol, effort: low }
+    - source: { model: opus, effort: medium }
+      target: { model: gpt-5.6-sol, effort: medium }
+    - source: { model: sonnet, effort: low }
+      target: { model: gpt-5.6-terra, effort: low }
+  codex_to_claude:
+    - source: { model: gpt-5.6-sol, effort: low }
+      target: { model: opus, effort: low }
+    - source: { model: gpt-5.6-terra, effort: low }
+      target: { model: gpt-5.6-sol, effort: low }

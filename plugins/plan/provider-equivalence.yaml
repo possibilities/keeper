@@ -1,0 +1,133 @@
+# Cross-provider worker-cell equivalence map (ADR 0047).
+#
+# For every dispatchable {model, effort} worker cell of one provider family,
+# names its most-equivalent cell in the other family. `autopilot_state.worker_provider`
+# reads this map at dispatch to translate an assigned cell into the pinned
+# family; a cell absent from the right direction refuses to dispatch rather
+# than silently keeping its provider.
+#
+# The two directions are authored INDEPENDENTLY and are never inverses of one
+# another — each names its own best-fit target, distilled from the capability-
+# relative when-to-pick prose in model-selector.yaml. `/model-guidance` owns
+# refreshes; this file is seeded v1, judgment-authored rather than researched,
+# pending that skill's refresh pass.
+#
+# Schema: `mappings.<direction>` is a list of `{source: {model, effort}, target:
+# {model, effort}}` entries — a list, not a nested map, so a duplicate source
+# cell is a structural fact the strict parser (src/provider_equivalence.ts) can
+# catch rather than something YAML's last-wins duplicate-key handling would
+# silently swallow. Every source model must cover all five canonical efforts;
+# every target model must be a SOURCE model of the OPPOSITE direction (the
+# host-blind opposite-family proxy) and never a source model of its OWN
+# direction (no same-family target).
+#
+# Drift gate: `bun plugins/plan/scripts/model-guidance-check.ts --check`
+# (structure + totality + proxy, host-blind) / `--state | jq .equivalence`
+# (totality + target validity against the live host matrix).
+
+schema_version: 1
+
+mappings:
+  # Claude-family dispatchable cells (opus, sonnet) -> their most-equivalent
+  # codex-family cell. opus (the exception-tier, highest-judgment model) maps
+  # to the GPT flagship (the highest GPT-side reasoning ceiling); sonnet (the
+  # everyday judgment-heavy workhorse) maps to the GPT family's own everyday
+  # balanced-middle tier.
+  claude_to_codex:
+    - source: { model: opus, effort: low }
+      target: { model: gpt-5.6-sol, effort: low }
+    - source: { model: opus, effort: medium }
+      target: { model: gpt-5.6-sol, effort: medium }
+    - source: { model: opus, effort: high }
+      target: { model: gpt-5.6-sol, effort: high }
+    - source: { model: opus, effort: xhigh }
+      target: { model: gpt-5.6-sol, effort: xhigh }
+    - source: { model: opus, effort: max }
+      target: { model: gpt-5.6-sol, effort: max }
+    - source: { model: sonnet, effort: low }
+      target: { model: gpt-5.6-terra, effort: low }
+    - source: { model: sonnet, effort: medium }
+      target: { model: gpt-5.6-terra, effort: medium }
+    - source: { model: sonnet, effort: high }
+      target: { model: gpt-5.6-terra, effort: high }
+    - source: { model: sonnet, effort: xhigh }
+      target: { model: gpt-5.6-terra, effort: xhigh }
+    - source: { model: sonnet, effort: max }
+      target: { model: gpt-5.6-terra, effort: max }
+
+  # Codex-family dispatchable cells -> their most-equivalent claude-family cell.
+  # The GPT flagship (highest GPT-side reasoning ceiling) maps up to opus (the
+  # exception tier); every other GPT tier maps to sonnet (the workhorse and
+  # only non-opus claude cell), matching model-selector.yaml's GPT-first /
+  # sonnet-by-default hand-tuned split.
+  codex_to_claude:
+    - source: { model: gpt-5.6-sol, effort: low }
+      target: { model: opus, effort: low }
+    - source: { model: gpt-5.6-sol, effort: medium }
+      target: { model: opus, effort: medium }
+    - source: { model: gpt-5.6-sol, effort: high }
+      target: { model: opus, effort: high }
+    - source: { model: gpt-5.6-sol, effort: xhigh }
+      target: { model: opus, effort: xhigh }
+    - source: { model: gpt-5.6-sol, effort: max }
+      target: { model: opus, effort: max }
+    - source: { model: gpt-5.5, effort: low }
+      target: { model: sonnet, effort: low }
+    - source: { model: gpt-5.5, effort: medium }
+      target: { model: sonnet, effort: medium }
+    - source: { model: gpt-5.5, effort: high }
+      target: { model: sonnet, effort: high }
+    - source: { model: gpt-5.5, effort: xhigh }
+      target: { model: sonnet, effort: xhigh }
+    - source: { model: gpt-5.5, effort: max }
+      target: { model: sonnet, effort: max }
+    - source: { model: gpt-5.6-terra, effort: low }
+      target: { model: sonnet, effort: low }
+    - source: { model: gpt-5.6-terra, effort: medium }
+      target: { model: sonnet, effort: medium }
+    - source: { model: gpt-5.6-terra, effort: high }
+      target: { model: sonnet, effort: high }
+    - source: { model: gpt-5.6-terra, effort: xhigh }
+      target: { model: sonnet, effort: xhigh }
+    - source: { model: gpt-5.6-terra, effort: max }
+      target: { model: sonnet, effort: max }
+    - source: { model: gpt-5.4, effort: low }
+      target: { model: sonnet, effort: low }
+    - source: { model: gpt-5.4, effort: medium }
+      target: { model: sonnet, effort: medium }
+    - source: { model: gpt-5.4, effort: high }
+      target: { model: sonnet, effort: high }
+    - source: { model: gpt-5.4, effort: xhigh }
+      target: { model: sonnet, effort: xhigh }
+    - source: { model: gpt-5.4, effort: max }
+      target: { model: sonnet, effort: max }
+    - source: { model: gpt-5.4-mini, effort: low }
+      target: { model: sonnet, effort: low }
+    - source: { model: gpt-5.4-mini, effort: medium }
+      target: { model: sonnet, effort: medium }
+    - source: { model: gpt-5.4-mini, effort: high }
+      target: { model: sonnet, effort: high }
+    - source: { model: gpt-5.4-mini, effort: xhigh }
+      target: { model: sonnet, effort: xhigh }
+    - source: { model: gpt-5.4-mini, effort: max }
+      target: { model: sonnet, effort: max }
+    - source: { model: gpt-5.6-luna, effort: low }
+      target: { model: sonnet, effort: low }
+    - source: { model: gpt-5.6-luna, effort: medium }
+      target: { model: sonnet, effort: medium }
+    - source: { model: gpt-5.6-luna, effort: high }
+      target: { model: sonnet, effort: high }
+    - source: { model: gpt-5.6-luna, effort: xhigh }
+      target: { model: sonnet, effort: xhigh }
+    - source: { model: gpt-5.6-luna, effort: max }
+      target: { model: sonnet, effort: max }
+    - source: { model: gpt-5.3-codex-spark, effort: low }
+      target: { model: sonnet, effort: low }
+    - source: { model: gpt-5.3-codex-spark, effort: medium }
+      target: { model: sonnet, effort: medium }
+    - source: { model: gpt-5.3-codex-spark, effort: high }
+      target: { model: sonnet, effort: high }
+    - source: { model: gpt-5.3-codex-spark, effort: xhigh }
+      target: { model: sonnet, effort: xhigh }
+    - source: { model: gpt-5.3-codex-spark, effort: max }
+      target: { model: sonnet, effort: max }
