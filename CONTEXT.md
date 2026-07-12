@@ -52,6 +52,8 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 
 ## Autopilot and dispatch
 - **Autopilot**: The server-side loop that reconciles the board against running work, dispatching ready tasks and closing finished epics without a human. Avoid: scheduler, cron, orchestrator.
+- **Autopilot arm**: The durable selection of an epic for dispatch under autopilot's armed mode, distinct from the Plan validation Arm. Avoid: validation marker, approval, readiness.
+- **Armed dependency closure**: The dispatch-eligible epic set in armed mode: every explicitly autopilot-armed epic plus its transitive upstream Epic dependencies. It governs new work and closer dispatch; existing sessions remain occupancy signals, not eligibility. Avoid: armed set (explicit members only), in-flight set, readiness closure.
 - **Reconciler**: The level-triggered core of autopilot that re-derives what should be running from current state each cycle. Avoid: dispatcher, poller, event loop.
 - **Dispatch**: To fire one worker at a task or a close, whether by autopilot or by hand. Avoid: launch, spawn, enqueue.
 - **Dispatch table**: The launch catalog's per-verb `dispatch:` map assigning each dispatched session's launch triple, floored to the compiled-in constants when a row is absent or the catalog is unreadable. Avoid: role key, worker preset, escalation preset.
