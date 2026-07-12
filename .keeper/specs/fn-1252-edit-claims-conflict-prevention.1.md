@@ -1,56 +1,43 @@
 ## Description
 
 **Size:** S
-**Files:** (read-only spike — findings land under ~/docs, no repo writes)
+**Files:** src/worktree-git.ts, test/worktree-git.test.ts
 
 ### Approach
 
-Measure which conflict class dominates keeper's history BEFORE the rest of this epic
-builds file-overlap machinery. Read-only over keeper.db (the daemon is sole writer —
-open read-only) plus git history: collect every historical DispatchFailed event whose
-reason carries a worktree merge-conflict token, and classify each incident: (a)
-sibling file-overlap — work-verb fan-in (rib into a dependent lane) and close-sink
-(leaf into base) conflicts where the two sides' landed per-task file sets intersect
-(reconstruct per-task actuals from Commit event files[] via Task: trailers); (b)
-base-drift — recover-pass and finalize base-into-default conflicts; (c) other —
-rename/semantic/unattributable. Write a findings doc with per-class counts and
-exemplars under ~/docs (with its yaml sidecar), and record the distribution plus a
-GO / NOT-DOMINANT verdict in the Done summary. Dominant means class (a) is the
-plurality of classified content conflicts.
-
-**Designed check-in (hard):** if file-overlap is NOT the dominant class, do not
-proceed and do not stamp done — return `BLOCKED: DESIGN_CONFLICT` with the class
-distribution in the block message so the human re-plans the epic toward the dominant
-class. Every later task in this epic depends on this one; the block is the brake.
+Add pure, injected-git primitives to MEASURE base-drift — none exists today
+(`git-worker.ts:396 parseBranchAheadBehind` parses only per-status upstream ahead/behind,
+NOT base-vs-default). Two reads through the GitRunner/`gitExec` seam (bounded by
+`GIT_LOCAL_TIMEOUT_MS`): (a) behind-count via `git rev-list --left-right --count <base>...<default>`
+(default commits the base lacks); (b) merge-base age via `git show -s --format=%ct
+$(git merge-base <base> <default>)`. Tri-state discipline: a definite magnitude on git
+exit 0, a DISTINCT inconclusive on timeout(124)/ambiguous-ref(128)/spawn-fail so callers
+DEFER — never treat inconclusive as high drift. Never throw.
 
 ### Investigation targets
 
-*Verify before relying — these file:line refs are planner-verified at authoring time, but the repo moves.*
+*Verify before relying — planner-verified at authoring time; the repo moves.*
 
-**Required** (read before coding):
-- src/derivers.ts:1206 — CommitPayload shape (files[], task_ids[], plan_epic_id) — the ground-truth actuals
-- src/dispatch-failure-key.ts:605 and :619 — the work-merge-conflict and merge-escalation route arms whose reason tokens identify incident classes
-- cli/escalation-brief.ts:424 — parseMergeConflictReason, the existing reason-string grammar (source branch, base branch, stderr)
+**Required:**
+- src/worktree-git.ts:603 — `isAncestorOf` (the runner-seam wrapper pattern to mirror)
+- src/worktree-git.ts:1554 — `mergeBranchInto` (GitRunner injection seam)
+- src/git-worker.ts:396 — `parseBranchAheadBehind` (the wrong axis — confirms this is net-new)
 
-**Optional** (reference as needed):
-- docs/adr/0039-work-verb-merge-conflict-escalation.md — how work-verb fan-in conflicts mint and route
-- keeper session events / keeper find-file-history — CLI forensics verbs if event JSON needs cross-checking
+**Optional:**
+- src/autopilot-worker.ts:2895-2917 — inlined tri-state exit-code discipline to copy
 
 ### Risks
 
-- Sparse event history (pruned events) — widen to `git log` trailer mining (Task:/Planctl-Target: trailers + git diff-tree) for actuals; state the data window used
-- Multi-task commits are ambiguous — count each incident once, mark shared attribution, never double-count
+Ref order in the `--left-right` count decides which side is "behind" — get it wrong and every lane reads drifted. A freshly-cut lane is behind by every post-fork commit (high count) but has a recent merge-base age; both feed the OR trigger in `.2`.
 
 ### Test notes
 
-No repo code changes — no new tests. Evidence is the queries/commands used and the
-resulting counts.
+Unit-test with a faked GitRunner: exit-0 magnitudes; inconclusive on 124/128/spawn-fail → a distinct value callers defer on. No real git in the fast tier (a slow variant may drive real git).
 
 ## Acceptance
 
-- [ ] A findings doc exists under ~/docs with per-class incident counts and at least one exemplar per non-empty class
-- [ ] The Done summary states the class distribution, the data window, and a GO or NOT-DOMINANT verdict
-- [ ] If the verdict was NOT-DOMINANT the task returned BLOCKED: DESIGN_CONFLICT rather than stamping done
+- [ ] A primitive returns the base's behind-count vs the local default AND the merge-base age, through the injected git seam.
+- [ ] Timeout / ambiguous-ref / spawn failure returns a DISTINCT inconclusive value (never a false magnitude); the function never throws.
 
 ## Done summary
 

@@ -1,51 +1,51 @@
 ## Description
 
-**Size:** S
-**Files:** plugins/plan/src/verbs/overlap_sweep.ts (new), plugins/plan/src/edit_claims.ts, the plan CLI verb registry module, plugins/plan/test/saga-overlap-sweep.test.ts (new)
+**Size:** M
+**Files:** src/autopilot-worker.ts, test/autopilot-worker.test.ts, test/worktree-git-catchup-realgit.slow.test.ts
 
 ### Approach
 
-A read-only verb `keeper plan overlap-sweep <epic_id>` that intersects the target
-epic's claims against every other OPEN epic's claims — the deterministic replacement
-for the planner eyeballing same-session sibling portfolios. It reads .keeper state
-directly (so an epic scaffolded seconds ago is visible — no commit dependency),
-scopes comparisons to task pairs resolving to the same repo, reuses the exact
-claims-module verdict from the gate, and emits an envelope splitting hard hits
-(expected same-kind exact — the wire-a-dep tier) from soft hits (the advisory tier),
-each naming the epic, the task pair, and the colliding claim. The verb performs NO
-writes and NO auto-commit: acting on hits (epic add-deps for hard, a References note
-for soft) stays with the calling skill — detection and action deliberately separate
-seams.
+Add a SEPARATE producer pass (a recover/finalize SIBLING — NOT inside the read-only snapshot
+probe) that consumes `.2`'s `baseDriftEntries` and, for each drifted lane that is QUIESCENT
+(clean tree + no live worker via `liveAttributedDirtyByWorktree` :7430 + `mergeReadiness`/
+`losslessPremergeClean`), MERGES the local default INTO the lane's base worktree — default→base,
+the OPPOSITE direction from finalize's base→default, into the lane's OWN worktree, never the
+shared checkout — via `mergeBranchInto` (:1554, flock-guarded, ancestor-skip, conflict-abort).
+Rate-limit via a git-derived cooldown (skip if the base's last refresh-merge `%ct` is within the
+cooldown) so a fast-moving default cannot trigger per-cycle churn. On `mergeBranchInto` conflict,
+route to the EXISTING `worktree-merge-conflict` → resolver → deconflict chain (no new code) —
+surfacing the drift conflict early, on the isolated delta, at a quiescent point, is the intended
+win. Lock/local timeout is a non-sticky retry-skip minting no distress (DEGRADE-to-retry
+discipline); defer on any inconclusive input. Verify the added merge commit does NOT turn
+finalize's base→default into a non-ff (`classifyPremergeRedundancy` :918).
 
 ### Investigation targets
 
-*Verify before relying — these file:line refs are planner-verified at authoring time, but the repo moves.*
+*Verify before relying — the repo moves.*
 
-**Required** (read before coding):
-- plugins/plan/src/edit_claims.ts — the pair-verdict function the sweep reuses (built by the prior task; do not fork the matrix)
-- plugins/plan/src/verbs/selection_brief.ts — the read-heavy verb shape (envelope discipline, state loading) to mirror
-- plugins/plan/src/state_path.ts — the single data-dir seam every read routes through
+**Required:**
+- src/autopilot-worker.ts:4261-4600 — `finalizeEpic` (sibling-pass shape; base→default direction to invert)
+- src/autopilot-worker.ts:7048-7091, :8271 — distress tracker mint/level-clear + consumption
+- src/autopilot-worker.ts:7430 — `liveAttributedDirtyByWorktree` (the live-worker quiescence signal)
+- src/worktree-git.ts:1554 `mergeBranchInto`, :767 `mergeReadiness`, :1107 `losslessPremergeClean`, :918 `classifyPremergeRedundancy`
 
-**Optional** (reference as needed):
-- plugins/plan/src/verbs/scaffold.ts — how open epics and task JSON are enumerated today
+**Optional:**
+- docs/adr/0016 (two-tree catch-up), docs/adr/0008 (plumbing merge direction / why merges avoid the shared checkout)
 
 ### Risks
 
-- Legacy epics without claims must sweep as vacuously clean (their tasks have no claims to intersect) — absence is not an error
-- Cross-project boards: sweep only epics whose resolved repos intersect the target's — never compare across unrelated repos
+Refreshing mid-lane-work can MANUFACTURE the conflict it prevents — the quiescence gate is load-bearing (the flock is commit-only, it does not protect an uncommitted dirty tree). NEVER rebase/force-push the base (dependent lanes build on it). Relationship to `computeStaleBaseLaneEntries`: a default→base refresh REMEDIATES the very drift stale-base only SURFACES — ensure the two do not double-escalate.
 
 ### Test notes
 
-Saga test with two in-tree epics: colliding expected path across epics lands in hard;
-glob/possible collision lands in soft; claim-less legacy epic yields empty; envelope
-is stable-ordered (deterministic across runs); verb leaves the .keeper tree
-byte-identical (no commit minted).
+Faked `WorktreeGitRunner`: drifted+quiescent → one default→base merge; dirty/live-worker lane → deferred, no merge, no distress; conflict → existing escalation chain; within cooldown → skipped. A slow real-git variant exercises the actual merge.
 
 ## Acceptance
 
-- [ ] The sweep reports a hard hit for an expected exact collision against another open epic, including one scaffolded in the same session with no commits
-- [ ] Soft hits (glob or possible) are reported separately from hard hits; zero-hit boards yield a clean empty envelope
-- [ ] The verb is read-only: no .keeper mutation, no auto-commit, stable-ordered output
+- [ ] When enabled, a producer pass merges the local default into a drifted, QUIESCENT lane's own base worktree (default→base) — never the shared checkout, never a rebase.
+- [ ] A non-quiescent lane (dirty tree or live worker) is deferred with no merge and no distress row.
+- [ ] A refresh-merge conflict routes to the existing worktree-merge-conflict/resolver/deconflict chain; lock/timeout is a non-sticky retry-skip.
+- [ ] Refresh is rate-limited so a fast-moving default cannot trigger a merge every cycle; the refresh commit does not turn finalize into a non-fast-forward.
 
 ## Done summary
 
