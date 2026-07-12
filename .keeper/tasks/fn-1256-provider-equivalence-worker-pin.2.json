@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T01:30:46.904000Z",
+  "depends_on": [
+    "fn-1256-provider-equivalence-worker-pin.1"
+  ],
+  "epic": "fn-1256-provider-equivalence-worker-pin",
+  "id": "fn-1256-provider-equivalence-worker-pin.2",
+  "model": null,
+  "priority": null,
+  "selection_input_hash": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": null,
+  "title": "Model-guidance skill owns equivalence",
+  "updated_at": "2026-07-12T01:30:46.904000Z"
+}
