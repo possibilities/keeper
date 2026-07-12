@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Exact teardown identity, atomic control publication, and terminal-path ordering form subtle cross-file correctness invariants.",
+      "task_id": "fn-1268-own-panel-run-lifecycles.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The durable state machine combines atomic admission, bounded recovery, and race-safe cancellation with high-blast-radius correctness invariants.",
+      "task_id": "fn-1268-own-panel-run-lifecycles.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Versioned RPC evolution and recursive concurrent cancellation require architectural changes with subtle isolation and settlement invariants.",
+      "task_id": "fn-1268-own-panel-run-lifecycles.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Adapting the protocol while preserving public Task and AbortError semantics across races is contract-shaped correctness-critical work.",
+      "task_id": "fn-1268-own-panel-run-lifecycles.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "This cross-cutting workflow redesign must enforce non-forgeable ownership, launch cardinality, and equivalent generated agent behavior.",
+      "task_id": "fn-1268-own-panel-run-lifecycles.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.91,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The rollout gate must safely validate exact process ownership and cleanup across injected, slow, operator, and documentation surfaces.",
+      "task_id": "fn-1268-own-panel-run-lifecycles.6",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-12T23:46:28.435000Z",
+  "epic_id": "fn-1268-own-panel-run-lifecycles",
+  "input_hash": "d14bb013da477c41f328e52c42a6229f5797eac2049a7ad070fa91a251210526",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3511398419,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1268-own-panel-run-lifecycles.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Exact teardown identity, atomic control publication, and terminal-path ordering form subtle cross-file correctness invariants.\",\"confidence\":0.94},{\"task_id\":\"fn-1268-own-panel-run-lifecycles.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The durable state machine combines atomic admission, bounded recovery, and race-safe cancellation with high-blast-radius correctness invariants.\",\"confidence\":0.97},{\"task_id\":\"fn-1268-own-panel-run-lifecycles.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Versioned RPC evolution and recursive concurrent cancellation require architectural changes with subtle isolation and settlement invariants.\",\"confidence\":0.97},{\"task_id\":\"fn-1268-own-panel-run-lifecycles.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Adapting the protocol while preserving public Task and AbortError semantics across races is contract-shaped correctness-critical work.\",\"confidence\":0.95},{\"task_id\":\"fn-1268-own-panel-run-lifecycles.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"This cross-cutting workflow redesign must enforce non-forgeable ownership, launch cardinality, and equivalent generated agent behavior.\",\"confidence\":0.96},{\"task_id\":\"fn-1268-own-panel-run-lifecycles.6\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The rollout gate must safely validate exact process ownership and cleanup across injected, slow, operator, and documentation surfaces.\",\"confidence\":0.91}]}\n"
+}
