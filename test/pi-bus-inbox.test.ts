@@ -202,4 +202,12 @@ describe("parseBusWatchRecord", () => {
       ),
     ).toBeNull();
   });
+
+  test("passes a file-backed read notification without exposing body content", () => {
+    const line =
+      "Agent Bus message from alice — read /trusted/bus-artifacts/00000000000000000000000000000001";
+    const record = JSON.stringify({ type: "agent_bus_message", line });
+    expect(parseBusWatchRecord(record)).toBe(line);
+    expect(record).not.toContain("private message body");
+  });
 });

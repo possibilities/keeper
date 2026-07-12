@@ -39,16 +39,28 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { chmodSync } from "node:fs";
+import { chmodSync, lstatSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
+  type BusArtifactRef,
+  decodeBusArtifactRef,
+  encodeBusArtifactRef,
+  listBusArtifactIds,
+  removeBusArtifact,
+  resolveBusArtifact,
+  resolveBusArtifactRoot,
+} from "./bus-artifact";
+import {
   appendMessage,
+  artifactRowExists,
   type ChannelRow,
   DELIVERED_AFTER_WAKE,
   deleteChannel,
   loadChannels,
   loadOldestChannels,
   type MessageRow,
+  markMessageDelivered,
   maxMessageId,
   openBusDb,
   pruneControlMessagesOlderThan,
@@ -123,6 +135,9 @@ export const MESSAGE_PRUNE_BATCH = 1_000;
 /** Oldest control-namespace messages deleted per tick. */
 export const CONTROL_PRUNE_BATCH = 1_000;
 
+export const ARTIFACT_ORPHAN_BATCH = 1_000;
+export const ARTIFACT_ORPHAN_GRACE_MS = 60 * 60 * 1000;
+
 /** Oldest channel rows examined per tick (the bounded candidate window). */
 export const CHANNEL_CANDIDATE_BATCH = 64;
 
@@ -182,6 +197,98 @@ export interface ToIdentity {
 export interface Payload {
   media_type: string;
   text: string;
+}
+
+export type ChatPayloadValidation =
+  | { ok: true; ref: BusArtifactRef }
+  | { ok: false; code: "inline_not_allowed" | "invalid_reference" };
+
+export function validateChatPayload(
+  payload: Payload,
+  artifactRoot: string,
+): ChatPayloadValidation {
+  const decoded = decodeBusArtifactRef(payload.text);
+  if (!decoded.ok) {
+    return {
+      ok: false,
+      code:
+        decoded.reason === "not-a-reference"
+          ? "inline_not_allowed"
+          : "invalid_reference",
+    };
+  }
+  return resolveBusArtifact(artifactRoot, decoded.ref).ok
+    ? { ok: true, ref: decoded.ref }
+    : { ok: false, code: "invalid_reference" };
+}
+
+export function payloadFromMessage(row: MessageRow): Payload {
+  if (row.artifact_ref !== null) {
+    return {
+      media_type: row.payload_media_type ?? "application/json",
+      text: encodeBusArtifactRef(row.artifact_ref),
+    };
+  }
+  return { media_type: "text/plain", text: row.body ?? "" };
+}
+
+export interface ArtifactCleanupOps {
+  remove(root: string, id: string): boolean;
+  list(root: string, limit: number): { ids: string[]; complete: boolean };
+  mtime(root: string, id: string): number | null;
+  referenced(db: Database, id: string): boolean;
+}
+
+const defaultArtifactCleanupOps: ArtifactCleanupOps = {
+  remove: removeBusArtifact,
+  list: listBusArtifactIds,
+  mtime(root, id) {
+    try {
+      return lstatSync(join(root, id)).mtimeMs;
+    } catch {
+      return null;
+    }
+  },
+  referenced: artifactRowExists,
+};
+
+export function cleanupBusArtifacts(
+  db: Database,
+  root: string,
+  now: number,
+  rowCutoff: number,
+  rowBatch: number,
+  orphanGrace: number,
+  orphanBatch: number,
+  ops: ArtifactCleanupOps = defaultArtifactCleanupOps,
+): { rowArtifacts: number; orphanArtifacts: number } {
+  const ids = pruneMessagesOlderThan(db, rowCutoff, rowBatch);
+  let rowArtifacts = 0;
+  for (const id of ids) {
+    try {
+      if (!ops.referenced(db, id) && ops.remove(root, id)) rowArtifacts += 1;
+    } catch {
+      // An inconclusive row check retains the file.
+    }
+  }
+
+  let orphanArtifacts = 0;
+  let page: { ids: string[]; complete: boolean };
+  try {
+    page = ops.list(root, orphanBatch);
+  } catch {
+    return { rowArtifacts, orphanArtifacts };
+  }
+  for (const id of page.ids) {
+    try {
+      const mtime = ops.mtime(root, id);
+      if (mtime === null || now - mtime < orphanGrace) continue;
+      if (!ops.referenced(db, id) && ops.remove(root, id)) orphanArtifacts += 1;
+    } catch {
+      // Files survive an inconclusive database or filesystem check.
+    }
+  }
+  return { rowArtifacts, orphanArtifacts };
 }
 
 /**
@@ -786,6 +893,7 @@ export function startBusServer(
   sockPath: string,
   lockPath: string,
   readStartTime: (pid: number) => string | null = readOsStartTime,
+  artifactRoot: string = resolveBusArtifactRoot(),
 ): BusServer {
   acquireLock(lockPath, sockPath);
 
@@ -1174,12 +1282,12 @@ export function startBusServer(
         row.to_target,
         row.resolved_channel_id,
         row.resolved_session_id,
-        { media_type: "text/plain", text: row.body ?? "" },
+        payloadFromMessage(row),
         row.reply_to,
       );
       const line = `${JSON.stringify(envelope)}\n`;
       if (deliver(entry, line)) {
-        setMessageStatus(busDb, row.id, DELIVERED_AFTER_WAKE);
+        setMessageStatus(busDb, row.id, DELIVERED_AFTER_WAKE, Date.now());
       }
     }
   };
@@ -1200,6 +1308,26 @@ export function startBusServer(
       media_type: "text/plain",
       text: "",
     };
+    const validated =
+      namespace === DEFAULT_NAMESPACE
+        ? validateChatPayload(payload, artifactRoot)
+        : null;
+    if (validated !== null && !validated.ok) {
+      sendError(
+        sock,
+        validated.code,
+        "chat publishes require a valid artifact reference",
+      );
+      return;
+    }
+    const artifactRef = validated?.ok ? validated.ref : null;
+    const messageContent =
+      artifactRef === null
+        ? { body: payload.text }
+        : {
+            artifact_ref: artifactRef,
+            payload_media_type: payload.media_type,
+          };
     const from = authoritativeFrom(
       entry.channel.channel_id,
       entry.channel.pid,
@@ -1241,7 +1369,7 @@ export function startBusServer(
         to_target: toTarget,
         resolved_channel_id: channel?.channel_id ?? null,
         resolved_session_id: resolvedSessionId,
-        body: payload.text,
+        ...messageContent,
         status,
         reply_to: op.reply_to ?? null,
       });
@@ -1263,7 +1391,7 @@ export function startBusServer(
       to_target: toTarget,
       resolved_channel_id: resolvedChannelId,
       resolved_session_id: resolvedSessionId,
-      body: payload.text,
+      ...messageContent,
       status: "pending",
       reply_to: op.reply_to ?? null,
     });
@@ -1284,7 +1412,12 @@ export function startBusServer(
       envelope,
     );
     const outcome = publishOutcome("ok", true, delivered);
-    setMessageStatus(busDb, id, outcome);
+    setMessageStatus(
+      busDb,
+      id,
+      outcome,
+      outcome === "delivered" ? Date.now() : undefined,
+    );
     sendAck(sock, "publish", { result: outcome, recipients: delivered });
   };
 
@@ -1541,10 +1674,14 @@ export function startBusServer(
       console.error("[bus-worker] channel retention failed (non-fatal):", err);
     }
     try {
-      pruneMessagesOlderThan(
+      cleanupBusArtifacts(
         busDb,
+        artifactRoot,
+        now,
         now - MESSAGE_RETENTION_HORIZON_MS,
         MESSAGE_PRUNE_BATCH,
+        ARTIFACT_ORPHAN_GRACE_MS,
+        ARTIFACT_ORPHAN_BATCH,
       );
     } catch (err) {
       console.error("[bus-worker] message retention failed (non-fatal):", err);
@@ -1621,11 +1758,20 @@ function publishControl(
  * (the bus worker is the sole bus.db writer). Best-effort — a forensic-log write
  * failure must never bounce the daemon.
  */
-function setMessageStatus(busDb: Database, id: number, status: string): void {
+function setMessageStatus(
+  busDb: Database,
+  id: number,
+  status: string,
+  deliveredAt?: number,
+): void {
   try {
-    busDb
-      .prepare("UPDATE messages SET status = ? WHERE id = ?")
-      .run(status, id);
+    if (deliveredAt === undefined) {
+      busDb
+        .prepare("UPDATE messages SET status = ? WHERE id = ?")
+        .run(status, id);
+    } else {
+      markMessageDelivered(busDb, id, status, deliveredAt);
+    }
   } catch (err) {
     console.error("[bus-worker] setMessageStatus failed (non-fatal):", err);
   }
@@ -1738,7 +1884,14 @@ function main(): void {
 
   let server: BusServer;
   try {
-    server = startBusServer(busDb, keeperDb, sockPath, lockPath);
+    server = startBusServer(
+      busDb,
+      keeperDb,
+      sockPath,
+      lockPath,
+      readOsStartTime,
+      join(dirname(busDbPath), "bus-artifacts"),
+    );
   } catch (err) {
     // Lock held by a live instance, or bind failed — boot failure, the ONLY
     // fatal class. Exit non-zero; the daemon's guard fatalExits.

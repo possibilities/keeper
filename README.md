@@ -16,6 +16,9 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   `keeper session events` answer who/when/what across sessions
 - **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling
   cadence of verified DB snapshots guards the log
+- **Agent Bus** — `keeper bus chat send <target> "message"` stores new content in a
+  Bus message artifact; receivers explicitly read its confined path from the
+  metadata-only notification. See the [bus skill](./plugins/keeper/skills/bus/SKILL.md).
 
 Install & uninstall: [docs/install.md](./docs/install.md) · Guardrails:
 [CLAUDE.md](./CLAUDE.md) · Vocabulary: [CONTEXT.md](./CONTEXT.md) · Decisions:
