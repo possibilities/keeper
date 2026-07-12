@@ -413,7 +413,7 @@ export function isSharedDesyncDistressKey(verb: string, id: string): boolean {
  * is evidence of a layer-1 fold gap, and a silently self-tidying corrector is how
  * this class stayed invisible for weeks, so the OPERATOR acks it, never a
  * level-trigger. To be `retry_dispatch`-clearable the verb MUST be a retryable one
- * ({@link import("./dispatch-command").RetryDispatchVerb} = work|close|approve);
+ * ({@link import("./dispatch-command").RetryDispatchVerb} = work|close|approve|repair);
  * `close` mirrors the merge-conflict precedent. The `id` is a DEDICATED synthetic
  * namespace (`stuck-sentinel:<jobId>`) that never collides with a real epic
  * (`fn-…`), so it routes as a `close-plain` dead-end (no escalation sweep fires on

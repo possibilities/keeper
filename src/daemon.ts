@@ -390,13 +390,20 @@ export function drainToCompletion(
  * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
  * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
- * isSharedDesyncDistressKey}) distress key, AND the per-repo shared-base repair latch
- * (`repair::<repo-token>`): each is un-retryable by the wire validator BY DESIGN (an
- * operator never clears them through the retry wire), and a level-trigger (main's boot
- * recovery / the recover pass observing the lane clean / the stale-base probe observing
- * the lane re-based or torn down / the desync content probe observing the checkout carry
- * the default tip / the repair sweep observing the base green) owns dropping them — so
- * the orphan sweep must never reap a self-managed row out from under its signal.
+ * isSharedDesyncDistressKey}) distress key: each is un-retryable by the wire validator
+ * BY DESIGN (an operator never clears them through the retry wire), and a level-trigger
+ * (main's boot recovery / the recover pass observing the lane clean / the stale-base
+ * probe observing the lane re-based or torn down / the desync content probe observing
+ * the checkout carry the default tip) owns dropping them — so the orphan sweep must
+ * never reap a self-managed row out from under its signal. The per-repo shared-base
+ * repair latch (`repair::<repo-token>`) is exempt for a DIFFERENT reason: its verb IS
+ * retryable via the wire (`keeper autopilot retry repair::<token>` re-arms a stranded
+ * row after a declined/dead repair session), so a well-formed row never reaches this
+ * check at all — {@link isRetryableDispatchKey} already `continue`s above. The explicit
+ * `row.verb === "repair"` guard below stays as a defensive belt for a malformed/pre-slug
+ * repair id that somehow fails the wire's id-shape check despite the verb match: the
+ * repair sweep's own level-trigger (re-minting from live evidence, clearing on the base
+ * observed green) owns that row too, so the orphan sweep must not reap it either.
  *
  * The per-repo shared-checkout-WEDGE (mid-merge) distress row is DELIBERATELY NOT exempt:
  * a mid-merge shared checkout no longer blocks the working-tree-free base merge, so that
@@ -465,10 +472,13 @@ export function gcUnretryableDispatchFailures(
     // And the per-repo shared-base repair latch (`repair::<repo-token>`) — a LIVE
     // producer owns it (the SHARED_BASE_BROKEN sweep re-mints it while the base is broken
     // and CLEARS it on positive evidence — base green + zero remaining candidates). Its
-    // `repair` verb is un-retryable by the wire validator BY DESIGN (the retry-wire stays
-    // narrow, per `parseDispatchKey`), so the orphan sweep must not reap it — reaping
-    // would drop its once-page / once-dispatch markers and re-page + re-dispatch a
-    // declined repair after every daemon restart.
+    // `repair` verb IS retryable via the wire (`parseDispatchKey` accepts it, per
+    // `RETRY_DISPATCH_VERBS`), so a well-formed row is already skipped by the
+    // `isRetryableDispatchKey` check above — this guard is a defensive belt for a
+    // malformed/pre-slug repair id that fails the wire's id-shape check despite the verb
+    // matching: reaping it would drop its once-page / once-dispatch markers and re-page +
+    // re-dispatch a declined repair after every daemon restart, the same as reaping the
+    // well-formed case would.
     if (row.verb === "repair") {
       continue;
     }
