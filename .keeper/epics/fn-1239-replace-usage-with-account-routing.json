@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-12T02:16:00.874000Z",
   "created_at": "2026-07-10T17:14:57.206000Z",
   "depends_on_epics": [
     "fn-1237-matrix-v2-single-host-config",
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-10T17:16:37.786000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Replace usage with account routing",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-11T17:23:46.240000Z"
+  "updated_at": "2026-07-12T02:16:00.874000Z"
 }
