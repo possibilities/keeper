@@ -6,72 +6,72 @@
   },
   "cells": [
     {
-      "confidence": 0.7,
-      "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "Open-ended forensic spike over event/git history with ambiguous attribution and a consequential GO/NOT-DOMINANT verdict that gates the whole epic \u2014 under-specified judgment work that fits sonnet, no nameable intelligence-bound reason for opus.",
-      "task_id": "fn-1252-edit-claims-conflict-prevention.1",
-      "tier": "xhigh"
-    },
-    {
       "confidence": 0.72,
       "label_source": "heuristic-guided",
-      "model": "gpt-5.6-sol",
-      "rationale": "Well-specified foundational contract work (new claims field, ReDoS-safe glob matcher, collect-all validation, new problem code, derived render) with a nameable acceptance and multi-file blast radius \u2014 GPT-first, top gpt tier for the hardest well-specified work at contract-touching effort.",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified net-new git primitives through an existing runner seam with named prior art and faked-git unit tests; a bounded single-surface everyday implementation, GPT-first.",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.63,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Threading producer-probe data onto the snapshot while honoring the pure-core boundary, defer-on-inconclusive, and the vacuous-ancestor trap is delicate in-repo idiom and invariant matching that warrants Claude judgment, not opus.",
       "task_id": "fn-1252-edit-claims-conflict-prevention.2",
-      "tier": "xhigh"
+      "tier": "high"
     },
     {
       "confidence": 0.68,
       "label_source": "heuristic-guided",
-      "model": "gpt-5.6-sol",
-      "rationale": "Correctness-sensitive but fully-specified gate: reachability closure plus an explicit REJECT/WARN matrix where over-firing silently serializes \u2014 GPT-first well-specified work at xhigh for the gate's asymmetric-cost correctness.",
+      "model": "gpt-5.6-terra",
+      "rationale": "Adding two autopilot_state columns via the established addColumnIfMissing + SCHEMA_STEPS + generic set_autopilot_config pattern is mechanical well-specified work with strong prior art, GPT-first.",
       "task_id": "fn-1252-edit-claims-conflict-prevention.3",
-      "tier": "xhigh"
+      "tier": "high"
     },
     {
       "confidence": 0.72,
       "label_source": "heuristic-guided",
-      "model": "gpt-5.6-terra",
-      "rationale": "Bounded read-only verb that reuses the existing claim verdict and mirrors the selection_brief verb shape \u2014 everyday well-specified GPT work at the high sweet spot.",
+      "model": "opus",
+      "rationale": "The load-bearing quiescence gate, default\u2192base merge direction, non-ff avoidance, and no-double-escalate coupling to finalize/recover form a subtle correctness invariant with architectural cascade \u2014 a nameable intelligence-bound opus reason.",
       "task_id": "fn-1252-edit-claims-conflict-prevention.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Revising ADR 0042 in place plus CONTEXT/CLAUDE/problem-codes under strict prune-not-append and no-re-narration doc discipline is wording-taste and idiom-matching work across surfaces, a sonnet fit.",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.5",
       "tier": "high"
     },
     {
       "confidence": 0.7,
       "label_source": "heuristic-guided",
-      "model": "sonnet",
-      "rationale": "Cross-surface authoring of skill/scout/agent guidance requiring user-facing wording, tiered-model taste, and delicate in-repo lockstep consistency \u2014 judgment-heavy prose work that is sonnet's lane, at the multi-file known-pattern high band.",
-      "task_id": "fn-1252-edit-claims-conflict-prevention.5",
-      "tier": "high"
-    },
-    {
-      "confidence": 0.74,
-      "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Keeper-root event-sourcing change touching a schema-ladder migration, fingerprint re-pin, and a re-fold-deterministic fold that must never throw, capturing paths inside a wedged merge without residue \u2014 a subtle correctness/schema invariant that gates opus.",
+      "rationale": "Capturing the conflicted set producer-side and storing it via event payload across a deterministic-replayed fold \u2014 where a live re-probe breaks byte-identical re-fold \u2014 is a sacred correctness invariant spanning git/schema/event/fold, a hard opus gate.",
       "task_id": "fn-1252-edit-claims-conflict-prevention.6",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.66,
+      "confidence": 0.64,
       "label_source": "heuristic-guided",
-      "model": "gpt-5.6-sol",
-      "rationale": "Metrics/eval verb with careful but fully-specified precision/recall, multi-task dedup, and dataset-seam mirroring \u2014 well-specified GPT work at xhigh for the new-pattern, correctness-careful surface.",
+      "model": "gpt-5.6-terra",
+      "rationale": "An out-of-band read-only classifier report over structured conflict history with a stable shape and a fixture test is bounded well-specified work, GPT-first.",
       "task_id": "fn-1252-edit-claims-conflict-prevention.7",
-      "tier": "xhigh"
+      "tier": "high"
     }
   ],
   "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
-  "created_at": "2026-07-11T22:04:27.172000Z",
+  "created_at": "2026-07-12T14:17:34.214000Z",
   "epic_id": "fn-1252-edit-claims-conflict-prevention",
-  "input_hash": "822be3c836b534581c2bc2fbf074c39843d86347e4145bdca8f6b5da1dd86dfb",
+  "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 2183914440,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Open-ended forensic spike over event/git history with ambiguous attribution and a consequential GO/NOT-DOMINANT verdict that gates the whole epic \u2014 under-specified judgment work that fits sonnet, no nameable intelligence-bound reason for opus.\",\"confidence\":0.7},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.2\",\"tier\":\"xhigh\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Well-specified foundational contract work (new claims field, ReDoS-safe glob matcher, collect-all validation, new problem code, derived render) with a nameable acceptance and multi-file blast radius \u2014 GPT-first, top gpt tier for the hardest well-specified work at contract-touching effort.\",\"confidence\":0.72},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.3\",\"tier\":\"xhigh\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Correctness-sensitive but fully-specified gate: reachability closure plus an explicit REJECT/WARN matrix where over-firing silently serializes \u2014 GPT-first well-specified work at xhigh for the gate's asymmetric-cost correctness.\",\"confidence\":0.68},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.4\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Bounded read-only verb that reuses the existing claim verdict and mirrors the selection_brief verb shape \u2014 everyday well-specified GPT work at the high sweet spot.\",\"confidence\":0.72},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Cross-surface authoring of skill/scout/agent guidance requiring user-facing wording, tiered-model taste, and delicate in-repo lockstep consistency \u2014 judgment-heavy prose work that is sonnet's lane, at the multi-file known-pattern high band.\",\"confidence\":0.7},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.6\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Keeper-root event-sourcing change touching a schema-ladder migration, fingerprint re-pin, and a re-fold-deterministic fold that must never throw, capturing paths inside a wedged merge without residue \u2014 a subtle correctness/schema invariant that gates opus.\",\"confidence\":0.74},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.7\",\"tier\":\"xhigh\",\"model\":\"gpt-5.6-sol\",\"rationale\":\"Metrics/eval verb with careful but fully-specified precision/recall, multi-task dedup, and dataset-seam mirroring \u2014 well-specified GPT work at xhigh for the new-pattern, correctness-careful surface.\",\"confidence\":0.66}]}\n"
+  "shuffle_seed": 2653890172,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.1\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified net-new git primitives through an existing runner seam with named prior art and faked-git unit tests; a bounded single-surface everyday implementation, GPT-first.\",\"confidence\":0.72},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Threading producer-probe data onto the snapshot while honoring the pure-core boundary, defer-on-inconclusive, and the vacuous-ancestor trap is delicate in-repo idiom and invariant matching that warrants Claude judgment, not opus.\",\"confidence\":0.63},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.3\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Adding two autopilot_state columns via the established addColumnIfMissing + SCHEMA_STEPS + generic set_autopilot_config pattern is mechanical well-specified work with strong prior art, GPT-first.\",\"confidence\":0.68},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The load-bearing quiescence gate, default\u2192base merge direction, non-ff avoidance, and no-double-escalate coupling to finalize/recover form a subtle correctness invariant with architectural cascade \u2014 a nameable intelligence-bound opus reason.\",\"confidence\":0.72},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Revising ADR 0042 in place plus CONTEXT/CLAUDE/problem-codes under strict prune-not-append and no-re-narration doc discipline is wording-taste and idiom-matching work across surfaces, a sonnet fit.\",\"confidence\":0.6},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.6\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Capturing the conflicted set producer-side and storing it via event payload across a deterministic-replayed fold \u2014 where a live re-probe breaks byte-identical re-fold \u2014 is a sacred correctness invariant spanning git/schema/event/fold, a hard opus gate.\",\"confidence\":0.7},{\"task_id\":\"fn-1252-edit-claims-conflict-prevention.7\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"An out-of-band read-only classifier report over structured conflict history with a stable shape and a fixture test is bounded well-specified work, GPT-first.\",\"confidence\":0.64}]}\n"
 }

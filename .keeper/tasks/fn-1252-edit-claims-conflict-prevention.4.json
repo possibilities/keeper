@@ -8,12 +8,12 @@
   ],
   "epic": "fn-1252-edit-claims-conflict-prevention",
   "id": "fn-1252-edit-claims-conflict-prevention.4",
-  "model": "gpt-5.6-terra",
+  "model": "opus",
   "priority": null,
   "selection_input_hash": "822be3c836b534581c2bc2fbf074c39843d86347e4145bdca8f6b5da1dd86dfb",
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "high",
+  "tier": "xhigh",
   "title": "Pre-arm portfolio overlap sweep",
-  "updated_at": "2026-07-12T14:15:34.979000Z"
+  "updated_at": "2026-07-12T14:17:34.214000Z"
 }
