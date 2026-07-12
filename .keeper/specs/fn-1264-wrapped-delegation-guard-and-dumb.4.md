@@ -42,5 +42,5 @@ advisory flag; probe error → no flag (inconclusive). No fold reads fs/clock. N
 - [ ] `docs/problem-codes.md` carries a row for the advisory mirroring the existing format.
 
 ## Done summary
-
+Added findWrappedDelegationSkips + logWrappedDelegationSkip in src/autopilot-worker.ts: a per-cycle producer probe (not a fold) that stats KEEPER_WRAPPED_ENVELOPE for every DONE wrapped-cell task and logs a coalesced advisory line when absent, never blocking dispatch or minting a sticky. Added a docs/problem-codes.md row and 7 new tests covering present/absent/probe-error/native/not-done/bad-matrix cases plus the coalescer.
 ## Evidence

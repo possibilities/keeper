@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "advisory delegation-skipped detection",
-  "updated_at": "2026-07-12T16:19:32.230000Z"
+  "updated_at": "2026-07-12T17:20:13.504000Z",
+  "worker_done_at": "2026-07-12T17:20:13.504000Z"
 }
