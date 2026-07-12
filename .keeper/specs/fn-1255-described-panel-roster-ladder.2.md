@@ -218,5 +218,5 @@ either level) through the pure core with hand-built inputs.
 - [ ] The plan suite is green including the new consistency test.
 
 ## Done summary
-
+Committed the approved 10-panel weak->max roster verbatim to plugins/plan/panel-selector.yaml, built its host-blind structural gate (panel-guidance-check.ts), and added the fast-suite consistency test covering every enumerated policy-violation class. Plan suite green.
 ## Evidence
