@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T14:28:49.594000Z",
+  "depends_on": [
+    "fn-1263-stale-tree-commit-sweep-guards.4"
+  ],
+  "epic": "fn-1263-stale-tree-commit-sweep-guards",
+  "id": "fn-1263-stale-tree-commit-sweep-guards.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "promote checkout stickies to operator jam",
+  "updated_at": "2026-07-12T14:28:49.594000Z"
+}
