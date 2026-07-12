@@ -250,8 +250,8 @@ const WRAPPERS = new Set([
 
 /** Interpreter / shell executables that are NEVER on the allowlist — an inline
  *  shell / interpreter reopens an exec context the classifier cannot see into.
- *  `bun` is NOT here — it is conditionally allowed (test/run) with eval flags
- *  denied. */
+ *  `bun` is NOT here — its test runner and named package-script surface are
+ *  conditionally allowed, with eval flags and path-shaped run targets denied. */
 const INTERPRETER_EXECUTABLES = new Set([
   "python",
   "python2",
@@ -288,9 +288,10 @@ const WRAPPED_KEEPER_SUBCOMMANDS = new Set([
   "baseline",
 ]);
 
-/** Read-only git subcommands allowed for a wrapped worker (staging `add` / `reset
- *  --soft` are handled separately). Mirrors escalation-guard's read set minus the
- *  ref-mutating `branch`, which a wrapped worker never needs. */
+/** Read-only git subcommands allowed for a wrapped worker (staging `add`, the
+ *  `commit` that lands the leg's work, and `reset --soft` are handled separately).
+ *  Mirrors escalation-guard's read set minus the ref-mutating `branch`, which a
+ *  wrapped worker never needs. */
 const READONLY_GIT_SUBCOMMANDS = new Set([
   "log",
   "show",
@@ -500,6 +501,7 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
     if (injection !== null) return injection;
     if (sub === undefined) return "bare `git` with no subcommand";
     if (sub.name === "add") return null; // staging
+    if (sub.name === "commit") return null; // land the leg's staged work
     if (sub.name === "reset")
       return classifyGitReset(tokens.slice(sub.index + 1));
     if (READONLY_GIT_SUBCOMMANDS.has(sub.name)) {
@@ -510,7 +512,7 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
       if (execFlag !== null) return execFlag;
       return null;
     }
-    return `git '${sub.name}' is not a read-only or staging git subcommand (a wrapped worker gets read + \`add\` / \`reset --soft\` only; commits go through \`keeper commit-work\`)`;
+    return `git '${sub.name}' is not a permitted git subcommand for a wrapped worker (read + \`add\` / \`commit\` / \`reset --soft\` only; branch create/switch and mutating stash are denied)`;
   }
 
   if (exe === "bun") {
@@ -521,8 +523,22 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
     ) {
       return "`bun` inline-eval (-e/--eval/-p/--print) is never permitted";
     }
-    if (sub === "test" || sub === "run") return null;
-    return `\`bun ${sub ?? ""}\` is not permitted (only \`bun test\` / \`bun run\` — the test runner)`;
+    if (sub === "test") return null;
+    if (sub === "run") {
+      const target = tokens[2];
+      if (
+        target !== undefined &&
+        target.length > 0 &&
+        !target.startsWith("-") &&
+        !target.includes(".") &&
+        !target.includes("/") &&
+        !target.includes("\\")
+      ) {
+        return null;
+      }
+      return "`bun run` requires a named package script (file-path and option targets are not permitted)";
+    }
+    return `\`bun ${sub ?? ""}\` is not permitted (only \`bun test\` or \`bun run <named-package-script>\`)`;
   }
 
   return `off-list command '${exe}' (a wrapped worker's Bash surface is the delegation + close-out allowlist only)`;
@@ -590,8 +606,9 @@ function bashReason(violation: string): string {
     `Wrapped-cell worker BLOCKED: this Bash command is off the delegation + ` +
     `close-out allowlist: ${violation}. Permitted: \`keeper agent\` (run/--resume/` +
     `wait/wait-for-stop/show-last-message/providers), \`keeper commit-work\`, ` +
-    `\`keeper plan done\` + reads, \`keeper session state\`, read-only + staging ` +
-    `git (add / reset --soft / log / status / diff / show / rev-parse), and the ` +
+    `\`keeper plan done\` + reads, \`keeper session state\`, the permitted git ` +
+    `surface (add / commit / reset --soft / log / status / diff / show / rev-parse), ` +
+    `and the ` +
     `test runner. Every source-editing vector — redirects, heredocs, tee, sed -i, ` +
     `patch, cp/mv/tar, git apply/am, interpreters, and re-entrant shells — is denied.`
   );

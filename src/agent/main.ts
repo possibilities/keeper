@@ -10,6 +10,7 @@ import {
   accessSync,
   constants,
   existsSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -1208,10 +1209,12 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
  *
  * When `outputPath` is set (`agent run --output`), the SAME envelope is ALSO
  * written there ATOMICALLY (temp-in-same-dir + rename) — an additional sink for
- * detached-leg pollers, written on EVERY outcome, exit-code-independent. A write
- * failure (a missing parent dir / an unwritable path) is the `--output` path's
- * OWN bad_args: it emits the bad_args envelope to stdout only (the broken path
- * gets no retry) and exits 2.
+ * detached-leg pollers, written on EVERY outcome, exit-code-independent. The
+ * parent dir is created as needed (`mkdir -p`), so a not-yet-existing target dir
+ * self-heals; a write failure that survives that (an unwritable path — e.g. a
+ * non-directory occupying the parent chain) is the `--output` path's OWN
+ * bad_args: it emits the bad_args envelope to stdout only (the broken path gets
+ * no retry) and exits 2.
  */
 function emitRunCapture(
   deps: MainDeps,
@@ -1282,6 +1285,9 @@ function writeEnvelopeAtomic(
   target: string,
   envelope: RunCaptureEnvelope,
 ): void {
+  // Self-create the parent so a `--output` at a not-yet-existing dir (e.g. the
+  // wrapped-envelope spool) lands rather than ENOENTs; recursive is idempotent.
+  mkdirSync(dirname(target), { recursive: true });
   const tmp = join(
     dirname(target),
     `.keeper-agent-run-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,

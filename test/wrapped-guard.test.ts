@@ -54,6 +54,11 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "git rev-parse HEAD",
     "git reset --soft HEAD~1",
     "git -C /repo log --oneline",
+    // commit: the wrapper lands the leg's staged work as its own single commit
+    // via the git-add + bare git-commit escape hatch (-m / -F <file> / --trailer)
+    "git commit -m 'feat(x): land the leg work'",
+    "git commit -F /scratch/msg.txt",
+    "git commit --trailer 'Job-Id: job-1' -m msg",
     // combined-diff `-c` is the log/show subcommand's OWN flag, a read
     "git log -c --format=%H",
     // the test runner
@@ -87,6 +92,11 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "bun -e 'code'",
     "bun --eval 'code'",
     "bun -p 'code'",
+    // --- bun run demands a NAMED package script: a path-shaped target could run a
+    //     just-written out-of-tree file, and a bare run has no script ---
+    "bun run /scratch/gen.ts",
+    "bun run ./gen.ts",
+    "bun run",
     // --- in-tree write vectors: redirect / heredoc / here-string / tee / sed -i ---
     "echo hacked > src/x.ts",
     "echo more >> src/x.ts",
@@ -106,8 +116,7 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "mv /tmp/evil.ts src/x.ts",
     "tar -x -f /tmp/payload.tar",
     "tar xf /tmp/payload.tar",
-    // --- mutating / off-list git (a wrapped worker gets read + staging only) ---
-    "git commit -m x",
+    // --- mutating / off-list git (a wrapped worker gets read + staging + commit only) ---
     "git push",
     "git rm src/x.ts",
     "git mv a b",
@@ -189,7 +198,7 @@ test("evaluateWrappedBash: the deny reason NAMES the offending construct / comma
     "substitution",
   );
   expect(evaluateWrappedBash("python3 -c 'x'")).toContain("python3");
-  expect(evaluateWrappedBash("git commit -m x")).toContain("commit-work");
+  expect(evaluateWrappedBash("git push")).toContain("push");
   expect(evaluateWrappedBash("keeper prompt render")).toContain("allowlist");
 });
 
@@ -331,6 +340,15 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
     expect(decide(writePayload(`${OUTSIDE}/contract.md`))).toBeNull();
   });
 
+  test("contains an out-of-tree Write followed by bun run of that file", () => {
+    const generated = `${OUTSIDE}/gen.ts`;
+    expect(decide(writePayload(generated))).toBeNull();
+    expect(
+      decide(bashPayload(`bun run ${generated}`))?.hookSpecificOutput
+        .permissionDecision,
+    ).toBe("deny");
+  });
+
   test("denies every in-tree Bash write vector for a marked subagent", () => {
     for (const cmd of [
       "echo x > src/x.ts",
@@ -360,6 +378,7 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
       "keeper session state",
       "git add -A",
       "git status",
+      "git commit -m 'feat(x): y'",
       "git reset --soft HEAD~1",
       "bun test",
     ]) {

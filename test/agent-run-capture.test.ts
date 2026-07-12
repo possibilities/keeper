@@ -1058,8 +1058,29 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     expect(fileEnvelope.outcome).toBe("bad_args");
   });
 
-  test("--output onto a missing parent dir is the path's own bad_args (exit 2)", async () => {
-    const outPath = join(tempDir(), "no-such-subdir", "leg.json");
+  test("--output self-creates a missing parent dir (mkdir -p) and lands the envelope", async () => {
+    // The wrapped-envelope spool (`.keeper/state/wrapped-envelopes/`) does not
+    // exist on a fresh checkout; the write must create the parent, not ENOENT.
+    const outPath = join(tempDir(), "no-such-subdir", "nested", "leg.json");
+    const { h } = completedRunHarness(["--output", outPath]);
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(0);
+    expect(existsSync(outPath)).toBe(true);
+    const fileEnvelope = JSON.parse(readFileSync(outPath, "utf8"));
+    expect(fileEnvelope).toMatchObject({ outcome: "completed" });
+    // The stdout sink carries the SAME envelope the created file holds.
+    expect(fileEnvelope).toEqual(parseEnvelope(h.out));
+  });
+
+  test("--output onto a genuinely unwritable path (a file in the parent chain) is the path's own bad_args (exit 2)", async () => {
+    const dir = tempDir();
+    const occupied = join(dir, "occupied");
+    writeFileSync(occupied, "i am a file, not a dir\n");
+    // The parent component is a FILE, so `mkdir -p` cannot create it → the write
+    // fails past the self-heal, and the --output path owns that as bad_args.
+    const outPath = join(occupied, "leg.json");
     const { h } = completedRunHarness(["--output", outPath]);
 
     const code = await expectExit(main(h.deps));

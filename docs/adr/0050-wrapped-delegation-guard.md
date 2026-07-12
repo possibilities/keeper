@@ -68,12 +68,12 @@ it nothing.
 
 - A wrapped worker reaching for Edit/Write/an off-allowlist Bash command is mechanically
   stopped before the edit lands, independent of system-prompt drift.
-- The guard is only as good as the marker's integrity: a launch path bypassing
-  `buildKeeperAgentLaunchArgv` entirely would escape jurisdiction — both current
-  work-launch producers ride the shared seam; a future one must too.
-- The wrapper cannot self-recover from a stuck leg by editing around it — every
-  iteration runs back through the leg, bounded by the same two-full-suite-run cap and
-  `stop_timeout_ms`/`max_attempts` budget as launch; a leg that will not converge still
-  ends in `BLOCKED`, exactly as a native worker's own unrecoverable red suite does.
-- The guard is single-state, needing no coordination with the provider-leg envelope's
-  `outcome` — marker-gated denial and envelope-carried leg result are independent.
+- `git commit` is allowed: `keeper commit-work` cannot stage a foreign leg's edits, so the
+  wrapper lands them as one commit (`git add <paths>` + bare `git commit`, `Job-Id:` via
+  `--trailer`); the edit-denial bounds the tree to the leg's work, and branch/stash/push stay denied.
+- `bun run` permits only a named package script — a path-shaped target is denied, so an
+  out-of-tree Write cannot become an in-tree edit by running the written file.
+- Marker integrity is load-bearing: a launch bypassing `buildKeeperAgentLaunchArgv` would
+  escape jurisdiction — both work-launch producers ride the shared seam; a future one must.
+- The wrapper cannot self-recover by editing around a stuck leg — every iteration runs back through the leg under launch's budget; a non-converging leg ends in `BLOCKED`.
+- The guard is single-state: marker-gated denial and the provider-leg envelope's `outcome` are independent.
