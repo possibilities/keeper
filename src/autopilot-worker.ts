@@ -887,7 +887,13 @@ export interface WorktreeDriver {
     liveAttributedDirty: ReadonlySet<string> | null,
   ): Promise<
     | { ok: true; cwd: string }
-    | { ok: false; reason: string; retry?: boolean; dir?: string }
+    | {
+        ok: false;
+        reason: string;
+        retry?: boolean;
+        dir?: string;
+        conflictedFiles?: string[];
+      }
   >;
   /**
    * After the epic closer reaches done: merge the epic base branch into the repo's
@@ -925,7 +931,15 @@ export interface WorktreeDriver {
     info: WorktreeLaunchInfo,
     isEpicDone: (epicId: string) => Promise<boolean>,
     runMergeSuite?: MergeSuiteProbe,
-  ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
+  ): Promise<
+    | { ok: true }
+    | {
+        ok: false;
+        reason: string;
+        retry?: boolean;
+        conflictedFiles?: string[];
+      }
+  >;
   /**
    * OFF-mode assertion: confirm `cwd` is on the repo's resolved default branch.
    * Returns `{ ok: true }` when it is, else `{ ok: false, reason }` (a sticky
@@ -1008,6 +1022,7 @@ export interface DispatchFailedPayload {
   id: string;
   reason: string;
   dir: string | null;
+  conflictedFiles: string[] | null;
   ts: number;
 }
 
@@ -3291,6 +3306,7 @@ export async function confirmRunning(
       id,
       reason: launchResult.error,
       dir: cwd === "" ? null : cwd,
+      conflictedFiles: null,
       ts: deps.now(),
     });
     return "failed";
@@ -3524,6 +3540,7 @@ export async function runReconcileCycle(
       id: sig.id,
       reason: sig.reason,
       dir: sig.dir,
+      conflictedFiles: null,
       ts: deps.now(),
     });
     if (sig.reclaimPaneId !== null) {
@@ -3559,6 +3576,7 @@ export async function runReconcileCycle(
         id: plan.id,
         reason: plan.worktreeReject.reason,
         dir: plan.cwd,
+        conflictedFiles: null,
         ts: deps.now(),
       });
       continue;
@@ -3578,6 +3596,7 @@ export async function runReconcileCycle(
         id: plan.id,
         reason: `cwd-missing: ${plan.cwd}`,
         dir: plan.cwd,
+        conflictedFiles: null,
         ts: deps.now(),
       });
       continue;
@@ -3655,6 +3674,7 @@ export async function runReconcileCycle(
         id: plan.id,
         reason,
         dir: plan.cwd,
+        conflictedFiles: null,
         ts: deps.now(),
       });
       continue;
@@ -3704,6 +3724,7 @@ export async function runReconcileCycle(
           id: plan.id,
           reason: wt.reason,
           dir: wt.dir,
+          conflictedFiles: wt.conflictedFiles ?? null,
           ts: deps.now(),
         });
         continue;
@@ -3885,6 +3906,7 @@ export async function runReconcileCycle(
             id: closeKeyEpicId(sink),
             reason: provisioned.reason,
             dir: provisioned.dir ?? sink.repoDir,
+            conflictedFiles: provisioned.conflictedFiles ?? null,
             ts: deps.now(),
           });
         }
@@ -3930,6 +3952,7 @@ export async function runReconcileCycle(
           id: finalizeKey,
           reason: result.reason,
           dir: info.repoDir,
+          conflictedFiles: result.conflictedFiles ?? null,
           ts: deps.now(),
         });
       }
@@ -3981,7 +4004,13 @@ async function runWorktreeProducerStep(
   liveAttributedDirty: ReadonlySet<string> | null,
 ): Promise<
   | { ok: true; cwd: string }
-  | { ok: false; reason: string; dir: string; retry?: boolean }
+  | {
+      ok: false;
+      reason: string;
+      dir: string;
+      retry?: boolean;
+      conflictedFiles?: string[];
+    }
 > {
   if (plan.worktree !== undefined) {
     const provisioned = await driver.provision(
@@ -3999,6 +4028,7 @@ async function runWorktreeProducerStep(
         reason: provisioned.reason,
         dir: provisioned.dir ?? launchCwd,
         retry: provisioned.retry,
+        conflictedFiles: provisioned.conflictedFiles,
       };
     }
     return { ok: true, cwd: provisioned.cwd };
@@ -4145,10 +4175,16 @@ export function createWorktreeDriver(
           if (merge.kind === "missing-source") {
             continue; // phantom lane: nothing to merge, never created
           }
-          // `abort-failed` (the conflict/timeout abort itself failed, leaving the
-          // lane worktree mid-merge) folds into today's conflict fail-loud; task 2
-          // specializes it into the distinct wedge-escalation reason.
-          if (merge.kind === "conflict" || merge.kind === "abort-failed") {
+          if (merge.kind === "conflict") {
+            return {
+              ok: false,
+              reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
+              conflictedFiles: merge.conflictedFiles,
+            };
+          }
+          // The conflict/timeout abort itself failed, leaving the lane worktree
+          // mid-merge. Keep this distinct wedge shape free of conflictedFiles.
+          if (merge.kind === "abort-failed") {
             return {
               ok: false,
               reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
@@ -4401,6 +4437,7 @@ export function createWorktreeDriver(
             return {
               ok: false,
               reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
+              conflictedFiles: merge.conflictedFiles,
             };
           case "push-failed":
             return {
@@ -4596,7 +4633,7 @@ export type MergeLaneResult =
   | { kind: "would-clobber"; paths: string[] }
   | { kind: "non-ff" }
   | { kind: "not-turn-key"; reason: PushNotReadyReason }
-  | { kind: "conflict"; stderr: string }
+  | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   // The conflict/timeout guarded `git merge --abort` ITSELF failed, leaving the
   // shared checkout mid-merge (MERGE_HEAD + unresolved paths) — DISTINCT from
   // `conflict` (which aborted cleanly): the residue did NOT clear, so the caller
@@ -4813,7 +4850,7 @@ function isPlausibleBranchName(name: string): boolean {
  */
 type ProspectiveMerge =
   | { kind: "computed"; defaultTip: string; newValue: string }
-  | { kind: "conflict"; stderr: string }
+  | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   | { kind: "local-timeout" }
   | { kind: "merge-tree-unsupported" }
   | { kind: "plumbing-failed"; detail: string };
@@ -4865,7 +4902,27 @@ async function computeProspectiveMerge(
   // so it detects content conflicts equivalently to a porcelain merge without ever
   // touching (or seeing) the working tree.
   if (mt.code === 1) {
-    return { kind: "conflict", stderr: (mt.stdout + mt.stderr).trim() };
+    // `merge-tree --write-tree` reports one stage record per conflicted side as
+    // `<mode> <oid> <stage>\t<path>`. Collect and de-duplicate those paths from
+    // the plumbing output; unlike a porcelain merge there is no live index to
+    // query because this path deliberately never touches the shared checkout.
+    const conflictedFiles = [
+      ...new Set(
+        mt.stdout
+          .split("\n")
+          .map((line) =>
+            line.match(/^\d{6} [0-9a-f]{7,64} [123]\t(.+)$/)?.[1]?.trim(),
+          )
+          .filter(
+            (path): path is string => path !== undefined && path.length > 0,
+          ),
+      ),
+    ];
+    return {
+      kind: "conflict",
+      stderr: (mt.stdout + mt.stderr).trim(),
+      conflictedFiles,
+    };
   }
   if (mt.code !== 0) {
     return {
@@ -8097,6 +8154,7 @@ function main(): void {
                 id: recoverFailureDispatchId(f),
                 reason: f.reason,
                 dir: f.dir,
+                conflictedFiles: null,
                 ts: deps.now(),
               });
             }
@@ -8113,6 +8171,7 @@ function main(): void {
                 id: e.epicId,
                 reason: e.reason,
                 dir: e.dir,
+                conflictedFiles: null,
                 ts: deps.now(),
               });
             }

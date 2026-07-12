@@ -11928,6 +11928,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           id: taskId,
           reason,
           dir,
+          conflictedFiles: null,
           ts: Date.now() / 1000,
         }),
       noteLine: (line) => console.error(`[keeperd] ${line}`),

@@ -4039,6 +4039,7 @@ interface DispatchFailedPayload {
   id: string;
   reason: string;
   dir: string | null;
+  conflictedFiles: string[] | null;
   ts: number;
 }
 
@@ -4082,11 +4083,17 @@ function extractDispatchFailedPayload(
       typeof parsed.dir === "string" && parsed.dir.length > 0
         ? parsed.dir
         : null;
+    const conflictedFiles = Array.isArray(parsed.conflictedFiles)
+      ? parsed.conflictedFiles.filter(
+          (path): path is string => typeof path === "string",
+        )
+      : null;
     return {
       verb: parsed.verb,
       id: parsed.id,
       reason: parsed.reason,
       dir,
+      conflictedFiles,
       ts: parsed.ts,
     };
   } catch (err) {
@@ -4141,13 +4148,14 @@ function foldDispatchFailed(db: Database, event: Event): void {
   }
   db.run(
     `INSERT INTO dispatch_failures (
-       verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-       merge_escalated_at, resolver_dispatched_at, human_notified_at,
-       instance_event_id, repair_dispatched_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)
+       verb, id, reason, dir, conflicted_files, ts, last_event_id, created_at,
+       updated_at, merge_escalated_at, resolver_dispatched_at,
+       human_notified_at, instance_event_id, repair_dispatched_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
+       conflicted_files = excluded.conflicted_files,
        ts = excluded.ts,
        last_event_id = excluded.last_event_id,
        -- created_at preserved through UPSERT: the row's "sticky since"
@@ -4171,6 +4179,9 @@ function foldDispatchFailed(db: Database, event: Event): void {
       payload.id,
       payload.reason,
       payload.dir,
+      payload.conflictedFiles === null
+        ? null
+        : JSON.stringify(payload.conflictedFiles),
       payload.ts,
       event.id,
       payload.ts,

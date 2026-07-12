@@ -198,6 +198,7 @@ import {
   projectPendingDispatches,
 } from "../src/readiness-client";
 import { loadReadinessInputs } from "../src/readiness-inputs";
+import { drain } from "../src/reducer";
 import { readBootStatus } from "../src/server-worker";
 import type {
   EmbeddedJob,
@@ -4316,6 +4317,36 @@ async function withSeededDb(
   }
 }
 
+/** Fold one emitted failure, then prove its structured conflict list re-folds. */
+async function expectConflictedFilesRefold(
+  payload: DispatchFailedPayload,
+  expected: string[],
+): Promise<void> {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, 'reconciler', 'DispatchFailed', 'synthetic', ?)`,
+      [payload.ts, JSON.stringify(payload)],
+    );
+    expect(drain(db)).toBe(1);
+    const select = (): { conflicted_files: string | null } | null =>
+      db
+        .query(
+          "SELECT conflicted_files FROM dispatch_failures WHERE verb = ? AND id = ?",
+        )
+        .get(payload.verb, payload.id) as {
+        conflicted_files: string | null;
+      } | null;
+    const before = select();
+    expect(before?.conflicted_files).toBe(JSON.stringify(expected));
+
+    db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+    db.run("DELETE FROM dispatch_failures");
+    expect(drain(db)).toBe(1);
+    expect(select()).toEqual(before);
+  });
+}
+
 test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcileSnapshot path", async () => {
   await withSeededDb(async (db) => {
     // A done epic: the default open scope would normally hide it, but the
@@ -5269,6 +5300,7 @@ interface FakeWorktreeLog {
 }
 function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
+  provisionConflictedFiles?: (info: WorktreeLaunchInfo) => string[];
   provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
   // A fan-in LANE pre-merge failure — the self-clearing shape `{ ok:false, reason,
   // dir }` (a `worktree-lane-premerge` reason + the base lane worktree path), NEVER
@@ -5277,6 +5309,7 @@ function makeFakeWorktreeDriver(opts?: {
     info: WorktreeLaunchInfo,
   ) => { reason: string; dir: string } | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
+  finalizeConflictedFiles?: (info: WorktreeLaunchInfo) => string[];
   finalizeRetry?: (info: WorktreeLaunchInfo) => string | null;
   assertFail?: (cwd: string) => string | null;
   recoverFailures?: WorktreeRecoveryFailure[];
@@ -5311,7 +5344,11 @@ function makeFakeWorktreeDriver(opts?: {
       }
       const reason = opts?.provisionFail?.(info) ?? null;
       if (reason !== null) {
-        return { ok: false, reason };
+        return {
+          ok: false,
+          reason,
+          conflictedFiles: opts?.provisionConflictedFiles?.(info),
+        };
       }
       return { ok: true, cwd: info.assignment.worktreePath };
     },
@@ -5324,7 +5361,11 @@ function makeFakeWorktreeDriver(opts?: {
       }
       const reason = opts?.finalizeFail?.(info) ?? null;
       if (reason !== null) {
-        return { ok: false, reason };
+        return {
+          ok: false,
+          reason,
+          conflictedFiles: opts?.finalizeConflictedFiles?.(info),
+        };
       }
       return { ok: true };
     },
@@ -6631,11 +6672,13 @@ test("fn-1034 runReconcileCycle: a clustered finalize provisions the non-primary
 });
 
 test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a sticky close row and SKIPS that group's finalize (never merges an unassembled base)", async () => {
+  const conflictedFiles = ["src/fan-in.ts", "docs/fan-in.md"];
   const { driver, log } = makeFakeWorktreeDriver({
     provisionFail: (info) =>
       info.repoDir === "/repo-b"
         ? "worktree-merge-conflict: merging a rib into keeper/epic/fn-1-foo"
         : null,
+    provisionConflictedFiles: () => conflictedFiles,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
   const epic = makeEpic({
@@ -6674,7 +6717,12 @@ test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a stick
     verb: "close",
     id: "fn-1-foo",
     dir: "/repo-b",
+    conflictedFiles,
   });
+  const emission = depsLog.emissions[0];
+  if (emission === undefined)
+    throw new Error("expected fan-in failure emission");
+  await expectConflictedFilesRefold(emission, conflictedFiles);
   // ONLY the primary group finalized — the /repo-b base was never assembled.
   expect(log.finalizes.map((f) => f.repoDir)).toEqual(["/repo-a"]);
 });
@@ -7400,9 +7448,11 @@ test("fn-959 runReconcileCycle: closer-done epic → finalizeEpic runs AFTER the
 });
 
 test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed on the per-repo finalize key, stops (no teardown observable to caller)", async () => {
+  const conflictedFiles = ["src/finalize.ts", "test/finalize.test.ts"];
   const { driver } = makeFakeWorktreeDriver({
     finalizeFail: () =>
       "worktree-finalize-conflict: merging keeper/epic/fn-1-foo into main — CONFLICT",
+    finalizeConflictedFiles: () => conflictedFiles,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
   const epic = makeEpic({
@@ -7435,7 +7485,12 @@ test("fn-959 runReconcileCycle: finalizeEpic conflict → sticky DispatchFailed 
     id: worktreeFinalizeDispatchId("fn-1-foo", "/repo"),
     reason:
       "worktree-finalize-conflict: merging keeper/epic/fn-1-foo into main — CONFLICT",
+    conflictedFiles,
   });
+  const emission = depsLog.emissions[0];
+  if (emission === undefined)
+    throw new Error("expected finalize failure emission");
+  await expectConflictedFilesRefold(emission, conflictedFiles);
 });
 
 test("fn-985 runReconcileCycle: a finalize RETRY result (dirty/off-branch/non-ff main checkout) mints NO sticky DispatchFailed", async () => {
@@ -15283,6 +15338,7 @@ function failedPayload(
     id: "worktree-recover:fn-1-foo-abc123",
     reason: "worktree-recover-dirty-checkout: /repo has a dirty working tree",
     dir: "/repo",
+    conflictedFiles: null,
     ts: 1000,
     ...overrides,
   };

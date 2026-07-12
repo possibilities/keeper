@@ -4178,6 +4178,18 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    version: 120,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "conflicted_files",
+        "TEXT",
+      );
+    },
+  },
 ];
 
 /**
@@ -4198,7 +4210,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v119:b3bd90cf439a2b12e2a0a95cf09492e81d12f4e1c9fea97952b11419f0595226";
+  "v120:b0fca67aacb255f1efc5d00b996292a51b76a7b46305d7c64e68df5b6f58980c";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`

@@ -2908,7 +2908,9 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `drift_age_threshold_days` base-drift threshold columns — additive ALTERs
   // on `autopilot_state`; they do not touch the epics table SHAPE this test
   // pins, fn-1252 task .3.
-  expect(SCHEMA_VERSION).toBe(119);
+  // v120 appends nullable `dispatch_failures.conflicted_files` via an additive
+  // ALTER; it does not touch the epics table shape pinned here.
+  expect(SCHEMA_VERSION).toBe(120);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
