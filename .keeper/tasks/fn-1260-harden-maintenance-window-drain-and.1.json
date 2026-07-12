@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T06:03:38.860000Z",
+  "depends_on": [],
+  "epic": "fn-1260-harden-maintenance-window-drain-and",
+  "id": "fn-1260-harden-maintenance-window-drain-and.1",
+  "model": null,
+  "priority": null,
+  "selection_input_hash": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": null,
+  "title": "Harden drain gate and verify probe",
+  "updated_at": "2026-07-12T06:03:38.860000Z"
+}
