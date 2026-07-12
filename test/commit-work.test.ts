@@ -688,6 +688,285 @@ describe("commit-work: lint_failed", () => {
 });
 
 // ---------------------------------------------------------------------------
+// index-purity gate (stale_index_carryover) + pathspec-limited commit
+// ---------------------------------------------------------------------------
+
+/** A flock stand-in that COUNTS release() calls, so a test can assert every
+ * in-lock failure path releases the lock (via the outer `finally`). */
+function recordingLock(): {
+  acquire: () => { release: () => void };
+  count: () => number;
+} {
+  let released = 0;
+  return {
+    acquire: () => ({
+      release: () => {
+        released += 1;
+      },
+    }),
+    count: () => released,
+  };
+}
+
+describe("commit-work: index-purity gate", () => {
+  test("fails by default with a stale_index_carryover envelope; no commit/push", async () => {
+    // Attributed = a.txt; the index also carries two unattributed paths.
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({
+        stagedNames: ["a.txt", "stale-b.txt", "stale-a.txt"],
+      }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: only a", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe("stale_index_carryover");
+    expect(parsed.count).toBe(2);
+    // Sorted sample of the offending staged-but-unattributed paths.
+    expect(parsed.sample).toEqual(["stale-a.txt", "stale-b.txt"]);
+    // Recovery names BOTH paths forward: the explicit override AND plain git.
+    expect(typeof parsed.hint).toBe("string");
+    expect(parsed.hint.length).toBeGreaterThan(0);
+    expect(parsed.recovery).toContain("--allow-stale-unstage");
+    expect(parsed.recovery).toContain("git add");
+    // Compact single line.
+    expect(stdout).not.toContain("\n  ");
+    // The commit was GATED — neither commit nor push issued, and the index was
+    // NOT silently reset.
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      false,
+    );
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+    expect(calls.some((c) => argvStartsWith(c.args, "reset", "HEAD"))).toBe(
+      false,
+    );
+  });
+
+  test("sample is capped at 20 while count carries the full total", async () => {
+    // 25 stale paths, zero-padded so lexical sort is numeric-stable.
+    const stale = Array.from(
+      { length: 25 },
+      (_, i) => `stale-${String(i).padStart(2, "0")}.txt`,
+    );
+    const { d } = deps({
+      files: ["keep.txt"],
+      rules: successRules({ stagedNames: ["keep.txt", ...stale] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: keep", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.error).toBe("stale_index_carryover");
+    expect(parsed.count).toBe(25);
+    expect(parsed.sample.length).toBe(20);
+    expect(parsed.sample).toEqual(stale.slice(0, 20));
+  });
+
+  test("--allow-stale-unstage restores the reset argv and commits attributed-only", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt", "stale.txt"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: only a", "--session-id", "s1", "--allow-stale-unstage"],
+      d,
+    );
+    expect(code).toBe(0);
+    // The stale path was unstaged via `reset HEAD -- stale.txt`.
+    const reset = calls.find((c) => argvStartsWith(c.args, "reset", "HEAD"));
+    expect(reset?.args).toEqual(["reset", "HEAD", "--", "stale.txt"]);
+    // Then the commit proceeded, pathspec-limited to the attributed set only.
+    const commit = calls.find((c) =>
+      argvStartsWith(c.args, "commit", "-F", "-"),
+    );
+    expect(commit?.args).toEqual(["commit", "-F", "-", "--", "a.txt"]);
+    // Line 1 reports the attributed file only.
+    expect(JSON.parse(stdout.split("\n")[0]).files).toEqual(["a.txt"]);
+  });
+
+  test("empty resolved pathspec yields nothing_to_commit; no commit/push", async () => {
+    // Files discovered + staged, but nothing actually lands in the index.
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: [] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: no-op", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe("nothing_to_commit");
+    expect(typeof parsed.hint).toBe("string");
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      false,
+    );
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+});
+
+describe("commit-work: pathspec-limited commit", () => {
+  test("commit argv carries the sorted pathspec after `--` + the literal-pathspecs env; staged read is --no-renames", async () => {
+    const { d, calls } = deps({
+      files: ["b.txt", "a.txt"],
+      rules: successRules({ stagedNames: ["a.txt", "b.txt"] }),
+    });
+    const { code } = await runForTest(["feat: two", "--session-id", "s1"], d);
+    expect(code).toBe(0);
+    const commit = calls.find((c) =>
+      argvStartsWith(c.args, "commit", "-F", "-"),
+    );
+    // `--only` mode: message flags, then `--`, then the exact attributed pathspec.
+    expect(commit?.args).toEqual(["commit", "-F", "-", "--", "a.txt", "b.txt"]);
+    // Pathspec magic disabled so poisoned-index paths can't smuggle options.
+    expect(commit?.env?.GIT_LITERAL_PATHSPECS).toBe("1");
+    // The staged-name read forces --no-renames so a rename splits into both halves.
+    const diff = calls.find((c) =>
+      argvStartsWith(c.args, "diff", "--cached", "--name-only", "-z"),
+    );
+    expect(diff?.args).toContain("--no-renames");
+  });
+
+  test("a rename's A and D halves both ride the pathspec when both are attributed", async () => {
+    // With --no-renames a rename reports the new path (A) and old path (D); when
+    // both are attributed the pathspec is rename-complete.
+    const { d, calls } = deps({
+      files: ["dir/new.txt", "dir/old.txt"],
+      rules: successRules({ stagedNames: ["dir/new.txt", "dir/old.txt"] }),
+    });
+    const { code } = await runForTest(
+      ["refactor: rename", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    const commit = calls.find((c) =>
+      argvStartsWith(c.args, "commit", "-F", "-"),
+    );
+    expect(commit?.args).toEqual([
+      "commit",
+      "-F",
+      "-",
+      "--",
+      "dir/new.txt",
+      "dir/old.txt",
+    ]);
+  });
+
+  test("a rename with one unattributed half fires the gate (all-or-nothing)", async () => {
+    // Only the new path is attributed; the D half (old path) is stale.
+    const { d, calls } = deps({
+      files: ["dir/new.txt"],
+      rules: successRules({ stagedNames: ["dir/new.txt", "dir/old.txt"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["refactor: half rename", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.error).toBe("stale_index_carryover");
+    expect(parsed.sample).toEqual(["dir/old.txt"]);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      false,
+    );
+  });
+
+  test("a deletion rides the pathspec even though it is skipped by lint", async () => {
+    // doomed.txt is staged as a removal (not on disk) — it must appear in the
+    // commit pathspec, which is built from staged NAMES not the lint list.
+    const { d, calls } = deps({
+      files: ["doomed.txt"],
+      rules: successRules({ stagedNames: ["doomed.txt"] }),
+    });
+    const { code } = await runForTest(
+      ["chore: drop doomed", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    const commit = calls.find((c) =>
+      argvStartsWith(c.args, "commit", "-F", "-"),
+    );
+    expect(commit?.args).toEqual(["commit", "-F", "-", "--", "doomed.txt"]);
+  });
+
+  test("git commit non-zero maps to a commit-failure envelope preserving git's stderr", async () => {
+    // Mid-merge partial-commit refusal is the live specimen.
+    const mergeRefusal = "fatal: cannot do a partial commit during a merge";
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: [
+        {
+          when: (a) => argvStartsWith(a, "commit", "-F", "-"),
+          result: { exitCode: 1, stderr: mergeRefusal },
+        },
+        ...successRules({ stagedNames: ["a.txt"] }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: mid-merge", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe(`git commit failed: ${mergeRefusal}`);
+    // Commit failed → push never runs.
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+  });
+});
+
+describe("commit-work: flock released on every in-lock failure path", () => {
+  const scenarios: {
+    name: string;
+    argv: string[];
+    files: string[];
+    rules: FakeGitRule[];
+  }[] = [
+    {
+      name: "stale_index_carryover gate",
+      argv: ["feat: gated", "--session-id", "s1"],
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt", "stale.txt"] }),
+    },
+    {
+      name: "nothing_to_commit",
+      argv: ["feat: no-op", "--session-id", "s1"],
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: [] }),
+    },
+    {
+      name: "git commit failure",
+      argv: ["feat: fails", "--session-id", "s1"],
+      files: ["a.txt"],
+      rules: [
+        {
+          when: (a: string[]) => argvStartsWith(a, "commit", "-F", "-"),
+          result: { exitCode: 1, stderr: "fatal: nope" },
+        },
+        ...successRules({ stagedNames: ["a.txt"] }),
+      ],
+    },
+  ];
+  for (const s of scenarios) {
+    test(`releases the flock on ${s.name}`, async () => {
+      const { d } = deps({ files: s.files, rules: s.rules });
+      const lock = recordingLock();
+      d.acquireLock = lock.acquire;
+      const { code } = await runForTest(s.argv, d);
+      expect(code).toBe(1);
+      expect(lock.count()).toBeGreaterThanOrEqual(1);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // inLinkedWorktree / pushCommitted detection unit tests
 // ---------------------------------------------------------------------------
 

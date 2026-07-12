@@ -14,9 +14,11 @@
  *     → no-files branch (pretty `committed:false`)
  *     → acquire flock (<per-worktree --git-dir>/keeper-commit-work.lock)
  *       → `git add -A -- <pathspecs>` (pathspec-scoped; deletions stage as removals)
- *       → unstage stale (`all_staged − caller_files`) BEFORE lint
+ *       → index-purity gate: staged content outside the attributed set fails
+ *         loud (`stale_index_carryover`) unless `--allow-stale-unstage` unstages it
  *       → lint matrix (src/commit-work/lint-matrix) — fail → release + emit
- *       → sanitize-safe `git commit -F -` with appended `Job-Id:` trailer
+ *       → sanitize-safe `git commit -F - -- <attributed pathspec>` (GIT_LITERAL_PATHSPECS=1),
+ *         appended `Job-Id:` trailer — poisoned index cannot leak into the tree
  *       → NDJSON line 1 (COMPACT `{success,commit_sha,files}`)
  *       → push (src/commit-work/push) → NDJSON line 2 (compact push envelope)
  *     → release flock (every path, no double-release)
@@ -52,6 +54,12 @@ board files are excluded (they commit via the plan-commit hook). Untracked
 gitignored files are filtered before staging; a runaway file list
 (> --max-files, default 500) aborts with a file_list_too_large envelope.
 
+The commit is scoped to the session-attributed set. Staged content outside
+that set (a dead worker's residue, a shared checkout that trails landed
+history, or a git-apply/codegen write the attribution hooks never saw) aborts
+with a stale_index_carryover envelope, and the commit itself is pathspec-
+limited so nothing outside the attributed set can enter the tree.
+
 Arguments:
   MSG                  Commit message (required unless --preview-files)
 
@@ -60,6 +68,11 @@ Options:
   --preview-files      List files that would be committed; no commit is made
   --max-files <n>      Abort when the post-filter file count exceeds <n>
                        (default 500; pass 0 to disable)
+  --allow-stale-unstage
+                       On a stale_index_carryover abort, unstage the extra
+                       paths and commit the attributed set only. Recovery
+                       opt-in, not a default; if the extra paths are yours,
+                       prefer plain git with explicit paths instead.
   --help, -h           Show this help
 
 Escape hatch: if commit-work won't stage every file you need to commit, use
@@ -85,6 +98,13 @@ On a {"error":"lint_failed"} envelope: read the named files, fix per stderr,
 runaway list (> --max-files, default 500) aborts with file_list_too_large. Every
 verb envelope is exit 1; an arg fault is exit 2. Escape hatch: if it won't stage
 a file you need, \`git add <explicit paths>\` then plain git commit/push.
+
+On a {"error":"stale_index_carryover"} envelope: the index carries staged paths
+outside your session's attributed set (a dead worker's residue or a desynced
+checkout). Do NOT reflexively override. Either \`git add <explicit paths>\` +
+plain git commit if those paths are genuinely yours, or --allow-stale-unstage to
+unstage the extras and commit the attributed set only. The commit is always
+pathspec-limited to the attributed set, so nothing else can enter the tree.
 `;
 
 // Trailer patterns forbidden in a multi-line commit message body. Forged
@@ -109,6 +129,27 @@ const LINT_FAILED_RECOVERY =
   "`git add <files>`, then re-invoke `keeper commit-work` with the same " +
   "message. Do NOT fall back to bare `git commit` or use `--no-verify` — a " +
   "lint failure is not a coverage gap.";
+
+// Carried in the stale_index_carryover envelope. The attributed set derives
+// ONLY from Write/Edit-class PostToolUse hooks, so a git-apply / codegen /
+// script-written file is invisible to it and would otherwise DROP silently —
+// and a desynced shared checkout surfaces as exactly this stale set. Both must
+// be loud, so the default is to refuse rather than silently unstage.
+const STALE_INDEX_CARRYOVER_HINT =
+  "The index has staged content outside this session's attributed file set — " +
+  "stale carryover from a prior worker that died mid-commit, a shared checkout " +
+  "trailing landed history, or a git-apply/codegen/script write the attribution " +
+  "hooks never saw. Committing it would sweep unrelated (possibly stale) paths " +
+  "into your commit.";
+
+// Recovery contract naming BOTH paths forward, so the operator chooses without
+// running another git command. `--allow-stale-unstage` is the explicit opt-in
+// for the old silent behavior; plain git is the path when the extras are yours.
+const STALE_INDEX_CARRYOVER_RECOVERY =
+  "Two ways forward: (1) if the extra paths are genuinely yours, commit the " +
+  "mixed set with plain git and explicit paths — `git add <path> …` (never -A " +
+  "/ .) then `git commit`; or (2) re-run `keeper commit-work --allow-stale-" +
+  "unstage` to unstage the extras and commit ONLY your attributed files.";
 
 // ---------------------------------------------------------------------------
 // Python-byte-parity JSON serializers
@@ -184,6 +225,7 @@ interface ParsedArgs {
   msg: string | null;
   sessionId: string | null;
   previewFiles: boolean;
+  allowStaleUnstage: boolean;
   maxFiles: number;
   help: boolean;
   agentHelp: boolean;
@@ -200,6 +242,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     msg: null,
     sessionId: null,
     previewFiles: false,
+    allowStaleUnstage: false,
     maxFiles: DEFAULT_MAX_FILES,
     help: false,
     agentHelp: false,
@@ -212,6 +255,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       parsed.agentHelp = true;
     } else if (a === "--preview-files") {
       parsed.previewFiles = true;
+    } else if (a === "--allow-stale-unstage") {
+      parsed.allowStaleUnstage = true;
     } else if (a === "--session-id") {
       parsed.sessionId = argv[++i] ?? null;
     } else if (a.startsWith("--session-id=")) {
@@ -311,19 +356,32 @@ async function gitStage(
 
 /**
  * Repo-relative names currently staged (incl. deletions, so deleted-file
- * session entries are not dropped from stale-cleanup or the commit envelope).
+ * session entries are not dropped from the purity gate or the commit pathspec).
+ *
+ * `--no-renames` is load-bearing: with rename detection a rename reports ONLY
+ * the new path, so the old path would neither land in the attributed pathspec
+ * (leaving half a rename → a broken tree) nor surface in the stale set. Forcing
+ * no-renames splits a rename into its A (new) and D (old) halves, so both ride
+ * the pathspec when attributed, and a rename with one un-attributed half falls
+ * into the stale set (the gate fires — all-or-nothing).
  *
  * Uses `-z` (NUL-delimited): without it git QUOTES non-ASCII paths
  * (`"caf\303\251.txt"`), which would never intersect the raw-UTF-8
  * `callerFiles` set (sourced from the porcelain-v2 `-z` attribution reader),
  * silently dropping a unicode-named file from BOTH the commit `files` list and
- * the stale-unstage set. For ASCII paths `-z` is byte-identical to the
- * line-delimited form, so the common-case envelope is unchanged — this only
- * FIXES the unicode case (the Python source carried the latent quoting bug).
+ * the stale set. For ASCII paths `-z` is byte-identical to the line-delimited
+ * form, so the common-case envelope is unchanged.
  */
 async function stagedFileNames(cwd: string, run: GitRunner): Promise<string[]> {
   const res = await run(
-    ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRD"],
+    [
+      "diff",
+      "--cached",
+      "--name-only",
+      "-z",
+      "--no-renames",
+      "--diff-filter=ACMRD",
+    ],
     { cwd },
   );
   if (res.code !== 0) return [];
@@ -373,19 +431,28 @@ async function appendJobIdTrailer(
 }
 
 /**
- * Commit whatever is staged with `msg` (passed via `-F -` stdin so the message
- * cannot be argv-injected). Returns the short SHA, or a failure envelope-like
- * string (prefixed `ERR:`) on commit failure.
+ * Commit the attributed staged set with `msg` (passed via `-F -` stdin so the
+ * message cannot be argv-injected). PATHSPEC-LIMITED: `git commit -- <pathspec>`
+ * uses git's `--only` mode, building the commit tree from HEAD plus the worktree
+ * content of ONLY the named paths — staged entries OUTSIDE the pathspec are
+ * physically held back, so a poisoned index cannot leak into the tree even if
+ * the purity gate was overridden. `GIT_LITERAL_PATHSPECS=1` + the `--` separator
+ * defeat leading-dash options and pathspec magic on attacker-influenced paths.
+ * `pathspec` is the rename-complete staged-name set (deletions included), never
+ * the lint list (which drops deleted paths). Returns the short SHA, or git's
+ * verbatim stderr on commit failure (e.g. a mid-merge partial-commit refusal).
  */
 async function gitCommitStaged(
   msg: string,
+  pathspec: string[],
   cwd: string,
   run: GitRunner,
 ): Promise<{ sha: string } | { error: string }> {
   const withTrailer = await appendJobIdTrailer(msg, cwd, run);
-  const commit = await run(["commit", "-F", "-"], {
+  const commit = await run(["commit", "-F", "-", "--", ...pathspec], {
     cwd,
     stdin: new TextEncoder().encode(withTrailer),
+    env: { GIT_LITERAL_PATHSPECS: "1" },
   });
   if (commit.code !== 0) {
     return { error: commit.stderr.trim() };
@@ -601,15 +668,51 @@ async function runInner(
       return 1;
     }
 
-    // Unstage any stale carryover (a previous worker that died between stage
-    // and commit) so the commit + lint see ONLY the caller's files.
+    // Index-purity gate. Any staged path outside the session-attributed set is
+    // stale carryover — a prior worker that died between stage and commit, a
+    // shared checkout trailing landed history, or a git-apply/codegen write the
+    // attribution hooks never saw. All of those must be LOUD, not silently
+    // dropped, so the default refuses and `--allow-stale-unstage` is the explicit
+    // opt-in for the old unstage-and-proceed behavior. `--no-renames` in
+    // `stagedFileNames` splits a rename into both halves, so a rename with one
+    // un-attributed half lands in `stale` and the gate fires all-or-nothing.
     const allStaged = new Set(await stagedFileNames(worktree, git));
     const callerFiles = new Set(files);
     const stale = [...allStaged].filter((f) => !callerFiles.has(f)).sort();
     if (stale.length > 0) {
-      await git(["reset", "HEAD", "--", ...stale], { cwd: worktree });
+      if (args.allowStaleUnstage) {
+        await git(["reset", "HEAD", "--", ...stale], { cwd: worktree });
+      } else {
+        printCompact({
+          success: false,
+          error: "stale_index_carryover",
+          count: stale.length,
+          sample: stale.slice(0, 20),
+          hint: STALE_INDEX_CARRYOVER_HINT,
+          recovery: STALE_INDEX_CARRYOVER_RECOVERY,
+        });
+        return 1;
+      }
     }
+
+    // The pathspec the commit is scoped to: the attributed ∩ staged set,
+    // rename-complete and deletion-inclusive (built from staged NAMES, never the
+    // lint list, which filters to paths still on disk).
     const stagedNames = [...allStaged].filter((f) => callerFiles.has(f)).sort();
+
+    // Empty resolved pathspec: files were discovered + staged, but none of them
+    // carry an actual index change (already committed, or reverted). Skip commit
+    // and push rather than issue an empty-tree commit.
+    if (stagedNames.length === 0) {
+      printCompact({
+        success: false,
+        error: "nothing_to_commit",
+        hint:
+          "The session-attributed files produced no staged change (already " +
+          "committed, or their edits were reverted). Nothing to commit.",
+      });
+      return 1;
+    }
 
     // Linters operate on file CONTENTS — skip paths deleted in this commit.
     const lintNames = stagedNames.filter((n) => existsSync(`${worktree}/${n}`));
@@ -634,7 +737,7 @@ async function runInner(
       throw err;
     }
 
-    const committed = await gitCommitStaged(msg, worktree, git);
+    const committed = await gitCommitStaged(msg, stagedNames, worktree, git);
     if ("error" in committed) {
       printCompact({
         success: false,
