@@ -43,6 +43,7 @@ import {
   type LockAcquirer,
   listEpicLaneBranches,
   losslessPremergeClean,
+  measureBaseDrift,
   mergeBranchInto,
   mergeReadiness,
   parseWorktreeList,
@@ -606,6 +607,147 @@ test("ensureWorktree: a failing add throws with git stderr", async () => {
   expect(ensureWorktree("/repo", "/p", "b", "c", run)).rejects.toThrow(
     /fatal: boom/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// measureBaseDrift — behind-count + merge-base age, tri-state on failure.
+// ---------------------------------------------------------------------------
+
+test("measureBaseDrift: measured — behind-count is the RIGHT (default-only) count, not the left", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { stdout: "1\t2\n" }, // 1 base-only, 2 default-only (behind)
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base"),
+      result: { stdout: "deadbeef\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "show", "-s", "--format=%ct"),
+      result: { stdout: "1700000000\n" },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({
+    kind: "measured",
+    behindCount: 2,
+    mergeBaseEpochSeconds: 1700000000,
+  });
+  expect(
+    calls.some(
+      (c) =>
+        argvStartsWith(c.args, "rev-list", "--left-right", "--count") &&
+        c.args.at(-1) === "base...main",
+    ),
+  ).toBe(true);
+  expect(
+    calls.some((c) =>
+      argvStartsWith(c.args, "show", "-s", "--format=%ct", "deadbeef"),
+    ),
+  ).toBe(true);
+});
+
+test("measureBaseDrift: no drift — both sides at zero", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { stdout: "0\t0\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base"),
+      result: { stdout: "cafebabe\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "show", "-s", "--format=%ct"),
+      result: { stdout: "1699999999\n" },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({
+    kind: "measured",
+    behindCount: 0,
+    mergeBaseEpochSeconds: 1699999999,
+  });
+});
+
+test("measureBaseDrift: rev-list timeout (124) → inconclusive, never throws", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({ kind: "inconclusive" });
+});
+
+test("measureBaseDrift: rev-list ambiguous ref (128) → inconclusive", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { exitCode: 128, stderr: "fatal: ambiguous argument" },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({ kind: "inconclusive" });
+});
+
+test("measureBaseDrift: rev-list spawn failure (127) → inconclusive", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { exitCode: 127, stderr: "spawn ENOENT" },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({ kind: "inconclusive" });
+});
+
+test("measureBaseDrift: rev-list output unparseable → inconclusive", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { stdout: "not-a-count\n" },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({ kind: "inconclusive" });
+});
+
+test("measureBaseDrift: merge-base lookup fails → inconclusive (no show call)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { stdout: "0\t3\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base"),
+      result: { exitCode: 128, stderr: "fatal: no merge base" },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({ kind: "inconclusive" });
+  expect(calls.some((c) => argvStartsWith(c.args, "show", "-s"))).toBe(false);
+});
+
+test("measureBaseDrift: merge-base commit-timestamp lookup times out → inconclusive", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-list", "--left-right", "--count"),
+      result: { stdout: "0\t5\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base"),
+      result: { stdout: "deadbeef\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "show", "-s", "--format=%ct"),
+      result: { exitCode: GIT_SPAWN_TIMEOUT_CODE },
+    },
+  ]);
+  const res = await measureBaseDrift("/wt", "base", "main", run);
+  expect(res).toEqual({ kind: "inconclusive" });
 });
 
 // ---------------------------------------------------------------------------
