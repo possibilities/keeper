@@ -49,5 +49,5 @@ Clone the exemplar cluster at test/collections.test.ts:1601 for all three descri
 - [ ] `bun test` (fast tier) is green and no schema version or fingerprint changes.
 
 ## Done summary
-
+Generalized liveKeyColumns to subagent_invocations, scheduled_tasks, and pending_dispatches (served agent_id); added a schema-derived REGISTRY contract test walking PRAGMA table_info to enforce composite-PK live identity, with block_escalations as the explicit single-key exemption.
 ## Evidence
