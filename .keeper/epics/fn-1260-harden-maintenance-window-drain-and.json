@@ -7,7 +7,7 @@
     "fn-1251-maintenance-window-tooling"
   ],
   "id": "fn-1260-harden-maintenance-window-drain-and",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-12T06:03:40.412000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-12T06:03:38.860000Z"
+  "updated_at": "2026-07-12T06:03:40.412000Z"
 }
