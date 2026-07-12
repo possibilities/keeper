@@ -991,7 +991,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   },
   {
     name: "transcript",
-    summary: "Discover and extract bounded agent-ready session transcripts",
+    summary:
+      "Discover and extract bounded agent-ready session transcripts: `keeper transcript <harness> <list|show|<session-id>>`",
     visibility: "public",
     mutates: false,
     requires_daemon: false,

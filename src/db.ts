@@ -4175,6 +4175,31 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       db.run("DROP TABLE IF EXISTS profiles");
     },
   },
+  {
+    version: 121,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v120→v121: add `autopilot_state.worker_provider` — the durable
+      // nullable TEXT enum (`NULL | 'claude' | 'codex'`) pinning every work
+      // dispatch to one provider family (docs/adr/0047). The column's original
+      // ladder entry (fn-1256 task .3, v119 at the time) was lost to the
+      // b39fab28 stale-tree sweep while fn-1239's v119/v120 landed in its
+      // place, so it returns as a NEW tail step — forward-only, never a
+      // renumber of the already-run v119/v120. `addColumnIfMissing` converges
+      // both fleet shapes: a DB migrated under the original entry already has
+      // the column (no-op), a DB migrated through the current v119/v120 gains
+      // it here. NULL rule unchanged: nullable, NO default, NO backfill — a
+      // DEFAULT would poison the NULL=unset invariant and a backfill can't
+      // synthesize intent no event carries. The generic `set_autopilot_config`
+      // fold writes it via its string-enum branch; a from-scratch re-fold over
+      // a stream with no worker_provider patch leaves the column NULL
+      // byte-identically. Declared in CREATE_AUTOPILOT_STATE too, appended
+      // AFTER `codex_adoption` (the previous final column) so fresh-vs-migrated
+      // `PRAGMA table_info(autopilot_state)` stays byte-identical.
+      addColumnIfMissing(db, "autopilot_state", "worker_provider", "TEXT");
+    },
+  },
 ];
 
 /**
@@ -4195,7 +4220,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v120:fb7f05f0e2289b8108f7d63b418a03b6a61fdb36f84e553381682ce39365792a";
+  "v121:f0d35b4b0bd4bd867f2ed5d2a2afada81cf35c09675a6181aa9f95fc34afd14d";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5779,7 +5804,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     max_concurrent_per_root INTEGER,
     worktree_mode INTEGER,
     worktree_multi_repo INTEGER,
-    codex_adoption INTEGER
+    codex_adoption INTEGER,
+    worker_provider TEXT
 )
 `;
 

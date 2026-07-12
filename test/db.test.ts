@@ -1348,6 +1348,33 @@ test("autopilot_state has a nullable worktree_mode column (NULL = OFF, the defau
   db.close();
 });
 
+test("autopilot_state has a nullable TEXT worker_provider column (NULL = unconstrained, the default) (fn-1256, re-appended at v121)", () => {
+  const { db } = openDb(":memory:");
+  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const col = stateCols.find((c) => c.name === "worker_provider");
+  expect(col).toBeDefined();
+  expect(col?.type).toBe("TEXT");
+  // Nullable, no SQL default — NULL/absent is unconstrained, the byte-identical
+  // default the producer resolves at read time.
+  expect(col?.notnull).toBe(0);
+  expect(col?.dflt_value).toBeNull();
+
+  // An INSERT that omits the column lands NULL (the lazy-materialize default).
+  db.prepare(
+    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT worker_provider FROM autopilot_state WHERE id = 1")
+    .get() as { worker_provider: string | null };
+  expect(r.worker_provider).toBeNull();
+  db.close();
+});
+
 test("the v113 rewind supersedes the v91→v92 backend_exec terminal-clear data-fix; hand-seeded (event-less) jobs do not survive the rewind (fn-977 v92, fn-1164 v113)", () => {
   // The v91→v92 migration was a ONE-TIME data-fix UPDATE: NULL backend_exec
   // pane/generation on EXISTING terminal jobs so a dead job stops holding a
@@ -2946,7 +2973,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v120 unconditionally DROPs the retired `usage` / `profiles` tables (the
   // `event_blobs` precedent) — it does not touch the epics table SHAPE this
   // test pins, fn-1239 task .6.
-  expect(SCHEMA_VERSION).toBe(120);
+  // v121 re-appends the nullable `autopilot_state.worker_provider` TEXT enum
+  // column (the durable work-dispatch provider pin, docs/adr/0047) — an
+  // idempotent additive ALTER on `autopilot_state`; it does not touch the
+  // epics table SHAPE this test pins.
+  expect(SCHEMA_VERSION).toBe(121);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

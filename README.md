@@ -5,12 +5,13 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 (`keeperd`) folds it into live projections and serves them over a subscribe/RPC socket.
 
 - **Session tracking** — every prompt, tool call, and file mutation across claude, codex,
-  pi, and hermes sessions lands in one queryable log
+  pi, and hermes sessions lands in one queryable log; a Pi `/rename` command derives a short
+  Session title inline
 - **Live board** — plan epics/tasks, jobs, and git state served as live-updating
   collections (`keeper status`, `keeper board`, `keeper query`)
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation
-- **History forensics** — `keeper transcript` extracts bounded main/subagent
+- **History forensics** — `keeper transcript <harness>` extracts bounded main/subagent
   conversations; `keeper search-history`, `keeper find-file-history`, and
   `keeper session events` answer who/when/what across sessions
 - **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling

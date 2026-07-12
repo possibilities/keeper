@@ -4287,7 +4287,14 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // no-ops and the `RateLimited`/`ApiError` profile-level fan-out is deleted,
   // so NO cursor rewind: neither retired table is ever read again and a
   // from-scratch re-fold never touches them).
-  expect(SCHEMA_VERSION).toBe(120);
+  // And to 121 re-appending the nullable `autopilot_state.worker_provider`
+  // TEXT enum column — the durable work-dispatch provider pin, docs/adr/0047;
+  // fn-1256 task .3's original ladder entry was lost to the b39fab28
+  // stale-tree sweep while fn-1239's v119/v120 landed in its place, so it
+  // returns as a NEW tail step (an idempotent additive ALTER, NO cursor
+  // rewind: a stream with no worker_provider patch folds the column NULL
+  // byte-identically).
+  expect(SCHEMA_VERSION).toBe(121);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
