@@ -44,5 +44,5 @@ fast suite green; no runtime surface.
 - [ ] Plan suite green
 
 ## Done summary
-
+Fold the provider-equivalence map into model-guidance's ownership: scope statement, when-to-invoke, state envelope, and research pass now cover both-direction equivalence authoring, contested-cell flagging, and alias re-point staleness; CLAUDE.md and README name both gated artifacts.
 ## Evidence
