@@ -158,6 +158,24 @@ task's assigned worker cell through the committed equivalence map at launch. The
 override's observability contract: an untranslatable cell spikes a visible sticky rather
 than silently starving the board or falling back to the wrong provider family.
 
+## Wrapped-delegation advisory (autopilot producer)
+
+A wrapped-cell `work` dispatch (its effective model not served natively by
+claude) carries the `KEEPER_WRAPPED_ENVELOPE` marker naming where its provider
+leg must write a result envelope. Every reconcile cycle the producer stats that
+path for each DONE wrapped-cell task and, when it's absent, logs a coalesced
+advisory line — evidence the wrapper implemented natively instead of
+delegating. DETECT-ONLY: it never blocks a dispatch and mints no
+`dispatch_failures` sticky, so there is nothing to `retry_dispatch`.
+
+| code                          | emitted by          | meaning                                                                                                        | recovery                                                                                                   | retry-safe |
+| ------------------------------ | -------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------- |
+| `wrapped-delegation-skipped`  | autopilot producer  | A wrapped-cell task done-stamped with no provider-leg result envelope at its `KEEPER_WRAPPED_ENVELOPE` path — advisory evidence the wrapper skipped delegation and implemented with claude tokens directly. | Advisory only — inspect the task's commit; no dispatch to retry. Clears itself once a later task's envelope lands, or the line simply stops recurring once the coalesce window lapses. | n/a (advisory, no sticky) |
+
+The line prints on the daemon's stderr (`~/.local/state/keeper/server.stderr`
+by default, per the LaunchAgent plist) — `grep 'wrapped-delegation-skipped'`
+there to find flagged tasks.
+
 ## Plan family (`keeper plan` accumulate-all failures)
 
 `plugins/plan/src/emit.ts::emitFailureEnvelope` prints
