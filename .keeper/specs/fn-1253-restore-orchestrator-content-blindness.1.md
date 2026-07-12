@@ -39,5 +39,5 @@ bun test in plugins/plan, fake VCS via getVcs() (no real git). Round-trip: submi
 - [ ] plugins/plan test, lint, and typecheck suites are green.
 
 ## Done summary
-
+Added keeper plan audit gate-check (read-only, single-JSON-root) and audit submit-task (commit-free finding writer) verbs, sharing one server-side commit-set derivation helper for hash parity; round-trip and git-unavailable fail-closed paths covered by new tests.
 ## Evidence
