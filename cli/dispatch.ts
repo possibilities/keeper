@@ -66,7 +66,11 @@ import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
 import { loadProviderEquivalenceSnapshot } from "../src/provider-equivalence";
 import type { HostMatrixAxes } from "../src/reconcile-core";
-import { applyProviderConstraint } from "../src/reconcile-core";
+import {
+  applyProviderConstraint,
+  isWrappedCell,
+  wrappedEnvelopePath,
+} from "../src/reconcile-core";
 import {
   composeWorkerCellDir,
   defaultShadowingWorkProbe,
@@ -696,6 +700,13 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   let dispatchedCellModel: string | undefined;
   let dispatchedCellTier: string | undefined;
   let dispatchCellConstraint: string | undefined;
+  // The wrapped-cell guard marker (task .1) for a `work::` launch whose EFFECTIVE
+  // cell is wrapped — the KEEPER_WRAPPED_* env carriers; undefined for a native /
+  // cell-less / free-form launch (byte-identical, empty carriers). Set alongside
+  // `workerPluginDir` in the plan-form block, so a hand-fired wrapped worker is
+  // guarded identically to an autopilot one.
+  let dispatchWrappedCell: string | undefined;
+  let dispatchWrappedEnvelope: string | undefined;
 
   if (hasPlanKey) {
     // ---- plan form ----
@@ -784,6 +795,22 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       let composeTier = assignedTier;
       let providerReject: WorkerCellCompose["providerReject"];
       let workerProvider: "claude" | "codex" | null = null;
+      // Load the host-matrix axes ONCE — reused for the provider-constraint
+      // target-on-host check AND the wrapped-cell marker below. A bad matrix defers
+      // to composeWorkerCellDir's own bad-matrix reject (ranks first): axes stays
+      // null, translation is skipped, and the assigned cell composes (then rejects).
+      let axes: HostMatrixAxes | null = null;
+      try {
+        const m = loadMatrixV2();
+        axes = {
+          models: m.subagentModels,
+          effortsByModel: m.effortsByModel,
+          efforts: m.efforts,
+          driverByModel: m.driverByModel,
+        };
+      } catch (err) {
+        if (!(err instanceof MatrixConfigError)) throw err;
+      }
       try {
         const st = await query("autopilot_state", { id: 1 });
         const raw = (st[0] as { worker_provider?: unknown } | undefined)
@@ -795,45 +822,30 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       if (
         workerProvider !== null &&
         assignedModel !== null &&
-        assignedTier !== null
+        assignedTier !== null &&
+        axes !== null
       ) {
-        // Load the host-matrix axes for the target-on-host check; a bad matrix
-        // defers to composeWorkerCellDir's own bad-matrix reject below (ranks
-        // first), so translation is skipped and the assigned cell composes.
-        let axes: HostMatrixAxes | null = null;
-        try {
-          const m = loadMatrixV2();
-          axes = {
-            models: m.subagentModels,
-            effortsByModel: m.effortsByModel,
-            efforts: m.efforts,
+        const result = applyProviderConstraint(
+          { model: assignedModel, effort: assignedTier },
+          workerProvider,
+          loadProviderEquivalenceSnapshot(),
+          axes,
+        );
+        if (result.kind === "reject") {
+          providerReject = {
+            reason: result.reason,
+            provider: result.provider,
+            direction: result.direction,
+            assigned: result.assigned,
+            target: result.target,
+            ...(result.detail !== undefined ? { detail: result.detail } : {}),
           };
-        } catch (err) {
-          if (!(err instanceof MatrixConfigError)) throw err;
-        }
-        if (axes !== null) {
-          const result = applyProviderConstraint(
-            { model: assignedModel, effort: assignedTier },
-            workerProvider,
-            loadProviderEquivalenceSnapshot(),
-            axes,
-          );
-          if (result.kind === "reject") {
-            providerReject = {
-              reason: result.reason,
-              provider: result.provider,
-              direction: result.direction,
-              assigned: result.assigned,
-              target: result.target,
-              ...(result.detail !== undefined ? { detail: result.detail } : {}),
-            };
-          } else if (result.kind === "translated") {
-            composeModel = result.cell.model;
-            composeTier = result.cell.effort;
-            dispatchedCellModel = result.cell.model;
-            dispatchedCellTier = result.cell.effort;
-            dispatchCellConstraint = workerProvider;
-          }
+        } else if (result.kind === "translated") {
+          composeModel = result.cell.model;
+          composeTier = result.cell.effort;
+          dispatchedCellModel = result.cell.model;
+          dispatchedCellTier = result.cell.effort;
+          dispatchCellConstraint = workerProvider;
         }
       }
       const compose: WorkerCellCompose =
@@ -891,6 +903,19 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
         // null pluginDir = cell-less → no `--plugin-dir` (byte-identical to a
         // close/free-form launch); a resolved cell threads its absolute dir.
         workerPluginDir = cell.pluginDir ?? undefined;
+        // Wrapped-cell guard marker off the EFFECTIVE cell (task .1) — the SAME
+        // predicate the autopilot producer uses, so a hand-fired wrapped worker is
+        // marked (and guarded) identically. Present only for a wrapped cell; a
+        // native / cell-less launch leaves both undefined → empty carriers.
+        if (
+          axes !== null &&
+          composeModel !== null &&
+          composeTier !== null &&
+          isWrappedCell(axes, composeModel)
+        ) {
+          dispatchWrappedCell = `${composeModel}::${composeTier}`;
+          dispatchWrappedEnvelope = wrappedEnvelopePath(cwd, id);
+        }
       }
     }
   } else {
@@ -977,6 +1002,15 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       : {}),
     ...(dispatchCellConstraint !== undefined
       ? { dispatchConstraint: dispatchCellConstraint }
+      : {}),
+    // The wrapped-cell guard carriers (task .1) — set only for a wrapped effective
+    // cell, so keeper agent emits the KEEPER_WRAPPED_* env exactly as the autopilot
+    // producer does; absent → empty carriers (a native worker the guard ignores).
+    ...(dispatchWrappedCell !== undefined
+      ? { wrappedCell: dispatchWrappedCell }
+      : {}),
+    ...(dispatchWrappedEnvelope !== undefined
+      ? { wrappedEnvelope: dispatchWrappedEnvelope }
       : {}),
   };
 

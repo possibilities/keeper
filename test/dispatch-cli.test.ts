@@ -435,6 +435,12 @@ test("plan work: a WRAPPED cell in subagent_models threads the resolved --plugin
   expect(argv[nameIdx + 1]).toBe("work::fn-1-x.1");
   expect(argv[nameIdx + 2]).toBe("--plugin-dir");
   expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/gpt-5.5-high");
+  // …and the wrapped-cell guard marker rides the spec (task .1): the effective
+  // `<model>::<effort>` + the per-task envelope path under the launch repo.
+  expect(r.spec?.wrappedCell).toBe("gpt-5.5::high");
+  expect(r.spec?.wrappedEnvelope).toBe(
+    join(dir, ".keeper", "state", "wrapped-envelopes", "fn-1-x.1.json"),
+  );
 });
 
 test("plan work: with NO host matrix present, a work dispatch refuses (exit 1) with worker-cell-bad-matrix", async () => {
@@ -519,6 +525,12 @@ test("plan work: worker_provider=codex TRANSLATES an opus cell to its mapped cod
   expect(r.spec?.dispatchedModel).toBe("gpt-5.6-sol");
   expect(r.spec?.dispatchedTier).toBe("max");
   expect(r.spec?.dispatchConstraint).toBe("codex");
+  // The wrapped-cell marker keys on the EFFECTIVE (translated) cell, not the
+  // assigned opus — the pin translated an opus cell INTO a wrapped codex cell.
+  expect(r.spec?.wrappedCell).toBe("gpt-5.6-sol::max");
+  expect(r.spec?.wrappedEnvelope).toBe(
+    join(dir, ".keeper", "state", "wrapped-envelopes", "fn-1-x.1.json"),
+  );
 });
 
 test("plan work: worker_provider=codex with the mapped target OFF the host matrix refuses (fail-closed, exit 1)", async () => {
@@ -555,6 +567,9 @@ test("plan work: a NULL worker_provider pin is byte-identical to today (assigned
   expect(r.spec?.pluginDir).toContain("plugins/plan/workers/opus-max");
   expect(r.spec?.dispatchedModel).toBeUndefined();
   expect(r.spec?.dispatchConstraint).toBeUndefined();
+  // A native opus cell carries NO wrapped-cell marker — the guard stays inert.
+  expect(r.spec?.wrappedCell).toBeUndefined();
+  expect(r.spec?.wrappedEnvelope).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------

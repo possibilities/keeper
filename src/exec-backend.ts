@@ -165,6 +165,18 @@ export interface LaunchSpec {
   readonly dispatchedModel?: string;
   readonly dispatchedTier?: string;
   readonly dispatchConstraint?: string;
+  /**
+   * The wrapped-cell guard marker for a wrapped `work` launch (task .1). The launch
+   * ALWAYS emits the two `KEEPER_WRAPPED_CELL` / `KEEPER_WRAPPED_ENVELOPE` carriers
+   * (EMPTY when absent — the KEEPER_PLAN_WORKTREE_BRANCH always-emit pattern) so a
+   * reused tmux session never inherits a stale marker. {@link wrappedCell} is the
+   * effective `<model>::<effort>`; {@link wrappedEnvelope} is the provider-leg
+   * result-envelope path. Present ONLY when the effective cell is wrapped (its
+   * model not natively served by claude); the guard hook (task .2) denies source
+   * edits to a session carrying a non-empty marker.
+   */
+  readonly wrappedCell?: string;
+  readonly wrappedEnvelope?: string;
 }
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
@@ -1062,6 +1074,17 @@ export interface KeeperAgentLaunchOpts {
   readonly dispatchedModel?: string;
   readonly dispatchedTier?: string;
   readonly dispatchConstraint?: string;
+  /**
+   * The wrapped-cell guard marker (task .1). ALWAYS emitted as the two trailing
+   * repeated `--x-tmux-env KEEPER_WRAPPED_CELL` / `KEEPER_WRAPPED_ENVELOPE`
+   * carriers (`?? ""`), mirroring the {@link worktreeBranch} always-emit discipline:
+   * a reused tmux session OVERWRITES any stale marker a prior wrapped launch left,
+   * and an empty pair means a native (or cell-less) worker the guard leaves inert.
+   * {@link wrappedCell} is the effective `<model>::<effort>`; {@link wrappedEnvelope}
+   * is the provider-leg result-envelope path. Set ONLY for a wrapped effective cell.
+   */
+  readonly wrappedCell?: string;
+  readonly wrappedEnvelope?: string;
 }
 
 /**
@@ -1202,6 +1225,17 @@ export function buildKeeperAgentLaunchArgv(
     `KEEPER_PLAN_DISPATCHED_TIER=${opts.dispatchedTier ?? ""}`,
     "--x-tmux-env",
     `KEEPER_PLAN_DISPATCH_CONSTRAINT=${opts.dispatchConstraint ?? ""}`,
+    // Wrapped-cell guard carriers (task .1) — the NINTH/TENTH repeated `--x-tmux-env`
+    // (keeper agent last-wins per dup key): the effective `<model>::<effort>` and the
+    // provider-leg result-envelope path for a wrapped cell, EMPTY for a native cell.
+    // ALWAYS present so the `-e` OVERWRITES any stale marker a prior wrapped launch
+    // left in a reused tmux session env (the same reason the carriers above are
+    // unconditional); the guard hook (task .2) keys total edit-denial on a non-empty
+    // KEEPER_WRAPPED_CELL, so an empty pair is byte-inert (no marker → fail open).
+    "--x-tmux-env",
+    `KEEPER_WRAPPED_CELL=${opts.wrappedCell ?? ""}`,
+    "--x-tmux-env",
+    `KEEPER_WRAPPED_ENVELOPE=${opts.wrappedEnvelope ?? ""}`,
     // Keeper-owned worker permission posture, mirroring the pair-launch precedent
     // (`nativeClaudeArgs`): every claude launch this builder mints is a detached
     // automated worker with NO human to answer a prompt, so it skips permission
@@ -1432,6 +1466,12 @@ export async function keeperAgentLaunch(
       : {}),
     ...(deps.spec.dispatchConstraint !== undefined
       ? { dispatchConstraint: deps.spec.dispatchConstraint }
+      : {}),
+    ...(deps.spec.wrappedCell !== undefined
+      ? { wrappedCell: deps.spec.wrappedCell }
+      : {}),
+    ...(deps.spec.wrappedEnvelope !== undefined
+      ? { wrappedEnvelope: deps.spec.wrappedEnvelope }
       : {}),
     noConfirm: true,
   });

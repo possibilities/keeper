@@ -64,6 +64,12 @@ const FULL_AXES: HostMatrixAxes = {
   models: ["opus", "sonnet", "gpt-5.6-sol", "gpt-5.6-terra"],
   effortsByModel: new Map(),
   efforts: ["low", "medium", "high", "xhigh", "max"],
+  driverByModel: new Map<string, "native" | "wrapped">([
+    ["opus", "native"],
+    ["sonnet", "native"],
+    ["gpt-5.6-sol", "wrapped"],
+    ["gpt-5.6-terra", "wrapped"],
+  ]),
 };
 
 const OK_MAP = { ok: true as const, map: buildProviderEquivalenceMap(CONFIG) };
@@ -197,6 +203,11 @@ describe("applyProviderConstraint", () => {
       models: ["opus", "sonnet", "gpt-5.6-sol"],
       effortsByModel: new Map(),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+        ["gpt-5.6-sol", "wrapped"],
+      ]),
     };
     const r = applyProviderConstraint(
       { model: "sonnet", effort: "high" },
@@ -220,6 +231,12 @@ describe("applyProviderConstraint", () => {
       models: ["opus", "sonnet", "gpt-5.6-sol", "gpt-5.6-terra"],
       effortsByModel: new Map([["gpt-5.6-sol", ["low", "medium"]]]),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+        ["gpt-5.6-sol", "wrapped"],
+        ["gpt-5.6-terra", "wrapped"],
+      ]),
     };
     const r = applyProviderConstraint(
       { model: "opus", effort: "high" },
