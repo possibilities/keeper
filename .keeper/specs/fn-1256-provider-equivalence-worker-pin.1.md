@@ -57,5 +57,5 @@ consistency test drives the pure cores over the committed files like the model-s
 - [ ] Fast suite green
 
 ## Done summary
-
+Added plugins/plan/provider-equivalence.yaml (ADR 0047) with a strict directional {model,effort} parser (provider_equivalence.ts), total in both directions over the dispatchable cell set; extended model-guidance-check.ts's --check/--state to gate it host-blind plus against the live matrix; registered the map/parser as a lint-matrix staged-path trigger; break-it-first fixture + full consistency test suite.
 ## Evidence
