@@ -59,5 +59,5 @@ prompt suite. Sanity: the file parses as a snippet template (header block intact
 - [ ] The embedded summary header describes the new rubric and all prose is present-tense.
 
 ## Done summary
-
+Rewrote the panel-strength snippet from the retired member-count/harness-diversity heuristic to the described-roster rubric: live roster read via presets list, two-stage weakest-covering selection, observable escalation triggers, anti-bias lines, and weak-band skip semantics. Regenerated the snippet index.
 ## Evidence
