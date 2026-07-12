@@ -4143,6 +4143,41 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    version: 119,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v118→v119 (fn-1252 task .3): add the two durable base-drift threshold
+      // columns to `autopilot_state` — `drift_behind_threshold` (INTEGER, the
+      // lane-base behind-count vs the local default) and
+      // `drift_age_threshold_days` (INTEGER, the merge-base age in days). Both
+      // are the SIXTH/SEVENTH scalar config columns riding the generic
+      // `set_autopilot_config` RPC → `AutopilotConfigSet` fold (mirrors
+      // `codex_adoption`/`worktree_multi_repo`), and are OFF by default: NULL,
+      // 0, or any non-positive/non-integer value resolves to "not configured" —
+      // the sentinel/0-disables discipline `.2`'s drift probe and `.4`'s refresh
+      // pass both key on to stay inert. NO fold reads either column (a producer
+      // probe resolves them `?? null` = OFF at read time), so an
+      // addColumnIfMissing append is re-fold-safe: a from-scratch re-fold
+      // re-derives byte-identical rows and leaves both columns NULL. Declared in
+      // CREATE_AUTOPILOT_STATE too (mirrors `codex_adoption`) — appended AFTER
+      // it so `ALTER TABLE ADD COLUMN` keeps fresh-vs-migrated
+      // `PRAGMA table_info(autopilot_state)` byte-identical. NO cursor rewind.
+      addColumnIfMissing(
+        db,
+        "autopilot_state",
+        "drift_behind_threshold",
+        "INTEGER",
+      );
+      addColumnIfMissing(
+        db,
+        "autopilot_state",
+        "drift_age_threshold_days",
+        "INTEGER",
+      );
+    },
+  },
 ];
 
 /**
@@ -4163,7 +4198,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v118:a3a252e4d8073355a01198c57cfbbc69a76248ee96b114c3889ffc1e5c03dc55";
+  "v119:b3bd90cf439a2b12e2a0a95cf09492e81d12f4e1c9fea97952b11419f0595226";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5790,7 +5825,9 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     max_concurrent_per_root INTEGER,
     worktree_mode INTEGER,
     worktree_multi_repo INTEGER,
-    codex_adoption INTEGER
+    codex_adoption INTEGER,
+    drift_behind_threshold INTEGER,
+    drift_age_threshold_days INTEGER
 )
 `;
 

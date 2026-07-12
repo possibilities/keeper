@@ -3993,6 +3993,8 @@ function autopilotConfigSetEvent(
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
     codex_adoption?: boolean;
+    drift_behind_threshold?: number | null;
+    drift_age_threshold_days?: number | null;
   },
   sessionId = "autopilot",
 ): number {
@@ -4016,6 +4018,8 @@ function getAutopilotStateConfig() {
     worktree_mode: number | null;
     worktree_multi_repo: number | null;
     codex_adoption: number | null;
+    drift_behind_threshold: number | null;
+    drift_age_threshold_days: number | null;
   } | null;
 }
 
@@ -4524,6 +4528,133 @@ test("AutopilotConfigSet present-but-non-boolean codex_adoption coerces to 0 (OF
     drainAll();
     expect(getAutopilotStateConfig()?.codex_adoption).toBe(0);
     autopilotConfigSetEvent({ codex_adoption: true });
+    drainAll();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Schema v119 (fn-1252 task .3) — `drift_behind_threshold` and
+// `drift_age_threshold_days` are the SIXTH/SEVENTH scalar config columns riding
+// the generic `AutopilotConfigSet` fold: positive-integer-or-null (mirroring
+// `max_concurrent_per_root`'s shape, NOT a boolean). NULL, 0, or any
+// non-positive/non-integer value resolves to `null` (OFF for that axis) — the
+// sentinel/0-disables discipline the base-drift gate keys its default-OFF
+// behavior on.
+// ---------------------------------------------------------------------------
+
+test("fresh DB has no autopilot_state row → both drift thresholds resolve to OFF (absent = NULL) (fn-1252 task .3)", () => {
+  expect(getAutopilotStateConfig()).toBeNull();
+});
+
+test("AutopilotConfigSet {drift_behind_threshold:15} sets the column and advances the cursor (fn-1252 task .3)", () => {
+  const eventId = autopilotConfigSetEvent({ drift_behind_threshold: 15 });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row?.drift_behind_threshold).toBe(15);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+  // INSERT path still materializes the boots-paused / yolo defaults.
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotConfigSet {drift_behind_threshold:null} clears the column (explicit OFF) (fn-1252 task .3)", () => {
+  autopilotConfigSetEvent({ drift_behind_threshold: 15 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15);
+  autopilotConfigSetEvent({ drift_behind_threshold: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_behind_threshold).toBeNull();
+});
+
+test("AutopilotConfigSet {drift_age_threshold_days:5} sets the column and advances the cursor (fn-1252 task .3)", () => {
+  const eventId = autopilotConfigSetEvent({ drift_age_threshold_days: 5 });
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateConfig();
+  expect(row?.drift_age_threshold_days).toBe(5);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("AutopilotConfigSet {drift_age_threshold_days:null} clears the column (explicit OFF) (fn-1252 task .3)", () => {
+  autopilotConfigSetEvent({ drift_age_threshold_days: 5 });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5);
+  autopilotConfigSetEvent({ drift_age_threshold_days: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBeNull();
+});
+
+test("AutopilotConfigSet {drift thresholds} PRESERVES paused, mode, worktree flags, codex_adoption, and both concurrency columns (fn-1252 task .3)", () => {
+  autopilotPausedEvent(false);
+  autopilotModeEvent("armed");
+  autopilotConfigSetEvent({
+    max_concurrent_jobs: 4,
+    max_concurrent_per_root: 3,
+    worktree_mode: true,
+    worktree_multi_repo: true,
+    codex_adoption: true,
+  });
+  drainAll();
+  autopilotConfigSetEvent({
+    drift_behind_threshold: 15,
+    drift_age_threshold_days: 5,
+  });
+  drainAll();
+  const row = getAutopilotStateConfig();
+  expect(row?.drift_behind_threshold).toBe(15); // landed
+  expect(row?.drift_age_threshold_days).toBe(5); // landed
+  expect(row?.codex_adoption).toBe(1); // PRESERVED
+  expect(row?.worktree_mode).toBe(1); // PRESERVED
+  expect(row?.worktree_multi_repo).toBe(1); // PRESERVED
+  expect(row?.max_concurrent_jobs).toBe(4); // PRESERVED
+  expect(row?.max_concurrent_per_root).toBe(3); // PRESERVED
+  expect(row?.paused).toBe(0); // PRESERVED
+  expect(row?.mode).toBe("armed"); // PRESERVED
+});
+
+test("a codex_adoption patch and a pause toggle PRESERVE both drift thresholds (fn-1252 task .3)", () => {
+  autopilotConfigSetEvent({
+    drift_behind_threshold: 15,
+    drift_age_threshold_days: 5,
+  });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15);
+  expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5);
+  autopilotConfigSetEvent({ codex_adoption: true });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15); // preserved
+  expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5); // preserved
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15); // preserved
+  expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5); // preserved
+});
+
+test("AutopilotConfigSet present-but-non-positive/non-integer drift thresholds coerce to NULL (OFF) (fn-1252 task .3)", () => {
+  autopilotConfigSetEvent({
+    drift_behind_threshold: 15,
+    drift_age_threshold_days: 5,
+  });
+  drainAll();
+  expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15);
+  expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5);
+  for (const bad of [0, -2, 2.5, "15"]) {
+    insertEvent({
+      hook_event: "AutopilotConfigSet",
+      session_id: "autopilot",
+      data: JSON.stringify({
+        drift_behind_threshold: bad,
+        drift_age_threshold_days: bad,
+      }),
+    });
+    drainAll();
+    expect(getAutopilotStateConfig()?.drift_behind_threshold).toBeNull();
+    expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBeNull();
+    autopilotConfigSetEvent({
+      drift_behind_threshold: 15,
+      drift_age_threshold_days: 5,
+    });
     drainAll();
   }
 });
