@@ -1763,7 +1763,7 @@ export interface DuplicateEpicNumberGroup {
 export function computeDuplicateEpicNumberGroups(
   epics: readonly Epic[],
 ): DuplicateEpicNumberGroup[] {
-  // (projectDir   number) → the colliding epic ids. The NUL joiner never appears in a
+  // (projectDir \0 number) → the colliding epic ids. The NUL joiner never appears in a
   // path or a number, so the composite key is unambiguous.
   const byKey = new Map<
     string,
@@ -1777,7 +1777,7 @@ export function computeDuplicateEpicNumberGroups(
     if (projectDir === "") {
       continue;
     }
-    const key = `${projectDir} ${e.epic_number}`;
+    const key = `${projectDir}\0${e.epic_number}`;
     let group = byKey.get(key);
     if (group === undefined) {
       group = { projectDir, epicNumber: e.epic_number, epicIds: [] };
@@ -3925,7 +3925,7 @@ export async function runReconcileCycle(
       // `provisionFailed` below so this group's finalize is skipped either way (its
       // base is not assembled). Only a GENUINE block mints the sticky `close::<epic>`.
       if (!provisioned.ok) {
-        provisionFailed.add(`${closeKeyEpicId(sink)} ${sink.repoDir}`);
+        provisionFailed.add(`${closeKeyEpicId(sink)}\0${sink.repoDir}`);
         if (provisioned.retry === true) {
           // A transient not-ready base lane — retry-skip: mint NO sticky
           // `close::<epic>` row; the next cycle retries once the base settles.
@@ -3960,7 +3960,7 @@ export async function runReconcileCycle(
       }
       // A group whose fan-in provision failed above must NOT finalize — its base is
       // not assembled, so merging it would push incomplete work to default.
-      if (provisionFailed.has(`${closeKeyEpicId(info)} ${info.repoDir}`)) {
+      if (provisionFailed.has(`${closeKeyEpicId(info)}\0${info.repoDir}`)) {
         continue;
       }
       const finalizeKey = worktreeFinalizeDispatchId(
