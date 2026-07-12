@@ -39,5 +39,5 @@ Config round-trips through `set_autopilot_config`; default OFF disables detectio
 - [ ] The schema change is one forward-only `SCHEMA_STEPS` entry with `SCHEMA_FINGERPRINT` re-pinned.
 
 ## Done summary
-
+Added drift_behind_threshold and drift_age_threshold_days to autopilot_state (SCHEMA_STEPS v119, FINGERPRINT re-pinned), settable via the existing set_autopilot_config RPC with default-OFF sentinel/0-disables semantics; added a resolveDriftThresholds resolver in autopilot-worker.ts for .2/.4 to consume.
 ## Evidence
