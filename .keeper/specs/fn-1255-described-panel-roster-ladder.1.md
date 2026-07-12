@@ -64,5 +64,5 @@ description in presets --json, ladder ordering, and providers-check refs over bo
 - [ ] The root fast suite is green.
 
 ## Done summary
-
+Cut both panel.yaml reader seams over to the described object schema {strength, members, description} (ADR 0046): the validating loader rejects legacy list-form panels with a /plan:panel-guidance remediation error, the lenient host-triples harvester reads both shapes, and presets list emits per-panel strength/description ordered weak->strong by band then name in both JSON and human output.
 ## Evidence
