@@ -29,8 +29,7 @@
  * of file type; each is self-contained and sub-second):
  *  - the vendored prompt corpus or a hack/panel skill body staged →
  *    `bun scripts/vendor-corpus.ts --check`
- *  - the plan model-selector config, its research-cache references, the
- *    cross-provider equivalence map, or its parser staged →
+ *  - the plan model-selector config or its research-cache references staged →
  *    `bun plugins/plan/scripts/model-guidance-check.ts --check`
  *  - the plan package's `src/` tree staged → the root
  *    `test/reconcile-core-depgraph.test.ts` import-boundary ratchet (never the
@@ -118,16 +117,12 @@ export function isVendorCorpusPath(path: string): boolean {
   );
 }
 
-/** True when `path` is the plan model-selector config, its research-cache
- * references tree, the cross-provider equivalence map, or its strict parser —
- * the model-guidance drift check's trigger set (the same script gates both
- * the selector config and the equivalence map). */
+/** True when `path` is the plan model-selector config or its research-cache
+ * references tree — the model-guidance drift check's trigger set. */
 export function isModelGuidancePath(path: string): boolean {
   return (
     path === "plugins/plan/model-selector.yaml" ||
-    path.startsWith("plugins/plan/skills/model-guidance/references/") ||
-    path === "plugins/plan/provider-equivalence.yaml" ||
-    path === "plugins/plan/src/provider_equivalence.ts"
+    path.startsWith("plugins/plan/skills/model-guidance/references/")
   );
 }
 

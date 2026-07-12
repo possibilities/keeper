@@ -36,18 +36,6 @@ import {
   WORKTREE_RECOVER_KEY_PREFIX,
 } from "./dispatch-failure-key";
 import type { LaunchSpec } from "./exec-backend";
-// TYPE-ONLY — the fs-touching provider-equivalence loader is a launcher island the
-// reconcile-core depgraph pin forbids the pure core from value-importing (the map is
-// parsed PRODUCER-SIDE and rides the snapshot as data). These are the reduced runtime
-// types the pure `applyProviderConstraint` reads; the walker drops type-only edges.
-import type {
-  EquivalenceCell,
-  EquivalenceDirection,
-  ProviderConstraintRejectReason,
-  ProviderConstraintResult,
-  ProviderEquivalenceSnapshot,
-  WorkerProvider,
-} from "./provider-equivalence";
 import {
   computeReadiness,
   isRootOccupant,
@@ -284,93 +272,6 @@ export function workerCellPluginDir(
     workerCellDir(model as string, tier as string),
   );
 }
-
-/** A model's effective effort list off the injected axes — a per-model narrowing
- *  when present, else the top-level axis (mirrors {@link workerCellPluginDir}'s
- *  resolver so target-on-host validation honors a ragged host roster). */
-function axesEffortsFor(
-  axes: HostMatrixAxes,
-  model: string,
-): readonly string[] {
-  return axes.effortsByModel.get(model) ?? axes.efforts;
-}
-
-/** The equivalence direction that translates a CROSS-family assigned cell INTO
- *  the pinned family: pinning to codex reads `claude_to_codex`, pinning to claude
- *  reads `codex_to_claude`. */
-function directionForProvider(provider: WorkerProvider): EquivalenceDirection {
-  return provider === "codex" ? "claude_to_codex" : "codex_to_claude";
-}
-
-/**
- * The pure translation seam — the ONE helper the reconcile cell-compose site AND
- * manual `keeper dispatch` both apply, so a task under a given pin resolves the
- * SAME dispatch cell either way (`.4` acceptance: identical translation decisions).
- * Given the task's ASSIGNED cell, the durable `worker_provider` pin, the cycle's
- * ONE parsed map snapshot, and the live host-matrix axes, it returns:
- *  - `unchanged` — the assigned cell is ALREADY in the pinned family (host-blind:
- *    its model is a source model of the pinned direction), a byte-identical no-op;
- *  - `translated` — the cross-family assigned cell's mapped equivalent, validated
- *    dispatchable on the live host matrix;
- *  - `reject` — fail-closed, NEVER a silent fallback: `map-malformed` (the snapshot
- *    failed to load), `no-map-entry` (no mapping for this cross-family cell), or
- *    `target-not-on-host` (the mapped target is not a live dispatchable cell).
- * Pure: the map + axes arrive as injected snapshot data, so the verdict path
- * reaches no filesystem (the depgraph pin holds).
- */
-export function applyProviderConstraint(
-  assigned: EquivalenceCell,
-  provider: WorkerProvider,
-  snapshot: ProviderEquivalenceSnapshot,
-  axes: HostMatrixAxes,
-): ProviderConstraintResult {
-  const direction = directionForProvider(provider);
-  if (!snapshot.ok) {
-    return {
-      kind: "reject",
-      reason: "map-malformed",
-      provider,
-      direction,
-      assigned,
-      target: null,
-      detail: snapshot.detail,
-    };
-  }
-  const map = snapshot.map;
-  const inPinnedFamily =
-    provider === "codex"
-      ? map.codexFamilyModels.has(assigned.model)
-      : map.claudeFamilyModels.has(assigned.model);
-  if (inPinnedFamily) {
-    return { kind: "unchanged" };
-  }
-  const table = provider === "codex" ? map.claudeToCodex : map.codexToClaude;
-  const target = table.get(assigned.model)?.get(assigned.effort);
-  if (target === undefined) {
-    return {
-      kind: "reject",
-      reason: "no-map-entry",
-      provider,
-      direction,
-      assigned,
-      target: null,
-    };
-  }
-  if (
-    !axes.models.includes(target.model) ||
-    !axesEffortsFor(axes, target.model).includes(target.effort)
-  ) {
-    return {
-      kind: "reject",
-      reason: "target-not-on-host",
-      provider,
-      direction,
-      assigned,
-      target,
-    };
-  }
-  return { kind: "translated", cell: target };
-}
 /**
  * Build the `claude` worker shell command for a `(verb, id, cwd)`, pinned
  * byte-for-byte by `test/autopilot-worker.test.ts`. Lives here rather than
@@ -448,9 +349,6 @@ export function buildPlannedLaunchSpec(
   worktreePath?: string,
   worktreeBranch?: string,
   pluginDir?: string | null,
-  dispatchedModel?: string | null,
-  dispatchedTier?: string | null,
-  dispatchConstraint?: WorkerProvider | null,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
@@ -464,16 +362,6 @@ export function buildPlannedLaunchSpec(
     ...(worktreeBranch !== undefined && worktreeBranch !== ""
       ? { worktreeBranch }
       : {}),
-    // The dispatched-cell carriers (ADR 0047) — set ONLY when the pin translated
-    // the assigned cell, so an unconstrained / same-family launch leaves them off
-    // and stays byte-identical (the exec builder always emits them empty).
-    ...(dispatchedModel != null && dispatchedModel !== ""
-      ? { dispatchedModel }
-      : {}),
-    ...(dispatchedTier != null && dispatchedTier !== ""
-      ? { dispatchedTier }
-      : {}),
-    ...(dispatchConstraint != null ? { dispatchConstraint } : {}),
   };
 }
 
@@ -750,27 +638,6 @@ export interface ReconcileSnapshot {
    * bad matrix parks dispatch without a `fatalExit`. NEVER a fold input.
    */
   hostMatrix: HostMatrixSnapshot;
-  /**
-   * The durable work-dispatch provider pin (`autopilot_state.worker_provider`,
-   * ADR 0047), read FRESH from the singleton each cycle: NULL/absent (the
-   * byte-identical unconstrained default) or a family (`"claude"`/`"codex"`) every
-   * cell-bearing `work` launch is translated into via {@link applyProviderConstraint}.
-   * A `close` row is cell-less and untouched. Projection-pull only so a runtime
-   * `set_autopilot_config` lands the next cycle; NEVER a fold input. Optional for
-   * call-site back-compat — an absent field is unconstrained (no translation).
-   */
-  workerProvider?: WorkerProvider | null;
-  /**
-   * The parsed cross-provider equivalence map (`plugins/plan/provider-equivalence.yaml`),
-   * loaded + reduced PRODUCER-SIDE in {@link loadReconcileSnapshot} ONCE per cycle
-   * — but ONLY when {@link workerProvider} is set (an unconstrained cycle reads no
-   * map). A discriminated field mirroring {@link hostMatrix}: the reduced runtime
-   * map on a clean parse, or a typed failure the pure translation turns into a
-   * per-cell `map-malformed` reject (fail-closed — a stale map never crashes the
-   * cycle). Consulted ONLY under an active pin; an absent field with a pin set
-   * fails closed as `map-malformed`. NEVER a fold input.
-   */
-  providerEquivalence?: ProviderEquivalenceSnapshot;
   /**
    * The global concurrency cap, read FRESH from the `autopilot_state` singleton's
    * `max_concurrent_jobs` column each cycle (resolved `column ?? DEFAULT` — an
@@ -1135,41 +1002,6 @@ export interface PlannedLaunch {
    * Mutually exclusive with {@link pluginDir} / {@link pluginDirReject}.
    */
   matrixReject?: { state: MatrixFailureState; detail: string };
-  /**
-   * The DISPATCHED cell's model/tier when the `worker_provider` pin TRANSLATED the
-   * assigned cell into the other family (ADR 0047) — the cell {@link pluginDir}
-   * actually composes over, distinct from {@link cellModel}/{@link tier} (which
-   * stay the untouched ASSIGNED cell for the selection record). BOTH null when no
-   * translation happened (same-family or NULL-pin), so the launch is byte-identical
-   * to today. The producer emits them as the always-present `KEEPER_PLAN_DISPATCHED_*`
-   * env carriers (empty when null) and records them on the launch event.
-   */
-  dispatchedCellModel?: string | null;
-  dispatchedCellTier?: string | null;
-  /**
-   * The `worker_provider` value that FORCED the translation (`"claude"`/`"codex"`),
-   * set ONLY when {@link dispatchedCellModel} is — the `KEEPER_PLAN_DISPATCH_CONSTRAINT`
-   * carrier. Null/absent when unconstrained (empty carrier). `.5`'s claim-time
-   * capture keys the selection cohort exclusion on this being present.
-   */
-  dispatchConstraint?: WorkerProvider | null;
-  /**
-   * Set IFF the `worker_provider` pin could not translate this `work` row's assigned
-   * cell — the fail-closed reject (ADR 0047), parallel to {@link matrixReject} /
-   * {@link pluginDirReject}. Carries the machine fields the producer composes its
-   * sticky `DispatchFailed` reason from (naming the cells + direction); NEVER a
-   * fallback to the assigned provider. Mutually exclusive with a non-null
-   * {@link pluginDir}. Ranks AFTER {@link matrixReject} (no host matrix ⇒ no target
-   * to validate), BEFORE the cell compose.
-   */
-  providerReject?: {
-    reason: ProviderConstraintRejectReason;
-    provider: WorkerProvider;
-    direction: EquivalenceDirection;
-    assigned: EquivalenceCell;
-    target: EquivalenceCell | null;
-    detail?: string;
-  };
   /**
    * `true` IFF this is an EPIC-level finalizer (`close` at the close-row site,
    * keyed by epic id). The cycle glue stamps `state.finalizerGuard[id]` for these
@@ -2096,72 +1928,25 @@ export function reconcile(
       let matrixReject:
         | { state: MatrixFailureState; detail: string }
         | undefined;
-      // The DISPATCHED cell — the ASSIGNED cell unless the `worker_provider` pin
-      // translated it into the other family (ADR 0047). Both stay null on the
-      // byte-identical unconstrained / same-family path; the compose below runs
-      // over the EFFECTIVE cell so `pluginDir` points at the cell that launches.
-      let dispatchedCellModel: string | null = null;
-      let dispatchedCellTier: string | null = null;
-      let dispatchConstraint: WorkerProvider | null = null;
-      let providerReject: PlannedLaunch["providerReject"];
       if (verb === "work") {
         const cellModel = task.model ?? null;
         const cellTier = task.tier ?? null;
         if (cellModel !== null && cellTier !== null) {
           if (!snapshot.hostMatrix.ok) {
-            // No matrix ⇒ no cell to compose AND no target to validate — the
-            // bad-matrix reject ranks first, ahead of any provider translation.
             matrixReject = {
               state: snapshot.hostMatrix.state,
               detail: snapshot.hostMatrix.detail,
             };
           } else {
-            // Apply the pin FIRST (translate assigned → effective), then compose
-            // the effective cell. The pin refuses fail-closed rather than falling
-            // back to the assigned provider; the reject rides `providerReject`.
-            let composeModel = cellModel;
-            let composeTier = cellTier;
-            const provider = snapshot.workerProvider ?? null;
-            if (provider !== null) {
-              const result = applyProviderConstraint(
-                { model: cellModel, effort: cellTier },
-                provider,
-                snapshot.providerEquivalence ?? {
-                  ok: false,
-                  detail: "provider-equivalence map not loaded",
-                },
+            try {
+              pluginDir = workerCellPluginDir(
+                cellModel,
+                cellTier,
                 snapshot.hostMatrix,
               );
-              if (result.kind === "reject") {
-                providerReject = {
-                  reason: result.reason,
-                  provider: result.provider,
-                  direction: result.direction,
-                  assigned: result.assigned,
-                  target: result.target,
-                  ...(result.detail !== undefined
-                    ? { detail: result.detail }
-                    : {}),
-                };
-              } else if (result.kind === "translated") {
-                composeModel = result.cell.model;
-                composeTier = result.cell.effort;
-                dispatchedCellModel = result.cell.model;
-                dispatchedCellTier = result.cell.effort;
-                dispatchConstraint = provider;
-              }
-            }
-            if (providerReject === undefined) {
-              try {
-                pluginDir = workerCellPluginDir(
-                  composeModel,
-                  composeTier,
-                  snapshot.hostMatrix,
-                );
-              } catch (err) {
-                pluginDirReject =
-                  err instanceof Error ? err.message : String(err);
-              }
+            } catch (err) {
+              pluginDirReject =
+                err instanceof Error ? err.message : String(err);
             }
           }
         }
@@ -2184,12 +1969,8 @@ export function reconcile(
         tier: verb === "work" ? task.tier : null,
         cellModel: verb === "work" ? (task.model ?? null) : null,
         pluginDir,
-        dispatchedCellModel,
-        dispatchedCellTier,
-        dispatchConstraint,
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
         ...(matrixReject !== undefined ? { matrixReject } : {}),
-        ...(providerReject !== undefined ? { providerReject } : {}),
       });
       budget--;
     }

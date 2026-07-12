@@ -42,7 +42,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { loadMatrixV2, MatrixConfigError } from "../src/agent/matrix";
 import { parseTriple } from "../src/agent/triple";
 import { KEEPER_ROOT } from "../src/autopilot-worker";
 import { GIT_LOCAL_TIMEOUT_MS, gitExec } from "../src/commit-work/git-exec";
@@ -64,15 +63,10 @@ import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
-import { loadProviderEquivalenceSnapshot } from "../src/provider-equivalence";
-import type { HostMatrixAxes } from "../src/reconcile-core";
-import { applyProviderConstraint } from "../src/reconcile-core";
 import {
   composeWorkerCellDir,
   defaultShadowingWorkProbe,
-  providerRejectReason,
   resolveWorkerCell,
-  type WorkerCellCompose,
 } from "../src/worker-cell";
 import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
 import { repoToken } from "../src/worktree-plan";
@@ -688,14 +682,6 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   // task carries an in-matrix {model, tier}; undefined for a cell-less work row,
   // and NEVER set for close / free-form launches (those stay byte-identical).
   let workerPluginDir: string | undefined;
-  // The DISPATCHED cell + constraint (ADR 0047) when the `worker_provider` pin
-  // translated this `work::` launch's assigned cell into the other family — the
-  // KEEPER_PLAN_DISPATCHED_* env carriers; undefined on an unconstrained /
-  // same-family launch (byte-identical, empty carriers). Set alongside
-  // `workerPluginDir` in the plan-form block below.
-  let dispatchedCellModel: string | undefined;
-  let dispatchedCellTier: string | undefined;
-  let dispatchCellConstraint: string | undefined;
 
   if (hasPlanKey) {
     // ---- plan form ----
@@ -774,90 +760,20 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     // reflects the reject a real run would hit. The switch is closed by `assertNever`
     // — a new reject kind fails compilation here.
     if (verb === "work") {
-      // Apply the `worker_provider` pin (ADR 0047) BEFORE composing the cell so a
-      // manual dispatch and autopilot resolve the SAME dispatched cell for the same
-      // task + pin. Read the pin client-side (same query seam as the worktree
-      // refusal); a daemon-unreachable read FAILS OPEN (dispatch the assigned cell).
-      const assignedModel = cwdResult.model ?? null;
-      const assignedTier = cwdResult.tier ?? null;
-      let composeModel = assignedModel;
-      let composeTier = assignedTier;
-      let providerReject: WorkerCellCompose["providerReject"];
-      let workerProvider: "claude" | "codex" | null = null;
-      try {
-        const st = await query("autopilot_state", { id: 1 });
-        const raw = (st[0] as { worker_provider?: unknown } | undefined)
-          ?.worker_provider;
-        workerProvider = raw === "claude" || raw === "codex" ? raw : null;
-      } catch {
-        // Transient read failure — fail open, dispatch the assigned cell.
-      }
-      if (
-        workerProvider !== null &&
-        assignedModel !== null &&
-        assignedTier !== null
-      ) {
-        // Load the host-matrix axes for the target-on-host check; a bad matrix
-        // defers to composeWorkerCellDir's own bad-matrix reject below (ranks
-        // first), so translation is skipped and the assigned cell composes.
-        let axes: HostMatrixAxes | null = null;
-        try {
-          const m = loadMatrixV2();
-          axes = {
-            models: m.subagentModels,
-            effortsByModel: m.effortsByModel,
-            efforts: m.efforts,
-          };
-        } catch (err) {
-          if (!(err instanceof MatrixConfigError)) throw err;
-        }
-        if (axes !== null) {
-          const result = applyProviderConstraint(
-            { model: assignedModel, effort: assignedTier },
-            workerProvider,
-            loadProviderEquivalenceSnapshot(),
-            axes,
-          );
-          if (result.kind === "reject") {
-            providerReject = {
-              reason: result.reason,
-              provider: result.provider,
-              direction: result.direction,
-              assigned: result.assigned,
-              target: result.target,
-              ...(result.detail !== undefined ? { detail: result.detail } : {}),
-            };
-          } else if (result.kind === "translated") {
-            composeModel = result.cell.model;
-            composeTier = result.cell.effort;
-            dispatchedCellModel = result.cell.model;
-            dispatchedCellTier = result.cell.effort;
-            dispatchCellConstraint = workerProvider;
-          }
-        }
-      }
-      const compose: WorkerCellCompose =
-        providerReject !== undefined
-          ? { pluginDir: null, providerReject }
-          : composeWorkerCellDir(composeModel, composeTier);
-      const cell = resolveWorkerCell(compose, {
-        dirExists: deps.dirExists ?? existsSync,
-        probeShadow:
-          deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
-      });
+      const cell = resolveWorkerCell(
+        composeWorkerCellDir(cwdResult.model ?? null, cwdResult.tier ?? null),
+        {
+          dirExists: deps.dirExists ?? existsSync,
+          probeShadow:
+            deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
+        },
+      );
       if (!cell.ok) {
         switch (cell.kind) {
           case "bad-matrix":
             die(
               `refusing to launch ${claudeName}: the host worker matrix is ` +
                 `${cell.state} — ${cell.detail} Then retry (worker-cell-bad-matrix)`,
-            );
-            break;
-          case "provider-reject":
-            // Fail-closed under the pin — NEVER a fallback to the assigned
-            // provider. Same three-reason prose the autopilot sticky carries.
-            die(
-              `refusing to launch ${claudeName}: ${providerRejectReason(cell)}`,
             );
             break;
           case "out-of-matrix":
@@ -966,18 +882,6 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort } : {}),
     ...(workerPluginDir !== undefined ? { pluginDir: workerPluginDir } : {}),
-    // The dispatched-cell carriers (ADR 0047) — set only when the pin translated
-    // this launch's assigned cell, so keeper agent emits the KEEPER_PLAN_DISPATCHED_*
-    // env exactly as the autopilot producer does; absent → empty carriers.
-    ...(dispatchedCellModel !== undefined
-      ? { dispatchedModel: dispatchedCellModel }
-      : {}),
-    ...(dispatchedCellTier !== undefined
-      ? { dispatchedTier: dispatchedCellTier }
-      : {}),
-    ...(dispatchCellConstraint !== undefined
-      ? { dispatchConstraint: dispatchCellConstraint }
-      : {}),
   };
 
   // UNNAMED window (empty `name`): the renamer worker labels plan-form windows

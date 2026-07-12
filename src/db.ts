@@ -4143,28 +4143,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
-  {
-    version: 119,
-    kind: "additive",
-    apply: (ctx) => {
-      const { db } = ctx;
-      // v118→v119 (fn-1256 task .3): add `autopilot_state.worker_provider` — the
-      // durable nullable TEXT enum (`NULL | 'claude' | 'codex'`) pinning every
-      // work dispatch to one provider family (docs/adr/0047). Riding the SAME
-      // generic `set_autopilot_config` patch machinery as `codex_adoption` /
-      // `worktree_multi_repo`, but the FIRST non-numeric config column — the
-      // reducer's patch parser gains a string-enum branch alongside the existing
-      // boolean/integer coercions. NULL rule: nullable, NO default, NO backfill
-      // (mirrors the v111 block) — a DEFAULT would poison the NULL=unset
-      // invariant and a backfill can't synthesize intent no event carries. No
-      // fold reads it — translation is a producer-only concern (task .4), so a
-      // from-scratch re-fold over any pre-v119 stream leaves the column NULL
-      // byte-identically. Declared in CREATE_AUTOPILOT_STATE too, appended AFTER
-      // `codex_adoption` (the current final column) so fresh-vs-migrated
-      // `PRAGMA table_info(autopilot_state)` stays byte-identical.
-      addColumnIfMissing(db, "autopilot_state", "worker_provider", "TEXT");
-    },
-  },
 ];
 
 /**
@@ -4185,7 +4163,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v119:6f6d4268513a2074b98429b81fee95a63e1dd4d2589fa92350c07ad81ba465e2";
+  "v118:a3a252e4d8073355a01198c57cfbbc69a76248ee96b114c3889ffc1e5c03dc55";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5812,8 +5790,7 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     max_concurrent_per_root INTEGER,
     worktree_mode INTEGER,
     worktree_multi_repo INTEGER,
-    codex_adoption INTEGER,
-    worker_provider TEXT
+    codex_adoption INTEGER
 )
 `;
 

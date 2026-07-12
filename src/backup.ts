@@ -53,16 +53,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { execFileSync } from "node:child_process";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  rmSync,
-  statSync,
-} from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -762,111 +753,6 @@ export function verifyReclaim(
 }
 
 /**
- * keeperd's launchd job label. Mirrors `daemon.ts`'s `KEEPERD_LAUNCHD_LABEL`
- * (kept as a local literal rather than an import to avoid a backup.ts ↔
- * daemon.ts import cycle — daemon.ts already imports from backup.ts). Kept in
- * sync with `plist/arthack.keeperd.plist`'s `Label`.
- */
-const KEEPERD_LAUNCHD_LABEL = "arthack.keeperd";
-
-/** keeperd's resolved launchctl targets, for {@link reclaimInstructions}. */
-export interface KeeperdTarget {
-  /** `gui/<uid>` — the launchctl domain-target `bootstrap` takes. */
-  domain: string;
-  /** `gui/<uid>/arthack.keeperd` — the launchctl service target `bootout` takes. */
-  service: string;
-  /** The LaunchAgent plist path launchd is loaded from (or the conventional
-   * install path, when not currently loaded). */
-  plistPath: string;
-}
-
-/**
- * Injectable seams for {@link resolveKeeperdTarget} — production defaults to
- * the real platform/uid/launchctl/filesystem; tests inject fakes so resolution
- * stays a pure, subprocess-free unit test (no real `launchctl` spawn).
- */
-export interface ResolveKeeperdTargetOptions {
-  platform?: NodeJS.Platform;
-  getuid?: () => number;
-  /** Runs `launchctl print <service>` and returns its stdout; throws on any
-   * failure (not loaded, launchctl missing, non-zero exit). */
-  launchctlPrint?: (service: string) => string;
-  existsSync?: (path: string) => boolean;
-  homedir?: () => string;
-}
-
-/**
- * Resolve keeperd's launchctl service target and loaded plist path at render
- * time, so {@link reclaimInstructions} can print copy-pasteable commands
- * instead of `<keeperd label>` placeholders. Best-effort and read-only: `null`
- * whenever resolution isn't possible (non-macOS, no usable uid, launchd
- * unreachable, and no conventional plist on disk) — callers fall back to the
- * placeholder text. Never throws.
- */
-export function resolveKeeperdTarget(
-  options: ResolveKeeperdTargetOptions = {},
-): KeeperdTarget | null {
-  const platform = options.platform ?? process.platform;
-  if (platform !== "darwin") {
-    return null;
-  }
-  const getuid =
-    options.getuid ??
-    (typeof process.getuid === "function" ? process.getuid : undefined);
-  let uid: number;
-  try {
-    uid = getuid ? getuid() : NaN;
-  } catch {
-    uid = NaN;
-  }
-  if (!Number.isInteger(uid) || uid < 0) {
-    return null;
-  }
-  const domain = `gui/${uid}`;
-  const service = `${domain}/${KEEPERD_LAUNCHD_LABEL}`;
-
-  // Ask launchd for the plist it actually loaded this service from — the
-  // authoritative path while the agent is loaded. `execFileSync` (no shell)
-  // so there is nothing here to interpolate.
-  const launchctlPrint =
-    options.launchctlPrint ??
-    ((svc: string) =>
-      execFileSync("launchctl", ["print", svc], {
-        encoding: "utf8",
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      }));
-  let plistPath: string | null = null;
-  try {
-    const out = launchctlPrint(service);
-    const match = out.match(/^[ \t]*path[ \t]*=[ \t]*(\S+\.plist)[ \t]*$/m);
-    if (match) {
-      plistPath = match[1];
-    }
-  } catch {
-    /* not loaded, launchctl missing, or a print-format change — fall through */
-  }
-
-  // Not currently loaded (or unparseable) — the conventional install location
-  // (scripts/install.sh symlinks the repo plist here).
-  if (plistPath === null) {
-    const exists = options.existsSync ?? existsSync;
-    const home = options.homedir ?? homedir;
-    const conventional = join(
-      home(),
-      "Library",
-      "LaunchAgents",
-      `${KEEPERD_LAUNCHD_LABEL}.plist`,
-    );
-    if (exists(conventional)) {
-      plistPath = conventional;
-    }
-  }
-
-  return plistPath === null ? null : { domain, service, plistPath };
-}
-
-/**
  * The DOCUMENTED offline reclaim procedure — pause autopilot, catch-up drain,
  * checkpoint, reclaim, gate, atomic mv, clear stale sidecars, restart, verify.
  * Rendered as a single source of truth here.
@@ -880,22 +766,11 @@ export function resolveKeeperdTarget(
  * paused BEFORE the daemon is stopped. Run the VACUUM step with the daemon
  * STOPPED; keep the pre-reclaim snapshot as the rollback until the restarted
  * binary verifies.
- *
- * `target` defaults to {@link resolveKeeperdTarget}'s render-time resolution
- * (real service + plist path); pass it explicitly (or `null`) to pin the
- * rendered bootout/bootstrap lines, e.g. in tests.
  */
 export function reclaimInstructions(
   outputPath: string,
   dbPath: string,
-  target: KeeperdTarget | null = resolveKeeperdTarget(),
 ): string {
-  const bootoutLine = target
-    ? `       launchctl bootout ${target.service}   # or: launchctl stop`
-    : "       launchctl bootout <keeperd label>   # or: launchctl stop";
-  const bootstrapLine = target
-    ? `       launchctl bootstrap ${target.domain} ${target.plistPath} && keeper await server-up`
-    : "       launchctl bootstrap <keeperd domain/label> && keeper await server-up";
   return [
     "Offline retention-shed reclaim (daemon STOPPED for the VACUUM):",
     "",
@@ -912,7 +787,7 @@ export function reclaimInstructions(
     "  3. Precheck free disk — VACUUM INTO needs ~1-1.5 GB transient headroom —",
     "     then stop the daemon so nothing holds the writer lock or a stale WAL:",
     `       df -h "$(dirname '${dbPath}')"`,
-    bootoutLine,
+    "       launchctl bootout <keeperd label>   # or: launchctl stop",
     "",
     "  4. Keep a pre-reclaim snapshot as the rollback (verified VACUUM INTO copy):",
     "       bun scripts/backup-db.ts   # or the existing rolling snapshot",
@@ -929,7 +804,7 @@ export function reclaimInstructions(
     "",
     "  7. Restart, wait for server-up, then verify before discarding the snapshot",
     "     and re-enabling autopilot:",
-    bootstrapLine,
+    "       launchctl bootstrap <keeperd domain/label> && keeper await server-up",
     `       sqlite3 -readonly '${dbPath}' 'PRAGMA auto_vacuum;'   # 2 (INCREMENTAL)`,
     `       ls -lh '${dbPath}'                                    # ~0.6 GB`,
     "       keeper search-history <a known term>                 # forensics intact",

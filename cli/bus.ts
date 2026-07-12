@@ -997,7 +997,10 @@ export function emitJsonMessage(msg: InboundMessage, inboxDir: string): void {
 }
 
 interface LifetimeInput {
-  once(event: "end" | "close" | "error", listener: () => void): unknown;
+  once(
+    event: "end" | "close" | "error",
+    listener: () => void,
+  ): unknown;
   resume(): unknown;
 }
 

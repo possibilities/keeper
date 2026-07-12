@@ -2,16 +2,13 @@
 // human-invoked out-of-band grading skill later hands its auditor.
 //
 // Assembles, for one closed epic, the grading context for each AUDITABLE
-// completed task: the task spec, the assigned {tier, model} the selector
-// picked, the DISPATCHED {tier, model} that actually ran (`tier`/`model` —
-// equal to the assigned cell absent a worker-provider constraint) plus its
-// `constraint` (null when unconstrained), the selection run's config + input
-// hashes, per-task diff stats derived from the Task-trailer source commits
-// (files touched + line counts), and the done summary. The brief carries no
-// selector rationale/confidence/label_source — those stay in the selection
-// sidecar for calibration only, kept out of the blinded grading pass. The
-// brief lands committed so a future grading run has a stable, git-recoverable
-// snapshot to grade from; no auditor runs at close time.
+// completed task: the task spec, the assigned {tier, model}, the selection
+// run's config + input hashes, per-task diff stats derived from the
+// Task-trailer source commits (files touched + line counts), and the done
+// summary. The brief carries no selector rationale/confidence/label_source —
+// those stay in the selection sidecar for calibration only, kept out of the
+// blinded grading pass. The brief lands committed so a future grading run has a
+// stable, git-recoverable snapshot to grade from; no auditor runs at close time.
 //
 // AUDITABLE excludes two non-decisions whose grading would poison the dataset:
 //   - a task whose cell was a degraded default (sidecar label_source
@@ -139,54 +136,6 @@ function taskStatus(t: Record<string, unknown>): string {
 function hasJobEvidence(t: Record<string, unknown>): boolean {
   const claimedAt = t.claimed_at;
   return typeof claimedAt === "string" && claimedAt !== "";
-}
-
-/** The assigned (sidecar) cell vs the dispatched (actually-ran) cell for one
- * task, per the merged runtime state. A worker-provider constraint records
- * `dispatched_model`/`dispatched_tier`/`dispatch_constraint` on the task
- * runtime at claim (claim.ts); an unconstrained claim clears any stale values,
- * so their absence — or a pre-feature brief's runtime predating the keys —
- * both fall to the one documented rule: dispatched == assigned, constraint
- * null. */
-function assignedAndDispatchedCell(
-  t: Record<string, unknown>,
-  cell: SidecarCell,
-): {
-  assignedTier: string;
-  assignedModel: string;
-  dispatchedTier: string;
-  dispatchedModel: string;
-  constraint: string | null;
-} {
-  const assignedTier = cell.tier;
-  const assignedModel = cell.model;
-  const rawDispatchedModel = t.dispatched_model;
-  const rawDispatchedTier = t.dispatched_tier;
-  const hasDispatch =
-    typeof rawDispatchedModel === "string" &&
-    rawDispatchedModel !== "" &&
-    typeof rawDispatchedTier === "string" &&
-    rawDispatchedTier !== "";
-  if (!hasDispatch) {
-    return {
-      assignedTier,
-      assignedModel,
-      dispatchedTier: assignedTier,
-      dispatchedModel: assignedModel,
-      constraint: null,
-    };
-  }
-  const rawConstraint = t.dispatch_constraint;
-  return {
-    assignedTier,
-    assignedModel,
-    dispatchedTier: rawDispatchedTier,
-    dispatchedModel: rawDispatchedModel,
-    constraint:
-      typeof rawConstraint === "string" && rawConstraint !== ""
-        ? rawConstraint
-        : null,
-  };
 }
 
 /** The `## Done summary` section of a task's spec markdown ("" when absent). */
@@ -345,27 +294,11 @@ export function runSelectionAuditBrief(args: SelectionAuditBriefArgs): void {
     const specPath = join(dataDir, "specs", `${taskId}.md`);
     const specMd = existsSync(specPath) ? readFileSync(specPath, "utf-8") : "";
 
-    const {
-      assignedTier,
-      assignedModel,
-      dispatchedTier,
-      dispatchedModel,
-      constraint,
-    } = assignedAndDispatchedCell(t, cell);
-
     auditableTasks.push({
       task_id: taskId,
       title: asString(t.title),
-      // The DISPATCHED cell — the one the auditor grades, since it is what
-      // actually ran. Equal to the assigned cell absent a constraint.
-      tier: dispatchedTier,
-      model: dispatchedModel,
-      // The selector's original pick, unaffected by any worker-provider
-      // translation — kept so a constrained run's evidence can still be
-      // routed back to the equivalence map, never conflated with the grade.
-      assigned_tier: assignedTier,
-      assigned_model: assignedModel,
-      constraint,
+      tier: cell.tier,
+      model: cell.model,
       config_hash: sidecar.config_hash,
       input_hash: sidecar.input_hash,
       spec_chars: specMd.length,

@@ -159,19 +159,12 @@ describe("native leaf --help is pure (exit 0, non-empty stdout, no side effects)
 describe("native two-level verb --help is pure", () => {
   // agent's verbs forward --help to the launched binary (a spawn), so they are
   // not keeper-help leaves; every other two-level command owns keeper help.
-  // transcript's verbs sit behind a required leading harness positional
-  // (`keeper transcript <harness> list|show`), so its argv needs that token
-  // prepended before the verb.
   for (const cmd of NATIVE_COMMANDS) {
     if (cmd.verbs === undefined || cmd.name === "agent") continue;
     for (const verb of cmd.verbs) {
       test(`keeper ${cmd.name} ${verb.name} --help`, async () => {
         const main = await resolveNativeMain(cmd.name);
-        const argv =
-          cmd.name === "transcript"
-            ? ["claude", verb.name, "--help"]
-            : [verb.name, "--help"];
-        assertPure(await runPure(() => main(argv)));
+        assertPure(await runPure(() => main([verb.name, "--help"])));
       });
     }
   }

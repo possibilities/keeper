@@ -61,15 +61,8 @@ makes an immediate re-run idempotent.
 
 For each work-list epic, read its **committed audit brief** at
 `.keeper/selection-audit-briefs/<epic>.json` — the authoritative grading record. It already carries,
-per auditable task: the spec, the graded (DISPATCHED) `{tier, model}` — the cell that actually ran —
-plus the untouched `{assigned_tier, assigned_model}` the selector originally picked and a `constraint`
-(non-null when a worker-provider pin translated the assigned cell at claim), the selection
-`config_hash`/`input_hash`, per-task `diff_stats`, and the done summary. You do not re-read the diff
-yourself.
-
-**Grade the dispatched cell, always.** The brief's `tier`/`model` already name the dispatched cell
-(equal to `assigned_tier`/`assigned_model` when `constraint` is null), so the verdict you land always
-grades what actually ran — never the assigned cell a constraint overrode.
+per auditable task: the spec, the graded `{tier, model}`, the selection `config_hash`/`input_hash`,
+per-task `diff_stats`, and the done summary. You do not re-read the diff yourself.
 
 **Enrich with observable difficulty proxies from keeper.db**, read-only, to sharpen the counterfactual
 grade beyond diff size. Per auditable task, gather the outcome signals a struggle leaves behind:
@@ -162,17 +155,8 @@ After the backlog is graded, compute over the **committed review dataset** (the 
 truth, joinable to selection sidecars by `config_hash`). Never grade and measure in the same pass off
 in-memory verdicts — measure what landed.
 
-**Exclude constrained runs from selector-policy cohort aggregation.** A verdict whose brief task carried
-a non-null `constraint` graded a cell the worker-provider pin chose, never the selector — folding it
-into a `config_hash` cohort rate would credit or blame the selection policy for a decision it did not
-make. Join each verdict back to its brief task by `task_id` (or carry the constraint forward at Phase 4
-landing time) and split the graded set: unconstrained verdicts feed the cohort rates and any guidance
-proposal below; constrained verdicts are set aside for the constrained-runs section (Phase 6) instead —
-their evidence is real, but it is evidence about the equivalence map, not the selector.
-
 - **Cohort rates keyed by `config_hash`.** A cohort is one selection-policy configuration; the graded
-  cells under it are its sample — CONSTRAINED runs excluded, per above. Report the underpowered /
-  right-sized / overpowered rates.
+  cells under it are its sample. Report the underpowered / right-sized / overpowered rates.
 - **Wilson (or Agresti-Coull) intervals**, never the naive normal approximation — the rates are small
   proportions on modest counts, exactly where the normal interval lies.
 - **Minimum-cohort-count refusal is a HARD behavior, not advice.** A cohort with **fewer than 20
@@ -196,15 +180,9 @@ these reports.
 
 - **Per-run report** — `~/docs/selection-reviews/run-<utc-stamp>.md`: what was graded this run, the
   cohort table with intervals, the calibration bins, and the proposals (or the explicit
-  below-threshold refusal). Include a **constrained-runs section** listing every verdict excluded from
-  the cohort pass (task id, assigned cell, dispatched cell, constraint, verdict) — addressed to
-  `/model-guidance`, since a pattern of underpowered/overpowered verdicts here is evidence the
-  cross-provider equivalence map (`provider-equivalence.yaml`) mapped a cell to a poor match, not that
-  the selector chose badly.
+  below-threshold refusal).
 - **Running-findings doc** — `~/docs/selection-reviews/findings.md`: the cumulative, human-facing
-  narrative updated each run — trends across runs, standing proposals, and resolved ones. Roll the
-  constrained-runs findings forward here too, so a recurring equivalence-map misfire is visible across
-  runs even though it never joins a `config_hash` cohort.
+  narrative updated each run — trends across runs, standing proposals, and resolved ones.
 
 **Proposals section — name the exact edits, then STOP.** When a cohort clears the minimum count and the
 evidence supports it, propose concrete `model-selector.yaml` guidance edits: the exact `efforts:` or
@@ -241,10 +219,6 @@ Use `AskUserQuestion` to confirm the backfill scope before spending the re-deriv
 
 - **Advisory only.** Land verdicts and propose edits; never write `model-selector.yaml`, never touch
   `hand_tuned` or the drift-gated blocks. The human ratifies.
-- **Grade the dispatched cell; cohort the unconstrained ones.** Every verdict grades the brief's
-  `tier`/`model` (the dispatched cell). Selector-policy cohort aggregation excludes any verdict whose
-  brief task carried a non-null `constraint` — those route to the constrained-runs report section
-  instead, addressed to `/model-guidance`.
 - **The minimum-cohort refusal is hard.** Below 20 graded cells in a cohort, propose nothing and state
   the count. Small-cohort statistics are the failure mode this skill exists to avoid.
 - **Blind the verdict pass.** The selector's `confidence`/`rationale`/`label_source` never reach the

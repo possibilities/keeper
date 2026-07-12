@@ -1030,8 +1030,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   },
   {
     name: "transcript",
-    summary:
-      "Discover and extract bounded agent-ready session transcripts: `keeper transcript <harness> <list|show|<session-id>>`",
+    summary: "Discover and extract bounded agent-ready session transcripts",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -1050,6 +1049,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         format_modes: ["human", "json"],
         flags: [
           FLAG_HELP,
+          {
+            name: "harness",
+            type: "string",
+            summary: "Harness (currently claude)",
+          },
           {
             name: "project",
             type: "string",
@@ -1088,6 +1092,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         format_modes: ["human", "json"],
         flags: [
           FLAG_HELP,
+          {
+            name: "harness",
+            type: "string",
+            summary: "Harness (currently claude)",
+          },
           {
             name: "project",
             type: "string",
@@ -1154,31 +1163,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             name: "thinking",
             type: "boolean",
             summary: "Include thinking blocks",
-          },
-          FLAG_FORMAT,
-          FLAG_JSON_ALIAS,
-        ],
-      },
-      {
-        name: "turn",
-        summary:
-          "Extract the selected branch's Latest turn as a bounded JSON contract (pi only)",
-        visibility: "public",
-        mutates: false,
-        requires_daemon: false,
-        requires_tty: false,
-        format_modes: ["json"],
-        flags: [
-          FLAG_HELP,
-          {
-            name: "leaf",
-            type: "string",
-            summary: "Entry id, or root — the tree leaf to resolve from",
-          },
-          {
-            name: "project",
-            type: "string",
-            summary: "Project path used to disambiguate the session",
           },
           FLAG_FORMAT,
           FLAG_JSON_ALIAS,

@@ -81,16 +81,21 @@ if command -v pi >/dev/null 2>&1; then
   ( cd "${repo_root}" && PI_CODING_AGENT_DIR="${HOME}/.pi/agent" bun scripts/install-pi-plan-agents.ts )
 fi
 
-# 3b. pi-subagents fork sync. pi loads @tintinweb/pi-subagents LIVE from the
-#     local fork checkout (a local-path package source in ~/.pi/agent/settings.json)
-#     so local patches and in-flight upstream PR branches take effect without a
-#     package reinstall. Keep the checkout rebased on upstream so drift surfaces
-#     at install time rather than as a live panel failure. ANY sync error rolls
-#     the checkout back to its pre-rebase tip (the last known-good state) and
-#     sends a desktop notification that we are out of sync with upstream. This
-#     step never fails the keeper install.
+# 3b. pi-subagents fork: ensure installed, then sync against upstream. pi loads
+#     @tintinweb/pi-subagents LIVE from the local fork checkout (a local-path
+#     package source in ~/.pi/agent/settings.json) so local patches and
+#     in-flight upstream PR branches take effect without a package reinstall.
+#     Every install: clone the fork if absent, register it as pi's package
+#     source (add-only — an existing packages entry for it is left alone), and
+#     rebase the checkout onto upstream so drift surfaces at install time
+#     rather than as a live panel failure. ANY sync error rolls the checkout
+#     back to its pre-rebase tip (the last known-good state) and sends a
+#     desktop notification that we are out of sync with upstream. This step
+#     never fails the keeper install.
 pi_subagents_fork="${HOME}/src/possibilities--pi-subagents"
 pi_subagents_branch="master"
+pi_subagents_origin="https://github.com/possibilities/pi-subagents.git"
+pi_subagents_upstream="https://github.com/tintinweb/pi-subagents.git"
 pi_subagents_notify() {
   echo "install: pi-subagents fork sync: $1" >&2
   if command -v notifyctl >/dev/null 2>&1; then
@@ -98,11 +103,42 @@ pi_subagents_notify() {
       -m "$1 (${pi_subagents_fork})" >/dev/null 2>&1 || true
   fi
 }
+if [ ! -d "${pi_subagents_fork}/.git" ]; then
+  echo "install: pi-subagents fork not present; cloning ${pi_subagents_origin}"
+  mkdir -p "$(dirname "${pi_subagents_fork}")"
+  git clone --quiet "${pi_subagents_origin}" "${pi_subagents_fork}" 2>/dev/null || \
+    pi_subagents_notify "clone failed — fork not installed (network/auth?)"
+fi
 if [ -d "${pi_subagents_fork}/.git" ]; then
+  # Register the checkout as pi's package source (never-clobber: adds the
+  # local-path entry only when absent; drops a redundant npm registry entry
+  # for the same package so pi never double-loads it).
+  ( cd "${repo_root}" && PI_SUBAGENTS_FORK="${pi_subagents_fork}" bun -e '
+    const { readFileSync, writeFileSync, mkdirSync, existsSync } = require("node:fs");
+    const { join } = require("node:path");
+    const dir = join(process.env.HOME, ".pi", "agent");
+    const path = join(dir, "settings.json");
+    const fork = process.env.PI_SUBAGENTS_FORK;
+    let settings = {};
+    if (existsSync(path)) settings = JSON.parse(readFileSync(path, "utf8"));
+    const packages = Array.isArray(settings.packages) ? settings.packages : [];
+    const next = packages.filter((p) => !String(p).startsWith("npm:@tintinweb/pi-subagents"));
+    if (!next.includes(fork)) next.push(fork);
+    if (JSON.stringify(next) !== JSON.stringify(packages)) {
+      settings.packages = next;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
+      console.log("install: registered pi-subagents fork as a pi package source");
+    } else {
+      console.log("install: pi-subagents fork already registered as a pi package source");
+    }
+  ' ) || echo "install: pi package-source registration failed (non-fatal); continuing" >&2
   echo "install: syncing pi-subagents fork against upstream"
   (
     set -Eeuo pipefail
     cd "${pi_subagents_fork}"
+    git remote get-url upstream >/dev/null 2>&1 || \
+      git remote add upstream "${pi_subagents_upstream}"
     current_branch="$(git branch --show-current)"
     if [ "${current_branch}" != "${pi_subagents_branch}" ]; then
       pi_subagents_notify "checkout is on '${current_branch:-<detached>}', expected '${pi_subagents_branch}' — pi is loading whatever is checked out"
@@ -135,7 +171,7 @@ if [ -d "${pi_subagents_fork}/.git" ]; then
     echo "install: pi-subagents fork rebased cleanly onto upstream/master"
   ) || echo "install: pi-subagents fork sync errored (non-fatal); continuing" >&2
 else
-  echo "install: pi-subagents fork not present (${pi_subagents_fork}); skipping sync"
+  echo "install: pi-subagents fork unavailable; pi keeps its current package source"
 fi
 
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
