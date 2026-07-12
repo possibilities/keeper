@@ -205,3 +205,23 @@ re-close idempotence path.
 | `BRIEF_MISSING`   | `selection-review-submit`                       | No selection-audit brief exists yet for this epic.                                                                                                            | Run `keeper plan selection-audit-brief <epic_id>` first, then resubmit the verdict.               |
 | `BRIEF_CORRUPT`   | `selection-review-submit`                       | The audit brief is unreadable, or its `schema_version` is newer than this `keeper plan` build understands.                                                    | Re-run `selection-audit-brief` to regenerate it, or upgrade `keeper plan`.                        |
 | `SIDECAR_MISSING` | `selection-audit-brief`                         | The epic never ran through the post-scaffold cell selector (`assign-cells`), so there are no graded `{tier, model}` cells to audit.                            | Run cell selection for the epic before auditing; an epic with no selection sidecar has nothing to grade. |
+
+### Per-task audit-gate verbs (`audit gate-check`, `audit submit-task`)
+
+The content-blind seam `/plan:work`'s per-task audit gate polls between a flagged worker's
+commit and its done-stamp. Both reject with the same converged `{code, message, details}`
+error sub-object on first-found fault, and neither emits a `recovery` key — `gate-check` is
+read-only (a git failure fails closed rather than fabricating a not-covering reading);
+`submit-task` writes only the gitignored per-task finding artifact, never a `.keeper/`
+commit.
+
+| code             | emitted by                    | meaning                                                                                          | recovery                                                                 |
+| ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `GIT_UNAVAILABLE`| `gate-check`, `submit-task`    | Deriving the task's current commit set failed (the shared repo scan hit a git subprocess error).   | Confirm the target/state repos are healthy git checkouts, then retry.      |
+| `BAD_STATUS`     | `submit-task`                  | `--status` is missing or not one of `clean`, `mild`, `severe`.                                     | Pass a valid `--status` value and re-run.                                  |
+| `BAD_JSON`       | `submit-task`                  | The `--file` payload is not valid JSON.                                                            | Fix the finding payload's JSON and re-run.                                 |
+| `BAD_PAYLOAD`    | `submit-task`                  | The `--file` payload parsed but is not a JSON object.                                              | Pass a JSON object payload and re-run.                                     |
+
+Both verbs also share `BAD_TASK_ID | NOT_A_PROJECT | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID`
+with the other task-scoped read verbs (`reconcile`, `resolve-task`, `find-task-commit`) —
+see their `README.md` entries for that shared vocabulary's meaning and recovery.
