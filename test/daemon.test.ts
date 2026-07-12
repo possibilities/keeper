@@ -55,6 +55,7 @@ import {
   buildDeconflictHumanNotifyBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
+  buildSharedCheckoutPageBody,
   buildSharedDirtyObservation,
   buildWorkMergeHumanNotifyBody,
   buildWorkResolverBrief,
@@ -148,6 +149,7 @@ import {
   runMergeEscalationSweep,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
+  runSharedCheckoutPageSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -159,6 +161,9 @@ import {
   SERVE_WATCHDOG_INTERVAL_MS,
   type ServeWatchdogTriggerState,
   SHARED_BASE_BROKEN_CATEGORY,
+  type SharedCheckoutNotifiedOutcome,
+  type SharedCheckoutPageRow,
+  type SharedCheckoutPageSweepDeps,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
@@ -5973,6 +5978,206 @@ test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op (f
   await runRepairEscalationSweep(deps);
   expect(mints).toEqual([]);
   expect(dispatches).toEqual([]);
+});
+
+// ---- runSharedCheckoutPageSweep (dirty/desync distress page-once, injected deps) --
+
+interface SharedCheckoutPageMint {
+  id: string;
+  outcome: SharedCheckoutNotifiedOutcome;
+}
+
+function sharedCheckoutRow(
+  id: string,
+  overrides: Partial<SharedCheckoutPageRow> = {},
+): SharedCheckoutPageRow {
+  return {
+    id,
+    dir: "/repo",
+    reason: `${id}: /repo has stayed live past the grace window`,
+    ...overrides,
+  };
+}
+
+/**
+ * Fake-deps fixture for the pure page-once sweep. The `live` map models the OPEN,
+ * not-yet-paged working set the daemon reader returns; a terminal `notified` mint
+ * models the fold stamping `human_notified_at` (the row drops out of `IS NULL`
+ * selection), while a `notify_failed` mint is a no-op (the row stays live and
+ * re-sweeps). No real daemon / botctl / DB.
+ */
+function fakeSharedCheckoutPageDeps(opts: {
+  rows?: SharedCheckoutPageRow[];
+  notify?: (
+    row: SharedCheckoutPageRow,
+  ) => Promise<SharedCheckoutNotifiedOutcome>;
+  rowsThrow?: boolean;
+}): {
+  deps: SharedCheckoutPageSweepDeps;
+  mints: SharedCheckoutPageMint[];
+  pages: string[];
+  notes: string[];
+  live: Map<string, SharedCheckoutPageRow>;
+} {
+  const mints: SharedCheckoutPageMint[] = [];
+  const pages: string[] = [];
+  const notes: string[] = [];
+  const live = new Map((opts.rows ?? []).map((r) => [r.id, r] as const));
+  const deps: SharedCheckoutPageSweepDeps = {
+    noteLine: (line) => notes.push(line),
+    selectUnpaged: () => {
+      if (opts.rowsThrow) throw new Error("row read boom");
+      return [...live.values()];
+    },
+    notifyHuman: async (row) => {
+      pages.push(row.id);
+      return (await opts.notify?.(row)) ?? "notified";
+    },
+    mintNotified: (id, outcome) => {
+      mints.push({ id, outcome });
+      // Fold-sim: the terminal `notified` stamps human_notified_at → the row drops
+      // out of the unpaged set; a `notify_failed` is a no-op (stays live, re-sweeps).
+      if (outcome === "notified") live.delete(id);
+    },
+  };
+  return { deps, mints, pages, notes, live };
+}
+
+test("runSharedCheckoutPageSweep: pages each OPEN dirty/desync row ONCE, then a stamped row never re-pages", async () => {
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({
+    rows: [
+      sharedCheckoutRow("shared-checkout-dirty:abc"),
+      sharedCheckoutRow("shared-checkout-desync:def"),
+    ],
+  });
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([
+    "shared-checkout-dirty:abc",
+    "shared-checkout-desync:def",
+  ]);
+  expect(mints).toEqual([
+    { id: "shared-checkout-dirty:abc", outcome: "notified" },
+    { id: "shared-checkout-desync:def", outcome: "notified" },
+  ]);
+  // A second heartbeat: both rows now carry human_notified_at (dropped from the
+  // unpaged set) → no re-page, page-once per row instance honored.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toHaveLength(2);
+  expect(mints).toHaveLength(2);
+});
+
+test("runSharedCheckoutPageSweep: a notify_failed leaves the row unpaged (re-sweeps and pages again next heartbeat)", async () => {
+  let attempt = 0;
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
+    notify: async () => (++attempt === 1 ? "notify_failed" : "notified"),
+  });
+  // Tick 1: the botctl send FAILS → non-terminal, marker stays NULL.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual(["shared-checkout-dirty:abc"]);
+  expect(mints).toEqual([
+    { id: "shared-checkout-dirty:abc", outcome: "notify_failed" },
+  ]);
+  // Tick 2: the row is STILL unpaged → pages again, succeeds this time.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([
+    "shared-checkout-dirty:abc",
+    "shared-checkout-dirty:abc",
+  ]);
+  expect(mints[1]).toEqual({
+    id: "shared-checkout-dirty:abc",
+    outcome: "notified",
+  });
+  // Tick 3: now stamped → silent.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toHaveLength(2);
+});
+
+test("runSharedCheckoutPageSweep: a cleared-then-reminted row pages ANEW (fresh incident episode)", async () => {
+  const { deps, mints, pages, live } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow("shared-checkout-desync:def")],
+  });
+  await runSharedCheckoutPageSweep(deps); // pages + stamps → drops out
+  expect(pages).toEqual(["shared-checkout-desync:def"]);
+  await runSharedCheckoutPageSweep(deps); // stamped → silent
+  expect(pages).toHaveLength(1);
+  // The producer's observed-clean level-clear DELETEs the row; after a fresh grace it
+  // re-mints at human_notified_at NULL (the DispatchCleared re-arm) — modeled by
+  // re-inserting into the live working set.
+  live.set(
+    "shared-checkout-desync:def",
+    sharedCheckoutRow("shared-checkout-desync:def"),
+  );
+  await runSharedCheckoutPageSweep(deps); // re-minted → pages anew
+  expect(pages).toEqual([
+    "shared-checkout-desync:def",
+    "shared-checkout-desync:def",
+  ]);
+  expect(mints.filter((m) => m.outcome === "notified")).toHaveLength(2);
+});
+
+test("runSharedCheckoutPageSweep: a throwing notify degrades to notify_failed (fail-open, re-sweepable)", async () => {
+  const { deps, mints, notes } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
+    notify: async () => {
+      throw new Error("botctl spawn boom");
+    },
+  });
+  await runSharedCheckoutPageSweep(deps);
+  expect(mints).toEqual([
+    { id: "shared-checkout-dirty:abc", outcome: "notify_failed" },
+  ]);
+  expect(notes.some((n) => n.includes("shared-checkout page threw"))).toBe(
+    true,
+  );
+});
+
+test("runSharedCheckoutPageSweep: a throwing row read degrades to a no-op (fail-open)", async () => {
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({
+    rowsThrow: true,
+    rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
+  });
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runSharedCheckoutPageSweep: an empty working set pages nobody (the shape a paused/clean board presents past the inherited heartbeat gate)", async () => {
+  // Pause + boot-catch-up suppression is the repair-escalation TICK's inherited
+  // early-return (`if (autopilotPaused) return`), upstream of this sweep — a paused
+  // board never even calls it. The pure sweep's own contract: page exactly the OPEN
+  // unpaged rows, so an empty set is a no-op.
+  const { deps, mints, pages } = fakeSharedCheckoutPageDeps({ rows: [] });
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("buildSharedCheckoutPageBody: names the repo and picks dirty-vs-desync wording by id prefix", () => {
+  const dirty = buildSharedCheckoutPageBody({
+    id: "shared-checkout-dirty:abc",
+    dir: "/repo",
+    reason: "x",
+  });
+  expect(dirty).toContain("/repo");
+  expect(dirty).toContain("DIRTY");
+  expect(dirty).not.toContain("DESYNCED");
+
+  const desync = buildSharedCheckoutPageBody({
+    id: "shared-checkout-desync:def",
+    dir: "/repo",
+    reason: "x",
+  });
+  expect(desync).toContain("DESYNCED");
+
+  // A null dir renders a placeholder, never the literal "null".
+  const noDir = buildSharedCheckoutPageBody({
+    id: "shared-checkout-dirty:abc",
+    dir: null,
+    reason: "x",
+  });
+  expect(noDir).toContain("repo ?");
+  expect(noDir).not.toContain("null");
 });
 
 test("repairReasonFor: the mint-side reason matches escalation-brief's REPAIR_REASON_RE", () => {

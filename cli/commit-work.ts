@@ -14,9 +14,11 @@
  *     → no-files branch (pretty `committed:false`)
  *     → acquire flock (<per-worktree --git-dir>/keeper-commit-work.lock)
  *       → `git add -A -- <pathspecs>` (pathspec-scoped; deletions stage as removals)
- *       → unstage stale (`all_staged − caller_files`) BEFORE lint
+ *       → index-purity gate: staged content outside the attributed set fails
+ *         loud (`stale_index_carryover`) unless `--allow-stale-unstage` unstages it
  *       → lint matrix (src/commit-work/lint-matrix) — fail → release + emit
- *       → sanitize-safe `git commit -F -` with appended `Job-Id:` trailer
+ *       → sanitize-safe `git commit -F - -- <attributed pathspec>` (GIT_LITERAL_PATHSPECS=1),
+ *         appended `Job-Id:` trailer — poisoned index cannot leak into the tree
  *       → NDJSON line 1 (COMPACT `{success,commit_sha,files}`)
  *       → push (src/commit-work/push) → NDJSON line 2 (compact push envelope)
  *     → release flock (every path, no double-release)
@@ -42,6 +44,13 @@ import { CommitWorkLock } from "../src/commit-work/flock";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
 import { pushCommitted } from "../src/commit-work/push";
+import {
+  analyzeReversionSweep,
+  detectInProgressOperation,
+  type InProgressOperation,
+  isMassReversion,
+  sharedCheckoutJamActive,
+} from "../src/commit-work/repo-state";
 import { resolveSessionId } from "../src/commit-work/session-id";
 
 const HELP = `keeper commit-work [MSG] [options]
@@ -52,6 +61,18 @@ board files are excluded (they commit via the plan-commit hook). Untracked
 gitignored files are filtered before staging; a runaway file list
 (> --max-files, default 500) aborts with a file_list_too_large envelope.
 
+The commit is scoped to the session-attributed set. Staged content outside
+that set (a dead worker's residue, a shared checkout that trails landed
+history, or a git-apply/codegen write the attribution hooks never saw) aborts
+with a stale_index_carryover envelope, and the commit itself is pathspec-
+limited so nothing outside the attributed set can enter the tree.
+
+Three repo-state gates guard the commit: it refuses while a merge/cherry-pick/
+revert/rebase/bisect is in progress (operation_in_progress, no override), while
+a live shared-checkout dirty/desync jam names this repo (shared_checkout_jam,
+--override-jam), and when the staged set mass-reverts landed work to ancestor
+content (mass_reversion, --allow-mass-reversion).
+
 Arguments:
   MSG                  Commit message (required unless --preview-files)
 
@@ -60,11 +81,22 @@ Options:
   --preview-files      List files that would be committed; no commit is made
   --max-files <n>      Abort when the post-filter file count exceeds <n>
                        (default 500; pass 0 to disable)
+  --allow-stale-unstage
+                       On a stale_index_carryover abort, unstage the extra
+                       paths and commit the attributed set only. Recovery
+                       opt-in, not a default; if the extra paths are yours,
+                       prefer plain git with explicit paths instead.
+  --override-jam       Proceed past a shared_checkout_jam refusal. Only when
+                       you are certain the staged set is correct and current.
+  --allow-mass-reversion
+                       Proceed past a mass_reversion abort — for a genuine
+                       bulk revert you intend.
   --help, -h           Show this help
 
-Escape hatch: if commit-work won't stage every file you need to commit, use
-plain git — \`git add <explicit paths>\` (never -A / .) then \`git commit\` and
-\`git push\`. Temporary; you're empowered to bypass for now.
+Escape hatch: plain-git-with-explicit-paths is the ONE documented path for a
+commit these gates block deliberately — \`git add <explicit paths>\` (never -A /
+.) then \`git commit\` and \`git push\`. That is the mixed/stale-index exception
+the gates exist to make visible; the commit itself stays pathspec-limited.
 
 Run \`keeper commit-work --agent-help\` for the terse operator runbook.
 `;
@@ -85,6 +117,23 @@ On a {"error":"lint_failed"} envelope: read the named files, fix per stderr,
 runaway list (> --max-files, default 500) aborts with file_list_too_large. Every
 verb envelope is exit 1; an arg fault is exit 2. Escape hatch: if it won't stage
 a file you need, \`git add <explicit paths>\` then plain git commit/push.
+
+On a {"error":"stale_index_carryover"} envelope: the index carries staged paths
+outside your session's attributed set (a dead worker's residue or a desynced
+checkout). Do NOT reflexively override. Either \`git add <explicit paths>\` +
+plain git commit if those paths are genuinely yours, or --allow-stale-unstage to
+unstage the extras and commit the attributed set only. The commit is always
+pathspec-limited to the attributed set, so nothing else can enter the tree.
+
+Repo-state refusals: {"error":"operation_in_progress"} — conclude or abort the
+named git operation, then retry (no override; a mid-op commit is never correct).
+{"error":"shared_checkout_jam"} — a live dirty/desync distress row names this
+repo; let the daemon's recovery clear it, or --override-jam if the staged set is
+truly correct. {"error":"mass_reversion"} — the staged set bulk-reverts landed
+work to ancestor content (a desynced checkout; suites cannot catch it); inspect
+the flagged paths, then --allow-mass-reversion only for an intended bulk revert.
+Across every gate, plain-git-with-explicit-paths remains the ONE documented
+mixed-commit path — the deliberate exception the gates exist to make visible.
 `;
 
 // Trailer patterns forbidden in a multi-line commit message body. Forged
@@ -109,6 +158,70 @@ const LINT_FAILED_RECOVERY =
   "`git add <files>`, then re-invoke `keeper commit-work` with the same " +
   "message. Do NOT fall back to bare `git commit` or use `--no-verify` — a " +
   "lint failure is not a coverage gap.";
+
+// Carried in the stale_index_carryover envelope. The attributed set derives
+// ONLY from Write/Edit-class PostToolUse hooks, so a git-apply / codegen /
+// script-written file is invisible to it and would otherwise DROP silently —
+// and a desynced shared checkout surfaces as exactly this stale set. Both must
+// be loud, so the default is to refuse rather than silently unstage.
+const STALE_INDEX_CARRYOVER_HINT =
+  "The index has staged content outside this session's attributed file set — " +
+  "stale carryover from a prior worker that died mid-commit, a shared checkout " +
+  "trailing landed history, or a git-apply/codegen/script write the attribution " +
+  "hooks never saw. Committing it would sweep unrelated (possibly stale) paths " +
+  "into your commit.";
+
+// Recovery contract naming BOTH paths forward, so the operator chooses without
+// running another git command. `--allow-stale-unstage` is the explicit opt-in
+// for the old silent behavior; plain git is the path when the extras are yours.
+const STALE_INDEX_CARRYOVER_RECOVERY =
+  "Two ways forward: (1) if the extra paths are genuinely yours, commit the " +
+  "mixed set with plain git and explicit paths — `git add <path> …` (never -A " +
+  "/ .) then `git commit`; or (2) re-run `keeper commit-work --allow-stale-" +
+  "unstage` to unstage the extras and commit ONLY your attributed files.";
+
+// Carried in the operation_in_progress refusal (gate 1, pre-lock, no override).
+// A full `git commit` on top of a live merge/sequencer op silently creates a
+// two-parent merge commit — the shape that propagated the incident's stale blobs
+// through an auto-merge. Retry-safe once the operator concludes or aborts the op.
+const OPERATION_IN_PROGRESS_RECOVERY =
+  "Conclude the operation (finish the merge/rebase/cherry-pick/revert, or " +
+  "`git bisect reset`), or abort it (`git merge --abort`, `git rebase --abort`, " +
+  "`git cherry-pick --abort`, `git revert --abort`), then re-run keeper " +
+  "commit-work. No override — a partial commit mid-operation is never correct.";
+
+// Carried in the shared_checkout_jam refusal (gate 2, pre-lock, --override-jam).
+// A live dirty/desync distress row means the shared checkout's working tree may
+// trail landed history, so a commit here risks sweeping stale content.
+const SHARED_CHECKOUT_JAM_HINT =
+  "A live shared-checkout dirty/desync distress row matches this repo — the " +
+  "working tree may trail landed history, so committing risks sweeping stale " +
+  "content back over landed work (the incident this gate exists to prevent).";
+
+const SHARED_CHECKOUT_JAM_RECOVERY =
+  "Let the daemon's repair/desync recovery clear the jam (inspect it with " +
+  "`keeper query dispatch_failures`), or — if you are certain the staged set is " +
+  "correct and current — re-run with `--override-jam` to proceed anyway.";
+
+// Carried in the mass_reversion abort (gate 3, in-lock, --allow-mass-reversion).
+// The staged set mass-matches ancestor blobs while differing from HEAD — the
+// desynced-checkout reversion signature (green suites cannot catch it because the
+// tests revert in the same sweep).
+const MASS_REVERSION_HINT =
+  "The staged set mass-matches ANCESTOR blobs while differing from HEAD — the " +
+  "signature of a desynced checkout reverting landed work in bulk. Green suites " +
+  "cannot catch this: the tests revert in the same sweep.";
+
+const MASS_REVERSION_RECOVERY =
+  "Inspect the flagged paths against landed history (`git log -p -- <path>`). If " +
+  "this is a genuine bulk revert you intend, re-run with `--allow-mass-reversion`; " +
+  "otherwise your checkout is stale — reconcile it with landed history first.";
+
+// Carried in the unmerged_paths refusal (gate 3). An index with stage 1/2/3
+// entries is mid-conflict-resolution; committing it is never a clean source commit.
+const UNMERGED_PATHS_RECOVERY =
+  "Resolve the conflicted paths (`git add` each once fixed) or abort the " +
+  "in-progress operation, then re-run keeper commit-work.";
 
 // ---------------------------------------------------------------------------
 // Python-byte-parity JSON serializers
@@ -184,6 +297,9 @@ interface ParsedArgs {
   msg: string | null;
   sessionId: string | null;
   previewFiles: boolean;
+  allowStaleUnstage: boolean;
+  overrideJam: boolean;
+  allowMassReversion: boolean;
   maxFiles: number;
   help: boolean;
   agentHelp: boolean;
@@ -200,6 +316,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     msg: null,
     sessionId: null,
     previewFiles: false,
+    allowStaleUnstage: false,
+    overrideJam: false,
+    allowMassReversion: false,
     maxFiles: DEFAULT_MAX_FILES,
     help: false,
     agentHelp: false,
@@ -212,6 +331,12 @@ function parseArgs(argv: string[]): ParsedArgs {
       parsed.agentHelp = true;
     } else if (a === "--preview-files") {
       parsed.previewFiles = true;
+    } else if (a === "--allow-stale-unstage") {
+      parsed.allowStaleUnstage = true;
+    } else if (a === "--override-jam") {
+      parsed.overrideJam = true;
+    } else if (a === "--allow-mass-reversion") {
+      parsed.allowMassReversion = true;
     } else if (a === "--session-id") {
       parsed.sessionId = argv[++i] ?? null;
     } else if (a.startsWith("--session-id=")) {
@@ -311,19 +436,32 @@ async function gitStage(
 
 /**
  * Repo-relative names currently staged (incl. deletions, so deleted-file
- * session entries are not dropped from stale-cleanup or the commit envelope).
+ * session entries are not dropped from the purity gate or the commit pathspec).
+ *
+ * `--no-renames` is load-bearing: with rename detection a rename reports ONLY
+ * the new path, so the old path would neither land in the attributed pathspec
+ * (leaving half a rename → a broken tree) nor surface in the stale set. Forcing
+ * no-renames splits a rename into its A (new) and D (old) halves, so both ride
+ * the pathspec when attributed, and a rename with one un-attributed half falls
+ * into the stale set (the gate fires — all-or-nothing).
  *
  * Uses `-z` (NUL-delimited): without it git QUOTES non-ASCII paths
  * (`"caf\303\251.txt"`), which would never intersect the raw-UTF-8
  * `callerFiles` set (sourced from the porcelain-v2 `-z` attribution reader),
  * silently dropping a unicode-named file from BOTH the commit `files` list and
- * the stale-unstage set. For ASCII paths `-z` is byte-identical to the
- * line-delimited form, so the common-case envelope is unchanged — this only
- * FIXES the unicode case (the Python source carried the latent quoting bug).
+ * the stale set. For ASCII paths `-z` is byte-identical to the line-delimited
+ * form, so the common-case envelope is unchanged.
  */
 async function stagedFileNames(cwd: string, run: GitRunner): Promise<string[]> {
   const res = await run(
-    ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRD"],
+    [
+      "diff",
+      "--cached",
+      "--name-only",
+      "-z",
+      "--no-renames",
+      "--diff-filter=ACMRD",
+    ],
     { cwd },
   );
   if (res.code !== 0) return [];
@@ -373,19 +511,28 @@ async function appendJobIdTrailer(
 }
 
 /**
- * Commit whatever is staged with `msg` (passed via `-F -` stdin so the message
- * cannot be argv-injected). Returns the short SHA, or a failure envelope-like
- * string (prefixed `ERR:`) on commit failure.
+ * Commit the attributed staged set with `msg` (passed via `-F -` stdin so the
+ * message cannot be argv-injected). PATHSPEC-LIMITED: `git commit -- <pathspec>`
+ * uses git's `--only` mode, building the commit tree from HEAD plus the worktree
+ * content of ONLY the named paths — staged entries OUTSIDE the pathspec are
+ * physically held back, so a poisoned index cannot leak into the tree even if
+ * the purity gate was overridden. `GIT_LITERAL_PATHSPECS=1` + the `--` separator
+ * defeat leading-dash options and pathspec magic on attacker-influenced paths.
+ * `pathspec` is the rename-complete staged-name set (deletions included), never
+ * the lint list (which drops deleted paths). Returns the short SHA, or git's
+ * verbatim stderr on commit failure (e.g. a mid-merge partial-commit refusal).
  */
 async function gitCommitStaged(
   msg: string,
+  pathspec: string[],
   cwd: string,
   run: GitRunner,
 ): Promise<{ sha: string } | { error: string }> {
   const withTrailer = await appendJobIdTrailer(msg, cwd, run);
-  const commit = await run(["commit", "-F", "-"], {
+  const commit = await run(["commit", "-F", "-", "--", ...pathspec], {
     cwd,
     stdin: new TextEncoder().encode(withTrailer),
+    env: { GIT_LITERAL_PATHSPECS: "1" },
   });
   if (commit.code !== 0) {
     return { error: commit.stderr.trim() };
@@ -463,6 +610,21 @@ export interface CommitWorkDeps {
   runLint?: (stagedFiles: string[], cwd: string) => Promise<void>;
   /** Commit-work flock acquire (default: real {@link CommitWorkLock.acquire}). */
   acquireLock?: (lockPath: string) => { release: () => void };
+  /**
+   * In-progress merge/sequencer operation probe (gate 1, pre-lock). Defaults to
+   * the real {@link detectInProgressOperation}; tests inject a canned state so
+   * the pipeline refusal is driven without a real repo mid-operation.
+   */
+  detectInProgress?: (
+    worktree: string,
+    git: GitRunner,
+  ) => Promise<InProgressOperation | null>;
+  /**
+   * Live shared-checkout jam probe (gate 2, pre-lock). Defaults to the real
+   * {@link sharedCheckoutJamActive} (a read-only keeper.db read). Keeps the fast
+   * suite DB-free; the call site fails open if an injected probe throws.
+   */
+  checkSharedCheckoutJam?: (worktree: string) => boolean;
 }
 
 /**
@@ -497,6 +659,9 @@ async function runInner(
   const waitCaughtUp = deps.waitCaughtUp ?? defaultWaitCaughtUp;
   const runLint = deps.runLint ?? runScopedLint;
   const acquireLock = deps.acquireLock ?? CommitWorkLock.acquire;
+  const detectInProgress = deps.detectInProgress ?? detectInProgressOperation;
+  const checkSharedCheckoutJam =
+    deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive;
 
   const sessionId = resolveSessionId(args.sessionId);
   if (sessionId === null) {
@@ -566,6 +731,49 @@ async function runInner(
     return 0;
   }
 
+  // Gate 1 — in-progress merge/sequencer refusal (pre-lock, always-on, NO
+  // override). A full `git commit` on top of a live merge silently creates a
+  // two-parent merge commit — the shape that propagated the incident's stale
+  // blobs through an auto-merge. Worktree-portable, retry-safe once the operator
+  // concludes or aborts the operation. Pre-lock, so the throwing `fail()` is safe.
+  const inProgress = await detectInProgress(worktree, git);
+  if (inProgress !== null) {
+    fail({
+      success: false,
+      error: "operation_in_progress",
+      operation: inProgress,
+      hint:
+        `A git ${inProgress} is in progress in this repo — committing now would ` +
+        "fold your work into that operation (a mid-merge commit becomes a " +
+        "two-parent merge commit), the shape that spread stale blobs through an " +
+        "auto-merge.",
+      recovery: OPERATION_IN_PROGRESS_RECOVERY,
+    });
+  }
+
+  // Gate 2 — shared-checkout jam refusal (pre-lock, `--override-jam` escape). A
+  // live dirty/desync distress row for this repo means the working tree may trail
+  // landed history. FAIL-OPEN around the whole probe: an injected probe that
+  // throws (or the default's own internal miss) proceeds WITHOUT the gate, so
+  // commit-work keeps working in a repo with no keeper state.
+  if (!args.overrideJam) {
+    let jam = false;
+    try {
+      jam = checkSharedCheckoutJam(worktree);
+    } catch {
+      jam = false;
+    }
+    if (jam) {
+      fail({
+        success: false,
+        error: "shared_checkout_jam",
+        dir: worktree,
+        hint: SHARED_CHECKOUT_JAM_HINT,
+        recovery: SHARED_CHECKOUT_JAM_RECOVERY,
+      });
+    }
+  }
+
   // Acquire the per-worktree commit lock for the full stage → lint → commit →
   // push window, keyed on the worktree's OWN git dir (`--git-dir`). The git index,
   // index.lock, and HEAD are per-worktree, so a commit-work serializes only against
@@ -601,15 +809,87 @@ async function runInner(
       return 1;
     }
 
-    // Unstage any stale carryover (a previous worker that died between stage
-    // and commit) so the commit + lint see ONLY the caller's files.
+    // Index-purity gate. Any staged path outside the session-attributed set is
+    // stale carryover — a prior worker that died between stage and commit, a
+    // shared checkout trailing landed history, or a git-apply/codegen write the
+    // attribution hooks never saw. All of those must be LOUD, not silently
+    // dropped, so the default refuses and `--allow-stale-unstage` is the explicit
+    // opt-in for the old unstage-and-proceed behavior. `--no-renames` in
+    // `stagedFileNames` splits a rename into both halves, so a rename with one
+    // un-attributed half lands in `stale` and the gate fires all-or-nothing.
     const allStaged = new Set(await stagedFileNames(worktree, git));
     const callerFiles = new Set(files);
     const stale = [...allStaged].filter((f) => !callerFiles.has(f)).sort();
     if (stale.length > 0) {
-      await git(["reset", "HEAD", "--", ...stale], { cwd: worktree });
+      if (args.allowStaleUnstage) {
+        await git(["reset", "HEAD", "--", ...stale], { cwd: worktree });
+      } else {
+        printCompact({
+          success: false,
+          error: "stale_index_carryover",
+          count: stale.length,
+          sample: stale.slice(0, 20),
+          hint: STALE_INDEX_CARRYOVER_HINT,
+          recovery: STALE_INDEX_CARRYOVER_RECOVERY,
+        });
+        return 1;
+      }
     }
+
+    // The pathspec the commit is scoped to: the attributed ∩ staged set,
+    // rename-complete and deletion-inclusive (built from staged NAMES, never the
+    // lint list, which filters to paths still on disk).
     const stagedNames = [...allStaged].filter((f) => callerFiles.has(f)).sort();
+
+    // Empty resolved pathspec: files were discovered + staged, but none of them
+    // carry an actual index change (already committed, or reverted). Skip commit
+    // and push rather than issue an empty-tree commit.
+    if (stagedNames.length === 0) {
+      printCompact({
+        success: false,
+        error: "nothing_to_commit",
+        hint:
+          "The session-attributed files produced no staged change (already " +
+          "committed, or their edits were reverted). Nothing to commit.",
+      });
+      return 1;
+    }
+
+    // Gate 3 — mass-reversion tripwire (in-lock, post-stage, `--allow-mass-
+    // reversion` escape). An unmerged (stage 1/2/3) index refuses outright; a
+    // staged set that mass-matches ANCESTOR blobs while differing from HEAD is the
+    // desynced-checkout reversion signature (green suites cannot catch it — the
+    // tests revert in the same sweep). In-lock emission: `printCompact` + return,
+    // the flock released by the outer finally.
+    const sweep = await analyzeReversionSweep(stagedNames, worktree, git);
+    if (sweep.unmergedPaths.length > 0) {
+      printCompact({
+        success: false,
+        error: "unmerged_paths",
+        count: sweep.unmergedPaths.length,
+        sample: sweep.unmergedPaths.slice(0, 20),
+        hint:
+          "The index carries unmerged (conflicted) paths — a commit now would " +
+          "record a half-resolved conflict.",
+        recovery: UNMERGED_PATHS_RECOVERY,
+      });
+      return 1;
+    }
+    if (
+      !args.allowMassReversion &&
+      isMassReversion(sweep.reversionCandidates.length, sweep.stagedCount)
+    ) {
+      printCompact({
+        success: false,
+        error: "mass_reversion",
+        count: sweep.reversionCandidates.length,
+        staged: sweep.stagedCount,
+        sample: sweep.reversionCandidates.slice(0, 20),
+        hint: MASS_REVERSION_HINT,
+        recovery: MASS_REVERSION_RECOVERY,
+      });
+      return 1;
+    }
 
     // Linters operate on file CONTENTS — skip paths deleted in this commit.
     const lintNames = stagedNames.filter((n) => existsSync(`${worktree}/${n}`));
@@ -634,7 +914,7 @@ async function runInner(
       throw err;
     }
 
-    const committed = await gitCommitStaged(msg, worktree, git);
+    const committed = await gitCommitStaged(msg, stagedNames, worktree, git);
     if ("error" in committed) {
       printCompact({
         success: false,

@@ -234,3 +234,29 @@ commit.
 Both verbs also share `BAD_TASK_ID | NOT_A_PROJECT | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID`
 with the other task-scoped read verbs (`reconcile`, `resolve-task`, `find-task-commit`) —
 see their `README.md` entries for that shared vocabulary's meaning and recovery.
+
+## keeper commit-work
+
+`cli/commit-work.ts` stages the session-attributed dirty set, runs the lint matrix,
+commits pathspec-limited, and pushes. Every failure is a compact single-line
+`{"success": false, "error": "<code>", …}` envelope at exit 1 (an arg fault is exit 2).
+Three repo-state gates plus the index-purity gate guard the commit; each names the ONE
+sanctioned exception — plain-git-with-explicit-paths — as the deliberate mixed-commit path
+it exists to make visible (`git add <explicit paths>` — never `-A` / `.` — then `git commit`
+/ `git push`). That escape hatch, the `--allow-stale-unstage` / `--override-jam` /
+`--allow-mass-reversion` overrides, and this table tell ONE recovery story; the commit stays
+pathspec-limited even when a gate is overridden, so a poisoned index never enters the tree.
+
+| code                     | meaning                                                                                                                                                                                                 | recovery                                                                                                                                                                            | retry-safe |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `operation_in_progress`  | Gate 1 (pre-lock, NO override). The repo is mid-merge / -cherry-pick / -revert / -rebase / -bisect (probed worktree-portably via `rev-parse`); `operation` names it. A full commit here silently makes a two-parent merge commit — the shape that spread the incident's stale blobs through an auto-merge. Nothing was staged or committed. | Conclude the operation (finish it, or `git bisect reset`) or abort it (`git <op> --abort`), then re-run unchanged. No override — a mid-operation partial commit is never correct. | yes (after the op concludes / aborts) |
+| `shared_checkout_jam`    | Gate 2 (pre-lock, `--override-jam`). A live `dispatch_failures` shared-checkout **dirty** / **desync** distress row (`shared-checkout-{dirty,desync}:<hash>`) matches this repo under a normalized dir compare — the working tree may trail landed history, so a commit risks sweeping stale content. FAIL-OPEN: a repo with no keeper.db (or an unreadable one) commits normally. | Let the daemon's repair/desync recovery clear the row (inspect via `keeper query dispatch_failures`); or, if the staged set is certainly correct and current, re-run with `--override-jam`. | yes (once the jam clears, or with `--override-jam`) |
+| `mass_reversion`         | Gate 3 (in-lock, `--allow-mass-reversion`). The staged set mass-matches ANCESTOR blobs while differing from HEAD (≥ 5 paths AND ≥ 30% of the staged set, excluding gitlinks + regenerated surfaces) — the desynced-checkout bulk-revert signature green suites cannot catch (the tests revert in the same sweep). `count` / `staged` / `sample` name the flagged paths. Nothing was committed. | Inspect the flagged paths against landed history (`git log -p -- <path>`). For a genuine intended bulk revert, re-run with `--allow-mass-reversion`; otherwise the checkout is stale — reconcile it with landed history first. | yes (with `--allow-mass-reversion`, or after reconciling the checkout) |
+| `unmerged_paths`         | Gate 3. The index carries unmerged (stage 1/2/3) paths — committing now would record a half-resolved conflict. `sample` names them. Nothing was committed. | Resolve the conflicted paths (`git add` each once fixed) or abort the in-progress operation, then re-run. | yes (once the conflict is resolved) |
+| `stale_index_carryover`  | Index-purity gate (in-lock, `--allow-stale-unstage`). Staged content sits OUTSIDE the session-attributed set — a dead worker's residue, a shared checkout trailing landed history, or a git-apply / codegen / script write the attribution hooks never saw. `sample` lists the offending paths. The default refuses (never a silent unstage); the commit is always pathspec-limited so the extras cannot leak. | If the extra paths are genuinely yours, commit the mixed set with plain git + explicit paths; otherwise re-run with `--allow-stale-unstage` to unstage the extras and commit only the attributed set. | yes (with either recovery path) |
+| `nothing_to_commit`      | The session-attributed files were discovered + staged but carry no actual index change (already committed, or their edits were reverted) — an empty-tree commit was skipped. | Nothing to do; if you expected a change, confirm the files still differ from HEAD. | yes (read-only outcome) |
+
+The lint (`lint_failed`), coverage (`file_list_too_large`), session (`no_session_id`), and
+message (`forbidden trailer pattern`) envelopes are documented inline in the verb's `--help`
+/ `--agent-help`; `lint_failed`'s only recovery loops back through `commit-work` (fix →
+`git add` → re-invoke the SAME message), never a bare-git bypass.

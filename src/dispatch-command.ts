@@ -24,36 +24,46 @@ import { REPO_TOKEN_RE } from "./derivers";
 /**
  * The keeper plan verbs the reconciler / dispatch surface accepts. Mirrors the
  * `Verb` union in `src/autopilot-worker.ts` (kept local rather than
- * re-imported to keep this leaf module's import graph empty).
+ * re-imported to keep this leaf module's import graph empty). `repair`
+ * overlaps {@link EscalationVerb} DELIBERATELY (see that type's docstring):
+ * the retryable and escalation verb sets are narrow BY POLICY, not
+ * structurally disjoint.
  */
-export type RetryDispatchVerb = "work" | "close" | "approve";
+export type RetryDispatchVerb = "work" | "close" | "approve" | "repair";
 
 const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
   "work",
   "close",
   "approve",
+  "repair",
 ]);
 
 /**
  * The escalation spawn verbs — the three autonomous escalation dispatches
- * (`unblock::<task>`, `deconflict::<epic>`, `repair::<repo-token>`).
- * DELIBERATELY separate from {@link RetryDispatchVerb}: an escalation session
- * is launched directly (`dispatchEscalationSession` / this manual CLI), never
- * through the `retry_dispatch` RPC, so the `retry_dispatch` wire validator
- * ({@link parseDispatchKey}) must NOT accept these verbs — widening it would
- * let an operator "retry" a key that RPC path never dispatches. `repair` is
- * repo-scoped rather than epic/task-scoped: its id half is a {@link
- * REPO_TOKEN_RE} repo token, never an `fn-`-shaped ref. The MANUAL `keeper
- * dispatch` surface parses the wider {@link DispatchableVerb} set via {@link
- * parseDispatchableKey}.
+ * (`unblock::<task>`, `deconflict::<epic>`, `repair::<repo-token>`). An
+ * escalation session is launched directly (`dispatchEscalationSession` / this
+ * manual CLI), never through the `retry_dispatch` RPC. `unblock` and
+ * `deconflict` stay OUT of {@link RetryDispatchVerb}: a live session is a
+ * first-class `jobs` row (folded via the spawn-name deriver), never a sticky
+ * `dispatch_failures` row, so there is nothing for `retry_dispatch` to clear —
+ * widening the wire to accept them would let an operator "retry" a key no row
+ * ever carries. `repair` is the ONE escalation verb the wire DOES accept: its
+ * sticky repair latch (`repair::<repo-token>`) IS a `dispatch_failures` row an
+ * operator re-arms via `keeper autopilot retry repair::<token>` after a
+ * dispatched repair session declines or dies (see `runRepairEscalationSweep`
+ * in `src/daemon.ts`). `repair` is repo-scoped rather than epic/task-scoped:
+ * its id half is a {@link REPO_TOKEN_RE} repo token, never an `fn-`-shaped
+ * ref. The MANUAL `keeper dispatch` surface parses the wider {@link
+ * DispatchableVerb} set via {@link parseDispatchableKey}.
  */
 export type EscalationVerb = "unblock" | "deconflict" | "repair";
 
 /**
  * Every verb the manual `keeper dispatch` plan-form positional accepts — the
- * retry-wire verbs PLUS the escalation verbs. A strict superset of {@link
- * RetryDispatchVerb}; the two stay distinct so the `retry_dispatch` wire stays
- * narrow (see {@link EscalationVerb}).
+ * retry-wire verbs PLUS the escalation verbs. A superset of {@link
+ * RetryDispatchVerb} (not strict: `repair` is a member of both). The two sets
+ * stay narrow BY POLICY — `unblock`/`deconflict` stay retry-wire-excluded —
+ * not because they are structurally disjoint (see {@link EscalationVerb}).
  */
 export type DispatchableVerb = RetryDispatchVerb | EscalationVerb;
 
@@ -70,7 +80,11 @@ const DISPATCHABLE_VERBS = new Set<DispatchableVerb>([
  * True iff `verb` is an escalation verb (`unblock` / `deconflict` / `repair`).
  * The launch surface uses this to select the escalation launch config
  * (sonnet/high + `escalation` preset) over the worker one — the escalation
- * dispatches boot a purpose-built plan skill, never a worker cell.
+ * dispatches boot a purpose-built plan skill, never a worker cell. `repair`
+ * satisfies BOTH this predicate AND {@link RETRY_DISPATCH_VERBS} membership —
+ * the two checks answer different questions (which launch config vs. whether
+ * `retry_dispatch` can clear the sticky row), so overlap here is expected,
+ * not a bug.
  */
 export function isEscalationVerb(verb: string): verb is EscalationVerb {
   return verb === "unblock" || verb === "deconflict" || verb === "repair";
@@ -92,10 +106,14 @@ export type ParseDispatchKeyResult =
  * read at the next reconcile, never the RPC payload):
  *
  * - Non-empty string with exactly one `::` separator.
- * - `verb` is one of `work` / `close` / `approve`. The reconciler only ever
- *   dispatches `work` / `close`; `approve` is accepted SOLELY so an operator can
- *   clear a resurrected/phantom `approve` pending via `retry_dispatch` (the
- *   actual fn-870 incident shape) — there is no live `approve` dispatch path.
+ * - `verb` is one of `work` / `close` / `approve` / `repair`. The reconciler
+ *   only ever dispatches `work` / `close`; `approve` is accepted SOLELY so an
+ *   operator can clear a resurrected/phantom `approve` pending via
+ *   `retry_dispatch` (the actual fn-870 incident shape) — there is no live
+ *   `approve` dispatch path. `repair` is accepted so an operator can re-arm a
+ *   stranded `repair::<repo-token>` sticky after a dispatched repair session
+ *   declines or dies — the repair-escalation sweep re-dispatches once the row
+ *   clears (see {@link EscalationVerb}).
  * - `id` is a non-empty token AND passes the {@link rejectDispatchIdToken}
  *   filename-safety predicate (no path separators, no embedded null, no
  *   leading dot). The `dispatch_id` never feeds a filesystem path, but the
@@ -132,7 +150,7 @@ export function parseDispatchKey(value: unknown): ParseDispatchKeyResult {
   if (!RETRY_DISPATCH_VERBS.has(verbRaw as RetryDispatchVerb)) {
     return {
       ok: false,
-      error: `retry_dispatch: \`verb\` must be one of work|close|approve (got ${JSON.stringify(verbRaw)})`,
+      error: `retry_dispatch: \`verb\` must be one of work|close|approve|repair (got ${JSON.stringify(verbRaw)})`,
     };
   }
   if (!isSafeDispatchIdToken(idRaw)) {
@@ -161,10 +179,13 @@ export type ParseDispatchableKeyResult =
  * (rejects an obviously malformed or path-shaped token); it cannot prove the
  * token names a real repo, which the CLI's DB-backed cwd resolution does
  * separately. Kept as a SEPARATE function (not a widening of {@link
- * parseDispatchKey}) so the `retry_dispatch` wire validator stays
- * byte-identical: it never accepts an escalation key (see {@link
- * EscalationVerb}). Returns a DISCRIMINATED result; dep-free (see the module
- * docstring for the one `./derivers` import).
+ * parseDispatchKey}): the REPO_TOKEN_RE structural check is specific to this
+ * manual-dispatch surface, and `unblock`/`deconflict` must stay OUT of the
+ * `retry_dispatch` wire (see {@link EscalationVerb}) — `parseDispatchKey`
+ * accepts `repair` too, but only via {@link RETRY_DISPATCH_VERBS} membership,
+ * without re-deriving the repo-token shape check. Returns a DISCRIMINATED
+ * result; dep-free (see the module docstring for the one `./derivers`
+ * import).
  */
 export function parseDispatchableKey(
   value: unknown,

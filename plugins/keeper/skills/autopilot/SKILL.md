@@ -301,7 +301,9 @@ live past a daemon bounce is running blind.
    per-row jam read, `.data.board.epics[].tasks[].dispatch_failure` and
    `.data.board.epics[].close.dispatch_failure` name the block KIND on the exact
    wedged row: the operator-action jams (multi-repo / merge-conflict / dirty-tree /
-   non-ff, cleared by `retry`), the self-clearing occupancy signals
+   non-ff / repair, cleared by `retry`; plus the shared-checkout dirty/desync hygiene
+   jams, which PAGE the operator once but clear ONLY when their producer observes the
+   checkout reconciled — never `retry`), the self-clearing occupancy signals
    `slot-occupied` (a stopped session holds the slot — visibility only) and
    `slot-reclaimed` (a provably-dead session's pane was auto-killed to free it),
    and `instant-death` (a key whose workers bound then died within a minute K
