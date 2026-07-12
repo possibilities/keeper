@@ -58,17 +58,37 @@ const STATE_TREE_TOKEN = /\.keeper[\\/]state[\\/](?:briefs|audits)\b/;
  * not reading state. Anchored at the command start. */
 const KEEPER_PLAN_SEAM = /^\s*keeper\s+plan\b/;
 
-/** Shell metacharacters that could chain, redirect, or substitute a second
- * command after the `keeper plan` seam. Their presence forfeits the exemption
- * so a read can never ride in behind a plan invocation
- * (`keeper plan … && cat <audits-path>`). */
-const SHELL_CHAIN = /[;&|`\n]|\$\(|[<>]/;
+/** Command substitution stays live inside double quotes, so a backtick or `$(`
+ * anywhere in the command — including inside the quoted `--reason` value —
+ * forfeits the seam exemption: a read must never ride in behind a plan
+ * invocation via `--reason "$(cat <audits-path>)"`. */
+const SHELL_SUBSTITUTION = /[`]|\$\(/;
+
+/** Chaining and redirection metacharacters. These are shell-inert inside a
+ * double-quoted value, so they forfeit the exemption only OUTSIDE the quoted
+ * `--reason` payload (a real `keeper plan … && cat <audits-path>` chain) — not
+ * when they sit in a free-form AUDIT_SEVERE summary (`--reason "timeout > 5s
+ * regresses"`), which per work/SKILL.md is a one-line finding summary. */
+const SHELL_CHAIN_OUTER = /[;&|<>\n]/;
+
+/** The command with the double-quoted `--reason "…"` value (or `--reason="…"`)
+ * removed, so a shell-inert metachar in the finding summary is not scanned as a
+ * chain. `[^"]*` stops at the first closing quote, so an unbalanced or
+ * escaped-quote reason leaves the residue intact — the fail-closed direction. */
+function outsideQuotedReason(command: string): string {
+  return command.replace(/--reason(?:=|\s+)"[^"]*"/g, "--reason");
+}
 
 export function commandTouchesStateTree(command: string): boolean {
   // A lone `keeper plan …` invocation is exempt: it is the sanctioned seam,
-  // never a tree read. Any shell chaining forfeits the exemption.
-  if (KEEPER_PLAN_SEAM.test(command) && !SHELL_CHAIN.test(command))
-    return false;
+  // never a tree read. A live substitution anywhere, or a chain/redirect
+  // outside the quoted --reason value, forfeits the exemption.
+  if (KEEPER_PLAN_SEAM.test(command)) {
+    const chained =
+      SHELL_SUBSTITUTION.test(command) ||
+      SHELL_CHAIN_OUTER.test(outsideQuotedReason(command));
+    if (!chained) return false;
+  }
   return STATE_TREE_TOKEN.test(command);
 }
 
