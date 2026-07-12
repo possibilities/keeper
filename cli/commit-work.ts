@@ -44,6 +44,13 @@ import { CommitWorkLock } from "../src/commit-work/flock";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
 import { pushCommitted } from "../src/commit-work/push";
+import {
+  analyzeReversionSweep,
+  detectInProgressOperation,
+  type InProgressOperation,
+  isMassReversion,
+  sharedCheckoutJamActive,
+} from "../src/commit-work/repo-state";
 import { resolveSessionId } from "../src/commit-work/session-id";
 
 const HELP = `keeper commit-work [MSG] [options]
@@ -60,6 +67,12 @@ history, or a git-apply/codegen write the attribution hooks never saw) aborts
 with a stale_index_carryover envelope, and the commit itself is pathspec-
 limited so nothing outside the attributed set can enter the tree.
 
+Three repo-state gates guard the commit: it refuses while a merge/cherry-pick/
+revert/rebase/bisect is in progress (operation_in_progress, no override), while
+a live shared-checkout dirty/desync jam names this repo (shared_checkout_jam,
+--override-jam), and when the staged set mass-reverts landed work to ancestor
+content (mass_reversion, --allow-mass-reversion).
+
 Arguments:
   MSG                  Commit message (required unless --preview-files)
 
@@ -73,11 +86,17 @@ Options:
                        paths and commit the attributed set only. Recovery
                        opt-in, not a default; if the extra paths are yours,
                        prefer plain git with explicit paths instead.
+  --override-jam       Proceed past a shared_checkout_jam refusal. Only when
+                       you are certain the staged set is correct and current.
+  --allow-mass-reversion
+                       Proceed past a mass_reversion abort — for a genuine
+                       bulk revert you intend.
   --help, -h           Show this help
 
-Escape hatch: if commit-work won't stage every file you need to commit, use
-plain git — \`git add <explicit paths>\` (never -A / .) then \`git commit\` and
-\`git push\`. Temporary; you're empowered to bypass for now.
+Escape hatch: plain-git-with-explicit-paths is the ONE documented path for a
+commit these gates block deliberately — \`git add <explicit paths>\` (never -A /
+.) then \`git commit\` and \`git push\`. That is the mixed/stale-index exception
+the gates exist to make visible; the commit itself stays pathspec-limited.
 
 Run \`keeper commit-work --agent-help\` for the terse operator runbook.
 `;
@@ -105,6 +124,16 @@ checkout). Do NOT reflexively override. Either \`git add <explicit paths>\` +
 plain git commit if those paths are genuinely yours, or --allow-stale-unstage to
 unstage the extras and commit the attributed set only. The commit is always
 pathspec-limited to the attributed set, so nothing else can enter the tree.
+
+Repo-state refusals: {"error":"operation_in_progress"} — conclude or abort the
+named git operation, then retry (no override; a mid-op commit is never correct).
+{"error":"shared_checkout_jam"} — a live dirty/desync distress row names this
+repo; let the daemon's recovery clear it, or --override-jam if the staged set is
+truly correct. {"error":"mass_reversion"} — the staged set bulk-reverts landed
+work to ancestor content (a desynced checkout; suites cannot catch it); inspect
+the flagged paths, then --allow-mass-reversion only for an intended bulk revert.
+Across every gate, plain-git-with-explicit-paths remains the ONE documented
+mixed-commit path — the deliberate exception the gates exist to make visible.
 `;
 
 // Trailer patterns forbidden in a multi-line commit message body. Forged
@@ -150,6 +179,49 @@ const STALE_INDEX_CARRYOVER_RECOVERY =
   "mixed set with plain git and explicit paths — `git add <path> …` (never -A " +
   "/ .) then `git commit`; or (2) re-run `keeper commit-work --allow-stale-" +
   "unstage` to unstage the extras and commit ONLY your attributed files.";
+
+// Carried in the operation_in_progress refusal (gate 1, pre-lock, no override).
+// A full `git commit` on top of a live merge/sequencer op silently creates a
+// two-parent merge commit — the shape that propagated the incident's stale blobs
+// through an auto-merge. Retry-safe once the operator concludes or aborts the op.
+const OPERATION_IN_PROGRESS_RECOVERY =
+  "Conclude the operation (finish the merge/rebase/cherry-pick/revert, or " +
+  "`git bisect reset`), or abort it (`git merge --abort`, `git rebase --abort`, " +
+  "`git cherry-pick --abort`, `git revert --abort`), then re-run keeper " +
+  "commit-work. No override — a partial commit mid-operation is never correct.";
+
+// Carried in the shared_checkout_jam refusal (gate 2, pre-lock, --override-jam).
+// A live dirty/desync distress row means the shared checkout's working tree may
+// trail landed history, so a commit here risks sweeping stale content.
+const SHARED_CHECKOUT_JAM_HINT =
+  "A live shared-checkout dirty/desync distress row matches this repo — the " +
+  "working tree may trail landed history, so committing risks sweeping stale " +
+  "content back over landed work (the incident this gate exists to prevent).";
+
+const SHARED_CHECKOUT_JAM_RECOVERY =
+  "Let the daemon's repair/desync recovery clear the jam (inspect it with " +
+  "`keeper query dispatch_failures`), or — if you are certain the staged set is " +
+  "correct and current — re-run with `--override-jam` to proceed anyway.";
+
+// Carried in the mass_reversion abort (gate 3, in-lock, --allow-mass-reversion).
+// The staged set mass-matches ancestor blobs while differing from HEAD — the
+// desynced-checkout reversion signature (green suites cannot catch it because the
+// tests revert in the same sweep).
+const MASS_REVERSION_HINT =
+  "The staged set mass-matches ANCESTOR blobs while differing from HEAD — the " +
+  "signature of a desynced checkout reverting landed work in bulk. Green suites " +
+  "cannot catch this: the tests revert in the same sweep.";
+
+const MASS_REVERSION_RECOVERY =
+  "Inspect the flagged paths against landed history (`git log -p -- <path>`). If " +
+  "this is a genuine bulk revert you intend, re-run with `--allow-mass-reversion`; " +
+  "otherwise your checkout is stale — reconcile it with landed history first.";
+
+// Carried in the unmerged_paths refusal (gate 3). An index with stage 1/2/3
+// entries is mid-conflict-resolution; committing it is never a clean source commit.
+const UNMERGED_PATHS_RECOVERY =
+  "Resolve the conflicted paths (`git add` each once fixed) or abort the " +
+  "in-progress operation, then re-run keeper commit-work.";
 
 // ---------------------------------------------------------------------------
 // Python-byte-parity JSON serializers
@@ -226,6 +298,8 @@ interface ParsedArgs {
   sessionId: string | null;
   previewFiles: boolean;
   allowStaleUnstage: boolean;
+  overrideJam: boolean;
+  allowMassReversion: boolean;
   maxFiles: number;
   help: boolean;
   agentHelp: boolean;
@@ -243,6 +317,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     sessionId: null,
     previewFiles: false,
     allowStaleUnstage: false,
+    overrideJam: false,
+    allowMassReversion: false,
     maxFiles: DEFAULT_MAX_FILES,
     help: false,
     agentHelp: false,
@@ -257,6 +333,10 @@ function parseArgs(argv: string[]): ParsedArgs {
       parsed.previewFiles = true;
     } else if (a === "--allow-stale-unstage") {
       parsed.allowStaleUnstage = true;
+    } else if (a === "--override-jam") {
+      parsed.overrideJam = true;
+    } else if (a === "--allow-mass-reversion") {
+      parsed.allowMassReversion = true;
     } else if (a === "--session-id") {
       parsed.sessionId = argv[++i] ?? null;
     } else if (a.startsWith("--session-id=")) {
@@ -530,6 +610,21 @@ export interface CommitWorkDeps {
   runLint?: (stagedFiles: string[], cwd: string) => Promise<void>;
   /** Commit-work flock acquire (default: real {@link CommitWorkLock.acquire}). */
   acquireLock?: (lockPath: string) => { release: () => void };
+  /**
+   * In-progress merge/sequencer operation probe (gate 1, pre-lock). Defaults to
+   * the real {@link detectInProgressOperation}; tests inject a canned state so
+   * the pipeline refusal is driven without a real repo mid-operation.
+   */
+  detectInProgress?: (
+    worktree: string,
+    git: GitRunner,
+  ) => Promise<InProgressOperation | null>;
+  /**
+   * Live shared-checkout jam probe (gate 2, pre-lock). Defaults to the real
+   * {@link sharedCheckoutJamActive} (a read-only keeper.db read). Keeps the fast
+   * suite DB-free; the call site fails open if an injected probe throws.
+   */
+  checkSharedCheckoutJam?: (worktree: string) => boolean;
 }
 
 /**
@@ -564,6 +659,9 @@ async function runInner(
   const waitCaughtUp = deps.waitCaughtUp ?? defaultWaitCaughtUp;
   const runLint = deps.runLint ?? runScopedLint;
   const acquireLock = deps.acquireLock ?? CommitWorkLock.acquire;
+  const detectInProgress = deps.detectInProgress ?? detectInProgressOperation;
+  const checkSharedCheckoutJam =
+    deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive;
 
   const sessionId = resolveSessionId(args.sessionId);
   if (sessionId === null) {
@@ -631,6 +729,49 @@ async function runInner(
   if (files.length === 0) {
     printPretty({ success: true, committed: false, files: [] });
     return 0;
+  }
+
+  // Gate 1 — in-progress merge/sequencer refusal (pre-lock, always-on, NO
+  // override). A full `git commit` on top of a live merge silently creates a
+  // two-parent merge commit — the shape that propagated the incident's stale
+  // blobs through an auto-merge. Worktree-portable, retry-safe once the operator
+  // concludes or aborts the operation. Pre-lock, so the throwing `fail()` is safe.
+  const inProgress = await detectInProgress(worktree, git);
+  if (inProgress !== null) {
+    fail({
+      success: false,
+      error: "operation_in_progress",
+      operation: inProgress,
+      hint:
+        `A git ${inProgress} is in progress in this repo — committing now would ` +
+        "fold your work into that operation (a mid-merge commit becomes a " +
+        "two-parent merge commit), the shape that spread stale blobs through an " +
+        "auto-merge.",
+      recovery: OPERATION_IN_PROGRESS_RECOVERY,
+    });
+  }
+
+  // Gate 2 — shared-checkout jam refusal (pre-lock, `--override-jam` escape). A
+  // live dirty/desync distress row for this repo means the working tree may trail
+  // landed history. FAIL-OPEN around the whole probe: an injected probe that
+  // throws (or the default's own internal miss) proceeds WITHOUT the gate, so
+  // commit-work keeps working in a repo with no keeper state.
+  if (!args.overrideJam) {
+    let jam = false;
+    try {
+      jam = checkSharedCheckoutJam(worktree);
+    } catch {
+      jam = false;
+    }
+    if (jam) {
+      fail({
+        success: false,
+        error: "shared_checkout_jam",
+        dir: worktree,
+        hint: SHARED_CHECKOUT_JAM_HINT,
+        recovery: SHARED_CHECKOUT_JAM_RECOVERY,
+      });
+    }
   }
 
   // Acquire the per-worktree commit lock for the full stage → lint → commit →
@@ -710,6 +851,42 @@ async function runInner(
         hint:
           "The session-attributed files produced no staged change (already " +
           "committed, or their edits were reverted). Nothing to commit.",
+      });
+      return 1;
+    }
+
+    // Gate 3 — mass-reversion tripwire (in-lock, post-stage, `--allow-mass-
+    // reversion` escape). An unmerged (stage 1/2/3) index refuses outright; a
+    // staged set that mass-matches ANCESTOR blobs while differing from HEAD is the
+    // desynced-checkout reversion signature (green suites cannot catch it — the
+    // tests revert in the same sweep). In-lock emission: `printCompact` + return,
+    // the flock released by the outer finally.
+    const sweep = await analyzeReversionSweep(stagedNames, worktree, git);
+    if (sweep.unmergedPaths.length > 0) {
+      printCompact({
+        success: false,
+        error: "unmerged_paths",
+        count: sweep.unmergedPaths.length,
+        sample: sweep.unmergedPaths.slice(0, 20),
+        hint:
+          "The index carries unmerged (conflicted) paths — a commit now would " +
+          "record a half-resolved conflict.",
+        recovery: UNMERGED_PATHS_RECOVERY,
+      });
+      return 1;
+    }
+    if (
+      !args.allowMassReversion &&
+      isMassReversion(sweep.reversionCandidates.length, sweep.stagedCount)
+    ) {
+      printCompact({
+        success: false,
+        error: "mass_reversion",
+        count: sweep.reversionCandidates.length,
+        staged: sweep.stagedCount,
+        sample: sweep.reversionCandidates.slice(0, 20),
+        hint: MASS_REVERSION_HINT,
+        recovery: MASS_REVERSION_RECOVERY,
       });
       return 1;
     }

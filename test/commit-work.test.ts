@@ -16,6 +16,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type CommitWorkDeps, runForTest } from "../cli/commit-work";
 import { LintFailure } from "../src/commit-work/lint-matrix";
 import {
@@ -24,12 +27,23 @@ import {
   pushCommitted,
   remotePushTurnKey,
 } from "../src/commit-work/push";
+import {
+  detectInProgressOperation,
+  isReversionExcluded,
+  sharedCheckoutJamActive,
+} from "../src/commit-work/repo-state";
+import {
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_ID_PREFIX,
+  SHARED_DIRTY_DISTRESS_VERB,
+} from "../src/dispatch-failure-key";
 import { PUSH_NON_FAST_FORWARD } from "./fixtures/git-push-goldens";
 import {
   argvStartsWith,
   type FakeGitRule,
   fakeAsyncGit,
 } from "./helpers/fake-git.ts";
+import { freshDbFile } from "./helpers/template-db.ts";
 
 // The verb resolves a session id from the ambient env when no --session-id is
 // passed; clear the harness ids so the no-session-id path is reachable and the
@@ -148,6 +162,8 @@ function deps(opts: {
   rules: FakeGitRule[];
   jobId?: string;
   runLint?: (files: string[], cwd: string) => Promise<void>;
+  detectInProgress?: CommitWorkDeps["detectInProgress"];
+  checkSharedCheckoutJam?: CommitWorkDeps["checkSharedCheckoutJam"];
 }): { d: CommitWorkDeps; calls: ReturnType<typeof fakeAsyncGit>["calls"] } {
   const fake = fakeAsyncGit(opts.rules);
   const baseRun = fake.run;
@@ -170,6 +186,12 @@ function deps(opts: {
     waitCaughtUp: async () => {},
     runLint: opts.runLint ?? (async () => {}),
     acquireLock: () => ({ release: () => {} }),
+    // Repo-state gates default to quiescent so the file-set-driven cases run
+    // unblocked; individual gate tests override these. The reversion tripwire
+    // (gate 3) runs through the injected git runner, whose default empty
+    // `ls-files` output yields no candidates.
+    detectInProgress: opts.detectInProgress ?? (async () => null),
+    checkSharedCheckoutJam: opts.checkSharedCheckoutJam ?? (() => false),
   };
   return { d, calls: fake.calls };
 }
@@ -1099,5 +1121,616 @@ describe("remotePushTurnKey: pre-merge push-readiness probe", () => {
     } else {
       throw new Error("expected a dry-run-rejected reason");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gate 1 — in-progress operation refusal (detectInProgressOperation + pipeline)
+// ---------------------------------------------------------------------------
+
+describe("detectInProgressOperation", () => {
+  test("MERGE_HEAD present → merge, via `rev-parse -q --verify`", async () => {
+    const { run, calls } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+        result: { exitCode: 0, stdout: "deadbeef\n" },
+      },
+    ]);
+    expect(await detectInProgressOperation("/repo", run)).toBe("merge");
+    expect(
+      calls.some((c) =>
+        argvStartsWith(c.args, "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+      ),
+    ).toBe(true);
+  });
+
+  test("CHERRY_PICK_HEAD present → cherry-pick", async () => {
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"),
+        result: { exitCode: 0, stdout: "cafe1234\n" },
+      },
+    ]);
+    expect(await detectInProgressOperation("/repo", run)).toBe("cherry-pick");
+  });
+
+  test("REVERT_HEAD present → revert", async () => {
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "-q", "--verify", "REVERT_HEAD"),
+        result: { exitCode: 0, stdout: "beef5678\n" },
+      },
+    ]);
+    expect(await detectInProgressOperation("/repo", run)).toBe("revert");
+  });
+
+  test("rebase-merge dir → rebase, via `--git-path`-resolved existence", async () => {
+    // Ref probes default to empty stdout (not present); the dir probe resolves a
+    // path and the injected pathExists reports it present.
+    const { run, calls } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--git-path", "rebase-merge"),
+        result: { exitCode: 0, stdout: "/repo/.git/rebase-merge\n" },
+      },
+    ]);
+    const exists = (p: string) => p === "/repo/.git/rebase-merge";
+    expect(await detectInProgressOperation("/repo", run, exists)).toBe(
+      "rebase",
+    );
+    // The probe used `rev-parse --git-path` (worktree-portable), asserted in argv.
+    expect(
+      calls.some((c) =>
+        argvStartsWith(c.args, "rev-parse", "--git-path", "rebase-merge"),
+      ),
+    ).toBe(true);
+  });
+
+  test("rebase-apply dir → rebase (am backend)", async () => {
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--git-path", "rebase-apply"),
+        result: { exitCode: 0, stdout: "/repo/.git/rebase-apply\n" },
+      },
+    ]);
+    const exists = (p: string) => p === "/repo/.git/rebase-apply";
+    expect(await detectInProgressOperation("/repo", run, exists)).toBe(
+      "rebase",
+    );
+  });
+
+  test("BISECT_LOG file → bisect", async () => {
+    const { run, calls } = fakeAsyncGit([
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path", "BISECT_LOG"),
+        result: { exitCode: 0, stdout: "/repo/.git/BISECT_LOG\n" },
+      },
+    ]);
+    const exists = (p: string) => p === "/repo/.git/BISECT_LOG";
+    expect(await detectInProgressOperation("/repo", run, exists)).toBe(
+      "bisect",
+    );
+    expect(
+      calls.some((c) =>
+        argvStartsWith(c.args, "rev-parse", "--git-path", "BISECT_LOG"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a resolved relative --git-path is joined to cwd before the existence check", async () => {
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--git-path", "rebase-merge"),
+        result: { exitCode: 0, stdout: ".git/rebase-merge\n" },
+      },
+    ]);
+    const exists = (p: string) => p === "/wt/.git/rebase-merge";
+    expect(await detectInProgressOperation("/wt", run, exists)).toBe("rebase");
+  });
+
+  test("quiescent repo (no ref, no state dir) → null", async () => {
+    // Every ref probe returns empty; every dir probe resolves a path that does
+    // not exist.
+    const { run } = fakeAsyncGit([
+      {
+        when: (a) => argvStartsWith(a, "rev-parse", "--git-path"),
+        result: { exitCode: 0, stdout: "/repo/.git/whatever\n" },
+      },
+    ]);
+    expect(
+      await detectInProgressOperation("/repo", run, () => false),
+    ).toBeNull();
+  });
+});
+
+describe("commit-work: operation_in_progress gate (pipeline)", () => {
+  for (const op of [
+    "merge",
+    "cherry-pick",
+    "revert",
+    "rebase",
+    "bisect",
+  ] as const) {
+    test(`refuses with an operation_in_progress envelope mid-${op}; no commit/push`, async () => {
+      const { d, calls } = deps({
+        files: ["a.txt"],
+        rules: successRules({ stagedNames: ["a.txt"] }),
+        detectInProgress: async () => op,
+      });
+      const { code, stdout } = await runForTest(
+        [`feat: mid-${op}`, "--session-id", "s1"],
+        d,
+      );
+      expect(code).toBe(1);
+      const parsed = JSON.parse(stdout);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toBe("operation_in_progress");
+      expect(parsed.operation).toBe(op);
+      expect(typeof parsed.recovery).toBe("string");
+      expect(parsed.recovery.length).toBeGreaterThan(0);
+      // Refused pre-lock — neither commit nor push issued.
+      expect(
+        calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-")),
+      ).toBe(false);
+      expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Gate 2 — shared-checkout jam refusal (pipeline + real-DB parity)
+// ---------------------------------------------------------------------------
+
+describe("commit-work: shared_checkout_jam gate (pipeline)", () => {
+  test("a live jam row refuses with a shared_checkout_jam envelope; no commit", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+      checkSharedCheckoutJam: () => true,
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: jammed", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe("shared_checkout_jam");
+    expect(typeof parsed.recovery).toBe("string");
+    expect(parsed.recovery).toContain("--override-jam");
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      false,
+    );
+  });
+
+  test("--override-jam proceeds past a live jam row and commits", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+      checkSharedCheckoutJam: () => true,
+    });
+    const { code } = await runForTest(
+      ["feat: overridden", "--session-id", "s1", "--override-jam"],
+      d,
+    );
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("a throwing jam probe fails open — the commit proceeds", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+      checkSharedCheckoutJam: () => {
+        throw new Error("keeper.db locked");
+      },
+    });
+    const { code } = await runForTest(
+      ["feat: fail-open", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("sharedCheckoutJamActive: real-DB provenance parity + fail-open", () => {
+  let tmpDir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "keeper-jam-"));
+    dbPath = join(tmpDir, "keeper.db");
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Seed one `dispatch_failures` row directly (a projection table). */
+  function seedRow(verb: string, id: string, dir: string | null): void {
+    const { db } = freshDbFile(dbPath);
+    db.query(
+      "INSERT INTO dispatch_failures " +
+        "(verb, id, reason, dir, ts, last_event_id, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(verb, id, "shared-checkout state", dir, 1.0, 1, 1.0, 1.0);
+    db.close();
+  }
+
+  test("a producer-shaped dir (trailing slash + un-realpath'd) matches the normalized toplevel", () => {
+    // The distress row's `dir` provenance is the producer's repo-dir plumbing
+    // (epics.project_dir), NOT `git rev-parse --show-toplevel` output — so it may
+    // carry a trailing slash and a pre-realpath symlink (macOS /var → /private/var).
+    // The worktree we pass is the realpath'd toplevel (what resolveWorktreeRoot
+    // returns). Normalizing BOTH sides (realpath + trailing-slash strip) converges.
+    const producerDir = `${tmpDir}/`; // trailing slash, pre-realpath
+    const worktree = realpathSync(tmpDir); // git-realpath'd toplevel
+    seedRow(
+      SHARED_DIRTY_DISTRESS_VERB,
+      `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`,
+      producerDir,
+    );
+    expect(sharedCheckoutJamActive(worktree, dbPath)).toBe(true);
+  });
+
+  test("a desync row for this repo also fires the gate", () => {
+    seedRow(
+      SHARED_DIRTY_DISTRESS_VERB,
+      `${SHARED_DESYNC_DISTRESS_ID_PREFIX}def456`,
+      tmpDir,
+    );
+    expect(sharedCheckoutJamActive(realpathSync(tmpDir), dbPath)).toBe(true);
+  });
+
+  test("a row naming a DIFFERENT repo does not fire", () => {
+    seedRow(
+      SHARED_DIRTY_DISTRESS_VERB,
+      `${SHARED_DIRTY_DISTRESS_ID_PREFIX}other`,
+      "/some/other/repo",
+    );
+    expect(sharedCheckoutJamActive(realpathSync(tmpDir), dbPath)).toBe(false);
+  });
+
+  test("a non-distress dispatch_failures row (wrong verb/id) never matches", () => {
+    // A close::<epic> merge-conflict row in THIS dir must not be read as a jam.
+    seedRow("close", "fn-999", tmpDir);
+    expect(sharedCheckoutJamActive(realpathSync(tmpDir), dbPath)).toBe(false);
+  });
+
+  test("no keeper.db present → fail open (false), commit-work keeps working", () => {
+    expect(
+      sharedCheckoutJamActive(realpathSync(tmpDir), join(tmpDir, "absent.db")),
+    ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gate 3 — mass-reversion tripwire (pipeline, canned ls-files/cat-file)
+// ---------------------------------------------------------------------------
+
+/** One staged path's blob geometry for the reversion probe. */
+interface RevSpec {
+  path: string;
+  indexOid: string;
+  mode?: string;
+  stage?: string;
+  headOid?: string;
+  ancestors?: Record<number, string>;
+}
+
+/**
+ * Build the `ls-files -s -z` + `cat-file --batch-check` canned rules for a set of
+ * staged specs. `cat-file` output is ordered to match the probe's spec order
+ * (candidates in the given order, HEAD:P then HEAD~1:P..HEAD~30:P per path),
+ * skipping gitlinks + excluded globs exactly as the analyzer does.
+ */
+function reversionRules(specs: RevSpec[]): FakeGitRule[] {
+  const lsOut = `${specs
+    .map(
+      (s) => `${s.mode ?? "100644"} ${s.indexOid} ${s.stage ?? "0"}\t${s.path}`,
+    )
+    .join("\0")}\0`;
+  // Candidate order must match the analyzer's: it filters the SORTED staged set,
+  // so sort by path here to keep the cat-file output correlated spec-for-spec.
+  const candidates = specs
+    .filter(
+      (s) => (s.mode ?? "100644") !== "160000" && !isReversionExcluded(s.path),
+    )
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const lines: string[] = [];
+  for (const s of candidates) {
+    lines.push(s.headOid ? `${s.headOid} blob 12` : `HEAD:${s.path} missing`);
+    for (let k = 1; k <= 30; k++) {
+      const oid = s.ancestors?.[k];
+      lines.push(oid ? `${oid} blob 12` : `HEAD~${k}:${s.path} missing`);
+    }
+  }
+  const catOut = lines.length > 0 ? `${lines.join("\n")}\n` : "";
+  return [
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "-s", "-z"),
+      result: { exitCode: 0, stdout: lsOut },
+    },
+    {
+      when: (a) => argvStartsWith(a, "cat-file", "--batch-check"),
+      result: { exitCode: 0, stdout: catOut },
+    },
+  ];
+}
+
+/** A reverting spec: index blob == HEAD~2 ancestor blob, differs from HEAD. */
+function reverting(path: string, n: number): RevSpec {
+  return {
+    path,
+    indexOid: `rev${n}`,
+    headOid: `head${n}`,
+    ancestors: { 2: `rev${n}` },
+  };
+}
+
+/** A normal spec: index blob == HEAD blob (no change vs HEAD → never a candidate). */
+function normal(path: string, n: number): RevSpec {
+  return { path, indexOid: `cur${n}`, headOid: `cur${n}` };
+}
+
+describe("commit-work: mass_reversion tripwire", () => {
+  test("5 reversions in a 10-path set (>=5 AND >=30%) aborts, naming the flagged paths", async () => {
+    const specs: RevSpec[] = [
+      ...[0, 1, 2, 3, 4].map((i) => reverting(`f${i}.txt`, i)),
+      ...[5, 6, 7, 8, 9].map((i) => normal(`f${i}.txt`, i)),
+    ];
+    const files = specs.map((s) => s.path);
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: sweep", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.error).toBe("mass_reversion");
+    expect(parsed.count).toBe(5);
+    expect(parsed.staged).toBe(10);
+    expect(parsed.sample).toEqual([
+      "f0.txt",
+      "f1.txt",
+      "f2.txt",
+      "f3.txt",
+      "f4.txt",
+    ]);
+    // Aborted before commit/push (and the single batched cat-file was used).
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      false,
+    );
+    const catCalls = calls.filter((c) =>
+      argvStartsWith(c.args, "cat-file", "--batch-check"),
+    );
+    expect(catCalls.length).toBe(1);
+  });
+
+  test("4 reversions (below the count floor) does NOT trip — commit proceeds", async () => {
+    const specs: RevSpec[] = [
+      ...[0, 1, 2, 3].map((i) => reverting(`f${i}.txt`, i)),
+      ...[4, 5, 6, 7, 8, 9].map((i) => normal(`f${i}.txt`, i)),
+    ];
+    const files = specs.map((s) => s.path);
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code } = await runForTest(["feat: minor", "--session-id", "s1"], d);
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("fraction denominator: 5 reversions in a 20-path set (< 30%) does NOT trip", async () => {
+    const specs: RevSpec[] = [
+      ...[0, 1, 2, 3, 4].map((i) =>
+        reverting(`f${String(i).padStart(2, "0")}.txt`, i),
+      ),
+      ...Array.from({ length: 15 }, (_, k) => k + 5).map((i) =>
+        normal(`f${String(i).padStart(2, "0")}.txt`, i),
+      ),
+    ];
+    const files = specs.map((s) => s.path);
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code } = await runForTest(
+      ["feat: big change", "--session-id", "s1"],
+      d,
+    );
+    // 5 >= 5 but 5 < 0.30 * 20 (= 6) → no trip.
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("a gitlink (mode 160000) is excluded from the numerator", async () => {
+    // 4 real reversions + one gitlink whose (would-be) index oid matches an
+    // ancestor: excluded, so count stays 4 → no trip.
+    const specs: RevSpec[] = [
+      ...[0, 1, 2, 3].map((i) => reverting(`f${i}.txt`, i)),
+      {
+        path: "vendored",
+        mode: "160000",
+        indexOid: "rev9",
+        headOid: "head9",
+        ancestors: { 2: "rev9" },
+      },
+      ...[5, 6, 7, 8, 9].map((i) => normal(`f${i}.txt`, i)),
+    ];
+    const files = specs.map((s) => s.path).sort();
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code } = await runForTest(
+      ["feat: gitlink", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("an excluded-glob surface (corpus) is skipped from the numerator", async () => {
+    // 4 real reversions + a plugins/prompt/corpus/** reversion (excluded) → 4, no trip.
+    const specs: RevSpec[] = [
+      ...[0, 1, 2, 3].map((i) => reverting(`f${i}.txt`, i)),
+      reverting("plugins/prompt/corpus/snip.md", 9),
+    ];
+    const files = specs.map((s) => s.path).sort();
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code } = await runForTest(
+      ["feat: corpus", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("short history (all ancestors missing) degrades to no signal", async () => {
+    // Every path reverts in principle, but HEAD~k are all missing (root reached),
+    // so no ancestor blob is ever found → no candidates → no trip.
+    const specs: RevSpec[] = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => ({
+      path: `f${i}.txt`,
+      indexOid: `idx${i}`,
+      headOid: `head${i}`,
+      ancestors: {}, // all HEAD~k missing
+    }));
+    const files = specs.map((s) => s.path);
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code } = await runForTest(
+      ["feat: shallow", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("a missing HEAD blob (re-added deleted file) still counts as a reversion", async () => {
+    // 5 paths absent at HEAD (HEAD:P missing) whose index matches HEAD~3 —
+    // re-introducing old content of a deleted file. The missing-object line is
+    // parsed as no-blob (differs from index), so the ancestor match still trips.
+    const specs: RevSpec[] = [0, 1, 2, 3, 4].map((i) => ({
+      path: `f${i}.txt`,
+      indexOid: `back${i}`,
+      // headOid omitted → HEAD:P missing line
+      ancestors: { 3: `back${i}` },
+    }));
+    const files = specs.map((s) => s.path);
+    const { d } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: readd", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout).error).toBe("mass_reversion");
+  });
+
+  test("--allow-mass-reversion proceeds past the tripwire and commits", async () => {
+    const specs: RevSpec[] = [0, 1, 2, 3, 4].map((i) =>
+      reverting(`f${i}.txt`, i),
+    );
+    const files = specs.map((s) => s.path);
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code } = await runForTest(
+      [
+        "revert: intended bulk revert",
+        "--session-id",
+        "s1",
+        "--allow-mass-reversion",
+      ],
+      d,
+    );
+    expect(code).toBe(0);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      true,
+    );
+  });
+
+  test("an unmerged (stage>0) index entry refuses with unmerged_paths", async () => {
+    const specs: RevSpec[] = [
+      { path: "conflicted.txt", indexOid: "aaa", stage: "2" },
+      { path: "clean.txt", indexOid: "bbb", headOid: "bbb" },
+    ];
+    const files = specs.map((s) => s.path).sort();
+    const { d, calls } = deps({
+      files,
+      rules: [
+        ...reversionRules(specs),
+        ...successRules({ stagedNames: files }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: unmerged", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.error).toBe("unmerged_paths");
+    expect(parsed.sample).toContain("conflicted.txt");
+    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
+      false,
+    );
+    // Refused on ls-files alone — no cat-file probe needed.
+    expect(calls.some((c) => argvStartsWith(c.args, "cat-file"))).toBe(false);
   });
 });
