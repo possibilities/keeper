@@ -63,18 +63,9 @@ interface FixtureEpic {
   question?: string | null;
 }
 
-interface FixtureJob {
-  state: string;
-  jobId?: string;
-  dispatchOrigin?: string | null;
-}
-
 interface SnapOverrides {
   epics?: FixtureEpic[];
   jobsByState?: string[];
-  /** Richer job fixtures carrying `job_id` + `dispatch_origin`, for the
-   *  `in_flight.board_work_jobs` distinction — additive to `jobsByState`. */
-  jobsDetailed?: FixtureJob[];
   pendingDispatches?: number;
   deadLetters?: number;
   blockEscalations?: number;
@@ -92,20 +83,9 @@ interface SnapOverrides {
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
-  const jobs = new Map<
-    string,
-    { state: string; job_id?: string; dispatch_origin?: string | null }
-  >();
+  const jobs = new Map<string, { state: string }>();
   (o.jobsByState ?? []).forEach((state, i) => {
     jobs.set(`job-${i}`, { state });
-  });
-  (o.jobsDetailed ?? []).forEach((j, i) => {
-    const jobId = j.jobId ?? `djob-${i}`;
-    jobs.set(jobId, {
-      state: j.state,
-      job_id: jobId,
-      dispatch_origin: j.dispatchOrigin ?? null,
-    });
   });
   const toMap = (
     rec: Record<string, Verdict> | undefined,
@@ -225,7 +205,6 @@ describe("buildStatusEnvelope shape", () => {
     expect(d.in_flight).toEqual({
       pending_dispatches: 0,
       running_jobs: 0,
-      board_work_jobs: 0,
       total: 0,
     });
     expect(d.needs_human.total).toBe(0);
@@ -579,39 +558,10 @@ describe("buildStatusEnvelope drained/jammed", () => {
     const d = buildStatusEnvelope(snap, BOOT, []).data;
     expect(d?.in_flight.pending_dispatches).toBe(2);
     expect(d?.in_flight.running_jobs).toBe(2);
-    // Neither working job carries a dispatch_origin — plain working sessions,
-    // not Board-work ones.
-    expect(d?.in_flight.board_work_jobs).toBe(0);
     expect(d?.in_flight.total).toBe(4);
     // in-flight work → not at rest → neither drained nor jammed
     expect(d?.drained).toBe(false);
     expect(d?.jammed).toBe(false);
-  });
-
-  test("in-flight: board_work_jobs counts only autopilot/escalation working sessions, excluding the caller's own", () => {
-    const snap = makeSnap({
-      jobsDetailed: [
-        // An interactive session — including the one asking this very
-        // question — is NOT a board-work session (null dispatch_origin).
-        { state: "working", jobId: "interactive-1", dispatchOrigin: null },
-        // A live autopilot work/close dispatch and an escalation session both
-        // count…
-        { state: "working", jobId: "w-1", dispatchOrigin: "autopilot" },
-        { state: "working", jobId: "e-1", dispatchOrigin: "escalation" },
-        // …but not a stopped one, and not the caller's own even when it is
-        // itself an autopilot dispatch (the reproduced case: a supervising
-        // session can itself be a work:: job).
-        { state: "stopped", jobId: "w-2", dispatchOrigin: "autopilot" },
-        { state: "working", jobId: "me", dispatchOrigin: "autopilot" },
-      ],
-    });
-    const withoutOwnSession = buildStatusEnvelope(snap, BOOT, []).data;
-    expect(withoutOwnSession?.in_flight.running_jobs).toBe(4);
-    expect(withoutOwnSession?.in_flight.board_work_jobs).toBe(3);
-
-    const withOwnSession = buildStatusEnvelope(snap, BOOT, [], "me").data;
-    expect(withOwnSession?.in_flight.running_jobs).toBe(4);
-    expect(withOwnSession?.in_flight.board_work_jobs).toBe(2);
   });
 });
 

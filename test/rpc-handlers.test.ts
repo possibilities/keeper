@@ -207,7 +207,6 @@ function autopilotStubBridge(opts: {
       worktree_mode?: boolean;
       worktree_multi_repo?: boolean;
       codex_adoption?: boolean;
-      worker_provider?: "claude" | "codex" | null;
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
@@ -562,45 +561,6 @@ test("set_autopilot_config rejects a non-boolean codex_adoption (fn-1131)", asyn
   ]) {
     expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
       BadParamsError,
-    );
-  }
-  expect(state.setConfigCalls).toEqual([]);
-});
-
-test("set_autopilot_config forwards a worker_provider enum patch incl. null clear (fn-1256)", async () => {
-  const { bridge, state } = autopilotStubBridge({});
-  const claude = await setAutopilotConfigHandler(
-    { worker_provider: "claude" },
-    bridge,
-  );
-  expect(claude).toEqual({ ok: true, patch: { worker_provider: "claude" } });
-  const codex = await setAutopilotConfigHandler(
-    { worker_provider: "codex" },
-    bridge,
-  );
-  expect(codex).toEqual({ ok: true, patch: { worker_provider: "codex" } });
-  const cleared = await setAutopilotConfigHandler(
-    { worker_provider: null },
-    bridge,
-  );
-  expect(cleared).toEqual({ ok: true, patch: { worker_provider: null } });
-  expect(state.setConfigCalls).toEqual([
-    { worker_provider: "claude" },
-    { worker_provider: "codex" },
-    { worker_provider: null },
-  ]);
-});
-
-test("set_autopilot_config rejects a worker_provider value outside claude|codex|null, naming the allowed set (fn-1256)", async () => {
-  const { bridge, state } = autopilotStubBridge({});
-  for (const bad of [
-    { worker_provider: "gpt" },
-    { worker_provider: 1 },
-    { worker_provider: true },
-    { worker_provider: "" },
-  ]) {
-    await expect(setAutopilotConfigHandler(bad, bridge)).rejects.toThrow(
-      /worker_provider.*claude.*codex/,
     );
   }
   expect(state.setConfigCalls).toEqual([]);

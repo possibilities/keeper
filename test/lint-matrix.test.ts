@@ -1,11 +1,9 @@
 /**
  * Trigger-set and dispatch coverage for the three staged-path-conditional
  * drift gates in `src/commit-work/lint-matrix.ts` (vendor-corpus,
- * model-guidance — which also covers the cross-provider equivalence map and
- * its parser — import-boundary). The underlying checks are proven correct
+ * model-guidance, import-boundary). The underlying checks are proven correct
  * elsewhere (`plugins/prompt/test/vendored-corpus.test.ts`,
  * `plugins/plan/test/consistency-model-selector.test.ts`,
- * `plugins/plan/test/consistency-provider-equivalence.test.ts`,
  * `test/reconcile-core-depgraph.test.ts`) — this file proves ONLY that
  * `runScopedLint` fires the right stage on the right staged-path set, fires
  * none of them on an unrelated set, and reports a failure through the
@@ -88,19 +86,6 @@ describe("trigger-set predicates", () => {
     ).toBe(false);
   });
 
-  test("isModelGuidancePath also matches the provider-equivalence map and its parser", () => {
-    expect(isModelGuidancePath("plugins/plan/provider-equivalence.yaml")).toBe(
-      true,
-    );
-    expect(
-      isModelGuidancePath("plugins/plan/src/provider_equivalence.ts"),
-    ).toBe(true);
-    expect(isModelGuidancePath("plugins/plan/other-equivalence.yaml")).toBe(
-      false,
-    );
-    expect(isModelGuidancePath("plugins/plan/src/host_matrix.ts")).toBe(false);
-  });
-
   test("isPlanBoundaryPath matches anything under plugins/plan/src/ only", () => {
     expect(isPlanBoundaryPath("plugins/plan/src/cli.ts")).toBe(true);
     expect(isPlanBoundaryPath("plugins/plan/src/verbs/done.ts")).toBe(true);
@@ -161,43 +146,6 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
       "bun",
       join(REPO_ROOT, "plugins", "plan", "scripts", "model-guidance-check.ts"),
       "--check",
-    ]);
-  });
-
-  test("the provider-equivalence map staged fires only the model-guidance stage", async () => {
-    const { runTool, calls } = fakeRunTool();
-    await runScopedLint(["plugins/plan/provider-equivalence.yaml"], REPO_ROOT, {
-      runTool,
-    });
-    expect(calls).toHaveLength(1);
-    expect(calls[0].cmd).toEqual([
-      "bun",
-      join(REPO_ROOT, "plugins", "plan", "scripts", "model-guidance-check.ts"),
-      "--check",
-    ]);
-  });
-
-  test("the provider-equivalence parser staged also fires both the model-guidance and import-boundary drift gates (it sits under plugins/plan/src/)", async () => {
-    // A real .ts path also fires the tsc/npm-lint arms (unrelated to the
-    // staged-path-conditional drift gates this suite covers) — so this checks
-    // the two drift-gate commands are AMONG the dispatched calls, not that
-    // they are the only calls.
-    const { runTool, calls } = fakeRunTool();
-    await runScopedLint(
-      ["plugins/plan/src/provider_equivalence.ts"],
-      REPO_ROOT,
-      { runTool },
-    );
-    const cmds = calls.map((c) => c.cmd);
-    expect(cmds).toContainEqual([
-      "bun",
-      join(REPO_ROOT, "plugins", "plan", "scripts", "model-guidance-check.ts"),
-      "--check",
-    ]);
-    expect(cmds).toContainEqual([
-      "bun",
-      "test",
-      join(REPO_ROOT, "test", "reconcile-core-depgraph.test.ts"),
     ]);
   });
 

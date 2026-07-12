@@ -30,7 +30,6 @@ import {
 } from "node:fs";
 import { join, sep } from "node:path";
 
-import { mergeTaskState } from "../src/models.ts";
 import {
   fakeDirtyPaths,
   firstJsonPayload,
@@ -247,130 +246,6 @@ describe("claim happy path + brief schema", () => {
     );
     expect(existsSync(briefRef)).toBe(true);
     expect(payload2.brief_ref).toBe(briefRef);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Dispatched-cell runtime capture — the KEEPER_PLAN_DISPATCHED_* contract
-// shared with the dispatch seam.
-// ---------------------------------------------------------------------------
-
-describe("claim captures the dispatched cell", () => {
-  const getProj = withProject("planctl-claim-dispatched-");
-
-  function runtimeStatePath(root: string, taskId: string): string {
-    return join(root, ".keeper", "state", "tasks", `${taskId}.state.json`);
-  }
-
-  function readRuntime(root: string, taskId: string): Record<string, unknown> {
-    return JSON.parse(
-      readFileSync(runtimeStatePath(root, taskId), "utf-8"),
-    ) as Record<string, unknown>;
-  }
-
-  function taskDef(root: string, taskId: string): Record<string, unknown> {
-    return JSON.parse(
-      readFileSync(join(root, ".keeper", "tasks", `${taskId}.json`), "utf-8"),
-    ) as Record<string, unknown>;
-  }
-
-  test("non-empty constraint env lands all three runtime keys", () => {
-    const proj = getProj();
-    const { taskIds } = scaffoldEpic(proj, { title: "Claim epic", nTasks: 1 });
-    const taskId = taskIds[0] as string;
-    const defBefore = taskDef(proj.root, taskId);
-
-    const r = runCli(["claim", taskId, "--project", proj.root], {
-      cwd: proj.root,
-      home: proj.home,
-      env: {
-        ...ALICE,
-        KEEPER_PLAN_DISPATCHED_MODEL: "sonnet",
-        KEEPER_PLAN_DISPATCHED_TIER: "low",
-        KEEPER_PLAN_DISPATCH_CONSTRAINT: "worker_provider=claude",
-      },
-    });
-    expect(r.code).toBe(0);
-
-    const runtime = readRuntime(proj.root, taskId);
-    expect(runtime.dispatched_model).toBe("sonnet");
-    expect(runtime.dispatched_tier).toBe("low");
-    expect(runtime.dispatch_constraint).toBe("worker_provider=claude");
-
-    // Merged reads surface the dispatched_* keys — mergeTaskState round-trips
-    // the unknown runtime keys through normalizeTask untouched.
-    const merged = mergeTaskState(taskDef(proj.root, taskId), runtime);
-    expect(merged.dispatched_model).toBe("sonnet");
-    expect(merged.dispatched_tier).toBe("low");
-    expect(merged.dispatch_constraint).toBe("worker_provider=claude");
-
-    const payload = parseCliOutput(r.output);
-    const briefRef = payload.brief_ref as string;
-    expect(existsSync(briefRef)).toBe(true);
-
-    // The definition cells (task.model / task.tier) and the selection sidecar
-    // never change.
-    const defAfter = taskDef(proj.root, taskId);
-    expect(defAfter.model).toBe(defBefore.model);
-    expect(defAfter.tier).toBe(defBefore.tier);
-  });
-
-  test("a subsequent unconstrained claim clears the stale dispatched keys", () => {
-    const proj = getProj();
-    const { taskIds } = scaffoldEpic(proj, { title: "Claim epic", nTasks: 1 });
-    const taskId = taskIds[0] as string;
-
-    const r1 = runCli(["claim", taskId, "--project", proj.root], {
-      cwd: proj.root,
-      home: proj.home,
-      env: {
-        ...ALICE,
-        KEEPER_PLAN_DISPATCHED_MODEL: "sonnet",
-        KEEPER_PLAN_DISPATCHED_TIER: "low",
-        KEEPER_PLAN_DISPATCH_CONSTRAINT: "worker_provider=claude",
-      },
-    });
-    expect(r1.code).toBe(0);
-    expect(readRuntime(proj.root, taskId).dispatched_model).toBe("sonnet");
-
-    // Re-claim (same actor -> ALREADY_MINE) with the env absent — the launcher
-    // always emits the vars, so absent here models an unconstrained run.
-    const r2 = runCli(["claim", taskId, "--project", proj.root], {
-      cwd: proj.root,
-      home: proj.home,
-      env: ALICE,
-    });
-    expect(r2.code).toBe(0);
-    expect(
-      (parseCliOutput(r2.output).task_state as Record<string, unknown>).outcome,
-    ).toBe("ALREADY_MINE");
-
-    const runtime = readRuntime(proj.root, taskId);
-    expect("dispatched_model" in runtime).toBe(false);
-    expect("dispatched_tier" in runtime).toBe(false);
-    expect("dispatch_constraint" in runtime).toBe(false);
-  });
-
-  test("empty-string constraint env is treated as absent (clears, not writes)", () => {
-    const proj = getProj();
-    const { taskIds } = scaffoldEpic(proj, { title: "Claim epic", nTasks: 1 });
-    const taskId = taskIds[0] as string;
-
-    const r = runCli(["claim", taskId, "--project", proj.root], {
-      cwd: proj.root,
-      home: proj.home,
-      env: {
-        ...ALICE,
-        KEEPER_PLAN_DISPATCHED_MODEL: "",
-        KEEPER_PLAN_DISPATCHED_TIER: "",
-        KEEPER_PLAN_DISPATCH_CONSTRAINT: "",
-      },
-    });
-    expect(r.code).toBe(0);
-    const runtime = readRuntime(proj.root, taskId);
-    expect("dispatched_model" in runtime).toBe(false);
-    expect("dispatched_tier" in runtime).toBe(false);
-    expect("dispatch_constraint" in runtime).toBe(false);
   });
 });
 

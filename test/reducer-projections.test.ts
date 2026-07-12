@@ -3993,7 +3993,6 @@ function autopilotConfigSetEvent(
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
     codex_adoption?: boolean;
-    worker_provider?: "claude" | "codex" | null;
   },
   sessionId = "autopilot",
 ): number {
@@ -4017,7 +4016,6 @@ function getAutopilotStateConfig() {
     worktree_mode: number | null;
     worktree_multi_repo: number | null;
     codex_adoption: number | null;
-    worker_provider: string | null;
   } | null;
 }
 
@@ -4528,127 +4526,6 @@ test("AutopilotConfigSet present-but-non-boolean codex_adoption coerces to 0 (OF
     autopilotConfigSetEvent({ codex_adoption: true });
     drainAll();
   }
-});
-
-// ---------------------------------------------------------------------------
-// fn-1256 task .3 — `worker_provider` is the durable work-dispatch provider
-// pin (docs/adr/0047), riding the same generic `AutopilotConfigSet` fold as
-// `codex_adoption` but the FIRST non-numeric config column: a STRICT string
-// enum (`"claude"` | `"codex"` | `null`), never coerced to a sentinel.
-// ---------------------------------------------------------------------------
-
-test("AutopilotConfigSet {worker_provider:'claude'} sets the column and advances the cursor (fn-1256)", () => {
-  const eventId = autopilotConfigSetEvent({ worker_provider: "claude" });
-  expect(drainAll()).toBe(1);
-  const row = getAutopilotStateConfig();
-  expect(row?.worker_provider).toBe("claude");
-  expect(row?.last_event_id).toBe(eventId);
-  expect(getCursor()).toBe(eventId);
-  // INSERT path still materializes the boots-paused / yolo defaults.
-  expect(row?.paused).toBe(1);
-  expect(row?.mode).toBe("yolo");
-});
-
-test("AutopilotConfigSet {worker_provider:'codex'} sets the column (fn-1256)", () => {
-  autopilotConfigSetEvent({ worker_provider: "codex" });
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("codex");
-});
-
-test("AutopilotConfigSet {worker_provider:null} explicitly clears the pin to SQL NULL (fn-1256)", () => {
-  autopilotConfigSetEvent({ worker_provider: "claude" });
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
-  autopilotConfigSetEvent({ worker_provider: null });
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBeNull();
-});
-
-test("AutopilotConfigSet {worker_provider} PRESERVES paused, mode, worktree flags, and both concurrency columns (fn-1256)", () => {
-  autopilotPausedEvent(false);
-  autopilotModeEvent("armed");
-  autopilotConfigSetEvent({
-    max_concurrent_jobs: 4,
-    max_concurrent_per_root: 3,
-    worktree_mode: true,
-    worktree_multi_repo: true,
-  });
-  drainAll();
-  autopilotConfigSetEvent({ worker_provider: "codex" });
-  drainAll();
-  const row = getAutopilotStateConfig();
-  expect(row?.worker_provider).toBe("codex"); // landed
-  expect(row?.worktree_mode).toBe(1); // worktree_mode PRESERVED
-  expect(row?.worktree_multi_repo).toBe(1); // worktree_multi_repo PRESERVED
-  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
-  expect(row?.max_concurrent_per_root).toBe(3); // per-root PRESERVED
-  expect(row?.paused).toBe(0); // play PRESERVED
-  expect(row?.mode).toBe("armed"); // mode PRESERVED
-});
-
-test("a codex_adoption patch and a pause toggle PRESERVE worker_provider (fn-1256)", () => {
-  autopilotConfigSetEvent({ worker_provider: "claude" });
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
-  autopilotConfigSetEvent({ codex_adoption: true });
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude"); // preserved
-  autopilotPausedEvent(true);
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude"); // preserved
-});
-
-test("AutopilotConfigSet present-but-unrecognized worker_provider DROPS the field — never throws, never coerces (fn-1256)", () => {
-  // Unlike the numeric fields (which coerce a bad value to a sentinel), an
-  // unrecognized worker_provider value is dropped from the patch entirely —
-  // the existing column survives untouched. The RPC validator rejects a bad
-  // value loud before it ever reaches the fold; this is a defensive backstop.
-  autopilotConfigSetEvent({ worker_provider: "claude" });
-  drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
-  for (const bad of ["gpt", 1, true, ""]) {
-    insertEvent({
-      hook_event: "AutopilotConfigSet",
-      session_id: "autopilot",
-      data: JSON.stringify({ worker_provider: bad }),
-    });
-    drainAll();
-    // Untouched — the malformed field never reached the column.
-    expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
-  }
-});
-
-test("AutopilotConfigSet malformed JSON payload for worker_provider folds to a safe no-op, never throws (fn-1256)", () => {
-  insertEvent({
-    hook_event: "AutopilotConfigSet",
-    session_id: "autopilot",
-    data: "not json",
-  });
-  expect(() => drainAll()).not.toThrow();
-  expect(getAutopilotStateConfig()).toBeNull();
-});
-
-test("from-scratch re-fold reproduces autopilot_state byte-identically with a worker_provider column (fn-1256)", () => {
-  autopilotConfigSetEvent({ worker_provider: "claude" });
-  autopilotPausedEvent(false);
-  autopilotConfigSetEvent({
-    max_concurrent_jobs: 9,
-    worker_provider: "codex",
-  });
-  autopilotModeEvent("armed");
-  autopilotConfigSetEvent({ worker_provider: null });
-  drainAll();
-  const before = db
-    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
-    .all();
-  expect(getAutopilotStateConfig()?.worker_provider).toBeNull();
-  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
-  expect(getAutopilotStateConfig()?.mode).toBe("armed");
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM autopilot_state");
-  drainAll();
-  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
-  expect(after).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------

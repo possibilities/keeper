@@ -131,16 +131,6 @@ describe("reconcile-core.ts pure import boundary", () => {
     expect(rels).toContain("src/worktree-plan.ts");
   });
 
-  test("the fs-touching provider-equivalence loader stays OUT of the pure closure", () => {
-    // reconcile-core reads the equivalence-map RUNTIME types type-only (dropped
-    // from the walk) and the map is parsed PRODUCER-SIDE, so the launcher island's
-    // `readFileSync`/`parseYaml` never reach the re-fold-safe verdict path. A
-    // flip of that `import type` to a value import would pull node:fs onto the
-    // closure and this ratchet catches it (the depgraph pin ADR 0047 promised).
-    const rels = new Set(closure.map((f) => f.rel));
-    expect(rels).not.toContain("src/provider-equivalence.ts");
-  });
-
   test("no closure module value-imports an impure driver", () => {
     const hits = closure.flatMap((f) => bannedHits(f.rel, f.valueSpecs));
     expect(hits).toEqual([]);

@@ -1,5 +1,5 @@
 {
-  "description": "plan generated-file guard: PreToolUse(Write|Edit) blocks edits to _promptctl_path-marked files; PostToolUse(Read) warns. Plus the content-blind orchestrator guards: PreToolUse(Bash) commit hard-deny, PreToolUse(Read|Write|Edit|Bash) state-read-guard denies orchestrator access to the briefs/audits state trees, SubagentStop worker guard (matcher ^work:worker$, fires cross-plugin for the launch-selected cell), Stop checklist guard (bun dispatchers).",
+  "description": "plan generated-file guard: PreToolUse(Write|Edit) blocks edits to _promptctl_path-marked files; PostToolUse(Read) warns. Plus the content-blind orchestrator guards: PreToolUse(Bash) commit hard-deny, SubagentStop worker guard (matcher ^work:worker$, fires cross-plugin for the launch-selected cell), Stop checklist guard (bun dispatchers).",
   "hooks": {
     "PreToolUse": [
       {
@@ -19,21 +19,6 @@
             "type": "command",
             "command": "bun",
             "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/commit-guard.ts"]
-          },
-          {
-            "type": "command",
-            "command": "bun",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/state-read-guard.ts"]
-          }
-        ]
-      },
-      {
-        "matcher": "Read|Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/state-read-guard.ts"]
           }
         ]
       }

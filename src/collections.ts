@@ -759,10 +759,6 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // OFF), served so `keeper query autopilot_state` reflects the real durable
     // state. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
     "codex_adoption",
-    // Durable worker-provider dispatch pin (TEXT, NULL | 'claude' | 'codex' —
-    // docs/adr/0047), served so `keeper query autopilot_state` reflects the
-    // real durable pin. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
-    "worker_provider",
   ],
   pk: "id",
   version: "last_event_id",

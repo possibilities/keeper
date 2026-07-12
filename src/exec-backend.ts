@@ -153,18 +153,6 @@ export interface LaunchSpec {
    * process env to key its command-family allowlist, an empty value being inert.
    */
   readonly escalationRole?: string;
-  /**
-   * The DISPATCHED worker cell + the constraint that forced it (ADR 0047), set
-   * ONLY when the `worker_provider` pin translated the task's assigned cell into
-   * the other family. The launch ALWAYS emits the three `KEEPER_PLAN_DISPATCHED_MODEL`
-   * / `KEEPER_PLAN_DISPATCHED_TIER` / `KEEPER_PLAN_DISPATCH_CONSTRAINT` carriers
-   * (EMPTY when absent — the KEEPER_PLAN_WORKTREE_BRANCH always-emit pattern) so a
-   * reused tmux session never inherits a stale cell. Empty carriers mean the
-   * assigned cell ran unconstrained; `.5`'s claim-time capture reads them.
-   */
-  readonly dispatchedModel?: string;
-  readonly dispatchedTier?: string;
-  readonly dispatchConstraint?: string;
 }
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
@@ -1050,18 +1038,6 @@ export interface KeeperAgentLaunchOpts {
    * launches only.
    */
   readonly escalationRole?: string;
-  /**
-   * The dispatched worker cell + the pin that forced it (ADR 0047). ALWAYS emitted
-   * as the three trailing repeated `--x-tmux-env KEEPER_PLAN_DISPATCHED_MODEL` /
-   * `KEEPER_PLAN_DISPATCHED_TIER` / `KEEPER_PLAN_DISPATCH_CONSTRAINT` carriers
-   * (`?? ""`), mirroring the {@link worktreeBranch} always-emit discipline: a
-   * reused tmux session OVERWRITES any stale cell a prior constrained launch left,
-   * and an empty value means the assigned cell ran unconstrained. Set ONLY when the
-   * `worker_provider` pin translated the assigned cell into the other family.
-   */
-  readonly dispatchedModel?: string;
-  readonly dispatchedTier?: string;
-  readonly dispatchConstraint?: string;
 }
 
 /**
@@ -1188,20 +1164,6 @@ export function buildKeeperAgentLaunchArgv(
     // escalation-guard hook (no marker → fail open).
     "--x-tmux-env",
     `KEEPER_ESCALATION_ROLE=${opts.escalationRole ?? ""}`,
-    // Dispatched-cell carriers (ADR 0047) — the SIXTH/SEVENTH/EIGHTH repeated
-    // `--x-tmux-env` (keeper agent last-wins per dup key): the model/tier the
-    // `worker_provider` pin translated the assigned cell TO, plus the pin that
-    // forced it, EMPTY when the assigned cell ran unconstrained. ALWAYS present so
-    // the `-e` OVERWRITES any stale cell a prior constrained launch left in a
-    // reused tmux session env (the same reason the worktree carriers above are
-    // unconditional); the empty triple is byte-inert (`.5`'s claim-time capture
-    // reads all-empty as "the assigned cell ran").
-    "--x-tmux-env",
-    `KEEPER_PLAN_DISPATCHED_MODEL=${opts.dispatchedModel ?? ""}`,
-    "--x-tmux-env",
-    `KEEPER_PLAN_DISPATCHED_TIER=${opts.dispatchedTier ?? ""}`,
-    "--x-tmux-env",
-    `KEEPER_PLAN_DISPATCH_CONSTRAINT=${opts.dispatchConstraint ?? ""}`,
     // Keeper-owned worker permission posture, mirroring the pair-launch precedent
     // (`nativeClaudeArgs`): every claude launch this builder mints is a detached
     // automated worker with NO human to answer a prompt, so it skips permission
@@ -1423,15 +1385,6 @@ export async function keeperAgentLaunch(
       : {}),
     ...(deps.spec.escalationRole !== undefined
       ? { escalationRole: deps.spec.escalationRole }
-      : {}),
-    ...(deps.spec.dispatchedModel !== undefined
-      ? { dispatchedModel: deps.spec.dispatchedModel }
-      : {}),
-    ...(deps.spec.dispatchedTier !== undefined
-      ? { dispatchedTier: deps.spec.dispatchedTier }
-      : {}),
-    ...(deps.spec.dispatchConstraint !== undefined
-      ? { dispatchConstraint: deps.spec.dispatchConstraint }
       : {}),
     noConfirm: true,
   });

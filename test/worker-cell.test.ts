@@ -379,8 +379,6 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     switch (r.kind) {
       case "bad-matrix":
         return "bad-matrix";
-      case "provider-reject":
-        return "provider-reject";
       case "out-of-matrix":
         return "out-of-matrix";
       case "missing":
@@ -397,16 +395,6 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     { pluginDir: null }, // → ok (cell-less)
     { pluginDir: null, reject: "x" }, // → out-of-matrix
     { pluginDir: null, matrixReject: { state, detail: "d" } }, // → bad-matrix
-    {
-      pluginDir: null,
-      providerReject: {
-        reason: "no-map-entry",
-        provider: "codex",
-        direction: "claude_to_codex",
-        assigned: { model: "opus", effort: "high" },
-        target: null,
-      },
-    }, // → provider-reject
   ];
   for (const c of cases) {
     kinds.add(
@@ -435,13 +423,6 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     ),
   );
   expect(kinds).toEqual(
-    new Set([
-      "ok",
-      "out-of-matrix",
-      "bad-matrix",
-      "provider-reject",
-      "missing",
-      "shadowed",
-    ]),
+    new Set(["ok", "out-of-matrix", "bad-matrix", "missing", "shadowed"]),
   );
 });

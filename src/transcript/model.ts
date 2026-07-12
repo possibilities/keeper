@@ -137,18 +137,3 @@ export interface TranscriptPage {
   newerOffset: number | null;
   clippedByChars: boolean;
 }
-
-/**
- * Harness-neutral Latest turn: the selected branch's most recent non-empty
- * user text, plus subsequent assistant text ONLY once that response reaches
- * a successful terminal stop. `response` stays null for a prompt with no
- * complete answer yet (pending, mid tool-use, or aborted/errored/length-cut).
- * `prompt`/`response` are independently capped; a `*Truncated` flag reports
- * whether the cap actually cut its field.
- */
-export interface LatestTurn {
-  prompt: string;
-  promptTruncated: boolean;
-  response: string | null;
-  responseTruncated: boolean;
-}

@@ -32,7 +32,6 @@ import {
   projectAutopilotPaused,
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
-  projectWorkerProvider,
   projectWorktreeMode,
   projectWorktreeMultiRepo,
 } from "../src/autopilot-projection";
@@ -101,16 +100,10 @@ Subcommands:
            {schema_version, ok, error, data} JSON envelope and exit:
            {paused, mode, worktree_mode, worktree_multi_repo, armed,
            max_concurrent_jobs, max_concurrent_per_root,
-           max_concurrent_per_root_stored, worker_provider,
-           worker_provider_scope, worker_provider_note}. max_concurrent_per_root
-           is the EFFECTIVE cap (worktree off => 1); _stored is the durable
-           intent you set. worker_provider is the work-dispatch provider pin
-           (null | claude | codex); worker_provider_scope names its "work cells
-           only" reach whenever the pin is set, and worker_provider_note names
-           the many-to-one GPT-tier collapse when pinned to claude (both null
-           otherwise). Read-only — the capture surface for a take-over (every
-           durable knob round-trips; restore stored via 'config
-           max_concurrent_per_root').
+           max_concurrent_per_root_stored}. max_concurrent_per_root is the
+           EFFECTIVE cap (worktree off => 1); _stored is the durable intent you
+           set. Read-only — the capture surface for a take-over (every durable
+           knob round-trips; restore stored via 'config max_concurrent_per_root').
   pause    Send set_autopilot_paused {paused:true} and exit.
   play     Send set_autopilot_paused {paused:false} and exit.
   mode     Send set_autopilot_mode {mode:<yolo|armed>} and exit. yolo works
@@ -129,15 +122,9 @@ Subcommands:
            1 until you turn worktree mode on. worktree_multi_repo on lets worktree
            mode CLUSTER a >1-toplevel epic into independent per-repo lane groups
            instead of rejecting it worktree-multi-repo (OFF by default).
-           worker_provider (claude | codex | none — the durable work-dispatch
-           provider pin; 'none' clears it to NULL). Scoped to cell-bearing work
-           dispatches only — close/deconflict/resolve sessions and the
-           wrapped-cell claude wrapper driver stay unaffected; pinning to
-           claude collapses every GPT tier onto its mapped claude model.
            e.g. keeper autopilot config max_concurrent_jobs 8
                 keeper autopilot config max_concurrent_per_root 3
                 keeper autopilot config worktree_multi_repo on
-                keeper autopilot config worker_provider claude
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
   disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
   worktree Send set_autopilot_config {worktree_mode:<on|off>} and exit. Durable
@@ -192,7 +179,7 @@ Control the server-side reconciler (the viewer is read-only). It boots PAUSED.
   keeper autopilot mode <yolo|armed>      # armed works ONLY armed epics + their dep-closure
   keeper autopilot arm <epic> | disarm <epic>
   keeper autopilot retry <verb::id>       # clear a sticky dispatch-failure row
-  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption | worker_provider
+  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption
   keeper autopilot worktree <on|off> [--force]
 
 Read state from the [paused]/mode/armed banner (\`keeper autopilot --snapshot\`).
@@ -430,16 +417,14 @@ export function projectAutopilotMode(
 
 // `projectAutopilotPaused` / `projectMaxConcurrentJobs` /
 // `projectMaxConcurrentPerRoot` / `projectWorktreeMode` /
-// `projectWorktreeMultiRepo` / `projectWorkerProvider` live in
-// `../src/autopilot-projection` (imported above) so daemon-side modules can
-// reach them without crossing into cli/; re-exported here for existing
-// cli-side importers (`cli/board.ts`, tests) that still resolve
-// `../cli/autopilot`.
+// `projectWorktreeMultiRepo` live in `../src/autopilot-projection` (imported
+// above) so daemon-side modules can reach them without crossing into cli/;
+// re-exported here for existing cli-side importers (`cli/board.ts`, tests)
+// that still resolve `../cli/autopilot`.
 export {
   projectAutopilotPaused,
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
-  projectWorkerProvider,
   projectWorktreeMode,
   projectWorktreeMultiRepo,
 };
@@ -486,33 +471,7 @@ export interface AutopilotShowData {
   // round-trips. Equals effective while worktree mode is on; while off it holds
   // the value the operator set even though effective floors to 1.
   max_concurrent_per_root_stored: number;
-  // The durable work-dispatch provider pin (docs/adr/0047): `"claude"` /
-  // `"codex"` pins every work dispatch to that family; `null` (the
-  // byte-identical default) is unconstrained.
-  worker_provider: "claude" | "codex" | null;
-  // Present iff `worker_provider` is set — the "work cells only" scope note so
-  // the pin's reach (cell-bearing work dispatches, never close/escalation
-  // sessions) is never surprising. `null` when the pin is unset.
-  worker_provider_scope: string | null;
-  // Present iff `worker_provider` is `"claude"` — names the many-to-one tier
-  // collapse (every GPT tier maps onto its mapped claude model). `null`
-  // otherwise.
-  worker_provider_note: string | null;
 }
-
-/** `keeper autopilot show`'s always-present scope note for an active
- *  `worker_provider` pin — the RPC scope is cell-bearing work dispatches only;
- *  close/deconflict/resolve sessions and the wrapped-cell claude wrapper driver
- *  are unaffected. */
-const WORKER_PROVIDER_SCOPE_NOTE =
-  "work cells only — close/deconflict/resolve sessions and the wrapped-cell claude wrapper driver are unaffected";
-
-/** `keeper autopilot show`'s claude-only note: pinning to claude collapses
- *  every dispatchable GPT tier onto its mapped claude model (docs/adr/0047 —
- *  "Consequences"), a many-to-one collapse worth surfacing so it is never
- *  surprising. */
-const WORKER_PROVIDER_CLAUDE_COLLAPSE_NOTE =
-  "pinning to claude collapses every GPT tier onto its mapped claude model — expect several assigned tiers to converge on the same dispatched cell";
 
 export type AutopilotShowEnvelope = Envelope<AutopilotShowData>;
 
@@ -534,7 +493,6 @@ export function buildAutopilotShowEnvelope(
   // effective cap through the ONE shared helper so `show` never re-interprets
   // the raw value inline and can't drift from `keeper status` / the reconciler.
   const storedPerRoot = projectMaxConcurrentPerRoot(autopilotRows);
-  const workerProvider = projectWorkerProvider(autopilotRows);
   return successEnvelope(AUTOPILOT_SHOW_SCHEMA_VERSION, {
     paused: projectAutopilotPaused(autopilotRows) ?? true,
     mode: projectAutopilotMode(autopilotRows) ?? "yolo",
@@ -544,11 +502,6 @@ export function buildAutopilotShowEnvelope(
     max_concurrent_jobs: projectMaxConcurrentJobs(autopilotRows),
     max_concurrent_per_root: effectivePerRootCap(storedPerRoot, worktreeMode),
     max_concurrent_per_root_stored: storedPerRoot,
-    worker_provider: workerProvider,
-    worker_provider_scope:
-      workerProvider == null ? null : WORKER_PROVIDER_SCOPE_NOTE,
-    worker_provider_note:
-      workerProvider === "claude" ? WORKER_PROVIDER_CLAUDE_COLLAPSE_NOTE : null,
   });
 }
 
@@ -767,7 +720,6 @@ export function buildSetConfigFrame(
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
     codex_adoption?: boolean;
-    worker_provider?: "claude" | "codex" | null;
   },
 ): ClientFrame {
   return {
@@ -1451,30 +1403,8 @@ export async function main(argv: string[]): Promise<void> {
       );
       return;
     }
-    if (key === "worker_provider") {
-      // The durable work-dispatch provider pin (docs/adr/0047) — `claude` /
-      // `codex` set the pin, `none` clears it to NULL (mirrors the
-      // `unlimited`/`default` clear sentinels above).
-      let workerProvider: "claude" | "codex" | null;
-      if (value === "none") {
-        workerProvider = null;
-      } else if (value === "claude" || value === "codex") {
-        workerProvider = value;
-      } else {
-        die(
-          `'config worker_provider' value must be one of claude | codex | none (got ${JSON.stringify(value)})`,
-        );
-      }
-      await sendControlRpc(
-        sockPath,
-        buildSetConfigFrame(id, { worker_provider: workerProvider }),
-        id,
-        AUTOPILOT_CONTROL_SCHEMA_VERSION,
-      );
-      return;
-    }
     die(
-      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption | worker_provider (got ${JSON.stringify(key)})`,
+      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption (got ${JSON.stringify(key)})`,
     );
   }
 
