@@ -524,10 +524,13 @@ describe("pi extension — factory arming + fail-open", () => {
     expect([...pi.handlers.keys()].sort()).toEqual([
       "agent_end",
       "agent_start",
+      "model_select",
       "session_shutdown",
       "session_start",
+      "thinking_level_select",
       "tool_call",
       "tool_result",
+      "turn_end",
     ]);
     expect([...pi.tools.keys()]).toEqual(["keeper_transcript", "Task"]);
   });

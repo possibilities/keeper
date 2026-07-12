@@ -6,8 +6,9 @@
  * AgentHarness lifecycle. The keeper launcher arms THIS file on every tracked pi
  * launch (interactive or detached); it translates pi's events into keeper's
  * events-log NDJSON contract so a pi session shows the same working/stopped churn
- * on the board that a claude session does, holds a session-scoped Agent Bus inbox,
- * and registers a read-only transcript tool backed by the keeper CLI.
+ * on the board that a claude session does, installs keeper's status footer and
+ * telemetry sink, holds a session-scoped Agent Bus inbox, and registers a
+ * read-only transcript tool backed by the keeper CLI.
  *
  * EPHEMERAL, NEVER a persistent `pi install`: a global install would fire on the
  * human's own non-keeper pi sessions. The `-e` per-launch arming plus the
@@ -59,6 +60,11 @@ import {
 } from "./bus-inbox.ts";
 import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
 import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
+import {
+  installPiStatusFooter,
+  type PiFooterApi,
+  type PiFooterContext,
+} from "./status-footer.ts";
 
 // ---------------------------------------------------------------------------
 // pi event shapes (minimal structural subset)
@@ -88,9 +94,13 @@ export interface PiObservedEvent {
 export interface PiExtensionApi {
   on(
     event: string,
-    handler: (event: PiObservedEvent) => void | Promise<void>,
+    handler: (
+      event: PiObservedEvent,
+      context?: PiFooterContext,
+    ) => void | Promise<void>,
   ): void;
   events?: PiTaskEventBus;
+  getThinkingLevel?(): string;
   registerTool?(tool: PiToolDefinition<unknown>): void;
   /** Presence-gated: `/rename` registers only when both this and
    *  `setSessionName` exist (see the `registerRenameCommand` call site). The
@@ -768,6 +778,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
         : null;
     const busOwnerToken = {};
     let ownsBusInbox = false;
+    let refreshStatusFooter = (): void => {};
 
     const emit = (event: PiObservedEvent): void => {
       try {
@@ -804,7 +815,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     ]) {
       pi.on(kind, emit);
     }
-    pi.on("session_start", () => {
+    pi.on("session_start", (_event, context) => {
       try {
         if (busInbox !== null && claimBusInboxOwnership(busOwnerToken)) {
           ownsBusInbox = true;
@@ -813,7 +824,27 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       } catch {
         // Presence-only degradation: a bus child must never break Pi startup.
       }
+      try {
+        if (context !== undefined) {
+          refreshStatusFooter = installPiStatusFooter(
+            pi as PiExtensionApi & PiFooterApi,
+            context,
+            jobId,
+          );
+        }
+      } catch {
+        // A cosmetic footer failure must never break Pi startup.
+      }
     });
+    for (const kind of ["turn_end", "model_select", "thinking_level_select"]) {
+      pi.on(kind, () => {
+        try {
+          refreshStatusFooter();
+        } catch {
+          // Rendering and telemetry are advisory.
+        }
+      });
+    }
     pi.on("session_shutdown", async () => {
       if (!ownsBusInbox) return;
       ownsBusInbox = false;
