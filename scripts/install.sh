@@ -132,7 +132,7 @@ if [ -d "${pi_subagents_fork}/.git" ]; then
     } else {
       console.log("install: pi-subagents fork already registered as a pi package source");
     }
-  ' ) || echo "install: pi package-source registration failed (non-fatal); continuing" >&2
+  ' ) || pi_subagents_notify "package-source registration failed — pi may not load the fork at all"
   echo "install: syncing pi-subagents fork against upstream"
   (
     set -Eeuo pipefail
@@ -170,8 +170,24 @@ if [ -d "${pi_subagents_fork}/.git" ]; then
     fi
     echo "install: pi-subagents fork rebased cleanly onto upstream/master"
   ) || echo "install: pi-subagents fork sync errored (non-fatal); continuing" >&2
+  # The point of the fork install is that BOTH live fixes are in the tree pi
+  # loads — verify their markers in the checkout as it stands (whatever branch
+  # or dirty state the steps above left in place). A missing marker means pi
+  # is running without that fix — wrong branch, lost commit, or an upstream
+  # refactor that renamed the seam — and an operator must reconcile; notify
+  # loudly, never fail the install.
+  pi_subagents_missing=""
+  grep -q "classifyEmptyResult" "${pi_subagents_fork}/src/agent-runner.ts" 2>/dev/null || \
+    pi_subagents_missing="the terminal-status fix (tintinweb/pi-subagents#144)"
+  grep -q "compaction_end" "${pi_subagents_fork}/src/output-file.ts" 2>/dev/null || \
+    pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the compaction fix (tintinweb/pi-subagents#145)"
+  if [ -n "${pi_subagents_missing}" ]; then
+    pi_subagents_notify "loaded tree is missing ${pi_subagents_missing} — pi runs without it"
+  else
+    echo "install: pi-subagents fixes verified in the loaded tree (terminal status + compaction)"
+  fi
 else
-  echo "install: pi-subagents fork unavailable; pi keeps its current package source"
+  pi_subagents_notify "fork unavailable — pi keeps its current package source and may be missing both fixes"
 fi
 
 # 3c. CodexBar CLI: install the latest signed upstream release directly into
