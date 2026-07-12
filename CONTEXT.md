@@ -13,7 +13,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Re-fold**: Rebuilding a projection by replaying every event, which stays deterministic only because a fold never reads wall-clock, environment, or the filesystem. Avoid: rebuild, replay-repair, reprocess.
 - **Dead letter**: An event the reducer could not fold, parked for inspection and later replay instead of crashing the fold. Avoid: error queue, poison message, reject.
 - **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a rewind. Avoid: snapshot, ephemeral view, scratch state.
-- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed. Avoid: registry (that word belongs to Usage-model registry), migration list, schema chain.
+- **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed. Avoid: registry, migration list, schema chain.
 - **Additive-idempotent step**: A migration ladder step whose `kind` only adds structure and converges safely on repeated application, the one class a merge-time renumber may resolve mechanically without a human. Avoid: safe migration, non-destructive step, idempotent guard.
 - **Schema singleton**: The property that keeper's schema is one lane-at-a-time resource, so two concurrent schema edits are meant to collide at merge rather than compose silently. Avoid: shared resource, lock file, mutex.
 
@@ -83,13 +83,11 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
 - **Lane pre-merge**: The guard that vets a dependent task's base lane BEFORE its fan-in merges the completed siblings in — restoring a provably-redundant leak to the base's HEAD, deferring a base it cannot safely settle to a self-clearing row, and escalating a persistent wedge to a needs-human distress; distinct from the fan-in conflict itself, which a Resolver settles rather than self-clearing. Avoid: clean, cleanup, premerge fixup, fan-in conflict.
 
-## Account routing and usage scraping
+## Account routing
 - **Capacity observation**: A freshness-bounded report from optional external tools that may inform selection for one new agent process, but is never durable truth. Avoid: usage projection, account state, balance record.
 - **Account route**: The account execution path selected independently for one new agent process, including a process resuming or restoring an existing conversation; it never binds that conversation to the account for a later launch. Avoid: profile, pin, affinity, session account.
 - **Launch attribution**: The immutable fact of which Account route one process used, retained for explanation and forensics but never consumed to route a later process. Avoid: account affinity, profile name, pin.
 - **Launch reservation**: Short-lived, non-exclusive pressure applied during concurrent account selection so new processes do not stampede one route; it conveys no durable ownership. Avoid: lease, lock, affinity.
-- **Usage-model registry**: The `usage_models` keeper-config map declaring which claude profiles and codex the usage scraper produces envelopes for, keyed by envelope id with an optional display alias per entry; an absent or malformed map idles the producer rather than erroring. Avoid: profile catalog, account list, scrape targets.
-- **agentusage**: The frozen on-disk namespace the usage scraper writes and reads — the envelope root, the tmux socket, and the path-filter token that share this name — pinned as a fixed wire/on-disk contract independent of any project directory. Avoid: the agentusage project, external scraper.
 
 ## Bus, presence, and session surface
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.

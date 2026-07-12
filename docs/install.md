@@ -13,15 +13,69 @@ bash scripts/install.sh          # bun install -> bun link -> keeperd LaunchAgen
 
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
 path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
-owned by you and mode `644` or macOS silently ignores it. Optional roots and runtimes live in
-`~/.config/keeper/config.yaml`, including the `usage_models` map that declares which claude profiles
-and codex the usage scraper produces envelopes for and their display aliases (an absent or malformed
-map idles the producer rather than erroring). The autoclose worker force-closes the tmux window of a
-done-and-idle keeper-dispatched agent (an autopilot `work::`/`close::` worker or a finished claude
-panel leg) after a grace: `autoclose_enabled` (default `true`; set `false`/`off`/`no`/`0` to disable —
-re-read every pulse, so a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`)
-govern it. A finished `unblock`/`deconflict`/`resolve` escalation window is reaped under the same
-knobs once its block or conflict instance is resolved.
+owned by you and mode `644` or macOS silently ignores it. Optional account-routing integrations are
+discovered through their CLIs; there is no keeper config map to author for them. The autoclose worker
+force-closes the tmux window of a done-and-idle keeper-dispatched agent (an autopilot `work::`/`close::`
+worker or a finished claude panel leg) after a grace: `autoclose_enabled` (default `true`; set
+`false`/`off`/`no`/`0` to disable — re-read every pulse, so a flip needs no daemon restart) and
+`autoclose_grace_seconds` (default `30`) govern it. A finished `unblock`/`deconflict`/`resolve`
+escalation window is reaped under the same knobs once its block or conflict instance is resolved.
+
+### Account routing (optional)
+
+Claude account routing is optional and fails open to the native default account when either integration
+is absent or unusable.
+
+| Capability | Public command | Keeper role |
+|---|---|---|
+| Ambient gate | `codexbar --provider claude --format json` | Observes the ambient Claude account and gates automatic balancing; never supplies managed-account rows. |
+| Managed telemetry | `cswap list --json` | Supplies managed-account inventory, launchability, quota windows, and freshness. |
+| Managed execution | `cswap run <slot> --share-history -- <claude arguments...>` | Runs one managed Claude process without globally switching other terminals. |
+
+`keeper agent accounts check --json` is the read-only, PII-free diagnostic: it reports integration
+health, snapshot age, candidate route ids such as `default` and `claude-swap:<slot>`, and the route the
+policy would choose without reserving it. Every Claude start, resume, and restore selects independently
+from the latest observation; launch attribution explains one process but never creates account affinity
+for a later process.
+
+The selection policy is continuous: each routeable candidate is scored by its worst normalized quota
+window after short-lived launch reservations, the greatest remaining headroom wins, and
+least-recently-used order breaks ties. The account-routing rationale lives in
+[ADR 0038](./adr/0038-external-capacity-and-per-launch-account-routing.md).
+
+Claude `settings.json` is seeded at install time from the keeper stow source only when the live file is
+absent. After that seed, the local file is the canonical value: keeper leaves local edits in place and
+claude-swap shares the same live settings into managed sessions.
+
+Private clean-break archive, outside keeper's runtime, with the archive root at mode `0700`:
+
+```sh
+archive="$HOME/archive/keeper-agent-usage"
+if [ -e "$archive" ]; then
+  echo "archive path already exists: $archive" >&2
+  exit 1
+fi
+install -d -m 700 "$archive"
+
+for path in \
+  "$HOME/.local/state/agentusage" \
+  "$HOME/.claude-profiles" \
+  "$HOME/.pi-profiles"
+do
+  [ -e "$path" ] || continue
+  dest="$archive/$(basename "$path")"
+  if [ -e "$dest" ]; then
+    echo "archive collision: $dest" >&2
+    exit 1
+  fi
+  mv "$path" "$dest"
+done
+
+chmod 700 "$archive"
+```
+
+This archive is rollback evidence only. It moves retired private state byte-for-byte without reading,
+inspecting, importing, or translating credentials, and keeper never reads the archive as launch state.
 
 ### Reload trigger
 
