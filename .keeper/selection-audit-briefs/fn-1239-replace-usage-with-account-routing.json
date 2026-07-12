@@ -1,0 +1,70 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Retire the usage/profiles projections at schema v120: DROP both tables unconditionally at the tail (event_blobs precedent), remove their query descriptors/collection registry/allowlist entries, delete the UsageSnapshot/UsageDeleted/profile fan-out fold arms (replaced with explicit no-ops), and prune the now-dead usageIdForProfileName/profileNameForUsageId helpers. Preserved: jobs.config_dir/profile_name as inert historical facts, account_route attribution, and RateLimited/ApiError's last_api_error_at/kind stamp.",
+      "input_hash": "unavailable",
+      "model": "gpt-5.6-sol",
+      "spec_chars": 5375,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/db.ts, src/reducer.ts, src/collections.ts, src/epic-deps.ts, src/types.ts, plugins/keeper/skills/query/SKILL.md, test/db.test.ts, test/reducer-lifecycle.test.ts, test/refold-equivalence.test.ts, test/collections.test.ts, test/epic-deps.test.ts, test/query.test.ts\n\n### Approach\n\nRemove `usage` and `profiles` as live query/projection surfaces, delete UsageSnapshot/UsageDeleted folds and profile/rate-limit fan-outs, and append one forward-only destructive migration that leaves those tables absent at schema head. Historical additive steps still execute during a fresh zero-to-head migration; the final retirement step is idempotent so bootstrap cannot resurrect the tables.\n\nPreserve task 3's explicit jobs `account_route` attribution and unrelated API-error/instant-death-wall behavior. Legacy `config_dir`/`profile_name` columns may remain inert historical schema facts if dropping them would rebuild core event/job tables; no live descriptor, fold, join, statusline, or routing path may consume them.\n\nOld usage events remain valid immutable history. A re-fold must advance safely past them without recreating a retired projection or throwing, and live-only rewind boundaries must remain unchanged.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/db.ts:5294 \u2014 usage projection schema and profile join contract\n- src/db.ts:5336 \u2014 profiles projection schema\n- src/db.ts:6863 \u2014 migration ladder execution semantics\n- src/reducer.ts:3016 \u2014 UsageSnapshot fold and malformed-data safety\n- src/reducer.ts:3221 \u2014 profiles-to-usage reverse fan-out\n- src/reducer.ts:3357 \u2014 usage deletion fold\n- src/reducer.ts:8389 \u2014 SessionStart profile seed\n- src/reducer.ts:9033 \u2014 rate-limit profile/usage fan-out\n- src/collections.ts:513 \u2014 profiles descriptor\n- src/collections.ts:1018 \u2014 collection registry/allowlist\n- src/epic-deps.ts:62 \u2014 profile/usage re-fold dependency declarations\n\n**Optional** (reference as needed):\n- test/refold-equivalence.test.ts:3583 \u2014 precedent for a historical table present during old steps and absent at head\n- test/db.test.ts:379 \u2014 schema fingerprint pin\n- test/rebase-schema-migration.test.ts:86 \u2014 destructive-step merge/renumber guard\n\n### Risks\n\nThis is a destructive schema-singleton change and cannot be mechanically renumbered across a collision; assign its version at merge time. Deleting folds must not make an old event a dead letter. Removing profile fan-outs must not remove independent rate-limit/instant-death evidence or task 3's attribution.\n\n### Test notes\n\nCover fresh zero-to-head, pre-retirement upgrade, idempotent reopen, re-fold over historical usage/profile events, schema fingerprint, collection allowlists, and absence of prepared statements against dropped tables. Use `freshMemDb`/`freshDbFile`; no real daemon or migration subprocess.\n\n### Detailed phases\n\n1. Remove query descriptors, projection statements, joins, fan-outs, and reducer dispatch while retaining safe no-op handling for historical events.\n2. Append the version-guarded destructive schema step and re-pin the fingerprint.\n3. Prune deterministic rewind/delete sets and dependency declarations without touching live-only surfaces.\n4. Prove zero-to-head, upgrade, reopen, and re-fold equivalence.\n\n### Alternatives\n\nRetaining empty compatibility tables was rejected because they would remain misleading live projections. Rebuilding the core events/jobs tables solely to erase inert historical columns was rejected as disproportionate risk; those columns carry no live account-routing semantics.\n\n### Non-functional targets\n\nFold cost remains constant-bounded and deterministic. The migration never reads wall clock, environment, filesystem, or liveness. No query can address retired collections after schema head.\n\n### Rollout\n\nMerge after runtime producers and consumers are gone, so no deployed code writes or queries the tables after the migration lands. A rollback must restore code and schema from source/backup explicitly; the archive is unrelated to the database migration.\n\n## Acceptance\n\n- [ ] `usage` and `profiles` are absent from the head schema, collection registry, query allowlist, reducer writes, and prepared statements.\n- [ ] A fresh database can execute historical steps and finishes without recreating either retired table.\n- [ ] An upgraded database drops the tables idempotently and reopens cleanly.\n- [ ] Historical usage/profile events advance through re-fold without dead letters or projection resurrection.\n- [ ] Explicit account-route attribution, API-error evidence, instant-death behavior, and live-only rewind invariants remain intact.\n- [ ] Schema fingerprint, migration, collection, reducer, and re-fold tests pass.\n\n## Done summary\nRetire the usage/profiles projections at schema v120: DROP both tables unconditionally at the tail (event_blobs precedent), remove their query descriptors/collection registry/allowlist entries, delete the UsageSnapshot/UsageDeleted/profile fan-out fold arms (replaced with explicit no-ops), and prune the now-dead usageIdForProfileName/profileNameForUsageId helpers. Preserved: jobs.config_dir/profile_name as inert historical facts, account_route attribution, and RateLimited/ApiError's last_api_error_at/kind stamp.\n## Evidence\n",
+      "task_id": "fn-1239-replace-usage-with-account-routing.6",
+      "tier": "xhigh",
+      "title": "Retire usage projection schema"
+    },
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 20,
+        "files_changed": 5,
+        "insertions": 70
+      },
+      "done_summary": "Pruned retired usage/profile guidance from README, CLAUDE.md, CONTEXT.md, docs/install.md, and docs/plan-name-retirement.md, and documented the surviving CodexBar+claude-swap account-routing system (keeper agent accounts check, independent per-launch selection, settings seeding, and the private clean-break archive procedure). ADR 0038 remains the sole rationale record. Note: plugins/prompt's parity golden-file test (panel-strength) fails pre-existing and unrelated to this task's files.",
+      "input_hash": "unavailable",
+      "model": "gpt-5.5",
+      "spec_chars": 4647,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** README.md, docs/install.md, CONTEXT.md, CLAUDE.md, docs/plan-name-retirement.md, plugins/keeper/skills/query/SKILL.md, plugins/keeper/skills/autopilot/SKILL.md\n\n### Approach\n\nMake forward-facing documentation describe only the surviving wrapper-based account-routing system. Prune the Usage-model registry and `agentusage` glossary entries, profile-directory guard, usage/query/operator instructions, and installation steps; retain ADR 0038 as the sole rationale/history record.\n\nDocument the optional capability matrix, exact public commands, PII-free diagnostics, independent start/resume/restore selection, continuous headroom policy, install-time settings seed with local evolution, and clean-break archive. The archive procedure creates `~/archive/keeper-agent-usage/` at mode 0700, moves retired state without inspecting/importing credentials, aborts on collisions, and is explicitly outside Keeper's runtime.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- README.md:1 \u2014 lean project front door\n- docs/install.md:14 \u2014 current `usage_models` and scraper setup\n- CONTEXT.md:87 \u2014 current account-routing and usage-scraping glossary clusters\n- CLAUDE.md:52 \u2014 current profile-directory name guard\n- plugins/keeper/skills/query/SKILL.md:125 \u2014 usage/profiles collection list\n- plugins/keeper/skills/autopilot/SKILL.md:1 \u2014 operator guidance that currently points to usage\n- docs/adr/0038-external-capacity-and-per-launch-account-routing.md:1 \u2014 accepted rationale and vocabulary boundary\n\n**Optional** (reference as needed):\n- docs/plan-name-retirement.md:1 \u2014 launcher environment naming inventory\n- /Users/mike/src/realiti4--claude-swap/README.md:112 \u2014 public session-mode and shared-history documentation\n- /Volumes/Scratch/src/steipete--CodexBar/docs/cli.md:38 \u2014 public JSON usage documentation\n\n### Risks\n\nDocumentation can accidentally imply CodexBar supplies managed claude-swap rows, that old profiles remain launchable, or that the archive is a credential migration. `CLAUDE.md` must only retain guardrails an agent could still violate, and `CONTEXT.md` must stay a compact pure glossary rather than narrating implementation/history.\n\n### Test notes\n\nRun domain-doc lint, CLAUDE.md lint, retired-name checks, command/help descriptor tests, and the full three-suite gate. Verify every documented command against current help; do not add a live CLI invocation to automated tests.\n\n### Detailed phases\n\n1. Prune retired front-door, install, glossary, guardrail, skill, and naming content.\n2. Add the concise optional integration/fallback and archive operator procedure.\n3. Run docs/name/descriptor gates and the full suite, deleting stale test references rather than preserving dead terminology.\n\n### Alternatives\n\nA compatibility page for `keeper usage` was rejected because the clean break has no legacy UI. Duplicating ADR rationale into README/install was rejected by Keeper's docs discipline.\n\n### Non-functional targets\n\nKeep README lean, CONTEXT within its line/sentence constraints, CLAUDE.md below its size cap, and every forward-facing statement present-tense. No doc exposes email, private paths, or credential contents.\n\n### Rollout\n\nPublish these docs with the retiring code, then perform the archive as an explicit post-deploy operator step. If the smoke check fails, disable routing and diagnose before moving any state.\n\n## Acceptance\n\n- [ ] README, installation docs, glossary, guardrails, skills, and naming inventory contain no live instruction for the retired usage/profile system.\n- [ ] Documentation clearly distinguishes CodexBar's gate/ambient role from claude-swap's managed-account telemetry and execution role.\n- [ ] Start, resume, and restore are documented as independently balanced with no account affinity.\n- [ ] The private clean-break archive procedure is collision-safe, mode-restricted, and explicitly performs no credential import.\n- [ ] Domain-doc, CLAUDE.md, retired-name, CLI descriptor, fast, and full-suite gates pass.\n\n## Done summary\nPruned retired usage/profile guidance from README, CLAUDE.md, CONTEXT.md, docs/install.md, and docs/plan-name-retirement.md, and documented the surviving CodexBar+claude-swap account-routing system (keeper agent accounts check, independent per-launch selection, settings seeding, and the private clean-break archive procedure). ADR 0038 remains the sole rationale record. Note: plugins/prompt's parity golden-file test (panel-strength) fails pre-existing and unrelated to this task's files.\n## Evidence\n",
+      "task_id": "fn-1239-replace-usage-with-account-routing.7",
+      "tier": "high",
+      "title": "Prune account routing docs"
+    }
+  ],
+  "created_at": "2026-07-12T02:15:57.071000Z",
+  "epic_id": "fn-1239-replace-usage-with-account-routing",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1239-replace-usage-with-account-routing.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1239-replace-usage-with-account-routing.2"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1239-replace-usage-with-account-routing.3"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1239-replace-usage-with-account-routing.4"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1239-replace-usage-with-account-routing.5"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "unavailable",
+  "selector": {
+    "harness": "claude",
+    "model": "claude-fable-5"
+  }
+}
