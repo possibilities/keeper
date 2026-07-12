@@ -64,5 +64,5 @@ constraint. Update the byte-pinned argv goldens. No daemon/subprocess.
 - [ ] The byte-pinned launch-argv goldens are updated with the new carriers ordered after the escalation-role carrier, suites green.
 
 ## Done summary
-
+Inject the wrapped-cell marker (KEEPER_WRAPPED_CELL + KEEPER_WRAPPED_ENVELOPE) at the work launch boundary via a shared isWrappedCell predicate keyed on effective-cell driver, threaded through both the autopilot producer and the manual dispatch path as always-emit carriers. Native launches carry empty carriers; goldens updated, suites green.
 ## Evidence
