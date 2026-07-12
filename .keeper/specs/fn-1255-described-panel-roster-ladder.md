@@ -21,7 +21,7 @@ list-form file fails panel launches with a remediation error until then.
 
 - [ ] An object-form panel.yaml loads and launches; a legacy list-form panel fails loud with remediation naming /plan:panel-guidance.
 - [ ] `keeper agent presets list --json` emits per-panel strength + description with panels ordered weak→strong.
-- [ ] The committed 10-panel roster passes its structural gate and matches the approved ladder (default: workhorse, no haiku, efforts high/xhigh/max only).
+- [ ] The committed 10-panel roster passes its structural gate and matches the approved ladder (default: workhorse, no haiku, efforts high/xhigh/max only, and the premium GPT flagship gpt-5.6-sol reserved to a single high-effort slot in the ceiling panel).
 - [ ] /plan:panel-guidance exists slash-only with consistency pins green; vendor bake gate and all three test suites green.
 
 ## Early proof point
@@ -36,7 +36,7 @@ validated read in the presets-list emitter instead.
 - docs/adr/0033 — launch triples as panel members (unchanged by this epic)
 - plugins/plan/skills/model-guidance/SKILL.md + plugins/plan/scripts/model-guidance-check.ts — the skill/gate precedent (this epic drops the research/hash-parity half)
 - Upstream epic fn-1254-panel-strength-snippet-rubric rewrites the arthack-side snippet source this epic re-vendors; the dep edge exists because the re-vendor task reads the arthack checkout's default branch, which only carries the rewrite after that epic's finalize merge.
-- Planning-session verification: the roster below was validated against the live post-haiku cube via the real loader/resolver — 10 panels, 24 members, efforts 11 high / 10 xhigh / 3 max, zero low/medium.
+- Planning-session verification: the roster below was validated against the live post-haiku cube via the real loader/resolver — 10 panels, 24 members, efforts 12 high / 10 xhigh / 2 max, zero low/medium.
 
 ## Docs gaps
 

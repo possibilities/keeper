@@ -15,12 +15,14 @@ read the live cube via `keeper agent presets list --json` and the capability blo
 plugins/plan/model-selector.yaml (so panel descriptions never contradict model guidance);
 author or refresh the 10-rung weak→max ladder under the committed policy (10 panels, 2–3
 members, efforts high/xhigh/max only, closed band enum, at least one weak and one max rung,
-default naming a defined panel) and the description discipline — near-uniform lengths with
-"use for X, not Y" differentiators, weakness from model tier never from dropped effort,
-honest single-family and same-family caveats, and the weak-band "skip the panel entirely"
-semantics; write `plugins/plan/panel-selector.yaml`; run the structural gate; INSTALL the
-committed roster verbatim to `~/.config/keeper/panel.yaml` (the skill is the sole resync
-writer of the installed copy — byte-identical, `default` included); verify with `keeper
+the premium GPT flagship (gpt-5.6-sol) reserved to a single high-effort slot in the ceiling
+panel, default naming a defined panel) and the description discipline — near-uniform lengths
+with "use for X, not Y" differentiators, weakness from model tier never from dropped effort,
+the premium flagship kept to its one reserved ceiling slot rather than scattered across the
+strong rungs, honest single-family and same-family caveats, and the weak-band "skip the panel
+entirely" semantics; write `plugins/plan/panel-selector.yaml`; run the structural gate;
+INSTALL the committed roster verbatim to `~/.config/keeper/panel.yaml` (the skill is the sole
+resync writer of the installed copy — byte-identical, `default` included); verify with `keeper
 agent providers check` (the load-bearing cube check) and a presets-list read showing the
 ladder; commit the pass scoped to the roster and any pinned tests. Also extend the skills
 consistency suite with the new skill's pins (bare name, slash-only posture, tool grants,
@@ -51,6 +53,7 @@ Consistency pins only — the skill body is prose; no runtime harness executes i
 ## Acceptance
 
 - [ ] /plan:panel-guidance exists as a slash-only skill whose documented pass composes from the live cube and model-selector guidance, gates the committed roster, installs it verbatim to ~/.config/keeper/panel.yaml as sole resync writer, and verifies via providers check.
+- [ ] The skill's roster-authoring pass encodes the premium-flagship reserve policy — gpt-5.6-sol confined to a single high-effort slot in the ceiling panel — so a refresh does not re-scatter it across rungs.
 - [ ] The skills consistency suite pins the new skill (name, slash-only posture, tool grants, presence) and is green.
 
 ## Done summary

@@ -40,6 +40,11 @@ The committed roster (land byte-verbatim, including comments):
 # are GPT-only; claude participation starts at the light band. Cross-family
 # diversity (claude vs the GPT tiers) is the strength lever on the upper rungs —
 # two families disagreeing is the signal a panel exists to find.
+#
+# The premium GPT flagship (gpt-5.6-sol) is a RESERVE tier, not a default: it
+# appears exactly once, at high effort, in the ceiling panel. Its model tier
+# already sets the reasoning ceiling, so it earns a slot only where being
+# confidently wrong is costliest — never scattered across the strong rungs.
 
 default: workhorse
 
@@ -140,51 +145,55 @@ panels:
       answer anchors above inline work and being confidently wrong is expensive,
       but the question is focused enough that two deep independent legs suffice.
       Best cost/strength ratio on the strong end; go to `deep-duo` or higher when
-      you need flagship ceilings.
+      you need a third vote or the reserved flagship.
 
   deep-duo:
     strength: strong
     members:
       - claude::opus::xhigh
-      - codex::gpt-5.6-sol::xhigh
+      - codex::gpt-5.5::xhigh
     description: >-
-      Two flagships, cross-family, at xhigh — opus and the top GPT tier. For
+      Opus over a frontier-class GPT tier (gpt-5.5), cross-family at xhigh — two
+      deep reasoners without reaching for the reserved premium flagship. For
       genuinely hard questions: a subtle correctness or security invariant, a
       novel algorithm or design, a cross-cutting architectural call, an
       intermittent bug with competing root-cause hypotheses, long-horizon
-      planning. Both legs can actually resolve the hard part; their independent
-      agreement is high-confidence, their disagreement is exactly the signal you
-      convened the panel to find. Expensive and as slow as its slowest flagship.
+      planning. Both legs resolve the hard part; their independent agreement is
+      high-confidence, their disagreement is the signal you convened the panel to
+      find. Step up to triad or apex when a third vote earns its cost.
 
   triad:
     strength: strong
     members:
       - claude::opus::xhigh
-      - codex::gpt-5.6-sol::xhigh
+      - codex::gpt-5.6-terra::xhigh
       - pi::openai-codex/gpt-5.5::xhigh
     description: >-
-      The three-leg strong panel — opus plus two frontier GPT legs on distinct
-      harnesses, two families across all three harnesses, at xhigh. Adds a
-      decisive third vote and broader coverage over `deep-duo` for a hard question
-      with real branch risk — adversarial design review, a schema/API/migration
-      contract, a security boundary — where a two-way split would leave you stuck.
-      The default choice when a hard question is also high-stakes but not
-      irreversible.
+      The three-leg strong panel — opus plus two distinct GPT tiers (a balanced
+      terra and a frontier-class gpt-5.5) on separate harnesses, two families
+      across all three harnesses, at xhigh. Adds a decisive third vote and wider
+      model coverage over `deep-duo` for a hard question with real branch risk —
+      adversarial design review, a schema/API/migration contract, a security
+      boundary — where a two-way split would leave you stuck. The default when a
+      hard question is high-stakes but not irreversible; apex adds the reserved
+      flagship above it.
 
   apex:
     strength: max
     members:
       - claude::opus::max
-      - codex::gpt-5.6-sol::max
+      - codex::gpt-5.6-sol::high
       - pi::openai-codex/gpt-5.5::max
     description: >-
-      The ceiling — three flagships across two families and all three harnesses,
-      every leg at max effort. The most cross-checking keeper can convene, and the
-      most expensive and slowest. Reserve it for decisions where confidently-wrong
-      is very expensive and hard to reverse: a security or data-integrity call, an
-      irreversible migration or wire contract, an architecture choice a whole epic
-      rides on. Overkill for anything a strong rung already covers — max effort has
-      diminishing returns on routine work.
+      The ceiling — opus and a frontier gpt-5.5 at max effort across two
+      harnesses, plus the one reserved slot for the premium GPT flagship
+      (gpt-5.6-sol), run at high because its tier already sets the ceiling and max
+      effort buys little for a lot. The most cross-checking keeper can convene,
+      and the most expensive and slowest. Reserve it for decisions where
+      confidently-wrong is very expensive and hard to reverse: a security or
+      data-integrity call, an irreversible migration or wire contract, an
+      architecture choice a whole epic rides on. Overkill for anything a strong
+      rung already covers.
 ```
 
 ### Investigation targets
@@ -213,7 +222,7 @@ either level) through the pure core with hand-built inputs.
 
 ## Acceptance
 
-- [ ] `plugins/plan/panel-selector.yaml` carries the ten described panels and `default: workhorse` byte-for-byte as specified, with no haiku member and every effort in {high, xhigh, max}.
+- [ ] `plugins/plan/panel-selector.yaml` carries the ten described panels and `default: workhorse` byte-for-byte as specified, with no haiku member, every effort in {high, xhigh, max}, and gpt-5.6-sol appearing exactly once (at high effort, in the apex panel).
 - [ ] `bun plugins/plan/scripts/panel-guidance-check.ts --check` exits 0 on the committed roster, and the pure core rejects every enumerated policy-violation class.
 - [ ] The plan suite is green including the new consistency test.
 
