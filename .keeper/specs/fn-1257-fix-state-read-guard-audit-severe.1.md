@@ -24,5 +24,5 @@ Files:
 - [ ] A new state-read-guard test asserts both directions above.
 
 ## Done summary
-
+Exempted the sanctioned keeper plan seam from the state-read guard's Bash vector so a marked orchestrator's own AUDIT_SEVERE block (finding_ref audits path in --reason) is allowed, while genuine tree reads — including a read chained behind a plan invocation — stay denied. Added guard regression tests (classifier + subprocess ladder).
 ## Evidence
