@@ -22,8 +22,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AGENT_HELP as BUS_AGENT_HELP,
   armLifetimeStdin,
+  AGENT_HELP as BUS_AGENT_HELP,
   buildPublishFrame,
   CHAT_NAMESPACE,
   emitJsonMessage,
@@ -38,14 +38,21 @@ import {
   pruneInbox,
   registerFrame,
   renderDecision,
+  renderMessageNotification,
   SPILL_MAX_AGE_MS,
   senderLabel,
   sendResultIsSuccess,
   sendSuccessMessage,
+  sendTransportIsAmbiguous,
   spillFileName,
   spillPointerLine,
   wakeResultLine,
 } from "../cli/bus";
+import {
+  BUS_ARTIFACT_REF_TAG,
+  BUS_ARTIFACT_REF_VERSION,
+  publishBusArtifact,
+} from "../src/bus-artifact";
 import type { WakeResult } from "../src/bus-wake";
 
 describe("parseBusArgv routing", () => {
@@ -58,13 +65,13 @@ describe("parseBusArgv routing", () => {
   });
 
   test("watch accepts only its machine transport flags", () => {
-    expect(
-      parseBusArgv(["watch", "--json", "--lifetime-stdin"]),
-    ).toEqual({ kind: "watch", json: true, lifetimeStdin: true });
+    expect(parseBusArgv(["watch", "--json", "--lifetime-stdin"])).toEqual({
+      kind: "watch",
+      json: true,
+      lifetimeStdin: true,
+    });
     expect(parseBusArgv(["watch", "--bogus"]).kind).toBe("usage");
-    expect(parseBusArgv(["watch", "--json", "--json"]).kind).toBe(
-      "usage",
-    );
+    expect(parseBusArgv(["watch", "--json", "--json"]).kind).toBe("usage");
   });
 
   test("resolve is gone → unknown verb usage", () => {
@@ -204,16 +211,37 @@ describe("registerFrame", () => {
 });
 
 describe("buildPublishFrame", () => {
-  test("send carries to + chat namespace + markdown payload, no claimed from", () => {
-    const f = buildPublishFrame("send", "hello", "bob");
+  test("send carries a typed artifact reference and a legacy-safe read instruction", () => {
+    const artifact = {
+      path: "/trusted/bus-artifacts/00000000000000000000000000000001",
+      ref: {
+        id: "00000000000000000000000000000001",
+        len: 5,
+        sha256:
+          "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      },
+    };
+    const f = buildPublishFrame("send", artifact, "bob");
     expect(f).toEqual({
       op: "publish",
       event: "send",
       namespace: CHAT_NAMESPACE,
       to: "bob",
-      payload: { media_type: "text/markdown", text: "hello" },
+      payload: {
+        media_type: "text/markdown",
+        text: "read /trusted/bus-artifacts/00000000000000000000000000000001",
+        t: "bus-artifact-ref",
+        v: 1,
+        id: "00000000000000000000000000000001",
+        len: 5,
+        sha256:
+          "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      },
     });
-    // Anti-spoof: the CLI never claims a `from` — the server stamps it.
+    expect(JSON.stringify(f)).not.toContain("hello");
+    expect(f.payload.text).toBe(
+      "read /trusted/bus-artifacts/00000000000000000000000000000001",
+    );
     expect((f as unknown as Record<string, unknown>).from).toBeUndefined();
   });
 });
@@ -409,7 +437,113 @@ describe("emitMessage (filesystem, sandboxed)", () => {
     }
   });
 
-  test("json mode keeps a multiline body in one physical record", () => {
+  test("new references render one read-only notification with no body preview", () => {
+    const base = mkdtempSync(join(tmpdir(), "bus-artifact-render-"));
+    const root = join(base, "bus-artifacts");
+    try {
+      const body = "TOP SECRET body that must never be previewed";
+      const artifact = publishBusArtifact(root, body);
+      const msg: InboundMessage = {
+        namespace: "chat",
+        event: "message",
+        from: { name: "alice", channel_id: "ch-1" },
+        ts: 0,
+        payload: {
+          media_type: "text/markdown",
+          text: `read ${artifact.path}`,
+          t: BUS_ARTIFACT_REF_TAG,
+          v: BUS_ARTIFACT_REF_VERSION,
+          ...artifact.ref,
+        },
+      };
+      const expected = `Agent Bus message from alice — read ${artifact.path}`;
+      expect(renderMessageNotification(msg, join(base, "inbox"), root)).toBe(
+        expected,
+      );
+      const out = captureStdout(() =>
+        emitJsonMessage(msg, join(base, "inbox"), root),
+      );
+      expect(out.trim().split("\n")).toHaveLength(1);
+      expect(JSON.parse(out)).toEqual({
+        type: "agent_bus_message",
+        line: expected,
+      });
+      expect(out).not.toContain(body);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("bad references fail loud without body fallback or untrusted path disclosure", () => {
+    const base = mkdtempSync(join(tmpdir(), "bus-artifact-render-"));
+    try {
+      const attackerPath = "/etc/passwd";
+      const msg: InboundMessage = {
+        namespace: "chat",
+        event: "message",
+        from: { name: "alice", channel_id: "ch-1" },
+        ts: 0,
+        payload: {
+          text: `read ${attackerPath}`,
+          t: BUS_ARTIFACT_REF_TAG,
+          v: BUS_ARTIFACT_REF_VERSION,
+          id: "../../etc/passwd",
+          len: 10,
+          sha256: "0".repeat(64),
+        },
+      };
+      const line = renderMessageNotification(
+        msg,
+        join(base, "inbox"),
+        join(base, "bus-artifacts"),
+      );
+      expect(line).toBe(
+        "Agent Bus message from alice — message artifact unavailable",
+      );
+      expect(line).not.toContain(attackerPath);
+      expect(line).not.toContain(msg.payload.text);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("a missing or corrupt artifact emits only metadata failure", () => {
+    const base = mkdtempSync(join(tmpdir(), "bus-artifact-render-"));
+    const root = join(base, "bus-artifacts");
+    try {
+      const artifact = publishBusArtifact(root, "hidden body");
+      const msg: InboundMessage = {
+        namespace: "chat",
+        event: "message",
+        from: { name: "alice", channel_id: "ch-1" },
+        ts: 0,
+        payload: {
+          text: `read ${artifact.path}`,
+          t: BUS_ARTIFACT_REF_TAG,
+          v: BUS_ARTIFACT_REF_VERSION,
+          ...artifact.ref,
+        },
+      };
+      const expected =
+        "Agent Bus message from alice — message artifact unavailable";
+      rmSync(artifact.path);
+      expect(renderMessageNotification(msg, join(base, "inbox"), root)).toBe(
+        expected,
+      );
+      writeFileSync(artifact.path, "corrupt");
+      const corruptLine = renderMessageNotification(
+        msg,
+        join(base, "inbox"),
+        root,
+      );
+      expect(corruptLine).toBe(expected);
+      expect(corruptLine).not.toContain("hidden body");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("json mode keeps a multiline legacy body in one physical record", () => {
     const dir = mkdtempSync(join(tmpdir(), "bus-emit-"));
     try {
       const msg: InboundMessage = {
@@ -534,6 +668,12 @@ describe("watch frame handling (no heartbeat)", () => {
 });
 
 describe("send result disposition (exit-0 successes vs exit-1 misses)", () => {
+  test("transport ambiguity begins only after publish and excludes server rejection", () => {
+    expect(sendTransportIsAmbiguous(false, false)).toBe(false);
+    expect(sendTransportIsAmbiguous(true, true)).toBe(false);
+    expect(sendTransportIsAmbiguous(true, false)).toBe(true);
+  });
+
   test("delivered and queued_for_wake are the exit-0 successes", () => {
     expect(sendResultIsSuccess("delivered")).toBe(true);
     expect(sendResultIsSuccess("queued_for_wake")).toBe(true);

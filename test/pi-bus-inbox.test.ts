@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import {
   BUS_WATCH_COMMAND,
-  claimBusInboxOwnership,
-  parseBusWatchRecord,
-  PiBusInboxController,
-  releaseBusInboxOwnership,
   type BusWatchChild,
+  claimBusInboxOwnership,
+  PiBusInboxController,
+  parseBusWatchRecord,
+  releaseBusInboxOwnership,
 } from "../plugins/keeper/pi-extension/bus-inbox";
 
 class FakeReadable extends EventEmitter {
@@ -201,5 +201,13 @@ describe("parseBusWatchRecord", () => {
         }),
       ),
     ).toBeNull();
+  });
+
+  test("passes a file-backed read notification without exposing body content", () => {
+    const line =
+      "Agent Bus message from alice — read /trusted/bus-artifacts/00000000000000000000000000000001";
+    const record = JSON.stringify({ type: "agent_bus_message", line });
+    expect(parseBusWatchRecord(record)).toBe(line);
+    expect(record).not.toContain("private message body");
   });
 });

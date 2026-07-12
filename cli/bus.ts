@@ -48,6 +48,18 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  type BUS_ARTIFACT_REF_TAG,
+  type BUS_ARTIFACT_REF_VERSION,
+  type BusArtifactRef,
+  decodeBusArtifactRef,
+  encodeBusArtifactRef,
+  type PublishedBusArtifact,
+  publishBusArtifact,
+  removeBusArtifact,
+  resolveBusArtifact,
+  resolveBusArtifactRoot,
+} from "../src/bus-artifact";
 import { loadChannels } from "../src/bus-db";
 import { parseRoleAddress, roleJobIds } from "../src/bus-identity";
 import {
@@ -89,7 +101,7 @@ const HELP = `keeper bus — Agent Bus command surface
 
 Usage:
   keeper bus list                         Show who is on the bus (JSON, informational)
-  keeper bus chat send <target> <msg|->   Message one agent (current or former name)
+  keeper bus chat send <target> <msg|->   Send a private file-backed message to one agent
   keeper bus wake <planner@epic>          Resume an offline epic-creator session so a
                                           queued escalation is redelivered (client-side)
   keeper bus watch                        Long-lived inbox subscriber
@@ -156,6 +168,7 @@ Wake an offline planner:
   reaping of 'agentbus' is owned by the separate cleanup system, NOT this verb.
 
 Notes:
+  - Message bodies are stored as private file-backed Bus artifacts.
   - <msg> of '-' reads the message body from stdin.
   - 'chat' is the first tenant; the wire carries a namespace axis for future tenants.
 
@@ -269,10 +282,12 @@ export function parseBusArgv(argv: string[]): BusCommand {
   }
 }
 
-/** The wire payload for a chat message (text/markdown is the chat tenant default). */
-export interface ChatPayload {
+/** The wire payload for a file-backed chat message. */
+export interface ChatPayload extends BusArtifactRef {
   media_type: string;
   text: string;
+  t: typeof BUS_ARTIFACT_REF_TAG;
+  v: typeof BUS_ARTIFACT_REF_VERSION;
 }
 
 /** A publish op frame (client → server). */
@@ -291,10 +306,18 @@ export interface PublishFrame {
  */
 export function buildPublishFrame(
   event: "send",
-  text: string,
+  artifact: PublishedBusArtifact,
   target?: string,
 ): PublishFrame {
-  const payload: ChatPayload = { media_type: "text/markdown", text };
+  const encoded = JSON.parse(encodeBusArtifactRef(artifact.ref)) as Pick<
+    ChatPayload,
+    "t" | "v" | "id" | "len" | "sha256"
+  >;
+  const payload: ChatPayload = {
+    media_type: "text/markdown",
+    text: `read ${artifact.path}`,
+    ...encoded,
+  };
   return {
     op: "publish",
     event,
@@ -310,7 +333,7 @@ export interface InboundMessage {
   event: string;
   from: { name: string | null; channel_id: string };
   ts: number;
-  payload: { text: string };
+  payload: { text: string; [key: string]: unknown };
 }
 
 /**
@@ -839,6 +862,22 @@ export interface SendResult {
   recipients: number;
 }
 
+class SendAttemptError extends Error {
+  constructor(
+    message: string,
+    readonly deliveryAmbiguous: boolean,
+  ) {
+    super(message);
+  }
+}
+
+export function sendTransportIsAmbiguous(
+  publishStarted: boolean,
+  serverRejected: boolean,
+): boolean {
+  return publishStarted && !serverRejected;
+}
+
 /**
  * Send a directed message. Connect → register (await ack so the server has bound
  * our authoritative identity) → publish → await the synchronous publish ack →
@@ -849,30 +888,41 @@ export interface SendResult {
 async function runSend(
   sockPath: string,
   event: "send",
-  text: string,
+  artifact: PublishedBusArtifact,
   target?: string,
 ): Promise<SendResult> {
-  return busRoundTrip<SendResult>(
-    sockPath,
-    (send, onFrame, resolve, reject) => {
-      onFrame((f) => {
-        if (f.type === "ack" && f.op === "register") {
-          // Identity bound — publish; the server replies a publish ack we await.
-          send(buildPublishFrame(event, text, target));
-        } else if (f.type === "ack" && f.op === "publish") {
-          resolve({
-            result: f.result as PublishResult,
-            recipients: typeof f.recipients === "number" ? f.recipients : 0,
-          });
-        } else if (f.type === "error") {
-          reject(new Error(`${f.code}: ${f.message}`));
-        }
-      });
-      // Send-only: bind identity for the `from` stamp without joining the
-      // registry or evicting the agent's live `watch` channel.
-      send(registerFrame(true));
-    },
-  );
+  let publishStarted = false;
+  let serverRejected = false;
+  try {
+    return await busRoundTrip<SendResult>(
+      sockPath,
+      (send, onFrame, resolve, reject) => {
+        onFrame((f) => {
+          if (f.type === "ack" && f.op === "register") {
+            // Identity bound — publish; the server replies a publish ack we await.
+            publishStarted = true;
+            send(buildPublishFrame(event, artifact, target));
+          } else if (f.type === "ack" && f.op === "publish") {
+            resolve({
+              result: f.result as PublishResult,
+              recipients: typeof f.recipients === "number" ? f.recipients : 0,
+            });
+          } else if (f.type === "error") {
+            serverRejected = true;
+            reject(new Error(`${f.code}: ${f.message}`));
+          }
+        });
+        // Send-only: bind identity for the `from` stamp without joining the
+        // registry or evicting the agent's live `watch` channel.
+        send(registerFrame(true));
+      },
+    );
+  } catch (err) {
+    throw new SendAttemptError(
+      (err as Error).message,
+      sendTransportIsAmbiguous(publishStarted, serverRejected),
+    );
+  }
 }
 
 /**
@@ -954,7 +1004,23 @@ export function pruneInbox(dir: string, nowMs: number = Date.now()): void {
 export function renderMessageNotification(
   msg: InboundMessage,
   inboxDir: string,
+  artifactRoot: string = resolveBusArtifactRoot(),
 ): string {
+  const decoded = decodeBusArtifactRef(JSON.stringify(msg.payload));
+  if (decoded.ok) {
+    const resolved = resolveBusArtifact(artifactRoot, decoded.ref);
+    if (!resolved.ok) {
+      return artifactFailureNotification(msg);
+    }
+    const line = `Agent Bus message from ${boundedSender(msg)} — read ${resolved.path}`;
+    return line.length <= NOTIFY_LINE_BUDGET
+      ? line
+      : artifactFailureNotification(msg);
+  }
+  if (decoded.reason !== "not-a-reference") {
+    return artifactFailureNotification(msg);
+  }
+
   const decision = renderDecision(msg);
   if (decision.kind === "inline") {
     return decision.line;
@@ -982,25 +1048,42 @@ export function renderMessageNotification(
   );
 }
 
-export function emitMessage(msg: InboundMessage, inboxDir: string): void {
-  process.stdout.write(`${renderMessageNotification(msg, inboxDir)}\n`);
+function boundedSender(msg: InboundMessage): string {
+  return senderLabel(msg.from)
+    .replace(/[\r\n]/g, " ")
+    .slice(0, 128);
+}
+
+function artifactFailureNotification(msg: InboundMessage): string {
+  return `Agent Bus message from ${boundedSender(msg)} — message artifact unavailable`;
+}
+
+export function emitMessage(
+  msg: InboundMessage,
+  inboxDir: string,
+  artifactRoot?: string,
+): void {
+  process.stdout.write(
+    `${renderMessageNotification(msg, inboxDir, artifactRoot)}\n`,
+  );
 }
 
 /** Pi's extension consumes one escaped notification per physical stdout line. */
-export function emitJsonMessage(msg: InboundMessage, inboxDir: string): void {
+export function emitJsonMessage(
+  msg: InboundMessage,
+  inboxDir: string,
+  artifactRoot?: string,
+): void {
   process.stdout.write(
     `${JSON.stringify({
       type: "agent_bus_message",
-      line: renderMessageNotification(msg, inboxDir),
+      line: renderMessageNotification(msg, inboxDir, artifactRoot),
     })}\n`,
   );
 }
 
 interface LifetimeInput {
-  once(
-    event: "end" | "close" | "error",
-    listener: () => void,
-  ): unknown;
+  once(event: "end" | "close" | "error", listener: () => void): unknown;
   resume(): unknown;
 }
 
@@ -1162,7 +1245,7 @@ function isInbound(f: Record<string, unknown>): boolean {
 /** Map a wire event envelope to the renderer's {@link InboundMessage}. */
 function toInbound(f: Record<string, unknown>): InboundMessage {
   const from = f.from as { name?: unknown; channel_id?: unknown };
-  const payload = f.payload as { text?: unknown };
+  const payload = f.payload as Record<string, unknown>;
   return {
     namespace: String(f.namespace ?? ""),
     event: String(f.event ?? ""),
@@ -1171,7 +1254,10 @@ function toInbound(f: Record<string, unknown>): InboundMessage {
       channel_id: String(from.channel_id ?? ""),
     },
     ts: typeof f.ts === "number" ? f.ts : 0,
-    payload: { text: typeof payload.text === "string" ? payload.text : "" },
+    payload: {
+      ...payload,
+      text: typeof payload.text === "string" ? payload.text : "",
+    },
   };
 }
 
@@ -1213,16 +1299,28 @@ export async function main(argv: string[]): Promise<void> {
     }
     case "send": {
       const text = await resolveMessage(cmd.message);
+      const artifactRoot = resolveBusArtifactRoot();
+      let artifact: PublishedBusArtifact;
+      try {
+        artifact = publishBusArtifact(artifactRoot, text);
+      } catch (err) {
+        return die((err as Error).message);
+      }
       let res: SendResult;
       try {
-        res = await runSend(sockPath, "send", text, cmd.target);
+        res = await runSend(sockPath, "send", artifact, cmd.target);
       } catch (err) {
+        if (!(err instanceof SendAttemptError) || !err.deliveryAmbiguous) {
+          removeBusArtifact(artifactRoot, artifact.ref.id);
+        }
+        // An ACK timeout after publish is ambiguous: retention owns its cleanup.
         return die((err as Error).message);
       }
       // `delivered` (live) and `queued_for_wake` (a planner@<epic> escalation
       // persisted for the offline creator) are the exit-0 successes; every other
       // result is a loud exit-1 miss.
       if (!sendResultIsSuccess(res.result)) {
+        removeBusArtifact(artifactRoot, artifact.ref.id);
         return die(sendErrorMessage(res.result, cmd.target));
       }
       process.stdout.write(
