@@ -35,5 +35,5 @@ bun scripts/lint-claude-md.ts; leave the vendor/bake drift gates untouched.
 - [ ] A new ADR records the self-read, sink-persist, advisory-guard decision cluster; problem-codes rows exist exactly when new typed codes shipped.
 
 ## Done summary
-
+Aligned plugins/plan/CLAUDE.md, README.md, CONTEXT.md, docs/problem-codes.md, and a new ADR (0047) with the restored self-read/sink-persist/advisory-guard contract: four hooks (adding the state-read guard), the per-task audit gate routed through gate-check/submit-task, and content-blind scoped accurately.
 ## Evidence
