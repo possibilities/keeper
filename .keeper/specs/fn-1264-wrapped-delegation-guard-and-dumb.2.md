@@ -76,5 +76,5 @@ any sibling allow). Inject the `TreeProbe`/fs seam; no real fs/daemon/subprocess
 - [ ] hooks.json wires the hook on Write/Edit/MultiEdit/Bash and its `description` enumerates it as the eighth hook.
 
 ## Done summary
-
+Add the eighth PreToolUse hook wrapped-guard.ts: a single-state total edit-denial for a marked wrapped work:worker subagent, denying all source-editing vectors (Edit/MultiEdit/NotebookEdit, in-tree Write, and a CVE-hardened positive-allowlist Bash decision) while permitting the delegation + keeper close-out surface. Wired into hooks.json (both matchers, enumerated 2d) with a table-driven decision-table test.
 ## Evidence
