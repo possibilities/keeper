@@ -40,5 +40,5 @@ it for a follow-up if churn stays high after retention lands.
 - [ ] Retention failures stay soft: an injected prune error never propagates out of the retention pass
 
 ## Done summary
-
+Added pruneControlMessagesOlderThan to bus-db.ts (namespace-scoped, oldest-first, bounded-batch prune reusing the existing (namespace,id) index) and wired it into bus-worker.ts's runRetentionPass under new CONTROL_RETENTION_HORIZON_MS (24h) / CONTROL_PRUNE_BATCH constants, fail-soft like the sibling message prune. Added namespace-isolation, queued-for-wake-immunity, batch-drain, and no-op tests in bus-db.test.ts.
 ## Evidence

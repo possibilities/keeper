@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "bounded bus control-row retention",
-  "updated_at": "2026-07-12T16:42:16.911000Z"
+  "updated_at": "2026-07-12T21:37:58.700000Z",
+  "worker_done_at": "2026-07-12T21:37:58.700000Z"
 }
