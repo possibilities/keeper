@@ -24,25 +24,12 @@
 // The pure cores (`checkModelGuidance` / `classifyModelGuidance`) are functions over
 // already-loaded data so the fast suite drives their failure modes in-process. The
 // model-guidance skill OWNS the config content — this only verifies.
-//
-// This script ALSO gates the cross-provider equivalence map
-// (../provider-equivalence.yaml, ADR 0047): `--check` runs its host-blind
-// structural + totality + opposite-family-proxy check alongside the selector
-// checks above (one combined report-or-exit); `--state` adds an `equivalence`
-// key to the envelope, reading its own totality/target-validity classification
-// from `src/provider_equivalence.ts` (the parallel pure coerce/check/state core
-// for that map).
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { loadHostMatrixV2 } from "../src/host_matrix.ts";
-import {
-  checkProviderEquivalenceFromDisk,
-  classifyProviderEquivalenceFromDisk,
-  type EquivalenceCheckResult,
-} from "../src/provider_equivalence.ts";
 import { loadYamlInput, parseYamlInput } from "../src/yaml_input.ts";
 
 /** Plan plugin root — model-selector.yaml sits here. */
@@ -663,22 +650,16 @@ export function classifyModelGuidanceFromDisk(
   });
 }
 
-function reportOrExit(
-  result: GuidanceCheckResult,
-  equivalence: EquivalenceCheckResult,
-): void {
-  if (result.ok && equivalence.ok) {
+function reportOrExit(result: GuidanceCheckResult): void {
+  if (result.ok) {
     process.stdout.write(
-      "model-guidance-check: config coerces; research hashes match references/; provider-equivalence map is well-formed\n",
+      "model-guidance-check: config coerces; research hashes match references/\n",
     );
     return;
   }
-  process.stderr.write("model-guidance-check: drift detected:\n");
+  process.stderr.write("model-guidance-check: selector config drifted:\n");
   for (const e of result.errors) {
     process.stderr.write(`  - ${e}\n`);
-  }
-  for (const e of equivalence.errors) {
-    process.stderr.write(`  - provider-equivalence: ${e}\n`);
   }
   process.exit(1);
 }
@@ -688,14 +669,7 @@ function main(argv: string[]): void {
   // default) runs the frozen drift gate. The model-guidance skill authors both.
   if (argv.includes("--state")) {
     process.stdout.write(
-      `${JSON.stringify(
-        {
-          ...classifyModelGuidanceFromDisk(),
-          equivalence: classifyProviderEquivalenceFromDisk(),
-        },
-        null,
-        2,
-      )}\n`,
+      `${JSON.stringify(classifyModelGuidanceFromDisk(), null, 2)}\n`,
     );
     return;
   }
@@ -705,7 +679,7 @@ function main(argv: string[]): void {
     );
     process.exit(2);
   }
-  reportOrExit(checkModelGuidanceFromDisk(), checkProviderEquivalenceFromDisk());
+  reportOrExit(checkModelGuidanceFromDisk());
 }
 
 if (import.meta.main) {

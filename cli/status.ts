@@ -33,7 +33,6 @@
  */
 
 import { parseArgs } from "node:util";
-import { isBoardWorkJob } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
 import {
   classifyDispatchFailure,
@@ -68,12 +67,8 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * `needs_human.instant_death_wall` count (the instant-death circuit breaker);
  * v7 drops the `needs_human.selection_reviews` count (close-time selection
  * grading retires — grading moves out-of-band); v8 adds the additive
- * `needs_human.finalize_suite_red` count (the merge-suite-gate finalize jam);
- * v9 adds the additive `in_flight.board_work_jobs` count — working Board-work
- * sessions only (autopilot/escalation dispatches), excluding the caller's own
- * session, distinct from `running_jobs` (every working job, supervising
- * session included). */
-export const STATUS_SCHEMA_VERSION = 9;
+ * `needs_human.finalize_suite_red` count (the merge-suite-gate finalize jam). */
+export const STATUS_SCHEMA_VERSION = 8;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -110,7 +105,6 @@ Examples:
   keeper status --json | jq .data.autopilot
   keeper status | jq '.data.drained, .data.jammed'
   keeper status --json | jq '.data.board.epics[].tasks[].dispatch_failure, .data.board.epics[].close.dispatch_failure'
-  keeper status --json | jq .data.in_flight.board_work_jobs  # safe-to-stop the daemon: 0 excludes this session
 `;
 
 // ---------------------------------------------------------------------------
@@ -186,13 +180,6 @@ export interface StatusData {
   in_flight: {
     pending_dispatches: number;
     running_jobs: number;
-    // Working Board-work sessions only (autopilot work/close + escalation
-    // unblock/deconflict/resolve/repair), excluding the caller's own session.
-    // Additive (v9) — the maintenance-window-safe count `running_jobs` can't
-    // give you: that one counts EVERY working job, so an interactive session
-    // (including the one asking) holds it open forever. Never rolled into
-    // `total`, which stays the pre-existing pending+running sum.
-    board_work_jobs: number;
     total: number;
   };
   needs_human: {
@@ -272,16 +259,11 @@ function tallyVerdicts(m: Map<string, Verdict>): VerdictTally {
  * Build the success status envelope from the readiness snapshot, the latched
  * boot header, and the sticky `dispatch_failures` rows. PURE — no socket, no
  * clock — so `test/status.test.ts` pins the shape against a fixture.
- *
- * `ownSessionId` (the caller's own `CLAUDE_CODE_SESSION_ID`, `null` when
- * unset) excludes the caller's own row from `in_flight.board_work_jobs` —
- * defaults to `null` so existing callers/fixtures are unaffected.
  */
 export function buildStatusEnvelope(
   snap: ReadinessClientSnapshot,
   boot: StatusBootInfo,
   dispatchFailures: readonly Row[],
-  ownSessionId: string | null = null,
 ): StatusEnvelope {
   // Resolve + classify each sticky `dispatch_failures` row to its board target
   // (a `work::` row → its task, a `close::` row — bare or worktree-mode-keyed →
@@ -349,9 +331,6 @@ export function buildStatusEnvelope(
   const runningJobs = [...snap.jobs.values()].filter(
     (j) => j.state === "working",
   ).length;
-  const boardWorkJobs = [...snap.jobs.values()].filter((j) =>
-    isBoardWorkJob(j, ownSessionId),
-  ).length;
   const pendingDispatches = snap.pendingDispatches.length;
   const inFlightTotal = pendingDispatches + runningJobs;
 
@@ -401,7 +380,6 @@ export function buildStatusEnvelope(
     in_flight: {
       pending_dispatches: pendingDispatches,
       running_jobs: runningJobs,
-      board_work_jobs: boardWorkJobs,
       total: inFlightTotal,
     },
     needs_human: {
@@ -515,9 +493,6 @@ export interface RunStatusDeps {
   connect?: ConnectFactory;
   /** Test clock forwarded to the give-up deadline. */
   now?: () => number;
-  /** The caller's own `CLAUDE_CODE_SESSION_ID` (`null` when unset), excluded
-   *  from `in_flight.board_work_jobs`. Defaults to `null`. */
-  ownSessionId?: string | null;
 }
 
 /**
@@ -550,12 +525,7 @@ export async function runStatus(
     // Absent (never null/empty) only if the flag were off; here it is always on,
     // so `?? []` is a belt-and-suspenders default the envelope treats as "no jam".
     const failures = snap.dispatchFailures ?? [];
-    const envelope = buildStatusEnvelope(
-      snap,
-      latestBoot,
-      failures,
-      deps.ownSessionId ?? null,
-    );
+    const envelope = buildStatusEnvelope(snap, latestBoot, failures);
     emitEnvelopeFormatted(envelope, deps, args.format);
   };
 
@@ -629,7 +599,6 @@ export async function main(argv: string[]): Promise<void> {
     writeStdout: (s) => process.stdout.write(s),
     writeStderr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
-    ownSessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null,
   });
 }
 

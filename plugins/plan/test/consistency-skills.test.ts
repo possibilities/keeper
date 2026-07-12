@@ -521,33 +521,21 @@ describe("close skill blocking-follow-up gate contract", () => {
 });
 
 // ---------------------------------------------------------------------------
-// close-planner: follow-up template stamps both tier and model, with the
-// full configured axes — derived from the required host matrix so axis drift
-// trips this pin instead of silently rotting the template.
+// close-planner: follow-up templates omit routing so only the trusted selector
+// can make the minted follow-up armable.
 // ---------------------------------------------------------------------------
 
 const CLOSE_PLANNER = join(REPO, "agents", "close-planner.md");
 
 describe.skipIf(!AGENTS_RENDERED)(
-  "close-planner follow-up template tier/model shape",
+  "close-planner follow-up assignment shape",
   () => {
-    const matrix = effectiveMatrix();
-
-    test("template block carries both `tier:` and `model:` lines with the full configured enums", () => {
+    test("template omits tier/model fields and states the unassigned contract", () => {
       const text = readFileSync(CLOSE_PLANNER, "utf-8");
-      const tierLine = new RegExp(
-        `tier: <${matrix.efforts.join("\\|")}>\\s+# REQUIRED`,
-      );
-      const modelLine = new RegExp(
-        `model: <${matrix.models.join("\\|")}>\\s+# REQUIRED`,
-      );
-      expect(text).toMatch(tierLine);
-      expect(text).toMatch(modelLine);
-    });
-
-    test("task-spec rules prose requires both tier and model", () => {
-      const text = readFileSync(CLOSE_PLANNER, "utf-8");
-      expect(text).toContain("`tier` and `model` are both required per task");
+      expect(text).toContain("tier/model omitted");
+      expect(text).toContain("Omit `tier` and `model`");
+      expect(text).not.toMatch(/^\s+tier:\s*</m);
+      expect(text).not.toMatch(/^\s+model:\s*</m);
     });
   },
 );

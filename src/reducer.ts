@@ -27,13 +27,7 @@ import {
   planVerbRefFromSpawnName,
 } from "./derivers";
 import { INSTANT_DEATH_BREAKER_REASON } from "./dispatch-failure-key";
-import {
-  epicIsCompleted,
-  profileNameForUsageId,
-  projectBasename,
-  resolveEpicDep,
-  usageIdForProfileName,
-} from "./epic-deps";
+import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
 import { allGatedRootsSeeded } from "./gated-roots";
 import { compileFnmatch, isGlobToken } from "./glob";
 import {
@@ -83,7 +77,6 @@ import type {
   SubagentDisposition,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
-import { asAccountState } from "./usage-scrape-runner";
 
 // Re-export the `WorktreeRepoStatus` / `LaneMerged` fold row contracts (now defined
 // on the pure verdict side) so existing `from "./reducer"` importers keep resolving.
@@ -3013,157 +3006,9 @@ function clearEmbeddedMonitorFactOnTerminal(
 }
 
 /**
- * Pre-flattened agentusage usage snapshot. The usage-worker carries every
- * projection-meaningful field in the synthetic `UsageSnapshot` event's `data`
- * blob; the reducer never re-reads the on-disk file. Freshness fields
- * (`fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
- * `last_skipped_fetch_at`) are filtered at the producer — including any here
- * would force a synthetic event on every fetch cycle.
- */
-interface UsageSnapshotPayload {
-  target: string | null;
-  multiplier: number | null;
-  session_percent: number | null;
-  session_resets_at: string | null;
-  week_percent: number | null;
-  week_resets_at: string | null;
-  sonnet_week_percent: number | null;
-  sonnet_week_resets_at: string | null;
-  codex_spark_session_percent: number | null;
-  codex_spark_session_resets_at: string | null;
-  codex_spark_week_percent: number | null;
-  codex_spark_week_resets_at: string | null;
-  // Envelope freshness / plan / stale-error axes.
-  status: string | null;
-  /**
-   * Coerced from the producer's bool|null to 1/0/null at extract time so the
-   * UPSERT binding matches the nullable INTEGER column. The wire shape stays
-   * boolean.
-   */
-  subscription_active: 1 | 0 | null;
-  /**
-   * Orthogonal account-state axis — one of the keeper-side `AccountState` values
-   * (`signed_out` / `no_subscription`), or null when subscribed / codex /
-   * pre-feature. Validated via `asAccountState` at extract time (garbage → null,
-   * never throws); NULL is the zero-event default. Stored opaque as TEXT.
-   */
-  account_state: string | null;
-  error_type: string | null;
-  error_message: string | null;
-  error_at: string | null;
-  /**
-   * Stable failure classification (one of the keeper-side `UsageErrorKind`
-   * values: `format_changed` / `panel_missing` / `scrape_failed` /
-   * `upstream_limited` / `runner_failed`). Stored opaque as TEXT; the producer
-   * (usage-worker) validates it before minting the event, so a malformed blob
-   * here folds to null. Older events that predate the field fold to null safely.
-   */
-  error_kind: string | null;
-  /**
-   * Rate-limit lift instant — ISO-8601 string carrying the soonest `resets_at`
-   * among windows at >=100% used; null when the profile is under every limit.
-   * Stored opaque as TEXT. Folds into `usage.rate_limit_lifts_at` on the
-   * percentage path; the rate-limit fan-out's UPDATE carves it out so a
-   * RateLimited fold cannot clobber a lift time.
-   */
-  lift_at: string | null;
-}
-
-function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
-  if (event.data == null || event.data.length === 0) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(event.data) as Partial<
-      Omit<UsageSnapshotPayload, "subscription_active">
-    > & { subscription_active?: unknown };
-    // bool|null → 1/0/null; non-booleans (including missing) fold to null.
-    const subRaw = parsed.subscription_active;
-    const subscriptionActive: 1 | 0 | null =
-      subRaw === true ? 1 : subRaw === false ? 0 : null;
-    return {
-      target: typeof parsed.target === "string" ? parsed.target : null,
-      multiplier:
-        typeof parsed.multiplier === "number" &&
-        Number.isInteger(parsed.multiplier)
-          ? parsed.multiplier
-          : null,
-      session_percent:
-        typeof parsed.session_percent === "number" &&
-        Number.isFinite(parsed.session_percent)
-          ? parsed.session_percent
-          : null,
-      session_resets_at:
-        typeof parsed.session_resets_at === "string"
-          ? parsed.session_resets_at
-          : null,
-      week_percent:
-        typeof parsed.week_percent === "number" &&
-        Number.isFinite(parsed.week_percent)
-          ? parsed.week_percent
-          : null,
-      week_resets_at:
-        typeof parsed.week_resets_at === "string"
-          ? parsed.week_resets_at
-          : null,
-      sonnet_week_percent:
-        typeof parsed.sonnet_week_percent === "number" &&
-        Number.isFinite(parsed.sonnet_week_percent)
-          ? parsed.sonnet_week_percent
-          : null,
-      sonnet_week_resets_at:
-        typeof parsed.sonnet_week_resets_at === "string"
-          ? parsed.sonnet_week_resets_at
-          : null,
-      codex_spark_session_percent:
-        typeof parsed.codex_spark_session_percent === "number" &&
-        Number.isFinite(parsed.codex_spark_session_percent)
-          ? parsed.codex_spark_session_percent
-          : null,
-      codex_spark_session_resets_at:
-        typeof parsed.codex_spark_session_resets_at === "string"
-          ? parsed.codex_spark_session_resets_at
-          : null,
-      codex_spark_week_percent:
-        typeof parsed.codex_spark_week_percent === "number" &&
-        Number.isFinite(parsed.codex_spark_week_percent)
-          ? parsed.codex_spark_week_percent
-          : null,
-      codex_spark_week_resets_at:
-        typeof parsed.codex_spark_week_resets_at === "string"
-          ? parsed.codex_spark_week_resets_at
-          : null,
-      status: typeof parsed.status === "string" ? parsed.status : null,
-      subscription_active: subscriptionActive,
-      // Account-state axis — `asAccountState` coerces garbage/absent → null and
-      // never throws, so a pre-v97 (field-absent) or malformed event re-folds to
-      // NULL byte-identically.
-      account_state: asAccountState(parsed.account_state),
-      error_type:
-        typeof parsed.error_type === "string" ? parsed.error_type : null,
-      error_message:
-        typeof parsed.error_message === "string" ? parsed.error_message : null,
-      error_at: typeof parsed.error_at === "string" ? parsed.error_at : null,
-      // Failure classification — null-safe string parse; older events that
-      // predate `error_kind` (and active/idle snapshots) fold to null safely.
-      error_kind:
-        typeof parsed.error_kind === "string" ? parsed.error_kind : null,
-      // Rate-limit lift instant — null-safe string parse; older events that
-      // predate `lift_at` fold to null safely.
-      lift_at: typeof parsed.lift_at === "string" ? parsed.lift_at : null,
-    };
-  } catch (err) {
-    console.error(
-      `keeper reducer: failed to parse usage snapshot blob for event id=${event.id} id=${event.session_id}: ${err}`,
-    );
-    return null;
-  }
-}
-
-/**
  * Decode one synthetic `SessionTelemetry` event's `data` blob (fn-1024) into the
- * six null-fallback telemetry fields, mirroring {@link extractUsageSnapshot}:
- * guarded `JSON.parse`, every field a type-checked null-fallback, NEVER throws.
+ * six null-fallback telemetry fields: guarded `JSON.parse`, every field a
+ * type-checked null-fallback, NEVER throws.
  * A malformed / empty blob folds to `null` (the arm no-ops); an
  * unknown-typed field folds to `null` individually so the COALESCE merge in the
  * `SessionTelemetry` jobs arm preserves whatever a prior snapshot wrote. The
@@ -3205,168 +3050,6 @@ export function extractSessionTelemetry(
     );
     return null;
   }
-}
-
-/**
- * Fold one synthetic `UsageSnapshot` event. Single-row UPSERT mirrors
- * {@link projectGitStatus}'s flat-row pattern — no read-modify-write, no
- * embedded arrays, no fan-out. The pk (`id`) rides in `event.session_id`
- * (the generic entity-key overload the synthetic-event pipeline uses);
- * payload fields ride in `event.data` (decoded by
- * {@link extractUsageSnapshot}).
- *
- * Bumps `last_event_id` + `updated_at` on every write. Re-fold deterministic:
- * the reducer NEVER re-reads the on-disk file.
- *
- * Reverse fan-out (UsageSnapshot ← profiles): the colocated
- * `last_rate_limit_at` + `last_rate_limit_session_id` columns are carved OUT of
- * the `ON CONFLICT DO UPDATE` clause so a `UsageSnapshot` re-fold can't clobber
- * the rate-limit annotation a prior `RateLimited` fan-out wrote. After the
- * UPSERT, a SELECT against the matching `profiles` row (joined on `profile_name
- * = usage.id`) stamps the current rate-limit state. NULL-safe when no profile
- * row exists; the `profile_name != ''` guard keeps the `''` sentinel out of the
- * join.
- */
-function projectUsageRow(db: Database, event: Event): void {
-  const id = event.session_id;
-  if (id == null || id.length === 0) {
-    return;
-  }
-  const snapshot = extractUsageSnapshot(event);
-  if (snapshot == null) {
-    return;
-  }
-  // Freshness stamp gate. `last_usage_fold_at` is the event `ts` ONLY on a
-  // SUCCESSFUL usage fold (status `"active"` or any per-window percent present)
-  // — NOT on idle/stale snapshots, which preserve the prior stamp via the
-  // COALESCE carve-out below so a wedged-ingestion warning keeps its meaning.
-  // The value is the event ts, never `Date.now()` — a wall-clock read would
-  // break re-fold determinism.
-  const hasUsagePercents =
-    snapshot.session_percent != null ||
-    snapshot.week_percent != null ||
-    snapshot.sonnet_week_percent != null ||
-    snapshot.codex_spark_session_percent != null ||
-    snapshot.codex_spark_week_percent != null;
-  const isSuccessfulFold = snapshot.status === "active" || hasUsagePercents;
-  const lastUsageFoldAt: number | null = isSuccessfulFold ? event.ts : null;
-  db.run(
-    `INSERT INTO usage (
-       id, target, multiplier, session_percent, session_resets_at,
-       week_percent, week_resets_at, sonnet_week_percent,
-       sonnet_week_resets_at, codex_spark_session_percent,
-       codex_spark_session_resets_at, codex_spark_week_percent,
-       codex_spark_week_resets_at, status, subscription_active,
-       account_state, error_type, error_message, error_at, error_kind,
-       rate_limit_lifts_at, last_usage_fold_at,
-       last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET
-       target = excluded.target,
-       multiplier = excluded.multiplier,
-       session_percent = excluded.session_percent,
-       session_resets_at = excluded.session_resets_at,
-       week_percent = excluded.week_percent,
-       week_resets_at = excluded.week_resets_at,
-       sonnet_week_percent = excluded.sonnet_week_percent,
-       sonnet_week_resets_at = excluded.sonnet_week_resets_at,
-       codex_spark_session_percent = excluded.codex_spark_session_percent,
-       codex_spark_session_resets_at = excluded.codex_spark_session_resets_at,
-       codex_spark_week_percent = excluded.codex_spark_week_percent,
-       codex_spark_week_resets_at = excluded.codex_spark_week_resets_at,
-       status = excluded.status,
-       subscription_active = excluded.subscription_active,
-       account_state = excluded.account_state,
-       error_type = excluded.error_type,
-       error_message = excluded.error_message,
-       error_at = excluded.error_at,
-       error_kind = excluded.error_kind,
-       -- fn-651: percentage path owns the lift instant; a re-snapshot
-       -- rewrites it cleanly. The rate-limit fan-out (RateLimited /
-       -- ApiError(kind='rate_limit')) carves this out of its UPDATE in
-       -- the opposite direction, so a rate-limit fold cannot clobber a
-       -- lift time the percentage path wrote.
-       rate_limit_lifts_at = excluded.rate_limit_lifts_at,
-       -- fn-651: freshness stamp. COALESCE preserves a prior successful
-       -- fold's stamp when the current fold is idle/stale (excluded value
-       -- is NULL). On a successful fold the excluded value is the event
-       -- ts, which overwrites the prior. The rate-limit fan-out carves
-       -- this out of its UPDATE for the same carve-out reason as
-       -- rate_limit_lifts_at.
-       last_usage_fold_at = COALESCE(excluded.last_usage_fold_at, usage.last_usage_fold_at),
-       last_event_id = excluded.last_event_id,
-       updated_at = excluded.updated_at`,
-    [
-      id,
-      snapshot.target,
-      snapshot.multiplier,
-      snapshot.session_percent,
-      snapshot.session_resets_at,
-      snapshot.week_percent,
-      snapshot.week_resets_at,
-      snapshot.sonnet_week_percent,
-      snapshot.sonnet_week_resets_at,
-      snapshot.codex_spark_session_percent,
-      snapshot.codex_spark_session_resets_at,
-      snapshot.codex_spark_week_percent,
-      snapshot.codex_spark_week_resets_at,
-      snapshot.status,
-      snapshot.subscription_active,
-      snapshot.account_state,
-      snapshot.error_type,
-      snapshot.error_message,
-      snapshot.error_at,
-      snapshot.error_kind,
-      snapshot.lift_at,
-      lastUsageFoldAt,
-      event.id,
-      event.ts,
-    ],
-  );
-  // Reverse fan-out: pull the current rate-limit annotation from the matching
-  // `profiles` row and stamp it onto the just-UPSERTed usage row. The join key
-  // `profileNameForUsageId(usage.id)` translates agentusage's `"default"` id to
-  // keeper's `''` default-profile sentinel. NULL-safe: a missing profile row
-  // leaves the columns NULL (the zero-event shape); a later `RateLimited`
-  // populates them via the forward fan-out. Pure function of the fold inputs +
-  // the in-transaction `profiles` row — re-fold deterministic.
-  const profileRow = db
-    .query(
-      `SELECT last_rate_limit_at, last_rate_limit_session_id
-         FROM profiles
-        WHERE profile_name = ?`,
-    )
-    .get(profileNameForUsageId(id)) as {
-    last_rate_limit_at: number | null;
-    last_rate_limit_session_id: string | null;
-  } | null;
-  db.run(
-    `UPDATE usage
-        SET last_rate_limit_at = ?,
-            last_rate_limit_session_id = ?
-      WHERE id = ?`,
-    [
-      profileRow?.last_rate_limit_at ?? null,
-      profileRow?.last_rate_limit_session_id ?? null,
-      id,
-    ],
-  );
-}
-
-/**
- * Fold one synthetic `UsageDeleted` tombstone. The usage-worker posts this when
- * an `<id>.json` file disappears; without it, {@link projectUsageRow}'s
- * UPSERT-only path would leak the final pre-delete snapshot row forever.
- *
- * The primary key (`id`) rides in `event.session_id`. An empty / missing pk is a
- * safe no-op — fold must never throw. DELETE is idempotent.
- */
-function retractUsageRow(db: Database, event: Event): void {
-  const id = event.session_id;
-  if (id == null || id.length === 0) {
-    return;
-  }
-  db.run("DELETE FROM usage WHERE id = ?", [id]);
 }
 
 // fn-907 retired two folds the new `TmuxTopologySnapshot` live-location fold
@@ -3961,9 +3644,9 @@ export function extractBuildSnapshot(
 
 /**
  * Fold one synthetic `BuildSnapshot` event into the `builds` projection. Flat
- * single-row UPSERT keyed on the builder NAME (`event.session_id`) — the
- * {@link projectUsageRow} pattern: no read-modify-write, no embedded arrays, no
- * fan-out. Payload rides in `event.data` (decoded by
+ * single-row UPSERT keyed on the builder NAME (`event.session_id`): no
+ * read-modify-write, no embedded arrays, no fan-out. Payload rides in
+ * `event.data` (decoded by
  * {@link extractBuildSnapshot}); a malformed/empty blob or empty pk folds to a
  * no-op (the cursor still advances in {@link applyEvent}). `updated_at` is the
  * event `ts`, never `Date.now()` — a wall-clock read would break re-fold
@@ -5312,7 +4995,6 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   worktree_mode: "worktree_mode",
   worktree_multi_repo: "worktree_multi_repo",
   codex_adoption: "codex_adoption",
-  worker_provider: "worker_provider",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -5357,17 +5039,6 @@ interface AutopilotConfigSetPayload {
    *  resolves to a concrete 0/1. No fold reads it — the codex adoption producer
    *  resolves an absent column `?? OFF` at read time. */
   codex_adoption?: number;
-  /** The durable worker-provider dispatch pin (docs/adr/0047), stored as TEXT —
-   *  the FIRST non-numeric config column. `"claude"` / `"codex"` pin every work
-   *  dispatch to that provider family; `null` clears the pin (unconstrained,
-   *  the byte-identical default). Present iff the patch touches it AND the raw
-   *  wire value is one of the three recognized members — an unrecognized value
-   *  (a typo, a stale enum member) drops the field entirely, preserving the
-   *  existing column, rather than coercing to a sentinel (unlike the numeric
-   *  fields above, silently clearing a dispatch pin is not the safe direction).
-   *  The RPC validator rejects a bad value loud before it ever reaches here;
-   *  this is a defensive backstop, never a throw. */
-  worker_provider?: "claude" | "codex" | null;
 }
 
 /**
@@ -5437,18 +5108,6 @@ function extractAutopilotConfigSetPayload(
       // producer resolves an absent column `?? OFF` at read time.
       patch.codex_adoption = raw === true ? 1 : 0;
     }
-    if ("worker_provider" in parsed) {
-      const raw = parsed.worker_provider;
-      // STRING ENUM, the first non-numeric config column: accept exactly
-      // `"claude"` / `"codex"` / `null`. Anything else (a typo, a number, a
-      // stale enum member) is NOT coerced to a sentinel — it drops the field
-      // entirely so the existing column survives untouched, matching the
-      // strict-mode discipline of `extractAutopilotModePayload` rather than the
-      // coerce-to-null tolerance the numeric fields above use.
-      if (raw === "claude" || raw === "codex" || raw === null) {
-        patch.worker_provider = raw;
-      }
-    }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;
   } catch (err) {
@@ -5489,13 +5148,7 @@ function foldAutopilotConfigSet(db: Database, event: Event): void {
     "created_at",
     "updated_at",
   ];
-  const insertVals: (number | string | null)[] = [
-    1,
-    1,
-    event.id,
-    event.ts,
-    event.ts,
-  ];
+  const insertVals: (number | null)[] = [1, 1, event.id, event.ts, event.ts];
   const setClauses: string[] = ["last_event_id = excluded.last_event_id"];
   for (const field of Object.keys(payload) as AutopilotConfigField[]) {
     const column = AUTOPILOT_CONFIG_COLUMNS[field];
@@ -8325,8 +7978,8 @@ function projectJobsRow(db: Database, event: Event): void {
         const spawnNameHistory =
           event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target, adopted)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target, adopted, account_route)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
@@ -8360,6 +8013,14 @@ function projectJobsRow(db: Database, event: Event): void {
              -- copies the event value verbatim and never synthesizes, so a NULL
              -- excluded leaves the prior value (NULL stays NULL, 1 stays 1).
              adopted = COALESCE(excluded.adopted, jobs.adopted),
+             -- v119 (fn-1239.3): latest-non-NULL-wins per-process account-route
+             -- attribution, mirroring config_dir/worktree/adopted. A resume
+             -- carrying a route (excluded.account_route non-NULL) re-stamps this
+             -- process's route; a resume that carried none (NULL) preserves the
+             -- prior launch's value. The fold copies the event value verbatim and
+             -- NEVER synthesizes one — so attribution stays observational and no
+             -- prior route ever binds a conversation or drives a later choice.
+             account_route = COALESCE(excluded.account_route, jobs.account_route),
              -- Schema v36: track config_dir's nullability — a resume carrying
              -- a NULL config_dir derives a NULL excluded.profile_name, so
              -- COALESCE preserves the seeded name (mirrors config_dir above).
@@ -8426,15 +8087,15 @@ function projectJobsRow(db: Database, event: Event): void {
             plan_verb,
             plan_ref,
             event.config_dir,
-            // NULL config_dir → NULL profile_name (NOT the `''`-collapse the
-            // profiles seed applies) so the column tracks `jobs.config_dir`'s
-            // own nullability under the resume COALESCE.
+            // NULL config_dir → NULL profile_name, so the column tracks
+            // `jobs.config_dir`'s own nullability under the resume COALESCE.
             event.config_dir == null ? null : projectBasename(event.config_dir),
             spawnNameHistory,
             event.worktree,
             event.harness,
             event.resume_target,
             event.adopted,
+            event.account_route,
             // The three trailing `?` bind the ADR-0013 lifecycle-stamp gate + set
             // value added to the ON CONFLICT DO UPDATE re-open above (state-CASE
             // gate, stamp-CASE gate, stamp value) — all the event ts. The DO
@@ -8444,18 +8105,6 @@ function projectJobsRow(db: Database, event: Event): void {
             ts,
             ts,
           ],
-        );
-        // Seed a visible `profiles` row for this session's `config_dir` bucket.
-        // `INSERT OR IGNORE` so the first seed wins. `COALESCE(?,'')` collapses a
-        // NULL config_dir into the `''` sentinel, matching the rate-limit
-        // fan-out's expression so a NULL-config session's later rate limit lands
-        // on the row it seeded here. `profile_name` is seeded from the same
-        // `projectBasename` the migrate backfill uses; the `profile_name != ''`
-        // guard on the usage<->profiles join keeps the `''` sentinel from
-        // cross-contaminating. Pure function of the event.
-        db.run(
-          `INSERT OR IGNORE INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?, ?)`,
-          [event.config_dir, projectBasename(event.config_dir), event.id, ts],
         );
         // Discharge-on-bind: fires on a spawn-INSERT OR a NULL->non-NULL heal
         // (a fork-seed row whose prior pair was NULL, now filled by the
@@ -9093,61 +8742,11 @@ function projectJobsRow(db: Database, event: Event): void {
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
-      // Profile-level rate-limit fan-out, gated on `kind === "rate_limit"` (other
-      // ApiErrorKind values are out of scope). Reads `config_dir` in-transaction;
-      // null-guarded (a rate_limit before SessionStart skips). Runs INDEPENDENTLY
-      // of the jobs UPDATE guard — a rate_limit on a terminal row still
-      // attributes to the profile. Last-write-wins (events fold id-ordered);
-      // `COALESCE(?,'')` matches the SessionStart seed's sentinel.
-      if (kind === "rate_limit") {
-        const profileRow = db
-          .query("SELECT config_dir FROM jobs WHERE job_id = ?")
-          .get(jobId) as { config_dir: string | null } | null;
-        if (profileRow != null) {
-          db.run(
-            `INSERT INTO profiles (config_dir, profile_name, last_rate_limit_at, last_rate_limit_session_id, last_event_id, updated_at)
-                  VALUES (COALESCE(?, ''), ?, ?, ?, ?, ?)
-             ON CONFLICT(config_dir) DO UPDATE SET
-               last_rate_limit_at = excluded.last_rate_limit_at,
-               last_rate_limit_session_id = excluded.last_rate_limit_session_id,
-               last_event_id = excluded.last_event_id,
-               updated_at = excluded.updated_at`,
-            [
-              profileRow.config_dir,
-              projectBasename(profileRow.config_dir),
-              ts,
-              jobId,
-              event.id,
-              ts,
-            ],
-          );
-          // Forward fan-out: colocate the rate-limit annotation on the matching
-          // `usage` row (join key `usage.id = profiles.profile_name`). Pure
-          // UPDATE, never UPSERT — a rate_limit must not mint a phantom `usage`
-          // row for a profile agentusage isn't tracking; a missing row matches
-          // zero, and a later `UsageSnapshot` pulls the annotation back via the
-          // reverse fan-out. `usageIdForProfileName` maps the `''` sentinel to
-          // agentusage's `"default"` id so a default-account rate limit colocates
-          // on `usage.default`. The `last_event_id` bump is load-bearing (it
-          // drives the wire diff). Pure function of the fold inputs.
-          //
-          // CARVE-OUT: writes ONLY the rate-limit columns + bookkeeping; MUST NOT
-          // touch `rate_limit_lifts_at` / `last_usage_fold_at` (those ride the
-          // percentage path), so a rate-limit fold can't clobber a lift time or
-          // freshness stamp the UsageSnapshot fold wrote.
-          const profileName = projectBasename(profileRow.config_dir);
-          const usageId = usageIdForProfileName(profileName);
-          db.run(
-            `UPDATE usage
-                SET last_rate_limit_at = ?,
-                    last_rate_limit_session_id = ?,
-                    last_event_id = ?,
-                    updated_at = ?
-              WHERE id = ?`,
-            [ts, jobId, event.id, ts, usageId],
-          );
-        }
-      }
+      // Retired fn-1239 task .6: the profile-level rate-limit fan-out into the
+      // `profiles` / `usage` tables (gated on `kind === "rate_limit"`) is gone —
+      // both tables are DROPped at schema v120. The `(last_api_error_at,
+      // last_api_error_kind)` stamp above, and every other RateLimited/ApiError
+      // behavior, is unaffected.
       break;
     }
 
@@ -9906,9 +9505,16 @@ export function applyEvent(
     } else if (event.hook_event === "Commit") {
       foldCommit(db, event);
     } else if (event.hook_event === "UsageSnapshot") {
-      projectUsageRow(db, event);
+      // Retired fn-1239 task .6 — the `usage` projection is DROPped at schema
+      // v120. Fold to NO-OP so historical UsageSnapshot events advance the
+      // cursor without routing into the final `else` (`projectJobsRow`, which
+      // would misread `event.session_id` as a job id and corrupt the jobs
+      // projection). MUST stay an explicit empty arm for the same reason as
+      // the retired TmuxPaneSnapshot / WindowIndexSnapshot arms below. The
+      // producer no longer posts this kind; the historical events remain in
+      // the log forever.
     } else if (event.hook_event === "UsageDeleted") {
-      retractUsageRow(db, event);
+      // Retired fn-1239 task .6, mirroring the UsageSnapshot no-op above.
     } else if (event.hook_event === "SessionTelemetry") {
       // fn-1024: a jobs-ONLY telemetry fold. Route it to projectJobsRow (its
       // `case "SessionTelemetry"` arm folds onto the row keyed by
@@ -10283,7 +9889,7 @@ export function drain(
               plan_op, plan_target, plan_epic_id, plan_task_id,
               plan_subject_present, tool_use_id, config_dir, plan_files,
               backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-              worktree, harness, resume_target, adopted
+              worktree, harness, resume_target, adopted, account_route
          FROM events
         WHERE id > ?
         ORDER BY id ASC

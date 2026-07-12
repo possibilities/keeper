@@ -238,27 +238,20 @@ export function compactKeeperLane(branch: string): string {
   return `${LANE_GLYPH} ${compactEpic}--${compactPlanId(taskId)}`;
 }
 
-function accountLabel(account: string): string {
-  if (account === "") {
-    return "";
+/**
+ * Render a concise account-route label from the explicit `KEEPER_ACCOUNT_ROUTE`
+ * launch carrier the Claude account router injects — `default` (native ambient
+ * account) → `def`, `claude-swap:<slot>` (managed route) → `cs<slot>`. The value
+ * is the launcher's PII-free route id; an absent or unrecognized value renders
+ * nothing, so the label is PII-free by construction. Attribution is explicit —
+ * this NEVER inspects `CLAUDE_CONFIG_DIR` for an account identity.
+ */
+function accountLabel(route: string): string {
+  if (route === "default") {
+    return "def";
   }
-  const n =
-    account === "default" ? "0" : account.match(/^multi-claude-(\d+)$/)?.[1];
-  return n === undefined ? account : `c${n}`;
-}
-
-function resolveActiveProfile(env: NodeJS.ProcessEnv): string {
-  const explicit = (env.KEEPER_AGENT_CLAUDE_PROFILE ?? "").trim();
-  if (explicit !== "") {
-    return explicit;
-  }
-  const configDir = (env.CLAUDE_CONFIG_DIR ?? "").trim();
-  if (configDir === "") {
-    return "";
-  }
-  const parent = basename(dirname(configDir));
-  const name = basename(configDir);
-  return parent === ".claude-profiles" && name !== "" ? name : "";
+  const slot = route.match(/^claude-swap:(\d+)$/)?.[1];
+  return slot === undefined ? "" : `cs${slot}`;
 }
 
 function resolveGitBranch(
@@ -359,12 +352,11 @@ export function renderStatusline(
     }
   }
 
-  const activeProfile = resolveActiveProfile(env);
   const statusChunks: string[] = [];
   if ((env.ANTHROPIC_BASE_URL ?? "").startsWith("http://127.0.0.1:")) {
     statusChunks.push(`${theme.account}${NETWORK_GLYPH}`);
   }
-  const profile = accountLabel(activeProfile);
+  const profile = accountLabel((env.KEEPER_ACCOUNT_ROUTE ?? "").trim());
 
   if (input.version !== "") {
     let versionSeg = `${theme.version}${input.version}`;

@@ -492,3 +492,163 @@ describe("captureFromHandle — claude prefers the gated stop's text", () => {
     expect(envelope.message).toBe("the show-last-message text");
   });
 });
+
+// ---- pi resume: the stale-answer guard -------------------------------------
+//
+// `keeper agent run pi --resume <target>` mints a NEW session file whose copied
+// prior conversation is RE-STAMPED with resume-time timestamps. That defeats the
+// started-at window codex leans on (codex keeps original timestamps), so the
+// plain first-stop scan matched a copied stop within seconds and returned the
+// PRIOR turn's answer. The wait now anchors on a structural stop-count watermark;
+// the timed-out partial read cuts to the resumed turn's own prompt.
+
+// Resume-time timestamps: a fixed launch instant with the copied history + the
+// new turn ALL stamped at/after it, exactly as pi's re-stamp produces.
+const PI_STARTED_AT_MS = Date.parse("2026-07-11T15:00:45.000Z");
+const PI_RESUME_TS = "2026-07-11T15:00:45.869Z";
+const PI_NEW_TURN_TS = "2026-07-11T15:00:52.100Z";
+
+function piSession(id: string): unknown {
+  return { type: "session", id, cwd: CWD };
+}
+
+function piUser(text: string, ts = PI_RESUME_TS): unknown {
+  return {
+    timestamp: ts,
+    type: "message",
+    message: { role: "user", content: [{ type: "text", text }] },
+  };
+}
+
+/** A text-bearing assistant stop (`stopReason` present, non-toolUse). */
+function piAsstStop(text: string, ts = PI_RESUME_TS): unknown {
+  return {
+    timestamp: ts,
+    type: "message",
+    message: {
+      role: "assistant",
+      stopReason: "endTurn",
+      content: [{ type: "text", text }],
+    },
+  };
+}
+
+/** In-flight assistant text carrying NO stopReason — text but not a stop. */
+function piAsstText(text: string, ts = PI_NEW_TURN_TS): unknown {
+  return {
+    timestamp: ts,
+    type: "message",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  };
+}
+
+function piTurnCompleted(ts = PI_RESUME_TS): unknown {
+  return { timestamp: ts, type: "turn.completed" };
+}
+
+function writePiTranscript(path: string, lines: unknown[]): void {
+  writeFileSync(path, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+}
+
+function piResumePath(): string {
+  return join(mkdtempSync(join(tmpdir(), "pi-resume-")), "session.jsonl");
+}
+
+/** The copied prior conversation + the resumed turn's own prompt, all re-stamped
+ *  at resume time — the state of the file the instant the wait begins. */
+const PI_COPIED_HISTORY: unknown[] = [
+  piSession("resumed-sess"),
+  piUser("the first question"),
+  piAsstStop("PRE-RESUME ANSWER"),
+  piTurnCompleted(),
+  piUser("the resumed follow-up"),
+];
+
+function piWaitOpts(
+  path: string,
+  over: Partial<TranscriptWatchOptions>,
+): TranscriptWatchOptions & { transcriptPath: string } {
+  return {
+    agent: "pi",
+    cwd: CWD,
+    env: {},
+    homeDir: "/fake-home",
+    startedAtMs: PI_STARTED_AT_MS,
+    sessionId: "resumed-sess",
+    transcriptPath: path,
+    pollIntervalMs: 10,
+    stopTimeoutMs: 2000,
+    ...over,
+  };
+}
+
+describe("pi resume — stale-answer guard", () => {
+  test("waits past the re-stamped copied stop, returns the NEW turn's answer", async () => {
+    const path = piResumePath();
+    writePiTranscript(path, PI_COPIED_HISTORY);
+
+    // The wait samples its floor SYNCHRONOUSLY (before its first poll yields), so
+    // the new turn's stop landing right after is deterministically past the floor.
+    const waitPromise = waitForTranscriptStop(
+      piWaitOpts(path, { isResume: true }),
+    );
+    writePiTranscript(path, [
+      ...PI_COPIED_HISTORY,
+      piAsstStop("POST-RESUME ANSWER", PI_NEW_TURN_TS),
+      piTurnCompleted(PI_NEW_TURN_TS),
+    ]);
+
+    const outcome = await waitPromise;
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      // The bug returned "PRE-RESUME ANSWER" here (first re-stamped stop in win).
+      expect(outcome.stop.message).toBe("POST-RESUME ANSWER");
+    }
+  });
+
+  test("a FRESH pi wait (isResume false) is byte-identical: first in-window stop", async () => {
+    // The SAME re-stamped file, but a fresh launch — the plain first-stop scan is
+    // exactly today's behavior, proving the watermark is gated on resume alone.
+    const path = piResumePath();
+    writePiTranscript(path, [
+      piSession("fresh-sess"),
+      piUser("q"),
+      piAsstStop("FIRST ANSWER"),
+      piTurnCompleted(),
+    ]);
+    const outcome = await waitForTranscriptStop(
+      piWaitOpts(path, { isResume: false, sessionId: "fresh-sess" }),
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.stop.message).toBe("FIRST ANSWER");
+    }
+  });
+
+  test("findLastMessage (timed-out path) does not resurface the copied answer with no new text yet", () => {
+    // The resumed turn has its prompt but produced no assistant text yet — a
+    // whole-file scan surfaces the copied PRIOR answer as "latest".
+    const path = piResumePath();
+    writePiTranscript(path, PI_COPIED_HISTORY);
+
+    // Whole-file scan (fresh semantics) DOES resurface the stale copied answer.
+    expect(findLastMessage("pi", path).text).toBe("PRE-RESUME ANSWER");
+
+    // Resume-aware: cut to this turn's own prompt — nothing after it, so no stale
+    // answer is returned (found:false rather than the copied text).
+    const resumed = findLastMessage("pi", path, { isResume: true });
+    expect(resumed.found).toBe(false);
+    expect(resumed.text).toBeNull();
+  });
+
+  test("findLastMessage (timed-out path) returns the resumed turn's partial, not the copied answer", () => {
+    const path = piResumePath();
+    writePiTranscript(path, [
+      ...PI_COPIED_HISTORY,
+      piAsstText("the new partial so far"),
+    ]);
+    const resumed = findLastMessage("pi", path, { isResume: true });
+    expect(resumed.found).toBe(true);
+    expect(resumed.text).toBe("the new partial so far");
+  });
+});

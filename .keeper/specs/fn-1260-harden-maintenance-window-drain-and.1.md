@@ -30,5 +30,5 @@ Files: scripts/maintenance-window.ts (and its orchestration test file).
 - [ ] New/updated orchestration unit tests cover both paths via the injected seams; fast tier stays subprocess-free.
 
 ## Done summary
-
+Gated awaitDrain on both board_work_jobs and pending_dispatches reaching zero (F1), and stopped captureForensicsTerm from stripping LIKE wildcards so the term stays a literal substring search-history can match (F2); added pure unit tests for both via injected seams.
 ## Evidence

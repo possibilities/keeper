@@ -1,7 +1,8 @@
 /**
  * Codex launcher pins: `keeper agent codex` uses Codex-native CLI contracts
- * instead of forwarding Claude-only flags. Explicit/env profiles map to Codex
- * `--profile`; `model`/`effort` defaults become `--model` and
+ * instead of forwarding Claude-only flags. An explicit `--x-profile` maps to
+ * Codex's native `--profile` (there is no `KEEPER_AGENT_PROFILE` env-forcing —
+ * that mechanism is retired); `model`/`effort` defaults become `--model` and
  * `-c model_reasoning_effort="..."`; admin subcommands pass through.
  */
 
@@ -97,8 +98,6 @@ describe("Codex command assembly", () => {
       threadName: "proj-001",
       expectedCwd: "/fake-home/code/proj",
     });
-    expect(h.deps.env.KEEPER_AGENT_CODEX_PROFILE).toBe("default");
-    expect(h.deps.env.KEEPER_AGENT_CLAUDE_PROFILE).toBeUndefined();
     // The canonical AGENTS.md leaf-guard runs on interactive launches too.
     expect(h.codexStateSharingCalls).toHaveLength(1);
   });
@@ -128,7 +127,6 @@ describe("Codex command assembly", () => {
       ...DEFAULT_EFFORT,
       "hello",
     ]);
-    expect(h.deps.env.KEEPER_AGENT_CODEX_PROFILE).toBe("work");
   });
 
   test("native Codex --profile suppresses wrapper profile injection", async () => {
@@ -150,7 +148,7 @@ describe("Codex command assembly", () => {
     ]);
   });
 
-  test("env profile maps to Codex --profile", async () => {
+  test("KEEPER_AGENT_PROFILE env is retired — it no longer maps to Codex --profile", async () => {
     const h = codexHarness(["--x-no-confirm", "hello"], {
       env: { KEEPER_AGENT_PROFILE: "work" },
     });
@@ -158,12 +156,11 @@ describe("Codex command assembly", () => {
     expect(cmd).toEqual([
       h.deps.codexBin,
       ...CODEX_WRAPPER_DEFAULTS,
-      "--profile",
-      "work",
       ...DEFAULT_MODEL,
       ...DEFAULT_EFFORT,
       "hello",
     ]);
+    expect(cmd).not.toContain("--profile");
   });
 
   test("configured model and effort are injected before the Codex subcommand", async () => {

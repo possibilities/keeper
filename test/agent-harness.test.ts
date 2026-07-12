@@ -57,8 +57,6 @@ describe("harness registry — descriptor completeness", () => {
       expect(d.displayName.length).toBeGreaterThan(0);
       expect(typeof d.binaryName).toBe("string");
       expect(d.binaryName.length).toBeGreaterThan(0);
-      expect(typeof d.profileEnvVar).toBe("string");
-      expect(d.profileEnvVar.length).toBeGreaterThan(0);
       expect(SECOND_AXES.has(d.secondAxis)).toBe(true);
       expect(typeof d.capturable).toBe("boolean");
       expect(typeof d.mintsOwnSessionId).toBe("boolean");
@@ -99,19 +97,6 @@ describe("harness registry — descriptor completeness", () => {
     expect(HARNESS_DESCRIPTORS.codex.hookMechanism).toBe("codex-rollout-tail");
     expect(HARNESS_DESCRIPTORS.pi.hookMechanism).toBe("pi-extension");
     expect(HARNESS_DESCRIPTORS.hermes.hookMechanism).toBe("none");
-    // Profile env vars are the KEEPER_AGENT_<X>_PROFILE names main() consumes.
-    expect(HARNESS_DESCRIPTORS.claude.profileEnvVar).toBe(
-      "KEEPER_AGENT_CLAUDE_PROFILE",
-    );
-    expect(HARNESS_DESCRIPTORS.codex.profileEnvVar).toBe(
-      "KEEPER_AGENT_CODEX_PROFILE",
-    );
-    expect(HARNESS_DESCRIPTORS.pi.profileEnvVar).toBe(
-      "KEEPER_AGENT_PI_PROFILE",
-    );
-    expect(HARNESS_DESCRIPTORS.hermes.profileEnvVar).toBe(
-      "KEEPER_AGENT_HERMES_PROFILE",
-    );
   });
 });
 

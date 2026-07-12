@@ -80,7 +80,6 @@ function makeHarness(): Harness {
       board: mkHandler("board"),
       jobs: mkHandler("jobs"),
       git: mkHandler("git"),
-      usage: mkHandler("usage"),
       autopilot: mkHandler("autopilot"),
       builds: mkHandler("builds"),
       frames: mkHandler("frames"),
@@ -224,7 +223,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("board")).toBe(true);
     expect(isSubcommand("jobs")).toBe(true);
     expect(isSubcommand("git")).toBe(true);
-    expect(isSubcommand("usage")).toBe(true);
+    expect(isSubcommand("usage")).toBe(false);
     expect(isSubcommand("autopilot")).toBe(true);
     expect(isSubcommand("builds")).toBe(true);
     expect(isSubcommand("dash")).toBe(true);
@@ -245,6 +244,27 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("bus")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
+  });
+
+  test("the retired usage command is absent from parsing, help, and descriptors", async () => {
+    const h = makeHarness();
+    let caught: unknown;
+    try {
+      await dispatch(["usage"], h.deps);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ExitError);
+    expect((caught as ExitError).code).toBe(1);
+    expect(h.stderr.join("")).toContain("unknown subcommand 'usage'");
+    expect(SUBCOMMANDS).not.toContain("usage" as Subcommand);
+    expect(NATIVE_COMMANDS.map((command) => command.name)).not.toContain(
+      "usage",
+    );
+    expect(
+      buildHelpIndex().subcommands.map((command) => command.name),
+    ).not.toContain("usage");
+    expect(USAGE).not.toContain("  usage");
   });
 
   test("dispatch is a registered subcommand routed to its handler", async () => {

@@ -1326,57 +1326,6 @@ export function isKeeperDispatched(dispatchOrigin: string | null): boolean {
 }
 
 /**
- * Is `job` a currently-active Board-work session — an autopilot `work`/`close`
- * dispatch or an escalation `unblock`/`deconflict`/`resolve`/`repair` session
- * (see {@link isKeeperDispatched}) — other than the caller's own? A supervising
- * session is not reliably excluded by provenance alone: it can itself be a
- * `dispatch_origin==='autopilot'` row (e.g. a worker whose OWN task happens to
- * be driving some other check), so `ownSessionId` is a required exclusion, not
- * a defensive extra — mirrors {@link agentsIdleState}'s self-exclusion.
- */
-export function isBoardWorkJob(
-  job: Pick<Job, "job_id" | "state" | "dispatch_origin">,
-  ownSessionId: string | null,
-): boolean {
-  if (job.state !== "working") {
-    return false;
-  }
-  if (!isKeeperDispatched(job.dispatch_origin)) {
-    return false;
-  }
-  return ownSessionId === null || job.job_id !== ownSessionId;
-}
-
-/**
- * `board-work-idle` predicate — is any Board-work session (excluding the
- * caller's own) currently `state==='working'`? MET when none are — the signal
- * a maintenance-window operator needs to know the board is safe to stop,
- * distinct from a raw "every working job" count (which an interactive
- * session, including the one asking, would always hold open). Reads the whole
- * `jobs` collection with no cwd containment — unlike {@link agentsIdleState},
- * a maintenance window pauses the daemon as a whole, not one repo. Pure: no
- * I/O, no `Date.now()`.
- */
-export function boardWorkIdleState(
-  jobsRows: Iterable<Job>,
-  ownSessionId: string | null,
-): AwaitState {
-  let active = 0;
-  for (const job of jobsRows) {
-    if (isBoardWorkJob(job, ownSessionId)) {
-      active += 1;
-    }
-  }
-  if (active === 0) {
-    return { kind: "met", detail: "no board-work session active" };
-  }
-  return {
-    kind: "waiting",
-    detail: `${active} board-work session(s) active`,
-  };
-}
-
-/**
  * One `state==='working'` job the {@link drainedState} predicate weighs. The CLI
  * projects each working `jobs` row into this; the pure predicate applies the
  * scope's provenance + self-exclusion filter (never the CLI — the scope

@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 15,
+        "files_changed": 3,
+        "insertions": 279
+      },
+      "done_summary": "Anchor resumed-pi capture on a structural stop-count watermark: waitForTranscriptStop samples the prior-stop count when the wait begins and returns only a strictly-newer stop, so a re-stamped copied prior answer is never captured; findLastMessage cuts the timed-out partial read to this turn's own prompt. Fresh pi and claude/codex/hermes byte-unchanged.",
+      "input_hash": "021549009c5d03aad23b65aa7ba76dd05c2a72d219a738102ce5ea8a41839f27",
+      "model": "opus",
+      "spec_chars": 2746,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/agent/transcript-watch.ts, src/agent/pair-subcommands.ts, test/\n\n### Approach\n\nA resumed pi session's transcript file contains the full copied prior\nconversation re-stamped with resume-time timestamps, so timestamp-window\nfiltering cannot distinguish copied history from the new turn. Anchor the\nresumed-capture stop scan past the copied history structurally instead:\nidentify the resume boundary (this turn's own user prompt entry \u2014 the last\nuser entry at file appearance, or a count-prior-stops-at-launch watermark\nand wait for a strictly newer one) and accept only a stop after it. The\n`isResume` marker already threads through ResolvedHandle into\ntranscript-watch, so the change is pi-branch-local; claude forks a fresh\nchild session on resume and codex/hermes resolve differently \u2014 their scans\nmust stay byte-identical. Also verify `findLastMessage` (used by the\ntimed-out partial path), which scans the whole file by design, does not\nreintroduce the stale answer on the resumed-timeout path.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/agent/transcript-watch.ts findTranscriptStop (~:377) \u2014 the `eventMs < startedAtMs - START_SLOP_MS` skip that re-stamped copies defeat; pi/codex share the plain first-stop scan\n- src/agent/transcript-watch.ts findPiTranscriptInFiles (~:354) \u2014 pinned-id resolution finds the resumed file\n- src/agent/pair-subcommands.ts ResolvedHandle.isResume \u2014 the resume marker already threaded for codex's created-at floor\n- src/agent/run-capture.ts captureFromHandle \u2014 where the stale stop became a `completed` envelope\n- Observed repro (this session): resumed pi partner returned the byte-identical prior answer at 28.5s while the new turn ran on for minutes; new file `2026-07-11T15-00-45-869Z_935e4d92-*.jsonl` carried copied entries stamped 15:00:45+\n\n## Acceptance\n\n- [ ] A synthetic resumed pi transcript (copied history with fresh timestamps + a new\n      in-flight turn) does NOT capture until the new turn's stop lands, and then captures\n      the NEW answer \u2014 pinned by a regression test that fails on the current code.\n- [ ] A fresh (non-resume) pi capture and claude/codex/hermes capture behavior are\n      byte-identical to today (existing suites stay green).\n\n## Done summary\nAnchor resumed-pi capture on a structural stop-count watermark: waitForTranscriptStop samples the prior-stop count when the wait begins and returns only a strictly-newer stop, so a re-stamped copied prior answer is never captured; findLastMessage cuts the timed-out partial read to this turn's own prompt. Fresh pi and claude/codex/hermes byte-unchanged.\n## Evidence\n",
+      "task_id": "fn-1250-pi-resume-capture-stale-answer.1",
+      "tier": "xhigh",
+      "title": "anchor pi resume capture past copied history"
+    }
+  ],
+  "created_at": "2026-07-12T07:03:59.376000Z",
+  "epic_id": "fn-1250-pi-resume-capture-stale-answer",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "021549009c5d03aad23b65aa7ba76dd05c2a72d219a738102ce5ea8a41839f27",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

@@ -126,7 +126,6 @@ import {
   type PaneInfo,
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
-import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
 import { loadReadinessInputs } from "./readiness-inputs";
 import {
   buildPlannedLaunchSpec,
@@ -167,11 +166,7 @@ import {
 import { isPidAlive, runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
-import {
-  defaultShadowingWorkProbe,
-  providerRejectReason,
-  resolveWorkerCell,
-} from "./worker-cell";
+import { defaultShadowingWorkProbe, resolveWorkerCell } from "./worker-cell";
 import {
   ELIGIBLE_REASON,
   memoizedAssessRepo,
@@ -2082,19 +2077,6 @@ export interface DispatchedPayload {
   id: string;
   dir: string | null;
   ts: number;
-  /**
-   * The dispatched-cell translation forensics (ADR 0047), present ONLY for a
-   * cell-bearing `work` launch: the ASSIGNED cell, the EFFECTIVE cell that
-   * launched (equal to assigned when the `worker_provider` pin did not translate),
-   * and the CONSTRAINT (the pin that forced translation, else null). Recorded on
-   * the event `data` blob for event-log forensics; the reducer fold reads only
-   * `(verb, id, dir, ts)` and ignores this, so re-fold stays byte-identical.
-   */
-  cell?: {
-    assigned: { model: string; tier: string };
-    effective: { model: string; tier: string };
-    constraint: string | null;
-  };
 }
 
 /**
@@ -3236,10 +3218,6 @@ export async function confirmRunning(
   spec: LaunchSpec,
   signal: AbortSignal,
   deps: ConfirmRunningDeps,
-  // The dispatched-cell translation forensics (ADR 0047) recorded on the
-  // pre-launch `Dispatched` event data — present only for a cell-bearing `work`
-  // launch. Optional trailing arg so existing call sites are unaffected.
-  launchCell?: DispatchedPayload["cell"],
 ): Promise<ConfirmOutcome> {
   const key = dispatchKey(verb, id);
   // Watermark BEFORE launch: a re-open of a stale terminal row carries
@@ -3260,7 +3238,6 @@ export async function confirmRunning(
       id,
       dir: cwd === "" ? null : cwd,
       ts: deps.now(),
-      ...(launchCell !== undefined ? { cell: launchCell } : {}),
     });
   } catch {
     // Ack-wait rejected (timeout or shutdown). Abort without launching.
@@ -3619,19 +3596,13 @@ export async function runReconcileCycle(
     const cell = resolveWorkerCell(
       {
         pluginDir: plan.pluginDir,
-        // The EFFECTIVE cell (the `worker_provider`-translated one when the pin
-        // fired, else the assigned cell) so a missing/invalid reject names the cell
-        // that actually launches — `plan.pluginDir` already composes over it.
-        model: plan.dispatchedCellModel ?? plan.cellModel,
-        tier: plan.dispatchedCellTier ?? plan.tier,
+        model: plan.cellModel,
+        tier: plan.tier,
         ...(plan.pluginDirReject !== undefined
           ? { reject: plan.pluginDirReject }
           : {}),
         ...(plan.matrixReject !== undefined
           ? { matrixReject: plan.matrixReject }
-          : {}),
-        ...(plan.providerReject !== undefined
-          ? { providerReject: plan.providerReject }
           : {}),
       },
       {
@@ -3650,13 +3621,6 @@ export async function runReconcileCycle(
           reason =
             `worker-cell-bad-matrix: ${cell.state} — ${cell.detail} ` +
             "Then 'keeper retry-dispatch'.";
-          break;
-        // (1b) the `worker_provider` pin could not translate the assigned cell
-        //      into the pinned family (ADR 0047) — fail-closed, NEVER a fallback to
-        //      the assigned provider. Distinct reason per the three totality gaps a
-        //      stale map leaves at runtime; each names the cells + direction.
-        case "provider-reject":
-          reason = providerRejectReason(cell);
           break;
         // (2) an out-of-matrix {model, effort} the pure compose flagged.
         case "out-of-matrix":
@@ -3797,28 +3761,7 @@ export async function runReconcileCycle(
       worktreeLane,
       worktreeBranch,
       resolvedPluginDir,
-      // The `worker_provider`-translated dispatched cell + the pin (ADR 0047),
-      // null when unconstrained — the always-emitted KEEPER_PLAN_DISPATCHED_* env
-      // carriers ride the spec (empty on a byte-identical unconstrained launch).
-      plan.dispatchedCellModel ?? null,
-      plan.dispatchedCellTier ?? null,
-      plan.dispatchConstraint ?? null,
     );
-    // The dispatched-cell forensics recorded on the `Dispatched` event (ADR
-    // 0047) — {assigned, effective, constraint} for a cell-bearing `work` launch,
-    // effective === assigned when the pin did not translate. Cell-less launches
-    // (a `close` row, a task with no cell) carry none.
-    const launchCell: DispatchedPayload["cell"] =
-      plan.verb === "work" && plan.cellModel != null && plan.tier != null
-        ? {
-            assigned: { model: plan.cellModel, tier: plan.tier },
-            effective: {
-              model: plan.dispatchedCellModel ?? plan.cellModel,
-              tier: plan.dispatchedCellTier ?? plan.tier,
-            },
-            constraint: plan.dispatchConstraint ?? null,
-          }
-        : undefined;
     try {
       const outcome = await confirmRunning(
         plan.verb,
@@ -3828,7 +3771,6 @@ export async function runReconcileCycle(
         spec,
         signal,
         deps,
-        launchCell,
       );
       // CLEAR the cooldown only when nothing actually launched: a definitive
       // launch failure (`"failed"`) or a pre-launch abort
@@ -7219,26 +7161,6 @@ export async function loadReconcileSnapshot(
   )?.worktree_multi_repo;
   const worktreeMultiRepo: boolean = worktreeMultiRepoRaw === 1;
 
-  // The durable work-dispatch provider pin (`worker_provider`, ADR 0047) rides the
-  // SAME singleton row — NULL/absent (unconstrained, the byte-identical default) or
-  // a family (`"claude"`/`"codex"`) every cell-bearing `work` launch is translated
-  // into. Projection-pull only so a runtime `set_autopilot_config` lands the next
-  // cycle. Mirrors `projectWorkerProvider`'s coercion (only the two exact members
-  // pass; anything else is unconstrained). The equivalence map is loaded + reduced
-  // ONCE per cycle ONLY when a pin is active — an unconstrained cycle reads no map
-  // (zero fs) and never consults the fail-closed snapshot below. Fail-closed: a
-  // stale/broken map becomes a per-cell `map-malformed` launch reject, NEVER a
-  // thrown cycle crash.
-  const workerProviderRaw = (
-    autopilotRows[0] as { worker_provider?: unknown } | undefined
-  )?.worker_provider;
-  const workerProvider: "claude" | "codex" | null =
-    workerProviderRaw === "claude" || workerProviderRaw === "codex"
-      ? workerProviderRaw
-      : null;
-  const providerEquivalence =
-    workerProvider !== null ? loadProviderEquivalenceSnapshot() : undefined;
-
   const armedIds = new Set<string>();
   for (const row of read("armed_epics")) {
     const epicId = (row as { epic_id?: unknown }).epic_id;
@@ -7468,8 +7390,6 @@ export async function loadReconcileSnapshot(
     closeModel,
     closeEffort,
     hostMatrix,
-    workerProvider,
-    ...(providerEquivalence !== undefined ? { providerEquivalence } : {}),
     maxConcurrentJobs,
     maxConcurrentPerRoot,
     worktreeMode,

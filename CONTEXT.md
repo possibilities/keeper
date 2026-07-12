@@ -42,8 +42,9 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Wrapped cell**: A worker cell whose model claude does not serve natively; its worker is a claude wrapper that delegates implementation to the model's provider and owns the keeper close-out. Avoid: foreign cell, proxy worker, delegated task.
 - **Wrapper driver**: The fixed claude model-and-effort every wrapped cell's wrapper runs at, set in the host matrix config. Avoid: chaperone, host model.
 - **Baseline**: The daemon-computed suite result at a commit sha that a worker consults to attribute a test failure as pre-existing or self-inflicted. Avoid: cache, snapshot, golden.
-- **Audit depth**: The lean, standard, or deep band a close audit runs at, self-read by the quality-auditor from the close brief's plan signals through the audit policy (lean floor). Avoid: review level, thoroughness, rigor.
-- **Audited task**: A task whose selected tier is policy-flagged for review, parking AUDIT_READY instead of stamping done until a content-blind orchestrator's **audit gate** — typed refs, hashes, counts, and enums only, never a spec or a findings artifact — drives the task-scoped audit (the quality-auditor's per-task mode: no brief, implicitly lean, findings sink-persisted, a content-free finding-ref reply) to decide resume or escalation. Avoid: keystone task, gated task, flagged task, review gate, done gate, checkpoint, blind orchestrator.
+- **Audit depth**: The lean, standard, or deep band a close audit runs at, derived from plan signals through the audit policy. Avoid: review level, thoroughness, rigor.
+- **Audited task**: A task whose selected tier is policy-flagged for review, parking AUDIT_READY instead of stamping done until its audit clears. Avoid: keystone task, gated task, flagged task.
+- **Audit gate**: The block-machinery hold between a worker finishing and its done-stamp, where the task-scoped audit decides resume or escalation. Avoid: review gate, done gate, checkpoint.
 - **Blocking follow-up**: A follow-up epic the close audit requires to complete before its source epic may stamp done; the source stays open, holding every epic that depends on it. Avoid: gating epic, close blocker.
 
 ## Personal notes
@@ -103,6 +104,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 
 ## Bus, presence, and session surface
 - **Agent Bus**: The local message bus running agents use to talk to each other, joined by subscribing a watch channel. Avoid: pubsub, chat room, socket.
+- **Bus message artifact**: The private immutable file carrying one Agent Bus message's content while the bus carries only its confined reference; it remains readable through ordinary message retention and any queued-for-wake lifetime. Avoid: spill file, attachment, inline payload.
 - **Presence**: Being a live participant on the bus by holding an open watch subscription, not merely having sent a message. Avoid: online status, heartbeat, session.
 - **Tmux session**: The terminal-multiplexer container workers, viewers, and panels launch into; an unqualified "session" in a launch or dispatch context means this one. Avoid: workspace, window group, terminal.
 - **Harness session**: One persisted agent conversation with its own transcript and immutable harness-native id; jobs and forensics key on it, while its display title is never identity. Avoid: job, chat, conversation.
@@ -137,6 +139,7 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 
 ## Panels and launch triples
 - **Launch triple**: The context-free `<harness>::<model>::<effort>` token naming one launchable configuration — the harness-native model id carried verbatim, the effort translated to the harness's own axis; every well-formed triple is launchable, enumerated by the matrix but never gated by it. A capability absent from the Worker-cell eligibility list still enumerates as a launch triple — launch-only is per-capability, not per-provider. Avoid: preset, virtual preset, profile, model alias.
-- **Panel**: A named, ordered selection of launch triples convened to answer one question in parallel, each member blind to the others, with a judge fusing the answers; a duplicated member is a distinct leg. Its **panel strength** — capacity for independent cross-checking, read from member count and harness diversity — costs proportionally more and runs as slow as its slowest member. Avoid: ensemble, quorum, committee, level, size, tier.
+- **Panel**: A named, ordered selection of launch triples convened to answer one question in parallel, each member blind to the others, with a judge fusing the answers; a duplicated member is a distinct leg. Avoid: ensemble, quorum, committee.
+- **Panel strength**: A panel's capacity for independent cross-checking, read from its member count and harness diversity; a stronger panel costs proportionally more and runs as slow as its slowest member. Avoid: level, size, tier.
 - **Default panel**: The panel the config's top-level `default` pointer names, used whenever no panel is chosen; the reserved word `default` always resolves to it and is never a panel's own name. Avoid: fallback panel, primary panel, default level.
 - **Settled stop**: A transcript stop marker the capture stack accepts as terminal because the session shows no live background agents — children a session launches without blocking its turn, whose launch and finish the parent transcript records (distinct from a Reaper, keeper's own background sweep); an unsettled stop is deferred, bounded by the stop timeout. Avoid: final stop, quiescence, real stop.

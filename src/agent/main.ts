@@ -1,8 +1,8 @@
 /**
  * main() assembly — the launcher control flow, wiring the pure modules, the
  * state layer, and the process layer. Side-effecting collaborators (spawn, the
- * keystroke read, profile listing/picking, exit) are injected via `MainDeps` so
- * the whole flow is testable against a fake agent and a recording spawn.
+ * keystroke read, exit) are injected via `MainDeps` so the whole flow is
+ * testable against a fake agent and a recording spawn.
  */
 
 import { spawnSync } from "node:child_process";
@@ -18,6 +18,16 @@ import {
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  inspectRouting,
+  type RouteSelection,
+  type RoutingInspection,
+  selectRoute,
+} from "../account-router";
+import {
+  KEEPER_ACCOUNT_ROUTE_ENV,
+  resolveCswapCommand,
+} from "../account-routing-config";
 import {
   type BirthRecordDraft,
   buildBirthDraft,
@@ -36,7 +46,6 @@ import {
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
 import { runPanel } from "../pair/panel";
-import { DEFAULT_PROFILE, listProfiles, pickProfile } from "../usage-picker";
 import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
 import {
   type CodexSessionNameIndexerOptions,
@@ -77,6 +86,7 @@ import {
 } from "./harness";
 import {
   buildAgentLaunchArgv,
+  composeManagedClaudeArgv,
   FINAL_MESSAGE_DIRECTIVE,
   piExtensionArgs,
   READ_ONLY_DIRECTIVE,
@@ -146,17 +156,10 @@ import {
 } from "./run-capture";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
 import {
-  findShadowProfileDirs,
-  type ShadowProfileAgent,
-  type ShadowProfileFinding,
-} from "./shadow-profiles";
-import {
   defaultClaudeStowDir,
   defaultSharedStowDir,
   ensureClaudeStateSharing,
   ensureCodexStateSharing,
-  ensureKeeperAgentPiProfileDir,
-  ensureKeeperAgentProfileDir,
   ensurePiStateSharing,
   StateError,
 } from "./state-sharing";
@@ -190,8 +193,6 @@ export interface MainDeps {
   cwd: string;
   spawn: SpawnFn;
   readChar: () => string;
-  listProfilesFn: () => string[];
-  pickProfileFn: () => string;
   nextCwdOrdinalFn: (dirName: string) => number;
   randomUuid: () => string;
   /** Wall clock (ms), seam for deterministic run-capture `elapsed_seconds`. */
@@ -220,10 +221,14 @@ export interface MainDeps {
    * Required + validated; consulted only when a name is not a catalog preset.
    */
   loadPanelSelectionsFn: (catalog: PresetCatalog) => PanelSelections;
-  ensureClaudeStateSharingFn: (
-    listProfilesFn: () => string[],
-    actionLog: string[],
-  ) => void;
+  /**
+   * Re-assert Claude's canonical `~/.claude/CLAUDE.md` global-instruction link
+   * onto the one shared source. HOME-coupled, so a seam; `realDeps()` binds it
+   * against `homedir()` + `defaultClaudeStowDir()` + `defaultSharedStowDir()`.
+   * Claude's `settings.json` is install-time-seeded only — this never compares,
+   * repairs, or blocks a launch on its live drift.
+   */
+  ensureClaudeStateSharingFn: (actionLog: string[]) => void;
   /**
    * Re-assert codex's canonical `<CODEX_HOME|~/.codex>/AGENTS.md` link onto the one
    * shared source. HOME/env-coupled, so a seam; `realDeps()` binds it against
@@ -232,25 +237,14 @@ export interface MainDeps {
    * human-edited file never aborts the launch.
    */
   ensureCodexStateSharingFn: (actionLog: string[]) => void;
-  ensureKeeperAgentProfileDirFn: (
-    profileName: string,
-    trustPaths: string[] | null,
-    actionLog: string[] | null,
-  ) => [string, boolean];
-  ensurePiStateSharingFn: (
-    listProfilesFn: () => string[],
-    actionLog: string[],
-  ) => void;
-  ensureKeeperAgentPiProfileDirFn: (
-    profileName: string,
-    actionLog: string[] | null,
-  ) => [string, boolean];
   /**
-   * Read-only scan of `~/.claude-profiles` + `~/.pi-profiles` for shadow/stray
-   * dirs (the `profiles check` diagnostic). HOME-coupled, so injected: realDeps()
-   * binds the real `findShadowProfileDirs` against `homedir()`.
+   * Materialize Pi's canonical `~/.pi/agent` root and re-assert its canonical
+   * `AGENTS.md` global-instruction link onto the one shared source. HOME-coupled,
+   * so a seam; `realDeps()` binds it against `homedir()` + `defaultSharedStowDir()`
+   * + `process.env`. Runs unconditionally on every pi launch, passthrough
+   * included — there is no Keeper-owned Pi profile farm.
    */
-  findShadowProfileDirsFn: () => ShadowProfileFinding[];
+  ensurePiStateSharingFn: (actionLog: string[]) => void;
   /**
    * Read the host provider matrix from `matrix.yaml` (v2, ADR 0036) — REQUIRED,
    * never null: an absent/unparseable/empty/schema-invalid file throws the typed
@@ -330,6 +324,30 @@ export interface MainDeps {
     target: string,
     requireHarness?: HarnessName,
   ) => ResumeDecision;
+  /**
+   * Resolve the account route for one Claude launch (fresh / resume / restore) —
+   * the single Claude process-boundary decision. Reads the latest validated
+   * observation, records a short-lived launch reservation, and fails open to the
+   * native default on every uncertain path. Selection is INDEPENDENT per launch:
+   * no prior attribution or conversation identity participates. Injected so the
+   * launch path is testable without touching the real observation sidecar /
+   * ledger; `realDeps()` binds {@link selectRoute}.
+   */
+  selectAccountRouteFn: () => RouteSelection;
+  /**
+   * Read-only account-routing diagnostic behind `accounts check` — reports
+   * integration health, snapshot age, PII-free candidates, and the route policy
+   * would choose WITHOUT recording a reservation. `realDeps()` binds
+   * {@link inspectRouting}.
+   */
+  inspectRoutingFn: () => RoutingInspection;
+  /**
+   * The claude-swap executable a MANAGED route wraps the launch through
+   * (`cswap run <slot> --share-history -- <Claude argv…>`). `realDeps()` resolves
+   * it via `KEEPER_CSWAP_BIN` / PATH; a seam keeps the managed byte-pins path-
+   * independent.
+   */
+  cswapBin: string;
 }
 
 /** Parse a host YAML file to its raw body, or null when the file is absent (the
@@ -360,8 +378,6 @@ export function realDeps(): MainDeps {
     cwd: process.cwd(),
     spawn: defaultSpawn,
     readChar: readSingleChar,
-    listProfilesFn: listProfiles,
-    pickProfileFn: pickProfile,
     nextCwdOrdinalFn: nextCwdOrdinal,
     randomUuid: () => crypto.randomUUID(),
     now: () => Date.now(),
@@ -376,9 +392,8 @@ export function realDeps(): MainDeps {
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
     loadPanelSelectionsFn: () => loadPanelSelections(),
-    ensureClaudeStateSharingFn: (listProfilesFn, actionLog) =>
+    ensureClaudeStateSharingFn: (actionLog) =>
       ensureClaudeStateSharing(
-        listProfilesFn,
         actionLog,
         homedir(),
         defaultClaudeStowDir(),
@@ -391,25 +406,13 @@ export function realDeps(): MainDeps {
         process.env,
         defaultSharedStowDir(),
       ),
-    ensureKeeperAgentProfileDirFn: ensureKeeperAgentProfileDir,
-    ensurePiStateSharingFn: (listProfilesFn, actionLog) =>
+    ensurePiStateSharingFn: (actionLog) =>
       ensurePiStateSharing(
-        listProfilesFn,
         actionLog,
         homedir(),
         defaultSharedStowDir(),
         process.env,
       ),
-    ensureKeeperAgentPiProfileDirFn: (profileName, actionLog) =>
-      ensureKeeperAgentPiProfileDir(
-        profileName,
-        actionLog,
-        homedir(),
-        defaultSharedStowDir(),
-        process.env,
-      ),
-    findShadowProfileDirsFn: () =>
-      findShadowProfileDirs(listProfiles, homedir()),
     loadMatrixFn: loadMatrixV2,
     loadHostTriplesFn: () =>
       extractHostTriples(
@@ -436,6 +439,9 @@ export function realDeps(): MainDeps {
         target,
         requireHarness,
       ),
+    selectAccountRouteFn: () => selectRoute(),
+    inspectRoutingFn: () => inspectRouting(),
+    cswapBin: resolveCswapCommand(),
   };
 }
 
@@ -652,10 +658,6 @@ function printVerbose(
 
 function displayAgent(agent: AgentKind): string {
   return HARNESS_DESCRIPTORS[agent].displayName;
-}
-
-function agentProfileEnvName(agent: AgentKind): string {
-  return HARNESS_DESCRIPTORS[agent].profileEnvVar;
 }
 
 function findPassthroughForAgent(
@@ -1931,155 +1933,6 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
   return deps.exit(0);
 }
 
-/** `profiles check` JSON contract version. Bump only on a breaking shape change. */
-const PROFILES_CHECK_SCHEMA_VERSION = 1;
-
-/** `profiles check` exit when one or more shadow/stray dirs are found. */
-const PROFILES_CHECK_FOUND_EXIT = 9;
-
-type ProfilesCheckFindingKind =
-  | "auth-bearing-reserved-shadow"
-  | "reserved-shadow"
-  | "stray-auth"
-  | "stray"
-  | "tier-metadata-missing";
-
-/** Classify a finding into a stable category that drives its remediation. */
-function profilesCheckKind(f: ShadowProfileFinding): ProfilesCheckFindingKind {
-  if (f.tierUnresolved) {
-    return "tier-metadata-missing";
-  }
-  if (f.isReservedShadow) {
-    return f.hasAuth ? "auth-bearing-reserved-shadow" : "reserved-shadow";
-  }
-  return f.hasAuth ? "stray-auth" : "stray";
-}
-
-function profilesRootDisplay(agent: ShadowProfileAgent): string {
-  return agent === "claude" ? "~/.claude-profiles" : "~/.pi-profiles";
-}
-
-function canonicalAccountDisplay(agent: ShadowProfileAgent): string {
-  return agent === "claude" ? "~/.claude" : "~/.pi";
-}
-
-/** Stable per-finding remediation prose — keeper NEVER performs the move/delete. */
-function profilesCheckRemediation(
-  f: ShadowProfileFinding,
-  kind: ProfilesCheckFindingKind,
-): string {
-  const account = canonicalAccountDisplay(f.agent);
-  switch (kind) {
-    case "auth-bearing-reserved-shadow":
-      return (
-        `Auth-bearing reserved shadow: the '${f.name}' account lives in ${account}, ` +
-        `so this dir strands a login nothing reads. Re-home it into ${account} by hand — ` +
-        "keeper never moves it for you."
-      );
-    case "reserved-shadow":
-      return (
-        `Reserved shadow with no auth. Remove the empty dir once confirmed — ` +
-        "keeper never deletes it."
-      );
-    case "stray-auth":
-      return (
-        `Untracked dir holding auth. Re-home into ${account} or add '${f.name}' to ` +
-        "agentusage config.yaml profiles; keeper never moves it for you."
-      );
-    case "stray":
-      return (
-        `Untracked profile dir. Remove it or add '${f.name}' to agentusage config.yaml ` +
-        "profiles; keeper never deletes it."
-      );
-    case "tier-metadata-missing":
-      return (
-        `Authed but the tier is unresolvable: ${account}'s oauthAccount carries no ` +
-        "resolvable organizationRateLimitTier, so usage renders '?x' instead of the real " +
-        "multiplier. A /login restores the keychain but not the oauthAccount tier cache — " +
-        `re-home that metadata into ${account} (see the re-homing runbook); a persistent ` +
-        "'?x' means the step is still pending. keeper never edits it for you."
-      );
-  }
-}
-
-/**
- * `profiles check [--json]`: the read-only shadow/stray profile-dir diagnostic.
- * Scans `~/.claude-profiles` + `~/.pi-profiles` for reserved shadows
- * (`default`/`auto`) and untracked strays, surfacing a stable `id` + remediation
- * per finding so the JSON doubles as a runbook. Findings (data) go to stdout, the
- * summary (prose) to stderr. NEVER mutates the filesystem. Exit 0 = clean, 9 =
- * findings, 1 = tool error (the scan itself threw).
- */
-function runProfilesCheck(deps: MainDeps, json: boolean): never {
-  let findings: ShadowProfileFinding[];
-  try {
-    findings = deps.findShadowProfileDirsFn();
-  } catch (exc) {
-    deps.writeErr(`Error: profiles check failed: ${(exc as Error).message}\n`);
-    return deps.exit(1);
-  }
-
-  const enriched = findings.map((f) => {
-    const kind = profilesCheckKind(f);
-    // The tier-metadata finding is the native ~/.claude account, not a
-    // profiles-root dir: render the canonical path + a DISTINCT id so it never
-    // collides with a `claude:default` ~/.claude-profiles/default shadow.
-    const canonical = canonicalAccountDisplay(f.agent);
-    return {
-      id: f.tierUnresolved ? `${f.agent}:${canonical}` : `${f.agent}:${f.name}`,
-      agent: f.agent,
-      name: f.name,
-      path: f.tierUnresolved
-        ? canonical
-        : `${profilesRootDisplay(f.agent)}/${f.name}`,
-      kind,
-      hasAuth: f.hasAuth,
-      isReservedShadow: f.isReservedShadow,
-      tracked: f.tracked,
-      remediation: profilesCheckRemediation(f, kind),
-    };
-  });
-  // Count tier-metadata findings SEPARATELY from the auth-bearing-shadow tally:
-  // their prose differs ("re-home incomplete", not "a login nothing reads"),
-  // and a tier finding is authed but is not a stranded shadow.
-  const tierMissing = enriched.filter(
-    (f) => f.kind === "tier-metadata-missing",
-  ).length;
-  const authBearing = enriched.filter(
-    (f) => f.hasAuth && f.kind !== "tier-metadata-missing",
-  ).length;
-
-  if (json) {
-    deps.write(
-      `${JSON.stringify({
-        schema_version: PROFILES_CHECK_SCHEMA_VERSION,
-        findings: enriched,
-        summary: { total: enriched.length, authBearing, tierMissing },
-      })}\n`,
-    );
-    return deps.exit(enriched.length === 0 ? 0 : PROFILES_CHECK_FOUND_EXIT);
-  }
-
-  if (enriched.length === 0) {
-    deps.writeErr("profiles check: no shadow or stray profile dirs found.\n");
-    return deps.exit(0);
-  }
-
-  for (const f of enriched) {
-    deps.write(
-      `${f.path}  [${f.kind}]  hasAuth=${f.hasAuth} tracked=${f.tracked}\n`,
-    );
-    deps.write(`    ${f.remediation}\n`);
-  }
-  const tierNote =
-    tierMissing > 0 ? `, ${tierMissing} tier-metadata-missing` : "";
-  deps.writeErr(
-    `profiles check: ${enriched.length} finding(s) (${authBearing} auth-bearing${tierNote}). ` +
-      "Read-only — nothing was moved or deleted.\n",
-  );
-  return deps.exit(PROFILES_CHECK_FOUND_EXIT);
-}
-
 /** `providers` (host-matrix doctor) JSON contract version. */
 const PROVIDERS_SCHEMA_VERSION = 1;
 /** `providers resolve`: a wrapped model has no configured provider (no_route). */
@@ -2276,6 +2129,36 @@ function runProvidersCheck(deps: MainDeps): never {
   return deps.exit(
     fault ? PROVIDERS_CHECK_FAULT_EXIT : PROVIDERS_CHECK_DRIFT_EXIT,
   );
+}
+
+/**
+ * `accounts check [--json]`: the read-only account-routing diagnostic. Reports
+ * integration health, observation age, PII-free candidates, and the route the
+ * per-launch policy WOULD pick — WITHOUT recording a reservation or launching
+ * anything. A machine diagnostic (the `--json` snapshot the operator/tests
+ * consume), not a replacement usage viewer. Always exits 0: a disabled or absent
+ * integration is a reported state, not an error.
+ */
+function runAccountsCheck(deps: MainDeps, json: boolean): never {
+  const inspection = deps.inspectRoutingFn();
+  if (json) {
+    deps.write(`${JSON.stringify(inspection)}\n`);
+    return deps.exit(0);
+  }
+  deps.write(
+    `account routing: health=${inspection.health} ` +
+      `fresh=${inspection.fresh} enabled=${inspection.enabled}\n`,
+  );
+  deps.write(
+    `would choose: ${inspection.would_choose.id} ` +
+      `(${inspection.would_choose.reason})\n`,
+  );
+  for (const c of inspection.candidates) {
+    deps.write(
+      `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)}\n`,
+    );
+  }
+  return deps.exit(0);
 }
 
 /**
@@ -2521,14 +2404,14 @@ export async function main(deps: MainDeps): Promise<never> {
   if (dispatch.kind === "presets-list") {
     return runPresetsList(deps, dispatch.json);
   }
-  if (dispatch.kind === "profiles-check") {
-    return runProfilesCheck(deps, dispatch.json);
-  }
   if (dispatch.kind === "providers-resolve") {
     return runProvidersResolve(deps, dispatch.model, dispatch.effort);
   }
   if (dispatch.kind === "providers-check") {
     return runProvidersCheck(deps);
+  }
+  if (dispatch.kind === "accounts-check") {
+    return runAccountsCheck(deps, dispatch.json);
   }
   if (dispatch.kind === "resume") {
     return runResumeSubcommand(deps, dispatch.target, dispatch.rest);
@@ -2684,17 +2567,6 @@ export async function main(deps: MainDeps): Promise<never> {
     );
   }
 
-  if (!explicitLauncherProfile) {
-    const envProfile = (deps.env.KEEPER_AGENT_PROFILE ?? "").trim();
-    if (envProfile && envProfile !== "auto") {
-      launcherProfile = envProfile;
-      explicitLauncherProfile = true;
-      actionLog.push(
-        `Forced profile from KEEPER_AGENT_PROFILE env: ${envProfile}`,
-      );
-    }
-  }
-
   if (explicitLauncherProfile && launcherProfile) {
     actionLog.push(`Parsed --x-profile: ${launcherProfile}`);
     if (launcherProfile !== "auto") {
@@ -2785,11 +2657,6 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   };
 
-  let configuredProfiles: string[] = [];
-  if (agent !== "codex" && !shouldPassthrough) {
-    configuredProfiles = safeList(deps.listProfilesFn);
-  }
-
   if (!shouldPassthrough && !hasPrint && !launcherNoConfirm) {
     phase("check cwd is a project dir", () => {
       checkCwdInProjectRoot(
@@ -2810,7 +2677,7 @@ export async function main(deps: MainDeps): Promise<never> {
   if (agent === "claude") {
     try {
       phase("ensure shared Claude state", () => {
-        deps.ensureClaudeStateSharingFn(deps.listProfilesFn, actionLog);
+        deps.ensureClaudeStateSharingFn(actionLog);
       });
     } catch (exc) {
       if (exc instanceof StateError || exc instanceof ConfigError) {
@@ -2837,15 +2704,12 @@ export async function main(deps: MainDeps): Promise<never> {
       throw exc;
     }
   } else if (agent === "pi") {
-    // The canonical ~/.pi/agent/AGENTS.md leaf is asserted on EVERY pi launch
-    // (passthrough default-account launches included); the heavy per-profile
-    // farm stays gated on a real launch by feeding it no profiles on passthrough.
+    // The canonical ~/.pi/agent/AGENTS.md leaf is asserted on EVERY pi launch,
+    // passthrough default-account launches included — there is no Keeper-owned
+    // Pi profile farm to gate.
     try {
       phase("ensure shared Pi state", () => {
-        deps.ensurePiStateSharingFn(
-          shouldPassthrough ? () => [] : deps.listProfilesFn,
-          actionLog,
-        );
+        deps.ensurePiStateSharingFn(actionLog);
       });
     } catch (exc) {
       if (exc instanceof StateError) {
@@ -2880,48 +2744,6 @@ export async function main(deps: MainDeps): Promise<never> {
           `Added Codex profile override: --profile ${launcherProfile}`,
         );
       }
-    } else if (agent === "pi" && launcherProfile) {
-      let profileDir: string;
-      try {
-        const [dir, bootstrapped] = deps.ensureKeeperAgentPiProfileDirFn(
-          launcherProfile,
-          actionLog,
-        );
-        profileDir = dir;
-        if (bootstrapped) {
-          actionLog.push(`Bootstrapped Pi profile config: ${profileDir}`);
-        }
-      } catch (exc) {
-        if (exc instanceof StateError) {
-          deps.writeErr(`Error: ${exc.message}\n`);
-          return deps.exit(1);
-        }
-        throw exc;
-      }
-      deps.env.PI_CODING_AGENT_DIR = profileDir;
-      actionLog.push(`Set PI_CODING_AGENT_DIR=${profileDir}`);
-    } else if (agent === "claude" && launcherProfile) {
-      let profileDir: string;
-      try {
-        const trustPaths = [deps.cwd];
-        const [dir, bootstrapped] = deps.ensureKeeperAgentProfileDirFn(
-          launcherProfile,
-          trustPaths,
-          actionLog,
-        );
-        profileDir = dir;
-        if (bootstrapped) {
-          actionLog.push(`Bootstrapped profile config: ${profileDir}`);
-        }
-      } catch (exc) {
-        if (exc instanceof StateError) {
-          deps.writeErr(`Error: ${exc.message}\n`);
-          return deps.exit(1);
-        }
-        throw exc;
-      }
-      deps.env.CLAUDE_CONFIG_DIR = profileDir;
-      actionLog.push(`Set CLAUDE_CONFIG_DIR=${profileDir}`);
     }
 
     ptCmd.push(...remainingArgs);
@@ -3001,8 +2823,6 @@ export async function main(deps: MainDeps): Promise<never> {
       printVerbose(deps, actionLog, formatCommand(runCmd));
     }
 
-    deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
-
     if (sectionsOn) {
       deps.write("~ launching codex\n");
     }
@@ -3060,7 +2880,6 @@ export async function main(deps: MainDeps): Promise<never> {
     // but as pane env it survives the detached re-exec.
     deps.env.HERMES_ACCEPT_HOOKS = "1";
     actionLog.push("Set HERMES_ACCEPT_HOOKS=1");
-    deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
 
     if (launcherVeryVerbose) {
       printVerbose(deps, actionLog, formatCommand(runCmd));
@@ -3111,75 +2930,15 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  if (launcherProfile === "auto" && configuredProfiles.length === 1) {
-    const forced = configuredProfiles[0] as string;
-    const normalizedForced = normalizeKeeperAgentProfileArg(forced);
-    launcherProfile = normalizedForced;
-    actionLog.push(
-      `Forced profile from config list: ${forced}` +
-        (normalizedForced !== forced
-          ? ` (normalized to default ${agentLabel} account)`
-          : ""),
-    );
-  }
-
-  if (launcherProfile === "auto") {
-    const selected = phase(`auto-select ${agentLabel} profile`, () => {
-      try {
-        return deps.pickProfileFn();
-      } catch {
-        return DEFAULT_PROFILE;
-      }
-    });
-    launcherProfile = normalizeKeeperAgentProfileArg(selected);
-    actionLog.push(
-      `Auto-selected ${agentLabel} profile: ${selected}` +
-        (launcherProfile !== selected
-          ? ` (normalized to default ${agentLabel} account)`
-          : ""),
-    );
-  }
-
-  const profileDir = phase(
-    "link shared settings + profile dir",
-    (): string | null => {
-      if (!launcherProfile) {
-        return null;
-      }
-      try {
-        if (agent === "pi") {
-          const [dir, bootstrapped] = deps.ensureKeeperAgentPiProfileDirFn(
-            launcherProfile,
-            actionLog,
-          );
-          if (bootstrapped) {
-            actionLog.push(`Bootstrapped Pi profile config: ${dir}`);
-          }
-          return dir;
-        }
-        const trustPaths = [deps.cwd];
-        const [dir, bootstrapped] = deps.ensureKeeperAgentProfileDirFn(
-          launcherProfile,
-          trustPaths,
-          actionLog,
-        );
-        if (bootstrapped) {
-          actionLog.push(`Bootstrapped profile config: ${dir}`);
-        }
-        return dir;
-      } catch (exc) {
-        if (exc instanceof StateError) {
-          deps.writeErr(`Error: ${exc.message}\n`);
-          return deps.exit(1);
-        }
-        throw exc;
-      }
-    },
-  );
-  note(`profile: ${launcherProfile || "default"}`);
+  // The account router owns every Claude launch — there is no Keeper-owned
+  // profile dir for it to take. An explicit Claude --x-profile is parsed above
+  // but has no downstream effect: the account route is resolved unconditionally
+  // at the spawn boundary below (native default, or a claude-swap wrap). Pi has
+  // no profile system either — every pi launch runs against its one canonical
+  // account.
 
   // Build agent command.
-  const runCmd = [bin, ...remainingArgs];
+  let runCmd = [bin, ...remainingArgs];
   actionLog.push(`Built base ${agentLabel} command`);
 
   if (agent === "claude") {
@@ -3391,21 +3150,37 @@ export async function main(deps: MainDeps): Promise<never> {
     scrubInheritedClaudeSessionEnv(deps.env, actionLog);
   }
 
+  // ── Claude account routing — the single Claude process-boundary decision ──
+  // Every Claude start/resume/restore resolves an account route from the latest
+  // validated observation. Selection is INDEPENDENT per launch: no prior
+  // attribution or conversation identity participates (cross-account resume stays
+  // conversation-correct via claude-swap's --share-history). The router fails open
+  // to the native default whenever an integration is unavailable or balancing is
+  // disabled, so a native decision preserves the launch byte-for-byte. A managed
+  // decision wraps the already-built Claude argv in the public
+  // `cswap run <slot> --share-history -- <argv…>` contract, letting claude-swap
+  // own account isolation and the exec handoff. The PII-free route id rides
+  // KEEPER_ACCOUNT_ROUTE on BOTH paths — it survives claude-swap's same-account
+  // fast path, so route identity never depends on CLAUDE_CONFIG_DIR.
+  if (agent === "claude") {
+    const route = deps.selectAccountRouteFn();
+    deps.env[KEEPER_ACCOUNT_ROUTE_ENV] = route.id;
+    actionLog.push(`Resolved account route: ${route.id} (${route.reason})`);
+    note(`route: ${route.id}`);
+    if (route.kind === "managed" && route.slot !== null) {
+      runCmd = composeManagedClaudeArgv({
+        cswapBin: deps.cswapBin,
+        slot: route.slot,
+        nativeClaudeArgv: runCmd,
+      });
+      actionLog.push(`Routed through claude-swap slot ${route.slot}`);
+    }
+  }
+
   if (launcherVeryVerbose) {
     printVerbose(deps, actionLog, formatCommand(runCmd));
   }
 
-  // Profile auth — export the agent-native profile selector/config dir.
-  if (profileDir) {
-    if (agent === "pi") {
-      deps.env.PI_CODING_AGENT_DIR = profileDir;
-      actionLog.push(`Set PI_CODING_AGENT_DIR=${profileDir}`);
-    } else {
-      deps.env.CLAUDE_CONFIG_DIR = profileDir;
-      actionLog.push(`Set CLAUDE_CONFIG_DIR=${profileDir}`);
-    }
-  }
-  deps.env[agentProfileEnvName(agent)] = launcherProfile || "default";
   if (agent === "claude") {
     deps.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   }
@@ -3421,21 +3196,13 @@ export async function main(deps: MainDeps): Promise<never> {
     agent === "pi"
       ? armBirthRecord(deps, "pi", {
           spawnName: resolvedSessionName,
-          configDir: profileDir,
+          configDir: null,
           pinnedSessionId: sessionUuid,
           hasContinueOrResume,
           remainingArgs,
         })
       : undefined;
   return runWithJobControl(runCmd, deps.spawn, deps.exit, onChildSpawned);
-}
-
-function safeList(fn: () => string[]): string[] {
-  try {
-    return fn();
-  } catch {
-    return [];
-  }
 }
 
 /**

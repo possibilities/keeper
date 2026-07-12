@@ -5,8 +5,8 @@ description: >-
   and the daemon's projections — without hand-parsing files or guessing at
   schema. Use when you need to look something up in keeper's own state: "what
   did that session do", "when did this file last change", "which jobs are
-  running", "what's on the board", "read the dead letters / dispatch failures /
-  usage" — even when the user never says "keeper" or "query". Reaches for
+  running", "what's on the board", "read the dead letters / dispatch failures"
+  — even when the user never says "keeper" or "query". Reaches for
   stable JSON history verbs first, the live query/status projections second,
   and read-only sqlite last. NOT for investigate-and-route a code question
   (that is `/plan:hack`), NOT for hunting a bug in misbehaving code (that is
@@ -36,7 +36,7 @@ You need a fact out of keeper's own state:
 - *"what did session X do"*, *"replay that worker's tool calls"*
 - *"when did this file last change / who touched it"*
 - *"which jobs are running / failed / stuck"*, *"what's on the board"*
-- *"read the dead letters / dispatch failures / handoffs / usage"*
+- *"read the dead letters / dispatch failures / handoffs"*
 
 **Near-miss exclusions — these are NOT this skill:**
 
@@ -117,13 +117,13 @@ engineering/keeper-history-forensics` for the full recipe set.
 ## The query collections
 
 `keeper query --help` is the canonical, always-current list — read it rather
-than trusting this enumeration if they ever disagree. The read allowlist is 18
+than trusting this enumeration if they ever disagree. The read allowlist is 16
 collections:
 
 `armed_epics`, `autopilot_state`, `block_escalations`, `builds`, `dead_letters`,
 `dispatch_failures`, `epics`, `git`, `handoffs`, `jobs`, `lane_merged`,
-`pending_dispatches`, `profiles`, `scheduled_tasks`, `subagent_invocations`,
-`tmux_client_focus`, `usage`, `worktree_repo_status`.
+`pending_dispatches`, `scheduled_tasks`, `subagent_invocations`,
+`tmux_client_focus`, `worktree_repo_status`.
 
 `tasks` is a derived view layered on top (one row per open-epic task) — the most
 useful read of all, and what you want over `epics` for per-task detail. An

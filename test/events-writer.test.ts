@@ -22,6 +22,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  accountRouteFromEnv,
   backendExecCoordsFromEnv,
   buildEventBindings,
   configDirFromEnv,
@@ -799,6 +800,51 @@ test("worktreeBranchFromEnv: a trailing slash is NOT stripped (canonical ref, re
 });
 
 // ---------------------------------------------------------------------------
+// accountRouteFromEnv unit (schema v119 / fn-1239.3 — KEEPER_ACCOUNT_ROUTE)
+// ---------------------------------------------------------------------------
+
+test("accountRouteFromEnv: the native default route passes through", () => {
+  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "default" })).toBe(
+    "default",
+  );
+});
+
+test("accountRouteFromEnv: a managed claude-swap slot passes through", () => {
+  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "claude-swap:7" })).toBe(
+    "claude-swap:7",
+  );
+});
+
+test("accountRouteFromEnv: undefined / empty collapse to null (launcher supplied none)", () => {
+  expect(accountRouteFromEnv({})).toBeNull();
+  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "" })).toBeNull();
+});
+
+test("accountRouteFromEnv: an unrecognized shape is rejected to null (PII-free by construction)", () => {
+  // The value is untrusted env — only the two known PII-free shapes survive, so
+  // a path/email/arbitrary string can never be persisted as a route id.
+  expect(
+    accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "user@example.com" }),
+  ).toBeNull();
+  expect(
+    accountRouteFromEnv({
+      KEEPER_ACCOUNT_ROUTE: "/Users/x/.claude-profiles/multi-claude-3",
+    }),
+  ).toBeNull();
+  // A slot must be all digits — a non-numeric slot is not a valid route id.
+  expect(
+    accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "claude-swap:abc" }),
+  ).toBeNull();
+  // `default` must match exactly — no leading/trailing decoration.
+  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "default " })).toBeNull();
+});
+
+test("accountRouteFromEnv: an over-long value is rejected to null (size-bounded)", () => {
+  const huge = `claude-swap:${"9".repeat(200)}`;
+  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: huge })).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // backendExecCoordsFromEnv unit (schema v48 / fn-668 — every-event capture)
 // ---------------------------------------------------------------------------
 
@@ -1030,6 +1076,44 @@ test("SessionStart with an empty KEEPER_PLAN_WORKTREE_BRANCH (serial launch) fol
     { env: { KEEPER_PLAN_WORKTREE_BRANCH: "" } },
   );
   expect(b.worktree).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Record build — account_route SessionStart capture + gate (buildEventBindings)
+// ---------------------------------------------------------------------------
+
+test("SessionStart stamps account_route from KEEPER_ACCOUNT_ROUTE (managed slot)", () => {
+  const b = build(
+    { hook_event_name: "SessionStart", session_id: "sess-route-managed" },
+    { env: { KEEPER_ACCOUNT_ROUTE: "claude-swap:3" } },
+  );
+  expect(b.account_route).toBe("claude-swap:3");
+});
+
+test("SessionStart with a malformed KEEPER_ACCOUNT_ROUTE folds account_route NULL (bounded at capture)", () => {
+  // The untrusted env value is shape-bounded HERE, so a hostile string never
+  // reaches the fold — the row carries NULL, not the raw value.
+  const b = build(
+    { hook_event_name: "SessionStart", session_id: "sess-route-bad" },
+    { env: { KEEPER_ACCOUNT_ROUTE: "notimpossiblemike@gmail.com" } },
+  );
+  expect(b.account_route).toBeNull();
+});
+
+test("SessionStart with no KEEPER_ACCOUNT_ROUTE leaves account_route NULL (launcher supplied none)", () => {
+  const b = build({
+    hook_event_name: "SessionStart",
+    session_id: "sess-route-absent",
+  });
+  expect(b.account_route).toBeNull();
+});
+
+test("a non-SessionStart event leaves account_route NULL even when the env is set (SessionStart-gated, mirrors config_dir)", () => {
+  const b = build(
+    { hook_event_name: "UserPromptSubmit", session_id: "sess-route-ups" },
+    { env: { KEEPER_ACCOUNT_ROUTE: "default" } },
+  );
+  expect(b.account_route).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

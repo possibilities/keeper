@@ -1,0 +1,32 @@
+{
+  "auditable_tasks": [
+    {
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 24,
+        "files_changed": 2,
+        "insertions": 152
+      },
+      "done_summary": "Gated awaitDrain on both board_work_jobs and pending_dispatches reaching zero (F1), and stopped captureForensicsTerm from stripping LIKE wildcards so the term stays a literal substring search-history can match (F2); added pure unit tests for both via injected seams.",
+      "input_hash": "d97292abfae431f96f9bc50b46f2fa73bf161cad52b1a3c2063b6a7df019032d",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2091,
+      "spec_md": "## Description\n\nTwo edges in scripts/maintenance-window.ts, bundled here because they share\nthe file and the drain/verify orchestration theme and land as one commit.\n\nF1 (awaitDrain, maintenance-window.ts:416): the gate returns as soon as\nin_flight.board_work_jobs === 0, but pending_dispatches is a separate\nlaunch-window projection (src/readiness-inputs.ts:58) tracking workers already\nspawned but not yet bound. Pausing autopilot does not recall an open pending\ndispatch, so such a worker can bind (becoming a board-work job) in the poll gap\nbetween the gate reading zero and stopDaemon() booting keeperd, landing mid-RPC\nwhen the daemon stops. Also gate the drain on the launch-window count reaching\nzero (or the in_flight total), so the tool waits for a fully quiet board.\n\nF2 (captureForensicsTerm, maintenance-window.ts:352): the captured term does\n.replace(/[%_\\]/g, \"\") to strip LIKE wildcards, but cli/search-history.ts:136\nescapeLike ESCAPEs those same chars for a literal LIKE match. A prompt whose\nfirst 32 chars contain a literal % _ or \\ yields a stripped term that is no\nlonger a substring of the stored prompt, so the verify() forensics probe finds\nno match and spuriously fails an otherwise-successful reclaim. Escape rather\nthan strip (mirroring search-history), or drop the strip since search-history\nalready escapes, so the captured term stays a literal substring.\n\nFiles: scripts/maintenance-window.ts (and its orchestration test file).\n\n## Acceptance\n\n- [ ] awaitDrain does not return drained while a launch-window (pending) dispatch is still open.\n- [ ] The forensics verify probe matches a prompt containing a literal %, _, or \\ in its captured prefix.\n- [ ] New/updated orchestration unit tests cover both paths via the injected seams; fast tier stays subprocess-free.\n\n## Done summary\nGated awaitDrain on both board_work_jobs and pending_dispatches reaching zero (F1), and stopped captureForensicsTerm from stripping LIKE wildcards so the term stays a literal substring search-history can match (F2); added pure unit tests for both via injected seams.\n## Evidence\n",
+      "task_id": "fn-1260-harden-maintenance-window-drain-and.1",
+      "tier": "high",
+      "title": "Harden drain gate and verify probe"
+    }
+  ],
+  "created_at": "2026-07-12T07:04:37.596000Z",
+  "epic_id": "fn-1260-harden-maintenance-window-drain-and",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 1,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "d97292abfae431f96f9bc50b46f2fa73bf161cad52b1a3c2063b6a7df019032d",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

@@ -141,14 +141,6 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   // keeper paths so a bus-spawn test never strands them at production defaults.
   env.KEEPER_BUS_DB = join(tmpDir, "bus.db");
   env.KEEPER_BUS_SOCK = join(tmpDir, "bus.sock");
-  // Agentusage state root (fn-930): the usage-scraper writes `<id>.json`
-  // envelopes + the vendored picker writes its `picker.json` ledger here. A
-  // scrape/spawn test that left this unset would corrupt the human's real
-  // `~/.local/state/agentusage/`. `resolveUsageRoot()` reads this env first;
-  // in-process tests ALSO drive the vendored picker's `setStateDir(<this>)` so
-  // the ledger lands in the sandbox.
-  env.KEEPER_AGENTUSAGE_ROOT = join(tmpDir, "agentusage");
-
   // Drop any key whose value was cleared to undefined.
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;

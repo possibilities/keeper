@@ -12,8 +12,11 @@ import { runSink, type StatuslineLeaf } from "../cli/statusline-sink";
 
 const LANE_GLYPH = "⑂";
 const SEP = "∕";
-const PROFILE_DEFAULT = "c0";
-const PROFILE_ONE = "c1";
+// Account-route labels rendered from the explicit KEEPER_ACCOUNT_ROUTE carrier:
+// `default` → `def`, `claude-swap:<slot>` → `cs<slot>` (hand-derived from the
+// label rule — the independent source of truth, never re-derived by the code).
+const ROUTE_DEFAULT = "def";
+const ROUTE_MANAGED = "cs1";
 const NETWORK_GLYPH = "";
 
 function stripAnsi(s: string): string {
@@ -61,10 +64,10 @@ function fakeGit(projectName = "keeper", branch = "main", diff = "") {
 }
 
 describe("statusline render", () => {
-  test("uses the soft slash separator and renders version/profile last", () => {
+  test("uses the soft slash separator and renders version/account-route last", () => {
     const plain = stripAnsi(
       renderStatusline(payload("/Users/test/code/jobsearch"), {
-        env: { KEEPER_AGENT_CLAUDE_PROFILE: "default" },
+        env: { KEEPER_ACCOUNT_ROUTE: "default" },
         cwd: "/Users/test/code/jobsearch",
         palette: null,
         runGit: fakeGit("jobsearch"),
@@ -72,7 +75,7 @@ describe("statusline render", () => {
     );
 
     expect(plain).toBe(
-      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${SEP} ${PROFILE_DEFAULT}`,
+      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${SEP} ${ROUTE_DEFAULT}`,
     );
     expect(plain).not.toContain("❘");
     expect(plain).not.toContain("·");
@@ -108,12 +111,12 @@ describe("statusline render", () => {
     expect(plain).not.toContain("·");
   });
 
-  test("network and non-default profile ride in the final version segment", () => {
+  test("network and managed account-route ride in the final version segment", () => {
     const plain = stripAnsi(
       renderStatusline(payload(), {
         env: {
           ANTHROPIC_BASE_URL: "http://127.0.0.1:9123",
-          KEEPER_AGENT_CLAUDE_PROFILE: "multi-claude-1",
+          KEEPER_ACCOUNT_ROUTE: "claude-swap:1",
         },
         cwd: "/Users/test/code/keeper",
         palette: null,
@@ -122,8 +125,29 @@ describe("statusline render", () => {
     );
 
     expect(
-      plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} ${PROFILE_ONE}`),
+      plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} ${ROUTE_MANAGED}`),
     ).toBe(true);
+  });
+
+  test("an absent or unrecognized account route renders no account segment and never inspects CLAUDE_CONFIG_DIR", () => {
+    // No KEEPER_ACCOUNT_ROUTE carrier — the launcher supplied none. The label
+    // resolves to "" and the version segment ends at the version, with no
+    // trailing account chunk. A CLAUDE_CONFIG_DIR / KEEPER_AGENT_CLAUDE_PROFILE
+    // in the env is NEVER consulted for an account label (acceptance #4).
+    const plain = stripAnsi(
+      renderStatusline(payload(), {
+        env: {
+          CLAUDE_CONFIG_DIR: "/Users/test/.claude-profiles/multi-claude-2",
+          KEEPER_AGENT_CLAUDE_PROFILE: "multi-claude-2",
+        },
+        cwd: "/Users/test/code/keeper",
+        palette: null,
+        runGit: fakeGit("keeper"),
+      }),
+    );
+    expect(plain.endsWith("2.1.204")).toBe(true);
+    expect(plain).not.toContain("multi-claude-2");
+    expect(plain).not.toContain("c2");
   });
 
   test("help is a non-empty machine-command description", () => {

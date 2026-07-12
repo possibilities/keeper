@@ -52,9 +52,11 @@ export interface ResolvedHandle {
   /**
    * Resume marker threaded into transcript discovery: a resumed codex leg resolves
    * its PRE-EXISTING rollout by the known uuid (`sessionId`) rather than the
-   * fresh-launch created-at floor. claude/pi stay strict-pinned; every harness's
-   * stop-scan still anchors at `startedAtMs` so a pre-resume stop is skipped.
-   * Absent/false = fresh launch, byte-unchanged.
+   * fresh-launch created-at floor. claude/pi stay strict-pinned. codex/claude
+   * anchor the stop-scan at `startedAtMs` so a pre-resume stop is skipped; a
+   * resumed pi wait anchors on a structural stop-count watermark instead, since pi
+   * re-stamps its copied history with resume-time timestamps. Absent/false = fresh
+   * launch, byte-unchanged.
    */
   isResume?: boolean;
 }
@@ -337,7 +339,9 @@ export async function runShowLastMessage(
     return transcriptPathFailure(resolved.reason);
   }
   const transcriptPath = resolved.path;
-  const last = findLastMessage(handle.agent, transcriptPath);
+  const last = findLastMessage(handle.agent, transcriptPath, {
+    isResume: handle.isResume,
+  });
   return {
     ok: true,
     transcriptPath,

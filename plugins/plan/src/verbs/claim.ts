@@ -151,27 +151,6 @@ interface ClaimArgs {
   format: OutputFormat | null;
 }
 
-/** The dispatch-injected effective-cell env contract, shared with the dispatch
- * seam: launchers always emit the three vars, non-empty exactly when a
- * provider constraint translated the assigned cell. Reads dispatchConstraint
- * as the non-empty gate — model/tier ride along only when it fires. */
-function readDispatchConstraint(): {
-  dispatchedModel: string;
-  dispatchedTier: string;
-  dispatchConstraint: string;
-  constrained: boolean;
-} {
-  const dispatchedModel = process.env.KEEPER_PLAN_DISPATCHED_MODEL ?? "";
-  const dispatchedTier = process.env.KEEPER_PLAN_DISPATCHED_TIER ?? "";
-  const dispatchConstraint = process.env.KEEPER_PLAN_DISPATCH_CONSTRAINT ?? "";
-  return {
-    dispatchedModel,
-    dispatchedTier,
-    dispatchConstraint,
-    constrained: dispatchConstraint !== "",
-  };
-}
-
 export function runClaim(args: ClaimArgs): void {
   const { taskId, force, note, project, format } = args;
 
@@ -331,18 +310,6 @@ export function runClaim(args: ClaimArgs): void {
       evidence: "evidence" in merged ? merged.evidence : null,
       blocked_reason: null,
     };
-    // Capture the dispatched cell at claim time. saveRuntime overwrites the
-    // whole sidecar, so an unconstrained claim clearing stale values needs no
-    // explicit delete — simply not adding the keys here is enough. Never
-    // touches task.model/task.tier (the definition cells) or the selection
-    // sidecar.
-    const { dispatchedModel, dispatchedTier, dispatchConstraint, constrained } =
-      readDispatchConstraint();
-    if (constrained) {
-      newState.dispatched_model = dispatchedModel;
-      newState.dispatched_tier = dispatchedTier;
-      newState.dispatch_constraint = dispatchConstraint;
-    }
     stateStore.saveRuntime(taskId, newState);
 
     // Write the brief AFTER saveRuntime, inside the lock. A write failure leaves

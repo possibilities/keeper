@@ -34,6 +34,8 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import type { AccountObserverWorkerData } from "./account-observer-worker";
+import { resolveAccountRoutingRoot } from "./account-routing-config";
 import {
   type AdoptableCodexRollout,
   findAdoptableCodexRollouts,
@@ -131,7 +133,6 @@ import {
   resolveSingleInstanceLockPath,
   resolveSockPath,
   resolveStatuslineRoot,
-  resolveUsageRoot,
   runDispatchMintGate,
   truncateEphemeralProjections,
 } from "./db";
@@ -270,12 +271,6 @@ import type {
 } from "./transcript-worker";
 import type { Job, SessionTelemetryMessage } from "./types";
 import { FileLock } from "./usage-flock";
-import type { UsageScraperWorkerData } from "./usage-scraper-worker";
-import type {
-  UsageMessage,
-  UsageSnapshotMessage,
-  UsageWorkerData,
-} from "./usage-worker";
 import type {
   ShutdownMessage,
   WakeWorkerData,
@@ -3770,52 +3765,12 @@ export function withBootDrainCheckpointTuning(
 const MAX_DEAD_LETTER_FILE_BYTES = 16 * 1024 * 1024;
 
 /**
- * Serialize a `UsageSnapshotMessage` into the JSON string that rides in the
- * synthetic `UsageSnapshot` event's `data` blob. The reducer
- * (`extractUsageSnapshot`) decodes the same shape; every projection-meaningful
- * field MUST appear here or the corresponding `usage` column folds to NULL
- * forever. NOT serialized: `kind` (event-tag discriminator) and `id` (rides in
- * `events.session_id`, not the data blob). Slot order here is shape-tolerant;
- * the load-bearing order lives in `usage-worker.ts` `buildUsageMessage`.
- */
-export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
-  return JSON.stringify({
-    target: msg.target,
-    multiplier: msg.multiplier,
-    session_percent: msg.session_percent,
-    session_resets_at: msg.session_resets_at,
-    week_percent: msg.week_percent,
-    week_resets_at: msg.week_resets_at,
-    sonnet_week_percent: msg.sonnet_week_percent,
-    sonnet_week_resets_at: msg.sonnet_week_resets_at,
-    codex_spark_session_percent: msg.codex_spark_session_percent,
-    codex_spark_session_resets_at: msg.codex_spark_session_resets_at,
-    codex_spark_week_percent: msg.codex_spark_week_percent,
-    codex_spark_week_resets_at: msg.codex_spark_week_resets_at,
-    // Envelope freshness / plan / stale-error axes — forwarded so the
-    // reducer's UPSERT populates the columns instead of folding NULL.
-    status: msg.status,
-    subscription_active: msg.subscription_active,
-    account_state: msg.account_state,
-    error_type: msg.error_type,
-    error_message: msg.error_message,
-    error_at: msg.error_at,
-    error_kind: msg.error_kind,
-    // Rate-limit lift instant — folded into `usage.rate_limit_lifts_at`. The
-    // companion `last_usage_fold_at` freshness stamp is NOT serialized; the
-    // reducer derives it from the event `ts` (never a wall-clock read in a fold).
-    lift_at: msg.lift_at,
-  });
-}
-
-/**
  * Serialize a `SessionTelemetryMessage` into the JSON string that rides in the
  * synthetic `SessionTelemetry` event's `data` blob (fn-1024). The reducer
  * (`extractSessionTelemetry`) decodes the same shape; every projection-meaningful
  * field MUST appear here or the corresponding `jobs` column folds to NULL. NOT
  * serialized: `kind` (the event-tag discriminator) and `id` (rides in
- * `events.session_id`, not the data blob) — mirroring {@link
- * serializeUsageSnapshot}. A `null` field stays `null` on the wire so the fold's
+ * `events.session_id`, not the data blob). A `null` field stays `null` on the wire so the fold's
  * COALESCE merge preserves whatever a prior snapshot wrote.
  */
 export function serializeSessionTelemetry(
@@ -5395,6 +5350,7 @@ export const INGEST_EVENTS_COLUMNS = [
   "harness",
   "resume_target",
   "adopted",
+  "account_route",
 ] as const;
 
 /**
@@ -6653,10 +6609,9 @@ export type WorkerName =
   | "plan"
   | "exit"
   | "git"
-  | "usage"
   | "statusline"
   | "builds"
-  | "usageScraper"
+  | "accountObserver"
   | "deadLetter"
   | "eventsIngest"
   | "birthIngest"
@@ -6682,10 +6637,9 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "plan",
   "exit",
   "git",
-  "usage",
   "statusline",
   "builds",
-  "usageScraper",
+  "accountObserver",
   "deadLetter",
   "eventsIngest",
   "birthIngest",
@@ -6710,7 +6664,6 @@ export const ALL_WORKERS: readonly WorkerName[] = [
 const WATCHER_WORKERS: readonly WorkerName[] = [
   "transcript",
   "plan",
-  "usage",
   "statusline",
   "deadLetter",
   "eventsIngest",
@@ -7344,34 +7297,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint one synthetic usage `events` row, surviving a transient writer-lock
-   * starvation instead of crashing the daemon.
-   *
-   * The usage producer churns `<id>.json` create/delete events whenever the
-   * agentusage daemon rotates a profile, so its mint is the one most likely to
-   * land mid-checkpoint while a multi-GB WAL writer holds the lock past the
-   * connection `busy_timeout`. `insertEvent.run` is synchronous, so on that
-   * miss it throws `SQLITE_BUSY` straight up through `uw.onmessage` (no awaits,
-   * no catch) to `process.on("uncaughtException")` → `fatalExit` — turning a
-   * recoverable lock-contention blip into a full restart into the unpaused-boot
-   * dispatch window. The 2026-06-10 incident took 39 such restarts.
-   *
-   * A DROPPED usage mint is recoverable BY DESIGN, which is what makes
-   * drop-don't-crash safe HERE specifically (the other producer mints have no
-   * such re-emit and must NOT adopt this without their own recoverability
-   * argument): a snapshot re-emits on the file's next change-gated write, and a
-   * tombstone is re-retracted by the next boot scan's {@link UsageScanner.sweep}
-   * (it diffs the live projection against the on-disk census). So a transient
-   * `SQLITE_BUSY` is logged loudly and dropped; the daemon stays up.
-   *
-   * Every OTHER error — notably `SQLITE_CORRUPT` (the malformed-image / fn-746
-   * class) — still rethrows so the loud-and-`fatalExit`-and-relaunch contract
-   * holds for genuine corruption. This narrows the fatal surface to real faults
-   * without widening any write path.
-   *
-   * @returns `true` if the row landed, `false` if a transient busy dropped it.
+   * Mint a recoverable producer snapshot while tolerating transient writer-lock
+   * starvation. Callers must have a level-triggered re-emit or boot-scan path;
+   * every other error remains fatal.
    */
-  function mintUsageEventTolerant(
+  function mintRecoverableSnapshotEvent(
     params: Parameters<typeof stmts.insertEvent.run>[0],
   ): boolean {
     try {
@@ -7380,8 +7310,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch (err) {
       if (isTransientBusyError(err)) {
         console.error(
-          "[keeperd] usage mint dropped a synthetic event on transient writer-lock " +
-            "contention (recoverable via re-emit / boot sweep); daemon stays up:",
+          "[keeperd] recoverable snapshot mint dropped on transient writer-lock " +
+            "contention; daemon stays up:",
           err,
         );
         return false;
@@ -9052,105 +8982,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (gitWorker)`
 
-  // Spawn the usage worker in the SAME post-migration window. It watches the
-  // agentusage daemon's flat leaf state dir (`~/.local/state/agentusage/`) and
-  // posts `{kind: "usage-snapshot" | "usage-deleted", ...}` messages — the
-  // fifth file-watcher producer-worker instance. Main turns each into a
-  // synthetic `UsageSnapshot`/`UsageDeleted` events row on its writable
-  // connection. The watch root is resolved on main via `resolveUsageRoot()`
-  // and tolerates absence (agentusage may not have run yet).
-  // Gated on the selector — `null` when unselected.
-  const usageWorker = want("usage")
-    ? new Worker(new URL("./usage-worker.ts", import.meta.url).href, {
-        workerData: {
-          dbPath,
-          root: resolveUsageRoot(),
-          disableNativeWatcher: opts.disableNativeWatcher,
-        } satisfies UsageWorkerData,
-      } as WorkerOptions & { workerData: unknown })
-    : null;
-
-  if (usageWorker) {
-    const uw = usageWorker;
-    // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
-    // becomes a synthetic events row on the WRITABLE connection, then a wake pump
-    // folds it. The agentusage profile id rides in `session_id`; the flattened
-    // snapshot in `data` (empty for tombstones). Everything else is NULL.
-    uw.onmessage = (ev: MessageEvent<UsageMessage | undefined>): void => {
-      const msg = ev.data;
-      if (!msg) return;
-      let hookEvent: string;
-      let data: string;
-      if (msg.kind === "usage-snapshot") {
-        hookEvent = "UsageSnapshot";
-        // Pre-flattened payload — the reducer never re-reads the on-disk file.
-        // Forwarded via the exported `serializeUsageSnapshot` so the wire shape
-        // is pinned by a direct test.
-        data = serializeUsageSnapshot(msg);
-      } else if (msg.kind === "usage-deleted") {
-        // Tombstone: the reducer DELETEs the `usage` row whose primary key is
-        // `id`. No payload beyond the pk in `session_id` — matches the
-        // GitRootDropped / EpicDeleted shape so re-fold reproduces the deletion.
-        hookEvent = "UsageDeleted";
-        data = "";
-      } else {
-        return;
-      }
-      // Tolerant mint: a transient writer-lock miss is logged-and-dropped
-      // (recoverable via change-gated re-emit / boot sweep) instead of crashing
-      // the daemon into the unpaused-boot dispatch window; real corruption still
-      // throws on through to `fatalExit`. See {@link mintUsageEventTolerant}.
-      const minted = mintUsageEventTolerant({
-        $ts: Date.now() / 1000,
-        $session_id: msg.id, // the entity pk: agentusage profile id
-        $pid: null,
-        $hook_event: hookEvent,
-        $event_type: "usage_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: data,
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      // Nothing landed on a dropped mint — skip the wake so we don't spin a
-      // no-op drain pass; the next re-emit / boot sweep carries the row.
-      if (minted) {
-        wakePending = true;
-        pumpWakes();
-      }
-    };
-
-    uw.onerror = (err: ErrorEvent): void => {
-      console.error("[keeperd] usage worker error:", err.message ?? err);
-      if (!shuttingDown) fatalExit();
-    };
-
-    uw.addEventListener("close", () => {
-      if (!shuttingDown) fatalExit();
-    });
-  } // end `if (usageWorker)`
-
   // Spawn the statusline worker in the SAME post-migration window (fn-1024). It
   // watches the keeper-managed statusLine leaf dir (`~/.local/state/keeper/
   // statusline/`, one `<token>.json` per session written by `keeper
@@ -9183,11 +9014,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     ): void => {
       const msg = ev.data;
       if (!msg || msg.kind !== "session-telemetry") return;
-      // Tolerant mint (shared with usage): a transient writer-lock miss is
+      // A transient writer-lock miss is
       // logged-and-dropped (recoverable via change-gated re-emit / boot scan)
       // instead of crashing the daemon; real corruption still throws through to
       // `fatalExit`.
-      const minted = mintUsageEventTolerant({
+      const minted = mintRecoverableSnapshotEvent({
         $ts: Date.now() / 1000,
         $session_id: msg.id, // RAW claude session_id === jobs.job_id
         $pid: null,
@@ -9243,8 +9074,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // It polls the local buildbot master's REST API on a fixed cadence and posts
   // `{kind: "build-snapshot" | "build-deleted", ...}` messages — main turns each
   // into a synthetic `BuildSnapshot`/`BuildDeleted` events row on its writable
-  // connection. Gated on the selector AND a configured `buildbot_url` (the spawn
-  // mirrors the usage spawn, but the config key has no default — an unconfigured
+  // connection. Gated on the selector AND a configured `buildbot_url` (the
+  // config key has no default — an unconfigured
   // buildbot leaves the worker un-spawned and the daemon boots normally).
   const buildbotUrl = resolveBuildbotUrl();
   const buildsWorker =
@@ -9286,7 +9117,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // Tolerant mint: a transient writer-lock miss is logged-and-dropped
       // (recoverable via change-gated re-emit on the next poll) instead of
       // crashing the daemon; real corruption still throws through to fatalExit.
-      const minted = mintUsageEventTolerant({
+      const minted = mintRecoverableSnapshotEvent({
         $ts: Date.now() / 1000,
         $session_id: msg.project, // the entity pk: builder name
         $pid: null,
@@ -9335,45 +9166,45 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (buildsWorker)`
 
-  // Spawn the usage-scraper PRODUCER worker — the in-process port of the retired
-  // agentusage daemon. It runs N per-account scrape loops and writes ONLY the
-  // on-disk `<id>.json` / `.error.json` / `events.jsonl` envelopes under the
-  // agentusage state root; the existing `usage` CONSUMER worker watches that same
-  // dir and mints the events, so the scraper posts NO messages to main and needs
-  // no `onmessage` minting. NOT a file-watcher (not in WATCHER_WORKERS). Gated on
-  // the plain worker selector — the scrape entry is first-class keeper source
-  // (always present), and the scraped model SET is governed by config declaring
-  // models (resolved inside the worker), so there is no runtime-resolution gate.
-  // The state dir is resolved on main via `resolveUsageRoot()` so the
-  // `KEEPER_AGENTUSAGE_ROOT` sandbox seam moves the producer + the consumer
-  // together.
-  const usageScraperWorker = want("usageScraper")
-    ? new Worker(new URL("./usage-scraper-worker.ts", import.meta.url).href, {
-        workerData: {
-          dbPath,
-          stateDir: resolveUsageRoot(),
-        } satisfies UsageScraperWorkerData,
-      } as WorkerOptions & { workerData: unknown })
+  // Spawn the account-observation PRODUCER worker — the optional, bounded probe
+  // over the two installed public CLIs (CodexBar + `cswap list --json`). It
+  // invokes each through an exact-argv runner, validates the payloads, and
+  // atomically publishes ONE PII-free observation sidecar under the routing
+  // root; the per-launch router reads that sidecar off the launch path. SHADOW
+  // MODE: it publishes health + candidate snapshots but nothing consumes them for
+  // launches yet. It posts NO messages to main and holds
+  // NO DB handle — its only output is the on-disk sidecar. NOT a file-watcher
+  // (not in WATCHER_WORKERS). The state dir is resolved on main via
+  // `resolveAccountRoutingRoot()` so the `KEEPER_ACCOUNT_ROUTING_ROOT` sandbox
+  // seam moves the observer + router together.
+  const accountObserverWorker = want("accountObserver")
+    ? new Worker(
+        new URL("./account-observer-worker.ts", import.meta.url).href,
+        {
+          workerData: {
+            stateDir: resolveAccountRoutingRoot(),
+          } satisfies AccountObserverWorkerData,
+        } as WorkerOptions & { workerData: unknown },
+      )
     : null;
 
-  if (usageScraperWorker) {
-    const usw = usageScraperWorker;
-    // No message minting — the producer's only output is its on-disk envelopes
-    // (the consumer worker turns those into events). Wire only the crash guards:
-    // a producer crash is fatal like every other worker (the `!shuttingDown`
-    // gate keeps an orderly teardown quiet).
-    usw.onerror = (err: ErrorEvent): void => {
+  if (accountObserverWorker) {
+    const aow = accountObserverWorker;
+    // No message minting — the observer's only output is its on-disk sidecar.
+    // Wire only the crash guards: a producer crash is fatal like every other
+    // worker (the `!shuttingDown` gate keeps an orderly teardown quiet).
+    aow.onerror = (err: ErrorEvent): void => {
       console.error(
-        "[keeperd] usage-scraper worker error:",
+        "[keeperd] account-observer worker error:",
         err.message ?? err,
       );
       if (!shuttingDown) fatalExit();
     };
 
-    usw.addEventListener("close", () => {
+    aow.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // end `if (usageScraperWorker)`
+  } // end `if (accountObserverWorker)`
 
   // Watches the dead-letters dir and posts a contentless
   // `{kind:"dead-letter-changed"}`. The worker holds NO DB handle — main is the
@@ -13666,7 +13497,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Spawn the Baseline runner PRODUCER worker (docs/adr/0005). It consumes the
   // CLI-written request spool, computes the fast-gate suite result once per key in
   // a detached scratch worktree, and is the SOLE writer of the per-key result
-  // leafs — a pure on-disk producer, so like the usage-scraper it posts NO message
+  // leafs — a pure on-disk producer, so it posts NO message
   // to main (no synthetic event, no keeper.db write). It boot-prunes orphaned
   // scratch worktrees itself.
   const baselineWorker = want("baseline")
@@ -13791,10 +13622,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       planWorker,
       exitWorker,
       gitWorker,
-      usageWorker,
       statuslineWorker,
       buildsWorker,
-      usageScraperWorker,
+      accountObserverWorker,
       deadLetterWorker,
       eventsIngestWorker,
       birthIngestWorker,
