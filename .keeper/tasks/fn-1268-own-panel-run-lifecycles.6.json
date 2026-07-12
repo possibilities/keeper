@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-12T23:45:47.807000Z",
+  "depends_on": [
+    "fn-1268-own-panel-run-lifecycles.5"
+  ],
+  "epic": "fn-1268-own-panel-run-lifecycles",
+  "id": "fn-1268-own-panel-run-lifecycles.6",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Gate panel recovery rollout",
+  "updated_at": "2026-07-12T23:45:47.807000Z"
+}

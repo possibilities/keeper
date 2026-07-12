@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-12T23:45:47.807000Z",
+  "depends_on_epics": [],
+  "id": "fn-1268-own-panel-run-lifecycles",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Own panel run lifecycles",
+  "touched_repos": [
+    "/Users/mike/code/keeper",
+    "/Volumes/Scratch/src/possibilities--pi-subagents"
+  ],
+  "updated_at": "2026-07-12T23:45:47.807000Z"
+}
