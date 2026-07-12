@@ -30,5 +30,5 @@ Files:
 - [ ] Classifier + subprocess-ladder regression tests cover the metachar-in-reason case and pin the intended behavior.
 
 ## Done summary
-
+Narrowed the state-read guard's keeper plan seam chain scan to strip the quoted --reason value before scanning chain/redirect metachars, so a legit AUDIT_SEVERE finding summary with a shell-inert metachar is exempt while command substitution and real out-of-quote chains still deny. Added classifier + subprocess-ladder regression tests.
 ## Evidence
