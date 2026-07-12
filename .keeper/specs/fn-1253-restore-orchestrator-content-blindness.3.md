@@ -36,5 +36,5 @@ Re-render plus bun test; grep the rendered skill: no Read of the per-task findin
 - [ ] The frontmatter lists only tools the skill still uses; the rendered file matches its template; consistency suites are green.
 
 ## Done summary
-
+Rewrote /plan:work's Phase 2d audit gate to consume only the gate-check envelope and the auditor's task-mode one-line return; deleted the orchestrator's finding-artifact Write; covering-severe short-circuits with no second refute, a freshly-derived severe gets one refute pass, and an empty commit set unblock-resumes. Dropped Read/Write from allowed-tools.
 ## Evidence
