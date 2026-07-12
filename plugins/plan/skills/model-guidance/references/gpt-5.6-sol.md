@@ -80,11 +80,14 @@ this capability research.)
 
 ## When to pick
 
-Route `gpt-5.6-sol` to the hardest well-specified GPT-side work: complex reasoning over a large
-codebase, demanding long-horizon agentic execution, and big-working-set multi-file changes — the
-family flagship for bounded work that would strain the mid tiers (a newer, stronger generalist than
-`gpt-5.5`). Its over-persistence findings set the guardrails: give it explicit stop conditions and
-an allowed change-scope, prefer supervised or reversible trajectories at the top effort bands, and
-keep it off unsupervised long or destructive scope. For a concrete, nameable intelligence-bound
+`gpt-5.6-sol` is a reserve tier, not a default — the family flagship, but over-powered (and, at
+$5/$30 per MTok, over-priced) for the bulk of well-specified GPT-side work, which the mid tiers
+clear cleanly. Route ordinary bounded work to `gpt-5.6-terra` and substantial multi-file work to
+`gpt-5.5`, and reserve `sol` for the hardest well-specified tail where those tiers genuinely fall
+short: complex reasoning over a large codebase, demanding long-horizon agentic execution, and
+big-working-set multi-file changes that would strain the mid tiers (a newer, stronger generalist
+than `gpt-5.5`). Its over-persistence findings set the guardrails: give it explicit stop conditions
+and an allowed change-scope, prefer supervised or reversible trajectories at the top effort bands,
+and keep it off unsupervised long or destructive scope. For a concrete, nameable intelligence-bound
 reason keeper still reaches for `opus`, and judgment-heavy or under-specified work stays Claude-side
 per `hand_tuned`; cell-review cohorts grade fit out-of-band and re-tune this range.
