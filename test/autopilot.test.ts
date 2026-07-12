@@ -43,6 +43,7 @@ import {
   projectFailedRows,
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
+  projectWorkerProvider,
   projectWorktreeMode,
   projectWorktreeMultiRepo,
   projectWorktreeStatusRows,
@@ -842,6 +843,25 @@ test("buildSetConfigFrame — a worktree_multi_repo boolean patch emits set_auto
   });
 });
 
+test("buildSetConfigFrame — a worker_provider patch emits set_autopilot_config {worker_provider} incl. null clear (fn-1256)", () => {
+  expect(
+    buildSetConfigFrame("rpc-uuid-17", { worker_provider: "claude" }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-17",
+    method: "set_autopilot_config",
+    params: { worker_provider: "claude" },
+  });
+  expect(buildSetConfigFrame("rpc-uuid-18", { worker_provider: null })).toEqual(
+    {
+      type: "rpc",
+      id: "rpc-uuid-18",
+      method: "set_autopilot_config",
+      params: { worker_provider: null },
+    },
+  );
+});
+
 // ---------------------------------------------------------------------------
 // projectWorktreeMode — fn-959 socket-sourced worktree-toggle projection.
 // ---------------------------------------------------------------------------
@@ -1409,6 +1429,28 @@ describe("projectWorktreeMultiRepo", () => {
 });
 
 // ---------------------------------------------------------------------------
+// projectWorkerProvider — the durable work-dispatch provider pin coercion
+// (docs/adr/0047, fn-1256 task .3).
+// ---------------------------------------------------------------------------
+
+describe("projectWorkerProvider", () => {
+  test("empty rows → null (unconstrained, the default)", () => {
+    expect(projectWorkerProvider([])).toBeNull();
+  });
+  test("a recognized enum member passes through", () => {
+    expect(projectWorkerProvider([{ worker_provider: "claude" }])).toBe(
+      "claude",
+    );
+    expect(projectWorkerProvider([{ worker_provider: "codex" }])).toBe("codex");
+  });
+  test("NULL / missing / an unrecognized value ALL resolve to null", () => {
+    expect(projectWorkerProvider([{ worker_provider: null }])).toBeNull();
+    expect(projectWorkerProvider([{}])).toBeNull();
+    expect(projectWorkerProvider([{ worker_provider: "gpt" }])).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // keeper autopilot show — durable config as ONE envelope-shaped read.
 // ---------------------------------------------------------------------------
 
@@ -1440,7 +1482,29 @@ describe("buildAutopilotShowEnvelope", () => {
       // worktree ON ⇒ effective equals stored.
       max_concurrent_per_root: 3,
       max_concurrent_per_root_stored: 3,
+      worker_provider: null,
+      worker_provider_scope: null,
+      worker_provider_note: null,
     });
+  });
+
+  test("renders worker_provider + its scope/collapse notes when the pin is active", () => {
+    const claude = buildAutopilotShowEnvelope(
+      [{ paused: 0, mode: "yolo", worker_provider: "claude" }],
+      [],
+    );
+    expect(claude.data?.worker_provider).toBe("claude");
+    expect(claude.data?.worker_provider_scope).toMatch(/work cells only/);
+    expect(claude.data?.worker_provider_note).toMatch(/GPT tier/);
+
+    const codex = buildAutopilotShowEnvelope(
+      [{ paused: 0, mode: "yolo", worker_provider: "codex" }],
+      [],
+    );
+    expect(codex.data?.worker_provider).toBe("codex");
+    expect(codex.data?.worker_provider_scope).toMatch(/work cells only/);
+    // The tier-collapse note is claude-specific — absent when pinned to codex.
+    expect(codex.data?.worker_provider_note).toBeNull();
   });
 
   test("worktree OFF floors effective to 1 while stored keeps the intent", () => {
@@ -1474,6 +1538,9 @@ describe("buildAutopilotShowEnvelope", () => {
       max_concurrent_jobs: null,
       max_concurrent_per_root: 1,
       max_concurrent_per_root_stored: 1,
+      worker_provider: null,
+      worker_provider_scope: null,
+      worker_provider_note: null,
     });
   });
 });

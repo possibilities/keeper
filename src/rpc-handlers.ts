@@ -358,6 +358,11 @@ export interface SetAutopilotConfigParams {
    *  positive-evidence codex rollout adoption; `false` (the byte-identical
    *  default) adopts nothing. */
   codex_adoption?: boolean;
+  /** The durable worker-provider dispatch pin (docs/adr/0047) — `"claude"` /
+   *  `"codex"` to pin every work dispatch to that provider family, or `null` to
+   *  clear the pin (unconstrained, the byte-identical default). Scoped to
+   *  cell-bearing work dispatches only. */
+  worker_provider?: "claude" | "codex" | null;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch.
@@ -388,6 +393,7 @@ function validateSetAutopilotConfigParams(
     "worktree_mode",
     "worktree_multi_repo",
     "codex_adoption",
+    "worker_provider",
   ]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
@@ -457,6 +463,19 @@ function validateSetAutopilotConfigParams(
     } else {
       throw new BadParamsError(
         `set_autopilot_config: \`codex_adoption\` must be a boolean (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  if ("worker_provider" in obj) {
+    const raw = obj.worker_provider;
+    // A strict string enum — `null` (clear the pin) or exactly `"claude"` /
+    // `"codex"`. Reject anything else loud, naming the allowed set, rather than
+    // silently coercing (the first non-numeric config column).
+    if (raw === null || raw === "claude" || raw === "codex") {
+      patch.worker_provider = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`worker_provider\` must be one of "claude" | "codex" | null (got ${JSON.stringify(raw)})`,
       );
     }
   }

@@ -31,8 +31,13 @@ import { join } from "node:path";
 import { atomicWriteJson } from "./store.ts";
 
 /** Committed audit-brief schema version. Integer, starts at 1; additive-only
- * within a version so a later reader tolerates an older brief. */
-export const SELECTION_AUDIT_BRIEF_SCHEMA_VERSION = 1;
+ * within a version so a later reader tolerates an older brief. Bumped to 2
+ * when each auditable task gained `assigned_tier`/`assigned_model` alongside
+ * the (possibly worker-provider-translated) `tier`/`model` it now names the
+ * DISPATCHED cell, plus `constraint` — a schema-version-1 brief simply lacks
+ * the assigned/constraint keys, and its `tier`/`model` were always the
+ * assigned cell (dispatched == assigned for every pre-feature run). */
+export const SELECTION_AUDIT_BRIEF_SCHEMA_VERSION = 2;
 
 /** Committed review-file schema version. Integer, starts at 1; additive-only.
  * Bumped to 2 when rubric_version/judge_model_version/prompt_hash joined the

@@ -722,6 +722,14 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     // Keeper-owned worker permission posture (mirrors the pair path); rides every
     // launch, right after the worktree env block and before model/effort/name.
     "--permission-mode",
@@ -769,6 +777,14 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -825,6 +841,14 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     // Permission posture rides even the minimal launch (no model/effort/name).
     "--permission-mode",
     "acceptEdits",
@@ -863,6 +887,14 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     // Resume is just as human-less as a fresh launch — the posture rides it too.
     "--permission-mode",
     "acceptEdits",
@@ -903,6 +935,14 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -941,6 +981,14 @@ test("buildKeeperAgentLaunchArgv: codex resume emits `keeper agent codex … res
     // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     "--x-no-confirm",
     "resume",
     "rollout-uuid",
@@ -1006,7 +1054,9 @@ test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JO
   // by its own `--x-tmux-env`.
   const idx = argv.indexOf("KEEPER_JOB_ID=45f94c4d-orig");
   expect(argv[idx - 1]).toBe("--x-tmux-env");
-  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(5);
+  // Eight repeated env carriers: session/lane/branch/job-id/escalation-role +
+  // the three dispatched-cell carriers (ADR 0047).
+  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(8);
   // Identity (job id) and the resume key (native target) stay DISTINCT.
   expect(argv.slice(-2)).toEqual(["--session", "d98a2d54-native"]);
   expect(idEntries[0]).not.toContain("d98a2d54-native");
@@ -1061,6 +1111,14 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     // The 5th carrier — empty here (a work launch, not an escalation).
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -1106,6 +1164,14 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     // The 5th carrier — empty here (a worktree resume, not an escalation).
     "--x-tmux-env",
     "KEEPER_ESCALATION_ROLE=",
+    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // EMPTY on an unconstrained launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_MODEL=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCHED_TIER=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -1174,7 +1240,44 @@ test("buildKeeperAgentLaunchArgv: an escalation launch carries the verb in KEEPE
   expect(argv[branchIdx + 2]).toBe("KEEPER_JOB_ID=");
   expect(argv[branchIdx + 3]).toBe("--x-tmux-env");
   expect(argv[branchIdx + 4]).toBe("KEEPER_ESCALATION_ROLE=unblock");
-  expect(argv[branchIdx + 5]).toBe("--permission-mode");
+  // Then the three always-present dispatched-cell carriers (ADR 0047), EMPTY on a
+  // non-work escalation launch, before the permission posture.
+  expect(argv[branchIdx + 5]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 6]).toBe("KEEPER_PLAN_DISPATCHED_MODEL=");
+  expect(argv[branchIdx + 7]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 8]).toBe("KEEPER_PLAN_DISPATCHED_TIER=");
+  expect(argv[branchIdx + 9]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 10]).toBe("KEEPER_PLAN_DISPATCH_CONSTRAINT=");
+  expect(argv[branchIdx + 11]).toBe("--permission-mode");
+});
+
+test("buildKeeperAgentLaunchArgv: a constrained work launch carries the dispatched cell + constraint (ADR 0047)", () => {
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "autopilot",
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+    model: "sonnet",
+    effort: "max",
+    pluginDir: "/abs/keeper/plugins/plan/workers/gpt-5.6-sol-max",
+    dispatchedModel: "gpt-5.6-sol",
+    dispatchedTier: "max",
+    dispatchConstraint: "codex",
+    noConfirm: true,
+  });
+  // Exactly one of each carrier, valued with the translated cell + the pin.
+  expect(
+    argv.filter((a) => a.startsWith("KEEPER_PLAN_DISPATCHED_MODEL=")),
+  ).toEqual(["KEEPER_PLAN_DISPATCHED_MODEL=gpt-5.6-sol"]);
+  expect(
+    argv.filter((a) => a.startsWith("KEEPER_PLAN_DISPATCHED_TIER=")),
+  ).toEqual(["KEEPER_PLAN_DISPATCHED_TIER=max"]);
+  expect(
+    argv.filter((a) => a.startsWith("KEEPER_PLAN_DISPATCH_CONSTRAINT=")),
+  ).toEqual(["KEEPER_PLAN_DISPATCH_CONSTRAINT=codex"]);
+  // Each is preceded by its own `--x-tmux-env`.
+  const modelIdx = argv.indexOf("KEEPER_PLAN_DISPATCHED_MODEL=gpt-5.6-sol");
+  expect(argv[modelIdx - 1]).toBe("--x-tmux-env");
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {

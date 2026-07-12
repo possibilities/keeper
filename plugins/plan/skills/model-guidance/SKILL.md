@@ -1,6 +1,6 @@
 ---
 name: model-guidance
-description: Author and refresh the selector policy config (plugins/plan/model-selector.yaml) — research each configured worker model, cache the raw research notes plus the vendor's own system card under references/, distill the notes into the config's guidance blocks, and re-hash both. Use when a model or effort is added to the host matrix's subagent_models, when a model's launch id is re-pointed to a newer version, or when the model-guidance drift gate fails.
+description: Author and refresh the selector policy config (plugins/plan/model-selector.yaml) and the cross-provider equivalence map (plugins/plan/provider-equivalence.yaml) — research each configured worker model, cache the raw research notes plus the vendor's own system card under references/, distill the notes into the config's guidance blocks, author/refresh the model's equivalence entries in both directions, and re-hash. Use when a model or effort is added to the host matrix's subagent_models, when a model's launch id is re-pointed to a newer version, or when the model-guidance drift gate fails.
 argument-hint: "[blank to choose interactively · an axis value · missing · all]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Edit, Write, AskUserQuestion, Bash(shasum:*), Bash(bun plugins/plan/scripts/model-guidance-check.ts:*), WebSearch, WebFetch
@@ -8,11 +8,15 @@ allowed-tools: Read, Glob, Grep, Edit, Write, AskUserQuestion, Bash(shasum:*), B
 
 # Model guidance
 
-Own the content of `plugins/plan/model-selector.yaml` — the post-scaffold selector's policy
-config. The config rides inside every selector brief, so it must stay short, concrete, and current;
-this skill is how it gets authored and kept honest. The `selection-brief` verb and the orchestrators only
-*read* the config — nothing regenerates it automatically. That is deliberate: model guidance is
-researched judgment, and a human owns when it is refreshed.
+Own two committed artifacts: `plugins/plan/model-selector.yaml`, the post-scaffold selector's
+policy config, and `plugins/plan/provider-equivalence.yaml`, the cross-provider worker-cell
+equivalence map (ADR 0047). The config rides inside every selector brief, so it must stay short,
+concrete, and current; the equivalence map is read at dispatch by the `worker_provider` pin to
+translate an assigned cell into the pinned provider family. Both are researched judgment kept
+honest by this skill. The `selection-brief` verb and the orchestrators only *read* the config, and
+the dispatch-time translation seam only *reads* the equivalence map — nothing regenerates either
+automatically. That is deliberate: model guidance is researched judgment, and a human owns when it
+is refreshed.
 
 The one section this skill never touches on its own is the top-level `hand_tuned` block. That is
 human-owned routing judgment — the binding model-axis tie-break — never authored or refreshed by a
@@ -24,22 +28,29 @@ consistency test's pinned phrasing) so no selector brief ships a self-contradict
 
 The unit of work is one **axis value**. The `efforts:` axis and the `models:` axis live in the
 required host matrix (`~/.config/keeper/matrix.yaml`'s `efforts:` and `subagent_models:` — the
-single source of truth); this config must carry exactly one guidance block per configured value and
-no block for a non-axis value. `--state` classifies coverage against that matrix; `--check` stays
-fully offline and enforces research-cache hash parity — notes AND every declared vendor card — keep
-both green.
+single source of truth); the config must carry exactly one guidance block per configured value and
+no block for a non-axis value, and the equivalence map must carry, in the direction each
+dispatchable `{model, effort}` cell's family requires, exactly one entry per cell targeting the
+opposite family — never a same-family target. `--state` classifies coverage against that matrix for
+both artifacts; `--check` stays fully offline and enforces research-cache hash parity (notes AND
+every declared vendor card) plus the equivalence map's own structural well-formedness — keep all
+green.
 
 ## When to invoke
 
 - A model or effort was added to the host matrix's `subagent_models` / `efforts:` — backfill its
-  guidance block (and, for a model, its research cache and vendor card) here. The gate fails until
-  you do; `--state` classifies the new model `missing` and the interactive flow offers to fill it.
-- A model's launch id was re-pointed to a newer version upstream — re-research it and re-distill.
-  This is the one staleness case the deterministic gate cannot see on its own; a human notices and
-  triggers the re-research.
+  guidance block (and, for a model, its research cache, vendor card, and both-direction
+  equivalence entries) here. The gate fails until you do; `--state` classifies the new model
+  `missing` and reports its now-unmapped dispatchable cells as equivalence gaps; the interactive
+  flow offers to fill both together.
+- A model's launch id was re-pointed to a newer version upstream — re-research it, re-distill, and
+  re-author its equivalence entries in both directions. This is the one staleness case the
+  deterministic gate cannot see on its own; a human notices and triggers the re-research. The
+  re-point stales the affected equivalence entries exactly as it stales the notes — never leave a
+  re-pointed model's old entries in place on the assumption they still hold.
 - The drift gate (`bun plugins/plan/scripts/model-guidance-check.ts --check`) failed — reconcile
-  the reported direction (missing block, extra block, missing research entry, or a notes/card hash
-  mismatch).
+  the reported direction (missing block, extra block, missing research entry, a notes/card hash
+  mismatch, or a malformed/non-total/same-family equivalence entry).
 
 ## Read the state envelope first
 
@@ -75,14 +86,24 @@ A **gap** is any model value that is not `fresh`, plus the `efforts` unit when i
 `researched`. A model whose `reasons` is exactly `[no-card]` is a **card-only gap** — its notes are
 already `researched` with parity; see the card-fetch-only shortcut below.
 
+The same envelope carries an `equivalence` field (`total`, `gaps`, `dangling_targets`) — the
+cross-provider map's own state, classified alongside the guidance blocks. An **equivalence gap** is
+a dispatchable cell absent from the direction its family requires; a **dangling target** is an
+authored entry whose target no longer resolves on the live matrix (a `target-not-on-host` or
+`target-effort-not-on-host` reason). Treat both as gaps on the model they belong to: a matrix axis
+change that adds a cell, or drops one a target relied on, surfaces here even when the model's own
+guidance block is already `fresh` — the interactive flow below offers to fill it alongside any
+notes/card gap on that model.
+
 ## Argument contract
 
 - **blank** → the interactive state-driven flow below.
 - **an axis value** (`opus`, `low`, …) → a scoped run on that one value, skipping the scope question.
   Validate the name against BOTH axes (efforts + models); on a miss, fail loud and list the configured
-  values. If the named value is already `fresh`, confirm before spending a research pass on it.
-- **`missing`** → non-interactive: fill every gap (each `missing`, `stub`, or `stale` value), no
-  questions.
+  values. If the named value is already `fresh` and carries no equivalence gap, confirm before
+  spending a research pass on it.
+- **`missing`** → non-interactive: fill every gap (each `missing`, `stub`, or `stale` guidance value,
+  plus any model with an equivalence gap or dangling target), no questions.
 - **`all`** → wipe and re-research every value, behind exactly one confirm.
 
 `missing` and `all` are reserved words, matched BEFORE the axis-value check — a future axis value must
@@ -93,8 +114,9 @@ never be named either one.
 Read `--state`, then pick the lightest path the state allows — at most two `AskUserQuestion` calls,
 often one, sometimes zero:
 
-- **All fresh** (no gaps) → report the fresh table and ask one gentle question defaulting to
-  *Nothing, exit*. Accepting the default is the whole flow: zero writes, no research.
+- **All fresh** (no guidance gap, no equivalence gap, no dangling target) → report the fresh table
+  and ask one gentle question defaulting to *Nothing, exit*. Accepting the default is the whole
+  flow: zero writes, no research.
 - **Exactly one gap** → skip the menu; one *Fill `<value>` — proceed?* confirm, then research it. A
   card-only gap (`reasons` exactly `[no-card]`) confirms a card-fetch-only pass instead — its notes
   are already researched, so skip straight to step 2 of the pass below.
@@ -165,7 +187,19 @@ For each model in scope on the host matrix's `subagent_models:` axis:
      to route a task to that band (difficulty and blast radius, not line count). When you refresh the
      efforts set, also author its provenance: `efforts_provenance.last_reviewed` (today) and
      `efforts_provenance.status`.
-5. **Re-hash.** Recompute each touched reference file's sha256 and update the matching config field —
+5. **Author/refresh equivalence entries** in `provider-equivalence.yaml`, in BOTH directions, for
+   every `{model, effort}` cell just distilled: a claude-native model gains or refreshes its
+   `claude_to_codex` entries (one per effort, each targeting its most-equivalent codex-served cell),
+   a codex-served model its `codex_to_claude` entries (targeting the most-equivalent claude-native
+   cell) — targets are restricted to the worker-cell eligibility list, and a target must never be
+   same-family with its source. Base the call on the freshly distilled behavioral blocks for both
+   sides of the pairing, not on names or price. When a cell has several defensible targets and no
+   single one clearly dominates, flag it as **contested**: surface it to the human via
+   `AskUserQuestion` instead of silently picking one, and note the tie in the entry's surrounding
+   commit message. A re-pointed launch id (the "When to invoke" re-point case) stales its affected
+   equivalence entries exactly as it stales the notes — re-author them in this step, never leave the
+   old target in place.
+6. **Re-hash.** Recompute each touched reference file's sha256 and update the matching config field —
    `research.<model>.sha256` for the notes, `research.<model>.card.sha256` for the card:
    ```bash
    shasum -a 256 plugins/plan/skills/model-guidance/references/<model>.md
@@ -198,16 +232,21 @@ bun plugins/plan/scripts/model-guidance-check.ts --check
 ```
 
 `--check` is fully offline and HOST-BLIND — no axis read, so it stays green with no host matrix
-present. It asserts (a) structural validation (the config coerces — a malformed section fails loud)
-and (b) research-cache hash parity: every configured research entry's notes reference AND any
-declared vendor card both exist on disk and their recorded sha256 matches the file, presence + hash
-only — the gate never parses either file's provenance header. The fast test suite
-(`plugins/plan/test/consistency-model-selector.test.ts`) asserts the same check in-process, so a red
-gate is a red suite. Note the gate checks hash parity, not freshness: a `stub`-stamped value with a
-matching hash passes `--check` but reads as a gap in `--state`, and axis coverage against the host
-matrix is a `--state` concern, not `--check`'s. After a research pass, also re-run `--state` and
-confirm every value in scope classifies `fresh` — researched notes that come back `stub` mean the
-provenance header failed to parse (see the plain-scalar rule above), which `--check` cannot see.
+present. It asserts (a) structural validation (the config coerces — a malformed section fails loud),
+(b) research-cache hash parity: every configured research entry's notes reference AND any declared
+vendor card both exist on disk and their recorded sha256 matches the file, presence + hash only —
+the gate never parses either file's provenance header, and (c) the equivalence map's own structural
+well-formedness: no same-family target, every target model a source model of the opposite
+direction, every source model covering all five canonical efforts, no duplicate source cell. The
+fast test suite (`plugins/plan/test/consistency-model-selector.test.ts` and
+`plugins/plan/test/consistency-provider-equivalence.test.ts`) asserts the same checks in-process, so
+a red gate is a red suite. Note the gate checks hash parity and structural well-formedness, not
+freshness or host coverage: a `stub`-stamped value with a matching hash passes `--check` but reads
+as a gap in `--state`, and axis coverage against the host matrix — for both the guidance blocks and
+the equivalence map's totality/dangling-target check — is a `--state` concern, not `--check`'s.
+After a research pass, also re-run `--state` and confirm every value in scope classifies `fresh`
+with `equivalence.total: true` — researched notes that come back `stub` mean the provenance header
+failed to parse (see the plain-scalar rule above), which `--check` cannot see.
 
 ## Commit the pass
 
@@ -221,9 +260,10 @@ keeper commit-work --preview-files
 keeper commit-work "docs(plan): <what was researched or refreshed>"
 ```
 
-The commit scope is exactly the pass's artifacts: `model-selector.yaml`, each touched
-`references/<model>.md` and `references/cards/<model>.md`, and any test that pins the on-disk
-guidance state. Unrelated dirty files
+The commit scope is exactly the pass's artifacts: `model-selector.yaml`,
+`provider-equivalence.yaml`, each touched `references/<model>.md` and
+`references/cards/<model>.md`, and any test that pins the on-disk guidance state. Unrelated dirty
+files
 (concurrent workers often leave some) stay out — when the preview shows `commit-work` would sweep
 in files outside the pass or miss one of its artifacts, fall back to plain git with explicit paths
 (`git add <path> …`, never `-A` / `.`), then `git commit` + `git push`. On a `lint_failed`
