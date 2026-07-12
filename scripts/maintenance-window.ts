@@ -7,8 +7,8 @@
  *   bun scripts/reclaim-db.ts -> launchctl bootout ... -> keeper reclaim
  *   -> launchctl bootstrap ... -> keeper await server-up
  *
- * Sequence: capture autopilot state -> pause -> await the board-work drain
- * signal (`keeper status` .in_flight.board_work_jobs, fn-1251.1) -> take a
+ * Sequence: capture autopilot state -> pause -> await the board drain signal
+ * (`keeper status` .in_flight board-work + pending-dispatch counts) -> take a
  * pre-reclaim snapshot while the daemon is still live -> stop keeperd
  * (launchctl bootout) -> `keeper reclaim` (which ITSELF snapshots +
  * checkpoints + VACUUM INTOs + self-verifies + atomically swaps) -> restart
@@ -325,6 +325,53 @@ function keeperdLivePlist(): string {
   );
 }
 
+export interface InFlightCounts {
+  boardWorkJobs: number | null;
+  pendingDispatches: number | null;
+}
+
+/** Parse `keeper status --json`'s `in_flight` counts; `null` means the field
+ * was missing/non-numeric, distinct from a legitimate zero. */
+export function readInFlightCounts(
+  data: Record<string, unknown> | null,
+): InFlightCounts {
+  const inFlight = data?.in_flight as
+    | { board_work_jobs?: unknown; pending_dispatches?: unknown }
+    | undefined;
+  return {
+    boardWorkJobs:
+      typeof inFlight?.board_work_jobs === "number"
+        ? inFlight.board_work_jobs
+        : null,
+    pendingDispatches:
+      typeof inFlight?.pending_dispatches === "number"
+        ? inFlight.pending_dispatches
+        : null,
+  };
+}
+
+/**
+ * True only once BOTH board-work sessions and launch-window (pending,
+ * not-yet-bound) dispatches read zero — a launched-but-unbound worker can
+ * still bind and become a board-work job between `board_work_jobs` alone
+ * reading zero and the daemon stopping, so neither count alone is a safe
+ * drain signal.
+ */
+export function isBoardQuiet(counts: InFlightCounts): boolean {
+  return counts.boardWorkJobs === 0 && counts.pendingDispatches === 0;
+}
+
+/**
+ * Trim/slice a prompt to the forensics probe term `captureForensicsTerm`
+ * hands to `keeper search-history`. Never strips `%`/`_`/`\` — `search-history`
+ * ESCAPEs those for a literal LIKE match, so stripping would break the
+ * substring match the post-restart `verify()` probe depends on.
+ */
+export function deriveForensicsTerm(prompt: string): string | null {
+  const cleaned = prompt.trim().slice(0, 32);
+  return cleaned.length >= 8 ? cleaned : null;
+}
+
 /**
  * Best-effort pick of a search-history forensics term from an EXISTING
  * prompt row, taken BEFORE the daemon stops. `null` (no rows, or a read
@@ -346,11 +393,7 @@ function captureForensicsTerm(dbPath: string): string | null {
         )
         .get() as { prompt?: unknown } | null;
       const prompt = typeof row?.prompt === "string" ? row.prompt : "";
-      const cleaned = prompt
-        .trim()
-        .slice(0, 32)
-        .replace(/[%_\\]/g, "");
-      return cleaned.length >= 8 ? cleaned : null;
+      return deriveForensicsTerm(prompt);
     } finally {
       db.close();
     }
@@ -417,23 +460,17 @@ function buildRealDeps(
       const deadline = Date.now() + DRAIN_TIMEOUT_MS;
       for (;;) {
         const data = await keeperStatusData();
-        const inFlight = data?.in_flight as
-          | { board_work_jobs?: unknown }
-          | undefined;
-        const count =
-          typeof inFlight?.board_work_jobs === "number"
-            ? inFlight.board_work_jobs
-            : null;
-        if (count === 0) {
+        const counts = readInFlightCounts(data);
+        if (isBoardQuiet(counts)) {
           return { ok: true, error: null };
         }
         if (Date.now() >= deadline) {
           return {
             ok: false,
             error:
-              count === null
-                ? "could not read in_flight.board_work_jobs from keeper status"
-                : `${count} board-work session(s) still active after ${DRAIN_TIMEOUT_MS}ms`,
+              counts.boardWorkJobs === null || counts.pendingDispatches === null
+                ? "could not read in_flight.board_work_jobs/pending_dispatches from keeper status"
+                : `${counts.boardWorkJobs} board-work session(s) and ${counts.pendingDispatches} pending dispatch(es) still active after ${DRAIN_TIMEOUT_MS}ms`,
           };
         }
         await Bun.sleep(DRAIN_POLL_MS);

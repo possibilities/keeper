@@ -1,22 +1,31 @@
 /**
- * `runMaintenanceWindow` orchestration tests (fn-1251.2). Every I/O boundary
- * (autopilot pause/play, drain, snapshot, launchctl stop/start, reclaim,
- * server-up, verify) is an injected fake — no real daemon, launchctl,
- * subprocess, or DB file. The production `keeper`/`launchctl` wiring lives in
- * `buildRealDeps` (scripts/maintenance-window.ts) and is exercised only by
- * hand against a live daemon, per the task's own test notes.
+ * `runMaintenanceWindow` orchestration tests. Every I/O boundary (autopilot
+ * pause/play, drain, snapshot, launchctl stop/start, reclaim, server-up,
+ * verify) is an injected fake — no real daemon, launchctl, subprocess, or DB
+ * file. The production `keeper`/`launchctl` wiring lives in `buildRealDeps`
+ * (scripts/maintenance-window.ts) and is exercised only by hand against a
+ * live daemon, per the task's own test notes.
  *
  * These tests lock the ONE invariant the whole tool exists for: once autopilot
  * is paused, `setAutopilotPaused(false)` is NEVER called except on the single
  * restore at the very end of a fully-successful, non-`--hold` run. Every
  * failure path — including a mid-window `reclaim` failure that brings the
  * daemon back up for the board's sake — leaves it paused.
+ *
+ * A second block below unit-tests the pure helpers `buildRealDeps` wires its
+ * `awaitDrain`/forensics-term logic through — `readInFlightCounts` /
+ * `isBoardQuiet` / `deriveForensicsTerm` — with fabricated inputs, no
+ * subprocess or DB required.
  */
 
 import { expect, test } from "bun:test";
 import {
+  deriveForensicsTerm,
+  type InFlightCounts,
+  isBoardQuiet,
   type MaintenanceWindowDeps,
   type MaintenanceWindowResult,
+  readInFlightCounts,
   runMaintenanceWindow,
 } from "../scripts/maintenance-window";
 
@@ -386,4 +395,86 @@ test("runMaintenanceWindow(): a failed final restore is surfaced distinctly from
     "setPaused(false)",
   ]);
   expect(setPausedCalls).toEqual([true, false]);
+});
+
+// ---------------------------------------------------------------------------
+// F1 — readInFlightCounts / isBoardQuiet: the drain gate must not report
+// quiet while a launch-window (pending) dispatch is still open, even once
+// board_work_jobs alone has reached zero.
+// ---------------------------------------------------------------------------
+
+test("readInFlightCounts(): reads both counts off a well-formed in_flight block", () => {
+  const counts = readInFlightCounts({
+    in_flight: { board_work_jobs: 2, pending_dispatches: 1 },
+  });
+  expect(counts).toEqual({ boardWorkJobs: 2, pendingDispatches: 1 });
+});
+
+test("readInFlightCounts(): a missing/non-numeric field reads null, not 0", () => {
+  expect(readInFlightCounts(null)).toEqual({
+    boardWorkJobs: null,
+    pendingDispatches: null,
+  });
+  expect(readInFlightCounts({})).toEqual({
+    boardWorkJobs: null,
+    pendingDispatches: null,
+  });
+  expect(readInFlightCounts({ in_flight: { board_work_jobs: "0" } })).toEqual({
+    boardWorkJobs: null,
+    pendingDispatches: null,
+  });
+});
+
+test("isBoardQuiet(): false while board-work jobs are still active", () => {
+  const counts: InFlightCounts = { boardWorkJobs: 1, pendingDispatches: 0 };
+  expect(isBoardQuiet(counts)).toBe(false);
+});
+
+test("isBoardQuiet(): false while a launch-window dispatch is open even though board_work_jobs already reads zero", () => {
+  const counts: InFlightCounts = { boardWorkJobs: 0, pendingDispatches: 1 };
+  expect(isBoardQuiet(counts)).toBe(false);
+});
+
+test("isBoardQuiet(): false on an unreadable count (null), never mistaken for quiet", () => {
+  expect(isBoardQuiet({ boardWorkJobs: null, pendingDispatches: 0 })).toBe(
+    false,
+  );
+  expect(isBoardQuiet({ boardWorkJobs: 0, pendingDispatches: null })).toBe(
+    false,
+  );
+});
+
+test("isBoardQuiet(): true only once both board-work and pending counts read zero", () => {
+  const counts: InFlightCounts = { boardWorkJobs: 0, pendingDispatches: 0 };
+  expect(isBoardQuiet(counts)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// F2 — deriveForensicsTerm: the captured term must stay a literal substring
+// of the source prompt so `keeper search-history` (which ESCAPEs %/_/\ for a
+// literal LIKE match) can find it — never stripped.
+// ---------------------------------------------------------------------------
+
+test("deriveForensicsTerm(): keeps a literal '%' in the captured prefix instead of stripping it", () => {
+  // Under the 32-char cap, so the whole trimmed prompt is the term — the
+  // expected value is the hand-typed literal, not a re-slice of the input.
+  const term = deriveForensicsTerm("100% done with tests");
+  expect(term).toBe("100% done with tests");
+});
+
+test("deriveForensicsTerm(): keeps a literal '_' and '\\\\' in the captured prefix instead of stripping them", () => {
+  const term = deriveForensicsTerm("fix_the\\path bug");
+  expect(term).toBe("fix_the\\path bug");
+});
+
+test("deriveForensicsTerm(): trims and caps at 32 chars", () => {
+  const prompt = `  ${"a".repeat(50)}  `;
+  const term = deriveForensicsTerm(prompt);
+  expect(term).toBe("a".repeat(32));
+});
+
+test("deriveForensicsTerm(): null when the usable prefix is shorter than 8 chars", () => {
+  expect(deriveForensicsTerm("short")).toBeNull();
+  expect(deriveForensicsTerm("   ")).toBeNull();
+  expect(deriveForensicsTerm("")).toBeNull();
 });
