@@ -112,6 +112,30 @@ describe("commandTouchesStateTree", () => {
       false,
     );
   });
+
+  test("a grep of a briefs path is detected", () => {
+    expect(
+      commandTouchesStateTree(
+        "grep finding_ref .keeper/state/briefs/fn-1.2.json",
+      ),
+    ).toBe(true);
+  });
+
+  test("the sanctioned keeper plan AUDIT_SEVERE block is exempt", () => {
+    expect(
+      commandTouchesStateTree(
+        'keeper plan block fn-1.2 --reason "AUDIT_SEVERE: finding_ref=.keeper/state/audits/fn-1/tasks/fn-1.2.json"',
+      ),
+    ).toBe(false);
+  });
+
+  test("a keeper plan seam chained to a tree read is NOT exempt", () => {
+    expect(
+      commandTouchesStateTree(
+        "keeper plan block fn-1.2 --reason x && cat .keeper/state/audits/fn-1/tasks/fn-1.2.json",
+      ),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -272,6 +296,40 @@ describe("state-read-guard ladder", () => {
       tool_name: "Bash",
       cwd: project,
       tool_input: { command: "cat .keeper/state/briefs/fn-1-x.2.json" },
+    });
+    expect(code).toBe(0);
+    expect(
+      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+  });
+
+  test("a Bash keeper plan AUDIT_SEVERE block vector allows despite the audits token", async () => {
+    writeMarker("work", { task_id: "fn-1-x.2" });
+    const { stdout, code } = await run({
+      hook_event_name: "PreToolUse",
+      session_id: SESSION,
+      tool_name: "Bash",
+      cwd: project,
+      tool_input: {
+        command:
+          'keeper plan block fn-1-x.2 --reason "AUDIT_SEVERE: finding_ref=.keeper/state/audits/fn-1-x/tasks/fn-1-x.2.json"',
+      },
+    });
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+  });
+
+  test("a Bash keeper plan seam chained to a tree read denies", async () => {
+    writeMarker("work", { task_id: "fn-1-x.2" });
+    const { stdout, code } = await run({
+      hook_event_name: "PreToolUse",
+      session_id: SESSION,
+      tool_name: "Bash",
+      cwd: project,
+      tool_input: {
+        command:
+          "keeper plan reconcile fn-1-x.2 && cat .keeper/state/audits/fn-1-x/tasks/fn-1-x.2.json",
+      },
     });
     expect(code).toBe(0);
     expect(
