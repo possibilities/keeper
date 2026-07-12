@@ -48,5 +48,5 @@ plan-suite bake-drift assertion if present.
 - [ ] The prompt suite is green including the re-recorded render golden.
 
 ## Done summary
-
+Vendored the described-roster panel-strength snippet from the rewritten arthack rubric: re-synced the corpus/index/vendor.lock, hand-patched both hack and panel skill BAKE regions to the new render (vendor-corpus.ts --sync does not itself rewrite skill bake regions), and re-recorded the render.json oracle golden for panel-strength. Vendor drift gate exits 0; root, plan, and prompt suites all green.
 ## Evidence

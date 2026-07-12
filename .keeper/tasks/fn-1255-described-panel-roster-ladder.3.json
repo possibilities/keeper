@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Re-vendor corpus and re-bake",
-  "updated_at": "2026-07-11T22:46:01.645000Z"
+  "updated_at": "2026-07-12T02:39:03.730000Z",
+  "worker_done_at": "2026-07-12T02:39:03.730000Z"
 }
