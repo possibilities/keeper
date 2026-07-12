@@ -65,5 +65,5 @@ The migration is forward-only and preserves old inline rows. Reference consumers
 - [ ] Fast tests cover schema, replay, retention, cleanup ordering, and failure paths without starting a real worker or socket.
 
 ## Done summary
-
+Bus worker and bus.db now persist and replay typed artifact references end-to-end: a provisional migration adds reference/delivery-timestamp columns, live and queued-for-wake replay reconstruct the original structured payload (legacy inline rows still replay as text), new inline chat publishes are rejected while control namespaces are unaffected, and the bounded retention pass couples row-first artifact deletion to a 7-day post-delivery grace with age-immune queued rows and bounded orphan collection.
 ## Evidence
