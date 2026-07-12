@@ -51,7 +51,24 @@ export function isProtectedStatePath(filePath: string, cwd: string): boolean {
  * expansion or a quoted `sh -c` payload). */
 const STATE_TREE_TOKEN = /\.keeper[\\/]state[\\/](?:briefs|audits)\b/;
 
+/** The sanctioned typed seam. A `keeper plan …` invocation IS the
+ * content-blind coordination surface — its AUDIT_SEVERE `block` legitimately
+ * embeds the finding_ref audits path in `--reason`, and no plan verb ever
+ * cats/greps the tree — so a marked orchestrator running one is coordinating,
+ * not reading state. Anchored at the command start. */
+const KEEPER_PLAN_SEAM = /^\s*keeper\s+plan\b/;
+
+/** Shell metacharacters that could chain, redirect, or substitute a second
+ * command after the `keeper plan` seam. Their presence forfeits the exemption
+ * so a read can never ride in behind a plan invocation
+ * (`keeper plan … && cat <audits-path>`). */
+const SHELL_CHAIN = /[;&|`\n]|\$\(|[<>]/;
+
 export function commandTouchesStateTree(command: string): boolean {
+  // A lone `keeper plan …` invocation is exempt: it is the sanctioned seam,
+  // never a tree read. Any shell chaining forfeits the exemption.
+  if (KEEPER_PLAN_SEAM.test(command) && !SHELL_CHAIN.test(command))
+    return false;
   return STATE_TREE_TOKEN.test(command);
 }
 
