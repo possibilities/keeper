@@ -119,5 +119,5 @@ spawn seam).
 - [ ] Fast suite green.
 
 ## Done summary
-
+Promoted shared-checkout dirty/desync stickies from advisory to paging operator jams: widened isJamReason (surface-only, audited), added a page-once botctl sweep on the repair heartbeat stamping human_notified_at via a new deterministic SharedCheckoutHumanNotified fold (no schema change), kept their clear producer-level-only. Recorded ADR 0049 (with ADR 0017 repair-retry partial supersession) and aligned CLAUDE.md, dispatch-failure-key comments, CONTEXT.md, and the autopilot/await/watch skills.
 ## Evidence
