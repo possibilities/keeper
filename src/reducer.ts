@@ -26,7 +26,10 @@ import {
   parsePlanRef,
   planVerbRefFromSpawnName,
 } from "./derivers";
-import { INSTANT_DEATH_BREAKER_REASON } from "./dispatch-failure-key";
+import {
+  INSTANT_DEATH_BREAKER_REASON,
+  SHARED_DIRTY_DISTRESS_VERB,
+} from "./dispatch-failure-key";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
 import { allGatedRootsSeeded } from "./gated-roots";
 import { compileFnmatch, isGlobToken } from "./glob";
@@ -74,6 +77,7 @@ import type {
   ResolvedEpicDep,
   ResolverDispatchAttemptedPayload,
   SessionTelemetryPayload,
+  SharedCheckoutHumanNotifiedPayload,
   SubagentDisposition,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
@@ -4759,6 +4763,69 @@ function foldRepairHumanNotified(db: Database, event: Event): void {
         SET human_notified_at = ?
       WHERE verb = 'repair' AND id = ? AND human_notified_at IS NULL`,
     [event.ts, payload.id],
+  );
+}
+
+/**
+ * Parse a `SharedCheckoutHumanNotified` event payload. Returns null on any structural
+ * miss ({@link foldSharedCheckoutHumanNotified} folds null to a safe no-op); NEVER
+ * throws. Strict: `id` / `outcome` non-empty strings.
+ */
+function extractSharedCheckoutHumanNotifiedPayload(
+  event: Event,
+): SharedCheckoutHumanNotifiedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      event.data,
+    ) as Partial<SharedCheckoutHumanNotifiedPayload>;
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
+      return null;
+    }
+    return { id: parsed.id, outcome: parsed.outcome };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse SharedCheckoutHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `SharedCheckoutHumanNotified` event — the terminal "human paged"
+ * once-latch of the shared-checkout hygiene page-once sweep, sibling to {@link
+ * foldRepairHumanNotified} but on a `shared-checkout-{dirty,desync}:<repoHash>` distress
+ * row (the shared daemon distress verb, {@link SHARED_DIRTY_DISTRESS_VERB} — the desync
+ * family shares that verb; the `id` prefix picks the family). For the TERMINAL `notified`
+ * outcome (the daemon paged the human about a live dirty/desync distress row) it stamps
+ * `human_notified_at = event.ts` on the distress row, gated `human_notified_at IS NULL`
+ * so the page fires exactly once per row instance and a re-fold reproduces it
+ * byte-identically. Every other outcome (`notify_failed` / unknown) is NON-TERMINAL and
+ * folds to a no-op, leaving the marker NULL so the sweep re-attempts. The branch reads
+ * ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so re-fold stays
+ * byte-deterministic. The UPDATE no-ops on a missing row (the clear-before-mint race) and
+ * NEVER clears the row — only the producer level-clear (`DispatchCleared`) does, which
+ * re-arms the marker at NULL so a cleared-then-reminted row pages anew. Malformed/missing
+ * payload → safe no-op.
+ */
+function foldSharedCheckoutHumanNotified(db: Database, event: Event): void {
+  const payload = extractSharedCheckoutHumanNotifiedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.outcome !== "notified") {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET human_notified_at = ?
+      WHERE verb = ? AND id = ? AND human_notified_at IS NULL`,
+    [event.ts, SHARED_DIRTY_DISTRESS_VERB, payload.id],
   );
 }
 
@@ -9578,6 +9645,8 @@ export function applyEvent(
       foldRepairDispatched(db, event);
     } else if (event.hook_event === "RepairHumanNotified") {
       foldRepairHumanNotified(db, event);
+    } else if (event.hook_event === "SharedCheckoutHumanNotified") {
+      foldSharedCheckoutHumanNotified(db, event);
     } else if (event.hook_event === "BlockHumanNotified") {
       foldBlockHumanNotified(db, event);
     } else if (event.hook_event === "AutopilotPaused") {

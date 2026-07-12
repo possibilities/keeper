@@ -59,6 +59,8 @@ import {
 import {
   INSTANT_DEATH_BREAKER_REASON,
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_DESYNC_DISTRESS_REASON,
+  SHARED_DIRTY_DISTRESS_REASON,
   WORKTREE_FINALIZE_NON_FF_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "../src/dispatch-failure-key";
@@ -1974,6 +1976,28 @@ test("isJamReason: finalize-non-ff + merge-conflict are jams; recover* is NOT", 
   // Unrelated reasons never count.
   expect(isJamReason("job-rejected")).toBe(false);
   expect(isJamReason("worktree-merge-local-timeout")).toBe(false);
+});
+
+test("isJamReason: shared-checkout dirty/desync distress rows are operator jams (startsWith the long minted sentence)", () => {
+  // The producers mint LONG sentences beginning with the family token — exact-match
+  // cannot work, so the jam check matches on the leading token via startsWith.
+  const dirtyMinted =
+    `${SHARED_DIRTY_DISTRESS_REASON}: /repo has stayed dirty past the grace ` +
+    `window — reconcile the shared checkout (commit, stash, or discard the changes). ` +
+    `Last recover verdict: repair::repo-abc cannot launch a write-capable session`;
+  const desyncMinted =
+    `${SHARED_DESYNC_DISTRESS_REASON}: /repo has stayed DESYNCED past the grace ` +
+    `window — the ref advanced but the working tree never caught up`;
+  expect(isJamReason(dirtyMinted)).toBe(true);
+  expect(isJamReason(desyncMinted)).toBe(true);
+  // The bare tokens count too (startsWith is reflexive).
+  expect(isJamReason(SHARED_DIRTY_DISTRESS_REASON)).toBe(true);
+  expect(isJamReason(SHARED_DESYNC_DISTRESS_REASON)).toBe(true);
+  // The recover-prefix exclusion is untouched: a recover row that happens to name a
+  // shared checkout in its free text still self-clears and never counts as a jam.
+  expect(
+    isJamReason("worktree-recover-conflict: shared-checkout-desync mentioned"),
+  ).toBe(false);
 });
 
 // Drained scope-axis fixtures (ADR 0032). Base inputs default to the shipped

@@ -1347,3 +1347,28 @@ export interface RepairHumanNotifiedPayload {
   /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
 }
+
+/**
+ * Pre-flattened `SharedCheckoutHumanNotified` synthetic event payload — the terminal
+ * "human paged" stage of the shared-checkout hygiene page-once sweep, sibling to
+ * `RepairHumanNotified` but on a `shared-checkout-{dirty,desync}:<repoHash>` distress
+ * row (the daemon distress verb). The daemon page-once sweep mints it after it pages the
+ * human about a live dirty/desync distress row, stamping the
+ * `dispatch_failures.human_notified_at` once-marker so the operator is paged exactly once
+ * per row instance. Keyed by the distress-row `id` (the family prefix + repo hash; verb
+ * is the shared daemon distress verb). The TERMINAL `notified` outcome stamps
+ * `human_notified_at = event.ts` (gated `IS NULL`); any other outcome (`notify_failed` /
+ * unknown) is NON-TERMINAL and folds to a no-op, leaving the marker NULL so the sweep
+ * re-attempts next heartbeat. The fold reads ONLY the payload + `event.ts`, so re-fold
+ * stays byte-deterministic. The marker NEVER clears the sticky row — only the producer
+ * level-clear (`DispatchCleared`) does, which re-arms it at NULL so a cleared-then-reminted
+ * row (a fresh incident episode past a new grace) pages anew. KEEP-SET inline forever
+ * (never added to the retention shed predicate).
+ */
+export interface SharedCheckoutHumanNotifiedPayload {
+  /** The distress-row `dispatch_failures.id` (`shared-checkout-{dirty,desync}:<hash>`;
+   *  verb is the daemon distress verb). */
+  id: string;
+  /** Producer-recorded page outcome; only the terminal `notified` stamps the marker. */
+  outcome: string;
+}
