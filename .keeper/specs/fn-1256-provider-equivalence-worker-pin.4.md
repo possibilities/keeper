@@ -66,5 +66,5 @@ still green (no cross-island import).
 - [ ] Root fast suite green including updated golden strings and the depgraph boundary
 
 ## Done summary
-
+Added the worker_provider dispatch-translation seam (ADR 0047): a dep-free launcher island (src/provider-equivalence.ts) parses the equivalence map, the pure applyProviderConstraint translates each cell-bearing work dispatch's assigned cell into the pinned family (composing the mapped --plugin-dir + three always-present KEEPER_PLAN_DISPATCHED_* exec carriers), and no-map-entry/target-not-on-host/map-malformed fail closed as sticky DispatchFailed (autopilot) or synchronous CLI refusal — never a fallback. Manual dispatch and autopilot share the helper for identical decisions; the launch event records {assigned, effective, constraint}.
 ## Evidence
