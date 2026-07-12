@@ -17,6 +17,7 @@
     ],
     "defaultMode": "default"
   },
+  "model": "opus[1m]",
   "enabledPlugins": {
     "swift-lsp@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
