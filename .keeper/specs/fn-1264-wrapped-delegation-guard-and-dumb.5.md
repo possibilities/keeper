@@ -48,5 +48,5 @@ Land the durable docs for the guard once its behavior is final. Deferred to this
 - [ ] A new ADR records the marker+guard contract, single-state edit-denial, dumb-courier wrapper, and fail-closed posture, modeled on 0025 and relating 0010/0047.
 
 ## Done summary
-
+Land durable docs for the wrapped-delegation guard: CLAUDE.md's Hook rules now lists eight hooks with a terse wrapped-guard clause (green under lint-claude-md.ts), CONTEXT.md defines the wrapped-cell marker and provider-leg result envelope, docs/plugin-composition-map.md's wrapped-cell section folds in the marker/envelope/guard, and a new ADR 0050 records the marker+guard contract, single-state edit-denial, and dumb-courier wrapper, relating ADR 0010/0025/0047.
 ## Evidence
