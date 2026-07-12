@@ -51,6 +51,7 @@ import {
   type MessageRow,
   maxMessageId,
   openBusDb,
+  pruneControlMessagesOlderThan,
   pruneMessagesOlderThan,
   QUEUED_FOR_WAKE,
   selectQueuedForWake,
@@ -112,9 +113,15 @@ export const RETENTION_INTERVAL_MS = 30_000;
  *  undelivered `queued_for_wake` row is preserved regardless — see bus-db). */
 export const MESSAGE_RETENTION_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** Control lifecycle rows are high-churn forensics and keep a shorter horizon. */
+export const CONTROL_RETENTION_HORIZON_MS = 24 * 60 * 60 * 1000;
+
 /** Oldest messages deleted per tick. One bounded transaction; the backlog
  *  drains across successive ticks. */
 export const MESSAGE_PRUNE_BATCH = 1_000;
+
+/** Oldest control-namespace messages deleted per tick. */
+export const CONTROL_PRUNE_BATCH = 1_000;
 
 /** Oldest channel rows examined per tick (the bounded candidate window). */
 export const CHANNEL_CANDIDATE_BATCH = 64;
@@ -1541,6 +1548,16 @@ export function startBusServer(
       );
     } catch (err) {
       console.error("[bus-worker] message retention failed (non-fatal):", err);
+    }
+    try {
+      pruneControlMessagesOlderThan(
+        busDb,
+        CONTROL_NAMESPACE,
+        now - CONTROL_RETENTION_HORIZON_MS,
+        CONTROL_PRUNE_BATCH,
+      );
+    } catch (err) {
+      console.error("[bus-worker] control retention failed (non-fatal):", err);
     }
     // PASSIVE checkpoint flushes pruned pages into the main file and (with
     // journal_size_limit set at open) truncates the -wal back; the bounded

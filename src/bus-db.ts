@@ -447,6 +447,40 @@ export function pruneMessagesOlderThan(
 }
 
 /**
+ * Namespace-scoped age-horizon retention for control-style logs. Mirrors
+ * {@link pruneMessagesOlderThan}, but its bounded front window is scoped through
+ * the existing `(namespace, id)` index, so a large backlog in one namespace can
+ * never inflate another namespace's prune work. The same `queued_for_wake`
+ * immunity applies regardless of namespace.
+ */
+export function pruneControlMessagesOlderThan(
+  db: Database,
+  namespace: string,
+  cutoffTs: number,
+  batchSize: number,
+): number {
+  const front = db
+    .prepare(
+      "SELECT id, ts, status FROM messages WHERE namespace = ? ORDER BY id ASC LIMIT ?",
+    )
+    .all(namespace, batchSize) as Array<{
+    id: number;
+    ts: number;
+    status: string | null;
+  }>;
+  const prunable = front
+    .filter((r) => r.ts < cutoffTs && r.status !== QUEUED_FOR_WAKE)
+    .map((r) => r.id);
+  if (prunable.length === 0) return 0;
+  db.transaction(() => {
+    db.prepare(
+      "DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+    ).run(JSON.stringify(prunable));
+  }).immediate();
+  return prunable.length;
+}
+
+/**
  * Replay messages strictly AFTER `afterId`, oldest-first — the reconnect-recovery
  * path. A subscriber that drops at cursor C calls this with `afterId = C` to
  * recover everything it missed, optionally narrowed to one tenant `namespace`.
