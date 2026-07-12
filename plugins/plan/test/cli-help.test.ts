@@ -66,7 +66,7 @@ const EXPECTED_TOP_LEVEL = [
 ];
 
 const EXPECTED_SUBCOMMANDS: Record<string, string[]> = {
-  audit: ["submit"],
+  audit: ["gate-check", "submit", "submit-task"],
   epic: [
     "add-dep",
     "add-deps",
