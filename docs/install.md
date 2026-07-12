@@ -57,6 +57,17 @@ gate that drops those scanned third-party plugins from worker launches (interact
 [plugin-composition-map.md](./plugin-composition-map.md) is the full map;
 `bun scripts/clean-machine-check.ts` proves the arthack-free launch path end to end.
 
+### Pi `/rename`
+
+Every keeper-launched Pi session (`keeper agent pi`) gets one extra command, `/rename`, which derives
+a short Session title from the current branch's Latest turn and applies it through Pi's own
+`setSessionName()`. It requires Pi's own OAuth login to serve the one fixed cheap
+`openai-codex/gpt-5.3-codex-spark` model — no fallback model, no separate keeper credential. Absent
+that OAuth, an unresolvable model, an empty turn, or a malformed model response, `/rename` no-ops
+with an in-Pi notification and leaves the existing title unchanged; a successful rename reaches
+Keeper's title projection and the tmux renamer asynchronously through the existing `TranscriptTitle`
+event, never a direct DB/tmux write.
+
 ## Host worker matrix (required)
 
 A host `~/.config/keeper/matrix.yaml`

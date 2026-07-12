@@ -57,6 +57,7 @@ import {
   PiBusInboxController,
   releaseBusInboxOwnership,
 } from "./bus-inbox.ts";
+import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
 import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,13 @@ export interface PiExtensionApi {
   ): void;
   events?: PiTaskEventBus;
   registerTool?(tool: PiToolDefinition<unknown>): void;
+  /** Presence-gated: `/rename` registers only when both this and
+   *  `setSessionName` exist (see the `registerRenameCommand` call site). The
+   *  real options/handler shape lives in `rename-command.ts`'s `PiRenameApi`
+   *  — kept `unknown` here so this file needs no import from it beyond the
+   *  registration call itself. */
+  registerCommand?(name: string, options: unknown): void;
+  setSessionName?(name: string): void;
   sendMessage?(
     message: {
       customType: string;
@@ -284,6 +292,30 @@ export function piEventBindings(
       // translation forward-compatible with pi vocabulary additions.
       return null;
   }
+}
+
+/**
+ * Translate a Pi session title into the same lifecycle-neutral `TranscriptTitle`
+ * shape the daemon's transcript worker mints synthetically for claude
+ * (`src/daemon.ts`'s `transcript-title` handler): `hook_event:
+ * "TranscriptTitle"` folds at the reducer's priority-3 `'transcript'` title
+ * source (`src/reducer.ts`'s `titleSourceForEvent`) regardless of whether the
+ * rename came from `/rename`, `/name`, or RPC — `session_info_changed` fires
+ * for all three. PURE.
+ */
+export function titleEventBindings(
+  title: string,
+  meta: PiTranslateMeta,
+): PiEventBindings {
+  return {
+    ts: meta.tsSec,
+    session_id: meta.jobId,
+    pid: meta.pid,
+    hook_event: "TranscriptTitle",
+    event_type: "transcript_title",
+    cwd: meta.cwd,
+    data: boundedData("TranscriptTitle", { session_title: title }),
+  };
 }
 
 /**
@@ -798,6 +830,36 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       if (pi.events !== undefined) {
         pi.registerTool(createTaskFacadeTool(pi.events));
       }
+    }
+    if (
+      typeof pi.registerCommand === "function" &&
+      typeof pi.setSessionName === "function"
+    ) {
+      // Cast to the real structural contract `rename-command.ts` needs
+      // (`registerCommand`'s options shape, typed `on` overloads for
+      // `session_info_changed`/`session_start`) — same runtime object, a
+      // narrower view than this file's own minimal `PiExtensionApi`.
+      registerRenameCommand(pi as unknown as PiRenameApi, {
+        onTitleChange: (title) => {
+          try {
+            appendEventsLogLine(
+              process.env,
+              pid,
+              serializePiLine(
+                titleEventBindings(title, {
+                  jobId,
+                  pid,
+                  cwd,
+                  tsSec: Date.now() / 1000,
+                }),
+              ),
+            );
+          } catch {
+            // Fail-open: an events-log write failure must never surface to
+            // Pi — a missed write heals on the next session_start replay.
+          }
+        },
+      });
     }
   } catch {
     // Top-level fail-open: a load-time throw would ABORT pi's launch. Swallow so
