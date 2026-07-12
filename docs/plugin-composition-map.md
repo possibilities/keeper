@@ -85,8 +85,17 @@ test.
 A **wrapped cell** (a worker model claude does not serve natively) rides this exact
 same additive `--plugin-dir <cell>` channel — there is no separate wrapped-cell
 launch path. Its manifest's driver is the fixed claude wrapper (the `wrapper_driver`
-model/effort from the host matrix), and the wrapper delegates implementation to the
-resolved foreign provider before re-owning tests and the close-out commit. The host
+model/effort from the host matrix); the wrapper is a dumb courier — it delegates ALL
+implementation, test, and lint iteration to the resolved foreign provider leg via
+`keeper agent run`/`--resume` and never edits source itself, owning only tests-
+adjudication and the keeper close-out (`commit-work` + `plan done`). The launch
+boundary always emits the `KEEPER_WRAPPED_CELL`/`KEEPER_WRAPPED_ENVELOPE` env pair
+(empty for a native cell; the effective `<model>::<effort>` plus the provider-leg
+result-envelope path for a wrapped one, keyed on effective-cell wrappedness rather
+than the worker-provider pin). A non-empty marker, plus the tool payload's subagent
+identity, is the sole jurisdiction the `wrapped-guard` `PreToolUse` hook keys its
+single-state total source-edit denial on — no envelope gate, fail-closed only when
+marked ([ADR 0050](./adr/0050-wrapped-delegation-guard.md)). The host
 `~/.config/keeper/matrix.yaml` ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
 is the composition INPUT that makes any cell render at all — claude-native included, since there
 is no embedded fallback: `render-plugin-templates` fans `subagent_templates` out over
