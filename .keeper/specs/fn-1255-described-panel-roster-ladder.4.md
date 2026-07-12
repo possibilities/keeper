@@ -57,5 +57,5 @@ Consistency pins only — the skill body is prose; no runtime harness executes i
 - [ ] The skills consistency suite pins the new skill (name, slash-only posture, tool grants, presence) and is green.
 
 ## Done summary
-
+Authored the slash-only /plan:panel-guidance skill (compose-not-research pass modeled on model-guidance) that owns the committed panel roster, encodes the gpt-5.6-sol single-ceiling-slot reserve policy, gates it structurally, and installs it verbatim to ~/.config/keeper/panel.yaml; extended the skills consistency suite with panel-guidance's frontmatter/tool-grant/presence pins.
 ## Evidence
