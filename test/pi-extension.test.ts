@@ -49,6 +49,7 @@ import {
   renameFeedback,
   renameSlugify,
   runRenameInvocation,
+  stripSkillBlocks,
   stripUnsafeText,
 } from "../plugins/keeper/pi-extension/rename-command";
 import { piExtensionArgs, piExtensionPath } from "../src/agent/launch-config";
@@ -720,6 +721,27 @@ describe("/rename — buildRenameInputText", () => {
 
   test("omits the assistant section when response is null", () => {
     expect(buildRenameInputText("do X", null, 1_000)).toBe("User: do X");
+  });
+
+  test("removes expanded skill blocks before truncation", () => {
+    const prompt = `<skill name="hack">${"x".repeat(1_000)}</skill>\n\nrename helper`;
+    expect(buildRenameInputText(prompt, null, 40)).toBe(
+      "User: \n\nrename helper",
+    );
+  });
+
+  test("removes every complete skill block from model input", () => {
+    expect(
+      stripSkillBlocks(
+        'before <skill name="one">first</skill> middle <skill name="two">second</skill> after',
+      ),
+    ).toBe("before  middle  after");
+  });
+
+  test("leaves incomplete skill markup unchanged", () => {
+    expect(stripSkillBlocks('<skill name="hack">unfinished')).toBe(
+      '<skill name="hack">unfinished',
+    );
   });
 
   test("bounds the combined text to maxBytes UTF-8 bytes", () => {

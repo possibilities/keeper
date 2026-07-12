@@ -97,9 +97,18 @@ export function renameSlugify(text: string): string | null {
 }
 
 /**
- * Bound the combined prompt+response text to `maxBytes` UTF-8 bytes. PURE.
- * A slice can land mid-codepoint; the model input tolerates a truncated tail
- * (this is a completion INPUT, never rendered verbatim to a human).
+ * Remove Pi's expanded skill envelopes from model input. Skill bodies are
+ * instructions for the live agent, not session-title subject matter. PURE.
+ */
+export function stripSkillBlocks(text: string): string {
+  return text.replace(/<skill(?:\s[^>]*)?>[\s\S]*?<\/skill>/g, "");
+}
+
+/**
+ * Remove expanded skills, then bound the combined prompt+response text to
+ * `maxBytes` UTF-8 bytes. PURE. A slice can land mid-codepoint; the model
+ * input tolerates a truncated tail (this is completion input, never rendered
+ * verbatim to a human).
  */
 export function buildRenameInputText(
   prompt: string,
@@ -110,7 +119,7 @@ export function buildRenameInputText(
   if (response !== null && response.length > 0) {
     parts.push(`Assistant: ${response}`);
   }
-  const combined = parts.join("\n\n");
+  const combined = stripSkillBlocks(parts.join("\n\n"));
   if (Buffer.byteLength(combined, "utf8") <= maxBytes) {
     return combined;
   }
