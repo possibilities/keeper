@@ -394,9 +394,9 @@ export function resolvePanelMembers(
     lookup = selections.default;
   }
 
-  const panelMembers = selections.panels[lookup];
-  if (panelMembers !== undefined) {
-    return buildTripleMembers(panelMembers, `panel '${lookup}'`);
+  const panel = selections.panels[lookup];
+  if (panel !== undefined) {
+    return buildTripleMembers(panel.members, `panel '${lookup}'`);
   }
 
   // Not a configured panel → accept a single launch triple as a panel of one.

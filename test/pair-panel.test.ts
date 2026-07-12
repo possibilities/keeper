@@ -30,7 +30,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, type PanelSelections } from "../src/agent/config";
+import {
+  ConfigError,
+  type PanelDefinition,
+  type PanelSelections,
+} from "../src/agent/config";
 import type { MaintenanceMessage } from "../src/maintenance-worker";
 import { runPanelPrunePass } from "../src/maintenance-worker";
 import {
@@ -77,10 +81,17 @@ const T_CLAUDE2 = "claude::sonnet::high";
 const T_CODEX2 = "codex::gpt-5.1::high";
 const T_PI = "pi::glm::high";
 
+/** Build a fixture `PanelDefinition` from an ordered member list — strength +
+ *  description are irrelevant to member-resolution/orchestration behavior
+ *  here, so every fixture panel shares an arbitrary uniform band + blurb. */
+function panelDef(members: string[]): PanelDefinition {
+  return { strength: "standard", members, description: "fixture panel." };
+}
+
 /** A two-member `default` panel of a claude + a codex triple — the stand-in for the
  *  removed zero-config fallback in the start/wait tests. */
 const DEFAULT_SELECTIONS: PanelSelections = {
-  panels: { default: [T_CLAUDE, T_CODEX] },
+  panels: { default: panelDef([T_CLAUDE, T_CODEX]) },
   default: "default",
 };
 
@@ -209,7 +220,7 @@ const EMPTY_SELECTIONS: PanelSelections = { panels: {}, default: null };
 
 test("resolvePanelMembers: panel hit → triple members with slug names + ordinals", () => {
   const sel: PanelSelections = {
-    panels: { default: [T_CLAUDE, T_CODEX] },
+    panels: { default: panelDef([T_CLAUDE, T_CODEX]) },
     default: "default",
   };
   const r = resolvePanelMembers(sel, "default");
@@ -238,7 +249,7 @@ test("resolvePanelMembers: a single triple → a one-member panel", () => {
 
 test("resolvePanelMembers: duplicate identical triples → two ordinal-bearing legs, distinct names", () => {
   const sel: PanelSelections = {
-    panels: { dup: [T_CLAUDE, T_CLAUDE] },
+    panels: { dup: panelDef([T_CLAUDE, T_CLAUDE]) },
     default: null,
   };
   const r = resolvePanelMembers(sel, "dup");
@@ -259,7 +270,10 @@ test("resolvePanelMembers: two distinct triples that slugify identically get dis
   // triple differs, so the disambiguating hash suffix keeps the leg names apart.
   const t1 = "claude::a.b::high";
   const t2 = "claude::a-b::high";
-  const sel: PanelSelections = { panels: { coll: [t1, t2] }, default: null };
+  const sel: PanelSelections = {
+    panels: { coll: panelDef([t1, t2]) },
+    default: null,
+  };
   const r = resolvePanelMembers(sel, "coll");
   expect(r.ok).toBe(true);
   if (!r.ok) return;
@@ -281,7 +295,7 @@ test("resolvePanelMembers: an unknown name is fail-loud (no fallback)", () => {
 
 test("resolvePanelMembers: a non-panel-eligible (axisless) member is fail-loud", () => {
   const sel: PanelSelections = {
-    panels: { bad: ["hermes::hermes-m::na"] },
+    panels: { bad: panelDef(["hermes::hermes-m::na"]) },
     default: null,
   };
   const r = resolvePanelMembers(sel, "bad");
@@ -295,7 +309,7 @@ test("resolvePanelMembers: 'default' dereferences the configured default panel",
   // The default pointer names a panel called `reviewers`, not one literally
   // named `default` — proving `default` is a symbolic pointer, not a frozen name.
   const sel: PanelSelections = {
-    panels: { reviewers: [T_CLAUDE, T_CODEX] },
+    panels: { reviewers: panelDef([T_CLAUDE, T_CODEX]) },
     default: "reviewers",
   };
   const r = resolvePanelMembers(sel, "default");
@@ -306,7 +320,7 @@ test("resolvePanelMembers: 'default' dereferences the configured default panel",
 
 test("resolvePanelMembers: 'default' with no configured default is fail-loud naming 'default'", () => {
   const sel: PanelSelections = {
-    panels: { reviewers: [T_CLAUDE] },
+    panels: { reviewers: panelDef([T_CLAUDE]) },
     default: null,
   };
   const r = resolvePanelMembers(sel, "default");
@@ -414,7 +428,7 @@ test("buildPanelLegArgv: leg carries the RAW triple as --preset + the slug as --
 
 test("start: persists + prints a manifest, launches every leg detached", async () => {
   const selections: PanelSelections = {
-    panels: { default: [T_CLAUDE, T_CODEX] },
+    panels: { default: panelDef([T_CLAUDE, T_CODEX]) },
     default: "default",
   };
   const { deps, spawns, stdout } = makeDeps({ selections });
@@ -495,7 +509,10 @@ test("start: an absent --panel uses the panel.yaml default, launching each via -
 
 test("start: no --panel and no default panel is fail-loud (exit 2)", async () => {
   const { deps, stderr } = makeDeps({
-    selections: { panels: { default: [T_CLAUDE, T_CODEX] }, default: null },
+    selections: {
+      panels: { default: panelDef([T_CLAUDE, T_CODEX]) },
+      default: null,
+    },
   });
   const code = await panelStart(
     {
@@ -516,7 +533,7 @@ test("start: an explicit --panel default resolves the configured default panel",
   // it (git-HEAD style) rather than look for a panel literally named `default`.
   const { deps, spawns } = makeDeps({
     selections: {
-      panels: { reviewers: [T_CLAUDE, T_CODEX] },
+      panels: { reviewers: panelDef([T_CLAUDE, T_CODEX]) },
       default: "reviewers",
     },
   });
@@ -538,7 +555,10 @@ test("start: an explicit --panel default resolves the configured default panel",
 
 test("start: --panel default with no configured default is fail-loud naming what was typed", async () => {
   const { deps, stderr } = makeDeps({
-    selections: { panels: { reviewers: [T_CLAUDE, T_CODEX] }, default: null },
+    selections: {
+      panels: { reviewers: panelDef([T_CLAUDE, T_CODEX]) },
+      default: null,
+    },
   });
   const code = await panelStart(
     {
@@ -604,7 +624,7 @@ const RECONCILE_BOOT = 1_700_000_000_000;
 
 test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg, relaunches a dead no-result leg to g2", async () => {
   const selections: PanelSelections = {
-    panels: { quad: [T_CLAUDE, T_CODEX, T_CLAUDE2, T_CODEX2] },
+    panels: { quad: panelDef([T_CLAUDE, T_CODEX, T_CLAUDE2, T_CODEX2]) },
     default: "quad",
   };
   const prompt = writePrompt("reconcile me");
@@ -681,7 +701,7 @@ test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg,
 
 test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live pid); a completed leg is still reused", async () => {
   const selections: PanelSelections = {
-    panels: { duo: [T_CLAUDE, T_CODEX] },
+    panels: { duo: panelDef([T_CLAUDE, T_CODEX]) },
     default: "duo",
   };
   const prompt = writePrompt("reboot me");
@@ -730,7 +750,7 @@ test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live 
 
 test("reconcile: a same-boot leg launched within grace is left (not relaunched) despite a dead pid", async () => {
   const selections: PanelSelections = {
-    panels: { solo: [T_CLAUDE] },
+    panels: { solo: panelDef([T_CLAUDE]) },
     default: "solo",
   };
   const prompt = writePrompt("grace me");
@@ -902,7 +922,7 @@ test("reconcile: a prompt mismatch refuses the resume (exit 2), no relaunch", as
 
 test("reconcile: a member-set mismatch refuses the resume (exit 2)", async () => {
   const selA: PanelSelections = {
-    panels: { p: [T_CLAUDE, T_CODEX] },
+    panels: { p: panelDef([T_CLAUDE, T_CODEX]) },
     default: "p",
   };
   const prompt = writePrompt("same prompt");
@@ -915,7 +935,7 @@ test("reconcile: a member-set mismatch refuses the resume (exit 2)", async () =>
   // Re-issue with the SAME prompt but a DIFFERENT member set (the codex triple
   // swapped for a second claude triple).
   const selB: PanelSelections = {
-    panels: { p: [T_CLAUDE, T_CLAUDE2] },
+    panels: { p: panelDef([T_CLAUDE, T_CLAUDE2]) },
     default: "p",
   };
   const second = makeDeps({ selections: selB });
@@ -1264,7 +1284,7 @@ test("wait recycle guard: the start-time probe runs at most ONCE per leg across 
 
 test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHES (not left)", async () => {
   const selections: PanelSelections = {
-    panels: { one: [T_CLAUDE] },
+    panels: { one: panelDef([T_CLAUDE]) },
     default: "one",
   };
   const prompt = writePrompt("recycle me");
@@ -1301,7 +1321,7 @@ test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHE
 
 test("reconcile recycle guard: a MATCHING start-time leaves the live leg untouched", async () => {
   const selections: PanelSelections = {
-    panels: { one: [T_CLAUDE] },
+    panels: { one: panelDef([T_CLAUDE]) },
     default: "one",
   };
   const prompt = writePrompt("keep me");

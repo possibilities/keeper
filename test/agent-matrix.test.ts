@@ -36,6 +36,7 @@ import {
 import {
   enumerateTripleStrings,
   enumerateTriples,
+  extractHostTriples,
   type HostTriples,
   hostTripleRefs,
   lintHostTriples,
@@ -1258,6 +1259,7 @@ describe("lintHostTriples (host-triple drift + fault)", () => {
     defaults: {},
     dispatch: {},
     panels: {},
+    panelMeta: {},
     panelDefault: null,
     ...host,
   });
@@ -1299,6 +1301,72 @@ describe("lintHostTriples (host-triple drift + fault)", () => {
       ),
     );
     expect(findings).toEqual([]);
+  });
+});
+
+describe("extractHostTriples (dual-shape panel harvesting)", () => {
+  test("harvests members from an object-form panel, plus its strength/description", () => {
+    const host = extractHostTriples(null, {
+      panels: {
+        duo: {
+          strength: "standard",
+          description: "a duo.",
+          members: ["claude::opus::high", "codex::gpt-5.5::high"],
+        },
+      },
+      default: "duo",
+    });
+    expect(host.panels.duo).toEqual([
+      "claude::opus::high",
+      "codex::gpt-5.5::high",
+    ]);
+    expect(host.panelMeta.duo).toEqual({
+      strength: "standard",
+      description: "a duo.",
+    });
+    expect(host.panelDefault).toBe("duo");
+  });
+
+  test("harvests members from a legacy list-form panel, with empty strength/description", () => {
+    const host = extractHostTriples(null, {
+      panels: { duo: ["claude::opus::high", "codex::gpt-5.5::high"] },
+    });
+    expect(host.panels.duo).toEqual([
+      "claude::opus::high",
+      "codex::gpt-5.5::high",
+    ]);
+    expect(host.panelMeta.duo).toEqual({ strength: "", description: "" });
+  });
+
+  test("an object-form panel missing strength/description harvests them as empty strings", () => {
+    const host = extractHostTriples(null, {
+      panels: { duo: { members: ["claude::opus::high"] } },
+    });
+    expect(host.panelMeta.duo).toEqual({ strength: "", description: "" });
+  });
+
+  test("hostTripleRefs flattens panel-member refs identically over both shapes", () => {
+    const listForm = hostTripleRefs(
+      extractHostTriples(null, {
+        panels: { duo: ["claude::opus::high", "codex::gpt-5.5::high"] },
+      }),
+    );
+    const objectForm = hostTripleRefs(
+      extractHostTriples(null, {
+        panels: {
+          duo: {
+            strength: "standard",
+            description: "a duo.",
+            members: ["claude::opus::high", "codex::gpt-5.5::high"],
+          },
+        },
+      }),
+    );
+    expect(listForm).toEqual(objectForm);
+    expect(listForm).toEqual([
+      { source: "panel 'duo' member 1", raw: "claude::opus::high" },
+      { source: "panel 'duo' member 2", raw: "codex::gpt-5.5::high" },
+    ]);
   });
 });
 
@@ -1534,6 +1602,7 @@ describe("providers check verb", () => {
         defaults: { claude: "claude::opus::low" },
         dispatch: { work: "claude::sonnet::high" },
         panels: { duo: ["codex::gpt-5.5-codex::high", "hermes::hermes-m::na"] },
+        panelMeta: { duo: { strength: "standard", description: "a duo." } },
         panelDefault: "duo",
       },
       providerReachable: () => true,
@@ -1553,6 +1622,7 @@ describe("providers check verb", () => {
         defaults: { claude: "claude::opus::xhigh" },
         dispatch: {},
         panels: {},
+        panelMeta: {},
         panelDefault: null,
       },
       providerReachable: (harness) => harness !== "pi",
@@ -1575,6 +1645,7 @@ describe("providers check verb", () => {
         // Two segments — the grammar rejects it (fault, not drift).
         dispatch: { unblock: "claude::opus" },
         panels: {},
+        panelMeta: {},
         panelDefault: null,
       },
       providerReachable: () => true,
@@ -1598,6 +1669,7 @@ describe("providers check verb", () => {
         defaults: {},
         dispatch: { unblock: "claude::sonnet::xhigh" },
         panels: {},
+        panelMeta: {},
         panelDefault: null,
       },
       providerReachable: () => true,
@@ -1701,6 +1773,7 @@ describe("providers check verb", () => {
           repair: "claude::opus::low",
         },
         panels: {},
+        panelMeta: {},
         panelDefault: null,
       },
       providerReachable: () => true,

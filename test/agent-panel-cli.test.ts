@@ -36,6 +36,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseDuration } from "../cli/duration";
 import type {
+  PanelDefinition,
   PanelSelections,
   Preset,
   PresetCatalog,
@@ -461,6 +462,13 @@ const AD_HOC_CATALOG: PresetCatalog = {
 };
 const AD_HOC_SELECTIONS: PanelSelections = { panels: {}, default: null };
 
+/** Build a fixture `PanelDefinition` from an ordered member list — strength +
+ *  description are irrelevant to leg-naming/spawn-argv behavior here, so every
+ *  fixture panel shares an arbitrary uniform band + blurb. */
+function panelDef(members: string[]): PanelDefinition {
+  return { strength: "standard", members, description: "fixture panel." };
+}
+
 interface AdHocSpawn {
   argv: string[];
 }
@@ -741,7 +749,9 @@ describe("panelStart (ad-hoc member fan-out)", () => {
       loadRegistry: () => ({
         catalog: { presets: {} },
         selections: {
-          panels: { duo: ["claude::opus::high", "codex::gpt-5.3::high"] },
+          panels: {
+            duo: panelDef(["claude::opus::high", "codex::gpt-5.3::high"]),
+          },
           default: null,
         },
       }),
@@ -884,7 +894,9 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
       loadRegistry: () => ({
         catalog: { presets: {} },
         selections: {
-          panels: { duo: ["claude::opus::high", "codex::gpt-5.3::high"] },
+          panels: {
+            duo: panelDef(["claude::opus::high", "codex::gpt-5.3::high"]),
+          },
           default: null,
         },
       }),

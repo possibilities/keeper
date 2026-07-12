@@ -32,6 +32,7 @@ export const DEFAULT_HOST_TRIPLES: HostTriples = {
   defaults: {},
   dispatch: {},
   panels: {},
+  panelMeta: {},
   panelDefault: null,
 };
 

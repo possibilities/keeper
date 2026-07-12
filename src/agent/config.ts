@@ -324,8 +324,22 @@ export interface PresetCatalog {
  * (`resolvePanelMembers`) disambiguates them by 1-based ordinal.
  */
 export interface PanelSelections {
-  panels: Record<string, string[]>;
+  panels: Record<string, PanelDefinition>;
   default: string | null;
+}
+
+/**
+ * One panel's value in `panel.yaml` (ADR 0046) — an object, never a bare list
+ * (a legacy list-form value is a fail-loud remediation case, {@link
+ * loadPanelSelections}). `strength`/`description` are free-form non-empty
+ * strings; band vocabulary and roster policy (closed strength enum, panel
+ * count, effort gravity) are NOT enforced here — that lives in the plan
+ * plugin's structural gate over the committed roster, never this loader.
+ */
+export interface PanelDefinition {
+  strength: string;
+  members: string[];
+  description: string;
 }
 
 /**
@@ -384,6 +398,15 @@ const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "dispatch",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
+
+/** The exactly-three keys a panel's object value admits (ADR 0046) — a
+ *  legacy list-form panel is detected and rejected BEFORE this set is
+ *  checked ({@link loadPanelSelections}). */
+const ALLOWED_PANEL_ENTRY_KEYS: ReadonlySet<string> = new Set([
+  "strength",
+  "members",
+  "description",
+]);
 
 /** Reject any unknown key in a config mapping (no silent typos). `label` names
  *  the offending key's kind in the error ("top-level key" for the catalog root,
@@ -604,16 +627,22 @@ export function isPanelEligibleHarness(name: string): boolean {
 
 /**
  * Read the panel selections from `panel.yaml`. REQUIRED + validated: a missing file
- * is fail-LOUD (ConfigError). Each panel is an ordered list of launch-triple members
- * (`<harness>::<model>::<effort>`) parsed with the shared grammar — a malformed
- * triple is fail-loud naming the panel and the offending member. Every member's
- * harness must be panel-eligible ({@link isPanelEligibleHarness}: capturable AND
- * carrying a reasoning axis; claude/codex/pi qualify, an axisless harness is rejected
- * AT LOAD, the same predicate the launch path re-checks). Duplicate identical triples
- * are legal (the launch path disambiguates by ordinal). The optional top-level
- * `default` key (a structural key, exempt from `validatePresetName` though `default`
- * is a reserved preset name) must name a defined panel. Fail-loud on malformed YAML,
- * an unknown top-level key, an empty panel list, or any of the above.
+ * is fail-LOUD (ConfigError). Each panel is an OBJECT `{strength, members, description}`
+ * (ADR 0046) — a legacy bare-list value is detected explicitly and rejected with a
+ * remediation error naming the panel and directing regeneration via
+ * `/plan:panel-guidance`, never the generic shape error. `members` is an ordered list
+ * of launch-triple members (`<harness>::<model>::<effort>`) parsed with the shared
+ * grammar — a malformed triple is fail-loud naming the panel and the offending member.
+ * Every member's harness must be panel-eligible ({@link isPanelEligibleHarness}:
+ * capturable AND carrying a reasoning axis; claude/codex/pi qualify, an axisless
+ * harness is rejected AT LOAD, the same predicate the launch path re-checks).
+ * Duplicate identical triples are legal (the launch path disambiguates by ordinal).
+ * `strength`/`description` must be non-empty strings — structure only; band
+ * vocabulary and roster policy are the plan plugin gate's job, not this loader's.
+ * The optional top-level `default` key (a structural key, exempt from
+ * `validatePresetName` though `default` is a reserved preset name) must name a
+ * defined panel. Fail-loud on malformed YAML, an unknown top-level or panel-entry
+ * key, an empty members list, or any of the above.
  */
 export function loadPanelSelections(
   configPath: string = panelConfigPath(),
@@ -624,16 +653,35 @@ export function loadPanelSelections(
   const raw = readMapping(configPath);
   rejectUnknownKeys(raw, ALLOWED_PANEL_KEYS, configPath);
 
-  const panels: Record<string, string[]> = {};
+  const panels: Record<string, PanelDefinition> = {};
   const panelsRaw = raw.panels ?? {};
   if (!isRecord(panelsRaw)) {
     throw new ConfigError(`Expected panels to be a mapping in ${configPath}`);
   }
-  for (const [name, members] of Object.entries(panelsRaw)) {
+  for (const [name, value] of Object.entries(panelsRaw)) {
     validatePresetName(name, configPath);
+    if (Array.isArray(value)) {
+      throw new ConfigError(
+        `Panel '${name}' uses the legacy list form in ${configPath}; regenerate ` +
+          `panel.yaml as the described object form {strength, members, description} ` +
+          `via /plan:panel-guidance`,
+      );
+    }
+    if (!isRecord(value)) {
+      throw new ConfigError(
+        `Panel '${name}' must be an object {strength, members, description} in ${configPath}`,
+      );
+    }
+    rejectUnknownKeys(
+      value,
+      ALLOWED_PANEL_ENTRY_KEYS,
+      configPath,
+      `panel '${name}' key`,
+    );
+    const members = value.members;
     if (!Array.isArray(members) || members.length === 0) {
       throw new ConfigError(
-        `Panel '${name}' must be a non-empty list in ${configPath}`,
+        `Panel '${name}' members must be a non-empty list in ${configPath}`,
       );
     }
     const out: string[] = [];
@@ -657,7 +705,23 @@ export function loadPanelSelections(
       }
       out.push(triple);
     }
-    panels[name] = out;
+    const strength = value.strength;
+    if (typeof strength !== "string" || !strength.trim()) {
+      throw new ConfigError(
+        `Panel '${name}' strength must be a non-empty string in ${configPath}`,
+      );
+    }
+    const description = value.description;
+    if (typeof description !== "string" || !description.trim()) {
+      throw new ConfigError(
+        `Panel '${name}' description must be a non-empty string in ${configPath}`,
+      );
+    }
+    panels[name] = {
+      strength: strength.trim(),
+      members: out,
+      description: description.trim(),
+    };
   }
 
   let defaultPanel: string | null = null;

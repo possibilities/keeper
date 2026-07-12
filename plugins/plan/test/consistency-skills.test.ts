@@ -222,6 +222,45 @@ const DEFER_SKILL = join(REPO, "skills", "defer", "SKILL.md");
 const CLOSE_SKILL = join(REPO, "skills", "close", "SKILL.md");
 const MODEL_SELECTOR_AGENT = join(REPO, "agents", "model-selector.md");
 const MODEL_GUIDANCE_SKILL = join(REPO, "skills", "model-guidance", "SKILL.md");
+const PANEL_GUIDANCE_SKILL = join(REPO, "skills", "panel-guidance", "SKILL.md");
+
+describe("panel-guidance skill consistency", () => {
+  test("exists as source in its documented skill directory", () => {
+    expect(existsSync(PANEL_GUIDANCE_SKILL)).toBe(true);
+    expect(readdirSync(join(REPO, "skills", "panel-guidance"))).toContain(
+      "SKILL.md",
+    );
+  });
+
+  test("name: is the bare verb panel-guidance", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PANEL_GUIDANCE_SKILL));
+    expect(fm.name).toBe("panel-guidance");
+  });
+
+  test("stays slash-only", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PANEL_GUIDANCE_SKILL));
+    expect(fm["disable-model-invocation"]).toBe("true");
+  });
+
+  test("grants only the roster-authoring tools", () => {
+    const fm = parseFrontmatter(frontmatterBlock(PANEL_GUIDANCE_SKILL));
+    const tools = fm["allowed-tools"] as string;
+    for (const tool of [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write",
+      "AskUserQuestion",
+      "Bash(bun plugins/plan/scripts/panel-guidance-check.ts:*)",
+      "Bash(keeper agent presets list:*)",
+      "Bash(keeper agent providers check:*)",
+      "Bash(cp plugins/plan/panel-selector.yaml:*)",
+    ]) {
+      expect(tools).toContain(tool);
+    }
+  });
+});
 
 describe("model-guidance skill frontmatter", () => {
   test("name: is the bare verb model-guidance", () => {
