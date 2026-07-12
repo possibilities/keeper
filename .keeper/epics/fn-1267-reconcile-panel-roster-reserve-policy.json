@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-12T23:02:54.843000Z",
+  "created_by_close_of": "fn-1255-described-panel-roster-ladder",
+  "depends_on_epics": [
+    "fn-1255-described-panel-roster-ladder"
+  ],
+  "id": "fn-1267-reconcile-panel-roster-reserve-policy",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Reconcile panel roster reserve policy",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-12T23:02:54.843000Z"
+}
