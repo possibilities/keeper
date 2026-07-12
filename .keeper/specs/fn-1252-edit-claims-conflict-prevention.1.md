@@ -40,5 +40,5 @@ Unit-test with a faked GitRunner: exit-0 magnitudes; inconclusive on 124/128/spa
 - [ ] Timeout / ambiguous-ref / spawn failure returns a DISTINCT inconclusive value (never a false magnitude); the function never throws.
 
 ## Done summary
-
+Added measureBaseDrift, a pure injected-git primitive in worktree-git.ts returning behind-count (git rev-list --left-right --count) and merge-base commit timestamp (git show %ct), with a distinct inconclusive kind on timeout/ambiguous-ref/spawn-fail so callers defer rather than misread drift.
 ## Evidence
