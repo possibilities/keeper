@@ -10,7 +10,7 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   collections (`keeper status`, `keeper board`, `keeper query`)
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation
-- **History forensics** — `keeper transcript` extracts bounded main/subagent
+- **History forensics** — `keeper transcript <harness>` extracts bounded main/subagent
   conversations; `keeper search-history`, `keeper find-file-history`, and
   `keeper session events` answer who/when/what across sessions
 - **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling

@@ -530,12 +530,13 @@ export function transcriptIdError(params: PiTranscriptParams): string | null {
   return null;
 }
 
-/** Build the argv-only keeper invocation from already-clamped params. */
+/** Build the argv-only keeper invocation from already-clamped params. The
+ *  extension stays claude-only, but the CLI grammar requires the harness
+ *  positional up front regardless. */
 function buildTranscriptArgv(params: PiTranscriptParams): string[] {
   const sessionId = params.session_id?.trim() ?? "";
   const listing = sessionId.length === 0;
-  const args = ["transcript", ...(listing ? ["list"] : [sessionId])];
-  args.push("--harness", "claude");
+  const args = ["transcript", "claude", ...(listing ? ["list"] : [sessionId])];
   pushStringFlag(args, "--project", params.project);
   pushNumberFlag(args, "--offset", params.offset);
   pushNumberFlag(args, "--limit", params.limit);
