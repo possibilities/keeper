@@ -57,5 +57,5 @@ diversity") to prove the sweep is complete.
 - [ ] The root lint-claude-md gate stays green.
 
 ## Done summary
-
+Swept CONTEXT.md, docs/install.md, docs/plugin-composition-map.md, plugins/plan/CLAUDE.md, plugins/plan/README.md, the panel skill reference, and the panel-runner template to describe the authored strength-band + description panel roster instead of the retired member-count/harness-diversity heuristic; pruned CONTEXT.md back under its 140-line cap.
 ## Evidence
