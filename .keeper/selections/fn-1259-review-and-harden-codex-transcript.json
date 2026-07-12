@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A defensive-parse and security review (path-traversal, TOCTOU, unbounded reads, fold-to-skip invariants) of a whole harness reader is a hard opus gate for a subtle security/correctness invariant, and security-shaped review is precisely the max effort band where deeper reasoning lifts quality.",
+      "task_id": "fn-1259-review-and-harden-codex-transcript.1",
+      "tier": "max"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-12T04:24:47.262000Z",
+  "epic_id": "fn-1259-review-and-harden-codex-transcript",
+  "input_hash": "98e4d824421dcccd5b6a096930e7c8274483f890b3c3be7e5a5b393551622e96",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2565134372,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"A defensive-parse and security review (path-traversal, TOCTOU, unbounded reads, fold-to-skip invariants) of a whole harness reader is a hard opus gate for a subtle security/correctness invariant, and security-shaped review is precisely the max effort band where deeper reasoning lifts quality.\",\"confidence\":0.83}]}\n"
+}
