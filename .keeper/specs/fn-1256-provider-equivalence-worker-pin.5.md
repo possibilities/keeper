@@ -45,5 +45,5 @@ env clears them; definition cells byte-identical throughout; merged reads surfac
 - [ ] Merged task reads surface dispatched_* keys; plan fast suite green
 
 ## Done summary
-
+claim reads KEEPER_PLAN_DISPATCHED_MODEL/TIER/CONSTRAINT and lands dispatched_model/dispatched_tier/dispatch_constraint in the runtime sidecar when non-empty; an unconstrained claim clears stale values via saveRuntime's full-overwrite semantics. task.model/task.tier and the selection sidecar untouched; merged reads surface the keys via mergeTaskState's unknown-key pass-through.
 ## Evidence

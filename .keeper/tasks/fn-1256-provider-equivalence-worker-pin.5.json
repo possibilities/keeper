@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Claim captures dispatched cell",
-  "updated_at": "2026-07-12T01:33:13.099000Z"
+  "updated_at": "2026-07-12T02:50:29.394000Z",
+  "worker_done_at": "2026-07-12T02:50:29.394000Z"
 }
