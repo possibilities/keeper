@@ -31,12 +31,12 @@ const COMMITTED_MAP = join(
 );
 
 /** A small hand-authored map: opus/sonnet (claude family) ↔ gpt-5.6-sol/
- *  gpt-5.6-terra (codex family), each at `high` only, so `opus/low` is a
+ *  gpt-5.6-terra (gpt family), each at `high` only, so `opus/low` is a
  *  deliberate no-map-entry gap. */
 const CONFIG: ProviderEquivalenceConfig = {
   schema_version: 1,
   mappings: {
-    claude_to_codex: [
+    claude_to_gpt: [
       {
         source: { model: "opus", effort: "high" },
         target: { model: "gpt-5.6-sol", effort: "high" },
@@ -46,7 +46,7 @@ const CONFIG: ProviderEquivalenceConfig = {
         target: { model: "gpt-5.6-terra", effort: "high" },
       },
     ],
-    codex_to_claude: [
+    gpt_to_claude: [
       {
         source: { model: "gpt-5.6-sol", effort: "high" },
         target: { model: "opus", effort: "high" },
@@ -90,13 +90,13 @@ describe("provider-equivalence strict parser", () => {
       coerceProviderEquivalenceConfig({
         schema_version: 1,
         mappings: {
-          claude_to_codex: [
+          claude_to_gpt: [
             {
               source: { model: "opus", effort: "turbo" },
               target: { model: "gpt-5.6-sol", effort: "high" },
             },
           ],
-          codex_to_claude: [],
+          gpt_to_claude: [],
         },
       }),
     ).toThrow(/canonical effort vocabulary/);
@@ -112,7 +112,7 @@ describe("provider-equivalence strict parser", () => {
     expect(() =>
       coerceProviderEquivalenceConfig({
         schema_version: 1,
-        mappings: { claude_to_codex: {}, codex_to_claude: [] },
+        mappings: { claude_to_gpt: {}, gpt_to_claude: [] },
       }),
     ).toThrow(/must be a list/);
   });
@@ -134,10 +134,10 @@ describe("loadProviderEquivalenceSnapshot fail-closed", () => {
 });
 
 describe("applyProviderConstraint", () => {
-  test("pins to codex: a claude-family cell TRANSLATES to its mapped codex cell", () => {
+  test("pins to gpt: a claude-family cell TRANSLATES to its mapped gpt cell", () => {
     const r = applyProviderConstraint(
       { model: "opus", effort: "high" },
-      "codex",
+      "gpt",
       OK_MAP,
       FULL_AXES,
     );
@@ -147,7 +147,7 @@ describe("applyProviderConstraint", () => {
     });
   });
 
-  test("pins to claude: a codex-family cell TRANSLATES to its mapped claude cell", () => {
+  test("pins to claude: a gpt-family cell TRANSLATES to its mapped claude cell", () => {
     const r = applyProviderConstraint(
       { model: "gpt-5.6-terra", effort: "high" },
       "claude",
@@ -164,7 +164,7 @@ describe("applyProviderConstraint", () => {
     expect(
       applyProviderConstraint(
         { model: "gpt-5.6-sol", effort: "high" },
-        "codex",
+        "gpt",
         OK_MAP,
         FULL_AXES,
       ),
@@ -182,22 +182,22 @@ describe("applyProviderConstraint", () => {
   test("no-map-entry: a cross-family cell with no mapping refuses (names cells + direction)", () => {
     const r = applyProviderConstraint(
       { model: "opus", effort: "low" },
-      "codex",
+      "gpt",
       OK_MAP,
       FULL_AXES,
     );
     expect(r).toEqual({
       kind: "reject",
       reason: "no-map-entry",
-      provider: "codex",
-      direction: "claude_to_codex",
+      provider: "gpt",
+      direction: "claude_to_gpt",
       assigned: { model: "opus", effort: "low" },
       target: null,
     });
   });
 
   test("target-not-on-host: a mapped target absent from the live matrix refuses", () => {
-    // A matrix MISSING gpt-5.6-terra — so translating sonnet/high (claude→codex)
+    // A matrix MISSING gpt-5.6-terra — so translating sonnet/high (claude→gpt)
     // resolves a target that is not a dispatchable cell.
     const axesNoTerra: HostMatrixAxes = {
       models: ["opus", "sonnet", "gpt-5.6-sol"],
@@ -211,15 +211,15 @@ describe("applyProviderConstraint", () => {
     };
     const r = applyProviderConstraint(
       { model: "sonnet", effort: "high" },
-      "codex",
+      "gpt",
       OK_MAP,
       axesNoTerra,
     );
     expect(r).toEqual({
       kind: "reject",
       reason: "target-not-on-host",
-      provider: "codex",
-      direction: "claude_to_codex",
+      provider: "gpt",
+      direction: "claude_to_gpt",
       assigned: { model: "sonnet", effort: "high" },
       target: { model: "gpt-5.6-terra", effort: "high" },
     });
@@ -240,7 +240,7 @@ describe("applyProviderConstraint", () => {
     };
     const r = applyProviderConstraint(
       { model: "opus", effort: "high" },
-      "codex",
+      "gpt",
       OK_MAP,
       axesNarrow,
     );
@@ -251,15 +251,15 @@ describe("applyProviderConstraint", () => {
   test("map-malformed: a failed-to-load snapshot refuses per-cell (never a fallback)", () => {
     const r = applyProviderConstraint(
       { model: "opus", effort: "high" },
-      "codex",
+      "gpt",
       { ok: false, detail: "boom" },
       FULL_AXES,
     );
     expect(r).toEqual({
       kind: "reject",
       reason: "map-malformed",
-      provider: "codex",
-      direction: "claude_to_codex",
+      provider: "gpt",
+      direction: "claude_to_gpt",
       assigned: { model: "opus", effort: "high" },
       target: null,
       detail: "boom",

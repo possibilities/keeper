@@ -43,7 +43,7 @@ export interface EquivalenceCell {
  *  translation runs only when a pin is set, so this carries the two active
  *  members while the unconstrained default (NULL) is modeled as `WorkerProvider |
  *  null` at the read sites. */
-export type WorkerProvider = "claude" | "codex";
+export type WorkerProvider = "claude" | "gpt";
 
 /**
  * The reduced runtime lookup the pure `applyProviderConstraint` reads — built
@@ -55,20 +55,20 @@ export type WorkerProvider = "claude" | "codex";
  * "already in the pinned family" on.
  */
 export interface ProviderEquivalenceMap {
-  /** claude-family source `model → effort → codex-family target`. */
-  readonly claudeToCodex: ReadonlyMap<
+  /** claude-family source `model → effort → gpt-family target`. */
+  readonly claudeToGpt: ReadonlyMap<
     string,
     ReadonlyMap<string, EquivalenceCell>
   >;
-  /** codex-family source `model → effort → claude-family target`. */
-  readonly codexToClaude: ReadonlyMap<
+  /** gpt-family source `model → effort → claude-family target`. */
+  readonly gptToClaude: ReadonlyMap<
     string,
     ReadonlyMap<string, EquivalenceCell>
   >;
-  /** The claude-family models — source models of `claude_to_codex`. */
+  /** The claude-family models — source models of `claude_to_gpt`. */
   readonly claudeFamilyModels: ReadonlySet<string>;
-  /** The codex-family models — source models of `codex_to_claude`. */
-  readonly codexFamilyModels: ReadonlySet<string>;
+  /** The gpt-family models — source models of `gpt_to_claude`. */
+  readonly gptFamilyModels: ReadonlySet<string>;
 }
 
 /**
@@ -130,10 +130,10 @@ function isModelToken(value: unknown): value is string {
 
 /** The two authored equivalence directions — independently authored, never
  *  inverses of one another. */
-export type EquivalenceDirection = "claude_to_codex" | "codex_to_claude";
+export type EquivalenceDirection = "claude_to_gpt" | "gpt_to_claude";
 export const EQUIVALENCE_DIRECTIONS: readonly EquivalenceDirection[] = [
-  "claude_to_codex",
-  "codex_to_claude",
+  "claude_to_gpt",
+  "gpt_to_claude",
 ];
 
 /** One authored mapping entry: a source cell and its most-equivalent target. */
@@ -244,19 +244,19 @@ export function coerceProviderEquivalenceConfig(
   const mappingsDoc = asMapping(doc.mappings, "mappings");
   rejectUnknownKeys(
     mappingsDoc,
-    ["claude_to_codex", "codex_to_claude"],
+    ["claude_to_gpt", "gpt_to_claude"],
     "mappings",
   );
   return {
     schema_version: 1,
     mappings: {
-      claude_to_codex: coerceDirection(
-        mappingsDoc.claude_to_codex,
-        "mappings.claude_to_codex",
+      claude_to_gpt: coerceDirection(
+        mappingsDoc.claude_to_gpt,
+        "mappings.claude_to_gpt",
       ),
-      codex_to_claude: coerceDirection(
-        mappingsDoc.codex_to_claude,
-        "mappings.codex_to_claude",
+      gpt_to_claude: coerceDirection(
+        mappingsDoc.gpt_to_claude,
+        "mappings.gpt_to_claude",
       ),
     },
   };
@@ -318,13 +318,13 @@ export function buildProviderEquivalenceMap(
     return byModel;
   };
   return {
-    claudeToCodex: build(config.mappings.claude_to_codex),
-    codexToClaude: build(config.mappings.codex_to_claude),
+    claudeToGpt: build(config.mappings.claude_to_gpt),
+    gptToClaude: build(config.mappings.gpt_to_claude),
     claudeFamilyModels: new Set(
-      config.mappings.claude_to_codex.map((e) => e.source.model),
+      config.mappings.claude_to_gpt.map((e) => e.source.model),
     ),
-    codexFamilyModels: new Set(
-      config.mappings.codex_to_claude.map((e) => e.source.model),
+    gptFamilyModels: new Set(
+      config.mappings.gpt_to_claude.map((e) => e.source.model),
     ),
   };
 }

@@ -5108,16 +5108,18 @@ interface AutopilotConfigSetPayload {
    *  resolves an absent column `?? OFF` at read time. */
   codex_adoption?: number;
   /** The durable worker-provider dispatch pin (docs/adr/0047), stored as TEXT —
-   *  the FIRST non-numeric config column. `"claude"` / `"codex"` pin every work
+   *  the FIRST non-numeric config column. `"claude"` / `"gpt"` pin every work
    *  dispatch to that provider family; `null` clears the pin (unconstrained,
    *  the byte-identical default). Present iff the patch touches it AND the raw
-   *  wire value is one of the three recognized members — an unrecognized value
-   *  (a typo, a stale enum member) drops the field entirely, preserving the
-   *  existing column, rather than coercing to a sentinel (unlike the numeric
-   *  fields above, silently clearing a dispatch pin is not the safe direction).
-   *  The RPC validator rejects a bad value loud before it ever reaches here;
-   *  this is a defensive backstop, never a throw. */
-  worker_provider?: "claude" | "codex" | null;
+   *  wire value is one of the recognized members — the deprecated `"codex"`
+   *  alias folds to `"gpt"` (LOAD-BEARING for re-fold determinism: historical
+   *  events carry `"codex"`), while an unrecognized value (a typo, a stale enum
+   *  member) drops the field entirely, preserving the existing column, rather
+   *  than coercing to a sentinel (unlike the numeric fields above, silently
+   *  clearing a dispatch pin is not the safe direction). The RPC validator
+   *  rejects a bad value loud before it ever reaches here; this is a defensive
+   *  backstop, never a throw. */
+  worker_provider?: "claude" | "gpt" | null;
 }
 
 /**
@@ -5190,13 +5192,18 @@ function extractAutopilotConfigSetPayload(
     if ("worker_provider" in parsed) {
       const raw = parsed.worker_provider;
       // STRING ENUM, the first non-numeric config column: accept exactly
-      // `"claude"` / `"codex"` / `null`. Anything else (a typo, a number, a
-      // stale enum member) is NOT coerced to a sentinel — it drops the field
-      // entirely so the existing column survives untouched, matching the
-      // strict-mode discipline of `extractAutopilotModePayload` rather than the
-      // coerce-to-null tolerance the numeric fields above use.
-      if (raw === "claude" || raw === "codex" || raw === null) {
+      // `"claude"` / `"gpt"` / `null`, plus the deprecated `"codex"` alias
+      // folded to `"gpt"` — LOAD-BEARING for re-fold determinism, since
+      // historical `set_autopilot_config` events already carry `"codex"` and
+      // every replay must fold them to `"gpt"`. Anything else (a typo, a
+      // number, a stale enum member) is NOT coerced to a sentinel — it drops
+      // the field entirely so the existing column survives untouched, matching
+      // the strict-mode discipline of `extractAutopilotModePayload` rather than
+      // the coerce-to-null tolerance the numeric fields above use.
+      if (raw === "claude" || raw === "gpt" || raw === null) {
         patch.worker_provider = raw;
+      } else if (raw === "codex") {
+        patch.worker_provider = "gpt";
       }
     }
     // An empty patch (no recognized field) folds to a safe no-op.

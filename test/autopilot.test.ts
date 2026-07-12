@@ -1441,12 +1441,14 @@ describe("projectWorkerProvider", () => {
     expect(projectWorkerProvider([{ worker_provider: "claude" }])).toBe(
       "claude",
     );
-    expect(projectWorkerProvider([{ worker_provider: "codex" }])).toBe("codex");
+    expect(projectWorkerProvider([{ worker_provider: "gpt" }])).toBe("gpt");
   });
   test("NULL / missing / an unrecognized value ALL resolve to null", () => {
     expect(projectWorkerProvider([{ worker_provider: null }])).toBeNull();
     expect(projectWorkerProvider([{}])).toBeNull();
-    expect(projectWorkerProvider([{ worker_provider: "gpt" }])).toBeNull();
+    // A stray `codex` (the pre-rename family label) reads as unset — after the
+    // migration + fold normalization the column only holds `claude | gpt | null`.
+    expect(projectWorkerProvider([{ worker_provider: "codex" }])).toBeNull();
   });
 });
 
@@ -1497,14 +1499,14 @@ describe("buildAutopilotShowEnvelope", () => {
     expect(claude.data?.worker_provider_scope).toMatch(/work cells only/);
     expect(claude.data?.worker_provider_note).toMatch(/GPT tier/);
 
-    const codex = buildAutopilotShowEnvelope(
-      [{ paused: 0, mode: "yolo", worker_provider: "codex" }],
+    const gpt = buildAutopilotShowEnvelope(
+      [{ paused: 0, mode: "yolo", worker_provider: "gpt" }],
       [],
     );
-    expect(codex.data?.worker_provider).toBe("codex");
-    expect(codex.data?.worker_provider_scope).toMatch(/work cells only/);
-    // The tier-collapse note is claude-specific — absent when pinned to codex.
-    expect(codex.data?.worker_provider_note).toBeNull();
+    expect(gpt.data?.worker_provider).toBe("gpt");
+    expect(gpt.data?.worker_provider_scope).toMatch(/work cells only/);
+    // The tier-collapse note is claude-specific — absent when pinned to gpt.
+    expect(gpt.data?.worker_provider_note).toBeNull();
   });
 
   test("worktree OFF floors effective to 1 while stored keeps the intent", () => {

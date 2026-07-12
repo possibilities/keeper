@@ -7320,7 +7320,7 @@ export async function loadReconcileSnapshot(
 
   // The durable work-dispatch provider pin (`worker_provider`, ADR 0047) rides the
   // SAME singleton row — NULL/absent (unconstrained, the byte-identical default) or
-  // a family (`"claude"`/`"codex"`) every cell-bearing `work` launch is translated
+  // a family (`"claude"`/`"gpt"`) every cell-bearing `work` launch is translated
   // into. Projection-pull only so a runtime `set_autopilot_config` lands the next
   // cycle. Mirrors `projectWorkerProvider`'s coercion (only the two exact members
   // pass; anything else is unconstrained). The equivalence map is loaded + reduced
@@ -7331,8 +7331,8 @@ export async function loadReconcileSnapshot(
   const workerProviderRaw = (
     autopilotRows[0] as { worker_provider?: unknown } | undefined
   )?.worker_provider;
-  const workerProvider: "claude" | "codex" | null =
-    workerProviderRaw === "claude" || workerProviderRaw === "codex"
+  const workerProvider: "claude" | "gpt" | null =
+    workerProviderRaw === "claude" || workerProviderRaw === "gpt"
       ? workerProviderRaw
       : null;
   const providerEquivalence =

@@ -53,10 +53,10 @@ function isModelToken(value: unknown): value is string {
 
 /** The two authored equivalence directions. Independently authored — never
  * inverses of one another. */
-export type EquivalenceDirection = "claude_to_codex" | "codex_to_claude";
+export type EquivalenceDirection = "claude_to_gpt" | "gpt_to_claude";
 export const EQUIVALENCE_DIRECTIONS: readonly EquivalenceDirection[] = [
-  "claude_to_codex",
-  "codex_to_claude",
+  "claude_to_gpt",
+  "gpt_to_claude",
 ];
 
 /** One `{model, effort}` cell — a source or a target. */
@@ -175,19 +175,19 @@ export function coerceProviderEquivalenceConfig(
   const mappingsDoc = asMapping(doc.mappings, "mappings");
   rejectUnknownKeys(
     mappingsDoc,
-    ["claude_to_codex", "codex_to_claude"],
+    ["claude_to_gpt", "gpt_to_claude"],
     "mappings",
   );
   return {
     schema_version: 1,
     mappings: {
-      claude_to_codex: coerceDirection(
-        mappingsDoc.claude_to_codex,
-        "mappings.claude_to_codex",
+      claude_to_gpt: coerceDirection(
+        mappingsDoc.claude_to_gpt,
+        "mappings.claude_to_gpt",
       ),
-      codex_to_claude: coerceDirection(
-        mappingsDoc.codex_to_claude,
-        "mappings.codex_to_claude",
+      gpt_to_claude: coerceDirection(
+        mappingsDoc.gpt_to_claude,
+        "mappings.gpt_to_claude",
       ),
     },
   };
@@ -211,9 +211,7 @@ function cellKey(cell: EquivalenceCell): string {
 }
 
 function otherDirection(direction: EquivalenceDirection): EquivalenceDirection {
-  return direction === "claude_to_codex"
-    ? "codex_to_claude"
-    : "claude_to_codex";
+  return direction === "claude_to_gpt" ? "gpt_to_claude" : "claude_to_gpt";
 }
 
 /** The pure, host-blind check core: no same-family target, every target model
@@ -226,11 +224,11 @@ export function checkProviderEquivalence(
 ): EquivalenceCheckResult {
   const errors: string[] = [];
   const sourceModelsByDirection: Record<EquivalenceDirection, Set<string>> = {
-    claude_to_codex: new Set(
-      config.mappings.claude_to_codex.map((e) => e.source.model),
+    claude_to_gpt: new Set(
+      config.mappings.claude_to_gpt.map((e) => e.source.model),
     ),
-    codex_to_claude: new Set(
-      config.mappings.codex_to_claude.map((e) => e.source.model),
+    gpt_to_claude: new Set(
+      config.mappings.gpt_to_claude.map((e) => e.source.model),
     ),
   };
 
@@ -322,8 +320,8 @@ export interface EquivalenceStateResult {
 
 /** Classify the map's totality (both directions, against the live matrix's
  * dispatchable cells) and target validity. A model's dispatchable cell
- * (`model × effortsFor(model)`) requires an entry in `claude_to_codex` when the
- * matrix drives it natively, else `codex_to_claude` — a gap absent from that
+ * (`model × effortsFor(model)`) requires an entry in `claude_to_gpt` when the
+ * matrix drives it natively, else `gpt_to_claude` — a gap absent from that
  * direction is reported with the direction it belongs in. Every mapping
  * entry's target must resolve to a live matrix model + effort. */
 export function classifyProviderEquivalence(
@@ -331,20 +329,18 @@ export function classifyProviderEquivalence(
   matrix: EffectiveMatrix,
 ): EquivalenceStateResult {
   const bySourceKey: Record<EquivalenceDirection, Set<string>> = {
-    claude_to_codex: new Set(
-      config.mappings.claude_to_codex.map((e) => cellKey(e.source)),
+    claude_to_gpt: new Set(
+      config.mappings.claude_to_gpt.map((e) => cellKey(e.source)),
     ),
-    codex_to_claude: new Set(
-      config.mappings.codex_to_claude.map((e) => cellKey(e.source)),
+    gpt_to_claude: new Set(
+      config.mappings.gpt_to_claude.map((e) => cellKey(e.source)),
     ),
   };
 
   const gaps: EquivalenceGap[] = [];
   for (const model of matrix.models) {
     const direction: EquivalenceDirection =
-      matrix.driverFor(model) === "native"
-        ? "claude_to_codex"
-        : "codex_to_claude";
+      matrix.driverFor(model) === "native" ? "claude_to_gpt" : "gpt_to_claude";
     for (const effort of matrix.effortsFor(model)) {
       if (!bySourceKey[direction].has(`${model}::${effort}`)) {
         gaps.push({ direction, model, effort });

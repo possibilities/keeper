@@ -1607,7 +1607,7 @@ test("reconcile: an out-of-matrix (model, tier) fails at compose — a reject, n
 // reconcile — worker_provider pin translation (ADR 0047)
 // ---------------------------------------------------------------------------
 
-// A matrix carrying opus/sonnet (claude) + gpt-5.6-sol (codex) at the five efforts.
+// A matrix carrying opus/sonnet (claude) + gpt-5.6-sol (gpt) at the five efforts.
 const PROVIDER_MATRIX = {
   ok: true as const,
   models: ["opus", "sonnet", "gpt-5.6-sol"],
@@ -1623,13 +1623,13 @@ const PROVIDER_MATRIX = {
 const PROVIDER_CONFIG: ProviderEquivalenceConfig = {
   schema_version: 1,
   mappings: {
-    claude_to_codex: [
+    claude_to_gpt: [
       {
         source: { model: "opus", effort: "max" },
         target: { model: "gpt-5.6-sol", effort: "max" },
       },
     ],
-    codex_to_claude: [
+    gpt_to_claude: [
       {
         source: { model: "gpt-5.6-sol", effort: "max" },
         target: { model: "opus", effort: "max" },
@@ -1642,29 +1642,29 @@ const PROVIDER_MAP_OK = {
   map: buildProviderEquivalenceMap(PROVIDER_CONFIG),
 };
 
-test("reconcile: pin=codex TRANSLATES a claude cell to its mapped codex --plugin-dir + non-empty carriers", () => {
+test("reconcile: pin=gpt TRANSLATES a claude cell to its mapped gpt --plugin-dir + non-empty carriers", () => {
   const epic = makeEpic({
     tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
   });
   const snap = makeSnapshot({
     epics: [epic],
     hostMatrix: PROVIDER_MATRIX,
-    workerProvider: "codex",
+    workerProvider: "gpt",
     providerEquivalence: PROVIDER_MAP_OK,
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];
-  // The launched cell is the TRANSLATED codex cell, not the assigned opus cell.
+  // The launched cell is the TRANSLATED gpt cell, not the assigned opus cell.
   expect(plan?.pluginDir).toContain("plugins/plan/workers/gpt-5.6-sol-max");
   expect(plan?.workerCommand).toContain(`--plugin-dir ${plan?.pluginDir}`);
   // The dispatched-cell carriers are populated; the ASSIGNED cell is untouched.
   expect(plan?.dispatchedCellModel).toBe("gpt-5.6-sol");
   expect(plan?.dispatchedCellTier).toBe("max");
-  expect(plan?.dispatchConstraint).toBe("codex");
+  expect(plan?.dispatchConstraint).toBe("gpt");
   expect(plan?.cellModel).toBe("opus");
   expect(plan?.tier).toBe("max");
   expect(plan?.providerReject).toBeUndefined();
   // The wrapped-cell marker keys on the EFFECTIVE (translated) cell — an opus cell
-  // translated INTO a wrapped codex cell IS marked (keyed on driver, not the pin).
+  // translated INTO a wrapped gpt cell IS marked (keyed on driver, not the pin).
   expect(plan?.wrappedCell).toBe("gpt-5.6-sol::max");
   expect(plan?.wrappedEnvelope).toBe(
     "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
@@ -1695,7 +1695,7 @@ test("reconcile: a SAME-family cell under a pin is UNCHANGED (empty carriers)", 
   const snap = makeSnapshot({
     epics: [epic],
     hostMatrix: PROVIDER_MATRIX,
-    workerProvider: "codex",
+    workerProvider: "gpt",
     providerEquivalence: PROVIDER_MAP_OK,
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];
@@ -1712,7 +1712,7 @@ test("reconcile: a SAME-family cell under a pin is UNCHANGED (empty carriers)", 
   );
 });
 
-test("isWrappedCell: driver-keyed — wrapped for a codex model (even with a null constraint), native for claude, wrapped for an unknown", () => {
+test("isWrappedCell: driver-keyed — wrapped for a gpt model (even with a null constraint), native for claude, wrapped for an unknown", () => {
   // The shared predicate the autopilot producer + the manual dispatch path both key
   // the marker on. A pre-assigned gpt cell is wrapped regardless of any pin.
   expect(isWrappedCell(PROVIDER_MATRIX, "gpt-5.6-sol")).toBe(true);
@@ -1867,28 +1867,28 @@ test("reconcile: no-map-entry refuses fail-closed (no pluginDir, no fallback)", 
   const snap = makeSnapshot({
     epics: [epic],
     hostMatrix: PROVIDER_MATRIX,
-    workerProvider: "codex",
+    workerProvider: "gpt",
     providerEquivalence: PROVIDER_MAP_OK,
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];
   expect(plan?.pluginDir).toBeNull();
   expect(plan?.providerReject?.reason).toBe("no-map-entry");
-  expect(plan?.providerReject?.direction).toBe("claude_to_codex");
+  expect(plan?.providerReject?.direction).toBe("claude_to_gpt");
   expect(plan?.workerCommand).not.toContain("--plugin-dir");
 });
 
 test("reconcile: target-not-on-host refuses when the mapped cell is absent", () => {
-  // Map opus/max → a codex model NOT on the host matrix.
+  // Map opus/max → a gpt model NOT on the host matrix.
   const config: ProviderEquivalenceConfig = {
     schema_version: 1,
     mappings: {
-      claude_to_codex: [
+      claude_to_gpt: [
         {
           source: { model: "opus", effort: "max" },
           target: { model: "gpt-absent", effort: "max" },
         },
       ],
-      codex_to_claude: [
+      gpt_to_claude: [
         {
           source: { model: "gpt-absent", effort: "max" },
           target: { model: "opus", effort: "max" },
@@ -1902,7 +1902,7 @@ test("reconcile: target-not-on-host refuses when the mapped cell is absent", () 
   const snap = makeSnapshot({
     epics: [epic],
     hostMatrix: PROVIDER_MATRIX,
-    workerProvider: "codex",
+    workerProvider: "gpt",
     providerEquivalence: { ok: true, map: buildProviderEquivalenceMap(config) },
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];
@@ -1921,7 +1921,7 @@ test("reconcile: a malformed map refuses per-cell (map-malformed, never a crash)
   const snap = makeSnapshot({
     epics: [epic],
     hostMatrix: PROVIDER_MATRIX,
-    workerProvider: "codex",
+    workerProvider: "gpt",
     providerEquivalence: { ok: false, detail: "stale map" },
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];

@@ -3931,7 +3931,7 @@ function autopilotConfigSetEvent(
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
     codex_adoption?: boolean;
-    worker_provider?: "claude" | "codex" | null;
+    worker_provider?: "claude" | "gpt" | "codex" | null;
   },
   sessionId = "autopilot",
 ): number {
@@ -4472,7 +4472,8 @@ test("AutopilotConfigSet present-but-non-boolean codex_adoption coerces to 0 (OF
 // fn-1256 task .3 — `worker_provider` is the durable work-dispatch provider
 // pin (docs/adr/0047), riding the same generic `AutopilotConfigSet` fold as
 // `codex_adoption` but the FIRST non-numeric config column: a STRICT string
-// enum (`"claude"` | `"codex"` | `null`), never coerced to a sentinel.
+// enum (`"claude"` | `"gpt"` | `null`, with the deprecated `"codex"` folded to
+// `"gpt"` for re-fold determinism), never coerced to a sentinel.
 // ---------------------------------------------------------------------------
 
 test("AutopilotConfigSet {worker_provider:'claude'} sets the column and advances the cursor (fn-1256)", () => {
@@ -4487,10 +4488,16 @@ test("AutopilotConfigSet {worker_provider:'claude'} sets the column and advances
   expect(row?.mode).toBe("yolo");
 });
 
-test("AutopilotConfigSet {worker_provider:'codex'} sets the column (fn-1256)", () => {
+test("AutopilotConfigSet {worker_provider:'gpt'} sets the column (fn-1256)", () => {
+  autopilotConfigSetEvent({ worker_provider: "gpt" });
+  drainAll();
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("gpt");
+});
+
+test("AutopilotConfigSet {worker_provider:'codex'} folds the deprecated alias to 'gpt' (re-fold determinism; docs/adr/0047)", () => {
   autopilotConfigSetEvent({ worker_provider: "codex" });
   drainAll();
-  expect(getAutopilotStateConfig()?.worker_provider).toBe("codex");
+  expect(getAutopilotStateConfig()?.worker_provider).toBe("gpt");
 });
 
 test("AutopilotConfigSet {worker_provider:null} explicitly clears the pin to SQL NULL (fn-1256)", () => {
@@ -4512,10 +4519,10 @@ test("AutopilotConfigSet {worker_provider} PRESERVES paused, mode, worktree flag
     worktree_multi_repo: true,
   });
   drainAll();
-  autopilotConfigSetEvent({ worker_provider: "codex" });
+  autopilotConfigSetEvent({ worker_provider: "gpt" });
   drainAll();
   const row = getAutopilotStateConfig();
-  expect(row?.worker_provider).toBe("codex"); // landed
+  expect(row?.worker_provider).toBe("gpt"); // landed
   expect(row?.worktree_mode).toBe(1); // worktree_mode PRESERVED
   expect(row?.worktree_multi_repo).toBe(1); // worktree_multi_repo PRESERVED
   expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
@@ -4544,7 +4551,7 @@ test("AutopilotConfigSet present-but-unrecognized worker_provider DROPS the fiel
   autopilotConfigSetEvent({ worker_provider: "claude" });
   drainAll();
   expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
-  for (const bad of ["gpt", 1, true, ""]) {
+  for (const bad of ["sonnet", 1, true, ""]) {
     insertEvent({
       hook_event: "AutopilotConfigSet",
       session_id: "autopilot",
@@ -4571,7 +4578,7 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with a wo
   autopilotPausedEvent(false);
   autopilotConfigSetEvent({
     max_concurrent_jobs: 9,
-    worker_provider: "codex",
+    worker_provider: "gpt",
   });
   autopilotModeEvent("armed");
   autopilotConfigSetEvent({ worker_provider: null });

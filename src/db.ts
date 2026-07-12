@@ -4181,7 +4181,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     apply: (ctx) => {
       const { db } = ctx;
       // v120→v121: add `autopilot_state.worker_provider` — the durable
-      // nullable TEXT enum (`NULL | 'claude' | 'codex'`) pinning every work
+      // nullable TEXT enum (`NULL | 'claude' | 'gpt'`) pinning every work
       // dispatch to one provider family (docs/adr/0047). The column's original
       // ladder entry (fn-1256 task .3, v119 at the time) was lost to the
       // b39fab28 stale-tree sweep while fn-1239's v119/v120 landed in its
@@ -4198,6 +4198,21 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // AFTER `codex_adoption` (the previous final column) so fresh-vs-migrated
       // `PRAGMA table_info(autopilot_state)` stays byte-identical.
       addColumnIfMissing(db, "autopilot_state", "worker_provider", "TEXT");
+    },
+  },
+  {
+    version: 122,
+    kind: "backfill",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // v121→v122: rename the worker_provider FAMILY LABEL value 'codex' → 'gpt'
+      // (docs/adr/0047 amendment). Idempotent targeted UPDATE — after the first
+      // run no 'codex' rows remain, so re-application is a no-op. The reducer
+      // fold also normalizes 'codex'→'gpt' for re-fold determinism; this fixes
+      // an already-materialized column no re-fold touches.
+      db.run(
+        "UPDATE autopilot_state SET worker_provider = 'gpt' WHERE worker_provider = 'codex'",
+      );
     },
   },
 ];
@@ -4220,7 +4235,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v121:f0d35b4b0bd4bd867f2ed5d2a2afada81cf35c09675a6181aa9f95fc34afd14d";
+  "v122:4848b26f6ac06fe46e2b6617d43f7d9b5aca8ed16bf3435c52a6e1c97beb456a";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`

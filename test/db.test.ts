@@ -1375,6 +1375,33 @@ test("autopilot_state has a nullable TEXT worker_provider column (NULL = unconst
   db.close();
 });
 
+test("the v122 backfill renames the durable worker_provider family label 'codex' → 'gpt' (docs/adr/0047 amendment)", () => {
+  // Seed a pre-v122 DB carrying the retired 'codex' family label on the
+  // autopilot_state singleton, then reopen through migrate() and assert the
+  // v121→v122 backfill rewrote the already-materialized column to 'gpt' — the
+  // durable column no re-fold touches (the reducer fold normalizes the same
+  // alias for re-fold determinism).
+  const { db: seed } = openDb(dbPath);
+  seed.run("UPDATE meta SET value = '121' WHERE key = 'schema_version'");
+  seed
+    .prepare(
+      "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, worker_provider) VALUES (1, 1, 0, 1, 1, 'codex')",
+    )
+    .run();
+  seed.close();
+
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
+  const r = db
+    .prepare("SELECT worker_provider FROM autopilot_state WHERE id = 1")
+    .get() as { worker_provider: string | null };
+  expect(r.worker_provider).toBe("gpt");
+  db.close();
+});
+
 test("the v113 rewind supersedes the v91→v92 backend_exec terminal-clear data-fix; hand-seeded (event-less) jobs do not survive the rewind (fn-977 v92, fn-1164 v113)", () => {
   // The v91→v92 migration was a ONE-TIME data-fix UPDATE: NULL backend_exec
   // pane/generation on EXISTING terminal jobs so a dead job stops holding a
@@ -2977,7 +3004,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // column (the durable work-dispatch provider pin, docs/adr/0047) — an
   // idempotent additive ALTER on `autopilot_state`; it does not touch the
   // epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(121);
+  // v122 backfills the `autopilot_state.worker_provider` family-label value
+  // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
+  // not touch the epics table SHAPE this test pins.
+  expect(SCHEMA_VERSION).toBe(122);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

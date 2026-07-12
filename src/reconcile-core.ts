@@ -339,10 +339,10 @@ function axesEffortsFor(
 }
 
 /** The equivalence direction that translates a CROSS-family assigned cell INTO
- *  the pinned family: pinning to codex reads `claude_to_codex`, pinning to claude
- *  reads `codex_to_claude`. */
+ *  the pinned family: pinning to gpt reads `claude_to_gpt`, pinning to claude
+ *  reads `gpt_to_claude`. */
 function directionForProvider(provider: WorkerProvider): EquivalenceDirection {
-  return provider === "codex" ? "claude_to_codex" : "codex_to_claude";
+  return provider === "gpt" ? "claude_to_gpt" : "gpt_to_claude";
 }
 
 /**
@@ -381,13 +381,13 @@ export function applyProviderConstraint(
   }
   const map = snapshot.map;
   const inPinnedFamily =
-    provider === "codex"
-      ? map.codexFamilyModels.has(assigned.model)
+    provider === "gpt"
+      ? map.gptFamilyModels.has(assigned.model)
       : map.claudeFamilyModels.has(assigned.model);
   if (inPinnedFamily) {
     return { kind: "unchanged" };
   }
-  const table = provider === "codex" ? map.claudeToCodex : map.codexToClaude;
+  const table = provider === "gpt" ? map.claudeToGpt : map.gptToClaude;
   const target = table.get(assigned.model)?.get(assigned.effort);
   if (target === undefined) {
     return {
@@ -805,7 +805,7 @@ export interface ReconcileSnapshot {
   /**
    * The durable work-dispatch provider pin (`autopilot_state.worker_provider`,
    * ADR 0047), read FRESH from the singleton each cycle: NULL/absent (the
-   * byte-identical unconstrained default) or a family (`"claude"`/`"codex"`) every
+   * byte-identical unconstrained default) or a family (`"claude"`/`"gpt"`) every
    * cell-bearing `work` launch is translated into via {@link applyProviderConstraint}.
    * A `close` row is cell-less and untouched. Projection-pull only so a runtime
    * `set_autopilot_config` lands the next cycle; NEVER a fold input. Optional for
@@ -1199,7 +1199,7 @@ export interface PlannedLaunch {
   dispatchedCellModel?: string | null;
   dispatchedCellTier?: string | null;
   /**
-   * The `worker_provider` value that FORCED the translation (`"claude"`/`"codex"`),
+   * The `worker_provider` value that FORCED the translation (`"claude"`/`"gpt"`),
    * set ONLY when {@link dispatchedCellModel} is — the `KEEPER_PLAN_DISPATCH_CONSTRAINT`
    * carrier. Null/absent when unconstrained (empty carrier). `.5`'s claim-time
    * capture keys the selection cohort exclusion on this being present.

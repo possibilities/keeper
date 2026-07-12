@@ -1317,7 +1317,7 @@ test("buildKeeperAgentLaunchArgv: a constrained work launch carries the dispatch
     pluginDir: "/abs/keeper/plugins/plan/workers/gpt-5.6-sol-max",
     dispatchedModel: "gpt-5.6-sol",
     dispatchedTier: "max",
-    dispatchConstraint: "codex",
+    dispatchConstraint: "gpt",
     noConfirm: true,
   });
   // Exactly one of each carrier, valued with the translated cell + the pin.
@@ -1329,7 +1329,7 @@ test("buildKeeperAgentLaunchArgv: a constrained work launch carries the dispatch
   ).toEqual(["KEEPER_PLAN_DISPATCHED_TIER=max"]);
   expect(
     argv.filter((a) => a.startsWith("KEEPER_PLAN_DISPATCH_CONSTRAINT=")),
-  ).toEqual(["KEEPER_PLAN_DISPATCH_CONSTRAINT=codex"]);
+  ).toEqual(["KEEPER_PLAN_DISPATCH_CONSTRAINT=gpt"]);
   // Each is preceded by its own `--x-tmux-env`.
   const modelIdx = argv.indexOf("KEEPER_PLAN_DISPATCHED_MODEL=gpt-5.6-sol");
   expect(argv[modelIdx - 1]).toBe("--x-tmux-env");

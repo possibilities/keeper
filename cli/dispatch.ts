@@ -794,7 +794,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       let composeModel = assignedModel;
       let composeTier = assignedTier;
       let providerReject: WorkerCellCompose["providerReject"];
-      let workerProvider: "claude" | "codex" | null = null;
+      let workerProvider: "claude" | "gpt" | null = null;
       // Load the host-matrix axes ONCE — reused for the provider-constraint
       // target-on-host check AND the wrapped-cell marker below. A bad matrix defers
       // to composeWorkerCellDir's own bad-matrix reject (ranks first): axes stays
@@ -815,7 +815,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
         const st = await query("autopilot_state", { id: 1 });
         const raw = (st[0] as { worker_provider?: unknown } | undefined)
           ?.worker_provider;
-        workerProvider = raw === "claude" || raw === "codex" ? raw : null;
+        workerProvider = raw === "claude" || raw === "gpt" ? raw : null;
       } catch {
         // Transient read failure — fail open, dispatch the assigned cell.
       }

@@ -3,7 +3,7 @@
 # proving a clean map coerces and passes the host-blind check.
 schema_version: 1
 mappings:
-  claude_to_codex:
+  claude_to_gpt:
     - source: { model: opus, effort: low }
       target: { model: gpt-5.6-sol, effort: low }
     - source: { model: opus, effort: medium }
@@ -14,7 +14,7 @@ mappings:
       target: { model: gpt-5.6-sol, effort: xhigh }
     - source: { model: opus, effort: max }
       target: { model: gpt-5.6-sol, effort: max }
-  codex_to_claude:
+  gpt_to_claude:
     - source: { model: gpt-5.6-sol, effort: low }
       target: { model: opus, effort: low }
     - source: { model: gpt-5.6-sol, effort: medium }

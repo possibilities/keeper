@@ -105,7 +105,7 @@ Subcommands:
            worker_provider_scope, worker_provider_note}. max_concurrent_per_root
            is the EFFECTIVE cap (worktree off => 1); _stored is the durable
            intent you set. worker_provider is the work-dispatch provider pin
-           (null | claude | codex); worker_provider_scope names its "work cells
+           (null | claude | gpt); worker_provider_scope names its "work cells
            only" reach whenever the pin is set, and worker_provider_note names
            the many-to-one GPT-tier collapse when pinned to claude (both null
            otherwise). Read-only — the capture surface for a take-over (every
@@ -129,8 +129,9 @@ Subcommands:
            1 until you turn worktree mode on. worktree_multi_repo on lets worktree
            mode CLUSTER a >1-toplevel epic into independent per-repo lane groups
            instead of rejecting it worktree-multi-repo (OFF by default).
-           worker_provider (claude | codex | none — the durable work-dispatch
-           provider pin; 'none' clears it to NULL). Scoped to cell-bearing work
+           worker_provider (claude | gpt | none — the durable work-dispatch
+           provider pin; 'none' clears it to NULL; the deprecated 'codex' alias
+           is accepted and normalized to gpt). Scoped to cell-bearing work
            dispatches only — close/deconflict/resolve sessions and the
            wrapped-cell claude wrapper driver stay unaffected; pinning to
            claude collapses every GPT tier onto its mapped claude model.
@@ -490,9 +491,9 @@ export interface AutopilotShowData {
   // the value the operator set even though effective floors to 1.
   max_concurrent_per_root_stored: number;
   // The durable work-dispatch provider pin (docs/adr/0047): `"claude"` /
-  // `"codex"` pins every work dispatch to that family; `null` (the
+  // `"gpt"` pins every work dispatch to that family; `null` (the
   // byte-identical default) is unconstrained.
-  worker_provider: "claude" | "codex" | null;
+  worker_provider: "claude" | "gpt" | null;
   // Present iff `worker_provider` is set — the "work cells only" scope note so
   // the pin's reach (cell-bearing work dispatches, never close/escalation
   // sessions) is never surprising. `null` when the pin is unset.
@@ -770,7 +771,7 @@ export function buildSetConfigFrame(
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
     codex_adoption?: boolean;
-    worker_provider?: "claude" | "codex" | null;
+    worker_provider?: "claude" | "gpt" | null;
   },
 ): ClientFrame {
   return {
@@ -1456,16 +1457,19 @@ export async function main(argv: string[]): Promise<void> {
     }
     if (key === "worker_provider") {
       // The durable work-dispatch provider pin (docs/adr/0047) — `claude` /
-      // `codex` set the pin, `none` clears it to NULL (mirrors the
-      // `unlimited`/`default` clear sentinels above).
-      let workerProvider: "claude" | "codex" | null;
+      // `gpt` set the pin, `none` clears it to NULL (mirrors the
+      // `unlimited`/`default` clear sentinels above). The deprecated `codex`
+      // alias is accepted and normalized to `gpt`.
+      let workerProvider: "claude" | "gpt" | null;
       if (value === "none") {
         workerProvider = null;
-      } else if (value === "claude" || value === "codex") {
+      } else if (value === "claude" || value === "gpt") {
         workerProvider = value;
+      } else if (value === "codex") {
+        workerProvider = "gpt";
       } else {
         die(
-          `'config worker_provider' value must be one of claude | codex | none (got ${JSON.stringify(value)})`,
+          `'config worker_provider' value must be one of claude | gpt | none (got ${JSON.stringify(value)})`,
         );
       }
       await sendControlRpc(

@@ -401,8 +401,8 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
       pluginDir: null,
       providerReject: {
         reason: "no-map-entry",
-        provider: "codex",
-        direction: "claude_to_codex",
+        provider: "gpt",
+        direction: "claude_to_gpt",
         assigned: { model: "opus", effort: "high" },
         target: null,
       },

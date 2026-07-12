@@ -359,10 +359,11 @@ export interface SetAutopilotConfigParams {
    *  default) adopts nothing. */
   codex_adoption?: boolean;
   /** The durable worker-provider dispatch pin (docs/adr/0047) — `"claude"` /
-   *  `"codex"` to pin every work dispatch to that provider family, or `null` to
+   *  `"gpt"` to pin every work dispatch to that provider family, or `null` to
    *  clear the pin (unconstrained, the byte-identical default). Scoped to
-   *  cell-bearing work dispatches only. */
-  worker_provider?: "claude" | "codex" | null;
+   *  cell-bearing work dispatches only. The deprecated `"codex"` input alias is
+   *  accepted on write and normalized to `"gpt"`, so the echoed patch is canonical. */
+  worker_provider?: "claude" | "gpt" | null;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch.
@@ -469,13 +470,17 @@ function validateSetAutopilotConfigParams(
   if ("worker_provider" in obj) {
     const raw = obj.worker_provider;
     // A strict string enum — `null` (clear the pin) or exactly `"claude"` /
-    // `"codex"`. Reject anything else loud, naming the allowed set, rather than
-    // silently coercing (the first non-numeric config column).
-    if (raw === null || raw === "claude" || raw === "codex") {
+    // `"gpt"`. The deprecated `"codex"` alias is accepted and normalized to
+    // `"gpt"` so every new event carries only the canonical label; anything
+    // else is rejected loud, naming the allowed set (the first non-numeric
+    // config column).
+    if (raw === null || raw === "claude" || raw === "gpt") {
       patch.worker_provider = raw;
+    } else if (raw === "codex") {
+      patch.worker_provider = "gpt";
     } else {
       throw new BadParamsError(
-        `set_autopilot_config: \`worker_provider\` must be one of "claude" | "codex" | null (got ${JSON.stringify(raw)})`,
+        `set_autopilot_config: \`worker_provider\` must be one of "claude" | "gpt" | null (got ${JSON.stringify(raw)})`,
       );
     }
   }

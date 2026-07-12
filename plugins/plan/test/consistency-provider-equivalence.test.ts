@@ -130,13 +130,13 @@ describe("coerceProviderEquivalenceConfig", () => {
     return {
       schema_version: 1,
       mappings: {
-        claude_to_codex: [
+        claude_to_gpt: [
           {
             source: { model: "opus", effort: "low" },
             target: { model: "gpt-5.6-sol", effort: "low" },
           },
         ],
-        codex_to_claude: [
+        gpt_to_claude: [
           {
             source: { model: "gpt-5.6-sol", effort: "low" },
             target: { model: "opus", effort: "low" },
@@ -149,8 +149,8 @@ describe("coerceProviderEquivalenceConfig", () => {
   test("a well-formed minimal document coerces", () => {
     const config = coerceProviderEquivalenceConfig(validDoc());
     expect(config.schema_version).toBe(1);
-    expect(config.mappings.claude_to_codex).toHaveLength(1);
-    expect(config.mappings.codex_to_claude).toHaveLength(1);
+    expect(config.mappings.claude_to_gpt).toHaveLength(1);
+    expect(config.mappings.gpt_to_claude).toHaveLength(1);
   });
 
   test("an unknown top-level key rejects", () => {
@@ -177,7 +177,7 @@ describe("coerceProviderEquivalenceConfig", () => {
 
   test("a direction that is not a list rejects", () => {
     const doc = validDoc();
-    (doc.mappings as Record<string, unknown>).claude_to_codex = {
+    (doc.mappings as Record<string, unknown>).claude_to_gpt = {
       opus: "low",
     };
     expect(() => coerceProviderEquivalenceConfig(doc)).toThrow(
@@ -187,7 +187,7 @@ describe("coerceProviderEquivalenceConfig", () => {
 
   test("an entry with an unknown key rejects", () => {
     const doc = validDoc();
-    (doc.mappings as { claude_to_codex: unknown[] }).claude_to_codex = [
+    (doc.mappings as { claude_to_gpt: unknown[] }).claude_to_gpt = [
       {
         source: { model: "opus", effort: "low" },
         target: { model: "gpt-5.6-sol", effort: "low" },
@@ -201,7 +201,7 @@ describe("coerceProviderEquivalenceConfig", () => {
 
   test("an entry missing target rejects", () => {
     const doc = validDoc();
-    (doc.mappings as { claude_to_codex: unknown[] }).claude_to_codex = [
+    (doc.mappings as { claude_to_gpt: unknown[] }).claude_to_gpt = [
       { source: { model: "opus", effort: "low" } },
     ];
     expect(() => coerceProviderEquivalenceConfig(doc)).toThrow(
@@ -211,7 +211,7 @@ describe("coerceProviderEquivalenceConfig", () => {
 
   test("a cell with an unknown key rejects", () => {
     const doc = validDoc();
-    (doc.mappings as { claude_to_codex: unknown[] }).claude_to_codex = [
+    (doc.mappings as { claude_to_gpt: unknown[] }).claude_to_gpt = [
       {
         source: { model: "opus", effort: "low", extra: 1 },
         target: { model: "gpt-5.6-sol", effort: "low" },
@@ -224,7 +224,7 @@ describe("coerceProviderEquivalenceConfig", () => {
 
   test("a non-canonical effort rejects, naming the vocabulary", () => {
     const doc = validDoc();
-    (doc.mappings as { claude_to_codex: unknown[] }).claude_to_codex = [
+    (doc.mappings as { claude_to_gpt: unknown[] }).claude_to_gpt = [
       {
         source: { model: "opus", effort: "ultra" },
         target: { model: "gpt-5.6-sol", effort: "low" },
@@ -237,7 +237,7 @@ describe("coerceProviderEquivalenceConfig", () => {
 
   test("a malformed model token rejects", () => {
     const doc = validDoc();
-    (doc.mappings as { claude_to_codex: unknown[] }).claude_to_codex = [
+    (doc.mappings as { claude_to_gpt: unknown[] }).claude_to_gpt = [
       {
         source: { model: "Opus!", effort: "low" },
         target: { model: "gpt-5.6-sol", effort: "low" },
@@ -268,19 +268,19 @@ describe("coerceProviderEquivalenceConfig", () => {
  * the entries under scrutiny. */
 function totalConfig(): ProviderEquivalenceConfig {
   const efforts = ["low", "medium", "high", "xhigh", "max"];
-  const claudeToCodex: EquivalenceEntry[] = efforts.map((effort) => ({
+  const claudeToGpt: EquivalenceEntry[] = efforts.map((effort) => ({
     source: { model: "opus", effort },
     target: { model: "gpt-5.6-sol", effort },
   }));
-  const codexToClaude: EquivalenceEntry[] = efforts.map((effort) => ({
+  const gptToClaude: EquivalenceEntry[] = efforts.map((effort) => ({
     source: { model: "gpt-5.6-sol", effort },
     target: { model: "opus", effort },
   }));
   return {
     schema_version: 1,
     mappings: {
-      claude_to_codex: claudeToCodex,
-      codex_to_claude: codexToClaude,
+      claude_to_gpt: claudeToGpt,
+      gpt_to_claude: gptToClaude,
     },
   };
 }
@@ -296,8 +296,8 @@ describe("checkProviderEquivalence", () => {
   test("a same-family target fails, naming the direction and target model", () => {
     const config = totalConfig();
     const bad: EquivalenceEntry[] = [
-      ...config.mappings.claude_to_codex.slice(0, 4),
-      // opus's `max` entry targets a model that is ALSO a claude_to_codex
+      ...config.mappings.claude_to_gpt.slice(0, 4),
+      // opus's `max` entry targets a model that is ALSO a claude_to_gpt
       // source model (opus itself) — same-family.
       {
         source: { model: "opus", effort: "max" },
@@ -306,13 +306,13 @@ describe("checkProviderEquivalence", () => {
     ];
     const result = checkProviderEquivalence({
       ...config,
-      mappings: { ...config.mappings, claude_to_codex: bad },
+      mappings: { ...config.mappings, claude_to_gpt: bad },
     });
     expect(result.ok).toBe(false);
     expect(
       result.errors.some(
         (e) =>
-          e.includes("claude_to_codex") &&
+          e.includes("claude_to_gpt") &&
           e.includes("same-family") &&
           e.includes("opus"),
       ),
@@ -322,8 +322,8 @@ describe("checkProviderEquivalence", () => {
   test("a dangling cross-direction target fails, naming the opposite direction", () => {
     const config = totalConfig();
     const bad: EquivalenceEntry[] = [
-      ...config.mappings.claude_to_codex.slice(0, 4),
-      // gpt-9000 is never a codex_to_claude source model — dangling.
+      ...config.mappings.claude_to_gpt.slice(0, 4),
+      // gpt-9000 is never a gpt_to_claude source model — dangling.
       {
         source: { model: "opus", effort: "max" },
         target: { model: "gpt-9000", effort: "max" },
@@ -331,16 +331,16 @@ describe("checkProviderEquivalence", () => {
     ];
     const result = checkProviderEquivalence({
       ...config,
-      mappings: { ...config.mappings, claude_to_codex: bad },
+      mappings: { ...config.mappings, claude_to_gpt: bad },
     });
     expect(result.ok).toBe(false);
     expect(
       result.errors.some(
         (e) =>
-          e.includes("claude_to_codex") &&
+          e.includes("claude_to_gpt") &&
           e.includes("dangling cross-direction target") &&
           e.includes("gpt-9000") &&
-          e.includes("codex_to_claude"),
+          e.includes("gpt_to_claude"),
       ),
     ).toBe(true);
   });
@@ -348,7 +348,7 @@ describe("checkProviderEquivalence", () => {
   test("a duplicate source cell fails, naming the model and effort", () => {
     const config = totalConfig();
     const bad: EquivalenceEntry[] = [
-      ...config.mappings.claude_to_codex,
+      ...config.mappings.claude_to_gpt,
       // A second entry for the same {opus, low} source cell.
       {
         source: { model: "opus", effort: "low" },
@@ -357,13 +357,13 @@ describe("checkProviderEquivalence", () => {
     ];
     const result = checkProviderEquivalence({
       ...config,
-      mappings: { ...config.mappings, claude_to_codex: bad },
+      mappings: { ...config.mappings, claude_to_gpt: bad },
     });
     expect(result.ok).toBe(false);
     expect(
       result.errors.some(
         (e) =>
-          e.includes("claude_to_codex") &&
+          e.includes("claude_to_gpt") &&
           e.includes("duplicate source cell") &&
           e.includes("opus") &&
           e.includes("low"),
@@ -373,18 +373,18 @@ describe("checkProviderEquivalence", () => {
 
   test("a model missing a canonical effort fails, naming the model and the missing effort", () => {
     const config = totalConfig();
-    const bad = config.mappings.claude_to_codex.filter(
+    const bad = config.mappings.claude_to_gpt.filter(
       (e) => e.source.effort !== "xhigh",
     );
     const result = checkProviderEquivalence({
       ...config,
-      mappings: { ...config.mappings, claude_to_codex: bad },
+      mappings: { ...config.mappings, claude_to_gpt: bad },
     });
     expect(result.ok).toBe(false);
     expect(
       result.errors.some(
         (e) =>
-          e.includes("claude_to_codex") &&
+          e.includes("claude_to_gpt") &&
           e.includes("missing effort") &&
           e.includes("opus") &&
           e.includes("xhigh"),
@@ -395,9 +395,7 @@ describe("checkProviderEquivalence", () => {
   test("multiple violations accumulate rather than short-circuiting", () => {
     const config = totalConfig();
     const bad: EquivalenceEntry[] = [
-      ...config.mappings.claude_to_codex.filter(
-        (e) => e.source.effort !== "max",
-      ),
+      ...config.mappings.claude_to_gpt.filter((e) => e.source.effort !== "max"),
       {
         source: { model: "opus", effort: "low" },
         target: { model: "opus", effort: "low" },
@@ -405,7 +403,7 @@ describe("checkProviderEquivalence", () => {
     ];
     const result = checkProviderEquivalence({
       ...config,
-      mappings: { ...config.mappings, claude_to_codex: bad },
+      mappings: { ...config.mappings, claude_to_gpt: bad },
     });
     expect(result.ok).toBe(false);
     // Same-family (target "opus"), duplicate ({opus, low} now appears twice),
@@ -457,7 +455,7 @@ describe("classifyProviderEquivalence", () => {
     expect(state).toEqual({ total: true, gaps: [], dangling_targets: [] });
   });
 
-  test("a new codex-family model absent from the map is a gap in the codex_to_claude direction", () => {
+  test("a new gpt-family model absent from the map is a gap in the gpt_to_claude direction", () => {
     const config = totalConfig();
     const matrix = fakeMatrix({
       models: ["opus", "gpt-5.6-sol", "gpt-9000"],
@@ -467,7 +465,7 @@ describe("classifyProviderEquivalence", () => {
     expect(state.total).toBe(false);
     for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
       expect(state.gaps).toContainEqual({
-        direction: "codex_to_claude",
+        direction: "gpt_to_claude",
         model: "gpt-9000",
         effort,
       });
@@ -477,7 +475,7 @@ describe("classifyProviderEquivalence", () => {
     expect(state.gaps.some((g) => g.model === "gpt-5.6-sol")).toBe(false);
   });
 
-  test("a new claude-family (native) model absent from the map is a gap in the claude_to_codex direction", () => {
+  test("a new claude-family (native) model absent from the map is a gap in the claude_to_gpt direction", () => {
     const config = totalConfig();
     const matrix = fakeMatrix({
       models: ["opus", "sonnet", "gpt-5.6-sol"],
@@ -487,7 +485,7 @@ describe("classifyProviderEquivalence", () => {
     expect(state.total).toBe(false);
     for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
       expect(state.gaps).toContainEqual({
-        direction: "claude_to_codex",
+        direction: "claude_to_gpt",
         model: "sonnet",
         effort,
       });
@@ -534,7 +532,7 @@ describe("classifyProviderEquivalence", () => {
   test("an empty map against an empty matrix is trivially total", () => {
     const config: ProviderEquivalenceConfig = {
       schema_version: 1,
-      mappings: { claude_to_codex: [], codex_to_claude: [] },
+      mappings: { claude_to_gpt: [], gpt_to_claude: [] },
     };
     const matrix = fakeMatrix({ models: [], native: new Set() });
     expect(classifyProviderEquivalence(config, matrix)).toEqual({
