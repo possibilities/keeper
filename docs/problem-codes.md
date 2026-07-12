@@ -144,10 +144,19 @@ non-zero (exit 1) with the same reason. These are launch-time reason tokens
 | code                     | emitted by                     | meaning                                                                                                                | recovery                                                                                                              | retry-safe |
 | ------------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `worker-cell-bad-matrix` | autopilot producer, `dispatch` | The host worker matrix (`~/.config/keeper/matrix.yaml`) failed to load — one of four states the reason NAMES: `absent` (no file), `unparseable` (bad YAML / unreadable), `schema-invalid` (a shape violation — e.g. a retired `route:`/`native:`/`name:`/`subagents:` key), or `valid-but-empty` (an empty file). No cell can compose, so the daemon parks every cell-bearing `work` dispatch behind this sticky and never exits. | Copy `docs/examples/matrix.example.yaml` to `~/.config/keeper/matrix.yaml` and edit it (the message names the exact path + fix), then `keeper retry-dispatch` (autopilot) / re-run (manual). | yes (fix config first) |
+| `worker-provider-no-map-entry` | autopilot producer, `dispatch` | The `worker_provider` pin (ADR 0047) must translate this cell's assigned cell into the pinned family, but the cross-provider equivalence map has NO entry for it in the required direction. The reason NAMES the assigned cell + direction. Fail-closed — the pin NEVER falls back to the assigned provider. | Add the mapping to `plugins/plan/provider-equivalence.yaml` (re-run `bun plugins/plan/scripts/model-guidance-check.ts --check`), then `keeper retry-dispatch` (autopilot) / re-run (manual) — OR clear the pin (`keeper autopilot config worker_provider none`). | yes (fix map or clear pin) |
+| `worker-provider-target-not-on-host` | autopilot producer, `dispatch` | The map's entry translated the assigned cell to a target cell that is NOT a dispatchable cell on the live host matrix (target model or its effort absent). The reason NAMES the assigned + mapped cell + direction. Fail-closed — no fallback. | Fix the map target (or add the target cell to `matrix.yaml`'s `subagent_models`/efforts), then `keeper retry-dispatch` / re-run — OR clear the pin. | yes (fix map/matrix or clear pin) |
+| `worker-provider-map-malformed` | autopilot producer, `dispatch` | The `worker_provider` pin is set but `provider-equivalence.yaml` failed to load/parse at dispatch (the drift gate is offline). The reason NAMES the assigned cell + direction + the parse detail. Fail-closed PER CELL — a stale map parks dispatch, never crashes the cycle. | Fix `plugins/plan/provider-equivalence.yaml` (re-run the `--check` drift gate), then `keeper retry-dispatch` / re-run — OR clear the pin. | yes (fix map or clear pin) |
 
 Distinct from the run-time `no_route` the `agent providers resolve` verb emits
 (above): that is a read-time doctor verdict, this is a launch-time dispatch
 reject that parks the task.
+
+The three `worker-provider-*` rejects surface ONLY while `autopilot_state.worker_provider`
+is pinned (`claude`/`codex`), the durable work-dispatch provider pin that translates each
+task's assigned worker cell through the committed equivalence map at launch. They are the
+override's observability contract: an untranslatable cell spikes a visible sticky rather
+than silently starving the board or falling back to the wrong provider family.
 
 ## Plan family (`keeper plan` accumulate-all failures)
 

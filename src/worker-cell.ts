@@ -27,6 +27,13 @@ import { join, resolve, sep } from "node:path";
 import { WORKERS_BASE } from "../plugins/plan/src/worker_cells.ts";
 import { ConfigError, loadPluginSources } from "./agent/config";
 import { loadMatrixV2, MatrixConfigError, type MatrixV2 } from "./agent/matrix";
+import { assertNever } from "./dispatch-failure-key";
+import type {
+  EquivalenceCell,
+  EquivalenceDirection,
+  ProviderConstraintRejectReason,
+  WorkerProvider,
+} from "./provider-equivalence";
 import {
   type HostMatrixAxes,
   KEEPER_ROOT,
@@ -137,6 +144,18 @@ export interface WorkerCellCompose {
   /** Set IFF the host matrix could not be loaded — the four-state failure the
    *  caller surfaces as a distress sticky naming the state. */
   matrixReject?: { state: MatrixFailureState; detail: string };
+  /** Set IFF the `worker_provider` pin could not translate the assigned cell (ADR
+   *  0047) — the fail-closed reject, carried so a caller composes an operator
+   *  reason naming the cells + direction. Ranks after {@link matrixReject}, before
+   *  the compose reject. */
+  providerReject?: {
+    reason: ProviderConstraintRejectReason;
+    provider: WorkerProvider;
+    direction: EquivalenceDirection;
+    assigned: EquivalenceCell;
+    target: EquivalenceCell | null;
+    detail?: string;
+  };
   /**
    * The capability `{model, tier}` this compose was built from — carried so a
    * caller can name the model/tier in its reject prose. Optional so a bare
@@ -212,6 +231,16 @@ export function composeWorkerCellDir(
 export type WorkerCellResult =
   | { ok: true; pluginDir: string | null }
   | { ok: false; kind: "bad-matrix"; state: MatrixFailureState; detail: string }
+  | {
+      ok: false;
+      kind: "provider-reject";
+      reason: ProviderConstraintRejectReason;
+      provider: WorkerProvider;
+      direction: EquivalenceDirection;
+      assigned: EquivalenceCell;
+      target: EquivalenceCell | null;
+      detail?: string;
+    }
   | { ok: false; kind: "out-of-matrix"; message: string }
   | { ok: false; kind: "missing"; pluginDir: string }
   | { ok: false; kind: "shadowed"; pluginDir: string; shadowManifest: string };
@@ -252,6 +281,23 @@ export function resolveWorkerCell(
       detail: compose.matrixReject.detail,
     };
   }
+  // Provider-pin reject ranks after bad-matrix (no host matrix ⇒ no target to
+  // validate) and before the compose reject — no cell composes when the pin
+  // refuses, so `pluginDir` is null and the fallthrough never reaches disk.
+  if (compose.providerReject !== undefined) {
+    return {
+      ok: false,
+      kind: "provider-reject",
+      reason: compose.providerReject.reason,
+      provider: compose.providerReject.provider,
+      direction: compose.providerReject.direction,
+      assigned: compose.providerReject.assigned,
+      target: compose.providerReject.target,
+      ...(compose.providerReject.detail !== undefined
+        ? { detail: compose.providerReject.detail }
+        : {}),
+    };
+  }
   if (compose.reject !== undefined) {
     return { ok: false, kind: "out-of-matrix", message: compose.reject };
   }
@@ -274,4 +320,54 @@ export function resolveWorkerCell(
     };
   }
   return { ok: true, pluginDir };
+}
+
+/**
+ * Compose the operator reason for a `worker_provider` fail-closed reject (ADR
+ * 0047) — the SHARED formatter the autopilot producer (sticky `DispatchFailed`)
+ * AND manual `keeper dispatch` (synchronous refusal) both surface, so the two
+ * paths name the same cells + direction for the same task + pin (the identical-
+ * decision parity). Each of the three reasons is distinct and NAMES the assigned
+ * cell, the mapped target (when relevant), the pin, and the direction; NONE ever
+ * falls back to the assigned provider. The `worker-provider-*` prefixes are the
+ * documented problem codes (docs/problem-codes.md). The closed switch is
+ * `assertNever`-guarded so a new reason fails compilation here.
+ */
+export function providerRejectReason(reject: {
+  reason: ProviderConstraintRejectReason;
+  provider: WorkerProvider;
+  direction: EquivalenceDirection;
+  assigned: EquivalenceCell;
+  target: EquivalenceCell | null;
+  detail?: string;
+}): string {
+  const named = (c: EquivalenceCell): string => `${c.model}/${c.effort}`;
+  const assigned = named(reject.assigned);
+  const pin = reject.provider;
+  const dir = reject.direction;
+  switch (reject.reason) {
+    case "no-map-entry":
+      return (
+        `worker-provider-no-map-entry: worker_provider=${pin} has no ${dir} ` +
+        `equivalence entry for assigned cell ${assigned} — refusing to dispatch ` +
+        "(no fallback to the assigned provider); add the mapping to " +
+        "plugins/plan/provider-equivalence.yaml, re-run the drift gate, then retry"
+      );
+    case "target-not-on-host":
+      return (
+        `worker-provider-target-not-on-host: worker_provider=${pin} maps assigned ` +
+        `cell ${assigned} (${dir}) to ${reject.target ? named(reject.target) : "(none)"}, ` +
+        "which is not a dispatchable cell on the live host matrix — refusing to " +
+        "dispatch (no fallback); fix the map target or the host matrix, then retry"
+      );
+    case "map-malformed":
+      return (
+        `worker-provider-map-malformed: worker_provider=${pin} cannot translate ` +
+        `assigned cell ${assigned} (${dir}) — the equivalence map failed to load` +
+        `${reject.detail !== undefined ? ` (${reject.detail})` : ""}; refusing to ` +
+        "dispatch (no fallback); fix plugins/plan/provider-equivalence.yaml, then retry"
+      );
+    default:
+      return assertNever(reject.reason);
+  }
 }
