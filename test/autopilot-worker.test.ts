@@ -96,6 +96,7 @@ import {
   isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
+  isWrappedCell,
   LANE_OWNER_STALL_GRACE_SEC,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
@@ -361,6 +362,10 @@ function makeSnapshot(
       models: ["opus", "sonnet"],
       effortsByModel: new Map(),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+      ]),
     },
     // fn-953: the runtime-settable cap, resolved snapshot-time `column ?? DEFAULT`.
     // Default unlimited (`null`) so a snapshot-driven reconcile sees the same
@@ -1605,6 +1610,11 @@ const PROVIDER_MATRIX = {
   models: ["opus", "sonnet", "gpt-5.6-sol"],
   effortsByModel: new Map<string, string[]>(),
   efforts: ["low", "medium", "high", "xhigh", "max"],
+  driverByModel: new Map<string, "native" | "wrapped">([
+    ["opus", "native"],
+    ["sonnet", "native"],
+    ["gpt-5.6-sol", "wrapped"],
+  ]),
 };
 // opus/max ↔ gpt-5.6-sol/max both directions; only `max`, so opus/high is a gap.
 const PROVIDER_CONFIG: ProviderEquivalenceConfig = {
@@ -1650,6 +1660,12 @@ test("reconcile: pin=codex TRANSLATES a claude cell to its mapped codex --plugin
   expect(plan?.cellModel).toBe("opus");
   expect(plan?.tier).toBe("max");
   expect(plan?.providerReject).toBeUndefined();
+  // The wrapped-cell marker keys on the EFFECTIVE (translated) cell — an opus cell
+  // translated INTO a wrapped codex cell IS marked (keyed on driver, not the pin).
+  expect(plan?.wrappedCell).toBe("gpt-5.6-sol::max");
+  expect(plan?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+  );
 });
 
 test("reconcile: NULL pin is byte-identical to today (assigned cell, empty carriers)", () => {
@@ -1662,6 +1678,9 @@ test("reconcile: NULL pin is byte-identical to today (assigned cell, empty carri
   expect(plan?.dispatchedCellModel).toBeNull();
   expect(plan?.dispatchedCellTier).toBeNull();
   expect(plan?.dispatchConstraint).toBeNull();
+  // A native opus cell carries NO wrapped-cell marker (empty carriers).
+  expect(plan?.wrappedCell).toBeUndefined();
+  expect(plan?.wrappedEnvelope).toBeUndefined();
 });
 
 test("reconcile: a SAME-family cell under a pin is UNCHANGED (empty carriers)", () => {
@@ -1681,6 +1700,23 @@ test("reconcile: a SAME-family cell under a pin is UNCHANGED (empty carriers)", 
   expect(plan?.dispatchedCellModel).toBeNull();
   expect(plan?.dispatchConstraint).toBeNull();
   expect(plan?.providerReject).toBeUndefined();
+  // A pre-assigned wrapped cell is STILL marked even though the pin did not
+  // translate it (dispatchConstraint null) — the marker keys on the cell driver,
+  // never the pin, so keying off the constraint would silently miss this cell.
+  expect(plan?.wrappedCell).toBe("gpt-5.6-sol::max");
+  expect(plan?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+  );
+});
+
+test("isWrappedCell: driver-keyed — wrapped for a codex model (even with a null constraint), native for claude, wrapped for an unknown", () => {
+  // The shared predicate the autopilot producer + the manual dispatch path both key
+  // the marker on. A pre-assigned gpt cell is wrapped regardless of any pin.
+  expect(isWrappedCell(PROVIDER_MATRIX, "gpt-5.6-sol")).toBe(true);
+  expect(isWrappedCell(PROVIDER_MATRIX, "opus")).toBe(false);
+  expect(isWrappedCell(PROVIDER_MATRIX, "sonnet")).toBe(false);
+  // An unknown model reads as wrapped, mirroring the renderer's `?? "wrapped"`.
+  expect(isWrappedCell(PROVIDER_MATRIX, "mystery-model")).toBe(true);
 });
 
 test("reconcile: no-map-entry refuses fail-closed (no pluginDir, no fallback)", () => {
@@ -3999,6 +4035,11 @@ test("runReconcileCycle: a WRAPPED-model work row composes + dispatches its cell
       models: ["opus", "sonnet", "gpt-5.5"],
       effortsByModel: new Map([["gpt-5.5", ["high"]]]),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+        ["gpt-5.5", "wrapped"],
+      ]),
     },
   });
   const state = makeState();
@@ -4012,6 +4053,13 @@ test("runReconcileCycle: a WRAPPED-model work row composes + dispatches its cell
   expect(decision.launches[0]?.pluginDirReject).toBeUndefined();
   expect(decision.launches[0]?.matrixReject).toBeUndefined();
   expect(decision.launches[0]?.cellModel).toBe("gpt-5.5");
+  // The wrapped-cell guard marker rides the launch (task .1) — a wrapped effective
+  // cell, so the effective `<model>::<effort>` + the per-task envelope path (cwd
+  // falls to the epic's project_dir here) are present.
+  expect(decision.launches[0]?.wrappedCell).toBe("gpt-5.5::high");
+  expect(decision.launches[0]?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
+  );
 
   await runReconcileCycle(
     decision,
@@ -4026,9 +4074,13 @@ test("runReconcileCycle: a WRAPPED-model work row composes + dispatches its cell
   expect(log.emissions).toEqual([]);
   expect(log.launches.length).toBe(1);
   const launch = log.launches[0];
-  // The structured spec carries the resolved cell dir…
+  // The structured spec carries the resolved cell dir + the wrapped-cell marker…
   expect(launch?.spec?.pluginDir).toContain(
     "plugins/plan/workers/gpt-5.5-high",
+  );
+  expect(launch?.spec?.wrappedCell).toBe("gpt-5.5::high");
+  expect(launch?.spec?.wrappedEnvelope).toBe(
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-foo.1.json",
   );
   // …and so does the byte-pinned argv: `--plugin-dir <dir>` right after `--name`.
   const argvStr = (launch?.argv ?? []).join(" ");
@@ -4051,6 +4103,11 @@ test("reconcile: a ragged host roster rejects a tier the model's narrowed effort
       models: ["opus", "sonnet", "gpt-5.5"],
       effortsByModel: new Map([["gpt-5.5", ["high"]]]),
       efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map<string, "native" | "wrapped">([
+        ["opus", "native"],
+        ["sonnet", "native"],
+        ["gpt-5.5", "wrapped"],
+      ]),
     },
   });
   const plan = reconcile(snap, makeState(), 0).launches[0];

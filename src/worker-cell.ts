@@ -192,6 +192,7 @@ export function composeWorkerCellDir(
       models: matrix.subagentModels,
       effortsByModel: matrix.effortsByModel,
       efforts: matrix.efforts,
+      driverByModel: matrix.driverByModel,
     };
   } catch (err) {
     if (err instanceof MatrixConfigError) {

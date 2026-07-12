@@ -730,6 +730,12 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     // Keeper-owned worker permission posture (mirrors the pair path); rides every
     // launch, right after the worktree env block and before model/effort/name.
     "--permission-mode",
@@ -785,6 +791,12 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -849,6 +861,12 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     // Permission posture rides even the minimal launch (no model/effort/name).
     "--permission-mode",
     "acceptEdits",
@@ -895,6 +913,12 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     // Resume is just as human-less as a fresh launch — the posture rides it too.
     "--permission-mode",
     "acceptEdits",
@@ -943,6 +967,12 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -989,6 +1019,12 @@ test("buildKeeperAgentLaunchArgv: codex resume emits `keeper agent codex … res
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) ride even a non-claude resume (they sit
+    // in the env block, BEFORE the claude-only permission posture) — EMPTY here.
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     "--x-no-confirm",
     "resume",
     "rollout-uuid",
@@ -1054,9 +1090,10 @@ test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JO
   // by its own `--x-tmux-env`.
   const idx = argv.indexOf("KEEPER_JOB_ID=45f94c4d-orig");
   expect(argv[idx - 1]).toBe("--x-tmux-env");
-  // Eight repeated env carriers: session/lane/branch/job-id/escalation-role +
-  // the three dispatched-cell carriers (ADR 0047).
-  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(8);
+  // Ten repeated env carriers: session/lane/branch/job-id/escalation-role +
+  // the three dispatched-cell carriers (ADR 0047) + the two wrapped-cell carriers
+  // (task .1).
+  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(10);
   // Identity (job id) and the resume key (native target) stay DISTINCT.
   expect(argv.slice(-2)).toEqual(["--session", "d98a2d54-native"]);
   expect(idEntries[0]).not.toContain("d98a2d54-native");
@@ -1119,6 +1156,12 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -1172,6 +1215,12 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     "KEEPER_PLAN_DISPATCHED_TIER=",
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
+    // Wrapped-cell guard carriers (task .1) — the 9th/10th always-present env,
+    // EMPTY on a native / non-work launch (byte-inert).
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_CELL=",
+    "--x-tmux-env",
+    "KEEPER_WRAPPED_ENVELOPE=",
     "--permission-mode",
     "acceptEdits",
     "--dangerously-skip-permissions",
@@ -1248,7 +1297,13 @@ test("buildKeeperAgentLaunchArgv: an escalation launch carries the verb in KEEPE
   expect(argv[branchIdx + 8]).toBe("KEEPER_PLAN_DISPATCHED_TIER=");
   expect(argv[branchIdx + 9]).toBe("--x-tmux-env");
   expect(argv[branchIdx + 10]).toBe("KEEPER_PLAN_DISPATCH_CONSTRAINT=");
-  expect(argv[branchIdx + 11]).toBe("--permission-mode");
+  // Then the two always-present wrapped-cell guard carriers (task .1), EMPTY on a
+  // non-work escalation launch, before the permission posture.
+  expect(argv[branchIdx + 11]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 12]).toBe("KEEPER_WRAPPED_CELL=");
+  expect(argv[branchIdx + 13]).toBe("--x-tmux-env");
+  expect(argv[branchIdx + 14]).toBe("KEEPER_WRAPPED_ENVELOPE=");
+  expect(argv[branchIdx + 15]).toBe("--permission-mode");
 });
 
 test("buildKeeperAgentLaunchArgv: a constrained work launch carries the dispatched cell + constraint (ADR 0047)", () => {
@@ -1278,6 +1333,36 @@ test("buildKeeperAgentLaunchArgv: a constrained work launch carries the dispatch
   // Each is preceded by its own `--x-tmux-env`.
   const modelIdx = argv.indexOf("KEEPER_PLAN_DISPATCHED_MODEL=gpt-5.6-sol");
   expect(argv[modelIdx - 1]).toBe("--x-tmux-env");
+});
+
+test("buildKeeperAgentLaunchArgv: a wrapped-cell work launch carries the marker cell + envelope (task .1)", () => {
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "autopilot",
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+    model: "sonnet",
+    effort: "max",
+    pluginDir: "/abs/keeper/plugins/plan/workers/gpt-5.6-sol-max",
+    wrappedCell: "gpt-5.6-sol::max",
+    wrappedEnvelope: "/repo/.keeper/state/wrapped-envelopes/fn-1-x.1.json",
+    noConfirm: true,
+  });
+  // Exactly one of each carrier, valued with the effective cell + the envelope path.
+  expect(argv.filter((a) => a.startsWith("KEEPER_WRAPPED_CELL="))).toEqual([
+    "KEEPER_WRAPPED_CELL=gpt-5.6-sol::max",
+  ]);
+  expect(argv.filter((a) => a.startsWith("KEEPER_WRAPPED_ENVELOPE="))).toEqual([
+    "KEEPER_WRAPPED_ENVELOPE=/repo/.keeper/state/wrapped-envelopes/fn-1-x.1.json",
+  ]);
+  // Each is preceded by its own `--x-tmux-env`, and both sit AFTER the dispatched-
+  // cell carriers, BEFORE the claude permission posture.
+  const cellIdx = argv.indexOf("KEEPER_WRAPPED_CELL=gpt-5.6-sol::max");
+  expect(argv[cellIdx - 1]).toBe("--x-tmux-env");
+  expect(argv.indexOf("KEEPER_PLAN_DISPATCH_CONSTRAINT=")).toBeLessThan(
+    cellIdx,
+  );
+  expect(cellIdx).toBeLessThan(argv.indexOf("--permission-mode"));
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {

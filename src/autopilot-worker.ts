@@ -298,6 +298,7 @@ export {
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
+  isWrappedCell,
   KEEPER_ROOT,
   prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
@@ -3803,6 +3804,11 @@ export async function runReconcileCycle(
       plan.dispatchedCellModel ?? null,
       plan.dispatchedCellTier ?? null,
       plan.dispatchConstraint ?? null,
+      // The wrapped-cell guard marker (task .1) — present only for a wrapped
+      // effective cell, so the KEEPER_WRAPPED_* carriers ride the spec (empty on a
+      // native launch, overwriting any stale session-env marker).
+      plan.wrappedCell ?? null,
+      plan.wrappedEnvelope ?? null,
     );
     // The dispatched-cell forensics recorded on the `Dispatched` event (ADR
     // 0047) — {assigned, effective, constraint} for a cell-bearing `work` launch,
@@ -7339,6 +7345,7 @@ export async function loadReconcileSnapshot(
       models: matrix.subagentModels,
       effortsByModel: matrix.effortsByModel,
       efforts: matrix.efforts,
+      driverByModel: matrix.driverByModel,
     };
   } catch (err) {
     if (err instanceof MatrixConfigError) {

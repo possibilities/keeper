@@ -219,6 +219,11 @@ export type MatrixFailureState =
   | "schema-invalid"
   | "valid-but-empty";
 
+/** A worker cell's driver: `native` iff claude serves the model, else `wrapped`
+ *  (a value copy of `agent/matrix`'s `Driver` — kept local so the pure verdict
+ *  core never value-imports the fs-touching matrix loader). */
+export type CellDriver = "native" | "wrapped";
+
 /** The parsed host-matrix cell axes the pure core composes worker cells over —
  *  `subagent_models` (the worker-cell model axis, native + wrapped), each model's
  *  effective effort list, and the top-level effort fallback. */
@@ -230,6 +235,44 @@ export interface HostMatrixAxes {
   effortsByModel: Map<string, string[]>;
   /** the top-level effort axis — the fallback a model no entry narrows inherits. */
   efforts: string[];
+  /** capability → its driver (native iff claude serves it, else wrapped), the
+   *  producer-side copy of the matrix's `driverByModel`. The SINGLE source the
+   *  shared {@link isWrappedCell} predicate reads so the autopilot producer, the
+   *  manual dispatch path, and the template renderer's `current_driver` notion
+   *  never drift. A model absent from the map is treated as wrapped (mirrors the
+   *  renderer's `driverByModel.get(model) ?? "wrapped"`). */
+  driverByModel: ReadonlyMap<string, CellDriver>;
+}
+
+/**
+ * The ONE wrappedness predicate — is the EFFECTIVE cell's model wrapped (not
+ * natively served by claude)? Keyed on the cell driver, NOT on whether the
+ * `worker_provider` pin translated the cell: a pre-assigned gpt/codex cell is
+ * wrapped with a null constraint, so a constraint check would silently miss it.
+ * An absent driver reads as wrapped, mirroring the template renderer's
+ * `driverByModel.get(model) ?? "wrapped"` so the guard-marker and the rendered
+ * worker contract agree. Pure — the axes carry the driver map producer-side.
+ */
+export function isWrappedCell(axes: HostMatrixAxes, model: string): boolean {
+  return (axes.driverByModel.get(model) ?? "wrapped") === "wrapped";
+}
+
+/**
+ * The standardized, per-task provider-leg result-envelope path — an ABSOLUTE
+ * path under the repo's gitignored `.keeper/state/`. It is the `--output` target
+ * the wrapped worker's provider leg writes its result envelope to, and the file
+ * task .4's detection surface probes to flag a wrapped-cell task done-stamped
+ * with no leg result. Absolute so the leg (running in the worker cwd) and the
+ * producer (reading it back) resolve the SAME location regardless of cwd. Pure.
+ */
+export function wrappedEnvelopePath(repoDir: string, taskId: string): string {
+  return join(
+    repoDir,
+    ".keeper",
+    "state",
+    "wrapped-envelopes",
+    `${taskId}.json`,
+  );
 }
 
 /**
@@ -451,6 +494,8 @@ export function buildPlannedLaunchSpec(
   dispatchedModel?: string | null,
   dispatchedTier?: string | null,
   dispatchConstraint?: WorkerProvider | null,
+  wrappedCell?: string | null,
+  wrappedEnvelope?: string | null,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
@@ -474,6 +519,13 @@ export function buildPlannedLaunchSpec(
       ? { dispatchedTier }
       : {}),
     ...(dispatchConstraint != null ? { dispatchConstraint } : {}),
+    // The wrapped-cell guard carriers (task .1) — set ONLY for a wrapped effective
+    // cell, so a native launch leaves them off and stays byte-identical (the exec
+    // builder always emits both empty).
+    ...(wrappedCell != null && wrappedCell !== "" ? { wrappedCell } : {}),
+    ...(wrappedEnvelope != null && wrappedEnvelope !== ""
+      ? { wrappedEnvelope }
+      : {}),
   };
 }
 
@@ -1153,6 +1205,19 @@ export interface PlannedLaunch {
    * capture keys the selection cohort exclusion on this being present.
    */
   dispatchConstraint?: WorkerProvider | null;
+  /**
+   * The wrapped-cell guard marker for a `work` row whose EFFECTIVE cell is wrapped
+   * (its model not natively served by claude — {@link isWrappedCell}). {@link
+   * wrappedCell} is the effective `<model>::<effort>`; {@link wrappedEnvelope} is the
+   * per-task provider-leg result-envelope path ({@link wrappedEnvelopePath}). BOTH
+   * absent for a native cell / non-`work` row (the producer then emits the two
+   * `KEEPER_WRAPPED_*` carriers EMPTY, overwriting any stale session-env marker).
+   * Keyed on effective-cell wrappedness, never the pin — a pre-assigned gpt cell
+   * with a null constraint is still marked. The guard (task .2) reads the emitted
+   * env; this layer only ensures the signal is present and correct.
+   */
+  wrappedCell?: string;
+  wrappedEnvelope?: string;
   /**
    * Set IFF the `worker_provider` pin could not translate this `work` row's assigned
    * cell — the fail-closed reject (ADR 0047), parallel to {@link matrixReject} /
@@ -2104,6 +2169,13 @@ export function reconcile(
       let dispatchedCellTier: string | null = null;
       let dispatchConstraint: WorkerProvider | null = null;
       let providerReject: PlannedLaunch["providerReject"];
+      // The wrapped-cell guard marker (task .1) — computed off the EFFECTIVE cell
+      // (`composeModel`/`composeTier` below, the pin-translated cell when the pin
+      // fired) so a native worker is never marked and a wrapped worker never
+      // escapes, independent of the `worker_provider` pin. Emitted EMPTY when
+      // absent (a native cell / cell-less / non-`work` row).
+      let wrappedCell: string | undefined;
+      let wrappedEnvelope: string | undefined;
       if (verb === "work") {
         const cellModel = task.model ?? null;
         const cellTier = task.tier ?? null;
@@ -2162,6 +2234,14 @@ export function reconcile(
                 pluginDirReject =
                   err instanceof Error ? err.message : String(err);
               }
+              // Wrapped-cell guard marker off the EFFECTIVE cell — present only when
+              // the model claude does not serve natively, so a native worker is
+              // never marked (independent of the pin). `cwd` is the launch repo the
+              // absolute envelope path anchors on.
+              if (isWrappedCell(snapshot.hostMatrix, composeModel)) {
+                wrappedCell = `${composeModel}::${composeTier}`;
+                wrappedEnvelope = wrappedEnvelopePath(cwd, taskId);
+              }
             }
           }
         }
@@ -2187,6 +2267,8 @@ export function reconcile(
         dispatchedCellModel,
         dispatchedCellTier,
         dispatchConstraint,
+        ...(wrappedCell !== undefined ? { wrappedCell } : {}),
+        ...(wrappedEnvelope !== undefined ? { wrappedEnvelope } : {}),
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
         ...(matrixReject !== undefined ? { matrixReject } : {}),
         ...(providerReject !== undefined ? { providerReject } : {}),
