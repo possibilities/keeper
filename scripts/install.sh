@@ -174,249 +174,71 @@ else
   echo "install: pi-subagents fork unavailable; pi keeps its current package source"
 fi
 
-# 3c. CodexBar fork: rebase the fork checkout onto upstream, package the rebased
-#     source, and install that bundle in place of Homebrew's cask. The existing
-#     app remains untouched unless fetch, rebase, and packaging all succeed. Any
-#     failure after rebase restores the checkout's last known-good tip; an app
-#     replacement failure also restores the previous bundle. This step never
-#     fails the keeper install.
-codexbar_fork="${HOME}/src/possibilities--CodexBar"
-codexbar_branch="main"
-codexbar_origin="https://github.com/possibilities/CodexBar.git"
-codexbar_upstream="https://github.com/steipete/CodexBar.git"
-codexbar_app="/Applications/CodexBar.app"
-codexbar_notify() {
-  echo "install: CodexBar fork install: $1" >&2
-  if command -v notifyctl >/dev/null 2>&1; then
-    notifyctl show-message -t "CodexBar fork install failed" \
-      -m "$1 (${codexbar_fork})" >/dev/null 2>&1 || true
+# 3c. CodexBar CLI: install the latest signed upstream release directly into
+#     ~/.local/bin. Keeper owns this install surface; remove Homebrew's GUI cask
+#     only after the replacement CLI is downloaded and checksum-verified.
+codexbar_cli_install() {
+  local arch tag version asset release_url install_tmp expected_sha actual_sha cli_dir
+  cli_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/keeper/codexbar"
+  case "$(uname -m)" in
+    arm64) arch="arm64" ;;
+    x86_64) arch="x86_64" ;;
+    *)
+      echo "install: unsupported CodexBar CLI architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+
+  tag="$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+    https://github.com/steipete/CodexBar/releases/latest)"
+  tag="${tag##*/}"
+  if [[ ! "${tag}" =~ ^v[0-9] ]]; then
+    echo "install: could not resolve the latest CodexBar release tag" >&2
+    return 1
+  fi
+  version="${tag#v}"
+  asset="CodexBarCLI-v${version}-macos-${arch}.tar.gz"
+  release_url="https://github.com/steipete/CodexBar/releases/download/${tag}"
+
+  if [ -x "${cli_dir}/CodexBarCLI" ] \
+    && [ "$(cat "${cli_dir}/VERSION" 2>/dev/null || true)" = "${version}" ]; then
+    echo "install: CodexBar CLI ${version} already installed"
+  else
+    install_tmp="$(mktemp -d "${TMPDIR:-/tmp}/keeper-codexbar-cli.XXXXXX")"
+    if ! (
+      set -Eeuo pipefail
+      trap 'rm -rf "${install_tmp}"' EXIT
+      curl -fsSL --retry 3 -o "${install_tmp}/${asset}" "${release_url}/${asset}"
+      curl -fsSL --retry 3 -o "${install_tmp}/${asset}.sha256" \
+        "${release_url}/${asset}.sha256"
+      expected_sha="$(awk 'NR == 1 { print $1 }' "${install_tmp}/${asset}.sha256")"
+      actual_sha="$(shasum -a 256 "${install_tmp}/${asset}" | awk '{ print $1 }')"
+      if [ -z "${expected_sha}" ] || [ "${actual_sha}" != "${expected_sha}" ]; then
+        echo "install: CodexBar CLI checksum verification failed" >&2
+        exit 1
+      fi
+      tar -xzf "${install_tmp}/${asset}" -C "${install_tmp}"
+      mkdir -p "${HOME}/.local/bin" "${cli_dir}"
+      install -m 755 "${install_tmp}/CodexBarCLI" "${cli_dir}/.CodexBarCLI.new"
+      install -m 644 "${install_tmp}/VERSION" "${cli_dir}/.VERSION.new"
+      mv -f "${cli_dir}/.CodexBarCLI.new" "${cli_dir}/CodexBarCLI"
+      mv -f "${cli_dir}/.VERSION.new" "${cli_dir}/VERSION"
+      ln -sfn "${cli_dir}/CodexBarCLI" "${HOME}/.local/bin/codexbar"
+      rm -f "${HOME}/.local/bin/CodexBarCLI"
+    ); then
+      echo "install: CodexBar CLI release installation failed" >&2
+      return 1
+    fi
+    echo "install: installed CodexBar CLI ${version} from upstream release"
+  fi
+
+  if command -v brew >/dev/null 2>&1 && brew list --cask codexbar >/dev/null 2>&1; then
+    echo "install: removing Homebrew CodexBar cask; keeper owns the CLI"
+    brew uninstall --cask --force codexbar >/dev/null
   fi
 }
-if [ ! -d "${codexbar_fork}/.git" ]; then
-  echo "install: CodexBar fork not present; cloning ${codexbar_origin}"
-  mkdir -p "$(dirname "${codexbar_fork}")"
-  git clone --quiet "${codexbar_origin}" "${codexbar_fork}" 2>/dev/null || \
-    codexbar_notify "clone failed — fork not installed (network/auth?)"
-fi
-if [ -d "${codexbar_fork}/.git" ]; then
-  echo "install: syncing and installing CodexBar fork"
-  (
-    set -Eeuo pipefail
-    cd "${codexbar_fork}"
-    git remote get-url upstream >/dev/null 2>&1 || \
-      git remote add upstream "${codexbar_upstream}"
-    current_branch="$(git branch --show-current)"
-    if [ "${current_branch}" != "${codexbar_branch}" ]; then
-      codexbar_notify "checkout is on '${current_branch:-<detached>}', expected '${codexbar_branch}' — leaving the installed app unchanged"
-      exit 0
-    fi
-    if [ -n "$(git status --porcelain)" ]; then
-      codexbar_notify "checkout has local changes — leaving the installed app unchanged"
-      exit 0
-    fi
-    safe_tip="$(git rev-parse HEAD)"
-    install_tmp=""
-    previous_app=""
-    had_previous=0
-    was_running=0
-    app_mutated=0
-    install_complete=0
-    # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2329
-    codexbar_cleanup() {
-      cleanup_status=$?
-      if [ "${cleanup_status}" -ne 0 ] && [ "${install_complete}" -ne 1 ]; then
-        if [ "${app_mutated}" -eq 1 ]; then
-          rm -rf "${codexbar_app}" || true
-          if [ "${had_previous}" -eq 1 ] && [ -d "${previous_app}" ]; then
-            ditto "${previous_app}" "${codexbar_app}" >/dev/null 2>&1 || true
-          fi
-        fi
-        git rebase --abort >/dev/null 2>&1 || true
-        git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-        codexbar_notify "unexpected error; restored the previous bundle and pre-rebase tip ${safe_tip:0:10}"
-        if [ "${was_running}" -eq 1 ] && [ -d "${codexbar_app}" ]; then
-          open -n "${codexbar_app}" >/dev/null 2>&1 || true
-        fi
-      fi
-      if [ -n "${install_tmp}" ]; then
-        rm -rf "${install_tmp}"
-      fi
-    }
-    trap codexbar_cleanup EXIT
-    if ! git fetch upstream --quiet; then
-      codexbar_notify "git fetch upstream failed — leaving the installed app unchanged"
-      exit 0
-    fi
-    if ! git rebase upstream/main >/dev/null 2>&1; then
-      git rebase --abort >/dev/null 2>&1 || true
-      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-      codexbar_notify "rebase onto upstream/main conflicted; restored pre-rebase tip ${safe_tip:0:10}"
-      exit 0
-    fi
-    # CommandLineTools does not ship Xcode's PreviewsMacros or SwiftUIMacros
-    # plugins. Materialize dependencies, remove dependency-only previews, and
-    # temporarily expand SwiftUI @Entry declarations to their EnvironmentKey
-    # equivalent. Restore tracked fork sources immediately after packaging.
-    if ! swift package resolve >/dev/null 2>&1; then
-      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-      codexbar_notify "Swift package resolution failed after rebase; restored pre-rebase tip ${safe_tip:0:10}"
-      exit 0
-    fi
-    keyboard_recorder="${codexbar_fork}/.build/checkouts/KeyboardShortcuts/Sources/KeyboardShortcuts/Recorder.swift"
-    if [ -f "${keyboard_recorder}" ] && grep -q '^#Preview' "${keyboard_recorder}"; then
-      chmod u+w "${keyboard_recorder}"
-      if ! KEYBOARD_RECORDER="${keyboard_recorder}" python3 - <<'PY'
-from os import environ
-from pathlib import Path
-
-path = Path(environ["KEYBOARD_RECORDER"])
-text = path.read_text()
-head, marker, tail = text.partition("\n#Preview {")
-if not marker:
-    raise SystemExit("KeyboardShortcuts preview marker not found")
-_, final_endif, _ = tail.rpartition("\n#endif")
-if not final_endif:
-    raise SystemExit("KeyboardShortcuts final #endif not found")
-path.write_text(f"{head}\n#endif\n")
-PY
-      then
-        git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-        codexbar_notify "could not patch Xcode-only dependency previews; restored pre-rebase tip ${safe_tip:0:10}"
-        exit 0
-      fi
-    fi
-    menu_environment="${codexbar_fork}/Sources/CodexBar/MenuHighlightStyle.swift"
-    widget_environment="${codexbar_fork}/Sources/CodexBarWidget/CodexBarWidgetViews.swift"
-    if ! MENU_ENVIRONMENT="${menu_environment}" WIDGET_ENVIRONMENT="${widget_environment}" python3 - <<'PY'
-from os import environ
-from pathlib import Path
-
-menu_path = Path(environ["MENU_ENVIRONMENT"])
-menu = menu_path.read_text()
-menu_macro = """extension EnvironmentValues {
-    @Entry var menuItemHighlighted: Bool = false
-    /// Optional live-refresh monitor injected into menu card views so the provider card
-    /// subtitle can reflect the in-flight \"Refreshing…\" state in place while the NSMenu
-    /// stays open, without rebuilding the menu during AppKit tracking.
-    @Entry var menuCardRefreshMonitor: MenuCardRefreshMonitor?
-}
-"""
-menu_compat = """private struct MenuItemHighlightedKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
-private struct MenuCardRefreshMonitorKey: EnvironmentKey {
-    static let defaultValue: MenuCardRefreshMonitor? = nil
-}
-
-extension EnvironmentValues {
-    var menuItemHighlighted: Bool {
-        get { self[MenuItemHighlightedKey.self] }
-        set { self[MenuItemHighlightedKey.self] = newValue }
-    }
-
-    /// Optional live-refresh monitor injected into menu card views so the provider card
-    /// subtitle can reflect the in-flight \"Refreshing…\" state in place while the NSMenu
-    /// stays open, without rebuilding the menu during AppKit tracking.
-    var menuCardRefreshMonitor: MenuCardRefreshMonitor? {
-        get { self[MenuCardRefreshMonitorKey.self] }
-        set { self[MenuCardRefreshMonitorKey.self] = newValue }
-    }
-}
-"""
-if menu_macro not in menu:
-    raise SystemExit("CodexBar menu @Entry block not found")
-menu_path.write_text(menu.replace(menu_macro, menu_compat, 1))
-
-widget_path = Path(environ["WIDGET_ENVIRONMENT"])
-widget = widget_path.read_text()
-widget_macro = """extension EnvironmentValues {
-    @Entry fileprivate var widgetUsageShowsUsed: Bool = false
-}
-"""
-widget_compat = """private struct WidgetUsageShowsUsedKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
-extension EnvironmentValues {
-    fileprivate var widgetUsageShowsUsed: Bool {
-        get { self[WidgetUsageShowsUsedKey.self] }
-        set { self[WidgetUsageShowsUsedKey.self] = newValue }
-    }
-}
-"""
-if widget_macro not in widget:
-    raise SystemExit("CodexBar widget @Entry block not found")
-widget_path.write_text(widget.replace(widget_macro, widget_compat, 1))
-PY
-    then
-      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-      codexbar_notify "could not apply CommandLineTools build compatibility; restored pre-rebase tip ${safe_tip:0:10}"
-      exit 0
-    fi
-    if ! ./Scripts/package_app.sh release >/dev/null 2>&1; then
-      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-      codexbar_notify "package build failed after rebase; restored pre-rebase tip ${safe_tip:0:10}"
-      exit 0
-    fi
-    git checkout -- "${menu_environment}" "${widget_environment}"
-
-    install_tmp="$(mktemp -d "${TMPDIR:-/tmp}/keeper-codexbar.XXXXXX")"
-    staged_app="${install_tmp}/CodexBar.app"
-    previous_app="${install_tmp}/previous-CodexBar.app"
-    if ! ditto "${codexbar_fork}/CodexBar.app" "${staged_app}"; then
-      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-      codexbar_notify "could not stage the packaged app; restored pre-rebase tip ${safe_tip:0:10}"
-      exit 0
-    fi
-    if [ -d "${codexbar_app}" ]; then
-      if ! ditto "${codexbar_app}" "${previous_app}"; then
-        git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-        codexbar_notify "could not back up the installed app; restored pre-rebase tip ${safe_tip:0:10}"
-        exit 0
-      fi
-      had_previous=1
-    fi
-    if pgrep -x CodexBar >/dev/null 2>&1; then
-      was_running=1
-    fi
-    pkill -x CodexBar >/dev/null 2>&1 || pkill -f CodexBar.app >/dev/null 2>&1 || true
-
-    install_failed=0
-    app_mutated=1
-    if command -v brew >/dev/null 2>&1 && brew list --cask codexbar >/dev/null 2>&1; then
-      echo "install: removing Homebrew-managed CodexBar"
-      brew uninstall --cask --force codexbar >/dev/null 2>&1 || install_failed=1
-    fi
-    if [ "${install_failed}" -eq 0 ]; then
-      rm -rf "${codexbar_app}"
-      ditto "${staged_app}" "${codexbar_app}" || install_failed=1
-    fi
-    if [ "${install_failed}" -ne 0 ]; then
-      rm -rf "${codexbar_app}"
-      if [ "${had_previous}" -eq 1 ]; then
-        ditto "${previous_app}" "${codexbar_app}" >/dev/null 2>&1 || true
-      fi
-      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
-      codexbar_notify "app replacement failed; restored the previous bundle and pre-rebase tip ${safe_tip:0:10}"
-      if [ "${was_running}" -eq 1 ] && [ -d "${codexbar_app}" ]; then
-        open -n "${codexbar_app}" >/dev/null 2>&1 || true
-      fi
-      exit 0
-    fi
-
-    mkdir -p "${HOME}/.local/bin"
-    ln -sfn "${codexbar_app}/Contents/Helpers/CodexBarCLI" "${HOME}/.local/bin/codexbar"
-    install_complete=1
-    if [ "${was_running}" -eq 1 ]; then
-      open -n "${codexbar_app}" >/dev/null 2>&1 || \
-        codexbar_notify "the fork installed successfully but could not be relaunched"
-    fi
-    echo "install: CodexBar fork rebased, packaged, and installed"
-  ) || codexbar_notify "fork install errored; leaving keeper installation running"
-else
-  echo "install: CodexBar fork unavailable; leaving the installed app unchanged"
+if ! codexbar_cli_install; then
+  echo "install: CodexBar CLI step failed (non-fatal); continuing" >&2
 fi
 
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
