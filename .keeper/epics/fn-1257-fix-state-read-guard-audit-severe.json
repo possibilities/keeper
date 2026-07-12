@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-12T02:42:58.370000Z",
+  "created_by_close_of": "fn-1253-restore-orchestrator-content-blindness",
+  "depends_on_epics": [
+    "fn-1253-restore-orchestrator-content-blindness"
+  ],
+  "id": "fn-1257-fix-state-read-guard-audit-severe",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix state-read guard AUDIT_SEVERE collision",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-12T02:42:58.370000Z"
+}
