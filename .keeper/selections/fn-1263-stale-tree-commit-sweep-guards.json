@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Correctness/security-critical: the index-purity gate + pathspec-limited commit is the structural defense that stops a poisoned index leaking into the commit tree. Subtle git-tree invariants (rename-completeness A/D halves, git --only worktree window, GIT_LITERAL_PATHSPECS injection defense) where a wrong abstraction silently corrupts the tree; a hard opus correctness gate, xhigh for the contract-shaped git semantics.",
+      "task_id": "fn-1263-stale-tree-commit-sweep-guards.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Adds a deterministic-replay fold arm plus a new synthetic-event round-trip and requires a cross-cutting audit that the jam-promotion perturbs no escalation-cap/readiness/dispatch path. Event-sourcing correctness invariant (fold determinism/idempotence, schema defaults) over a multi-file cascade; opus gate, xhigh for the new-event contract shape.",
+      "task_id": "fn-1263-stale-tree-commit-sweep-guards.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Layered defensive commit gates: fail-open keeper.db read, defensive cat-file --batch-check parsing, the dir-parity normalization silent-failure risk, and worktree-portable in-progress probes. Correctness-critical with subtle failure modes where a mis-normalized compare silently no-ops the whole gate; opus gate, xhigh.",
+      "task_id": "fn-1263-stale-tree-commit-sweep-guards.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified additive wire-validator change (add repair to the retry_dispatch allowlist) with a named root cause and explicit scope guards (no reducer/db change); the reasoning core is a bounded call-site disjointness audit across isEscalationVerb/RETRY_DISPATCH_VERBS consumers. No novel design or Claude taste needed, GPT-first; gpt-5.5's multi-step-agentic-coding sweet spot fits the audit-across-files, high band for a known-pattern change.",
+      "task_id": "fn-1263-stale-tree-commit-sweep-guards.4",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "created_at": "2026-07-12T14:36:32.474000Z",
+  "epic_id": "fn-1263-stale-tree-commit-sweep-guards",
+  "input_hash": "3dc85d42e474ef6798ad2cbfb0daa0297d6cbf22f39710bdf2cc191873450923",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1036541250,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1263-stale-tree-commit-sweep-guards.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Correctness/security-critical: the index-purity gate + pathspec-limited commit is the structural defense that stops a poisoned index leaking into the commit tree. Subtle git-tree invariants (rename-completeness A/D halves, git --only worktree window, GIT_LITERAL_PATHSPECS injection defense) where a wrong abstraction silently corrupts the tree; a hard opus correctness gate, xhigh for the contract-shaped git semantics.\", \"confidence\": 0.8}, {\"task_id\": \"fn-1263-stale-tree-commit-sweep-guards.2\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Adds a deterministic-replay fold arm plus a new synthetic-event round-trip and requires a cross-cutting audit that the jam-promotion perturbs no escalation-cap/readiness/dispatch path. Event-sourcing correctness invariant (fold determinism/idempotence, schema defaults) over a multi-file cascade; opus gate, xhigh for the new-event contract shape.\", \"confidence\": 0.72}, {\"task_id\": \"fn-1263-stale-tree-commit-sweep-guards.3\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Layered defensive commit gates: fail-open keeper.db read, defensive cat-file --batch-check parsing, the dir-parity normalization silent-failure risk, and worktree-portable in-progress probes. Correctness-critical with subtle failure modes where a mis-normalized compare silently no-ops the whole gate; opus gate, xhigh.\", \"confidence\": 0.72}, {\"task_id\": \"fn-1263-stale-tree-commit-sweep-guards.4\", \"tier\": \"high\", \"model\": \"gpt-5.5\", \"rationale\": \"Well-specified additive wire-validator change (add repair to the retry_dispatch allowlist) with a named root cause and explicit scope guards (no reducer/db change); the reasoning core is a bounded call-site disjointness audit across isEscalationVerb/RETRY_DISPATCH_VERBS consumers. No novel design or Claude taste needed, GPT-first; gpt-5.5's multi-step-agentic-coding sweet spot fits the audit-across-files, high band for a known-pattern change.\", \"confidence\": 0.6}]}\n"
+}
