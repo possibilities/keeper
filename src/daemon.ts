@@ -158,6 +158,7 @@ import {
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
   MERGE_ESCALATION_REASON_TOKEN,
+  SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_VERB,
@@ -390,13 +391,20 @@ export function drainToCompletion(
  * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
  * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
- * isSharedDesyncDistressKey}) distress key, AND the per-repo shared-base repair latch
- * (`repair::<repo-token>`): each is un-retryable by the wire validator BY DESIGN (an
- * operator never clears them through the retry wire), and a level-trigger (main's boot
- * recovery / the recover pass observing the lane clean / the stale-base probe observing
- * the lane re-based or torn down / the desync content probe observing the checkout carry
- * the default tip / the repair sweep observing the base green) owns dropping them — so
- * the orphan sweep must never reap a self-managed row out from under its signal.
+ * isSharedDesyncDistressKey}) distress key: each is un-retryable by the wire validator
+ * BY DESIGN (an operator never clears them through the retry wire), and a level-trigger
+ * (main's boot recovery / the recover pass observing the lane clean / the stale-base
+ * probe observing the lane re-based or torn down / the desync content probe observing
+ * the checkout carry the default tip) owns dropping them — so the orphan sweep must
+ * never reap a self-managed row out from under its signal. The per-repo shared-base
+ * repair latch (`repair::<repo-token>`) is exempt for a DIFFERENT reason: its verb IS
+ * retryable via the wire (`keeper autopilot retry repair::<token>` re-arms a stranded
+ * row after a declined/dead repair session), so a well-formed row never reaches this
+ * check at all — {@link isRetryableDispatchKey} already `continue`s above. The explicit
+ * `row.verb === "repair"` guard below stays as a defensive belt for a malformed/pre-slug
+ * repair id that somehow fails the wire's id-shape check despite the verb match: the
+ * repair sweep's own level-trigger (re-minting from live evidence, clearing on the base
+ * observed green) owns that row too, so the orphan sweep must not reap it either.
  *
  * The per-repo shared-checkout-WEDGE (mid-merge) distress row is DELIBERATELY NOT exempt:
  * a mid-merge shared checkout no longer blocks the working-tree-free base merge, so that
@@ -465,10 +473,13 @@ export function gcUnretryableDispatchFailures(
     // And the per-repo shared-base repair latch (`repair::<repo-token>`) — a LIVE
     // producer owns it (the SHARED_BASE_BROKEN sweep re-mints it while the base is broken
     // and CLEARS it on positive evidence — base green + zero remaining candidates). Its
-    // `repair` verb is un-retryable by the wire validator BY DESIGN (the retry-wire stays
-    // narrow, per `parseDispatchKey`), so the orphan sweep must not reap it — reaping
-    // would drop its once-page / once-dispatch markers and re-page + re-dispatch a
-    // declined repair after every daemon restart.
+    // `repair` verb IS retryable via the wire (`parseDispatchKey` accepts it, per
+    // `RETRY_DISPATCH_VERBS`), so a well-formed row is already skipped by the
+    // `isRetryableDispatchKey` check above — this guard is a defensive belt for a
+    // malformed/pre-slug repair id that fails the wire's id-shape check despite the verb
+    // matching: reaping it would drop its once-page / once-dispatch markers and re-page +
+    // re-dispatch a declined repair after every daemon restart, the same as reaping the
+    // well-formed case would.
     if (row.verb === "repair") {
       continue;
     }
@@ -1384,6 +1395,36 @@ export function buildRepairHumanNotifyBody(args: {
   ].join("\n");
 }
 
+/**
+ * Build the ONE structured operator page the shared-checkout page-once sweep sends over
+ * botctl when a `shared-checkout-{dirty,desync}:<repoHash>` distress row has stayed live
+ * past its producer's grace watermark. Short by design — the sticky distress row carries
+ * the full context on the board; this is the courtesy page that names the repo, the
+ * hazard, and how the row clears. The `id` prefix picks dirty-vs-desync wording. Pure —
+ * no clock/fs/spawn. The dirty/desync rows clear EXCLUSIVELY via their producer
+ * level-trigger (never `keeper autopilot retry`), so the page names no re-arm command.
+ */
+export function buildSharedCheckoutPageBody(row: {
+  id: string;
+  dir: string | null;
+  reason: string;
+}): string {
+  const repo = row.dir != null && row.dir !== "" ? row.dir : "?";
+  const isDesync = row.id.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX);
+  const hazard = isDesync
+    ? `DESYNCED — its ref advanced but the working tree never caught up, so it`
+    : `DIRTY — it carries uncommitted content, so it`;
+  return [
+    `🔴 keeper: ${row.id} needs you — the shared checkout for repo ${repo} is`,
+    `${hazard} trails landed history. Everything served off it (selector policy,`,
+    `skills, worker templates, daemon source) is stale, and a commit made from it`,
+    `can sweep landed work back to stale content.`,
+    ``,
+    `Reconcile the shared checkout by hand (commit or discard local changes, then`,
+    `resync it to the default tip). The row clears itself once it is observed clean.`,
+  ].join("\n");
+}
+
 /** Injectable dependency surface for {@link runBlockHumanNotifySweep} — the stage-3
  *  unblock human-notify sweep. Same fail-open injectable-deps discipline as
  *  {@link DeconflictHumanNotifySweepDeps}. */
@@ -2095,6 +2136,104 @@ export async function runRepairEscalationSweep(
     if (groups.has(row.id)) continue; // still broken → owned by the dispatch/notify pass
     if (!deps.isBaseGreen(row.dir ?? "")) continue; // retained on no report / red base
     deps.clearRow(row.id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared-checkout hygiene page-once sweep (dirty/desync distress promotion)
+// ---------------------------------------------------------------------------
+
+/**
+ * One OPEN shared-checkout hygiene distress row the page-once sweep weighs — a daemon-verb
+ * `shared-checkout-{dirty,desync}:<repoHash>` sticky read with `human_notified_at IS NULL`
+ * (not yet paged). Its live producers (the repair-defer dirt tracker / the merge desync
+ * probe) own the mint-after-grace and the observed-clean level-clear; this sweep only
+ * pages a row that has already crossed grace and stayed open.
+ */
+export interface SharedCheckoutPageRow {
+  /** The distress-row `dispatch_failures.id` (`shared-checkout-{dirty,desync}:<hash>`). */
+  id: string;
+  /** The affected shared-checkout dir, for the page body; may be null / "". */
+  dir: string | null;
+  /** The full distress reason sentence — its family prefix picks the page wording. */
+  reason: string;
+}
+
+/** The page outcome the shared-checkout page-once sweep records. Only the terminal
+ *  `notified` stamps `human_notified_at`; `notify_failed` is NON-terminal (re-sweeps). */
+export type SharedCheckoutNotifiedOutcome = "notified" | "notify_failed";
+
+/**
+ * Injectable dependency surface for {@link runSharedCheckoutPageSweep}. Same fail-open
+ * injectable-deps discipline as {@link RepairEscalationSweepDeps} — every seam is a pure
+ * function so a fixture pins the page-once contract with no real daemon / botctl / DB.
+ */
+export interface SharedCheckoutPageSweepDeps {
+  /** The OPEN daemon-verb `shared-checkout-{dirty,desync}` rows not yet paged
+   *  (`human_notified_at IS NULL`) — the current-state working set. */
+  readonly selectUnpaged: () => SharedCheckoutPageRow[];
+  /** Send the ONE botctl page about a live dirty/desync distress row. Async + fail-open —
+   *  every error degrades to `notify_failed` so the row re-sweeps (it stays
+   *  operator-visible meanwhile), never a wedge or a silent drop. */
+  readonly notifyHuman: (
+    row: SharedCheckoutPageRow,
+  ) => Promise<SharedCheckoutNotifiedOutcome>;
+  /** Mint a `SharedCheckoutHumanNotified{outcome}` synthetic event. The fold stamps
+   *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the row — only
+   *  the producer level-clear (`DispatchCleared`) does, re-arming the marker at NULL so a
+   *  cleared-then-reminted row pages anew. */
+  readonly mintNotified: (
+    id: string,
+    outcome: SharedCheckoutNotifiedOutcome,
+  ) => void;
+  /** Optional greppable trace sink (a page failure). */
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Run one shared-checkout hygiene page-once sweep — the promotion that pages the human
+ * about a live `shared-checkout-dirty` / `shared-checkout-desync` distress row so it can
+ * never sit advisory-and-ignored again. Rides the repair-escalation heartbeat and its
+ * gating (autopilot wanted, not paused) rather than a timer of its own, so a paused board
+ * defers the page until play. For each OPEN, not-yet-paged row it sends ONE botctl page
+ * and mints `SharedCheckoutHumanNotified{outcome}`; the fold stamps `human_notified_at`
+ * ONLY on the terminal `notified`, so a `notify_failed` leaves the marker NULL and the row
+ * re-sweeps next heartbeat (the page is never lost). It pages on ROW PRESENCE past the
+ * producer's grace — the desync-propagation risk exists whether or not a finalize is
+ * currently starving. The producer's observed-clean level-clear DELETEs the row, resetting
+ * the once-marker: a re-minted row after a fresh grace pages again (a new incident episode;
+ * the sustained grace bounds flapping). NEVER throws — a read edge degrades to a skipped
+ * tick; the spawn lives only in the injected `notifyHuman`, never reachable from
+ * `applyEvent`, so a re-fold never re-pages.
+ */
+export async function runSharedCheckoutPageSweep(
+  deps: SharedCheckoutPageSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let rows: SharedCheckoutPageRow[];
+  try {
+    rows = deps.selectUnpaged();
+  } catch (err) {
+    note(
+      `# warn: shared-checkout page sweep row read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  for (const row of rows) {
+    let outcome: SharedCheckoutNotifiedOutcome;
+    try {
+      outcome = await deps.notifyHuman(row);
+    } catch (err) {
+      note(
+        `# warn: shared-checkout page threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      outcome = "notify_failed";
+    }
+    deps.mintNotified(row.id, outcome);
   }
 }
 
@@ -10840,6 +10979,65 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  /**
+   * Mint one synthetic `SharedCheckoutHumanNotified` event onto the writable connection —
+   * the shared-checkout page-once sweep's only write path into the
+   * `dispatch_failures.human_notified_at` once-marker on a
+   * `shared-checkout-{dirty,desync}:<repoHash>` distress row (the reducer fold owns the
+   * UPDATE, stamping ONLY on the terminal `notified` and NEVER clearing the row). Sibling
+   * of {@link mintRepairHumanNotifiedEvent}; the distress-row `id` rides the entity-key
+   * overload on `session_id`. NON-FATAL on insert failure — the next heartbeat sweep
+   * re-attempts (the marker stays NULL on a `notify_failed`).
+   */
+  function mintSharedCheckoutHumanNotifiedEvent(
+    id: string,
+    outcome: SharedCheckoutNotifiedOutcome,
+  ): void {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: id,
+        $pid: null,
+        $hook_event: "SharedCheckoutHumanNotified",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ id, outcome }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] SharedCheckoutHumanNotified mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -11993,6 +12191,60 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // The OPEN, not-yet-paged shared-checkout hygiene distress rows — daemon-verb
+  // `shared-checkout-{dirty,desync}:<repoHash>` stickies with `human_notified_at IS NULL`
+  // — the page-once sweep's current-state working set. Both families share the daemon
+  // distress verb; the two id prefixes are disjoint. A read failure degrades to an empty
+  // set (the next tick re-reads).
+  function selectUnpagedSharedCheckoutRows(): SharedCheckoutPageRow[] {
+    try {
+      return db
+        .query(
+          `SELECT id, dir, reason FROM dispatch_failures
+             WHERE verb = ? AND (id LIKE ? OR id LIKE ?)
+               AND human_notified_at IS NULL`,
+        )
+        .all(
+          SHARED_DIRTY_DISTRESS_VERB,
+          `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
+          `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
+        ) as SharedCheckoutPageRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Send the ONE botctl page about a live shared-checkout dirty/desync distress row.
+  // Sibling of `notifyHumanOfRepair`: ASYNC spawn, array form so the body rides as a
+  // literal argv element. A non-zero exit OR a missing botctl maps to `notify_failed` —
+  // NON-terminal, so the marker stays NULL and the row re-sweeps: the page is never lost,
+  // and the distress row stays operator-visible on the board throughout.
+  async function notifyHumanOfSharedCheckout(
+    row: SharedCheckoutPageRow,
+  ): Promise<SharedCheckoutNotifiedOutcome> {
+    const body = buildSharedCheckoutPageBody(row);
+    try {
+      const proc = Bun.spawn(
+        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          env: process.env as Record<string, string | undefined>,
+        },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0 ? "notified" : "notify_failed";
+    } catch (err) {
+      console.error(
+        `[keeperd] shared-checkout human-page spawn threw for ${row.id} (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return "notify_failed";
+    }
+  }
+
   // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
   // checkout (the repo dir itself — NOT the lane-or-project resolution unblock uses),
   // where the base branch lives and `keeper commit-work` lands a trunk commit; the prompt
@@ -12202,6 +12454,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     for (const c of decision.clear) {
       mintDispatchClearedEvent(SHARED_DIRTY_DISTRESS_VERB, c.id);
     }
+
+    // Page-once step — the shared-checkout hygiene distress promotion. Runs AFTER the
+    // dirt mint/clear above so a dirty row minted THIS tick is eligible to page (it is
+    // already open by the time this reads), while a row cleared this tick has already
+    // dropped out of `human_notified_at IS NULL` selection. Inherits this tick's
+    // not-paused / not-shutting-down gating; a paused board defers the page until play.
+    await runSharedCheckoutPageSweep({
+      selectUnpaged: () => selectUnpagedSharedCheckoutRows(),
+      notifyHuman: (row) => notifyHumanOfSharedCheckout(row),
+      mintNotified: (id, outcome) =>
+        mintSharedCheckoutHumanNotifiedEvent(id, outcome),
+      noteLine: note,
+    });
   }
   // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
   // launcher is reachable. Rides the same 60s heartbeat as the block-escalation sweep.

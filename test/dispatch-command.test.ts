@@ -40,6 +40,14 @@ test("parseDispatchKey: splits the composite key into {ok, verb, id}", () => {
     verb: "approve",
     id: "fn-1-foo",
   });
+  // `repair` is accepted so an operator can re-arm a stranded
+  // `repair::<repo-token>` sticky after a dispatched repair session declines
+  // or dies — the repair-escalation sweep re-dispatches once the row clears.
+  expect(parseDispatchKey("repair::keeper-qzvs8i")).toEqual({
+    ok: true,
+    verb: "repair",
+    id: "keeper-qzvs8i",
+  });
 });
 
 test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", () => {
@@ -54,6 +62,9 @@ test("isRetryableDispatchKey: a clearable composite vs. an un-retryable raw-path
   // A normal plan/close key is retryable (the operator can `keeper autopilot retry` it).
   expect(isRetryableDispatchKey("close", "fn-1-foo")).toBe(true);
   expect(isRetryableDispatchKey("work", "fn-1-foo.3")).toBe(true);
+  // A well-formed repair latch is retryable too — the operator re-arm path for
+  // a stranded `repair::<repo-token>` sticky.
+  expect(isRetryableDispatchKey("repair", "keeper-qzvs8i")).toBe(true);
   // A slugged recover key (separators stripped) is retryable too.
   expect(
     isRetryableDispatchKey("close", "worktree-recover:Users-mike-code-arthack"),
@@ -169,13 +180,21 @@ test("parseDispatchableKey: same id-shape rejections as parseDispatchKey", () =>
   }
 });
 
-test("retry wire byte-identical: parseDispatchKey REJECTS the escalation verbs", () => {
-  // The escalation verbs are dispatchable but NEVER sticky `dispatch_failures`
-  // rows, so the `retry_dispatch` wire validator must keep rejecting them —
-  // widening it would accept keys that never exist as rows.
+test("retry wire: parseDispatchKey REJECTS unblock/deconflict, ACCEPTS repair", () => {
+  // unblock:: / deconflict:: sessions are first-class `jobs` rows (folded via
+  // the spawn-name deriver), never sticky `dispatch_failures` rows, so the
+  // `retry_dispatch` wire validator must keep rejecting them — widening it
+  // would accept keys that never exist as rows.
   expect(parseDispatchKey("unblock::fn-1-foo.3").ok).toBe(false);
   expect(parseDispatchKey("deconflict::fn-1-foo").ok).toBe(false);
-  expect(parseDispatchKey("repair::keeper-qzvs8i").ok).toBe(false);
+  // repair:: IS a sticky `dispatch_failures` row (the repair latch an
+  // operator re-arms after a declined/dead repair session) — the wire
+  // deliberately accepts it (see `EscalationVerb`'s docstring).
+  expect(parseDispatchKey("repair::keeper-qzvs8i")).toEqual({
+    ok: true,
+    verb: "repair",
+    id: "keeper-qzvs8i",
+  });
 });
 
 test("isEscalationVerb: true only for unblock/deconflict/repair", () => {
@@ -187,14 +206,16 @@ test("isEscalationVerb: true only for unblock/deconflict/repair", () => {
   }
 });
 
-test("isRetryableDispatchKey: an escalation key is NOT retry-wire (first-class job, not an orphan row)", () => {
-  // A live unblock::/deconflict::/repair:: job is a first-class `jobs` row
-  // (folded via the spawn-name deriver), never a `dispatch_failures` row — so
-  // it must never be a retry-wire key, and the boot orphan-GC (which only
-  // sweeps `dispatch_failures`) never sees it.
+test("isRetryableDispatchKey: unblock/deconflict are NOT retry-wire (first-class jobs, not orphan rows); repair IS", () => {
+  // A live unblock::/deconflict:: job is a first-class `jobs` row (folded via
+  // the spawn-name deriver), never a `dispatch_failures` row — so it must
+  // never be a retry-wire key, and the boot orphan-GC (which only sweeps
+  // `dispatch_failures`) never sees it.
   expect(isRetryableDispatchKey("unblock", "fn-1-foo.3")).toBe(false);
   expect(isRetryableDispatchKey("deconflict", "fn-1-foo")).toBe(false);
-  expect(isRetryableDispatchKey("repair", "keeper-qzvs8i")).toBe(false);
+  // repair:: IS retry-wire — its sticky `dispatch_failures` row is exactly
+  // what `keeper autopilot retry repair::<token>` re-arms.
+  expect(isRetryableDispatchKey("repair", "keeper-qzvs8i")).toBe(true);
 });
 
 // ---------------------------------------------------------------------------

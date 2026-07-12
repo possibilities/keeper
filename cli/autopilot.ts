@@ -158,8 +158,11 @@ Subcommands:
            ephemeral per-cycle wait, never a sticky failure.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
            the canonical composite key (e.g. work::fn-619-foo.3). verb is
-           one of work|close|approve; approve clears a resurrected/phantom
-           approve pending (the reconciler never dispatches approve itself).
+           one of work|close|approve|repair; approve clears a resurrected/
+           phantom approve pending (the reconciler never dispatches approve
+           itself); repair re-arms a stranded repair::<repo-token> sticky
+           after a dispatched repair session declined or died (the sweep
+           re-dispatches on persisting candidates once the row clears).
 
 Options:
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)

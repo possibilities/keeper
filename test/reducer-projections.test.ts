@@ -1666,6 +1666,233 @@ test("a DispatchFailed re-UPSERT of an uncleared WORK row preserves human_notifi
 });
 
 // ---------------------------------------------------------------------------
+// `SharedCheckoutHumanNotified` folds the terminal page-once marker
+// `dispatch_failures.human_notified_at` on a `shared-checkout-{dirty,desync}:<hash>`
+// distress row (the daemon distress verb). A TERMINAL `notified` stamps
+// `human_notified_at = event.ts` (gated IS NULL); a `notify_failed` / unknown outcome
+// leaves it NULL (re-sweepable). The marker PERSISTS across a `DispatchFailed` re-UPSERT
+// (reason churn) of an uncleared row and is dropped with the row on its producer
+// level-clear (`DispatchCleared`), re-arming a re-minted row at NULL so it pages anew.
+// Pure fold (event.ts + persisted row only) → re-fold reproduces the stamp.
+// ---------------------------------------------------------------------------
+
+const SHARED_DIRTY_ROW_ID = "shared-checkout-dirty:abc123";
+const SHARED_DESYNC_ROW_ID = "shared-checkout-desync:def456";
+// The shared daemon distress verb both families ride (mirrors
+// SHARED_DIRTY_DISTRESS_VERB / SHARED_DESYNC_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB).
+const SHARED_DISTRESS_VERB = "daemon";
+
+function sharedCheckoutHumanNotifiedEvent(
+  id: string,
+  outcome: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "SharedCheckoutHumanNotified",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ id, outcome }),
+  });
+}
+
+function seedSharedCheckoutRow(id: string, reason: string, ts: number): void {
+  dispatchFailedEvent(SHARED_DISTRESS_VERB, id, reason, "/repo", ts);
+}
+
+test("SharedCheckoutHumanNotified stamps human_notified_at = event.ts on the terminal notified outcome (dirty + desync families)", () => {
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: /repo has stayed dirty past grace",
+    1700,
+  );
+  seedSharedCheckoutRow(
+    SHARED_DESYNC_ROW_ID,
+    "shared-checkout-desync: /repo has stayed DESYNCED past grace",
+    1700,
+  );
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID),
+  ).toBeNull();
+
+  const dirtyId = sharedCheckoutHumanNotifiedEvent(
+    SHARED_DIRTY_ROW_ID,
+    "notified",
+    1750,
+  );
+  sharedCheckoutHumanNotifiedEvent(SHARED_DESYNC_ROW_ID, "notified", 1760);
+  expect(drainAll()).toBe(2);
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID)).toBe(
+    1760,
+  );
+  expect(getCursor()).toBeGreaterThanOrEqual(dirtyId);
+});
+
+test("SharedCheckoutHumanNotified with a notify_failed / unknown outcome leaves human_notified_at NULL (re-sweepable)", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notify_failed", 1750);
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+
+  // An unknown outcome is non-terminal too (terminal is a strict allow-list).
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "weird_outcome", 1760);
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+
+  // A later terminal retry over the same still-uncleared row stamps it.
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1770);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1770,
+  );
+});
+
+test("SharedCheckoutHumanNotified is idempotent — a second notified event no-ops (first observation wins)", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+
+  // A second terminal notify (later ts) must NOT move the marker — gated IS NULL.
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1900);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+});
+
+test("SharedCheckoutHumanNotified marker survives a DispatchFailed re-UPSERT (reason churn preserves page-once)", () => {
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: /repo has stayed dirty past grace",
+    1700,
+  );
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+
+  // The producer re-mints the SAME uncleared row with a churned reason sentence
+  // (a fresh dirty-count / recover verdict). The UPSERT must PRESERVE the marker —
+  // else the page-once sweep would re-page every heartbeat.
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: /repo has stayed dirty past grace (12 paths)",
+    1850,
+  );
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID)).toBe(
+    1750,
+  );
+});
+
+test("SharedCheckoutHumanNotified: DispatchCleared drops the marker with the row so a re-minted row pages anew (re-arm at NULL)", () => {
+  seedSharedCheckoutRow(
+    SHARED_DESYNC_ROW_ID,
+    "shared-checkout-desync: x",
+    1700,
+  );
+  sharedCheckoutHumanNotifiedEvent(SHARED_DESYNC_ROW_ID, "notified", 1750);
+  drainAll();
+  expect(getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID)).toBe(
+    1750,
+  );
+
+  // The producer's observed-clean level-trigger DELETEs the row.
+  dispatchClearedEvent(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID);
+  drainAll();
+  expect(
+    getDispatchFailure(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID),
+  ).toBeNull();
+
+  // A fresh incident episode re-mints the row — the marker re-arms at NULL, so the
+  // next page-once sweep pages anew.
+  seedSharedCheckoutRow(
+    SHARED_DESYNC_ROW_ID,
+    "shared-checkout-desync: x",
+    1900,
+  );
+  drainAll();
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DESYNC_ROW_ID),
+  ).toBeNull();
+});
+
+test("SharedCheckoutHumanNotified on a missing row is a safe no-op (cursor advances)", () => {
+  const id = sharedCheckoutHumanNotifiedEvent(
+    "shared-checkout-dirty:gone",
+    "notified",
+    1750,
+  );
+  expect(drainAll()).toBe(1);
+  expect(
+    getDispatchFailure(SHARED_DISTRESS_VERB, "shared-checkout-dirty:gone"),
+  ).toBeNull();
+  expect(getCursor()).toBe(id);
+});
+
+test("SharedCheckoutHumanNotified with a malformed payload is a safe no-op (cursor advances, marker untouched)", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  drainAll();
+  const malformed = [
+    "{ not json",
+    JSON.stringify({ outcome: "notified" }), // missing id
+    JSON.stringify({ id: "", outcome: "notified" }), // empty id
+    JSON.stringify({ id: SHARED_DIRTY_ROW_ID }), // missing outcome
+    JSON.stringify({ id: SHARED_DIRTY_ROW_ID, outcome: "" }), // empty outcome
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "SharedCheckoutHumanNotified",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(getCursor()).toBe(lastId);
+  expect(
+    getHumanNotifiedAt(SHARED_DISTRESS_VERB, SHARED_DIRTY_ROW_ID),
+  ).toBeNull();
+});
+
+test("from-scratch re-fold reproduces the SharedCheckoutHumanNotified stamp byte-identically", () => {
+  seedSharedCheckoutRow(SHARED_DIRTY_ROW_ID, "shared-checkout-dirty: x", 1700);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notify_failed", 1740);
+  sharedCheckoutHumanNotifiedEvent(SHARED_DIRTY_ROW_ID, "notified", 1750);
+  seedSharedCheckoutRow(
+    SHARED_DIRTY_ROW_ID,
+    "shared-checkout-dirty: churn",
+    1800,
+  );
+  drainAll();
+  const before = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v110 (fn-1129.1) — the `block_escalations` latch gains STAGED escalation-
 // dispatch outcomes and the terminal human-notify once-marker (the UNBLOCK path).
 // `BlockEscalationAttempted` records a TERMINAL `dispatched` (→ status

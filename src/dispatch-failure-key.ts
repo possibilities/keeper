@@ -190,7 +190,12 @@ export function isSharedWedgeDistressKey(verb: string, id: string): boolean {
  * orphan-GC-EXEMPT (a level-trigger owns dropping it, UNLIKE the drained wedge row). Its
  * ONLY clear is the repair sweep's level-trigger observing the checkout clean (the
  * `reason` lives OUTSIDE {@link WORKTREE_RECOVER_REASON_PREFIX}). In-memory grace
- * tracking, so a daemon restart re-emits at most once per still-present dirt.
+ * tracking, so a daemon restart re-emits at most once per still-present dirt. This is a
+ * PAGING operator jam: its minted reason startsWith {@link SHARED_DIRTY_DISTRESS_REASON},
+ * so `isJamReason` surfaces it through needs-human, and the daemon page-once sweep pages
+ * the operator EXACTLY once per row instance (the `human_notified_at` once-marker,
+ * re-armed at NULL when the producer level-clear DELETEs the row). The `retry_dispatch`
+ * wire STILL cannot clear it — the ONLY clear stays the producer level-trigger above.
  */
 export const SHARED_DIRTY_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
 export const SHARED_DIRTY_DISTRESS_ID_PREFIX = "shared-checkout-dirty:";
@@ -380,7 +385,12 @@ export function isDupEpicNumberDistressKey(verb: string, id: string): boolean {
  * WORKTREE_RECOVER_REASON_PREFIX}. UNLIKE the drained wedge/dirty family it IS boot
  * orphan-GC-EXEMPT (a live level-trigger owns dropping it). Prefix-disjoint from every
  * existing family (recover/finalize/shared-wedge/shared-dirty/slot/crash-loop/lane-
- * premerge/lane-wedge/stale-base).
+ * premerge/lane-wedge/stale-base). Like its shared-dirty sibling it is a PAGING operator
+ * jam: its minted reason startsWith {@link SHARED_DESYNC_DISTRESS_REASON}, so
+ * `isJamReason` surfaces it through needs-human, and the daemon page-once sweep pages the
+ * operator EXACTLY once per row instance (`human_notified_at`, re-armed at NULL by the
+ * producer level-clear). The `retry_dispatch` wire STILL cannot clear it — the ONLY clear
+ * stays the per-cycle content probe above.
  */
 export const SHARED_DESYNC_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
 export const SHARED_DESYNC_DISTRESS_ID_PREFIX = "shared-checkout-desync:";
@@ -413,7 +423,7 @@ export function isSharedDesyncDistressKey(verb: string, id: string): boolean {
  * is evidence of a layer-1 fold gap, and a silently self-tidying corrector is how
  * this class stayed invisible for weeks, so the OPERATOR acks it, never a
  * level-trigger. To be `retry_dispatch`-clearable the verb MUST be a retryable one
- * ({@link import("./dispatch-command").RetryDispatchVerb} = work|close|approve);
+ * ({@link import("./dispatch-command").RetryDispatchVerb} = work|close|approve|repair);
  * `close` mirrors the merge-conflict precedent. The `id` is a DEDICATED synthetic
  * namespace (`stuck-sentinel:<jobId>`) that never collides with a real epic
  * (`fn-…`), so it routes as a `close-plain` dead-end (no escalation sweep fires on
