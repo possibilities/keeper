@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Harden drain gate and verify probe",
-  "updated_at": "2026-07-12T06:03:39.713000Z"
+  "updated_at": "2026-07-12T06:24:51.051000Z",
+  "worker_done_at": "2026-07-12T06:24:51.051000Z"
 }
