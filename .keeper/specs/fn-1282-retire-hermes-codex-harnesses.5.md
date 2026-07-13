@@ -56,5 +56,5 @@ Old generated retired commands are not migrated and fail normally.
 - [ ] Claude/Pi suites pass.
 
 ## Done summary
-
+Restricted resume, restore, tabs, wake, and exec argv-building paths to Claude/Pi via harnessOrClaude; empty/null harness remains Claude, and any unregistered non-empty value fails before process creation with no retired-harness compatibility treatment.
 ## Evidence
