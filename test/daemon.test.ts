@@ -205,6 +205,7 @@ import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
+  MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_VERB,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
@@ -483,6 +484,7 @@ test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout WEDGE r
   const dirtyId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`;
   const laneId = `${LANE_WEDGE_DISTRESS_ID_PREFIX}def456`;
   const desyncId = `${SHARED_DESYNC_DISTRESS_ID_PREFIX}abc123`;
+  const monitorSlotId = `${MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX}job-1`;
   insert.run(
     SHARED_WEDGE_DISTRESS_VERB,
     wedgeId,
@@ -518,6 +520,13 @@ test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout WEDGE r
     "/repo",
     34,
   );
+  insert.run(
+    SHARED_DESYNC_DISTRESS_VERB,
+    monitorSlotId,
+    "monitor-slot-wedge: …",
+    "/repo",
+    35,
+  );
 
   const cleared: { verb: string; id: string }[] = [];
   const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
@@ -532,6 +541,7 @@ test("gcUnretryableDispatchFailures: DRAINS the neutered shared-checkout WEDGE r
   expect(cleared.some((c) => c.id === laneId)).toBe(false);
   expect(cleared.some((c) => c.id === CRASH_LOOP_DISTRESS_ID)).toBe(false);
   expect(cleared.some((c) => c.id === desyncId)).toBe(false);
+  expect(cleared.some((c) => c.id === monitorSlotId)).toBe(false);
   db.close();
 });
 
@@ -6297,6 +6307,14 @@ test("buildSharedCheckoutPageBody: names the repo and picks dirty-vs-desync word
     reason: "x",
   });
   expect(desync).toContain("DESYNCED");
+
+  const monitorSlot = buildSharedCheckoutPageBody({
+    id: "monitor-slot-wedge:job-1",
+    dir: "/repo",
+    reason: "monitor-slot-wedge: stale",
+  });
+  expect(monitorSlot).toContain("dispatch root /repo");
+  expect(monitorSlot).toContain("will not release or kill");
 
   // A null dir renders a placeholder, never the literal "null".
   const noDir = buildSharedCheckoutPageBody({

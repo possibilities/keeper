@@ -273,6 +273,18 @@ export function deriveHarnessActivities<
   return activities;
 }
 
+export function isResourceEvidenceStaleActivity(
+  activity: HarnessActivity | undefined,
+): activity is HarnessActivity & {
+  status: "unknown";
+  reason: "resource-evidence-stale";
+} {
+  return (
+    activity?.status === "unknown" &&
+    activity.reason === "resource-evidence-stale"
+  );
+}
+
 export function harnessActivityHoldsCapacity(
   activity: HarnessActivity,
 ): boolean {

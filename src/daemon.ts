@@ -163,12 +163,14 @@ import {
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
+  isMonitorSlotWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
   LANE_BACKUP_DISTRESS_ID_PREFIX,
   LANE_TEARDOWN_DISTRESS_ID_PREFIX,
   MERGE_ESCALATION_REASON_TOKEN,
+  MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
@@ -487,6 +489,11 @@ export function gcUnretryableDispatchFailures(
     // (the checkout observed clean) owns dropping it, so the orphan sweep must not reap it
     // out from under its signal. (Its mid-merge WEDGE sibling stays DRAINED above.)
     if (isSharedDirtyDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // The monitor-slot paging row is likewise producer-owned: only positive
+    // settle/exit/fact-clear evidence may drop it.
+    if (isMonitorSlotWedgeDistressKey(row.verb, row.id)) {
       continue;
     }
     // And the per-(project,number) duplicate-epic-number distress row — a LIVE producer
@@ -1457,6 +1464,16 @@ export function buildSharedCheckoutPageBody(row: {
   reason: string;
 }): string {
   const repo = row.dir != null && row.dir !== "" ? row.dir : "?";
+  if (row.id.startsWith(MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX)) {
+    return [
+      `🔴 keeper: ${row.id} needs you — dispatch root ${repo} is wedged by a`,
+      `stopped, pid-alive session whose worker-monitor evidence stayed unknown.`,
+      row.reason,
+      ``,
+      `Inspect or settle that session. Keeper will not release or kill it based on`,
+      `age; the row clears only after active, exited, or cleared-monitor evidence.`,
+    ].join("\n");
+  }
   if (
     row.id.startsWith(LANE_TEARDOWN_DISTRESS_ID_PREFIX) ||
     row.id.startsWith(LANE_BACKUP_DISTRESS_ID_PREFIX)
@@ -12601,7 +12618,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         db
           .query(
             `SELECT id, dir, reason FROM dispatch_failures
-               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
+               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
                  AND human_notified_at IS NULL`,
           )
           .all(
@@ -12610,6 +12627,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
             `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
             `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
+            `${MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX}%`,
           ) as SharedCheckoutPageRow[]
       ).filter((row) => !excludeIds.has(row.id));
     } catch {

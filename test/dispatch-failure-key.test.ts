@@ -671,6 +671,7 @@ describe("single vocabulary source", () => {
       ["shared-checkout-wedge", "shared-wedge"],
       ["shared-checkout-dirty", "shared-dirty"],
       ["shared-checkout-desync", "shared-desync"],
+      ["monitor-slot-wedge", "monitor-slot-wedge"],
       ["worktree-lane-wedge", "lane-wedge"],
       ["worktree-lane-backup-failed", "lane-wedge"],
       ["worktree-lane-teardown", "lane-wedge"],

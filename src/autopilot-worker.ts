@@ -94,6 +94,7 @@ import {
   isDupEpicNumberDistressKey,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
+  isMonitorSlotWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -107,6 +108,9 @@ import {
   LANE_TEARDOWN_DISTRESS_REASON,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
+  MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
+  MONITOR_SLOT_WEDGE_DISTRESS_REASON,
+  monitorSlotWedgeJobId,
   routeDispatchFailure,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
@@ -133,6 +137,10 @@ import {
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
+import {
+  findLongUnknownMonitorOccupants,
+  type LongUnknownMonitorOccupant,
+} from "./readiness";
 import { loadReadinessInputs, type ReadinessQuery } from "./readiness-inputs";
 import {
   type BaseDriftEntry,
@@ -178,6 +186,7 @@ import {
   wrappedEnvelopePath,
 } from "./reconcile-core";
 import { isPidAlive, runQuery } from "./server-worker";
+import type { HarnessActivity } from "./session-activity";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
@@ -244,6 +253,7 @@ export {
   isDupEpicNumberDistressKey,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
+  isMonitorSlotWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -260,6 +270,9 @@ export {
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_DISTRESS_VERB,
+  MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
+  MONITOR_SLOT_WEDGE_DISTRESS_REASON,
+  MONITOR_SLOT_WEDGE_DISTRESS_VERB,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
   SHARED_DESYNC_DISTRESS_VERB,
@@ -1273,6 +1286,80 @@ export function dupEpicNumberDistressId(
  */
 export function sharedDesyncDistressId(repoDir: string): string {
   return `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
+}
+
+/** A long-unknown live monitor pages after this horizon; it never releases. */
+export const MONITOR_SLOT_WEDGE_PAGE_SEC = 30 * 60;
+
+export function monitorSlotWedgeDistressId(jobId: string): string {
+  return `${MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX}${jobId}`;
+}
+
+export interface OpenMonitorSlotWedge {
+  id: string;
+  jobId: string;
+  dir: string;
+}
+
+export interface MonitorSlotWedgeDecision {
+  mint: { id: string; dir: string; reason: string }[];
+  clear: { id: string; dir: string }[];
+}
+
+/** Positive evidence that a monitor-slot incident ended; uncertainty retains it. */
+export function monitorSlotHasPositiveClearEvidence(input: {
+  activity: HarnessActivity | undefined;
+  pidAlive: boolean | null;
+  jobState: "present" | "terminal" | "absent";
+}): boolean {
+  return (
+    input.activity?.status === "active" ||
+    input.activity?.status === "quiescent" ||
+    input.pidAlive === false ||
+    input.jobState === "terminal" ||
+    input.jobState === "absent"
+  );
+}
+
+/**
+ * Decide the page-once distress delta for long-unknown monitor occupants.
+ * Presence of an open row suppresses re-minting (and therefore re-paging);
+ * only producer-proven settle/exit/fact-clear evidence can clear one. A later
+ * stale episode sees no open row and mints again. There is deliberately no
+ * release/kill action in this contract.
+ */
+export function decideMonitorSlotWedgeDistress(input: {
+  occupants: readonly LongUnknownMonitorOccupant[];
+  open: ReadonlyMap<string, OpenMonitorSlotWedge>;
+  positivelyClearedJobIds: ReadonlySet<string>;
+  thresholdSec?: number;
+}): MonitorSlotWedgeDecision {
+  const thresholdSec = input.thresholdSec ?? MONITOR_SLOT_WEDGE_PAGE_SEC;
+  const thresholdMin = Math.round(thresholdSec / 60);
+  const decision: MonitorSlotWedgeDecision = { mint: [], clear: [] };
+  for (const occupant of input.occupants) {
+    const id = monitorSlotWedgeDistressId(occupant.jobId);
+    if (input.open.has(id)) continue;
+    const root = occupant.root === "" ? "?" : occupant.root;
+    decision.mint.push({
+      id,
+      dir: occupant.root,
+      reason:
+        `${MONITOR_SLOT_WEDGE_DISTRESS_REASON}: dispatch root ${root} remains ` +
+        `occupied by stopped pid-alive session ${occupant.jobId} after its ` +
+        `worker-monitor evidence stayed resource-evidence-stale past the ` +
+        `${thresholdMin}min paging horizon — inspect the session; keeper will ` +
+        `not release or kill it based on age`,
+    });
+  }
+  for (const row of input.open.values()) {
+    if (input.positivelyClearedJobIds.has(row.jobId)) {
+      decision.clear.push({ id: row.id, dir: row.dir });
+    }
+  }
+  decision.mint.sort((a, b) => a.id.localeCompare(b.id));
+  decision.clear.sort((a, b) => a.id.localeCompare(b.id));
+  return decision;
 }
 
 /** A shared-checkout-wedge distress row to mint (past grace) or clear (recovered). */
@@ -8269,6 +8356,7 @@ export async function loadReconcileSnapshot(
   // dead/live matrix without a real process; defaults to {@link isPidAlive}.
   pidAlive: (pid: number) => boolean = isPidAlive,
   readinessQuery: ReadinessQuery = runQuery,
+  nowSec: number = Math.floor(Date.now() / 1000),
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -8299,7 +8387,7 @@ export async function loadReconcileSnapshot(
     harnessActivityByJobId,
     unseededRoots,
     maxConcurrentPerRoot,
-  } = loadReadinessInputs(db, readinessQuery);
+  } = loadReadinessInputs(db, readinessQuery, nowSec);
 
   // The shared jobs descriptor intentionally omits the live-only generation
   // column; exact Resource holds require it, so enrich the producer snapshot
@@ -8343,6 +8431,10 @@ export async function loadReconcileSnapshot(
   // set + the desync grace tracker's clear set, so a restarted worker still probes +
   // clears a distress it minted before the restart.
   const sharedDesyncDistressDirs = new Set<string>();
+  // OPEN per-occupant monitor-slot paging rows. Keyed by id so the producer can
+  // suppress re-mint/page and level-clear the exact durable row after positive
+  // settle/exit/fact-clear evidence.
+  const openMonitorSlotWedges = new Map<string, OpenMonitorSlotWedge>();
   // The `(verb, id, dir)` of every OPEN fan-in LANE pre-merge row (reason carries
   // WORKTREE_LANE_PREMERGE_REASON_PREFIX), collected VERB-AGNOSTICALLY off the REASON
   // so the recover pass's level-clear reaches a `work::<taskId>` row the typed router
@@ -8389,6 +8481,17 @@ export async function loadReconcileSnapshot(
         const dir = (row as { dir?: unknown }).dir;
         if (typeof dir === "string" && dir.length > 0) {
           sharedDesyncDistressDirs.add(dir);
+        }
+      }
+      if (isMonitorSlotWedgeDistressKey(verb, id)) {
+        const jobId = monitorSlotWedgeJobId(id);
+        const dir = (row as { dir?: unknown }).dir;
+        if (jobId != null && jobId !== "") {
+          openMonitorSlotWedges.set(id, {
+            id,
+            jobId,
+            dir: typeof dir === "string" ? dir : "",
+          });
         }
       }
       if (isLaneWedgeDistressKey(verb, id)) {
@@ -8625,6 +8728,23 @@ export async function loadReconcileSnapshot(
   // Empty whenever the pane probe is degraded (`livePaneIds === null`): with no
   // live-pane set there is nothing to reclaim, so the slot pass stays inert.
   const provenDeadJobIds = new Set<string>();
+  const pidLivenessByJobId = new Map<string, boolean | null>();
+  const probeJobPid = (job: Job): boolean | null => {
+    const prior = pidLivenessByJobId.get(job.job_id);
+    if (prior !== undefined) return prior;
+    if (job.pid == null) {
+      pidLivenessByJobId.set(job.job_id, null);
+      return null;
+    }
+    try {
+      const alive = pidAlive(job.pid);
+      pidLivenessByJobId.set(job.job_id, alive);
+      return alive;
+    } catch {
+      pidLivenessByJobId.set(job.job_id, null);
+      return null;
+    }
+  };
   if (livePaneIds !== null) {
     for (const job of jobs.values()) {
       if (job.state !== "stopped" || job.pid == null) {
@@ -8634,11 +8754,63 @@ export async function loadReconcileSnapshot(
       if (paneId == null || paneId === "" || !livePaneIds.has(paneId)) {
         continue;
       }
-      if (!pidAlive(job.pid)) {
+      if (probeJobPid(job) === false) {
         provenDeadJobIds.add(job.job_id);
       }
     }
   }
+
+  // Paging backstop for a dispatch root held by a stopped session whose worker-
+  // monitor evidence remains canonically unknown. Readiness still holds the slot;
+  // this producer only proves pid liveness and mints/clears an operator distress.
+  const confirmedLongUnknownMonitorOccupants: LongUnknownMonitorOccupant[] = [];
+  for (const occupant of findLongUnknownMonitorOccupants(
+    epics,
+    harnessActivityByJobId,
+    nowSec,
+    MONITOR_SLOT_WEDGE_PAGE_SEC,
+  )) {
+    const job = jobs.get(occupant.jobId);
+    if (job == null || job.state !== "stopped") continue;
+    const alive = probeJobPid(job);
+    if (alive === true) {
+      confirmedLongUnknownMonitorOccupants.push(occupant);
+    } else if (alive === false) {
+      provenDeadJobIds.add(job.job_id);
+    }
+  }
+
+  const positivelyClearedMonitorJobIds = new Set<string>();
+  for (const row of openMonitorSlotWedges.values()) {
+    const job = jobs.get(row.jobId);
+    const activity = harnessActivityByJobId.get(row.jobId);
+    let jobState: "present" | "terminal" | "absent" = "present";
+    if (job == null) {
+      const raw = db
+        .query("SELECT state FROM jobs WHERE job_id = ?")
+        .get(row.jobId) as { state: string } | null;
+      jobState =
+        raw == null
+          ? "absent"
+          : raw.state === "ended" || raw.state === "killed"
+            ? "terminal"
+            : "present";
+    }
+    if (
+      monitorSlotHasPositiveClearEvidence({
+        activity,
+        pidAlive: job == null ? null : probeJobPid(job),
+        jobState,
+      })
+    ) {
+      positivelyClearedMonitorJobIds.add(row.jobId);
+    }
+  }
+  const monitorSlotWedgeActions = decideMonitorSlotWedgeDistress({
+    occupants: confirmedLongUnknownMonitorOccupants,
+    open: openMonitorSlotWedges,
+    positivelyClearedJobIds: positivelyClearedMonitorJobIds,
+  });
 
   // The PER-ROOT unseeded set (`reconcile` forces UNKNOWN only for rows whose
   // `effectiveRoot` is unseeded, so a stale/failed root never darks the whole
@@ -8806,6 +8978,7 @@ export async function loadReconcileSnapshot(
     sharedWedgeDistressDirs,
     sharedDirtyDistressDirs,
     sharedDesyncDistressDirs,
+    monitorSlotWedgeActions,
     laneFailures,
     laneWedgeDistressDirs,
     laneTeardownDistressDirs,
@@ -9441,6 +9614,34 @@ function main(): void {
         // {max_concurrent_per_root} takes effect this cycle. Snapshot already
         // resolved `column ?? DEFAULT` (= 1).
         state.maxConcurrentPerRoot = snapshot.maxConcurrentPerRoot;
+        // Long-unknown worker-monitor slot backstop. This is a paging producer,
+        // never a reaper: mints one daemon distress for each stopped pid-alive
+        // occupant past the horizon and level-clears only after positive
+        // settle/exit/fact-clear evidence. Paused boards defer synthetic writes.
+        if (!state.paused) {
+          try {
+            for (const action of snapshot.monitorSlotWedgeActions?.mint ?? []) {
+              deps.emitSharedWedgeDistress?.({
+                id: action.id,
+                dir: action.dir,
+                reason: action.reason,
+                ts: deps.now(),
+              });
+            }
+            for (const action of snapshot.monitorSlotWedgeActions?.clear ??
+              []) {
+              deps.clearSharedWedgeDistress?.({
+                id: action.id,
+                dir: action.dir,
+              });
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] monitor-slot wedge distress step threw (non-fatal):",
+              err,
+            );
+          }
+        }
         // Producer-only worktree crash/restart recovery, BEFORE the
         // dispatch decision (so the first boot cycle is the post-restart sweep).
         // Gated on worktree mode ON AND not-paused (recovery does git merges +

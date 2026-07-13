@@ -58,7 +58,11 @@ import {
   resolveEpicDep as resolveEpicDepLeaf,
 } from "./epic-deps";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
-import { deriveHarnessActivity } from "./session-activity";
+import {
+  deriveHarnessActivity,
+  type HarnessActivity,
+  isResourceEvidenceStaleActivity,
+} from "./session-activity";
 import { isOpenTurnRow } from "./subagent-invocations";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
 
@@ -341,12 +345,68 @@ export const SUBAGENT_STALENESS_SEC = 120;
  */
 export const MONITOR_STALENESS_SEC = 600;
 
+/** A stopped worker-monitor occupant whose canonical Harness resource evidence
+ * remains unknown beyond a caller-provided paging horizon. This is producer
+ * input only: discovering one never changes readiness or releases its slot. */
+export interface LongUnknownMonitorOccupant {
+  jobId: string;
+  root: string;
+  updatedAt: number;
+}
+
 /**
- * Resource-age horizon retained for consumers that display or bound historical
- * monitor snapshots. Harness activity does not treat age as terminal evidence;
- * a stale worker resource is unknown until positive terminality arrives.
+ * Project the monitor occupants that still hold a dispatch root after their
+ * canonical Harness activity became `resource-evidence-stale` and stayed that
+ * way past `thresholdSec`. The producer separately proves the session pid alive
+ * before paging; this pure read-side seam only correlates the canonical activity
+ * with the exact embedded task/close row that owns the root mutex.
+ *
+ * Strictly `>` the threshold, matching the monitor-staleness lease. No age is a
+ * terminal verdict: this function returns observations only and never mutates a
+ * readiness verdict, releases capacity, or kills a session.
  */
-export const MONITOR_RELEASE_SEC = 1800;
+export function findLongUnknownMonitorOccupants(
+  epics: readonly Epic[],
+  activityByJobId: ReadonlyMap<string, HarnessActivity>,
+  now: number,
+  thresholdSec: number,
+): LongUnknownMonitorOccupant[] {
+  const out: LongUnknownMonitorOccupant[] = [];
+  const seen = new Set<string>();
+  const add = (
+    jobs: readonly {
+      job_id: string;
+      state: string;
+      updated_at: number;
+      has_live_worker_monitor?: boolean;
+    }[],
+    root: string,
+  ): void => {
+    for (const job of jobs) {
+      if (
+        seen.has(job.job_id) ||
+        job.state !== "stopped" ||
+        job.has_live_worker_monitor !== true ||
+        !Number.isFinite(job.updated_at) ||
+        now - job.updated_at <= thresholdSec ||
+        !isResourceEvidenceStaleActivity(activityByJobId.get(job.job_id))
+      ) {
+        continue;
+      }
+      seen.add(job.job_id);
+      out.push({ jobId: job.job_id, root, updatedAt: job.updated_at });
+    }
+  };
+
+  for (const epic of epics) {
+    const projectDir = stringOrNull(epic.project_dir);
+    for (const task of epic.tasks) {
+      add(task.jobs, effectiveRoot(stringOrNull(task.target_repo), projectDir));
+    }
+    add(epic.jobs, effectiveRoot(null, projectDir));
+  }
+  return out;
+}
 
 export type Verdict =
   | { tag: "ready" }
@@ -928,8 +988,6 @@ function evaluateTask(
   // turn-end). Past `MONITOR_STALENESS_SEC` the canonical fact is unknown;
   // readiness conservatively renders `monitor-stale` and keeps the mutex hold.
   if (embeddedMonitorOccupies(task.jobs, now)) {
-    // Within the hard ceiling (the release case is already excluded by
-    // `embeddedMonitorOccupies`). Split on the soft lease.
     if (allLiveMonitorsAreStale(task.jobs, now, MONITOR_STALENESS_SEC)) {
       return { tag: "running", reason: { kind: "monitor-stale" } };
     }
