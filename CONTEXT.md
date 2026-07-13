@@ -23,8 +23,6 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Plan**: The durable spec-and-dependency graph for an epic, authored interactively and consumed read-only, never mutated by the reducer. Avoid: roadmap, schedule, spec sheet.
 - **Id ledger**: The host-local append-only record of every plan number a project has handed out, consulted at mint alongside the directory scan so destroying a minted file can never free its number. Avoid: high-water mark, watermark, counter.
 - **Brief**: The self-contained context packet a worker receives for its task, carrying the spec and glossary out-of-band instead of inlined prose. Avoid: prompt, ticket body, handoff note.
-- **Edit claim**: One structured write-prediction on a task — an exact path, a bounded glob, or a logical resource token, carrying expected or possible certainty; a task's claims form its write surface (what it mutates, never what it merely reads), and the claim noun is distinct from the claim verb, which takes ownership of a task. Avoid: Files list, touched files, write set.
-- **Overlap gate**: The scaffold-time check that intersects sibling tasks' edit claims and refuses DAG-incomparable tasks whose expected exact claims collide, downgrading softer intersections to warnings. Avoid: conflict gate, serialization check, file lock.
 - **Readiness**: The gate deciding whether a task may dispatch, recomputed each cycle from its dependencies and validation state. Avoid: status, priority, availability.
 - **Arm**: To flip an epic or task from not-ready to dispatchable by stamping it validated. Avoid: enable, approve, unlock.
 - **Ghost**: A not-yet-validated epic or task that renders dashed and blocks dispatch until it is armed. Avoid: draft, stub, placeholder.
@@ -86,6 +84,9 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Lane**: A per-task worktree the autopilot derives from the dependency graph each cycle to run tasks in parallel. Avoid: branch, checkout, slot.
 - **Worktree mode**: A producer-only autopilot setting that gives each ready task its own isolated checkout instead of sharing one. Avoid: parallel mode, multi-branch, fork mode.
 - **Merge-gate**: The check that holds a dependent lane until every upstream it needs has truly merged into the local default branch. Avoid: barrier, dependency wait, lock.
+- **Base-drift**: The measured divergence of a lane-base from local default, expressed by behind-count and merge-base age and used by base-freshness alongside the Merge-gate. Avoid: staleness, branch lag, rebase debt.
+- **Base-freshness**: The producer-only, threshold-and-quiescence-gated refresh that merges local default into a lane-base on a bounded cadence, reducing divergence that the Merge-gate does not order away. Avoid: rebase, lane reset, merge gate.
+- **Lane-base**: The per-lane linked base worktree a dependent lane's dependents build on, refreshed by base-freshness only when idle and kept ordered by the Merge-gate. Avoid: shared checkout, trunk, lane branch.
 - **Resolver**: The tier-1 autonomous worker autopilot dispatches to settle a mechanically-clear fan-in merge conflict, epic-scoped or task-scoped to match the conflicting row, stamping blocked when judgment is needed; a decline hands the conflict off to the context-loaded Deconflict session. Avoid: merger, rebase bot, fixer, deconflict session.
 - **Fan-in**: The convergence point where parallel lanes or failures collapse onto one epic- or task-keyed outcome. Avoid: join, merge point, aggregation.
 - **Recover pass**: The per-cycle worktree sweep that aborts interrupted merges, merges a done-but-unmerged epic base into the default branch, and prunes orphaned lanes. Avoid: cleanup pass, reconcile, gc.
