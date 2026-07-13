@@ -64,5 +64,5 @@ patterns allow.
 - [ ] The spool env is sandboxed in tests and the CLAUDE.md recover-pass + test-isolation lines match shipped behavior
 
 ## Done summary
-
+Recover-pass lane teardown now bounded: an ownership classifier (owned/foreign/ambiguous/locked) plus a backup-then-force helper snapshot dirt to a new lane-dirt-spool before destroying a closed epic's merged/tombstoned lane past a per-lane grace with TOCTOU re-probes; unsafe or unmergeable lanes mint one page-once distress row instead of the old silent re-mint, and a failed backup blocks destruction and eventually pages too. The finalize-path sibling now defers instead of hard-failing. CLAUDE.md's recover-pass and test-isolation lines were revised in place and the spool env is sandboxed.
 ## Evidence
