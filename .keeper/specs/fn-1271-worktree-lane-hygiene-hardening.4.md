@@ -51,5 +51,5 @@ skips destroy; multi-repo epic tears down in each touched repo; envelope shape s
 - [ ] Plugin isolation holds (no daemon src import; no RPC change)
 
 ## Done summary
-
+Extended keeper plan epic rm to tear down the epic's worktree lanes (base + ribs) across every touched repo, following ADR 0053's backup-then-force / page-once discipline (locked, foreign, and ambiguous lanes are skipped and reported, never destroyed; a backup failure also skips the destroy). The rm envelope now reports torn_down_lanes and skipped_lanes; --keeper/ artifact removal proceeds regardless of individual lane failures. Implemented plan-plugin-side with no daemon src import and no RPC change.
 ## Evidence
