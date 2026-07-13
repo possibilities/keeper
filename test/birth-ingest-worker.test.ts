@@ -38,15 +38,13 @@ import {
 } from "../src/birth-record";
 import type { EventsIngestContext } from "../src/daemon";
 import { drainToCompletion, scanBirthDir } from "../src/daemon";
-import { openDb } from "../src/db";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
-let dbPath: string;
 let birthDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-birth-ingest-test-"));
-  dbPath = join(tmpDir, "keeper.db");
   birthDir = join(tmpDir, "births");
 });
 
@@ -87,7 +85,7 @@ function makeBirthRecord(overrides: Partial<BirthRecord> = {}): BirthRecord {
 
 /** Count SessionStart events for a session. */
 function sessionStartCount(
-  db: ReturnType<typeof openDb>["db"],
+  db: ReturnType<typeof freshMemDb>["db"],
   sessionId: string,
 ): number {
   const row = db
@@ -127,7 +125,7 @@ function readBackstopRecords(logPath: string): Record<string, unknown>[] {
 }
 
 test("scanBirthDir mints a synthetic SessionStart that folds to a tracked jobs row (harness, title, backend coords, resume_target)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const record = makeBirthRecord();
   writeBirthRecord(birthDir, record);
 
@@ -167,7 +165,7 @@ test("scanBirthDir mints a synthetic SessionStart that folds to a tracked jobs r
 });
 
 test("a Pi birth binds only the exact current Dispatch claim", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO events (ts, session_id, hook_event, event_type, data)
      VALUES (?, ?, 'Dispatched', 'pending_dispatches', ?)`,
@@ -215,7 +213,7 @@ test("a Pi birth binds only the exact current Dispatch claim", () => {
 });
 
 test("scanBirthDir processes each record exactly once: retired after minting, a re-scan mints nothing new", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const record = makeBirthRecord();
   writeBirthRecord(birthDir, record);
 
@@ -243,7 +241,7 @@ test("scanBirthDir processes each record exactly once: retired after minting, a 
 });
 
 test("scanBirthDir parks a malformed record to dead_letters, retires it, and still ingests a valid record in the same scan", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const { ctx, backstopLogPath } = makeIngestCtx();
 
   // A valid record AND a raw garbage file, both in `new/`.
@@ -294,7 +292,7 @@ test("scanBirthDir parks a malformed record to dead_letters, retires it, and sti
 });
 
 test("scanBirthDir tolerates an absent births tree (no-op, no throw)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // No births dir at all.
   scanBirthDir(db, join(tmpDir, "does-not-exist"));
@@ -311,7 +309,7 @@ test("scanBirthDir tolerates an absent births tree (no-op, no throw)", () => {
 });
 
 test("scanBirthDir re-fold parity: the birth-minted SessionStart events row is byte-identical to a canonical direct INSERT of the same fields", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   const record = makeBirthRecord({ session_id: "parity" });
 
   // Producer path: mint via the births ingest.

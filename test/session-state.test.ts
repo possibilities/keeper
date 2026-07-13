@@ -30,6 +30,7 @@ import type {
   GitRunner,
 } from "../src/commit-work/git-exec";
 import { openDb } from "../src/db";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -39,7 +40,7 @@ const REPO = "/synthetic/keeper-ss-repo";
 beforeEach(() => {
   tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "keeper-ss-")));
   dbPath = join(tmpDir, "keeper.db");
-  openDb(dbPath).db.close();
+  freshDbFile(dbPath).db.close();
 });
 
 afterEach(() => {

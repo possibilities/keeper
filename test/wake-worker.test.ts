@@ -1,20 +1,14 @@
-/**
- * Wake-worker round-trip tests. The deterministic data_version behavior (two
- * connections, timing) is covered end-to-end in the integration test; here we
- * verify the two structural contracts that don't depend on tight timing:
- *
- * - `watchLoop` posts a wake when ANOTHER connection commits, and stops when
- *   `isShutdown()` flips (driven directly, no real Worker — fast + reliable).
- * - A real spawned Worker shuts down cleanly on `{ type: "shutdown" }`.
- */
-
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
-import { watchLoop } from "../src/wake-worker";
-import { retryUntil } from "./helpers/retry-until";
+import {
+  stepWatchLoop,
+  type WatchLoopScheduler,
+  watchLoop,
+} from "../src/wake-worker";
+import { ManualScheduler } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -22,7 +16,6 @@ let dbPath: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-wake-test-"));
   dbPath = join(tmpDir, "keeper.db");
-  // Bootstrap the schema with a writer so the readonly connection can open.
   openDb(dbPath).db.close();
 });
 
@@ -30,78 +23,78 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("watchLoop posts a wake when another connection commits", async () => {
+function loopScheduler(clock: ManualScheduler): WatchLoopScheduler {
+  return {
+    now: () => clock.now,
+    sleep: (ms) => clock.sleep(ms),
+  };
+}
+
+function commit(db: ReturnType<typeof openDb>["db"], id: string): void {
+  db.query(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, ?, 'Stop', 'lifecycle', '{}')",
+  ).run(id);
+}
+
+test("stepWatchLoop proves idle deadline boundaries and commit coalescing", () => {
+  const initial = { lastVersion: 1, lastWakeAt: 100 };
+  expect(stepWatchLoop(initial, 1, 149, 50)).toEqual({
+    state: initial,
+    wake: false,
+  });
+  expect(stepWatchLoop(initial, 1, 150, 50)).toEqual({
+    state: { lastVersion: 1, lastWakeAt: 150 },
+    wake: true,
+  });
+  expect(stepWatchLoop(initial, 1, 151, 50).wake).toBe(true);
+
+  const commitAtDeadline = stepWatchLoop(initial, 2, 150, 50);
+  expect(commitAtDeadline).toEqual({
+    state: { lastVersion: 2, lastWakeAt: 150 },
+    wake: true,
+  });
+});
+
+test("watchLoop posts one wake when another connection commits at the default cadence", async () => {
   const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+  const clock = new ManualScheduler();
   let wakes = 0;
   let shutdown = false;
-
   const loop = watchLoop(
     reader,
     () => {
       wakes += 1;
     },
     () => shutdown,
-    25,
+    undefined,
+    0,
+    undefined,
+    loopScheduler(clock),
   );
 
-  // A SEPARATE writer connection commits — data_version only moves for the
-  // reader when a different connection writes.
-  const writer = openDb(dbPath).db;
-  writer
-    .query(
-      "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
-    )
-    .run();
+  expect(clock.nextDelay()).toBe(25);
+  commit(writer, "s");
+  await clock.advanceBy(24);
+  expect(wakes).toBe(0);
+  expect(clock.pendingCount()).toBe(1);
+  await clock.advanceBy(1);
+  expect(wakes).toBe(1);
+  expect(clock.pendingCount()).toBe(1);
 
-  // Wait for the poll to observe the commit and post a wake (positive gate).
-  await retryUntil(() => (wakes >= 1 ? wakes : null));
   shutdown = true;
+  await clock.runNext();
   await loop;
-
-  expect(wakes).toBeGreaterThanOrEqual(1);
+  expect(clock.pendingCount()).toBe(0);
   writer.close();
   reader.close();
 });
 
-test("watchLoop default cadence (DEFAULT_POLL_MS=25) observes a commit within ~75ms", async () => {
-  // fn-694 lever B2: the default poll cadence dropped 50→25ms. Drive the loop
-  // with NO explicit pollMs so it uses DEFAULT_POLL_MS, and assert it observes
-  // a commit within a window only the tighter cadence reliably clears.
+test("watchLoop shutdown with no writes is silent and drains its pending sleep", async () => {
   const reader = openDb(dbPath, { readonly: true }).db;
+  const clock = new ManualScheduler();
   let wakes = 0;
   let shutdown = false;
-
-  const loop = watchLoop(
-    reader,
-    () => {
-      wakes += 1;
-    },
-    () => shutdown,
-    // no pollMs → DEFAULT_POLL_MS (25)
-  );
-
-  const writer = openDb(dbPath).db;
-  writer
-    .query(
-      "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
-    )
-    .run();
-
-  // 75ms ≈ 3 cycles at 25ms; at the old 50ms default this is a single cycle.
-  await Bun.sleep(75);
-  shutdown = true;
-  await loop;
-
-  expect(wakes).toBeGreaterThanOrEqual(1);
-  writer.close();
-  reader.close();
-});
-
-test("watchLoop resolves once isShutdown flips with no writes", async () => {
-  const reader = openDb(dbPath, { readonly: true }).db;
-  let wakes = 0;
-  let shutdown = false;
-
   const loop = watchLoop(
     reader,
     () => {
@@ -109,109 +102,104 @@ test("watchLoop resolves once isShutdown flips with no writes", async () => {
     },
     () => shutdown,
     25,
+    0,
+    undefined,
+    loopScheduler(clock),
   );
 
-  // Negative settle: with no commits the loop must post zero wakes; only a
-  // fixed wait can disprove a spurious wake.
-  await Bun.sleep(80);
-  shutdown = true;
-  await loop; // must resolve, not hang
-
   expect(wakes).toBe(0);
+  expect(clock.pendingCount()).toBe(1);
+  shutdown = true;
+  await clock.runNext();
+  await loop;
+  expect(wakes).toBe(0);
+  expect(clock.pendingCount()).toBe(0);
   reader.close();
 });
 
-test("watchLoop maxIdleMs fires an idle wake with no commits (epic fn-907)", async () => {
-  // No writer commits at all — only the idle timer drives wakes. The restore
-  // worker rides this so the out-of-band tmux topology probe pulses ~1s even
-  // when keeper.db is idle.
+test("watchLoop maxIdleMs wakes exactly at the boundary and re-arms", async () => {
   const reader = openDb(dbPath, { readonly: true }).db;
+  const clock = new ManualScheduler();
   let wakes = 0;
   let shutdown = false;
-
   const loop = watchLoop(
     reader,
     () => {
       wakes += 1;
-    },
-    () => shutdown,
-    25, // poll cadence
-    40, // maxIdleMs — fire an idle wake every ~40ms with no commit
-  );
-
-  // ~200ms of pure idle should yield several idle wakes (no DB writes).
-  await Bun.sleep(220);
-  shutdown = true;
-  await loop;
-
-  expect(wakes).toBeGreaterThanOrEqual(2);
-  reader.close();
-});
-
-test("watchLoop maxIdleMs=0 (default) fires NO idle wake without a commit", async () => {
-  const reader = openDb(dbPath, { readonly: true }).db;
-  let wakes = 0;
-  let shutdown = false;
-
-  // maxIdleMs omitted → 0 → the idle path is disabled; a commit-less loop stays
-  // silent (the wake worker's contract is unchanged).
-  const loop = watchLoop(
-    reader,
-    () => {
-      wakes += 1;
-    },
-    () => shutdown,
-    25,
-  );
-
-  // Negative settle: the idle path is disabled (maxIdleMs=0), so a commit-less
-  // loop must stay silent; only a fixed wait can disprove an idle wake.
-  await Bun.sleep(120);
-  shutdown = true;
-  await loop;
-
-  expect(wakes).toBe(0);
-  reader.close();
-});
-
-test("watchLoop coalesces a commit and an overdue idle tick (one wake per turn)", async () => {
-  // A commit resets the idle clock, so a fresh commit and an overdue idle wake
-  // never both fire in the same loop iteration — one onWake per turn.
-  const reader = openDb(dbPath, { readonly: true }).db;
-  const wakeTimes: number[] = [];
-  let shutdown = false;
-
-  const loop = watchLoop(
-    reader,
-    () => {
-      wakeTimes.push(Date.now());
     },
     () => shutdown,
     25,
     50,
+    undefined,
+    loopScheduler(clock),
   );
 
-  // Commit once mid-flight; the rest of the wakes come from the idle timer.
-  const writer = openDb(dbPath).db;
-  // Fixed durations are load-bearing here: the test measures inter-wake spacing,
-  // so the ~60ms pre-commit gap and ~160ms post-commit tail must stay fixed
-  // (a retryUntil would collapse the timing characteristic the assertion checks).
-  await Bun.sleep(60);
-  writer
-    .query(
-      "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (1, 's', 'Stop', 'lifecycle', '{}')",
-    )
-    .run();
-  await Bun.sleep(160);
-  shutdown = true;
-  await loop;
+  await clock.advanceBy(49);
+  expect(wakes).toBe(0);
+  await clock.advanceBy(1);
+  expect(wakes).toBe(1);
+  await clock.advanceBy(50);
+  expect(wakes).toBe(2);
 
-  // Consecutive wakes are always at least ~one poll interval apart — never two
-  // in the same iteration (the coalesce). Allow a small scheduling slop floor.
-  for (let i = 1; i < wakeTimes.length; i++) {
-    expect(wakeTimes[i] - wakeTimes[i - 1]).toBeGreaterThanOrEqual(20);
-  }
-  expect(wakeTimes.length).toBeGreaterThanOrEqual(2);
+  shutdown = true;
+  await clock.runNext();
+  await loop;
+  reader.close();
+});
+
+test("watchLoop maxIdleMs=0 keeps explicit idle pending without waking", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const clock = new ManualScheduler();
+  let wakes = 0;
+  let shutdown = false;
+  const loop = watchLoop(
+    reader,
+    () => {
+      wakes += 1;
+    },
+    () => shutdown,
+    25,
+    0,
+    undefined,
+    loopScheduler(clock),
+  );
+
+  await clock.advanceBy(250);
+  expect(wakes).toBe(0);
+  expect(clock.pendingCount()).toBe(1);
+  shutdown = true;
+  await clock.runNext();
+  await loop;
+  reader.close();
+});
+
+test("watchLoop coalesces a commit and overdue idle condition into one wake per step", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+  const clock = new ManualScheduler();
+  const wakeAt: number[] = [];
+  let shutdown = false;
+  const loop = watchLoop(
+    reader,
+    () => wakeAt.push(clock.now),
+    () => shutdown,
+    25,
+    50,
+    undefined,
+    loopScheduler(clock),
+  );
+
+  commit(writer, "coalesced");
+  await clock.advanceBy(25);
+  expect(wakeAt).toEqual([25]);
+  await clock.advanceBy(49);
+  expect(wakeAt).toEqual([25]);
+  await clock.advanceBy(1);
+  expect(wakeAt).toEqual([25, 75]);
+
+  shutdown = true;
+  await clock.runNext();
+  await loop;
   writer.close();
   reader.close();
 });
