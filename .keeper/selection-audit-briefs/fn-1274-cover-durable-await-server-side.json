@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 2,
+        "insertions": 451
+      },
+      "done_summary": "Added table-driven server-side coverage for evaluateDurableAwaitConditions (all 14 condition kinds, target-null guard, task-vs-epic split, drained scope) and a daemon-level test for the request-await spill guard rejecting escaping/empty/oversized doc_path without minting AwaitRequested. Test-only; no production source changed.",
+      "input_hash": "a79f87da05e9dca2c8555e1f013029d9e2fad69c00657adb416fa682ae077b39",
+      "model": "gpt-5.5",
+      "spec_chars": 2326,
+      "spec_md": "## Description\n\nAdd direct unit coverage for two untested server-side durable-await\nsurfaces flagged by the fn-1273 close audit:\n\n- **F1** \u2014 `evaluateDurableAwaitConditions` (`src/await-worker.ts:269`).\n  The ~130-line evaluator dispatches all 14 condition kinds\n  (complete / unblocked / started / git-clean / agents-idle / drained /\n  landed / dead-letter / block-escalation / parked-question /\n  stuck-dispatch / finalize-non-ff / instant-death-wall / needs-human) and\n  returns met/waiting/unknown. It has zero direct test references in\n  `test/` \u2014 only transitive exercise via `decideAwaitAction`. Add a\n  table-driven test in `test/await-worker.test.ts` that seeds a DB snapshot\n  per condition kind and asserts the met/waiting/unknown verdict, covering\n  the `target === null` guard, the task-vs-epic (`/\\.\\d+$/`) split, and the\n  `drained` scope default.\n\n- **F2** \u2014 the `request-await` daemon handler spill guard\n  (`src/daemon.ts:8343`). It carries its OWN copy (distinct from the\n  handoff copy) of the realpath + `startsWith(realDir + sep)` containment\n  check plus empty-file and `HANDOFF_DOC_MAX_BYTES` rejections. Only\n  param-shape validation is covered (`test/rpc-handlers.test.ts`). Add a\n  daemon-level test in `test/daemon.test.ts` asserting that a\n  `../`-escaping `doc_path`, an empty spill file, and an oversized spill\n  file each return `ok:false` and mint no `AwaitRequested` event.\n\nBundled as one task: both are durable-await server-side test coverage of\nthe same feature, landing as one test-only commit. Tests only \u2014 do not\nchange production behavior.\n\nFiles: `test/await-worker.test.ts`, `test/daemon.test.ts`.\n\n## Acceptance\n\n- [ ] Table-driven `evaluateDurableAwaitConditions` test asserts\n      met/waiting/unknown per condition kind against a seeded DB.\n- [ ] Daemon test asserts `../`-escape, empty, and oversized spill\n      `doc_path` each return `ok:false` and mint no event.\n- [ ] `bun test` green; no production source changed.\n\n## Done summary\nAdded table-driven server-side coverage for evaluateDurableAwaitConditions (all 14 condition kinds, target-null guard, task-vs-epic split, drained scope) and a daemon-level test for the request-await spill guard rejecting escaping/empty/oversized doc_path without minting AwaitRequested. Test-only; no production source changed.\n## Evidence\n",
+      "task_id": "fn-1274-cover-durable-await-server-side.1",
+      "tier": "high",
+      "title": "Test durable-await server surface"
+    }
+  ],
+  "created_at": "2026-07-13T11:30:22.115000Z",
+  "epic_id": "fn-1274-cover-durable-await-server-side",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "a79f87da05e9dca2c8555e1f013029d9e2fad69c00657adb416fa682ae077b39",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
