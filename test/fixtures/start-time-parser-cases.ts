@@ -1,8 +1,7 @@
 /**
  * Shared source of truth for the platform-tagged start_time parsers'
  * expected behavior. `src/birth-record.ts`'s `darwinLstartToStartTime` /
- * `linuxStatToStartTime` and the hermes events shim's DRIFT-GUARD
- * byte-identical copies (`plugins/keeper/plugin/hooks/hermes-events-shim.ts`)
+ * `linuxStatToStartTime` and any DRIFT-GUARD byte-identical copies
  * both consume these cases, so a silent drift between the two
  * implementations fails in both suites instead of two independently
  * maintained expectation sets going stale in isolation.

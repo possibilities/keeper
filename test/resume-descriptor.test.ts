@@ -69,13 +69,10 @@ test("resumeTarget: a pi job resolves to its stored session id", () => {
   expect(resumeTarget(job)).toBe("pi-session-42");
 });
 
-test("resumeTarget: a non-claude job with no back-filled target is not-resumable (empty)", () => {
-  // codex/hermes back-fill resume_target post-stop; before that it is NULL and the
-  // agent is not-resumable — resumeTarget returns "" (never the job_id, which is
-  // NOT a codex resume key).
+test("resumeTarget: a Pi job with no target is not-resumable (empty)", () => {
   const job = fixtureJob({
     job_id: "keeper-job-3",
-    harness: "hermes",
+    harness: "pi",
     resume_target: null,
   });
   expect(resumeTarget(job)).toBe("");
@@ -121,12 +118,6 @@ test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {
 test("buildResumeCommand: pi renders `pi --session`", () => {
   expect(buildResumeCommand("/repo", "pi-42", null, "pi")).toBe(
     'cd /repo && pi --session "pi-42"',
-  );
-});
-
-test("buildResumeCommand: hermes renders `hermes --resume`", () => {
-  expect(buildResumeCommand("", "hx-9", null, "hermes")).toBe(
-    'hermes --resume "hx-9"',
   );
 });
 

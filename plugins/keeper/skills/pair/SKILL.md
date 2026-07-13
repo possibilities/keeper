@@ -1,8 +1,8 @@
 ---
 name: pair
 description: >-
-  Pair with another model CLI — fan ONE task out to claude, codex, pi, or
-  hermes, wait, then read its answer; or resume a prior partner conversation by
+  Pair with another model CLI — fan ONE task out to claude, codex, or pi, wait,
+  then read its answer; or resume a prior partner conversation by
   name instead of starting cold. Use when the user wants a second opinion, a
   cross-check, or to "ask claude / ask codex / ask another model", a code review
   or co-plan from a different model, a read-only audit by a partner, or to
@@ -17,14 +17,14 @@ description: >-
   (that is `keeper:bus`), NOT for a multi-model consensus panel (that is
   `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash
-argument-hint: <what to ask> [--preset <harness::model::effort> | --cli claude|codex|pi|hermes] [--resume <name-or-id>] [--name <n>] [--role …] [--read-only]
+argument-hint: <what to ask> [--preset <harness::model::effort> | --cli claude|codex|pi] [--resume <name-or-id>] [--name <n>] [--role …] [--read-only]
 ---
 
 # pair
 
-Pairing fans ONE task out to another model CLI — `claude`, `codex`, `pi`, or
-`hermes` — launched as a detached **interactive TUI** partner via `keeper agent`,
-and reads the partner's final answer back as a uniform JSON envelope. It is
+Pairing fans ONE task out to another model CLI — `claude`, `codex`, or `pi` —
+launched as a detached **interactive TUI** partner via `keeper agent`, and reads
+the partner's final answer back as a uniform JSON envelope. It is
 keeper's pairing surface: a second opinion, a cross-vendor cross-check, a code
 review or co-plan from a different model, or a read-only audit. There are two
 entry states: **fresh-launch** starts a brand-new partner conversation, and
@@ -34,10 +34,7 @@ pre-seeded so the window never stalls, all fail-open: for a codex partner keeper
 seeds the cwd's codex directory-trust before launch so it never hangs on codex's
 "trust this directory?" prompt; a pi partner launches with `-na`
 (`--no-approve`), ignoring the cwd's project-local `.pi/` resources so it
-likewise never stalls on pi's trust prompt; a hermes partner has its shell-hook
-allowlist + keeper events-shim pre-seeded so it reports live state with no
-interactive hook-approval prompt (degrading to presence-only tracking if the
-seed can't be written).
+likewise never stalls on pi's trust prompt.
 
 **Name your partners.** Pass `--name <n>` on a fresh launch so the partner is
 resumable by name later — an unnamed partner is still resumable by job id, but
@@ -253,7 +250,7 @@ schema-versioned JSON envelope. The fields:
   from the **settled stop** — the transcript stop marker capture accepts as
   terminal because no background agent the partner launched is still live at
   that point — so a partner that ends a turn early while a background agent is
-  still working never gets captured mid-flight. codex/pi/hermes have no
+  still working never gets captured mid-flight. codex/pi have no
   background-agent concept, so their capture is a plain final-message read.
 - `message_found` — whether a final message was present.
 - `transcript_path` — the partner's per-backend transcript JSONL, the drill-down
@@ -303,9 +300,9 @@ model guidance and panel roster use, applied to one leg:**
 | Flag | Meaning |
 |---|---|
 | `--preset <triple>` | **`agent run` only** (Quick single-shot). A launch triple `<harness>::<model>::<effort>` — supplies harness + model + effort in one token. The triple's harness must equal the `<cli>` positional, or it's an arg fault. `agent panel start`'s ad-hoc member has no `--preset`; compose the triple with `--panel <triple>` there instead (see *Detached + chunked wait* above). |
-| `--cli claude\|codex\|pi\|hermes` | The partner CLI. **Required unless `--preset`/`--panel` already names a triple.** All four launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded, pi launches with `-na` (ignore project-local `.pi/` resources), and hermes gets its shell-hook allowlist + events-shim pre-seeded — all fail-open, so none stalls on a consent prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
-| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex`/`hermes` `-m`). Omit for the CLI's default; a triple already supplies it unless this overrides. |
-| `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi/hermes member is an arg fault; hermes is model-only, pi takes thinking not effort). |
+| `--cli claude\|codex\|pi` | The partner CLI. **Required unless `--preset`/`--panel` already names a triple.** All three launch as an interactive TUI; codex gets its cwd directory-trust pre-seeded and pi launches with `-na` (ignore project-local `.pi/` resources), both fail-open so neither stalls on a consent prompt. Reach for a DIFFERENT vendor than yourself when the user wants genuine diversity / a true second opinion. |
+| `--model <m>` | Native model id, passed through (`claude`/`pi` `--model`, `codex` `-m`). Omit for the CLI's default; a triple already supplies it unless this overrides. |
+| `--effort <e>` | Reasoning effort — **codex only** (passing it with a claude/pi member is an arg fault; pi takes thinking not effort). |
 | `--role <r>` | Role prompt: `default` \| `planner` \| `codereviewer` \| `coplanner` (rides the leg as a `--system` block on the panel path; pairs with `--cli`, not with a bare triple). Pick `codereviewer` for "review this", `coplanner`/`planner` for "help me plan", `default` otherwise. |
 | `--read-only` | Read-only posture (see below). Use for any audit / review / second-opinion where the partner should NOT touch the tree. |
 | `--name <n>` | **`agent run` only.** Names the partner so it is resumable by name later — pass it on a fresh launch; a `--resume` launch ignores it and keeps the partner's original name. |

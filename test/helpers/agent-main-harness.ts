@@ -45,14 +45,13 @@ export const DEFAULT_HOST_TRIPLES: HostTriples = {
  * fresh launch pin them) instead of the fresh-launch fail-loud. Bare launches that
  * don't assert the exact command are unaffected; exact-command tests either see
  * these injected values or pass their own catalog / explicit flags. `presets` is
- * empty (the freeform named catalog is retired); pi's effort segment `high`
- * translates to its thinking band, hermes carries the axisless `na`.
+ * empty (the freeform named catalog is retired); Pi's effort segment `high`
+ * translates to its thinking band.
  */
 export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
   presets: {},
   claude_default: { harness: "claude", model: "opus", effort: "high" },
   pi_default: { harness: "pi", model: "glm", effort: "high" },
-  hermes_default: { harness: "hermes", model: "gpt-5.5", effort: "na" },
 };
 
 /** Throwing exit so a test sees the exit code without killing the runner. */
@@ -109,12 +108,11 @@ export interface HarnessOptions {
    * the dispatch suite to test bare/unknown/help/version classification.
    */
   rawArgv?: boolean;
-  agent?: "claude" | "pi" | "hermes";
+  agent?: "claude" | "pi";
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeBin?: string;
   piBin?: string;
-  hermesBin?: string;
   /**
    * Preset catalog loadPresetCatalogFn returns. Default: {@link
    * DEFAULT_PRESET_CATALOG} — a `<harness>_default` for each harness so a bare
@@ -195,7 +193,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
 
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
-  const hermesBin = opts.hermesBin ?? "/fake-home/.local/bin/hermes";
 
   const spawn: SpawnFn =
     opts.spawn ??
@@ -219,7 +216,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
     exit: throwingExit,
     claudeBin: homeBin,
     piBin,
-    hermesBin,
     pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
     loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,

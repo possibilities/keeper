@@ -419,7 +419,6 @@ describe("launchToResolvedHandle — teardown target", () => {
           runTmuxCommand: () => {
             throw new Error("fake launch must not execute tmux");
           },
-          ensureHermesShimTrust: () => "already-seeded",
           now: () => 123,
           writeErr: (message) => errs.push(message),
         },

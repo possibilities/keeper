@@ -24,11 +24,10 @@
  * worktree) ALSO fails preflight naming the project dir — never a dropped `cd` or
  * a `$HOME` fallback.
  *
- * NON-CLAUDE. Artifact-existence gates: a Pi session file under the cwd's Pi
- * project dir (or anywhere in the sessions tree) matching the resume target, or
- * the Hermes session store's presence. A resume target that names no on-disk
- * artifact is typed not-resumable with a reason rather than launched into a
- * broken resume.
+ * PI. Artifact-existence gates: a session file under the cwd's Pi project dir
+ * (or anywhere in the sessions tree) matching the resume target. A resume target
+ * that names no on-disk artifact is typed not-resumable with a reason rather than
+ * launched into a broken resume.
  *
  * All filesystem access rides the injectable {@link ResumeResolveFs} seam — the
  * pure resolution logic is exercised against an in-memory fake, and the
@@ -377,11 +376,11 @@ export function resolveNonClaudeArtifact(
   if (harness === "pi") {
     return piArtifact(fs, input);
   }
-  if (harness === "hermes") {
-    return hermesArtifact(fs, input);
-  }
-  // claude never reaches here; an unknown harness is left permissive.
-  return { kind: "resumable" };
+  // Claude never reaches here.
+  return {
+    kind: "not-resumable",
+    reason: `${harness} is not a non-Claude harness`,
+  };
 }
 
 function piArtifact(
@@ -420,24 +419,6 @@ function piArtifact(
     reason: `pi session ${target} has no on-disk artifact under ${
       roots.map((r) => join(r, "sessions")).join(", ") || "(no pi dir)"
     }`,
-  };
-}
-
-function hermesArtifact(
-  _fs: ResumeResolveFs,
-  input: NonClaudeResolveInput,
-): ResumeResolution {
-  const { resumeTarget: target, homeDir, env } = input;
-  const hermesHome = (env.HERMES_HOME ?? "").trim() || join(homeDir, ".hermes");
-  const store = join(hermesHome, "state.db");
-  // Hermes sessions live in a SQLite store, not per-session files — the coarsest
-  // honest on-disk gate is the store's presence.
-  if (_fs.exists(store)) {
-    return { kind: "resumable" };
-  }
-  return {
-    kind: "not-resumable",
-    reason: `hermes session store ${store} is absent — session ${target} not resumable`,
   };
 }
 

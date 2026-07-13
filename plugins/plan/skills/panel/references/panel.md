@@ -31,9 +31,9 @@ band and `description` says which work the panel fits; read both live with `keep
 the host matrix's enumerable cube — no separate preset catalog names them. Eligibility is
 **capability-derived**: a triple is panel-valid when its harness is *capturable* (keeper can read that
 harness's final message) AND carries a second reasoning axis (an effort or thinking rung to compare
-across panelists) — a capability flag, never a harness-name allowlist. Today that is claude and pi;
-hermes is axisless (no second reasoning axis), so it is never panel-eligible. A triple on a
-non-panel-eligible harness is rejected when the panel loads.
+across panelists) — a capability flag, never a harness-name allowlist. Both supported harnesses,
+Claude and Pi, are panel-eligible. A triple on a non-panel-eligible harness is rejected when the
+panel loads.
 `keeper agent presets resolve <panel>` returns the selected object's members in declaration order, each
 identified by its **triple** (not just its harness), so two panelists on the same harness but different
 models or efforts stay distinguishable; duplicate identical triples are legal too — each gets a

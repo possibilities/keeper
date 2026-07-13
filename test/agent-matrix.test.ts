@@ -109,7 +109,7 @@ describe("matrix provider registry", () => {
   test("v1 rejects a retired harness provider", () => {
     expect(() =>
       loadMatrix(writeMatrix(V1.replace("name: pi", "name: codex"))),
-    ).toThrow(/claude\|pi\|hermes/);
+    ).toThrow(/claude\|pi/);
   });
 
   test("v1 triple cube keeps the Pi-qualified model opaque", () => {

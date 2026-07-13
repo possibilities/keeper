@@ -759,13 +759,6 @@ describe("keeper transcript harness-first grammar", () => {
     expect(result.stdout).toContain("keeper transcript <harness>");
   });
 
-  test("an unregistered harness token exits non-zero naming the registry keys", () => {
-    const result = runTranscriptCli(["hermes", "list"], deps);
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("hermes");
-    expect(result.stderr).toContain("claude");
-  });
-
   test("an unknown position-0 token exits non-zero the same way", () => {
     const result = runTranscriptCli(["bogus", "list"], deps);
     expect(result.code).not.toBe(0);

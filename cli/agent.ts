@@ -1,6 +1,6 @@
 /**
  * `keeper agent` — the in-binary agent-launch surface: `keeper agent
- * <claude|pi|hermes> [args...]` launches a supported agent CLI with keeper agent
+ * <claude|pi> [args...]` launches a supported agent CLI with keeper agent
  * routing + startup defaults, and `keeper agent wait-for-stop <handle>` /
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
  * The blocking run-and-capture verbs compose those primitives into the uniform

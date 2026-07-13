@@ -133,19 +133,6 @@ describe("loadHostMatrixV2 — dedup + launch-only", () => {
     ).toThrow(/same-provider duplicate/);
   });
 
-  test("a cross-provider dedup keeps the first provider + logs the shadow", () => {
-    const h = loadHostMatrixV2(writeMatrix(fx.CROSS_PROVIDER_DEDUP));
-    expect(h.effortsByModel.get("gpt-5.5")).toEqual(["high"]);
-    expect(h.shadowed).toEqual([
-      {
-        provider: "pi",
-        capability: "gpt-5.5",
-        launchId: "openai/gpt-5.5",
-        winner: "hermes",
-      },
-    ]);
-  });
-
   test("a subagent_models entry no provider serves errors at load", () => {
     expect(() =>
       loadHostMatrixV2(writeMatrix(fx.SUBAGENT_MODEL_UNSERVED)),

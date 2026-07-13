@@ -332,7 +332,7 @@ export type ParseRunArgsResult =
 /**
  * Parse `agent run <cli> <prompt> [--read-only] [--reap-window-on-terminal]
  * [--stop-timeout <dur>]`. Two
- * positionals — the partner CLI (Claude/Pi/Hermes) and the prompt — plus the
+ * positionals — the partner CLI (Claude/Pi) and the prompt — plus the
  * optional read-only posture, the one-shot reap posture, and stop-wait override. A malformed/missing
  * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
  * `--read-only` is prompting-only: it prepends the read-only directive to the
@@ -621,14 +621,6 @@ export async function captureFromHandle(
 ): Promise<RunCaptureResult> {
   const { handle, handleId, agent, startMs } = args;
   const baseResume = handle.sessionId;
-  // Claude/Pi pin `handle.sessionId` at launch. Hermes mints its own id; its
-  // wait/show path carries that native session id as `transcriptPath`.
-  const resolveResume = (transcriptPath: string | null): string | null => {
-    if (baseResume !== null) {
-      return baseResume;
-    }
-    return agent === "hermes" ? transcriptPath : null;
-  };
   const elapsed = (): number => roundTenths((deps.now() - startMs) / 1000);
 
   const wait = await deps.waitForStop(handle, verbDeps);
@@ -638,10 +630,9 @@ export async function captureFromHandle(
     // capture (timed_out) — never re-run path discovery on a second budget. A
     // path-stage failure is already terminal: the whole budget was spent
     // looking, so re-probing would just spend another one (no_transcript, or
-    // transcript_ambiguous when attribution collided). hermes has no
-    // path-discovery phase — its show keeps the original handle.
+    // transcript_ambiguous when attribution collided).
     const knownPath = wait.transcriptPath ?? null;
-    if (knownPath === null && agent !== "hermes") {
+    if (knownPath === null) {
       return buildRunCaptureEnvelope({
         outcome:
           wait.reason === "ambiguous"
@@ -654,7 +645,7 @@ export async function captureFromHandle(
       });
     }
     const show = await deps.showLastMessage(
-      knownPath === null ? handle : { ...handle, transcriptPath: knownPath },
+      { ...handle, transcriptPath: knownPath },
       verbDeps,
     );
     if (!show.ok) {
@@ -673,7 +664,7 @@ export async function captureFromHandle(
       agent,
       handle: handleId,
       transcriptPath: show.transcriptPath,
-      resumeTarget: resolveResume(show.transcriptPath),
+      resumeTarget: baseResume,
       message: show.text,
       messageFound: show.found,
       elapsedSeconds: elapsed(),
@@ -688,8 +679,8 @@ export async function captureFromHandle(
   // For claude, the gated wait stop is the BLESSED settled turn: prefer its own
   // message so a later human-resume turn's whole-file re-scan cannot displace
   // the answer. Only a structural claude stop (null text) falls back to the
-  // re-scan. Pi/Hermes keep the re-scan-first preference (their stop text
-  // is a subset of what show-last-message resolves).
+  // re-scan. Pi keeps the re-scan-first preference (its stop text is a subset
+  // of what show-last-message resolves).
   let message: string | null;
   let messageFound: boolean;
   if (agent === "claude" && wait.stop.message !== null) {
@@ -711,7 +702,7 @@ export async function captureFromHandle(
     agent,
     handle: handleId,
     transcriptPath,
-    resumeTarget: resolveResume(transcriptPath),
+    resumeTarget: baseResume,
     message,
     messageFound,
     elapsedSeconds: elapsed(),

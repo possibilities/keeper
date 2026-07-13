@@ -4,7 +4,7 @@
  * fake (no real fs, hermetic). Covers the four claude cases the epic names —
  * rehomed transcript, zero-match, multi-match with tail-cwd disambiguation,
  * multi-match unresolvable — plus torn-tail safety, the vanished-resolved-cwd
- * risk guard, realpath dedup, and the pi/codex/hermes existence gates.
+ * risk guard, realpath dedup, and the Pi existence gate.
  */
 import { expect, test } from "bun:test";
 import { basename, dirname, join } from "node:path";
@@ -337,29 +337,6 @@ test("pi: a session drifted onto a DIFFERENT cwd dir is still found by the sessi
     env: {},
   });
   expect(res).toEqual({ kind: "resumable" });
-});
-test("hermes: gated on the session store's presence", () => {
-  const store = join(HOME, ".hermes", "state.db");
-  const present = makeFakeFs({ files: { [store]: "sqlite" } });
-  expect(
-    resolveNonClaudeArtifact(present, {
-      harness: "hermes",
-      resumeTarget: "hermes-id",
-      cwd: "/repo",
-      homeDir: HOME,
-      env: {},
-    }),
-  ).toEqual({ kind: "resumable" });
-  const absent = makeFakeFs({ files: {} });
-  expect(
-    resolveNonClaudeArtifact(absent, {
-      harness: "hermes",
-      resumeTarget: "hermes-id",
-      cwd: "/repo",
-      homeDir: HOME,
-      env: {},
-    }).kind,
-  ).toBe("not-resumable");
 });
 test("non-claude with an empty resume target is not-resumable (no artifact to name)", () => {
   const fs = makeFakeFs({ files: {} });

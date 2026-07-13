@@ -955,8 +955,8 @@ test("fn-1131 a SessionStart carrying adopted=1 folds the marker onto the row", 
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-adopted",
-    spawn_name: "hermes-hand-started",
-    harness: "hermes",
+    spawn_name: "pi-hand-started",
+    harness: "pi",
     adopted: 1,
   });
   expect(drainAll()).toBeGreaterThan(0);
@@ -1004,8 +1004,8 @@ test("fn-1131 a launcher re-mint (adopted NULL) over an adopted row preserves th
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-remint",
-    spawn_name: "hermes-hand-started",
-    harness: "hermes",
+    spawn_name: "pi-hand-started",
+    harness: "pi",
     adopted: 1,
   });
   expect(drainAll()).toBeGreaterThan(0);

@@ -766,21 +766,21 @@ export function buildEventBindings(
     hookEvent === "SessionStart" ? worktreeBranchFromEnv(env) : null;
 
   // SessionStart only: stamp the launching harness. THIS hook only ever fires
-  // for claude (codex/hermes/pi get their harness tag from a birth-ingest
+  // for claude (other harnesses get their harness tag from a birth-ingest
   // synthetic SessionStart minted daemon-side), so it is a constant "claude"
   // going forward — NULL on every non-SessionStart row, mirroring `worktree`.
   // The fold folds it verbatim and never synthesizes a value; a legacy
   // NULL-harness row therefore reads as claude at every consumer. `resume_target`
   // stays NULL from this hook — claude resumes by its session id (== job_id)
-  // already; the column is the back-fill channel for codex/hermes, populated by
+  // already; the column is the back-fill channel for older producers, populated by
   // the daemon's ResumeTargetResolved producer, not here.
   const harness = hookEvent === "SessionStart" ? "claude" : null;
   const resumeTarget: string | null = null;
 
   // The ADOPTED marker is ALWAYS NULL from this hook — claude sessions this hook
   // fires for are launcher-owned (or claude-native), never "adopted". The marker
-  // is set only by the NON-launcher paths (the hand-started hermes self-seed / the
-  // codex rollout-adoption mint), so the fold copies it verbatim and this claude
+  // is set only by NON-launcher adoption paths, so the fold copies it verbatim
+  // and this claude
   // producer carries NULL. Present-as-a-key to satisfy the KNOWN_EVENT_COLUMNS
   // lockstep (a bare-NULL binding, mirroring resume_target).
   const adopted: number | null = null;

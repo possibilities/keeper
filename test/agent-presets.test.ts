@@ -183,7 +183,7 @@ describe("launch-triple grammar (parseTriple)", () => {
       "claude::opus::high",
       { harness: "claude", model: "opus", effort: "high" },
     ],
-    // pi carries a keeper effort (translated at launch) — na is only for axisless.
+    // Pi carries a keeper effort translated at launch.
     [
       "pi::glm-4.6::xhigh",
       { harness: "pi", model: "glm-4.6", effort: "xhigh" },
@@ -192,11 +192,6 @@ describe("launch-triple grammar (parseTriple)", () => {
     [
       "pi::openai/gpt-5.5::low",
       { harness: "pi", model: "openai/gpt-5.5", effort: "low" },
-    ],
-    // hermes is axisless — na required.
-    [
-      "hermes::gpt-5.5::na",
-      { harness: "hermes", model: "gpt-5.5", effort: "na" },
     ],
   ] as const)("parses %s", (raw, triple) => {
     const result = parseTriple(raw);
@@ -213,8 +208,7 @@ describe("launch-triple grammar (parseTriple)", () => {
     ["claude::op:us::high", "model segment"], // bare colon inside a segment
     ["ghost::opus::high", "harness segment"], // unknown harness
     ["claude::OPUS::high", "model segment"], // uppercase off the charset
-    ["claude::opus::na", "forbidden"], // na on an axisful harness
-    ["hermes::gpt-5.5::high", "must be 'na'"], // non-na on hermes
+    ["claude::opus::na", "not a canonical effort"],
     ["claude::opus::turbo", "not a canonical effort"], // bad effort token
   ] as const)("rejects %s naming the offending segment", (raw, needle) => {
     const result = parseTriple(raw);
@@ -263,15 +257,6 @@ describe("presets resolve JSON contract", () => {
       model: "opus",
       effort: "xhigh",
     });
-  });
-  test("an axisless (hermes na) triple echoes with na", async () => {
-    const h = makeHarness({
-      argv: ["presets", "resolve", "hermes::gpt-5.5::na"],
-      rawArgv: true,
-    });
-    const code = await expectExit(main(h.deps));
-    expect(code).toBe(0);
-    expect(JSON.parse(h.out.join("")).effort).toBe("na");
   });
   test("the reserved name 'default' derefs the configured default panel by its real name", async () => {
     const h = makeHarness({

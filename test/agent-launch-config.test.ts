@@ -16,7 +16,6 @@ import {
   isAgentRole,
   loadRolePrompt,
   nativeClaudeArgs,
-  nativeHermesArgs,
   nativePiArgs,
   stripClaudeEnv,
 } from "../src/agent/launch-config";
@@ -226,7 +225,7 @@ test("nativeClaudeArgs: resume mode without resumeSessionId throws ResumeLaunchU
 });
 
 // ---------------------------------------------------------------------------
-// Pi and Hermes native flags
+// Pi native flags
 // ---------------------------------------------------------------------------
 
 test("nativePiArgs preserves an OpenAI-qualified launch id", () => {
@@ -251,17 +250,6 @@ test("buildAgentLaunchArgv routes a Pi Codex-named id through Pi", () => {
   expect(argv.slice(0, LAP.length + 1)).toEqual([...LAP, "pi"]);
   expect(argv).toContain("openai-codex/gpt-5.4");
   expect(argv.at(-1)).toBe("ask");
-});
-
-test("nativeHermesArgs remains model-only", () => {
-  expect(
-    nativeHermesArgs({
-      launcherArgvPrefix: LAP,
-      cli: "hermes",
-      prompt: "ask",
-      model: "hermes-model",
-    }),
-  ).toEqual(["--yolo", "-m", "hermes-model", "-z"]);
 });
 
 test("Pi effort mapping caps max and leaves native bands opaque", () => {

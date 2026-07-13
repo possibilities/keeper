@@ -295,18 +295,6 @@ test("resolvePanelMembers: an unknown name is fail-loud (no fallback)", () => {
   expect(r.error).toContain("not a known panel");
 });
 
-test("resolvePanelMembers: a non-panel-eligible (axisless) member is fail-loud", () => {
-  const sel: PanelSelections = {
-    panels: { bad: panelDef(["hermes::hermes-m::na"]) },
-    default: null,
-  };
-  const r = resolvePanelMembers(sel, "bad");
-  expect(r.ok).toBe(false);
-  if (r.ok) return;
-  expect(r.error).toContain("hermes::hermes-m::na");
-  expect(r.error).toContain("not panel-eligible");
-});
-
 test("resolvePanelMembers: 'default' dereferences the configured default panel", () => {
   // The default pointer names a panel called `reviewers`, not one literally
   // named `default` — proving `default` is a symbolic pointer, not a frozen name.

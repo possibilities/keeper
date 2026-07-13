@@ -88,8 +88,8 @@ test("resolves a unique id prefix", () => {
   const { db } = freshMemDb();
   seedJob(db, {
     job_id: "sess-prefix-xyz",
-    harness: "hermes",
-    resume_target: "hermes-target",
+    harness: "pi",
+    resume_target: "pi-target",
   });
   const result = resolveResumeDecision("sess-prefix", db, undefined, deps());
   expect(result.kind).toBe("ok");
@@ -198,7 +198,7 @@ test("an unresolvable target returns unknown", () => {
   const result = resolveResumeDecision("no-such-target", db, undefined, deps());
   expect(result).toEqual({ kind: "unknown", target: "no-such-target" });
 });
-test.each(["claude", "pi", "hermes"] as const)(
+test.each(["claude", "pi"] as const)(
   "a %s row with a NULL resume_target fails immediately, no back-fill attempted",
   (harness) => {
     const { db } = freshMemDb();

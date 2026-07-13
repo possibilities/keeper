@@ -1340,7 +1340,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "agent",
     summary:
-      "Launch an agent CLI: `keeper agent <claude|pi|hermes> [args...]` (folded keeper agent launcher)",
+      "Launch an agent CLI: `keeper agent <claude|pi> [args...]` (folded keeper agent launcher)",
     visibility: "public",
     mutates: true,
     requires_daemon: false,
@@ -1356,7 +1356,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     verbs: [
       "claude",
       "pi",
-      "hermes",
       "run",
       "wait",
       "panel",

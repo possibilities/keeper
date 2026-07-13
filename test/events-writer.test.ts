@@ -1144,7 +1144,7 @@ test("SessionStart stamps harness 'claude' (this hook only ever fires for claude
   const b = build({ hook_event_name: "SessionStart", session_id: "sess-h" });
   expect(b.harness).toBe("claude");
   // resume_target stays NULL from the hook — claude resumes by session id; the
-  // column is the codex/hermes back-fill channel, populated daemon-side.
+  // column is an older-producer back-fill channel, populated daemon-side.
   expect(b.resume_target).toBeNull();
 });
 

@@ -16,16 +16,15 @@
 
 /** The canonical, ordered set of harness names keeper drives. The one literal
  *  list — every union's membership check derives from it. */
-export const HARNESS_NAMES = ["claude", "pi", "hermes"] as const;
+export const HARNESS_NAMES = ["claude", "pi"] as const;
 
 /** A harness keeper can drive — the derivation root for `AgentKind`/`AgentCli`/
  *  `PresetHarness`. */
 export type HarnessName = (typeof HARNESS_NAMES)[number];
 
 /** The second reasoning axis a harness exposes. Claude takes `effort`; Pi takes
- *  `thinking`; the two are mutually exclusive per harness. `none` means the
- *  harness is model-only (hermes) — a preset for it may set neither axis. */
-export type SecondAxis = "effort" | "thinking" | "none";
+ *  `thinking`; the two are mutually exclusive per harness. */
+export type SecondAxis = "effort" | "thinking";
 
 /** keeper's own five-rung reasoning-effort vocabulary — the effort axis of the
  *  plan worker `{model × effort}` matrix and the `--effort` flag, ordered
@@ -43,9 +42,8 @@ export type KeeperEffort = (typeof KEEPER_EFFORTS)[number];
 /** How a harness's live working/stopped churn reaches keeper's jobs projection.
  *  `claude-hooks`: keeper's native hook set feeds the events-log channel.
  *  `pi-extension`: an ephemeral in-process pi extension (armed per-launch via
- *  `-e`) translates pi's AgentHarness events into the same events-log channel.
- *  `none`: no live hook channel — presence-only (Hermes today). */
-export type HookMechanism = "claude-hooks" | "pi-extension" | "none";
+ *  `-e`) translates pi's AgentHarness events into the same events-log channel. */
+export type HookMechanism = "claude-hooks" | "pi-extension";
 
 /**
  * How a harness's resume target is passed on its OWN native CLI argv.
@@ -69,24 +67,20 @@ export interface ResumeArgvForm {
  * the CLI's own argv-parse error or its target-validation error):
  *  - `double-dash`: a bare `--` immediately before the prompt reliably ends
  *    option parsing (Claude).
- *  - `equals-join`: the prompt must ride joined by `=` onto the flag that
- *    owns it, never as a separate token (hermes `-z=<prompt>`; argparse reads
- *    a separate `-z <dash-prompt>` token as a NEW unrecognized flag).
  *  - `unsupported`: no safe composition exists — pi's parser honors neither
  *    `--` nor a joined form for its bare `--session <target> <prompt>`
  *    positional (probe-confirmed: both leave a leading-dash prompt read as
  *    "Unknown option"), so a resume-launch builder must fail loud on a
  *    leading-dash prompt rather than risk silently misrouting it.
  */
-export type DashPromptGuard = "double-dash" | "equals-join" | "unsupported";
+export type DashPromptGuard = "double-dash" | "unsupported";
 
 /**
  * One harness's resume-LAUNCH composition capability — how it accepts a
  * resume target ALONGSIDE a brand-new prompt, the shape `keeper agent run
  * <cli> "<ask>" --resume <x>` composes. Distinct from the bare {@link
  * ResumeArgvForm} the prompt-less daemon-restore path uses. Probe-settled per
- * docs/adr/0034 plus live CLI probes run for this capability
- * (pi/hermes).
+ * docs/adr/0034 plus live CLI probes run for Pi.
  */
 export interface ResumeLaunchForm {
   /** The end-of-options / dash-safety strategy a resume-launch builder must
@@ -106,8 +100,8 @@ export interface HarnessDescriptor {
   /** The second reasoning axis this harness accepts (effort|thinking|none). */
   secondAxis: SecondAxis;
   /** Translation of keeper's five efforts onto this harness's native second-axis
-   *  bands, or `null` when they pass through unmapped (claude's `--effort` is
-   *  native; hermes has no second axis). Total over {@link KEEPER_EFFORTS}; a
+   *  bands, or `null` when they pass through unmapped (Claude's `--effort` is
+   *  native). Total over {@link KEEPER_EFFORTS}; a
    *  token that is not a keeper effort (an already-native band) is left as-is by
    *  {@link mapKeeperEffortToAxis}. */
   effortAxisMap: Record<KeeperEffort, string> | null;
@@ -116,11 +110,9 @@ export interface HarnessDescriptor {
    *  eligibility — a non-capturable harness is a launchable partner but not a
    *  panel member. */
   capturable: boolean;
-  /** True when the harness mints its OWN session id keeper cannot pin at launch
-   *  (Hermes): the resume target is discovered post-stop by positive
-   *  attribution from its session store. False when keeper pins the session id
-   *  at launch (Claude/Pi), so it is
-   *  authoritative immediately. */
+  /** True when the harness mints its OWN session id keeper cannot pin at launch.
+   *  False when keeper pins the session id at launch, so it is authoritative
+   *  immediately. */
   mintsOwnSessionId: boolean;
   /** Whether this harness can carry an exact Dispatch-attempt identity through
    *  its lifecycle adapter. Consumers use this capability instead of branching
@@ -190,33 +182,6 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // way, so composing one must fail loud rather than guess a shape.
     resumeLaunch: { dashGuard: "unsupported" },
   },
-  hermes: {
-    name: "hermes",
-    displayName: "Hermes",
-    binaryName: "hermes",
-    // Hermes is model-only: it exposes neither an effort nor a thinking axis, so
-    // a preset for it may set neither (config.ts fails a preset that does).
-    secondAxis: "none",
-    // Model-only: no second axis, so keeper efforts never reach a hermes argv.
-    effortAxisMap: null,
-    // M2: captured by bounded polling of `hermes sessions export`, positively
-    // attributed by cwd + created-at (refuse-to-guess on collision). Capturable
-    // ⇒ panel-eligible with no extra panel wiring.
-    capturable: true,
-    // Hermes mints its own session id keeper cannot pin at launch; the resume
-    // target is its native session id, discovered post-stop from the store.
-    mintsOwnSessionId: true,
-    carriesDispatchAttempt: false,
-    hookMechanism: "none",
-    // Hermes resumes by native session id: `hermes --resume <id>` (option flag,
-    // MEDIUM confidence — verified against `src/agent/args.ts`'s hermes predicate).
-    resumeArgv: { kind: "flag", token: "--resume" },
-    // Probe-verified (live hermes binary, argparse): `-z <dash-prompt>` as a
-    // SEPARATE token is read as a new unrecognized flag, but the `=`-joined
-    // form (`-z=<prompt>`) reaches the model unchanged — argparse only
-    // accepts a dash-led option VALUE unambiguously when joined.
-    resumeLaunch: { dashGuard: "equals-join" },
-  },
 };
 
 /** The set of all known harness names — the runtime membership root every
@@ -237,8 +202,8 @@ export function harnessDescriptor(name: string): HarnessDescriptor | undefined {
 
 /**
  * Translate a keeper effort onto `harness`'s native second-axis band via its
- * descriptor {@link HarnessDescriptor.effortAxisMap}. A null map (claude effort
- * is native, hermes has none) returns the token unchanged, so those argvs stay
+ * descriptor {@link HarnessDescriptor.effortAxisMap}. A null map (Claude effort
+ * is native) returns the token unchanged, so those argvs stay
  * byte-identical. A token outside {@link KEEPER_EFFORTS} — an already-native band
  * such as Pi's `minimal` — also passes through untouched, so the map rewrites
  * only genuine keeper efforts (in practice just `max` → `xhigh` for Pi).
@@ -310,33 +275,21 @@ export class ResumeLaunchUnsupportedError extends Error {}
  *    — not just for a leading-dash prompt — so the argv shape is one
  *    deterministic path, not two, and "--" is a no-op ahead of a normal
  *    prompt.
- *  - `equals-join` (hermes): `[\`${joinFlagToken}=${prompt}\`]`, folding the
- *    prompt onto the flag that owns it as ONE token (also unconditional, for
- *    the same reason); `joinFlagToken` is required and throws
- *    {@link ResumeLaunchUnsupportedError} when omitted.
- *  - `unsupported` (pi): a normal prompt passes through as `[prompt]`
- *    unchanged (pi's bare `--session <target> <prompt>` composes fine); a
+ *  - `unsupported` (Pi): a normal prompt passes through as `[prompt]`
+ *    unchanged (Pi's bare `--session <target> <prompt>` composes fine); a
  *    leading-dash prompt throws {@link ResumeLaunchUnsupportedError} instead
- *    of emitting a shape pi's parser could misread as a new flag.
- * `joinFlagToken` is used only for `equals-join`; ignored otherwise. Pure.
+ *    of emitting a shape Pi's parser could misread as a new flag.
+ * Pure.
  */
 export function buildResumeLaunchPromptTail(
   name: string | null | undefined,
   prompt: string,
-  joinFlagToken?: string,
 ): string[] {
   const harness = harnessOrClaude(name);
   const { dashGuard } = HARNESS_DESCRIPTORS[harness].resumeLaunch;
   switch (dashGuard) {
     case "double-dash":
       return ["--", prompt];
-    case "equals-join":
-      if (joinFlagToken === undefined || joinFlagToken === "") {
-        throw new ResumeLaunchUnsupportedError(
-          `resume-launch prompt tail for '${harness}' requires a joinFlagToken (equals-join guard)`,
-        );
-      }
-      return [`${joinFlagToken}=${prompt}`];
     case "unsupported":
       if (prompt.startsWith("-")) {
         throw new ResumeLaunchUnsupportedError(

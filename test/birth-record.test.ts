@@ -129,7 +129,7 @@ describe("parse rejects torn / malformed records", () => {
   });
 
   test("unsupported harnesses and schema versions parse to null", () => {
-    for (const harness of ["claude", "hermes", "codex", "other"]) {
+    for (const harness of ["claude", "codex", "other"]) {
       expect(parseBirthRecord(JSON.stringify({ ...FULL, harness }))).toBeNull();
     }
     expect(
@@ -333,7 +333,7 @@ describe("env-derived coords / worktree / draft", () => {
 
 const UUID = "00000000-0000-0000-0000-000000000000";
 
-function harness(agent: "claude" | "pi" | "hermes", argv: string[]) {
+function harness(agent: "claude" | "pi", argv: string[]) {
   return makeHarness({
     argv: [agent, ...argv],
     rawArgv: true,
@@ -352,12 +352,6 @@ describe("main() emits birth records for Pi launches", () => {
     expect(draft.resume_target).toBe(UUID);
     expect(h.deps.env.KEEPER_JOB_ID).toBe(UUID);
     expect(h.deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE).toBeUndefined();
-  });
-
-  test("hermes interactive emits no birth record", async () => {
-    const h = harness("hermes", ["--x-no-confirm", "-z", "hi"]);
-    await runAndCapture(h, main);
-    expect(h.birthRecords).toEqual([]);
   });
 
   test("claude launch emits NO birth record and sets no job-id env", async () => {

@@ -3,8 +3,7 @@
  * for `keeper transcript`: the CLI's help text and its unsupported-harness
  * error both derive from `transcriptHarnessNames()`, so a sibling task adds a
  * harness solely by registering a reader here — the CLI and its error/help
- * wording never need editing again. Hermes is deliberately absent; its
- * history lives behind `hermes sessions export`, not this registry.
+ * wording never need editing again.
  */
 
 import { claudeTranscriptReader } from "./claude";

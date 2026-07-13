@@ -601,9 +601,9 @@ test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED b
   // The rest of the generation still restores — the not-resumable agent is
   // surfaced (an empty resume_target), never dropped.
   seedJob(kdb.db, {
-    job_id: "hermes-nobackfill",
+    job_id: "pi-no-target",
     close_kind: "server_gone",
-    harness: "hermes",
+    harness: "pi",
     resume_target: null,
     window_index: 0,
   });
@@ -614,12 +614,12 @@ test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED b
   });
   const res = derive();
   expect(res.candidates.map((c) => c.job_id)).toEqual([
-    "hermes-nobackfill",
+    "pi-no-target",
     "claude-ok",
   ]);
-  const hermes = res.candidates.find((c) => c.job_id === "hermes-nobackfill");
-  expect(hermes?.resume_target).toBe("");
-  expect(isRestorableCandidate(hermes as RestoreCandidate)).toBe(false);
+  const pi = res.candidates.find((c) => c.job_id === "pi-no-target");
+  expect(pi?.resume_target).toBe("");
+  expect(isRestorableCandidate(pi as RestoreCandidate)).toBe(false);
 });
 test("deriveRestoreSet: a coordless NON-adopted row keeps today's silent skip (not counted)", () => {
   seedJob(kdb.db, {
@@ -648,25 +648,25 @@ test("deriveRestoreSet: a user-closed coordless adopted row is not a crash candi
 });
 test("deriveLastGenerationSetFromTopology: a coordful adopted pane restores like a launched one (no skip count)", () => {
   seedJob(kdb.db, {
-    job_id: "hermes-adopted",
+    job_id: "pi-adopted",
     state: "killed",
-    title: "hermes-adopted",
+    title: "pi-adopted",
     adopted: 1,
-    harness: "hermes",
-    resume_target: "hermes-session",
+    harness: "pi",
+    resume_target: "pi-session",
   });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
     {
       pane_id: "%1",
       session_name: "work",
       window_index: 0,
-      job_id: "hermes-adopted",
+      job_id: "pi-adopted",
     },
     PAD_PANE, // >1 pane so the generation clears the degenerate skeleton filter
   ]);
   const res = deriveTopo("gen-now");
-  expect(res.candidates.map((c) => c.job_id)).toEqual(["hermes-adopted"]);
-  expect(res.candidates[0]?.resume_target).toBe("hermes-session");
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["pi-adopted"]);
+  expect(res.candidates[0]?.resume_target).toBe("pi-session");
   expect(res.adoptedCoordlessSkipCount).toBe(0);
   expect(res.fallbackNote).toBeUndefined();
 });

@@ -142,11 +142,11 @@ export interface AgentLaunchOpts {
   cli: AgentCli;
   /** The assembled prompt — the FINAL positional argv element. */
   prompt: string;
-  /** `--model <m>` (Claude/Pi `--model`, Hermes `-m`). Omitted when absent. */
+  /** `--model <m>` for Claude/Pi. Omitted when absent. */
   model?: string;
   /** Keeper reasoning effort, mapped per-harness onto the native second axis at
-   *  argv-build time: Pi `--thinking`. Claude and Hermes ignore it here (claude effort rides the run-handler `--effort`;
-   *  hermes has no second axis). Omitted when absent. */
+   *  argv-build time: Pi `--thinking`. Claude ignores it here because effort
+   *  rides the run-handler `--effort`. Omitted when absent. */
   effort?: string;
   /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
   session?: string;
@@ -156,7 +156,7 @@ export interface AgentLaunchOpts {
    *  `--model`/`--effort`). */
   preset?: string;
   /** Launch NAME. Rides as `--x-tmux-window-name <name>` (the tmux window name,
-   *  EVERY harness) and, for Claude/Pi only, as the harness-native `--name <name>`. Omitted/empty = no name flag. */
+   *  EVERY harness) and as the harness-native `--name <name>`. Omitted/empty = no name flag. */
   name?: string;
   /** Resume-launch target: when set, the native builder composes a RESUME
    *  argv (the harness's own resume token/target from {@link
@@ -187,7 +187,6 @@ const NATIVE_ARGS_BUILDERS: Record<
 > = {
   claude: nativeClaudeArgs,
   pi: nativePiArgs,
-  hermes: nativeHermesArgs,
 };
 
 /**
@@ -357,45 +356,6 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
       ...buildResumeLaunchPromptTail("pi", opts.prompt),
     );
   }
-  return args;
-}
-
-/**
- * Native hermes flags for a one-turn partner. `--yolo` runs the turn with no
- * approval gate so a detached pane never stalls; `-m <model>` sets the model
- * (hermes has no effort/thinking axis, so neither is emitted). Hermes has NO
- * interactive first-turn prompt positional (unlike claude/pi) — the prompt must
- * ride its `-z/--oneshot` flag — so this builder ENDS with `-z`, making the
- * trailing `opts.prompt` that {@link buildAgentLaunchArgv} appends the value of
- * `-z`: `hermes --yolo -m <model> -z <prompt>`. The one-shot prints only the
- * final message and records the session in hermes's store for post-stop capture.
- * Hermes has no native `--name` flag, so `opts.name` rides only the
- * tmux window name. Consent for its shell hooks is seeded via the
- * `HERMES_ACCEPT_HOOKS=1` pane env (set by the inner launch), not a flag here.
- *
- * RESUME mode ({@link AgentLaunchOpts.resumeTarget} set) appends `--resume
- * <target> -z=<prompt>` — live-probed for this capability (hermes has no
- * ADR-settled fact): a bogus resume target still reaches the model rather
- * than erroring, confirming the composition, and the `=`-joined oneshot form
- * (never the bare-`-z`-then-separate-token shape the fresh launch uses) is
- * probe-verified to carry a leading-dash prompt through unmisread — a
- * separate `-z <dash-prompt>` token argparse reads as a NEW unrecognized
- * flag.
- * Pure — exported for tests.
- */
-export function nativeHermesArgs(opts: AgentLaunchOpts): string[] {
-  const args = ["--yolo"];
-  if (opts.model !== undefined && opts.model !== "") {
-    args.push("-m", opts.model);
-  }
-  if (opts.resumeTarget !== undefined && opts.resumeTarget !== "") {
-    args.push(
-      ...buildHarnessResumeArgv("hermes", opts.resumeTarget),
-      ...buildResumeLaunchPromptTail("hermes", opts.prompt, "-z"),
-    );
-    return args;
-  }
-  args.push("-z");
   return args;
 }
 

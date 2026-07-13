@@ -3,7 +3,7 @@
  * `keeper agent` is a subcommand dispatcher. `splitSubcommand` strips exactly ONE
  * leading agent token and hands the rest to the launcher flow, so the composed
  * agent argv stays byte-identical to what the bare launcher produced.
- * `keeper agent claude claude` keeps the second `claude` as a prompt arg; the same contract applies to Pi and Hermes.
+ * `keeper agent claude claude` keeps the second `claude` as a prompt arg; the same contract applies to Pi.
  *
  * Informational flags (`-h`/`--help`, `-v`/`--version`) and the bare/unknown
  * invocation are owned here — they print and exit before `parseArgs` and the
@@ -71,7 +71,6 @@ export const USAGE = `keeper agent — launch agent CLIs with keeper agent routi
 Usage:
   keeper agent claude [args...]        Launch Claude Code.
   keeper agent pi [args...]            Launch pi.
-  keeper agent hermes [args...]        Launch Hermes (Nous Research).
   keeper agent --x-preset <name> [args...]
                                     Launch the preset's harness (harnessless).
   keeper agent presets resolve <name>  Emit the resolved preset/panel JSON.
@@ -160,7 +159,6 @@ export const KEEPER_AGENT_HELP = `keeper agent — launch agent CLIs with keeper
 Usage:
   keeper agent claude [args...]   Launch Claude Code.
   keeper agent pi [args...]       Launch pi.
-  keeper agent hermes [args...]   Launch Hermes (Nous Research).
 
 The flags below are consumed by the wrapper; every other arg after the agent
 subcommand passes through to that launcher unchanged. For a launcher's own
@@ -233,7 +231,7 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         changed-files audit). --system-file/--system compose a
                                         caller-side System:-prepend into the prompt
                                         (mutually exclusive; missing file → bad_args),
-                                        uniform across Claude/Pi/Hermes — user-turn
+                                        uniform across Claude/Pi — user-turn
                                         text, not a privileged system prompt. Pi launches with CLAUDE* env stripped by default
                                         (partner isolation). --preset applies a named
                                         launch-config preset (its resolved harness
@@ -327,7 +325,7 @@ export const KEEPER_AGENT_RUNBOOK = `keeper agent — operator runbook (agent-fa
 
 Launch or drive a partner model CLI from this session.
 
-  keeper agent run <claude|pi|hermes> "<prompt>" [--read-only] [--system <text>]
+  keeper agent run <claude|pi> "<prompt>" [--read-only] [--system <text>]
                                     # launch, wait, capture — one uniform JSON envelope
   keeper agent run <cli> "<prompt>" --preset <name> --output <path>
                                     # apply a launch-config preset; mirror the envelope to a file

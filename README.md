@@ -5,7 +5,7 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 (`keeperd`) folds it into live projections and serves them over a subscribe/RPC socket.
 
 - **Session tracking** — every prompt, tool call, and file mutation across claude, codex,
-  pi, and hermes sessions lands in one queryable log; a Pi `/rename` command derives a short
+  pi sessions lands in one queryable log; a Pi `/rename` command derives a short
   Session title inline
 - **Live board** — plan epics/tasks, jobs, and git state served as live-updating
   collections (`keeper status`, `keeper board`, `keeper query`)

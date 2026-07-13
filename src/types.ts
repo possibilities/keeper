@@ -288,8 +288,8 @@ export interface Event {
    */
   worktree: string | null;
   /**
-   * Launching harness for this session — `"claude"`/`"codex"`/`"pi"`/`"hermes"`.
-   * The claude hook stamps `"claude"` at SessionStart; a codex/hermes birth-ingest
+   * Launching harness for this session — `"claude"` or `"pi"`.
+   * The Claude hook stamps `"claude"` at SessionStart; Pi birth-ingest
    * synthetic SessionStart carries its own tag. NULL on every non-SessionStart row
    * AND on legacy rows. Folded onto `jobs.harness` via the SessionStart COALESCE
    * arm; the fold NEVER synthesizes a value, so a NULL harness reads as claude at
@@ -299,14 +299,14 @@ export interface Event {
   /**
    * The harness-native resume target — the token its own `--resume` argv needs.
    * claude/pi pin their session uuid at seed (carried on the SessionStart event);
-   * codex/hermes back-fill it later via a synthetic `ResumeTargetResolved` event
+   * older producers back-fill it later via a synthetic `ResumeTargetResolved` event
    * (rollout SessionMeta / hook session id) that folds ONLY this column and never
    * touches lifecycle state. NULL on rows that carry no resume identity.
    */
   resume_target: string | null;
   /**
    * The harness-agnostic ADOPTED marker — `1` on a SessionStart a NON-launcher
-   * path minted (the hand-started hermes self-seed or the codex rollout-adoption
+   * path minted (rather than the normal launcher-owned path
    * mint), NULL otherwise. An EXPLICIT field, never derived: the claude hook and
    * every birth mint bind it NULL (launcher-owned by definition), so the fold
    * copies it verbatim and never synthesizes a value. Folded onto `jobs.adopted`
@@ -620,7 +620,7 @@ export interface Job {
    */
   escalation_instance: number | null;
   /**
-   * Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`), folded onto
+   * Launching harness (`"claude"` or `"pi"`), folded onto
    * `jobs.harness` from the SessionStart tag. NULL on legacy rows and reads as
    * claude at every consumer (the fold never synthesizes a value). The resume/
    * restore surfaces route {@link resume_target} through this harness's native
@@ -629,7 +629,7 @@ export interface Job {
   harness: string | null;
   /**
    * The harness-native resume target — the token the launching harness's own
-   * resume argv needs (claude/pi the session id at seed; codex/hermes back-filled
+   * resume argv needs (Claude/Pi receive the session id at seed; older rows back-filled
    * post-stop). NULL when keeper resolved no resume identity, which the restore
    * surfaces render as not-resumable for a non-claude harness.
    */

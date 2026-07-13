@@ -171,7 +171,6 @@ test("unsupported harness and wrong-version births cannot mint jobs", () => {
   mkdirSync(join(birthDir, "new"), { recursive: true });
   const rawRecords: Record<string, unknown>[] = [
     { ...makeBirthRecord({ session_id: "codex-birth" }), harness: "codex" },
-    { ...makeBirthRecord({ session_id: "hermes-birth" }), harness: "hermes" },
     {
       ...makeBirthRecord({ session_id: "wrong-version-birth" }),
       schema_version: BIRTH_RECORD_SCHEMA_VERSION + 1,

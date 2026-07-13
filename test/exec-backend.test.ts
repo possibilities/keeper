@@ -1006,7 +1006,7 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
   ]);
 });
 
-test("buildKeeperAgentLaunchArgv: pi resume emits `--session <t>`, hermes emits `--resume <t>`", () => {
+test("buildKeeperAgentLaunchArgv: Pi resume emits `--session <t>`", () => {
   const pi = buildKeeperAgentLaunchArgv({
     launcherArgvPrefix: LAP,
     session: "s",
@@ -1018,17 +1018,6 @@ test("buildKeeperAgentLaunchArgv: pi resume emits `--session <t>`, hermes emits 
   expect(pi.slice(-2)).toEqual(["--session", "pi-42"]);
   expect(pi[LAP.length]).toBe("pi");
   expect(pi).not.toContain("--dangerously-skip-permissions");
-
-  const hermes = buildKeeperAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    session: "s",
-    prompt: "",
-    resumeTarget: "hx-9",
-    harness: "hermes",
-    noConfirm: true,
-  });
-  expect(hermes.slice(-2)).toEqual(["--resume", "hx-9"]);
-  expect(hermes[LAP.length]).toBe("hermes");
 });
 
 test("buildKeeperAgentLaunchArgv: an explicit claude harness is byte-identical to the default", () => {
@@ -1354,13 +1343,11 @@ test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and
   expect(
     pi.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
   ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
-  for (const harness of ["codex", "hermes"] as const) {
-    expect(
-      buildKeeperAgentLaunchArgv({ ...base, harness }).some((arg) =>
-        arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID="),
-      ),
-    ).toBe(false);
-  }
+  expect(
+    buildKeeperAgentLaunchArgv({ ...base, harness: "codex" }).some((arg) =>
+      arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID="),
+    ),
+  ).toBe(false);
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {

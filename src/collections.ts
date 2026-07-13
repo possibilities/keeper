@@ -183,7 +183,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     "resume_target",
     // `adopted`: the harness-agnostic "a non-launcher path minted this session"
     // marker (schema v110 / fn-1131), 1 on an adopted session (hand-started
-    // hermes self-seed / codex rollout mint), NULL otherwise. Served so the board
+    // non-launcher mint), NULL otherwise. Served so the board
     // can pill an adopted job distinctly. Display-only — never a `sortable` /
     // `filters` / `jsonColumns` key.
     "adopted",

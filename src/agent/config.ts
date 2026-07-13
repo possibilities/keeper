@@ -7,8 +7,8 @@
  *
  * `plugins.yaml` supplies the Claude plugin sources (fail-loud on a missing
  * file). The launch-config catalog (`presets.yaml`) holds ONLY launch triples
- * (ADR 0033): the three `<harness>_default` keys (`claude_default`/`pi_default`/
- * `hermes_default`) naming the `<harness>::<model>::<effort>` triple a
+ * (ADR 0033): the two `<harness>_default` keys (`claude_default`/`pi_default`)
+ * naming the `<harness>::<model>::<effort>` triple a
  * bare `keeper agent <harness>` launch resolves, the `worker`/`escalation`
  * machine-launch triples, and the nested `dispatch:` per-verb table (ADR 0040,
  * ADDITIVE alongside `worker`/`escalation` today). The freeform named-preset
@@ -303,8 +303,6 @@ export interface PresetCatalog {
   claude_default?: Triple | null;
   /** Triple a bare `keeper agent pi` resolves; null/absent when unset. */
   pi_default?: Triple | null;
-  /** Triple a bare `keeper agent hermes` resolves; null/absent when unset. */
-  hermes_default?: Triple | null;
   /** The `dispatch:` per-verb launch table (ADR 0040) — the SOLE machine-launch
    *  surface, replacing the retired `worker`/`escalation` keys. Every {@link
    *  DispatchVerb} key present, null when unset. Optional in the type though {@link
@@ -349,7 +347,6 @@ export interface PanelDefinition {
 const RESERVED_PRESET_NAMES: ReadonlySet<string> = new Set([
   "claude",
   "pi",
-  "hermes",
   "wait-for-stop",
   "show-last-message",
   "default",
@@ -390,7 +387,6 @@ function validatePresetName(name: string, configPath: string): void {
 const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "claude_default",
   "pi_default",
-  "hermes_default",
   "dispatch",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
@@ -507,7 +503,7 @@ export function loadPresetCatalog(
   if ("presets" in raw) {
     throw new ConfigError(
       `The freeform 'presets:' catalog is retired (ADR 0033) in ${configPath}. ` +
-        `presets.yaml now holds only launch triples: the three <harness>_default ` +
+        `presets.yaml now holds only launch triples: the two <harness>_default ` +
         `keys plus the per-verb 'dispatch:' table, each a ` +
         `'<harness>::<model>::<effort>' string. See 'keeper agent presets list'.`,
     );
@@ -529,7 +525,6 @@ export function loadPresetCatalog(
     presets: {},
     claude_default: parseDefaultTriple(raw, "claude", configPath),
     pi_default: parseDefaultTriple(raw, "pi", configPath),
-    hermes_default: parseDefaultTriple(raw, "hermes", configPath),
     dispatch: parseDispatchBlock(raw, configPath),
   };
 }
@@ -606,9 +601,8 @@ function parseMachineTriple(
 
 /**
  * True when a harness may serve as a panel member: its final message is capturable
- * (a panel leg must read a verdict) AND it exposes a second reasoning axis (an
- * axisless harness has no effort/thinking rung to compare, so it is not a panel
- * comparand — panels are Claude/Pi). The SINGLE eligibility predicate both
+ * (a panel leg must read a verdict). Every supported harness exposes a second
+ * reasoning axis. The SINGLE eligibility predicate both
  * the load gate ({@link loadPanelSelections}) and the launch gate (panel.ts
  * `resolvePanelMembers`) read, so panel eligibility can never drift between them.
  */
@@ -617,7 +611,7 @@ export function isPanelEligibleHarness(name: string): boolean {
   if (d === undefined) {
     return false;
   }
-  return d.capturable && d.secondAxis !== "none";
+  return d.capturable;
 }
 
 /**
@@ -629,8 +623,8 @@ export function isPanelEligibleHarness(name: string): boolean {
  * of launch-triple members (`<harness>::<model>::<effort>`) parsed with the shared
  * grammar — a malformed triple is fail-loud naming the panel and the offending member.
  * Every member's harness must be panel-eligible ({@link isPanelEligibleHarness}:
- * capturable AND carrying a reasoning axis; Claude/Pi qualify, an axisless
- * harness is rejected AT LOAD, the same predicate the launch path re-checks).
+ * capturable and registered; Claude/Pi qualify), with the same predicate the
+ * launch path re-checks.
  * Duplicate identical triples are legal (the launch path disambiguates by ordinal).
  * `strength`/`description` must be non-empty strings — structure only; band
  * vocabulary and roster policy are the plan plugin gate's job, not this loader's.

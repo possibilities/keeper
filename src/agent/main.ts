@@ -36,11 +36,6 @@ import {
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import {
-  HERMES_SHIM_EVENTS,
-  HERMES_SHIM_VERSION,
-} from "../hermes-shim-contract";
-import { ensureHermesShimTrust } from "../hermes-trust";
-import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
@@ -86,7 +81,6 @@ import {
   READ_ONLY_DIRECTIVE,
 } from "./launch-config";
 import {
-  hermesShimCommand,
   type LaunchHandleDeps,
   launchEnvForAgent,
   launchToResolvedHandle,
@@ -109,12 +103,10 @@ import {
   type VerbDeps,
 } from "./pair-subcommands";
 import {
-  findHermesPassthroughCommand,
   findPassthroughCommand,
   findPiPassthroughCommand,
   hasExplicitEffortArg,
   hasExplicitModelArg,
-  hasExplicitShortModelArg,
   hasExplicitThinkingArg,
   piModelColonThinking,
   resolveStartupEffortOverride,
@@ -200,7 +192,6 @@ export interface MainDeps {
   // they must be seams. realDeps() wires the production implementations.
   claudeBin: string;
   piBin: string;
-  hermesBin: string;
   pluginConfigPath: string;
   loadPluginSourcesFn: () => PluginSources;
   /**
@@ -254,7 +245,7 @@ export interface MainDeps {
    */
   providerReachableFn: (harness: HarnessName) => boolean;
   /**
-   * Emit a birth record for a freshly-spawned non-Claude harness child (Pi / Hermes): probe the child's platform-tagged start_time and atomically
+   * Emit a birth record for a freshly-spawned Pi child: probe the child's platform-tagged start_time and atomically
    * write the maildir record the ingest worker turns into a synthetic
    * SessionStart. Fail-open — a write failure degrades to presence-only. Injected
    * so the launcher wiring is testable without a real fs write or `ps` fork;
@@ -350,7 +341,6 @@ export function realDeps(): MainDeps {
   const bins: Record<HarnessName, string> = {
     claude: join(homedir(), ".local", "bin", "claude"),
     pi: "pi",
-    hermes: resolveHermesBin(),
   };
   return {
     argv: process.argv.slice(2),
@@ -366,7 +356,6 @@ export function realDeps(): MainDeps {
     exit: (code) => process.exit(code),
     claudeBin: bins.claude,
     piBin: bins.pi,
-    hermesBin: bins.hermes,
     pluginConfigPath: pluginConfigPath(),
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
@@ -498,22 +487,6 @@ function scrubInheritedClaudeSessionEnv(
 }
 
 /**
- * Resolve the hermes binary: the canonical `~/.local/bin/hermes` install path
- * when present + executable, else the bare `hermes` name (PATH fallback). Mirrors
- * the binary-before-config ordering — a machine without the install path still
- * launches if `hermes` is on PATH.
- */
-function resolveHermesBin(): string {
-  const installed = join(homedir(), ".local", "bin", "hermes");
-  try {
-    accessSync(installed, constants.X_OK);
-    return installed;
-  } catch {
-    return "hermes";
-  }
-}
-
-/**
  * True when a resolved harness binary is reachable + executable — the
  * `providers check` reachability probe. An absolute path is X_OK-tested directly;
  * a bare name is searched across PATH. Any access failure reads as unreachable.
@@ -536,34 +509,6 @@ function isBinaryReachable(bin: string): boolean {
     }
   }
   return false;
-}
-
-/**
- * Run `hermes sessions export --source cli -` and return its JSONL text, or null
- * on any failure. The hermes M2 capture seam ({@link runHermesSessionsExport} is
- * bound onto {@link VerbDeps.hermesExport} for the wait/show verbs). `--source cli`
- * bounds the export to keeper's own one-shot launches (`source: cli`); reading is
- * strictly read-only. A non-zero exit / spawn error / empty stdout → null so the
- * poll loop keeps trying and fails to `no_transcript`, never hangs. Production
- * only — tests inject a fixture seam, so this subprocess never runs under test.
- */
-function runHermesSessionsExport(
-  hermesBin: string,
-  env: NodeJS.ProcessEnv,
-): string | null {
-  try {
-    const result = spawnSync(
-      hermesBin,
-      ["sessions", "export", "--source", "cli", "-"],
-      { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-    );
-    if (result.status !== 0 || typeof result.stdout !== "string") {
-      return null;
-    }
-    return result.stdout.trim() === "" ? null : result.stdout;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -620,9 +565,6 @@ function findPassthroughForAgent(
   if (agent === "claude") {
     return findPassthroughCommand(args);
   }
-  if (agent === "hermes") {
-    return findHermesPassthroughCommand(args);
-  }
   return findPiPassthroughCommand(args);
 }
 
@@ -667,16 +609,6 @@ function resolveLaunchConfigSignals(
   args: string[],
   env: NodeJS.ProcessEnv,
 ): LaunchConfigSignals {
-  if (agent === "hermes") {
-    // Model-only: Hermes uses `-m`/`--model` and exposes no
-    // second axis, so `effortOrThinking` is trivially satisfied (readiness rests
-    // on the model alone via the descriptor-driven core).
-    return {
-      model: hasExplicitShortModelArg(args),
-      effortOrThinking: true,
-      exemptAll: false,
-    };
-  }
   if (agent === "pi") {
     const colon = piModelColonThinking(args) !== null;
     return {
@@ -709,13 +641,6 @@ function unresolvedDefaultMessage(agent: AgentKind): string {
       `(or --model <model>:<thinking>).\n`
     );
   }
-  if (agent === "hermes") {
-    return (
-      `Error: keeper agent hermes: no model resolved for a fresh launch. ` +
-      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
-      `or pass -m <model> (hermes is model-only — no effort/thinking).\n`
-    );
-  }
   return (
     `Error: keeper agent claude: no model/effort resolved for a fresh launch. ` +
     `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
@@ -735,16 +660,14 @@ function harnessDefaultTriple(
       return catalog.claude_default ?? null;
     case "pi":
       return catalog.pi_default ?? null;
-    case "hermes":
-      return catalog.hermes_default ?? null;
   }
 }
 
 /**
  * Bridge a parsed launch {@link Triple} into the {@link Preset} shape the launch
  * resolver machinery consumes. The triple's single `effort` segment routes onto the
- * harness's own second axis (descriptor-driven): Claude takes it as `effort`,
- * pi as `thinking`, and an axisless harness (hermes, effort `na`) takes neither.
+ * harness's own second axis (descriptor-driven): Claude takes it as `effort`
+ * and Pi as `thinking`.
  * The launch path then translates that band per-harness at argv-build time exactly
  * as a hand-authored preset did. `role` is never carried by a triple.
  */
@@ -775,30 +698,11 @@ function resolveLaunchReadiness(
   signals: LaunchConfigSignals,
 ): boolean {
   const modelResolved = (preset?.model ?? null) !== null || signals.model;
-  // A model-only harness (hermes, `secondAxis: "none"`) needs no second axis —
-  // the model alone makes it ready. The axis is descriptor-driven, never a
-  // harness-name literal.
   const axis = HARNESS_DESCRIPTORS[agent].secondAxis;
-  if (axis === "none") {
-    return modelResolved;
-  }
   const second =
     axis === "thinking" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
   const secondResolved = second !== null || signals.effortOrThinking;
   return modelResolved && secondResolved;
-}
-
-/**
- * The no-approval posture keeper prepends for a hermes launch: `--yolo` unless the
- * caller already set an explicit posture (`--yolo` or `--safe-mode`). Paired with
- * the `HERMES_ACCEPT_HOOKS=1` pane env (set at launch) so a detached one-shot never
- * stalls on an approval or a first-use hook-consent prompt.
- */
-function hermesWrapperDefaults(args: string[]): string[] {
-  if (args.includes("--yolo") || args.includes("--safe-mode")) {
-    return [];
-  }
-  return ["--yolo"];
 }
 
 /** Return the plugin-owned statusLine settings file, or null fail-open. */
@@ -810,19 +714,6 @@ export function resolveKeeperPluginStatuslineSettingsPath(): string | null {
     "settings.json",
   );
   return existsSync(path) ? path : null;
-}
-
-/** The hermes model override, or null to leave it to the caller. An explicit
- *  Hermes `-m`/`--model` wins over the
- *  preset/hermes_default. */
-function resolveHermesStartupModelOverride(
-  args: string[],
-  defaultModel: string | null,
-): string | null {
-  if (hasExplicitShortModelArg(args)) {
-    return null;
-  }
-  return defaultModel;
 }
 
 /**
@@ -974,14 +865,11 @@ async function runTranscriptSubcommand(
 }
 
 /** The transcript-verb deps shared by wait-for-stop / show-last-message / the
- *  run-capture compose — the env + home for the file-transcript agents, plus the
- *  hermes export seam (a bounded `hermes sessions export` subprocess) its
- *  store-based capture polls. */
+ *  run-capture compose. */
 function makeVerbDeps(deps: MainDeps): VerbDeps {
   return {
     env: deps.env,
     homeDir: deps.transcriptHomeDir,
-    hermesExport: () => runHermesSessionsExport(deps.hermesBin, deps.env),
   };
 }
 
@@ -1006,7 +894,6 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
     launcherArgvPrefix: deps.launcherArgvPrefix,
     randomUuid: deps.randomUuid,
     runTmuxCommand: deps.runTmuxCommandFn,
-    ensureHermesShimTrust,
     now: deps.now,
     writeErr: deps.writeErr,
   };
@@ -1350,7 +1237,8 @@ type ComposedPrompt =
 /**
  * Compose the `agent run` prompt CALLER-SIDE (raw `\n\n` join, no `User:` scaffold
  * — `agent run` has no role framing): [read-only directive]? → [final-message
- * directive] → [System: <text>]? → [user prompt], uniform across Claude/Pi/Hermes and across fresh AND resume runs (a resumed leg carries the same directive
+ * directive] → [System: <text>]? → [user prompt], uniform across Claude/Pi and
+ * across fresh AND resume runs (a resumed leg carries the same directive
  * contract). The shared launch helper stays directive-free so this is the sole
  * prepender. Read-only is prompting-only (the directive is the whole mechanism —
  * keeper enforces nothing); the final-message directive is always-on; the `System:`
@@ -1504,16 +1392,13 @@ async function runResumeCaptureSubcommand(
   // claude forks a NEW child session file on --resume (ADR 0034); mint + pin the
   // child uuid so strict discovery resolves the child (never the parent) and the
   // envelope reports it as the POST-resume id. Pi resumes its existing
-  // session in place, so the resumed id IS the target; hermes has no file
-  // transcript (store-based capture attributes by cwd + time).
+  // session in place, so the resumed id IS the target.
   const childSessionId =
     decision.harness === "claude" ? deps.randomUuid() : undefined;
   const discoverySessionId =
     decision.harness === "claude"
       ? (childSessionId as string)
-      : decision.harness === "hermes"
-        ? null
-        : decision.resume_target;
+      : decision.resume_target;
 
   let killWindowCommand: string[] | null = null;
   let control: { path: string; artifact: RunControlArtifact } | undefined;
@@ -1811,7 +1696,6 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
   const defaults = {
     claude: host.defaults.claude ?? null,
     pi: host.defaults.pi ?? null,
-    hermes: host.defaults.hermes ?? null,
   };
   const panelNames = sortedPanelNames(host);
   const dispatchRows = buildDispatchListRows(catalog);
@@ -1863,7 +1747,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     }
   }
   lines.push(`Harness defaults (${presetsCatalogPath()}):`);
-  for (const harness of ["claude", "pi", "hermes"] as const) {
+  for (const harness of ["claude", "pi"] as const) {
     lines.push(`  ${harness}_default  ${defaults[harness] ?? "(unset)"}`);
   }
   lines.push(`Dispatch table (${presetsCatalogPath()}):`);
@@ -2234,8 +2118,8 @@ function runResumeSubcommand(
   }
 
   // A resume launch must mint a FRESH job id — never fold onto the matched
-  // row (claude is immune: its --session-id above is explicit argv, not
-  // env-carried). Pi/Hermes derive identity from KEEPER_JOB_ID, which a
+  // row (Claude is immune: its --session-id above is explicit argv, not
+  // env-carried). Pi derives identity from KEEPER_JOB_ID, which a
   // freshly-forked tmux SERVER would otherwise inherit from THIS process's own
   // ambient env (a resume launch with no explicit --x-tmux-session lands in
   // the shared 'keeper-agent' session, per tmux-launch.ts's resolveSession
@@ -2248,15 +2132,6 @@ function runResumeSubcommand(
   if (tmuxLaunch.error !== null) {
     deps.writeErr(`keeper agent resume: ${tmuxLaunch.error}\n`);
     return deps.exit(2);
-  }
-
-  if (decision.harness === "hermes") {
-    ensureHermesShimTrust({
-      env: deps.env,
-      shimCommand: hermesShimCommand(deps.launcherArgvPrefix),
-      events: HERMES_SHIM_EVENTS,
-      version: HERMES_SHIM_VERSION,
-    });
   }
 
   try {
@@ -2397,7 +2272,6 @@ export async function main(deps: MainDeps): Promise<never> {
   const bins: Record<AgentKind, string> = {
     claude: deps.claudeBin,
     pi: deps.piBin,
-    hermes: deps.hermesBin,
   };
   const bin = bins[agent];
   const agentLabel = displayAgent(agent);
@@ -2639,46 +2513,6 @@ export async function main(deps: MainDeps): Promise<never> {
       printVerbose(deps, actionLog, ptCmd.join(" "));
     }
     return runPassthrough(ptCmd, deps.spawn, deps.exit);
-  }
-
-  if (agent === "hermes") {
-    const runCmd = [bin];
-    // No-approval posture: --yolo (unless the caller set one) + the hook-consent
-    // env below. hermes is model-only, so there is no effort/thinking to inject.
-    const defaults = hermesWrapperDefaults(remainingArgs);
-    runCmd.push(...defaults);
-    if (defaults.includes("--yolo")) {
-      actionLog.push("Added Hermes no-approval default (--yolo)");
-    }
-
-    // Preset (--x-preset or the resolved hermes_default) supplies the model;
-    // an explicit -m/--model still wins.
-    const startupModel = resolveHermesStartupModelOverride(
-      remainingArgs,
-      resolvedPreset?.model ?? null,
-    );
-    if (startupModel !== null) {
-      runCmd.push("-m", startupModel);
-      actionLog.push(`Added startup model override: -m ${startupModel}`);
-      note(`model: ${startupModel}`);
-    }
-
-    runCmd.push(...remainingArgs);
-
-    // Seed hook consent so a non-TTY / fresh pane never silently skips (or blocks
-    // on) hermes's first-use shell-hook prompt. Equivalent to `--accept-hooks`,
-    // but as pane env it survives the detached re-exec.
-    deps.env.HERMES_ACCEPT_HOOKS = "1";
-    actionLog.push("Set HERMES_ACCEPT_HOOKS=1");
-
-    if (launcherVeryVerbose) {
-      printVerbose(deps, actionLog, formatCommand(runCmd));
-    }
-    if (sectionsOn) {
-      deps.write("~ launching hermes\n");
-    }
-
-    return runWithJobControl(runCmd, deps.spawn, deps.exit);
   }
 
   if (agent === "claude") {

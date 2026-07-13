@@ -79,11 +79,7 @@ export function hostMatrixPath(): string {
  * underscore, dot — no leading dot, so a dotted capability id like `gpt-5.5` is
  * valid while a path-escape or scalar-coerced value fails loud. */
 const MATRIX_TOKEN_RE = /^[a-z0-9._-]+$/;
-const SUPPORTED_HARNESSES: ReadonlySet<string> = new Set([
-  "claude",
-  "pi",
-  "hermes",
-]);
+const SUPPORTED_HARNESSES: ReadonlySet<string> = new Set(["claude", "pi"]);
 
 function isMatrixToken(value: unknown): value is string {
   return (

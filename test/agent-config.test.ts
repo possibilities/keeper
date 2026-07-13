@@ -74,7 +74,6 @@ describe("loadPresetCatalog", () => {
     presets: {},
     claude_default: null,
     pi_default: null,
-    hermes_default: null,
     dispatch: EMPTY_DISPATCH,
   };
 
@@ -132,7 +131,6 @@ describe("loadPresetCatalog", () => {
       [
         "claude_default: claude::opus::xhigh",
         "pi_default: pi::glm::high",
-        "hermes_default: hermes::gpt-5.5::na",
         "",
       ].join("\n"),
     );
@@ -147,11 +145,6 @@ describe("loadPresetCatalog", () => {
       model: "glm",
       effort: "high",
     });
-    expect(cat.hermes_default).toEqual({
-      harness: "hermes",
-      model: "gpt-5.5",
-      effort: "na",
-    });
   });
 
   test("no `<harness>_default` keys → all triples null", () => {
@@ -162,7 +155,6 @@ describe("loadPresetCatalog", () => {
     const cat = loadPresetCatalog(p);
     expect(cat.claude_default).toBeNull();
     expect(cat.pi_default).toBeNull();
-    expect(cat.hermes_default).toBeNull();
   });
 
   test("a malformed `<harness>_default` triple is fail-loud naming the segment", () => {
@@ -313,17 +305,6 @@ describe("loadPanelSelections", () => {
       "claude::opus::high",
       "pi::glm::high",
     ]);
-  });
-
-  test("an axisless harness member is fail-loud (not panel-eligible)", () => {
-    // hermes is capturable but exposes no reasoning axis (na) — panels compare an
-    // axis, so it is rejected AT LOAD with the member named.
-    const p = writeYaml(
-      "panel.yaml",
-      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - hermes::hermes-m::na\n",
-    );
-    expect(() => loadPanelSelections(p)).toThrow(/hermes::hermes-m::na/);
-    expect(() => loadPanelSelections(p)).toThrow(/not panel-eligible/);
   });
 
   test("duplicate identical triples are legal at load (kept in order)", () => {

@@ -8931,7 +8931,7 @@ function projectJobsRow(db: Database, event: Event): void {
              -- claude). The fold copies the event value verbatim and never
              -- synthesizes, so a NULL excluded.harness preserves the prior value.
              -- resume_target stays on THIS SessionStart arm ONLY for claude/pi's
-             -- own seed value; a codex/hermes back-fill flows through the separate
+             -- own seed value; an older producer's back-fill flows through the separate
              -- ResumeTargetResolved arm precisely so it can never trip this arm's
              -- terminal-row revive (killed -> stopped) semantics.
              harness = COALESCE(excluded.harness, jobs.harness),
@@ -8939,7 +8939,7 @@ function projectJobsRow(db: Database, event: Event): void {
              -- v110 (fn-1131.1): set-once ADOPTED marker, mirroring worktree. The
              -- claude hook + every birth mint carry excluded.adopted NULL
              -- (launcher-owned), so COALESCE preserves an adopted marker a prior
-             -- non-launcher mint (hermes self-seed / codex rollout) set — a later
+             -- non-launcher mint set — a later
              -- resume or a racing launcher re-mint NEVER clobbers it. The fold
              -- copies the event value verbatim and never synthesizes, so a NULL
              -- excluded leaves the prior value (NULL stays NULL, 1 stays 1).
@@ -9620,7 +9620,7 @@ function projectJobsRow(db: Database, event: Event): void {
     case "ResumeTargetResolved":
       // Synthetic event (fn-1103) minted daemon-side when a harness's native
       // resume target is resolved AFTER launch — the codex rollout-poll match or
-      // the hermes on_session_start hook id back-fills a keeper-minted job. Folds
+      // an older producer's session-start hook id back-fills a keeper-minted job. Folds
       // ONLY `jobs.resume_target` (idempotent replace) and NEVER touches lifecycle
       // state, so a late back-fill can NEVER revive a terminal row — which is
       // exactly why this is a SEPARATE arm from SessionStart's killed->stopped

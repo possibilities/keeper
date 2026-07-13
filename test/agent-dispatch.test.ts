@@ -366,7 +366,7 @@ describe("resume route", () => {
       resolveResumeDecision: {
         kind: "no-target",
         job_id: "job-nt",
-        harness: "hermes",
+        harness: "pi",
         title: "stale",
       },
     });

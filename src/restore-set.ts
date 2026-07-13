@@ -34,7 +34,7 @@
  *     reconciler-managed; generic restore must not double-spawn either verb.
  *   - exclude Keeper job ids and harness-native resume identities already LIVE
  *     (the idempotence guard — prevents both a respawn race and two Keeper launch
- *     associations from reopening one Codex/Pi/Hermes conversation). The live set
+ *     associations from reopening one Pi conversation). The live set
  *     is computed from the SAME DB read (`state ∈ {working, stopped}`), so no
  *     socket is needed. [fn-817 best-practice: probe by identity, never name.]
  *   - exclude rows idle beyond {@link DEFAULT_IDLE_CUTOFF_SECS} (last activity
@@ -50,7 +50,7 @@
  *
  * RESULT. Each candidate carries a `harness` tag and a harness-native
  * `resume_target`: the session UUID (`job_id`) for a claude candidate (exact
- * `claude --resume <uuid>` re-attach), the stored native id for codex/pi/hermes,
+ * `claude --resume <uuid>` re-attach), the stored native id for Pi,
  * or EMPTY when a non-claude harness has no resolved target (not-resumable — see
  * {@link isRestorableCandidate}). `label` carries the latest `title` — the session
  * name keeper currently knows, read live from the jobs projection so it is never a
@@ -103,7 +103,7 @@ const USER_CLOSED: CloseKind = "window_gone_server_alive";
 /**
  * True when a jobs row carries the harness-agnostic ADOPTED marker
  * (`jobs.adopted = 1`) — a session a NON-launcher path minted: a hand-started
- * hermes self-seed or an adopted codex rollout. A NULL marker (launcher-owned)
+ * non-launcher adoption. A NULL marker (launcher-owned)
  * reads false. Used at the coordless-skip paths to SURFACE an adopted session
  * keeper cannot auto-restore rather than silently drop it. Pure.
  */
@@ -166,7 +166,7 @@ export interface RestoreCandidate {
   backend_exec_session_id: string;
   created_at: number;
   /**
-   * The launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). ABSENT ⇒
+   * The launching harness (`"claude"`/`"pi"`). ABSENT ⇒
    * claude (a NULL `jobs.harness` reads as claude at every consumer), so a legacy
    * candidate carries none and every claude-only consumer stays byte-stable. The
    * resume surfaces route `resume_target` through this harness's native resume
@@ -195,7 +195,7 @@ export interface RestoreSetResult {
    *  cutoff (a false-negative risk we make visible — never a silent drop). */
   excludedIdleCount: number;
   /**
-   * Count of ADOPTED jobs (`jobs.adopted = 1` — a hand-started hermes self-seed or
+   * Count of ADOPTED jobs (`jobs.adopted = 1` — a non-launcher mint or
    * an adopted codex rollout) dropped from candidacy ONLY because they carry no
    * backend coords (coordless-by-design for codex; harness-agnostic here). Surfaced
    * like {@link excludedIdleCount} so an adopted session keeper cannot auto-restore
@@ -348,7 +348,7 @@ export function compareCandidates(
 /**
  * Collapse multiple Keeper job records that point at the same harness-native
  * conversation. Keeper job ids describe launch associations; the native resume
- * target is what `codex/pi/hermes --resume` actually opens, so launching two job
+ * target is what the Pi resume invocation actually opens, so launching two job
  * ids with one target duplicates a conversation and can produce conflicting cwd
  * prompts. The newest association is canonical; empty targets remain separate
  * so every not-resumable job is still surfaced. Output keeps visual sort order.
@@ -601,7 +601,7 @@ function collectCrashCandidates(
       continue; // user-closed, or isolated unknown/legacy — not a candidate.
     }
     // Filter: no backend coords ⇒ nothing to replay. An ADOPTED coordless row
-    // (codex-by-design, or a hermes self-seed keeper never resolved coords for) is
+    // (for example, when keeper never resolved coordinates) is
     // COUNTED and surfaced rather than silently dropped; a non-adopted coordless
     // row keeps today's silent skip.
     const backendSession = row.backend_exec_session_id;
@@ -628,7 +628,7 @@ function collectCrashCandidates(
     const nativeIdentity = resumeIdentityKey(harness, nativeTarget);
     // Filter: already live under this Keeper id OR the same harness-native
     // conversation ⇒ restoring it would double-spawn. The native check catches
-    // duplicate Keeper launch associations for one Codex/Pi/Hermes session.
+    // duplicate Keeper launch associations for one Pi session.
     if (
       liveJobIds.has(jobId) ||
       (nativeIdentity !== null && liveResumeIdentities.has(nativeIdentity))
