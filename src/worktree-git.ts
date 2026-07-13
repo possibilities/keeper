@@ -45,8 +45,10 @@ import {
   mkdir,
   readdir,
   readlink,
+  realpath,
   rm,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -1508,6 +1510,61 @@ export async function enumerateEpicLaneBranches(
   return { ok: true, branches };
 }
 
+export interface LaneNodeModulesLinkFs {
+  lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
+  realpath(path: string): Promise<string>;
+  symlink(target: string, path: string, type: "dir"): Promise<void>;
+  unlink(path: string): Promise<void>;
+}
+
+const laneNodeModulesLinkFs: LaneNodeModulesLinkFs = {
+  lstat,
+  realpath,
+  symlink,
+  unlink,
+};
+
+export async function ensureLaneNodeModulesLink(
+  sourceCheckout: string,
+  lanePath: string,
+  fs: LaneNodeModulesLinkFs = laneNodeModulesLinkFs,
+): Promise<void> {
+  const sourceNodeModules = resolve(sourceCheckout, "node_modules");
+  let sourceRealPath: string;
+  try {
+    sourceRealPath = await fs.realpath(sourceNodeModules);
+  } catch (err) {
+    if (isEnoent(err) || isEnotdir(err)) {
+      return;
+    }
+    throw err;
+  }
+
+  const laneNodeModules = resolve(lanePath, "node_modules");
+  let laneEntry: { isSymbolicLink(): boolean } | null;
+  try {
+    laneEntry = await fs.lstat(laneNodeModules);
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
+    laneEntry = null;
+  }
+
+  if (laneEntry !== null && !laneEntry.isSymbolicLink()) {
+    return;
+  }
+  if (laneEntry !== null) {
+    try {
+      if ((await fs.realpath(laneNodeModules)) === sourceRealPath) {
+        return;
+      }
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
+    }
+    await fs.unlink(laneNodeModules);
+  }
+  await fs.symlink(sourceNodeModules, laneNodeModules, "dir");
+}
+
 /**
  * Ensure a worktree exists at `path` on `branch`, forked off `commitish` (the
  * parent lane's committed tip, or the base branch for a root). Idempotent + crash-
@@ -2161,6 +2218,14 @@ function isEnoent(err: unknown): boolean {
     typeof err === "object" &&
     err !== null &&
     (err as { code?: string }).code === "ENOENT"
+  );
+}
+
+function isEnotdir(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: string }).code === "ENOTDIR"
   );
 }
 

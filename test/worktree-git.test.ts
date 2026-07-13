@@ -36,6 +36,7 @@ import {
   commitWorkLockPath,
   currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
+  ensureLaneNodeModulesLink,
   ensureWorktree,
   enumerateEpicLaneBranches,
   epicIdFromKeeperLaneEntry,
@@ -695,6 +696,117 @@ test("ensureWorktree: a failing add throws with git stderr", async () => {
   expect(ensureWorktree("/repo", "/p", "b", "c", run)).rejects.toThrow(
     /fatal: boom/,
   );
+});
+
+type LaneNodeModulesEntry =
+  | { kind: "dir" }
+  | { kind: "symlink"; resolvesTo: string | null }
+  | null;
+
+function fakeLaneNodeModulesFs(
+  sourcePresent: boolean,
+  initialLaneEntry: LaneNodeModulesEntry,
+) {
+  const source = "/repo/node_modules";
+  const lane = "/repo.worktrees/lane/node_modules";
+  const sourceReal = "/private/repo/node_modules";
+  let laneEntry = initialLaneEntry;
+  const symlinks: Array<[string, string, string]> = [];
+  let unlinks = 0;
+  const missing = () => Object.assign(new Error("missing"), { code: "ENOENT" });
+  return {
+    fs: {
+      async lstat(path: string) {
+        expect(path).toBe(lane);
+        if (laneEntry === null) throw missing();
+        return { isSymbolicLink: () => laneEntry?.kind === "symlink" };
+      },
+      async realpath(path: string) {
+        if (path === source) {
+          if (!sourcePresent) throw missing();
+          return sourceReal;
+        }
+        expect(path).toBe(lane);
+        if (laneEntry?.kind !== "symlink" || laneEntry.resolvesTo === null) {
+          throw missing();
+        }
+        return laneEntry.resolvesTo;
+      },
+      async symlink(target: string, path: string, type: "dir") {
+        symlinks.push([target, path, type]);
+        laneEntry = { kind: "symlink", resolvesTo: sourceReal };
+      },
+      async unlink(path: string) {
+        expect(path).toBe(lane);
+        unlinks += 1;
+        laneEntry = null;
+      },
+    },
+    laneEntry: () => laneEntry,
+    symlinks,
+    unlinks: () => unlinks,
+  };
+}
+
+test("ensureLaneNodeModulesLink: a bare lane links to its source dependency store", async () => {
+  const fake = fakeLaneNodeModulesFs(true, null);
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+  ]);
+  expect(fake.laneEntry()).toEqual({
+    kind: "symlink",
+    resolvesTo: "/private/repo/node_modules",
+  });
+});
+
+test("ensureLaneNodeModulesLink: a correct link is an idempotent no-op", async () => {
+  const fake = fakeLaneNodeModulesFs(true, {
+    kind: "symlink",
+    resolvesTo: "/private/repo/node_modules",
+  });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([]);
+  expect(fake.unlinks()).toBe(0);
+});
+
+test("ensureLaneNodeModulesLink: a real lane directory is left untouched", async () => {
+  const fake = fakeLaneNodeModulesFs(true, { kind: "dir" });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.laneEntry()).toEqual({ kind: "dir" });
+  expect(fake.symlinks).toEqual([]);
+});
+
+test("ensureLaneNodeModulesLink: a missing source dependency store is skipped", async () => {
+  const fake = fakeLaneNodeModulesFs(false, null);
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([]);
+  expect(fake.laneEntry()).toBeNull();
+});
+
+test("ensureLaneNodeModulesLink: a broken lane link is replaced", async () => {
+  const fake = fakeLaneNodeModulesFs(true, {
+    kind: "symlink",
+    resolvesTo: null,
+  });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.unlinks()).toBe(1);
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+  ]);
+});
+
+test("ensureLaneNodeModulesLink: a stale lane link is replaced", async () => {
+  const fake = fakeLaneNodeModulesFs(true, {
+    kind: "symlink",
+    resolvesTo: "/other/node_modules",
+  });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.unlinks()).toBe(1);
+  expect(fake.laneEntry()).toEqual({
+    kind: "symlink",
+    resolvesTo: "/private/repo/node_modules",
+  });
 });
 
 // ---------------------------------------------------------------------------
