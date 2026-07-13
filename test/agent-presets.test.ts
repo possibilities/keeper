@@ -370,6 +370,7 @@ describe("presets resolve JSON contract", () => {
         defaults: {},
         dispatch: {},
         panels: { duo: ["claude::opus::high", "codex::gpt-5.5::high"] },
+        panelMeta: {},
         panelDefault: null,
       },
     });
@@ -390,6 +391,7 @@ describe("presets resolve JSON contract", () => {
         defaults: {},
         dispatch: {},
         panels: { reviewers: ["claude::opus::high"] },
+        panelMeta: {},
         panelDefault: "reviewers",
       },
     });
@@ -410,6 +412,7 @@ describe("presets resolve JSON contract", () => {
         defaults: {},
         dispatch: {},
         panels: { reviewers: ["claude::opus::high"] },
+        panelMeta: {},
         panelDefault: null,
       },
     });
@@ -427,6 +430,7 @@ describe("presets resolve JSON contract", () => {
         defaults: {},
         dispatch: {},
         panels: { duo: ["claude::opus::high"] },
+        panelMeta: {},
         panelDefault: null,
       },
     });
@@ -485,6 +489,7 @@ describe("presets list discovery surface", () => {
         },
         dispatch: {},
         panels: { duo: ["claude::opus::high", "pi::pi/spark::low"] },
+        panelMeta: { duo: { strength: "standard", description: "a duo." } },
         panelDefault: "duo",
       },
     });
@@ -550,10 +555,50 @@ describe("presets list discovery surface", () => {
         { verb: "handoff", triple: null, floored: true },
       ],
       panels: [
-        { name: "duo", members: ["claude::opus::high", "pi::pi/spark::low"] },
+        {
+          name: "duo",
+          strength: "standard",
+          description: "a duo.",
+          members: ["claude::opus::high", "pi::pi/spark::low"],
+        },
       ],
       default: "duo",
     });
+  });
+
+  test("--json orders panels weak→strong by band then name, unbanded last", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list", "--json"],
+      rawArgv: true,
+      matrix: writeAndLoad(LIST_MATRIX_BODY),
+      hostTriples: {
+        defaults: {},
+        dispatch: {},
+        panels: {
+          zeta: ["claude::opus::high"],
+          maxer: ["claude::opus::high"],
+          alpha: ["claude::opus::high"],
+          weaker: ["claude::opus::high"],
+          unbanded: ["claude::opus::high"],
+        },
+        panelMeta: {
+          zeta: { strength: "weak", description: "z." },
+          maxer: { strength: "max", description: "m." },
+          alpha: { strength: "weak", description: "a." },
+          weaker: { strength: "light", description: "w." },
+          // `unbanded` carries no panelMeta entry at all — the same shape a
+          // legacy list-form panel harvests to (empty strings), sorting last.
+        },
+        panelDefault: null,
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const names = JSON.parse(h.out.join("")).panels.map(
+      (p: { name: string }) => p.name,
+    );
+    // weak (alpha, zeta — name tiebreak) < light (weaker) < max (maxer) < unbanded last.
+    expect(names).toEqual(["alpha", "zeta", "weaker", "maxer", "unbanded"]);
   });
 
   test("--json marks a configured dispatch verb unfloored, mixed with floored rows", async () => {
@@ -624,6 +669,7 @@ describe("presets list discovery surface", () => {
         defaults: { claude: "claude::opus::high" },
         dispatch: {},
         panels: { duo: ["claude::opus::high"] },
+        panelMeta: { duo: { strength: "standard", description: "a duo." } },
         panelDefault: null,
       },
     });
@@ -634,7 +680,27 @@ describe("presets list discovery surface", () => {
     expect(text).toContain("pi::pi/spark::low (launch-only)");
     expect(text).toContain("claude_default  claude::opus::high");
     expect(text).toContain("codex_default  (unset)");
-    expect(text).toContain("duo");
+    expect(text).toContain("duo [standard]");
+    expect(text).toContain("a duo.");
+  });
+
+  test("human-readable marks the default panel and falls back for an unbanded panel", async () => {
+    const h = makeHarness({
+      argv: ["presets", "list"],
+      rawArgv: true,
+      matrix: writeAndLoad(LIST_MATRIX_BODY),
+      hostTriples: {
+        defaults: {},
+        dispatch: {},
+        panels: { duo: ["claude::opus::high"] },
+        panelMeta: {},
+        panelDefault: "duo",
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    const text = h.out.join("");
+    expect(text).toContain("duo [(no strength)] (default)");
   });
 
   test("an absent matrix is the claude-only world: empty cube, exit 0", async () => {

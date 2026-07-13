@@ -23,19 +23,21 @@ answers meet. Cross-pollination before the judge defeats the entire mechanism.
 
 ## Defining the panel
 
-The panel's members come from a named `panels.<name>` array in `~/.config/keeper/panel.yaml`, each
-member a launch triple `<harness>::<model>::<effort>` (ADR 0033) drawn from the host matrix's
-enumerable cube — no separate preset catalog names them. Eligibility is **capability-derived**: a
-triple is panel-valid when its harness is *capturable* (keeper can read that harness's final message)
-AND carries a second reasoning axis (an effort or thinking rung to compare across panelists) — a
-capability flag, never a harness-name allowlist. Today that is claude, codex, and pi; hermes is
-axisless (no second reasoning axis), so it is never panel-eligible. A triple on a non-panel-eligible
-harness is rejected when the panel loads. Run `keeper agent presets list` (`--json` for structure) to
-see the enumerable cube plus the configured panels.
-`keeper agent presets resolve <panel>` returns the members in declaration order, each identified by its
-**triple** (not just its harness), so two panelists on the same harness but different models or efforts
-stay distinguishable; duplicate identical triples are legal too — each gets a 1-based ordinal so
-repeats stay distinct. Every member answers **in parallel** via a detached
+The configured roster maps each named `panels.<name>` entry in `~/.config/keeper/panel.yaml` to an
+object with `strength`, `members`, and `description`. `strength` is an authored closed-vocabulary
+band and `description` says which work the panel fits; read both live with `keeper agent presets list`
+(`--json` for structure) when choosing a panel, never infer fit from member count or a panel name.
+`members` is an ordered array of launch triples `<harness>::<model>::<effort>` (ADR 0033) drawn from
+the host matrix's enumerable cube — no separate preset catalog names them. Eligibility is
+**capability-derived**: a triple is panel-valid when its harness is *capturable* (keeper can read that
+harness's final message) AND carries a second reasoning axis (an effort or thinking rung to compare
+across panelists) — a capability flag, never a harness-name allowlist. Today that is claude, codex,
+and pi; hermes is axisless (no second reasoning axis), so it is never panel-eligible. A triple on a
+non-panel-eligible harness is rejected when the panel loads.
+`keeper agent presets resolve <panel>` returns the selected object's members in declaration order, each
+identified by its **triple** (not just its harness), so two panelists on the same harness but different
+models or efforts stay distinguishable; duplicate identical triples are legal too — each gets a
+1-based ordinal so repeats stay distinct. Every member answers **in parallel** via a detached
 `keeper agent run <harness> --preset <triple> --read-only` leg that writes its answer as a uniform JSON
 result envelope (`--output`), then the `plan:panel-judge` subagent fuses them:
 
@@ -68,9 +70,15 @@ providers:
   - name: codex
     models: [<model>]
 
-# ~/.config/keeper/panel.yaml — a panel over launch triples, plus the default pointer
+# ~/.config/keeper/panel.yaml — described panel objects plus the default pointer
 panels:
-  core: ["claude::sonnet::high", "codex::<model>::<effort>"]
+  core:
+    strength: standard
+    members:
+      - claude::sonnet::high
+      - codex::<model>::<effort>
+    description: >-
+      An everyday cross-check for a moderate-stakes question with real judgment.
 default: core   # the literal `default` resolves here; never name a panel `default`
 ```
 

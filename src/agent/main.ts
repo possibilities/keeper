@@ -1832,18 +1832,52 @@ function buildDispatchListRows(catalog: PresetCatalog): DispatchListRow[] {
 }
 
 /**
+ * The strength-band display ladder (ADR 0046): weak, light, standard, strong,
+ * max sort first, in that order; an unrecognized or absent band (a legacy
+ * list-form panel, or an object-form one whose `strength` didn't harvest)
+ * sorts last. Presentation-only — band vocabulary is NOT enforced here (that
+ * is the plan plugin's structural gate over the committed roster); an unknown
+ * string is displayed and ordered last, never rejected.
+ */
+const PANEL_BAND_ORDER: readonly string[] = [
+  "weak",
+  "light",
+  "standard",
+  "strong",
+  "max",
+];
+
+function panelBandRank(strength: string): number {
+  const i = PANEL_BAND_ORDER.indexOf(strength);
+  return i === -1 ? PANEL_BAND_ORDER.length : i;
+}
+
+/** Panel names ordered weak→strong by band ({@link PANEL_BAND_ORDER}), then
+ *  name — the order both `presets list` output forms render panels in. */
+function sortedPanelNames(host: HostTriples): string[] {
+  return Object.keys(host.panels).sort((a, b) => {
+    const rank =
+      panelBandRank(host.panelMeta[a]?.strength ?? "") -
+      panelBandRank(host.panelMeta[b]?.strength ?? "");
+    return rank !== 0 ? rank : a.localeCompare(b);
+  });
+}
+
+/**
  * `presets list [--json]`: the discovery surface — the virtual launch cube plus
  * the four harness defaults, the resolved `dispatch:` per-verb table, and the
  * configured panels. Enumerates every triple the host matrix defines (cell AND
  * launch-only capabilities, launch ids fanned over effective efforts, an
  * axisless harness emitting `na`) grouped per harness, echoes the four
- * `<harness>_default` triples and each panel's ordered members read from the
- * host files, and resolves every dispatch verb to its configured triple or
- * compiled floor ({@link buildDispatchListRows}), flagging a floored row.
- * Human-readable by default, `--json` ({kind:"presets-list", harnesses,
- * defaults, dispatch, panels, default}) for machine consumption. A malformed
- * matrix / host file / preset catalog is fail-loud (exit 2); an ABSENT matrix
- * is the claude-only world with an empty cube, never a crash.
+ * `<harness>_default` triples and each panel's ordered members + strength +
+ * description read from the host files, and resolves every dispatch verb to
+ * its configured triple or compiled floor ({@link buildDispatchListRows}),
+ * flagging a floored row. Panels are ordered weak→strong by band then name
+ * ({@link sortedPanelNames}) in both output forms. Human-readable by default,
+ * `--json` ({kind:"presets-list", harnesses, defaults, dispatch, panels,
+ * default}) for machine consumption. A malformed matrix / host file / preset
+ * catalog is fail-loud (exit 2); an ABSENT matrix is the claude-only world
+ * with an empty cube, never a crash.
  */
 function runPresetsList(deps: MainDeps, json: boolean): never {
   let matrix: MatrixV2 | null;
@@ -1868,7 +1902,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     pi: host.defaults.pi ?? null,
     hermes: host.defaults.hermes ?? null,
   };
-  const panelNames = Object.keys(host.panels).sort();
+  const panelNames = sortedPanelNames(host);
   const dispatchRows = buildDispatchListRows(catalog);
 
   if (json) {
@@ -1889,6 +1923,8 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
         dispatch: dispatchRows,
         panels: panelNames.map((name) => ({
           name,
+          strength: host.panelMeta[name]?.strength ?? "",
+          description: host.panelMeta[name]?.description ?? "",
           members: host.panels[name] ?? [],
         })),
         default: host.panelDefault,
@@ -1930,8 +1966,11 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
   } else {
     for (const name of panelNames) {
       const marker = host.panelDefault === name ? " (default)" : "";
+      const meta = host.panelMeta[name];
+      const band = meta?.strength ? meta.strength : "(no strength)";
+      const description = meta?.description ?? "";
       lines.push(
-        `  ${name}  [${(host.panels[name] ?? []).join(", ")}]${marker}`,
+        `  ${name} [${band}]${marker}  ${description}  [${(host.panels[name] ?? []).join(", ")}]`,
       );
     }
   }
@@ -2096,6 +2135,7 @@ function runProvidersCheck(deps: MainDeps): never {
         defaults: {},
         dispatch: {},
         panels: {},
+        panelMeta: {},
         panelDefault: null,
       };
     } else {

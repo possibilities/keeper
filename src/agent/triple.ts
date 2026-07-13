@@ -428,6 +428,12 @@ export interface HostTriples {
    *  set, so an unknown/future verb still lints rather than vanishing). */
   dispatch: Record<string, string>;
   panels: Record<string, string[]>;
+  /** Per-panel `strength`/`description`, harvested from an object-form panel
+   *  value alongside {@link panels}' members — raw, optional strings (empty
+   *  when absent: a legacy list-form panel, or an object-form one missing the
+   *  field). Discovery-surface metadata only (`presets list` in `main.ts`);
+   *  never validated or policy-checked here. */
+  panelMeta: Record<string, { strength: string; description: string }>;
   panelDefault: string | null;
 }
 
@@ -467,9 +473,13 @@ function asRecord(value: unknown): Record<string, unknown> | null {
  * Extract the host launch triples from the parsed `presets.yaml` + `panel.yaml`
  * bodies — LENIENT string harvesting only (the four `<harness>_default` pointers,
  * the nested `dispatch:` verb map, the `panels` map, and its `default`), never a
- * validating parse. The doctor validates the harvested strings against the cube;
- * anything that is not a plain string is simply dropped here. Pure over the
- * parsed bodies.
+ * validating parse. Harvests panel members from BOTH panel-value shapes (ADR
+ * 0046) — a bare list (legacy) or an object's `members` — so the doctor lint and
+ * `presets list` never go dark on a stale file; an object-form value additionally
+ * contributes its raw `strength`/`description` to {@link HostTriples.panelMeta}
+ * (empty string when absent or non-string). The doctor validates the harvested
+ * strings against the cube; anything that is not a plain string is simply
+ * dropped here. Pure over the parsed bodies.
  */
 export function extractHostTriples(
   presetsRaw: unknown,
@@ -496,20 +506,37 @@ export function extractHostTriples(
     }
   }
   const panels: Record<string, string[]> = {};
+  const panelMeta: Record<string, { strength: string; description: string }> =
+    {};
   let panelDefault: string | null = null;
   const panel = asRecord(panelRaw);
   if (panel !== null) {
     const panelsRaw = asRecord(panel.panels);
     if (panelsRaw !== null) {
-      for (const [name, members] of Object.entries(panelsRaw)) {
-        if (Array.isArray(members)) {
-          panels[name] = members.filter(
+      for (const [name, value] of Object.entries(panelsRaw)) {
+        if (Array.isArray(value)) {
+          // Legacy list-form: members only, no strength/description.
+          panels[name] = value.filter(
             (m): m is string => typeof m === "string",
           );
+          panelMeta[name] = { strength: "", description: "" };
+          continue;
         }
+        const obj = asRecord(value);
+        if (obj === null) {
+          continue; // Not a recognizable shape — lenient, silently dropped.
+        }
+        panels[name] = Array.isArray(obj.members)
+          ? obj.members.filter((m): m is string => typeof m === "string")
+          : [];
+        panelMeta[name] = {
+          strength: typeof obj.strength === "string" ? obj.strength : "",
+          description:
+            typeof obj.description === "string" ? obj.description : "",
+        };
       }
     }
     panelDefault = asNonEmptyString(panel.default);
   }
-  return { defaults, dispatch, panels, panelDefault };
+  return { defaults, dispatch, panels, panelMeta, panelDefault };
 }
