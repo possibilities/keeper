@@ -57,6 +57,7 @@ import {
   type PanelStatus,
   type PanelVerdict,
   panelPrune,
+  panelResume,
   panelStart,
   panelStatus,
   parseManifest,
@@ -974,7 +975,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
     expect(manifest.generation).toBe(1);
   });
 
-  test("re-issuing relaunches a no-result dead leg to a new-generation path", async () => {
+  test("explicit resume replaces a no-result dead leg on the same request", async () => {
     const promptFile = join(dir, "ask.md");
     writeFileSync(promptFile, "q");
     const panelDir = join(dir, "keeper-state", "panels", "relaunch-run");
@@ -995,7 +996,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
     // pidAlive already reads dead.
     const base = makeAdHocDeps();
     const deps2: PanelDeps = { ...base.deps, graceMs: 0 };
-    const code = await panelStart(
+    const code = await panelResume(
       {
         promptFile,
         slug: "relaunch-run",

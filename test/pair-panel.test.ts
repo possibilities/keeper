@@ -41,6 +41,8 @@ import {
   type PanelManifest,
   type PanelManifestMember,
   type PanelVerdict,
+  panelCancel,
+  panelResume,
   panelStart,
   panelWait,
   parseManifest,
@@ -602,7 +604,7 @@ test("start: a ConfigError from the config load exits 2", async () => {
 
 const RECONCILE_BOOT = 1_700_000_000_000;
 
-test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg, relaunches a dead no-result leg to g2", async () => {
+test("resume: reuses terminal legs, leaves a live leg, and explicitly replaces a dead attempt", async () => {
   const selections: PanelSelections = {
     panels: { quad: [T_CLAUDE, T_CODEX, T_CLAUDE2, T_CODEX2] },
     default: "quad",
@@ -648,7 +650,7 @@ test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg,
     pidAlive: (pid) => pid === 4242,
   });
   expect(
-    await panelStart(
+    await panelResume(
       {
         promptFile: prompt,
         slug: "quad",
@@ -679,7 +681,7 @@ test("reconcile: reuses terminal legs (completed AND failed), leaves a live leg,
   expect(byName[dead]?.pidfile).toBe(join(dir, `${dead}.g2.pidfile`));
 });
 
-test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live pid); a completed leg is still reused", async () => {
+test("resume: a boot mismatch replaces every non-terminal leg while reusing completed legs", async () => {
   const selections: PanelSelections = {
     panels: { duo: [T_CLAUDE, T_CODEX] },
     default: "duo",
@@ -703,7 +705,7 @@ test("reconcile: a boot mismatch relaunches every non-terminal leg (even a live 
     pidAlive: () => true,
   });
   expect(
-    await panelStart(
+    await panelResume(
       {
         promptFile: prompt,
         slug: "duo",
@@ -928,6 +930,207 @@ test("reconcile: a member-set mismatch refuses the resume (exit 2)", async () =>
   expect(second.stderr()).toContain("different member set");
 });
 
+test("start: one reservation has an opaque identity and never implicitly re-fans out", async () => {
+  const prompt = writePrompt("one fanout");
+  const first = makeDeps({ selections: DEFAULT_SELECTIONS, graceMs: 0 });
+  first.deps.randomUuid = () => "11111111-2222-4333-8444-555555555555";
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "owned",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    first.deps,
+  );
+  const initial = readManifest();
+  expect(initial.request_id).toBe("11111111-2222-4333-8444-555555555555");
+  expect(initial.argument_digest).toMatch(/^[0-9a-f]{64}$/);
+  expect(initial.normal_fanout_started).toBe(true);
+  expect(initial.members.every((m) => m.attempts?.length === 1)).toBe(true);
+
+  const second = makeDeps({ selections: DEFAULT_SELECTIONS, graceMs: 0 });
+  expect(
+    await panelStart(
+      {
+        promptFile: prompt,
+        slug: "owned",
+        panel: "default",
+        dir,
+        timeoutSeconds: 900,
+      },
+      second.deps,
+    ),
+  ).toBe(0);
+  expect(second.spawns).toHaveLength(0);
+  expect(readManifest().request_id).toBe(initial.request_id);
+});
+
+test("resume is capped to one replacement attempt per member", async () => {
+  const selections: PanelSelections = {
+    panels: { one: [T_CLAUDE] },
+    default: "one",
+  };
+  const prompt = writePrompt("bounded resume");
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "bounded",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    makeDeps({ selections }).deps,
+  );
+  const [name] = memberSlugs() as [string];
+  seedPidfile(name, 10);
+  const firstResume = makeDeps({ selections, graceMs: 0 });
+  await panelResume(
+    {
+      promptFile: prompt,
+      slug: "bounded",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    firstResume.deps,
+  );
+  expect(firstResume.spawns).toHaveLength(1);
+  writeFileSync(join(dir, `${name}.g2.pidfile`), "11\n");
+  const secondResume = makeDeps({ selections, graceMs: 0 });
+  await panelResume(
+    {
+      promptFile: prompt,
+      slug: "bounded",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    secondResume.deps,
+  );
+  expect(secondResume.spawns).toHaveLength(0);
+  expect(readManifest().members[0]?.attempts).toHaveLength(2);
+});
+
+test("cancel tombstones first, tears down exact live attempts, and is idempotent", async () => {
+  const selections: PanelSelections = {
+    panels: { one: [T_CLAUDE] },
+    default: "one",
+  };
+  const prompt = writePrompt("cancel me");
+  const launched = makeDeps({ selections });
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "cancel",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    launched.deps,
+  );
+  const [name] = memberSlugs() as [string];
+  seedPidfile(name, 42);
+  let alive = true;
+  const cancel = makeDeps({ selections, pidAlive: () => alive });
+  const signalled: number[] = [];
+  cancel.deps.terminatePid = (pid) => {
+    expect(readManifest().state).toBe("cancelling");
+    signalled.push(pid);
+    alive = false;
+  };
+  expect(await panelCancel({ dir, cleanupMs: 10 }, cancel.deps)).toBe(0);
+  expect(signalled).toEqual([42]);
+  expect(readManifest().state).toBe("cancelled");
+  expect(await panelCancel({ dir, cleanupMs: 10 }, cancel.deps)).toBe(0);
+  expect(signalled).toEqual([42]);
+});
+
+test("cancel reports exact unresolved identities and duplicate cancellation does not signal twice", async () => {
+  const selections: PanelSelections = {
+    panels: { one: [T_CLAUDE] },
+    default: "one",
+  };
+  const prompt = writePrompt("wedged cleanup");
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "wedged",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    makeDeps({ selections }).deps,
+  );
+  const [name] = memberSlugs() as [string];
+  seedPidfile(name, 77);
+  const cancel = makeDeps({
+    selections,
+    pidAlive: (pid) => pid === 77,
+    pollIntervalMs: 1,
+  });
+  let signals = 0;
+  cancel.deps.terminatePid = () => {
+    signals += 1;
+  };
+  expect(await panelCancel({ dir, cleanupMs: 2 }, cancel.deps)).toBe(1);
+  expect(JSON.parse(cancel.stdout().trim()).unresolved).toEqual([`${name}#1`]);
+  expect(await panelCancel({ dir, cleanupMs: 2 }, cancel.deps)).toBe(1);
+  expect(signals).toBe(1);
+});
+
+test("cancel refuses to signal a recycled pid", async () => {
+  const selections: PanelSelections = {
+    panels: { one: [T_CLAUDE] },
+    default: "one",
+  };
+  const prompt = writePrompt("recycled cancel");
+  await panelStart(
+    {
+      promptFile: prompt,
+      slug: "recycled",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    makeDeps({ selections }).deps,
+  );
+  const [name] = memberSlugs() as [string];
+  seedPidfile(name, 88);
+  seedStartfile(name, "ORIGINAL");
+  const cancel = makeDeps({
+    selections,
+    pidAlive: () => true,
+    readStartTime: () => "FOREIGN",
+  });
+  let signalled = false;
+  cancel.deps.terminatePid = () => {
+    signalled = true;
+  };
+  expect(await panelCancel({ dir, cleanupMs: 1 }, cancel.deps)).toBe(0);
+  expect(signalled).toBe(false);
+});
+
+test("a marked panel member cannot reserve a nested panel request", async () => {
+  const marked = makeDeps({ selections: DEFAULT_SELECTIONS });
+  marked.deps.env.KEEPER_PANEL_MEMBER = "parent-request";
+  expect(
+    await panelStart(
+      {
+        promptFile: writePrompt(),
+        slug: "nested",
+        panel: "default",
+        dir,
+        timeoutSeconds: 900,
+      },
+      marked.deps,
+    ),
+  ).toBe(2);
+  expect(marked.spawns).toHaveLength(0);
+  expect(existsSync(join(dir, "manifest.json"))).toBe(false);
+});
+
 // ---- wait ------------------------------------------------------------------
 
 /** Drive start (recording spawn) against the default claude+codex panel, then
@@ -1078,6 +1281,27 @@ test("wait: a dead pid past the startup grace → crash fail (exit 0, ok:false)"
   expect(v.members[1]?.status).toBe("fail");
   expect(v.members[1]?.reason).toContain(
     "exited before producing a result file",
+  );
+});
+
+test("wait: a successful launch missing its pidfile terminalizes after grace", async () => {
+  const launched = makeDeps({ selections: DEFAULT_SELECTIONS, graceMs: 0 });
+  await panelStart(
+    {
+      promptFile: writePrompt(),
+      slug: "missing-pid",
+      panel: "default",
+      dir,
+      timeoutSeconds: 900,
+    },
+    launched.deps,
+  );
+  const waited = makeDeps({ graceMs: 0 });
+  expect(await panelWait({ dir, chunkSeconds: 1 }, waited.deps)).toBe(0);
+  const verdict = JSON.parse(waited.stdout()) as PanelVerdict;
+  expect(verdict.ok).toBe(false);
+  expect(verdict.members[0]?.reason).toBe(
+    "launched but left no pidfile or result",
   );
 });
 
@@ -1262,7 +1486,7 @@ test("wait recycle guard: the start-time probe runs at most ONCE per leg across 
   expect(probeCount).toBe(1); // …but forked the probe just once
 });
 
-test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHES (not left)", async () => {
+test("resume recycle guard: a live recycled pid is explicitly replaced", async () => {
   const selections: PanelSelections = {
     panels: { one: [T_CLAUDE] },
     default: "one",
@@ -1283,7 +1507,7 @@ test("reconcile recycle guard: a live pid with a mismatched start-time RELAUNCHE
     readStartTime: (pid) => (pid === 4242 ? "RECYCLED" : null), // ≠ stored → recycled
   });
   expect(
-    await panelStart(
+    await panelResume(
       {
         promptFile: prompt,
         slug: "one",

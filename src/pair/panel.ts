@@ -8,14 +8,11 @@
  * macOS, where `os.tmpdir()` is a different APFS volume).
  *
  *   - `start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]`
- *     is idempotent-by-slug: it resolves the members in-process and derives the
- *     run's durable dir from the slug (or the `--run-dir` override), then under a
- *     per-slug advisory lock either fans out fresh (copy the prompt in, launch each
- *     member as a DETACHED `keeper agent run` leg writing its own uniform JSON
- *     result envelope via `--output`, persist `<dir>/manifest.json`) or RECONCILES
- *     an existing run — reusing terminal legs, leaving running legs, relaunching
- *     only no-result legs to a new-generation result path. Prints the manifest and
- *     exits 0; a colliding-slug prompt/member mismatch or lock contention exits 2.
+ *     atomically reserves one opaque panel request, persists its immutable argument
+ *     digest and complete attempt skeleton, then spends its single normal fan-out.
+ *     Repeated starts join that request and never launch again. `resume` is the only
+ *     operation that may append a bounded replacement for a positively dead attempt.
+ *     The slug remains display/discovery metadata, never the teardown identity.
  *   - `wait (--slug <slug> | --run-dir <d>) [--chunk <dur>]` re-reads the manifest and
  *     blocks ONE chunk polling each leg's terminality; exit 0 + verdict JSON when
  *     all legs are terminal, exit 124 when the chunk elapses (re-issuable), exit 2
@@ -48,6 +45,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { uptime } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -124,6 +122,10 @@ const STARTED_AT_SENTINEL = "started-at";
  *  renamed here (a same-parent, EXDEV-safe atomic move) before its recursive
  *  removal, so a lock-free reader never observes a half-deleted dir. */
 const PANEL_TRASH_DIR = ".gc";
+/** One normal attempt plus one explicitly requested replacement. */
+export const MAX_PANEL_MEMBER_ATTEMPTS = 2;
+/** Bounded cancellation cleanup window. */
+const DEFAULT_CANCEL_CLEANUP_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -164,6 +166,25 @@ export interface PanelMember {
  *  ms stamp taken right after a successful spawn (null in the pre-spawn skeleton and
  *  for a spawn-throw leg), so a crash mid-fan-out is reconstructable by a resuming
  *  driver. Optional so a pre-durable-format manifest still parses. */
+export type PanelAttemptState =
+  | "reserved"
+  | "running"
+  | "launch_failed"
+  | "lost"
+  | "cancelled"
+  | "cleanup_failed";
+
+/** One durably registered launch attempt. Attempts are append-only; the member's
+ * legacy path fields mirror the newest entry for compatible inspection. */
+export interface PanelMemberAttempt {
+  attempt: number;
+  yaml: string;
+  pidfile: string | null;
+  startfile: string | null;
+  launched_at: number | null;
+  state: PanelAttemptState;
+}
+
 export interface PanelManifestMember {
   name: string;
   harness: string;
@@ -171,6 +192,8 @@ export interface PanelManifestMember {
   pidfile: string | null;
   startfile?: string | null;
   launched_at?: number | null;
+  attempts?: PanelMemberAttempt[];
+  spec?: PanelMember;
 }
 
 /** The `start`-persisted, `wait`-re-read manifest. `slug` is the run's
@@ -182,9 +205,25 @@ export interface PanelManifestMember {
  *  rounds — the skeleton is
  *  generation 1; a future reconcile bumps it. Both optional so a pre-durable
  *  manifest still parses. */
+export type PanelRequestState =
+  | "reserved"
+  | "starting"
+  | "running"
+  | "cancelling"
+  | "cancelled"
+  | "completed"
+  | "failed"
+  | "cleanup_failed";
+
 export interface PanelManifest {
   dir: string;
   slug: string;
+  request_id?: string;
+  argument_digest?: string;
+  state?: PanelRequestState;
+  normal_fanout_started?: boolean;
+  cancellation_requested_at?: number | null;
+  unresolved_cleanup?: string[];
   boot_epoch_ms?: number;
   generation?: number;
   members: PanelManifestMember[];
@@ -229,6 +268,9 @@ export interface PanelStatusMember {
 export interface PanelStatus {
   dir: string;
   slug: string;
+  request_id?: string;
+  argument_digest?: string;
+  state: PanelRequestState;
   generation: number;
   all_terminal: boolean;
   members: PanelStatusMember[];
@@ -302,12 +344,15 @@ export interface PanelDeps {
   pollIntervalMs?: number;
   /** Pid-death grace override (tests); defaults to {@link PID_STARTUP_GRACE_MS}. */
   graceMs?: number;
+  /** Opaque panel request identity source. */
+  randomUuid?: () => string;
+  /** Exact, injected process signal seam used only after pid + start-time match. */
+  terminatePid?: (pid: number) => void;
 }
 
 /** Discriminated member-resolution result. */
 export type ResolveMembersResult =
-  | { ok: true; members: PanelMember[] }
-  | { ok: false; error: string };
+  { ok: true; members: PanelMember[] } | { ok: false; error: string };
 
 // ---------------------------------------------------------------------------
 // Member resolution (mirrors src/agent/main.ts runPresetsResolve)
@@ -838,13 +883,21 @@ function evaluateLeg(
       reason: "leg failed to launch (no process spawned)",
     };
   }
-  if (probe.pid !== null && !probe.pidAlive) {
-    const graceMs = deps.graceMs ?? PID_STARTUP_GRACE_MS;
-    if (deps.now() - waitStartMs >= graceMs) {
+  const graceMs = deps.graceMs ?? PID_STARTUP_GRACE_MS;
+  const graceAnchor = member.launched_at ?? waitStartMs;
+  if (deps.now() - graceAnchor >= graceMs) {
+    if (probe.pid !== null && !probe.pidAlive) {
       return {
         status: "fail",
         yaml: null,
         reason: `leg process ${probe.pid} exited before producing a result file`,
+      };
+    }
+    if (probe.pid === null) {
+      return {
+        status: "fail",
+        yaml: null,
+        reason: "launched but left no pidfile or result",
       };
     }
   }
@@ -934,6 +987,54 @@ function classifyLegStatus(
 // Manifest parse
 // ---------------------------------------------------------------------------
 
+/** Immutable digest of every launch-affecting panel request argument. */
+export function panelArgumentDigest(args: {
+  slug: string;
+  prompt: string;
+  timeoutSeconds: number;
+  members: readonly PanelMember[];
+}): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        schema: 1,
+        slug: args.slug,
+        prompt: args.prompt,
+        timeout_seconds: args.timeoutSeconds,
+        members: args.members,
+      }),
+    )
+    .digest("hex");
+}
+
+function currentAttempt(member: PanelManifestMember): PanelMemberAttempt {
+  const existing = member.attempts?.at(-1);
+  if (existing !== undefined) return existing;
+  return {
+    attempt: 1,
+    yaml: member.yaml,
+    pidfile: member.pidfile,
+    startfile: member.startfile ?? null,
+    launched_at: member.launched_at ?? null,
+    state:
+      member.pidfile === null
+        ? "launch_failed"
+        : member.launched_at === null
+          ? "reserved"
+          : "running",
+  };
+}
+
+function syncMemberFromAttempt(
+  member: PanelManifestMember,
+  attempt: PanelMemberAttempt,
+): void {
+  member.yaml = attempt.yaml;
+  member.pidfile = attempt.pidfile;
+  member.startfile = attempt.startfile;
+  member.launched_at = attempt.launched_at;
+}
+
 /** Validate a parsed manifest object's shape. Pure. */
 export function parseManifest(
   raw: unknown,
@@ -952,7 +1053,7 @@ export function parseManifest(
   // corrupt), tolerated when absent (a pre-durable-format manifest). A missing
   // boot-epoch is preserved as `undefined` (NEVER coerced to 0) so `wait`'s reboot
   // guard can fail OPEN on a pre-durable manifest instead of reading 0 as a
-  // reboot; `start` still treats absent as a relaunch via its own `?? 0`.
+  // reboot; explicit resume treats absent as process-loss evidence via `?? 0`.
   if (
     obj.boot_epoch_ms !== undefined &&
     typeof obj.boot_epoch_ms !== "number"
@@ -993,6 +1094,37 @@ export function parseManifest(
     ) {
       return { ok: false, error: "manifest member launched_at is malformed" };
     }
+    let attempts: PanelMemberAttempt[] | undefined;
+    if (mm.attempts !== undefined) {
+      if (!Array.isArray(mm.attempts)) {
+        return { ok: false, error: "manifest member attempts is malformed" };
+      }
+      attempts = [];
+      for (const rawAttempt of mm.attempts) {
+        if (rawAttempt === null || typeof rawAttempt !== "object") {
+          return { ok: false, error: "manifest member attempt is malformed" };
+        }
+        const a = rawAttempt as Record<string, unknown>;
+        if (
+          typeof a.attempt !== "number" ||
+          typeof a.yaml !== "string" ||
+          !(a.pidfile === null || typeof a.pidfile === "string") ||
+          !(a.startfile === null || typeof a.startfile === "string") ||
+          !(a.launched_at === null || typeof a.launched_at === "number") ||
+          ![
+            "reserved",
+            "running",
+            "launch_failed",
+            "lost",
+            "cancelled",
+            "cleanup_failed",
+          ].includes(String(a.state))
+        ) {
+          return { ok: false, error: "manifest member attempt is malformed" };
+        }
+        attempts.push(a as unknown as PanelMemberAttempt);
+      }
+    }
     members.push({
       name: mm.name,
       harness: mm.harness,
@@ -1000,6 +1132,11 @@ export function parseManifest(
       pidfile: mm.pidfile,
       startfile: typeof mm.startfile === "string" ? mm.startfile : null,
       launched_at: typeof mm.launched_at === "number" ? mm.launched_at : null,
+      attempts,
+      spec:
+        mm.spec !== null && typeof mm.spec === "object"
+          ? (mm.spec as unknown as PanelMember)
+          : undefined,
     });
   }
   return {
@@ -1007,6 +1144,29 @@ export function parseManifest(
     manifest: {
       dir: obj.dir,
       slug: obj.slug,
+      request_id:
+        typeof obj.request_id === "string" ? obj.request_id : undefined,
+      argument_digest:
+        typeof obj.argument_digest === "string"
+          ? obj.argument_digest
+          : undefined,
+      state:
+        typeof obj.state === "string"
+          ? (obj.state as PanelRequestState)
+          : undefined,
+      normal_fanout_started:
+        typeof obj.normal_fanout_started === "boolean"
+          ? obj.normal_fanout_started
+          : undefined,
+      cancellation_requested_at:
+        typeof obj.cancellation_requested_at === "number"
+          ? obj.cancellation_requested_at
+          : null,
+      unresolved_cleanup: Array.isArray(obj.unresolved_cleanup)
+        ? obj.unresolved_cleanup.filter(
+            (v): v is string => typeof v === "string",
+          )
+        : undefined,
       boot_epoch_ms:
         typeof obj.boot_epoch_ms === "number" ? obj.boot_epoch_ms : undefined,
       generation: typeof obj.generation === "number" ? obj.generation : 1,
@@ -1091,27 +1251,25 @@ export interface PanelStartArgs {
 }
 
 /**
- * `start` — idempotent-by-slug. Resolve members → derive the run's durable dir
- * (the deterministic slug-keyed `~/.local/state/keeper/panels/<slug>/`, or the
- * `--run-dir` location override) → mkdir 0700 → acquire the per-slug advisory lock
- * (non-blocking; contention fails fast exit 2, never blocks the caller's single
- * Bash call). With the lock held, either FRESH-START (no prior manifest: copy the
- * prompt in, write the SKELETON — members + boot-epoch + generation 1 — BEFORE the
- * spawn loop, launch every leg DETACHED) or RECONCILE an existing run: an identity
- * guard (byte-exact prompt + same member set, else exit 2) refuses a colliding-slug
- * merge, then per leg REUSE a terminal result (ANY outcome — resume is not retry),
- * LEAVE a running leg, or RELAUNCH a no-result / rebooted leg to a new-generation
- * result path. Re-stamp the boot-epoch + bump the generation whenever a leg
- * relaunches; each manifest write is atomic (temp-then-rename) so lock-free readers
- * never see a torn file. Print the manifest, exit 0. Returns the process exit code
- * (0 on success, 2 on a fault). Every entry's `launched_at` is stamped post-spawn;
- * a spawn throw records a null pidfile (the N-of-N launch-failed signal `wait`
- * reads).
+ * Reserve and launch one panel request under its nonblocking directory lock. The
+ * manifest skeleton (opaque run identity, immutable argument digest, request state,
+ * and attempt registry) is atomic and durable before the first child. Normal start
+ * spends one fan-out budget; later starts only reconcile identity and join. Explicit
+ * resume may append one bounded replacement for a positively dead nonterminal
+ * attempt. Every successful spawn stamps its attempt; a spawn throw records the
+ * terminal launch-failed shape. Returns 0 on success and 2 on refusal/fault.
  */
-export async function panelStart(
+async function panelLaunch(
   args: PanelStartArgs,
   deps: PanelDeps,
+  mode: "start" | "resume",
 ): Promise<number> {
+  if (deps.env.KEEPER_PANEL_MEMBER !== undefined) {
+    deps.writeErr(
+      `pair panel ${mode}: a panel member cannot admit another panel request\n`,
+    );
+    return 2;
+  }
   let config: PanelConfig;
   try {
     config = deps.loadRegistry();
@@ -1151,6 +1309,13 @@ export async function panelStart(
     );
     return 2;
   }
+
+  const argumentDigest = panelArgumentDigest({
+    slug: args.slug,
+    prompt: promptText,
+    timeoutSeconds: args.timeoutSeconds,
+    members: resolved.members,
+  });
 
   // Derive the run's dir. `--run-dir` is a location override; without it the run
   // lives at the deterministic, slug-keyed durable path (0700) so a restarted driver
@@ -1199,8 +1364,7 @@ export async function panelStart(
     const graceMs = deps.graceMs ?? PID_STARTUP_GRACE_MS;
 
     let manifest: PanelManifest;
-    // The legs to (re)launch this call — every member on a fresh start, only the
-    // relaunched ones on a reconcile.
+    // Every member on fresh start, or bounded replacements on explicit resume.
     const launchTasks: {
       member: PanelMember;
       entry: PanelManifestMember;
@@ -1208,6 +1372,12 @@ export async function panelStart(
     }[] = [];
 
     if (!existsSync(manifestPath)) {
+      if (mode === "resume") {
+        deps.writeErr(
+          `pair panel resume: no reserved panel request at ${dir}\n`,
+        );
+        return 2;
+      }
       // FRESH START — no prior run for this slug. A human-readable copy of the
       // prompt (the leg receives the text inline; agent run takes a positional, not
       // a file), then the skeleton (member set + boot-epoch + generation 1)
@@ -1219,19 +1389,38 @@ export async function panelStart(
       // fresh start — a reconcile never rewrites it, so it stays the run's original
       // start instant even across relaunch generations.
       writeFileAtomic(dir, join(dir, STARTED_AT_SENTINEL), `${deps.now()}\n`);
+      const requestId = (deps.randomUuid ?? randomUUID)();
       manifest = {
         dir,
         slug: args.slug,
+        request_id: requestId,
+        argument_digest: argumentDigest,
+        state: "starting",
+        normal_fanout_started: true,
+        cancellation_requested_at: null,
         boot_epoch_ms: currentBootEpochMs,
         generation: 1,
-        members: resolved.members.map((member) => ({
-          name: member.name,
-          harness: member.harness,
-          yaml: join(dir, `${legBaseName(member.name, 1)}.yaml`),
-          pidfile: join(dir, `${legBaseName(member.name, 1)}.pidfile`),
-          startfile: join(dir, `${legBaseName(member.name, 1)}.starttime`),
-          launched_at: null,
-        })),
+        members: resolved.members.map((member) => {
+          const base = legBaseName(member.name, 1);
+          const attempt: PanelMemberAttempt = {
+            attempt: 1,
+            yaml: join(dir, `${base}.yaml`),
+            pidfile: join(dir, `${base}.pidfile`),
+            startfile: join(dir, `${base}.starttime`),
+            launched_at: null,
+            state: "reserved",
+          };
+          return {
+            name: member.name,
+            harness: member.harness,
+            yaml: attempt.yaml,
+            pidfile: attempt.pidfile,
+            startfile: attempt.startfile,
+            launched_at: null,
+            attempts: [attempt],
+            spec: member,
+          };
+        }),
       };
       resolved.members.forEach((member, i) => {
         launchTasks.push({
@@ -1241,9 +1430,8 @@ export async function panelStart(
         });
       });
     } else {
-      // RECONCILE — a prior run for this slug exists. Re-issuing the same start
-      // reuses terminal legs, leaves running legs, and relaunches only no-result
-      // legs; it never blindly re-fans-out.
+      // RECONCILE — normal start only joins the reservation. Replacement attempts
+      // are exclusively minted by the explicit, bounded resume operation.
       let raw: unknown;
       try {
         raw = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -1261,7 +1449,16 @@ export async function panelStart(
         return 2;
       }
       const existing = parsed.manifest;
-
+      if (
+        existing.state === "cancelling" ||
+        existing.state === "cancelled" ||
+        existing.state === "cleanup_failed"
+      ) {
+        deps.writeErr(
+          `pair panel ${mode}: panel request ${existing.request_id ?? existing.slug} is cancellation-tombstoned\n`,
+        );
+        return 2;
+      }
       // Identity guard — a colliding slug must never silently merge into another
       // run. The stored prompt must be byte-exact AND the resolved member set must
       // match; either mismatch is a different run → exit 2.
@@ -1286,52 +1483,58 @@ export async function panelStart(
         );
         return 2;
       }
-
-      // A boot mismatch means the machine rebooted since launch → every recorded
-      // pid is a dead pre-reboot process, so every non-terminal leg relaunches.
-      const bootMismatch =
-        Math.abs(currentBootEpochMs - (existing.boot_epoch_ms ?? 0)) >
-        BOOT_EPOCH_TOLERANCE_MS;
-      const priorByName = new Map(existing.members.map((m) => [m.name, m]));
-      const newGeneration = (existing.generation ?? 1) + 1;
-      let relaunched = false;
-      const members: PanelManifestMember[] = [];
-      for (const member of resolved.members) {
-        // Guaranteed present — the member-set guard above passed.
-        const prior = priorByName.get(member.name) as PanelManifestMember;
-        const action = reconcileLeg(prior, deps, { bootMismatch, graceMs });
-        if (action === "reuse" || action === "leave") {
-          members.push(prior);
-          continue;
-        }
-        // RELAUNCH to a fresh per-generation result PATH so a still-writing prior
-        // leg (a pid-recycle / grace race) and its successor never collide on a
-        // path — the live winner is authoritative, so the presumed-dead leg is
-        // never SIGTERM'd.
-        relaunched = true;
-        const base = legBaseName(member.name, newGeneration);
-        const entry: PanelManifestMember = {
-          name: member.name,
-          harness: member.harness,
-          yaml: join(dir, `${base}.yaml`),
-          pidfile: join(dir, `${base}.pidfile`),
-          startfile: join(dir, `${base}.starttime`),
-          launched_at: null,
-        };
-        members.push(entry);
-        launchTasks.push({ member, entry, logPath: join(dir, `${base}.log`) });
+      if (
+        existing.argument_digest !== undefined &&
+        existing.argument_digest !== argumentDigest
+      ) {
+        deps.writeErr(
+          `pair panel ${mode}: argument digest mismatch for panel request ${existing.request_id ?? existing.slug}\n`,
+        );
+        return 2;
       }
-      manifest = {
-        dir,
-        slug: args.slug,
-        // Re-stamp the boot-epoch + bump the generation only when a leg actually
-        // relaunched; a pure reuse/leave reconcile leaves the run's identity intact.
-        boot_epoch_ms: relaunched
-          ? currentBootEpochMs
-          : (existing.boot_epoch_ms ?? currentBootEpochMs),
-        generation: relaunched ? newGeneration : (existing.generation ?? 1),
-        members,
-      };
+
+      manifest = existing;
+      if (mode === "resume") {
+        const bootMismatch =
+          Math.abs(currentBootEpochMs - (existing.boot_epoch_ms ?? 0)) >
+          BOOT_EPOCH_TOLERANCE_MS;
+        const newGeneration = (existing.generation ?? 1) + 1;
+        let relaunched = false;
+        for (const member of manifest.members) {
+          const action = reconcileLeg(member, deps, { bootMismatch, graceMs });
+          if (action !== "relaunch") continue;
+          const attempts = member.attempts ?? [currentAttempt(member)];
+          member.attempts = attempts;
+          if (attempts.length >= MAX_PANEL_MEMBER_ATTEMPTS) {
+            continue;
+          }
+          attempts[attempts.length - 1]!.state = "lost";
+          const base = legBaseName(member.name, newGeneration);
+          const attempt: PanelMemberAttempt = {
+            attempt: attempts.length + 1,
+            yaml: join(dir, `${base}.yaml`),
+            pidfile: join(dir, `${base}.pidfile`),
+            startfile: join(dir, `${base}.starttime`),
+            launched_at: null,
+            state: "reserved",
+          };
+          attempts.push(attempt);
+          syncMemberFromAttempt(member, attempt);
+          relaunched = true;
+          launchTasks.push({
+            member:
+              member.spec ??
+              resolved.members.find((m) => m.name === member.name)!,
+            entry: member,
+            logPath: join(dir, `${base}.log`),
+          });
+        }
+        if (relaunched) {
+          manifest.generation = newGeneration;
+          manifest.boot_epoch_ms = currentBootEpochMs;
+          manifest.state = "starting";
+        }
+      }
     }
 
     const persistManifest = (): void => {
@@ -1365,6 +1568,7 @@ export async function panelStart(
         deps.spawn(buildDetachWrapperArgv(legArgv), {
           env: {
             ...deps.env,
+            KEEPER_PANEL_MEMBER: manifest.request_id ?? args.slug,
             LOG: logPath,
             PIDFILE: pidfilePath,
             STARTFILE: startfilePath,
@@ -1372,18 +1576,211 @@ export async function panelStart(
           cwd: deps.cwd,
         });
         entry.launched_at = deps.now();
+        const attempt = currentAttempt(entry);
+        attempt.launched_at = entry.launched_at;
+        attempt.state = "running";
       } catch {
         // Spawn threw → the leg never started. Null the pidfile (the launch-failed
         // signal `wait` surfaces as an N-of-N fail) + the startfile; launched_at
         // stays null.
         entry.pidfile = null;
         entry.startfile = null;
+        const attempt = currentAttempt(entry);
+        attempt.pidfile = null;
+        attempt.startfile = null;
+        attempt.state = "launch_failed";
       }
       persistManifest();
     }
 
+    if (manifest.state === "starting") {
+      manifest.state = "running";
+      persistManifest();
+    }
     deps.write(`${JSON.stringify(manifest)}\n`);
     return 0;
+  } finally {
+    lock.release();
+  }
+}
+
+/** Atomically reserve/start a panel request. Repeated calls only join it. */
+export function panelStart(
+  args: PanelStartArgs,
+  deps: PanelDeps,
+): Promise<number> {
+  return panelLaunch(args, deps, "start");
+}
+
+/** Explicitly mint at most one replacement for each positively dead attempt. */
+export function panelResume(
+  args: PanelStartArgs,
+  deps: PanelDeps,
+): Promise<number> {
+  return panelLaunch(args, deps, "resume");
+}
+
+export interface PanelCancelArgs {
+  dir: string;
+  cleanupMs?: number;
+}
+
+export interface PanelCancelResult {
+  dir: string;
+  request_id: string;
+  state: "cancelled" | "cleanup_failed";
+  unresolved: string[];
+}
+
+/**
+ * Persist the cancellation tombstone before signalling any exact registered
+ * process identity. The bounded cleanup pass reports every still-live attempt.
+ */
+export async function panelCancel(
+  args: PanelCancelArgs,
+  deps: PanelDeps,
+): Promise<number> {
+  const manifestPath = join(args.dir, "manifest.json");
+  const lock =
+    deps.lock?.(join(args.dir, ".lock")) ??
+    (deps.lock === undefined ? { release: (): void => {} } : null);
+  if (lock === null) {
+    deps.writeErr(`pair panel cancel: panel request is locked (${args.dir})\n`);
+    return 2;
+  }
+  try {
+    let parsed: ReturnType<typeof parseManifest>;
+    try {
+      parsed = parseManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
+    } catch (err) {
+      deps.writeErr(
+        `pair panel cancel: cannot read manifest: ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
+    if (!parsed.ok) {
+      deps.writeErr(`pair panel cancel: corrupt manifest: ${parsed.error}\n`);
+      return 2;
+    }
+    const manifest = parsed.manifest;
+    if (
+      (manifest.state === "cancelled" || manifest.state === "cleanup_failed") &&
+      manifest.request_id !== undefined
+    ) {
+      const unresolved = manifest.unresolved_cleanup ?? [];
+      deps.write(
+        `${JSON.stringify({ dir: manifest.dir, request_id: manifest.request_id, state: manifest.state, unresolved })}\n`,
+      );
+      return manifest.state === "cancelled" ? 0 : 1;
+    }
+    manifest.state = "cancelling";
+    manifest.cancellation_requested_at ??= deps.now();
+    writeFileAtomic(
+      args.dir,
+      manifestPath,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+    );
+
+    const targets: {
+      id: string;
+      member: PanelManifestMember;
+      attempt: PanelMemberAttempt;
+    }[] = [];
+    for (const member of manifest.members) {
+      const attempts = member.attempts ?? [currentAttempt(member)];
+      member.attempts = attempts;
+      for (const attempt of attempts) {
+        if (
+          existsSync(attempt.yaml) ||
+          attempt.state === "launch_failed" ||
+          attempt.state === "lost"
+        ) {
+          continue;
+        }
+        targets.push({
+          id: `${member.name}#${attempt.attempt}`,
+          member,
+          attempt,
+        });
+      }
+    }
+
+    const deadline = deps.now() + (args.cleanupMs ?? DEFAULT_CANCEL_CLEANUP_MS);
+    const unresolved = new Set<string>();
+    const signalled = new Set<string>();
+    const ownedLivePid = (target: (typeof targets)[number]): number | null => {
+      const pid =
+        target.attempt.pidfile === null
+          ? null
+          : readPid(target.attempt.pidfile);
+      if (pid === null || !deps.pidAlive(pid)) return null;
+      const view: PanelManifestMember = {
+        ...target.member,
+        yaml: target.attempt.yaml,
+        pidfile: target.attempt.pidfile,
+        startfile: target.attempt.startfile,
+        launched_at: target.attempt.launched_at,
+      };
+      return legIdentityHolds(view, pid, deps) ? pid : null;
+    };
+
+    for (;;) {
+      let awaitingCleanup = false;
+      for (const target of targets) {
+        if (unresolved.has(target.id)) continue;
+        const pid = ownedLivePid(target);
+        if (pid === null) {
+          const pidMissing =
+            target.attempt.pidfile !== null &&
+            readPid(target.attempt.pidfile) === null &&
+            target.attempt.launched_at !== null;
+          if (pidMissing && deps.now() < deadline) awaitingCleanup = true;
+          else target.attempt.state = "cancelled";
+          continue;
+        }
+        awaitingCleanup = true;
+        if (!signalled.has(target.id)) {
+          try {
+            (
+              deps.terminatePid ??
+              ((ownedPid: number) => process.kill(ownedPid, "SIGTERM"))
+            )(pid);
+            signalled.add(target.id);
+          } catch {
+            unresolved.add(target.id);
+          }
+        }
+      }
+      if (!awaitingCleanup || deps.now() >= deadline) break;
+      await deps.sleep(
+        Math.min(deps.pollIntervalMs ?? 50, Math.max(1, deadline - deps.now())),
+      );
+    }
+    for (const target of targets) {
+      if (ownedLivePid(target) !== null || unresolved.has(target.id)) {
+        unresolved.add(target.id);
+        target.attempt.state = "cleanup_failed";
+      }
+    }
+    const unresolvedList = [...unresolved].sort();
+    manifest.state =
+      unresolvedList.length === 0 ? "cancelled" : "cleanup_failed";
+    manifest.unresolved_cleanup = unresolvedList;
+    for (const member of manifest.members)
+      syncMemberFromAttempt(member, currentAttempt(member));
+    writeFileAtomic(
+      args.dir,
+      manifestPath,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+    );
+    const result: PanelCancelResult = {
+      dir: manifest.dir,
+      request_id: manifest.request_id ?? manifest.slug,
+      state: manifest.state,
+      unresolved: unresolvedList,
+    };
+    deps.write(`${JSON.stringify(result)}\n`);
+    return unresolvedList.length === 0 ? 0 : 1;
   } finally {
     lock.release();
   }
@@ -1408,7 +1805,7 @@ export interface PanelWaitArgs {
  * `boot_epoch_ms` beyond {@link BOOT_EPOCH_TOLERANCE_MS}, classify every
  * non-terminal leg as terminal-failed with a distinct `machine-rebooted` reason
  * and return promptly (exit 0, `ok:false`) rather than spin to 124 — the driver's
- * cue to re-issue `start` (idempotent reconcile relaunches the legs) then `wait`
+ * cue to issue explicit `resume` under the same request identity, then `wait`
  * again. An ABSENT `boot_epoch_ms` (pre-durable manifest) fails OPEN — no guard, no
  * boot derivation. STRICTLY read-only: zero manifest writes, zero relaunches.
  */
@@ -1445,6 +1842,26 @@ export async function panelWait(
     return 2;
   }
   const { dir, members } = parsed.manifest;
+  if (
+    parsed.manifest.state === "cancelling" ||
+    parsed.manifest.state === "cancelled" ||
+    parsed.manifest.state === "cleanup_failed"
+  ) {
+    const reason =
+      parsed.manifest.state === "cleanup_failed"
+        ? "cleanup_failed"
+        : "cancelled";
+    deps.write(
+      `${JSON.stringify(
+        buildVerdict(
+          dir,
+          members,
+          members.map(() => ({ status: "fail" as const, yaml: null, reason })),
+        ),
+      )}\n`,
+    );
+    return 0;
+  }
 
   const chunkMs = args.chunkSeconds * 1000;
   const waitStartMs = deps.now();
@@ -1538,11 +1955,26 @@ export function panelStatus(args: PanelStatusArgs, deps: PanelDeps): number {
       reason: c.reason,
     };
   });
+  const allTerminal = out.every((m) => m.status !== "running");
+  const storedState = parsed.manifest.state ?? "running";
+  const state: PanelRequestState =
+    storedState === "cancelling" ||
+    storedState === "cancelled" ||
+    storedState === "cleanup_failed"
+      ? storedState
+      : allTerminal
+        ? out.every((m) => m.status === "completed")
+          ? "completed"
+          : "failed"
+        : storedState;
   const snapshot: PanelStatus = {
     dir,
     slug,
+    request_id: parsed.manifest.request_id,
+    argument_digest: parsed.manifest.argument_digest,
+    state,
     generation: generation ?? 1,
-    all_terminal: out.every((m) => m.status !== "running"),
+    all_terminal: allTerminal,
     members: out,
   };
   deps.write(`${JSON.stringify(snapshot)}\n`);
@@ -1766,35 +2198,36 @@ export function buildPanelDeps(): PanelDeps {
   };
 }
 
-export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | wait | status | prune)
+export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start | resume | wait | status | cancel | prune)
 
 Usage:
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]
+  keeper agent panel resume <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]
   keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|codex|pi>)
        [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--run-dir <d>] [--timeout <dur>]
   keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <dur>]
   keeper agent panel status (--slug <slug> | --run-dir <d>)
+  keeper agent panel cancel (--slug <slug> | --run-dir <d>)
   keeper agent panel prune
 
-start  idempotent-by-slug. Resolves the panel members (a panel.yaml panel or a
-       single launch triple; an absent/empty --slug, or a missing/invalid catalog
-       or panel.yaml, is fail-loud exit 2), derives the run's DURABLE dir from the
-       slug (~/.local/state/keeper/panels/<slug>/, 0700 — or the --run-dir override),
-       and under a per-slug advisory lock either fans out fresh (launch each member
-       as a DETACHED read-only \`keeper agent run\` leg named \`panel::<slug>::<member>\`
-       in the 'panels' session) or RECONCILES an existing run — reuse terminal legs
-       (completed OR failed; resume is not retry), leave running legs, relaunch only
-       no-result legs. Prints the manifest, exits 0. A colliding-slug prompt/member
-       mismatch or lock contention exits 2. An ad-hoc --preset/--cli builds a
-       1-member panel (pairing = a panel of one); --panel and --preset/--cli are
+start  atomically reserves one opaque panel request and immutable argument digest,
+       persists every member attempt before launch, and spends one normal fan-out.
+       Repeated starts join without relaunching. The display slug locates the durable
+       directory but is never the teardown identity. Explicit resume alone may add
+       one bounded replacement for a positively dead attempt. An ad-hoc
+       --preset/--cli builds a 1-member panel; --panel and --preset/--cli are
        mutually exclusive.
+resume verifies the original request digest and may replace positively dead
+       nonterminal attempts without changing the run identity.
+cancel writes its tombstone before identity-checked signalling, waits a bounded
+       cleanup window, and reports exact unresolved member-attempt identities.
 wait   re-reads the manifest (by --slug or --run-dir) and blocks ONE --chunk window
        polling each leg. Exit 0 + verdict JSON {dir, ok, members:[…]} when all legs
        are terminal; exit 124 when the chunk elapses (re-issue it); exit 2 on a
        missing/corrupt manifest (an unknown/pruned slug) or bad flags. Exit 0 means
        ALL-TERMINAL, not all-success — key off the verdict's 'ok' flag.
-status read-only, non-blocking per-leg snapshot {dir, slug, generation,
-       all_terminal, members:[{name,harness,status,yaml,reason}]} where status is
+status read-only, non-blocking per-leg snapshot {dir, slug, request_id, state,
+       generation, all_terminal, members:[{name,harness,status,yaml,reason}]} where status is
        completed|running|failed|absent (a dead no-result leg reads failed/absent,
        never a phantom 'running'). Exit 0; exit 2 on a missing/corrupt manifest.
 prune  GC abandoned run dirs under ~/.local/state/keeper/panels/. Reclaims a slug
@@ -1877,17 +2310,24 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.stdout.write(PANEL_HELP);
     process.exit(op === undefined ? 2 : 0);
   }
-  if (op !== "start" && op !== "wait" && op !== "status" && op !== "prune") {
+  if (
+    op !== "start" &&
+    op !== "resume" &&
+    op !== "wait" &&
+    op !== "status" &&
+    op !== "cancel" &&
+    op !== "prune"
+  ) {
     process.stderr.write(
-      `pair panel: unknown operation '${op}' (expected 'start', 'wait', 'status', or 'prune')\n`,
+      `pair panel: unknown operation '${op}' (expected 'start', 'resume', 'wait', 'status', 'cancel', or 'prune')\n`,
     );
     process.exit(2);
   }
 
   const deps = buildPanelDeps();
 
-  if (op === "start") {
-    const parsed = parsePanelArgs("start", () =>
+  if (op === "start" || op === "resume") {
+    const parsed = parsePanelArgs(op, () =>
       parseArgs({
         args: argv.slice(1),
         options: {
@@ -1996,7 +2436,7 @@ export async function runPanel(argv: string[]): Promise<void> {
       };
     }
 
-    const code = await panelStart(
+    const code = await (op === "resume" ? panelResume : panelStart)(
       {
         promptFile,
         slug,
@@ -2025,8 +2465,8 @@ export async function runPanel(argv: string[]): Promise<void> {
     process.exit(panelPrune({}, deps));
   }
 
-  if (op === "status") {
-    const parsed = parsePanelArgs("status", () =>
+  if (op === "status" || op === "cancel") {
+    const parsed = parsePanelArgs(op, () =>
       parseArgs({
         args: argv.slice(1),
         options: {
@@ -2043,8 +2483,11 @@ export async function runPanel(argv: string[]): Promise<void> {
     }
     const resolved = resolvePanelDir(parsed.values);
     if (!resolved.ok) {
-      process.stderr.write(`pair panel status: ${resolved.msg}\n`);
+      process.stderr.write(`pair panel ${op}: ${resolved.msg}\n`);
       process.exit(2);
+    }
+    if (op === "cancel") {
+      process.exit(await panelCancel({ dir: resolved.dir }, deps));
     }
     process.exit(panelStatus({ dir: resolved.dir }, deps));
   }
