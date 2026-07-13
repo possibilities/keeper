@@ -56,6 +56,7 @@ import {
 import { piExtensionArgs, piExtensionPath } from "../src/agent/launch-config";
 import { parseEventLogLine } from "../src/dead-letter";
 import { slugify as canonicalSlugify } from "../src/slug";
+import { retryUntil } from "./helpers/retry-until";
 
 const META: PiTranslateMeta = {
   jobId: "job-1111-2222",
@@ -1006,6 +1007,7 @@ function fakeRenameCtx(overrides?: {
   sessionManager?: FakeSessionManager;
   cwd?: string;
   ui?: ReturnType<typeof fakeUi>;
+  isIdle?: () => boolean;
 }): RenameCommandContext {
   const sessionManager =
     overrides?.sessionManager ??
@@ -1018,6 +1020,7 @@ function fakeRenameCtx(overrides?: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "key-123" }),
     },
     ui: overrides?.ui ?? fakeUi(),
+    isIdle: overrides?.isIdle ?? (() => true),
   };
 }
 
@@ -1325,10 +1328,13 @@ describe("createRenameCommandHandler", () => {
     );
     await handler("", ctx);
     expect(calls).toEqual(["add-dark-mode"]);
+    expect(ui.calls[0]?.message).toBe(
+      "/rename: generating a session title…",
+    );
     expect(ui.calls.at(-1)?.message).toBe("Session renamed: add-dark-mode");
   });
 
-  test("never calls setSessionName on a non-success outcome", async () => {
+  test("an empty turn remains pending after the initial generating notice", async () => {
     const calls: string[] = [];
     const pi = { setSessionName: (name: string) => calls.push(name) };
     const ui = fakeUi();
@@ -1346,7 +1352,89 @@ describe("createRenameCommandHandler", () => {
     );
     await handler("", ctx);
     expect(calls).toEqual([]);
-    expect(ui.calls.at(-1)?.message).toBe(renameFeedback("empty").message);
+    expect(ui.calls).toEqual([
+      { message: "/rename: generating a session title…", level: "info" },
+    ]);
+  });
+
+  test("an active turn waits without reading the transcript", async () => {
+    const idle = false;
+    let reads = 0;
+    const calls: string[] = [];
+    const ui = fakeUi();
+    const ctx = fakeRenameCtx({ ui, isIdle: () => idle });
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => calls.push(name) },
+      fakeRenameDeps({
+        runTurnCli: async () => {
+          reads += 1;
+          return {
+            stdout: turnEnvelopeStdout({
+              prompt: "settled request",
+              response: "done",
+            }),
+            stderr: "",
+          };
+        },
+      }),
+      createRenameInvocationState(),
+    );
+
+    await handler("", ctx);
+    expect(reads).toBe(0);
+    expect(calls).toEqual([]);
+    expect(ui.calls).toHaveLength(1);
+  });
+
+  test("a leaf change during inference retries the settled latest leaf", async () => {
+    const sm = fakeSessionManager({
+      sessionId: "sess-a",
+      leaf: "leaf-1",
+      title: undefined,
+    });
+    const calls: string[] = [];
+    let completions = 0;
+    const ctx = fakeRenameCtx({ sessionManager: sm });
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => calls.push(name) },
+      fakeRenameDeps({
+        runCompletion: async () => {
+          completions += 1;
+          if (completions === 1) sm.setLeafId("leaf-2");
+          return {
+            stopReason: "stop",
+            content: [{ type: "text", text: `Title ${completions}` }],
+          };
+        },
+      }),
+      createRenameInvocationState(),
+    );
+
+    await handler("", ctx);
+    expect(completions).toBe(2);
+    expect(calls).toEqual(["title-2"]);
+  });
+
+  test("retries transient transcript read failures before one terminal error", async () => {
+    let reads = 0;
+    const ui = fakeUi();
+    const handler = createRenameCommandHandler(
+      { setSessionName: () => {} },
+      fakeRenameDeps({
+        runTurnCli: async () => {
+          reads += 1;
+          return { stdout: "not-json", stderr: "" };
+        },
+      }),
+      createRenameInvocationState(),
+    );
+
+    await handler("", fakeRenameCtx({ ui }));
+    expect(reads).toBe(3);
+    expect(ui.calls.map((call) => call.message)).toEqual([
+      "/rename: generating a session title…",
+      renameFeedback("read_failed").message,
+    ]);
   });
 
   test("feedback never echoes transcript text, model output, or credentials", async () => {
@@ -1435,6 +1523,78 @@ describe("registerRenameCommand", () => {
     const pi = fakeRenamePi();
     registerRenameCommand(pi, { onTitleChange: () => {} });
     expect(pi.commands.has("rename")).toBe(true);
+  });
+
+  test("an empty request renames once after the next settled turn", async () => {
+    const pi = fakeRenamePi();
+    let hasTurn = false;
+    const deps = fakeRenameDeps({
+      runTurnCli: async () => ({
+        stdout: turnEnvelopeStdout(
+          hasTurn
+            ? { prompt: "add durable retries", response: "done" }
+            : null,
+        ),
+        stderr: "",
+      }),
+    });
+    registerRenameCommand(pi, { onTitleChange: () => {}, deps });
+    const ctx = fakeRenameCtx();
+
+    await pi.commands.get("rename")?.handler("", ctx);
+    expect(pi.setNameCalls).toEqual([]);
+    hasTurn = true;
+    pi.fire("agent_settled", {}, ctx);
+
+    expect(
+      await retryUntil(() =>
+        pi.setNameCalls.length === 1 ? pi.setNameCalls[0] : null,
+      ),
+    ).toBe("add-dark-mode");
+  });
+
+  test("a manual rename cancels a request waiting for its first turn", async () => {
+    const pi = fakeRenamePi();
+    let hasTurn = false;
+    const deps = fakeRenameDeps({
+      runTurnCli: async () => ({
+        stdout: turnEnvelopeStdout(
+          hasTurn ? { prompt: "later prompt", response: "done" } : null,
+        ),
+        stderr: "",
+      }),
+    });
+    registerRenameCommand(pi, { onTitleChange: () => {}, deps });
+    const ctx = fakeRenameCtx();
+
+    await pi.commands.get("rename")?.handler("", ctx);
+    pi.fire("session_info_changed", { name: "human-title" });
+    hasTurn = true;
+    pi.fire("agent_settled", {}, ctx);
+
+    expect(pi.setNameCalls).toEqual([]);
+  });
+
+  test("session shutdown cancels a queued request", async () => {
+    const pi = fakeRenamePi();
+    let hasTurn = false;
+    const deps = fakeRenameDeps({
+      runTurnCli: async () => ({
+        stdout: turnEnvelopeStdout(
+          hasTurn ? { prompt: "later prompt", response: "done" } : null,
+        ),
+        stderr: "",
+      }),
+    });
+    registerRenameCommand(pi, { onTitleChange: () => {}, deps });
+    const ctx = fakeRenameCtx();
+
+    await pi.commands.get("rename")?.handler("", ctx);
+    pi.fire("session_shutdown");
+    hasTurn = true;
+    pi.fire("agent_settled", {}, ctx);
+
+    expect(pi.setNameCalls).toEqual([]);
   });
 
   test("session_info_changed bridges a non-empty name to onTitleChange", () => {

@@ -18,8 +18,9 @@ Pi metadata commands invoke inference directly through Pi's runtime model bounda
 
 - resolve the fixed model through the command context's model registry;
 - resolve request authentication and provider configuration through Pi so OAuth refresh and account selection retain Pi's semantics;
-- issue one bounded lower-level completion without changing the live model, appending a message, creating a Harness session, or launching another process;
-- accept only a successful complete response, then validate and normalize the derived metadata before mutating Pi state.
+- issue one bounded lower-level completion per naming attempt without changing the live model, appending a message, creating a Harness session, or launching another process;
+- accept only a successful complete response, then validate and normalize the derived metadata before mutating Pi state;
+- coordinate attempts outside the inference boundary so an empty or active turn waits for `agent_settled`, and a result made stale by transcript movement may be discarded and retried against the settled leaf.
 
 The host-model dependency is invocation-local. Extension startup and the NDJSON events writer remain free of static Pi-package imports; a command loads the host-supplied inference surface only when invoked, catches import and API-shape failures, and exposes pure injected seams for Keeper's in-process tests. A model API failure disables that command invocation, never the Pi session.
 
@@ -40,3 +41,4 @@ The command uses one fixed cheap `openai-codex/*` model and does not fall back t
 - Command code carries a narrow runtime dependency on Pi's lower-level inference API and must fail open across API drift.
 - Tests inject model lookup, authentication, and completion results; they never call a real model or start a harness.
 - A missing cheap model, failed OAuth refresh, timeout, cancellation, or malformed completion leaves existing metadata unchanged.
+- Metadata commands may remain pending until a usable turn settles; manual title changes and session replacement cancel that pending intent rather than being overwritten.

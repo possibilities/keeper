@@ -903,9 +903,9 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       typeof pi.setSessionName === "function"
     ) {
       // Cast to the real structural contract `rename-command.ts` needs
-      // (`registerCommand`'s options shape, typed `on` overloads for
-      // `session_info_changed`/`session_start`) — same runtime object, a
-      // narrower view than this file's own minimal `PiExtensionApi`.
+      // (`registerCommand`'s options shape plus typed title, settle, and
+      // shutdown handlers) — same runtime object, a narrower view than this
+      // file's own minimal `PiExtensionApi`.
       registerRenameCommand(pi as unknown as PiRenameApi, {
         onTitleChange: (title) => {
           try {

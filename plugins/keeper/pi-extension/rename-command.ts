@@ -41,6 +41,8 @@ export const RENAME_TIMEOUT_MS = 20_000;
  *  is a local file read through the `keeper` binary, never network I/O. */
 const RENAME_TURN_CLI_TIMEOUT_MS = 10_000;
 const RENAME_TURN_CLI_MAX_BUFFER = 256 * 1024;
+const RENAME_MAX_READ_FAILURES = 3;
+const RENAME_MAX_COMPLETION_ATTEMPTS = 3;
 
 const RENAME_SYSTEM_PROMPT =
   "Generate a short session title (3-6 words) summarizing the user's most " +
@@ -419,17 +421,39 @@ export interface RenameCommandContext {
   sessionManager: RenameSessionManager;
   modelRegistry: RenameModelRegistry;
   ui: RenameUi;
+  /** Current Pi hosts provide this on command and event contexts. Absent on an
+   *  older host degrades to the original immediate-attempt behavior. */
+  isIdle?(): boolean;
 }
 
-/** Monotonic in-process generation token — the LAST `/rename` invocation to
- *  reach the pre-mutation revalidation wins; every earlier one discards. A
- *  fresh state per `registerRenameCommand()` call keeps tests isolated. */
+interface PendingRenameRequest {
+  generation: number;
+  sessionId: string;
+  initialTitle: string | undefined;
+  readFailures: number;
+  completionAttempts: number;
+}
+
+/** Session-scoped `/rename` controller. Explicit invocations advance the
+ *  generation; internal retries keep the same immutable request identity. */
 export interface RenameInvocationState {
   generation: number;
+  pending: PendingRenameRequest | null;
+  running: boolean;
+  wakeRequested: boolean;
+  wakeContext: RenameCommandContext | null;
+  activeAbort: AbortController | null;
 }
 
 export function createRenameInvocationState(): RenameInvocationState {
-  return { generation: 0 };
+  return {
+    generation: 0,
+    pending: null,
+    running: false,
+    wakeRequested: false,
+    wakeContext: null,
+    activeAbort: null,
+  };
 }
 
 export type RenameOutcomeKind =
@@ -445,30 +469,64 @@ export type RenameOutcomeKind =
 export interface RenameOutcome {
   outcome: RenameOutcomeKind;
   title?: string;
+  staleReason?: "retryable" | "cancelled";
 }
 
-/**
- * Compute (never apply) the `/rename` outcome for one invocation. Snapshots
- * session id / leaf / title BEFORE any await, bumps the generation token,
- * and revalidates snapshot + generation IMMEDIATELY before reporting success
- * — a newer turn, branch navigation, session replacement, manual title
- * change, or a later `/rename` all fold to `"stale"` here. Never mutates Pi
- * state; the caller applies `pi.setSessionName()` exactly once on success.
- */
-export async function runRenameInvocation(
+function beginRenameRequest(
+  ctx: RenameCommandContext,
+  state: RenameInvocationState,
+): PendingRenameRequest {
+  state.activeAbort?.abort();
+  const request: PendingRenameRequest = {
+    generation: ++state.generation,
+    sessionId: ctx.sessionManager.getSessionId(),
+    initialTitle: ctx.sessionManager.getSessionName(),
+    readFailures: 0,
+    completionAttempts: 0,
+  };
+  state.pending = request;
+  state.wakeRequested = false;
+  state.wakeContext = null;
+  return request;
+}
+
+function requestIsCurrent(
+  ctx: RenameCommandContext,
+  state: RenameInvocationState,
+  request: PendingRenameRequest,
+): boolean {
+  return (
+    state.pending === request &&
+    state.generation === request.generation &&
+    ctx.sessionManager.getSessionId() === request.sessionId &&
+    ctx.sessionManager.getSessionName() === request.initialTitle
+  );
+}
+
+/** Compute (never apply) one attempt for an immutable explicit request. */
+async function runRenameAttempt(
   ctx: RenameCommandContext,
   deps: RenameCommandDeps,
   state: RenameInvocationState,
+  request: PendingRenameRequest,
 ): Promise<RenameOutcome> {
-  const myGeneration = ++state.generation;
-  const sessionId = ctx.sessionManager.getSessionId();
+  if (!requestIsCurrent(ctx, state, request)) {
+    return { outcome: "stale", staleReason: "cancelled" };
+  }
   const leaf = ctx.sessionManager.getLeafId() ?? "root";
-  const preTitle = ctx.sessionManager.getSessionName();
-
   const cliExit = await deps.runTurnCli(
-    buildPiTurnArgv(sessionId, leaf, ctx.cwd),
+    buildPiTurnArgv(request.sessionId, leaf, ctx.cwd),
   );
   const turnOutcome = parseTurnCliOutput(cliExit);
+  if (!requestIsCurrent(ctx, state, request)) {
+    return { outcome: "stale", staleReason: "cancelled" };
+  }
+  if (
+    (ctx.sessionManager.getLeafId() ?? "root") !== leaf ||
+    !(ctx.isIdle?.() ?? true)
+  ) {
+    return { outcome: "stale", staleReason: "retryable" };
+  }
   if (turnOutcome.kind === "error") {
     return { outcome: "read_failed" };
   }
@@ -489,6 +547,15 @@ export async function runRenameInvocation(
   if (auth.ok !== true) {
     return { outcome: "auth_failed" };
   }
+  if (!requestIsCurrent(ctx, state, request)) {
+    return { outcome: "stale", staleReason: "cancelled" };
+  }
+  if (
+    (ctx.sessionManager.getLeafId() ?? "root") !== leaf ||
+    !(ctx.isIdle?.() ?? true)
+  ) {
+    return { outcome: "stale", staleReason: "retryable" };
+  }
 
   const inputText = buildRenameInputText(
     turnOutcome.prompt,
@@ -496,11 +563,14 @@ export async function runRenameInvocation(
     RENAME_MAX_TRANSCRIPT_BYTES,
   );
 
+  request.completionAttempts += 1;
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    deps.timeoutMs ?? RENAME_TIMEOUT_MS,
-  );
+  state.activeAbort = controller;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, deps.timeoutMs ?? RENAME_TIMEOUT_MS);
   let completion: RenameCompletionResult;
   try {
     completion = await deps.runCompletion(
@@ -525,14 +595,19 @@ export async function runRenameInvocation(
       },
     );
   } catch {
-    return {
-      outcome: controller.signal.aborted ? "timeout" : "model_unavailable",
-    };
+    if (!timedOut && controller.signal.aborted) {
+      return { outcome: "stale", staleReason: "cancelled" };
+    }
+    return { outcome: timedOut ? "timeout" : "model_unavailable" };
   } finally {
     clearTimeout(timer);
+    if (state.activeAbort === controller) state.activeAbort = null;
   }
 
   if (completion.stopReason === "aborted") {
+    if (controller.signal.aborted && !timedOut) {
+      return { outcome: "stale", staleReason: "cancelled" };
+    }
     return { outcome: "timeout" };
   }
   const text = extractCompletionText(completion);
@@ -545,16 +620,26 @@ export async function runRenameInvocation(
     return { outcome: "invalid_output" };
   }
 
-  const stillNewest =
-    myGeneration === state.generation &&
-    ctx.sessionManager.getSessionId() === sessionId &&
-    (ctx.sessionManager.getLeafId() ?? "root") === leaf &&
-    ctx.sessionManager.getSessionName() === preTitle;
-  if (!stillNewest) {
-    return { outcome: "stale" };
+  if (!requestIsCurrent(ctx, state, request)) {
+    return { outcome: "stale", staleReason: "cancelled" };
+  }
+  if (
+    (ctx.sessionManager.getLeafId() ?? "root") !== leaf ||
+    !(ctx.isIdle?.() ?? true)
+  ) {
+    return { outcome: "stale", staleReason: "retryable" };
   }
 
   return { outcome: "success", title: slug };
+}
+
+/** One-shot compatibility seam used by pure orchestration tests. */
+export async function runRenameInvocation(
+  ctx: RenameCommandContext,
+  deps: RenameCommandDeps,
+  state: RenameInvocationState,
+): Promise<RenameOutcome> {
+  return runRenameAttempt(ctx, deps, state, beginRenameRequest(ctx, state));
 }
 
 /** Human-facing feedback for one outcome. Never echoes transcript text,
@@ -600,40 +685,117 @@ export function renameFeedback(
   }
 }
 
-/**
- * Build the `/rename` command handler. The ONLY call site of
- * `pi.setSessionName()` — invoked at most once per handler call, and only on
- * a freshly-revalidated success outcome.
- */
+function clearPendingRename(
+  state: RenameInvocationState,
+  request?: PendingRenameRequest,
+): void {
+  if (request !== undefined && state.pending !== request) return;
+  state.pending = null;
+  state.wakeRequested = false;
+  state.wakeContext = null;
+  state.activeAbort?.abort();
+  state.activeAbort = null;
+}
+
+/** Drive one pending request while the session is settled. Calls coalesce so
+ *  an `agent_settled` arriving during inference becomes one later wake. */
+async function drivePendingRename(
+  pi: { setSessionName(name: string): void },
+  deps: RenameCommandDeps,
+  state: RenameInvocationState,
+  ctx: RenameCommandContext,
+): Promise<void> {
+  const request = state.pending;
+  if (request === null) return;
+  if (state.running) {
+    state.wakeRequested = true;
+    state.wakeContext = ctx;
+    return;
+  }
+  if (!(ctx.isIdle?.() ?? true)) return;
+
+  state.running = true;
+  try {
+    while (state.pending === request && (ctx.isIdle?.() ?? true)) {
+      let result: RenameOutcome;
+      try {
+        result = await runRenameAttempt(ctx, deps, state, request);
+      } catch {
+        result = { outcome: "read_failed" };
+      }
+
+      if (result.outcome === "empty") return;
+      if (result.outcome === "read_failed") {
+        request.readFailures += 1;
+        if (request.readFailures < RENAME_MAX_READ_FAILURES) continue;
+      }
+      if (
+        result.outcome === "stale" &&
+        result.staleReason === "retryable"
+      ) {
+        if (request.completionAttempts < RENAME_MAX_COMPLETION_ATTEMPTS) {
+          if (ctx.isIdle?.() ?? true) continue;
+          return;
+        }
+        clearPendingRename(state, request);
+        const fb = renameFeedback("stale");
+        ctx.ui.notify(fb.message, fb.level);
+        return;
+      }
+      if (result.outcome === "stale") {
+        clearPendingRename(state, request);
+        return;
+      }
+      if (result.outcome === "success" && result.title !== undefined) {
+        // Clear BEFORE mutation: the resulting session_info_changed event can
+        // never look like an external manual rename of a live request.
+        clearPendingRename(state, request);
+        try {
+          pi.setSessionName(result.title);
+        } catch {
+          const fb = renameFeedback("model_unavailable");
+          ctx.ui.notify(fb.message, fb.level);
+          return;
+        }
+        const fb = renameFeedback("success", result.title);
+        ctx.ui.notify(fb.message, fb.level);
+        return;
+      }
+
+      clearPendingRename(state, request);
+      const fb = renameFeedback(result.outcome);
+      ctx.ui.notify(fb.message, fb.level);
+      return;
+    }
+  } finally {
+    state.running = false;
+    const wakeCtx = state.wakeContext;
+    const shouldWake = state.wakeRequested && wakeCtx !== null;
+    state.wakeRequested = false;
+    state.wakeContext = null;
+    if (shouldWake) {
+      void drivePendingRename(pi, deps, state, wakeCtx).catch(() => {});
+    }
+  }
+}
+
+/** Build `/rename`: arm one eventual title, acknowledge immediately, then
+ *  either attempt now or let `agent_settled` wake it. */
 export function createRenameCommandHandler(
   pi: { setSessionName(name: string): void },
   deps: RenameCommandDeps,
   state: RenameInvocationState,
 ): (args: string, ctx: RenameCommandContext) => Promise<void> {
   return async (_args, ctx) => {
-    let result: RenameOutcome;
+    const request = beginRenameRequest(ctx, state);
+    ctx.ui.notify("/rename: generating a session title…", "info");
     try {
-      result = await runRenameInvocation(ctx, deps, state);
+      await drivePendingRename(pi, deps, state, ctx);
     } catch {
-      // Fail-open: any unforeseen throw in the pipeline degrades to a plain
-      // failure notification, never an escaped exception into Pi's command
-      // dispatch.
-      result = { outcome: "model_unavailable" };
-    }
-    if (result.outcome === "success" && result.title !== undefined) {
-      try {
-        pi.setSessionName(result.title);
-      } catch {
-        const fb = renameFeedback("model_unavailable");
-        ctx.ui.notify(fb.message, fb.level);
-        return;
-      }
-      const fb = renameFeedback("success", result.title);
+      clearPendingRename(state, request);
+      const fb = renameFeedback("model_unavailable");
       ctx.ui.notify(fb.message, fb.level);
-      return;
     }
-    const fb = renameFeedback(result.outcome);
-    ctx.ui.notify(fb.message, fb.level);
   };
 }
 
@@ -665,6 +827,11 @@ export interface PiRenameApi {
       ctx: { sessionManager: RenameSessionManager },
     ) => void,
   ): void;
+  on(
+    event: "agent_settled",
+    handler: (event: unknown, ctx: RenameCommandContext) => void,
+  ): void;
+  on(event: "session_shutdown", handler: () => void): void;
 }
 
 export interface RegisterRenameCommandOptions {
@@ -690,11 +857,31 @@ export function registerRenameCommand(
   });
   pi.on("session_info_changed", (event) => {
     try {
+      const pending = state.pending;
+      if (pending !== null && event?.name !== pending.initialTitle) {
+        // Any external title mutation wins. A successful `/rename` clears its
+        // request before calling setSessionName, so it never enters here live.
+        clearPendingRename(state, pending);
+      }
       if (typeof event?.name === "string" && event.name.length > 0) {
         opts.onTitleChange(event.name);
       }
     } catch {
       // Fail-open: never let a title-bridge failure escape into Pi.
+    }
+  });
+  pi.on("agent_settled", (_event, ctx) => {
+    try {
+      void drivePendingRename(pi, deps, state, ctx).catch(() => {});
+    } catch {
+      // Fail-open: a missed wake can heal on a later settled turn.
+    }
+  });
+  pi.on("session_shutdown", () => {
+    try {
+      clearPendingRename(state);
+    } catch {
+      // Session teardown must never inherit a metadata-command failure.
     }
   });
   pi.on("session_start", (_event, ctx) => {
